@@ -26,6 +26,7 @@ use floem::views::editor::id::EditorId;
 use floem::views::editor::layout::{LineExtraStyle, TextLayoutLine};
 use floem::views::editor::text::{Document, Styling};
 use schemaic_core::intel::SqlDialect;
+use schemaic_core::sql::{is_word_byte, is_word_start};
 
 #[derive(Clone, Copy)]
 enum Tok {
@@ -384,9 +385,20 @@ fn lex_line(line: &str, dialect: SqlDialect, start_in_block: bool) -> Vec<(usize
             continue;
         }
         // word: keyword or identifier
-        if c.is_ascii_alphabetic() || c == b'_' {
+        //
+        // **`core::sql`'s predicates, not an ASCII rule** — architecture
+        // invariant 11, and this was its first site outside `core/sql.rs`. The
+        // ASCII spelling stepped over each byte of a multi-byte character with
+        // the `i += 1` fallthrough and then lexed the ASCII tail as a fresh
+        // word, so `SELECT éselect FROM t` painted `select` as a keyword
+        // *inside* a legal column name — and the same spans reach the Ctrl+K
+        // diff through `highlight_spans`. It surfaced only when a keyword
+        // happened to follow the non-ASCII byte (`naïve_from`'s tail is not
+        // one), which is why nobody saw it. `is_keyword` folds ASCII only, so a
+        // whole non-ASCII word now correctly matches nothing.
+        if is_word_start(c) {
             let mut j = i + 1;
-            while j < n && (b[j].is_ascii_alphanumeric() || b[j] == b'_') {
+            while j < n && is_word_byte(b[j]) {
                 j += 1;
             }
             if is_keyword(&line[i..j]) {
@@ -520,6 +532,32 @@ mod tests {
 
     fn flags(text: &str) -> Vec<bool> {
         block_comment_lines(text, SqlDialect::MySql)
+    }
+
+    /// **Architecture invariant 11, asked of the scanner.** The invariant's own
+    /// tests in `core/sql.rs` assert the two predicates and nothing that uses
+    /// them, which is why this file's ASCII word rule was green: the ASCII tail
+    /// of a non-ASCII identifier was lexed as a fresh word and
+    /// `SELECT éselect FROM t` painted `select` as a keyword inside a legal
+    /// column name. The same spans reach the Ctrl+K diff.
+    #[test]
+    fn a_keyword_inside_a_non_ascii_identifier_is_not_a_keyword() {
+        let keywords = |line: &str| -> Vec<String> {
+            lex_line(line, SqlDialect::MySql, false)
+                .into_iter()
+                .filter(|(_, _, t)| matches!(t, Tok::Keyword))
+                .map(|(s, e, _)| line[s..e].to_string())
+                .collect()
+        };
+        assert_eq!(keywords("SELECT éselect FROM t"), ["SELECT", "FROM"]);
+        // The counterweight that hid it: a tail that is not a keyword was
+        // always painted correctly, so only some identifiers showed the bug.
+        assert_eq!(keywords("SELECT naïve_from FROM t"), ["SELECT", "FROM"]);
+        // A whole non-ASCII word, and one whose *head* is a keyword.
+        assert_eq!(keywords("SELECT 日本語 FROM t"), ["SELECT", "FROM"]);
+        assert_eq!(keywords("SELECT selecté FROM t"), ["SELECT", "FROM"]);
+        // And an ordinary keyword is still one.
+        assert_eq!(keywords("select 1 where a"), ["select", "where"]);
     }
 
     #[test]
