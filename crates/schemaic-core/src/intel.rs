@@ -1387,6 +1387,7 @@ fn scan_clauses(
     sql: &str,
     toks: &[Token],
     scan_end: usize,
+    dialect: SqlDialect,
 ) -> (StmtKind, Clause, usize, Vec<Clause>, bool, bool, bool) {
     let word_up = |t: &Token| -> Option<String> {
         if let TkKind::Word(w) = &t.kind {
@@ -1558,12 +1559,24 @@ fn scan_clauses(
         i += 1;
     }
     // `*` (and `count(*)`) is a projection but the tokenizer drops it, so scan the
-    // raw SELECT-clause span (up to the caret's word) for one to know the projection
+    // SELECT-clause span (up to the caret's word) for one to know the projection
     // is non-empty.
+    //
+    // **Through `code_mask`, not `str::contains`.** A raw byte scan counted a
+    // star inside a string or a comment: `SELECT 'a*b', ` — an *empty*
+    // projection slot after the comma — offered `FROM`, and `SELECT -- *` and
+    // `SELECT /* * */` offered `FROM` and suppressed `DISTINCT` though nothing
+    // had been projected. One boundary lexer is the invariant, `code_mask` is
+    // this module's own primitive for it, and it is dialect-aware, which a
+    // `contains` cannot be.
     let select_has_star = matches!(cur, Clause::Select)
-        && sql
-            .get(select_kw_end..scan_end)
-            .is_some_and(|s| s.contains('*'));
+        && sql.get(select_kw_end..scan_end).is_some_and(|_| {
+            let code = code_mask(sql, dialect);
+            sql.as_bytes()[select_kw_end..scan_end]
+                .iter()
+                .enumerate()
+                .any(|(k, &c)| c == b'*' && code[select_kw_end + k])
+        });
     (
         kind,
         cur,
@@ -1590,7 +1603,7 @@ pub fn clause_continuation(
     let start = local_scope_start(sql, lo, word_lo, dialect);
     let toks = tokenize_range(sql, start, word_lo, dialect);
     let (kind, cur, operand, seen, select_has_content, select_has_star, distinct_seen) =
-        scan_clauses(sql, &toks, word_lo);
+        scan_clauses(sql, &toks, word_lo, dialect);
     let filled = operand >= 1;
     let has = |c: Clause| seen.contains(&c);
     let mut kws: Vec<&str> = Vec::new();
@@ -1964,12 +1977,28 @@ mod ast_scope {
         })
     }
 
+    /// Add `r` unless the scope already holds the same reference.
+    ///
+    /// **`db` is part of the identity**, and leaving it out was a data-losing
+    /// dedupe rather than a tidy one: `FROM shop.users JOIN archive.users`
+    /// collapsed to a single entry, so "Expand `*`" wrote `id, a_only` — the
+    /// other database's columns simply gone — and wrote them *unqualified*,
+    /// because `expand_star` reads `scope.len() > 1` off the truncated scope, so
+    /// the statement it produced then failed as ambiguous. `table_ref_of` five
+    /// lines above exists to fill `db`, and `statement_scope`'s own doc states
+    /// the rule this broke: "a superset is the safe direction".
+    ///
+    /// Case-folded like the name, since a database name folds on the engines
+    /// that have one.
     fn push_ref(r: TableRef, out: &mut Scope) {
-        if !out
-            .tables
-            .iter()
-            .any(|e| e.name.eq_ignore_ascii_case(&r.name) && e.alias == r.alias)
-        {
+        let same_db = |a: &Option<String>, b: &Option<String>| match (a, b) {
+            (Some(x), Some(y)) => x.eq_ignore_ascii_case(y),
+            (None, None) => true,
+            _ => false,
+        };
+        if !out.tables.iter().any(|e| {
+            e.name.eq_ignore_ascii_case(&r.name) && e.alias == r.alias && same_db(&e.db, &r.db)
+        }) {
             out.tables.push(r);
         }
     }
@@ -2330,6 +2359,28 @@ fn word_range_at(sql: &str, off: usize) -> (usize, usize) {
     }
 }
 
+/// Does an `INSERT`/`REPLACE` introduce the `INTO` at `toks[i]`?
+///
+/// The word before it, or the statement's leading keyword — the first covers
+/// `WITH … INSERT INTO t` (a PostgreSQL data-modifying CTE, where the leading
+/// keyword is `WITH`), the second covers `INSERT IGNORE INTO t` and
+/// `REPLACE DELAYED INTO t`, where a modifier sits in between.
+fn insert_precedes(toks: &[Token], i: usize) -> bool {
+    let is_insert = |w: &str| matches!(w.to_ascii_uppercase().as_str(), "INSERT" | "REPLACE");
+    let prev = i
+        .checked_sub(1)
+        .and_then(|j| toks.get(j))
+        .and_then(|t| match &t.kind {
+            TkKind::Word(w) => Some(w.as_str()),
+            _ => None,
+        });
+    let leading = toks.iter().find_map(|t| match &t.kind {
+        TkKind::Word(w) => Some(w.as_str()),
+        _ => None,
+    });
+    prev.is_some_and(is_insert) || leading.is_some_and(is_insert)
+}
+
 /// All FROM/JOIN/UPDATE/INTO table references in `sql[lo..hi]`, each with the byte
 /// range of its *table-name* token (positions the AST can't reliably give). Unlike
 /// [`lexer_scope`] this ignores paren scoping — for a parsed statement we want
@@ -2366,6 +2417,22 @@ fn table_refs_with_pos(
         // is still a table list, which is why this asks the *call's name* and
         // not the paren depth.
         if is_from && from_separates_call_arguments(&toks, i) {
+            i += 1;
+            continue;
+        }
+        // **Only `INSERT INTO` / `REPLACE INTO` names a table.** `INTO` has
+        // three other meanings and none of them does: PostgreSQL's legacy
+        // `SELECT a INTO newtbl FROM t` names the table it is about to
+        // *create*, and MySQL's `SELECT a INTO @x` and `INTO OUTFILE`/`DUMPFILE`
+        // name no table at all — `@` is not `is_word_start`, so `@x` tokenized
+        // as the bare word `x` and looked exactly like one. Both drew a
+        // confident ``Table `x` not found``, because the active database *is*
+        // loaded so `table_status` has no `Unknown` arm to fall back on.
+        //
+        // Asked of the previous word rather than the statement's leading
+        // keyword, so `INSERT IGNORE INTO t` and PostgreSQL's
+        // `WITH … INSERT INTO t` both still register their table.
+        if up == "INTO" && !insert_precedes(&toks, i) {
             i += 1;
             continue;
         }
@@ -6690,6 +6757,36 @@ mod tests {
         cont(sql).keywords
     }
 
+    /// **A star inside a string or a comment is not a projection.**
+    ///
+    /// `select_has_star` was a raw `str::contains('*')` over the SELECT-clause
+    /// span — no boundary awareness and no dialect, against the invariant that
+    /// everything scanning SQL for string/comment boundaries builds on
+    /// `sql::skip_noncode`. This module already owns the primitive
+    /// (`code_mask`), which is what it asks now.
+    #[test]
+    fn a_star_in_a_string_or_comment_is_not_a_projection() {
+        // Nothing has been projected, so `DISTINCT` is still on offer and `FROM`
+        // is not.
+        for sql in ["SELECT -- *\n  ", "SELECT /* * */ "] {
+            let got = kws(sql);
+            assert!(
+                got.contains(&"DISTINCT".to_string()) && !got.contains(&"FROM".to_string()),
+                "{sql:?} -> {got:?}"
+            );
+        }
+        // A trailing comma reopens the projection slot, so `FROM` is wrong there
+        // too — the star is inside the literal.
+        assert!(
+            !kws("SELECT 'a*b', ").contains(&"FROM".to_string()),
+            "{:?}",
+            kws("SELECT 'a*b', ")
+        );
+        // And a real star still counts, which is the whole point of the scan.
+        assert_eq!(kws("SELECT * "), vec!["FROM"]);
+        assert_eq!(kws("SELECT count(*) "), vec!["FROM"]);
+    }
+
     #[test]
     fn continuation_from_ranks_after_projection() {
         // `select * f` → FROM is the expected continuation (the projection is
@@ -8256,6 +8353,95 @@ mod tests {
 
     fn join_at(sql: &str, caret: usize) -> Option<String> {
         join_at_on(sql, caret, SqlDialect::MySql)
+    }
+
+    /// **`INTO` names a table only after `INSERT`/`REPLACE`.**
+    ///
+    /// Both of these were a confident ``Table `x` not found`` under something
+    /// that is not a table: PostgreSQL's legacy `SELECT INTO` names the table it
+    /// is about to *create*, and MySQL's `INTO @var` names a user variable —
+    /// which tokenized as the bare word `x`, because `@` is not
+    /// `is_word_start`. The MariaDB form was run live at the review's SHA.
+    #[test]
+    fn into_is_a_table_only_when_an_insert_introduces_it() {
+        for (sql, dialect) in [
+            ("SELECT id INTO @x FROM employees;", SqlDialect::MySql),
+            (
+                "SELECT id INTO newtbl FROM employees;",
+                SqlDialect::Postgres,
+            ),
+        ] {
+            let d = diag_d(sql, dialect);
+            assert!(d.is_empty(), "{sql} on {dialect:?} squiggled {d:?}");
+        }
+        // The side that has to keep working: `INSERT INTO` really does name an
+        // existing table, and a missing one is still flagged. Three spellings,
+        // because the guard asks the *previous* word and the leading keyword.
+        for sql in [
+            "INSERT INTO nosuchtbl (id) VALUES (1);",
+            "INSERT IGNORE INTO nosuchtbl (id) VALUES (1);",
+            "REPLACE INTO nosuchtbl (id) VALUES (1);",
+        ] {
+            let d = diag(sql);
+            assert!(
+                d.iter().any(|x| x.message.contains("nosuchtbl")),
+                "{sql} no longer names its table: {d:?}"
+            );
+        }
+        // …including the CTE-fronted form, whose leading keyword is `WITH`.
+        let d = diag_d(
+            "WITH x AS (SELECT 1 AS a) INSERT INTO nosuchtbl (id) SELECT a FROM x;",
+            SqlDialect::Postgres,
+        );
+        assert!(
+            d.iter().any(|x| x.message.contains("nosuchtbl")),
+            "a data-modifying CTE's INSERT lost its table: {d:?}"
+        );
+    }
+
+    /// **A cross-database join of two same-named tables is two tables.**
+    ///
+    /// `push_ref` deduped on name + alias and ignored `db`, so
+    /// `FROM shop.users JOIN archive.users` collapsed to one entry — and
+    /// "Expand `*`" then wrote `id, a_only` (the other database's columns simply
+    /// gone) *unqualified*, because `expand_star` reads `scope.len() > 1` off
+    /// the scope it was handed. The statement it produced failed as ambiguous.
+    #[test]
+    fn two_databases_same_table_name_are_two_scope_entries() {
+        let shop = DbSchema {
+            tables: vec![tbl("users", &["id", "a_only"])],
+            ..Default::default()
+        };
+        let archive = DbSchema {
+            tables: vec![tbl("users", &["id", "b_only"])],
+            ..Default::default()
+        };
+        let cat = Catalog::build(&[("shop", &shop), ("archive", &archive)], Some("shop"));
+        let sql = "SELECT * FROM shop.users JOIN archive.users ON shop.users.id = archive.users.id";
+        let scope = statement_scope(sql, 0, sql.len(), sql.len(), SqlDialect::MySql);
+        assert_eq!(
+            scope.tables.len(),
+            2,
+            "one of the two databases' users was deduped away: {:?}",
+            scope.tables
+        );
+        // The star expands to both, qualified — the qualifier is what makes the
+        // result runnable with two same-named tables in scope.
+        let star = sql.find('*').unwrap();
+        let ex = expand_star(sql, 0, sql.len(), star + 1, &cat, SqlDialect::MySql)
+            .expect("the star expands");
+        for want in ["a_only", "b_only"] {
+            assert!(
+                ex.replacement.contains(want),
+                "{want} is missing from {:?}",
+                ex.replacement
+            );
+        }
+        assert!(
+            ex.replacement.contains('.'),
+            "two tables in scope and the columns came back unqualified: {:?}",
+            ex.replacement
+        );
     }
 
     /// `join_at` with the engine named. Every test in this block was MySQL, and
