@@ -1083,18 +1083,40 @@ pub fn export_json_chunks<W: Write>(w: &mut W, src: &mut dyn RowChunks) -> io::R
 
 /// Column names made unique for use as JSON object keys: a repeated name gets a
 /// `_2`/`_3`/… suffix (first occurrence keeps the bare name).
+///
+/// **A generated suffix never takes a name a real column already has** — the
+/// same rule, and the same reasoning, as [`export_file_names`] a few hundred
+/// lines above; this was a bare occurrence counter and had the bug that one is
+/// a paragraph about. `SELECT 1 AS a, 2 AS a, 3 AS a_2` produced the keys
+/// `["a", "a_2", "a_2"]`; every key is written, and every JSON parser keeps the
+/// last duplicate, so the **middle** column's value was gone on the way back
+/// in — including through this app's own JSON import, which reads the format.
+///
+/// So every bare name is reserved before any key is handed out, which makes the
+/// answer independent of the order the columns arrive in, and only a
+/// *generated* suffix has to step around the reservation: a column always keeps
+/// its own name.
 fn unique_column_keys(rs: &ResultSet) -> Vec<String> {
-    let mut seen: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let reserved: std::collections::HashSet<&str> =
+        rs.columns.iter().map(|c| c.name.as_str()).collect();
+    let mut taken: std::collections::HashSet<String> = std::collections::HashSet::new();
     rs.columns
         .iter()
         .map(|c| {
-            let n = seen.entry(c.name.clone()).or_insert(0);
-            *n += 1;
-            if *n == 1 {
-                c.name.clone()
-            } else {
-                format!("{}_{}", c.name, n)
+            let mut candidate = c.name.clone();
+            let mut n = 1u32;
+            loop {
+                // `n > 1` is what lets a column keep its own name: the
+                // reservation set holds every bare name, including this one.
+                if !(n > 1 && reserved.contains(candidate.as_str()))
+                    && taken.insert(candidate.clone())
+                {
+                    break;
+                }
+                n += 1;
+                candidate = format!("{}_{}", c.name, n);
             }
+            candidate
         })
         .collect()
 }
@@ -1514,11 +1536,24 @@ fn fit_cell(s: &str) -> &str {
 /// legal in PostgreSQL, and `history` is an ordinary table name everywhere.
 /// `rust_xlsxwriter` enforces the first three for us and documents the fourth
 /// without checking it, so that one is ours.
+///
+/// **And so is every control character**, which is not an Excel rule but an XML
+/// one. A sheet name is written into an *attribute*, and the escaper that runs
+/// there covers `& " < > \n` and nothing else — while C0 characters other than
+/// tab, LF and CR are not XML 1.0 characters at all. A table named `a<U+0001>b`
+/// (legal on MySQL, legal on PostgreSQL) therefore produced an
+/// `xl/workbook.xml` that does not parse, and Excel refuses such a workbook
+/// rather than repairing it: the export reported `Exported n rows` over a file
+/// nothing opens. `suggested_filename` ten screens up already scrubs them out
+/// of the *file* name derived from the same table name, and
+/// `erd_export::svg_text` exists for this rule alone.
 fn sheet_name(source: Option<(&str, Option<&str>, &str)>) -> String {
     let base = source.map(|(_, _, t)| t).unwrap_or("");
     let cleaned: String = base
         .chars()
         .map(|c| match c {
+            // Before the ceiling, so the 31 is counted over what survives.
+            c if c.is_control() => '_',
             '[' | ']' | ':' | '*' | '?' | '/' | '\\' => '_',
             c => c,
         })
@@ -4654,6 +4689,56 @@ mod tests {
         assert_eq!(sheet_of(&to_xlsx(&rs(), &[0], None)), "Result");
     }
 
+    /// **A C0 control character in a table name made the workbook malformed,
+    /// and the export reported success.**
+    ///
+    /// `a<U+0001>b` is a legal table name on MySQL and on PostgreSQL.
+    /// `rust_xlsxwriter`'s `set_name` validates blank, length, `* ? : [ ] \ /`
+    /// and apostrophes, and nothing else; a sheet name is written into an XML
+    /// *attribute*, whose escaper covers only `& " < > \n`. C0 characters other
+    /// than tab, LF and CR are not XML 1.0 characters at all, so the resulting
+    /// `xl/workbook.xml` does not parse and Excel refuses the file rather than
+    /// repairing it.
+    ///
+    /// Two places in this crate already knew the rule: `suggested_filename` ten
+    /// screens up opens with `c.is_control()`, so the *file name* derived from
+    /// the same table name was scrubbed and the sheet name was not; and
+    /// `erd_export::svg_text` exists for nothing else, after the SVG export
+    /// wrote a file no renderer opens and said `Saved diagram.svg`.
+    #[test]
+    fn a_control_character_in_a_table_name_cannot_reach_the_worksheet_name() {
+        assert_eq!(sheet_name(Some(("db", None, "a\u{1}b"))), "a_b");
+        // Tab, LF and CR are legal XML but still nothing to name a sheet with.
+        assert_eq!(sheet_name(Some(("db", None, "a\tb\nc\rd"))), "a_b_c_d");
+        // The count is over the *cleaned* string, so a name of nothing but
+        // control characters cannot smuggle 31 of them past the ceiling.
+        let noisy = "\u{1}".repeat(40);
+        assert_eq!(sheet_name(Some(("db", None, &noisy))), "_".repeat(31));
+
+        // The composition, which is where the failure actually lived: the pure
+        // scrub is worthless if the writer publishes the raw name anyway.
+        let bytes = to_xlsx(&rs(), &[0], Some(("shop", None, "a\u{1}b")));
+        assert_eq!(sheet_of(&bytes), "a_b");
+        let book = zip_entry(&bytes, "xl/workbook.xml");
+        assert!(
+            !book
+                .iter()
+                .any(|&b| b < 0x20 && !matches!(b, b'\t' | b'\n' | b'\r')),
+            "xl/workbook.xml holds a byte XML 1.0 has no character for"
+        );
+    }
+
+    /// One entry of a zip archive, as bytes.
+    fn zip_entry(archive: &[u8], name: &str) -> Vec<u8> {
+        use std::io::Read;
+        let mut z = zip::ZipArchive::new(std::io::Cursor::new(archive.to_vec()))
+            .expect("a workbook is a zip");
+        let mut f = z.by_name(name).expect("the entry");
+        let mut out = Vec::new();
+        f.read_to_end(&mut out).expect("entry bytes");
+        out
+    }
+
     #[test]
     fn format_render_matches_the_direct_call() {
         // The enum is the single dispatch point for both menus, so it must agree
@@ -5126,6 +5211,53 @@ mod tests {
         assert_eq!(v[0]["id"], 1);
         assert_eq!(v[0]["id_2"], 2);
         assert_eq!(v[0]["id_3"], 3);
+    }
+
+    /// **A generated suffix must not take a name a real column already has** —
+    /// the same rule `export_file_names` is a paragraph about, ten screens up,
+    /// and the same failure: `a`, `a`, `a_2` produced the keys
+    /// `["a", "a_2", "a_2"]`, the writer emitted all three, and every JSON
+    /// parser keeps the last duplicate. The *middle* column's value was gone
+    /// on the way back in — including through Schemaic's own JSON import.
+    ///
+    /// Asserted after a re-parse rather than on `unique_column_keys`' `Vec`,
+    /// because in the `Vec` the duplicate is merely visible; the loss only
+    /// exists at the composition with the serializer.
+    #[test]
+    fn a_generated_json_key_steps_around_a_column_that_already_has_that_name() {
+        let rs = ResultSet::from_rows(
+            vec![col("a"), col("a"), col("a_2")],
+            vec![vec![Value::Int(1), Value::Int(2), Value::Int(3)]],
+        );
+        let text = export_json(&rs, &[0]);
+        let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let obj = v[0].as_object().expect("a row object");
+        assert_eq!(obj.len(), 3, "no value may be overwritten: {text}");
+        // The real `a_2` keeps its own name; the *second* `a` is the one that
+        // has to move.
+        assert_eq!(obj["a"], 1);
+        assert_eq!(obj["a_3"], 2);
+        assert_eq!(obj["a_2"], 3);
+    }
+
+    /// And it keeps stepping: `_3` is taken too, so the second `a` lands on
+    /// `_4`. A single skip passes on the case above and fails here.
+    #[test]
+    fn a_generated_json_key_skips_every_name_that_is_taken() {
+        let rs = ResultSet::from_rows(
+            vec![col("a"), col("a"), col("a_2"), col("a_3")],
+            vec![vec![
+                Value::Int(1),
+                Value::Int(2),
+                Value::Int(3),
+                Value::Int(4),
+            ]],
+        );
+        let text = export_json(&rs, &[0]);
+        let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let obj = v[0].as_object().expect("a row object");
+        assert_eq!(obj.len(), 4, "{text}");
+        assert_eq!(obj["a_4"], 2);
     }
 
     #[test]
