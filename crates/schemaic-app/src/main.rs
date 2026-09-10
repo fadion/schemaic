@@ -2629,9 +2629,15 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
     // A filter/sort re-run: keeps the current table until the filtered result lands
     // (or an error shows in the grid's bottom bar), without recording history or
     // disturbing `base_sql`/`grid_query` (the grid owns those).
-    let apply_view: Rc<dyn Fn(String)> = {
+    // **The refusal arrives with the argument.** `RerunRequest` can only be
+    // minted through `sql::rerunnable_for_export`, so this reaches
+    // `run_query_core` past `run_verdict` by design rather than by omission —
+    // through a gate strictly stronger than it, with no `Confirm` arm. It used
+    // to take a bare `String` and rest on whatever each caller happened to
+    // check.
+    let apply_view: Rc<dyn Fn(schemaic_ui::RerunRequest)> = {
         let core = run_query_core.clone();
-        Rc::new(move |sql: String| core(sql, true))
+        Rc::new(move |req: schemaic_ui::RerunRequest| core(req.into_sql(), true))
     };
 
     // ── Run EXPLAIN for the query-plan modal (targets the active tab's db) ──
@@ -5816,7 +5822,16 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             // double-click). Consumed + cleared by the grid.
             tab.highlight_col.set(highlight);
             (place_tab)(tab);
-            run(sql);
+            // Through the mint like every other use of the raw `run`, though
+            // this statement is `filter::table_query`'s own and cannot be a
+            // write: a caller that happens to generate only reads is a property
+            // of the caller, and the whole point of `RerunRequest` is that the
+            // action does not depend on one. With this, the two `run(sql)` sites
+            // outside `guarded_run` both hold a request nothing but
+            // `sql::rerunnable_for_export` can mint.
+            if let Some(req) = schemaic_ui::RerunRequest::approved(sql, dialect) {
+                run(req.into_sql());
+            }
         })
     };
 
@@ -5894,11 +5909,15 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
     // `(database, table)` so the new grid is editable and shows key icons — like a
     // normal table tab, only with a WHERE. The referenced table lives on the same
     // connection (FKs can't cross servers), possibly in another database.
-    let open_table_filtered: Rc<dyn Fn(TableSource, String)> = {
+    // Same rule as `apply_view`: the caller supplies the SQL and this ends in
+    // the raw `run`, so the guard is the argument's own — see
+    // `schemaic_ui::RerunRequest`.
+    let open_table_filtered: Rc<dyn Fn(TableSource, schemaic_ui::RerunRequest)> = {
         let next_id = next_id.clone();
         let place_tab = place_tab.clone();
         let run = run.clone();
-        Rc::new(move |source: TableSource, sql: String| {
+        Rc::new(move |source: TableSource, req: schemaic_ui::RerunRequest| {
+            let sql = req.into_sql();
             let id = next_id.get();
             next_id.set(id + 1);
             let tab = Tab::new(
@@ -11486,6 +11505,48 @@ mod app_tests {
     use schemaic_core::connection::Connection;
     use schemaic_ui::InlineAiState;
     use tokio_util::sync::CancellationToken;
+
+    /// **The raw `run` binding has exactly two callers, and both hold an
+    /// approved statement.**
+    ///
+    /// `run` at `:2401` is `run_query_core` with no `sql::run_verdict`, no
+    /// `params::prepare_run` and no `read_only` term — `guarded_run` is what
+    /// `TabsActions::run` is wired to, and CLAUDE.md's invariant is that the
+    /// guard lives on the action rather than in a caller. Two other closures
+    /// reach the raw one (`spawn_table_tab` and `open_table_filtered`), and both
+    /// now take their SQL out of a [`schemaic_ui::RerunRequest`], which only
+    /// `sql::rerunnable_for_export` can mint.
+    ///
+    /// The type carries that for the two `TabsActions` fields; what it cannot
+    /// carry is a *third* closure calling `run` with a bare `String`, which is
+    /// exactly how `open_table_filtered` came to be unguarded. So the count is
+    /// the gate: a new call site fails this test and has to say, here, what
+    /// refuses it.
+    #[test]
+    fn the_unguarded_run_has_only_its_two_stated_callers() {
+        let src = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("src")
+                .join("main.rs"),
+        )
+        .expect("this file's own source");
+        // Comment lines out, so the prose above (which names `run(sql)`) is not
+        // itself a call site. A call is `run(` at the head of a statement —
+        // `guarded_run(`, `run_query_core(` and the rest end in other characters
+        // before the paren and do not match.
+        let calls: Vec<&str> = src
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.starts_with("//"))
+            .filter(|l| l.starts_with("run(") && l.ends_with(");"))
+            .collect();
+        assert_eq!(
+            calls,
+            ["run(req.into_sql());", "run(sql);"],
+            "the raw `run` gained or lost a caller: every one must take its SQL \
+             from a `RerunRequest`, which only `sql::rerunnable_for_export` mints"
+        );
+    }
 
     /// A gate that behaves like `with_conn` on a **down** connection: it holds
     /// the action instead of running it, and the caller decides when it lands.

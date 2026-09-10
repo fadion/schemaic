@@ -73,10 +73,12 @@ substitute for the statement, and none of these is a style preference.
   SQL goes through `TabsActions::run`/`run_all` and `sql::run_verdict`, or through a refusal
   *strictly stronger* than it. There are **two** such refusals now:
   `sql::rerunnable_for_export`, which has no `Confirm` arm, and `sql::script_verdict`, which treats
-  a whole `.sql` file as a write without reading it. Never a second, laxer gate — and the script
-  one is reached only through `ScriptRequest::approved`, because the guard being a *step* the
-  launcher had to remember is how one `return` came to be all that stood between a read-only
-  connection and a file.
+  a whole `.sql` file as a write without reading it. Never a second, laxer gate — and **each is
+  reached only through a request its guard mints**: `ScriptRequest::approved` for the file,
+  `RerunRequest::approved` for `apply_view` and `open_table_filtered`. That shape is the invariant,
+  not a detail of it: the guard being a *step* the launcher had to remember is how one `return`
+  came to be all that stood between a read-only connection and a file, and how two of the three
+  re-run affordances came to rest on predicates that were not about writes.
 - **One SQL boundary lexer** — everything scanning SQL for string/comment/quote boundaries builds
   on `core::sql::skip_noncode`, and it is dialect-aware.
 - **Structure-aware SQL analysis goes through `core::intel`** (a real per-dialect AST), not a new

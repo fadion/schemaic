@@ -12511,10 +12511,12 @@ Re-introducing the anti-patterns these guard against is a regression:
   verdict** — a new protection is an arm of `run_verdict`, and a `RunVerdict::Block` must stay
   un-overridable. (`plan_view`'s `contains_write` is not a second guard: it decides whether
   `EXPLAIN ANALYZE` may run a statement for its timings.)
-  **The two re-run affordances answer to the guard too, through a refusal strictly stronger than
-  it.** `ExportScope::AllRows` re-executes the tab's captured statement through `Db::stream_query`,
-  and the capped notice's "read N rows" re-executes it through `apply_view` at a bigger ceiling.
-  Both are paths executing user SQL that reached the server without passing `run_verdict` at all —
+  **The re-run affordances answer to the guard too, through a refusal strictly stronger than
+  it.** `ExportScope::AllRows` re-executes the tab's captured statement through `Db::stream_query`;
+  the capped notice's "read N rows" re-executes it through `apply_view` at a bigger ceiling; the
+  grid **filter/sort bar** re-executes a rewritten one through the same action; and **Follow
+  relation** opens a new tab running a `SELECT` the grid built, through `open_table_filtered`.
+  All are paths executing user SQL that reached the server without passing `run_verdict` at all —
   so an `UPDATE … RETURNING` on a table past the row cap could be run a second time from a Save
   dialog or from a link that says *read*, with no confirmation, on a read-only connection included.
   `sql::rerunnable_for_export` is the gate, built on the same `contains_write` the verdict uses so
@@ -12527,6 +12529,24 @@ Re-introducing the anti-patterns these guard against is a regression:
   of the three returns rows, so each could otherwise have reached a truncated grid and been offered
   the scope (`a_row_returning_write_is_never_rerunnable_for_an_export`,
   `an_ordinary_read_is_rerunnable_for_an_export`).
+  **Where that gate *lives* is the second half, and it used to be in the callers.** `apply_view`
+  and `open_table_filtered` took a bare `String` and ended in the app's raw `run`; `apply_view`
+  documented itself "not guarded: it re-runs the `SELECT` the grid is already showing", a premise
+  nothing on the action enforced. Its two callers each tested something different — the capped
+  notice asked `rerunnable_for_export`, the filter bar rested on `filter::build_query` returning
+  `Ok(None)`, which is a *rewritability* answer and not a write test at all — and
+  `open_table_filtered` tested nothing. The cost is on record at `grid.rs`: a capped `SELECT`
+  followed by a `DELETE` once left the "read N rows" link drawn over the new base, and clicking it
+  re-ran the `DELETE` through `apply_view`. That was fixed at one caller, and a third caller
+  inherited none of it. Both fields now take **`schemaic_ui::RerunRequest`**, which only
+  `RerunRequest::approved` → `sql::rerunnable_for_export` can mint — the same shape
+  `ScriptRequest::approved` has, and for the same stated reason: *the guard being a step the
+  launcher had to remember is how one `return` came to be all that stood between a read-only
+  connection and a file.* The type covers the two fields; `main.rs`'s
+  `the_unguarded_run_has_only_its_two_stated_callers` covers what a type cannot — a *third* closure
+  calling the raw `run` with a bare `String`, which is exactly how `open_table_filtered` came to be
+  unguarded. `spawn_table_tab`'s own generated `table_query` `SELECT` goes through the mint too,
+  because a caller that happens to generate only reads is a property of the caller.
   **Running a `.sql` script is the third such path, and it is refused the other way round.**
   `sql::script_verdict` gates `script.rs`'s runner. `run_verdict` takes the statements; a script has
   tens of thousands of them, arriving a block at a time, and *none of them read* at the moment the

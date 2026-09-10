@@ -209,11 +209,13 @@ type SummarizeFn = Rc<dyn Fn(String)>;
 /// Splice sink: replace the tab's canonical result set after an in-place commit.
 type SyncCanonicalFn = Rc<dyn Fn(Arc<ResultSet>)>;
 /// "Follow foreign key" callback: open the referenced table in a new tab running
-/// the given filter `sql`. The grid builds the SQL from a FK + row.
-type FollowFn = Rc<dyn Fn(TableSource, String)>;
+/// the request's filter statement. The grid builds the SQL from a FK + row and
+/// mints the request, which is what carries the write guard — see
+/// [`crate::RerunRequest`].
+type FollowFn = Rc<dyn Fn(TableSource, crate::RerunRequest)>;
 /// Re-run the active tab with a rewritten (filtered/sorted) statement — the
 /// server-side filter/sort callback (`TabsActions::apply_view`).
-type ApplyViewFn = Rc<dyn Fn(String)>;
+type ApplyViewFn = Rc<dyn Fn(crate::RerunRequest)>;
 
 /// Per-result interactive grid state. `Copy` (every field is an `RwSignal`, which
 /// is `Copy`) so it threads freely into the many cell/handler closures. Created
@@ -731,11 +733,22 @@ impl GridState {
         };
         let gq = self.grid_query.get_untracked();
         match build_query(&base, &gq.filter, &gq.sort, self.dialect) {
-            Ok(Some(sql)) => {
-                if let Some(run) = self.apply_view.get_untracked() {
-                    run(sql);
+            // **Two refusals, and they are different questions.** `Ok(None)` is
+            // `build_query` saying it cannot *rewrite* the base; `approved`
+            // returning `None` is the write guard, which lives on the action
+            // and used to live here — this caller's only protection was the
+            // rewritability answer, which is not a write test at all. See
+            // `crate::RerunRequest`.
+            Ok(Some(sql)) => match crate::RerunRequest::approved(sql, self.dialect) {
+                Some(req) => {
+                    if let Some(run) = self.apply_view.get_untracked() {
+                        run(req);
+                    }
                 }
-            }
+                None => self.view_err.set(Some(
+                    "Can't re-run this statement — it would write to the database".into(),
+                )),
+            },
             Ok(None) => self.view_err.set(Some(
                 "Can't filter this query — not a simple single-table SELECT".into(),
             )),
@@ -2712,8 +2725,13 @@ fn follow_relation(gs: GridState, data_idx: usize, spec: &FollowSpec) {
     if let Some(ft) =
         schemaic_core::schema::follow_target(&spec.fk, &values, &spec.default_schema, gs.dialect)
         && let Some(cb) = gs.follow_fk.get_untracked()
+        // The statement is this app's own `follow_target` `SELECT`, so the mint
+        // cannot refuse — and it is asked anyway: the guard is on the action,
+        // and a caller that happens to generate only reads is a property of the
+        // caller, not of the action. See `crate::RerunRequest`.
+        && let Some(req) = crate::RerunRequest::approved(ft.sql, gs.dialect)
     {
-        (cb)(TableSource::new(ft.database, ft.schema, ft.table), ft.sql);
+        (cb)(TableSource::new(ft.database, ft.schema, ft.table), req);
     }
 }
 
@@ -7350,8 +7368,14 @@ fn grid_toolbar(
                 // clears it, because getting past the cap once is not a
                 // decision about every query the user will ever run.
                 gs.row_cap_override.set(Some(cap));
-                if let Some(run) = gs.apply_view.get_untracked() {
-                    run(sql);
+                // `current_statement` already asked `rerunnable_for_export`, so
+                // this mint cannot refuse — and it is here anyway, because the
+                // guard being a step a launcher had to remember is the shape
+                // `RerunRequest` exists to remove.
+                if let Some(req) = crate::RerunRequest::approved(sql, gs.dialect)
+                    && let Some(run) = gs.apply_view.get_untracked()
+                {
+                    run(req);
                 }
             })
             .into_any()

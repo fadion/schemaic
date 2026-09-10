@@ -416,6 +416,55 @@ pub struct ScriptRequest {
     dialect: SqlDialect,
 }
 
+/// A statement approved for a **re-run** — the second minted request on the
+/// same rule as [`ScriptRequest`], for the two `TabsActions` fields that take
+/// caller-supplied SQL and are not [`TabsActions::run`].
+///
+/// **The guard lives on the action, and a type is the only way to say so
+/// here.** `apply_view` and `open_table_filtered` both reach the app's raw run
+/// — no `run_verdict`, no `read_only` term — and both used to rest on their
+/// callers: `apply_view`'s filter caller on `filter::build_query` returning
+/// `Ok(None)`, which is a *rewritability* answer and not a write test at all,
+/// and its capped-notice caller on `sql::rerunnable_for_export`. Two callers,
+/// two unrelated predicates, one of them not about writes — and the cost is on
+/// record: a capped `SELECT` followed by a `DELETE` once left the "read N rows"
+/// link drawn over the new base, and clicking it re-ran the `DELETE` through
+/// `apply_view`. That was fixed at one caller; a third caller inherits nothing.
+///
+/// So the refusal is a value the launcher cannot mint without passing it,
+/// exactly as `ScriptRequest::approved` is — "the guard being a *step* the
+/// launcher had to remember is how one `return` came to be all that stood
+/// between a read-only connection and a file".
+///
+/// [`sql::rerunnable_for_export`] rather than [`sql::run_verdict`], and that is
+/// **strictly stronger, never weaker**: it has no `Confirm` arm. A filter
+/// re-run and a Follow-relation are not moments at which the user asked to run
+/// anything, so a confirmation raised there would be a question about something
+/// they never requested.
+///
+/// [`sql::rerunnable_for_export`]: schemaic_core::sql::rerunnable_for_export
+/// [`sql::run_verdict`]: schemaic_core::sql::run_verdict
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RerunRequest {
+    sql: String,
+}
+
+impl RerunRequest {
+    /// The guard and the request in one step; `None` is a refusal, and the
+    /// caller has nothing to run with.
+    pub fn approved(sql: String, dialect: SqlDialect) -> Option<RerunRequest> {
+        schemaic_core::sql::rerunnable_for_export(&sql, dialect).then_some(RerunRequest { sql })
+    }
+
+    pub fn sql(&self) -> &str {
+        &self.sql
+    }
+
+    pub fn into_sql(self) -> String {
+        self.sql
+    }
+}
+
 impl ScriptRequest {
     /// The guard and the request, in one step: `Err` is the message for the
     /// error bar, `Ok` is a run that has passed `sql::script_verdict`.
@@ -3690,10 +3739,15 @@ pub struct TabsActions {
     /// Re-run the active tab with a server-side filter/sort view applied (the grid
     /// filter bar / header sort). Unlike `run`, this does NOT record history, does
     /// NOT touch `tab.base_sql`, and does NOT reset `tab.grid_query` — so the base
-    /// statement and the active filter/sort survive the re-run. `sql` is the
-    /// already-rewritten statement (see `schemaic_core::filter::build_query`).
-    /// Not guarded: it re-runs the `SELECT` the grid is already showing.
-    pub apply_view: Rc<dyn Fn(String)>,
+    /// statement and the active filter/sort survive the re-run.
+    ///
+    /// **Guarded by its argument.** It takes a [`RerunRequest`], which only
+    /// `sql::rerunnable_for_export` can mint — a refusal *strictly stronger*
+    /// than `run_verdict` (no `Confirm` arm), on the action rather than in its
+    /// callers. It used to take a bare `String` and say "not guarded: it
+    /// re-runs the `SELECT` the grid is already showing", a premise nothing on
+    /// the action enforced and two callers each tested differently.
+    pub apply_view: Rc<dyn Fn(RerunRequest)>,
     /// Run several statements in order (Run Everything): one result tab each.
     /// Guarded exactly as [`Self::run`] is.
     pub run_all: Rc<dyn Fn(Vec<String>)>,
@@ -3808,9 +3862,13 @@ pub struct TabsActions {
     /// `core::tabsel::others_to_close` the action itself calls.
     pub can_close_other_tabs: Rc<dyn Fn(usize) -> bool>,
     /// Open a brand-new tab sourced from a table (so its grid stays editable)
-    /// running `sql`, and auto-run it. Used by the grid's "Follow foreign key" to
-    /// land on the referenced table filtered to a row.
-    pub open_table_filtered: Rc<dyn Fn(TableSource, String)>,
+    /// running the request's statement, and auto-run it. Used by the grid's
+    /// "Follow foreign key" to land on the referenced table filtered to a row.
+    ///
+    /// **Guarded by its argument**, like [`Self::apply_view`] and for the same
+    /// reason: the caller supplies the SQL and this reaches the app's raw run.
+    /// See [`RerunRequest`].
+    pub open_table_filtered: Rc<dyn Fn(TableSource, RerunRequest)>,
     /// Switch the active tab to a database (remembers it as the new-tab default).
     pub set_active_db: Rc<dyn Fn(String)>,
     /// Open the DB CLI for the active connection in the terminal, optionally
