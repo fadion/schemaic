@@ -162,6 +162,34 @@ pub fn block_at(view: &InlineView, line: usize) -> Option<Block> {
     })
 }
 
+/// Translate a **combined** column back to the column it had before the phantom
+/// text was folded in — floem's `PhantomTextLine::before_col`, over the
+/// `(column, byte length)` of each phantom instead of the phantoms themselves.
+///
+/// It is spelled out here rather than delegated because the whole point of
+/// [`InlineDiffDoc::before_phantom_col`] is to answer without *building* the
+/// phantoms: their text and colour are what cost, and this arithmetic never
+/// looks at either. `spans` must be in the same order floem would iterate them
+/// (`PhantomTextLine::offset_size_iter`, which is insertion order with a
+/// running shift), which is what the caller assembles.
+///
+/// Kept byte-for-byte faithful to floem 0.2.0's loop, including its quirks: the
+/// answer is the *last* span that claims the column, not the first, and a
+/// column inside a span collapses to that span's own column.
+fn before_col_of(spans: &[(usize, usize)], col: usize) -> usize {
+    let mut last = col;
+    let mut shift = 0usize;
+    for &(at, size) in spans {
+        let start = at + shift;
+        let end = start + size;
+        if col >= start {
+            last = if col >= end { col - shift - size } else { at };
+        }
+        shift += size;
+    }
+    last
+}
+
 /// Build the phantom rows hanging off `line`, or `None` if no hunk anchors there.
 ///
 /// Each added line contributes a `\n` (which is what makes Floem lay it out as
@@ -341,14 +369,66 @@ impl DocumentPhantom for InlineDiffDoc {
             || self.inner.has_multiline_phantom(edid, styling)
     }
 
+    /// **Answered from [`block_at`], never by rebuilding the block.**
+    ///
+    /// The trait default is `self.phantom_text(…).before_col(col)`, and taking
+    /// it was the expensive kind of wrong. Floem calls this **once per yielded
+    /// row** of a line's layout (`TextLayoutLine::layout_cols`), and
+    /// `has_multiline_phantom` returning `true` while a plan is up puts the
+    /// editor on the non-linear vline path, where `offset_of_vline` /
+    /// `find_vline_init_info` reach a row part-way down a block by
+    /// `start_layout_cols(...).nth(k)`. A whole-buffer Ctrl+K fix is *one*
+    /// hunk with every added line hanging off one anchor, so `k` is the scroll
+    /// position inside the block: with 1,000 added lines and the viewport at
+    /// row 500, one vline lookup was 501 × (a full `InlinePlan` clone plus a
+    /// complete `segments()` re-tokenise) ≈ 760 ms — per scroll tick, on a
+    /// path `compute_screen_lines` runs every frame. Quadratic in the
+    /// suggestion's length, with a full re-highlight for a constant.
+    ///
+    /// Nothing in `before_col`'s arithmetic reads a phantom's text or colour —
+    /// only its column and its byte length — and `block_at` has both without
+    /// tokenising anything. The block's parts all sit at one column, and a run
+    /// of phantoms at the same column shifts a position exactly as one
+    /// phantom of their combined length does, which is what lets `Block::len`
+    /// stand in for the whole list. floem's own `ExtCmdDocument` overrides all
+    /// three `DocumentPhantom` methods; this one overrode two.
+    fn before_phantom_col(
+        &self,
+        edid: EditorId,
+        styling: &EditorStyle,
+        line: usize,
+        col: usize,
+    ) -> usize {
+        // The real document's own phantoms (placeholder, IME preedit) are
+        // cheap and must still count.
+        let inner = self.inner.phantom_text(edid, styling, line);
+        let mut spans: Vec<(usize, usize)> = Vec::with_capacity(inner.text.len() + 1);
+        let block = self
+            .preview
+            .with_untracked(|v| v.as_ref().and_then(|v| block_at(v, line)));
+        // Same order `phantom_text` inserts them in: a `before` block leads,
+        // every other block trails.
+        if let Some(b) = block.filter(|b| b.before) {
+            spans.push((0, b.len));
+        }
+        spans.extend(inner.text.iter().map(|p| (p.col, p.text.len())));
+        if let Some(b) = block.filter(|b| !b.before) {
+            spans.push((self.inner.rope_text().line_content(line).len(), b.len));
+        }
+        before_col_of(&spans, col)
+    }
+
     fn phantom_text(&self, edid: EditorId, styling: &EditorStyle, line: usize) -> PhantomTextLine {
         // Start from the real document's own phantoms (placeholder, IME preedit)
         // so wrapping never costs the editor either of them.
         let mut out = self.inner.phantom_text(edid, styling, line);
-        let Some(view) = self.preview.get_untracked() else {
-            return out;
-        };
-        let Some(seg) = segments(&view, line, self.dialect) else {
+        // `with_untracked`, not `get_untracked`: the latter clones the whole
+        // `InlinePlan` — every hunk and every added line's `String` — and this
+        // runs per line, per relayout.
+        let Some(seg) = self
+            .preview
+            .with_untracked(|v| v.as_ref().and_then(|v| segments(v, line, self.dialect)))
+        else {
             return out;
         };
         // The column the block hangs off: 0 to render before the line, else the
@@ -445,6 +525,88 @@ mod tests {
             add: add.iter().map(|s| s.to_string()).collect(),
             anchor,
             before,
+        }
+    }
+
+    /// **`before_col_of` must be floem's own arithmetic, not a plausible
+    /// version of it.**
+    ///
+    /// It replaces the `DocumentPhantom::before_phantom_col` default, which
+    /// built the whole suggestion — an `InlinePlan` clone and a complete
+    /// `segments()` re-tokenise — to ask a question about columns and byte
+    /// lengths. Every column translation in the editor flows through it, so a
+    /// wrong answer moves the caret; the only test worth having compares it
+    /// against floem 0.2.0's `PhantomTextLine::before_col` on the same spans,
+    /// which is the thing it has to agree with.
+    ///
+    /// The corpus covers what the shipped shapes reach and what a careless
+    /// transcription gets wrong: a block at column 0 (a `before` hunk on line
+    /// 0), a block at end-of-line (every other hunk), both at once, several
+    /// phantoms at the *same* column — which is what the block's own parts are,
+    /// and the case that lets `Block::len` stand in for the list — and columns
+    /// before, inside, at both edges of, and past every span.
+    #[test]
+    fn before_col_of_agrees_with_floems_own_translation() {
+        use floem::views::editor::phantom_text::{PhantomText, PhantomTextKind, PhantomTextLine};
+
+        fn floems(spans: &[(usize, usize)], col: usize) -> usize {
+            let mut line = PhantomTextLine::default();
+            for &(at, size) in spans {
+                line.text.push(PhantomText {
+                    kind: PhantomTextKind::Completion,
+                    col: at,
+                    affinity: None,
+                    text: "x".repeat(size),
+                    font_size: None,
+                    fg: None,
+                    bg: None,
+                    under_line: None,
+                });
+            }
+            line.before_col(col)
+        }
+
+        let corpora: &[&[(usize, usize)]] = &[
+            &[],
+            &[(0, 5)],                 // a leading block
+            &[(7, 12)],                // a trailing block at end-of-line
+            &[(0, 5), (7, 12)],        // both
+            &[(3, 1), (3, 4), (3, 2)], // the block's own parts, one column
+            &[(0, 3), (0, 3), (9, 1)], // a run at 0, then one further out
+            &[(2, 0), (2, 4)],         // a zero-length phantom in the way
+            &[(9, 2), (1, 3)],         // out of column order, as the shift walks it
+        ];
+        for spans in corpora {
+            for col in 0..30usize {
+                assert_eq!(
+                    before_col_of(spans, col),
+                    floems(spans, col),
+                    "spans {spans:?}, col {col}"
+                );
+            }
+        }
+    }
+
+    /// **A run of phantoms at one column shifts a column exactly as one
+    /// phantom of their combined length does.**
+    ///
+    /// That equivalence is the whole licence for `before_phantom_col` to hand
+    /// `before_col_of` a single `(col, Block::len)` pair where `phantom_text`
+    /// inserts one `PhantomText` per coloured run. If it ever stopped holding,
+    /// the caret would land in the wrong column inside a suggestion and
+    /// nothing else would notice.
+    #[test]
+    fn a_run_of_parts_at_one_column_equals_one_span_of_their_total_length() {
+        for at in [0usize, 4, 11] {
+            let parts: Vec<(usize, usize)> = vec![(at, 1), (at, 6), (at, 2), (at, 3)];
+            let whole = [(at, 12)];
+            for col in 0..32usize {
+                assert_eq!(
+                    before_col_of(&parts, col),
+                    before_col_of(&whole, col),
+                    "at {at}, col {col}"
+                );
+            }
         }
     }
 

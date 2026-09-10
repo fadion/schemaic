@@ -18,7 +18,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use floem::peniko::Color;
-use floem::reactive::{RwSignal, SignalGet};
+use floem::reactive::{RwSignal, SignalGet, SignalWith};
 use floem::text::{Attrs, AttrsList, FamilyOwned};
 use floem::views::editor::EditorStyle;
 use floem::views::editor::core::buffer::rope_text::RopeText;
@@ -135,16 +135,56 @@ impl SqlStyling {
     }
 }
 
+/// The value `SqlStyling::id` returns — floem folds it into the key its cached
+/// `TextLayoutLine`s live under, so anything baked into a layout that this key
+/// does not move with **cannot repaint**.
+///
+/// Three inputs, and every one of them is something baked in:
+///
+/// - `editor_gen` — the token colours, which come from `editor()`, and the tab
+///   width. Bumped by `set_editor` and the font/tab setters.
+/// - `ui_gen` — `diff_add_bg` / `diff_del_bg`, the inline-diff bands
+///   `apply_layout_styles` writes into `LineExtraStyle`. Those read `ui()`,
+///   which `set_ui` and `set_ui_scale` bump and `editor_gen` knows nothing
+///   about. Without this term an interface-theme switch left the bands behind
+///   the code in the old palette while the gutter strips finishing the very
+///   same bands — ordinary style closures, calling the same two accessors —
+///   took the new one.
+/// - `px` — the effective font size, so a per-tab zoom re-lays out.
+///
+/// The generations are **summed** rather than XOR'd: both are monotonic
+/// counters, so their sum climbs on every bump of either and never returns to
+/// a value the cache has already seen. An XOR does — `2 ^ 3` and `0 ^ 1` are
+/// both 1, two states one bump apart sharing a key. (The sum is not injective
+/// over `(editor, ui)` pairs, and does not need to be: in one process the pair
+/// only ever moves forward.)
+fn layout_cache_key(editor_gen: u64, ui_gen: u64, px: f32) -> u64 {
+    (editor_gen.wrapping_add(ui_gen) << 8) | (px.round() as u64 & 0xFF)
+}
+
 impl Styling for SqlStyling {
     // Tracks the editor-theme generation: a theme switch bumps it, which
     // invalidates the editor's cached layout so lines re-highlight in the new
     // palette. (A per-line lexer has no cross-line state, so edited lines are
     // re-highlighted on relayout regardless.)
+    //
+    // **And the UI generation, because two of the colours this styling bakes in
+    // come from that axis.** `apply_layout_styles` writes `diff_del_bg()` /
+    // `diff_add_bg()` into each banded line's `LineExtraStyle`, and those read
+    // `ui()`, not `editor()`. `set_ui` bumps `ui_gen` alone, so the cached
+    // layouts survived an interface-theme switch and kept painting the old
+    // palette — while the gutter and right-padding strips that finish the same
+    // bands (`editor_pane::inline_band_runs`) are ordinary style closures
+    // calling the same two accessors and repainted at once. One band, two
+    // colours, disagreeing at the code column, and disagreeing line-to-line as
+    // scrolling rebuilt some of them. `editor_generation`'s own doc describes
+    // this hazard for its sibling axis; it solved it for one axis of two.
     fn id(&self) -> u64 {
-        // Fold the effective font size into the cache key so a per-tab zoom (or a
-        // settings font-size change) invalidates this editor's layout and re-lays
-        // out at the new size — the generation covers theme/tab-width changes.
-        (crate::theme::editor_generation() << 8) | (self.effective_px().round() as u64 & 0xFF)
+        layout_cache_key(
+            crate::theme::editor_generation(),
+            crate::theme::ui_generation(),
+            self.effective_px(),
+        )
     }
 
     fn font_size(&self, _edid: EditorId, _line: usize) -> usize {
@@ -172,20 +212,34 @@ impl Styling for SqlStyling {
             return;
         }
         let content = rope.line_content(line);
-        let view = self.preview.get_untracked();
-        // A line that is being worked on, or that a settled suggestion replaces,
-        // is faded — alpha on the token colour, since editor text has no opacity
-        // of its own. The two states fade by different amounts; the view says
-        // which, so this stays one rule rather than two.
-        let fade = view.as_ref().filter(|v| v.fades(line)).map(|v| v.fade());
-        // Floem hands this hook the line's PRE-phantom columns and only adds the
-        // phantom spans afterwards, so an end-of-line block (every block but one)
-        // needs no adjustment. The exception is a block rendering *before* line 0,
-        // which pushes the line's own content right by its whole length.
-        let shift = view
-            .as_ref()
-            .and_then(|v| crate::inline_diff::block_at(v, line))
-            .map_or(0, |b| b.prefix_len());
+        // **`with_untracked`, not `get_untracked`.** The latter *clones* — the
+        // whole `InlinePlan`, every hunk, every added line's `String` — and
+        // this hook runs once per line laid out: 90 whole-plan clones for a
+        // 45-line viewport, 8.1 ms of them at a 3,000-line suggestion, per
+        // relayout, and `set_preview` bumps `cache_rev` precisely to force one.
+        // `set_preview` twelve lines from here already reads this same signal
+        // with `with_untracked` and says why. Both answers are `Copy`, so
+        // nothing escapes the borrow.
+        //
+        // `fade`: a line that is being worked on, or that a settled suggestion
+        // replaces, is faded — alpha on the token colour, since editor text has
+        // no opacity of its own. The two states fade by different amounts; the
+        // view says which, so this stays one rule rather than two.
+        //
+        // `shift`: floem hands this hook the line's PRE-phantom columns and
+        // only adds the phantom spans afterwards, so an end-of-line block
+        // (every block but one) needs no adjustment. The exception is a block
+        // rendering *before* line 0, which pushes the line's own content right
+        // by its whole length.
+        let (fade, shift) = self.preview.with_untracked(|v| {
+            let Some(v) = v.as_ref() else {
+                return (None, 0);
+            };
+            (
+                Some(v).filter(|v| v.fades(line)).map(|v| v.fade()),
+                crate::inline_diff::block_at(v, line).map_or(0, |b| b.prefix_len()),
+            )
+        });
         let tint = |c: Color| match fade {
             Some(a) => c.multiply_alpha(a),
             None => c,
@@ -216,25 +270,30 @@ impl Styling for SqlStyling {
         line: usize,
         layout_line: &mut TextLayoutLine,
     ) {
-        let Some(view) = self.preview.get_untracked() else {
-            return;
-        };
+        // `with_untracked` for the same reason `apply_attr_styles` uses it —
+        // `get_untracked` deep-copies the whole plan, and this is the second of
+        // the two hooks that run per line, per relayout. Everything taken out
+        // is `Copy`.
+        //
         // Only a settled suggestion paints bands. While the model is working there
         // is nothing to band — the lines just fade (`apply_attr_styles`), which is
         // the design's "dimmed, waiting" state and not a diff yet.
-        if view.plan().is_none() {
-            return;
-        }
-        // `InlineView::fades`, not a third spelling of it. "Is this line
-        // replaced" was written out here, in `InlineView::fades` and in
+        //
+        // `replaced` is `InlineView::fades`, not a third spelling of it. "Is this
+        // line replaced" was written out here, in `InlineView::fades` and in
         // `editor_pane`'s band gate, with nothing asserting the three agreed —
-        // and this one and `fades` are the *same* question (the guard above has
-        // already established the `Plan` arm), so a change to either left the
+        // and this one and `fades` are the *same* question (the `Plan` guard has
+        // already been established), so a change to either left the
         // code column faded where the bands were not, or banded where the fade
         // was not, with nothing red. `editor_pane`'s is a narrower question and
         // stays its own; see the comment there.
-        let replaced = view.fades(line);
-        let block = crate::inline_diff::block_at(&view, line);
+        let Some((replaced, block)) = self.preview.with_untracked(|v| {
+            let v = v.as_ref()?;
+            v.plan()?;
+            Some((v.fades(line), crate::inline_diff::block_at(v, line)))
+        }) else {
+            return;
+        };
         if !replaced && block.is_none() {
             return;
         }
@@ -723,5 +782,82 @@ mod tests {
     fn line_not_in_block_is_unaffected() {
         // start_in_block = false → leading text isn't forced to a comment.
         assert!(comment_spans("SELECT 1", false).is_empty());
+    }
+
+    /// **Both theme axes move the layout cache key, and the font size moves it
+    /// independently of either.**
+    ///
+    /// A colour baked into a cached `TextLayoutLine` cannot re-evaluate; the
+    /// only thing that repaints it is this key changing. The diff bands come
+    /// from the UI axis and the key knew only the editor one, so an
+    /// interface-theme switch repainted the gutter strips and left the bands
+    /// behind the code in the old palette.
+    #[test]
+    fn the_layout_cache_key_moves_on_either_theme_axis() {
+        let base = layout_cache_key(3, 7, 14.0);
+        assert_ne!(base, layout_cache_key(4, 7, 14.0), "the editor axis");
+        assert_ne!(base, layout_cache_key(3, 8, 14.0), "the interface axis");
+        assert_ne!(base, layout_cache_key(3, 7, 15.0), "the font size");
+
+        // The property that matters is that the key never *returns* to a value
+        // it has already had, since floem's cache is keyed on it: both counters
+        // only climb, so the sum climbs with them. An XOR would not — `2^3 == 1`
+        // and `0^1 == 1`, two different states one bump apart sharing a key.
+        let mut prev = layout_cache_key(0, 0, 14.0);
+        let mut seen = vec![prev];
+        for (e, u) in [(1, 0), (1, 1), (2, 1), (2, 4), (9, 4)] {
+            let k = layout_cache_key(e, u, 14.0);
+            assert!(k > prev, "the key went backwards at ({e}, {u})");
+            assert!(!seen.contains(&k), "the key repeated at ({e}, {u})");
+            seen.push(k);
+            prev = k;
+        }
+    }
+
+    /// The composition, through the accessors the styling actually calls: a
+    /// **real** interface-theme switch has to move the key. Asserting
+    /// `layout_cache_key` alone would pass with `id()` still handing it a
+    /// constant for `ui_gen`, which is exactly the bug.
+    #[test]
+    fn switching_the_interface_theme_moves_the_key_the_styling_returns() {
+        use crate::themes;
+        let key = || {
+            layout_cache_key(
+                crate::theme::editor_generation(),
+                crate::theme::ui_generation(),
+                14.0,
+            )
+        };
+        let before = key();
+        themes::set_ui(themes::UiThemeKind::Light);
+        let after_light = key();
+        assert_ne!(before, after_light, "set_ui did not move the key");
+        themes::set_ui(themes::UiThemeKind::Dark);
+        assert_ne!(after_light, key(), "and back again");
+
+        // `id()` must be spelled over both accessors, not just this test.
+        let src = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("src")
+                .join("sql_highlight.rs"),
+        )
+        .expect("sql_highlight.rs");
+        let body = crate::source_gate::production_code(&src);
+        let at = body
+            .find("fn id(&self)")
+            .expect("`id` is gone — gate is stale");
+        let end = at + body[at..].find("\n    }").expect("`id`'s end");
+        let f = &body[at..end];
+        for term in [
+            "layout_cache_key(",
+            "editor_generation()",
+            "ui_generation()",
+        ] {
+            assert!(
+                f.contains(term),
+                "`Styling::id` no longer reads {term} — a colour from that axis \
+                 is baked into the cached layout and can never repaint"
+            );
+        }
     }
 }
