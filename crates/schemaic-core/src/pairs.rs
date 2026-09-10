@@ -119,6 +119,59 @@ pub fn region_at(text: &str, offset: usize, dialect: SqlDialect) -> Region {
     Region::Code
 }
 
+/// [`region_at`] for **many** offsets, in one walk of the text.
+///
+/// `offsets` must be non-decreasing; the answers come back in the same order,
+/// one per offset, and each is exactly what `region_at` would have said.
+///
+/// Asking `region_at` in a loop is quadratic, and the loop is real: Ctrl+/
+/// inside a PostgreSQL `$$ … $$` body called it **once per selected line**,
+/// which measured 223 ms over a 3,200-line selection and quadrupled with every
+/// doubling — around 11 s extrapolated at 1 MiB, on the UI thread, for one
+/// keystroke. Every one of those walks re-scanned the same prefix.
+///
+/// The walk is the shared `skip_noncode` lexer, as everything here must be: an
+/// offset the walk passes without finding a span that strictly contains it is
+/// `Code`, which is `region_at`'s own rule read forwards.
+pub fn regions_at(text: &str, offsets: &[usize], dialect: SqlDialect) -> Vec<Region> {
+    debug_assert!(
+        offsets.windows(2).all(|w| w[0] <= w[1]),
+        "regions_at needs its offsets in order"
+    );
+    let b = text.as_bytes();
+    let mut out = vec![Region::Code; offsets.len()];
+    let mut k = 0usize;
+    let mut i = 0usize;
+    while i < b.len() && k < offsets.len() {
+        // A span opening at or after an offset cannot contain it, so every
+        // offset the walk has reached is settled — as `Code`, which `out` is
+        // already filled with.
+        while k < offsets.len() && offsets[k] <= i {
+            k += 1;
+        }
+        if k >= offsets.len() {
+            break;
+        }
+        if let Some(j) = skip_noncode(b, i, dialect) {
+            let kind = if is_comment_start(b, i, dialect) {
+                Region::Comment
+            } else {
+                Region::Str
+            };
+            // The interior of `[i, j)` — the boundaries are code positions,
+            // and `offsets[k] > i` is what the skip above established.
+            while k < offsets.len() && offsets[k] < j {
+                out[k] = kind;
+                k += 1;
+            }
+            i = j.max(i + 1);
+        } else {
+            i += 1;
+        }
+    }
+    out
+}
+
 /// Resolve an auto-pair keystroke. `sel_start`/`sel_end` are the current selection
 /// (equal → a bare caret); `ch` is the character being typed. Returns `None` to
 /// let the editor insert `ch` normally.
@@ -720,6 +773,51 @@ mod tests {
         assert!(identifier_occurrences("alpha beta", 0, MySql).is_empty());
         // caret on whitespace, not adjacent to any word
         assert!(identifier_occurrences("a   a", 2, MySql).is_empty());
+    }
+
+    /// **`regions_at` must answer exactly what `region_at` would**, offset for
+    /// offset — it exists only to stop the caller asking in a loop, and
+    /// `toggle_line_comment` decides from it whether a line is code to comment
+    /// out or the inside of a string literal to leave alone.
+    ///
+    /// Every offset of each corpus is checked, so span starts, span interiors,
+    /// the byte just past a span end and the position past the text are all in
+    /// it, on all three dialects — which is where the two could differ:
+    /// `region_at` settles at the caret and `regions_at` settles when the walk
+    /// *passes* it, and the boundary cases are where those two readings of the
+    /// same rule can come apart.
+    #[test]
+    fn regions_at_answers_offset_for_offset_what_region_at_does() {
+        let corpora = [
+            "",
+            "select 1",
+            "select 'a b' from t -- tail",
+            "/* head */ select 1 /* tail",
+            "select \"q\" , `b` , [c] from t",
+            "select $$ a 'b' -- c $$ , $tag$ d $tag$ from t",
+            "-- only a comment",
+            "'unterminated",
+            "a\n  'str\n  more\n  ' end\nb",
+        ];
+        for sql in corpora {
+            for d in [MySql, Postgres, Sqlite] {
+                let offsets: Vec<usize> = (0..=sql.len()).collect();
+                let batch = regions_at(sql, &offsets, d);
+                for &o in &offsets {
+                    assert_eq!(batch[o], region_at(sql, o, d), "{d:?} {sql:?} at {o}");
+                }
+                // A sparse, duplicated, non-decreasing list is the shape the
+                // caller actually hands over.
+                let sparse: Vec<usize> = offsets.iter().copied().filter(|o| o % 3 == 0).collect();
+                let mut dup = sparse.clone();
+                dup.extend(sparse.iter().copied());
+                dup.sort_unstable();
+                let got = regions_at(sql, &dup, d);
+                for (k, &o) in dup.iter().enumerate() {
+                    assert_eq!(got[k], region_at(sql, o, d), "{d:?} {sql:?} sparse at {o}");
+                }
+            }
+        }
     }
 
     /// **A caret word that is not in code still answers nothing** — now that

@@ -66,18 +66,24 @@ pub fn toggle_line_comment(
     // is staying put and a `-- ` would land in the data, so those lines are left
     // alone. That is the difference between "comment out this statement" and
     // "comment out the middle of the string it writes".
-    let span_starts_in_string =
-        crate::pairs::region_at(text, starts[first], dialect) == crate::pairs::Region::Str;
+    //
+    // **One walk of the text for the whole span**, not one per line.
+    // `region_at` scans from the start of the document, so asking it per line
+    // is quadratic: measured 223 ms over a 3,200-line selection, quadrupling
+    // with every doubling, on the UI thread, for one Ctrl+/. The probes are
+    // the span's own start followed by each line's first non-blank byte, which
+    // is already in order — see `pairs::regions_at`.
+    let probe_of = |i: usize| {
+        let content: &str = lines[i];
+        starts[i] + (content.len() - content.trim_start().len())
+    };
+    let mut probes: Vec<usize> = Vec::with_capacity(last - first + 2);
+    probes.push(starts[first]);
+    probes.extend((first..=last).map(probe_of));
+    let regions = crate::pairs::regions_at(text, &probes, dialect);
+    let span_starts_in_string = regions[0] == crate::pairs::Region::Str;
     let in_string: Vec<bool> = (first..=last)
-        .map(|i| {
-            if !span_starts_in_string {
-                return false;
-            }
-            let content = lines[i];
-            let indent_len = content.len() - content.trim_start().len();
-            crate::pairs::region_at(text, starts[i] + indent_len, dialect)
-                == crate::pairs::Region::Str
-        })
+        .map(|i| span_starts_in_string && regions[i - first + 1] == crate::pairs::Region::Str)
         .collect();
     let editable = |i: usize| !in_string[i - first];
 

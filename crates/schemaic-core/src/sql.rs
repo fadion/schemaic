@@ -750,7 +750,7 @@ pub struct Bound {
 /// inside an unterminated string produces no boundary, so those bytes stay in
 /// the caller's buffer rather than being executed as a statement of their own.
 pub fn statement_bounds_open(sql: &str, dialect: SqlDialect, state: &mut ScanState) -> Vec<Bound> {
-    scan_bounds(sql, dialect, &mut state.delim, false)
+    scan_bounds(sql, dialect, &mut state.delim, false, None)
 }
 
 /// Byte offsets bounding each top-level statement: `[0, after-`;`, …, len]`.
@@ -760,7 +760,7 @@ pub fn statement_bounds_open(sql: &str, dialect: SqlDialect, state: &mut ScanSta
 /// either (see [`TriggerScan`]).
 pub fn statement_bounds(sql: &str, dialect: SqlDialect) -> Vec<usize> {
     let mut delim: Vec<u8> = vec![b';'];
-    let mut bounds: Vec<usize> = scan_bounds(sql, dialect, &mut delim, true)
+    let mut bounds: Vec<usize> = scan_bounds(sql, dialect, &mut delim, true, None)
         .into_iter()
         .map(|b| b.at)
         .collect();
@@ -785,7 +785,7 @@ pub fn statement_bounds(sql: &str, dialect: SqlDialect) -> Vec<usize> {
 /// Everything.
 pub fn executable_statements(sql: &str, dialect: SqlDialect) -> Vec<String> {
     let mut delim: Vec<u8> = vec![b';'];
-    let bounds = scan_bounds(sql, dialect, &mut delim, true);
+    let bounds = scan_bounds(sql, dialect, &mut delim, true, None);
     let mut out = Vec::new();
     let mut prev = 0usize;
     for bound in bounds.iter().skip(1).copied().chain(std::iter::once(Bound {
@@ -827,7 +827,24 @@ pub fn executable_range(sql: &str, from: usize, bound: Bound, dialect: SqlDialec
 /// `delim` is in/out so a chunked caller can carry the terminator across a
 /// drain; `at_eof` says whether the end of `sql` is the end of the *script*,
 /// which is the only thing the two callers genuinely disagree about.
-fn scan_bounds(sql: &str, dialect: SqlDialect, delim: &mut Vec<u8>, at_eof: bool) -> Vec<Bound> {
+///
+/// `until` stops the walk once a boundary **past** that offset has been
+/// recorded — everything after it belongs to statements the caller has already
+/// said it does not care about. It exists for [`statement_range`], which asks
+/// "which statement is the caret in" on **every caret move**, undebounced,
+/// through `update_signature_help`: over the whole document that measured 5.0
+/// ms at 1 MiB and 80.7 ms at 16 MiB, to answer a question whose actual work
+/// (`intel::signature_help` on the isolated statement) is 8 µs. `None` keeps
+/// the full walk, and the boundaries produced before the stop are byte-for-byte
+/// the ones the full walk produces — this is the same lexer, cut short, not a
+/// second one.
+fn scan_bounds(
+    sql: &str,
+    dialect: SqlDialect,
+    delim: &mut Vec<u8>,
+    at_eof: bool,
+    until: Option<usize>,
+) -> Vec<Bound> {
     let b = sql.as_bytes();
     let n = b.len();
     let mut bounds = vec![Bound { at: 0, strip: 0 }];
@@ -860,6 +877,9 @@ fn scan_bounds(sql: &str, dialect: SqlDialect, delim: &mut Vec<u8>, at_eof: bool
             // The directive's own segment is dropped whole by
             // `is_runnable_segment`, so there is nothing to strip off it.
             bounds.push(Bound { at: end, strip: 0 });
+            if until.is_some_and(|u| end > u) {
+                break;
+            }
             *delim = token.into_bytes();
             i = end;
             seg = end;
@@ -894,6 +914,11 @@ fn scan_bounds(sql: &str, dialect: SqlDialect, delim: &mut Vec<u8>, at_eof: bool
                 },
             });
             i += delim.len();
+            // The caller's statement has now been closed; the rest of the
+            // document is somebody else's.
+            if until.is_some_and(|u| i > u) {
+                break;
+            }
             seg = i;
             scan = TriggerScan::Start;
             continue;
@@ -933,7 +958,7 @@ pub fn trim_range(sql: &str, lo: usize, hi: usize) -> (usize, usize) {
 pub fn executable_at(sql: &str, offset: usize, dialect: SqlDialect) -> Option<&str> {
     let offset = offset.min(sql.len());
     let mut delim: Vec<u8> = vec![b';'];
-    let mut bounds = scan_bounds(sql, dialect, &mut delim, true);
+    let mut bounds = scan_bounds(sql, dialect, &mut delim, true, None);
     bounds.push(Bound {
         at: sql.len(),
         strip: 0,
@@ -952,9 +977,30 @@ pub fn executable_at(sql: &str, offset: usize, dialect: SqlDialect) -> Option<&s
 }
 
 /// The trimmed byte range of the statement containing `offset`.
+///
+/// **Scans as far as the caret's statement and stops**, not to the end of the
+/// document: `update_signature_help` asks this on every caret move with no
+/// debounce and no size cap, and `sqlfile::open_verdict` will open a 64 MiB
+/// script. Over the whole buffer it measured 5.0 / 20.5 / 80.7 ms at
+/// 1 / 4 / 16 MiB — an arrow key's worth of UI-thread work to locate a
+/// statement whose signature help then costs 8 µs.
+///
+/// The boundaries are the same lexer's, cut short (see `scan_bounds`' `until`),
+/// so the answer is unchanged; only the boundaries *after* the caret's
+/// statement go unvisited, and nothing here ever read them.
 pub fn statement_range(sql: &str, offset: usize, dialect: SqlDialect) -> (usize, usize) {
     let offset = offset.min(sql.len());
-    let bounds = statement_bounds(sql, dialect);
+    let mut delim: Vec<u8> = vec![b';'];
+    let mut bounds: Vec<usize> = scan_bounds(sql, dialect, &mut delim, true, Some(offset))
+        .into_iter()
+        .map(|b| b.at)
+        .collect();
+    // `statement_bounds` closes the list with the document's end. Here that is
+    // right only when the walk ran out of document rather than stopping — if it
+    // stopped, the last bound it recorded already closes the caret's statement.
+    if bounds.last().is_none_or(|&last| last <= offset) {
+        bounds.push(sql.len());
+    }
     let mut k = 0;
     for (w, &b) in bounds.iter().enumerate().take(bounds.len() - 1) {
         if b <= offset {
@@ -3384,6 +3430,66 @@ mod tests {
         // Offset beyond the string length is clamped.
         let (lo, hi) = statement_range("SELECT 1", 9999);
         assert_eq!(&"SELECT 1"[lo..hi], "SELECT 1");
+    }
+
+    /// **Stopping at the caret's statement must not change the answer.**
+    ///
+    /// `statement_range` now cuts the boundary walk short instead of scanning
+    /// the whole document. The reference here is the *old* spelling — the full
+    /// `statement_bounds` list, and the same selection over it — so this is a
+    /// migration equivalence check rather than a restatement of the function
+    /// under test: if the two ever disagree, the caret's statement has been
+    /// mis-located and signature help, Run Current and the completion scope go
+    /// with it.
+    ///
+    /// The corpus is the shapes where an early stop can go wrong: the very
+    /// first and very last offsets, a `;` inside a string or comment (no
+    /// boundary), MySQL's `DELIMITER` (a boundary the directive itself makes,
+    /// and a terminator that changes mid-document), SQLite's `BEGIN … END`
+    /// trigger body (semicolons that do not split), and blank trailing
+    /// segments, which are the one case that reads a boundary *behind* the
+    /// caret.
+    #[test]
+    fn stopping_at_the_caret_gives_the_same_range_as_scanning_the_whole_buffer() {
+        fn full_scan(sql: &str, offset: usize, dialect: SqlDialect) -> (usize, usize) {
+            let offset = offset.min(sql.len());
+            let bounds = statement_bounds(sql, dialect);
+            let mut k = 0;
+            for (w, &b) in bounds.iter().enumerate().take(bounds.len() - 1) {
+                if b <= offset {
+                    k = w;
+                }
+            }
+            let (lo, hi) = trim_range(sql, bounds[k], bounds[k + 1]);
+            if lo == hi && k > 0 {
+                return trim_range(sql, bounds[k - 1], bounds[k]);
+            }
+            (lo, hi)
+        }
+
+        let corpora = [
+            "",
+            "SELECT 1",
+            "SELECT 1; SELECT 2; SELECT 3",
+            "SELECT 1;   ;  ; SELECT 2;   ",
+            "SELECT ';' ; SELECT 2",
+            "SELECT 1 -- ; not a bound\n; SELECT 2",
+            "SELECT /* ; */ 1; SELECT 2",
+            "DELIMITER $$\nCREATE TRIGGER t BEGIN SELECT 1; END$$\nDELIMITER ;\nSELECT 2;",
+            "CREATE TRIGGER t AFTER INSERT ON a BEGIN UPDATE b SET x=1; END; SELECT 2;",
+            "SELECT 1;",
+        ];
+        for sql in corpora {
+            for d in [SqlDialect::MySql, SqlDialect::Postgres, SqlDialect::Sqlite] {
+                for offset in 0..=sql.len() + 2 {
+                    assert_eq!(
+                        super::statement_range(sql, offset, d),
+                        full_scan(sql, offset, d),
+                        "{d:?} {sql:?} at {offset}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
