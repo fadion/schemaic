@@ -2124,6 +2124,22 @@ impl CatalogCache {
 /// `ref_columns`, aligned by position).
 #[derive(Clone)]
 struct FkEdge {
+    /// The **declaring** table's name, in the case the server reported it.
+    ///
+    /// The FK map is keyed on a lower-cased name so a reference can be looked
+    /// up however it was typed, and `join_targets_for`'s reverse arm used that
+    /// *key* for all three fields of the suggestion it built — so on PostgreSQL
+    /// a mixed-case table came back as `orderitems`, `ident_if_needed` left an
+    /// all-lower name unquoted (correctly, by its own rules), and accepting the
+    /// suggestion produced `relation "orderitems" does not exist`. Reproduced
+    /// live on PG 16.15, and equally broken on a MySQL server with
+    /// `lower_case_table_names=0` — the Linux default, which is why it is
+    /// invisible on Windows.
+    ///
+    /// The forward arm was right for exactly the reason this one was not: it
+    /// takes the name from [`FkEdge::ref_table`], which is stored in the
+    /// server's own case. This field is that, for the other end of the edge.
+    table: String,
     columns: Vec<String>,
     ref_table: String,
     ref_columns: Vec<String>,
@@ -2189,6 +2205,7 @@ impl Catalog {
                     if !t.foreign_keys.is_empty() {
                         fks.entry(t.name.to_ascii_lowercase()).or_default().extend(
                             t.foreign_keys.iter().map(|fk| FkEdge {
+                                table: t.name.clone(),
                                 columns: fk.columns.clone(),
                                 ref_table: fk.ref_table.clone(),
                                 ref_columns: fk.ref_columns.clone(),
@@ -4324,6 +4341,18 @@ fn friendly_syntax_message(msg: &str) -> String {
 /// Drop diagnostics whose range is fully covered by an earlier, higher-or-equal
 /// severity one (e.g. a keyword typo under a syntax squiggle), so a token isn't
 /// double-underlined.
+///
+/// **"Higher-or-equal severity" is a term in the coverage test, not only in the
+/// sort.** The sort expresses it at an *equal* `range.0` and nowhere else, and
+/// the coverage test used to read no severity at all — so a Warning that
+/// happened to start earlier swallowed a real Error inside it.
+/// `cartesian_check` squiggles `join.relation.span()`, which for a derived table
+/// is the whole subquery, so
+/// `SELECT * FROM employees e JOIN (SELECT id FROM departments WHERE nope=1) d`
+/// reported only "JOIN has no ON/USING condition" and said nothing about `nope`
+/// — the statement will fail, and the user was told about the lesser of the two.
+/// Adding an `ON` brought the error back, which is what says the warning was the
+/// cause.
 fn dedup_diagnostics(mut v: Vec<Diagnostic>) -> Vec<Diagnostic> {
     // Errors first so a Warning on the same span is the one dropped.
     v.sort_by(|a, b| {
@@ -4332,11 +4361,15 @@ fn dedup_diagnostics(mut v: Vec<Diagnostic>) -> Vec<Diagnostic> {
             .cmp(&b.range.0)
             .then((a.severity == Severity::Warning).cmp(&(b.severity == Severity::Warning)))
     });
+    let rank = |s: Severity| match s {
+        Severity::Error => 1u8,
+        Severity::Warning => 0,
+    };
     let mut out: Vec<Diagnostic> = Vec::new();
     for d in v {
-        let covered = out
-            .iter()
-            .any(|e| e.range.0 <= d.range.0 && d.range.1 <= e.range.1);
+        let covered = out.iter().any(|e| {
+            e.range.0 <= d.range.0 && d.range.1 <= e.range.1 && rank(e.severity) >= rank(d.severity)
+        });
         if !covered {
             out.push(d);
         }
@@ -4578,15 +4611,17 @@ fn join_targets_for(scope: &[TableRef], catalog: &Catalog, dialect: SqlDialect) 
                 .iter()
                 .find(|s| e.ref_table.eq_ignore_ascii_case(&s.name))
             {
+                // `e.table`, not the map key `t` — see `FkEdge::table`. The key
+                // is folded, and a folded PostgreSQL name is a different table.
                 let cand = TableRef {
-                    name: t.clone(),
+                    name: e.table.clone(),
                     alias: None,
                     db: None,
                 };
                 if seen.insert(t.clone()) {
                     out.push(JoinTarget {
-                        table: t.clone(),
-                        table_sql: crate::export::ident_if_needed(t, dialect),
+                        table: e.table.clone(),
+                        table_sql: crate::export::ident_if_needed(&e.table, dialect),
                         predicate: build_predicate(&cand, &e.columns, s, &e.ref_columns, dialect),
                     });
                 }
@@ -8514,6 +8549,179 @@ mod tests {
         let (schema, db) = fk_catalog();
         let cat = Catalog::build(&[(db, &schema)], Some(db));
         join_targets(sql, 0, sql.len(), sql.len(), &cat, dialect)
+    }
+
+    /// **The last gate every offline diagnostic passes, which had no test.**
+    ///
+    /// `dedup_diagnostics` promises to drop what an earlier, *higher-or-equal
+    /// severity* diagnostic already covers. The severity half was only in the
+    /// sort, and only at an equal start offset — the coverage test read no
+    /// severity at all. So a Warning that happened to start earlier swallowed a
+    /// real Error inside it, and that is not hypothetical: `cartesian_check`
+    /// squiggles the whole derived table, so the unconstrained-join warning hid
+    /// the unknown column inside the subquery. The user was told the join was
+    /// unconstrained and not told the statement would fail.
+    #[test]
+    fn a_warning_does_not_swallow_the_error_inside_it() {
+        let sql = "SELECT * FROM employees e JOIN (SELECT id FROM departments WHERE nope=1) d";
+        let d = diag(sql);
+        assert!(
+            d.iter().any(|x| x.message.contains("nope")),
+            "the unknown column was swallowed: {d:?}"
+        );
+        assert!(
+            d.iter().any(|x| x.message.contains("ON/USING")),
+            "and the warning must still be reported: {d:?}"
+        );
+    }
+
+    /// The function itself, over the four combinations — which is what says the
+    /// fix is about severity and not about that one statement.
+    #[test]
+    fn dedup_keeps_a_covered_diagnostic_only_when_the_cover_is_no_weaker() {
+        let d = |lo: usize, hi: usize, severity, msg: &str| Diagnostic {
+            range: (lo, hi),
+            severity,
+            message: msg.to_string(),
+        };
+        let outer_warn = d(0, 100, Severity::Warning, "outer warning");
+        let outer_err = d(0, 100, Severity::Error, "outer error");
+        let inner_err = d(10, 20, Severity::Error, "inner error");
+        let inner_warn = d(10, 20, Severity::Warning, "inner warning");
+
+        let msgs =
+            |v: Vec<Diagnostic>| -> Vec<String> { v.into_iter().map(|x| x.message).collect() };
+        // A warning cannot hide an error inside it — the bug.
+        assert_eq!(
+            msgs(dedup_diagnostics(vec![
+                outer_warn.clone(),
+                inner_err.clone()
+            ])),
+            ["outer warning", "inner error"]
+        );
+        // An error hides an error inside it: one squiggle per token.
+        assert_eq!(
+            msgs(dedup_diagnostics(vec![
+                outer_err.clone(),
+                inner_err.clone()
+            ])),
+            ["outer error"]
+        );
+        // An error hides a warning inside it.
+        assert_eq!(
+            msgs(dedup_diagnostics(vec![
+                outer_err.clone(),
+                inner_warn.clone()
+            ])),
+            ["outer error"]
+        );
+        // A warning hides a warning inside it.
+        assert_eq!(
+            msgs(dedup_diagnostics(vec![
+                outer_warn.clone(),
+                inner_warn.clone()
+            ])),
+            ["outer warning"]
+        );
+        // Same span, both severities: the error is the one kept, whichever order
+        // it arrives in. That is what the sort is for.
+        for v in [
+            vec![outer_warn.clone(), outer_err.clone()],
+            vec![outer_err.clone(), outer_warn.clone()],
+        ] {
+            assert_eq!(msgs(dedup_diagnostics(v)), ["outer error"]);
+        }
+        // Disjoint spans are both kept, and an empty input is empty.
+        assert_eq!(
+            msgs(dedup_diagnostics(vec![
+                d(0, 5, Severity::Error, "a"),
+                d(6, 9, Severity::Error, "b")
+            ])),
+            ["a", "b"]
+        );
+        assert!(dedup_diagnostics(Vec::new()).is_empty());
+    }
+
+    /// **A reverse-edge JOIN suggestion keeps the server's own casing.**
+    ///
+    /// The FK map is keyed on a folded name, and the reverse arm used that key
+    /// for the suggestion's table, its SQL and its predicate qualifier — so a
+    /// PostgreSQL `"OrderItems"` was offered, and inserted, as `orderitems`.
+    /// `ident_if_needed` cannot rescue it: an all-lower name needs no quoting by
+    /// its own rules. Reproduced live on PG 16.15 as
+    /// `relation "orderitems" does not exist`.
+    ///
+    /// The whole existing FK block uses all-lower fixture names, which is why it
+    /// was green. This one is mixed-case on purpose, and asserts the forward
+    /// edge in the same breath — that arm was always right, and the fix must not
+    /// move it.
+    #[test]
+    fn a_reverse_join_suggestion_keeps_the_declared_casing() {
+        let mut orders = tbl("Orders", &["Id"]);
+        let mut items = tbl("OrderItems", &["Id", "OrderId"]);
+        items.foreign_keys = vec![crate::schema::ForeignKeyInfo {
+            name: "fk_items_orders".into(),
+            columns: vec!["OrderId".into()],
+            ref_table: "Orders".into(),
+            ref_columns: vec!["Id".into()],
+            ..Default::default()
+        }];
+        orders.foreign_keys = Vec::new();
+        let schema = DbSchema {
+            tables: vec![orders, items],
+            ..Default::default()
+        };
+        for dialect in [SqlDialect::Postgres, SqlDialect::MySql] {
+            let cat = Catalog::build(&[("shop", &schema)], Some("shop"));
+            // Quoted the way the engine quotes an identifier: MySQL reads
+            // `"Orders"` as a string, so the scope would be empty there.
+            let sql = if dialect == SqlDialect::MySql {
+                "SELECT * FROM `Orders` o JOIN "
+            } else {
+                "SELECT * FROM \"Orders\" o JOIN "
+            };
+            let ts = join_targets(sql, 0, sql.len(), sql.len(), &cat, dialect);
+            let rev = ts
+                .iter()
+                .find(|t| t.table.eq_ignore_ascii_case("orderitems"))
+                .unwrap_or_else(|| panic!("{dialect:?} offers no reverse edge: {ts:?}"));
+            assert_eq!(rev.table, "OrderItems", "{dialect:?}");
+            assert!(
+                rev.predicate.contains("OrderItems"),
+                "{dialect:?} folded the qualifier: {}",
+                rev.predicate
+            );
+            // `table_sql` is what gets spliced, so it has to be the declared
+            // name — quoted or not, per the engine's own rules.
+            assert!(
+                rev.table_sql.contains("OrderItems"),
+                "{dialect:?} splices {}",
+                rev.table_sql
+            );
+        }
+        // The forward edge, unmoved: from `OrderItems` the candidate is
+        // `Orders`, taken from `FkEdge::ref_table` and always correctly cased.
+        let cat = Catalog::build(&[("shop", &schema)], Some("shop"));
+        let sql = "SELECT * FROM \"OrderItems\" i JOIN ";
+        let ts = join_targets(sql, 0, sql.len(), sql.len(), &cat, SqlDialect::Postgres);
+        let fwd = ts
+            .iter()
+            .find(|t| t.table.eq_ignore_ascii_case("orders"))
+            .expect("the forward edge");
+        assert_eq!(fwd.table, "Orders");
+
+        // **And `expand_star`'s per-dialect quoting, which the same all-lower
+        // fixtures let anyone delete with the suite green.** Its own comment
+        // says why it is there: PostgreSQL folds a bare `OrderId` to `orderid`,
+        // which resolves to nothing.
+        let sql = "SELECT * FROM \"OrderItems\"";
+        let star = sql.find('*').unwrap();
+        let ex = expand_star(sql, 0, sql.len(), star + 1, &cat, SqlDialect::Postgres)
+            .expect("the star expands");
+        assert_eq!(
+            ex.replacement, "\"Id\", \"OrderId\"",
+            "unquoted, PG folds it"
+        );
     }
 
     /// **A join modifier is not the left table's alias**, on every engine.
