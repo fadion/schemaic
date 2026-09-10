@@ -741,6 +741,41 @@ mod tests {
         assert_eq!(v.len(), 2);
     }
 
+    /// **The composition is the whole of `preview_for_highlight`**, and it had
+    /// no test.
+    ///
+    /// The function exists only to call `sql::inline_line_comments` before the
+    /// fold, because a saved query with `-- daily revenue` on its first line
+    /// rendered as if the whole statement were commented out: the fold puts
+    /// everything on one line, and a `--` comment runs to end-of-line. Delete
+    /// that call and the plain fold comes back green — `inline_line_comments`
+    /// is itself well covered in `sql`, so what was unpinned was not the pure
+    /// function but its use, which is exactly the split CLAUDE.md names.
+    #[test]
+    fn a_leading_line_comment_does_not_swallow_the_preview() {
+        let p = preview_for_highlight("-- daily revenue\nSELECT 1", SqlDialect::MySql);
+        // The fold is one line, so the comment must already be delimited at
+        // both ends by the time it gets there.
+        let end = crate::sql::skip_noncode(p.as_bytes(), 0, SqlDialect::MySql)
+            .expect("the preview opens with a comment span");
+        let sel = p.find("SELECT").expect("the statement survives: {p}");
+        assert!(end <= sel, "the comment runs over the statement: {p}");
+        assert!(p.contains("daily revenue"), "the text is kept: {p}");
+        // And it really is one line — that is what makes the rewrite
+        // necessary rather than cosmetic.
+        assert!(!p.contains('\n'), "{p}");
+    }
+
+    /// A preview with no comment in it is the plain fold, so the rewrite is
+    /// not paid for by every other entry in the list.
+    #[test]
+    fn a_preview_without_a_comment_is_unchanged() {
+        assert_eq!(
+            preview_for_highlight("SELECT  1\n  FROM t", SqlDialect::MySql),
+            "SELECT 1 FROM t"
+        );
+    }
+
     /// A fetch that stopped at the row cap says so, or the entry claims the cap
     /// as the query's own count — indistinguishable, later, from a query that
     /// really returned exactly that many.

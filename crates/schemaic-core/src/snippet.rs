@@ -541,6 +541,33 @@ pub fn remove(all: &mut Vec<Snippet>, id: u64) {
 mod tests {
     use super::*;
 
+    /// **The composition is the whole of `collapsed_for_highlight`**, and it
+    /// had no test — the same gap as `history::preview_for_highlight`, in the
+    /// second panel the same shipped bug reached.
+    ///
+    /// A snippet whose first line is `-- what this does` collapsed onto one
+    /// line rendered as if the body were commented out, because a `--`
+    /// comment runs to end-of-line and the fold removed the end of the line.
+    #[test]
+    fn a_leading_line_comment_does_not_swallow_the_collapsed_body() {
+        let c = collapsed_for_highlight("-- what this does\nSELECT 1", SqlDialect::MySql);
+        let end = crate::sql::skip_noncode(c.as_bytes(), 0, SqlDialect::MySql)
+            .expect("the collapsed body opens with a comment span");
+        let sel = c.find("SELECT").expect("the statement survives");
+        assert!(end <= sel, "the comment runs over the statement: {c}");
+        assert!(c.contains("what this does"), "the text is kept: {c}");
+        assert!(!c.contains('\n'), "{c}");
+    }
+
+    /// A body with no comment is the plain collapse.
+    #[test]
+    fn a_collapsed_body_without_a_comment_is_unchanged() {
+        assert_eq!(
+            collapsed_for_highlight("SELECT  1\n  FROM t", SqlDialect::MySql),
+            collapsed("SELECT  1\n  FROM t")
+        );
+    }
+
     const MY: SqlDialect = SqlDialect::MySql;
     const PG: SqlDialect = SqlDialect::Postgres;
 

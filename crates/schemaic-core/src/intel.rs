@@ -5364,6 +5364,30 @@ fn source_table_of(name: &sqlparser::ast::ObjectName) -> Option<SourceTable> {
 /// which is a question this crate has no connection to answer. Names bound by a
 /// CTE are left out: they shadow any real object of the same name, and the body
 /// they stand for was walked here already.
+///
+/// **A CTE shadows a name inside its own query, not statement-wide.** The
+/// filter was one flat list of every CTE name met at any depth, applied to
+/// every relation after the walk — so a nested `WITH` could strip a real
+/// object of the same name out of the *outer* scope:
+///
+/// ```sql
+/// SELECT a.id, v.x FROM a JOIN v ON v.id = a.id
+/// CROSS JOIN (WITH v AS (SELECT 1 AS z) SELECT z FROM v) q
+/// ```
+///
+/// left `[a]`, with the real view `v` gone. On SQLite that matters: the caller
+/// never learns `v` is a view, and `column_table_name` reports one branch's
+/// provenance for a whole compound view — so `v.x` is attributed to `main.a`
+/// and offered as editable, and the rows that came from `b` are edited against
+/// `a`. The 1-row write-back net catches the usual outcome, but it is the
+/// backstop and not the gate, and it does not catch an `a` holding a row with
+/// the same key. A *top-level* `WITH` cannot produce this — the name is
+/// shadowed statement-wide, so no real relation of that name is reachable —
+/// which is why the rule read as safe.
+///
+/// The scope is a stack: a frame per query node, pushed before its subtree and
+/// popped after, so a relation is only shadowed by a CTE of an **enclosing**
+/// query.
 pub fn provenance_sources(sql: &str, dialect: SqlDialect) -> Option<Vec<SourceTable>> {
     use sqlparser::ast::{Query, SetExpr, Visit, Visitor};
     use std::ops::ControlFlow;
@@ -5371,7 +5395,19 @@ pub fn provenance_sources(sql: &str, dialect: SqlDialect) -> Option<Vec<SourceTa
     #[derive(Default)]
     struct Sources {
         relations: Vec<SourceTable>,
-        cte_names: Vec<String>,
+        /// One frame per open query node, innermost last — see the doc above.
+        /// A frame is that query's own CTE names, and it is on the stack for
+        /// exactly the subtree those names bind.
+        scopes: Vec<Vec<String>>,
+    }
+    impl Sources {
+        /// Is `name` bound by a CTE of some enclosing query?
+        fn shadowed(&self, name: &str) -> bool {
+            self.scopes
+                .iter()
+                .flatten()
+                .any(|c| c.eq_ignore_ascii_case(name))
+        }
     }
     impl Visitor for Sources {
         type Break = ();
@@ -5380,17 +5416,32 @@ pub fn provenance_sources(sql: &str, dialect: SqlDialect) -> Option<Vec<SourceTa
             if matches!(q.body.as_ref(), SetExpr::SetOperation { .. }) {
                 return ControlFlow::Break(());
             }
-            if let Some(with) = &q.with {
-                for cte in &with.cte_tables {
-                    self.cte_names.push(cte.alias.name.value.clone());
-                }
-            }
+            let names = match &q.with {
+                Some(with) => with
+                    .cte_tables
+                    .iter()
+                    .map(|cte| cte.alias.name.value.clone())
+                    .collect(),
+                None => Vec::new(),
+            };
+            self.scopes.push(names);
+            ControlFlow::Continue(())
+        }
+
+        fn post_visit_query(&mut self, _q: &Query) -> ControlFlow<()> {
+            self.scopes.pop();
             ControlFlow::Continue(())
         }
 
         fn pre_visit_relation(&mut self, name: &sqlparser::ast::ObjectName) -> ControlFlow<()> {
             match source_table_of(name) {
-                Some(t) => self.relations.push(t),
+                // Decided **here**, while the enclosing scopes are on the
+                // stack. Afterwards there is nothing left to tell an outer
+                // relation from an inner one.
+                Some(t) if t.qualifier.is_some() || !self.shadowed(&t.name) => {
+                    self.relations.push(t);
+                }
+                Some(_) => {}
                 // A shape `source_table_of` refuses — a three-part name — is one
                 // this can't name to the caller, so it can't be checked either.
                 None => return ControlFlow::Break(()),
@@ -5410,18 +5461,7 @@ pub fn provenance_sources(sql: &str, dialect: SqlDialect) -> Option<Vec<SourceTa
     if query.visit(&mut v).is_break() {
         return None;
     }
-    let Sources {
-        relations,
-        cte_names,
-    } = v;
-    Some(
-        relations
-            .into_iter()
-            .filter(|r| {
-                r.qualifier.is_some() || !cte_names.iter().any(|c| c.eq_ignore_ascii_case(&r.name))
-            })
-            .collect(),
-    )
+    Some(v.relations)
 }
 
 /// The table a statement reads **in full** — every row of it, once each — or
@@ -6340,6 +6380,97 @@ mod tests {
                 assert!(!is_single_expression(text, d), "{d:?} accepted {text}");
             }
         }
+    }
+
+    /// **A CTE shadows a name inside its own query, not statement-wide.**
+    ///
+    /// The filter was one flat list of every CTE name met at any depth,
+    /// applied to every relation after the walk — so a *nested* `WITH` bound
+    /// to `v` stripped the real view `v` out of the outer scope, and
+    /// `provenance_sources` handed the caller `[a]` alone. On SQLite the
+    /// caller then never learns `v` is a view, and `column_table_name`
+    /// reports one branch's provenance for a whole compound view: `v.x` is
+    /// attributed to `main.a` and offered as editable, so rows that came from
+    /// `b` are edited against `a`.
+    #[test]
+    fn a_nested_cte_does_not_shadow_a_name_in_the_outer_scope() {
+        let names = |sql: &str| -> Option<Vec<String>> {
+            provenance_sources(sql, SqlDialect::Sqlite)
+                .map(|v| v.iter().map(|t| t.name.to_lowercase()).collect())
+        };
+        let got = names(
+            "SELECT a.id, v.x FROM a JOIN v ON v.id = a.id \
+             CROSS JOIN (WITH v AS (SELECT 1 AS z) SELECT z FROM v) q",
+        )
+        .expect("a readable shape");
+        assert!(
+            got.contains(&"v".to_string()),
+            "the real view was stripped by a CTE in another scope: {got:?}"
+        );
+        assert!(got.contains(&"a".to_string()), "{got:?}");
+
+        // **And with the nested query first**, which is the order that needs
+        // the scope to be *popped* rather than merely pushed: with the
+        // subquery before the join, an unpopped frame is still on the stack
+        // when the outer `v` is visited.
+        let got = names(
+            "SELECT q.z, v.x FROM (WITH v AS (SELECT 1 AS z) SELECT z FROM v) q              JOIN v ON v.id = q.z",
+        )
+        .expect("a readable shape");
+        assert!(
+            got.contains(&"v".to_string()),
+            "the nested CTE outlived its own query: {got:?}"
+        );
+    }
+
+    /// …and the shadowing that is real still happens: a **top-level** `WITH`
+    /// binds the name for the whole statement, so no relation of that name is
+    /// a real object and none may be reported.
+    #[test]
+    fn a_top_level_cte_still_shadows_its_own_name() {
+        let names = |sql: &str| -> Option<Vec<String>> {
+            provenance_sources(sql, SqlDialect::Sqlite)
+                .map(|v| v.iter().map(|t| t.name.to_lowercase()).collect())
+        };
+        let got = names("WITH v AS (SELECT id FROM a) SELECT * FROM v JOIN b ON b.id = v.id")
+            .expect("a readable shape");
+        assert!(!got.contains(&"v".to_string()), "{got:?}");
+        // The CTE's own body is still walked, so what it reads is reported.
+        assert!(
+            got.contains(&"a".to_string()) && got.contains(&"b".to_string()),
+            "{got:?}"
+        );
+    }
+
+    /// A CTE inside a subquery shadows within *that* subquery, which is the
+    /// other half of the same rule — the fix must not simply stop shadowing.
+    #[test]
+    fn a_nested_cte_still_shadows_inside_its_own_query() {
+        let names = |sql: &str| -> Option<Vec<String>> {
+            provenance_sources(sql, SqlDialect::Sqlite)
+                .map(|v| v.iter().map(|t| t.name.to_lowercase()).collect())
+        };
+        let got = names("SELECT * FROM (WITH v AS (SELECT 1 AS z) SELECT z FROM v) q")
+            .expect("a readable shape");
+        assert!(
+            !got.contains(&"v".to_string()),
+            "the CTE's own reference to itself is not a real object: {got:?}"
+        );
+    }
+
+    /// A qualified name is never a CTE reference — `main.v` names an object,
+    /// whatever a CTE in scope is called — and that arm is unchanged.
+    #[test]
+    fn a_qualified_name_is_not_shadowed_by_a_cte() {
+        let got = provenance_sources(
+            "WITH v AS (SELECT 1 AS z) SELECT * FROM main.v",
+            SqlDialect::Sqlite,
+        )
+        .expect("a readable shape");
+        assert!(
+            got.iter().any(|t| t.name.eq_ignore_ascii_case("v")),
+            "{got:?}"
+        );
     }
 
     /// The shapes driver provenance may be trusted on, and the relations each
