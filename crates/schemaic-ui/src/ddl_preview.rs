@@ -1293,6 +1293,7 @@ mod tests {
             dialect: SqlDialect::MySql,
             is_view: false,
             current: Vec::new(),
+            sibling_triggers: Vec::new(),
             read_only: false,
         }));
         d.object.set(Some(crate::ObjectTarget {
@@ -1453,6 +1454,7 @@ mod tests {
             dialect: SqlDialect::Postgres,
             is_view: false,
             current: Vec::new(),
+            sibling_triggers: Vec::new(),
             read_only: false,
         }));
         d.routine.set(Some(crate::RoutineTarget {
@@ -1547,6 +1549,7 @@ mod tests {
                     dialect: SqlDialect::MySql,
                     is_view: false,
                     current: Vec::new(),
+                    sibling_triggers: Vec::new(),
                     read_only: false,
                 }))
             }),

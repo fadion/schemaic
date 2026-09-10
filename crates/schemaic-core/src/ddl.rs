@@ -7441,6 +7441,37 @@ pub fn supports_trigger_editing(dialect: SqlDialect) -> bool {
         )
 }
 
+/// Is a trigger's name unique across the whole **schema** on `dialect`, rather
+/// than only within its own table?
+///
+/// The one place the three engines genuinely disagree about a trigger's
+/// *identity*, and it decides what a "new trigger" button may propose. Measured
+/// on all four servers with `new_trigger` already on a sibling table in the same
+/// database:
+///
+/// * MariaDB 10.11.14 — `ERROR 1359: Trigger 'db.new_trigger' already exists`
+/// * MySQL 8.4.11 — `ERROR 1359: Trigger already exists`
+/// * SQLite 3.45.1 — `trigger new_trigger already exists`
+/// * PostgreSQL 16.15 — **accepted**, both triggers created
+///
+/// [`TriggerSetDraft::validate`] states the same divergence and deliberately
+/// checks only the narrow half, because one modal holds one table's set and that
+/// is the only scope it can see. Asked here so the *proposal* — a separate
+/// decision, made by whoever has the wider list — can widen the names it avoids
+/// instead of offering one the server will refuse at apply, after the drops in
+/// the same set have already committed on MySQL.
+///
+/// An exhaustive `match`, not a comparison: this is a fact about each engine's
+/// namespace rather than a capability computed from a statement, and a fourth
+/// engine must be made to answer it rather than fall onto whichever side a `==`
+/// left open.
+pub fn trigger_names_are_schema_scoped(dialect: SqlDialect) -> bool {
+    match dialect {
+        SqlDialect::MySql | SqlDialect::Sqlite => true,
+        SqlDialect::Postgres => false,
+    }
+}
+
 /// Can `dialect` have its **stored routines** edited here?
 ///
 /// MySQL and PostgreSQL, not SQLite — which has no stored routines at all, so
@@ -19269,6 +19300,19 @@ mod sqlite_view_tests {
     #[test]
     fn sqlite_edits_views() {
         assert!(supports_view_editing(Sqlite));
+    }
+
+    /// The scope, measured on all four servers with `new_trigger` already on a
+    /// sibling table: MariaDB and MySQL answer `ERROR 1359`, SQLite "trigger
+    /// new_trigger already exists", PostgreSQL creates both.
+    ///
+    /// Two of the three, so a `!= Postgres` or a `== MySql` would each have
+    /// sorted one engine onto the wrong side.
+    #[test]
+    fn two_of_three_engines_scope_a_trigger_name_to_the_schema() {
+        assert!(trigger_names_are_schema_scoped(SqlDialect::MySql));
+        assert!(trigger_names_are_schema_scoped(Sqlite));
+        assert!(!trigger_names_are_schema_scoped(SqlDialect::Postgres));
     }
 
     /// **`diff_view(x, ViewDraft::from_table(x))` is empty by construction, and

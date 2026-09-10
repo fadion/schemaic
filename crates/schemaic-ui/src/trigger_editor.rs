@@ -327,22 +327,65 @@ pub(crate) fn open_for_table(ui: &Ui, database: &str, schema: Option<&str>, tabl
             dialect: ctx.dialect,
             is_view: info.is_view,
             current: info.triggers.clone(),
+            sibling_triggers: sibling_trigger_names(ui, database, &info, ctx.dialect),
             read_only: ctx.read_only,
         },
         TriggerSetDraft::from_table(&info),
     );
 }
 
+/// Every trigger name in `database` that belongs to some **other** table — read
+/// now, off the schema the tree is showing, the way `object_editor` reads a
+/// type's dependents.
+///
+/// Empty on an engine that scopes a trigger name to its own table: there the
+/// wider list is not a restriction the server imposes and avoiding it would
+/// propose `new_trigger_2` for no reason the user can see.
+fn sibling_trigger_names(
+    ui: &Ui,
+    database: &str,
+    info: &schemaic_core::schema::TableInfo,
+    dialect: SqlDialect,
+) -> Vec<String> {
+    if !ddl::trigger_names_are_schema_scoped(dialect) {
+        return Vec::new();
+    }
+    crate::table_designer::loaded_schema(ui, database)
+        .map(|db| {
+            db.tables
+                .iter()
+                // This table's own are in the draft already, and the `+` reads
+                // both lists.
+                .filter(|t| t.name != info.name || t.schema != info.schema)
+                .flat_map(|t| t.triggers.iter().map(|tr| tr.name.clone()))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// A blank trigger for the list's `+` — pre-shaped per engine, so the form opens
 /// on something the preview can emit rather than on three validation errors.
+///
+/// `reserved` is [`TriggerTarget::sibling_triggers`]: the names taken elsewhere
+/// in the schema on an engine that scopes them there. Proposing against
+/// `existing` alone meant the second table to get a trigger through this button
+/// was offered `new_trigger` again and refused at apply — MySQL's `ERROR 1359`,
+/// arriving after any `DROP` in the same set had already committed, and naming
+/// a table the modal never mentioned. Widening the *scope* is the half that was
+/// wrong: sharing [`unique_name`] had already fixed the suffix walk.
 fn blank_trigger(
     existing: &[TriggerDraft],
+    reserved: &[String],
     table: &str,
     schema: Option<String>,
     dialect: SqlDialect,
     is_view: bool,
 ) -> TriggerDraft {
-    let taken: Vec<String> = existing.iter().map(|t| t.info.name.clone()).collect();
+    let taken: Vec<String> = existing
+        .iter()
+        .map(|t| t.info.name.clone())
+        .chain(reserved.iter().cloned())
+        .collect();
     let mut draft = TriggerDraft::blank(unique_name(&taken, "new_trigger"), table, schema);
     draft.info.events = vec![TriggerEvent::Insert];
     // A view's row-level trigger can only be `INSTEAD OF` — on SQLite that is
@@ -1126,6 +1169,8 @@ fn trigger_list(
     is_view: bool,
     table: String,
     schema: Option<String>,
+    // `TriggerTarget::sibling_triggers` — what the `+` may not propose.
+    reserved: Vec<String>,
     ring: FocusRing,
 ) -> impl IntoView {
     let d = ui.ddl.trigger_draft;
@@ -1168,7 +1213,14 @@ fn trigger_list(
 
     let add = move || {
         d.update(|s| {
-            let fresh = blank_trigger(&s.triggers, &table, schema.clone(), dialect, is_view);
+            let fresh = blank_trigger(
+                &s.triggers,
+                &reserved,
+                &table,
+                schema.clone(),
+                dialect,
+                is_view,
+            );
             s.triggers.push(fresh);
         });
         // Select what was just added, and bump `rev`: `selected` may be
@@ -1309,6 +1361,7 @@ pub(crate) fn trigger_editor_overlay(ui: Ui) -> impl IntoView {
                     target.is_view,
                     target.table.clone(),
                     target.schema.clone(),
+                    target.sibling_triggers.clone(),
                     ring.clone(),
                 ),
                 crate::widgets::autohide(scroll(container(detail).style(|s| {
@@ -1603,5 +1656,43 @@ mod tests {
         let quoted = routine("s22", "My Fn");
         assert!(fn_names(&quoted, "s22.\"My Fn\""));
         assert!(fn_names(&quoted, "\"s22\".\"My Fn\""));
+    }
+
+    /// **The composition, not `unique_name`.** `unique_name(&["new_trigger"],
+    /// "new_trigger") == "new_trigger_2"` passed all along; what was wrong was
+    /// the *list* it was given — this table's drafts only, while MySQL, MariaDB
+    /// and SQLite scope a trigger name to the whole schema. So the second table
+    /// to get a trigger through the `+` was offered `new_trigger` again and the
+    /// server refused it at apply.
+    ///
+    /// Could not be written against the unfixed tree at all: `blank_trigger`
+    /// had no parameter for the wider list.
+    #[test]
+    fn the_plus_avoids_a_trigger_name_taken_on_a_sibling_table() {
+        let sibling = vec!["new_trigger".to_string()];
+        for d in [SqlDialect::MySql, SqlDialect::Sqlite] {
+            let t = blank_trigger(&[], &sibling, "b", None, d, false);
+            assert_eq!(t.info.name, "new_trigger_2", "{d:?}");
+        }
+        // PostgreSQL scopes it to the table, so the sibling's name is not in the
+        // way and proposing `new_trigger_2` there would be unexplainable. The
+        // door passes an empty list for exactly that reason
+        // (`sibling_trigger_names`), which is what this asserts against.
+        let t = blank_trigger(&[], &[], "b", None, SqlDialect::Postgres, false);
+        assert_eq!(t.info.name, "new_trigger");
+    }
+
+    /// Both lists at once, and the suffix walk still walks: this table already
+    /// holds `new_trigger_2` while a sibling holds `new_trigger`.
+    #[test]
+    fn the_plus_walks_past_both_lists() {
+        let mine = [TriggerDraft::blank("new_trigger_2", "b", None)];
+        let sibling = vec!["new_trigger".to_string()];
+        let t = blank_trigger(&mine, &sibling, "b", None, SqlDialect::MySql, false);
+        assert_eq!(t.info.name, "new_trigger_3");
+        // And case-insensitively, since both engines fold a name here.
+        let sibling = vec!["NEW_TRIGGER".to_string()];
+        let t = blank_trigger(&[], &sibling, "b", None, SqlDialect::MySql, false);
+        assert_eq!(t.info.name, "new_trigger_2");
     }
 }

@@ -807,6 +807,27 @@ fn target_sequence(target: &ObjectTarget) -> Option<&SequenceInfo> {
     }
 }
 
+/// The **Restart at** box's text whenever the sequence form is built.
+///
+/// From the draft, not from a constant. The form is rebuilt whole by every
+/// Preview SQL — `object_editor_overlay`'s `dyn_container` is keyed on
+/// `(object.is_some(), preview.is_some())` and returns `empty()` while the
+/// preview is up — and `ddl_preview::close_preview` writes only `preview`/`sql`,
+/// so the draft's `restart` survives the round trip. Seeded from `String::new()`
+/// the box came back **empty with `RESTART WITH 500` still in the plan and in
+/// the change count**, and the only way to withdraw it through the form was to
+/// type a character into the empty box and delete it again — which is what turns
+/// the effect's `prev` from `None` into `Some`.
+///
+/// "Empty on open" is unaffected, and is not this function's doing:
+/// `SequenceDraft::from_info` and `blank` both set `restart: None` because
+/// restarting is an action rather than a state, so a freshly opened draft seeds
+/// `""` either way. The `owner` block eighty lines below fixed the same failure
+/// in its other flavour by reading the target rather than the draft.
+fn restart_seed(restart: Option<i64>) -> String {
+    restart.map(|r| r.to_string()).unwrap_or_default()
+}
+
 fn sequence_form(
     ui: &Ui,
     d: &SequenceDraft,
@@ -946,7 +967,9 @@ fn sequence_form(
 
     // Where the counter is, and where it could be moved to. `RESTART` is an
     // action rather than a state, so this box is empty on open however many
-    // times the editor is re-opened.
+    // times the editor is *opened* — which `SequenceDraft::from_info`'s
+    // `restart: None` is what actually says, and is why seeding from the draft
+    // keeps that property (see [`restart_seed`]).
     let position = form_setting_owned(
         match d.info.last_value {
             Some(v) => format!("Restart at — the counter last handed out {v}"),
@@ -954,7 +977,7 @@ fn sequence_form(
         },
         {
             let errs = ui.ddl.object_errors;
-            let sig = floem::reactive::create_rw_signal(String::new());
+            let sig = floem::reactive::create_rw_signal(restart_seed(d.restart));
             create_effect(move |prev: Option<String>| {
                 let v = sig.get();
                 if prev.is_some_and(|p| p != v) {
@@ -1278,6 +1301,43 @@ mod tests {
         // Everything else is editable.
         assert!(is_editable_object(&ObjectItem::Enum(Default::default())));
         assert!(is_editable_object(&ObjectItem::Domain(Default::default())));
+    }
+
+    /// **The round trip, not the function.** What shipped was a form whose
+    /// Restart box seeded from `String::new()` while the change it asked for
+    /// lived on in the draft, so a Preview → Cancel left `RESTART WITH 500` in
+    /// the plan with nothing on screen naming it. So this walks the same three
+    /// steps the form does — open, type, rebuild — rather than asserting the
+    /// seed in isolation.
+    #[test]
+    fn the_restart_box_survives_the_preview_it_opened() {
+        let info = SequenceInfo {
+            name: "orders_id_seq".into(),
+            last_value: Some(20_000),
+            ..Default::default()
+        };
+        // Open: empty, because restarting is an action and `from_info` says so.
+        let mut d = schemaic_core::ddl::SequenceDraft::from_info(&info);
+        assert_eq!(d.restart, None, "a re-opened sequence is not mid-restart");
+        assert_eq!(restart_seed(d.restart), "");
+        // Type `500` — what the box's effect writes.
+        d.restart = Some(500);
+        // Preview SQL tears the form down and Cancel builds it again, off this
+        // same draft.
+        assert_eq!(restart_seed(d.restart), "500");
+        // And a blank draft opens empty too, so Create sequence is unchanged.
+        assert_eq!(
+            restart_seed(schemaic_core::ddl::SequenceDraft::blank("s", None).restart),
+            ""
+        );
+    }
+
+    /// A negative restart is a number the server takes (a descending sequence),
+    /// so the box has to be able to show one back.
+    #[test]
+    fn a_negative_restart_seeds_its_own_sign() {
+        assert_eq!(restart_seed(Some(-9)), "-9");
+        assert_eq!(restart_seed(Some(0)), "0");
     }
 
     /// Detaching has to be undoable, and there is nowhere else to recover the

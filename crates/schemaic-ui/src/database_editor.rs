@@ -89,10 +89,14 @@ pub(crate) fn open_for_new(ui: &Ui, kind: ContainerKind, database: Option<&str>)
     let d = ui.ddl;
     // A new editing session — see `DdlUi::session`.
     d.session.update(|g| *g += 1);
-    d.database_draft.set(DatabaseDraft::blank(match kind {
-        ContainerKind::Database => "new_database",
-        ContainerKind::Schema => "new_schema",
-    }));
+    d.database_draft
+        .set(DatabaseDraft::blank(crate::trigger_editor::unique_name(
+            &container_names(ui, kind, database),
+            match kind {
+                ContainerKind::Database => "new_database",
+                ContainerKind::Schema => "new_schema",
+            },
+        )));
     d.error.set(None);
     d.preview.set(None);
     // Every editor shares the preview stacked on top, and each overlay knows
@@ -106,6 +110,49 @@ pub(crate) fn open_for_new(ui: &Ui, kind: ContainerKind, database: Option<&str>)
         read_only: ctx.read_only,
     }));
     fetch_roles(ui, &ctx);
+}
+
+/// The container names already taken, so the form doesn't open on one of them.
+///
+/// This was the last create in the app to propose a fixed literal. Both
+/// siblings in the same `Create ▸` submenu walk the suffixes off the tree's own
+/// snapshot (`routine_editor::taken_names`, `event_editor::taken_names`), and
+/// the list here is just as local — `db_nodes` is what the tree renders. So a
+/// second *Create database* opened on `new_database` again and Apply came back
+/// `ERROR 1007: Can't create database 'new_database'; database exists`
+/// (`DatabaseDraft::create_sql` writes a bare `CREATE DATABASE`, with no
+/// `IF NOT EXISTS`).
+///
+/// **The proposal only.** Refusing a typed name that is taken stays out —
+/// `DatabaseDraft::validate` names that among the questions it will not guess
+/// at, because guessing means refusing what the server would have accepted. A
+/// name the app can *see* is taken is a different thing from one it cannot.
+///
+/// A namespace holding no objects at all is invisible here, for the same reason
+/// it is invisible in the tree: `DbSchema::schemas` derives the list from the
+/// objects. The cost is one avoidable round trip, not a wrong statement.
+fn container_names(ui: &Ui, kind: ContainerKind, database: Option<&str>) -> Vec<String> {
+    ui.schema
+        .db_nodes
+        .with_untracked(|nodes| names_in(nodes, kind, database))
+}
+
+/// [`container_names`] over the snapshot rather than the signal, so the fold has
+/// a test. `ConnNode::schema` is itself a signal and is read untracked, the same
+/// read `loaded_schema` makes.
+fn names_in(nodes: &[crate::ConnNode], kind: ContainerKind, database: Option<&str>) -> Vec<String> {
+    match kind {
+        ContainerKind::Database => nodes.iter().map(|n| n.database.clone()).collect(),
+        ContainerKind::Schema => {
+            let Some(node) = nodes.iter().find(|n| Some(n.database.as_str()) == database) else {
+                return Vec::new();
+            };
+            match node.schema.get_untracked() {
+                crate::SchemaState::Loaded(s) => s.schemas(),
+                _ => Vec::new(),
+            }
+        }
+    }
 }
 
 /// Start the Owner shortcut's role fetch, if this engine has owners.
@@ -586,5 +633,60 @@ mod tests {
         let on: crate::ddl_preview::PlanTarget =
             (&target(ContainerKind::Schema, Some("shop"))).into();
         assert_eq!(on.database, "shop");
+    }
+
+    /// **The seed, walked past what the tree can already see.** This was the
+    /// last create in the app proposing a fixed literal, so the second *Create
+    /// database* opened on `new_database` again and the server refused it —
+    /// `create_sql` writes a bare `CREATE DATABASE`.
+    ///
+    /// Asserted through the same composition `open_for_new` performs (the fold,
+    /// then `unique_name`), because the fold alone was never the bug.
+    #[test]
+    fn create_container_proposes_a_name_the_tree_does_not_already_show() {
+        let cx = floem::reactive::Scope::new();
+        let nodes = vec![
+            crate::ConnNode::new(cx, 0, "conn", "new_database"),
+            crate::ConnNode::new(cx, 1, "conn", "shop"),
+        ];
+        let seed = |kind, db| {
+            crate::trigger_editor::unique_name(
+                &names_in(&nodes, kind, db),
+                match kind {
+                    ContainerKind::Database => "new_database",
+                    ContainerKind::Schema => "new_schema",
+                },
+            )
+        };
+        assert_eq!(seed(ContainerKind::Database, None), "new_database_2");
+
+        // A namespace: the answer comes from the named database's own loaded
+        // schema, and from no other node's.
+        let loaded = |names: &[&str]| schemaic_core::schema::DbSchema {
+            tables: names
+                .iter()
+                .map(|ns| schemaic_core::schema::TableInfo {
+                    name: "t".into(),
+                    schema: Some((*ns).to_string()),
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        };
+        nodes[1]
+            .schema
+            .set(crate::SchemaState::Loaded(std::sync::Arc::new(loaded(&[
+                "new_schema",
+            ]))));
+        assert_eq!(seed(ContainerKind::Schema, Some("shop")), "new_schema_2");
+        // …and a database that hasn't loaded, or isn't in the tree at all,
+        // reserves nothing rather than guessing.
+        assert_eq!(seed(ContainerKind::Schema, Some("other")), "new_schema");
+        assert_eq!(
+            seed(ContainerKind::Schema, Some("new_database")),
+            "new_schema",
+            "a `Loading` node has no namespace list to read"
+        );
+        cx.dispose();
     }
 }

@@ -1037,6 +1037,18 @@ pub struct TriggerTarget {
     /// The introspected triggers the draft started from — the left-hand side of
     /// the diff.
     pub current: Vec<schemaic_core::schema::TriggerInfo>,
+    /// Every trigger name **elsewhere in this schema**, on an engine that scopes
+    /// a trigger name to the schema rather than to its table
+    /// (`ddl::trigger_names_are_schema_scoped`) — empty on PostgreSQL, and empty
+    /// until the database's schema has loaded.
+    ///
+    /// Only the `+` button reads it, and only to avoid proposing a name the
+    /// server will refuse: MySQL, MariaDB and SQLite all answer `ERROR 1359` /
+    /// `trigger new_trigger already exists` for a duplicate on a *sibling*
+    /// table, which is exactly what a second use of that button produced.
+    /// `TriggerSetDraft::validate` cannot see this — one modal holds one table's
+    /// set — so the wider list has to be gathered by whoever opens the modal.
+    pub sibling_triggers: Vec<String>,
     pub read_only: bool,
 }
 
