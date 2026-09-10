@@ -5362,9 +5362,28 @@ fn schema_hits(
     let mut names: Vec<FindHit> = Vec::new();
     let mut objects: Vec<FindHit> = Vec::new();
     let mut columns: Vec<FindHit> = Vec::new();
-    // Pass 1 — table and view *names*.
+    // Pass 1 — table and view *names*, through the **one** search predicate.
+    //
+    // `schema::object_name_matches`, not an inline `to_lowercase().contains`:
+    // this function asked the same question three times and answered it two
+    // ways, so a clause added to that predicate — the doc's own hypotheticals
+    // are quote-stripping and underscore/camel splitting — would have moved the
+    // tree and this function's *object* pass while leaving its name and column
+    // passes behind, and the palette would then disagree with the tree and with
+    // itself.
+    //
+    // **Not `TableInfo::matches_search`**, though it is the wrapper that looks
+    // right: that one is name *or any column*, which is the schema tree's
+    // question — a table shows when a column matches. Here the columns are
+    // pass 3's, each as its own `table.column` hit, and folding them into
+    // pass 1 would list the table itself for a needle its name does not
+    // contain and crowd out the object pass.
+    //
+    // The empty-needle arm stays here rather than moving into the predicate,
+    // which answers `false` for one: "no filter" is each caller's own question,
+    // and `find_matches` is never reached with an empty `q` anyway.
     for t in &schema.tables {
-        if !(q.is_empty() || t.name.to_lowercase().contains(q)) {
+        if !(q.is_empty() || schemaic_core::schema::object_name_matches(&t.name, q)) {
             continue;
         }
         names.push(FindHit {
@@ -5434,7 +5453,10 @@ fn schema_hits(
     if !q.is_empty() {
         'cols: for t in &schema.tables {
             for c in &t.columns {
-                if !c.name.to_lowercase().contains(q) {
+                // The same predicate as Pass 1 and Pass 2, per column — the
+                // per-column hit is what stops this using
+                // `TableInfo::any_column_matches`, which answers for the table.
+                if !schemaic_core::schema::object_name_matches(&c.name, q) {
                     continue;
                 }
                 columns.push(FindHit {
@@ -6494,6 +6516,50 @@ mod menu_order_gate {
         Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("src")
             .join("overlays.rs")
+    }
+
+    /// **Find-Anywhere's three passes ask one predicate.**
+    ///
+    /// Passes 1 and 3 hand-spelled `name.to_lowercase().contains(q)` while
+    /// pass 2 went through `schema::object_name_matches` — the same function
+    /// asking one question three times and answering it two ways. Nothing
+    /// failed for it today, which is why a behavioural test is green either
+    /// way: the divergence is what a *future* clause on the predicate would
+    /// cause, and the palette would then disagree with the schema tree and
+    /// with itself.
+    ///
+    /// So the assertion is on the source, in `source_gate`'s idiom, scoped to
+    /// the one function rather than the file — `overlays.rs` has other
+    /// lower-casing that is not a search predicate.
+    #[test]
+    fn find_anywhere_matches_through_the_one_predicate() {
+        let src = std::fs::read_to_string(this_file()).expect("this file");
+        let body = crate::source_gate::production_code(&src);
+        let at = body
+            .find("fn schema_hits(")
+            .expect("schema_hits is gone — this gate is stale");
+        // To the next top-level item, not through `source_gate::item_end`: this
+        // function carries a `'cols:` loop label, and that helper's
+        // char-or-lifetime skip is not the tool for a body this shape.
+        //
+        // `schema_hits`, not `find_matches` — the three passes live in the
+        // former, and a gate scoped to the latter scans forty lines of
+        // delegation and reports success.
+        let end = body[at..]
+            .find(
+                "
+fn ",
+            )
+            .map(|n| at + n)
+            .unwrap_or(body.len());
+        // Split so this assertion is not itself a match.
+        let spelled = format!("to_lowercase().{}(q)", "contains");
+        assert!(
+            !body[at..end].contains(&spelled),
+            "a Find-Anywhere pass spells the search predicate itself; every \
+             schema-search surface matches through `schema::object_name_matches` \
+             (or a wrapper of it), or the palette drifts from the tree"
+        );
     }
 
     /// One entry construction found in the builder.

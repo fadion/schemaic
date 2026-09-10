@@ -1109,7 +1109,7 @@ pub fn use_target(sql: &str, dialect: SqlDialect) -> Option<String> {
         // `` `a``b` `` — a doubled backtick is one literal backtick.
         let end = skip_noncode(b, i, dialect)?;
         (sql[i + 1..end - 1].replace("``", "`"), end)
-    } else if i < n && (b[i].is_ascii_alphabetic() || b[i] == b'_' || b[i] >= 0x80) {
+    } else if i < n && is_word_start(b[i]) {
         let s = i;
         let mut j = i + 1;
         while j < n && is_word_byte(b[j]) {
