@@ -1054,10 +1054,15 @@ fn leading_keyword_span(sql: &str, dialect: SqlDialect) -> Option<(usize, usize)
         }
         break;
     }
-    if i < n && (b[i].is_ascii_alphabetic() || b[i] == b'_') {
+    // Invariant 11, not an ASCII rule: with the ASCII spelling
+    // `leading_keyword("SELECTé 1")` was `Some("SELECT")`, because the
+    // non-ASCII byte ended the word early. The statement is a syntax error
+    // either way, so nothing downstream lost a guard — but a second wrong
+    // spelling of the one definition is how the first one gets copied.
+    if i < n && is_word_start(b[i]) {
         let s = i;
         let mut j = i + 1;
-        while j < n && (b[j].is_ascii_alphanumeric() || b[j] == b'_') {
+        while j < n && is_word_byte(b[j]) {
             j += 1;
         }
         return Some((s, j));
@@ -1161,10 +1166,19 @@ pub fn has_top_level_where(sql: &str, dialect: SqlDialect) -> bool {
                 depth = (depth - 1).max(0); // unbalanced `)` must not go negative
                 i += 1;
             }
-            c if c.is_ascii_alphabetic() || c == b'_' => {
+            // **`is_word_start`/`is_word_byte`, not an ASCII rule.** This
+            // scanner is the missing-`WHERE` safety net, and with the ASCII
+            // spelling a byte `>= 0x80` *ended* a word — so the ASCII tail of a
+            // non-ASCII identifier was scanned as a word of its own and
+            // `DELETE FROM éwhere` answered `true`, i.e. "this statement has a
+            // WHERE". `unsafe_reason` then returned `None`, `run_verdict` never
+            // reached its `Confirm` arm, and with `confirm_writes` off the
+            // delete ran unasked. utf8 identifiers are ordinary on MySQL and
+            // PostgreSQL, which is what invariant 11 is for.
+            c if is_word_start(c) => {
                 let s = i;
                 let mut j = i + 1;
-                while j < n && (b[j].is_ascii_alphanumeric() || b[j] == b'_') {
+                while j < n && is_word_byte(b[j]) {
                     j += 1;
                 }
                 if depth == 0 && sql[s..j].eq_ignore_ascii_case("WHERE") {
@@ -1584,7 +1598,7 @@ fn word_tokens(sql: &str, dialect: SqlDialect) -> (Vec<String>, bool) {
     let n = b.len();
     let mut i = 0;
     let mut words = Vec::new();
-    let mut word = String::new();
+    let mut word: Vec<u8> = Vec::new();
     let mut ended = false;
     let mut multi = false;
     macro_rules! flush {
@@ -1593,7 +1607,7 @@ fn word_tokens(sql: &str, dialect: SqlDialect) -> (Vec<String>, bool) {
                 if ended {
                     multi = true;
                 }
-                words.push(std::mem::take(&mut word));
+                words.push(String::from_utf8_lossy(&std::mem::take(&mut word)).into_owned());
             }
         };
     }
@@ -1607,8 +1621,20 @@ fn word_tokens(sql: &str, dialect: SqlDialect) -> (Vec<String>, bool) {
         if c == b';' {
             flush!();
             ended = true;
-        } else if c.is_ascii_alphanumeric() || c == b'_' {
-            word.push(c.to_ascii_uppercase() as char);
+        } else if is_word_byte(c) {
+            // Invariant 11's third site here. The ASCII rule flushed at every
+            // byte `>= 0x80`, so `cafédelete` arrived as the two tokens `CAFÃ`
+            // and `DELETE` and `contains_write` answered true for a `SELECT`.
+            // That direction is safe for a refusal gate — over-blocking is the
+            // correct way to be wrong — but it is still a wrong answer, and the
+            // reason `is_word_byte` is the one definition.
+            //
+            // A byte, not a `char`: pushing a `u8 as char` re-encodes a
+            // continuation byte as a Latin-1 code point. The bytes are a
+            // `&str`'s, so a word cut at [`is_word_byte`]'s boundaries is whole
+            // UTF-8 and `from_utf8` cannot fail — but `_lossy` rather than an
+            // `unwrap`, because a token is not worth a panic.
+            word.push(c.to_ascii_uppercase());
         } else {
             flush!();
         }
@@ -3703,6 +3729,81 @@ mod tests {
         for &b in b" .,()'`\"-;" {
             assert!(!is_word_byte(b), "{:?} treated as a word byte", b as char);
         }
+    }
+
+    /// **The invariant asked of a *scanner*, which is the half that was
+    /// missing.** The three tests above assert the two predicates and nothing
+    /// that uses them, so `sql.rs`' own three hand-rolled ASCII word scanners
+    /// were green — and one of them is the missing-`WHERE` safety net.
+    ///
+    /// `has_top_level_where` ended a word at every byte `>= 0x80`, so the ASCII
+    /// tail of a non-ASCII identifier scanned as a word of its own:
+    /// `DELETE FROM éwhere` answered "this statement has a WHERE",
+    /// `unsafe_reason` returned `None`, and `run_verdict` never reached its
+    /// `Confirm` arm — with `confirm_writes` off the delete ran unasked.
+    /// Measured on the unfixed tree for all three spellings below.
+    #[test]
+    fn a_non_ascii_table_name_does_not_hide_a_missing_where() {
+        for dialect in [SqlDialect::MySql, SqlDialect::Postgres, SqlDialect::Sqlite] {
+            // The control: the same statement with an ASCII name is guarded,
+            // and always was.
+            assert!(!super::has_top_level_where(
+                "DELETE FROM plainwhere",
+                dialect
+            ));
+            for sql in [
+                "DELETE FROM éwhere",
+                "DELETE FROM sıwhere",
+                "UPDATE caféwhere SET a = 1",
+                // The lead byte immediately before the keyword, and a name that
+                // *is* the keyword with a non-ASCII prefix.
+                "DELETE FROM日本where",
+            ] {
+                assert!(
+                    !super::has_top_level_where(sql, dialect),
+                    "{sql} on {dialect:?} claims a WHERE it does not have"
+                );
+                assert!(
+                    super::unsafe_reason(sql, dialect).is_some(),
+                    "{sql} on {dialect:?} would run with no confirmation"
+                );
+            }
+            // And a real `WHERE` after a non-ASCII name is still found, or the
+            // fix would trade a missed guard for a spurious one.
+            assert!(super::has_top_level_where(
+                "DELETE FROM café WHERE a = 1",
+                dialect
+            ));
+            assert!(super::unsafe_reason("DELETE FROM café WHERE a = 1", dialect).is_none());
+        }
+    }
+
+    /// The same invariant at this module's other two scanners.
+    ///
+    /// Neither loses a guard — a statement `leading_keyword` mis-splits is a
+    /// syntax error anyway, and `word_tokens` splitting only makes
+    /// `contains_write` over-block, which is the correct direction for a
+    /// refusal gate. They are pinned because a wrong copy of the one definition
+    /// is what the next scanner gets copied from.
+    #[test]
+    fn a_non_ascii_byte_does_not_end_a_word_for_the_other_two_scanners() {
+        // `SELECTé 1` is one word, so the leading keyword is that whole word —
+        // not `SELECT`, which is what the ASCII scanner answered and what every
+        // `read_only_heads` comparison downstream would have matched.
+        assert_eq!(
+            super::leading_keyword("SELECTé 1", SqlDialect::MySql).as_deref(),
+            Some("SELECTé")
+        );
+        assert_eq!(
+            super::leading_keyword("SELECT 1", SqlDialect::MySql),
+            Some("SELECT".to_string())
+        );
+        // `cafédelete` is a column name, not a `DELETE`.
+        assert!(!super::contains_write(
+            "SELECT * FROM cafédelete",
+            SqlDialect::MySql
+        ));
+        assert!(super::contains_write("DELETE FROM t", SqlDialect::MySql));
     }
 
     #[test]

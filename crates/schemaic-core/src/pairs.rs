@@ -346,7 +346,7 @@ pub fn identifier_occurrences(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use SqlDialect::{MySql, Postgres};
+    use SqlDialect::{MySql, Postgres, Sqlite};
 
     // --- region_at ---------------------------------------------------------
 
@@ -369,6 +369,46 @@ mod tests {
         assert_eq!(region_at(sql, 4, MySql), Region::Comment);
         // Postgres: `#` is an operator, not a comment → code
         assert_eq!(region_at(sql, 4, Postgres), Region::Code);
+        // **SQLite, the engine that motivated the fix this test guards.**
+        // `is_comment_start` was a private byte test saying `#` opened a comment
+        // on everything but Postgres — a claim that stopped being true the
+        // moment SQLite existed, which is why it now delegates to
+        // `sql::comment_open`. That went in with no assertion on the engine it
+        // was about, and this file had none anywhere.
+        assert_eq!(region_at(sql, 4, Sqlite), Region::Code);
+    }
+
+    /// SQLite's `[…]` identifiers, the module's other documented divergence.
+    ///
+    /// `region_at` has to call the span a `Str` there — it is a quoted name,
+    /// and a caret inside one is not in code, so nothing may offer to complete
+    /// or auto-close into it. On the other two engines `[` is an ordinary
+    /// character, so the same text is code throughout.
+    #[test]
+    fn a_bracket_identifier_is_a_quoted_span_on_sqlite_only() {
+        let sql = "[a b]";
+        assert_eq!(region_at(sql, 2, Sqlite), Region::Str);
+        for d in [MySql, Postgres] {
+            assert_eq!(region_at(sql, 2, d), Region::Code, "{d:?}");
+        }
+        // The caret one past the closing `]` is out of the span again.
+        assert_eq!(region_at(sql, 5, Sqlite), Region::Code);
+    }
+
+    /// Backtick auto-close on SQLite, which takes MySQL's identifier quote for
+    /// compatibility — the capability `SqlDialect::backtick_ident` states and
+    /// both `classify` and `backspace_pair` ask.
+    #[test]
+    fn sqlite_takes_the_backtick_pair_and_postgres_does_not() {
+        assert_eq!(backspace_pair("``", 1, Sqlite), Some((0, 2)));
+        assert_eq!(backspace_pair("``", 1, MySql), Some((0, 2)));
+        assert_eq!(backspace_pair("``", 1, Postgres), None);
+        // The pairs that are every engine's.
+        for d in [MySql, Postgres, Sqlite] {
+            assert_eq!(backspace_pair("()", 1, d), Some((0, 2)), "{d:?}");
+            assert_eq!(backspace_pair("''", 1, d), Some((0, 2)), "{d:?}");
+            assert_eq!(backspace_pair("\"\"", 1, d), Some((0, 2)), "{d:?}");
+        }
     }
 
     #[test]
