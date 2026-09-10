@@ -395,6 +395,33 @@ const _: () = {
 /// `radius` is the face's own corner radius, so the outline can follow it rather
 /// than boxing it — see [`button_focus_ring`]. `0.0` for the icon buttons, whose
 /// faces are square.
+/// Does this key event **press** a focusable button?
+///
+/// **The modifier term is the whole of it, and it was missing.** The two arms
+/// below matched the logical key alone, so `Ctrl+Enter` on a ringed button
+/// pressed it — and `Ctrl+Enter` is the grid's *Commit* key. With focus on the
+/// results strip's ✗ (one keypress from wherever the strip was last left, since
+/// `FocusRing::step_from` resumes) that ran `discard_edits`: every staged cell
+/// edit, every pending new row and every pending delete thrown away,
+/// unconfirmed and unrecoverable, under the key the ✓ *beside it* advertises as
+/// Commit. The same shape reached every footer action in the app, including the
+/// DDL preview's Apply — under a doc three paragraphs up that says an
+/// irreversible `ALTER` must not answer a stray Enter.
+///
+/// A bare press only, then: a modified one belongs to whatever binding owns
+/// that combination, and this returning `false` is what lets the event keep
+/// travelling to it.
+///
+/// Free and pure so both arms ask one question — the two used to be two
+/// `matches!`es, which is how one could have gained the term and the other not.
+pub(crate) fn presses(key: &Key, mods: floem::keyboard::Modifiers) -> bool {
+    mods.is_empty()
+        && matches!(
+            key,
+            Key::Named(NamedKey::Space) | Key::Named(NamedKey::Enter)
+        )
+}
+
 pub(crate) fn in_ring_button<V: IntoView + 'static>(
     view: V,
     ring: FocusRing,
@@ -415,10 +442,7 @@ pub(crate) fn in_ring_button<V: IntoView + 'static>(
             let Event::KeyDown(ke) = e else {
                 return EventPropagation::Continue;
             };
-            if matches!(
-                ke.key.logical_key,
-                Key::Named(NamedKey::Space) | Key::Named(NamedKey::Enter)
-            ) {
+            if presses(&ke.key.logical_key, ke.modifiers) {
                 on_press();
                 return EventPropagation::Stop;
             }
@@ -464,10 +488,7 @@ pub(crate) fn key_pressable<V: IntoView + 'static>(
             let Event::KeyDown(ke) = e else {
                 return EventPropagation::Continue;
             };
-            if matches!(
-                ke.key.logical_key,
-                Key::Named(NamedKey::Space) | Key::Named(NamedKey::Enter)
-            ) {
+            if presses(&ke.key.logical_key, ke.modifiers) {
                 on_press();
                 return EventPropagation::Stop;
             }
@@ -5141,6 +5162,51 @@ pub(crate) fn accept_dialog_launch(
 /// class and must not re-derive the answer.
 pub fn may_launch_destructive(in_flight: bool, read_only: bool) -> bool {
     accept_launch(in_flight, read_only)
+}
+
+#[cfg(test)]
+mod press_tests {
+    use super::presses;
+    use floem::keyboard::{Key, Modifiers, NamedKey};
+
+    /// **A modified Enter is somebody else's key.** Without the modifier term,
+    /// `Ctrl+Enter` on the results strip's ✗ ran `discard_edits` — every staged
+    /// edit, every pending row, every pending delete, gone unconfirmed — while
+    /// the ✓ beside it advertises `Ctrl+Enter` as *Commit*. The same press on
+    /// the DDL preview's Apply ran the `ALTER`.
+    #[test]
+    fn only_an_unmodified_enter_or_space_presses_a_button() {
+        for key in [
+            Key::Named(NamedKey::Enter),
+            Key::Named(NamedKey::Space),
+            // A numpad Enter arrives as the same logical key.
+            Key::Named(NamedKey::Enter),
+        ] {
+            assert!(presses(&key, Modifiers::empty()), "{key:?}");
+            for held in [
+                Modifiers::CONTROL,
+                Modifiers::SHIFT,
+                Modifiers::ALT,
+                Modifiers::META,
+                Modifiers::CONTROL | Modifiers::SHIFT,
+            ] {
+                assert!(
+                    !presses(&key, held),
+                    "{key:?} with {held:?} pressed the button"
+                );
+            }
+        }
+        // And nothing else presses one, modified or not.
+        for key in [
+            Key::Named(NamedKey::Tab),
+            Key::Named(NamedKey::Escape),
+            Key::Named(NamedKey::ArrowDown),
+            Key::Character("a".into()),
+        ] {
+            assert!(!presses(&key, Modifiers::empty()), "{key:?}");
+            assert!(!presses(&key, Modifiers::CONTROL), "{key:?}");
+        }
+    }
 }
 
 #[cfg(test)]

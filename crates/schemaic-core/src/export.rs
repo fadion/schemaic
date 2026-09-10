@@ -1848,31 +1848,35 @@ fn withheld_binary(mask: &[bool], ci: usize, c: &crate::model::CellRef<'_>) -> b
 /// note on every save is a note nobody reads — so an ordinary `Fetched` export
 /// stays quiet, and only a streamed one announces its row count.
 ///
-/// **All three losses override that silence, but the third only when the rows
-/// were never on screen.** A column *blanked* or *cut* is a surprise anywhere —
-/// the value was there, the file has less of it than the screen does, and
-/// nothing on screen says so. A **withheld** binary column is not a surprise on
-/// a *save of the grid*: it renders that cell as `<7 bytes>`, so the user
-/// picking CSV or JSON for it can already see what they are asking a text
-/// format to carry, and "a text export cannot hold raw bytes" restated it at a
-/// length that painted past the export modal's own width.
+/// **All three losses override that silence.** A column *blanked* or *cut* is a
+/// surprise — the value was there, the file has less of it than the screen does,
+/// and nothing on screen says so.
 ///
-/// **That premise is false on exactly the paths the tally was built for.** The
-/// grid-mounted export is `SliceChunks`; the paths that reach `withheld` with no
-/// grid at all are `PullChunks` — All rows, the dump, and the folder export.
-/// Those rows were never rendered, so nothing ever showed the user `<7 bytes>`
-/// for them: the file has an empty field where the bytes were, which is also how
-/// every text format writes NULL, and re-importing it writes empty over the
-/// blobs. So `withheld` speaks when `streaming`, and stays quiet otherwise —
-/// which keeps the modal-width argument where it applies and closes the two
-/// paths where it never did.
+/// **A `withheld` binary column used to be exempt, and the exemption no longer
+/// has a term to hang on.** The argument for it was that the grid renders such a
+/// cell as `<7 bytes>`, so a user picking CSV for it can already see what they
+/// are asking a text format to carry — true of a save *of the grid*, and false
+/// of the paths that reach `withheld` with no grid at all: `PullChunks`, which
+/// is All rows, the dump and the folder export. Those rows were never rendered,
+/// the file has an empty field where the bytes were (indistinguishable from how
+/// every text format writes NULL), and re-importing it writes empty over the
+/// blobs.
+///
+/// Gating the clause on `streaming` looks like the fix and is not: **every
+/// production caller passes `true`** — `grid.rs`, `dump_view.rs` and
+/// [`files_note`] alike, since a modal that stays up *is* the confirmation and
+/// one that said nothing after a fetched export would be a dialog reporting
+/// silence. So the flag no longer means "no grid was mounted", and a clause
+/// hung on it would read as exempting the grid save while exempting nothing.
+/// It is said unconditionally instead, at a length the modal can hold — which
+/// is the other half of the original objection, and the half that was fixable.
 ///
 /// The caveats read the way the grid's own arena note does — the column names,
 /// then what happened to them — because a user comparing the file to the screen
 /// needs to know *which* part of it to distrust, and "some data was lost" tells
 /// them nothing.
 pub fn export_note(t: &ExportTally, name: &str, streaming: bool) -> Option<String> {
-    if !streaming && t.blanked.is_empty() && t.cut.is_empty() {
+    if !streaming && !t.has_caveat() {
         return None;
     }
     let n = t.rows as usize;
@@ -1890,7 +1894,7 @@ pub fn export_note(t: &ExportTally, name: &str, streaming: bool) -> Option<Strin
         s.push_str(&text);
         said = true;
     };
-    if streaming && !t.withheld.is_empty() {
+    if !t.withheld.is_empty() {
         clause(
             &mut s,
             format!(
@@ -3584,29 +3588,29 @@ mod tests {
             Some("Exported 2 rows to docs.csv")
         );
 
-        // **A withheld binary column is tallied but not said.** The grid already
-        // shows the cell as `<7 bytes>`, so "a text export cannot hold raw bytes"
-        // told the user what the screen in front of them had already told them —
-        // and it did so in a clause long enough to overflow the export modal it
-        // was rendered in. The tally still records it (`withheld` is what the SQL
-        // writer's `-- binary column` comment and `has_caveat` read), it just no
-        // longer earns a sentence.
+        // **A withheld binary column is said, like the other two losses.** It
+        // used to be exempt — the grid renders the cell as `<7 bytes>`, so a
+        // user picking CSV for it can see what they are asking a text format to
+        // carry — and the exemption was true of a save *of the grid* and false
+        // of every path that reaches `withheld` without one. There is no term to
+        // hang it on either: `streaming` is `true` at every production call
+        // site, so gating on it would exempt nothing while reading as though it
+        // exempted the grid.
         let one = ExportTally {
             rows: 2,
             withheld: vec!["file".to_string()],
             ..Default::default()
         };
-        // Not merely trimmed — a withheld column no longer breaks the silence of
-        // a non-streamed save at all, which is the half a caller-blind test of
-        // the string would have missed.
-        assert_eq!(export_note(&one, "docs.csv", false), None);
-        assert!(one.has_caveat(), "the loss is still recorded on the tally");
-        // **But a streamed export says it**, because there the premise above is
-        // false: `PullChunks` — All rows, the dump, the folder export — never
-        // mounted a grid, so nothing ever showed the user `<7 bytes>` for these
-        // rows. The file has an empty field where the bytes were, which is also
-        // how that format writes NULL, and re-importing it writes empty over
-        // the blobs.
+        assert!(one.has_caveat(), "the loss is recorded on the tally");
+        // A caveat overrides the silence, which is what `has_caveat` means and
+        // what the other two already did.
+        assert_eq!(
+            export_note(&one, "docs.csv", false).as_deref(),
+            Some(
+                "Exported 2 rows to docs.csv — file holds bytes this format cannot carry: \
+                 those cells are empty"
+            )
+        );
         let two = ExportTally {
             rows: 1,
             withheld: vec!["file".to_string(), "thumb".to_string()],
@@ -3646,13 +3650,11 @@ mod tests {
                 "Exported 3 rows to docs.csv — file holds bytes this format cannot carry: those cells are empty; body too large to hold in full: later rows are blank"
             )
         );
-        // And the same pair on a **non-streamed** save says only the blanked
-        // half: there the grid is on screen and the `<7 bytes>` premise holds.
+        // The `streaming` flag decides only whether a **clean** export speaks;
+        // once there is a caveat it says the same thing either way.
         assert_eq!(
-            export_note(&both, "docs.csv", false).as_deref(),
-            Some(
-                "Exported 3 rows to docs.csv — body too large to hold in full: later rows are blank"
-            )
+            export_note(&both, "docs.csv", false),
+            export_note(&both, "docs.csv", true)
         );
 
         // The truncation caveat joins the same sentence, and reads on its own

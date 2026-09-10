@@ -533,7 +533,9 @@ existing prose was left alone.
     already verified every column's origin itself.
     `a_join_with_one_keyless_table_has_no_insert_target` is the fixture that was missing — the only
     join fixture this family had carried two *writable* tables, which is the half that already
-    worked.
+    worked — and `a_join_with_one_unkeyed_side_still_offers_no_insert_target` is the same shape
+    against real servers, where what each side of a join reports as its provenance is the driver's
+    answer rather than a test's.
     **The one key column that is never editable is an implicit key** (`ColumnOrigin::implicit_key`).
     `resolve_key` falls back to it only after a primary key and a fully-present unique NOT NULL
     index have *both* failed — a real key is what the user means by the row's identity, and it is
@@ -794,6 +796,17 @@ existing prose was left alone.
     Everything that is not a plain filename character becomes `_`, because a key value is server
     data on its way to a save dialog — a separator, a `..` or an NTFS stream colon must not steer
     where the file lands (`the_save_stem_cannot_escape_into_a_path`).
+    **The sanitizer is `save_stem_from(parts)`, on the operation rather than on one of its
+    callers.** `BlobRef::save_stem` is only *one* producer of a save name and it was the only one
+    that sanitized: the other is the panel opened on a cell with no committed row behind it — a
+    pending row, or a `NULL` cell — which has no key to name and borrows the table and column
+    straight out of the result set instead. Those are server-supplied identifiers, PostgreSQL and
+    SQLite restrict neither and MySQL restricts `/ \ .` in a *table* name but not in a column name,
+    so a `bytea` column called `..\..\..\Startup\payload` reached the save dialog's name box as a
+    relative path out of the folder it was showing. `BlobTarget::stem` is a private field behind
+    `BlobTarget::new` for the same reason — a field anyone can write is a third producer waiting to
+    forget — and `grid.rs`'s `blob_launch` sends both arms through the constructor, the keyed one
+    included, so the two are one rule rather than two that agree today.
     **`column_byte_cap(dialect, type_name)` is the write's one pure question: how much does this
     column actually hold?** It exists so an oversized file is refused where the user picked it. The other
     place it gets refused is MySQL's `ERROR 1406: Data too long`, which arrives at the *commit*,
@@ -839,9 +852,23 @@ existing prose was left alone.
     that being the largest the read half can return whole
     (`a_file_of_exactly_the_load_cap_still_fits`, which pins the boundary and the two constants'
     equality together). The app's `load_blob` asks it of `fs::metadata` **before** the read — refusing
-    a 4 GB file by inspecting the `Vec` it produced means allocating it first — and again of the
-    bytes afterwards, since a file can grow between the two; missing metadata is not itself a
-    refusal, the read below reporting the real error. Its sentence contrasts the two sizes through
+    a 4 GB file by inspecting the `Vec` it produced means allocating it first — and the read then
+    bounds itself; missing metadata is not itself a refusal, the read below reporting the real error.
+    **That second half was a claim the code did not keep, and `read_capped(reader, cap)` is it.** The
+    site's own comment said "the read still bounds itself below" while calling `std::fs::read`, which
+    sizes its buffer from the same `metadata` hint and then reads to EOF — and on Linux `st_size` is
+    **0** for a character or block device, so `/dev/zero`, a FIFO or a `/proc` file passed the
+    pre-check and grew a `Vec` until the allocator or the OOM killer stopped it, taking the window,
+    every tab's uncommitted grid edits and any open manual transaction with it. `LOAD_CAP`'s only
+    enforcement was the allocation it exists to prevent. `read_capped` asks the reader for `cap + 1`
+    bytes and answers `Ok(None)` when it gets them all, which is what keeps "exactly the cap" and
+    "more than the cap" apart on the boundary `load_too_large` draws; it takes a **reader** rather
+    than a path so it can be tested against `io::repeat(0)`, an infinite one, which is exactly the
+    shape of the bug and something no real file in a test could be
+    (`read_capped_stops_on_a_reader_that_never_ends`, `read_capped_keeps_the_caps_own_boundary`).
+    `load_blob` opens the file and reads through it; over the cap, the honest size is the `metadata`
+    hint where there is one and `cap + 1` — "more than this" — where there is not, since the rest of
+    the file was never read. Its sentence contrasts the two sizes through
     `format::contrasting_bytes`, like the column cap's: every size in a ~51 KB window above 64 MiB
     otherwise read *"That file is 64.0 MB — the most that can be loaded is 64.0 MB."*
   - `export.rs` — CSV/JSON/SQL/Markdown/HTML/Excel export (incl. CSV formula-injection guard;
@@ -1082,22 +1109,31 @@ existing prose was left alone.
     nothing can test, the caller needing a `Db`, a runtime handle and two channels to reach.
     None of the three is an error — the file is written and the rows in it are real — so the one
     thing that must not happen is a *surprise* going unsaid, which is `export_note(tally, name,
-    streaming)`'s job: silent for a clean non-streamed save, and never silent about `blanked` or
-    `cut`. **Two of the three losses override that silence and the third no longer does.** A blanked
-    or cut column is a surprise — the value was there, the file holds less of it than the screen
-    does, and nothing on screen says so — while a withheld binary column is one the grid already
-    renders as `<7 bytes>`, so *"a text export cannot hold raw bytes"* restated what the user could
-    see, at a length that painted past the export modal it lands in. That clause is gone, and the
-    silence gate at the top of the function reads `blanked` and `cut` directly instead of
-    `has_caveat()`: a withheld-only tally now returns `None` on a non-streamed save and a bare
-    `Exported N rows to X` on a streamed one, and the `" — "` / `"; "` seam before the `cut` clause
-    is computed from `blanked` alone. **The tally itself is unchanged** — `withheld` is still
-    populated, `has_caveat` still counts it and the SQL writer's `-- NOTE: binary column … exported
-    as NULL` still reads it — only the sentence dropped it.
-    **Nothing in production passes `false` any more.** The grid export reports into a modal that
-    stays up until it is dismissed, and a confirmation saying nothing about a clean save would be a
-    dialog reporting silence, so both call sites — the grid's and the dump's — and `files_note` ask
-    with `true`; the silent arm survives with only its tests for callers.
+    streaming)`'s job: silent for a clean non-streamed save, and **never silent about any of the
+    three losses**. A blanked or cut column is a surprise anywhere — the value was there, the file
+    holds less of it than the screen does, and nothing on screen says so.
+    **A withheld binary column used to be exempt, and the exemption no longer has a term to hang
+    on.** The argument for it was that a *save of the grid* already renders that cell as
+    `<7 bytes>`, so *"a text export cannot hold raw bytes"* restated what the user could see, at a
+    length that painted past the export modal it lands in. That is true of the grid-mounted export
+    (`SliceChunks`) and false of every path that reaches `withheld` without one — All rows, the
+    dump, the folder export, all `PullChunks`. Those rows were never rendered, so nothing showed
+    anyone `<7 bytes>` for them; the file has an empty field where the bytes were, which is also how
+    every text format writes NULL, and re-importing it writes empty over the blobs.
+    Gating the clause on `streaming` looks like the fix and is not, which is the part worth knowing
+    before touching it: **every production caller passes `true`** — the grid's, the dump's and
+    `files_note` alike, because the grid export reports into a modal that stays up until it is
+    dismissed and a confirmation saying nothing about a clean save would be a dialog reporting
+    silence. So the flag no longer means "no grid was mounted", and a clause hung on it would read
+    as exempting the grid save while exempting nothing. The clause is said unconditionally instead,
+    at a length the modal can hold — the other half of the original objection, and the half that was
+    fixable. The silence gate at the top of the function is `!streaming && !t.has_caveat()`, so the
+    flag now decides only whether a **clean** export speaks; and the `" — "` / `"; "` seam is
+    computed per clause from **what has already been said**, not from a sibling category — the `cut`
+    clause read `blanked` alone, which is the shape that opens with `; ` the day it is the first
+    thing in the sentence. **The tally itself is unchanged** — `withheld` was always populated,
+    `has_caveat` has always counted it and the SQL writer's `-- NOTE: binary column … exported as
+    NULL` has always read it; it is only the sentence that moved.
     `export_failure_note(message, partial)` is the same rule on the other side, and what it has to
     say changed with `part_path`: the destination is no longer opened until the export succeeds, so
     the sentence is not "your file is a fragment" but `— <name> was not changed; the rows that were
@@ -1116,7 +1152,7 @@ existing prose was left alone.
     folder, missing, replaced)` **delegates the caveat half to `export_note`** rather than restating
     it — a
     folder loses exactly what a single file does, and the wording of a loss belongs in one place, so
-    it inherits that function's silence about a withheld binary column along with everything it says —
+    it inherits that function's rules about a withheld binary column along with everything it says —
     and asks it with `streaming: true`, since a folder has no other way to say how much arrived and
     `export_note` is otherwise silent on a clean write. It then **terminates that sentence itself**:
     `export_note` does not end its own, its single-file caller being the last clause of one, and here
@@ -1361,6 +1397,18 @@ existing prose was left alone.
     is written last: the header has to be able to report the count, so a future tidy that moves the
     section back into file order silently empties that sentence
     (`a_foreign_key_to_a_table_outside_the_selection_is_not_restated`).
+    **A key carried inside a verbatim `CREATE TABLE` still points outside the export, and that is a
+    second counter with a second sentence.** `needs_fk_section` used to gate the whole loop body, so
+    on SQLite — where the keys ride in the captured DDL and there is nothing to restate — the count
+    stayed 0 and the header said nothing at all: replayed against SQLite 3.53.2 the load is clean,
+    `PRAGMA foreign_keys = ON` not validating existing rows, and every later write to the table fails
+    with *no such table: main.customers*. The question that predicate answers is *"restate it
+    separately?"*, never *"is it carried?"*, and only the first belongs in front of the emit, so
+    `dangling_fks` is tallied where the `continue` used to be. Its sentence is deliberately not the
+    `dropped_fks` one: nothing was dropped, the constraint is in the file and restores without
+    complaint, and it points at nothing — saying the key is gone would be the opposite lie
+    (`a_verbatim_key_pointing_out_of_the_export_is_still_reported`, which asserts the new wording
+    appears **and** that the restatable engines' one does not).
     **The FK guard wraps the transaction, never the other way round.** `PRAGMA foreign_keys` is a
     silent no-op inside a transaction on SQLite, so a guard emitted after `BEGIN` reads correctly in
     the file and does nothing at all. `fk_guard_sql` and `transaction_sql` are the strings and `plan`
@@ -3379,7 +3427,21 @@ existing prose was left alone.
     `celledit::value_list`, which goes through `sql::skip_noncode` because a member may contain a
     quote, a comma or a `)`.
   - `format.rs` — per-column display formatters (`ColumnFormat`/`apply`: epoch→datetime, bytes,
-    bool). Display-only; edit/copy stay raw. Persisted to `format.json`. `human_bytes` is `pub`
+    bool). Display-only; edit/copy stay raw. Persisted to `format.json`.
+    **`rule_key(conn_id, rs, ci)` is the whole identity a saved formatter is stored under**, and it
+    is one function because the read and the write are one key. The grid seeded a column's formatter
+    from the connection the result was *loaded on* and saved one against the tab's *live* `conn_id`,
+    which moves when a tab is rebound while its result stays on screen — so setting a format upserted
+    the rule against a server the rows never came from: absent where the user set it, and silently
+    applied to a real, different table on the other connection. `grid.rs`'s private `format_key` was
+    the half that only the seed called; both `GridState::new` and `set_format` come through here now,
+    and both read `conn_at_load`. The table part is the name the UI shows the table by
+    (`schema.table` outside PostgreSQL's `public`), so a rule on `sales.orders` cannot leak onto
+    `public.orders`, and the identity is the column's **own** provenance rather than the tab's source
+    table — keying on the source meant a hand-written query in a table-opened tab read and wrote
+    rules under a table its columns never came from. An expression column answers `None`: it belongs
+    to no table, so there is nothing to persist against, and it still formats for the life of the
+    result. `human_bytes` is `pub`
     because the binary-cell panel says the same sentence about a blob that `ColumnFormat::Bytes`
     says about a number in a cell, and two spellings of `1.5 MB` in one application is the kind of
     drift only a screenshot ever catches.
@@ -3577,6 +3639,25 @@ existing prose was left alone.
     (SQLite's `rowid`), or `None` — which is every MySQL and PostgreSQL table, every view, and every
     SQLite `WITHOUT ROWID` table. `filter::table_query` reads it to decide whether to project it, so
     no caller has to test which engine it is holding.
+    **`index_disabled_sql(version)` is how the MySQL family is asked whether an index is switched
+    off**, and it is pure and here because the column that answers differs in three ways at once. A DBA
+    hides an index to test a plan change — MySQL 8's `ALTER TABLE … ALTER INDEX … INVISIBLE`,
+    MariaDB 10.6's `… IGNORED` — and neither state was read, so a hidden index came back as an
+    ordinary one with `IndexInfo::lossy` `false`, any edit to it took `ddl::diff`'s drop-and-recreate
+    arm, and the index came back **live** with the optimizer using it again and the preview saying
+    nothing. What the function returns is an `information_schema.STATISTICS` *expression* answering
+    `1`/`0` rather than a column name: the columns are named differently, carry opposite polarity
+    (`IGNORED = 'YES'` against `IS_VISIBLE = 'NO'`), and do not exist at all on a server older than
+    the feature — where naming one fails the whole introspection rather than the one value, which is
+    the same reason the `EXPRESSION` and `ALGORITHM` columns beside it hold the row shape steady with
+    a `NULL`. A version string it cannot parse falls to the constant `0`, an unread flag reported as
+    "not switched off": that is what the model said before this existed, and it is the reading that
+    offers an edit rather than withholding one on a guess. `major_minor` is the private half — the
+    digits before the second `.`, which is all `10.11.14-MariaDB-1:10.11.14+maria~ubu2204`, `8.4.11`
+    and `5.7.44-log` have in common. The live pin is
+    `a_switched_off_index_is_not_silently_brought_back`, which asserts the read **and** the
+    composition through `diff` that the read exists to govern, since either half alone passes for the
+    wrong reason.
     **`TableInfo::create_sql` short-circuits all of that where the engine keeps its own `CREATE`
     text** — which of the three only SQLite does (`sqlite_master.sql`, plus the `CREATE INDEX`
     statements it stores separately and without which a table's DDL is incomplete). That is a
@@ -4914,7 +4995,10 @@ existing prose was left alone.
   through `OptsBuilder` (passwords with `@ / # ? %` need no escaping; no plaintext URL anywhere).
   Schema introspection fills the **full** column model (see `core::schema`): MySQL from
   `information_schema.COLUMNS` (`COLUMN_DEFAULT`/`EXTRA`/`COLLATION_NAME`/`COLUMN_COMMENT`/
-  `GENERATION_EXPRESSION`) + `STATISTICS` (`SUB_PART`/`COLLATION` for prefix + `DESC`); PostgreSQL
+  `GENERATION_EXPRESSION`) + `STATISTICS` (`SUB_PART`/`COLLATION` for prefix + `DESC`, and
+  `schema::index_disabled_sql`'s interpolated `CASE` for an index the DBA has switched off — the
+  same hold-the-row-shape trick the view `ALGORITHM` below plays, and what makes `IdxRow::lossy`
+  read `expression || disabled` rather than the functional key part alone); PostgreSQL
   from **`pg_catalog`, not `information_schema`** — `format_type(atttypid, atttypmod)` is the only
   source of the *declared* type (`udt_name` gives `varchar`, losing the `(45)`), plus
   `pg_get_expr` for defaults and `attidentity`/`attgenerated`. `mysql_column` normalizes the
@@ -5675,7 +5759,9 @@ existing prose was left alone.
   simply names a column the table doesn't have, and SQLite resolves `rowid` in a projection and in a
   `WHERE` alike, which is also why the in-place splice re-fetch works
   (`a_keyless_table_writes_back_through_its_rowid`,
-  `a_refetch_reads_a_keyless_row_back_by_its_rowid`).
+  `a_refetch_reads_a_keyless_row_back_by_its_rowid` — which asserts the template's `confirm_cols`
+  as well as its key columns and builds the key it re-fetches with through `edit::refetch_key`, the
+  app's own composition, rather than by hand).
   **But a rowid is not a row identity, and the safety net alone cannot see that.** SQLite reassigns
   them: the twelve-step rebuild used to renumber a keyless table, an insert after a delete takes the
   freed number, `VACUUM` compacts them — and nothing re-runs an open result tab when any of that
@@ -5901,6 +5987,26 @@ existing prose was left alone.
   `INSERT`s pulled from a `RowSource` iterator, each batch required to affect exactly as many rows
   as it carried — the `commit_writes` 1-row safety net scaled to a file, without its
   statement-per-row round-trips.
+  **Its cancel lives inside the loop, not in a `select!` around the whole of it.** The MySQL arm
+  used to race `import_on` against the token and *drop* that future on cancel, which leaves a
+  `mysql_async` connection's result stream desynchronised: measured on MariaDB 10.11.14 and MySQL
+  8.4.11, `SELECT CONNECTION_ID()` afterwards came back `Ok(None)`, the following `ROLLBACK`
+  "succeeded" and the `SHOW WARNINGS` behind `rollback()` was empty — so `Rollback::Complete` was
+  classified off a reply that was not its own, and a cancelled import into a `MyISAM` table reported
+  `DbError::Cancelled`, the variant the modal renders as *"nothing was written"*, over 1,000 rows
+  that were permanently there. That is the exact failure this path's `Rollback::note()` was added to
+  prevent, still live on the one exit that dropped the connection out from under it. The token goes
+  *into* `import_on` now, which stops only where the protocol is intact: between batches and again
+  before the `COMMIT` — both points where the connection is idle and a `ROLLBACK` is its own next
+  statement — and it races each individual `query_drop`, killing that statement and then **awaiting**
+  the future rather than dropping it, the same "the killed statement is awaited, not dropped" rule
+  `run_script_mysql` states. `cancelled_import(Rollback)` is the one place that outcome becomes an
+  error, so `Cancelled` is reserved for a rollback that completed and anything else carries the note.
+  PostgreSQL's arm is unchanged — it still races the whole of its own `import_on` — and its
+  `Cancelled` really does mean nothing was written, every PostgreSQL table being transactional.
+  `a_cancelled_import_rolls_back_and_says_so` and
+  `a_cancelled_import_on_a_non_transactional_table_says_the_rows_remain` are the live pins — what
+  each of them asserts, and why it takes two, is under `tests/live/` below.
   **`tests/live/` is the DB layer against real servers**, and it exists because the pure suite can
   only reach the *decisions*: SQLite is testable directly (in-memory, shared-cache), so it is the
   one backend whose wire layer was covered at all, while MySQL, MariaDB and PostgreSQL — the
@@ -5946,6 +6052,10 @@ existing prose was left alone.
   loudly, it writes to a row nobody asked for, with only the 1-row net behind it. Removing the
   `NOT NULL` guard from the unique-index rung fails `a_nullable_unique_index_is_no_key_at_all` on all
   three legs and nothing else — checked, not assumed.
+  `a_join_with_one_unkeyed_side_still_offers_no_insert_target` is the join shape the pure fixtures
+  could not reach: the driver decides what provenance each side of a join reports, and the answer
+  `EditModel::insert_target` used to get wrong is the one where only *one* side is keyable (see
+  `core::edit` for the row that was destroyed by it).
   **`a_write_built_from_the_resolved_key_lands_on_that_row` is the composition the rungs' own tests
   cannot reach.** It walks every writable type case, keys a table on that type where the server
   allows one — asked by *trying* it and falling back, not by a hand-kept exception list, since
@@ -6004,20 +6114,34 @@ existing prose was left alone.
   the column's **data** arrived with it, since a reorder implemented as a drop-and-add would pass a
   test that checked only the order. PostgreSQL returns early with a comment, having no column order
   to change, rather than quietly asserting nothing.
-  **Three capability differences are recorded as leg data rather than discovered per test**, since a
+  **Four capability differences are recorded as leg data rather than discovered per test**, since a
   test asserting one answer would be wrong on two servers out of three: `Target::non_transactional`
   (MySQL's `MyISAM`, which accepts `BEGIN` and ignores it), `Target::transactional_ddl`
   (PostgreSQL wraps a DDL plan, so a refused one applies **nothing** and `DdlError::applied` is 0,
-  while MySQL commits each `ALTER` as it runs and the count is what the preview reports), and
+  while MySQL commits each `ALTER` as it runs and the count is what the preview reports),
   `Target::grants_are_database_scoped` (whether a grant list covers one database, and so whether
-  `Grants::note` is there to qualify it).
+  `Grants::note` is there to qualify it), and `Target::disable_index_sql` — the statement that hides
+  an index, which is a capability *and* a spelling, MySQL 8's `INVISIBLE` and MariaDB 10.6's
+  `IGNORED` having arrived in different releases under different words. `None` is PostgreSQL, which
+  has no equivalent, and its leg returns early rather than asserting a property the engine does not
+  have.
   **`runtime.rs` covers the four paths that need a connection to *behave*** — `.sql` scripts, bulk
   imports, the pinned manual-transaction `Session`, and cancelling a statement already running — and
   every one of them is an exception to something, which is precisely what a pure test cannot check.
   That `run_script` holds **one** connection for a whole file is asserted by making a temporary
   table in one statement and reading it in the next: under a connection per statement the second
   fails, and so would a dump's opening `SET FOREIGN_KEY_CHECKS = 0`. That a `Session`'s transaction
-  is real is asserted from a *second* connection, which must not see the uncommitted row. Feeding a
+  is real is asserted from a *second* connection, which must not see the uncommitted row.
+  **Cancelling an import is two tests because the answer is two answers**, and they are what
+  `Target::non_transactional` was recorded for:
+  `a_cancelled_import_rolls_back_and_says_so` asserts `Err(Cancelled)` **and** that nothing is in the
+  table, since the first alone passes against a path that killed the query and disconnected without
+  rolling back — which is what that path used to do — while
+  `a_cancelled_import_on_a_non_transactional_table_says_the_rows_remain` makes `MyISAM` raise its
+  warning 1196 and requires the error to say the rows are still there. `Err(Cancelled)` from *that*
+  one is a failure with the surviving row count in the panic message, because it is the sentence the
+  modal renders as "nothing was written". PostgreSQL returns early, having no non-transactional table
+  to make. Feeding a
   script is **a task of its own**, not tidiness: the test channel holds 16, so filling it inline
   meant the seventeenth `send` awaited a receiver nothing was polling yet — `run_script` is called
   on the next line — and a 17-statement script test would have hung forever rather than failed. It
@@ -6038,6 +6162,14 @@ existing prose was left alone.
   `SLEEP_SECS`: it was `"SELECT SLEEP(5)"` in three places beside a constant documented as linked to
   them and held together by nothing, so changing the constant left three servers sleeping for the
   old duration and the assertion measuring against the new one.
+  **That marker is shared, which is why the *script* cancel arms on something else.** Its token used
+  to fire when `running_sleeps` saw a sleep, and that count matches on a marker every leg's sleep
+  carries — so with the read-cancellation test running beside it the probe answered about somebody
+  else's statement and the token fired before this script had started. It waits for the script's own
+  inserted row instead: statement 2 is committed by the time a second connection can see it, so a
+  visible row means both statements before the sleep have run. A fixed delay is the other thing it
+  cannot be — under the whole tier's load PostgreSQL lost that race, the token fired with `ran == 0`,
+  and the test read as the accounting bug it exists to catch.
   **`views.rs` and `triggers.rs`** carry the same round trip for the two objects the engines model
   differently. A view's body is never the text that went in — MySQL fully qualifies and back-quotes
   it, PostgreSQL re-prints it from the parse tree — so the identity diff is doing real work there;
@@ -6113,15 +6245,16 @@ existing prose was left alone.
   on both catalogues; the note is present exactly where `grants_are_database_scoped` says and names
   the database it covers; and `no_password_material_survives_the_fetch`, which is the assertion that
   the redaction is on the fetch rather than on one view that happens to call it.
-  **The six write tests go through the real emit-and-run path** — `ddl::account` →
+  **The seven write tests go through the real emit-and-run path** — `ddl::account` →
   `ChangeSet::emit` → `Db::run_ddl` — rather than asserting statement text, because a statement no
   engine accepts is exactly what only a server can tell you:
   `a_created_account_is_one_the_server_then_lists`,
   `a_created_account_can_log_in_with_the_password_it_was_given`,
   `a_created_role_is_one_the_server_accepts`,
   `a_granted_privilege_comes_back_and_a_revoke_takes_it_off`,
-  `a_granted_role_comes_back_and_a_revoke_takes_it_off` and
-  `a_dropped_account_is_gone_from_the_list`, eighteen in all across MariaDB 10.11, MySQL 8.4 and
+  `a_granted_role_comes_back_and_a_revoke_takes_it_off`,
+  `a_grant_at_every_level_reads_back_naming_that_object` and
+  `a_dropped_account_is_gone_from_the_list`, twenty-one in all across MariaDB 10.11, MySQL 8.4 and
   PostgreSQL 16.
   **The second of those is the one branch that writes a credential to a server, and until it existed
   nothing in the workspace took it.** `ScratchAccount::create` drafted an empty password and
@@ -6142,6 +6275,19 @@ existing prose was left alone.
   *object* there that carries only `CONNECT`, `CREATE` and `TEMPORARY` rather than a shorthand for
   everything in it. Taking the engine's own first entry is what makes it one test instead of three,
   and it exercises the same list the grant form is built from.
+  **And it asserts the grant's *scope*, not just that the word came back**, because
+  `s.contains(&privilege)` is satisfied identically by `GRANT SELECT ON *.*`: collapse
+  `users::GrantLevel::object_sql`'s `Database` arm and the check passes unchanged, on the one feature
+  whose entire safety property is scope. `a_grant_at_every_level_reads_back_naming_that_object` then
+  walks every level `users::levels_for(dialect)` offers, two-sided at each — the read-back names that
+  object, and below `Global` is not a whole-server grant, since one side alone is what let the
+  substring check stand. `as_read_back` is the helper that makes the comparison possible and the
+  thing to read before touching it: MySQL echoes the **stored `LIKE` pattern**, so a database-level
+  grant on a scratch database reads back with a backslash before each underscore, while PostgreSQL
+  rebuilds the statement from the catalogue and leaves an ordinary lower-case name bare. Comparing
+  against the raw name would pass only for a name with no wildcard character in it, which is the one
+  case the escaping does not matter for — so this is also the live guard on
+  `export::ident_pattern_sql`, which nothing before it reached.
   **The role test reads its role back out of the catalogue before touching it, and that is what makes
   it a test.** It created and dropped one through the principal it had *drafted* —
   `AccountDraft::principal` gives a role no host — so the catalogue's own representation, the one
@@ -6163,7 +6309,7 @@ existing prose was left alone.
   needed it yet: streaming a genuinely large export, and multi-schema PostgreSQL.
   **It is gated as a *target*, not at runtime.** The manifest declares the target
   `required-features = ["live-tests"]`, so `cargo test --workspace` does not build it and the pure
-  tier stays pure by construction. It is **263 tests** as this is written — 86 suite functions
+  tier stays pure by construction. It is **290 tests** as this is written — 95 suite functions
   expanded across the three legs by `main.rs`'s macro, plus the five that need no server (the four
   name-guard cases and `endpoint.rs`'s) — and it is reachable from this Windows environment again,
   which several fixes in the same range were measured against after being written blind. With the feature on, an unreachable server is a **failure** —
@@ -8229,7 +8375,8 @@ existing prose was left alone.
     workspace group beside `properties_overlay`/`erd_overlay`/`monitor_overlay` and counted by
     `workspace_modals_up`.
     **It renders nothing while one of its own forms or the DDL preview is up.** Its `dyn_container`
-    is keyed on `(target, hidden)`, where `hidden` reads `ddl.account`/`ddl.grant`/`ddl.preview`,
+    is keyed on `(target, hidden, live_read_only)`, where `hidden` reads
+    `ddl.account`/`ddl.grant`/`ddl.preview`,
     and the outer fill style asks the same question. That is the pairing every schema editor already
     has with the preview one level up, and here it is load-bearing rather than tidy: the two account
     forms live in the modal layer's **DDL group**, which is painted *before* the workspace group, so
@@ -8237,6 +8384,15 @@ existing prose was left alone.
     identical three signals, because a wrapper that still filled the layer would be a transparent
     full-window box sitting on top of the form and swallowing every click meant for it. Cancel over
     there returns here with the list intact.
+    **The live read-only flag is the third term of that key, because `write_gate` reads it** and the
+    gate is computed once per container build. Nothing re-ran it when the flag moved, so flipping the
+    connection to read-only from the status bar left **Drop** lit, the "This connection is
+    read-only." note absent, and Apply enabled on a preview that then silently did nothing.
+    `live_read_only` is the *tracked* reader of that flag and sits deliberately beside
+    `table_designer::edit_ctx`'s untracked one: `get_untracked` is the right reading at a click and
+    the wrong one as a container key, since a browser keyed on it has to rebuild when the answer
+    changes — which is the whole point of the question. Both readings are wanted here, so there are
+    two.
     **The fetch effect therefore lives *above* that container and keys on the target alone.**
     `hidden` moves whenever a form or the preview opens *or closes*, so an effect created inside the
     child re-ran on every one of those transitions: a full `fetch_principals` — a fresh connection,
@@ -8345,7 +8501,12 @@ existing prose was left alone.
     account, and no privilege screen should make that one click away — the pane says so in a line
     instead. Drop goes through a `Confirm` whose body is the change's own `Change::risks` via
     `overlays::risk_prompt`, so the question and the preview's warning cannot drift into saying
-    different things about one act, and then through the preview like everything else.
+    different things about one act, and then through the preview like everything else. **It also
+    guards its own launch, twice** — `widgets::accept_launch` at the click and again inside the
+    confirm's `resolve`, and the `read_only` that second call reads is what goes into
+    `ddl_preview::PlanTarget` instead of the `false` that was written there. The rule and the bug are
+    under *Architecture invariants*; what is worth knowing here is that the `enabled` this row dims
+    itself with is a `bool` captured at build time, so it can never be the guard.
     **Reversing a listed `GRANT` into a `REVOKE` by parsing it was built, tested and then removed.**
     It is the feature the right-hand pane invites — a button beside each statement — and it needed
     either a raw-statement `Change` variant, which would have become the escape hatch every
@@ -8399,8 +8560,10 @@ existing prose was left alone.
     running the sniffer over it would let a compressed stream's byte frequencies decide `has_header`.
     While a load runs,
     the footer's Cancel fires `SchemaActions::import_cancel` (the app owns the token, as it does
-    for query runs) instead of closing — the transaction rolls back, so a cancelled import writes
-    nothing.
+    for query runs) instead of closing — the load rolls back on its own connection and the report
+    says what that achieved, which on a non-transactional MySQL table is that the rows already loaded
+    are still there (`db::cancelled_import`; the modal renders `DbError::Cancelled` as *nothing was
+    written*, so that variant is reserved for a rollback the server confirmed).
   - `script_view.rs` — the **script-load** modal, **Import** to the user, over `core::script`; the
     inverse of `dump_view.rs` below, and the entry directly *above* it in the two menus that carry
     both (a database's and a PostgreSQL namespace's), where the group reads
@@ -8543,12 +8706,12 @@ existing prose was left alone.
     static label and a hung one look identical. The **outcome** replaces it in that slot: the green
     `Wrote 5 tables.` followed by `export::export_note` — the grid's own caveat wording, reused
     rather than restated, so a file that lost a column at the text arena's cap says so instead of
-    reading as a clean success — and the red failure or cancel sentence. **What that wording no
-    longer carries is the withheld half**: the clause naming binary columns a text export could not
-    hold was dropped for the grid's reason, that the cell on screen already reads `<7 bytes>`, and a
-    dump's reader is not looking at a grid — so for a dump the only place it is said is the file's own
-    `-- NOTE: binary column … exported as NULL`, and for a folder export of CSVs, nowhere
-    (*core::export*). A ticked table the run's **own** fresh
+    reading as a clean success — and the red failure or cancel sentence. **That wording carries the
+    withheld half again**, and a dump is one of the cases it was restored for: the clause naming
+    binary columns a text export could not hold had been dropped on the grid's argument that the cell
+    on screen already reads `<7 bytes>`, and a dump's reader is not looking at a grid at all. It was
+    said nowhere but the file's own `-- NOTE: binary column … exported as NULL`, and for a folder
+    export of CSVs — a format with no comment syntax — nowhere at all (*core::export*). A ticked table the run's **own** fresh
     introspection could not find (`DumpPlan::missing`) is named in that same green sentence rather
     than only in the file's header, for the reason the tally is named there: a file one table short
     of what was ticked looks exactly like a complete one. `DumpUi::done` is therefore the
@@ -11333,17 +11496,39 @@ existing prose was left alone.
   `SELECT/SHOW/DESCRIBE/EXPLAIN/WITH` told every model that a SQLite connection accepted
   `SHOW TABLES`, so a model reasoning from the tool's own text spent turns on statements that could
   only come back as parser errors; `run_query_advertises_exactly_the_heads_its_gate_allows` walks
-  every advertised head back through the gate. Below `AiData::Full` the tool is **withheld, not
-  merely refused**: `reads_row_data` is the one predicate `tools_list` filters on and `refusal_for`
-  turns a call away with (`NO_DATA_ACCESS`, which names the setting so the model asks the user for
-  values instead of retrying). Listing `run_query` and denying the call is worse than not listing
+  every advertised head back through the gate.
+  **The four are a type — `McpTool` — and that is what makes the advertised array and the gates one
+  set.** They used to be written out independently in five places the compiler related to nothing:
+  the `json!` array in `tools_list`, a `==` in `reads_row_data`, a `matches!` in `reads_schema`,
+  `call_tool`'s dispatch with its `other =>` catch-all, and `ai.rs`'s two `mcp__schemaic__*` `const`
+  lists. A new tool therefore joined the array, joined the dispatch and **defaulted to ungated at
+  both gates**, which is exactly how `propose_table_change` came to sit on neither — full
+  `fetch_schema` access at the app's tightest setting, with nothing failing to compile and nothing
+  failing to run. `name`, `ai_name`, `reads_row_data` and `reads_schema` are exhaustive matches on
+  the enum now, so a fifth variant does not compile until both gates have answered for it: five
+  `non-exhaustive patterns` errors, checked rather than assumed, and the same rule
+  `ai/harness.rs`'s `env_seal` states one crate over. The `json!` array survives, each tool's input
+  schema being JSON, but every entry in it is filtered back through `McpTool::from_name` before it is
+  listed — a `json!` array is not a type, and matching each advertised name back to a variant is what
+  makes the array and the gates one set rather than two that agree today; `call_tool` refuses an
+  unknown name up front and then matches with **no catch-all**; and `McpTool::offered` is the one
+  place the two gates are combined, so the listing and the refusal cannot disagree about what
+  *available* means. Nothing about the behaviour moved.
+  Below `AiData::Full` the tool is **withheld, not
+  merely refused**: `reads_row_data` is the one predicate both halves ask — `tools_list` leaves the
+  tool out (through `offered`) and `refusal_for` turns a call to it away with `NO_DATA_ACCESS`,
+  which names the setting so the model asks the user for
+  values instead of retrying. Listing `run_query` and denying the call is worse than not listing
   it — the CLI's `--allowedTools` withheld it while `tools/list` still advertised it, so the model
   planned a turn around a tool it could see, offered to run a query and analyse the results, and
   learned only after the user agreed that the call was denied. No system-prompt sentence outranks a
   tool the model can see, which is why the listing is where the level has to bite; the server-side
   refusal is the backstop for a client working from a stale listing. The mirror of that listing is
-  `ai.rs`'s `AI_TOOLS_WITH_QUERY` / `AI_TOOLS_READ_ONLY`, the `--allowedTools` the CLI is spawned
-  with — and since `build_session_args` empties the built-in set with `--tools ""`, that list is now
+  `ai::ai_allowed_tools(may_query)`, the `--allowedTools` the CLI is spawned
+  with — **derived from `McpTool::ALL` rather than typed out**, since it was two more hand-written
+  `const` lists (`AI_TOOLS_WITH_QUERY` / `AI_TOOLS_READ_ONLY`) of a set the compiler related to
+  nothing, on top of the three in `mcp.rs`; a fifth tool now cannot be added without answering
+  `reads_row_data` for it, and that answer is what reaches here. And since `build_session_args` empties the built-in set with `--tools ""`, that list is now
   the session's *entire* tool set rather than an addition to it (on a CLI whose `--help` does not
   advertise the flag it is an addition again, with the twenty-nine-name backstop behind it — see
   `schemaic-ai`): it runs
@@ -11354,7 +11539,8 @@ existing prose was left alone.
   un-allow-listed and why the guard on them had to be `--tools ""` rather than this list (that
   measurement is under `schemaic-ai`). What a built-in would do if the CLI *did* decide it needed
   approval is not known: none was ever observed asking, so nothing here says built-ins are never
-  gated — only that those three were not. Two lists in two files drift —
+  gated — only that those three were not. Two lists in two files drift, which is the history behind
+  both the enum above and the test below —
   `propose_table_change` was offered by the server from the day it landed and named by neither
   list, so the assistant's check of a proposed change against the live table was denied every time,
   invisibly, since the model then writes the fenced block from the schema it already has and the
@@ -12843,7 +13029,16 @@ Re-introducing the anti-patterns these guard against is a regression:
   disconnect, and the modal then said "the transaction rolled back, so nothing was written" —
   which on those engines is false, so the user re-ran the import and doubled ~250k rows. It rolls
   back on the same connection now and reports what that achieved, `DbError::Cancelled` meaning the
-  rollback completed and an incomplete one arriving as an error carrying the note.
+  rollback completed and an incomplete one arriving as an error carrying the note. **A rollback the
+  connection cannot hear is the same bug one layer down**: racing the whole import and dropping the
+  future mid-statement desynchronised `mysql_async`'s result stream, so that `ROLLBACK` and its
+  `SHOW WARNINGS` read replies that were not their own and `Complete` was claimed off garbage — the
+  shape a cancel has to take is under `schemaic-db`, and `cancelled_import` is where the verdict
+  becomes an error. **And a cancelled write leaves through an explicit `ROLLBACK` on both engines
+  now**: `pg::commit_writes`' cancel arm was the one exit resting on the client's drop, which does
+  abort the transaction but not until the connection actually goes away — holding every row lock the
+  completed statements took meanwhile. `pg::import_rows` and every error exit in `pg::write_on`
+  already issued one.
   `one_row_verdict` states only what the guard saw — it runs *before* the rollback and can't
   know what it achieved, so **every** executor appends the clause once it does: SQLite's was the one
   that didn't, and a user reading *"UPDATE main.t affected 2 rows (expected exactly 1)"* with nothing
@@ -12866,7 +13061,8 @@ Re-introducing the anti-patterns these guard against is a regression:
   deciding *which* table a row action addresses is the only line, and any future widening of what
   the grid offers to write has to be sound on its own rather than backed by the count.
 - **A destructive modal action guards its own launch, in the same step that launches it.** Import,
-  the DDL preview's Apply, Server Activity's kill and the Export modal's own launch are the four,
+  the DDL preview's Apply, Server Activity's kill, the Export modal's own launch and the Users
+  browser's account **Drop** are the five,
   and they go through
   `widgets::accept_launch(in_flight, read_only)` — not through the disabled button, which is what
   *says* the action is unavailable and takes effect on a later update pass. `run_import` set a busy
@@ -12875,6 +13071,16 @@ Re-introducing the anti-patterns these guard against is a regression:
   **two** bulk loads of the same file, both committing, with the second launch overwriting the
   cancellation token so the first could no longer be stopped. A new destructive action asks the same function; a guard re-derived per site
   is one that will be derived differently.
+  **The Drop was the plainest instance of failing it**, and it is the one of that pane's three
+  actions the rule bites on — its neighbours refuse read-only inside `open_for_new` /
+  `open_for_grant`. Its launch read an `enabled` `bool` captured when the account row was *built*, so
+  the disabled button was the whole guard, which is verbatim what this rule forbids. It asks
+  `accept_launch` at the click **and again inside the `Confirm`'s `resolve`** — the deferred half
+  `accept_dialog_launch` exists for, since that closure runs an arbitrary time after the press and
+  the flag can flip while the red confirm stands — and the same live read then rides into
+  `ddl_preview::PlanTarget` in place of the literal `false` that site passed, `PlanTarget`'s own doc
+  saying the struct exists so no call site comes to pass a constant beside a live `conn_id`. With
+  that constant there the preview opened with Apply enabled and inert.
   **The other way to fail this rule is to have no gesture to guard**, which is where the folder
   export sat. The single-file export's consent is the save dialog's own "replace?";
   `select_directories()` has none, and the per-table names are `dump::file_plan`'s rather than the
@@ -15750,9 +15956,14 @@ this bundle's.
   tab while the `database` deliberately came off the result, and a tab rebound to another connection
   keeps its loaded result on screen: the two then disagreed and the export could re-run the
   statement against a different server. `conn_at_load` is snapshotted in `GridState::new` from the
-  same `gctx.conn_id.get_untracked()` the format seeding already reads. It is
+  same `gctx.conn_id.get_untracked()` the format seeding already reads. The `All rows` export is
   deliberately a **second read** of the server rather than a continuation of the first: the rows on
-  screen may be minutes old, and stitching a stale page onto fresh ones would be neither. The
+  screen may be minutes old, and stitching a stale page onto fresh ones would be neither.
+  **The formatter's *save* reads `conn_at_load` too now**, through `format::rule_key`, which is the
+  same disagreement one surface over: the seed keyed on the connection the rows came from while
+  `set_format` keyed on the tab's live one, so a rule set after a rebind was written against a server
+  the rows never came from — absent where the user set it, and applied to a real, different table on
+  the other connection (see `core::format`). The
   statement is snapshotted before the save dialog opens for the same reason the rows are — the
   dialog is modal and slow, and a filter typed while it stood open must not change what the export
   was asked for. **Neither menu opens on an empty result**, and both used to: they offered their
@@ -15859,12 +16070,14 @@ this bundle's.
   that stays up until it is dismissed *is* the confirmation, and one that said nothing after a
   fetched export would be a dialog reporting silence. What is unchanged underneath is that a
   **blanked or cut** column speaks in either scope, naming the columns, because a user comparing the
-  file to the screen needs to know which part of it to distrust. **`withheld` no longer speaks at
-  all**: this grid already draws that cell as `<7 bytes>`, and the clause explaining that a text file
-  cannot hold raw bytes restated it at a length that painted past the borders of this very modal
-  (*core::export* has the rule, and what still reads the flag); and the callback carries an
-  `unwrap_or_else` fallback
-  (`Exported to <name>`) for the `None` that arm can no longer return. The count is printed through
+  file to the screen needs to know which part of it to distrust. **`withheld` speaks again**, having
+  been silent for a while on the argument that this grid already draws the cell as `<7 bytes>` — true
+  of a `Fetched` save and false of the `PullChunks` scopes, whose rows were never on any screen
+  (*core::export* has the rule and the wording; since every production caller asks with `true`, the
+  clause is said here in both scopes); and the callback takes the sentence with `expect` rather than
+  a fallback behind `unwrap_or_else`, `None` being reachable only from `streaming: false` — a second
+  success message no input can produce is one no test can cover and one that drifts from the real
+  one. The count is printed through
   `text::human_count`, the same row-count printer the
   stats line and the modal's own progress line use, so the figure in the report agrees with the
   `1k of ~16k rows` it replaces and with the stats line behind the backdrop —
