@@ -6104,17 +6104,31 @@ mod tests {
             schemaic_core::edit::refetch_template(&rs, &m).expect("a keyless table is spliceable");
         assert_eq!(template.columns, ["rowid", "a", "b"]);
         assert_eq!(template.key_cols, vec![0]);
+        assert_eq!(
+            template.confirm_cols,
+            vec![1, 2],
+            "an implicit rowid key is confirmed by every column the grid read"
+        );
 
+        // The commit's own `UPDATE`, then the re-fetch keyed the way the app
+        // keys it — through `refetch_key`, so the key carries the confirming
+        // values and not just the rowid. Hand-building the key here is what let
+        // the confirmation half go untested.
         keeper
             .execute("UPDATE t SET b = 'written' WHERE rowid = 2", [])
             .unwrap();
+        let edited: std::collections::HashMap<usize, schemaic_core::model::CellEdit> = [(
+            2,
+            schemaic_core::model::CellEdit::Text("written".to_string()),
+        )]
+        .into_iter()
+        .collect();
+        let key = schemaic_core::edit::refetch_key(&template, &rs, 1, &edited);
+        assert_eq!(key.len(), 3, "rowid + the two confirming columns");
         let got = refetch_rows(
             &db,
             &template,
-            &[RefetchRow {
-                data_row: 1,
-                key: vec![Value::Int(2)],
-            }],
+            &[RefetchRow { data_row: 1, key }],
             CancellationToken::new(),
         )
         .await

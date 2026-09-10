@@ -99,6 +99,7 @@ live_suite!(
         an_alias_does_not_hide_the_real_column,
         an_expression_column_has_no_provenance,
         a_join_attributes_each_column_to_its_own_table,
+        a_join_with_one_unkeyed_side_still_offers_no_insert_target,
         a_primary_key_becomes_the_write_key,
         a_write_built_from_the_resolved_key_lands_on_that_row,
         a_not_null_unique_index_is_the_fallback_key,

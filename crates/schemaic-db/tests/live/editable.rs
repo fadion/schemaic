@@ -216,6 +216,73 @@ pub async fn a_join_attributes_each_column_to_its_own_table(target: &'static Tar
     scratch.teardown().await;
 }
 
+/// The join shape the sibling above cannot reach: **only one side is keyable**.
+///
+/// `a_join_attributes_each_column_to_its_own_table` keys both tables, so
+/// `EditModel::tables` has length 2 and `insert_target` answers `None` through
+/// the arm that counts *writable* tables — for a reason that has nothing to do
+/// with the join. Refuse the unkeyed side and `tables` has length 1 again, and
+/// the count-the-writable-tables spelling said `Some(parent)` on a row of a
+/// join. That gates the gutter's **Delete row**, which then issues
+/// `DELETE FROM parent` with the other table's columns on screen and affects
+/// exactly one row — under the 1-row safety net, not caught by it.
+///
+/// So the question is asked over the result's **origin** tables, and this is the
+/// fixture that tells the two spellings apart.
+pub async fn a_join_with_one_unkeyed_side_still_offers_no_insert_target(target: &'static Target) {
+    let scratch = Scratch::create(target, "join_unkeyed").await;
+    seed(&scratch, "parent", KEYED).await;
+    // No primary key and no unique index: `resolve_key` refuses it outright, so
+    // it never reaches `model.tables`.
+    seed(&scratch, "note", "(parent_id INTEGER, body VARCHAR(32))").await;
+    let (rs, model) = scratch
+        .edit_model(&format!(
+            "SELECT p.id, n.body FROM {} p JOIN {} n ON n.parent_id = p.id",
+            scratch.qualified("parent"),
+            scratch.qualified("note")
+        ))
+        .await;
+
+    // The premise: one side really is unkeyed, or the assertion below is about
+    // the same shape the sibling already covers.
+    assert_eq!(
+        sole_table(&model, target).table,
+        "parent",
+        "{}: the keyed side",
+        target.name
+    );
+    assert!(
+        model.table(1).is_none(),
+        "{}: the unkeyed side was keyed after all — {:?}",
+        target.name,
+        model.table(1).map(|t| &t.table)
+    );
+    let origins: Vec<&str> = (0..rs.col_count())
+        .map(|ci| {
+            rs.columns[ci]
+                .origin
+                .as_ref()
+                .map(|o| o.table.as_str())
+                .unwrap_or("<none>")
+        })
+        .collect();
+    assert_eq!(
+        origins,
+        ["parent", "note"],
+        "{}: the result still spans two tables",
+        target.name
+    );
+
+    assert!(
+        model.insert_target().is_none(),
+        "{}: a join with one unkeyed side offered {:?} as a row-gesture target",
+        target.name,
+        model.insert_target().map(|t| &t.table)
+    );
+
+    scratch.teardown().await;
+}
+
 /// A primary key present in the result becomes the write key.
 pub async fn a_primary_key_becomes_the_write_key(target: &'static Target) {
     let scratch = Scratch::create(target, "pk").await;
