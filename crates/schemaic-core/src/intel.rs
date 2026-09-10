@@ -2166,6 +2166,16 @@ impl Catalog {
             let in_scope = active_lower
                 .as_deref()
                 .is_none_or(|a| a == db_lower.as_str());
+            // **A stored routine is a known identifier.** `function_typo_checks`
+            // exempts anything in `known_idents`, and its doc claims
+            // user-defined functions "pass through untouched" — but this set was
+            // filled from database, table, column and namespace names only, so
+            // a function the app had already introspected and lists in its own
+            // tree still got "looks like a misspelled function" the moment its
+            // name was within an edit or two of a builtin's.
+            for r in &schema.routines {
+                known_idents.insert(r.name.to_ascii_lowercase());
+            }
             for t in &schema.tables {
                 let cols: Vec<String> = t.columns.iter().map(|c| c.name.clone()).collect();
                 known_idents.insert(t.name.to_ascii_lowercase());
@@ -4244,6 +4254,16 @@ fn function_typo_checks(
     dialect: SqlDialect,
     out: &mut Vec<Diagnostic>,
 ) {
+    // **Only where the catalog is this engine's** — see
+    // `builtin_functions_are_authoritative`. Measured against PG 16.15,
+    // `btrim`, `to_number`, `make_date` and `make_time` are core builtins and
+    // all four were squiggled "looks like a misspelled function" in a
+    // PostgreSQL tab: the checker did not recognise the engine's own functions
+    // *and* measured its distances against another engine's list. Telling
+    // somebody that correct SQL is misspelled is worse than saying nothing.
+    if !builtin_functions_are_authoritative(dialect) {
+        return;
+    }
     let b = sql.as_bytes();
     let mut i = lo;
     while i < hi {
@@ -4293,6 +4313,33 @@ fn is_known_function(word_lower: &str) -> bool {
     function_names().any(|f| f.eq_ignore_ascii_case(word_lower))
 }
 
+/// Is [`FUNCTIONS`] the builtin catalog of `dialect`?
+///
+/// **MySQL and MariaDB only, and the table's own doc says so** — "the
+/// authoritative catalog of *MySQL/MariaDB* built-in functions". The typo
+/// checker spent its `dialect` on `skip_noncode` and `is_sql_keyword` and never
+/// on the two catalog questions, so on PostgreSQL it failed to recognise the
+/// engine's real functions *and* measured its distances against another
+/// engine's: `btrim`, `to_number`, `make_date` and `make_time` are core
+/// builtins (verified on PG 16.15) and all four were squiggled as misspelled.
+///
+/// So the checker is off where its catalog is not the engine's. That loses a
+/// nicety on two engines and stops the app calling correct SQL broken, which is
+/// the direction that matters. **Writing `PG_FUNCTIONS` / `SQLITE_FUNCTIONS` is
+/// what flips this to `true`** for them — a data task, and an incomplete list
+/// would reintroduce the same false positives for whatever it omits, so it is
+/// deliberately not attempted here.
+///
+/// An exhaustive `match`, like [`ops`](crate::sqlfmt) and `ident_quote`: a
+/// lexical or builtin table really is per dialect, and a fourth engine must be
+/// made to answer rather than inherit whichever side a `==` left open.
+fn builtin_functions_are_authoritative(dialect: SqlDialect) -> bool {
+    match dialect {
+        SqlDialect::MySql => true,
+        SqlDialect::Postgres | SqlDialect::Sqlite => false,
+    }
+}
+
 /// Is `word` a near-miss of a known builtin function name? A near-miss is a small
 /// Levenshtein distance (1, or 2 for longer names) *or* a single adjacent
 /// transposition (`COUTN`↔`COUNT`) — the latter is distance 2 under plain
@@ -4304,6 +4351,23 @@ fn is_probable_function_typo(word: &str) -> bool {
         return false;
     }
     let up = word.to_ascii_uppercase();
+    // **A builtin's name plus a `_` or a digit is a *derived* name, not a
+    // misspelling.** The doc above says the design avoids flagging `format_x`
+    // as a typo of `FORMAT`; at length 8 the threshold is already 2, so it
+    // flagged it anyway — and `coalesce_x`, `concat_ws2`, `instr2` and `md55`
+    // with it, all measured. Nobody misspells `FORMAT` by typing every letter
+    // of it and then an underscore.
+    //
+    // The separator is what keeps this narrow: a *letter* continuation is how a
+    // real typo looks (`SUBSTRIN` is `SUBSTR` plus `IN`, and is a dropped `G`
+    // from `SUBSTRING`), so those still get flagged.
+    if function_names().any(|f| {
+        up.len() > f.len()
+            && up.starts_with(f)
+            && matches!(up.as_bytes()[f.len()], b'_' | b'0'..=b'9')
+    }) {
+        return false;
+    }
     let thresh = if word.len() >= 7 { 2 } else { 1 };
     function_names().any(|f| {
         let close = (f.len() as isize - up.len() as isize).unsigned_abs() <= thresh
@@ -8549,6 +8613,102 @@ mod tests {
         let (schema, db) = fk_catalog();
         let cat = Catalog::build(&[(db, &schema)], Some(db));
         join_targets(sql, 0, sql.len(), sql.len(), &cat, dialect)
+    }
+
+    /// **The typo checker measured against another engine's function list.**
+    ///
+    /// `FUNCTIONS`' own doc calls it "the authoritative catalog of
+    /// *MySQL/MariaDB* built-in functions", and `function_typo_checks` spent its
+    /// `dialect` on `skip_noncode` and `is_sql_keyword` and never on the two
+    /// catalog questions. So in a PostgreSQL tab `btrim`, `to_number`,
+    /// `make_date` and `make_time` — all core builtins, verified against PG
+    /// 16.15 — were squiggled "looks like a misspelled function".
+    #[test]
+    fn a_postgres_builtin_is_not_a_misspelled_mysql_one() {
+        for sql in [
+            "SELECT btrim(name) FROM employees",
+            "SELECT to_number(name, '99') FROM employees",
+            "SELECT make_date(2024, 1, 1) FROM employees",
+            "SELECT make_time(1, 2, 3) FROM employees",
+        ] {
+            for dialect in [SqlDialect::Postgres, SqlDialect::Sqlite] {
+                let d = diag_d(sql, dialect);
+                assert!(
+                    !d.iter().any(|x| x.message.contains("misspelled function")),
+                    "{sql} on {dialect:?}: {d:?}"
+                );
+            }
+        }
+        // MySQL, where the catalog *is* the engine's, still catches a typo.
+        assert!(
+            diag("SELECT COUTN(*) FROM employees")
+                .iter()
+                .any(|x| x.message.contains("misspelled function"))
+        );
+    }
+
+    /// A builtin's name plus a `_` or a digit is a derived name, and
+    /// `is_probable_function_typo`'s own doc says the design avoids flagging
+    /// `format_x` as a typo of `FORMAT` — which at length 8 it did anyway,
+    /// because the threshold there is already 2.
+    #[test]
+    fn a_derived_function_name_is_not_a_typo() {
+        for sql in [
+            "SELECT format_x(1) FROM employees",
+            "SELECT coalesce_x(1) FROM employees",
+            "SELECT concat_ws2(1) FROM employees",
+            "SELECT instr2(name, 'a') FROM employees",
+            "SELECT md55(name) FROM employees",
+        ] {
+            let d = diag(sql);
+            assert!(
+                !d.iter().any(|x| x.message.contains("misspelled function")),
+                "{sql}: {d:?}"
+            );
+        }
+        // And a real typo whose extra characters are *letters* is still a typo —
+        // `SUBSTRIN` is `SUBSTR` plus `IN`, and a dropped `G` from `SUBSTRING`.
+        assert!(
+            diag("SELECT SUBSTRIN(name, 1) FROM employees")
+                .iter()
+                .any(|x| x.message.contains("misspelled function"))
+        );
+    }
+
+    /// **A stored routine the app has already introspected is a known
+    /// identifier.** `function_typo_checks`' doc claims user-defined functions
+    /// "pass through untouched", resting on `known_idents` — which was filled
+    /// from database, table, column and namespace names only, so a function
+    /// listed in the app's own tree was still squiggled.
+    #[test]
+    fn an_introspected_routine_is_not_a_misspelled_builtin() {
+        let schema = DbSchema {
+            tables: vec![tbl("employees", &["id", "name"])],
+            routines: vec![std::sync::Arc::new(crate::schema::RoutineInfo {
+                name: "lengths".into(),
+                ..Default::default()
+            })],
+            ..Default::default()
+        };
+        let cat = Catalog::build(&[("company", &schema)], Some("company"));
+        let sql = "SELECT lengths(name) FROM employees";
+        let d = diagnostics(sql, &cat, SqlDialect::MySql);
+        assert!(
+            !d.iter().any(|x| x.message.contains("misspelled function")),
+            "{d:?}"
+        );
+        // Without the routine in the catalog it *is* a near-miss of `LENGTH`,
+        // which is what says the exemption is what did the work.
+        let bare = DbSchema {
+            tables: vec![tbl("employees", &["id", "name"])],
+            ..Default::default()
+        };
+        let cat = Catalog::build(&[("company", &bare)], Some("company"));
+        assert!(
+            diagnostics(sql, &cat, SqlDialect::MySql)
+                .iter()
+                .any(|x| x.message.contains("misspelled function"))
+        );
     }
 
     /// **The last gate every offline diagnostic passes, which had no test.**
