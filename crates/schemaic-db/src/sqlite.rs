@@ -2916,6 +2916,27 @@ fn ident_at(sql: &str, at: usize) -> (Option<String>, usize) {
 /// From `at`, scan forward for `AS (` at a code position and return the text
 /// inside its parens. Stops at the comma or close-paren that ends this column's
 /// declaration, so a *later* column's expression can't be attributed to this one.
+///
+/// **The depth really is tracked now**, and it was not: the only write was
+/// `b'(' if depth > 0 => depth += 1`, an arm unreachable from zero, so `depth`
+/// was a constant and both terminators fired at the *first* comma or
+/// close-paren at any nesting. For `total NUMERIC(10,2) GENERATED ALWAYS AS
+/// (price*qty) STORED` that is the comma inside the precision — digits are not
+/// `is_word_start` — so the expression was never found and the column came back
+/// `generated: None`.
+///
+/// What that cost: `table_columns` still set `generated_stored` from
+/// `hidden == 3`, so the column *was* seen as generated; only its expression was
+/// lost. The emitter writes the `GENERATED ALWAYS AS (…)` clause only inside
+/// `if let Some(expr)`, so the next rebuild declared a plain column — and
+/// `sqlite_rebuild_sql`'s copy list filters on `generated.is_none()`, so the
+/// column was *included* in the `INSERT … SELECT` and the stale values came
+/// across with no error. `diff` could not see it either: both sides read `None`,
+/// so the round-trip gate stayed green. A `VARCHAR(255)` is enough, and so is a
+/// column-level `CHECK (…)` written before the `GENERATED` clause.
+///
+/// Its sibling `ddl::unrestatable_sqlite_clauses` tracks depth correctly, which
+/// is what this arm was meant to be.
 fn as_expression(sql: &str, at: usize) -> Option<String> {
     use schemaic_core::intel::SqlDialect;
     use schemaic_core::sql::{balanced_paren_span, is_word_byte, is_word_start, skip_noncode};
@@ -2929,9 +2950,12 @@ fn as_expression(sql: &str, at: usize) -> Option<String> {
             continue;
         }
         match b[i] {
-            b'(' if depth > 0 => depth += 1,
+            b'(' => depth += 1,
+            // Only the paren that closes the *table* ends the scan; one that
+            // closes a type's parameters or a column-level `CHECK` is nesting.
+            b')' if depth == 0 => return None,
+            b')' => depth -= 1,
             b',' if depth == 0 => return None, // this column's declaration ended
-            b')' if depth == 0 => return None, // the table's declaration ended
             _ => {}
         }
         if is_word_start(b[i]) {
@@ -2940,7 +2964,9 @@ fn as_expression(sql: &str, at: usize) -> Option<String> {
             while end < b.len() && is_word_byte(b[end]) {
                 end += 1;
             }
-            if sql[start..end].eq_ignore_ascii_case("AS") {
+            // At the column's own level: an `AS` inside a type's parameters or
+            // a `CHECK` predicate is not this column's generated clause.
+            if depth == 0 && sql[start..end].eq_ignore_ascii_case("AS") {
                 // The next code byte should be `(`.
                 let mut k = end;
                 while k < b.len() && b[k].is_ascii_whitespace() {
@@ -6561,6 +6587,49 @@ mod tests {
         );
         // A plain column has no expression.
         assert_eq!(generated_expr_of(sql, "a"), None);
+    }
+
+    /// **A parameterised type is not the end of the column's declaration.**
+    ///
+    /// `as_expression`'s only write to `depth` was an arm unreachable from zero,
+    /// so the scan stopped at the *first* comma or close-paren at any nesting —
+    /// which for `NUMERIC(10,2)` is the one inside the precision. The expression
+    /// was lost, `table_columns` still set `generated_stored` from
+    /// `hidden == 3`, and the next rebuild declared a plain column that the
+    /// `INSERT … SELECT` then filled with the values it happened to hold. It
+    /// stops recomputing, later `UPDATE`s leave it stale, and nothing in the
+    /// preview says so — `diff` cannot see it either, since both sides read
+    /// `generated: None`.
+    #[test]
+    fn a_generated_expression_survives_a_type_with_parameters() {
+        let sql = "CREATE TABLE inv (
+  price NUMERIC(10,2),
+  qty INTEGER,
+                     total NUMERIC(10,2) GENERATED ALWAYS AS (price*qty) STORED
+)";
+        assert_eq!(
+            generated_expr_of(sql, "total").as_deref(),
+            Some("price*qty"),
+            "the comma inside NUMERIC(10,2) is not the end of the declaration"
+        );
+        // A column-level CHECK before the GENERATED clause is the same shape.
+        let sql = "CREATE TABLE inv (
+  qty INTEGER,
+                     total INTEGER CHECK (total >= 0) GENERATED ALWAYS AS (qty*2) VIRTUAL
+)";
+        assert_eq!(
+            generated_expr_of(sql, "total").as_deref(),
+            Some("qty*2"),
+            "the parens of a column-level CHECK are nesting, not the end"
+        );
+        // And the terminators still terminate: a plain column with a
+        // parameterised type has no expression, and a *later* column's is not
+        // attributed to it.
+        let sql = "CREATE TABLE inv (
+  price NUMERIC(10,2),
+                     total INTEGER GENERATED ALWAYS AS (price*2) VIRTUAL
+)";
+        assert_eq!(generated_expr_of(sql, "price"), None);
     }
 
     fn blob_ref(table: &str, column: &str, key: &[(&str, Value)]) -> BlobRef {
