@@ -857,7 +857,7 @@ fn for_each_record<R: std::io::Read>(
         }
         ImportFormat::Json => {
             let mut keys: Vec<String> = Vec::new();
-            json_records(r, &mut keys, usize::MAX, on_record)?;
+            json_records(r, &mut keys, usize::MAX, false, on_record)?;
         }
         ImportFormat::Xlsx => {
             let mut names: Vec<String> = Vec::new();
@@ -1034,10 +1034,30 @@ impl<R: std::io::Read> std::io::Read for ArrayUnwrap<R> {
 /// cosmetic issue here. JSON records are matched to columns by name and inserted
 /// in table order, so key order only affects how the preview lays its columns
 /// out.
+/// `bounded` says the reader is a **prefix** of the file — a
+/// `Read::take(SAMPLE_MAX_BYTES)` — so running out of input mid-value is the cap
+/// arriving, not a broken file.
+///
+/// **That distinction is the whole of B6.1-L1-02.** `read_sample` wraps both
+/// non-Excel formats in the byte cap, and CSV degrades gracefully under
+/// truncation (the reader simply yields fewer records) while `serde_json`'s
+/// `StreamDeserializer` meets EOF *inside* a value and errors — which reached
+/// the user as `Couldn't read the file: EOF while parsing a string at line 1
+/// column 8388608`, a message that reads as file corruption, on a file
+/// `validate` then walks end to end without complaint. The trigger is the first
+/// `limit` records exceeding the cap, i.e. an average record over ~42 KiB,
+/// which one text column reaches easily: a JSON export of a hundred support
+/// tickets is inside it. `read_sample`'s own doc says "a truncated read can
+/// only make the preview *shorter*", and it could not.
+///
+/// A whole-file walk passes `false`, so a genuinely truncated file still fails
+/// there rather than importing a prefix in silence — which is why this is a
+/// parameter and not an unconditional `is_eof` arm.
 fn json_records<R: std::io::Read>(
     r: R,
     keys: &mut Vec<String>,
     limit: usize,
+    bounded: bool,
     mut on_record: impl FnMut(Vec<Field>, u64) -> bool,
 ) -> Result<bool, ImportError> {
     // Collected first so every record can be emitted against the *final* key set
@@ -1055,7 +1075,17 @@ fn json_records<R: std::io::Read>(
             more = true;
             break;
         }
-        let v = v.map_err(|e| ImportError::Read(e.to_string()))?;
+        let v = match v {
+            Ok(v) => v,
+            // The cap, not a broken file — and only when something parsed, so a
+            // file that is empty or truncated before its first record still
+            // reports rather than previewing nothing with `more = true`.
+            Err(e) if bounded && e.is_eof() && !objects.is_empty() => {
+                more = true;
+                break;
+            }
+            Err(e) => return Err(ImportError::Read(e.to_string())),
+        };
         let serde_json::Value::Object(map) = v else {
             return Err(ImportError::Read(
                 "expected JSON objects (an array of them, or one per line)".into(),
@@ -1565,7 +1595,7 @@ fn read_xlsx_sample<R: std::io::Read>(
 fn read_json_sample<R: std::io::Read>(r: R, limit: usize) -> Result<Sample, ImportError> {
     let mut columns: Vec<String> = Vec::new();
     let mut rows: Vec<Vec<Field>> = Vec::new();
-    let more = json_records(r, &mut columns, limit, |fields, _| {
+    let more = json_records(r, &mut columns, limit, true, |fields, _| {
         rows.push(fields);
         true
     })?;
@@ -2017,7 +2047,7 @@ pub fn row_iter<R: std::io::Read>(
         ImportFormat::Json => {
             let mut keys = Vec::new();
             let mut rows = Vec::new();
-            json_records(r, &mut keys, usize::MAX, |fields, n| {
+            json_records(r, &mut keys, usize::MAX, false, |fields, n| {
                 rows.push((fields, n));
                 true
             })?;
@@ -4150,6 +4180,61 @@ mod tests {
         };
         // It may fail or return a short sample; what it must not do is read on.
         let _ = read_sample(r, ImportFormat::Csv, &cfg(true), 200);
+    }
+
+    /// **A big JSON file previews as a prefix of records, not as an error.**
+    ///
+    /// `read_sample` wraps both non-Excel formats in the `SAMPLE_MAX_BYTES`
+    /// cap. CSV degrades gracefully under truncation — the reader just yields
+    /// fewer records — while `serde_json`'s `StreamDeserializer` meets EOF
+    /// *inside* a value and errors, which reached the user as `Couldn't read
+    /// the file: EOF while parsing a string at line 1 column 8388608`: a
+    /// message that reads as file corruption, on a file `validate` then walks
+    /// end to end without complaint. `read_sample`'s own doc says "a truncated
+    /// read can only make the preview *shorter*", and it could not.
+    ///
+    /// The trigger is the first `limit` records exceeding the cap — an average
+    /// record over ~42 KiB, which one text column reaches easily.
+    #[test]
+    fn a_json_file_past_the_sample_cap_previews_what_it_read() {
+        // Five records of ~3 MiB each: the cap lands inside the third string.
+        let big = "x".repeat(3 * 1024 * 1024);
+        let mut json = String::from("[");
+        for i in 0..5 {
+            if i > 0 {
+                json.push(',');
+            }
+            json.push_str(&format!(r#"{{"id": {i}, "body": "{big}"}}"#));
+        }
+        json.push(']');
+        assert!(json.len() as u64 > SAMPLE_MAX_BYTES, "the fixture must exceed the cap");
+
+        let s = read_sample(json.as_bytes(), ImportFormat::Json, &cfg(true), 200)
+            .expect("a large file previews rather than failing");
+        assert!(!s.rows.is_empty(), "nothing was previewed at all");
+        assert!(s.rows.len() < 5, "the cap did not bite: {}", s.rows.len());
+        assert!(s.more, "a cut-short preview has to say there is more");
+        assert_eq!(s.columns, vec!["body".to_string(), "id".to_string()]);
+    }
+
+    /// And a file that really is broken still says so — the reason the bound is
+    /// a parameter rather than an unconditional "EOF means stop".
+    #[test]
+    fn a_truncated_json_file_is_still_an_error_on_the_whole_file_walk() {
+        let json = r#"[{"a": 1}, {"a": "unterminated"#;
+        // The sample path is bounded, and something parsed, so it previews what
+        // it got — the same rule as above.
+        let s = read_sample(json.as_bytes(), ImportFormat::Json, &cfg(true), 200).expect("preview");
+        assert_eq!(s.rows.len(), 1);
+        assert!(s.more);
+        // The whole-file walk is not bounded, so the same bytes are a failure
+        // there rather than a silent partial import.
+        let mut n = 0;
+        let err = for_each_record(json.as_bytes(), ImportFormat::Json, &cfg(true), |_, _| {
+            n += 1;
+            true
+        });
+        assert!(err.is_err(), "a truncated file imported {n} rows in silence");
     }
 
     /// The rewrite is byte-for-byte in place, so it has to survive a record
