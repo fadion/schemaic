@@ -7129,7 +7129,12 @@ fn toolbar_sep() -> impl IntoView {
 /// a clear ✕ (when a filter is active) and an inline red error round it out.
 fn filter_bar(gs: GridState) -> impl IntoView {
     dyn_container(
-        move || gs.base_sql.get().is_some() && gs.edit_model.get().insert_target().is_some(),
+        // `with`, not `get`: this is a `dyn_container` key, so it re-runs on
+        // every write to either signal, and `get` clones the whole statement
+        // text to ask whether there is one.
+        move || {
+            gs.base_sql.with(Option::is_some) && gs.edit_model.with(|m| m.insert_target().is_some())
+        },
         move |eligible| {
             if !eligible {
                 return empty().into_any();
@@ -7284,7 +7289,12 @@ fn grid_toolbar(
     // status bar's segments, which toggle off the same channel.
     let menu_is_mine = move |origin: RwSignal<Point>| {
         crate::widgets::menu_anchored_at(
-            gs.popup.get_untracked().is_some(),
+            // `with_untracked`, not `get_untracked`: the latter clones the
+            // whole entry list — up to nine `String` labels, their `Rc`
+            // closures and icon tuples — to ask whether it is `Some`, on every
+            // press of the copy, save and AI icons. The two closures directly
+            // below already spell it the right way on this same signal.
+            gs.popup.with_untracked(Option::is_some),
             gs.popup_anchor.get_untracked(),
             anchor_below(origin.get_untracked()),
         )
@@ -8602,7 +8612,34 @@ fn data_row(
 /// Apply a display formatter to column `ci`: update the live per-column state (so
 /// cells re-render) and, when the source table is known, upsert + persist the rule
 /// so it survives restarts.
+/// Is this pick a change? — the guard [`set_format`] opens with.
+///
+/// A column the result does not have answers **true**, deliberately: this
+/// decides only whether to stop early, and the arms below are already
+/// range-checked. Answering false there would make an out-of-range index a
+/// silent no-op instead of the no-op-with-a-rule-write it has always been,
+/// which is a different question and not this one's to settle.
+fn format_change_needed(formats: &[ColumnFormat], ci: usize, fmt: ColumnFormat) -> bool {
+    formats.get(ci) != Some(&fmt)
+}
+
 fn set_format(gs: GridState, ci: usize, fmt: ColumnFormat) {
+    // **Picking the format that is already on costs nothing.**
+    //
+    // The submenu renders the current choice as a live action rather than a
+    // checkmark, so re-picking it is a natural "yes, that one" — and
+    // `RwSignal::update` notifies whether or not the value changed
+    // (floem_reactive's `update_value` calls `run_effects()` with no equality
+    // check). Every mounted cell's style closure tracks `formats`, and so does
+    // every header's, so a no-op re-pick re-ran about a thousand of them and
+    // then wrote `format.json` to disk synchronously on the UI thread.
+    // `GridState::clear_bar` guards the identical way three hundred lines up.
+    if !gs
+        .formats
+        .with_untracked(|v| format_change_needed(v, ci, fmt))
+    {
+        return;
+    }
     gs.formats.update(|v| {
         if ci < v.len() {
             v[ci] = fmt;
@@ -8985,7 +9022,10 @@ fn cell_pick_editor(
         opened.set(true);
     });
     create_effect(move |_| {
-        let up = gs.popup.get().is_some();
+        // `with`, not `get` — `get` is `with(|v| v.clone())`, so this cloned
+        // the whole entry list on **every** write to the window-wide popup
+        // channel to ask a question `is_some` needs no clone for.
+        let up = gs.popup.with(Option::is_some);
         if opened.get() && !up {
             drop_cell_edit(gs, i, ci, true);
         }
@@ -9204,10 +9244,25 @@ fn data_cell(
             }
             None => {
                 let staged = gs.dirty.with(|d| d.get(&dkey).cloned());
-                let (orig, orig_null) = gs.rs.with(|rs| match rs.cell(data_idx, ci) {
-                    Some(c) => (format::apply(fmt, &c.to_value()), c.is_null()),
-                    None => (String::new(), true),
-                });
+                // **Cut to what the cell paints, here rather than downstream.**
+                // The tuple below is stored and byte-compared on every
+                // notification of a grid-wide signal, and the cell draws 200
+                // characters. Carrying the whole value made a `JSON`/`LONGTEXT`
+                // column cost 3.1 ms per notification at 256 KiB a cell and
+                // 12 ms at 1 MiB over ~25 mounted rows — and one Tab-hop during
+                // data entry is three notifications. `StagedFace` makes exactly
+                // this argument for the field beside it.
+                //
+                // A `Str` cell short-circuits `to_value`, which copies the
+                // whole arena string so that `Value::display` can copy it again
+                // to build something the preview immediately cuts. With no
+                // formatter there is nothing between the two — `format::apply`'s
+                // `None` arm *is* `Value::display`, and a `Value::Str`'s display
+                // is the string — so the borrowed text is the same answer. Any
+                // other tag, or any formatter, goes the long way: a formatter
+                // may rewrite a value entirely, and none of those values are
+                // large.
+                let (orig, orig_null) = gs.rs.with(|rs| cell_orig_preview(rs, data_idx, ci, fmt));
                 (staged, orig, orig_null)
             }
         };
@@ -9409,11 +9464,9 @@ fn data_cell(
                 }
                 None => orig.clone(), // original (live from `rs`)
             };
-            // Preview only: flatten newlines/tabs to spaces so a multiline
-            // value stays a single grid row (the viewer shows it verbatim).
-            let src = src.replace(['\r', '\n', '\t'], " ");
-            let shown = truncate(&src, 200);
-            text(shown)
+            // `cell_preview` again: `orig` arrives already cut, but the
+            // staged and placeholder arms do not, and it is idempotent.
+            text(cell_preview(&src))
                 .style(move |s| {
                     let s = s.font_size(theme::font_body());
                     match ink {
@@ -9901,6 +9954,62 @@ fn numeric_edit_pad_left(w: f64, text_px: f64) -> f64 {
     (content - text_px - SLACK).max(0.0)
 }
 
+/// The stored cell at `(data_idx, ci)` as `data_cell`'s key memo carries it:
+/// the painted preview, and whether it is SQL `NULL`.
+///
+/// **Split out so the cap can be tested at all.** The memo needs a whole
+/// `GridState`, which no `#[test]` can build; this is the arm that produces the
+/// value, and `data_cell_memo_gate` is what keeps the memo calling it.
+///
+/// A `Str` cell short-circuits `to_value`, which copies the whole arena string
+/// so that `Value::display` can copy it again to build something the preview
+/// immediately cuts. With no formatter there is nothing between the two —
+/// `format::apply`'s `None` arm *is* `Value::display`, and a `Value::Str`'s
+/// display is the string — so the borrowed text is the same answer, and
+/// `the_str_shortcut_answers_what_the_long_way_does` pins that. Any other tag,
+/// or any formatter, goes the long way: a formatter may rewrite a value
+/// entirely, and none of those values are large.
+fn cell_orig_preview(
+    rs: &ResultSet,
+    data_idx: usize,
+    ci: usize,
+    fmt: ColumnFormat,
+) -> (String, bool) {
+    match rs.cell(data_idx, ci) {
+        Some(c) if fmt == ColumnFormat::None && c.tag == CellTag::Str => {
+            (cell_preview(c.display()), false)
+        }
+        Some(c) => (
+            cell_preview(&format::apply(fmt, &c.to_value())),
+            c.is_null(),
+        ),
+        None => (String::new(), true),
+    }
+}
+
+/// How wide a grid cell's preview is, in characters. The cell is one row of
+/// a table, not a viewer: the whole value is a double-click away, and
+/// everything past this is work nobody sees.
+const CELL_PREVIEW_CHARS: usize = 200;
+
+/// What a data cell actually paints: newlines and tabs flattened to spaces
+/// so a multiline value stays one grid row, then cut to
+/// [`CELL_PREVIEW_CHARS`].
+///
+/// **Named and shared because `data_cell`'s key memo has to produce it
+/// too.** That memo stores its value and byte-compares it on every
+/// notification of a grid-wide signal; carrying the untruncated text made a
+/// large-text column cost milliseconds per keystroke to recompute something
+/// identical for every cell but the one that changed. Deriving the preview
+/// in the memo and again in the builder would be two spellings of what the
+/// cell shows, so there is one.
+///
+/// Idempotent, which is what lets the builder call it over a value the memo
+/// has already cut.
+fn cell_preview(s: &str) -> String {
+    truncate(&s.replace(['\r', '\n', '\t'], " "), CELL_PREVIEW_CHARS)
+}
+
 fn truncate(s: &str, max: usize) -> String {
     if s.chars().count() > max {
         let mut out: String = s.chars().take(max).collect();
@@ -9908,6 +10017,201 @@ fn truncate(s: &str, max: usize) -> String {
         out
     } else {
         s.to_string()
+    }
+}
+
+#[cfg(test)]
+mod cell_preview_tests {
+    use super::*;
+    use schemaic_core::model::Column;
+
+    fn one(text: &str) -> ResultSet {
+        ResultSet::from_rows(
+            vec![Column {
+                name: "payload".into(),
+                type_name: "LONGTEXT".into(),
+                origin: None,
+            }],
+            vec![vec![Value::Str(text.to_string())]],
+        )
+    }
+
+    /// **Re-picking the format the menu already shows costs nothing.**
+    ///
+    /// The submenu renders the current choice as a live action rather than a
+    /// checkmark, so re-picking it is a natural gesture — and `update`
+    /// notifies whether or not the value moved. Every mounted cell's style
+    /// closure and every header's tracks `formats`, so an unguarded re-pick
+    /// re-ran about a thousand of them and wrote `format.json` to disk
+    /// synchronously on the UI thread.
+    #[test]
+    fn re_picking_the_active_format_is_not_a_change() {
+        let formats = vec![ColumnFormat::Timestamp, ColumnFormat::None];
+        assert!(!format_change_needed(&formats, 0, ColumnFormat::Timestamp));
+        assert!(!format_change_needed(&formats, 1, ColumnFormat::None));
+        // A real change, in both directions.
+        assert!(format_change_needed(&formats, 0, ColumnFormat::None));
+        assert!(format_change_needed(&formats, 1, ColumnFormat::Grouped));
+        // A column the result does not have proceeds — see the doc.
+        assert!(format_change_needed(&formats, 9, ColumnFormat::None));
+        assert!(format_change_needed(&[], 0, ColumnFormat::None));
+    }
+
+    /// And `set_format` still opens with it. The predicate alone is a
+    /// decoration — the bug was that the caller never asked.
+    #[test]
+    fn set_format_refuses_before_it_writes_anything() {
+        let src = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("src")
+                .join("grid.rs"),
+        )
+        .expect("grid.rs");
+        let body = crate::source_gate::production_code(&src);
+        let at = body
+            .find("fn set_format(")
+            .expect("`set_format` is gone — this gate is stale");
+        let guard = body[at..]
+            .find("format_change_needed(")
+            .expect("`set_format` no longer asks whether the pick is a change");
+        let write = body[at..]
+            .find(".update(")
+            .expect("`set_format` writes nothing — this gate is stale");
+        assert!(
+            guard < write,
+            "the guard must come before the first write, or the notification \
+             and the disk write have already happened"
+        );
+    }
+
+    /// **What the key memo carries is what the cell paints, not the cell.**
+    ///
+    /// `data_cell`'s memo stores its value and byte-compares it on every
+    /// notification of a grid-wide signal — `formats`, `dirty`, `new_rows`,
+    /// `rs`, `edit_cell` — and one Tab-hop during data entry is three of
+    /// those. Carrying a 1 MiB `JSON`/`LONGTEXT` value there cost 12 ms per
+    /// notification across a maximised window's mounted rows, to recompute
+    /// something byte-identical for every cell but the one that changed.
+    ///
+    /// Asserted on `cell_orig_preview`, which is the arm the memo runs —
+    /// asserting `cell_preview` alone would pass against the unfixed tree,
+    /// where the truncation happened downstream of the memo.
+    #[test]
+    fn the_memos_value_is_capped_at_what_the_cell_draws() {
+        let big = "x".repeat(1024 * 1024);
+        let rs = one(&big);
+        let (orig, is_null) = cell_orig_preview(&rs, 0, 0, ColumnFormat::None);
+        assert!(!is_null);
+        assert!(
+            orig.chars().count() <= CELL_PREVIEW_CHARS + 1,
+            "{} chars carried for a cell that paints {CELL_PREVIEW_CHARS}",
+            orig.chars().count()
+        );
+        assert!(orig.ends_with('…'), "and it says it was cut");
+    }
+
+    /// The short-circuit for an unformatted `Str` must answer exactly what the
+    /// long way does, or the cell paints something different depending on a
+    /// branch about *cost*.
+    #[test]
+    fn the_str_shortcut_answers_what_the_long_way_does() {
+        for text in [
+            "",
+            "plain",
+            "with\ttabs\r\nand newlines",
+            "unicode — ünïcodé 😀",
+            &"y".repeat(500),
+        ] {
+            let rs = one(text);
+            let c = rs.cell(0, 0).unwrap();
+            let long_way = cell_preview(&format::apply(ColumnFormat::None, &c.to_value()));
+            assert_eq!(
+                cell_orig_preview(&rs, 0, 0, ColumnFormat::None).0,
+                long_way,
+                "{text:?}"
+            );
+        }
+    }
+
+    /// A formatter still runs — the short-circuit is for the `None` case only,
+    /// and a `Timestamp` column must keep rendering its date.
+    #[test]
+    fn a_formatted_column_still_goes_the_long_way() {
+        let rs = ResultSet::from_rows(
+            vec![Column {
+                name: "at".into(),
+                type_name: "BIGINT".into(),
+                origin: None,
+            }],
+            vec![vec![Value::Int(0)]],
+        );
+        let (orig, _) = cell_orig_preview(&rs, 0, 0, ColumnFormat::Timestamp);
+        assert!(orig.starts_with("1970"), "{orig}");
+    }
+
+    /// A stored NULL is still reported as one — the short-circuit's `false` is
+    /// only reachable for a `Str` tag, which `CellTag::Null` is not.
+    #[test]
+    fn a_null_cell_is_still_null() {
+        let rs = ResultSet::from_rows(
+            vec![Column {
+                name: "n".into(),
+                type_name: "TEXT".into(),
+                origin: None,
+            }],
+            vec![vec![Value::Null]],
+        );
+        assert_eq!(
+            cell_orig_preview(&rs, 0, 0, ColumnFormat::None),
+            ("NULL".to_string(), true)
+        );
+    }
+
+    /// The builder calls it over a value the memo has already cut, so cutting
+    /// twice must not add a second ellipsis or lose a character.
+    #[test]
+    fn the_preview_is_idempotent() {
+        for text in ["short", &"z".repeat(1000), "a\nb\tc"] {
+            let once = cell_preview(text);
+            assert_eq!(cell_preview(&once), once, "{text:?}");
+        }
+    }
+
+    /// The memo must keep going through it. A `format::apply` back in the memo
+    /// body passes every test above and restores the whole cost.
+    #[test]
+    fn the_key_memo_still_reads_the_capped_preview() {
+        let src = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("src")
+                .join("grid.rs"),
+        )
+        .expect("grid.rs");
+        let body = crate::source_gate::production_code(&src);
+        let at = body
+            .find("fn data_cell(")
+            .expect("`data_cell` is gone — this gate is stale");
+        // The key memo alone, not the whole 500-line builder: the context menu
+        // further down formats a cell too, legitimately and once per click.
+        let memo = at
+            + body[at..]
+                .find("let key = create_memo(")
+                .expect("`data_cell`'s key memo is gone — this gate is stale");
+        let end = memo
+            + body[memo..]
+                .find("\n    });")
+                .expect("the key memo's end — this gate is stale");
+        let f = &body[memo..end];
+        assert!(
+            f.contains("cell_orig_preview(rs, data_idx, ci, fmt)"),
+            "`data_cell`'s key memo builds the original itself again — it stores \
+             and byte-compares that value on every grid-wide notification"
+        );
+        assert!(
+            !f.contains("format::apply("),
+            "and it must not format inside the memo: that is the copy the cap \
+             exists to avoid"
+        );
     }
 }
 
