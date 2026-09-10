@@ -443,10 +443,35 @@ pub async fn a_cancelled_script_stops_at_the_server_and_reports_what_ran(target:
         format!("INSERT INTO {t} (id) VALUES (2)"),
     ];
 
+    // **Armed on this script's own progress, not on a stopwatch.** A fixed
+    // delay races the two statements ahead of the sleep, and under the whole
+    // tier's load PostgreSQL lost that race: the token fired with `ran == 0`
+    // and the test read as the accounting bug it exists to catch.
+    //
+    // The probe is the *row*, not `running_sleeps` — that count matches on a
+    // marker every leg's sleep carries, so with `a_cancelled_query_stops_at_
+    // the_server` running beside this one it answers about somebody else's
+    // statement and the token fires before this script has started. Statement 2
+    // is committed by the time a second connection can see its row, so a row
+    // that is visible means both statements before the sleep have run.
     let cancel = CancellationToken::new();
     let armed = cancel.clone();
+    let probe = scratch.db.clone();
+    let database = scratch.database.clone();
+    let probe_sql = format!("SELECT COUNT(*) FROM {t}");
     tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        let deadline = Instant::now() + Duration::from_secs(SLEEP_SECS) - CANCEL_MARGIN;
+        while Instant::now() < deadline {
+            let seen = probe
+                .fetch_query(Some(&database), &probe_sql, 1, CancellationToken::new())
+                .await
+                .ok()
+                .and_then(|rs| rs.cell(0, 0).map(|c| c.display().to_string()));
+            if seen.as_deref() == Some("1") {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
         armed.cancel();
     });
 
