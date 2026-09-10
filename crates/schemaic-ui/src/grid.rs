@@ -1975,14 +1975,31 @@ fn hand_back_on_close(flag: RwSignal<bool>, back: Rc<dyn Fn()>) {
 /// or `frozen` write that lands on the value already there stops rebuilding
 /// too.
 ///
+/// `key_gen` is the fourth term and the only one that is not about layout: it
+/// counts the times the source table's **key map** has changed. The header
+/// cells are built inside this container and read that map by value, so a
+/// schema arriving after the result — ordinary on a large server, where
+/// introspection is ten-plus round trips per database — otherwise never
+/// reached them, and the key icons and *Follow relation* were missing for the
+/// life of the result. It is a counter rather than the map itself so the memo
+/// compares a `u64` per notification instead of a `HashMap`.
+///
 /// Generic in the row type so the composition can be tested with no window —
 /// see `body_key_tests`. Only the count is read, and only `Vec::len` is called.
 fn body_rebuild_key<T: 'static>(
     sort: RwSignal<SortState>,
     frozen: RwSignal<Option<usize>>,
     new_rows: RwSignal<Vec<T>>,
-) -> Memo<(SortState, Option<usize>, usize)> {
-    create_memo(move |_| (sort.get(), frozen.get(), new_rows.with(Vec::len)))
+    key_gen: RwSignal<u64>,
+) -> Memo<(SortState, Option<usize>, usize, u64)> {
+    create_memo(move |_| {
+        (
+            sort.get(),
+            frozen.get(),
+            new_rows.with(Vec::len),
+            key_gen.get(),
+        )
+    })
 }
 
 /// Wrap every action in `entries` — submenus included, to any depth — so it
@@ -3687,8 +3704,17 @@ pub(crate) fn grid_goto_bar(
 fn grid_view(rs: Arc<ResultSet>, gctx: GridCtx) -> impl IntoView {
     let ncols = rs.col_count();
     let nrows = rs.row_count();
-    // Per-column key roles (snapshot from the source table's schema at build).
-    let key_map = Arc::new(column_key_map(&rs, gctx.source, gctx.db_nodes));
+    // Per-column key roles from the source table's schema. **Not a snapshot.**
+    // Introspection is ten-plus catalogue round trips per database and is
+    // spawned per database, so on a large server or over an SSH tunnel a
+    // `SELECT * FROM orders` typed straight after connecting renders before its
+    // schema lands — and this used to be read once, by value, at build. The
+    // result then showed no key icons on `id` or on any foreign key, offered no
+    // *Follow relation*, and answered no Ctrl+click, **for its whole life**;
+    // only re-running the statement recovered it. `key_gen` below is what
+    // rebuilds the header when the schema arrives.
+    let key_map: RwSignal<Arc<HashMap<usize, ColKey>>> =
+        RwSignal::new(Arc::new(column_key_map(&rs, gctx.source, gctx.db_nodes)));
     let elapsed = rs.elapsed_ms;
     let truncated = rs.truncated;
     // Named, not indexed: the toolbar has to say *which* column went blank.
@@ -3702,10 +3728,41 @@ fn grid_view(rs: Arc<ResultSet>, gctx: GridCtx) -> impl IntoView {
     let (connections, active_conn) = (gctx.connections, gctx.active_conn);
 
     // Interactive state, created once and shared across sort rebuilds.
-    let gs = GridState::new(rs.clone(), &gctx, &key_map);
-    // Resolve the source table's foreign keys → per-column "Follow" specs (once).
-    gs.follow
-        .set(Rc::new(build_follow_specs(&rs, gctx.source, gctx.db_nodes)));
+    let gs = GridState::new(rs.clone(), &gctx, &key_map.get_untracked());
+    // Both halves of "what does this column mean in its table" — the header's
+    // key icons and the cells' *Follow relation* — recomputed when the source
+    // or its schema moves, not once at build.
+    //
+    // The one tracked read is the *matching* node's schema, so an unrelated
+    // database finishing its introspection does not re-run this. The write is
+    // guarded because the effect's own first run reproduces what the build
+    // already computed, and `RwSignal::set` never dedups — an unguarded write
+    // here would bump `key_gen` and rebuild the grid body on every mount.
+    let key_gen: RwSignal<u64> = RwSignal::new(0);
+    let (src_sig, nodes_sig) = (gctx.source, gctx.db_nodes);
+    let rs_for_keys = rs.clone();
+    create_effect(move |_| {
+        let src = src_sig.get();
+        let nodes = nodes_sig.get();
+        if let Some(src) = src.as_ref()
+            && let Some(node) = nodes.iter().find(|n| n.database == src.database)
+        {
+            node.schema.track();
+        }
+        let fresh = column_key_map(&rs_for_keys, src_sig, nodes_sig);
+        if key_map.with_untracked(|cur| cur.as_ref() != &fresh) {
+            key_map.set(Arc::new(fresh));
+            key_gen.update(|g| *g += 1);
+        }
+        // `follow` has no cheap equality (its specs carry `Rc`s), so it rides
+        // the key map's: both are derived from the same schema lookup, and a
+        // schema that has not moved cannot have changed either of them.
+        gs.follow.set(Rc::new(build_follow_specs(
+            &rs_for_keys,
+            src_sig,
+            nodes_sig,
+        )));
+    });
     // Editability: which columns can be written back, and each base table's
     // WHERE key — derived from the result's per-column provenance + schema. The
     // closure looks up a base table's schema from the live `db_nodes` signals.
@@ -3962,12 +4019,12 @@ fn grid_view(rs: Arc<ResultSet>, gctx: GridCtx) -> impl IntoView {
     // The body rebuilds on every sort/freeze/new-row change, so the ring is cloned
     // per build rather than captured once.
     let strip_for_body = strip.clone();
-    let body_key = body_rebuild_key(sort, gs.frozen, gs.new_rows);
+    let body_key = body_rebuild_key(sort, gs.frozen, gs.new_rows, key_gen);
     let grid = dyn_container(
         // Rebuild on sort / freeze change, and when the number of pending new rows
         // changes (adding/removing a row extends the virtual-stack length).
         move || body_key.get(),
-        move |(sort_val, frozen_col, new_len)| {
+        move |(sort_val, frozen_col, new_len, _key_gen)| {
             let strip_entry = strip_for_body.clone();
             let rs = gs.rs.get_untracked();
             // Total displayed rows = real rows + pending new rows (rendered below).
@@ -4032,14 +4089,14 @@ fn grid_view(rs: Arc<ResultSet>, gctx: GridCtx) -> impl IntoView {
             });
             let mut fhead: Vec<AnyView> = vec![gutter_header.into_any()];
             if let Some(fc) = frozen_col {
-                fhead.push(header_cell(gs, fc, sort_val, sort, key_map.clone()).into_any());
+                fhead.push(header_cell(gs, fc, sort_val, sort, key_map.get_untracked()).into_any());
             }
             let frozen_header = h_stack_from_iter(fhead).style(|s| {
                 s.flex_row()
                     .flex_shrink(0.0_f32)
                     .background(theme::bg_header_row())
             });
-            let km = key_map.clone();
+            let km = key_map.get_untracked();
             let hdr_cols = data_cols.clone();
             // Virtualized header: leading spacer + the visible window's header cells
             // + trailing spacer, rebuilt (via `win`) only when the visible column
@@ -10435,7 +10492,7 @@ mod body_key_tests {
     /// stands for the `dyn_container` builder, which rebuilds both panes, the
     /// header and two memos, and re-runs `compute_order` over the whole result
     /// — 14.3 ms at 200,000 rows on a sorted column.
-    fn runs_of(key: Memo<(SortState, Option<usize>, usize)>) -> Rc<std::cell::Cell<u32>> {
+    fn runs_of(key: Memo<(SortState, Option<usize>, usize, u64)>) -> Rc<std::cell::Cell<u32>> {
         let n = Rc::new(std::cell::Cell::new(0u32));
         let c = n.clone();
         create_effect(move |_| {
@@ -10460,7 +10517,8 @@ mod body_key_tests {
         let frozen = scope.create_rw_signal(Some(0usize));
         // One pending row, whose contents are patched in place.
         let new_rows: RwSignal<Vec<Vec<u8>>> = scope.create_rw_signal(vec![Vec::new()]);
-        let runs = runs_of(body_rebuild_key(sort, frozen, new_rows));
+        let key_gen = scope.create_rw_signal(0u64);
+        let runs = runs_of(body_rebuild_key(sort, frozen, new_rows, key_gen));
         assert_eq!(runs.get(), 1, "the builder's first run");
 
         for col in 0..10u8 {
@@ -10486,7 +10544,12 @@ mod body_key_tests {
         let bare = Rc::new(std::cell::Cell::new(0u32));
         let c = bare.clone();
         create_effect(move |_| {
-            let _ = (sort.get(), frozen.get(), new_rows.with(Vec::len));
+            let _ = (
+                sort.get(),
+                frozen.get(),
+                new_rows.with(Vec::len),
+                key_gen.get(),
+            );
             c.set(c.get() + 1);
         });
         for col in 0..10u8 {
@@ -10500,6 +10563,34 @@ mod body_key_tests {
         assert_eq!(runs.get(), 1, "the memo absorbed all ten");
     }
 
+    /// **A key map that arrives late has to rebuild the header.**
+    ///
+    /// The header cells are built inside the body container and read the key
+    /// map by value, so a schema landing after the result reached nothing:
+    /// no key icons on `id` or any foreign key, no *Follow relation*, no
+    /// Ctrl+click, for the life of the result. Introspection is ten-plus
+    /// catalogue round trips per database, so `SELECT * FROM orders` typed
+    /// straight after connecting is the ordinary way in.
+    #[test]
+    fn a_key_map_arriving_after_the_result_rebuilds_the_body() {
+        let scope = Scope::new();
+        let sort: RwSignal<SortState> = scope.create_rw_signal(None);
+        let frozen = scope.create_rw_signal(None);
+        let new_rows: RwSignal<Vec<Vec<u8>>> = scope.create_rw_signal(Vec::new());
+        let key_gen = scope.create_rw_signal(0u64);
+        let runs = runs_of(body_rebuild_key(sort, frozen, new_rows, key_gen));
+        assert_eq!(runs.get(), 1);
+
+        key_gen.update(|g| *g += 1); // the schema landed
+        assert_eq!(runs.get(), 2, "the header must be rebuilt with the icons");
+
+        // And it is a *generation*, so a write that does not move it — the
+        // effect's own first run, which recomputes what the build already had
+        // — costs nothing. `set` never dedups; the memo is what absorbs it.
+        key_gen.set(1);
+        assert_eq!(runs.get(), 2, "an unchanged key map rebuilt the grid");
+    }
+
     /// **And the rebuilds that must still happen, do.** A key that dedups
     /// everything is the other way to pass the test above.
     #[test]
@@ -10508,7 +10599,8 @@ mod body_key_tests {
         let sort: RwSignal<SortState> = scope.create_rw_signal(None);
         let frozen = scope.create_rw_signal(None);
         let new_rows: RwSignal<Vec<Vec<u8>>> = scope.create_rw_signal(Vec::new());
-        let runs = runs_of(body_rebuild_key(sort, frozen, new_rows));
+        let key_gen = scope.create_rw_signal(0u64);
+        let runs = runs_of(body_rebuild_key(sort, frozen, new_rows, key_gen));
         assert_eq!(runs.get(), 1);
 
         new_rows.update(|v| v.push(Vec::new())); // ＋ Row
