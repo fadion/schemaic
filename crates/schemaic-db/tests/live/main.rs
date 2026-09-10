@@ -138,6 +138,7 @@ live_suite!(
         a_cancelled_script_stops_at_the_server_and_reports_what_ran,
         a_cancelled_import_rolls_back_and_says_so,
         a_cancelled_import_on_a_non_transactional_table_says_the_rows_remain,
+        a_refused_write_says_which_value_the_server_refused,
     ],
     streaming: [
         a_streamed_export_delivers_every_row,

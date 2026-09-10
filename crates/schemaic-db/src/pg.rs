@@ -352,7 +352,7 @@ pub(crate) async fn ping(db: &Db, timeout: Duration) -> Result<(), DbError> {
         client
             .simple_query("SELECT 1")
             .await
-            .map_err(|e| DbError::Query(e.to_string()))?;
+            .map_err(|e| db_err(&e))?;
         Ok::<(), DbError>(())
     };
     tokio::time::timeout(timeout, check)
@@ -404,7 +404,7 @@ pub(crate) async fn fetch_databases(db: &Db) -> Result<Vec<String>, DbError> {
         let msgs = client
             .simple_query(DATABASE_LISTING)
             .await
-            .map_err(|e| DbError::Query(e.to_string()))?;
+            .map_err(|e| db_err(&e))?;
         let mut out = Vec::new();
         for m in msgs {
             if let SimpleQueryMessage::Row(r) = m
@@ -506,13 +506,49 @@ pub(crate) async fn run_batch(
     }
 }
 
+/// What Postgres actually said, on one line: the `message`, then `DETAIL` and
+/// `HINT` if it sent them.
+///
+/// **All three, because all three are the diagnostic.** A foreign-key violation
+/// answers `violates foreign key constraint "chi_pid_fkey"` on the first line
+/// and `Key (pid)=(9) is not present in table "par".` on the second, and the
+/// second is the one that names the value — on a multi-column key or a bulk
+/// `INSERT … SELECT` it is the whole of it. `HINT` is where "Perhaps you meant
+/// to reference the column …" lives. `psql` prints all three, and `DbError`
+/// carries a `String`, so anything dropped here cannot be recovered downstream.
+///
+/// A separate function from [`db_err`] only because a `tokio_postgres::Error`
+/// cannot be constructed by hand, so this is the seam a test can reach — the
+/// same reason [`error_chain`]'s tests use a synthetic chain.
+fn pg_message(message: &str, detail: Option<&str>, hint: Option<&str>) -> String {
+    let mut out = message.to_string();
+    for extra in [detail, hint].into_iter().flatten() {
+        // A server that sends an empty field must not add a dangling separator.
+        let extra = extra.trim();
+        if !extra.is_empty() {
+            out.push_str(" — ");
+            out.push_str(extra);
+        }
+    }
+    out
+}
+
 /// A clean error message from a `tokio_postgres::Error`: prefer the server's own
 /// `ERROR: …` text (via `as_db_error`) over the driver's wrapped `Display`, so the
 /// editor squiggle / toolbar shows what Postgres actually said.
+///
+/// **Never `e.to_string()`.** That `Display` is a *category*: locked at 0.7.18
+/// it is `Kind::Db => "db error"`, and every `ErrorResponse` from the server
+/// arrives as `Kind::Db`. Six read paths in this module built their `DbError`
+/// from it, so a statement timeout during a catalogue sweep put
+/// `query failed: db error` in the schema tree while the server had said
+/// `canceling statement due to statement timeout`. The non-server arm walks
+/// the chain for the same reason [`error_chain`] does — a failed TLS handshake
+/// keeps its cause in `source()`.
 fn db_err(e: &tokio_postgres::Error) -> DbError {
     match e.as_db_error() {
-        Some(d) => DbError::Query(d.message().to_string()),
-        None => DbError::Query(e.to_string()),
+        Some(d) => DbError::Query(pg_message(d.message(), d.detail(), d.hint())),
+        None => DbError::Query(error_chain(e)),
     }
 }
 
@@ -3127,15 +3163,12 @@ async fn query_all_optional(
         {
             Ok(Vec::new())
         }
-        Err(e) => Err(DbError::Query(e.to_string())),
+        Err(e) => Err(db_err(&e)),
     }
 }
 
 async fn query_all(client: &Client, sql: &str) -> Result<Vec<Vec<Option<String>>>, DbError> {
-    let msgs = client
-        .simple_query(sql)
-        .await
-        .map_err(|e| DbError::Query(e.to_string()))?;
+    let msgs = client.simple_query(sql).await.map_err(|e| db_err(&e))?;
     let mut out = Vec::new();
     for m in msgs {
         if let SimpleQueryMessage::Row(r) = m {
@@ -3733,23 +3766,20 @@ pub(crate) async fn blob_on(client: &Client, r: &BlobRef) -> Result<Option<BlobV
         pg_qname(r.schema.as_deref(), &r.table),
         where_key(&r.key),
     );
-    let rows = client
-        .query(&sql, &[])
-        .await
-        .map_err(|e| DbError::Query(e.to_string()))?;
+    let rows = client.query(&sql, &[]).await.map_err(|e| db_err(&e))?;
     let Some(row) = rows.first() else {
         return Ok(None); // no such row
     };
     // A NULL cell makes `octet_length` NULL too — the same "no bytes to show"
     // as a row that is gone. `octet_length` is `int4`, so `i32` is its type on
     // the wire and the cast up is the lossless direction.
-    let len: Option<i32> = row.try_get(0).map_err(|e| DbError::Query(e.to_string()))?;
+    let len: Option<i32> = row.try_get(0).map_err(|e| db_err(&e))?;
     let Some(len) = len else {
         return Ok(None);
     };
     // The length was not NULL but the value was: impossible from one row, and
     // not something to invent bytes for.
-    let bytes: Option<Vec<u8>> = row.try_get(1).map_err(|e| DbError::Query(e.to_string()))?;
+    let bytes: Option<Vec<u8>> = row.try_get(1).map_err(|e| db_err(&e))?;
     let Some(bytes) = bytes else {
         return Ok(None);
     };
@@ -3833,10 +3863,7 @@ pub(crate) async fn refetch_on(
                 .collect::<Vec<_>>()
                 .join(" AND ");
             let sql = format!("SELECT {proj} FROM {qname} WHERE {where_sql} LIMIT 1");
-            let msgs = client
-                .simple_query(&sql)
-                .await
-                .map_err(|e| DbError::Query(e.to_string()))?;
+            let msgs = client.simple_query(&sql).await.map_err(|e| db_err(&e))?;
             for m in msgs {
                 if let SimpleQueryMessage::Row(r) = m {
                     let cells: Vec<Value> = kinds
@@ -4040,6 +4067,87 @@ mod tests {
     #[test]
     fn an_error_with_no_cause_is_left_alone() {
         assert_eq!(error_chain(&Layer("plain", None)), "plain");
+    }
+
+    /// **`DETAIL` is where PostgreSQL puts the value that broke the
+    /// constraint, and `HINT` is where it puts the column you meant.**
+    ///
+    /// Live on PG 16.15, `INSERT INTO chi VALUES (9)` against
+    /// `chi(pid int references par(id))` answers three lines; `db_err`
+    /// returned the first, so the editor squiggle said a constraint was
+    /// violated and never said which value violated it — which on a
+    /// multi-column key or a bulk `INSERT … SELECT` is the whole of the
+    /// diagnostic, and is what `psql` prints.
+    ///
+    /// Tested through the pure join because a `tokio_postgres::Error` cannot
+    /// be constructed by hand — the same reason `error_chain`'s tests above
+    /// use a synthetic `Layer`.
+    #[test]
+    fn a_server_error_keeps_the_detail_and_hint_that_name_the_offender() {
+        assert_eq!(pg_message("boom", None, None), "boom");
+        assert_eq!(
+            pg_message(
+                "insert or update on table \"chi\" violates foreign key constraint \"chi_pid_fkey\"",
+                Some("Key (pid)=(9) is not present in table \"par\"."),
+                None,
+            ),
+            "insert or update on table \"chi\" violates foreign key constraint \
+             \"chi_pid_fkey\" — Key (pid)=(9) is not present in table \"par\"."
+        );
+        assert_eq!(
+            pg_message(
+                "column \"nam\" does not exist",
+                None,
+                Some("Perhaps you meant \"name\".")
+            ),
+            "column \"nam\" does not exist — Perhaps you meant \"name\"."
+        );
+        assert_eq!(
+            pg_message("m", Some("d"), Some("h")),
+            "m — d — h",
+            "both, in the order psql prints them"
+        );
+        // A server that sends an empty DETAIL must not add a dangling dash.
+        assert_eq!(pg_message("m", Some(""), Some("  ")), "m");
+    }
+
+    /// **The driver's `Display` for a server error is the literal string
+    /// `db error`.**
+    ///
+    /// `tokio_postgres::Error`'s `Display` is a category, not a message —
+    /// locked at 0.7.18, `Kind::Db => fmt.write_str("db error")`, and every
+    /// `ErrorResponse` from the server arrives as `Kind::Db`. Six read paths
+    /// in this module built `DbError::Query(e.to_string())` from it, so a
+    /// statement timeout during a catalogue sweep put `query failed: db
+    /// error` in the schema tree while the server had said
+    /// `canceling statement due to statement timeout`.
+    ///
+    /// The gate is over the module's own source, because the defect is which
+    /// of two spellings each site used and both compile: `db_err` was already
+    /// here, already used at eight *write* sites, and its doc already said
+    /// why.
+    #[test]
+    fn no_error_in_this_module_is_built_from_the_drivers_own_display() {
+        let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/pg.rs"))
+            .expect("this module's own source");
+        let mut offenders = Vec::new();
+        for (i, line) in src.lines().enumerate() {
+            let code = line.trim_start();
+            if code.starts_with("//") {
+                continue;
+            }
+            // Assembled, so this line is not its own first offender.
+            let needle = format!("DbError::Query(e.{}())", "to_string");
+            if code.contains(&needle) {
+                offenders.push(format!("pg.rs:{}: {code}", i + 1));
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "call `db_err(&e)` — the driver's Display for a server error is the \
+             literal \"db error\":\n{}",
+            offenders.join("\n")
+        );
     }
 
     /// The decision this pins lives in the SQL string, so the string is the

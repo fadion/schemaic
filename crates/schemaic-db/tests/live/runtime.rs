@@ -864,3 +864,80 @@ pub async fn a_typo_in_a_manual_transaction_names_what_the_server_refused(target
     session.close().await;
     scratch.teardown().await;
 }
+
+/// **What the server said, all of it — and never the driver's word for the
+/// category it fell into.**
+///
+/// Two defects met on this path. `tokio_postgres::Error`'s `Display` is
+/// `"db error"` for every `ErrorResponse` the server sends, and eight read
+/// paths in `pg.rs` built their `DbError` from it — so a statement timeout
+/// during a catalogue sweep put `query failed: db error` in the schema tree.
+/// And `db_err`, which the write paths did use, kept only `message` and
+/// dropped `DETAIL` and `HINT` — the lines that name *which value* broke the
+/// constraint and *which column* you probably meant. On a multi-column key or
+/// a bulk `INSERT … SELECT`, the DETAIL is the whole of the diagnostic, and
+/// `psql` prints it.
+///
+/// Live rather than pure because both halves are facts about a server and a
+/// driver: `pg_message`'s join can be unit-tested, but that `d.detail()` is
+/// populated at all, and that the whole chain reaches `DbError`'s text, cannot.
+/// MySQL's driver reports its own message directly, so this pins the shared
+/// promise — the error text names the offending value — on every engine, which
+/// is the point of running one suite against three.
+pub async fn a_refused_write_says_which_value_the_server_refused(target: &'static Target) {
+    let scratch = Scratch::create(target, "err_detail").await;
+    let par = scratch.qualified("par");
+    let chi = scratch.qualified("chi");
+    scratch
+        .exec(&format!("CREATE TABLE {par} (id INTEGER PRIMARY KEY)"))
+        .await;
+    // **Table-level, not an inline `REFERENCES` on the column.** MySQL 8.4
+    // parses a column-level `REFERENCES` clause and silently ignores it, so the
+    // first version of this test created no constraint there at all and the
+    // insert simply succeeded — the exact shape of vacuous test this suite
+    // exists to catch. MariaDB and PostgreSQL both honoured it, which is what
+    // made it look right.
+    scratch
+        .exec(&format!(
+            "CREATE TABLE {chi} (pid INTEGER, FOREIGN KEY (pid) REFERENCES {par}(id))"
+        ))
+        .await;
+
+    let err = scratch
+        .try_exec(&format!("INSERT INTO {chi} VALUES (9)"))
+        .await
+        .err()
+        .unwrap_or_else(|| {
+            panic!(
+                "{}: an insert against a missing parent key succeeded",
+                target.name
+            )
+        })
+        .to_string();
+
+    assert!(
+        !err.contains("db error"),
+        "{}: the driver's category, not the server's message: {err}",
+        target.name
+    );
+    // The shared promise: whatever the server called it, the text says a
+    // foreign key was the problem.
+    assert!(
+        err.to_lowercase().contains("foreign key"),
+        "{}: the error does not name the constraint: {err}",
+        target.name
+    );
+    // And where the server sends the value in a field of its own, that field
+    // has to survive the trip. This is the assertion `db_err` failed: it kept
+    // `message` and dropped `DETAIL`, so the whole of what the user could act
+    // on was gone before `DbError` was built.
+    if target.error_names_the_value {
+        assert!(
+            err.contains("(9)"),
+            "{}: the offending value was dropped with DETAIL: {err}",
+            target.name
+        );
+    }
+
+    scratch.teardown().await;
+}

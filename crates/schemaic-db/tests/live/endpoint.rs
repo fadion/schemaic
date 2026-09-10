@@ -86,6 +86,20 @@ pub struct Target {
     /// Data on the target rather than an `if engine == Postgres` in a test body,
     /// for the reason at the top of [`crate::suite`].
     pub grants_are_database_scoped: bool,
+    /// Does a refused write on this server carry a **separate detail field**
+    /// naming the offending value?
+    ///
+    /// PostgreSQL's `ErrorResponse` has `DETAIL` and `HINT` beside `message`,
+    /// and for a constraint violation the value that broke it is only in
+    /// `DETAIL` (`Key (pid)=(9) is not present in table "par".`) —
+    /// `pg::db_err` dropped both, so the squiggle said a constraint was
+    /// violated and never which value did it. MySQL and MariaDB put everything
+    /// in one message and name the constraint rather than the value, so the
+    /// value is not theirs to lose.
+    ///
+    /// Data on the target rather than an `if engine == Postgres` in a test
+    /// body, for the reason at the top of [`crate::suite`].
+    pub error_names_the_value: bool,
     /// How a trigger on this server says "uppercase the name being inserted".
     ///
     /// **The two engines model a trigger differently, not just spell it
@@ -165,6 +179,7 @@ pub static MARIADB: Target = Target {
     disable_index_sql: Some("ALTER TABLE {table} ALTER INDEX {index} IGNORED"),
     transactional_ddl: false,
     grants_are_database_scoped: false,
+    error_names_the_value: false,
     trigger_body: Some("SET NEW.name = UPPER(NEW.name)"),
     trigger_function_ddl: None,
     trigger_function_name: None,
@@ -188,6 +203,7 @@ pub static MYSQL: Target = Target {
     disable_index_sql: Some("ALTER TABLE {table} ALTER INDEX {index} INVISIBLE"),
     transactional_ddl: false,
     grants_are_database_scoped: false,
+    error_names_the_value: false,
     trigger_body: Some("SET NEW.name = UPPER(NEW.name)"),
     trigger_function_ddl: None,
     trigger_function_name: None,
@@ -211,6 +227,7 @@ pub static POSTGRES: Target = Target {
     disable_index_sql: None,
     transactional_ddl: true,
     grants_are_database_scoped: true,
+    error_names_the_value: true,
     trigger_body: None,
     trigger_function_ddl: Some(
         "CREATE FUNCTION upper_name() RETURNS trigger AS $$          BEGIN NEW.name := UPPER(NEW.name); RETURN NEW; END $$ LANGUAGE plpgsql",
