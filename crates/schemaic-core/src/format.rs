@@ -318,17 +318,35 @@ fn exact_bytes(n: u64) -> String {
     format!("{grouped} bytes")
 }
 
-/// `true` / `false` for a value's truthiness (0 / empty / `false` are false).
+/// `true` / `false` for a value's truthiness, or the raw display for text that
+/// is not a boolean at all.
+///
+/// **Text goes through [`crate::celledit::read_bool`], the one reader of the
+/// word.** This was a `matches!` over eight hand-listed spellings, and
+/// PostgreSQL's text protocol hands `false` back as the single letter `f` —
+/// which was in none of them, so every false row in a `boolean` column painted
+/// **`true`** the moment the Boolean format was chosen. `read_bool` is the edit
+/// path's reader, is case-insensitive throughout, and says in its own doc that
+/// it is deliberately wide *because* PostgreSQL says `t`/`f`; the two never
+/// met, so one column could paint `true` while its own picker held **false**.
+///
+/// And a `None` from it falls back to the raw display rather than to `true`,
+/// which is the module's own rule at [`apply`]: a formatter can never hide or
+/// corrupt data. The old `_ => true` broke it — a mis-clicked Boolean format on
+/// a `name` column printed the word over every name.
+///
+/// The numeric arms stay: `1`/`0` is how MySQL and SQLite store one, and a
+/// number that is neither is still a number the user can read.
 fn bool_glyph(v: &Value) -> String {
     let falsey = match v {
         Value::Null => return v.display(),
         Value::Int(0) | Value::UInt(0) => true,
         Value::Int(_) | Value::UInt(_) => false,
         Value::Float(f) => *f == 0.0,
-        Value::Str(s) => matches!(
-            s.trim(),
-            "" | "0" | "false" | "FALSE" | "False" | "no" | "NO" | "No"
-        ),
+        Value::Str(s) => match crate::celledit::read_bool(s) {
+            Some(b) => !b,
+            None => return v.display(),
+        },
     };
     if falsey {
         "false".to_string()
@@ -539,6 +557,52 @@ mod tests {
             "false"
         );
         assert_eq!(apply(ColumnFormat::Bool, &Value::Str("yes".into())), "true");
+    }
+
+    /// **The formatter read PostgreSQL's own boolean spelling backwards.** Its
+    /// text protocol hands `false` back as the single letter `f`, which was in
+    /// none of the eight literals the glyph matched — so every false row in a
+    /// `boolean` column painted **`true`** the moment the user chose the
+    /// Boolean format. `celledit::read_bool` is the workspace's other reader of
+    /// "is this text a boolean", is case-insensitive throughout and says in its
+    /// own doc that it is wide *because* PostgreSQL says `t`/`f`; the two never
+    /// met, so one column could paint `true` while its own editor showed
+    /// **false** as the held value.
+    #[test]
+    fn every_engines_boolean_spelling_reads_the_same_way_it_edits() {
+        for falsey in ["f", "F", "false", "FaLsE", "no", "n", "off", "OFF", "0"] {
+            assert_eq!(
+                apply(ColumnFormat::Bool, &Value::Str(falsey.into())),
+                "false",
+                "{falsey:?}"
+            );
+        }
+        for truthy in ["t", "T", "true", "TrUe", "yes", "y", "on", "ON", "1"] {
+            assert_eq!(
+                apply(ColumnFormat::Bool, &Value::Str(truthy.into())),
+                "true",
+                "{truthy:?}"
+            );
+        }
+    }
+
+    /// **A formatter can never hide or corrupt data** — the module's own rule,
+    /// which the glyph's `_ => true` broke: text that is not a boolean at all
+    /// printed `true` over itself, so a mis-clicked format on a `name` column
+    /// replaced every name with the word.
+    #[test]
+    fn text_that_is_not_a_boolean_falls_back_to_itself() {
+        for raw in ["hello", "7", "-1", "", "  ", "2"] {
+            assert_eq!(
+                apply(ColumnFormat::Bool, &Value::Str(raw.into())),
+                raw,
+                "{raw:?}"
+            );
+        }
+        // A number that is not 0 stays truthy: `Int`/`Float` are a different
+        // question from text, and `1`/`0` is how MySQL and SQLite store one.
+        assert_eq!(apply(ColumnFormat::Bool, &Value::Int(7)), "true");
+        assert_eq!(apply(ColumnFormat::Bool, &Value::Float(0.0)), "false");
     }
 
     #[test]

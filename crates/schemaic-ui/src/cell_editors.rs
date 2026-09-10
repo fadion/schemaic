@@ -844,7 +844,11 @@ fn day_cell(
     let ed = editor.clone();
     text(day.day.to_string())
         .on_click_stop(move |_| {
-            buf.set(celledit::set_date(&ed, &buf.get_untracked(), day));
+            // The client's offset, the same one `Now` states — see
+            // `celledit::set_date`. Read at the click, not captured: a panel
+            // left open across a DST change would otherwise state the old one.
+            let (_, _, offset) = date::local_now();
+            buf.set(celledit::set_date(&ed, &buf.get_untracked(), day, &offset));
             (done)();
         })
         .style(move |s| {

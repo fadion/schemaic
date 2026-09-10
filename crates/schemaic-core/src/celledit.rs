@@ -436,31 +436,55 @@ pub fn toggle_set_member(value: &str, member: &str, members: &[String]) -> Strin
 /// there. Any other editor is not a date column and is left alone; a caller that
 /// reached here with one has a bug, and rewriting the cell would hide it.
 ///
-/// **The offset does not come along, on either flavour of column.** It is the
-/// old value's, and an offset qualifies a particular instant: `+01` on a Berlin
-/// `timestamptz` is true in January and false in July, so carrying it onto a
-/// picked July day restates the time of day an hour out — pick 15 July on
-/// `2024-01-15 11:30:00+01` and the cell re-reads as `12:30:00+02`. The day
-/// changed and so did the thing the user did not touch. Dropping it hands the
-/// wall clock to the server to resolve in its session zone, which is what
-/// "keep the time of day" means to whoever picked the day.
+/// **On a column that resolves one, the offset is re-stated as the client's**;
+/// on one that cannot, there is none. `offset` is the same
+/// `crate::date::local_now()` third element [`set_now`] takes, and passing it
+/// here is what makes the pair coherent.
 ///
-/// [`set_now`] does the opposite and for the same reason: *that* instant is the
-/// client's, so it has to be stated. Here the instant is the server's rendering,
-/// and the user changed only which day it falls on.
-pub fn set_date(editor: &CellEditor, current: &str, date: Date) -> String {
+/// **The pair is the reason.** This used to clear the offset unconditionally, on
+/// the premise that it was "the old value's" — the server's rendering — and that
+/// handing back a bare wall clock lets the server resolve it in its session
+/// zone. True of a value read from the server; false of one [`set_now`] wrote
+/// two clicks earlier, which is the *client's* assertion about which instant
+/// "now" is. Client at UTC+2, server at UTC: **Now** put `09:00:00+02:00` in the
+/// field, picking another day turned it into a bare `09:00:00`, and the commit
+/// stored an instant two hours from the one the field had been showing — with
+/// the re-read rendered back in the server's zone, so nothing on screen said it
+/// had moved. Every test asked one of the two functions at a time; nothing
+/// composed them.
+///
+/// **What this costs, stated rather than hidden.** An offset qualifies a
+/// particular instant, and the client's is *today's*: pick a July day in January
+/// from Berlin and the value is stated `+01`, an hour from the July wall clock
+/// the field shows. Recomputing it needs the zone's DST rules, which `core` has
+/// no business carrying, and the string alone cannot tell a server-rendered
+/// offset from a client-asserted one. So this is a choice between two wrong
+/// answers, and it takes the one that is wrong only across a DST boundary over
+/// the one that was wrong whenever the client and the server sit in different
+/// zones.
+pub fn set_date(editor: &CellEditor, current: &str, date: Date, offset: &str) -> String {
+    // A column that cannot resolve an offset is given none: a tail the
+    // destination discards would suggest the instant was pinned when it was not
+    // — `set_now`'s own reasoning, and the half of it that has not changed.
+    let tail = match editor {
+        CellEditor::DateTime(Zoned::Offset) => offset,
+        _ => "",
+    };
     match editor {
         CellEditor::Date => date.iso(),
         CellEditor::DateTime(_) => match Stamp::parse(current) {
             Some(s) => match s.time() {
-                Some(_) => s.with_date(date).with_offset("").render(),
+                Some(_) => s.with_date(date).with_offset(tail).render(),
                 None => s
                     .with_date(date)
                     .with_time(Time::MIDNIGHT)
-                    .with_offset("")
+                    .with_offset(tail)
                     .render(),
             },
-            None => Stamp::from_date(date).with_time(Time::MIDNIGHT).render(),
+            None => Stamp::from_date(date)
+                .with_time(Time::MIDNIGHT)
+                .with_offset(tail)
+                .render(),
         },
         _ => current.to_string(),
     }
@@ -1036,11 +1060,11 @@ mod tests {
     #[test]
     fn picking_a_day_on_a_date_column_writes_the_bare_date() {
         assert_eq!(
-            set_date(&CellEditor::Date, "2020-05-05", day(2024, 1, 15)),
+            set_date(&CellEditor::Date, "2020-05-05", day(2024, 1, 15), "+02:00"),
             "2024-01-15"
         );
         assert_eq!(
-            set_date(&CellEditor::Date, "", day(2024, 1, 15)),
+            set_date(&CellEditor::Date, "", day(2024, 1, 15), "+02:00"),
             "2024-01-15"
         );
     }
@@ -1050,55 +1074,99 @@ mod tests {
     #[test]
     fn picking_a_day_on_a_datetime_column_keeps_the_time_of_day() {
         assert_eq!(
-            set_date(&naive(), "2020-05-05 23:59:59.250", day(2024, 1, 15)),
+            set_date(
+                &naive(),
+                "2020-05-05 23:59:59.250",
+                day(2024, 1, 15),
+                "+02:00"
+            ),
             "2024-01-15 23:59:59.250"
         );
     }
 
-    /// **And the offset is not part of the time of day.** `+01` on a Berlin
-    /// `timestamptz` is true in January and false in July, so carrying it onto a
-    /// picked July day restates the wall clock an hour out: the value below used
-    /// to come back `2024-07-15 11:30:00+01`, which the server stores as
-    /// `10:30Z` and renders back as **`12:30:00+02`**. The day changed and so did
-    /// the one thing the user did not touch.
+    /// **The old value's offset is not carried, and the client's is stated.**
     ///
-    /// Dropped rather than recomputed: recomputing needs the zone's DST rules,
-    /// which `core` has no business carrying, and the server resolves a bare wall
-    /// clock in its session zone — which is what "keep the time of day" means to
-    /// whoever picked the day.
+    /// Carrying the old one restates the wall clock an hour out across a DST
+    /// boundary — `2024-01-15 11:30:00+01` picked onto 15 July would come back
+    /// `11:30:00+01`, which a Berlin server stores as `10:30Z` and renders back
+    /// as `12:30:00+02`. But *dropping* it was wrong the other way: on a column
+    /// that resolves an offset, a bare wall clock is handed to the server to
+    /// read in **its** session zone, so a client and server in different zones
+    /// stored an instant the field had never shown. See `set_date`'s doc for
+    /// why there is no third answer without the zone's DST rules.
     #[test]
-    fn picking_a_day_does_not_carry_the_old_values_offset() {
+    fn picking_a_day_states_the_clients_offset_not_the_values() {
         assert_eq!(
-            set_date(&zoned(), "2024-01-15 11:30:00+01", day(2024, 7, 15)),
-            "2024-07-15 11:30:00"
+            set_date(
+                &zoned(),
+                "2024-01-15 11:30:00+01",
+                day(2024, 7, 15),
+                "+02:00"
+            ),
+            "2024-07-15 11:30:00+02:00"
         );
-        // A `Z` is an offset too, and the same reasoning applies.
+        // A `Z` is an offset too, and it is replaced like any other.
         assert_eq!(
-            set_date(&zoned(), "2024-01-15 11:30:00Z", day(2024, 7, 15)),
-            "2024-07-15 11:30:00"
+            set_date(&zoned(), "2024-01-15 11:30:00Z", day(2024, 7, 15), "+02:00"),
+            "2024-07-15 11:30:00+02:00"
         );
-        // A column that cannot hold one had none to drop, and the fraction —
-        // which *is* part of the time of day — stays either way.
+        // A column that cannot resolve one is given none — the half of the old
+        // rule that has not changed — and the fraction, which *is* part of the
+        // time of day, stays either way.
         assert_eq!(
-            set_date(&naive(), "2020-05-05 23:59:59.250", day(2024, 1, 15)),
+            set_date(
+                &naive(),
+                "2020-05-05 23:59:59.250",
+                day(2024, 1, 15),
+                "+02:00"
+            ),
             "2024-01-15 23:59:59.250"
         );
-        // A value with no time of day gains midnight and still no tail.
+        // A value with no time of day gains midnight, and the tail follows the
+        // column rather than the value.
         assert_eq!(
-            set_date(&zoned(), "2024-01-15+01", day(2024, 7, 15)),
+            set_date(&zoned(), "2024-01-15+01", day(2024, 7, 15), "+02:00"),
+            "2024-07-15 00:00:00+02:00"
+        );
+        assert_eq!(
+            set_date(&naive(), "2024-01-15+01", day(2024, 7, 15), "+02:00"),
             "2024-07-15 00:00:00"
+        );
+    }
+
+    /// **The pair, which nothing composed.** `Now` states the client's instant
+    /// and the very next click used to throw the offset away: client at UTC+2,
+    /// server at UTC, the field showed `09:00:00+02:00` and the commit stored
+    /// an instant two hours from it — rendered back in the server's zone, so
+    /// nothing on screen said it had moved. Every test asked one function at a
+    /// time, which is the shape CLAUDE.md's testing note names as the recurring
+    /// defect.
+    #[test]
+    fn now_then_pick_a_day_keeps_the_instant_now_stated() {
+        let after_now = set_now(&zoned(), "", now_at(9, 0, 0, "+02:00"));
+        assert_eq!(after_now, "2024-01-15 09:00:00+02:00");
+        assert_eq!(
+            set_date(&zoned(), &after_now, day(2024, 7, 15), "+02:00"),
+            "2024-07-15 09:00:00+02:00"
+        );
+        // And on a column that cannot resolve one, neither half states a tail.
+        let after_now = set_now(&naive(), "", now_at(9, 0, 0, "+02:00"));
+        assert_eq!(after_now, "2024-01-15 09:00:00");
+        assert_eq!(
+            set_date(&naive(), &after_now, day(2024, 7, 15), "+02:00"),
+            "2024-07-15 09:00:00"
         );
     }
 
     #[test]
     fn picking_a_day_on_an_empty_datetime_starts_at_midnight() {
         assert_eq!(
-            set_date(&naive(), "", day(2024, 1, 15)),
+            set_date(&naive(), "", day(2024, 1, 15), "+02:00"),
             "2024-01-15 00:00:00"
         );
         // Same for a value the parser can make nothing of — the cell had no time.
         assert_eq!(
-            set_date(&naive(), "0000-00-00 00:00:00", day(2024, 1, 15)),
+            set_date(&naive(), "0000-00-00 00:00:00", day(2024, 1, 15), "+02:00"),
             "2024-01-15 00:00:00"
         );
     }
@@ -1106,7 +1174,7 @@ mod tests {
     #[test]
     fn a_datetime_column_holding_only_a_date_gains_midnight() {
         assert_eq!(
-            set_date(&naive(), "2020-05-05", day(2024, 1, 15)),
+            set_date(&naive(), "2020-05-05", day(2024, 1, 15), "+02:00"),
             "2024-01-15 00:00:00"
         );
     }
@@ -1114,7 +1182,7 @@ mod tests {
     #[test]
     fn a_column_that_is_not_a_date_is_left_alone() {
         assert_eq!(
-            set_date(&CellEditor::Text, "whatever", day(2024, 1, 15)),
+            set_date(&CellEditor::Text, "whatever", day(2024, 1, 15), "+02:00"),
             "whatever"
         );
         assert_eq!(
