@@ -3392,9 +3392,36 @@ impl SequenceInfo {
 /// `EnumInfo`/`DomainInfo`/`SequenceInfo` without building an owned `ObjectItem`
 /// first — see [`DbSchema::objects_matching`], which is on a per-keystroke path
 /// and so must not clone the objects it rejects.
+/// **It allocates nothing for an ASCII name.** The body was
+/// `name.to_lowercase().contains(needle_lower)` — one heap allocation per name
+/// asked — and the Find-Anywhere palette is deliberately undebounced, so a term
+/// that has not narrowed to anything yet (`custz` on the way to `customers`)
+/// walked every table name and every column name of every loaded database,
+/// allocating and freeing a `String` for each. Measured in release on a
+/// synthetic schema with a needle matching nothing — the worst case, and the
+/// one that happens while you are still typing — that was 0.66 ms per database
+/// at 500 tables × 25 columns and 1.57 ms at 1000 × 30; ten middling databases
+/// is ~6.6 ms on the UI thread per character. The early exits do not help on
+/// that input: nothing fills a bucket, so nothing breaks out.
+///
+/// The fallback is kept rather than replaced because `to_lowercase` is not
+/// `to_ascii_lowercase`: `İ` lowercases to two chars and `ẞ` to `ß`, so a
+/// byte-wise walk would answer differently for the names that motivated
+/// `ghost_suffix`. The fast path is taken only when *both* sides are ASCII,
+/// where the two are identical by construction, and
+/// `the_allocation_free_path_agrees_with_lowercasing_the_name` is what says so.
 pub fn object_name_matches(name: &str, needle_lower: &str) -> bool {
     if needle_lower.is_empty() {
         return false;
+    }
+    if name.is_ascii() && needle_lower.is_ascii() {
+        let (hay, needle) = (name.as_bytes(), needle_lower.as_bytes());
+        return hay.len() >= needle.len()
+            && hay.windows(needle.len()).any(|w| {
+                w.iter()
+                    .zip(needle)
+                    .all(|(a, b)| a.to_ascii_lowercase() == *b)
+            });
     }
     name.to_lowercase().contains(needle_lower)
 }
@@ -6103,6 +6130,54 @@ mod tests {
         assert!(!t.any_column_matches("zzz"));
         // Empty needle matches nothing (callers handle "no filter" separately).
         assert!(!t.matches_search(""));
+    }
+
+    /// **The allocation-free path and the lowercasing one answer the same.**
+    ///
+    /// `object_name_matches` is the single name-versus-term rule for every
+    /// schema-search surface — fourteen callers — and its body stopped being
+    /// `name.to_lowercase().contains(needle)` so the undebounced palette would
+    /// stop allocating a `String` per table and per column per keystroke. The
+    /// fast path is only sound where both sides are ASCII, because
+    /// `to_lowercase` is not `to_ascii_lowercase`: `İ` becomes two chars and
+    /// `ẞ` becomes `ß`. This walks both against a corpus that crosses that
+    /// line in every direction.
+    #[test]
+    fn the_allocation_free_path_agrees_with_lowercasing_the_name() {
+        let slow = |name: &str, needle_lower: &str| {
+            !needle_lower.is_empty() && name.to_lowercase().contains(needle_lower)
+        };
+        let names = [
+            "",
+            "o",
+            "Orders",
+            "ORDERS",
+            "order_lines",
+            "customer_email",
+            // Non-ASCII names, including the two whose lowercase changes
+            // length — the reason the slow path is kept rather than replaced.
+            "İzmir",
+            "STRAẞE",
+            "café",
+            "ÎLE_DE_FRANCE",
+            "Ünterlagen",
+        ];
+        let needles = [
+            "o", "ord", "orders", "orderz", "s", "_", "email", "zzz",
+            // Lower-cased the way every caller lower-cases its term.
+            "i̇zmir", "izmir", "straße", "café", "î", "ü", "ẞ",
+        ];
+        for name in names {
+            for needle in needles {
+                assert_eq!(
+                    object_name_matches(name, needle),
+                    slow(name, needle),
+                    "{name:?} vs {needle:?}"
+                );
+            }
+            // The empty needle is nobody's match, on either path.
+            assert!(!object_name_matches(name, ""));
+        }
     }
 
     #[test]

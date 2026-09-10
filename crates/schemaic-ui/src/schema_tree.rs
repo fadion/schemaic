@@ -1119,7 +1119,18 @@ pub(crate) fn schema_panel(ui: Ui) -> impl IntoView {
         })
         .keyboard_navigable()
         .on_event(EventListener::FocusGained, move |_| {
-            nav.focused.set(true);
+            // **Guarded, because this fires on a tree that is already
+            // focused.** `widgets::set_menu_return` hands the keyboard back
+            // when a context menu closes, and a `set` to the same value still
+            // notifies: every row reads `nav.focused` and `nav.selected` in
+            // its own `.style()` closure and again in `with_nav_scroll`'s
+            // cursor effect, so an unchanged write is two full-tree restyles
+            // (~1.2 ms at 2,000 rows, by `tree_row`'s own measurement) for
+            // nothing. The same pair fired on every click into the tree that
+            // did not move the cursor, which is most of them.
+            if !nav.focused.get_untracked() {
+                nav.focused.set(true);
+            }
             // Start from the active table when the cursor is nowhere; otherwise
             // resume where it was. The decision is `resume_cursor`, which states
             // why the second half matters now that the context menu hands focus
@@ -1141,13 +1152,22 @@ pub(crate) fn schema_panel(ui: Ui) -> impl IntoView {
                     .any(|r| r.key == k)
                 })
             });
-            if let Some(k) = seeded {
+            // `resume_cursor`'s first branch returns the cursor it was given,
+            // so on a focus return with a cursor already set this is the value
+            // that is already there.
+            if let Some(k) = seeded
+                && nav
+                    .selected
+                    .with_untracked(|cur| cur.as_deref() != Some(k.as_str()))
+            {
                 nav.selected.set(Some(k));
             }
             EventPropagation::Continue
         })
         .on_event(EventListener::FocusLost, move |_| {
-            nav.focused.set(false);
+            if nav.focused.get_untracked() {
+                nav.focused.set(false);
+            }
             EventPropagation::Continue
         })
         .on_event(EventListener::KeyDown, move |e| {
@@ -3665,6 +3685,49 @@ mod tests {
         // A match on the level above shows the whole folder.
         assert_eq!(objects_shown(&enums, true, false, "zzz").len(), enums.len());
         assert_eq!(objects_shown(&enums, false, true, "zzz").len(), enums.len());
+    }
+
+    /// **The tree's focus handlers do not write a value that is already
+    /// there.**
+    ///
+    /// `resume_cursor` is pure and tested, and it is not the bug: its first
+    /// branch returns the cursor it was *given*, and the handler then wrote it
+    /// back unconditionally. A `set` to the same value still notifies, and
+    /// every row reads `nav.focused` and `nav.selected` in its `.style()`
+    /// closure and again in `with_nav_scroll`'s cursor effect — so closing a
+    /// context menu (which hands focus back to a tree that is already focused)
+    /// cost two full-tree restyles for nothing, as did every click that did
+    /// not move the cursor.
+    ///
+    /// The handlers live inside a view builder, so no test here can call them;
+    /// this asserts on the source, in `source_gate`'s idiom.
+    #[test]
+    fn the_focus_handlers_guard_their_writes() {
+        let src = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("src")
+                .join("schema_tree.rs"),
+        )
+        .expect("this file's own source");
+        let body = crate::source_gate::production_code(&src);
+        // One `nav.focused` write per handler, and each preceded by its own
+        // guard — `!get_untracked()` before the `true`, `get_untracked()`
+        // before the `false`. Counted rather than matched pairwise, the way
+        // `every_piped_child` counts: a third writer shows up as an imbalance.
+        let writes = body.matches("nav.focused.set(").count();
+        let guards = body.matches("nav.focused.get_untracked()").count();
+        assert_eq!(
+            writes, guards,
+            "a `nav.focused` write is unguarded; a same-value `set` still \
+             notifies, and every row in the tree reads it in its style closure"
+        );
+        assert_eq!(writes, 2, "this gate is stale — the handlers have moved");
+        // The seeded cursor is the other half: `resume_cursor` hands back the
+        // cursor it was given, so the write has to compare first.
+        assert!(
+            body.contains("|cur| cur.as_deref() != Some(k.as_str())"),
+            "the resumed cursor is written back without comparing it"
+        );
     }
 
     /// **A namespace row's capsule counts the tables under it, not the ones
