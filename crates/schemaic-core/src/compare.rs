@@ -3142,6 +3142,11 @@ mod tests {
         // comparison produces no account change, so the two are byte-identical
         // — which is why `export_script` exists as a function rather than as a
         // comment claiming the two are interchangeable here.
+        //
+        // This is an identity by construction — `export_script` returns
+        // `editor_script()` on this input — so it pins the *pass-through* and
+        // nothing else. The branch that matters is pinned by
+        // `a_plan_carrying_an_account_change_does_not_export_the_password`.
         let c = mysql(
             schema_of(vec![]),
             schema_of(vec![table("fresh", &[("id", "int")])]),
@@ -3577,14 +3582,78 @@ mod tests {
     fn the_plans_statements_are_exactly_its_sets_statements_in_order() {
         // The aggregate is a concatenation, not a second emitter. If this ever
         // diverges, some statement is being built here instead of in `ddl`.
+        //
+        // **The expectation is built from `ddl` alone** and never reads
+        // `plan.sets`. The previous form was
+        // `assert_eq!(plan.emit(), plan.sets.iter().flat_map(ChangeSet::emit))`
+        // — the same expression as `SchemaPlan::emit`'s own body, so it held
+        // for every input and for every future body keeping that first step,
+        // which is the one thing it was written to catch. `!is_empty()` saved
+        // it from being vacuous, not from being tautological.
+        let gone = table("gone", &[("id", "int")]);
+        let fresh = table("fresh", &[("id", "int")]);
         let c = mysql(
-            schema_of(vec![table("gone", &[("id", "int")])]),
-            schema_of(vec![table("fresh", &[("id", "int")])]),
+            schema_of(vec![gone.clone()]),
+            schema_of(vec![fresh.clone()]),
         );
         let plan = c.plan(|_| true);
-        let expected: Vec<String> = plan.sets.iter().flat_map(|s| s.emit()).collect();
+
+        let mut expected = ddl::create(&TableDraft::from_table(&fresh), SqlDialect::MySql).emit();
+        expected.extend(ddl::single(&gone.name, None, SqlDialect::MySql, Change::DropTable).emit());
+        assert!(
+            expected.len() >= 2,
+            "the fixture has to plan both: {expected:?}"
+        );
         assert_eq!(plan.emit(), expected);
-        assert!(!expected.is_empty());
+    }
+
+    /// **The redaction branch of [`SchemaPlan::export_script`] had no coverage
+    /// anywhere in the workspace.** Its sibling test asserts
+    /// `export_script() == editor_script()` on a plan with no account change —
+    /// and the body's first line is `if no account change { return
+    /// editor_script() }`, so that assertion is `f() == f()` and cannot fail.
+    ///
+    /// No builder puts an account change in a compare plan *today*, which is
+    /// precisely the situation the method's own doc says it is written to
+    /// survive: the property is "no plaintext password leaves this modal", and
+    /// a future builder should inherit it rather than have to read the prose.
+    /// So the plan is assembled here by hand.
+    #[test]
+    fn a_plan_carrying_an_account_change_does_not_export_the_password() {
+        let draft = crate::users::AccountDraft {
+            name: "reporter".to_string(),
+            host: "%".to_string(),
+            kind: crate::users::PrincipalKind::User,
+            password: "hunter2-in-the-clear".to_string(),
+        };
+        let name = draft.name.clone();
+        let plan = SchemaPlan {
+            sets: vec![ddl::single(
+                &name,
+                None,
+                SqlDialect::MySql,
+                Change::CreateAccount(Box::new(draft)),
+            )],
+            dialect: SqlDialect::MySql,
+            cycles: false,
+            omitted: Vec::new(),
+        };
+        assert!(
+            plan.editor_script().contains("hunter2-in-the-clear"),
+            "the fixture has to carry a password for this to mean anything: {}",
+            plan.editor_script()
+        );
+
+        let out = plan.export_script();
+        assert!(
+            !out.contains("hunter2-in-the-clear"),
+            "a password reached the clipboard and a saved editor tab: {out}"
+        );
+        assert!(out.contains(ddl::PASSWORD_PLACEHOLDER), "{out}");
+        assert!(
+            out.contains("CREATE USER") || out.to_uppercase().contains("CREATE USER"),
+            "the statement itself still travels: {out}"
+        );
     }
 
     #[test]
