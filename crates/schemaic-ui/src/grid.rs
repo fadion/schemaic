@@ -172,16 +172,47 @@ fn cell_num(c: CellRef) -> Option<f64> {
     }
 }
 
-/// Compare two precomputed [`SortKey`]s: NULLs sort last; two numeric cells
-/// compare numerically; anything else compares by text.
+/// Compare two precomputed [`SortKey`]s: NULLs sort last; numeric cells compare
+/// numerically and sort **before** every non-numeric one; two non-numeric cells
+/// compare by text.
+///
+/// **The two orders are disjoint, and interleaving them was not a total order.**
+/// The `_ => a.text.cmp(b.text)` arm compared a numeric key against a text one
+/// *as text*, which is a cycle rather than a preference: with
+/// `Int 9`, `Int 100`, `Str "50"` — one SQLite column with no declared affinity,
+/// or any `json_extract`/`CASE`/`coalesce` projection, since `db/sqlite.rs` maps
+/// per *value* — it gave `9 < 100` (numeric), `100 < "50"` (text, `"100" <
+/// "50"`) and `"50" < 9` (text, `"50" < "9"`). `slice::sort_by` is free to
+/// return anything for a comparator like that: measured at eight row counts on
+/// rustc 1.97 it returned the input pattern unchanged at 30 rows,
+/// `100, 50, 9, …` at 1,000 and `9, 100, 50, …` at 5,000 — neither sorted nor
+/// original, and different per row count. Newer toolchains panic on it.
+///
+/// So a numeric key is never compared with a text one at all: numbers first, in
+/// numeric order, then text in text order, then NULLs. Which group leads is a
+/// choice; that they do not interleave is not.
+///
+/// `NaN` gets a fixed slot at the end of the numeric group for the same reason —
+/// `partial_cmp(…).unwrap_or(Equal)` made it equal to *every* value, which is
+/// the same violation. A PostgreSQL `double precision` column can hold one, and
+/// this app's own importer has put one there.
 fn cmp_key(a: &SortKey, b: &SortKey) -> Ordering {
     match (a.null, b.null) {
         (true, true) => Ordering::Equal,
         (true, false) => Ordering::Greater,
         (false, true) => Ordering::Less,
         (false, false) => match (a.num, b.num) {
-            (Some(x), Some(y)) => x.partial_cmp(&y).unwrap_or(Ordering::Equal),
-            _ => a.text.cmp(b.text),
+            (Some(x), Some(y)) => match x.partial_cmp(&y) {
+                Some(o) => o,
+                // At least one is NaN: NaNs last within the numeric group, and
+                // equal to each other.
+                None => x.is_nan().cmp(&y.is_nan()),
+            },
+            // A number sorts before anything that is not one, rather than being
+            // compared against it.
+            (Some(_), None) => Ordering::Less,
+            (None, Some(_)) => Ordering::Greater,
+            (None, None) => a.text.cmp(b.text),
         },
     }
 }
@@ -10893,35 +10924,102 @@ mod tests {
         assert_eq!(compute_order(&rs, Some((0, true))), vec![1, 0, 2]);
     }
 
+    /// **The comparator is a total order, on a mixed-tag column too.**
+    ///
+    /// This test used to compare `compute_order` against a *reference
+    /// implementation of the same comparator* — so both were wrong in the same
+    /// way and it passed. The old rule compared numerically when both keys were
+    /// numeric and **by text otherwise**, which is a cycle rather than a
+    /// preference: `Int 9`, `Int 100`, `Str "50"` gives `9 < 100` (numeric),
+    /// `100 < "50"` (text) and `"50" < 9` (text). `slice::sort_by` may return
+    /// anything for such a comparator, and did: measured at eight row counts on
+    /// rustc 1.97 it gave the input pattern unchanged at 30 rows,
+    /// `100, 50, 9, …` at 1,000 and `9, 100, 50, …` at 5,000. Newer toolchains
+    /// panic instead.
+    ///
+    /// Asserted as the *property* rather than against a reference, because a
+    /// reference is exactly what hid it.
     #[test]
-    fn compute_order_matches_naive_pairwise_on_mixed_column() {
-        // Decorate-sort must order identically to a per-pair comparison even when a
-        // column mixes numeric-tagged and string-tagged cells (the defensive case):
-        // numeric compares numerically only when *both* are numeric, else by text.
-        let cells = vec![
-            Value::Int(100),
-            Value::Str("apple".into()),
-            Value::Null,
-            Value::Int(9),
-            Value::Str("9zzz".into()),
+    fn the_sort_comparator_is_a_total_order() {
+        let key = |null: bool, num: Option<f64>, text: &'static str| SortKey { null, num, text };
+        // A mixed-tag column, plus the two shapes that are their own violation.
+        let keys = [
+            key(false, Some(9.0), "9"),
+            key(false, Some(100.0), "100"),
+            key(false, None, "50"),
+            key(false, None, "apple"),
+            key(false, Some(-1.0), "-1"),
+            key(false, Some(f64::NAN), "NaN"),
+            key(false, Some(f64::NAN), "nan"),
+            key(true, None, ""),
+            key(true, None, ""),
         ];
-        let rs = rs_col("MIXED", cells);
-        let got = compute_order(&rs, Some((0, true)));
-        // Reference: sort indices with a fresh per-pair comparator over cells.
-        let mut want: Vec<usize> = (0..rs.row_count()).collect();
-        want.sort_by(|&a, &b| {
-            let (x, y) = (rs.cell(a, 0).unwrap(), rs.cell(b, 0).unwrap());
-            match (x.is_null(), y.is_null()) {
-                (true, true) => Ordering::Equal,
-                (true, false) => Ordering::Greater,
-                (false, true) => Ordering::Less,
-                (false, false) => match (cell_num(x), cell_num(y)) {
-                    (Some(p), Some(q)) => p.partial_cmp(&q).unwrap_or(Ordering::Equal),
-                    _ => x.display().cmp(y.display()),
-                },
+        // Antisymmetry, and reflexivity.
+        for a in &keys {
+            assert_eq!(cmp_key(a, a), Ordering::Equal, "{:?}", a.text);
+            for b in &keys {
+                assert_eq!(
+                    cmp_key(a, b),
+                    cmp_key(b, a).reverse(),
+                    "{} vs {}",
+                    a.text,
+                    b.text
+                );
             }
-        });
-        assert_eq!(got, want);
+        }
+        // Transitivity — the property the cycle broke.
+        for a in &keys {
+            for b in &keys {
+                for c in &keys {
+                    if cmp_key(a, b) != Ordering::Greater && cmp_key(b, c) != Ordering::Greater {
+                        assert_ne!(
+                            cmp_key(a, c),
+                            Ordering::Greater,
+                            "{} <= {} <= {} but {} > {}",
+                            a.text,
+                            b.text,
+                            c.text,
+                            a.text,
+                            c.text
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// The failure the cycle produced, through the real entry point.
+    ///
+    /// Asserted as the **sequence of values**, not as "each adjacent pair is in
+    /// order under `cmp_key`" — a cyclic comparator can satisfy that trivially,
+    /// which is the trap the reference-implementation version of this test fell
+    /// into. Numbers ascending, then text ascending, then NULL.
+    #[test]
+    fn a_mixed_tag_column_sorts_into_a_real_order() {
+        // Ten copies of the review's `9 / 100 / '50'`, which is what a SQLite
+        // column with no declared affinity returns (`db/sqlite.rs` maps per
+        // *value*), plus a name and a NULL.
+        let mut cells = Vec::new();
+        for _ in 0..10 {
+            cells.push(Value::Int(9));
+            cells.push(Value::Int(100));
+            cells.push(Value::Str("50".into()));
+        }
+        cells.push(Value::Str("apple".into()));
+        cells.push(Value::Null);
+        let rs = rs_col("MIXED", cells);
+        let order = compute_order(&rs, Some((0, true)));
+        let seq: Vec<String> = order
+            .iter()
+            .map(|&r| rs.cell(r, 0).unwrap().display().to_string())
+            .collect();
+        let mut want: Vec<String> = Vec::new();
+        want.extend(std::iter::repeat_n("9".to_string(), 10));
+        want.extend(std::iter::repeat_n("100".to_string(), 10));
+        want.extend(std::iter::repeat_n("50".to_string(), 10));
+        want.push("apple".to_string());
+        want.push("NULL".to_string()); // how a NULL cell displays
+        assert_eq!(seq, want);
     }
 }
 
