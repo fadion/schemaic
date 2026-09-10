@@ -687,10 +687,21 @@ pub fn plan(
     // silently emitting a statement that cannot succeed is not the alternative.
     let mut fks: Vec<String> = Vec::new();
     let mut dropped_fks = 0usize;
+    // **The other half of the same accounting, and it had none.** A table whose
+    // DDL is the engine's own captured text carries its keys *inside* the
+    // `CREATE TABLE`, so there is nothing to restate and nothing to drop — but a
+    // key pointing outside the export is still a key pointing at a table this
+    // file does not create. `needs_fk_section` used to gate the whole loop body,
+    // so on SQLite the count stayed 0 and the header said nothing: the restore
+    // succeeds (`PRAGMA foreign_keys = ON` does not validate existing rows), and
+    // the table is unusable from the next write on. The question that predicate
+    // answers is *"restate it separately?"*, not *"is it carried?"*, and only the
+    // first belongs in front of the emit.
+    let mut dangling_fks = 0usize;
     if opts.structure {
         for &i in &order {
             let t = &schema.tables[i];
-            if !needs_fk_section(t) {
+            if t.is_view || t.foreign_keys.is_empty() {
                 continue;
             }
             let (here, elsewhere): (Vec<_>, Vec<_>) = t
@@ -698,6 +709,10 @@ pub fn plan(
                 .iter()
                 .cloned()
                 .partition(|fk| order.iter().any(|&j| fk_targets(fk, t, &schema.tables[j])));
+            if !needs_fk_section(t) {
+                dangling_fks += elsewhere.len();
+                continue;
+            }
             dropped_fks += elsewhere.len();
             if here.is_empty() {
                 continue;
@@ -800,6 +815,19 @@ pub fn plan(
             crate::text::plural(dropped_fks, "key is", "keys are"),
             crate::text::plural(dropped_fks, "it does", "they do"),
             crate::text::plural(dropped_fks, "it", "them"),
+        ));
+    }
+    // The verbatim-DDL half, and deliberately a different sentence: nothing was
+    // dropped, so saying the key is gone would be the opposite lie. It is in the
+    // file, it restores without complaint, and it points at nothing.
+    if dangling_fks > 0 {
+        header.push_str(&format!(
+            "\n--\n-- {dangling_fks} foreign {} at tables outside this export, and this engine\n\
+             -- writes {} inside the CREATE TABLE above. The restore will not complain; the\n\
+             -- restored {} nothing to point at. Add the missing tables.",
+            crate::text::plural(dangling_fks, "key points", "keys point"),
+            crate::text::plural(dangling_fks, "it", "them"),
+            crate::text::plural(dangling_fks, "key has", "keys have"),
         ));
     }
     text!(header);
@@ -2868,6 +2896,41 @@ mod tests {
         // share the name.
         assert!(text.contains("foreign key is not restated"), "{text}");
         assert!(!text.contains("ADD CONSTRAINT"), "{text}");
+    }
+
+    /// A key carried **inside** a verbatim `CREATE TABLE` still points outside
+    /// the export, and the header has to say so — the one engine where the
+    /// restore succeeds is the one where nothing warned.
+    ///
+    /// SQLite writes its keys inside the table's own DDL, so `needs_fk_section`
+    /// is false and `plan` used to `continue` before the accounting, leaving
+    /// `dropped_fks` at 0 and the header silent. Replayed against SQLite
+    /// 3.53.2 the load is clean — `PRAGMA foreign_keys = ON` does not validate
+    /// existing rows — and every later write to the table fails with
+    /// *no such table: main.customers*.
+    #[test]
+    fn a_verbatim_key_pointing_out_of_the_export_is_still_reported() {
+        let mut orders = refs(table("orders"), "customers");
+        orders.create_sql = Some(
+            "CREATE TABLE \"orders\" (id INTEGER, cust INTEGER REFERENCES customers(id))"
+                .to_string(),
+        );
+        let s = schema_of(vec![orders]);
+        let text = text_of(&plan(
+            &s,
+            "shop",
+            &all(&s),
+            DumpOptions::default(),
+            SqlDialect::Sqlite,
+        ));
+        assert!(
+            text.contains("outside this export"),
+            "the header says nothing about a key that will dangle: {text}"
+        );
+        // And it is *not* the restatable engines' sentence: nothing was
+        // dropped here, so promising that the constraint is gone would be the
+        // opposite lie.
+        assert!(!text.contains("not restated"), "{text}");
     }
 
     /// The re-introspection is deliberate, but its cost is that a selection can
