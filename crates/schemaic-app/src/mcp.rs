@@ -223,7 +223,7 @@ impl McpTool {
     ///
     /// The hidden-database set is a separate matter and still unconsulted on
     /// this path — it reaches only `listed_databases`.
-    fn reads_schema(self) -> bool {
+    pub(crate) fn reads_schema(self) -> bool {
         match self {
             McpTool::RunQuery => false,
             McpTool::ListSchema | McpTool::DescribeTable | McpTool::ProposeTableChange => true,

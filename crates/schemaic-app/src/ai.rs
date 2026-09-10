@@ -58,10 +58,10 @@ use crate::agent_cli::{harness_bin, probe};
 /// so it cannot name a built-in even in principle. Nothing here ever governed the
 /// CLI's own tools — that is why nineteen of them were reachable, and why the
 /// guard on them is `--tools ""` rather than this list.
-pub(crate) fn ai_allowed_tools(may_query: bool) -> Vec<&'static str> {
+pub(crate) fn ai_allowed_tools(may_query: bool, schema: bool) -> Vec<&'static str> {
     crate::mcp::McpTool::ALL
         .into_iter()
-        .filter(|t| may_query || !t.reads_row_data())
+        .filter(|t| (may_query || !t.reads_row_data()) && (schema || !t.reads_schema()))
         .map(|t| t.ai_name())
         .collect()
 }
@@ -1302,7 +1302,7 @@ pub(crate) fn start_ai_session(
         let private = SessionPrivate::of([ep_file.clone()], cwd.clone());
         // **The same list Claude's `--allowedTools` gets**, so no two harnesses
         // can disagree about what this connection's access level offers.
-        let allowed = ai_allowed_tools(data.may_query());
+        let allowed = ai_allowed_tools(data.may_query(), schema_scope != SchemaScope::None);
         let exe = std::env::current_exe()
             .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_else(|_| "schemaic".to_string());
@@ -1592,7 +1592,7 @@ pub(crate) fn start_ai_session(
         return (tx, private);
     }
 
-    let tools = ai_allowed_tools(data.may_query());
+    let tools = ai_allowed_tools(data.may_query(), schema_scope != SchemaScope::None);
     // **Two persistent harnesses, two ways of being told about the server.**
     // Claude is pointed at a config file: launch THIS binary in `--mcp-serve`
     // mode, handing it the (already-tunnelled) DB endpoint — written to a temp
@@ -3144,31 +3144,51 @@ mod tests {
     /// change against the live table was denied — and the failure is invisible,
     /// because the model falls back to writing the fenced block from the schema
     /// it already has and the user sees a preview either way.
+    ///
+    /// **Both axes, and the second one was hard-coded to `true`.** The rule is
+    /// stated per *level*, and there are two of them: `AiData` and *Schema
+    /// context*. This iterated only the first and passed `schema: true` as a
+    /// literal, so `SchemaScope::None` — the setting whose whole purpose is to
+    /// publish no structure — was never compared against anything. At that
+    /// level `tools_list` offers one tool while the allow-list named three,
+    /// and the allow-list did not read the setting at all.
     #[test]
     fn every_offered_tool_is_allow_listed_at_its_level() {
         for reads_data in [true, false] {
-            let allowed = ai_allowed_tools(reads_data);
-            for engine in [
-                schemaic_db::Engine::MySql,
-                schemaic_db::Engine::Postgres,
-                schemaic_db::Engine::Sqlite,
-            ] {
-                let mut offered: Vec<String> = crate::mcp::tools_list(engine, reads_data, true)
-                    .as_array()
-                    .expect("a list")
-                    .iter()
-                    .map(|t| format!("mcp__schemaic__{}", t["name"].as_str().expect("a name")))
-                    .collect();
-                offered.sort();
-                let mut allowed: Vec<String> = allowed.iter().map(|t| (*t).to_string()).collect();
-                allowed.sort();
-                assert_eq!(
-                    offered, allowed,
-                    "{engine:?} at reads_data={reads_data}: the server's tools and the \
-                     allow-list disagree"
-                );
+            for schema in [true, false] {
+                let allowed = ai_allowed_tools(reads_data, schema);
+                for engine in [
+                    schemaic_db::Engine::MySql,
+                    schemaic_db::Engine::Postgres,
+                    schemaic_db::Engine::Sqlite,
+                ] {
+                    let mut offered: Vec<String> =
+                        crate::mcp::tools_list(engine, reads_data, schema)
+                            .as_array()
+                            .expect("a list")
+                            .iter()
+                            .map(|t| {
+                                format!("mcp__schemaic__{}", t["name"].as_str().expect("a name"))
+                            })
+                            .collect();
+                    offered.sort();
+                    let mut allowed: Vec<String> =
+                        allowed.iter().map(|t| (*t).to_string()).collect();
+                    allowed.sort();
+                    assert_eq!(
+                        offered, allowed,
+                        "{engine:?} at reads_data={reads_data}, schema={schema}: the \
+                         server's tools and the allow-list disagree"
+                    );
+                }
             }
         }
+        // And the tightest level really does offer less than the loosest — the
+        // assertion above is about *agreement*, which two empty lists satisfy.
+        assert!(
+            ai_allowed_tools(false, false).len() < ai_allowed_tools(true, true).len(),
+            "the tightest level offers as much as the loosest"
+        );
     }
 
     #[test]
@@ -3314,7 +3334,7 @@ mod tests {
         let overrides = schemaic_ai::harness::codex_mcp_overrides(
             "/usr/bin/schemaic",
             "/tmp/ep.json",
-            &ai_allowed_tools(true),
+            &ai_allowed_tools(true, true),
         );
         for o in &overrides {
             assert!(!o.contains("hunter2"), "{o}");
