@@ -4037,6 +4037,58 @@ impl ServerFlavour {
     }
 }
 
+/// The `information_schema.STATISTICS` expression answering **is this index
+/// switched off** as `1`/`0`, for the MySQL-family server that reported
+/// `version`.
+///
+/// A DBA hides an index to test a plan change — MySQL 8's
+/// `ALTER TABLE … ALTER INDEX … INVISIBLE`, MariaDB 10.6's `… IGNORED`. Both
+/// servers publish the state and both print it in `SHOW CREATE TABLE`, and
+/// neither was read: a hidden index came back as an ordinary one with
+/// [`IndexInfo::lossy`] `false`, so any edit to it took `ddl::diff`'s
+/// `DROP INDEX` + `ADD INDEX` arm and brought it back **live**, with the
+/// optimizer using it again and the preview saying nothing.
+///
+/// **An expression rather than a column name**, because the two columns are
+/// named differently *and* carry opposite polarity (`IGNORED = 'YES'` versus
+/// `IS_VISIBLE = 'NO'`) — one place for that, not two — and because a server
+/// too old for either has neither column, where naming one fails the whole
+/// query rather than the one value. Same reason the `EXPRESSION` and
+/// `ALGORITHM` columns beside it hold the row shape steady with a `NULL`.
+///
+/// A version this cannot parse falls to the constant `0`: an unread flag is
+/// reported as "not switched off", which is what the model said before this
+/// existed and is the reading that offers an edit rather than refusing one on
+/// a guess.
+pub fn index_disabled_sql(version: &str) -> &'static str {
+    let (major, minor) = major_minor(version);
+    match ServerFlavour::parse_version(version) {
+        // MariaDB 10.6.0 added `IGNORED`.
+        ServerFlavour::MariaDb if (major, minor) >= (10, 6) => {
+            "CASE WHEN IGNORED = 'YES' THEN 1 ELSE 0 END"
+        }
+        // MySQL 8.0.0 added invisible indexes and `IS_VISIBLE`.
+        ServerFlavour::MySql if major >= 8 => "CASE WHEN IS_VISIBLE = 'NO' THEN 1 ELSE 0 END",
+        _ => "0",
+    }
+}
+
+/// The leading `major.minor` of a `SELECT VERSION()` string, or `(0, 0)`.
+///
+/// Both families lead with the numbers and then diverge —
+/// `10.11.14-MariaDB-1:10.11.14+maria~ubu2204`, `8.4.11`, `5.7.44-log` — so the
+/// digits before the second `.` are the whole of what is portable here.
+fn major_minor(version: &str) -> (u32, u32) {
+    let mut parts = version.split('.').map(|p| {
+        p.chars()
+            .take_while(char::is_ascii_digit)
+            .collect::<String>()
+            .parse::<u32>()
+            .unwrap_or(0)
+    });
+    (parts.next().unwrap_or(0), parts.next().unwrap_or(0))
+}
+
 impl DbSchema {
     pub fn table_count(&self) -> usize {
         self.tables.len()
@@ -5453,6 +5505,46 @@ mod sqlite_affinity_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The two servers that can hide an index name the column differently and
+    /// answer with **opposite polarity**, and a server too old for either has
+    /// no column at all — where naming one fails the whole schema fetch rather
+    /// than one value.
+    #[test]
+    fn index_disabled_sql_asks_each_server_the_column_it_has() {
+        // Measured servers: MariaDB 10.11.14 (`IGNORED = 'YES'`) and MySQL
+        // 8.4.11 (`IS_VISIBLE = 'NO'`).
+        assert_eq!(
+            index_disabled_sql("10.11.14-MariaDB-1:10.11.14+maria~ubu2204"),
+            "CASE WHEN IGNORED = 'YES' THEN 1 ELSE 0 END"
+        );
+        assert_eq!(
+            index_disabled_sql("8.4.11"),
+            "CASE WHEN IS_VISIBLE = 'NO' THEN 1 ELSE 0 END"
+        );
+        // Too old for the feature, so too old for the column.
+        assert_eq!(index_disabled_sql("10.5.23-MariaDB"), "0");
+        assert_eq!(index_disabled_sql("5.7.44-log"), "0");
+        // MariaDB's own numbering passed 8 long ago and it has never had
+        // `IS_VISIBLE`, which is why the flavour is asked before the number.
+        assert_eq!(
+            index_disabled_sql("11.4.2-MariaDB"),
+            "CASE WHEN IGNORED = 'YES' THEN 1 ELSE 0 END"
+        );
+        // An unparseable version withholds the read rather than guessing.
+        assert_eq!(index_disabled_sql(""), "0");
+        assert_eq!(index_disabled_sql("unknown"), "0");
+    }
+
+    #[test]
+    fn major_minor_reads_both_families_leading_numbers() {
+        assert_eq!(major_minor("10.11.14-MariaDB-1:10.11.14"), (10, 11));
+        assert_eq!(major_minor("8.4.11"), (8, 4));
+        assert_eq!(major_minor("5.7.44-log"), (5, 7));
+        assert_eq!(major_minor("8"), (8, 0));
+        assert_eq!(major_minor(""), (0, 0));
+        assert_eq!(major_minor("not-a-version"), (0, 0));
+    }
 
     /// MySQL treats `\` as an escape inside a single-quoted literal, so a
     /// comment of `C:\temp` was stored as `C:<TAB>emp` — silently different from

@@ -59,6 +59,14 @@ pub struct Target {
     /// assert both halves of [`schemaic_core::model::Rollback`] where both
     /// exist, and the honest half where only one does — rather than skipping.
     pub non_transactional: Option<&'static str>,
+    /// How to switch an index **off** on this server, or `None` where nothing
+    /// can. `{table}` and `{index}` are substituted.
+    ///
+    /// The two MySQL-family spellings differ and arrived in different releases
+    /// (MySQL 8's `INVISIBLE`, MariaDB 10.6's `IGNORED`); PostgreSQL has no
+    /// equivalent, so its leg returns early rather than asserting a property
+    /// the engine does not have.
+    pub disable_index_sql: Option<&'static str>,
     /// Does a **DDL** plan roll back as a whole on this server?
     ///
     /// PostgreSQL's `run_ddl` wraps the plan in `BEGIN`/`ROLLBACK` and its DDL
@@ -154,6 +162,7 @@ pub static MARIADB: Target = Target {
     namespace: None,
     binary_type: "VARBINARY(4)",
     non_transactional: Some("ENGINE=MyISAM"),
+    disable_index_sql: Some("ALTER TABLE {table} ALTER INDEX {index} IGNORED"),
     transactional_ddl: false,
     grants_are_database_scoped: false,
     trigger_body: Some("SET NEW.name = UPPER(NEW.name)"),
@@ -176,6 +185,7 @@ pub static MYSQL: Target = Target {
     namespace: None,
     binary_type: "VARBINARY(4)",
     non_transactional: Some("ENGINE=MyISAM"),
+    disable_index_sql: Some("ALTER TABLE {table} ALTER INDEX {index} INVISIBLE"),
     transactional_ddl: false,
     grants_are_database_scoped: false,
     trigger_body: Some("SET NEW.name = UPPER(NEW.name)"),
@@ -198,6 +208,7 @@ pub static POSTGRES: Target = Target {
     namespace: Some("public"),
     binary_type: "bytea",
     non_transactional: None,
+    disable_index_sql: None,
     transactional_ddl: true,
     grants_are_database_scoped: true,
     trigger_body: None,

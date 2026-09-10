@@ -911,6 +911,80 @@ pub async fn a_partly_read_index_says_so_and_is_emitted_whole(target: &'static T
     scratch.teardown().await;
 }
 
+/// An index the DBA has **switched off** is read as switched off, so an edit
+/// to it is withheld rather than bringing it silently back to life.
+///
+/// A DBA hides an index to test a plan change — MySQL 8's
+/// `ALTER TABLE … ALTER INDEX … INVISIBLE`, MariaDB 10.6's `… IGNORED`. Neither
+/// flag was read: the index came back as an ordinary `KEY` with `lossy = false`,
+/// so renaming it (or touching it in any way) took `ddl::diff`'s
+/// `DROP INDEX` + `ADD INDEX` arm — and the recreate carries no visibility
+/// clause, so the index came back **live**, the optimizer started using it
+/// again, and the preview said nothing at all.
+///
+/// Both halves are asserted because either alone passes for the wrong reason:
+/// the read (`lossy`), and the composition through `diff` that the read exists
+/// to govern. PostgreSQL has no such flag and returns early.
+pub async fn a_switched_off_index_is_not_silently_brought_back(target: &'static Target) {
+    let Some(disable_sql) = target.disable_index_sql else {
+        return;
+    };
+    let scratch = Scratch::create(target, "ddl_off_index").await;
+    let t = scratch.qualified("t");
+    scratch
+        .exec(&format!("CREATE TABLE {t} (a INTEGER, b INTEGER)"))
+        .await;
+    scratch
+        .exec(&format!("CREATE INDEX ix_off ON {t} (a)"))
+        .await;
+    scratch
+        .exec(
+            &disable_sql
+                .replace("{table}", &t)
+                .replace("{index}", "ix_off"),
+        )
+        .await;
+
+    let current = table_of(&scratch, "t").await;
+    let ix = current
+        .indexes
+        .iter()
+        .find(|i| i.name == "ix_off")
+        .unwrap_or_else(|| panic!("{}: no index ix_off", target.name));
+    assert!(
+        ix.lossy,
+        "{}: a switched-off index was read as one the model holds whole",
+        target.name
+    );
+
+    // The composition the read is for: rename it in the designer's own way and
+    // the plan must withhold the edit, not drop and recreate it.
+    let mut draft = TableDraft::from_table(&current);
+    let slot = draft
+        .indexes
+        .iter_mut()
+        .find(|i| i.info.name == "ix_off")
+        .unwrap_or_else(|| panic!("{}: the draft lost ix_off", target.name));
+    slot.info.name = "ix_renamed".to_string();
+    let set = ddl::diff(&current, &draft, target.engine.dialect());
+    assert!(
+        set.changes
+            .iter()
+            .any(|c| matches!(c, ddl::Change::KeepLossyIndex { name } if name == "ix_off")),
+        "{}: the plan does not withhold the edit — {:?}",
+        target.name,
+        set.changes
+    );
+    let emitted = set.emit().join("\n");
+    assert!(
+        !emitted.to_ascii_uppercase().contains("IX_OFF"),
+        "{}: the plan touches the switched-off index:\n{emitted}",
+        target.name
+    );
+
+    scratch.teardown().await;
+}
+
 async fn table_of(scratch: &Scratch, name: &str) -> TableInfo {
     let schema = scratch
         .db

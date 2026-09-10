@@ -2326,11 +2326,17 @@ async fn collect_schema(conn: &mut Conn, database: &str) -> Result<DbSchema, DbE
     // Which server this is, for `mysql_column`'s default normalization — MariaDB
     // hands back SQL text where MySQL hands back a raw value, and nothing in the
     // catalogue itself says which. One extra row per schema fetch.
-    let mariadb: bool = conn
+    //
+    // The whole string is kept, not just the family: the index read below needs
+    // the *number* too, since the column saying an index is switched off arrived
+    // in MariaDB 10.6 and MySQL 8.0 and naming it on an older server fails the
+    // query outright.
+    let version: String = conn
         .query_first::<String, _>("SELECT VERSION()")
         .await
         .map_err(qerr)?
-        .is_some_and(|v| v.to_ascii_lowercase().contains("mariadb"));
+        .unwrap_or_default();
+    let mariadb: bool = version.to_ascii_lowercase().contains("mariadb");
 
     // Columns for the whole schema in one pass, grouped back onto their tables.
     let col_rows: Vec<ColRow> = conn
@@ -2410,7 +2416,8 @@ async fn collect_schema(conn: &mut Conn, database: &str) -> Result<DbSchema, DbE
                 CAST(SUB_PART AS SIGNED) AS sub, \
                 CAST(COLLATION AS CHAR) AS coll, \
                 CAST(INDEX_TYPE AS CHAR) AS ty, \
-                {} AS expr \
+                {} AS expr, \
+                {} AS off \
          FROM information_schema.STATISTICS \
          WHERE TABLE_SCHEMA = ? \
          ORDER BY TABLE_NAME, INDEX_NAME, SEQ_IN_INDEX",
@@ -2418,7 +2425,12 @@ async fn collect_schema(conn: &mut Conn, database: &str) -> Result<DbSchema, DbE
             "CAST(NULL AS CHAR)"
         } else {
             "CAST(EXPRESSION AS CHAR)"
-        }
+        },
+        // Same trick, one column over: `IGNORED` (MariaDB 10.6+) and
+        // `IS_VISIBLE` (MySQL 8.0+) are named differently, answer with opposite
+        // polarity, and do not exist at all on an older server — so the
+        // normalising is `core`'s and the row shape stays one shape.
+        schemaic_core::schema::index_disabled_sql(&version)
     );
     type MyIdxRow = (
         String,
@@ -2435,14 +2447,19 @@ async fn collect_schema(conn: &mut Conn, database: &str) -> Result<DbSchema, DbE
         Option<String>,
         Option<String>,
         Option<String>,
+        // 1 when the server says this index is switched off — see
+        // `schema::index_disabled_sql`. Never NULL: the expression is a `CASE`
+        // or the constant `0`.
+        i64,
     );
     let idx_rows: Vec<IdxRow> = conn
         .exec_map(idx_sql.as_str(), (database,), |r: MyIdxRow| r)
         .await
         .map_err(qerr)?
         .into_iter()
-        .map(|(t, i, nu, c, sub, coll, ty, expr)| {
+        .map(|(t, i, nu, c, sub, coll, ty, expr, off)| {
             let expression = c.is_none();
+            let disabled = off != 0;
             IdxRow {
                 table: t,
                 index: i,
@@ -2473,12 +2490,16 @@ async fn collect_schema(conn: &mut Conn, database: &str) -> Result<DbSchema, DbE
                 method: ty.filter(|t| !t.eq_ignore_ascii_case("BTREE") && !t.is_empty()),
                 predicate: None,
                 // `STATISTICS` gives the whole key — prefix, direction and now
-                // the type — for an ordinary index. A **functional** one is the
-                // exception: the expression comes back as MySQL 8 stored it and
-                // re-emitting it as a key part is not something this model can
-                // promise, so the index is marked lossy and the existing refusal
-                // fires instead of a silent drop-and-recreate.
-                lossy: expression,
+                // the type — for an ordinary index. Two exceptions: a
+                // **functional** key part, whose expression comes back as
+                // MySQL 8 stored it and re-emitting it as a key part is not
+                // something this model can promise; and an index the DBA has
+                // **switched off** (`INVISIBLE`/`IGNORED`), which no emitter
+                // here can spell. Both are marked lossy so the existing refusal
+                // fires instead of a silent drop-and-recreate — and for the
+                // second one that recreate brought a hidden index back *live*,
+                // with the optimizer using it again and the preview silent.
+                lossy: expression || disabled,
                 // MySQL publishes no per-index `CREATE`; the model
                 // reconstructs one from the columns it read.
                 create_sql: None,
@@ -3918,8 +3939,11 @@ pub(crate) struct IdxRow {
     pub predicate: Option<String>,
     /// This index holds something the model can't represent — see
     /// [`schemaic_core::schema::IndexInfo::lossy`]. On MySQL that is a
-    /// **functional** key part and nothing else: the index type is read and can
-    /// be re-emitted, and a prefix and a direction always could be.
+    /// **functional** key part or an index the DBA has **switched off**
+    /// (`INVISIBLE` on MySQL 8, `IGNORED` on MariaDB 10.6+ — see
+    /// [`schemaic_core::schema::index_disabled_sql`]): the index type is read
+    /// and can be re-emitted, and a prefix and a direction always could be, but
+    /// no emitter here can spell either of those two.
     pub lossy: bool,
     /// The server's own whole `CREATE INDEX`, where the engine publishes one —
     /// `pg_get_indexdef` on PostgreSQL, and `None` on MySQL, which has no such

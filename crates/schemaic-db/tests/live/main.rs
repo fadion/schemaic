@@ -124,6 +124,7 @@ live_suite!(
         a_retyped_column_reads_back_as_the_new_type,
         a_refused_plan_says_where_it_stopped,
         a_partly_read_index_says_so_and_is_emitted_whole,
+        a_switched_off_index_is_not_silently_brought_back,
     ],
     runtime: [
         a_script_runs_every_statement_in_order,
