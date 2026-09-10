@@ -43,9 +43,10 @@ mod properties;
 mod routine_editor;
 mod schema_tree;
 mod script_view;
-/// The tree-node key builders. Public because the persisted expanded-node set is
-/// the app's to edit (collapsing a database drops every `tbl:<db>:*` key), and
-/// the format belongs to exactly one module.
+/// The tree-node key builders, and the two predicates that read a key back.
+/// Public because the persisted expanded-node set is the app's to edit —
+/// collapsing a database drops every key `key_under` claims, the size column
+/// asks `wants_db_stats` — and the format belongs to exactly one module.
 pub use schema_tree::{
     column_key_named, db_key, db_name_of_key, key_under, table_key_named, wants_db_stats,
 };

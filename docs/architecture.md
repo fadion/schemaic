@@ -211,6 +211,21 @@ existing prose was left alone.
     accumulators when it meets a wider scale — because the vector was 32 bytes per selected cell,
     allocated and freed on **every** recompute (6.4 MB for a Ctrl+A over 200k rows, once per
     auto-repeat and once per cell crossed in a drag).
+    **And the scan is now bounded**: `aggregate_capped` is the real body, `aggregate_texts` calls
+    it with `usize::MAX`, and the grid passes `AGGREGATE_CELL_BUDGET` (100,000). The selection
+    aggregate is undebounced and was uncapped, unlike the find-count effect fifty lines below it in
+    the same function — 150 ms debounced *and* budgeted at two million cells "so a big grid doesn't
+    stutter typing" — though both are per-cell scans over the same result feeding a small readout
+    in the same panel. It cannot take that debounce, being driven by the selection rather than by
+    typing, and a two-cell selection has to answer at once; so the cap is the guard, and it is much
+    smaller than the find bar's precisely because this one runs inside the frame. A drag down a
+    column re-scans the range-so-far on every row it enters, so what matters is the cost of one
+    run, and this bounds it. Stopping produces `Aggregates::truncated`: the counts become lower
+    bounds printed with a `+`, the idiom the find bar's `find_more` already uses in the same panel,
+    and `numeric` goes to `None` — **a partial sum is not a sum**, which is the same call this
+    module already makes for overflow, arrived at by a different route. It reads exactly one cell
+    past the budget, which is how "there were more" is told from "that was all" without a second
+    pass.
   - `sql.rs` — one `skip_noncode` tokenizer → statement splitting, unsafe-statement guard, AI
     read-only gate, `edit_distance`. The *single* SQL boundary lexer; `intel` (scope/context/
     diagnostics)/`sql_highlight`/`sqlfmt` all build on it so string/`#`/`--`/`/* */`/backtick
@@ -263,6 +278,17 @@ existing prose was left alone.
     (`the_gate_reads_this_engines_string_escape` / `…_comment_rule` / `…_identifier_quoting`) assert
     that the engines' answers *differ*, so a mis-paired dialect fails instead of passing by
     coincidence.
+    **`scan_bounds` is the one walk both `statement_bounds` and `statement_bounds_open` are, and its
+    `until` is what keeps the caret off it.** With `Some(offset)` the walk stops once a boundary
+    *past* that offset has been recorded — everything after belongs to statements the caller has
+    already said it does not care about — and the boundaries produced before the stop are
+    byte-for-byte the ones the full walk produces, this being the same lexer cut short and not a
+    second one. It exists for `statement_range`, which answers "which statement is the caret in" on
+    **every caret move**, undebounced, through `update_signature_help`, and which nothing caps:
+    `sqlfile::open_verdict` will open a 64 MiB script, and over the whole document the walk measured
+    5.0 / 20.5 / 80.7 ms at 1 / 4 / 16 MiB — an arrow key's worth of UI-thread work to locate a
+    statement whose actual work, `intel::signature_help` on the isolated statement, is 8 µs. `None`
+    keeps the full walk, which is what every other caller wants.
   - `intel.rs` — the **SQL intelligence** layer (structure-aware, dialect-pluggable). Parses a
     *complete* statement with a real per-dialect AST (`sqlparser`; `SqlDialect` seam — MySQL,
     PostgreSQL and SQLite all wired) and answers what a token stream can't: `statement_scope`
@@ -387,6 +413,20 @@ existing prose was left alone.
     `G` from `SUBSTRING`, so those are still flagged. It is the same shape as the transposition case
     the function already carries — a named exception rather than a wider distance, because widening
     the distance is what produced this class in the first place.
+    **`diagnostics` runs over the whole document on the UI thread 120 ms after a keystroke, with no
+    size cap, and two things in it were redoing work the statement could not change.**
+    `static_words` is every keyword and builtin name this crate knows, lowercased, behind a
+    `OnceLock` — it was rebuilt inside `typo_checks`, which runs once per statement per tick, so
+    ~700 `String` allocations per statement per tick for a value that depends on neither the schema,
+    the dialect nor the SQL. And `table_existence_checks` now takes the `asts` its caller already
+    has rather than reaching for the CTE names through `statement_scope`, which **re-parses the
+    identical statement** and, on a parse failure, tokenizes it a second time on top — everything
+    but `.ctes` then thrown away. Measured at 500 statements, that redundant parse was 10% of an
+    `INSERT`-heavy pass and 18% of a `SELECT … JOIN … ORDER BY` one; 72 ms at 98 KB, four dropped
+    frames, on a file size that is an ordinary thing to open here. The one call site is
+    `diagnostics`' `Ok(asts)` arm, so an AST is always in hand and the `Err` arm never reached this
+    function at all — `statement_scope`'s lexer fallback is not lost, only unreachable from here,
+    and it yields the same empty CTE list a `len() != 1` parse gives.
     **Two facts about a FROM source that the resolver was not recording.** `Src::shadowed` is the
     table name an alias **replaced**: an alias is a rename for the whole query rather than a second
     name, and MariaDB 10.11.14 answers `SELECT employees.id FROM employees e` with
@@ -472,7 +512,25 @@ existing prose was left alone.
     doesn't parse, several statements, anything that isn't a `Query` — and for a **set operation at
     any depth**, one buried in a derived table or a CTE body included; otherwise it hands back every
     base relation the statement reads, with CTE-bound names filtered out, since those shadow any real
-    object of the same name and the body they stand for was walked here already. The set-operation
+    object of the same name and the body they stand for was walked here already.
+    **The shadowing is scoped, and it is a stack rather than a set** (`Sources { relations, scopes }`
+    — `pre_visit_query` pushes a frame of that query's own CTE names, `post_visit_query` pops it, and
+    a relation is decided *while* its enclosing frames are on the stack, since afterwards nothing
+    tells an outer relation from an inner one). It was one flat list of every CTE name met at any
+    depth, applied to every relation after the walk, so a **nested** `WITH` stripped a real object of
+    the same name out of the enclosing scope: `SELECT a.id, v.x FROM a JOIN v ON v.id = a.id CROSS
+    JOIN (WITH v AS (SELECT 1 AS z) SELECT z FROM v) q` came back `[a]`, with the real view `v` gone.
+    On SQLite that is the whole failure — the caller never learns `v` is a view, provenance reports
+    one branch's table for a compound view, so `v.x` is attributed to `main.a` and offered as
+    editable, and the rows that came from `b` are edited against `a`. The 1-row net catches the
+    usual outcome but is the backstop and not the gate, and it does not catch an `a` holding a row
+    with the same key. A *top-level* `WITH` cannot produce this, the name being shadowed
+    statement-wide, which is why the flat rule read as safe. Three tests hold the scoping apart:
+    `a_nested_cte_does_not_shadow_a_name_in_the_outer_scope` (in both orders, the nested query first
+    being the one that needs the frame *popped* rather than merely pushed),
+    `a_top_level_cte_still_shadows_its_own_name` and
+    `a_nested_cte_still_shadows_inside_its_own_query` — the last because the fix must not simply stop
+    shadowing. The set-operation
     refusal is the load-bearing part, and it is there because provenance answers a narrower question
     than its name suggests: it names the table a result *column expression* resolves to, not the table
     a result *row* came from. Measured on SQLite 3.53.2,
@@ -874,6 +932,41 @@ existing prose was left alone.
     promise being that the model is answering about what the user is looking at, while Ctrl+C stays
     raw and the cell menu offers *Copy formatted* as its own entry. A staged value is never
     formatted either way, because it is text the user typed and the painter doesn't format one.
+    **`with_text` is the same resolution handed to a closure borrowed wherever it can be**, and
+    `text` is now the wrapper that allocates. Three of the four sources are already `&str` in
+    memory — the arena text of a stored cell, and a staged or pending `CellEdit::Text` — so only a
+    staged NULL or blob (which render as a sentinel) and a formatted column have to build anything.
+    It was written for the find bar's jump: `grid_find` walks up to `rows × cols` cells from the
+    caret on *every character typed into the find box*, and each cell cost two heap allocations,
+    `CellRef::to_value` copying the arena string and `Value::display` copying it again. At the
+    200,000-row cap × 50 columns that is ten million cells and twenty million allocations,
+    synchronously on the UI thread, per keystroke, whenever the needle or one of its prefixes is
+    absent — while its sibling the match *count* is debounced and capped for exactly this reason
+    and says so.
+    **`summary_text` is the fourth reader and differs from `text` on one point that is the whole
+    point**: a NULL has to be *absent* rather than the string `NULL`, because the aggregate counts
+    nulls and parses numbers out of the rest. A **staged blob is a value** there —
+    `CellEdit::as_text` answers `None` for `Bytes`, which is what every text caller wants (the
+    re-fetch key, the paste round-trip, the clipboard) and read as NULL here, so loading a file
+    into a selected cell turned `3 rows` into `3 rows · 1 null` while the *stored* blob it replaced
+    counted as a value. That was fixed once for the staged-over-a-real-row arm and the
+    pending-new-row arm four lines below reproduced it verbatim, which is why the rule now lives
+    beside the painter's own resolution and there is one of it. An **unset** cell of a pending new
+    row stays `None` and is deliberately not the same thing as a NULL of the same shape: what it
+    will hold is a server default, previewed as `<auto>`, and it counts as neither a value nor a
+    null. It returns a `Cow`, for `with_text`'s reason — a Ctrl+A over a 200,000-row column
+    resolves every cell and only a staged blob's `<n bytes>` has to be built.
+    **`order_key_columns` is `resolve_key`'s ladder walked over the *table* alone**, for a caller
+    that needs the key before it has a result set. The Live Monitor is that caller: it must put an
+    `ORDER BY` on the very first poll and cannot ask `analyze_edit` until a poll has come back, and
+    it reached for the primary key alone instead — so the whole band "no PK, but a usable key
+    exists" polled **unordered** while still diffing happily, and the exportable log filled with
+    inserts and deletes that never happened (see `monitor::Snapshot::ordered`). It cannot be
+    `resolve_key` and does not try: that one interleaves a *presence* check against the result's
+    columns and falls from a primary key that is not fully projected down to an index that is,
+    while there is no result here to check against and the caller selects `*`. SQLite's implicit
+    `rowid` is likewise out of reach — it is asserted by the backend on a returned column, not by
+    the schema.
     **`visual_cols(ncols, frozen)` is the one definition of the order the grid draws columns in** —
     the frozen column, then every other column in index order. A frozen column keeps its *absolute*
     index on purpose, so selection, sort and resize stay consistent, which means draw order and index
@@ -3034,7 +3127,22 @@ existing prose was left alone.
     go through `aliases`, which is **collision-broken on purpose**: `sales.orders` and
     `sales_orders` both slug to `sales_orders`, and a Mermaid file naming two entities the same
     silently merges them into one card with interleaved columns and no error anywhere. DBML and
-    Graphviz keep the real names, quoted or escaped. `crow_ends` is the shared cardinality notation
+    Graphviz keep the real names, quoted or escaped.
+    **`column_names` is that same rule one level down, and it had to be**: sanitising is lossy, so
+    distinct columns collapse onto one name — `slug` maps every non-ASCII character to `_`, so a
+    Japanese table's `名前`, `年齢` and `住所` all become `__`, and even in ASCII `user id` and
+    `user_id` both become `user_id`. What that produced is not cosmetic: a Mermaid entity listing
+    one attribute three times misrepresents the table, and a Graphviz label declaring one `port`
+    name three times makes `from:port -> to:port` an **ambiguous endpoint**, so the FK attaches to
+    whichever row `dot` resolves first. Collisions take `_2`, `_3`, … in column order, so the
+    mapping is deterministic and both ends of an edge agree — which is why the map is returned once
+    rather than each site sanitising again. It takes the emitter's own `sanitize`, and DBML's is
+    split in two for it: `dbml_inner` is the text an identifier carries and `dbml_wrap` the quoting
+    decision, so the uniquifying suffix lands **inside** the quotes. Appended to a rendered `"a'b"`
+    it would sit after the closing quote — and `a"b` and `a'b` are both legal column names on every
+    engine while `plain_label` rewrites `"` to `'`, so the two arrived as one name: a table body
+    declaring the same column twice, and a `Ref` naming a pair the foreign key is not on.
+    `crow_ends` is the shared cardinality notation
     and reads the *parent* end from `DiagramEdge::optional` — a nullable FK means a child may
     reference nothing, so "exactly one" drops to "zero or one" — while the child end is "zero or
     more" (`o{`) or "zero or one" (`o|`) from the uniqueness `core::erd` already worked out: zero
@@ -3079,6 +3187,28 @@ existing prose was left alone.
     `Snapshot`. The caller must skip the *first* poll itself — diffing against an empty prior reads
     every row as an insert. A delete carries the row's last-seen cells deliberately: it is the one
     case where the row is gone from the database and the log is the only remaining record.
+    **A `Snapshot` records *how it was taken* in two flags, and they were one.** `ordered` says the
+    poll asked the server for a deterministic total order (`ORDER BY` the key), so position means
+    something and two windows are comparable as prefixes of one sequence; `window_full` says the
+    fetch came back at its row limit, so the table holds more than these. They were a single
+    `ordered_window_full`, and conflating them is what made the log false. A bounded window has to
+    be a *stable* one — delete a row inside it and the next is promoted in, which reads as an insert
+    of a row that existed all along, so `diff_snapshots` suppresses the tail, but only for a window
+    it knows is an ordered prefix. A window that is **full but unordered** is neither state the old
+    flag could express and it landed on the "report everything" branch: measured on MariaDB 10.11,
+    deleting one row of a 1,200-row table with no primary key logged a phantom INSERT beside the
+    real DELETE; on PostgreSQL 16.15 an `UPDATE` that moved the heap tuple out of the window was
+    logged as a **DELETE of the row it updated**, with the update never reported at all. There are
+    three states per window, and each cut asks about the *other* one, because that is the window
+    whose silence has to be interpreted: below the limit the window **is** the table, so absence
+    from it is real; at the limit and ordered, absence before the last row the two share is real and
+    everything after it is the window sliding; at the limit and unordered, which rows came back is
+    arbitrary and absence means nothing. The boundary is positional (`last_common`) and not a key
+    comparison — the keys are text, and comparing them here would order `"1000"` before `"500"`
+    where the server did not. Rows both windows hold are diffed either way, so a real change to a
+    visible row is still seen. This matters more than a display nicety because the log is
+    exportable, and `discard_needs_asking` exists precisely because it is treated as a record
+    somebody keeps.
     The **log** lives here too, not just the diff. `MonitorEntry { at, change }` — a change plus the
     `M:SS` at which a poll *observed* it — moved down from `ui/lib.rs`, which re-exports it so every
     use site still reads as a UI type, because the log's export is a pure projection of these
@@ -3510,7 +3640,17 @@ existing prose was left alone.
     that was never sent. The overshoot is bounded by capping the batch's own contribution at
     `MAX_PER_CONN`, so a connection holds at most twice that between launch and verdict, and the
     statements kept under that bound are the **first** ones, because those are the ones that can
-    already have run. `trim` is over the *whole* store rather than one connection because the caller
+    already have run.
+    **A statement repeated inside one batch keeps its *first* run id**, and that is the same seam
+    read from the other side. `COMMIT;` twice in a dump is ordinary, and deduplicating within the
+    batch the way `push` deduplicates across runs replaced the first occurrence's entry with the
+    last one's — so on `A; B; A;` where `A` succeeded and `B` failed, the surviving entry carried
+    run 3, which is in the undispatched set, `drop_runs` deleted it, and `finish(run 1)` found
+    nothing: the `A` that **ran and succeeded** vanished from the log entirely. `finish`'s own doc
+    reasons about this seam in the opposite direction — "a run whose entry has since been
+    de-duplicated away simply finds nothing" — and is right there, because the survivor describes a
+    *newer* run of the same statement; here the survivor was keyed to a run that never happened.
+    `trim` is over the *whole* store rather than one connection because the caller
     applying it knows run ids and not connections, and a cap that is idempotent and total needs
     neither; being idempotent is also what lets a batch that fitted report no change and cost no
     file write. `remove` is the row
@@ -4236,7 +4376,24 @@ existing prose was left alone.
     list still works.
   - `persist.rs` — the small on-disk state that survives a restart, and the one place that decides
     **how a config file is written and how it comes back**. `config_dir` is `%APPDATA%/schemaic` or
-    `$XDG_CONFIG_HOME`/`~/.config`; `UiState`/`ui_state.json` is the original tenant and
+    `$XDG_CONFIG_HOME`/`~/.config`, and each candidate is filtered through **`usable_base`, because
+    an empty or relative base is no base**. `std::env::var_os` answers `Some("")` for a variable
+    that is *set and empty* — what a login script clearing one leaves, and what a container image
+    or a launcher writes as `export XDG_CONFIG_HOME=` — and `PathBuf::from("").join("schemaic")` is
+    the **relative** path `schemaic`, resolved against the process's working directory. Launch from
+    `~/projects/acme`, add three connections, quit, and `connections.json`, `chats.json`,
+    `history.json` and `tabs.json` are in that git working tree; launch from anywhere else and every
+    one of them reads absent and falls back to defaults, which presents as "all my connections
+    vanished". Where the keyring is unavailable it is worse, that being the documented fallback in
+    which `connections.json` holds **plaintext** database passwords, SSH passwords and key
+    passphrases — landing in a directory the user may be about to `git add`. The test is `has_root`
+    and deliberately not `is_absolute`: the question is whether the path depends on the working
+    directory, so a rooted Windows path with no drive letter (`\schemaic`) passes, a Unix-shaped
+    `HOME` handed to a Windows build by Git Bash passes, and drive-relative `C:schemaic` — exactly
+    the shape to refuse — does not. The freedesktop spec says an empty `$XDG_CONFIG_HOME` must be
+    treated as unset; the same reasoning is applied to `HOME` and `APPDATA`, and falling through to
+    the next candidate and finally to `None` is what the callers already handle.
+    `UiState`/`ui_state.json` is the original tenant and
     `tabs.json`, `connections.json`, `history.json`, `chats.json`, `snippets.json`,
     `favorites.json`, `db_colors.json`, `diagrams.json`, `search_history.json` and
     `ssh_known_hosts.json` all arrived behind it. Every decision in it is pure and testable because
@@ -4795,6 +4952,31 @@ existing prose was left alone.
     (`Code`/`Str`/`Comment` classification). Pure + unit-tested; dialect-aware, and its two "is a
     backtick an identifier quote here" sites ask `SqlDialect::backtick_ident` (`pub(crate)` for
     them) rather than re-spelling `!= Postgres`, which is the capability rule one module over.
+    **Three of those walk the document, and all three are on the editor's *undebounced*
+    per-caret-move path** — `match_paren` and `identifier_occurrences` are two `create_effect`s with
+    no debounce and no size cap, and `sqlfile::open_verdict` will open a 64 MiB script — so each
+    stops as early as its answer allows. `region_at` stops **at the caret**: the answer is settled
+    once the walk reaches `offset`, since a span opening at or after it cannot contain it, and
+    everything past that was a scan of the rest of the document for nothing (at 16 MiB the full walk
+    measured 37.9 ms, so one arrow key was ~123 ms of UI-thread work across the two effects).
+    `match_paren` returns **at the pair** rather than after every pair: it used to build a `Vec` of
+    every balanced pair in the document and then `find_map` the one touching the caret, 44.6 ms at
+    16 MiB for a single arrow key. The walk is the same walk — one stack, the shared lexer skipping
+    strings and comments — and the pair it picks is unchanged, closes still being visited in
+    increasing order with a position the open or the close of exactly one pair;
+    `match_paren_returns_the_carets_pair_not_the_first_one_closed` separates "the first pair that
+    closes" from "the caret's pair" in the three shapes a return placed one line too early would
+    confuse. `paren_pairs`, the whole-document sweep both of those went through, is **deleted** —
+    there is no second caller to keep it for, and leaving it is how the quadratic spelling comes
+    back.
+    **`regions_at` is `region_at` for many offsets in one walk**, because asking `region_at` in a
+    loop is quadratic and the loop was real: Ctrl+/ inside a PostgreSQL `$$ … $$` body called it
+    once per selected line, 223 ms over a 3,200-line selection, quadrupling with every doubling —
+    around 11 s extrapolated at 1 MiB, on the UI thread, for one keystroke. Every one of those
+    walks re-scanned the same prefix. Its `offsets` must be non-decreasing, the answers come back in
+    the same order, and each is exactly what `region_at` would have said — an offset the walk passes
+    without finding a span that strictly contains it is `Code`, which is `region_at`'s own rule read
+    forwards.
   - `params.rs` — `:name` query parameters: `scan`/`names` (every placeholder and its byte range,
     built on `skip_noncode` so a `:id` inside a string, comment, dollar-quoted body or quoted
     identifier is not one), `bindings_for` (the parameters bar's rows, re-derived from the SQL on
@@ -5078,6 +5260,16 @@ existing prose was left alone.
       destroys the *value*, and since the app rewrites the whole of `search_history.json` on every
       change, merely running an older build once would rewrite a newer one's `"collation"` as the
       literal `"unknown"`.
+      **`recent_visible` is what the palette actually reads, and it is the `db_hidden` rule's
+      second surface finally honoured on both branches.** Find-Anywhere's *typed* branch filtered
+      through `schema::db_visible`; its **empty-query** branch read `recent`, which asks only about
+      `conn_id` — so a row for a database the user had put away with the SCHEMA eye stayed in the
+      list, opened a tab on that database when activated, and disappeared the moment a single
+      character was typed. The visibility test runs **before** the `MAX_PER_CONN` take and not
+      after, or a hidden database's ten entries spend the whole window and leave the list empty;
+      `a_hidden_databases_entries_do_not_spend_the_per_connection_window` is that half, and
+      `a_hidden_databases_history_row_is_not_offered` the other. `recent` stays as it is — the
+      unfiltered question is still the right one for a caller that has no hidden set to apply.
     - `favorite.rs` — the `(conn_id, database)` star list. `toggle` appends newest-**last** on
       purpose: `rank` (0 = that connection's oldest) is what the schema tree sorts by, so order in
       the `Vec` *is* the sort key.
@@ -5246,7 +5438,13 @@ existing prose was left alone.
         is that only the composition can decide whether the notice is still needed. Its private
         half `rows_read_of` prints `1k` alone or `1k of ~4.2m`, dropping a total at or below what
         was already read (`1k of ~400` reads as a bug rather than as the stale estimate it is);
-        **whether that comparison got printed is then what silences the word.** A total is in hand
+        **`names_a_bigger_total` is that test, and it asks two things where it used to ask one** —
+        bigger, *and rendered differently*. `human_count` keeps two decimals of its unit, so its
+        resolution is 10 rows at `k` and 10,000 at `m`: a 200,004-row table read at the 200,000 cap
+        printed `200k of ~200k rows`, which reads as "every row is here" — and, because a
+        comparison *had* been made, without the `(capped)` that is the only word on the line saying
+        otherwise. Same at every band: 5,004 at a 5,000 cap, 1,002,000 at a million.
+        **Whether that comparison got printed is then what silences the word.** A total is in hand
         only for a capped read — `grid_view`'s `scanned` is gated on `truncated` before the
         catalogue is asked — so `200k of ~292.02k rows` cannot mean anything but a read that
         stopped short, and `200k of ~292.02k rows (capped)` spent nine characters restating it on
@@ -6399,7 +6597,20 @@ existing prose was left alone.
   red the day the drivers agree again. And a **passphrase-protected client key** is refused by name
   (`parse_key`), with the `openssl pkcs8` command to fix it: the form used to collect a passphrase
   for one and hand it to nobody, so an encrypted key failed with "is not a PEM private key",
-  blaming a file that was perfectly good. `read_certs` refuses a file with **no PEM section** for
+  blaming a file that was perfectly good. **There are two spellings of "encrypted" and only PKCS#8's
+  was recognised**, which is why that test is `is_encrypted_key` rather than a `contains` at the
+  call site. PKCS#8 says it in the header (`-----BEGIN ENCRYPTED PRIVATE KEY-----`); the legacy
+  RFC 1421 form keeps an ordinary `EC PRIVATE KEY` / `RSA PRIVATE KEY` header and puts the fact in a
+  `Proc-Type: 4,ENCRYPTED` line above the base64, with no occurrence of the string being matched —
+  and that is what the *plain* `openssl ec -aes256` and `openssl rsa -aes256 -traditional` produce.
+  Unrecognised, those reached `from_pem_slice`, which cannot base64-decode a header line and answers
+  `Base64Decode(InvalidCharacter(45))`, reported as the very message this arm exists to stop
+  emitting. It keys on `Proc-Type` and not on the header, because the header is shared with the
+  *unencrypted* legacy key that must still be read
+  (`an_unencrypted_legacy_key_is_not_mistaken_for_an_encrypted_one`, beside
+  `a_legacy_encrypted_key_is_named_too`), and
+  on `Proc-Type` rather than `DEK-Info`, because that is the field which says encrypted —
+  `DEK-Info` only names the cipher. `read_certs` refuses a file with **no PEM section** for
   the same reason — a DER `.crt` is what Windows' *Export certificate* writes, it came back as
   `Ok(vec![])`, and `preflight` passed it while PostgreSQL rejected the identity and MySQL
   presented it.
@@ -7802,9 +8013,9 @@ existing prose was left alone.
     **There are two pieces of that state now, and the second is `seen_tools`.** Two dialects restate
     a tool call while it is still running, neither marking the repeat —
     Codex on every `item.updated` for the item id, Antigravity on every `state: "ACTIVE"` for the
-    `step_index` — while `TurnState::apply` pushes a chip for every `ToolUse` it is handed and
-    attaches a `ToolResult` to the *last* pending one. So a restated call left the earlier chip
-    spinning for the rest of the transcript. **Antigravity's half of that is measured and Codex's is
+    `step_index` — while `TurnState::apply` pushes a chip for every `ToolUse` it is handed and, for
+    a result it cannot pair by id, attaches it to the *last* pending one. So a restated call left
+    the earlier chip spinning for the rest of the transcript. **Antigravity's half of that is measured and Codex's is
     a documented contract**, on exactly the footing of the cumulative prose restatement it mirrors
     (see the confidence-boundary paragraph at the end of this entry): the three codex-cli 0.153.4
     turns that settled the prose question contained no tool call at all — no MCP server was
@@ -7878,6 +8089,23 @@ existing prose was left alone.
     `codex_a_restated_shell_step_opens_one_chip_and_closes_it` covers the other, driven through
     `TurnState` as well as the parser because a chip that never closes is a rendering fact the event
     list does not show.
+    **`ToolUse` and `ToolResult` both carry an `id` now, and it is the pairing key rather than a
+    convenience.** Every harness puts one on the wire — `tool_use.id` on Claude, `item.id` on
+    Codex, `step_index` on Antigravity, `callID` on OpenCode — and without it a result can only be
+    attached by recency, which is exactly backwards for the ordinary parallel shape: the model
+    makes two calls in one step, three of the four tools the panel allow-lists being read-only ones
+    a model routinely batches, and their results arrive in **call** order, so the first result
+    landed on the second chip and the second on the first. `is_error` travels with the text, so a
+    query that *failed* read as having succeeded and returned another tool's output, under a green
+    dot, with the red one on the call that was fine — and `chat::drop_tool_results` keeps
+    `is_error` deliberately, so a restored conversation showed it permanently the wrong way round.
+    Sequential calls are unaffected either way, which is why the suite was green: every fixture
+    opened one call and closed it before the next. `TurnState` keeps a `by_id` side map from call
+    id to the index of the chip it opened, and it is a **side map rather than a field on
+    `ToolCall`** because that type is `core::transcript`'s and is persisted to `chats.json` — the
+    id is plumbing for one turn's pairing and has no meaning in a restored conversation. A `None`
+    id, or an id no chip was opened under, degrades to the recency rule rather than losing the
+    result.
     **Codex's session model differs in kind, not in field names** — one process per *turn*, resumed
     by id (`codex exec resume <id>`), against Claude's one persistent bidirectional process per
     conversation. `StreamEvent::SessionStarted { id }` exists to carry the `thread.started`/`init`
@@ -8034,6 +8262,24 @@ existing prose was left alone.
     fixture was added**: a 300-word near-duplicate of a shape that one already pins would hold
     nothing it does not.
 - `schemaic-term` — terminal panel + shell (`shell.rs`).
+  **The reader notifies once per *unread* grid state, not once per read** (`Pending`, an
+  `AtomicBool` with `mark`/`taken`). Its buffer is 8 KB and it used to notify on every successful
+  read, so `cat` of a 10 MB log is ~1,280 notifies with no coalescing point anywhere downstream:
+  `term_notify` sends on an *unbounded* channel, floem's `create_signal_from_channel` drains its
+  deque with one `set` per queued message, `Signal::run_effects` runs subscribers synchronously
+  with no equality check, and `ApplicationHandle::idle` paints only once every queued trigger has
+  run. So each 8 KB chunk cost one full `snapshot()` — a fresh `cols × lines` grid plus a `String`
+  per run — and one rebuild of the whole terminal `dyn_container`, every row and every run, on the
+  UI thread, before a single frame was painted. The work was O(chunks) rather than O(frames), and
+  the window neither repainted nor accepted input until the backlog cleared — with the panel
+  **closed**, too, since the effect lives in `app_view` and the shell is spawned at launch, so a
+  `.bashrc` running `neofetch` spends the same thread. `mark` returns true only on the `false →
+  true` edge and `Terminal::snapshot` clears the flag, so a reader running ahead of the UI notifies
+  once and then stays quiet until its last output has actually been read. Nothing is dropped: the
+  state is in the grid and the pending notify only says there is a new one. **Exit is not
+  coalesced** — `read_loop`'s final notify after `exited.store` must arrive whatever the flag says,
+  or a shell that exits with its last output already read leaves the panel showing a live prompt
+  for a process that is gone.
 - `schemaic-ui` — the Floem UI. The central `Ui` struct (threaded everywhere) is split per-domain:
   `Copy` signal bundles (`TabsUi`/`SchemaUi`/`ConnUi`/`AiUi`/`TermUi`/`LayoutUi`/`OverlayUi`) +
   `Rc<…Actions>` callback bundles — so `ui.run` is `ui.tab_actions.run`, `ui.db_nodes` is
@@ -8390,8 +8636,21 @@ existing prose was left alone.
     `.map(str::trim).filter(|m| !m.is_empty())`, and
     `an_empty_model_or_effort_is_omitted_rather_than_passed_as_an_empty_flag` is the pin for that
     path — so clearing lands on the one value
-    every harness is guaranteed to take. It is a *clear*, not a per-harness memory: switching back
-    does not restore the old id.
+    every harness is guaranteed to take.
+    **A clear with no way back was the other half of the bug, and `HarnessFields` is the memory
+    that answers it.** The modal's ✕, its backdrop and Escape all commit, so there is no cancel,
+    and the clearing fired on any `prev != now` in *both* directions — a user who opened the
+    dropdown to see what was there and picked their own harness again came back to three empty
+    fields, permanently, with the modal's own header still promising "Changes commit when the modal
+    closes". `harness_switch(prev, now, …, remembered)` restores what a harness held the last time
+    it was selected, and `HarnessFields` is **all three** fields: it was a pair, and the one left
+    out is the one that got lost. Effort was re-derived from the clamp on every call, and
+    `clamped_to` is not injective, so the round trip loses — Claude at the shipped default
+    **Medium**, a glance at OpenCode (`minimal|high|max`, so Medium → High), back to Claude, and
+    the effort is now High on the harness the user started on, chosen by nobody and written to
+    `ui_state.json`. Claude at `xhigh` is the same failure downward and needs only a glance at
+    Antigravity, whose flag stops at `high`. The memory is **session-scoped on purpose**: it is a
+    "you were just here" affordance, not a fourth thing to persist.
     **Effort is clamped to the nearest level the harness offers rather than cleared**, because unlike
     the other two it has no "the harness's default" value: `AiEffort` is a closed enum and every level
     in it means something. `AiEffort::clamped_to` ranks the requested level against `ALL` and takes the
@@ -8425,6 +8684,9 @@ existing prose was left alone.
     `ui_state.json` never clamped at all: a file pairing `opencode` with `medium` came back reading
     "Medium" in a closed dropdown whose list offers only Minimal/High/Max, while `effort_arg` sent no
     flag. That is the stale caption the clamp exists to prevent, arrived at from the other direction.
+    A *remembered* level is clamped too, on the same rule: it is one this harness advertised when
+    it was left and its list has not changed, so the clamp is a no-op there — but the first call is
+    the `ui_state.json` restore, and that one can pair a harness with a level it does not take.
     The effect returns the **previous** harness rather than reading the
     signal twice: on the first run there is none, and clearing then would throw away the override
     just restored from `ui_state.json`.
@@ -9703,7 +9965,19 @@ existing prose was left alone.
     test module could not reach it, while its sibling had already been split out after an ordering
     inversion no test could see. `GearEntry` carries a `GearKind` discriminant rather than a bare
     label, for `BlankKind`'s reason: routing on the string with a catch-all arm makes a sixth entry
-    render as a row that does nothing. The two menus deliberately **do not agree entry for entry**
+    render as a row that does nothing. **Whether a row is *inert* is a second question with a
+    different lifetime, and that is why it is `GearKind::disabled_when(read_only, down)` rather than
+    a field `gear_entries` fills.** Which rows exist is settled when the menu opens — the engine's
+    capabilities and whether a connection is saved cannot change under a standing menu — but whether
+    a row acts cannot be: the health poll writes `ConnStatus::Disconnected` with no user interaction
+    at all, and the gear menu is deliberately not rebuilt while it stands. Frozen into a per-row
+    `bool` at build time, `Create database` and `Users and privileges` stayed lit on a server that
+    had since stopped, and `Create database` opened the form, previewed a real `CREATE DATABASE` and
+    failed at Apply with the connect error the header was already showing — verbatim the outcome
+    their own comments say the dim exists to prevent. `read_only` is not the live half (it changes
+    only on a status-bar click, and that press dismisses the menu) but it is asked here too, so
+    there is one answer per row rather than two half-fresh ones.
+    The two menus deliberately **do not agree entry for entry**
     — the gear also carries `Collapse all` and the size toggle, which are about the panel rather
     than the server — so it is a second list and not a call to the first; what they must agree on is
     the *gating*, which is why both ask `users::supports_users` and `ddl::supports_database_editing`. **The read-only refusal is inside
@@ -9984,10 +10258,50 @@ existing prose was left alone.
     match would be hidden by the row that contains it. `nav_rows` carries the folders and their
     leaves like everything else — it is the function that must stay bug-for-bug identical to
     the render.
+    **`FolderItems` is why the header's count agrees with the rows under it**: a folder's surviving
+    items and how many of them there are travel as one value, because `items.len()` in the header
+    left a folder reading *"Sequences 200"* over the one row that matched. `object_group_nodes`
+    walks the items once to decide whether the folder renders at all, so the count is already in
+    hand and nothing walks them twice.
+    **`tables_shown` is the same repair one level up**, and `objects_shown`'s counterpart: the
+    namespace row's capsule read `schema.tables.iter().filter(by namespace).count()`, so filtering a
+    multi-schema PostgreSQL database for one table name left a namespace reading *"412 tables"* over
+    the two that matched. The children were right and the capsule above them was not, because the
+    two spelled the question separately. It derives `ns_hit` itself rather than taking it, since a
+    namespace whose *name* matches reveals all of its tables — the rule the children already applied,
+    and the half a caller cannot supply correctly by accident.
+    **`key_under(database, key)` owns which expansion-key families live under a database**, and it
+    is what "Collapse all" on a database row drops. That entry collapsed only the *tables*:
+    `collapse_db` retained `!k.starts_with("tbl:{db}:")`, while the same set also holds the `col:`,
+    `sch:` and `objgrp:` keys the very same `on_toggle` writes. So on MariaDB's `sakila`, whose six
+    routines give it a **Procedures** folder, the entry left that folder open with its rows on
+    screen; on a multi-schema PostgreSQL database, where the namespace level sits *above* the
+    tables, it left every namespace group open with its full table list rendered and read as doing
+    nothing at all — while the gear's identically labelled entry clears the whole set, so two entries
+    of the same name did different amounts of work. `db:` is absent from the list because the
+    database row itself stays open, `obj:` because an object leaf has no children to close, and
+    `keyrow:` because it never reaches the expansion set at all. Matching is on the
+    `{prefix}{database}:` boundary rather than on `{prefix}{database}` alone, so collapsing `shop`
+    leaves `shopify` alone (`collapsing_a_database_drops_every_key_under_it` asserts both halves).
+    It replaced `table_key_prefix`, which was re-exported from `lib.rs` and is gone.
+    **`chevron` takes the open state rather than deriving it**, and that is the same disagreement in
+    the disclosure triangle. Its key was `expanded.contains(key)` and nothing else, while every
+    consumer of that key ORs in a second term — `|| filtering` for a database or a namespace,
+    `|| force_cols` for a table, `|| (filtering && !parent_hit && !ns_hit)` for an object folder. So
+    for the whole duration of a filter every force-expanded node showed a **right**-pointing chevron
+    over children that were on screen, and clicking it flipped the glyph and changed nothing, since
+    with a filter running neither state of `expanded` alters what is rendered. `nav_rows` agreed
+    with the children, so the keyboard was right and only the glyph lied. Each caller now passes the
+    same expression its own children container uses, which is what makes one answer per node
+    possible at all.
     **What the eye hides, it hides from every surface — and the rule is two predicates in
     `core::schema`, not a filter each surface remembers.** `db_visible` answers "may a *list* show
     this database": the tree's `dyn_stack`, `nav_rows`, the QUERY toolbar's selector menu and the
     trigger that opens it, and **Find-Anywhere**, which had spelled it `!hidden.contains(…)` inline.
+    The palette has **two** branches and only the typed one was ever filtered: the empty-query
+    branch reads the search history, which is keyed by `conn_id` alone, so a hidden database's
+    remembered row sat in the list until a character was typed. That half is
+    `search_history::recent_visible`.
     The two agree today — `db_visible` *is* that expression — but the palette is the surface
     `core::db_hidden`'s module doc names first among those a hidden database must disappear from,
     so it is the one that would silently stop following the rule the moment the rule grew a clause
@@ -10073,7 +10387,16 @@ existing prose was left alone.
       `DbStatsState::Idle`, moving each to `Loading` before
       spawning, and settles a failure at `Unavailable` rather than retrying on every expand.
       **Two things ask it, and the slot is what keeps that from being two queries.** The size
-      column's effect asks for the databases that are *expanded* with the column on; a capped
+      column's effect asks for the databases `schema_tree::wants_db_stats` answers for, with the
+      column on — **expanded *and* visible, which is not the same as expanded**. It filtered on
+      `expanded` alone while its own header said "only for the ones the user can actually see", and
+      putting a database away with the SCHEMA eye prunes neither its `db:` key nor its node from
+      `db_nodes` (the tree filters visibility at *render*). So an expanded-then-hidden database went
+      on being asked for an `information_schema.tables` aggregate — the expensive one on a large
+      MySQL instance — on every connect, every connection switch and every SCHEMA Refresh, for
+      output rendered nowhere. The predicate lives beside the key builders rather than in
+      `core::stats` because the expansion half *is* `db_key`'s, and asking that a second way is the
+      drift those builders are gathered to prevent. A capped
       result's toolbar asks for its own through `SchemaActions::db_stats`, which resolves the node by
       name — that route exists because the column is opt-in while `1,000 of ~4.2m` is not, and
       without it the line would only ever appear for users who had already switched the column on.
@@ -10097,6 +10420,19 @@ existing prose was left alone.
     `snippet::by_abbrev` so the narrowest scope wins by the same rule everywhere; the row shows the
     abbrev and inserts the **body**, through the same `Suggestion::insert` override an FK-JOIN row
     uses.
+    **The `SchemaIndex` is memoised per UI thread beside the catalogue, and it was the half that
+    never got it.** `SchemaIndex::build` walks every loaded database, every table and every column,
+    allocating a fresh `ColMeta` per column plus three `HashMap`s, and `recompute_completions`
+    called it directly — a function that is deliberately undebounced (`editor_pane` schedules it at
+    `Duration::ZERO`, one tick, only so the caret has settled), so it ran on effectively every
+    keystroke of the ordinary case, typing an identifier leaving a non-empty prefix. That exact
+    cost had been found and fixed once, for `Catalog`, with a cache keyed on `Arc` identity; the
+    index kept paying it. `schema_index` is the lookup and `CachedIndex` the entry — the nodes, the
+    hidden set, the active database and the built index — rebuilding only when one of those has
+    moved, and comparing schemas by `Arc::ptr_eq` rather than by value, since identity is what a
+    re-introspection changes and so nothing has to be invalidated by hand. `LoadedNode` exists so
+    the snapshot is taken out of the signals **once**: reading `node.schema` twice could key an
+    index on a schema it was not built from.
   - `tabs.rs` — query-tab strip, and where a **`.sql`-backed tab** shows itself. The state behind
     that is four signals on `Tab`: `path`, `disk_sql` (the file's text as of the last open / save /
     reload — `None` means *unknown*, which reads as modified, the safe direction), `file_format`
@@ -10270,6 +10606,20 @@ existing prose was left alone.
     the selection as its marker. The gate is a source gate for the reason the crate's others are —
     the thing under test is a set of call sites — and it bounds its look-back to a window rather
     than latching a flag per file, since a 5.8k-line file has unrelated `set_insert`s in it.
+    **`cmdk_anchor_at` is `anchor_cmdk`'s pure half, and it exists because
+    `points_of_offset` answers `(Point::ZERO, Point::ZERO)` for an offset it cannot place.**
+    `screen_lines` is built with no overscan, so anything outside the visible range falls into that
+    arm — and the anchor consumed it as a position. A 300-line `INSERT … VALUES` with the caret on
+    line 1 has `statement_range`'s `end` far below the viewport, so the bar anchored at the
+    document origin: unscrolled that is y = 9, *over* the first line of the statement it is meant
+    to sit under; scrolled down 2,000 px it is −1,991, and `editor_area` neither scrolls nor clips,
+    so the prompt opened **off the top of the window with the keyboard already in it** and every
+    keystroke went into a box nobody could see. The scroll fix below could not rescue it either —
+    from a deeply negative anchor it answers `None`. The likelier route in is *AI fix*, whose
+    button sits on a bar pinned to the pane's bottom and which anchors to a failing statement that
+    need not be on screen at all. So an unplaced `end` falls back to the **caret's** line, which is
+    on screen by definition and is where the user is looking, and an unplaced caret (nothing laid
+    out yet) to the top of the *viewport* — never to the document's origin, which is not visible.
     `anchor_cmdk` does two things neither caller should
     repeat. It stores the point in the editor's **content** coordinates and leaves the style closure
     to subtract the viewport, so the bar tracks a later scroll — while the closure was *not*
@@ -10534,6 +10884,21 @@ existing prose was left alone.
     `TextLayoutLine`. Nine tests now cover it, `a_start_row_at_the_end_bands_nothing_as_added` being
     the shipped off-by-one itself. `row_split` keeps only the part that genuinely needs the layout:
     which visual row the block starts on.
+    **`before_col_of` is `segments`' cost taken off the *column translation* path**, and it is
+    deliberately a transcription rather than a delegation. `InlineDiffDoc::before_phantom_col`
+    replaces floem's default, which builds the whole suggestion — an `InlinePlan` clone and a
+    complete `segments()` re-tokenise — to answer a question about columns and byte lengths;
+    `before_col_of` takes the `(column, byte length)` of each phantom and never looks at their text
+    or colour. Every column translation in the editor flows through it, so a wrong answer moves the
+    caret, and it is kept **byte-for-byte faithful to floem 0.2.0's `PhantomTextLine::before_col`**
+    including its quirks: the answer is the *last* span that claims the column, not the first, and
+    a column inside a span collapses to that span's own column. `spans` must arrive in the order
+    floem would iterate them (`offset_size_iter` — insertion order with a running shift), which is
+    what the caller assembles. The only test worth having is the differential one,
+    `before_col_of_agrees_with_floems_own_translation`, running both over a corpus that covers a
+    block at column 0, a block at end of line, both at once, several phantoms at the *same* column
+    — which is what a block's own parts are, and the case that lets `Block::len` stand in for the
+    list — and columns before, inside, at both edges of, and past every span.
   - `erd_view.rs` — the **ER-diagram** canvas over `core::erd`. Edges are drawn by a custom paint
     view (`EdgeCanvas`), *not* a Floem `svg` — `svg` doesn't repaint reliably on reactive change
     here and blanked the edges on drag/hover. Zoom is **semantic, not a paint transform**: cards and
@@ -10541,6 +10906,22 @@ existing prose was left alone.
     zoom. The surface is an infinite free pan (not a scroll view) — drag/middle-drag pans, Ctrl+wheel
     zooms about the cursor, plain/Shift+wheel pans — and hit-testing maps cursor → logical space via
     `(p − pan) / z`.
+    **The edge geometry is one memo with two readers** (`EdgeGeometry`, built by `edge_geometry`
+    over the positions, sizes and collapse maps). `rects` + `visible_map` + `edge_shapes` is
+    O(cards) + O(edges × 32) — a fresh `HashMap<String, Rect>` over every card, `card_metrics`
+    (O(columns)) per node, and a cubic bezier resampled into 33 points per edge — and it ran in the
+    canvas's `PointerMove` handler on **every raw pointer-move event over empty canvas**, the
+    gesture by which the user reaches everything, and again in `EdgeCanvas::paint`, so a move that
+    did change the hovered edge paid for it twice. The hover write is dedup-guarded, but the guard
+    sits *after* all of it, so it saved the paint and none of the work. This is the same cost class
+    as the position map's 8.4 ms per pointer move at 500 cards recorded under *Floem 0.2 gotchas*:
+    that handler was fixed and the sibling thirty lines below it cloned both maps and then did
+    strictly more than the original bug. The value is `Rc`-wrapped and compares by pointer, so it
+    never dedups — the point is to compute once per change of the inputs, not to suppress a repaint
+    the canvas's own effect already handles. The hit test reads the same memo through
+    `erd::nearest_polyline_of`, which is `nearest_polyline` over *borrowed* polylines and exists for
+    exactly this caller: rebuilding every edge's sampled curve to hand it a `Vec<Vec<Pt>>` was the
+    other half of the same per-pointer-move cost.
     **The toolbar is responsive**, and the decision is `core::erd::fit_toolbar`'s while the
     measurement is this module's: `chip_w` / `icon_button_w` / `zoom_unit_w` predict each group's
     width *before* layout, from the same `TOOLBAR_*` constants the widgets are drawn with — the
@@ -11886,6 +12267,29 @@ existing prose was left alone.
   for its own reasons. The turn is already rendered by then, so the grace is only about reaping: long
   enough that a healthy CLI flushing and shutting down is never killed mid-cleanup, short enough that
   one which never exits cannot wedge the session against every later question.
+  **stderr has the same hazard from the other pipe, which is why `drain_stderr` is a function.** A
+  child whose diagnostics fill the pipe buffer — 64 KiB on Linux — blocks in `write` until somebody
+  reads, so reading only when it dies is a deadlock, and `kill_on_drop` cannot help because the
+  owner is blocked in `wait()`. It is a function rather than an inline spawn because the persistent
+  session creates a child **twice**: the Stop respawn above reassigns `child`, `stdin`, `reader`,
+  `parser` and `raw_output` and left `child.stderr` alone, so nothing read that pipe for the rest of
+  the session — and `stderr_buf` still held the *killed* child's output, which `cli_failure_message`
+  prefers over everything. A source gate counts the `drain_stderr(&mut child` sites so a third spawn
+  cannot quietly skip it.
+  **A dropped session is a turn nobody is listening to, and the per-turn loop distinguishes it from
+  a Stop with its own `abandoned` flag.** `switch_conn` sets `*ai_session.borrow_mut() = None` and,
+  eight lines later, replaces the panel with the connection switched *to* and clears `ai_busy`.
+  That `None` arm used to fold in with `Interrupt` and close the turn, which sends an
+  `AiStreamMsg { segs, done: true, is_error: true }` carrying **connection A's half-written
+  answer** — and that message carries no session or connection id, so the consumer applies it blind
+  to `v.last_mut()`: B's last assistant answer replaced by A's text, recoloured as an error, and
+  written into B's entry in `chats.json` by B's next `persist_chat`. Not a race — `switch_conn`
+  runs to completion on the UI thread, so the restored transcript is always already in place. The
+  persistent branch had always got this right (`None => break`, falling out to `child.kill()` with
+  nothing sent), and the comment beside the consumer names this exact hazard and then guards only
+  the *save*, which fails open because `ai_session` is `None` by then: nothing is written at that
+  moment and the corruption stays in the signal. So the per-turn branch kills and sets `abandoned`,
+  and the close is `if !ended && !abandoned` — a Stop still reports, a drop says nothing at all.
   The MCP subprocess gets its DB endpoint as JSON in `$SCHEMAIC_MCP_ENDPOINT` via a
   per-session `--mcp-config` file (removed on drop) — never argv, so credentials don't leak
   to other same-user processes. **That file, and every other per-session file carrying the endpoint,
@@ -12162,6 +12566,20 @@ existing prose was left alone.
     shim is ever found. `harness_bin(h, override)` and `harness_reachable(h, path)` are the former
     `claude_bin`/`claude_reachable` with the harness passed in rather than assumed — the first
     resolves what to spawn, the second answers the settings modal's "is this reachable".
+    **`pick_executable` is `which_on_path`'s per-directory half, pure so it can be tested, and on
+    Windows the bare name must not win.** `npm i -g` writes *three* shims per binary: `<name>`, a
+    `#!/bin/sh` script for Git Bash, plus `<name>.cmd` and `<name>.ps1`. Taking the bare file first
+    resolved an npm-installed harness to the `sh` script, which `Command::spawn` answers with **os
+    error 193, "%1 is not a valid Win32 application"** — and the two surfaces then contradicted
+    each other: `harness_reachable` said connected, because it only asks whether the file exists,
+    while `probe`'s `--help` errored into `Constraint::Unknown` and `inline_gate` refused *every*
+    generation with "could not confirm … so the assistant is disabled". The whole AI feature dead,
+    for a harness that was installed. `cmd.exe` and `where.exe` consider only `PATHEXT` extensions,
+    so this does too: the bare name is taken only when its own extension is already one of them
+    (`foo.exe` asked for by full name), and `PATHEXT`'s order *is* the preference order, which is
+    what puts `.CMD` ahead of a `.ps1` nobody can spawn directly. Off Windows `exts` is empty and
+    the bare name is the only candidate, which is correct there — the executable bit is the test,
+    not the name.
     **One `--help`, three answers.** `probe(h, bin)` returns a `Probe { seal, constraint,
     isolate_config }` rather than the old bare `CliSeal`, because all three come out of the same help
     text and spawning it three times is three times the ~140 ms nobody has. **Which page that is comes
@@ -12322,6 +12740,26 @@ existing prose was left alone.
     the window without being the guarantee — `install` is handed to a blocking thread inside the new
     session's task, so the old teardown can still land after it — and the comment at that call site
     says as much, so nobody reads the reordering as having replaced the nonce.
+    **`may_claim` is the other half of that, and the nonce could not have covered it.** The marker
+    is one slot and `claim` used to overwrite it unconditionally: two Schemaic windows on
+    Antigravity, A installs and claims, B installs and claims over A's marker, and B's *New Chat*
+    then drops its session, sees `on_disk == mine` and runs `agy mcp remove schemaic` and withdraws
+    the allow-rules — machine-global state A is still using. A's session is untouched in memory, so
+    `is_installed()` still says true and the panel still reports its constraint, while every
+    database tool call in A is refused; a denied Antigravity turn reports `"status":"SUCCESS"` with
+    an empty response, so the user watches the assistant silently stop using the database with no
+    error anywhere. That is verbatim the failure this module's header says it fixed — *"a second
+    window's session ending disarmed a live one just as surely as its starting used to"* — and the
+    nonce cannot see it, since it solves two sessions in **one** process, where the pid and start
+    time are identical, and here they differ. So: no claim on disk, take it; our own process, take
+    it (a respawn, and the nonce is what keeps the outgoing teardown off the new one); another
+    process still running, **refuse**; another process gone, or its pid reissued to something with
+    a different start time, take it. Declining to claim is safe either way, because the startup
+    sweep clears the full tool set for a crashed owner. What a session got is `Claimed`, three
+    states rather than a bool: `Mine(claim)` cleans up on teardown, `Shared` registers and grants
+    anyway — both are idempotent upserts of the same state and this session needs the tools — but
+    **withdraws nothing on the way out**, the owner still being the owner, and `Refused` installs
+    nothing at all.
     **The claim goes first and is released last, and the first half is what changed.** It used to be
     written *after* `agy mcp add` and after the grant, so from the instant the registration landed
     until the claim returned there was machine-global state that no marker accounted for, and another
@@ -13941,7 +14379,30 @@ Re-introducing the anti-patterns these guard against is a regression:
   each keeping its own `to_lowercase().contains`. The empty needle is why that matters beyond
   tidiness: the predicate owns the rule that an empty term matches nothing (every caller answers "no
   filter" separately), and while the callers spelled the comparison themselves that case was handled
-  in some of them and not others. **Find-Anywhere's three passes were the last two copies**, and
+  in some of them and not others. **`schema::name_survives` is the second empty-input rule, and the
+  two are deliberately not interchangeable**: an empty *needle* matches nothing, an empty *filter*
+  keeps every row. A search asks "does this name match what I typed", and nothing matches nothing;
+  the schema tree's filter box asks "does this row survive", and with the box empty every row does.
+  It exists so the tree can stop hand-spelling `filt.is_empty() ||
+  name.to_lowercase().contains(filt)`, which it did at eight sites — the database and namespace
+  rows, in the rendered tree and again in the keyboard walk that has to stay bug-for-bug identical
+  to it — and it is a *second* spelling rather than a clause folded into `object_name_matches`,
+  because folding it in there would have inverted every search on an empty term.
+  **The predicate's body is no longer `name.to_lowercase().contains(needle)`.** That allocated one
+  `String` per name asked, and the palette is deliberately undebounced, so a term that has not
+  narrowed to anything yet (`custz` on the way to `customers`) walked every table name and every
+  column name of every loaded database, allocating and freeing one for each — and the early exits do
+  not help on that input, since nothing fills a bucket and nothing breaks out. Measured in release
+  on a synthetic schema with a needle matching nothing (the worst case, and the one that happens
+  while you are still typing): 0.66 ms per database at 500 tables × 25 columns, 1.57 ms at 1000 ×
+  30, so ten middling databases were ~6.6 ms on the UI thread per character. There is now an
+  allocation-free byte walk, taken only when **both** sides are ASCII, and the `to_lowercase`
+  fallback is *kept* rather than replaced — `to_lowercase` is not `to_ascii_lowercase`, `İ`
+  lowercases to two chars and `ẞ` to `ß`, so a byte-wise walk would answer differently for exactly
+  the names `ghost_suffix` was written for.
+  `the_allocation_free_path_agrees_with_lowercasing_the_name` is what pins the two together, and it
+  is the assertion that matters: the fast path is an optimisation whose only failure mode is a
+  quietly different answer. **Find-Anywhere's three passes were the last two copies**, and
   they were one function asking one question three times and answering it two ways: pass 2 went
   through the predicate while passes 1 and 3 hand-spelled `name.to_lowercase().contains(q)`, so a
   clause added to it — the predicate's own hypotheticals are quote-stripping and
@@ -13974,10 +14435,32 @@ Re-introducing the anti-patterns these guard against is a regression:
   entirely, and a type could not be found however precisely you typed its name. That is the same
   symptom the object arm was added to fix, arriving by a different route, which is why
   `an_object_survives_a_flood_of_column_matches` pins it with a deliberately small cap. Names are
-  few, so the ordering costs only the tail of a broad column search. Two residual limits, both
-  pre-existing and both accepted: a database with `limit` *table-name* matches can still starve its
-  objects (a name match is rare where a column match is not), and the cap is **global across
-  databases**, so a wide first database still contributes everything and later ones nothing.
+  few, so the ordering costs only the tail of a broad column search.
+  **Ordering alone was not enough, and `overlays::pass_shares` is what replaced it.** Ordering
+  decided which category could crowd the others out and did so in *both* directions: objects last,
+  and one `user_id` across a hundred tables pushed every type past the cap; objects ahead of the
+  columns, and a serial-heavy PostgreSQL schema answered `id` with eighty `*_id_seq` rows and no
+  table or column at all (`a_flood_of_sequences_does_not_crowd_out_tables_and_columns`). Neither is
+  a *wrong* result — each is an absent one, for something the user typed precisely. So each pass is
+  guaranteed `room / 3` if it can use it, a pass that cannot hands its share straight on, and the
+  spare goes in pass order — names, objects, columns — so a narrow search still fills the list with
+  the most precise matches first and only a search broad enough to overflow ever pays the share
+  (`each_pass_gets_a_share_and_the_spare_goes_in_order`).
+  **The same share is now applied a second time, across *databases*, which is why `pass_shares`
+  takes a slice rather than `[usize; 3]`.** The cap used to be spent first-come by database:
+  `find_matches` walked `db_nodes` in order and returned at the first one to fill the list, so on a
+  connection holding `analytics` (400 tables, many carrying `order`) and `shop` (20 tables, one of
+  them literally named `orders`), typing `orders` returned eighty rows of `analytics` and
+  **`shop.orders` was not in the list at all** — an exact match on the term typed in full,
+  unreachable by typing more, since a longer prefix cannot narrow `analytics` faster than it narrows
+  `shop`. Hiding `analytics` was the only way to see it. `overlays::matches_across` is the merge:
+  the early return is gone, every visible database is asked for at most `limit` hits of its own, and
+  the buckets are combined by the same share. The extra work is bounded because `schema_hits` still
+  stops each of its passes at the room it was given, so a database contributes at most `limit`
+  however large it is. Three tests hold the shape — `a_later_databases_exact_match_is_not_crowded_out`,
+  `one_database_still_fills_the_list` (the share must not cap a lone database at a fraction of
+  `limit`) and `the_share_holds_for_any_number_of_buckets`, the last because the bucket count is now
+  however many databases are loaded rather than always three.
   **Snippets are a fourth category, appended after all three** (`overlays::snippet_items`), with the
   bookmark glyph the panel toggle wears — in the **accent**, the only row colour in the list, because
   a snippet is the one result that is the user's rather than the server's (the completion popup tints
@@ -14706,6 +15189,22 @@ Re-introducing the anti-patterns these guard against is a regression:
   the safe direction of wrong: two `Arc`s over identical bytes compare unequal and cost one needless
   rebuild of one cell — the behaviour before the memo — and nothing unequal can ever be called
   equal.
+  **The schema tree is the same fact at every level of one view, and `schema_tree::dedup_key` is the
+  remedy applied wholesale.** `expanded` is one app-wide `RwSignal<HashSet<String>>` and every
+  children container and every chevron in the tree subscribes to it, so expanding one table in a
+  500-table database re-ran `db_node`'s children key — which deep-copies every `TableInfo` in the
+  database (measured, release: 2.77 ms at 500 tables × 25 columns, 6.78 ms at 1000 × 30, the clone
+  alone) — and then constructed 500 fresh `table_node`s, each six views with two nested
+  `dyn_container`s and two effects. Nor was it scoped to the database being touched: expanding a
+  table in `analytics` rebuilt `shop`'s children too, and every chevron in both. `dedup_key` is a
+  one-line `create_memo` wrapper round a key closure, the same device and the same framework fact as
+  `widgets::overlay_open_key`. **`SchemaKey` is what makes a `SchemaState` usable in such a key**: it
+  compares `Loaded` by `Arc::ptr_eq`, because a derived `PartialEq` would compare a whole `DbSchema`
+  by content on every notification — far worse than the rebuild being avoided — while what the
+  container actually needs to know is "is this the same catalogue I built from", and a refresh
+  replaces the `Arc`. It holds the `Arc` rather than reducing it to a pointer, so a later allocation
+  cannot reuse the address, compare equal and leave a stale subtree; that is the one way this
+  optimisation can go wrong, and `erd_view::EdgeGeometry` is the same shape for the same reason.
   **And only the key closure is wrapped in an effect — the *builder* is called outside it**, so a
   scaled metric read there subscribes nothing and freezes at the scale the view was built at. Two
   sites paid for that. `schema_tree`'s `SchemaTreeCtx` therefore carries `indent_levels: u32`, a
@@ -15549,7 +16048,15 @@ renders the themed panel; the caller positions it absolutely. Used by the schema
 - **Edge-flipping**: submenus flip left past the right edge and shift up past the bottom — from the
   parent row's window position (`on_move`/`on_resize`) + the live `window_size()` global (set from
   `workspace`'s root `on_resize`). `popup_menu_overlay` flips the whole panel the same way at the
-  cursor. Only the width is a flat estimate (`SUBMENU_FLIP_W = 210` for a submenu; the popup uses the
+  cursor. **Tracking `window_size()` means the placement closure re-runs on a resize, so what it
+  resolves there has to be only the flip.** The schema context menu's anchor is now a `create_memo`
+  over `ctx` alone: the closure used to re-evaluate `menu.at.unwrap_or_else(|| last_mouse
+  .get_untracked())` on every run, so a border drag or Win+Up teleported a menu raised on a row at
+  the top of the tree to wherever the pointer had since wandered. Reading `last_mouse` untracked
+  stops a bare pointer *move* from re-placing the panel and does nothing about a re-run driven by
+  another signal; the keyboard route was immune only because it fills `at`. Fixed at the open,
+  re-flipped on the resize — which is the half that should follow the window. Only the width is a
+  flat estimate (`SUBMENU_FLIP_W = 210` for a submenu; the popup uses the
   panel's real `min_width`); the height both ask for is `menu_panel_height`, which sums the entries
   that will actually be drawn — 30.5 per action row, 9 per separator, plus 14 — because counting
   separators as full rows shoved an upward-flipped panel tens of px too high. A row carrying a
@@ -15801,6 +16308,31 @@ renders the themed panel; the caller positions it absolutely. Used by the schema
   every style closure reading it), the workspace root passes `None` so a pointer-down keeps nothing,
   and `closing_leaves_exactly_the_one_menu_that_asked_to_stay` walks every id. Add a new dropdown by
   adding a variant and a field here, not a fourth copy of the list.
+  **What actually holds a ninth variant to that list is `MenuFlags::slot`, not `MenuId::ALL`.**
+  `slot(id) -> MenuSlot` is "what do open and close mean for this one", boxed so five
+  `RwSignal<bool>` and three `RwSignal<Option<T>>` of three different `T` can sit in one array, and
+  its `match` has **no wildcard arm** — so a ninth `MenuId` fails to compile until somebody says
+  what opening and closing it mean. `ALL` is a hand-written literal like any other and is the
+  second half; `every_variant_has_a_slot` is what asks for it. `close_except` was three `if`s and a
+  five-element array before this, which a new variant compiles straight past. The tests read
+  openness through `slot` for the same reason: the fixture's own hand-written list is exactly the
+  shape that let `close_except` omit a flag, and the `open()` it replaced spelled all eight itself
+  and left `Context` out of its loop, so "keep the context menu, close the rest" was asserted
+  nowhere.
+  **`MenuFlags::any_open` is the second reader of that list, and it is a refusal rather than a
+  dismissal.** Nothing in the window's key handler closes menus — `close_except(None)` is on
+  `PointerDown` — and a menu panel is a `focus_root` that returns `Continue` for every key but Tab,
+  so a `Ctrl+…` reaches the window fallback with the menu still standing. Ctrl+W then disposes the
+  tab under a grid menu whose entries are `Rc` closures over that grid's signals, and clicking one
+  afterwards is a `get_untracked` on a disposed signal — a panic that takes every other tab's
+  uncommitted edits with it; Ctrl+T opens a query tab whose autofocus declines, because the
+  stranded panel's `focus_root` is still registered. It asks all eight channels and not just the
+  two the grid uses, the gear, the eye, the switcher, the active-database menu and the activity
+  clock stranding exactly the same way, and `any_open_sees_every_channel_by_itself` raises each
+  alone — `closing_leaves_exactly_the_one_menu_that_asked_to_stay` opens all eight at once and so
+  cannot tell seven-of-eight from eight-of-eight. It is deliberately **not** folded into
+  `modals::modal_backdrop_up`, whose doc forbids menus in terms: that predicate also raises the
+  modal layer's full-window box and the title-bar band, and a menu must do neither.
 - **The panel owes an absorb too, and it is the same fact read from the other end.** The root closes
   every menu on any pointer-down, and floem delivers `Click` on the way *up*, only to a view that
   still exists — so a panel that does not stop its own `PointerDown` is torn down by the root on the
@@ -15939,6 +16471,19 @@ renders the themed panel; the caller positions it absolutely. Used by the schema
   Without it the surface that raised the menu goes **keyboard-dead**: the panel is a `focus_root`
   with no other root above it in the workspace, so its teardown drops focus and the next key reaches
   nothing. Both the grid toolbar's F6 and the tree's Shift+F10 hit exactly that.
+  **The schema tree's *pointer* route needs the same return, and `keyboard_nav` is the wrong gate
+  for it** — `schema_tree::arm_menu_return`, called from `marking_opener` so both of a row's ways
+  into its menu arm it. A right-click left the tree with no focus once the menu went away: floem
+  focuses a `keyboard_navigable` view on a **secondary** pointer-down exactly as on a primary one,
+  so the click put focus on the tree and the panel's teardown took it away again — arrow keys, Enter
+  and Shift+F10 all stopped answering and the nav highlight vanished with them, until something was
+  clicked. The Shift+F10 route armed a return and said why; the pointer route armed nothing. The
+  stated reason for withholding the slot after a click is that "moving focus to the control that was
+  clicked would take the arrow keys away from whatever had them", and that premise does not hold
+  here — floem has already moved focus, and the arrow keys were the tree's. So the guard is
+  `Nav::focused`, which arms the return only when the tree actually held the keyboard and leaves
+  every other trigger's rule intact. `Nav` carries the tree container's own `ViewId` for it
+  (`tree_id`, published once the view exists), which was a local before there was a second caller.
   **Handing focus back is a focus *event*, and a handler that re-seeds state on one is a bug waiting
   for a caller.** The tree's `FocusGained` seeded the nav cursor from the open table unconditionally
   — correct while the only way in was a click from outside, and wrong the moment the menu started
@@ -16102,7 +16647,27 @@ this bundle's.
 
 - **Two panes** side by side (`h_stack`): a **frozen pane** (row-number gutter + optional frozen
   column) and a horizontally-scrolling **data pane**. Rebuilt by a `dyn_container` keyed on
-  `(sort, frozen)`. **Freeze is per-column, any column**: `gs.frozen` holds the frozen column's
+  `body_rebuild_key` — sort state, frozen column, **how many** pending new rows there are, and a
+  `key_gen` counter — and it is a **memo, not the bare closure it used to be**. `dyn_container`
+  does not dedup (`create_updater`'s `UpdaterEffect::run` calls `on_change` on every notification,
+  whether or not the value moved), and `new_rows` takes *shape-preserving* writes: every
+  `stage_new`/`stage_new_many`/`stage_new_bytes` patches a value inside a row's map and leaves the
+  vector's length alone. So filling a pending row cell by cell — the documented Tab/Enter gesture —
+  tore both panes, the header and the `win`/`body_h` memos down per cell and re-ran `compute_order`
+  over the whole result: measured 14.3 ms per keystroke at the default 200,000-row cap on a numeric
+  sort, *before* the rebuild it sits inside, with each rebuild also republishing `gs.order` and so
+  re-firing the selection aggregate and restarting the find-count rescan. A memo compares on
+  `PartialEq`, which covers all three layout terms rather than only the length —
+  `add_cloned_rows`' batching becomes an optimisation instead of the only defence, and a `sort` or
+  `frozen` write landing on the value already there stops rebuilding too. `key_gen` is the fourth
+  term and the only one that is not about layout: it counts changes to the source table's **key
+  map**, which the header cells read by value from inside this container, so a schema arriving
+  after the result — ordinary on a large server, where introspection is ten-plus round trips per
+  database — otherwise never reached them and the key icons and *Follow relation* were missing for
+  the life of the result. A counter and not the map, so the memo compares a `u64` per notification
+  instead of a `HashMap`. It is generic in the row type purely so the composition can be tested
+  with no window (`body_key_tests`); only `Vec::len` is called.
+  **Freeze is per-column, any column**: `gs.frozen` holds the frozen column's
   *absolute* index, set from the header right-click menu (no toolbar button). The data pane renders
   `data_cols` = `(0..ncols)` minus the frozen index (an `Arc<Vec<usize>>`); cells keep their
   *absolute* `ci` so selection/resize/sort stay consistent. Frozen pane width = `GUTTER_W + widths[frozen]`.
@@ -16270,6 +16835,41 @@ this bundle's.
   takes the staged `CellEdit`, and a staged **blob** weighs as `Staged` rather than `StagedNull`:
   it paints `<n bytes>`, and the italic in this grid means *absence*, where a placeholder stands
   for a value that is there. The green fill is what says it changed.
+- **Every menu this grid raises goes through one door, `GridState::open_menu`, and the door is
+  where the liveness guard lives.** Each of them — the toolbar's Copy, Download and AI dropdowns,
+  the gutter, header and cell context menus, the in-cell picker's own list — is a `Vec` of `Rc`
+  closures over *this grid's* signals parked in `ui.overlay.popup_menu`, which is **window**-scoped.
+  Nothing but a pointer-down clears it: not a tab switch, not a re-run, not a commit that re-runs
+  the query. So a menu routinely outlives the scope its entries close over, and the click that
+  follows is a `get_untracked` on a disposed signal — a panic that takes the window and every other
+  tab's uncommitted edits. It is not a millisecond race: type a `WHERE` fragment, press Enter and
+  open the Copy menu while the re-run is in flight, or press the commit ✓ on a change carrying an
+  insert (`CommitDone::FullReran` re-runs) and open a menu while the write is — `apply_splice`
+  puts that window at `innodb_lock_wait_timeout`, 50 s by default and open-ended inside a Manual
+  transaction. **Guarding the entries one at a time is what was already going wrong**:
+  `GridState::alive` is `rs.try_get_untracked().is_some()`, its own doc records the file having had
+  that guard "in five places and missing it in five others", and the eight functions the entries
+  call each open with an unguarded read. So `guarded_entries` wraps every action — submenus
+  included, to any depth — asking `alive` at **click** time rather than at build time, which is the
+  whole point; a dead grid's entry is **inert, not absent**, still drawing and still dismissing the
+  menu, because `menu_panel` calls `close` after the action whatever the action did. `alive` is
+  passed as a closure so the composition can be tested without a window: a `GridState` cannot be
+  built in a `#[test]`, while a disposed `Scope` holding one signal reproduces the identical hazard.
+  `popup_channel_gate` keeps the door the only one, matching on the single whitespace-stripped write
+  `open_menu` makes — rustfmt wraps it across two lines, and a line-based scan would find no write
+  at all and pass while every installer went round it.
+- **An in-flight AI fill carries `FillTarget`, resolved at launch — never a display coordinate.**
+  `stage_fill` used to take the `(display row, pending index)` the user had selected and re-resolve
+  it when the model answered seconds later, and both halves move in the meantime. A sort mid-flight
+  rewrites `gs.order` while `GridState` survives, so `gs.order.get(disp)` came back a *different
+  data row* and the value was staged there as an ordinary green edit — the purple "generating" wash
+  having been on the right row the whole time, because `ai_fill_value` already resolved the data row
+  at launch for that and then threw it away. A pending row is worse: **✗ Discard** clears `new_rows`
+  and bumps `new_rows_gen`, and the next **+ Row** hands out index 0 again, so a reply carrying
+  `pending = Some(0)` overwrote what the user had just typed. That is verbatim the bug
+  `new_rows_gen` exists for, and the guard had been written into `ai_seed_rows` and not into the
+  sibling reaching the same `stage_new`. So the enum carries a committed row by its **data** index,
+  stable under a sort, and a pending row by index *and* the generation it belongs to.
 - **Right-click menus** (generic `menu_panel` / `ui.popup_menu`): a header offers `Copy › CSV / JSON`
   of that column's values (`export_column_csv`/`_json`); a data cell offers `View`, `Edit` (editable
   cells only), a Copy entry whose scope and wording come from `edit::copy_scope` (**Copy** for the
@@ -16960,7 +17560,20 @@ this bundle's.
   (`grid_find_bar`/`grid_goto_bar`, mounted in `results_section`) so it can sit at the panel's edge,
   while the work happens in `grid_view`, which is the only place that has the row data. Find is
   incremental on `find_query`; goto fires on a `goto_step` **nonce** the popup bumps on Enter,
-  because a jump belongs to submit rather than to every keystroke. `grid_view` keeps at most one of
+  because a jump belongs to submit rather than to every keystroke.
+  **The find *jump* is budgeted, and `budget` is not an optional argument to `next_match`.** The
+  jump runs on every character typed into the box — its effect's own comment says "incremental as
+  the query changes" — and a needle that matches nothing, or whose early prefixes match nothing,
+  walked every cell: ten million of them at the 200,000-row cap × 50 columns, synchronously on the
+  UI thread, per keystroke. Its sibling the match *count* is debounced **and** capped at
+  `FIND_COUNT_CELL_BUDGET`, with a comment saying the scan is "a String per cell" and must stay
+  "well under a frame's worth of jank"; the jump, which is the expensive half, had neither. Running
+  out means the jump does not move, which is what "no match" already looks like, and the readout
+  says `N+` off the same budget so the two surfaces agree about where they stopped looking. It is
+  split out of `grid_find` for the reason `find_hits` already is: the decision is testable without
+  a live grid, and a budget nothing asserts is a constant nobody would miss. The cells themselves
+  are read through `edit::GridCells::with_text`, which is what took two heap allocations per cell
+  off that walk. `grid_view` keeps at most one of
   the two open, as the editor does with its own pair — in **both** directions: the exclusion
   tracked `goto_open` alone, so Ctrl+F over an open Go-to-row left both mounted on one anchor and
   you typed into the one you couldn't see. Go to row resolves through the pure

@@ -5510,8 +5510,14 @@ fn matches_across<'a>(
     out
 }
 
-/// One database's hits, appended to `out`. Returns whether `limit` was reached —
-/// the caller stops there.
+/// One database's hits, appended to `out`. Returns whether `limit` was reached.
+///
+/// **No caller stops there any more.** It used to: `find_matches` walked the
+/// databases in order and returned at the first one to fill the list, which is
+/// how a small database's exact match became unreachable. [`matches_across`]
+/// asks every database for at most `limit` hits and merges them under a share,
+/// so the answer is discarded — kept only because the per-pass `break`s inside
+/// still need `room`, and a caller that wants to know can.
 ///
 /// Split out from [`find_matches`] because that one reads signals and this one is
 /// plain data: it is what the tests drive to prove the palette matches the same
