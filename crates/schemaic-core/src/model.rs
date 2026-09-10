@@ -1695,6 +1695,48 @@ mod tests {
         assert!(b.take_chunk(0).capped_columns.is_empty());
     }
 
+    /// **And `binary` is inherited, which is the opposite choice and the one
+    /// nothing asserted.** `capped_columns` is a property of the chunk's arena;
+    /// this is a property of the *column* — a blob seen in block 3 says the
+    /// column holds bytes, and the `<n bytes>` placeholder a later block writes
+    /// for it must be withheld on the same grounds.
+    ///
+    /// Deleting the carry-forward left `cargo test --workspace` green, and a
+    /// streamed export of a table whose blob column is `NULL` for the first
+    /// chunk's rows and real bytes afterwards then wrote the placeholder into
+    /// CSV, JSON **and** SQL as though it were the value — exactly what
+    /// `ResultSet::binary_columns` exists to stop, and what
+    /// `export::dropped_binary_columns` reads this field to prevent.
+    #[test]
+    fn binary_columns_are_inherited_by_the_next_chunk() {
+        let mut b = ResultBuilder::new(vec![named("id", "INT"), named("photo", "BLOB")]);
+        // Block 1: the column is there but every value is NULL, so nothing has
+        // asserted bytes yet.
+        b.push_row(&[Value::Int(1), Value::Null]);
+        let first = b.take_chunk(0);
+        assert!(
+            first.binary_columns.is_empty(),
+            "nothing said this column held bytes yet"
+        );
+
+        // Block 2: the backend sees a `Blob` and says so.
+        b.push_row(&[Value::Int(2), Value::Str("<7 bytes>".into())]);
+        b.mark_binary(1);
+        let second = b.take_chunk(0);
+        assert_eq!(second.binary_columns, vec![1]);
+
+        // Block 3: nothing new is marked, and the answer must not be forgotten
+        // — the chunk that carries the placeholder text is this one.
+        b.push_row(&[Value::Int(3), Value::Str("<9 bytes>".into())]);
+        let third = b.take_chunk(0);
+        assert_eq!(
+            third.binary_columns,
+            vec![1],
+            "a later chunk forgot the column holds bytes, so its placeholder \
+             text is about to be exported as data"
+        );
+    }
+
     // ── Raw-bytes columns ──
 
     #[test]

@@ -1580,6 +1580,103 @@ mod tests {
         }
     }
 
+    /// **The one field the `dialect` parameter reaches, and nothing exercised
+    /// it.** The helper above says a test that means a *cap* names its engine
+    /// and calls `super::analyze_edit` outright; no test did, so every fixture
+    /// went through the 2-argument shim and `analyze_edit`'s dialect argument
+    /// was unexercised end to end. `blob::column_byte_cap` is well covered in
+    /// isolation, which is exactly the split CLAUDE.md warns about: the pure
+    /// function pinned, its composition with the caller not.
+    ///
+    /// `EditModel::byte_cap`'s sole reader is the blob panel's *Load from file*
+    /// refusal — "That file is X — this column holds at most Y" — so a wrong
+    /// fill either refuses a file the column would take or accepts one the
+    /// server will reject at commit.
+    ///
+    /// Four decisions, one per assertion: **which** columns get a cap (binary
+    /// only), **where** the type comes from (the loaded `TableInfo`, not
+    /// `rs.columns[ci].type_name`, whose length the wire has stripped), **how**
+    /// the schema column is matched (by `origin.column`), and that the
+    /// **dialect** really reaches the answer.
+    #[test]
+    fn the_byte_cap_comes_from_the_schemas_type_for_binary_columns_only() {
+        // `rs`'s own type is the stripped wire name — `blob::column_byte_cap`
+        // would answer 65_535 for it — while the schema declares the real one.
+        let r = rs(vec![
+            col("id", "INT", "docs", true, false),
+            col("photo", "BLOB", "docs", false, true),
+            col("note", "VARCHAR", "docs", false, false),
+        ]);
+        let declared = |ty: &str| {
+            let ty = ty.to_string();
+            move |_db: &str, _s: Option<&str>, t: &str| {
+                (t == "docs").then(|| {
+                    schema_with_pk(
+                        "docs",
+                        &["id"],
+                        &[("id", "int"), ("photo", &ty), ("note", "varchar(190)")],
+                    )
+                })
+            }
+        };
+
+        let m = super::analyze_edit(&r, SqlDialect::MySql, declared("varbinary(64)"));
+        assert_eq!(
+            m.byte_cap(1),
+            Some(64),
+            "the schema's declared length won, not the wire's stripped `BLOB`"
+        );
+        assert_eq!(m.byte_cap(2), None, "a non-binary column is never asked");
+        assert_eq!(m.byte_cap(0), None);
+        assert_eq!(
+            m.byte_cap(9),
+            None,
+            "past the end is no answer, not a panic"
+        );
+
+        // The family, since the four MySQL blob types are four different
+        // columns and the wire calls all of them `BLOB`.
+        for (ty, cap) in [
+            ("tinyblob", 255),
+            ("blob", 65_535),
+            ("mediumblob", 16_777_215),
+        ] {
+            let m = super::analyze_edit(&r, SqlDialect::MySql, declared(ty));
+            assert_eq!(m.byte_cap(1), Some(cap), "{ty}");
+        }
+
+        // **The dialect reaches the answer.** SQLite's declared types carry no
+        // byte ceiling, so the same fixture gets none.
+        let m = super::analyze_edit(&r, SqlDialect::Sqlite, declared("varbinary(64)"));
+        assert_eq!(m.byte_cap(1), None, "SQLite declares no byte ceiling");
+
+        // No schema loaded is "no answer", not "no limit".
+        let m = super::analyze_edit(
+            &r,
+            SqlDialect::MySql,
+            |_: &str, _: Option<&str>, _: &str| None,
+        );
+        assert_eq!(m.byte_cap(1), None);
+
+        // And the match is by the column's **provenance** name: a schema that
+        // calls it something else answers for nothing.
+        let renamed = |_db: &str, _s: Option<&str>, t: &str| {
+            (t == "docs").then(|| {
+                schema_with_pk(
+                    "docs",
+                    &["id"],
+                    &[
+                        ("id", "int"),
+                        ("image", "varbinary(64)"),
+                        ("note", "varchar"),
+                    ],
+                )
+            })
+        };
+        let m = super::analyze_edit(&r, SqlDialect::MySql, renamed);
+        assert_eq!(m.byte_cap(1), None);
+    }
+
     #[test]
     fn happy_path_int_pk_is_editable() {
         let r = rs(vec![
