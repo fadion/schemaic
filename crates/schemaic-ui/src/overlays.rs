@@ -2278,14 +2278,27 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                                         }
                                     },
                                 )
-                                // An unloaded schema has nothing to edit from,
-                                // and a materialized view has no
-                                // `CREATE OR REPLACE` to edit it with.
-                                .disabled(if is_view {
-                                    !editable_view
-                                } else {
-                                    !has_columns
-                                }),
+                                // A read-only connection may not, an unloaded
+                                // schema has nothing to edit from, and a
+                                // materialized view has no `CREATE OR REPLACE`
+                                // to edit it with.
+                                //
+                                // **`read_only` was the term this entry and
+                                // Triggers below were the only two in the block
+                                // to omit** — bound at the top of it and used by
+                                // eight siblings, including every Drop. So the
+                                // menu offered a live Edit table beside a dimmed
+                                // Truncate on the same connection, and
+                                // `properties.rs`' handoff cited this entry as
+                                // its reference for a term it did not have.
+                                .disabled(
+                                    read_only
+                                        || if is_view {
+                                            !editable_view
+                                        } else {
+                                            !has_columns
+                                        },
+                                ),
                             );
                         }
                         // Triggers: one entry opening a modal over the table's
@@ -2317,11 +2330,13 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                                         )
                                     },
                                 )
-                                // An unloaded schema has no trigger list to show.
-                                // Which *objects* can have triggers at all is
-                                // `view_has_no_triggers` above, and decides
-                                // whether this entry exists rather than dimming it.
-                                .disabled(!has_columns),
+                                // A read-only connection may not edit them, and
+                                // an unloaded schema has no trigger list to
+                                // show. Which *objects* can have triggers at
+                                // all is `view_has_no_triggers` above, and
+                                // decides whether this entry exists rather than
+                                // dimming it.
+                                .disabled(read_only || !has_columns),
                             );
                         }
                         // **Not the `Refresh` above.** That one re-reads the
@@ -2482,15 +2497,21 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                     if offers.edit {
                         let ui = import_ui.clone();
                         let (src, col) = (source.clone(), column.clone());
-                        entries.push(MenuEntry::action("Edit column", move || {
-                            crate::table_designer::open_for_table(
-                                &ui,
-                                &src.database,
-                                src.schema.as_deref(),
-                                &src.table,
-                                crate::table_designer::DesignerFocus::Column(&col),
-                            );
-                        }));
+                        entries.push(
+                            MenuEntry::action("Edit column", move || {
+                                crate::table_designer::open_for_table(
+                                    &ui,
+                                    &src.database,
+                                    src.schema.as_deref(),
+                                    &src.table,
+                                    crate::table_designer::DesignerFocus::Column(&col),
+                                );
+                            })
+                            // It opens the designer, so it is the same write the
+                            // red Drop below it is dimmed for. This entry
+                            // carried no `.disabled` at all.
+                            .disabled(read_only),
+                        );
                     }
                     if offers.drop {
                         let ui = import_ui.clone();
@@ -2556,18 +2577,24 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                         } else {
                             "Edit index"
                         };
-                        entries.push(MenuEntry::action(label, move || {
-                            crate::table_designer::open_for_table(
-                                &ui,
-                                &src.database,
-                                src.schema.as_deref(),
-                                &src.table,
-                                crate::table_designer::DesignerFocus::Key {
-                                    index: &ix,
-                                    foreign_key: fk.as_deref(),
-                                },
-                            );
-                        }));
+                        entries.push(
+                            MenuEntry::action(label, move || {
+                                crate::table_designer::open_for_table(
+                                    &ui,
+                                    &src.database,
+                                    src.schema.as_deref(),
+                                    &src.table,
+                                    crate::table_designer::DesignerFocus::Key {
+                                        index: &ix,
+                                        foreign_key: fk.as_deref(),
+                                    },
+                                );
+                            })
+                            // Same designer as Edit column, and the same write
+                            // the two Drops below are dimmed for. This entry
+                            // carried no `.disabled` either.
+                            .disabled(read_only),
+                        );
                     }
                     // A foreign key's backing index can't be dropped while the
                     // constraint stands, so the entry offers the constraint —

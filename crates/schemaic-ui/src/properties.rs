@@ -730,6 +730,13 @@ fn footer(
     // dead end. Gated exactly as the context menu's own entry is: an unloaded
     // schema has nothing to edit from, a read-only connection may not, and a
     // materialized view has no `CREATE OR REPLACE` to be edited with.
+    //
+    // **The read-only clause was true of this comment and not of the menu it
+    // names** until the term was added there (B11.2-L2-01), and this gate is a
+    // build-time `bool` besides: the panel outlives a connection being marked
+    // read-only from the status bar, and the button would stay live. What makes
+    // it so in both directions is the refusal inside `open_for_table` /
+    // `open_for_view`; this decides only what the button *says*.
     let ctx = crate::table_designer::edit_ctx(&ui);
     let editable_view = crate::view_editor::is_editable_view(info.as_ref());
     let can_edit = !ctx.read_only

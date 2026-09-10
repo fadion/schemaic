@@ -106,8 +106,17 @@ fn open(ui: &Ui, target: RoutineTarget, draft: RoutineDraft) {
 }
 
 /// Open the editor on an existing routine.
+///
+/// **The read-only refusal is at each door in this file**, per
+/// `database_editor::open_for_new`: `open_for_routine` is reached from
+/// `object_editor::open_for_object`, which the tree's double-click and
+/// Find-Anywhere both call without consulting the menu's gate, and the two
+/// `open_for_new`s are reached from `create_submenu` directly.
 pub(crate) fn open_for_routine(ui: &Ui, database: &str, r: &RoutineInfo) {
     let ctx = edit_ctx(ui);
+    if ctx.read_only {
+        return;
+    }
     open(
         ui,
         RoutineTarget {
@@ -124,6 +133,9 @@ pub(crate) fn open_for_routine(ui: &Ui, database: &str, r: &RoutineInfo) {
 /// Open the editor on a blank draft — Create function / Create procedure.
 pub(crate) fn open_for_new(ui: &Ui, database: &str, schema: Option<&str>, kind: RoutineKind) {
     let ctx = edit_ctx(ui);
+    if ctx.read_only {
+        return;
+    }
     open(
         ui,
         RoutineTarget {
@@ -155,6 +167,9 @@ pub(crate) fn open_for_new(ui: &Ui, database: &str, schema: Option<&str>, kind: 
 /// signal already answers.
 pub(crate) fn open_for_new_trigger_function(ui: &Ui, database: &str, schema: Option<&str>) {
     let ctx = edit_ctx(ui);
+    if ctx.read_only {
+        return;
+    }
     // Against the functions already fetched for this database, so a second
     // "New function…" doesn't propose a name the first one took.
     let taken: Vec<String> = ui.ddl.functions.with_untracked(|l| {

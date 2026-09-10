@@ -138,6 +138,14 @@ pub(crate) fn open_for_object(ui: &Ui, database: &str, item: &ObjectItem) {
         return;
     }
     let ctx = edit_ctx(ui);
+    // The other half of the menu's own gate. `overlays.rs`' entry spells it
+    // `read_only || !editable` and only the `!editable` term had been moved
+    // here, so the three paths that bypass the menu — double-click, keyboard
+    // activation, a remembered Find-Anywhere hit — opened a fully editable form
+    // on a read-only connection. See `database_editor::open_for_new`.
+    if ctx.read_only {
+        return;
+    }
     let dependents = match loaded_schema(ui, database) {
         Some(s) => ddl::type_dependents(&s, item.schema(), item.name()),
         None => Vec::new(),
@@ -172,6 +180,11 @@ pub(crate) fn open_for_new(ui: &Ui, database: &str, schema: Option<&str>, kind: 
         return;
     }
     let ctx = edit_ctx(ui);
+    // As at the door above: `create_children` dims every entry on a read-only
+    // connection, and this is what makes it so.
+    if ctx.read_only {
+        return;
+    }
     let name = match kind {
         ObjectKind::Domain => "new_domain",
         ObjectKind::Sequence => "new_sequence",

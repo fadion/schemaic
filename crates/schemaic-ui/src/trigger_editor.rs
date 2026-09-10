@@ -304,11 +304,19 @@ fn fetch_functions(ui: &Ui) {
 }
 
 /// Open the editor on a table's triggers.
+///
+/// **This modal has exactly one launcher and it carried no read-only term**, so
+/// until the refusal below there was no gated route to it at all: the list was
+/// live, `+` added a trigger and Preview SQL lit up on a connection the app had
+/// been told not to write to. See `database_editor::open_for_new`.
 pub(crate) fn open_for_table(ui: &Ui, database: &str, schema: Option<&str>, table: &str) {
     let Some(info) = loaded_table(ui, database, schema, table) else {
         return;
     };
     let ctx = edit_ctx(ui);
+    if ctx.read_only {
+        return;
+    }
     open_editor(
         ui,
         TriggerTarget {

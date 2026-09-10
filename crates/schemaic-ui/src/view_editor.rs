@@ -87,6 +87,13 @@ pub(crate) fn open_for_view(ui: &Ui, database: &str, schema: Option<&str>, view:
         return;
     };
     let ctx = edit_ctx(ui);
+    // Three of this editor's four launchers carry a read-only term; the fourth
+    // is the schema tree's Edit view, which shares its `.disabled` with Edit
+    // table and had never had one. The refusal belongs here either way — see
+    // `database_editor::open_for_new`.
+    if ctx.read_only {
+        return;
+    }
     // MySQL's question and nobody else's — `SHOW CREATE VIEW` is the only place
     // the algorithm lives. Asked as `== MySql`, not `!= Postgres`: the second
     // spelling sent SQLite off to fetch an option it has no concept of.
@@ -177,6 +184,12 @@ pub(crate) fn open_from_query(ui: &Ui, database: &str, select: &str) {
 
 fn open_blank(ui: &Ui, database: &str, schema: Option<&str>, body: &str) {
     let ctx = edit_ctx(ui);
+    // Both blank doors at once — Create view and "Create view from this query",
+    // the second of which is an editor context-menu entry rather than a tree
+    // one and so has no dimmed sibling to speak for it.
+    if ctx.read_only {
+        return;
+    }
     let mut draft = ViewDraft::blank("new_view", schema.map(str::to_string));
     draft.select = body.to_string();
     open_editor(

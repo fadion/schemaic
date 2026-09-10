@@ -3891,6 +3891,111 @@ mod engine_comparison_gate {
     }
 }
 
+/// **A schema editor's door refuses a read-only connection in the same step
+/// that opens it** — the `widgets::accept_launch` rule, applied to the ten
+/// launches that open a DDL form rather than to a button.
+///
+/// Eleven doors across eight files stamp `EditCtx::read_only` into the target
+/// they open, and `ddl_preview`'s Apply is refused on that stamp — so no write
+/// ever escaped. What did was the *door*: on a connection marked read-only the
+/// schema tree's double-click, its keyboard activation, Find-Anywhere, **Edit
+/// table**, **Edit column**, **Edit index**, **Triggers**, **Edit view** and the
+/// Properties panel's handoff all opened a fully live form, counted the changes
+/// and lit Preview SQL, and the first thing that said no was Apply. Three
+/// findings in one family (B11.1-L2-01, B11.2-L2-01, B11.3-L2-01), found one
+/// editor at a time, because each door is written where its own modal is and
+/// nothing looked at the eleven together.
+///
+/// The gate is spelled over the **stamp**, not over a list of function names:
+/// writing `read_only: ctx.read_only` into a target is what makes a function one
+/// of these doors, so a twelfth editor is caught the moment it is written rather
+/// than when someone remembers to add it here. The refusal has to come *before*
+/// the stamp, which is also the order that keeps a half-opened modal off the
+/// screen.
+#[cfg(test)]
+mod read_only_door_gate {
+    /// Files that stamp the flag and are **not** editor doors, with the reason.
+    const EXEMPT: &[(&str, &str)] = &[(
+        "overlays.rs",
+        "`ddl_preview::PlanTarget`, not an editor target: the two Drop-container \
+         entries capture the context where the menu fired so the confirmation \
+         cannot be answered against a connection the user switched to \
+         meanwhile. The refusal on that stamp is `preview_container`'s, and the \
+         enclosing item is the menu builder — there is no door here to guard.",
+    )];
+
+    /// What makes a function a door.
+    const STAMP: &str = "read_only: ctx.read_only,";
+    /// What it must say first.
+    const REFUSAL: &str = "if ctx.read_only {";
+
+    /// The `(offset, name)` of the top-level `fn` header nearest above `at`.
+    fn enclosing_fn(code: &str, at: usize) -> (usize, &str) {
+        let start = code[..at]
+            .rmatch_indices('\n')
+            .map(|(i, _)| i + 1)
+            .find(|&s| {
+                let rest = &code[s..];
+                ["fn ", "pub fn ", "pub(crate) fn "]
+                    .iter()
+                    .any(|k| rest.starts_with(k))
+            })
+            .unwrap_or(0);
+        let name = code[start..at]
+            .split_once("fn ")
+            .and_then(|(_, r)| r.split_once('('))
+            .map(|(n, _)| n)
+            .unwrap_or("<unnamed>");
+        (start, name)
+    }
+
+    #[test]
+    fn every_editor_door_refuses_a_read_only_connection() {
+        let mut offenders: Vec<String> = Vec::new();
+        let mut doors = 0usize;
+        let mut exempt_seen: Vec<&str> = Vec::new();
+        for (file, code) in crate::source_gate::crate_sources() {
+            if !code.contains(STAMP) {
+                continue;
+            }
+            if let Some((name, _)) = EXEMPT.iter().find(|(f, _)| *f == file) {
+                exempt_seen.push(name);
+                continue;
+            }
+            for (at, _) in code.match_indices(STAMP) {
+                doors += 1;
+                let (start, name) = enclosing_fn(&code, at);
+                if !code[start..at].contains(REFUSAL) {
+                    offenders.push(format!("{file}::{name}"));
+                }
+            }
+        }
+        // A renamed field or a moved `src` would otherwise make this pass by
+        // finding nothing at all — the failure mode `crate_sources` guards
+        // against for the whole family.
+        assert!(
+            doors >= 11,
+            "only {doors} editor doors found — is `{STAMP}` still the spelling?"
+        );
+        for (file, why) in EXEMPT {
+            assert!(
+                exempt_seen.contains(file),
+                "{file} is exempted ({why}) but no longer stamps the flag — drop it from EXEMPT"
+            );
+        }
+        assert!(
+            offenders.is_empty(),
+            "these open a schema editor without refusing a read-only connection \
+             first:\n    {}\n\nA launch guards itself in the same step that \
+             launches it (CLAUDE.md). Put `if ctx.read_only {{ return; }}` above \
+             the target, as `database_editor::open_for_new` does — the dimmed \
+             menu entry stays, because that is what *says* the action is \
+             unavailable; this is what makes it so.",
+            offenders.join("\n    ")
+        );
+    }
+}
+
 /// Tabs / query signals (Copy bundle).
 #[derive(Clone, Copy)]
 pub struct TabsUi {

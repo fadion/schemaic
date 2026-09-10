@@ -377,6 +377,16 @@ pub(crate) fn open_for_table(
         return;
     }
     let ctx = edit_ctx(ui);
+    // **The third lock, and the one this door had none of.** Of its four
+    // launchers — Edit table, Edit column, Edit index and the Properties
+    // panel's handoff — only the last carried a read-only term, and that one is
+    // a build-time `bool` that goes stale if the connection is marked read-only
+    // while the panel is open. `create_submenu`'s Create ▸ Table was dimmed all
+    // along, so a read-only connection was refused a new table and invited to
+    // redesign an existing one. See `database_editor::open_for_new`.
+    if ctx.read_only {
+        return;
+    }
     // Resolved against the introspected table, before it moves into the target.
     // The key case is resolved *after* the open instead, against the draft the
     // open seeds — that is the sequence the Indexes and Foreign keys lists show.
@@ -464,6 +474,10 @@ pub(crate) fn preview_draft_edit(
 /// Open the designer on a blank draft — Create table.
 pub(crate) fn open_for_new(ui: &Ui, database: &str, schema: Option<&str>) {
     let ctx = edit_ctx(ui);
+    // `create_children` already dims the entry; this is what makes it so.
+    if ctx.read_only {
+        return;
+    }
     open_designer(
         ui,
         DesignerTarget {
