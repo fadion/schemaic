@@ -505,7 +505,12 @@ pub(crate) fn account_editor_overlay(ui: Ui) -> impl IntoView {
         // The preview stacks on top and this stays open behind it (Cancel there
         // returns here with the draft intact), but must render nothing — the
         // pairing every other editor uses.
-        move || (d.account.get().is_some(), d.preview.get().is_some()),
+        move || {
+            (
+                d.account.with(Option::is_some),
+                d.preview.with(Option::is_some),
+            )
+        },
         move |(open, previewing)| {
             if !open || previewing {
                 return empty().into_any();
@@ -621,7 +626,7 @@ pub(crate) fn account_editor_overlay(ui: Ui) -> impl IntoView {
         },
     )
     .style(move |s| {
-        if d.account.get().is_some() && d.preview.get().is_none() {
+        if d.account.with(Option::is_some) && d.preview.with(Option::is_none) {
             s.absolute().inset(0.0)
         } else {
             s
@@ -903,7 +908,12 @@ pub(crate) fn grant_editor_overlay(ui: Ui) -> impl IntoView {
     };
 
     dyn_container(
-        move || (d.grant.get().is_some(), d.preview.get().is_some()),
+        move || {
+            (
+                d.grant.with(Option::is_some),
+                d.preview.with(Option::is_some),
+            )
+        },
         move |(open, previewing)| {
             if !open || previewing {
                 return empty().into_any();
@@ -1033,7 +1043,7 @@ pub(crate) fn grant_editor_overlay(ui: Ui) -> impl IntoView {
         },
     )
     .style(move |s| {
-        if d.grant.get().is_some() && d.preview.get().is_none() {
+        if d.grant.with(Option::is_some) && d.preview.with(Option::is_none) {
             s.absolute().inset(0.0)
         } else {
             s

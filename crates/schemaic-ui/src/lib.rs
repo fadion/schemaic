@@ -5823,7 +5823,7 @@ pub fn workspace(ui: Ui, window: WindowId) -> impl IntoView {
     {
         let popup_width = ui.overlay.popup_width;
         create_effect(move |_| {
-            if popup_menu.get().is_none() && popup_width.get_untracked() != 170.0 {
+            if popup_menu.with(Option::is_none) && popup_width.get_untracked() != 170.0 {
                 popup_width.set(170.0);
             }
         });
@@ -5835,9 +5835,9 @@ pub fn workspace(ui: Ui, window: WindowId) -> impl IntoView {
     // and the submenu would be left floating over the app with nothing behind it.
     // Both channels, because a submenu can come from either.
     create_effect(move |_| {
-        if popup_menu.get().is_none()
-            && context_menu.get().is_none()
-            && widgets::hoisted_submenu().get_untracked().is_some()
+        if popup_menu.with(Option::is_none)
+            && context_menu.with(Option::is_none)
+            && widgets::hoisted_submenu().with_untracked(Option::is_some)
         {
             widgets::hoisted_submenu().set(None);
         }
@@ -12109,6 +12109,73 @@ mod export_target_tests {
         // and the rest are folders.
         assert!(!target(ExportFormat::Sql).writes_folder());
         assert!(target(ExportFormat::Csv).writes_folder());
+    }
+}
+
+/// **`.get().is_some()` is a clone, and it is the one spelling of that defect
+/// the doc's own greps cannot see.**
+///
+/// `SignalGet::get` is `with(|v| v.clone())`, so asking a `RwSignal<Option<T>>`
+/// whether it is `Some` deep-copies `T` first — every `String`, every `Rc`,
+/// every `Vec` — and throws it away. The doc names "`.get()` clones — use
+/// `.with()`" as its most-repeated mechanical defect and records that no gate
+/// exists for it; the two instruments raised against it match
+/// `\.get\(\)\.(get|contains|len|iter|is_empty)\(` and
+/// `let \w+ = theme::\w+\(\);`, and neither sees `.is_some()`.
+///
+/// A census over `schemaic-ui` and `schemaic-app` found **89**. Most are over
+/// a `bool`-ish payload where the clone costs nothing real, so this is a
+/// **ceiling, not a ban**: it exists to stop the population growing back to
+/// where the expensive ones hide, and it is lowered whenever a batch is
+/// converted. The ones that mattered — the DDL previews in the account,
+/// database, event and object editors, the import sample, and the menu-entry
+/// vectors in `editor_pane` and `lib` — are converted.
+#[cfg(test)]
+mod get_is_some_ceiling {
+    /// What this crate's production code stood at when the gate was written,
+    /// after converting the payload sites. **Lower it, never raise it.** A new
+    /// `.get().is_some()` over anything with an allocation in it belongs as
+    /// `.with(Option::is_some)`; over a `Copy` payload it is merely noise, and
+    /// the ceiling is what keeps the noise from hiding the next real one.
+    ///
+    /// `schemaic-ui` only — `crate_sources` is this crate's — while the census
+    /// that produced the number spanned `schemaic-app` too. That crate is not
+    /// gated here and its share is small; say so rather than let the number
+    /// imply a coverage it does not have.
+    const CEILING: usize = 65;
+
+    #[test]
+    fn the_clone_that_asks_a_boolean_does_not_spread() {
+        let mut found = 0usize;
+        let mut worst: Vec<String> = Vec::new();
+        for (name, src) in crate::source_gate::crate_sources() {
+            for (n, line) in crate::source_gate::production_code(&src)
+                .lines()
+                .enumerate()
+            {
+                if line.contains(".get().is_some()") || line.contains(".get().is_none()") {
+                    found += 1;
+                    if worst.len() < 8 {
+                        worst.push(format!("  {name}:{} {}", n + 1, line.trim()));
+                    }
+                }
+            }
+        }
+        assert!(
+            found <= CEILING,
+            "{found} `.get().is_some()`/`is_none()` sites, up from {CEILING}. \
+             `get` is `with(|v| v.clone())`, so each one deep-copies its \
+             payload to ask a boolean — and this spelling is invisible to \
+             every other grep the project has for that defect. Use \
+             `.with(Option::is_some)`. First few:\n{}",
+            worst.join("\n")
+        );
+        // And it has to still be finding them, or a rename makes it pass by
+        // seeing nothing.
+        assert!(
+            found >= 20,
+            "the scan found only {found} — has the census stopped working?"
+        );
     }
 }
 

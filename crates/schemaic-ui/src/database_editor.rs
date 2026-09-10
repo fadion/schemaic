@@ -411,7 +411,12 @@ pub(crate) fn database_editor_overlay(ui: Ui) -> impl IntoView {
         // The preview stacks on top and this stays open behind it (Cancel there
         // returns here with the draft intact), but must render nothing — the
         // same pairing every other editor uses, for the same reason.
-        move || (d.database.get().is_some(), d.preview.get().is_some()),
+        move || {
+            (
+                d.database.with(Option::is_some),
+                d.preview.with(Option::is_some),
+            )
+        },
         move |(open, previewing)| {
             if !open || previewing {
                 return empty().into_any();
@@ -529,7 +534,7 @@ pub(crate) fn database_editor_overlay(ui: Ui) -> impl IntoView {
         },
     )
     .style(move |s| {
-        if d.database.get().is_some() && d.preview.get().is_none() {
+        if d.database.with(Option::is_some) && d.preview.with(Option::is_none) {
             s.absolute().inset(0.0)
         } else {
             s

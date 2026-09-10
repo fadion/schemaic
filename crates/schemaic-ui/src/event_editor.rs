@@ -1021,7 +1021,7 @@ pub(crate) fn event_editor_overlay(ui: Ui) -> impl IntoView {
     )
     .style(move |s| {
         // The same absolute placement every other DDL overlay takes.
-        if d.event.get().is_some() && d.preview.get().is_none() {
+        if d.event.with(Option::is_some) && d.preview.with(Option::is_none) {
             s.absolute().inset(0.0)
         } else {
             s

@@ -1187,7 +1187,7 @@ pub(crate) fn import_overlay(ui: Ui) -> impl IntoView {
     }
 
     dyn_container(
-        move || (i.target.get().is_some(), i.step.get()),
+        move || (i.target.with(Option::is_some), i.step.get()),
         move |(open, step)| {
             if !open {
                 return empty().into_any();
@@ -1255,7 +1255,7 @@ pub(crate) fn import_overlay(ui: Ui) -> impl IntoView {
             let ring_done = ring.clone();
             let footer = match step {
                 ImportStep::Source => dyn_container(
-                    move || (i.sample.get().is_some(), i.reading.get()),
+                    move || (i.sample.with(Option::is_some), i.reading.get()),
                     move |(has_sample, busy)| {
                         let ui = ui_next.clone();
                         let ring = ring_src.clone();
@@ -1386,7 +1386,7 @@ pub(crate) fn import_overlay(ui: Ui) -> impl IntoView {
         },
     )
     .style(move |s| {
-        if i.target.get().is_some() {
+        if i.target.with(Option::is_some) {
             s.absolute().inset(0.0)
         } else {
             s

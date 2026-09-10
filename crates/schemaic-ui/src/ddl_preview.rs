@@ -874,7 +874,7 @@ pub(crate) fn ddl_preview_overlay(ui: Ui) -> impl IntoView {
     });
 
     dyn_container(
-        move || (d.preview.get().is_some(), d.applied.get()),
+        move || (d.preview.with(Option::is_some), d.applied.get()),
         move |(open, applied)| {
             if !open {
                 return empty().into_any();
@@ -1194,7 +1194,7 @@ pub(crate) fn ddl_preview_overlay(ui: Ui) -> impl IntoView {
         },
     )
     .style(move |s| {
-        if d.preview.get().is_some() {
+        if d.preview.with(Option::is_some) {
             s.absolute().inset(0.0)
         } else {
             s

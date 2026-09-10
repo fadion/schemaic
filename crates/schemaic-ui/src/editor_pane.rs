@@ -2178,19 +2178,22 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
     // dismiss catchers cover different regions, so a click in one doesn't reach
     // the others.)
     create_effect(move |_| {
-        if popup_menu.get().is_some() {
+        // `with`, not `get`: this fires on every write to the window-wide
+        // menu channel, and `get` clones the whole entry list — labels, `Rc`
+        // closures, submenu vectors — to ask whether one is open.
+        if popup_menu.with(Option::is_some) {
             context_menu.set(None);
             run_menu.set(None);
         }
     });
     create_effect(move |_| {
-        if context_menu.get().is_some() {
+        if context_menu.with(Option::is_some) {
             popup_menu.set(None);
             run_menu.set(None);
         }
     });
     create_effect(move |_| {
-        if run_menu.get().is_some() {
+        if run_menu.with(Option::is_some) {
             popup_menu.set(None);
             context_menu.set(None);
         }
