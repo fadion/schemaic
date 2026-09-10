@@ -492,6 +492,38 @@ impl NullRule {
 /// a NULL.
 pub type Field = Option<String>;
 
+/// One source record as the traversal hands it over: its fields, plus what the
+/// *format* knows about them that the text no longer can say.
+///
+/// `sheet_errors` holds the indices of fields whose worksheet cell was a
+/// `calamine::Data::Error` — a cell the sheet itself could not evaluate. It
+/// exists because [`cell_text`] renders such a cell with Excel's own spelling
+/// (`#N/A`, `#REF!`), which is the right thing to show and also the point at
+/// which a formula error and a string cell holding those five characters become
+/// byte-identical. Re-deriving it downstream from the spelling refused an
+/// ordinary file: `#N/A` is pandas' first default `na_values` entry and what
+/// people type by hand for "not applicable". Empty for CSV and JSON, which have
+/// no such cell.
+///
+/// The indices are into the record as read. Nothing trims them alongside a
+/// trimmed field list ([`trim_to_mapping`]) because nothing needs to: an index
+/// past the end simply never matches a field that is still there.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct Record {
+    fields: Vec<Field>,
+    sheet_errors: Vec<usize>,
+}
+
+impl Record {
+    /// A record from a format that has no notion of a broken cell.
+    fn plain(fields: Vec<Field>) -> Self {
+        Record {
+            fields,
+            sheet_errors: Vec::new(),
+        }
+    }
+}
+
 /// The column families import validates. Everything outside them is
 /// [`ColKind::Other`] and passes through untouched — see the module docs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -834,7 +866,7 @@ fn for_each_record<R: std::io::Read>(
     r: R,
     format: ImportFormat,
     cfg: &ReadConfig,
-    mut on_record: impl FnMut(Vec<Field>, u64) -> bool,
+    mut on_record: impl FnMut(Record, u64) -> bool,
 ) -> Result<(), ImportError> {
     match format {
         ImportFormat::Csv => {
@@ -850,14 +882,16 @@ fn for_each_record<R: std::io::Read>(
                 // line number in an error list is worse than none.
                 let line = rec.position().map(|p| p.line()).unwrap_or(0);
                 let fields = rec.iter().map(|f| Some(f.to_string())).collect();
-                if !on_record(fields, line) {
+                if !on_record(Record::plain(fields), line) {
                     break;
                 }
             }
         }
         ImportFormat::Json => {
             let mut keys: Vec<String> = Vec::new();
-            json_records(r, &mut keys, usize::MAX, false, on_record)?;
+            json_records(r, &mut keys, usize::MAX, false, |fields, line| {
+                on_record(Record::plain(fields), line)
+            })?;
         }
         ImportFormat::Xlsx => {
             let mut names: Vec<String> = Vec::new();
@@ -1167,8 +1201,11 @@ pub fn read_workbook_sample<R: std::io::Read>(
     let sheets = wb.sheet_names().to_vec();
     let mut columns: Vec<String> = Vec::new();
     let mut rows: Vec<Vec<Field>> = Vec::new();
-    let more = xlsx_rows(&mut wb, &sheets, cfg, &mut columns, limit, |fields, _| {
-        rows.push(fields);
+    // The preview shows an error cell as the text Excel shows, which is what
+    // `rec.fields` already holds — `sheet_errors` is the coercion's question,
+    // not the rendering's.
+    let more = xlsx_rows(&mut wb, &sheets, cfg, &mut columns, limit, |rec, _| {
+        rows.push(rec.fields);
         true
     })?;
     Ok((
@@ -1262,7 +1299,7 @@ fn xlsx_records<R: std::io::Read>(
     cfg: &ReadConfig,
     columns: &mut Vec<String>,
     limit: usize,
-    on_record: impl FnMut(Vec<Field>, u64) -> bool,
+    on_record: impl FnMut(Record, u64) -> bool,
 ) -> Result<bool, ImportError> {
     use calamine::Reader;
     let mut wb = open_xlsx(r)?;
@@ -1278,7 +1315,7 @@ fn xlsx_rows(
     cfg: &ReadConfig,
     columns: &mut Vec<String>,
     limit: usize,
-    mut on_record: impl FnMut(Vec<Field>, u64) -> bool,
+    mut on_record: impl FnMut(Record, u64) -> bool,
 ) -> Result<bool, ImportError> {
     let name = match &cfg.sheet {
         // Not a fall back to the first sheet: a workbook the user edited between
@@ -1329,6 +1366,12 @@ fn xlsx_rows(
     // — and a *wholly* empty row never appears, which is exactly the rule the
     // doc above states, arrived at for free instead of by a filter.
     let mut row: Vec<Option<String>> = vec![None; width];
+    // Which of this row's slots came from a cell the sheet could not evaluate —
+    // see [`Record`]. A sparse index list rather than a parallel `Vec<bool>`
+    // precisely so it has no width to keep in step with `row`'s: the only two
+    // things that touch it are the push at the placement site and the take at
+    // the emit site, both below.
+    let mut errs: Vec<usize> = Vec::new();
     let mut at: Option<u32> = None;
     loop {
         let cell = cells
@@ -1347,6 +1390,9 @@ fn xlsx_rows(
             // mismatch report becomes noise on every row after the widest one.
             geometry_open = false;
             let full = std::mem::replace(&mut row, vec![None; width]);
+            // Taken on every emitted row *and* on the header row, which is why
+            // it sits beside the replace above rather than in the data branch.
+            let errs = std::mem::take(&mut errs);
             // A headerless sheet names its columns from that settled width,
             // here rather than before the loop — before the loop the width was
             // still only the file's claim.
@@ -1379,7 +1425,11 @@ fn xlsx_rows(
                     return Ok(true);
                 }
                 seen += 1;
-                if !on_record(full, line) {
+                let rec = Record {
+                    fields: full,
+                    sheet_errors: errs,
+                };
+                if !on_record(rec, line) {
                     return Ok(false);
                 }
             }
@@ -1411,7 +1461,13 @@ fn xlsx_rows(
             }
         }
         at = Some(r);
-        let Some(text) = cell_text(&c.get_value().clone().into()) else {
+        let value: calamine::Data = c.get_value().clone().into();
+        // **Asked here and nowhere else.** `cell_text` is about to render an
+        // error cell with Excel's own spelling, which is the right thing to
+        // show and the point at which it stops being distinguishable from a
+        // string cell holding those same characters. See [`Record`].
+        let broken = matches!(value, calamine::Data::Error(_));
+        let Some(text) = cell_text(&value) else {
             continue;
         };
         let text = if cfg.trim {
@@ -1422,8 +1478,13 @@ fn xlsx_rows(
         // A cell outside the declared range is dropped rather than widening or
         // shifting the row: every record has to carry the same field count, or
         // the mismatch report becomes noise on every row after the widest one.
-        if let Some(slot) = col.checked_sub(left).and_then(|i| row.get_mut(i as usize)) {
+        if let Some(i) = col.checked_sub(left).map(|i| i as usize)
+            && let Some(slot) = row.get_mut(i)
+        {
             *slot = Some(text);
+            if broken {
+                errs.push(i);
+            }
         }
     }
     // A sheet with no cells at all: no header to take, and no rows to emit.
@@ -1499,29 +1560,6 @@ fn duration_hms(days: f64) -> String {
     format!("{sign}{h}:{m:02}:{s:02}")
 }
 
-/// Is this field one of Excel's own formula-error spellings?
-///
-/// The closed set the format defines, matched exactly — `#N/A` and its siblings
-/// are not values a sheet can otherwise produce, and [`cell_text`] writes them
-/// with `Display`, which is Excel's spelling rather than calamine's variant
-/// name. Case-sensitive and whole-field, so a `VARCHAR` holding the sentence
-/// "check the #REF! column" is text, which it is.
-fn is_worksheet_error(text: &str) -> bool {
-    matches!(
-        text,
-        "#DIV/0!"
-            | "#N/A"
-            | "#NAME?"
-            | "#NULL!"
-            | "#NUM!"
-            | "#REF!"
-            | "#VALUE!"
-            | "#GETTING_DATA"
-            | "#SPILL!"
-            | "#CALC!"
-    )
-}
-
 /// One worksheet cell as the text an import coerces, or `None` for a cell that
 /// holds nothing.
 ///
@@ -1542,8 +1580,10 @@ fn is_worksheet_error(text: &str) -> bool {
 ///   the 3600× trap lives.
 /// - A **formula error** becomes Excel's own spelling of it (`#REF!`,
 ///   `#DIV/0!`) rather than a null: it is a cell the sheet itself could not
-///   evaluate, and [`is_worksheet_error`] is what turns that into an
-///   [`IssueKind::CellError`] naming the row, where a silent null would not.
+///   evaluate, and [`Record::sheet_errors`] — recorded by the caller, which
+///   still has the `Data` variant this rendering flattens — is what turns that
+///   into an [`IssueKind::CellError`] naming the row, where a silent null
+///   would not.
 fn cell_text(c: &calamine::Data) -> Field {
     use calamine::Data;
     match c {
@@ -1760,11 +1800,11 @@ pub fn insert_columns(mapping: &Mapping, table: &TableInfo) -> Vec<usize> {
 /// worksheet has them.
 pub fn coerce_record(
     fields: &[Field],
+    sheet_errors: &[usize],
     mapping: &Mapping,
     table: &TableInfo,
     nulls: &NullRule,
     dialect: SqlDialect,
-    format: ImportFormat,
     line: u64,
 ) -> (Vec<Value>, Vec<Issue>) {
     let cols = insert_columns(mapping, table);
@@ -1806,7 +1846,8 @@ pub fn coerce_record(
             // Three cases, and they're genuinely different: a field the format
             // says is null (`Some(None)`), a field the record simply doesn't
             // reach (`None` — a short CSV record), and text to interpret.
-            let field = match field_of[ci].and_then(|fi| fields.get(fi)) {
+            let from = field_of[ci];
+            let field = match from.and_then(|fi| fields.get(fi)) {
                 Some(Some(text)) => text.as_str(),
                 Some(None) | None => {
                     return if col.nullable {
@@ -1825,9 +1866,18 @@ pub fn coerce_record(
             // Asked before the type dispatch, and independently of it: a cell
             // the sheet could not evaluate is wrong for *every* column type,
             // and `ColKind::Other` — text, date, JSON, blob, enum — has no
-            // dispatch to catch it with. Format-gated, because only a worksheet
-            // has formula errors: `#N/A` typed into a CSV is text.
-            if format == ImportFormat::Xlsx && is_worksheet_error(field) {
+            // dispatch to catch it with.
+            //
+            // **Asked of the reader, not of the text.** This used to be
+            // `format == Xlsx && is_worksheet_error(field)`, matching the ten
+            // spellings — which cannot tell a formula error from a string cell
+            // whose whole content is one of them, so an ordinary file with
+            // `#N/A` typed into a `status` column was refused *whole*: the
+            // first issue makes `row_iter` return `Err` and aborts the
+            // transaction. `sheet_errors` is what calamine knew and
+            // `cell_text` had to discard; see [`Record`]. No format gate is
+            // needed any more, because only a worksheet ever fills it.
+            if from.is_some_and(|fi| sheet_errors.contains(&fi)) {
                 issues.push(Issue {
                     line,
                     column: col.name.clone(),
@@ -1907,11 +1957,20 @@ pub fn validate<R: std::io::Read>(
         issues: Vec::new(),
         more_issues: false,
     };
-    for_each_record(r, format, cfg, |mut fields, line| {
+    for_each_record(r, format, cfg, |mut rec, line| {
         out.rows += 1;
         // See `trim_to_mapping` — the check must see exactly what the import will.
-        fields.truncate(trim_to_mapping(&fields, format, mapping));
-        let (_, issues) = coerce_record(&fields, mapping, table, &nulls, dialect, format, line);
+        rec.fields
+            .truncate(trim_to_mapping(&rec.fields, format, mapping));
+        let (_, issues) = coerce_record(
+            &rec.fields,
+            &rec.sheet_errors,
+            mapping,
+            table,
+            &nulls,
+            dialect,
+            line,
+        );
         for i in issues {
             if out.issues.len() >= max_issues {
                 out.more_issues = true;
@@ -1958,15 +2017,20 @@ struct RowCtx {
 }
 
 impl RowCtx {
-    fn row(&self, fields: &[Field], line: u64) -> Result<Vec<Value>, String> {
+    fn row(
+        &self,
+        fields: &[Field],
+        sheet_errors: &[usize],
+        line: u64,
+    ) -> Result<Vec<Value>, String> {
         let fields = &fields[..trim_to_mapping(fields, self.format, &self.mapping)];
         let (values, issues) = coerce_record(
             fields,
+            sheet_errors,
             &self.mapping,
             &self.table,
             &self.nulls,
             self.dialect,
-            self.format,
             line,
         );
         match issues.first() {
@@ -2008,7 +2072,7 @@ enum RowSourceIter<R: std::io::Read> {
     /// cannot know its columns before EOF, and an `.xlsx` cannot be read as a
     /// prefix at all. Either way the rows exist before the first one is handed
     /// out, so one variant carries both.
-    Buffered(std::vec::IntoIter<(Vec<Field>, u64)>),
+    Buffered(std::vec::IntoIter<(Record, u64)>),
 }
 
 /// Build the row stream for an import. `mapping` must have at least one target,
@@ -2048,7 +2112,7 @@ pub fn row_iter<R: std::io::Read>(
             let mut keys = Vec::new();
             let mut rows = Vec::new();
             json_records(r, &mut keys, usize::MAX, false, |fields, n| {
-                rows.push((fields, n));
+                rows.push((Record::plain(fields), n));
                 true
             })?;
             RowSourceIter::Buffered(rows.into_iter())
@@ -2056,8 +2120,8 @@ pub fn row_iter<R: std::io::Read>(
         ImportFormat::Xlsx => {
             let mut names = Vec::new();
             let mut rows = Vec::new();
-            xlsx_records(r, cfg, &mut names, usize::MAX, |fields, n| {
-                rows.push((fields, n));
+            xlsx_records(r, cfg, &mut names, usize::MAX, |rec, n| {
+                rows.push((rec, n));
                 true
             })?;
             RowSourceIter::Buffered(rows.into_iter())
@@ -2077,14 +2141,14 @@ impl<R: std::io::Read> Iterator for RowIter<R> {
                     Ok(rec) => {
                         let line = rec.position().map(|p| p.line()).unwrap_or(0);
                         let fields: Vec<Field> = rec.iter().map(|f| Some(f.to_string())).collect();
-                        self.ctx.row(&fields, line)
+                        self.ctx.row(&fields, &[], line)
                     }
                     Err(e) => Err(e.to_string()),
                 })
             }
             RowSourceIter::Buffered(rows) => {
-                let (fields, line) = rows.next()?;
-                Some(self.ctx.row(&fields, line))
+                let (rec, line) = rows.next()?;
+                Some(self.ctx.row(&rec.fields, &rec.sheet_errors, line))
             }
         }
     }
@@ -3133,23 +3197,23 @@ mod tests {
         let table = tbl(&[("id", "int", false), ("note", "varchar", true)]);
         let mapping = auto_map(&["id".into(), "note".into()], &table, true);
 
-        // The seam, both ends: what the reader writes for an error cell is what
-        // the coercion recognises. `rust_xlsxwriter` cannot author an error cell,
-        // so the fixture is the reader's own output rather than a workbook — and
-        // joining the two here is the point, since each half looked right alone.
+        // Still the seam, both ends — but the two ends no longer meet in the
+        // *spelling*. What the reader renders for an error cell is what the
+        // user reads; what the coercion is asked is the index the reader
+        // recorded, so this half only has to stay a non-null rendering.
         for e in [CellErrorType::NA, CellErrorType::Div0, CellErrorType::Ref] {
             let text = cell_text(&Data::Error(e)).expect("an error cell is not a null");
-            assert!(is_worksheet_error(&text), "{text}");
+            assert!(text.starts_with('#'), "{text}");
         }
         let na = cell_text(&Data::Error(CellErrorType::NA)).unwrap();
 
         let (_, issues) = coerce_record(
             &f(&["2", &na]),
+            &[1],
             &mapping,
             &table,
             &NullRule::default(),
             MySql,
-            ImportFormat::Xlsx,
             3,
         );
         assert_eq!(issues.len(), 1, "{issues:?}");
@@ -3157,30 +3221,34 @@ mod tests {
         assert_eq!(issues[0].column, "note");
         assert_eq!(issues[0].line, 3);
 
-        // …and the same text in a CSV is text: only a worksheet has formula
-        // errors, and this must not start refusing files that never had one.
+        // …and the same text with nothing recorded against it is text. A CSV
+        // reaches here that way by construction, and so does a worksheet's
+        // *string* cell — which is the whole of [B6.1-L1-04].
         let (_, issues) = coerce_record(
             &f(&["2", &na]),
+            &[],
             &mapping,
             &table,
             &NullRule::default(),
             MySql,
-            ImportFormat::Csv,
             3,
         );
         assert!(issues.is_empty(), "{issues:?}");
 
-        // A sentence that merely mentions one is text on every format.
+        // An index recorded against a *different* field does not leak onto this
+        // one: `sheet_errors` is positional, and getting that wrong would flag
+        // whichever column happened to sort first.
         let (_, issues) = coerce_record(
-            &f(&["2", "check the #REF! column"]),
+            &f(&["2", &na]),
+            &[0],
             &mapping,
             &table,
             &NullRule::default(),
             MySql,
-            ImportFormat::Xlsx,
             3,
         );
-        assert!(issues.is_empty(), "{issues:?}");
+        assert_eq!(issues.len(), 1, "{issues:?}");
+        assert_eq!(issues[0].column, "id");
     }
 
     #[test]
@@ -3844,6 +3912,118 @@ mod tests {
         out
     }
 
+    /// Turn one cell of a real workbook into an **error cell** (`t="e"`) — the
+    /// other thing `rust_xlsxwriter` will not write, since it has no API for a
+    /// cached formula result, let alone a failed one.
+    ///
+    /// Without it the two halves of the error-cell question cannot be asked of
+    /// the same file: a fixture can hold the *text* `#N/A` or it can hold what
+    /// a `VLOOKUP` miss leaves behind, and until this existed only the first
+    /// was reachable — which is exactly why the code could tell them apart by
+    /// spelling and look right. `reference` is a cell the fixture already
+    /// wrote, so there is a `<c>` element to replace.
+    fn make_error_cell(xlsx: &[u8], reference: &str, spelling: &str) -> Vec<u8> {
+        use std::io::{Cursor, Read, Write};
+        let mut zin = zip::ZipArchive::new(Cursor::new(xlsx)).expect("a workbook is a zip");
+        let mut out = Vec::new();
+        let mut zout = zip::ZipWriter::new(Cursor::new(&mut out));
+        let opts: zip::write::FileOptions<'_, ()> =
+            zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+        let mut patched = false;
+        for i in 0..zin.len() {
+            let mut f = zin.by_index(i).expect("an entry");
+            let name = f.name().to_string();
+            let mut bytes = Vec::new();
+            f.read_to_end(&mut bytes).expect("entry bytes");
+            if name.starts_with("xl/worksheets/") && name.ends_with(".xml") {
+                let xml = String::from_utf8(bytes).expect("sheet xml is utf-8");
+                let needle = format!("<c r=\"{reference}\"");
+                let at = xml.find(&needle).expect("the fixture wrote that cell");
+                let end = xml[at..].find("</c>").expect("a cell with a value") + at + 4;
+                bytes = format!(
+                    "{}<c r=\"{reference}\" t=\"e\"><v>{spelling}</v></c>{}",
+                    &xml[..at],
+                    &xml[end..]
+                )
+                .into_bytes();
+                patched = true;
+            }
+            zout.start_file(name, opts).expect("start");
+            zout.write_all(&bytes).expect("write");
+        }
+        zout.finish().expect("finish");
+        assert!(patched, "no worksheet XML in the workbook");
+        out
+    }
+
+    /// **A cell whose text *is* `#N/A` and a cell the sheet could not evaluate
+    /// are different things, and only the second is a [`IssueKind::CellError`].**
+    ///
+    /// `cell_text` is handed a `Data::String` and a `Data::Error` — calamine
+    /// keeps them apart — and flattened both to `Some(String)`, after which the
+    /// only oracle left was the spelling. So a `status` column holding the
+    /// literal `#N/A` was reported as *"the sheet could not evaluate this
+    /// cell"*, which is untrue, and the file became unimportable: `row_iter`'s
+    /// `Err` aborts the whole transaction, and `NullRule` is no escape because
+    /// `has_own_nulls()` replaces the rule for a worksheet. `#N/A` is pandas'
+    /// first default `na_values` entry and what people type for "not
+    /// applicable", so this is an ordinary file, not an exotic one.
+    ///
+    /// Both cells are in the same column of the same workbook on purpose: a
+    /// fixture with only one of them passes whichever way the code guesses.
+    #[test]
+    fn a_typed_na_is_text_and_only_the_sheet_s_own_error_is_refused() {
+        let good = workbook(&[(
+            "Sheet1",
+            &[
+                &[Cell::Text("id"), Cell::Text("status")],
+                &[Cell::Num(1.0), Cell::Text("#N/A")],
+                &[Cell::Num(2.0), Cell::Num(0.0)],
+            ],
+        )]);
+        let bytes = make_error_cell(&good, "B3", "#N/A");
+
+        let table = tbl(&[("id", "int", false), ("status", "varchar", true)]);
+        let mapping = auto_map(&["id".into(), "status".into()], &table, true);
+        let cfg = xlsx_cfg(true, None);
+
+        let v = validate(
+            &bytes[..],
+            ImportFormat::Xlsx,
+            &cfg,
+            &table,
+            &mapping,
+            MySql,
+            200,
+        )
+        .unwrap();
+        assert_eq!(v.issues.len(), 1, "{:?}", v.issues);
+        assert_eq!(v.issues[0].kind, IssueKind::CellError);
+        assert_eq!(v.issues[0].line, 3);
+        assert_eq!(v.issues[0].column, "status");
+
+        let rows: Vec<_> = row_iter(
+            &bytes[..],
+            ImportFormat::Xlsx,
+            &cfg,
+            &table,
+            &mapping,
+            MySql,
+        )
+        .unwrap()
+        .collect();
+        assert_eq!(
+            rows[0],
+            Ok(vec![Value::Int(1), Value::Str("#N/A".into())]),
+            "the typed one is text"
+        );
+        assert!(
+            rows[1].is_err(),
+            "the sheet's own one is not: {:?}",
+            rows[1]
+        );
+    }
+
     /// **A worksheet's `<dimension>` is advisory, and believing it as the width
     /// threw away two columns of three — in the preview *and* in the load, with
     /// every surface reporting success.**
@@ -4207,7 +4387,10 @@ mod tests {
             json.push_str(&format!(r#"{{"id": {i}, "body": "{big}"}}"#));
         }
         json.push(']');
-        assert!(json.len() as u64 > SAMPLE_MAX_BYTES, "the fixture must exceed the cap");
+        assert!(
+            json.len() as u64 > SAMPLE_MAX_BYTES,
+            "the fixture must exceed the cap"
+        );
 
         let s = read_sample(json.as_bytes(), ImportFormat::Json, &cfg(true), 200)
             .expect("a large file previews rather than failing");
@@ -4234,7 +4417,10 @@ mod tests {
             n += 1;
             true
         });
-        assert!(err.is_err(), "a truncated file imported {n} rows in silence");
+        assert!(
+            err.is_err(),
+            "a truncated file imported {n} rows in silence"
+        );
     }
 
     /// The rewrite is byte-for-byte in place, so it has to survive a record
@@ -4552,11 +4738,11 @@ mod tests {
         let m = auto_map(&["name".into(), "id".into()], &t, true);
         let (vals, issues) = coerce_record(
             &f(&["Smith", "7"]),
+            &[],
             &m,
             &t,
             &NullRule::default(),
             MySql,
-            ImportFormat::Csv,
             2,
         );
         // insert_columns is [0 (id), 1 (name)] — values follow that, not the file.
@@ -4570,11 +4756,11 @@ mod tests {
         let m = auto_map(&["id".into(), "name".into()], &t, true);
         let (_, issues) = coerce_record(
             &f(&["N/A", "Smith"]),
+            &[],
             &m,
             &t,
             &NullRule::default(),
             MySql,
-            ImportFormat::Csv,
             42,
         );
         assert_eq!(issues.len(), 1);
@@ -4590,15 +4776,7 @@ mod tests {
     fn coerce_record_reports_a_field_count_mismatch() {
         let t = tbl(&[("id", "int", false), ("name", "varchar", true)]);
         let m = auto_map(&["id".into(), "name".into()], &t, true);
-        let (vals, issues) = coerce_record(
-            &f(&["7"]),
-            &m,
-            &t,
-            &NullRule::default(),
-            MySql,
-            ImportFormat::Csv,
-            3,
-        );
+        let (vals, issues) = coerce_record(&f(&["7"]), &[], &m, &t, &NullRule::default(), MySql, 3);
         assert!(issues.iter().any(|i| i.kind
             == IssueKind::FieldCount {
                 expected: 2,
