@@ -2860,7 +2860,6 @@ mod tests {
                 optional: true,
             }],
             hidden_islands: vec![],
-            total_tables: 2,
         };
         let sizes: HashMap<String, (f64, f64)> = [
             ("a".to_string(), (200.0, 120.0)),
@@ -2920,7 +2919,6 @@ mod tests {
             }],
             edges: vec![],
             hidden_islands: vec![],
-            total_tables: 1,
         };
         // **Sized the way `build_placed` sizes a stub**, which is the whole
         // point: `node_width` adds an icon box, a title gap and 6 px of slack a
@@ -2980,7 +2978,6 @@ mod tests {
             ],
             edges: vec![],
             hidden_islands: vec![],
-            total_tables: 4,
         };
         let mut positions = HashMap::new();
         let mut sizes = HashMap::new();
@@ -3090,7 +3087,6 @@ mod tests {
             }],
             edges: vec![],
             hidden_islands: vec![],
-            total_tables: 1,
         };
         let positions: HashMap<String, (f64, f64)> =
             [("orders".to_string(), (0.0, 0.0))].into_iter().collect();
@@ -3144,7 +3140,6 @@ mod tests {
                 optional: false,
             }],
             hidden_islands: vec![],
-            total_tables: 2,
         };
         // orders card left of users so the edge runs orders.right → users.left.
         let positions: HashMap<String, (f64, f64)> = [
@@ -3195,7 +3190,6 @@ mod tests {
                 optional: true,
             }],
             hidden_islands: vec![],
-            total_tables: 1,
         };
         let positions: HashMap<String, (f64, f64)> = [("employees".to_string(), (0.0, 0.0))]
             .into_iter()

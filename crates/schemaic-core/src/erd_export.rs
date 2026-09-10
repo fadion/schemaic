@@ -171,6 +171,63 @@ pub fn aliases(graph: &DiagramGraph) -> HashMap<String, String> {
     out
 }
 
+/// Every node's columns mapped to **unique** emitted names, per node.
+///
+/// The same rule [`aliases`] applies to node ids, one level down — and for the
+/// same reason. Sanitising is lossy, so distinct columns collapse onto one
+/// name: `slug` maps every non-ASCII character to `_`, so a Japanese table's
+/// `名前` / `年齢` / `住所` all become `__`, and even in ASCII `user id` and
+/// `user_id` both become `user_id`. What that produced was not a cosmetic
+/// mess — a Mermaid entity listing one attribute three times misrepresents
+/// the table, and a Graphviz label declaring one `port` name three times
+/// makes `from:port -> to:port` an **ambiguous endpoint**, so the FK attaches
+/// to whichever row `dot` resolves first.
+///
+/// `sanitize` is the emitter's own (slug for Mermaid and DOT, the DBML
+/// identifier rule for DBML). Collisions take a `_2`, `_3`, … suffix in column
+/// order, so the mapping is deterministic and both ends of an edge agree — the
+/// reason the map is returned rather than each site sanitising again.
+///
+/// Keyed by node id, then by the column's real name.
+fn column_names(
+    graph: &DiagramGraph,
+    sanitize: impl Fn(&str) -> String,
+) -> HashMap<String, HashMap<String, String>> {
+    let mut out = HashMap::new();
+    for n in &graph.nodes {
+        let mut taken: HashSet<String> = HashSet::new();
+        let mut per_node: HashMap<String, String> = HashMap::new();
+        for c in columns(n) {
+            let base = sanitize(&c.name);
+            let mut candidate = base.clone();
+            let mut nth = 2;
+            while taken.contains(&candidate) {
+                candidate = format!("{base}_{nth}");
+                nth += 1;
+            }
+            taken.insert(candidate.clone());
+            per_node.insert(c.name.clone(), candidate);
+        }
+        out.insert(n.id.clone(), per_node);
+    }
+    out
+}
+
+/// One column's emitted name on `node`, or the sanitised name when the map has
+/// no entry — a stub node has no columns to enumerate, and an edge may name a
+/// column the diagram does not carry.
+fn column_name<'a>(
+    map: &'a HashMap<String, HashMap<String, String>>,
+    node: &str,
+    col: &str,
+    sanitize: impl Fn(&str) -> String,
+) -> std::borrow::Cow<'a, str> {
+    match map.get(node).and_then(|m| m.get(col)) {
+        Some(n) => std::borrow::Cow::Borrowed(n.as_str()),
+        None => std::borrow::Cow::Owned(sanitize(col)),
+    }
+}
+
 /// A column type reduced to what Mermaid's attribute grammar accepts: alphanumerics
 /// plus `()[]-_,`, everything else collapsed to `_`. MySQL's `int unsigned` and
 /// PostgreSQL's `timestamp with time zone` are the cases that matter — a space
@@ -253,6 +310,9 @@ fn columns(n: &DiagramNode) -> &[DiagramColumn] {
 /// composite FK stays readable after the rename.
 pub fn to_mermaid(graph: &DiagramGraph) -> String {
     let alias = aliases(graph);
+    // Per node, so two columns that slug the same are still two attributes —
+    // see `column_names`.
+    let cols = column_names(graph, slug);
     let mut out = String::from("erDiagram\n");
     for n in &graph.nodes {
         let a = &alias[&n.id];
@@ -265,7 +325,7 @@ pub fn to_mermaid(graph: &DiagramGraph) -> String {
         out.push_str(&format!("    {a} {{\n"));
         for c in columns(n) {
             let ty = mermaid_type(&c.type_name);
-            let name = slug(&c.name);
+            let name = column_name(&cols, &n.id, &c.name, slug);
             match key_tags(c) {
                 Some(k) => out.push_str(&format!("        {ty} {name} {k}\n")),
                 None => out.push_str(&format!("        {ty} {name}\n")),
@@ -344,27 +404,57 @@ fn plain_label(s: &str) -> String {
 /// `Table "sales.orders"` is legal — so nothing is renamed here beyond what
 /// [`plain_label`] must substitute to keep the file parseable at all.
 fn dbml_name(s: &str) -> String {
+    dbml_wrap(&dbml_inner(s))
+}
+
+/// The text a DBML identifier carries, before the quoting decision — `s`
+/// itself, or its `plain_label` when it needs quoting.
+///
+/// Split out so [`column_names`] can uniquify **inside** the quotes: a `_2`
+/// appended to the rendered `"a'b"` would land after the closing quote. Two
+/// columns `a"b` and `a'b` are both legal on every engine and `plain_label`
+/// rewrites `"` to `'`, so they arrived here as one name — a table body
+/// declaring the same column twice, and a `Ref` naming a pair the foreign key
+/// is not on.
+fn dbml_inner(s: &str) -> String {
     if !s.is_empty()
         && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
         && !s.starts_with(|c: char| c.is_ascii_digit())
     {
         s.to_string()
     } else {
-        format!("\"{}\"", plain_label(s))
+        plain_label(s)
+    }
+}
+
+/// Quote a DBML identifier if its text needs it.
+fn dbml_wrap(inner: &str) -> String {
+    if !inner.is_empty()
+        && inner.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        && !inner.starts_with(|c: char| c.is_ascii_digit())
+    {
+        inner.to_string()
+    } else {
+        format!("\"{inner}\"")
     }
 }
 
 /// One side of a DBML `Ref`: `table.column`, or `table.(a, b)` for a composite key.
-fn dbml_ref_side(table: &str, cols: &[String]) -> String {
+///
+/// `names` is [`column_names`]' map, so both sides of a `Ref` name the columns
+/// the table body declared — including the `_2` a collision took.
+fn dbml_ref_side(
+    names: &HashMap<String, HashMap<String, String>>,
+    table: &str,
+    cols: &[String],
+) -> String {
     let t = dbml_name(table);
+    let name = |c: &str| column_name(names, table, c, |s| dbml_wrap(&dbml_inner(s))).into_owned();
     match cols {
-        [one] => format!("{t}.{}", dbml_name(one)),
+        [one] => format!("{t}.{}", name(one)),
         many => format!(
             "{t}.({})",
-            many.iter()
-                .map(|c| dbml_name(c))
-                .collect::<Vec<_>>()
-                .join(", ")
+            many.iter().map(|c| name(c)).collect::<Vec<_>>().join(", ")
         ),
     }
 }
@@ -400,6 +490,9 @@ fn stub_columns(graph: &DiagramGraph, node: &str) -> Vec<String> {
 /// Unlike Mermaid this keeps qualified names verbatim, quoting where the grammar
 /// needs it, and nullability survives as DBML's own `[not null]`.
 pub fn to_dbml(graph: &DiagramGraph) -> String {
+    // Per node, so two columns whose DBML spellings collide are still two
+    // columns — and so both sides of a `Ref` name what the body declared.
+    let cols = column_names(graph, |s| dbml_wrap(&dbml_inner(s)));
     let mut out = String::new();
     for n in &graph.nodes {
         if n.kind == NodeKind::Stub {
@@ -434,7 +527,7 @@ pub fn to_dbml(graph: &DiagramGraph) -> String {
             };
             out.push_str(&format!(
                 "  {} {}{tail}\n",
-                dbml_name(&c.name),
+                column_name(&cols, &n.id, &c.name, |s| dbml_wrap(&dbml_inner(s))),
                 dbml_name(&c.type_name)
             ));
         }
@@ -451,8 +544,8 @@ pub fn to_dbml(graph: &DiagramGraph) -> String {
         };
         out.push_str(&format!(
             "Ref: {} {op} {}\n",
-            dbml_ref_side(&e.from, &e.from_columns),
-            dbml_ref_side(&e.to, &e.to_columns)
+            dbml_ref_side(&cols, &e.from, &e.from_columns),
+            dbml_ref_side(&cols, &e.to, &e.to_columns)
         ));
     }
     out
@@ -552,6 +645,15 @@ fn svg_text(s: &str) -> String {
         .map(|c| match c {
             '\t' | '\n' | '\r' => c,
             c if c.is_control() => ' ',
+            // **The non-characters are not XML characters either.** XML 1.0's
+            // `Char` production excludes U+FFFE and U+FFFF exactly as it
+            // excludes the C0 controls above, and a document containing one is
+            // not well-formed: expat rejects the file, and the export reported
+            // `Saved diagram.svg`. A table or column can carry one — nothing
+            // in MySQL, PostgreSQL or SQLite validates an identifier against
+            // XML — and the identical C0 case is what this function was
+            // written for.
+            '\u{FFFE}' | '\u{FFFF}' => ' ',
             c => c,
         })
         .collect();
@@ -571,6 +673,9 @@ fn svg_text(s: &str) -> String {
 /// worse than one that never claimed to have a layout.
 pub fn to_dot(graph: &DiagramGraph) -> String {
     let ids = aliases(graph);
+    // Per node: a repeated `port` name in one HTML-like label makes every
+    // edge naming it an ambiguous endpoint — see `column_names`.
+    let cols = column_names(graph, slug);
     let mut out = String::from("digraph erd {\n");
     out.push_str("  graph [rankdir=LR, splines=spline, nodesep=0.5, ranksep=1.0];\n");
     out.push_str("  node [shape=plaintext, fontname=\"Helvetica\", fontsize=10];\n");
@@ -595,7 +700,7 @@ pub fn to_dot(graph: &DiagramGraph) -> String {
             };
             label.push_str(&format!(
                 "<tr><td port=\"{}\" align=\"left\">{} : {}{key}</td></tr>",
-                slug(&c.name),
+                column_name(&cols, &n.id, &c.name, slug),
                 dot_text(&c.name),
                 dot_text(&c.type_name)
             ));
@@ -610,15 +715,17 @@ pub fn to_dot(graph: &DiagramGraph) -> String {
         };
         // Ported onto the first column of each side; a composite FK's remaining
         // columns are named in the label rather than drawn as N parallel edges.
+        // The *same* map the label was written from, so the port an edge
+        // names is the port that exists.
         let fp = e
             .from_columns
             .first()
-            .map(|c| format!(":{}", slug(c)))
+            .map(|c| format!(":{}", column_name(&cols, &e.from, c, slug)))
             .unwrap_or_default();
         let tp = e
             .to_columns
             .first()
-            .map(|c| format!(":{}", slug(c)))
+            .map(|c| format!(":{}", column_name(&cols, &e.to, c, slug)))
             .unwrap_or_default();
         // The edge runs child → parent, so the *tail* carries the many-end crow —
         // and the zero-circle behind it, because the child end is optional either
@@ -1120,8 +1227,139 @@ mod tests {
                 optional: false,
             }],
             hidden_islands: vec![],
-            total_tables: 2,
         }
+    }
+
+    /// **Column names are sanitised into three of the text exports, and
+    /// sanitising is lossy** — so distinct columns collapsed onto one name,
+    /// exactly as node ids used to before `aliases`.
+    ///
+    /// `slug` maps every non-ASCII character to `_`, so a Japanese table's
+    /// `名前` / `年齢` / `住所` all became `__`: the Mermaid entity listed one
+    /// attribute three times and misrepresented the table, and the Graphviz
+    /// label declared one `port` name three times — which makes every
+    /// `from:port -> to:port` an **ambiguous endpoint**, so `dot` attaches the
+    /// foreign key to whichever row it resolves first. All three names are
+    /// legal on every engine.
+    #[test]
+    fn columns_that_sanitise_to_one_name_are_still_three_columns() {
+        let g = DiagramGraph {
+            nodes: vec![node(
+                "t",
+                NodeKind::Table,
+                vec![
+                    col("名前", "int", false, false, false),
+                    col("年齢", "int", false, false, false),
+                    col("住所", "int", false, false, false),
+                ],
+            )],
+            edges: vec![],
+            hidden_islands: vec![],
+        };
+
+        // Mermaid: three attribute names, all different.
+        let mmd = to_mermaid(&g);
+        let attrs: Vec<&str> = mmd
+            .lines()
+            .filter_map(|l| l.trim().strip_prefix("int "))
+            .collect();
+        assert_eq!(attrs.len(), 3, "{mmd}");
+        assert_eq!(
+            attrs.iter().collect::<HashSet<_>>().len(),
+            3,
+            "three columns became one attribute:\n{mmd}"
+        );
+
+        // DOT: three ports, all different.
+        let dot = to_dot(&g);
+        let ports: Vec<&str> = dot
+            .match_indices("port=\"")
+            .map(|(i, _)| {
+                let rest = &dot[i + 6..];
+                &rest[..rest.find('"').unwrap()]
+            })
+            .collect();
+        assert_eq!(ports.len(), 3, "{dot}");
+        assert_eq!(
+            ports.iter().collect::<HashSet<_>>().len(),
+            3,
+            "one port name three times is an ambiguous FK endpoint:\n{dot}"
+        );
+    }
+
+    /// The DBML half, by a different route: `plain_label` rewrites `"` to
+    /// `'`, so `a"b` and `a'b` — both legal, both quotable — emitted as one
+    /// column declared twice, and a `Ref` naming a pair the foreign key is not
+    /// on. The uniquifying suffix has to land **inside** the quotes.
+    #[test]
+    fn dbml_columns_that_quote_to_one_name_stay_two_columns() {
+        let g = DiagramGraph {
+            nodes: vec![
+                node(
+                    "t",
+                    NodeKind::Table,
+                    vec![
+                        col("a\"b", "int", false, false, false),
+                        col("a'b", "int", false, true, false),
+                    ],
+                ),
+                node(
+                    "p",
+                    NodeKind::Table,
+                    vec![col("id", "int", true, false, false)],
+                ),
+            ],
+            edges: vec![DiagramEdge {
+                from: "t".to_string(),
+                from_columns: vec!["a'b".to_string()],
+                to: "p".to_string(),
+                to_columns: vec!["id".to_string()],
+                cardinality: Cardinality::OneToMany,
+                optional: false,
+            }],
+            hidden_islands: vec![],
+        };
+        let dbml = to_dbml(&g);
+        let body: Vec<&str> = dbml
+            .lines()
+            .filter(|l| l.starts_with("  \"a"))
+            .map(str::trim)
+            .collect();
+        assert_eq!(body.len(), 2, "{dbml}");
+        assert_ne!(body[0], body[1], "one column declared twice:\n{dbml}");
+
+        // And the `Ref` names the second of them — the FK's own column —
+        // rather than a name the body no longer carries.
+        let refline = dbml
+            .lines()
+            .find(|l| l.starts_with("Ref:"))
+            .expect("a Ref")
+            .to_string();
+        let declared = body[1].split_whitespace().next().unwrap();
+        assert!(
+            refline.contains(&format!("t.{declared}")),
+            "the Ref names a column the body does not declare:\n{refline}\n{dbml}"
+        );
+    }
+
+    /// **U+FFFE and U+FFFF are not XML characters either.** `svg_text`
+    /// replaced the C0 controls and left these, so a table or column carrying
+    /// one produced a file expat rejects while the export reported
+    /// `Saved diagram.svg`. Nothing in MySQL, PostgreSQL or SQLite validates
+    /// an identifier against XML — and `dot_text` is the same function, so a
+    /// Graphviz HTML-like label was unparseable for the same reason.
+    #[test]
+    fn the_xml_scrub_drops_every_character_xml_forbids() {
+        for bad in ['\u{FFFE}', '\u{FFFF}', '\u{1}', '\u{1F}'] {
+            let out = svg_text(&format!("a{bad}b"));
+            assert!(!out.contains(bad), "{bad:?} survived into an XML text node");
+            // Replaced by a space, not deleted: the name keeps its shape.
+            assert_eq!(out, "a b", "{bad:?}");
+        }
+        // The three XML *does* allow are untouched.
+        assert_eq!(svg_text("a\tb\nc\rd"), "a\tb\nc\rd");
+        // And it is still escaping, not only scrubbing.
+        assert_eq!(svg_text("a<b&c"), "a&lt;b&amp;c");
     }
 
     // ── Formats ─────────────────────────────────────────────────────────────

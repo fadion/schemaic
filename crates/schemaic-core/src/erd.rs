@@ -110,8 +110,6 @@ pub struct DiagramGraph {
     /// Tables omitted because they have no relationships (Database seed only),
     /// surfaced as a "N unrelated tables hidden" note. Sorted, for stable display.
     pub hidden_islands: Vec<String>,
-    /// Total table count in the source schema (the "N tables" chip).
-    pub total_tables: usize,
 }
 
 /// Does `fk_cols` (a foreign key's referencing columns) form a unique key on
@@ -203,10 +201,7 @@ pub fn build_graph(schema: &DbSchema, current_db: &str, seed: &DiagramSeed) -> D
         DiagramSeed::Database => schema.tables.iter().collect(),
         DiagramSeed::Table(seed_id) => {
             let Some(seed_t) = by_id.get(seed_id.as_str()) else {
-                return DiagramGraph {
-                    total_tables: schema.tables.len(),
-                    ..Default::default()
-                };
+                return DiagramGraph::default();
             };
             let mut set: HashSet<String> = HashSet::new();
             set.insert(node_id(seed_t));
@@ -244,7 +239,10 @@ pub fn build_graph(schema: &DbSchema, current_db: &str, seed: &DiagramSeed) -> D
     for child in &included {
         let from_id = node_id(child);
         for fk in &child.foreign_keys {
-            let (to, cross) = target_id(child, fk, current_db);
+            // The `cross` half is no longer read: what an unresolvable target
+            // means is decided by the seed and by whose edge it is, not by
+            // which database it points into — see the `Table` arm below.
+            let (to, _cross) = target_id(child, fk, current_db);
             if !included_ids.contains(&to) {
                 // The target isn't a node yet. What that means depends on the
                 // seed, and conflating the two cost a whole diagram.
@@ -273,7 +271,20 @@ pub fn build_graph(schema: &DbSchema, current_db: &str, seed: &DiagramSeed) -> D
                     // What "one hop" means must not depend on which side of a
                     // database boundary the second hop happens to sit.
                     DiagramSeed::Table(seed_id) => {
-                        if !cross || &from_id != seed_id {
+                        // **The seed's own edge, whichever database it points
+                        // into.** This asked `!cross ||`, which is also true
+                        // for a *same-database* target step 1 could not
+                        // resolve — and step 1 only admits one that is in the
+                        // schema, so a privilege-filtered parent never enters
+                        // `included_ids` and its edge died here. The database
+                        // seed above draws exactly that as a stub, for the
+                        // reason its comment gives; the table seed silently
+                        // reported a table with relationships as having none.
+                        // Reproduced on MariaDB 10.11 with `SELECT` on the
+                        // child and not the parent: the database diagram shows
+                        // `orders → customers` with a stub, the `orders`
+                        // diagram showed one node and no edges.
+                        if &from_id != seed_id {
                             continue;
                         }
                         if !stubs.contains(&to) {
@@ -325,7 +336,6 @@ pub fn build_graph(schema: &DbSchema, current_db: &str, seed: &DiagramSeed) -> D
         nodes,
         edges,
         hidden_islands,
-        total_tables: schema.tables.len(),
     }
 }
 
@@ -961,7 +971,30 @@ pub fn clear_conn_layouts(file: &mut DiagramLayoutsFile, conn_id: u64) {
     file.layouts.retain(|k, _| !k.starts_with(&prefix));
 }
 
-/// Store (replacing) a diagram's manual positions.
+/// Store a diagram's manual positions, **merging** them into whatever that
+/// database already has.
+///
+/// **A table-scoped diagram holds a subset, and this used to be a wholesale
+/// replace.** `layout_key` is `{conn_id}:{database}` with no seed term, so a
+/// `DiagramSeed::Database` diagram and every `DiagramSeed::Table(_)` diagram
+/// of that database share one slot — and both are reachable from the schema
+/// tree. Arrange all sixteen tables of `sakila`, close it, open the ER diagram
+/// of `payment` (four nodes), nudge one card: `persist` fired with a
+/// four-entry map and the sixteen-entry record was gone. Reopening the
+/// database diagram put twelve tables back at auto-layout and the other four
+/// at positions a four-node `place()` had computed — near the origin, stacked
+/// over whatever the auto-layout had put there. No warning, no undo, and
+/// `diagrams.json` was the only copy. Two table diagrams of one database did
+/// it to each other, and **Reset layout** inside a table diagram did it too.
+///
+/// Merging is safe in both directions: a node id the diagram no longer has is
+/// already ignored on load, and [`clear_conn_layouts`] still bounds the file
+/// by connection. The cost is that a dropped table's coordinates linger —
+/// sixteen bytes, against losing an arrangement the user built by hand.
+///
+/// A *reset* is therefore a reset of the nodes the user is looking at, which
+/// is what the button in a table diagram means; from the database diagram it
+/// still names every node and so still resets the lot.
 pub fn upsert_layout(
     file: &mut DiagramLayoutsFile,
     conn_id: u64,
@@ -969,7 +1002,9 @@ pub fn upsert_layout(
     positions: NodePositions,
 ) {
     file.layouts
-        .insert(layout_key(conn_id, database), positions);
+        .entry(layout_key(conn_id, database))
+        .or_default()
+        .extend(positions);
 }
 
 // ── Find-in-diagram ─────────────────────────────────────────────────────────
@@ -1312,12 +1347,10 @@ mod search_tests {
     }
 
     fn graph(nodes: Vec<DiagramNode>) -> DiagramGraph {
-        let total = nodes.len();
         DiagramGraph {
             nodes,
             edges: Vec::new(),
             hidden_islands: Vec::new(),
-            total_tables: total,
         }
     }
 
@@ -1543,9 +1576,8 @@ mod tests {
     }
 
     #[test]
-    fn database_seed_hides_island_and_counts() {
+    fn database_seed_hides_an_island() {
         let g = build_graph(&shop(), "shop", &DiagramSeed::Database);
-        assert_eq!(g.total_tables, 5);
         assert_eq!(g.hidden_islands, vec!["logs".to_string()]);
         let names: HashSet<&str> = g.nodes.iter().map(|n| n.id.as_str()).collect();
         assert!(!names.contains("logs"));
@@ -1589,10 +1621,9 @@ mod tests {
     }
 
     #[test]
-    fn unknown_seed_table_yields_empty_graph_but_keeps_count() {
+    fn unknown_seed_table_yields_an_empty_graph() {
         let g = build_graph(&shop(), "shop", &DiagramSeed::Table("nope".into()));
         assert!(g.nodes.is_empty() && g.edges.is_empty());
-        assert_eq!(g.total_tables, 5);
     }
 
     /// A schema where `orders.customer_id → customers.id` is declared but
@@ -1683,6 +1714,120 @@ mod tests {
             vec!["customers", "orderdetails", "orders"],
             "a neighbour's second hop must not be drawn, cross-database or not"
         );
+    }
+
+    /// **A privilege-filtered parent is a stub, not a missing edge** — and the
+    /// table seed silently dropped it.
+    ///
+    /// MySQL's `information_schema.TABLES` is privilege-filtered while
+    /// `KEY_COLUMN_USAGE` is not, so `SELECT` on the child and not the parent
+    /// gives exactly this schema: a foreign key whose target is not in the
+    /// table list. The **database** seed draws it as a stub, for the reason
+    /// its own comment gives; the **table** seed's guard asked `!cross`, which
+    /// is also true for an unresolvable *same-database* target, so the edge
+    /// died and the modal reported a table with relationships as having none.
+    #[test]
+    fn a_table_seed_keeps_its_own_edge_to_a_parent_the_schema_cannot_see() {
+        let s = DbSchema {
+            tables: vec![table(
+                "orders",
+                vec![col("id", "int", true), col("cust", "int", false)],
+                vec![ForeignKeyInfo {
+                    columns: vec!["cust".into()],
+                    ref_table: "customers".into(),
+                    ref_columns: vec!["id".into()],
+                    ..Default::default()
+                }],
+            )],
+            ..Default::default()
+        };
+
+        // The database seed has always drawn it.
+        let db = build_graph(&s, "shop", &DiagramSeed::Database);
+        assert_eq!(db.edges.len(), 1);
+        assert!(db.nodes.iter().any(|n| n.id == "customers"));
+
+        // …and the table seed must agree: same connection, same schema.
+        let t = build_graph(&s, "shop", &DiagramSeed::Table("orders".into()));
+        assert_eq!(t.edges.len(), 1, "the seed's own FK is one hop");
+        let stub = t
+            .nodes
+            .iter()
+            .find(|n| n.id == "customers")
+            .expect("the unresolvable parent is a stub");
+        assert_eq!(stub.kind, NodeKind::Stub);
+    }
+
+    /// …and the guard it replaces must still hold: a **neighbour's**
+    /// unresolvable target is two hops and stays out, whichever side of a
+    /// database boundary it is on.
+    #[test]
+    fn a_table_seed_still_refuses_a_neighbours_unresolvable_target() {
+        let s = DbSchema {
+            tables: vec![
+                table(
+                    "orders",
+                    vec![col("id", "int", true), col("cust", "int", false)],
+                    vec![ForeignKeyInfo {
+                        columns: vec!["cust".into()],
+                        ref_table: "customers".into(),
+                        ref_columns: vec!["id".into()],
+                        ..Default::default()
+                    }],
+                ),
+                table(
+                    "customers",
+                    vec![col("id", "int", true), col("region", "int", false)],
+                    vec![ForeignKeyInfo {
+                        columns: vec!["region".into()],
+                        ref_table: "regions".into(),
+                        ref_columns: vec!["id".into()],
+                        ..Default::default()
+                    }],
+                ),
+            ],
+            ..Default::default()
+        };
+        let t = build_graph(&s, "shop", &DiagramSeed::Table("orders".into()));
+        let mut ids: Vec<&str> = t.nodes.iter().map(|n| n.id.as_str()).collect();
+        ids.sort();
+        assert_eq!(
+            ids,
+            vec!["customers", "orders"],
+            "`regions` is the neighbour's second hop"
+        );
+    }
+
+    /// **A table diagram holds a subset of the database's nodes, and saving it
+    /// used to replace the whole record.**
+    ///
+    /// `layout_key` is `{conn_id}:{database}` with no seed term, so a database
+    /// diagram and every table diagram of that database share one slot.
+    /// Arrange sixteen tables, then nudge one card of a four-node table
+    /// diagram: the sixteen-entry record became a four-entry one, twelve
+    /// tables went back to auto-layout, and `diagrams.json` was the only copy.
+    #[test]
+    fn saving_a_table_diagrams_layout_keeps_the_databases_other_nodes() {
+        let mut f = DiagramLayoutsFile::default();
+        let whole: NodePositions = (0..4)
+            .map(|i| (format!("t{i}"), (i as f64 * 10.0, 0.0)))
+            .collect();
+        upsert_layout(&mut f, 7, "sakila", whole);
+        assert_eq!(get_layout(&f, 7, "sakila").unwrap().len(), 4);
+
+        // A table-scoped diagram of the same database, holding two of them.
+        let subset: NodePositions = [("t1".to_string(), (99.0, 99.0))].into_iter().collect();
+        upsert_layout(&mut f, 7, "sakila", subset);
+        let saved = get_layout(&f, 7, "sakila").unwrap();
+        assert_eq!(saved.len(), 4, "the other three nodes were forgotten");
+        assert_eq!(saved["t1"], (99.0, 99.0), "and the nudged one moved");
+        assert_eq!(saved["t3"], (30.0, 0.0), "while an untouched one did not");
+
+        // A different database is untouched either way, and so is a different
+        // connection — the key still separates those.
+        upsert_layout(&mut f, 7, "other", NodePositions::new());
+        upsert_layout(&mut f, 8, "sakila", NodePositions::new());
+        assert_eq!(get_layout(&f, 7, "sakila").unwrap().len(), 4);
     }
 
     /// The seed's *own* cross-database FK is one hop, and must still be drawn.
@@ -1876,7 +2021,6 @@ mod tests {
                 })
                 .collect(),
             hidden_islands: vec![],
-            total_tables: ids.len(),
         }
     }
 
