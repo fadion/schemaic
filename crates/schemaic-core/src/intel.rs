@@ -3507,6 +3507,19 @@ mod colres {
         quals: Vec<String>,
         cols: Cols,
         table: Option<String>,
+        /// The table name an alias **replaced**, lower-cased, when this source
+        /// is aliased.
+        ///
+        /// An alias is a rename for the whole query, not a second name: MariaDB
+        /// 10.11.14 answers `SELECT employees.id FROM employees e` with
+        /// `ERROR 1054: Unknown column 'employees.id' in 'SELECT'`, and
+        /// PostgreSQL the same. `quals` used to carry **both** spellings, so
+        /// that statement resolved clean; dropping the table name from `quals`
+        /// alone only made the qualifier *unmodelled*, and an unmodelled
+        /// qualifier is deliberately not flagged (a `db.table.col` reference
+        /// reaches the same arm). Recording what the alias hid is what lets the
+        /// difference be stated.
+        shadowed: Option<String>,
     }
 
     /// A resolution scope: the byte range it spans, its FROM sources, and the output
@@ -3632,6 +3645,7 @@ mod colres {
                                 quals: Vec::new(),
                                 cols: select_output_cols(first),
                                 table: None,
+                                shadowed: None,
                             }],
                             proj_aliases: HashSet::new(),
                             where_range: None,
@@ -3745,6 +3759,25 @@ mod colres {
                                 )),
                             };
                         }
+                    }
+                }
+                // **A name an alias replaced**, which is a different thing from
+                // an unmodelled qualifier: the table is right there in the
+                // FROM clause and the server still refuses the reference, so
+                // this is exactly what the tier is for. Checked only after the
+                // whole chain has failed, so `FROM employees e JOIN employees`
+                // — where the bare name really is a source — still resolves.
+                for s in &chain {
+                    if let Some(src) = s
+                        .sources
+                        .iter()
+                        .find(|src| src.shadowed.as_deref() == Some(q.as_str()))
+                    {
+                        let alias = src.quals.first().cloned().unwrap_or_default();
+                        return Some(err(
+                            r,
+                            &format!("`{q}` is aliased as `{alias}` here — qualify with `{alias}`"),
+                        ));
                     }
                 }
                 // Unknown qualifier (db-qualified, or an outer name we didn't model) —
@@ -4025,10 +4058,18 @@ mod colres {
                     [] => return,
                 };
                 let alias_name = alias.as_ref().map(|a| a.name.value.clone());
-                let quals: Vec<String> = std::iter::once(&tname)
-                    .chain(alias_name.as_ref())
-                    .map(|s| s.to_ascii_lowercase())
-                    .collect();
+                // **An alias replaces the table name; it does not add to it.**
+                // Registering both spellings let `SELECT employees.id FROM
+                // employees e` pass clean, and MariaDB 10.11.14 answers
+                // `ERROR 1054: Unknown column 'employees.id' in 'SELECT'`
+                // (PostgreSQL likewise) — a statement the server rejects, which
+                // is the exact thing the qualified-column tier exists to say
+                // before the round trip.
+                let quals: Vec<String> = match &alias_name {
+                    Some(a) => vec![a.to_ascii_lowercase()],
+                    None => vec![tname.to_ascii_lowercase()],
+                };
+                let shadowed = alias_name.as_ref().map(|_| tname.to_ascii_lowercase());
                 // A bare name matching a CTE resolves to the CTE's columns.
                 if db.is_none()
                     && let Some(cols) = ctes.get(&tname.to_ascii_lowercase())
@@ -4037,6 +4078,7 @@ mod colres {
                         quals,
                         cols: cols.clone(),
                         table: None,
+                        shadowed: shadowed.clone(),
                     });
                     return;
                 }
@@ -4067,6 +4109,7 @@ mod colres {
                     quals,
                     cols,
                     table: Some(tname),
+                    shadowed,
                 });
             }
             TableFactor::Derived {
@@ -4080,6 +4123,7 @@ mod colres {
                     quals,
                     cols: output_cols(subquery),
                     table: None,
+                    shadowed: None,
                 });
             }
             TableFactor::NestedJoin {
@@ -4161,6 +4205,7 @@ mod colres {
             quals: Vec::new(),
             cols: Cols::Open,
             table: None,
+            shadowed: None,
         }
     }
 
@@ -7327,6 +7372,46 @@ mod tests {
             .filter(|d| d.message.starts_with("Column "))
             .map(|d| d.message)
             .collect()
+    }
+
+    /// **An alias replaces the table name for the whole query.** Registering
+    /// both spellings let `SELECT employees.id FROM employees e` pass clean,
+    /// though MariaDB 10.11.14 answers
+    /// `ERROR 1054: Unknown column 'employees.id' in 'SELECT'` and PostgreSQL
+    /// the same — a statement the server rejects, which is what this tier
+    /// exists to say before the round trip.
+    #[test]
+    fn a_bare_table_name_is_not_a_qualifier_once_it_is_aliased() {
+        let aliased_away = |sql: &str| -> Vec<String> {
+            diag(sql)
+                .into_iter()
+                .filter(|d| d.message.contains("is aliased as"))
+                .map(|d| d.message)
+                .collect()
+        };
+        assert_eq!(
+            aliased_away("SELECT employees.id FROM employees e"),
+            ["`employees` is aliased as `e` here — qualify with `e`"]
+        );
+        // `AS` spelling too.
+        assert_eq!(
+            aliased_away("SELECT employees.id FROM employees AS e").len(),
+            1
+        );
+        // The alias itself still works, and so does the bare name when there is
+        // no alias — the two directions an over-tightening would break.
+        for sql in [
+            "SELECT e.id FROM employees e",
+            "SELECT employees.id FROM employees",
+            "SELECT e.id FROM company.employees e",
+            // The bare name really *is* a source here, so it resolves rather
+            // than being reported as shadowed.
+            "SELECT employees.id FROM employees e JOIN employees ON e.id = employees.id",
+        ] {
+            assert!(diag(sql).is_empty(), "{sql} -> {:?}", diag(sql));
+        }
+        // A wrong column under the alias is still the column error it was.
+        assert_eq!(col_errors("SELECT e.nope FROM employees e").len(), 1);
     }
 
     // ── the columns a table has without declaring them ─────────────────────────
