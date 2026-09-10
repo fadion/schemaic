@@ -6955,23 +6955,78 @@ fn grid_find(gs: GridState, forward: bool, from_current: bool) {
     if nrows == 0 || ncols == 0 {
         return;
     }
-    let total = nrows * ncols;
     let (cr, cc) = gs.active.get_untracked().unwrap_or((0, 0));
-    let start = (cr * ncols + cc).min(total.saturating_sub(1));
-    for off in 0..total {
-        let lin = if forward {
-            (start + if from_current { off } else { off + 1 }) % total
+    let from = MatchFrom {
+        start: cr * ncols + cc,
+        forward,
+        from_current,
+    };
+    if let Some((dr, ci)) = next_match(&cells, nrows, ncols, &q, from, FIND_COUNT_CELL_BUDGET) {
+        gs.active.set(Some((dr, ci)));
+        gs.anchor.set(Some((dr, ci)));
+        scroll_active_into_view(gs, dr, ci);
+    }
+}
+
+/// Where a find jump starts and which way it goes.
+#[derive(Clone, Copy, Debug)]
+struct MatchFrom {
+    /// The caret's linear position (`display_row * ncols + col`).
+    start: usize,
+    forward: bool,
+    /// Include the caret's own cell — Enter re-checks where you are, next/prev
+    /// steps off it.
+    from_current: bool,
+}
+
+/// The next cell whose **displayed** text contains `q`, walking from
+/// `from.start` and wrapping, or `None` within `budget` cells.
+///
+/// **`budget` is not optional, and that is the finding.** This runs on *every
+/// character typed into the find box* — its effect's own comment says
+/// "incremental as the query changes" — and a needle that matches nothing, or
+/// whose early prefixes match nothing, walked every cell. At the 200,000-row
+/// cap × 50 columns that is ten million cells, synchronously on the UI thread,
+/// per keystroke. Its sibling, the match *count*, is debounced **and** capped
+/// at [`FIND_COUNT_CELL_BUDGET`], with a comment saying the scan is "a String
+/// per cell" and must stay "well under a frame's worth of jank"; the jump,
+/// which is the expensive half, had neither.
+///
+/// Running out means the jump does not move, which is what "no match" already
+/// looks like — and the readout says `N+` off the same budget, so the two
+/// surfaces agree about where they stopped looking.
+///
+/// Split out from `grid_find` for the reason `find_hits` already is: the
+/// decision is testable without a live grid, and a budget nothing asserts is
+/// a constant nobody would miss.
+fn next_match(
+    cells: &schemaic_core::edit::GridCells<'_>,
+    nrows: usize,
+    ncols: usize,
+    q: &str,
+    from: MatchFrom,
+    budget: usize,
+) -> Option<(usize, usize)> {
+    let total = nrows * ncols;
+    if total == 0 || q.is_empty() {
+        return None;
+    }
+    let start = from.start.min(total - 1);
+    for off in 0..total.min(budget) {
+        let lin = if from.forward {
+            (start + if from.from_current { off } else { off + 1 }) % total
         } else {
             (start + total * 2 - off - 1) % total
         };
         let (dr, ci) = (lin / ncols, lin % ncols);
-        if contains_ignore_ascii_case(&cells.text(dr, ci, true), &q) {
-            gs.active.set(Some((dr, ci)));
-            gs.anchor.set(Some((dr, ci)));
-            scroll_active_into_view(gs, dr, ci);
-            return;
+        // `with_text`, not `text`: borrowed wherever the value already is a
+        // string, which is three of its four sources. Matching against an
+        // allocated copy cost two heap allocations per cell.
+        if cells.with_text(dr, ci, true, |t| contains_ignore_ascii_case(t, q)) {
+            return Some((dr, ci));
         }
     }
+    None
 }
 
 /// Cap on cells scanned when counting matches for the find bar's `total`. A wide
@@ -7028,7 +7083,7 @@ fn find_hits(cells: &schemaic_core::edit::GridCells<'_>, q: &str) -> (Vec<usize>
                 break 'outer;
             }
             scanned += 1;
-            if contains_ignore_ascii_case(&cells.text(dr, ci, true), q) {
+            if cells.with_text(dr, ci, true, |t| contains_ignore_ascii_case(t, q)) {
                 hits.push(dr * ncols + ci);
                 if hits.len() >= FIND_MAX_HITS {
                     more = true;
@@ -12332,6 +12387,86 @@ mod find_hits_tests {
             .0
             .is_empty()
         );
+    }
+
+    /// **The jump consults a cell budget**, which is the whole finding: it ran
+    /// on every character typed into the find box and, for a needle nothing
+    /// matched, walked every cell — ten million of them at the 200,000-row cap
+    /// × 50 columns, synchronously on the UI thread, per keystroke. Its
+    /// sibling the match *count* is debounced and capped for exactly that
+    /// reason and says so.
+    #[test]
+    fn the_jump_gives_up_when_it_runs_out_of_budget() {
+        let rs = grid(&[["a", "b"], ["c", "d"], ["e", "f"], ["g", "needle"]]);
+        let order = [0usize, 1, 2, 3];
+        let formats = fmts();
+        let clean = DirtyCells::new();
+        let cells = stored(&rs, &order, &formats, &clean, &[]);
+        let from = MatchFrom {
+            start: 0,
+            forward: true,
+            from_current: true,
+        };
+        // The match is the eighth cell, so seven is not enough.
+        assert_eq!(next_match(&cells, 4, 2, "needle", from, 7), None);
+        assert_eq!(next_match(&cells, 4, 2, "needle", from, 8), Some((3, 1)));
+        // A generous budget is not a different answer, only a slower way to
+        // the same one.
+        assert_eq!(
+            next_match(&cells, 4, 2, "needle", from, FIND_COUNT_CELL_BUDGET),
+            Some((3, 1))
+        );
+    }
+
+    /// The walk itself, which the budget must not have changed: forward and
+    /// backward, wrapping, and whether the caret's own cell counts.
+    #[test]
+    fn the_jump_walks_from_the_caret_in_both_directions_and_wraps() {
+        let rs = grid(&[["hit", "x"], ["y", "hit"]]);
+        let order = [0usize, 1];
+        let formats = fmts();
+        let clean = DirtyCells::new();
+        let cells = stored(&rs, &order, &formats, &clean, &[]);
+        let at = |start: usize, forward: bool, from_current: bool| {
+            next_match(
+                &cells,
+                2,
+                2,
+                "hit",
+                MatchFrom {
+                    start,
+                    forward,
+                    from_current,
+                },
+                FIND_COUNT_CELL_BUDGET,
+            )
+        };
+        // Enter re-checks where you are; next steps off it and finds the other.
+        assert_eq!(at(0, true, true), Some((0, 0)));
+        assert_eq!(at(0, true, false), Some((1, 1)));
+        // Backwards from the first match wraps round to the last.
+        assert_eq!(at(0, false, false), Some((1, 1)));
+        // And from the last one forward, wrapping to the first.
+        assert_eq!(at(3, true, false), Some((0, 0)));
+    }
+
+    /// An empty needle and an empty grid answer nothing rather than looping.
+    #[test]
+    fn the_jump_answers_nothing_for_an_empty_needle_or_an_empty_grid() {
+        let rs = grid(&[["a", "b"]]);
+        let order = [0usize];
+        let formats = fmts();
+        let clean = DirtyCells::new();
+        let cells = stored(&rs, &order, &formats, &clean, &[]);
+        let from = MatchFrom {
+            start: 99,
+            forward: true,
+            from_current: true,
+        };
+        assert_eq!(next_match(&cells, 1, 2, "", from, 100), None);
+        assert_eq!(next_match(&cells, 0, 0, "a", from, 100), None);
+        // An out-of-range caret is clamped rather than panicking.
+        assert_eq!(next_match(&cells, 1, 2, "a", from, 100), Some((0, 0)));
     }
 
     /// **A staged edit is what the cell shows, so it is what Find must

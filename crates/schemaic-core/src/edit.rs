@@ -1009,6 +1009,34 @@ impl GridCells<'_> {
     /// and quietly widening it into what Ctrl+C yields is not this reader's to
     /// do.
     pub fn text(&self, i: usize, ci: usize, formatted: bool) -> String {
+        self.with_text(i, ci, formatted, str::to_string)
+    }
+
+    /// [`GridCells::text`] handed to `f` **borrowed wherever it can be** — the
+    /// same resolution, without the `String`.
+    ///
+    /// For a reader that only looks at the text, which is most of them. Three
+    /// of the four sources are already `&str` in memory: the arena text of a
+    /// stored cell, and a staged or pending `CellEdit::Text`. Only a staged
+    /// NULL or blob (which render as a sentinel) and a formatted column have
+    /// to build anything.
+    ///
+    /// **Written for the find bar's jump.** `grid_find` walks up to
+    /// `rows × cols` cells from the caret on *every character typed into the
+    /// find box*, and each cell cost two heap allocations —
+    /// `CellRef::to_value` copying the arena string, then `Value::display`
+    /// copying it again. At the 200,000-row cap × 50 columns that is ten
+    /// million cells and twenty million allocations, synchronously on the UI
+    /// thread, per keystroke, whenever the needle (or one of its prefixes) is
+    /// absent. Its sibling, the match *count*, is debounced and capped for
+    /// exactly this reason and says so.
+    pub fn with_text<R>(
+        &self,
+        i: usize,
+        ci: usize,
+        formatted: bool,
+        f: impl FnOnce(&str) -> R,
+    ) -> R {
         let nreal = self.rs.row_count();
         // Display rows past the real ones are the pending new rows, whose values
         // live in `new_rows` — resolving one through `order` would fall back to
@@ -1017,22 +1045,24 @@ impl GridCells<'_> {
         // it will hold is a server default the cell previews as `<auto>`.
         if i >= nreal {
             return match self.new_rows.get(i - nreal).and_then(|r| r.get(&ci)) {
-                Some(v) => v.display(),
-                None => String::new(),
+                Some(CellEdit::Text(t)) => f(t),
+                Some(v) => f(&v.display()),
+                None => f(""),
             };
         }
         let di = self.order.get(i).copied().unwrap_or(i);
         match self.dirty.get(&(di, ci)) {
-            Some(v) => v.display(),
+            Some(CellEdit::Text(t)) => f(t),
+            Some(v) => f(&v.display()),
             None => {
                 let fmt = match formatted {
                     true => self.formats.get(ci).copied().unwrap_or_default(),
                     false => crate::format::ColumnFormat::None,
                 };
                 match self.rs.cell(di, ci) {
-                    None => String::new(),
-                    Some(c) if fmt == crate::format::ColumnFormat::None => c.display().to_string(),
-                    Some(c) => crate::format::apply(fmt, &c.to_value()),
+                    None => f(""),
+                    Some(c) if fmt == crate::format::ColumnFormat::None => f(c.display()),
+                    Some(c) => f(&crate::format::apply(fmt, &c.to_value())),
                 }
             }
         }
