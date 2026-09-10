@@ -1378,6 +1378,42 @@ const VERDICT_BAR_H: f64 = 30.0;
 /// the error bar, the error modal and the editor menu's "AI fix".
 type FixFn = Rc<dyn Fn((usize, usize), Vec<String>, FixOrigin)>;
 
+/// Where the Ctrl+K bar hangs, in editor **content** coordinates — the pure
+/// half of [`anchor_cmdk`], and the rule the rest of this module's overlays
+/// already obey.
+///
+/// **`points_of_offset` answers `(Point::ZERO, Point::ZERO)` for an offset it
+/// cannot place.** `screen_lines` is built with no overscan, so anything
+/// outside the visible range falls into that arm — and `anchor_cmdk` consumed
+/// it as a position. A 300-line `INSERT … VALUES` with the caret on line 1 has
+/// `statement_range`'s `end` far below the viewport, so the bar anchored at the
+/// document origin: unscrolled that is y = 9, *over* the first line of the
+/// statement it is supposed to sit under; scrolled down 2,000 px it is
+/// −1,991, and `editor_area` neither scrolls nor clips, so the prompt opened
+/// **off the top of the window with the keyboard already in it** and every
+/// keystroke went into a box nobody could see. `cmdk_scroll_overflow` could not
+/// rescue it either — from a deeply negative anchor it answers `None`. The
+/// likelier route is *AI fix*, whose button sits on a bar pinned to the pane's
+/// bottom and which anchors to a failing statement that need not be on screen
+/// at all.
+///
+/// So when `end` is unplaced the answer is the **caret's** line, which is on
+/// screen by definition and is where the user is looking — the same fact the
+/// completion popup relies on. If even that is unplaced (nothing laid out yet)
+/// the bar goes to the top of the *viewport*, which is visible; never to the
+/// document's origin, which is not.
+fn cmdk_anchor_at(
+    points: impl Fn(usize) -> Option<(Point, Point)>,
+    end: usize,
+    caret: usize,
+    vp_y0: f64,
+) -> Point {
+    match points(end).or_else(|| points(caret)) {
+        Some((_, below)) => Point::new(below.x, below.y + EDITOR_PAD_TOP),
+        None => Point::new(0.0, vp_y0 + EDITOR_PAD_TOP),
+    }
+}
+
 /// Anchor the Ctrl+K bar under `end`, scrolling the editor if the bar would not
 /// fit below it.
 ///
@@ -1388,8 +1424,16 @@ type FixFn = Rc<dyn Fn((usize, usize), Vec<String>, FixOrigin)>;
 /// (the style closure subtracts the viewport, so the bar tracks a later scroll);
 /// only the fit test converts to screen coordinates.
 fn anchor_cmdk(ed: &Editor, cmdk: CmdK, end: usize, area_h: RwSignal<f64>) {
-    let (_, mut below) = ed.points_of_offset(end, CursorAffinity::Backward);
-    below.y += EDITOR_PAD_TOP;
+    let vp_y0 = ed.viewport.get_untracked().y0;
+    let caret = ed.cursor.get_untracked().offset();
+    // `placed`, not `editor_points`: that adapter *tracks* `screen_lines`, and
+    // this runs from a key handler — the same reason the viewport read below
+    // is untracked.
+    let points = |off: usize| {
+        let (top, bot) = ed.points_of_offset(off, CursorAffinity::Backward);
+        placed(top, bot).then_some((top, bot))
+    };
+    let below = cmdk_anchor_at(points, end, caret, vp_y0);
     cmdk.point.set(below);
     // Untracked, like the viewport read beside it: this runs from a key handler,
     // and a tracked read here would quietly give any future caller inside an
@@ -1659,12 +1703,11 @@ fn visible_hi(content_x: f64, vp: Rect) -> f64 {
 /// width. A zero width (before first layout) means "unknown", not "no room".
 fn span_box_at(
     points: impl Fn(usize) -> Option<(Point, Point)>,
-    sql: &str,
+    content_x: f64,
     lo: usize,
     hi: usize,
     vp: Rect,
 ) -> Option<(f64, f64, f64, f64)> {
-    let content_x = content_x_of(sql);
     let (top, bot) = points(lo)?;
     let (end, _) = points(hi)?;
     let vis_hi = visible_hi(content_x, vp);
@@ -1689,12 +1732,11 @@ fn span_box_at(
 /// no more entitled to paint over the panel beside the editor than a box is.
 fn underline_seg_at(
     points: impl Fn(usize) -> Option<(Point, Point)>,
-    sql: &str,
+    content_x: f64,
     lo: usize,
     hi: usize,
     vp: Rect,
 ) -> Option<(f64, f64, f64)> {
-    let content_x = content_x_of(sql);
     let (top, bot) = points(lo)?;
     let (end, _) = points(hi)?;
     // `content_x` slightly over-estimates the code start (the padded statement-
@@ -1716,9 +1758,9 @@ fn underline_seg_at(
 
 /// Pixel box in `editor_area` coords around the single-line span `[lo, hi]`.
 /// `None` when off screen.
-fn span_box(sql: &str, ed: &Editor, lo: usize, hi: usize) -> Option<(f64, f64, f64, f64)> {
+fn span_box(content_x: f64, ed: &Editor, lo: usize, hi: usize) -> Option<(f64, f64, f64, f64)> {
     let vp = ed.viewport.get();
-    span_box_at(editor_points(ed), sql, lo, hi, vp)
+    span_box_at(editor_points(ed), content_x, lo, hi, vp)
 }
 
 // (There is no `ed`-taking `underline_seg` wrapper: the squiggle overlay has to
@@ -1726,13 +1768,27 @@ fn span_box(sql: &str, ed: &Editor, lo: usize, hi: usize) -> Option<(f64, f64, f
 // SVG markup — so it calls `underline_seg_at` from inside a memo instead. See
 // `syntax_view`.)
 
+/// Is `[lo, hi]` **one of several** statements — i.e. is there any alphanumeric
+/// content outside it?
+///
+/// The question two features share: the picked-statement highlight (a lone
+/// query needs none, per the spec) and the Ctrl+Enter run menu (a lone query
+/// just runs — no menu, no choice to make). It was spelled here and again
+/// inline in the Ctrl+Enter handler, with nothing asserting the two agreed —
+/// and they must, or the menu offers *Run Current* / *Run Everything* over a
+/// statement the editor has not outlined, or outlines one it then runs without
+/// asking.
+///
+/// Alphanumeric rather than "non-whitespace" on purpose: a trailing `;`, a
+/// comment's punctuation and stray blank lines are not another statement.
+fn statement_has_neighbours(sql: &str, lo: usize, hi: usize) -> bool {
+    sql[..lo].chars().any(|c| c.is_alphanumeric()) || sql[hi..].chars().any(|c| c.is_alphanumeric())
+}
+
 /// Set the picked-statement highlight to `[lo, hi]` — but only when it's ONE OF
-/// SEVERAL statements (a lone query needs no highlight, per the spec). "Several"
-/// = some alphanumeric content exists outside the picked range.
+/// SEVERAL statements (a lone query needs no highlight, per the spec).
 fn highlight_pick(sql: &str, lo: usize, hi: usize, highlight: RwSignal<Option<(usize, usize)>>) {
-    let others = sql[..lo].chars().any(|c| c.is_alphanumeric())
-        || sql[hi..].chars().any(|c| c.is_alphanumeric());
-    highlight.set(if others { Some((lo, hi)) } else { None });
+    highlight.set(statement_has_neighbours(sql, lo, hi).then_some((lo, hi)));
 }
 
 /// Per-line pixel boxes (x, y, w, h in `editor_area` coords) covering the picked
@@ -2109,7 +2165,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
     }
     // Turning validation off clears any lingering DB squiggle.
     create_effect(move |_| {
-        if !live_validate.get() {
+        if !live_validate.get() && !db_diag.with_untracked(Vec::is_empty) {
             db_diag.set(Vec::new());
         }
     });
@@ -2601,9 +2657,10 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                 // Multiple statements → highlight the one under the caret and open
                 // the Run Current / Run Everything menu at the caret. A lone
                 // statement just runs (no menu, no highlight).
-                let multi = sql[..lo].chars().any(|c| c.is_alphanumeric())
-                    || sql[hi..].chars().any(|c| c.is_alphanumeric());
-                if multi {
+                // `statement_has_neighbours`, not a second spelling of it: the
+                // menu and the outline have to answer the same question, or one
+                // appears without the other.
+                if statement_has_neighbours(&sql, lo, hi) {
                     highlight_pick(&sql, lo, hi, highlight);
                     run_menu_offset.set(offset);
                     run_sel.set(0);
@@ -2890,11 +2947,15 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
     create_effect(move |_| {
         let caret = ed_occ.cursor.get().offset();
         let sql = query.get();
-        ident_occurrences.set(pairs::identifier_occurrences(
-            &sql,
-            caret,
-            dialect.get_untracked(),
-        ));
+        let hits = pairs::identifier_occurrences(&sql, caret, dialect.get_untracked());
+        // Guarded: `set` never dedups, and `dyn_container` swaps its child on
+        // every *run* of the key closure rather than on every change of its
+        // value. So a caret walking *within* one identifier — the commonest
+        // arrow-key move there is — tore down and rebuilt every occurrence box,
+        // each of which then re-ran its own geometry.
+        if ident_occurrences.with_untracked(|cur| cur != &hits) {
+            ident_occurrences.set(hits);
+        }
     });
 
     // Jump the caret to a byte offset requested from outside (the status-bar
@@ -3565,7 +3626,14 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
             // cursor. Clear any stale DB squiggle immediately, then (if enabled)
             // schedule a round-trip that fires only if this is still the latest edit
             // and the statement parses cleanly (never nag a half-typed fragment).
-            db_diag.set(Vec::new());
+            //
+            // Guarded, because `set` never dedups and this runs on **every
+            // edit**: writing an empty `Vec` over an empty `Vec` re-ran
+            // `syntax_view`'s `segs` memo a second time per keystroke, and that
+            // memo rebuilds every squiggle's view.
+            if !db_diag.with_untracked(Vec::is_empty) {
+                db_diag.set(Vec::new());
+            }
             if live_validate.get_untracked() {
                 let g = val_gen.get().wrapping_add(1);
                 val_gen.set(g);
@@ -4518,11 +4586,14 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
             move |m| match m {
                 None => empty().into_any(),
                 Some((p, q)) => {
-                    let sql = query.get_untracked();
+                    // Once per rebuild, not once per style-closure run: the
+                    // two boxes' closures re-run on every scroll frame and
+                    // `content_x_of` counts every newline in the document.
+                    // Read untracked here exactly as the text was before it.
+                    let cx = content_x_of(&query.get_untracked());
                     let (edp, edq) = (ed.clone(), ed.clone());
-                    let (sqp, sqq) = (sql.clone(), sql);
                     v_stack((
-                        empty().style(move |s| match span_box(&sqp, &edp, p, p + 1) {
+                        empty().style(move |s| match span_box(cx, &edp, p, p + 1) {
                             // Scrolled out of view: draw nothing rather than a
                             // box at the editor's origin.
                             None => s.hide(),
@@ -4536,7 +4607,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                                 .border_radius(2.0)
                                 .border_color(theme::bracket_match().multiply_alpha(0.5)),
                         }),
-                        empty().style(move |s| match span_box(&sqq, &edq, q, q + 1) {
+                        empty().style(move |s| match span_box(cx, &edq, q, q + 1) {
                             None => s.hide(),
                             Some((x, y, w, h)) => s
                                 .absolute()
@@ -4569,12 +4640,14 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                 if ranges.is_empty() {
                     return empty().into_any();
                 }
-                let sql = query.get_untracked();
+                // Once for the whole list. Each box's style closure re-runs
+                // on every scroll frame, and `content_x_of` is O(document) —
+                // N occurrences meant N full scans per frame.
+                let cx = content_x_of(&query.get_untracked());
                 let ed = ed.clone();
                 v_stack_from_iter(ranges.into_iter().map(move |(lo, hi)| {
                     let ed = ed.clone();
-                    let sql = sql.clone();
-                    empty().style(move |s| match span_box(&sql, &ed, lo, hi) {
+                    empty().style(move |s| match span_box(cx, &ed, lo, hi) {
                         // An occurrence scrolled out of view draws nothing —
                         // this is what produced stray boxes over unrelated text.
                         None => s.hide(),
@@ -4620,13 +4693,20 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
             let sql = query.get();
             let vp = ed.viewport.get();
             let points = editor_points(&ed);
+            // **Once for the whole list.** `content_x_of` counts every newline
+            // in the document and its answer does not depend on the span it is
+            // asked about, so paying for it per diagnostic made a scroll frame
+            // O(document × diagnostics): 7.7 ms at 1 MiB with 30 squiggles,
+            // 125 ms at 16 MiB, on the UI thread, on a memo that re-runs on
+            // every scroll tick and every keystroke.
+            let content_x = content_x_of(&sql);
             diags
                 .iter()
                 .filter_map(|d| {
                     // `None` = off screen. Rendering nothing is the point: this
                     // used to collapse to a 2px stub at the editor's top-left
                     // carrying the tooltip of an error twenty lines away.
-                    underline_seg_at(&points, &sql, d.range.0, d.range.1, vp)
+                    underline_seg_at(&points, content_x, d.range.0, d.range.1, vp)
                         .map(|(x, y, w)| (x, y, w, d.severity, d.message.clone()))
                 })
                 .collect::<Vec<_>>()
@@ -5759,8 +5839,11 @@ mod geometry_tests {
 
     #[test]
     fn an_offset_the_editor_cannot_place_produces_no_segment() {
-        assert_eq!(underline_seg_at(|_| None, SQL, 30, 40, VP), None);
-        assert_eq!(span_box_at(|_| None, SQL, 30, 40, VP), None);
+        assert_eq!(
+            underline_seg_at(|_| None, content_x_of(SQL), 30, 40, VP),
+            None
+        );
+        assert_eq!(span_box_at(|_| None, content_x_of(SQL), 30, 40, VP), None);
         assert!(statement_line_boxes_at(|_| None, SQL, 0, SQL.len(), VP).is_empty());
     }
 
@@ -5773,6 +5856,114 @@ mod geometry_tests {
         assert!(placed(Point::ZERO, Point::new(0.0, 18.0)));
     }
 
+    /// **The Ctrl+K bar never anchors at the document origin.**
+    ///
+    /// `anchor_cmdk` consumed `points_of_offset` raw, and floem's answer for an
+    /// offset it cannot place is the origin pair — so a statement whose end is
+    /// below the viewport (a 300-line `INSERT … VALUES`, or *AI fix* on a
+    /// failing statement the user has scrolled away from) put the prompt over
+    /// the first line of the statement when unscrolled, and off the top of the
+    /// window, with the keyboard already in it, when scrolled. Nothing else in
+    /// this module makes that mistake; this one had no pure half to test.
+    #[test]
+    fn the_cmdk_bar_falls_back_to_the_caret_when_the_statements_end_is_off_screen() {
+        let placed_at = |y: f64| Some((Point::new(0.0, y), Point::new(0.0, y + 18.0)));
+        const VP_Y0: f64 = 2000.0;
+
+        // Both on screen: the statement's end wins, which is the normal case.
+        let both = |off: usize| placed_at(if off == 900 { 2100.0 } else { 2050.0 });
+        assert_eq!(
+            cmdk_anchor_at(both, 900, 40, VP_Y0),
+            Point::new(0.0, 2118.0 + EDITOR_PAD_TOP),
+        );
+
+        // The end is off screen, the caret is not — the bar goes to the caret,
+        // and emphatically not to `EDITOR_PAD_TOP` at the document origin,
+        // which is what the unfixed code returned here.
+        let caret_only = |off: usize| (off == 40).then(|| placed_at(2050.0)).flatten();
+        let p = cmdk_anchor_at(caret_only, 900, 40, VP_Y0);
+        assert_eq!(p, Point::new(0.0, 2068.0 + EDITOR_PAD_TOP));
+        assert_ne!(p, Point::new(0.0, EDITOR_PAD_TOP), "the document origin");
+
+        // Nothing placed at all (no layout yet) — the top of the *viewport*,
+        // which is on screen, rather than the top of the document, which at
+        // this scroll position is 2,000 px above the window.
+        let none = |_: usize| None;
+        assert_eq!(
+            cmdk_anchor_at(none, 900, 40, VP_Y0),
+            Point::new(0.0, VP_Y0 + EDITOR_PAD_TOP)
+        );
+
+        // And the fallback is not blanket: with the end placed, the caret's
+        // position is never consulted.
+        let end_only = |off: usize| (off == 900).then(|| placed_at(2100.0)).flatten();
+        assert_eq!(
+            cmdk_anchor_at(end_only, 900, 40, VP_Y0),
+            Point::new(0.0, 2118.0 + EDITOR_PAD_TOP)
+        );
+    }
+
+    /// **"Is this one of several statements?" — the predicate the outline and
+    /// the Ctrl+Enter menu both read, and neither had a test.**
+    ///
+    /// It was spelled twice, once in `highlight_pick` and once inline in the
+    /// key handler, so the two could drift into offering a *Run Current* menu
+    /// over a statement the editor had not outlined. Now one function; these
+    /// are the answers both depend on.
+    #[test]
+    fn a_lone_statement_has_no_neighbours_however_it_is_punctuated() {
+        // The whole buffer is the statement.
+        let sql = "SELECT 1";
+        assert!(!statement_has_neighbours(sql, 0, sql.len()));
+        // Whitespace, a terminator and blank lines are not another statement —
+        // which is why the test is alphanumeric and not "non-whitespace".
+        let sql = "\n\n  SELECT 1;  \n\n";
+        let (lo, hi) = (4, 12);
+        assert_eq!(&sql[lo..hi], "SELECT 1");
+        assert!(!statement_has_neighbours(sql, lo, hi));
+
+        // A real neighbour, on either side.
+        let sql = "SELECT 1; SELECT 2";
+        assert!(statement_has_neighbours(sql, 0, 9), "one follows");
+        assert!(statement_has_neighbours(sql, 10, sql.len()), "one precedes");
+
+        // A *comment* beside it is alphanumeric, so it counts as a neighbour —
+        // recorded because it is a real consequence of the rule and not an
+        // accident: the editor outlines the statement, and the menu opens.
+        assert!(statement_has_neighbours("-- note\nSELECT 1", 8, 16));
+    }
+
+    /// The composition `cmdk_open_gate` could not see: it proves the four
+    /// openers *call* `anchor_cmdk`, and nothing said what `anchor_cmdk` then
+    /// does with an answer it cannot place. This is the missing half — the
+    /// wrapper has to route through the pure function above, or the property
+    /// it pins is not the one the app runs.
+    #[test]
+    fn anchor_cmdk_routes_through_the_pure_anchor() {
+        let src = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("src")
+                .join("editor_pane.rs"),
+        )
+        .expect("editor_pane.rs");
+        let body = crate::source_gate::production_code(&src);
+        let at = body
+            .find("fn anchor_cmdk(")
+            .expect("`anchor_cmdk` is gone — this gate is stale");
+        let end = at + body[at..].find("\n}").expect("`anchor_cmdk`'s end");
+        let f = &body[at..end];
+        assert!(
+            f.contains("cmdk_anchor_at("),
+            "`anchor_cmdk` positions the bar itself again — a `points_of_offset` \
+             consumed raw is the document origin whenever the offset is off \
+             screen:\n{f}"
+        );
+        assert!(
+            !f.contains("ed.points_of_offset(end"),
+            "and it must not read the end's point directly:\n{f}"
+        );
+    }
+
     // ── The viewport rule ─────────────────────────────────────────────────
 
     #[test]
@@ -5781,10 +5972,10 @@ mod geometry_tests {
         // The old code returned the document y, putting the squiggle hundreds
         // of pixels below a ~190px pane.
         let scrolled_down = Rect::new(0.0, 400.0, 800.0, 590.0);
-        let seg = underline_seg_at(at(450.0), SQL, 10, 18, scrolled_down).unwrap();
+        let seg = underline_seg_at(at(450.0), content_x_of(SQL), 10, 18, scrolled_down).unwrap();
         assert!(seg.1 < 200.0, "y must be viewport-relative, got {}", seg.1);
 
-        let b = span_box_at(at(450.0), SQL, 10, 18, scrolled_down).unwrap();
+        let b = span_box_at(at(450.0), content_x_of(SQL), 10, 18, scrolled_down).unwrap();
         assert!(b.1 < 200.0, "y must be viewport-relative, got {}", b.1);
 
         let boxes =
@@ -5800,16 +5991,16 @@ mod geometry_tests {
         // `an_occurrence_box_scrolled_off_to_the_left_is_not_drawn_at_all`
         // covers. A token that clamps can't also demonstrate a translation.
         let scrolled_vp = Rect::new(120.0, 0.0, 920.0, 180.0);
-        let unscrolled = span_box_at(at(0.0), SQL, 30, 38, VP).unwrap();
-        let scrolled = span_box_at(at(0.0), SQL, 30, 38, scrolled_vp).unwrap();
+        let unscrolled = span_box_at(at(0.0), content_x_of(SQL), 30, 38, VP).unwrap();
+        let scrolled = span_box_at(at(0.0), content_x_of(SQL), 30, 38, scrolled_vp).unwrap();
         assert!(
             (unscrolled.0 - scrolled.0 - 120.0).abs() < 1.5,
             "{} vs {}",
             unscrolled.0,
             scrolled.0
         );
-        let u = underline_seg_at(at(0.0), SQL, 30, 38, VP).unwrap();
-        let s = underline_seg_at(at(0.0), SQL, 30, 38, scrolled_vp).unwrap();
+        let u = underline_seg_at(at(0.0), content_x_of(SQL), 30, 38, VP).unwrap();
+        let s = underline_seg_at(at(0.0), content_x_of(SQL), 30, 38, scrolled_vp).unwrap();
         assert!((u.0 - s.0 - 120.0).abs() < 1.5, "{} vs {}", u.0, s.0);
     }
 
@@ -5909,8 +6100,14 @@ mod geometry_tests {
         let sql = "x".repeat(50);
         // Token at x 320..384, in a 200px-wide viewport scrolled to 0.
         let vp = Rect::new(0.0, 0.0, 200.0, 180.0);
-        assert_eq!(span_box_at(one_long_line(), &sql, 40, 48, vp), None);
-        assert_eq!(underline_seg_at(one_long_line(), &sql, 40, 48, vp), None);
+        assert_eq!(
+            span_box_at(one_long_line(), content_x_of(&sql), 40, 48, vp),
+            None
+        );
+        assert_eq!(
+            underline_seg_at(one_long_line(), content_x_of(&sql), 40, 48, vp),
+            None
+        );
     }
 
     #[test]
@@ -5920,8 +6117,14 @@ mod geometry_tests {
         // gutter. This is the reported bug: it used to paint at a negative x,
         // over the panel to the left of the editor.
         let vp = Rect::new(300.0, 0.0, 500.0, 180.0);
-        assert_eq!(span_box_at(one_long_line(), &sql, 0, 8, vp), None);
-        assert_eq!(underline_seg_at(one_long_line(), &sql, 0, 8, vp), None);
+        assert_eq!(
+            span_box_at(one_long_line(), content_x_of(&sql), 0, 8, vp),
+            None
+        );
+        assert_eq!(
+            underline_seg_at(one_long_line(), content_x_of(&sql), 0, 8, vp),
+            None
+        );
     }
 
     #[test]
@@ -5931,7 +6134,8 @@ mod geometry_tests {
         // Token at x 288..352, viewport scrolled to 300 and 200px wide: its left
         // half is behind the gutter, its right half is visible.
         let vp = Rect::new(300.0, 0.0, 200.0, 180.0);
-        let b = span_box_at(one_long_line(), &sql, 36, 44, vp).expect("partly visible");
+        let b =
+            span_box_at(one_long_line(), content_x_of(&sql), 36, 44, vp).expect("partly visible");
         assert!(b.0 >= content_x, "left {} is over the gutter", b.0);
         assert!(
             b.0 + b.2 <= content_x + 200.0 + 0.01,
@@ -5939,7 +6143,8 @@ mod geometry_tests {
             b.0 + b.2,
             content_x + 200.0
         );
-        let u = underline_seg_at(one_long_line(), &sql, 36, 44, vp).expect("partly visible");
+        let u = underline_seg_at(one_long_line(), content_x_of(&sql), 36, 44, vp)
+            .expect("partly visible");
         assert!(u.0 >= content_x, "left {} is over the gutter", u.0);
         assert!(u.0 + u.2 <= content_x + 200.0 + 0.01, "{u:?} past the fold");
     }
@@ -5949,8 +6154,8 @@ mod geometry_tests {
         // Same rule the statement border follows: width 0 is "unknown", not "no
         // room". Clamping to it would blank every highlight before first layout.
         let sql = "x".repeat(50);
-        assert!(span_box_at(one_long_line(), &sql, 0, 8, Rect::ZERO).is_some());
-        assert!(underline_seg_at(one_long_line(), &sql, 0, 8, Rect::ZERO).is_some());
+        assert!(span_box_at(one_long_line(), content_x_of(&sql), 0, 8, Rect::ZERO).is_some());
+        assert!(underline_seg_at(one_long_line(), content_x_of(&sql), 0, 8, Rect::ZERO).is_some());
     }
 
     // ── The gutter ────────────────────────────────────────────────────────
@@ -5961,6 +6166,90 @@ mod geometry_tests {
         let two_digit = content_x_of(&"x\n".repeat(20));
         assert!(two_digit > one_digit);
         assert_eq!(two_digit - one_digit, HL_DIGIT_W);
+    }
+
+    /// **The code column is a property of the document, so it is derived once
+    /// per list and not once per element.**
+    ///
+    /// `content_x_of` counts every newline in the buffer and its answer does
+    /// not depend on the span it is asked about — but it was computed *inside*
+    /// `span_box_at` and `underline_seg_at`, which the overlay builders call
+    /// once per diagnostic, per bracket and per occurrence, inside closures
+    /// that re-run on every scroll frame and every keystroke. 30 elements on a
+    /// 1 MiB buffer measured 7.7 ms per frame, and 125 ms at 16 MiB.
+    ///
+    /// The geometry functions take the origin now, so the scan cannot come
+    /// back per element by accident; this is what says so. A counting closure
+    /// in place of the real `content_x_of` reads 1 against the fixed tree and
+    /// N against the unfixed one.
+    #[test]
+    fn the_overlays_derive_the_code_column_once_per_list_not_once_per_element() {
+        let sql = "x\n".repeat(300);
+        let calls = std::cell::Cell::new(0u32);
+        let content_x = || {
+            calls.set(calls.get() + 1);
+            content_x_of(&sql)
+        };
+        let vp = Rect::new(0.0, 0.0, 800.0, 600.0);
+
+        // What `syntax_view`'s memo does: one derivation, then a call per
+        // diagnostic.
+        let cx = content_x();
+        let spans: Vec<(usize, usize)> = (0..30).map(|i| (i, i + 1)).collect();
+        let drawn = spans
+            .iter()
+            .filter(|(lo, hi)| underline_seg_at(at(10.0), cx, *lo, *hi, vp).is_some())
+            .count();
+        assert_eq!(drawn, 30, "the fixture must actually draw, or 1 is trivial");
+        assert_eq!(calls.get(), 1, "one scan for thirty squiggles");
+
+        // And the same for the occurrence boxes, which go through `span_box_at`.
+        let cx = content_x();
+        for (lo, hi) in &spans {
+            assert!(span_box_at(at(10.0), cx, *lo, *hi, vp).is_some());
+        }
+        assert_eq!(calls.get(), 2, "one more scan for thirty boxes");
+    }
+
+    /// The composition the counter above cannot see: the builders have to be
+    /// the ones hoisting it. A `content_x_of` back inside a per-element style
+    /// closure passes every geometry test in this module and restores the
+    /// whole cost.
+    #[test]
+    fn no_overlay_builder_derives_the_code_column_per_element() {
+        let src = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("src")
+                .join("editor_pane.rs"),
+        )
+        .expect("editor_pane.rs");
+        let body = crate::source_gate::production_code(&src);
+        // Two pure helpers took `sql` only to scan it; they take the origin
+        // now, and nothing may hand them a document again.
+        for f in ["fn span_box_at(", "fn underline_seg_at(", "fn span_box("] {
+            let at = body.find(f).unwrap_or_else(|| panic!("{f} is gone"));
+            let end = at + body[at..].find("\n}").expect("its end");
+            assert!(
+                !body[at..end].contains("content_x_of("),
+                "{f} derives the code column itself again — its callers run it \
+                 once per diagnostic, bracket and occurrence, on every scroll \
+                 frame"
+            );
+        }
+        // And no call site may pass it *inline* to one of them, which is the
+        // per-element scan wearing the hoisted spelling.
+        for line in body.lines().map(str::trim) {
+            if !line.contains("content_x_of(") {
+                continue;
+            }
+            for f in ["span_box(", "span_box_at(", "underline_seg_at("] {
+                assert!(
+                    !line.contains(f),
+                    "the code column is derived inline at a {f} call — hoist it \
+                     above the loop the way the three builders do:\n  {line}"
+                );
+            }
+        }
     }
 
     // ── The run menu's placement ──────────────────────────────────────────
