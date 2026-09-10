@@ -7209,6 +7209,27 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
     let fetch_seq: Rc<RefCell<HashMap<usize, u64>>> = Rc::new(RefCell::new(HashMap::new()));
     let next_fetch_seq: Rc<Cell<u64>> = Rc::new(Cell::new(0));
 
+    /// How many whole-database catalogue reads may be in flight at once.
+    ///
+    /// Small on purpose. Each one is a connection of its own plus five
+    /// catalogue queries over every table in a database, and the thing being
+    /// protected is a *shared* server: four is enough to keep the tree filling
+    /// in visibly while leaving a hosting account's connection allowance to
+    /// the queries the user is actually waiting on.
+    const INTROSPECT_PERMITS: usize = 4;
+
+    /// The permits, shared by every schema fetch in the process.
+    ///
+    /// Process-wide rather than per connection, because the limit is about the
+    /// client's own burst — switching connections while a load is out would
+    /// otherwise double it, and that is exactly the moment two full loads
+    /// overlap.
+    fn introspect_permits() -> Arc<tokio::sync::Semaphore> {
+        static PERMITS: std::sync::LazyLock<Arc<tokio::sync::Semaphore>> =
+            std::sync::LazyLock::new(|| Arc::new(tokio::sync::Semaphore::new(INTROSPECT_PERMITS)));
+        PERMITS.clone()
+    }
+
     let start_fetch: FetchSchemaFn = {
         let handle = handle.clone();
         let fetch_seq = fetch_seq.clone();
@@ -7252,7 +7273,23 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                 let _ = sig.try_update(|v| *v = st);
                 let _ = refreshing.try_update(|v| *v = false);
             });
+            let permits = introspect_permits();
             handle.spawn(async move {
+                // **At most `INTROSPECT_PERMITS` catalogue reads at once.**
+                // `fetch_schema` opens a connection of its own and reads every
+                // column, index, key, view, check and trigger of a whole
+                // database, and the connection load starts one per database
+                // with nothing between them. On a shared host with 200 user
+                // databases that is 200 simultaneous handshakes against a
+                // server whose `max_connections` is 151 out of the box: the
+                // 152nd onward failed ERROR 1040 and rendered as `Failed` rows
+                // whose only retry is a manual Refresh, which repeats the
+                // storm. `db::sqlite`'s `probe_permit` serialises the same
+                // class of work for the same reason.
+                //
+                // Acquired inside the task, so the fan-out loop still returns
+                // at once and the tree shows every database as loading.
+                let _permit = permits.acquire_owned().await;
                 // A fresh token: the tree's own refresh has no Stop to offer, so
                 // there is nothing to cancel it with. `fetch_schema` takes one
                 // for the Export modal, which does.
@@ -7385,8 +7422,31 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                         }
                         // One `Db` for this connection, cloned per-database fetch.
                         let db = Db::connect(&conn_send, tunnel_port);
-                        for node in &nodes {
-                            (start_fetch_cb)(node, db.clone());
+                        // **Most-wanted first.** `start_fetch` bounds how many
+                        // of these run at once (`INTROSPECT_PERMITS`), so the
+                        // order the queue is filled in decides which
+                        // database's tables appear first. Unordered, a shared
+                        // host's two-hundredth database could be read before
+                        // the one the user opened the connection to look at.
+                        let order = {
+                            let open: HashSet<String> = expanded.with_untracked(|e| {
+                                e.iter()
+                                    .filter_map(|k| {
+                                        schemaic_ui::db_name_of_key(k).map(str::to_string)
+                                    })
+                                    .collect()
+                            });
+                            hidden_dbs.with_untracked(|h| {
+                                schemaic_core::schema::introspection_order(
+                                    &names,
+                                    Some(conn_send.database.as_str()),
+                                    &open,
+                                    h,
+                                )
+                            })
+                        };
+                        for i in order {
+                            (start_fetch_cb)(&nodes[i], db.clone());
                         }
                     }
                     Err(e) => {

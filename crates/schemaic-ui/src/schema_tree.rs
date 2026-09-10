@@ -121,6 +121,18 @@ pub fn db_key(database: &str) -> String {
     format!("db:{database}")
 }
 
+/// [`db_key`]'s inverse: the database a `db:` key names, or `None` for a key of
+/// any other family.
+///
+/// Public for the same reason `db_key` is, and it is the second half of the
+/// same rule — the app asks the expansion set which *databases* are open when
+/// it decides what to introspect first, and a `k[3..]` there would be the
+/// format drifting from its builder in the one direction the builder cannot
+/// catch.
+pub fn db_name_of_key(key: &str) -> Option<&str> {
+    key.strip_prefix("db:")
+}
+
 /// A PostgreSQL namespace group. Only rendered when a database has more than one
 /// (see [`schema_groups`]), so this key never appears for MySQL.
 fn schema_key(database: &str, schema: &str) -> String {

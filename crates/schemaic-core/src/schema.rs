@@ -3446,6 +3446,50 @@ pub fn name_survives(name: &str, filt: &str) -> bool {
     filt.is_empty() || object_name_matches(name, filt)
 }
 
+/// The order to introspect a connection's databases in — indices into `names`,
+/// most-wanted first.
+///
+/// **The load used to be one unbounded fan-out in catalogue order.** Opening a
+/// connection ran a full `fetch_schema` for *every* database the server
+/// returned, each opening a connection of its own and reading every column,
+/// index, key, view, check and trigger of a whole database. On a shared host
+/// with 200 user databases — the ordinary shape of a hosting account — that is
+/// 200 simultaneous handshakes against a server whose `max_connections` is 151
+/// out of the box, so the 152nd onward failed ERROR 1040 and rendered as
+/// `Failed` rows with no retry but a manual Refresh, which repeats the storm.
+/// Below the cap it is still N connections and N catalogue reads per connect.
+///
+/// Bounding the concurrency is the caller's half. This is the other: **which
+/// database's answer arrives first** once only a handful are in flight. The
+/// active one is what the user is looking at; the ones they have already
+/// expanded are what is on screen; a hidden one is on nobody's screen by
+/// definition, so it goes last rather than being dropped — the completion
+/// index and `intel`'s catalogue read the same models, and skipping it
+/// entirely would be a laziness change rather than an ordering one.
+///
+/// Stable within each rank, so a server's own order is preserved among equals.
+pub fn introspection_order(
+    names: &[String],
+    active: Option<&str>,
+    expanded: &std::collections::HashSet<String>,
+    hidden: &std::collections::HashSet<String>,
+) -> Vec<usize> {
+    let rank = |n: &str| -> u8 {
+        if active.is_some_and(|a| a.eq_ignore_ascii_case(n)) {
+            0
+        } else if !db_visible(hidden, n) {
+            3
+        } else if expanded.contains(n) {
+            1
+        } else {
+            2
+        }
+    };
+    let mut order: Vec<usize> = (0..names.len()).collect();
+    order.sort_by_key(|&i| rank(&names[i]));
+    order
+}
+
 /// One standalone object, whichever kind it is.
 ///
 /// The tree renders a mixed list of these and the editor holds exactly one, so
@@ -6150,6 +6194,47 @@ mod tests {
         assert!(!t.any_column_matches("zzz"));
         // Empty needle matches nothing (callers handle "no filter" separately).
         assert!(!t.matches_search(""));
+    }
+
+    /// **What the user is looking at is introspected first**, and nothing is
+    /// dropped: with the fan-out bounded, order is what decides whether the
+    /// tree fills in from the top or from wherever the catalogue happened to
+    /// list things.
+    #[test]
+    fn the_active_and_expanded_databases_are_introspected_first() {
+        let names: Vec<String> = ["archive", "analytics", "shop", "world", "scratch"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let expanded: std::collections::HashSet<String> = ["world".to_string()].into();
+        let hidden: std::collections::HashSet<String> = ["archive".to_string()].into();
+
+        let got: Vec<&str> = introspection_order(&names, Some("shop"), &expanded, &hidden)
+            .into_iter()
+            .map(|i| names[i].as_str())
+            .collect();
+        assert_eq!(
+            got,
+            ["shop", "world", "analytics", "scratch", "archive"],
+            "active, then expanded, then visible in catalogue order, hidden last"
+        );
+        // Nothing is dropped — the completion index and `intel`'s catalogue
+        // read the same models, so this is an ordering and not a laziness.
+        assert_eq!(got.len(), names.len());
+    }
+
+    /// The degenerate inputs: no active database, nothing expanded, nothing
+    /// hidden — the order the server gave, unchanged.
+    #[test]
+    fn introspection_order_without_a_preference_is_the_catalogue_order() {
+        let names: Vec<String> = ["a", "b", "c"].iter().map(|s| s.to_string()).collect();
+        let none = std::collections::HashSet::new();
+        assert_eq!(introspection_order(&names, None, &none, &none), [0, 1, 2]);
+        assert!(introspection_order(&[], Some("a"), &none, &none).is_empty());
+        // The active database wins over hidden — it is the one being queried,
+        // which is the same exception `schema::tab_target` makes.
+        let hidden: std::collections::HashSet<String> = ["a".to_string()].into();
+        assert_eq!(introspection_order(&names, Some("a"), &none, &hidden)[0], 0);
     }
 
     /// **The two empty-filter answers are opposite, and both are right.**
