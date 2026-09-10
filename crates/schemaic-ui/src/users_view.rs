@@ -161,9 +161,18 @@ pub(crate) fn users_overlay(ui: Ui) -> impl IntoView {
         });
     }
 
+    // **The read-only flag is part of the key, because `write_gate` reads it.**
+    // The gate below is computed once per container build; its `read_only` term
+    // comes from the *live* connection, and `core/users.rs` states why that is
+    // the live one rather than the target's — *"one is a setting that can change
+    // while the browser is open"*. Nothing re-ran the gate when it changed, so
+    // flipping the connection to read-only from the status bar left **Drop**
+    // lit, the "This connection is read-only." note absent, and Apply enabled on
+    // a preview that then silently did nothing.
+    let key_ui = ui.clone();
     dyn_container(
-        move || (target.get(), hidden()),
-        move |(open, hidden)| {
+        move || (target.get(), hidden(), live_read_only(&key_ui)),
+        move |(open, hidden, _)| {
             let Some(t) = open.filter(|_| !hidden) else {
                 return empty().into_any();
             };
@@ -691,9 +700,24 @@ fn statement_row(sql: &str, dialect: SqlDialect) -> AnyView {
 fn write_gate(ui: &Ui, target: &UsersTarget) -> WriteGate {
     WriteGate::of(
         target.dialect,
-        crate::table_designer::edit_ctx(ui).read_only,
+        live_read_only(ui),
         target.database.is_some(),
     )
+}
+
+/// The live connection's read-only flag, read **tracked**.
+///
+/// [`crate::table_designer::edit_ctx`] answers the same question with
+/// `get_untracked`, which is right at a click and wrong as a container key: a
+/// browser keyed on it has to rebuild when the status bar flips the flag, or the
+/// gate it computed once is a stale answer to a question whose whole point is
+/// that it changes. Both readings are wanted here, so this is the tracked one
+/// and `edit_ctx` stays the untracked one.
+fn live_read_only(ui: &Ui) -> bool {
+    let conn_id = ui.conn.active_conn.get();
+    ui.conn
+        .connections
+        .with(|cs| cs.iter().any(|c| c.id == conn_id && c.read_only))
 }
 
 /// **`+ New account`, at the foot of the list column** — the shape Manage
@@ -811,13 +835,18 @@ fn actions_row(
     // The connection the browser was opened on, like the dialect beside it —
     // the preview must be built for the server this account lives on, not for
     // whichever the switcher points at by the time the confirm is answered.
-    // `read_only` is `false` because this button is only reachable through
-    // `WriteGate::Allowed`, and the preview re-asks the live connection by
-    // `conn_id` before it applies anything.
     let plan_conn_id = target.conn_id;
     let confirm = ui.overlay.confirm;
     let drop = action_button("Drop", ActionKind::Danger, enabled, ring, 13, move || {
         let ui = drop_ui.clone();
+        // **The launch guards itself, in the step that launches it.** `enabled`
+        // is a `bool` captured when this row was built, so the disabled button
+        // *was* the whole guard — verbatim what `widgets::accept_launch`'s
+        // contract forbids, on the one destructive action of the three (its two
+        // neighbours refuse read-only inside `open_for_new` / `open_for_grant`).
+        if !crate::widgets::accept_launch(false, crate::table_designer::edit_ctx(&ui).read_only) {
+            return;
+        }
         let database = drop_target.database.clone().unwrap_or_default();
         let who = drop_who.clone();
         let change = schemaic_core::ddl::Change::DropAccount(Box::new(who.clone()));
@@ -833,14 +862,24 @@ fn actions_row(
             // the switcher points at.
             message: crate::overlays::risk_prompt(&change, risk_dialect),
             resolve: Rc::new(move |yes| {
-                if yes {
+                // **And again here**, because this closure runs an arbitrary
+                // time after the button was pressed — the deferred half
+                // `accept_dialog_launch` exists for. The flag can flip while the
+                // red confirm stands.
+                let read_only = crate::table_designer::edit_ctx(&ui).read_only;
+                if yes && crate::widgets::accept_launch(false, read_only) {
                     crate::ddl_preview::preview_account(
                         &ui,
                         crate::ddl_preview::PlanTarget {
                             conn_id: plan_conn_id,
                             database: database.clone(),
                             dialect: risk_dialect,
-                            read_only: false,
+                            // Read, not a literal `false`. `PlanTarget`'s own
+                            // doc says the struct exists so no call site comes
+                            // to pass a constant beside a live `conn_id`, and
+                            // this was the site that did — which is why the
+                            // preview opened with Apply enabled and inert.
+                            read_only,
                         },
                         &who.display(),
                         schemaic_core::ddl::Change::DropAccount(Box::new(who.clone())),
