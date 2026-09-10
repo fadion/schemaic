@@ -2361,6 +2361,14 @@ fn table_refs_with_pos(
             i += 1;
             continue;
         }
+        // Inside `EXTRACT`/`TRIM`/`SUBSTRING`/`OVERLAY` a `FROM` separates
+        // arguments — see `from_separates_call_arguments`. A subquery's `FROM`
+        // is still a table list, which is why this asks the *call's name* and
+        // not the paren depth.
+        if is_from && from_separates_call_arguments(&toks, i) {
+            i += 1;
+            continue;
+        }
         i += 1;
         while let Some(mut name) = toks.get(i).and_then(|t| word(&t.kind)) {
             if is_reserved_word(&name, dialect) {
@@ -3102,6 +3110,53 @@ fn is_implicit_alias(word: &str, dialect: SqlDialect) -> bool {
 /// `AS or` and gating on a parse would miss the real thing this diagnostic is
 /// for. The tokenizer already emits `LParen`/`RParen`, so this adds no scanner.
 fn as_introduces_a_type(toks: &[Token], i: usize) -> bool {
+    enclosing_call_name(toks, i).is_some_and(|w| {
+        matches!(
+            w.to_ascii_uppercase().as_str(),
+            "CAST" | "CONVERT" | "TRY_CAST" | "SAFE_CAST"
+        )
+    })
+}
+
+/// Is the `FROM` at `toks[i]` an **argument separator** rather than a clause?
+///
+/// SQL spells four functions with `FROM` inside their parentheses, and inside a
+/// call it is never a table list:
+///
+/// * `EXTRACT(YEAR FROM order_date)`
+/// * `TRIM(BOTH ' ' FROM note)` (and `LEADING`/`TRAILING`)
+/// * `SUBSTRING(note FROM 1 FOR 3)` / `SUBSTR`
+/// * `OVERLAY(a PLACING b FROM 1 FOR 2)`
+///
+/// `table_refs_with_pos` treats every `FROM` as opening a table list — its doc
+/// says so, and for a subquery's `FROM` that is right — so
+/// `SELECT EXTRACT(YEAR FROM order_date) FROM orders` drew a red
+/// ``Table `order_date` not found`` on **both** MySQL and PostgreSQL, on a
+/// statement MariaDB 10.11 runs. `SUBSTRING(note FROM 1 FOR 3)` escaped only by
+/// luck: its operand is a digit, and a digit is not `is_word_start`.
+///
+/// **An allowlist of the four, not "any call".** The tempting rule — "a `(`
+/// directly preceded by a word is a call" — sorts a subquery onto the wrong
+/// side, because `FROM (SELECT …)`'s paren is also directly preceded by a word,
+/// namely `FROM`. Naming the four functions cannot reach a subquery at all, and
+/// the standard's list of them is closed.
+fn from_separates_call_arguments(toks: &[Token], i: usize) -> bool {
+    enclosing_call_name(toks, i).is_some_and(|w| {
+        matches!(
+            w.to_ascii_uppercase().as_str(),
+            "EXTRACT" | "TRIM" | "SUBSTRING" | "SUBSTR" | "OVERLAY"
+        )
+    })
+}
+
+/// The word immediately before the innermost **unmatched** `(` above `toks[i]`
+/// — the name of the call whose parentheses enclose it, if any.
+///
+/// `None` when `toks[i]` is not inside parentheses, or when the `(` was opened
+/// by something other than a word. A *subquery's* `(` is also preceded by a
+/// word (`FROM (`, `IN (`, `EXISTS (`), so a caller decides on the **name**
+/// rather than on this returning `Some`.
+fn enclosing_call_name(toks: &[Token], i: usize) -> Option<&str> {
     let mut depth = 0i32;
     let mut j = i;
     while j > 0 {
@@ -3109,19 +3164,16 @@ fn as_introduces_a_type(toks: &[Token], i: usize) -> bool {
         match &toks[j].kind {
             TkKind::RParen => depth += 1,
             TkKind::LParen if depth > 0 => depth -= 1,
-            // The `(` this `AS` sits inside. Whatever word opened it decides.
             TkKind::LParen => {
-                return j > 0
-                    && matches!(&toks[j - 1].kind, TkKind::Word(w)
-                    if matches!(
-                        w.to_ascii_uppercase().as_str(),
-                        "CAST" | "CONVERT" | "TRY_CAST" | "SAFE_CAST"
-                    ));
+                return match toks.get(j.wrapping_sub(1)).map(|t| &t.kind) {
+                    Some(TkKind::Word(w)) if j > 0 => Some(w.as_str()),
+                    _ => None,
+                };
             }
             _ => {}
         }
     }
-    false
+    None
 }
 
 /// Flag a reserved keyword used as an alias — explicit (`orders AS or`, `id AS key`)
@@ -7861,9 +7913,16 @@ mod tests {
         diagnostics(sql, &cat, SqlDialect::MySql)
     }
 
-    #[test]
-    fn corpus_valid_queries_produce_no_diagnostics() {
-        let valid = [
+    /// The valid-SQL corpus this module's oldest false-positive test reads.
+    ///
+    /// Lifted out of the test so its **catalog-true subset** can be re-run with
+    /// the unknown-table/unknown-column tier switched on — see
+    /// `corpus_valid_queries_are_clean_against_a_loaded_catalog`, which is where
+    /// the reason lives. Only a subset: a third of the entries below name
+    /// `order`/`group`/`select` columns that `sample_catalog` does not have, so
+    /// against a loaded catalog they are *correctly* flagged.
+    fn valid_corpus() -> &'static [&'static str] {
+        &[
             // Basics.
             "SELECT 1;",
             "SELECT * FROM employees;",
@@ -7950,7 +8009,12 @@ mod tests {
             "SELECT * FROM employees e RIGHT JOIN departments d ON e.dept_id = d.id;",
             "WITH a AS (SELECT 1 AS x), b AS (SELECT 2 AS y) SELECT * FROM a JOIN b ON a.x = b.y;",
             "SELECT * FROM employees e JOIN departments d ON e.dept_id = d.id WHERE d.id > 1;",
-        ];
+        ]
+    }
+
+    #[test]
+    fn corpus_valid_queries_produce_no_diagnostics() {
+        let valid = valid_corpus();
         let failures: Vec<String> = valid
             .iter()
             .filter_map(|q| {
@@ -7966,6 +8030,83 @@ mod tests {
             "false positives on valid SQL ({} of {}):\n{}",
             failures.len(),
             valid.len(),
+            failures.join("\n")
+        );
+    }
+
+    /// **The corpus above, against a catalog that is actually loaded.**
+    ///
+    /// `diag_bare` builds `Catalog::build(&[], None)`, so `unqualified_db_loaded`
+    /// is false, `table_status` answers `Unknown` for every unqualified
+    /// reference, and `table_existence_checks` and the column resolver emit
+    /// **nothing at all** — the whole unknown-table/unknown-column tier is off
+    /// inside the test written to guard against false positives. That is why
+    /// `SELECT EXTRACT(YEAR FROM hired_at) FROM employees` could squiggle a red
+    /// ``Table `hired_at` not found`` with the suite green: it is a false
+    /// positive *of the disabled tier*, so adding it to the pass above could not
+    /// have failed.
+    ///
+    /// **Which statements.** Every entry of `valid_corpus` that names only
+    /// `sample_catalog`'s own columns — the rest genuinely *are* unknown columns
+    /// there, so re-running the whole list would assert the tier is off again —
+    /// plus the cases below, which is where the FROM-separated calls live. Both
+    /// dialects for those, because every test in this block was MySQL and this
+    /// bug was on both; MySQL only for the corpus, which is MySQL-shaped
+    /// (backtick identifiers, `LIMIT 5, 10`).
+    #[test]
+    fn corpus_valid_queries_are_clean_against_a_loaded_catalog() {
+        // `sample_catalog` is employees(id, name, salary, dept_id) and
+        // departments(id, name); an entry naming anything else is skipped
+        // rather than silently expected to pass.
+        let catalog_true = |q: &str| {
+            !["`order`", "`group`", "`select`", "hired_at"]
+                .iter()
+                .any(|c| q.contains(c))
+        };
+        let extra = [
+            // The four functions that spell an argument separator `FROM`.
+            "SELECT EXTRACT(YEAR FROM salary) FROM employees;",
+            "SELECT TRIM(BOTH ' ' FROM name) FROM employees;",
+            "SELECT TRIM(LEADING '0' FROM name) FROM employees;",
+            "SELECT SUBSTRING(name FROM 1 FOR 3) FROM employees;",
+            "SELECT SUBSTRING(name FROM 2) FROM employees;",
+            // Nested in another call, and two in one projection.
+            "SELECT CONCAT(EXTRACT(YEAR FROM salary), name) FROM employees;",
+            "SELECT EXTRACT(YEAR FROM salary), TRIM(BOTH ' ' FROM name) FROM employees;",
+            // What the allowlist exists to protect: a subquery's `FROM` is still
+            // a table list, and its table still has to be a real one.
+            "SELECT * FROM (SELECT id FROM employees) x;",
+            "SELECT * FROM employees WHERE dept_id IN (SELECT id FROM departments);",
+        ];
+        let mut failures: Vec<String> = Vec::new();
+        let mut ran = 0usize;
+        // The corpus is MySQL-shaped (backtick identifiers, `LIMIT 5, 10`), so
+        // it runs on MySQL only.
+        for q in valid_corpus().iter().filter(|q| catalog_true(q)) {
+            ran += 1;
+            let d = diag(q);
+            if !d.is_empty() {
+                let msgs: Vec<&str> = d.iter().map(|x| x.message.as_str()).collect();
+                failures.push(format!("  [MySql] {q}\n      -> {msgs:?}"));
+            }
+        }
+        for q in extra.iter() {
+            for dialect in [SqlDialect::MySql, SqlDialect::Postgres] {
+                ran += 1;
+                let d = diag_d(q, dialect);
+                if !d.is_empty() {
+                    let msgs: Vec<&str> = d.iter().map(|x| x.message.as_str()).collect();
+                    failures.push(format!("  [{dialect:?}] {q}\n      -> {msgs:?}"));
+                }
+            }
+        }
+        // A filter that stopped matching would let this pass by running almost
+        // nothing — the same failure mode `crate_sources` guards against.
+        assert!(ran > 60, "only {ran} statements reached the loaded catalog");
+        assert!(
+            failures.is_empty(),
+            "false positives against a loaded catalog ({} of {ran}):\n{}",
+            failures.len(),
             failures.join("\n")
         );
     }
