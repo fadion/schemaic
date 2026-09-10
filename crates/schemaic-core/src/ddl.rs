@@ -3066,7 +3066,7 @@ impl Change {
             Change::DropColumn { name, .. } => {
                 vec![format!("Drops column {name} and all the data in it.")]
             }
-            Change::AlterColumn { from, to, .. } => alter_risks(from, to),
+            Change::AlterColumn { from, to, .. } => alter_risks(from, to, dialect),
             Change::PrimaryKey { from, to, .. } if !from.is_empty() && to.is_empty() => {
                 vec!["Leaves the table without a primary key — rows can no longer be edited from the grid.".to_string()]
             }
@@ -3349,9 +3349,14 @@ impl Change {
                 // truncation.
                 let mut out = Vec::new();
                 out.extend(type_change_risk(
-                    &normalize_type(from_type, SqlDialect::Postgres),
-                    &normalize_type(&info.base_type, SqlDialect::Postgres),
+                    from_type,
+                    &info.base_type,
                     &format!("domain {}", info.name),
+                    // A domain exists on no other engine, so the dialect is not
+                    // in question here — and `type_change_risk` normalises for
+                    // itself now, which is where the call site's own comment
+                    // said the fix belonged.
+                    SqlDialect::Postgres,
                 ));
                 out.push(recreate_risk(&info.name, "domain", dependents));
                 out
@@ -3612,7 +3617,7 @@ fn sequence_edits(from: &SequenceInfo, to: &SequenceInfo) -> Vec<String> {
 /// **All of them, not the first.** Nullability and type are independent halves of
 /// one edit and a designer changes both at once routinely; returning early on the
 /// nullability half hid the narrowing — the more dangerous of the two.
-fn alter_risks(from: &ColumnInfo, to: &ColumnInfo) -> Vec<String> {
+fn alter_risks(from: &ColumnInfo, to: &ColumnInfo, dialect: SqlDialect) -> Vec<String> {
     let mut out = Vec::new();
     if from.nullable && !to.nullable {
         out.push(format!(
@@ -3645,7 +3650,12 @@ fn alter_risks(from: &ColumnInfo, to: &ColumnInfo) -> Vec<String> {
         )),
         _ => {}
     }
-    out.extend(type_change_risk(&from.type_name, &to.type_name, &to.name));
+    out.extend(type_change_risk(
+        &from.type_name,
+        &to.type_name,
+        &to.name,
+        dialect,
+    ));
     out
 }
 
@@ -3656,16 +3666,39 @@ fn alter_risks(from: &ColumnInfo, to: &ColumnInfo) -> Vec<String> {
 /// Split out of [`alter_risks`] because a domain's base type is the same
 /// question asked of a different object, and `RecreateDomain` was the one
 /// narrowing path in the emitter that answered it with nothing at all.
-fn type_change_risk(from: &str, to: &str, subject: &str) -> Option<String> {
+///
+/// **Compared on the normalised pair, said in the raw one.** A synonym is the
+/// same type family, and comparing the declared spellings got both directions
+/// wrong: `decimal(10,4)` → `numeric(10,0)` is a rounding edit whose bases
+/// differ, so the pairwise arm was skipped and the generic "rewrites every
+/// value" fired in place of the *"rounds every value in the column"* sentence
+/// that exists because a smaller scale loses data without the statement
+/// complaining; and PostgreSQL's own `character varying(45)` widened to
+/// `varchar(255)` — metadata-only — was reported as a full rewrite **and**
+/// flipped `is_destructive`, gating Apply behind the destructive path. Same for
+/// `integer` → `int4` and `boolean` → `bool`.
+///
+/// The normalisation used to be at [`Change::RecreateDomain`]'s call site,
+/// where its comment names this defect in so many words — so the fix reached
+/// the newer path and not the one every table edit on every engine takes. It
+/// lives here now, and that call site no longer needs it.
+///
+/// The *message* still quotes `from` and `to` as the user typed them: the
+/// comparison is the machine's question, the sentence is theirs.
+fn type_change_risk(from: &str, to: &str, subject: &str, dialect: SqlDialect) -> Option<String> {
+    let normalized_from = normalize_type(from, dialect);
+    let normalized_to = normalize_type(to, dialect);
     let (fb, fa) = {
-        let p = split_type(from);
+        let p = split_type(&normalized_from);
         (p.base, p.params)
     };
     let (tb, ta) = {
-        let p = split_type(to);
+        let p = split_type(&normalized_to);
         (p.base, p.params)
     };
-    if fb.is_empty() || tb.is_empty() || from == to {
+    // `normalized_from == normalized_to` and not `from == to`: two spellings of
+    // one type cost the values nothing, and saying so was the false-alarm half.
+    if fb.is_empty() || tb.is_empty() || normalized_from == normalized_to {
         return None;
     }
     if fb == tb {
@@ -10570,6 +10603,58 @@ mod tests {
         assert_eq!(risk.len(), 1);
         assert!(risk[0].contains("Narrowing email"), "{risk:?}");
         assert!(risk[0].contains("truncates"), "{risk:?}");
+    }
+
+    /// **A synonym is the same type family, and the risk sentence compared the
+    /// raw spellings.** Both directions are wrong and both are reachable
+    /// without a server.
+    ///
+    /// *Lost disclosure:* `decimal(10,4)` → `numeric(10,0)` is a genuine
+    /// rounding edit — `types_equal` normalises and emits the `ALTER` — but
+    /// `split_type`'s bases differ, so the pairwise arm was skipped and the
+    /// generic "rewrites every value; it can fail or lose precision" fired
+    /// instead. The dedicated *"rounds every value in the column"* sentence,
+    /// which exists precisely because a smaller scale loses data **without the
+    /// statement complaining**, never appeared.
+    ///
+    /// *False alarm:* PostgreSQL's `format_type` reports `character
+    /// varying(45)`; widening it to `varchar(255)` is metadata-only, and the
+    /// differing bases made it "rewrites every value" **and** flipped
+    /// `is_destructive`, gating Apply behind the preview's destructive path.
+    /// Same for `integer` → `int4` and `boolean` → `bool`.
+    ///
+    /// The existing tests could not see either: both spell `varchar(...)` on
+    /// both sides. `Change::RecreateDomain` — the *other* caller — normalises
+    /// at the call site and its comment names this exact defect, so the fix had
+    /// been applied to the newer path and not to the one every table edit on
+    /// every engine takes.
+    #[test]
+    fn a_type_synonym_is_the_same_family_for_the_risk_sentence() {
+        // Rounding, through a synonym: the sentence that names it must survive.
+        let mut t = users();
+        t.columns[1].name = "amount".into();
+        t.columns[1].type_name = "decimal(10,4)".into();
+        let mut draft = TableDraft::from_table(&t);
+        draft.columns[1].info.type_name = "numeric(10,0)".into();
+        let risk = diff(&t, &draft, MySql).destructive();
+        assert_eq!(risk.len(), 1, "{risk:?}");
+        assert!(risk[0].contains("rounds every value"), "{risk:?}");
+        // And the message still quotes what the user typed, not the normalised
+        // pair — they should read the text they wrote.
+        assert!(risk[0].contains("numeric(10,0)"), "{risk:?}");
+
+        // Widening, through a synonym: nothing is lost, so nothing is said.
+        let mut pg = users();
+        pg.columns[1].name = "email".into();
+        pg.columns[1].type_name = "character varying(45)".into();
+        let mut draft = TableDraft::from_table(&pg);
+        draft.columns[1].info.type_name = "varchar(255)".into();
+        let cs = diff(&pg, &draft, Postgres);
+        assert!(
+            cs.destructive().is_empty(),
+            "a metadata-only widening was reported as a rewrite: {:?}",
+            cs.destructive()
+        );
     }
 
     #[test]

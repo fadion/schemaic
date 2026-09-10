@@ -4434,6 +4434,14 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                     tab.tx
                         .update(|t| *t = t.on_statement(engine, "UPDATE", stmt));
                 });
+                // **Its own action, because `create_ext_action` is one-shot** —
+                // and the post-commit re-fetch is a second statement on the same
+                // pinned connection, so it has its own outcome to fold. A
+                // `SELECT`, like the blob read's.
+                let fold_refetch = create_ext_action(cx, move |stmt: StmtOutcome| {
+                    tab.tx
+                        .update(|t| *t = t.on_statement(engine, "SELECT", stmt));
+                });
                 let finish = create_ext_action(cx, move |outcome: CommitDone| {
                     // A full re-run must happen on the UI thread and only if the
                     // committed tab is still active — `run` targets the active tab,
@@ -4490,7 +4498,24 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                         Some(req) => {
                             let rows = match &session {
                                 Some(s) => {
-                                    s.refetch_rows(&req.template, &req.rows, token).await.result
+                                    // **Folded, like every other session call
+                                    // site.** This one took `.result` and threw
+                                    // the `StmtOutcome` away, so a connection
+                                    // that died between the commit and the
+                                    // re-read left the tab's `tx` reading
+                                    // `Open`: the pill went on claiming a live
+                                    // transaction over a dead socket,
+                                    // `can_commit()` stayed true, and Commit
+                                    // issued `COMMIT` for a transaction the
+                                    // server had already discarded — while the
+                                    // failure fell to `FullReran` and showed
+                                    // the pre-commit rows. The blob read 230
+                                    // lines above states the rule: "a read on
+                                    // the pinned connection still tells the
+                                    // transaction what happened to it".
+                                    let out = s.refetch_rows(&req.template, &req.rows, token).await;
+                                    fold_refetch(out.stmt);
+                                    out.result
                                 }
                                 None => db.refetch_rows(&req.template, &req.rows, token).await,
                             };
