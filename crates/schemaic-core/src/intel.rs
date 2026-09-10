@@ -3520,6 +3520,19 @@ mod colres {
         /// reaches the same arm). Recording what the alias hid is what lets the
         /// difference be stated.
         shadowed: Option<String>,
+        /// The byte range of the **subquery that defines this source**, when it
+        /// is a derived table or a CTE.
+        ///
+        /// A reference inside that range must not resolve against it. The scope
+        /// chain walks outwards so a subquery can see an enclosing scope's
+        /// tables (`diag_column_correlated_subquery_sees_outer` pins that), but
+        /// a subquery can never see the derived table it is itself the body of
+        /// — and `select_output_cols` names an unaliased projection item by the
+        /// identifier itself, so the outer source's columns *were* the
+        /// misspelling. `SELECT nope FROM departments` was flagged and
+        /// `SELECT * FROM (SELECT nope FROM departments) d` was silent, which
+        /// is the most common place for a wrong column name to be.
+        defines: Option<(usize, usize)>,
     }
 
     /// A resolution scope: the byte range it spans, its FROM sources, and the output
@@ -3589,8 +3602,9 @@ mod colres {
         /// added to every **base table** source — not to a derived table or a CTE,
         /// which expose only what their projection selects.
         implicit: &'static [&'static str],
-        /// CTE name (lower) → its output columns. Populated as queries are visited.
-        ctes: HashMap<String, Cols>,
+        /// CTE name (lower) → its output columns and the byte range of its
+        /// body. Populated as queries are visited; the range is `Src::defines`.
+        ctes: HashMap<String, (Cols, (usize, usize))>,
         scopes: Vec<Scope>,
         refs: Vec<Ref>,
         /// `only_full_group_by` warnings collected per SELECT scope as it's pushed.
@@ -3605,8 +3619,11 @@ mod colres {
             if let Some(with) = &q.with {
                 for cte in &with.cte_tables {
                     let cols = cte_cols(cte);
+                    // The body's range, so a reference inside it cannot resolve
+                    // against the CTE the body defines — see `Src::defines`.
+                    let range = to_range(self.stmt, self.lo, cte.query.span());
                     self.ctes
-                        .insert(cte.alias.name.value.to_ascii_lowercase(), cols);
+                        .insert(cte.alias.name.value.to_ascii_lowercase(), (cols, range));
                 }
             }
             match q.body.as_ref() {
@@ -3646,6 +3663,7 @@ mod colres {
                                 cols: select_output_cols(first),
                                 table: None,
                                 shadowed: None,
+                                defines: None,
                             }],
                             proj_aliases: HashSet::new(),
                             where_range: None,
@@ -3687,8 +3705,14 @@ mod colres {
         /// Record a scope for `sel` covering byte `range`, resolving its FROM sources
         /// against the catalog + the CTEs registered so far.
         fn push_scope(&mut self, range: (usize, usize), sel: &Select) {
-            let (sources, proj_aliases) =
-                build_sources(sel, self.catalog, self.implicit, &self.ctes);
+            let (sources, proj_aliases) = build_sources(
+                sel,
+                self.catalog,
+                self.implicit,
+                &self.ctes,
+                self.stmt,
+                self.lo,
+            );
             let (coalesced, natural) = coalesced_cols(sel);
             group_by_check(
                 sel,
@@ -3739,12 +3763,20 @@ mod colres {
         if chain.is_empty() {
             return None;
         }
+        // A source **defined by** a subquery is invisible to references inside
+        // that subquery: the chain walks outwards so a subquery can see an
+        // enclosing scope's tables, but never the derived table or CTE it is
+        // itself the body of. See `Src::defines`.
+        let visible = |src: &&Src| {
+            src.defines
+                .is_none_or(|(a, b)| !(a <= r.range.0 && r.range.1 <= b))
+        };
 
         match &r.qualifier {
             Some(q) => {
                 // Find the source this qualifier names, in this or an enclosing scope.
                 for s in &chain {
-                    for src in &s.sources {
+                    for src in s.sources.iter().filter(visible) {
                         if src.quals.iter().any(|x| x == q) {
                             return match &src.cols {
                                 Cols::Open => None,
@@ -3771,6 +3803,7 @@ mod colres {
                     if let Some(src) = s
                         .sources
                         .iter()
+                        .filter(visible)
                         .find(|src| src.shadowed.as_deref() == Some(q.as_str()))
                     {
                         let alias = src.quals.first().cloned().unwrap_or_default();
@@ -3792,7 +3825,7 @@ mod colres {
                 for s in &chain {
                     let mut known_matches = 0usize;
                     let mut has_open = false;
-                    for src in &s.sources {
+                    for src in s.sources.iter().filter(visible) {
                         match &src.cols {
                             Cols::Open => has_open = true,
                             Cols::Known(cols) if cols.contains(&r.col) => known_matches += 1,
@@ -3847,13 +3880,31 @@ mod colres {
         sel: &Select,
         catalog: &Catalog,
         implicit: &'static [&'static str],
-        ctes: &HashMap<String, Cols>,
+        ctes: &HashMap<String, (Cols, (usize, usize))>,
+        stmt: &str,
+        lo: usize,
     ) -> (Vec<Src>, HashSet<String>) {
         let mut sources = Vec::new();
         for twj in &sel.from {
-            add_source(&twj.relation, &mut sources, catalog, implicit, ctes);
+            add_source(
+                &twj.relation,
+                &mut sources,
+                catalog,
+                implicit,
+                ctes,
+                stmt,
+                lo,
+            );
             for join in &twj.joins {
-                add_source(&join.relation, &mut sources, catalog, implicit, ctes);
+                add_source(
+                    &join.relation,
+                    &mut sources,
+                    catalog,
+                    implicit,
+                    ctes,
+                    stmt,
+                    lo,
+                );
             }
         }
         (sources, proj_aliases(sel))
@@ -4040,7 +4091,9 @@ mod colres {
         sources: &mut Vec<Src>,
         catalog: &Catalog,
         implicit: &'static [&'static str],
-        ctes: &HashMap<String, Cols>,
+        ctes: &HashMap<String, (Cols, (usize, usize))>,
+        stmt: &str,
+        lo: usize,
     ) {
         match factor {
             TableFactor::Table {
@@ -4072,13 +4125,14 @@ mod colres {
                 let shadowed = alias_name.as_ref().map(|_| tname.to_ascii_lowercase());
                 // A bare name matching a CTE resolves to the CTE's columns.
                 if db.is_none()
-                    && let Some(cols) = ctes.get(&tname.to_ascii_lowercase())
+                    && let Some((cols, body)) = ctes.get(&tname.to_ascii_lowercase())
                 {
                     sources.push(Src {
                         quals,
                         cols: cols.clone(),
                         table: None,
                         shadowed: shadowed.clone(),
+                        defines: Some(*body),
                     });
                     return;
                 }
@@ -4110,6 +4164,7 @@ mod colres {
                     cols,
                     table: Some(tname),
                     shadowed,
+                    defines: None,
                 });
             }
             TableFactor::Derived {
@@ -4124,14 +4179,23 @@ mod colres {
                     cols: output_cols(subquery),
                     table: None,
                     shadowed: None,
+                    defines: Some(to_range(stmt, lo, subquery.span())),
                 });
             }
             TableFactor::NestedJoin {
                 table_with_joins, ..
             } => {
-                add_source(&table_with_joins.relation, sources, catalog, implicit, ctes);
+                add_source(
+                    &table_with_joins.relation,
+                    sources,
+                    catalog,
+                    implicit,
+                    ctes,
+                    stmt,
+                    lo,
+                );
                 for join in &table_with_joins.joins {
-                    add_source(&join.relation, sources, catalog, implicit, ctes);
+                    add_source(&join.relation, sources, catalog, implicit, ctes, stmt, lo);
                 }
             }
             _ => sources.push(open_src()),
@@ -4206,6 +4270,7 @@ mod colres {
             cols: Cols::Open,
             table: None,
             shadowed: None,
+            defines: None,
         }
     }
 
@@ -7372,6 +7437,41 @@ mod tests {
             .filter(|d| d.message.starts_with("Column "))
             .map(|d| d.message)
             .collect()
+    }
+
+    /// **A misspelling in a derived table's or CTE's own projection.**
+    ///
+    /// The same wrong column was reported standalone and silent one paren
+    /// deeper, which is the position it is most likely to be in.
+    /// `select_output_cols` names an unaliased projection item by the
+    /// identifier itself, so the *outer* scope got a source whose columns were
+    /// the misspelling — and the chain walk, which is right for correlation,
+    /// then found `nope` there and resolved.
+    #[test]
+    fn a_misspelling_in_a_subquerys_own_projection_is_flagged() {
+        for sql in [
+            "SELECT * FROM (SELECT nope FROM departments) d",
+            "WITH c AS (SELECT nope FROM departments) SELECT * FROM c",
+            "SELECT * FROM employees e, (SELECT nope FROM departments) d",
+            // The control the review used to isolate the mechanism: an
+            // *aliased* projection was already flagged, because the outer
+            // source's column is then the alias rather than the misspelling.
+            "SELECT x FROM (SELECT nope AS x FROM departments) d",
+            "SELECT * FROM (SELECT id FROM departments WHERE nope=1) d",
+        ] {
+            let d = col_errors(sql);
+            assert_eq!(d.len(), 1, "{sql} -> {d:?}");
+            assert!(d[0].contains("nope"), "{sql} -> {d:?}");
+        }
+        // **Correlation still works**, which is the property the chain walk
+        // exists for: a subquery may reference an *enclosing* scope's tables.
+        for sql in [
+            "SELECT id FROM employees e WHERE EXISTS (SELECT 1 FROM departments d WHERE d.id = e.dept_id)",
+            "SELECT * FROM (SELECT id FROM departments) d WHERE d.id > 0",
+            "WITH c AS (SELECT id FROM departments) SELECT c.id FROM c",
+        ] {
+            assert!(diag(sql).is_empty(), "{sql} -> {:?}", diag(sql));
+        }
     }
 
     /// **An alias replaces the table name for the whole query.** Registering
