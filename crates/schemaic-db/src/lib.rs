@@ -274,7 +274,7 @@ impl Engine {
 /// a password containing `@ / # ? % :` needs no percent-encoding and can't break
 /// parsing (review B7), and no plaintext URL is embedded anywhere as identity or
 /// leaked on a command line (review C6).
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct Db {
     pub(crate) engine: Engine,
     pub(crate) host: String,
@@ -295,6 +295,39 @@ pub struct Db {
     /// [`schemaic_core::connection::Connection::tls_plan`], so no driver here
     /// re-reads a mode. See [`tls`].
     pub(crate) tls: Option<schemaic_core::connection::TlsPlan>,
+}
+
+/// **Hand-written, because the derived one printed the password.**
+///
+/// No site formats a `Db` today — the whole workspace was checked — which is
+/// what made the derive latent rather than live. But this type is threaded
+/// through nearly everything (cloned into `McpEndpoint`, `StartAiParams`, the
+/// dump and script runners), and the moment a struct that owns one gains a
+/// `#[derive(Debug)]` and is logged, or anyone writes
+/// `.expect(&format!("{db:?}"))`, the credential lands in
+/// `%APPDATA%\Roaming\schemaic`'s log — the folder the Settings pane invites
+/// the user to share for support.
+///
+/// The struct's own doc already claims the property: "no plaintext URL is
+/// embedded anywhere as identity or leaked on a command line". A derived
+/// `Debug` was an unguarded second spelling of the same leak, and the invariant
+/// it belongs to is *no credential in a URL, argv or log* — all three.
+///
+/// Everything else prints, because the point of a `Debug` here is to say which
+/// endpoint this is.
+impl std::fmt::Debug for Db {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Db")
+            .field("engine", &self.engine)
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("user", &self.user)
+            .field("pass", &"<redacted>")
+            .field("file", &self.file)
+            .field("database", &self.database)
+            .field("tls", &self.tls)
+            .finish()
+    }
 }
 
 /// What database a MySQL/MariaDB connection opens in.
@@ -5846,6 +5879,40 @@ pub(crate) fn parse_typed(s: String, type_name: &str) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **A `Db` must not print its password**, in any formatting, ever.
+    ///
+    /// The derive did, and no site formats one today — which is what made it
+    /// latent rather than live. This type is cloned into `McpEndpoint`,
+    /// `StartAiParams`, the dump and script runners, so the day a struct owning
+    /// one gains a `#[derive(Debug)]` and is logged, the credential lands in
+    /// `%APPDATA%\Roaming\schemaic`'s log — the folder the Settings pane
+    /// invites the user to share for support. The struct's own doc already
+    /// claimed "no plaintext URL is embedded anywhere as identity or leaked on
+    /// a command line"; the invariant behind it says *URL, argv or log*.
+    ///
+    /// It is also the test a future field keeps honest: a hand-written `Debug`
+    /// has to be extended for a new secret, and this says what happens if it is
+    /// not.
+    #[test]
+    fn a_db_never_prints_its_password() {
+        let db = Db::from_parts(
+            Engine::MySql,
+            "db.internal".into(),
+            3306,
+            "app".into(),
+            "hunter2".into(),
+            String::new(),
+        );
+        let shown = format!("{db:?}");
+        assert!(!shown.contains("hunter2"), "{shown}");
+        assert!(shown.contains("<redacted>"), "{shown}");
+        // Everything a reader needs to say *which* endpoint this is still
+        // prints — a `Debug` that redacted the host would be no use at all.
+        assert!(shown.contains("db.internal"), "{shown}");
+        assert!(shown.contains("3306"), "{shown}");
+        assert!(shown.contains("app"), "{shown}");
+    }
 
     // ── The server-level DDL runner ───────────────────────────────────────
 

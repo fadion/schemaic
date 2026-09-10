@@ -113,6 +113,19 @@ pub enum ImportNote {
     /// [`PgpassScope`]. It also un-ticks the row, because a credential leaving
     /// the machine is not a thing to do by not noticing.
     PasswordFromPgpass,
+    /// The source named no port that could be read as one — a `.pgpass`
+    /// wildcard (`h:*:*:u:p`, one credential for every port on a host) — so the
+    /// row carries the **engine's default** and this says the file did not.
+    ///
+    /// The module's rule is "only decide what can be decided": the sibling
+    /// wildcards obey it in the same twenty lines — a `*` host is
+    /// [`SkipReason::NoServer`], a `*` database and a `*` user are blanked —
+    /// and the port was the one that guessed, silently, on a preselected row
+    /// whose form then showed 5432 as though the file had said so. On a machine
+    /// running two clusters that connection is simply wrong, and
+    /// `same_endpoint` compares the invented number too, so the row can also
+    /// collapse against an unrelated one.
+    PortAssumed,
 }
 
 impl ImportNote {
@@ -123,6 +136,7 @@ impl ImportNote {
             ImportNote::AlreadySaved => "Already saved",
             ImportNote::UnexpandedPath => "Path contains an unexpanded macro",
             ImportNote::PasswordFromPgpass => "Password taken from your own .pgpass",
+            ImportNote::PortAssumed => "The source named no port; this is the default",
         }
     }
 }
@@ -1577,9 +1591,18 @@ pub fn parse_pgpass(text: &str) -> ImportScan {
         }
         let mut c = blank(POSTGRES);
         c.host = e.host;
-        if let Ok(p) = e.port.parse::<u16>() {
-            c.port = p;
-        }
+        // A `*` port — the shape for one credential serving every port on a
+        // host — does not parse, so the row keeps the engine default. That is
+        // the only answer available, but it is a *guess*, and the module's rule
+        // is to decide only what can be decided: it is said on the row rather
+        // than shown in the form as though the file had named it.
+        let port_stated = match e.port.parse::<u16>() {
+            Ok(p) => {
+                c.port = p;
+                true
+            }
+            Err(_) => false,
+        };
         c.database = if e.database == "*" {
             String::new()
         } else {
@@ -1588,7 +1611,11 @@ pub fn parse_pgpass(text: &str) -> ImportScan {
         c.user = if e.user == "*" { String::new() } else { e.user };
         c.password = e.password;
         c.name = suggest_name(&c);
-        out.found.push(imported(c, ImportSource::Pgpass));
+        let mut row = imported(c, ImportSource::Pgpass);
+        if !port_stated {
+            row.note(ImportNote::PortAssumed);
+        }
+        out.found.push(row);
     }
     out
 }
@@ -2936,6 +2963,34 @@ mod tests {
         assert_eq!(scan.found[0].connection.host, "real.example");
         assert_eq!(scan.skipped.len(), 1);
         assert_eq!(scan.skipped[0].reason, SkipReason::NoServer);
+    }
+
+    /// **The one wildcard that guessed.** A `*` host is skipped, a `*` database
+    /// and a `*` user are blanked — and a `*` port fell through an `if let` and
+    /// left the engine default in place, on a row that is preselected and whose
+    /// form then shows 5432 as though the file had said so. On a machine
+    /// running two clusters that connection is simply wrong, and
+    /// `same_endpoint` compares the invented number too.
+    ///
+    /// The default stays — it is the only answer available — and the row now
+    /// says the file did not name it, which is how `NoPassword` handles the
+    /// same shape.
+    #[test]
+    fn a_wildcard_port_keeps_the_default_and_says_so() {
+        let scan = parse_pgpass("warehouse.example.com:*:*:ro:secret\n");
+        assert_eq!(scan.found.len(), 1);
+        let row = &scan.found[0];
+        assert_eq!(row.connection.port, 5432, "the only answer available");
+        assert!(row.has(ImportNote::PortAssumed), "{:?}", row.notes);
+        // The sibling wildcard in the same line is unchanged: a `*` database is
+        // blanked, and the user it does name comes through.
+        assert_eq!(row.connection.database, "");
+        assert_eq!(row.connection.user, "ro");
+
+        // A line that *does* name a port says nothing extra.
+        let scan = parse_pgpass("warehouse.example.com:6432:app:ro:secret\n");
+        assert_eq!(scan.found[0].connection.port, 6432);
+        assert!(!scan.found[0].has(ImportNote::PortAssumed));
     }
 
     #[test]

@@ -629,9 +629,25 @@ pub fn coerce(
         },
         // Shape-checked only; the text is what gets inserted, so no precision is
         // lost on the way through.
+        //
+        // **`is_finite`, the same term the `Float` arm above carries**, and this
+        // arm did not: `NaN`, `inf`, `Infinity` and `1e400` all parse as `f64`,
+        // so they passed the shape check and went into the `INSERT` verbatim
+        // with `validate` reporting zero issues — the pass whose whole purpose
+        // is "a single list of everything wrong, before anything is written".
+        // One file, three answers: MariaDB 10.11.14 answers `ERROR 1366:
+        // Incorrect decimal value: 'NaN'` and rolls back whichever batch it
+        // landed in; PostgreSQL 16.15 **accepts** `'NaN'::numeric` and
+        // `'Infinity'::numeric`, so the file imports clean and leaves a NaN in
+        // an exact column, where it changes every `SUM`, `AVG` and comparison
+        // over it afterwards.
+        //
+        // The parse is still only a *shape* check — the text is what is
+        // inserted, so a value no `f64` can hold precisely still goes through
+        // unrounded, which is the whole reason this arm is not `Float`.
         ColKind::Exact => match t.parse::<f64>() {
-            Ok(_) => Ok(Value::Str(t.to_string())),
-            Err(_) => Err(IssueKind::NotANumber),
+            Ok(f) if f.is_finite() => Ok(Value::Str(t.to_string())),
+            _ => Err(IssueKind::NotANumber),
         },
         ColKind::Bool => {
             let b = match t.to_ascii_lowercase().as_str() {
@@ -2612,6 +2628,58 @@ mod tests {
             coerce("oops", ColKind::Exact, true, &n, MySql),
             Err(IssueKind::NotANumber)
         );
+    }
+
+    /// **And an exact numeric refuses them too**, which it did not — three
+    /// lines from the `Float` arm that says why.
+    ///
+    /// `Exact` shape-checks with `parse::<f64>()` and keeps the *text*, which is
+    /// right (a `DECIMAL` must never round-trip through `f64`). But `"NaN"`,
+    /// `"inf"`, `"Infinity"` and `"1e400"` all parse as `f64`, so they passed
+    /// the check and went into the `INSERT` verbatim — with `validate`
+    /// reporting **zero issues**, on the pass whose whole purpose is "a single
+    /// list of everything wrong, before anything is written".
+    ///
+    /// Then, one file, three answers: MariaDB 10.11.14 answers
+    /// `ERROR 1366: Incorrect decimal value: 'NaN'` and rolls back whichever
+    /// batch it landed in, showing the raw server error for a file validation
+    /// had just certified; PostgreSQL 16.15 **accepts** `'NaN'::numeric` and
+    /// `'Infinity'::numeric`, so the same file imports clean and puts a NaN in
+    /// an exact-numeric column, where it then changes every `SUM`, `AVG` and
+    /// comparison over it.
+    #[test]
+    fn coerce_rejects_non_finite_exact_numerics() {
+        let n = NullRule::default();
+        for bad in [
+            "NaN",
+            "nan",
+            "inf",
+            "-inf",
+            "Infinity",
+            "-Infinity",
+            "1e400",
+            "-1e400",
+        ] {
+            assert_eq!(
+                coerce(bad, ColKind::Exact, true, &n, MySql),
+                Err(IssueKind::NotANumber),
+                "{bad:?}"
+            );
+        }
+        // And the values an exact column is *for* still go through as text,
+        // including ones no `f64` could hold precisely.
+        for good in [
+            "1234567890123456789012.345",
+            "-0.00000000000000000001",
+            "0",
+            "1e30",
+        ] {
+            assert_eq!(
+                coerce(good, ColKind::Exact, true, &n, MySql),
+                Ok(Value::Str(good.to_string())),
+                "{good:?}"
+            );
+        }
     }
 
     #[test]
