@@ -2612,15 +2612,10 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             }
             let id = active.get_untracked();
             if let Some(tab) = tabs.with_untracked(|v| v.iter().find(|t| t.id == id).copied()) {
-                tab.base_sql.set(Some(sql.clone()));
-                tab.grid_query
-                    .set(schemaic_core::filter::GridQuery::default());
-                // A raised cap belongs to the result it was raised for. A fresh
-                // manual run is a different question, and silently fetching a
-                // million rows for it — because the last statement's notice was
-                // clicked once — is the global setting the user didn't change.
-                tab.row_cap_override.set(None);
-                tab.view_err.set(None);
+                // One statement, so the grid's filter row and sort rebuild
+                // from it — see `Tab::start_manual_run`, which `run_all` calls
+                // with `None` for the same reason.
+                tab.start_manual_run(Some(&sql));
             }
             core(sql, false);
         })
@@ -2846,6 +2841,11 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             // run makes, which is what keeps a batch and a single run one thing.
             // Before the two resolutions below, so a batch that never dispatches
             // still reports into its own panels.
+            // **A batch has no single base**, and this is a fresh manual run
+            // like any other: without it, the previous single run's statement
+            // stayed as `base_sql` and a batch panel's filter row rebuilt
+            // *that* statement into *this* panel. See `Tab::start_manual_run`.
+            tab.start_manual_run(None);
             let n = stmts.len();
             let panels = tab.begin_run(&stmts);
             // A batch that can't reach its connection **stops at its first
@@ -11572,6 +11572,33 @@ mod app_tests {
     /// exactly how `open_table_filtered` came to be unguarded. So the count is
     /// the gate: a new call site fails this test and has to say, here, what
     /// refuses it.
+    /// Both manual-run paths have to call it, which is the half a unit test on
+    /// `Tab` cannot see: the bug was `run_all` not asking, not
+    /// `start_manual_run` answering wrongly.
+    #[test]
+    fn both_run_and_run_all_start_a_manual_run() {
+        let src = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("src")
+                .join("main.rs"),
+        )
+        .expect("main.rs");
+        let body = src
+            .split("#[cfg(test)]")
+            .next()
+            .expect("production code")
+            .to_string();
+        assert!(
+            body.contains("tab.start_manual_run(Some(&sql));"),
+            "the single-statement run no longer records its base"
+        );
+        assert!(
+            body.contains("tab.start_manual_run(None);"),
+            "Run Everything no longer clears the previous run's base — a batch \
+             panel's filter row will rebuild the last single statement"
+        );
+    }
+
     #[test]
     fn the_unguarded_run_has_only_its_two_stated_callers() {
         let src = std::fs::read_to_string(

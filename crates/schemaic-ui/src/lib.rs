@@ -2048,6 +2048,44 @@ impl Tab {
             .with_untracked(|v| v.iter().map(|p| (p.id, p.pinned)).collect())
     }
 
+    /// **What a fresh manual run resets on the tab**, whatever it is running.
+    ///
+    /// `base` is the statement the grid's filter row and sort rebuild from —
+    /// `Some` for a single run, and **`None` for Run Everything**, which has
+    /// no single base. These three signals live on the *tab*, not the panel,
+    /// so every panel of a batch shares them; `run` set all three and
+    /// `run_all` set none, which left the previous single run's statement
+    /// standing as the base for a batch's panels.
+    ///
+    /// The result was silent substitution. Run `SELECT * FROM film`, then Run
+    /// Everything on `SELECT * FROM actor; SELECT * FROM category;`: panel 1
+    /// is a single attributable table, so its filter row is drawn, and typing
+    /// a condition into it rebuilt **`SELECT * FROM film WHERE …`** and landed
+    /// it in `actor`'s panel — which `set_panel_sql` then relabelled with the
+    /// film statement, so the substitution left no trace. A column both tables
+    /// have makes it silent; one only `actor` has makes it
+    /// `ERROR 1054 Unknown column` naming a table that is not on screen. The
+    /// capped notice's *read all rows* link runs off the same base.
+    ///
+    /// `grid.rs` states the opposite as settled fact — "the statement is
+    /// rebuilt from `base_sql`, which a Run Everything panel does not have" —
+    /// and that belief is what licenses the offer being drawn at all. It is
+    /// true only for a tab whose very first action was Run Everything, and
+    /// `base = None` is what makes it true generally.
+    ///
+    /// The other two ride along because they are the same question. A filter
+    /// typed against the previous result must not still be in the box over a
+    /// batch's results; and a raised row cap belongs to the result it was
+    /// raised for, which is `run`'s own stated rule — "A fresh manual run is a
+    /// different question" — and Run Everything is a fresh manual run.
+    pub fn start_manual_run(&self, base: Option<&str>) {
+        self.base_sql.set(base.map(str::to_string));
+        self.grid_query
+            .set(schemaic_core::filter::GridQuery::default());
+        self.row_cap_override.set(None);
+        self.view_err.set(None);
+    }
+
     /// Start a run: replace the unpinned panels with one `Running` panel per
     /// statement, and show the first of them. Returns the fresh ids, in
     /// statement order, for the landing to write its states back into.
@@ -11390,6 +11428,56 @@ mod result_panel_tab_tests {
     fn ids(t: &Tab) -> Vec<u64> {
         t.result_tabs
             .with_untracked(|v| v.iter().map(|p| p.id).collect())
+    }
+
+    /// **Run Everything has no single base, and saying so is the fix.**
+    ///
+    /// `base_sql`, `grid_query` and `row_cap_override` live on the *tab*, so
+    /// every panel of a batch shares them — and `run` set all three while
+    /// `run_all` set none. A single run of `SELECT * FROM film` followed by
+    /// Run Everything on `actor`/`category` left `film` standing as the base,
+    /// so typing a condition into the batch panel's filter row rebuilt
+    /// `SELECT * FROM film WHERE …` and landed it in `actor`'s panel — which
+    /// `set_panel_sql` then relabelled with the film statement, leaving no
+    /// trace of the substitution.
+    #[test]
+    fn a_fresh_manual_run_resets_the_tabs_filter_base_and_cap() {
+        let t = tab();
+
+        // A single run: the statement *is* the base.
+        t.start_manual_run(Some("SELECT * FROM film"));
+        assert_eq!(
+            t.base_sql.get_untracked().as_deref(),
+            Some("SELECT * FROM film")
+        );
+
+        // The user filters and raises the row cap on that result.
+        t.grid_query.update(|q| {
+            q.filter = "id > 5".to_string();
+            q.sort = vec![("id".to_string(), true)];
+        });
+        t.row_cap_override.set(Some(1_000_000));
+        t.view_err.set(Some("stale".to_string()));
+
+        // Run Everything: no single base, and none of the previous result's
+        // state carries over.
+        t.start_manual_run(None);
+        assert_eq!(
+            t.base_sql.get_untracked(),
+            None,
+            "a batch panel's filter row must not rebuild the previous statement"
+        );
+        assert_eq!(
+            t.grid_query.get_untracked(),
+            schemaic_core::filter::GridQuery::default(),
+            "a filter typed against the previous result is not this one's"
+        );
+        assert_eq!(
+            t.row_cap_override.get_untracked(),
+            None,
+            "a raised cap belongs to the result it was raised for"
+        );
+        assert_eq!(t.view_err.get_untracked(), None);
     }
 
     /// **What decides whether a new tab silently eats this one.** `place_tab`
