@@ -6182,6 +6182,34 @@ pub fn workspace(ui: Ui, window: WindowId) -> impl IntoView {
                 if modal_up() {
                     return EventPropagation::Continue;
                 }
+                // **Nor while a menu stands** — the second refusal, and a
+                // separate statement from the one above on purpose.
+                //
+                // A menu is not a modal and must not become one: adding a term
+                // to `modal_backdrop_up` would raise the modal layer's own
+                // full-window box (a transparent click-eating sheet) and lift
+                // the title-bar band over a live header, which that predicate's
+                // doc forbids in terms. So the width lives here instead, over
+                // all eight `MenuFlags` channels.
+                //
+                // Nothing in this handler closes a menu — `close_except(None)`
+                // is on `PointerDown`, which a menu panel swallows — and the
+                // panel is a `focus_root` that returns `Continue` for every key
+                // but Tab, so the key arrives with the menu still up. Two
+                // failures, both reported: **Ctrl+W under a grid's gutter,
+                // header or cell menu** disposes the tab and with it every
+                // `GridState` signal the menu's `Rc` entries close over, so the
+                // next click on the still-standing menu is a `get_untracked` on
+                // a disposed signal — a panic that takes the window and every
+                // other tab's uncommitted edits. **Ctrl+T under any of the
+                // eight** opens a query tab whose deferred autofocus finds
+                // `innermost_focus_root()` is `Some` (the stranded panel) and
+                // declines, leaving a new empty tab the keyboard cannot reach.
+                //
+                // Escape still dismisses, in the branch at the top.
+                if root_menus.any_open() {
+                    return EventPropagation::Continue;
+                }
                 if crate::shortcuts::primary_held(m) {
                     // Global nav (Ctrl+P/T/W/Tab/1-9, Cmd on macOS) — also wired inside the
                     // editor, which stops KeyDown; here it catches every other
@@ -12184,6 +12212,27 @@ mod window_key_gate {
             "the modal guard must come *after* the Escape and Tab branches: those \
              two exist to serve the modal that is up, and an early return above \
              them takes the modal's own focus ring and popup dismissal with it"
+        );
+
+        // **And it refuses while a menu stands**, which is a second refusal in
+        // the same band and not a term added to the first: `modal_backdrop_up`
+        // must not learn about menus (its doc forbids it — it also raises the
+        // modal layer's full-window box and the title-bar band), so this is
+        // `MenuFlags::any_open`, spelled as its own statement.
+        //
+        // Without it, Ctrl+W under a grid's gutter/header/cell menu disposes
+        // the tab while the menu's `Rc` entries still close over that grid's
+        // signals — the next click on it is a `get_untracked` on a disposed
+        // signal — and Ctrl+T under any of the eight channels opens a tab whose
+        // autofocus declines to the stranded panel's `focus_root`.
+        let menus = f
+            .find("any_open()")
+            .expect("the menu guard is gone — Ctrl+W now closes a tab under a standing menu");
+        assert!(
+            menus > tab_trap && menus < nav,
+            "the menu guard must sit in the same band as the modal one: after the \
+             Escape and Tab branches (Escape is how a menu is dismissed from the \
+             keyboard) and before `navkeys.handle`"
         );
     }
 

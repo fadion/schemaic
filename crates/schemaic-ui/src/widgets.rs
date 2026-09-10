@@ -2540,6 +2540,39 @@ pub(crate) enum MenuId {
     DatePick,
 }
 
+impl MenuId {
+    /// Every variant, so a caller that has to ask about *all* of them —
+    /// [`MenuFlags::close_except`], [`MenuFlags::any_open`] — asks once.
+    ///
+    /// **What holds a ninth variant to this list.** Not this array, which is a
+    /// hand-written literal like any other: it is [`MenuFlags::slot`], whose
+    /// `match` has no wildcard arm, so a ninth `MenuId` fails to compile until
+    /// somebody says what opening and closing it mean. Adding it *here* as well
+    /// is the second half, and `every_variant_has_a_slot` is what asks for it.
+    pub(crate) const ALL: [MenuId; 8] = [
+        MenuId::Popup,
+        MenuId::Context,
+        MenuId::SchemaEye,
+        MenuId::SchemaGear,
+        MenuId::Connection,
+        MenuId::ActiveDb,
+        MenuId::ActivityClock,
+        MenuId::DatePick,
+    ];
+}
+
+/// One menu's two questions, spelled the same way whatever the flag behind it
+/// actually is — a `bool`, a `Vec<MenuEntry>` or a whole calendar panel.
+///
+/// The boxes are the price of putting five `RwSignal<bool>` and three
+/// `RwSignal<Option<T>>` of three different `T` in one array. They are built
+/// per call and dropped at the end of it; the alternative is the hand-written
+/// list this type exists to delete.
+pub(crate) struct MenuSlot {
+    is_open: Box<dyn Fn() -> bool>,
+    close: Box<dyn Fn()>,
+}
+
 /// Every menu-open flag in the app, gathered once so a new one is added in a
 /// single place and `git grep MenuFlags` finds every trigger.
 #[derive(Clone, Copy)]
@@ -2572,32 +2605,88 @@ impl MenuFlags {
         }
     }
 
+    /// What "open" and "close" mean for one menu — **the wildcard-free `match`
+    /// that makes a ninth [`MenuId`] a compile error here** rather than a menu
+    /// that [`close_except`](Self::close_except) silently never closes and
+    /// [`any_open`](Self::any_open) silently never counts.
+    ///
+    /// That was the state before this existed: `close_except` was three `if`s
+    /// and a five-element array, which a new variant compiles straight past.
+    /// `MenuId`'s own doc records what a stranded menu costs — its `focus_root`
+    /// stays registered, and `innermost_focus_root()` being `Some` makes every
+    /// newly opened query tab decline the keyboard.
+    pub(crate) fn slot(&self, id: MenuId) -> MenuSlot {
+        // `Option`-carrying channels and plain flags, each spelled once.
+        macro_rules! panel {
+            ($sig:expr) => {{
+                let s = $sig;
+                MenuSlot {
+                    is_open: Box::new(move || s.with_untracked(|v| v.is_some())),
+                    close: Box::new(move || s.set(None)),
+                }
+            }};
+        }
+        macro_rules! flag {
+            ($sig:expr) => {{
+                let s = $sig;
+                MenuSlot {
+                    is_open: Box::new(move || s.get_untracked()),
+                    close: Box::new(move || s.set(false)),
+                }
+            }};
+        }
+        match id {
+            MenuId::Popup => panel!(self.popup),
+            MenuId::Context => panel!(self.context),
+            MenuId::DatePick => panel!(self.date_pick),
+            MenuId::SchemaEye => flag!(self.schema_eye),
+            MenuId::SchemaGear => flag!(self.schema_gear),
+            MenuId::Connection => flag!(self.connection),
+            MenuId::ActiveDb => flag!(self.active_db),
+            MenuId::ActivityClock => flag!(self.activity_clock),
+        }
+    }
+
     /// Close every open menu but `keep`.
     ///
     /// Guarded per flag, because `RwSignal::set` never dedups and an unguarded
     /// write re-runs every style closure reading it.
     pub(crate) fn close_except(&self, keep: Option<MenuId>) {
-        let live = |id: MenuId| keep != Some(id);
-        if live(MenuId::Popup) && self.popup.get_untracked().is_some() {
-            self.popup.set(None);
-        }
-        if live(MenuId::Context) && self.context.get_untracked().is_some() {
-            self.context.set(None);
-        }
-        if live(MenuId::DatePick) && self.date_pick.get_untracked().is_some() {
-            self.date_pick.set(None);
-        }
-        for (id, flag) in [
-            (MenuId::SchemaEye, self.schema_eye),
-            (MenuId::SchemaGear, self.schema_gear),
-            (MenuId::Connection, self.connection),
-            (MenuId::ActiveDb, self.active_db),
-            (MenuId::ActivityClock, self.activity_clock),
-        ] {
-            if live(id) && flag.get_untracked() {
-                flag.set(false);
+        for id in MenuId::ALL {
+            if keep == Some(id) {
+                continue;
+            }
+            let slot = self.slot(id);
+            if (slot.is_open)() {
+                (slot.close)();
             }
         }
+    }
+
+    /// **Is any menu standing?** — the refusal the window's key handler asks
+    /// before it acts on the workspace behind one.
+    ///
+    /// Not a modal, and deliberately not part of
+    /// [`crate::modals::modal_backdrop_up`], whose doc forbids menus in terms:
+    /// that predicate also raises the modal layer's full-window box and the
+    /// title-bar band, and a menu must do neither. This is the second predicate
+    /// beside it, at the one handler that needs it.
+    ///
+    /// **Why the handler needs it.** Nothing in it closes menus —
+    /// `close_except(None)` is on `PointerDown` — and a menu panel is a
+    /// `focus_root` that returns `Continue` for every key but Tab, so a
+    /// `Ctrl+…` reaches the window fallback with the menu still up. Ctrl+W then
+    /// disposes the tab under a grid menu whose entries are `Rc` closures over
+    /// that grid's signals (clicking one is a `get_untracked` on a disposed
+    /// signal — a panic that takes every other tab's uncommitted edits with
+    /// it), and Ctrl+T opens a query tab whose autofocus declines, because the
+    /// stranded panel's `focus_root` is still registered.
+    ///
+    /// All eight channels, not just the two the grid uses: the gear, the eye,
+    /// the switcher, the active-database menu and the activity clock strand
+    /// exactly the same way.
+    pub(crate) fn any_open(&self) -> bool {
+        MenuId::ALL.into_iter().any(|id| (self.slot(id).is_open)())
     }
 }
 
@@ -7497,7 +7586,15 @@ mod menu_exclusivity {
     fn flags(scope: Scope) -> MenuFlags {
         MenuFlags {
             popup: scope.create_rw_signal(Some(Vec::new())),
-            context: scope.create_rw_signal(None),
+            // Open, like the other seven. It was the one channel this fixture
+            // left `None`, which is why "keep the context menu, close the rest"
+            // could be asserted nowhere.
+            context: scope.create_rw_signal(Some(crate::CtxMenu {
+                kind: crate::CtxKind::Database { ddl: String::new() },
+                name: String::new(),
+                ai_prompt: String::new(),
+                at: None,
+            })),
             schema_eye: scope.create_rw_signal(true),
             schema_gear: scope.create_rw_signal(true),
             connection: scope.create_rw_signal(true),
@@ -7522,44 +7619,77 @@ mod menu_exclusivity {
     #[test]
     fn closing_leaves_exactly_the_one_menu_that_asked_to_stay() {
         let scope = Scope::new();
+        // Read openness the way production does, so a channel that `slot` gets
+        // wrong cannot be hidden by a second hand-written list here — the very
+        // shape that let `close_except` omit a flag in the first place. The
+        // `open()` this replaces spelled all eight itself, and its `for keep`
+        // loop left `Context` out, so "keep the context menu, close the rest"
+        // was asserted nowhere.
         let open = |f: &MenuFlags| {
-            [
-                (MenuId::Popup, f.popup.get_untracked().is_some()),
-                (MenuId::Context, f.context.get_untracked().is_some()),
-                (MenuId::SchemaEye, f.schema_eye.get_untracked()),
-                (MenuId::SchemaGear, f.schema_gear.get_untracked()),
-                (MenuId::Connection, f.connection.get_untracked()),
-                (MenuId::ActiveDb, f.active_db.get_untracked()),
-                (MenuId::ActivityClock, f.activity_clock.get_untracked()),
-                (
-                    MenuId::DatePick,
-                    f.date_pick.with_untracked(|p| p.is_some()),
-                ),
-            ]
-            .into_iter()
-            .filter(|(_, on)| *on)
-            .map(|(id, _)| id)
-            .collect::<Vec<_>>()
+            MenuId::ALL
+                .into_iter()
+                .filter(|&id| (f.slot(id).is_open)())
+                .collect::<Vec<_>>()
         };
 
-        for keep in [
-            MenuId::Popup,
-            MenuId::SchemaEye,
-            MenuId::SchemaGear,
-            MenuId::Connection,
-            MenuId::ActiveDb,
-            MenuId::ActivityClock,
-            MenuId::DatePick,
-        ] {
+        // Every variant, including `Context`.
+        for keep in MenuId::ALL {
             let f = flags(scope);
+            assert!(f.any_open(), "the fixture opens all eight");
             f.close_except(Some(keep));
             assert_eq!(open(&f), vec![keep], "closing all but {keep:?}");
+            assert!(f.any_open(), "{keep:?} is still standing");
         }
 
         // The root's own dismissal keeps none of them.
         let f = flags(scope);
         f.close_except(None);
         assert!(open(&f).is_empty());
+        assert!(!f.any_open(), "nothing stands after close_except(None)");
+    }
+
+    /// **`any_open` has to see each channel on its own**, because the window's
+    /// key handler refuses on it: a channel it cannot see is a Ctrl+W that
+    /// closes the tab under that menu, and the grid's entries are `Rc` closures
+    /// over signals the close disposes.
+    ///
+    /// `closing_leaves_exactly_the_one_menu_that_asked_to_stay` opens all eight
+    /// at once and so cannot tell seven-of-eight from eight-of-eight; this one
+    /// raises each alone.
+    #[test]
+    fn any_open_sees_every_channel_by_itself() {
+        let scope = Scope::new();
+        for only in MenuId::ALL {
+            let f = flags(scope);
+            f.close_except(Some(only));
+            assert!(f.any_open(), "{only:?} standing alone is not seen");
+        }
+    }
+
+    /// A ninth `MenuId` is a compile error in `MenuFlags::slot` (its `match` has
+    /// no wildcard) — but `MenuId::ALL` is a plain array literal, and the two
+    /// halves of `close_except` and `any_open` are only as wide as *it*. This is
+    /// the half a compiler cannot check: every variant appears in `ALL`, exactly
+    /// once.
+    ///
+    /// It cannot prove a ninth variant is present — nothing in stable Rust
+    /// counts an enum's variants — so read it as a reminder in the place a
+    /// reader looks, not as a guarantee.
+    #[test]
+    fn every_variant_has_a_slot() {
+        let scope = Scope::new();
+        let f = flags(scope);
+        let mut seen = MenuId::ALL.to_vec();
+        let before = seen.len();
+        seen.dedup();
+        assert_eq!(before, seen.len(), "`MenuId::ALL` repeats a variant");
+        // Each one answers, rather than panicking on a signal it does not own.
+        for id in MenuId::ALL {
+            let slot = f.slot(id);
+            assert!((slot.is_open)(), "{id:?}'s slot reads the wrong flag");
+            (slot.close)();
+            assert!(!(f.slot(id).is_open)(), "{id:?}'s slot closes nothing");
+        }
     }
 }
 
@@ -7606,8 +7736,21 @@ mod popup_anchor_gate {
     /// Does this line *fill* the popup channel? `set(None)` closes it and needs
     /// no anchor; `popup_width.set(…)` is a different signal whose name merely
     /// starts the same way, which is why the suffix is matched exactly.
+    ///
+    /// **`grid.rs` fills it through a door**, `GridState::open_menu`, which
+    /// wraps every entry in the grid's `alive()` guard. So the *opener* there is
+    /// the `open_menu(` call — that is what has to have written an anchor first
+    /// — and the door's own `self.popup.set(Some(…)` is not an opener at all.
+    /// Told apart by the receiver: the openers are `gs.popup`,
+    /// `overlay.popup_menu` or a bare local, and `self.` is only ever the door.
     fn fills_channel(line: &str) -> bool {
         let t = line.trim_start();
+        if t.contains(".open_menu(") {
+            return true;
+        }
+        if t.contains("self.popup.set(Some(") {
+            return false;
+        }
         for name in ["popup_menu", "popup"] {
             let pat = format!("{name}.set(Some(");
             if let Some(i) = t.find(&pat) {

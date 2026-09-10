@@ -1228,6 +1228,44 @@ impl GridState {
         self.rs.try_get_untracked().is_some()
     }
 
+    /// **The one door onto the shared popup channel**, and the one place
+    /// [`GridState::alive`] is spelled for a menu entry.
+    ///
+    /// Every menu this file raises — the toolbar's Copy, Download and AI
+    /// dropdowns, the gutter, header and cell context menus, the in-cell
+    /// picker's own list — is a `Vec` of `Rc` closures over *this grid's*
+    /// signals, parked in `ui.overlay.popup_menu`, which is **window**-scoped.
+    /// Nothing but a pointer-down clears it: not a tab switch, not a re-run,
+    /// not a commit that re-runs the query. So the menu routinely outlives the
+    /// scope its entries close over, and the click that follows is a
+    /// `get_untracked` on a disposed signal — `try_get_untracked().unwrap()`,
+    /// a panic that takes the window and every other tab's uncommitted edits.
+    ///
+    /// It is not a millisecond race. Type a `WHERE` fragment, press Enter, and
+    /// open the Copy menu while the re-run is in flight; or press the commit ✓
+    /// on a change that carries an insert (`CommitDone::FullReran` re-runs) and
+    /// open a menu while the write is in flight — `apply_splice`'s own note
+    /// puts that window at `innodb_lock_wait_timeout`, 50 s by default and
+    /// open-ended inside a Manual transaction.
+    ///
+    /// **Why here and not at each entry.** The eight functions the entries call
+    /// (`render_export`, `save_export`, `attach_to_chat`, `ai_fill_value`,
+    /// `ai_insert_row`, `open_seed_popover`, `export_column_csv`/`_json`) each
+    /// open with an unguarded read, and so does everything the three context
+    /// menus reach. Guarding them one at a time is the arrangement `alive`'s
+    /// own doc describes going wrong — *"the file had this guard in five places
+    /// and was missing it in five others"*. A door cannot be forgotten, and
+    /// `popup_channel_gate` keeps it the only one.
+    ///
+    /// A dead grid's entry is **inert, not absent**: the row still draws and
+    /// still dismisses the menu, because `menu_panel` calls `close` after the
+    /// action whatever the action did.
+    fn open_menu(&self, entries: Vec<MenuEntry>) {
+        let gs = *self;
+        self.popup
+            .set(Some(guarded_entries(Rc::new(move || gs.alive()), entries)));
+    }
+
     /// Close any open popup menu and clear a lingering commit-error bar. Called
     /// from every grid click surface (cell / gutter / header) so a click anywhere
     /// on the table dismisses the error bar (its own clicks don't reach here).
@@ -1867,6 +1905,59 @@ fn scroll_active_into_view(gs: GridState, i: usize, ci: usize) {
 }
 
 /// Copy the current selection to the clipboard as TSV (a lone cell → raw value).
+/// Wrap every action in `entries` — submenus included, to any depth — so it
+/// runs only while `alive()` still answers true. The teardown half of
+/// [`GridState::open_menu`]; see that doc for why the guard lives at the door.
+///
+/// The wrapper asks `alive` at **click** time, not at build time: the whole
+/// point is that the menu is built while the grid is alive and clicked after it
+/// may not be.
+///
+/// `alive` is a closure rather than the `GridState` itself so the composition
+/// this function *is* — a predicate, and the entries it gates — can be tested
+/// without a window. A `GridState` cannot be built in a `#[test]`; a disposed
+/// `Scope` with one signal in it reproduces the identical hazard, because
+/// `alive` is `rs.try_get_untracked().is_some()` and nothing more.
+fn guarded_entries(alive: Rc<dyn Fn() -> bool>, entries: Vec<MenuEntry>) -> Vec<MenuEntry> {
+    entries
+        .into_iter()
+        .map(|e| match e {
+            MenuEntry::Action {
+                label,
+                icon,
+                detail,
+                label_color,
+                disabled,
+                action,
+            } => MenuEntry::Action {
+                label,
+                icon,
+                detail,
+                label_color,
+                disabled,
+                action: {
+                    let alive = alive.clone();
+                    Rc::new(move || {
+                        if (alive)() {
+                            (action)();
+                        }
+                    })
+                },
+            },
+            MenuEntry::Sub {
+                label,
+                icon,
+                children,
+            } => MenuEntry::Sub {
+                label,
+                icon,
+                children: guarded_entries(alive.clone(), children),
+            },
+            MenuEntry::Separator => MenuEntry::Separator,
+        })
+        .collect()
+}
+
 fn copy_selection(gs: GridState) {
     let Some(rect) = gs.bounds_untracked() else {
         return;
@@ -7672,7 +7763,7 @@ fn grid_toolbar(
         gs.popup_width.set(grid_copy_menu_w());
         gs.popup_anchor
             .set(Some(anchor_below(copy_origin.get_untracked())));
-        gs.popup.set(Some(
+        gs.open_menu(
             // **Text formats only**, and the list is `clipboard_formats()`
             // rather than a filter written here: `render_export` produces a
             // `String`, and a binary format's rendering is not one —
@@ -7689,7 +7780,7 @@ fn grid_toolbar(
                     })
                 })
                 .collect(),
-        ));
+        );
     });
     let copy_click = open_copy.clone();
     let copy_menu = container(
@@ -7753,11 +7844,11 @@ fn grid_toolbar(
         gs.popup_width.set(grid_copy_menu_w());
         gs.popup_anchor
             .set(Some(anchor_below(save_origin.get_untracked())));
-        gs.popup.set(Some(export_menu(
+        gs.open_menu(export_menu(
             gs,
             row_total.get_untracked(),
             sort.with_untracked(Option::is_some),
-        )));
+        ));
     });
     let save_click = open_save.clone();
     let save_menu = container(
@@ -7891,7 +7982,7 @@ fn grid_toolbar(
                         .disabled(gs.order.get_untracked().is_empty()),
                     ]
                 };
-                gs.popup.set(Some(entries));
+                gs.open_menu(entries);
             });
             let ai_click = open_ai.clone();
             let face = container(
@@ -8106,7 +8197,7 @@ fn gutter_cell(gs: GridState, pos: usize, ncols: usize, pending: Option<usize>) 
                 gs.active.set(Some(active));
             }
             gs.popup_anchor.set(None); // right-click → open at the cursor
-            gs.popup.set(Some(gutter_menu(gs, pos, pending)));
+            gs.open_menu(gutter_menu(gs, pos, pending));
         })
         .style(move |s| {
             let in_sel = matches!(gs.bounds(), Some((r0, _, r1, _)) if pos >= r0 && pos <= r1);
@@ -8702,7 +8793,7 @@ fn header_cell(
                     },
                 ));
             }
-            gs.popup.set(Some(entries));
+            gs.open_menu(entries);
         })
         .style(move |s| {
             // `with`, not `get`: `get` clones the whole widths `Vec` to read one
@@ -9637,7 +9728,7 @@ fn data_cell(
                 ));
             }
             gs.popup_anchor.set(None); // right-click → open at the cursor
-            gs.popup.set(Some(entries));
+            gs.open_menu(entries);
         })
         .style(move |s| {
             // `with`, not `get` — see the header closure. This one runs for every
@@ -9807,6 +9898,172 @@ mod clipboard_gate {
         assert!(
             src[at..body_end].contains("copy_split_note"),
             "copy_selection must report the cells the TSV format split"
+        );
+    }
+}
+
+/// **One door onto the window-scoped popup channel, and it carries the
+/// `alive()` guard.**
+///
+/// `ui.overlay.popup_menu` outlives every grid: nothing but a pointer-down
+/// clears it — not a tab switch, not a re-run, not a commit that re-runs the
+/// query — while the entries parked in it are `Rc` closures over one grid's
+/// signals. Clicking one after that grid's scope is disposed is a
+/// `get_untracked` on a freed signal, which panics and takes the window and
+/// every other tab's uncommitted edits with it.
+///
+/// Six installers in this file had the same shape and not one of them had the
+/// guard, so the guard now lives at [`GridState::open_menu`] and this asserts
+/// that nothing goes round it. A seventh menu written next year is caught here
+/// rather than by the crash.
+#[cfg(test)]
+mod popup_channel_gate {
+    use std::path::Path;
+
+    /// The one write `open_menu` itself makes, whitespace removed — rustfmt
+    /// wraps it across two lines, and a line-based scan would then find *no*
+    /// write and pass while every installer went round the door.
+    const DOOR: &str = "self.popup.set(Some(guarded_entries(Rc::new(move||gs.alive()),entries)));";
+
+    #[test]
+    fn every_grid_menu_goes_through_open_menu() {
+        let src = std::fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("src")
+                .join("grid.rs"),
+        )
+        .expect("grid.rs");
+        let body = crate::source_gate::production_code(&src);
+        let flat: String = body.chars().filter(|c| !c.is_whitespace()).collect();
+
+        // `popup_width.set(Some(` and `popup_anchor.set(Some(` are different
+        // names and do not match; this is the channel itself.
+        let writes = flat.matches("popup.set(Some(").count();
+        assert_eq!(
+            writes, 1,
+            "{writes} writes fill the grid's popup channel; exactly one may — \
+             `GridState::open_menu`. A menu installed round it reads this grid's \
+             signals with no `alive()` guard, and six installers had that shape: \
+             every one was a window-killing panic waiting on an in-flight re-run \
+             or commit. Route the new one through `open_menu` too. (The in-cell \
+             picker and the calendar are not counted here on purpose — they go \
+             through `widgets::open_picker` and discharge the rule with their own \
+             `close_picker` cleanup.)"
+        );
+        assert!(
+            flat.contains(DOOR),
+            "the one write is no longer `open_menu`'s guarded one — the door has \
+             been rewritten or moved"
+        );
+
+        // And the door still guards. Deleting `guarded_entries` from it would
+        // leave every assertion above green.
+        assert!(
+            body.contains("fn guarded_entries("),
+            "`guarded_entries` is gone — `open_menu` is now a plain `popup.set`"
+        );
+    }
+}
+
+/// The behaviour the gate above only *locates*: what a menu entry does when the
+/// grid behind it is gone.
+#[cfg(test)]
+mod guarded_entry_tests {
+    use super::*;
+    use floem::reactive::Scope;
+
+    /// An entry whose action reads a signal, and a `Vec` of them with a
+    /// submenu, so the recursion is exercised too. `hits` counts what ran.
+    fn menu(sig: RwSignal<u8>, hits: Rc<std::cell::Cell<u32>>) -> Vec<MenuEntry> {
+        let leaf = {
+            let hits = hits.clone();
+            move || {
+                // Exactly what `render_export`, `save_export`, `copy_selection`
+                // and the rest open with: floem's `get_untracked` is
+                // `try_get_untracked().unwrap()`.
+                let _ = sig.get_untracked();
+                hits.set(hits.get() + 1);
+            }
+        };
+        let nested = leaf.clone();
+        vec![
+            MenuEntry::action("top", leaf),
+            MenuEntry::Separator,
+            MenuEntry::Sub {
+                label: "Copy".into(),
+                icon: None,
+                children: vec![MenuEntry::action("CSV", nested)],
+            },
+        ]
+    }
+
+    fn fire(entries: &[MenuEntry]) {
+        for e in entries {
+            match e {
+                MenuEntry::Action { action, .. } => (action)(),
+                MenuEntry::Sub { children, .. } => fire(children),
+                MenuEntry::Separator => {}
+            }
+        }
+    }
+
+    /// **A live grid's entries still do their work** — the guard must not be a
+    /// silent "nothing happens ever".
+    #[test]
+    fn a_live_grid_runs_both_the_entry_and_the_submenu_entry() {
+        let scope = Scope::new();
+        let sig = scope.create_rw_signal(7u8);
+        let hits = Rc::new(std::cell::Cell::new(0u32));
+        let entries = guarded_entries(
+            Rc::new(move || sig.try_get_untracked().is_some()),
+            menu(sig, hits.clone()),
+        );
+        fire(&entries);
+        assert_eq!(hits.get(), 2, "the top entry and the submenu's");
+    }
+
+    /// **The whole finding, in the composition that carries it.**
+    ///
+    /// The menu is built while the grid is alive and clicked after the grid's
+    /// scope is disposed — a tab switch, a `Ctrl+W`, or (with no key at all) an
+    /// in-flight re-run or `CommitDone::FullReran` landing under a standing
+    /// menu. Unwrapped, that click is a `get_untracked` on a freed signal:
+    /// `try_get_untracked().unwrap()`, a panic that takes the window and every
+    /// other tab's uncommitted edits with it.
+    ///
+    /// Both halves are asserted, because either alone is satisfied by a
+    /// mistake: the guarded call not panicking is also true of a `guarded_entries`
+    /// that drops every entry, and the raw call panicking is also true if the
+    /// signal was never live. The `hits` counter and the live test above close
+    /// both.
+    #[test]
+    fn a_disposed_grids_entry_is_inert_where_an_unguarded_one_panics() {
+        let scope = Scope::new();
+        let sig = scope.create_rw_signal(7u8);
+        let hits = Rc::new(std::cell::Cell::new(0u32));
+
+        let guarded = guarded_entries(
+            Rc::new(move || sig.try_get_untracked().is_some()),
+            menu(sig, hits.clone()),
+        );
+        let raw = menu(sig, hits.clone());
+
+        scope.dispose();
+
+        fire(&guarded);
+        assert_eq!(hits.get(), 0, "a disposed grid's entries must not run");
+
+        // And the same click without the door. The hook swap keeps the expected
+        // panic's backtrace out of the test log.
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let boom = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| fire(&raw)));
+        std::panic::set_hook(prev);
+        assert!(
+            boom.is_err(),
+            "the unguarded entry read a disposed signal without panicking — if \
+             floem has stopped unwrapping in `get_untracked`, this finding's \
+             mechanism has changed and the guard needs re-justifying"
         );
     }
 }
