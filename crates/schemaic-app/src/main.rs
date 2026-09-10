@@ -3411,11 +3411,13 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                 // On every failure path the target is untouched and the fragment is
                 // left in the sibling rather than swept away — see
                 // `export::export_failure_note`, which names it.
-                let part_of = |path: &std::path::Path| -> std::path::PathBuf {
-                    let mut p = path.as_os_str().to_owned();
-                    p.push(".part");
-                    std::path::PathBuf::from(p)
-                };
+                // `dump::part_of`, not a second spelling of `.part`: the
+                // suffix belongs to `export::part_path`, which is also what
+                // builds the sentences below that tell the user where the
+                // fragment went. Two spellings is two things to keep in step,
+                // on the one path where the fragment is the only copy of the
+                // rows.
+                let part_of = crate::dump::part_of;
                 let create = |path: &std::path::Path| {
                     std::fs::File::create(path).map(std::io::BufWriter::new)
                 };

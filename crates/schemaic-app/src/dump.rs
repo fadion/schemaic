@@ -46,7 +46,7 @@ enum Msg {
 /// same function. Spelling `.part` again here would let the file this writes and
 /// the file that message names drift apart — in the one situation where the
 /// fragment is the thing the user still wants.
-fn part_of(path: &Path) -> PathBuf {
+pub(crate) fn part_of(path: &Path) -> PathBuf {
     match path.file_name().map(|n| n.to_string_lossy().to_string()) {
         Some(name) => path.with_file_name(schemaic_core::export::part_path(&name)),
         // A path with no file name is not one we can write to anyway; the
@@ -600,5 +600,52 @@ mod tests {
     fn a_path_with_no_file_name_is_returned_unchanged() {
         let p = Path::new("/");
         assert_eq!(part_of(p), p.to_path_buf());
+    }
+
+    /// **The gate.** Nothing in this crate spells `.part` — the suffix belongs
+    /// to `export::part_path`, and every sentence the user reads about the
+    /// fragment (`export_cancel_note`, `export_failure_note`) is built from
+    /// that same function.
+    ///
+    /// `export_file` in `main.rs` had its own inline closure appending the
+    /// literal, and it is the site that matters most: it serves both export
+    /// scopes and all five grid formats, and its cancel and failure arms are
+    /// the ones that name the fragment. A change to `part_path` — a dot prefix
+    /// to hide it, a timestamp so two exports cannot collide — would have made
+    /// both of those sentences point at a path that does not exist, on the one
+    /// path where the fragment is the only copy of the user's rows.
+    ///
+    /// Doc comments are dropped before the scan, so the prose above (and the
+    /// several paragraphs in `main.rs` that discuss the sibling) is not a hit.
+    #[test]
+    fn nothing_in_this_crate_spells_the_fragment_suffix_itself() {
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut offenders = Vec::new();
+        for entry in std::fs::read_dir(&dir).expect("the crate's src") {
+            let path = entry.expect("a dir entry").path();
+            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                continue;
+            }
+            let src = std::fs::read_to_string(&path).expect("a source file");
+            for (i, line) in src.lines().enumerate() {
+                let code = line.trim_start();
+                if code.starts_with("//") {
+                    continue;
+                }
+                if code.contains("\".part\"") {
+                    offenders.push(format!(
+                        "{}:{}: {}",
+                        path.file_name().unwrap().to_string_lossy(),
+                        i + 1,
+                        code.trim()
+                    ));
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "call `dump::part_of` (which asks `export::part_path`) instead:\n{}",
+            offenders.join("\n")
+        );
     }
 }
