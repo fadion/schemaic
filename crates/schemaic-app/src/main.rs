@@ -1723,7 +1723,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
     // coming back does not cost the user their path and model. Session-scoped on
     // purpose: it is a "you were just here" memory, not a fifth thing to
     // persist.
-    let harness_fields: RwSignal<HashMap<Harness, (String, String)>> =
+    let harness_fields: RwSignal<HashMap<Harness, schemaic_ui::HarnessFields>> =
         RwSignal::new(HashMap::new());
     create_effect(move |prev: Option<Harness>| {
         let now = ai_harness.get();
@@ -1733,7 +1733,13 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
         {
             // The user has chosen, so the file should start naming what runs.
             ai_harness_unknown.set(None);
-            let held = (ai_cli_path.get_untracked(), ai_model.get_untracked());
+            // **All three**, including the effort — the field that was left
+            // out is the one a round trip through the dropdown lost.
+            let held = schemaic_ui::HarnessFields {
+                cli_path: ai_cli_path.get_untracked(),
+                model: ai_model.get_untracked(),
+                effort: ai_effort.get_untracked(),
+            };
             harness_fields.update(|m| {
                 m.insert(p, held);
             });

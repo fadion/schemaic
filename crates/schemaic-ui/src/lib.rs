@@ -5740,6 +5740,19 @@ pub struct HarnessSwitch {
 /// fields, with the modal's own header still promising "Changes commit when the
 /// modal closes".
 ///
+/// **All three fields, and the third was the one left out.** `remembered`
+/// carried only the path and the model, so the effort was re-derived from the
+/// clamp on every call — and `clamped_to` is not injective, so the round trip
+/// loses. Claude at the shipped default **Medium**, a glance at OpenCode
+/// (`minimal|high|max`, so Medium → High), and back to Claude: the path and
+/// the model return and the effort is now **High**, on the harness the user
+/// started on, chosen by nobody — and `ai_effort` is written to
+/// `ui_state.json`, so it is permanent. Claude at `xhigh` is the same failure
+/// downward and needs only a glance at Antigravity, whose flag stops at
+/// `high`. Coming back to a harness this session has already been on now
+/// restores the level it was left at, still clamped, because the harness's own
+/// list has not changed.
+///
 /// **The clamp runs on every call, including the first**, which is a different
 /// question from "did the user switch": it is "is the level in the box one this
 /// harness takes". Gating it on a change meant the restore from `ui_state.json`
@@ -5752,21 +5765,38 @@ pub fn harness_switch(
     cli_path: String,
     model: String,
     effort: AiEffort,
-    remembered: Option<(String, String)>,
+    remembered: Option<HarnessFields>,
 ) -> HarnessSwitch {
     let switched = prev.is_some_and(|p| p != now);
-    let (cli_path, model) = match (switched, remembered) {
+    let (cli_path, model, effort) = match (switched, remembered) {
         // Coming back to a harness this session has already configured: its own
-        // path and model, not the ones typed for the harness being left.
-        (true, Some((p, m))) => (Some(p), Some(m)),
-        (true, None) => (None, None),
-        (false, _) => (Some(cli_path), Some(model)),
+        // path, model and effort, not the ones the harness being left had.
+        (true, Some(h)) => (Some(h.cli_path), Some(h.model), h.effort),
+        (true, None) => (None, None, effort),
+        (false, _) => (Some(cli_path), Some(model), effort),
     };
     HarnessSwitch {
         cli_path,
         model,
+        // Still clamped, on every path: a remembered level is one this harness
+        // advertised when it was left and its list has not changed, but the
+        // *first* call restores from `ui_state.json`, which can pair a harness
+        // with a level it does not take.
         effort: effort.clamped_to(now.effort_levels()).unwrap_or(effort),
     }
+}
+
+/// What one harness held when it was last selected — the memory
+/// [`harness_switch`] reads to give the dropdown a way back.
+///
+/// A named triple rather than a tuple because it *was* a pair, and the field
+/// left out of it is the one that got lost. Session-scoped on purpose: it is a
+/// "you were just here" memory, not a fourth thing to persist.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HarnessFields {
+    pub cli_path: String,
+    pub model: String,
+    pub effort: AiEffort,
 }
 
 /// How much schema context to inject into the AI system prompt.
@@ -10997,7 +11027,7 @@ pub(crate) fn search_box(
 
 #[cfg(test)]
 mod effort_clamp_tests {
-    use super::{AiEffort, harness_switch};
+    use super::{AiEffort, HarnessFields, harness_switch};
     use crate::Harness;
 
     /// Against the harnesses' **own** level lists rather than literals, so this
@@ -11124,14 +11154,18 @@ mod effort_clamp_tests {
     /// "Changes commit when the modal closes".
     #[test]
     fn coming_back_to_a_harness_restores_what_it_held() {
-        let claude = (r"C:\tools\claude.exe".to_string(), "haiku".to_string());
+        let claude = HarnessFields {
+            cli_path: r"C:\tools\claude.exe".to_string(),
+            model: "haiku".to_string(),
+            effort: AiEffort::Medium,
+        };
         // Away to Codex: Claude's fields are filed, and Codex starts clean.
         let away = harness_switch(
             Some(Harness::Claude),
             Harness::Codex,
-            claude.0.clone(),
-            claude.1.clone(),
-            AiEffort::Medium,
+            claude.cli_path.clone(),
+            claude.model.clone(),
+            claude.effort,
             None,
         );
         assert_eq!(away.cli_path, None);
@@ -11144,8 +11178,110 @@ mod effort_clamp_tests {
             AiEffort::Medium,
             Some(claude.clone()),
         );
-        assert_eq!(back.cli_path.as_deref(), Some(claude.0.as_str()));
-        assert_eq!(back.model.as_deref(), Some(claude.1.as_str()));
+        assert_eq!(back.cli_path.as_deref(), Some(claude.cli_path.as_str()));
+        assert_eq!(back.model.as_deref(), Some(claude.model.as_str()));
+    }
+
+    /// **The effort level comes back too**, and it was the one field left out
+    /// of the memory.
+    ///
+    /// `clamped_to` is not injective, so re-deriving the level on the way back
+    /// loses: Claude at the shipped default **Medium**, a glance at OpenCode
+    /// (`minimal|high|max`, so Medium → High), and back to Claude leaves the
+    /// box reading **High** on the harness the user started on, chosen by
+    /// nobody — and `ai_effort` is persisted to `ui_state.json`, so it stays.
+    /// `xhigh` → Antigravity (`low|medium|high`) → back is the same failure
+    /// downward, and needs only a glance.
+    #[test]
+    fn a_round_trip_through_the_dropdown_keeps_the_effort_level() {
+        // Every level Claude offers, out through each other harness and back.
+        for start in [
+            AiEffort::Low,
+            AiEffort::Medium,
+            AiEffort::High,
+            AiEffort::Extra,
+        ] {
+            for via in [Harness::OpenCode, Harness::Antigravity, Harness::Codex] {
+                let held = HarnessFields {
+                    cli_path: "claude".to_string(),
+                    model: "sonnet".to_string(),
+                    effort: start,
+                };
+                // Out: the level is clamped to what `via` advertises, which is
+                // the behaviour being kept — the box must never show a level
+                // its harness does not take.
+                let out = harness_switch(
+                    Some(Harness::Claude),
+                    via,
+                    held.cli_path.clone(),
+                    held.model.clone(),
+                    start,
+                    None,
+                );
+                assert!(
+                    via.effort_levels().is_empty()
+                        || via.effort_levels().contains(&out.effort.cli()),
+                    "{via:?} shows a level it does not take"
+                );
+                // Back: what Claude was left at, not what the clamp derived.
+                let back = harness_switch(
+                    Some(via),
+                    Harness::Claude,
+                    String::new(),
+                    String::new(),
+                    out.effort,
+                    Some(held),
+                );
+                assert_eq!(
+                    back.effort, start,
+                    "Claude/{start:?} → {via:?} → Claude came back as {:?}",
+                    back.effort
+                );
+            }
+        }
+    }
+
+    /// A harness this session has **not** been on keeps the clamp: there is
+    /// nothing to restore, and the level in the box must still be one the new
+    /// harness takes.
+    #[test]
+    fn a_first_visit_to_a_harness_still_clamps() {
+        let s = harness_switch(
+            Some(Harness::Claude),
+            Harness::OpenCode,
+            "claude".to_string(),
+            "sonnet".to_string(),
+            AiEffort::Medium,
+            None,
+        );
+        assert!(Harness::OpenCode.effort_levels().contains(&s.effort.cli()));
+        assert_eq!(s.cli_path, None, "and its fields start clean");
+    }
+
+    /// A *remembered* level that the harness has somehow stopped offering is
+    /// still clamped — the memory is a preference, not an override of what the
+    /// dropdown can show.
+    #[test]
+    fn a_remembered_level_is_clamped_like_any_other() {
+        let held = HarnessFields {
+            cli_path: "oc".to_string(),
+            model: String::new(),
+            // Not in OpenCode's `minimal|high|max`.
+            effort: AiEffort::Medium,
+        };
+        let s = harness_switch(
+            Some(Harness::Claude),
+            Harness::OpenCode,
+            String::new(),
+            String::new(),
+            AiEffort::High,
+            Some(held),
+        );
+        assert!(
+            Harness::OpenCode.effort_levels().contains(&s.effort.cli()),
+            "a remembered level reached the box unclamped: {:?}",
+            s.effort
+        );
     }
 
     /// **The clamp runs on every call, including the first** — a different
