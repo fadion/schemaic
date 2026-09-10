@@ -518,7 +518,7 @@ pub(crate) fn sweep(bin: Option<&str>) {
     release(held);
     // The rules can be removed with no `agy` at all — it is our own file surgery
     // — so that half runs regardless.
-    let all: Vec<&str> = crate::ai::AI_TOOLS_WITH_QUERY.to_vec();
+    let all = crate::ai::ai_allowed_tools(true);
     let rules = antigravity_allow_rules(&all);
     // Never creates. This runs on **every** launch, for every user, and most of
     // them have no Antigravity at all — writing `{}` into that CLI's config
@@ -679,10 +679,10 @@ mod tests {
         // A crashed session may have granted the full set, so the sweep has to
         // clear the full set — clearing only a schema-only connection's two
         // would leave `run_query` granted forever.
-        let all: Vec<&str> = crate::ai::AI_TOOLS_WITH_QUERY.to_vec();
+        let all = crate::ai::ai_allowed_tools(true);
         let rules = antigravity_allow_rules(&all);
         assert!(rules.iter().any(|r| r.contains("run_query")), "{rules:?}");
-        assert!(rules.len() >= crate::ai::AI_TOOLS_READ_ONLY.len());
+        assert!(rules.len() >= crate::ai::ai_allowed_tools(false).len());
     }
 
     /// The bug the marker exists for: the sweep runs at **every** launch and

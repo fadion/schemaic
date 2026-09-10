@@ -32,34 +32,39 @@ use schemaic_ui::{AiEffort, ConnNode, InlineAiRequest, SchemaScope, Tab};
 use crate::agent_cli::{harness_bin, probe};
 
 // ===== moved from main.rs (AI session + context) =====
-// The `claude` CLI runs non-interactively, so an **MCP** tool that isn't named
-// here has no one to approve it: the call is denied outright. Both lists must
-// therefore name every tool `mcp::tools_list` offers at that level, which
-// `every_offered_tool_is_allow_listed_at_its_level` holds them to.
-//
-// **Only the MCP surface**, and not by convention: `build_session_args` emits
-// `--allowedTools` solely alongside `--mcp-config` and solely from these names,
-// so it cannot name a built-in even in principle. Nothing here ever governed the
-// CLI's own tools — that is why nineteen of them were reachable, and why the
-// guard on them is `--tools ""` rather than this list.
-pub(crate) const AI_TOOLS_WITH_QUERY: &[&str] = &[
-    "mcp__schemaic__run_query",
-    "mcp__schemaic__list_schema",
-    "mcp__schemaic__describe_table",
-    "mcp__schemaic__propose_table_change",
-];
-// `describe_table` stays available with queries off — it's a schema tool, and the
-// server drops its sample-rows section when the endpoint says samples are off.
-// `run_query` is withheld at both ends: absent from this allow-list, and absent
-// from the MCP server's own `tools/list` so the model never plans a turn around
-// a tool it would only be denied on (see `mcp::tools_list`).
-// `propose_table_change` is on both lists: it reads the table's *structure* and
-// runs nothing, which is not the access `AiData` gates.
-pub(crate) const AI_TOOLS_READ_ONLY: &[&str] = &[
-    "mcp__schemaic__list_schema",
-    "mcp__schemaic__describe_table",
-    "mcp__schemaic__propose_table_change",
-];
+/// The MCP tools a session at this data-access level may call, spelled the way
+/// a CLI harness's allow-list wants them.
+///
+/// The `claude` CLI runs non-interactively, so an **MCP** tool that is not named
+/// here has no one to approve it: the call is denied outright. So this must name
+/// every tool `mcp::tools_list` offers at that level, which
+/// `every_offered_tool_is_allow_listed_at_its_level` holds it to.
+///
+/// **Derived from [`crate::mcp::McpTool`], not typed out.** It used to be two
+/// hand-written `const` lists in this file — two more independent spellings of a
+/// set the compiler related to nothing, on top of the three in `mcp.rs`. A fifth
+/// tool now cannot be added without answering `reads_row_data` for it, and the
+/// answer reaches here.
+///
+/// `describe_table` and `propose_table_change` stay available with queries off —
+/// they read structure and run nothing, which is not the access `AiData` gates,
+/// and the server drops `describe_table`'s sample-rows section when the endpoint
+/// says samples are off. `run_query` is withheld at both ends: absent from this
+/// list, and absent from the MCP server's own `tools/list`, so the model never
+/// plans a turn around a tool it would only be denied on.
+///
+/// **Only the MCP surface**, and not by convention: `build_session_args` emits
+/// `--allowedTools` solely alongside `--mcp-config` and solely from these names,
+/// so it cannot name a built-in even in principle. Nothing here ever governed the
+/// CLI's own tools — that is why nineteen of them were reachable, and why the
+/// guard on them is `--tools ""` rather than this list.
+pub(crate) fn ai_allowed_tools(may_query: bool) -> Vec<&'static str> {
+    crate::mcp::McpTool::ALL
+        .into_iter()
+        .filter(|t| may_query || !t.reads_row_data())
+        .map(|t| t.ai_name())
+        .collect()
+}
 
 /// A live AI conversation: the CLI child's stdin channel plus which connection
 /// it's bound to. Dropping this (its `stdin_tx`) ends the session task, which
@@ -1297,11 +1302,7 @@ pub(crate) fn start_ai_session(
         let private = SessionPrivate::of([ep_file.clone()], cwd.clone());
         // **The same list Claude's `--allowedTools` gets**, so no two harnesses
         // can disagree about what this connection's access level offers.
-        let allowed: &[&str] = if data.may_query() {
-            AI_TOOLS_WITH_QUERY
-        } else {
-            AI_TOOLS_READ_ONLY
-        };
+        let allowed = ai_allowed_tools(data.may_query());
         let exe = std::env::current_exe()
             .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_else(|_| "schemaic".to_string());
@@ -1318,7 +1319,7 @@ pub(crate) fn start_ai_session(
         match (harness, ep_file.as_ref()) {
             (Harness::Codex, Some(p)) => {
                 overrides =
-                    schemaic_ai::harness::codex_mcp_overrides(&exe, &p.to_string_lossy(), allowed);
+                    schemaic_ai::harness::codex_mcp_overrides(&exe, &p.to_string_lossy(), &allowed);
             }
             // No endpoint file → no database tools, rather than a server that
             // would come up pointed at nothing.
@@ -1354,7 +1355,7 @@ pub(crate) fn start_ai_session(
             // half-configured state the way there is for Codex.
             (Harness::OpenCode, Some(p)) => {
                 oc_config =
-                    crate::opencode::OpenCodeConfig::write(&exe, &p.to_string_lossy(), allowed);
+                    crate::opencode::OpenCodeConfig::write(&exe, &p.to_string_lossy(), &allowed);
             }
             _ => {}
         }
@@ -1591,11 +1592,7 @@ pub(crate) fn start_ai_session(
         return (tx, private);
     }
 
-    let tools = if data.may_query() {
-        AI_TOOLS_WITH_QUERY
-    } else {
-        AI_TOOLS_READ_ONLY
-    };
+    let tools = ai_allowed_tools(data.may_query());
     // **Two persistent harnesses, two ways of being told about the server.**
     // Claude is pointed at a config file: launch THIS binary in `--mcp-serve`
     // mode, handing it the (already-tunnelled) DB endpoint — written to a temp
@@ -1644,7 +1641,7 @@ pub(crate) fn start_ai_session(
     // The seal for the binary the gate above actually checked. Re-resolving here
     // would let the two disagree the moment `harness_bin` gains a reason to
     // answer differently on a second call.
-    let args = schemaic_ai::harness::session_args(harness, &spec, checked.seal, tools);
+    let args = schemaic_ai::harness::session_args(harness, &spec, checked.seal, &tools);
 
     // Before the spawn, because afterwards it is unrecognisable: the OS returns
     // a generic failure and the arm below blames the installation.
@@ -1686,8 +1683,9 @@ pub(crate) fn start_ai_session(
                 None
             }
             (true, Some((exe, ep))) => {
+                let for_agy = tools.clone();
                 let reg = tokio::task::spawn_blocking(move || {
-                    crate::antigravity::AgyRegistration::install(&agy_bin, &exe, &ep, tools)
+                    crate::antigravity::AgyRegistration::install(&agy_bin, &exe, &ep, &for_agy)
                 })
                 .await
                 .ok();
@@ -1793,7 +1791,7 @@ pub(crate) fn start_ai_session(
                             ..spec.clone()
                         };
                         let next = schemaic_ai::harness::session_args(
-                            harness, &resumed, checked.seal, tools,
+                            harness, &resumed, checked.seal, &tools,
                         );
                         match spawn_child(next) {
                             Ok(c) => {
@@ -3148,7 +3146,8 @@ mod tests {
     /// it already has and the user sees a preview either way.
     #[test]
     fn every_offered_tool_is_allow_listed_at_its_level() {
-        for (allowed, reads_data) in [(AI_TOOLS_WITH_QUERY, true), (AI_TOOLS_READ_ONLY, false)] {
+        for reads_data in [true, false] {
+            let allowed = ai_allowed_tools(reads_data);
             for engine in [
                 schemaic_db::Engine::MySql,
                 schemaic_db::Engine::Postgres,
@@ -3315,7 +3314,7 @@ mod tests {
         let overrides = schemaic_ai::harness::codex_mcp_overrides(
             "/usr/bin/schemaic",
             "/tmp/ep.json",
-            AI_TOOLS_WITH_QUERY,
+            &ai_allowed_tools(true),
         );
         for o in &overrides {
             assert!(!o.contains("hunter2"), "{o}");

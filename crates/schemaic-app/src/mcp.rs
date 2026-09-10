@@ -132,42 +132,110 @@ pub async fn serve(endpoint: crate::ai::McpEndpoint) {
     }
 }
 
-/// Which tools read row data, and so exist only on a connection whose
-/// [`AiData`](schemaic_core::connection::AiData) level lets the assistant fetch
-/// rows for itself.
+/// The tools this server offers — **the set, as a type**.
 ///
-/// One predicate, consulted twice — [`tools_list`] leaves the tool out and
-/// [`refusal_for`] turns a call to it away — so a tool can never be advertised
-/// by one rule and denied by another.
-fn reads_row_data(tool: &str) -> bool {
-    tool == "run_query"
+/// The four names used to be written out independently in five places that the
+/// compiler related to nothing: the `json!` array in [`tools_list`], a `==` in
+/// `reads_row_data`, a `matches!` in `reads_schema`, [`call_tool`]'s dispatch
+/// with its `other =>` catch-all, and `ai.rs`'s two `mcp__schemaic__*` lists. A
+/// new tool therefore joined the advertised array, joined the dispatch, and
+/// **defaulted to ungated at both gates** — which is exactly how
+/// `propose_table_change` came to sit on neither, with full `fetch_schema`
+/// access at the app's tightest setting, nothing failing to compile and nothing
+/// failing to run.
+///
+/// Every question about a tool is now an exhaustive `match` on this enum, so a
+/// fifth variant does not compile until both gates have answered for it. Same
+/// rule `ai/harness.rs`'s `env_seal` states one crate over — *"a fifth harness
+/// is a compile error here rather than a silent default there"*.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum McpTool {
+    RunQuery,
+    ListSchema,
+    DescribeTable,
+    ProposeTableChange,
 }
 
-/// Does this tool read the **catalogue** — the thing *Schema context* governs?
-///
-/// The same one-predicate-consulted-twice shape [`reads_row_data`] has, and for
-/// the same reason.
-///
-/// **`propose_table_change` is on this list, and its absence was a hole.** The
-/// exclusion was justified as "it carries the table it is about in the call and
-/// reads nothing the model did not already have", and both halves were false:
-/// [`propose_change`] calls `db.fetch_schema(database, …)`, a full catalogue
-/// read of an arbitrary database, and `propose::resolve_target`'s hit/miss split
-/// is a working existence oracle over every database and table name a model
-/// cares to guess — at the one setting whose entire purpose is to publish none
-/// of them. On SQLite it is not even an oracle: `AddCheck` is off the native
-/// allowlist, so `ddl::diff` collapses the set into one `RebuildTable`, and the
-/// emitted SQL is the table's complete `CREATE TABLE` followed by an
-/// `INSERT … SELECT` naming every column again. One call on a guessed name
-/// returned the whole declaration.
-///
-/// The hidden-database set is a separate matter and still unconsulted on this
-/// path — it reaches only `listed_databases`.
-fn reads_schema(tool: &str) -> bool {
-    matches!(
-        tool,
-        "list_schema" | "describe_table" | "propose_table_change"
-    )
+impl McpTool {
+    /// Every tool, in the order `tools/list` advertises them.
+    pub(crate) const ALL: [McpTool; 4] = [
+        McpTool::RunQuery,
+        McpTool::ListSchema,
+        McpTool::DescribeTable,
+        McpTool::ProposeTableChange,
+    ];
+
+    /// The name on the wire.
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            McpTool::RunQuery => "run_query",
+            McpTool::ListSchema => "list_schema",
+            McpTool::DescribeTable => "describe_table",
+            McpTool::ProposeTableChange => "propose_table_change",
+        }
+    }
+
+    /// The name a CLI harness's allow-list spells it under. Written out rather
+    /// than `format!`ed so it is a `&'static str` the allow-lists can hold —
+    /// and so a fifth tool has to state it here too.
+    pub(crate) fn ai_name(self) -> &'static str {
+        match self {
+            McpTool::RunQuery => "mcp__schemaic__run_query",
+            McpTool::ListSchema => "mcp__schemaic__list_schema",
+            McpTool::DescribeTable => "mcp__schemaic__describe_table",
+            McpTool::ProposeTableChange => "mcp__schemaic__propose_table_change",
+        }
+    }
+
+    pub(crate) fn from_name(name: &str) -> Option<Self> {
+        McpTool::ALL.into_iter().find(|t| t.name() == name)
+    }
+
+    /// Does this tool read **row data**, and so exist only on a connection
+    /// whose [`AiData`](schemaic_core::connection::AiData) level lets the
+    /// assistant fetch rows for itself?
+    ///
+    /// One predicate, consulted twice — [`tools_list`] leaves the tool out and
+    /// [`refusal_for`] turns a call to it away — so a tool can never be
+    /// advertised by one rule and denied by another.
+    pub(crate) fn reads_row_data(self) -> bool {
+        match self {
+            McpTool::RunQuery => true,
+            McpTool::ListSchema | McpTool::DescribeTable | McpTool::ProposeTableChange => false,
+        }
+    }
+
+    /// Does this tool read the **catalogue** — the thing *Schema context*
+    /// governs?
+    ///
+    /// **`propose_table_change` answers yes, and its `false` was a hole.** The
+    /// exclusion was justified as "it carries the table it is about in the call
+    /// and reads nothing the model did not already have", and both halves were
+    /// false: [`propose_change`] calls `db.fetch_schema(database, …)`, a full
+    /// catalogue read of an arbitrary database, and `propose::resolve_target`'s
+    /// hit/miss split is a working existence oracle over every database and
+    /// table name a model cares to guess — at the one setting whose entire
+    /// purpose is to publish none of them. On SQLite it is not even an oracle:
+    /// `AddCheck` is off the native allowlist, so `ddl::diff` collapses the set
+    /// into one `RebuildTable`, and the emitted SQL is the table's complete
+    /// `CREATE TABLE` followed by an `INSERT … SELECT` naming every column
+    /// again. One call on a guessed name returned the whole declaration.
+    ///
+    /// The hidden-database set is a separate matter and still unconsulted on
+    /// this path — it reaches only `listed_databases`.
+    fn reads_schema(self) -> bool {
+        match self {
+            McpTool::RunQuery => false,
+            McpTool::ListSchema | McpTool::DescribeTable | McpTool::ProposeTableChange => true,
+        }
+    }
+
+    /// Is this tool available at this connection's two levels? The one place
+    /// the two gates are combined, so the listing and the refusal cannot
+    /// disagree about what "available" means.
+    fn offered(self, reads_data: bool, schema: bool) -> bool {
+        (reads_data || !self.reads_row_data()) && (schema || !self.reads_schema())
+    }
 }
 
 /// What the server says when a schema tool is called at *Schema context: None*.
@@ -189,11 +257,11 @@ const NO_DATA_ACCESS: &str = "Refused: this connection's AI data access is set s
 
 /// The refusal a tool call earns from the connection's data-access level, if
 /// any. Pure, so the gate is unit-tested without a live endpoint.
-fn refusal_for(tool: &str, reads_data: bool, schema: bool) -> Option<&'static str> {
-    if !reads_data && reads_row_data(tool) {
+fn refusal_for(tool: McpTool, reads_data: bool, schema: bool) -> Option<&'static str> {
+    if !reads_data && tool.reads_row_data() {
         return Some(NO_DATA_ACCESS);
     }
-    (!schema && reads_schema(tool)).then_some(NO_SCHEMA_ACCESS)
+    (!schema && tool.reads_schema()).then_some(NO_SCHEMA_ACCESS)
 }
 
 /// The tools this server offers, described for **this** connection's engine.
@@ -334,9 +402,13 @@ pub(crate) fn tools_list(engine: schemaic_db::Engine, reads_data: bool, schema: 
         }
     ]);
     if let Some(list) = tools.as_array_mut() {
+        // **Through the enum, so an entry the set does not know is dropped.**
+        // A `json!` array is not a type; matching each advertised name back to
+        // an `McpTool` is what makes the array and the gates one set rather
+        // than two that happen to agree today.
         list.retain(|t| {
-            let name = t["name"].as_str().unwrap_or("");
-            (reads_data || !reads_row_data(name)) && (schema || !reads_schema(name))
+            McpTool::from_name(t["name"].as_str().unwrap_or(""))
+                .is_some_and(|tool| tool.offered(reads_data, schema))
         });
     }
     tools
@@ -354,7 +426,13 @@ async fn call_tool(
     // The level gates the call as well as the listing: a client working from a
     // stale `tools/list` must not reach the DB through a tool this connection
     // withheld.
-    if let Some(why) = refusal_for(name, reads_data, schema) {
+    let Some(tool) = McpTool::from_name(name) else {
+        return json!({
+            "content": [ { "type": "text", "text": format!("Unknown tool: {name}") } ],
+            "isError": true
+        });
+    };
+    if let Some(why) = refusal_for(tool, reads_data, schema) {
         return json!({ "content": [ { "type": "text", "text": why } ], "isError": true });
     }
     let arg = |key: &str| {
@@ -362,18 +440,20 @@ async fn call_tool(
             .and_then(|s| s.as_str())
             .filter(|s| !s.is_empty())
     };
-    let (text, is_error) = match name {
-        "run_query" => {
+    // Exhaustive, with no catch-all: the unknown name was refused above, so a
+    // fifth variant fails to compile here rather than falling into an arm
+    // written for something else.
+    let (text, is_error) = match tool {
+        McpTool::RunQuery => {
             let sql = args.get("sql").and_then(|s| s.as_str()).unwrap_or("");
             run_query(db, database, sql).await
         }
-        "list_schema" => list_schema(db, arg("database"), database, hidden).await,
-        "describe_table" => match arg("table") {
+        McpTool::ListSchema => list_schema(db, arg("database"), database, hidden).await,
+        McpTool::DescribeTable => match arg("table") {
             Some(table) => describe_table(db, database, arg("database"), table, reads_data).await,
             None => ("describe_table needs a `table`.".to_string(), true),
         },
-        "propose_table_change" => propose_change(db, database, arg("database"), args).await,
-        other => (format!("Unknown tool: {other}"), true),
+        McpTool::ProposeTableChange => propose_change(db, database, arg("database"), args).await,
     };
     json!({ "content": [ { "type": "text", "text": text } ], "isError": is_error })
 }
@@ -850,10 +930,10 @@ async fn propose_change(
 #[cfg(test)]
 mod tests {
     use super::{
-        HashSet, NO_DATA_ACCESS, SUPPORTED_PROTOCOLS, dialect_of, find_described,
+        HashSet, McpTool, NO_DATA_ACCESS, SUPPORTED_PROTOCOLS, dialect_of, find_described,
         format_database_list, format_database_schema, format_table, format_table_detail,
         format_table_heading, listed_databases, negotiate_protocol, normalize_stmt,
-        proposal_from_args, reads_row_data, refusal_for,
+        proposal_from_args, refusal_for,
     };
 
     /// Tool names the server advertises, in order.
@@ -922,9 +1002,49 @@ mod tests {
     /// rule and refused by another.
     #[test]
     fn only_the_query_tool_counts_as_reading_rows() {
-        assert!(reads_row_data("run_query"));
-        for schema_tool in ["list_schema", "describe_table", "propose_table_change"] {
-            assert!(!reads_row_data(schema_tool));
+        assert!(McpTool::RunQuery.reads_row_data());
+        for schema_tool in [
+            McpTool::ListSchema,
+            McpTool::DescribeTable,
+            McpTool::ProposeTableChange,
+        ] {
+            assert!(!schema_tool.reads_row_data());
+        }
+    }
+
+    /// **The set is one set.** Every advertised name maps back to a variant and
+    /// every variant is advertised — the property the five independent
+    /// spellings could not have, and the one that made a new tool default to
+    /// ungated at both gates.
+    #[test]
+    fn every_advertised_tool_is_a_known_one_and_every_known_one_is_advertised() {
+        for engine in [
+            schemaic_db::Engine::MySql,
+            schemaic_db::Engine::Postgres,
+            schemaic_db::Engine::Sqlite,
+        ] {
+            let names = offered_with(engine, true, true);
+            for name in &names {
+                assert!(
+                    McpTool::from_name(name).is_some(),
+                    "{engine:?} advertises {name}, which is not an McpTool"
+                );
+            }
+            for tool in McpTool::ALL {
+                assert!(
+                    names.iter().any(|n| n == tool.name()),
+                    "{engine:?} does not advertise {}: {names:?}",
+                    tool.name()
+                );
+                // And its harness spelling is the wire name, prefixed — the
+                // relationship `ai_allowed_tools` depends on.
+                assert_eq!(
+                    tool.ai_name(),
+                    format!("mcp__schemaic__{}", tool.name()),
+                    "{} names itself two ways",
+                    tool.name()
+                );
+            }
         }
     }
 
@@ -933,9 +1053,16 @@ mod tests {
     /// itself, and told which setting to point the user at.
     #[test]
     fn a_call_to_the_withheld_tool_is_refused_with_the_reason() {
-        assert_eq!(refusal_for("run_query", false, true), Some(NO_DATA_ACCESS));
-        assert_eq!(refusal_for("run_query", true, true), None);
-        for schema_tool in ["list_schema", "describe_table", "propose_table_change"] {
+        assert_eq!(
+            refusal_for(McpTool::RunQuery, false, true),
+            Some(NO_DATA_ACCESS)
+        );
+        assert_eq!(refusal_for(McpTool::RunQuery, true, true), None);
+        for schema_tool in [
+            McpTool::ListSchema,
+            McpTool::DescribeTable,
+            McpTool::ProposeTableChange,
+        ] {
             assert_eq!(refusal_for(schema_tool, false, true), None);
         }
     }
@@ -986,11 +1113,15 @@ mod tests {
             );
         }
         // …and a call to one anyway is refused with the setting named.
-        for gone in ["list_schema", "describe_table", "propose_table_change"] {
+        for gone in [
+            McpTool::ListSchema,
+            McpTool::DescribeTable,
+            McpTool::ProposeTableChange,
+        ] {
             let refusal = refusal_for(gone, true, false).expect("refused");
             assert!(refusal.contains("Schema context"), "{refusal}");
         }
-        assert_eq!(refusal_for("run_query", true, false), None);
+        assert_eq!(refusal_for(McpTool::RunQuery, true, false), None);
     }
 
     /// The tool's arguments carry `database` alongside the proposal's own
