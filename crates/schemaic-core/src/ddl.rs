@@ -6501,6 +6501,27 @@ fn columns_equal(a: &ColumnInfo, b: &ColumnInfo, d: SqlDialect) -> bool {
         && (pg || a.on_update == b.on_update)
         && blank_as_none(a.comment.as_deref()) == blank_as_none(b.comment.as_deref())
         && blank_as_none(a.collation.as_deref()) == blank_as_none(b.collation.as_deref())
+        // **The three the model carries and this used to skip.** Each is a
+        // decision the emitter restates and the diff could not see, so a draft
+        // that changed one raised no change at all — dropped with nothing on
+        // screen, which is the shape this gate exists to prevent.
+        //
+        // * `generated_stored` — SQLite defaults to `VIRTUAL`, so a `STORED`
+        //   column re-emitted without the word stops being materialised and the
+        //   trade the user chose is reversed silently.
+        // * `sqlite_autoincrement` — the keyword whose whole purpose is that a
+        //   freed id is never reused; the rebuild carries `sqlite_sequence` over
+        //   for it, on a plan `diff` could not build.
+        // * `identity_always` — `ALWAYS` versus `BY DEFAULT`, which decides
+        //   whether PostgreSQL *rejects an explicit write*.
+        //
+        // No designer control produces such a draft today, which is why this was
+        // latent rather than reported. The day one does — an import, an AI
+        // `propose_table_change` — the edit would have been dropped and the
+        // suite stayed green.
+        && a.generated_stored == b.generated_stored
+        && a.sqlite_autoincrement == b.sqlite_autoincrement
+        && a.identity_always == b.identity_always
 }
 
 fn blank_as_none(s: Option<&str>) -> Option<&str> {
@@ -10817,6 +10838,87 @@ mod tests {
             "{:?}",
             draft.validate(MySql)
         );
+    }
+
+    /// **Three `ColumnInfo` fields the diff could not see.** `columns_equal`
+    /// compared nine of thirteen; `generated_stored`, `sqlite_autoincrement` and
+    /// `identity_always` were absent, with no test saying whether that was
+    /// deliberate. Each is a decision the emitter restates:
+    /// SQLite defaults a generated column to `VIRTUAL`, so a `STORED` one
+    /// re-emitted without the word stops being materialised;
+    /// `sqlite_autoincrement` is the keyword whose whole purpose is that a freed
+    /// id is never reused, and the rebuild carries `sqlite_sequence` over for a
+    /// plan `diff` could not build; `identity_always` decides whether PostgreSQL
+    /// **rejects an explicit write**.
+    ///
+    /// Latent rather than reported, because no designer control produces such a
+    /// draft today — which is exactly why it wanted a test and not an argument:
+    /// the day an import or an AI proposal sets one, the edit would have been
+    /// dropped with nothing on screen and the suite green.
+    ///
+    /// Asserted through `diff`, not through the predicate: the predicate in
+    /// isolation is the half that would still have passed.
+    #[test]
+    fn a_change_to_one_of_the_three_quiet_column_fields_is_a_change() {
+        let base = |f: fn(&mut ColumnInfo)| {
+            let mut c = ColumnInfo {
+                name: "id".into(),
+                type_name: "INTEGER".into(),
+                nullable: false,
+                primary_key: true,
+                ..Default::default()
+            };
+            f(&mut c);
+            TableInfo {
+                name: "t".into(),
+                schema: None,
+                columns: vec![c],
+                ..Default::default()
+            }
+        };
+
+        for (name, dialect, set, clear) in [
+            (
+                "generated_stored",
+                Sqlite,
+                (|c: &mut ColumnInfo| {
+                    c.generated = Some("1 + 1".into());
+                    c.generated_stored = true;
+                }) as fn(&mut ColumnInfo),
+                (|c: &mut ColumnInfo| {
+                    c.generated = Some("1 + 1".into());
+                    c.generated_stored = false;
+                }) as fn(&mut ColumnInfo),
+            ),
+            (
+                "sqlite_autoincrement",
+                Sqlite,
+                |c: &mut ColumnInfo| c.sqlite_autoincrement = true,
+                |c: &mut ColumnInfo| c.sqlite_autoincrement = false,
+            ),
+            (
+                "identity_always",
+                Postgres,
+                |c: &mut ColumnInfo| c.identity_always = true,
+                |c: &mut ColumnInfo| c.identity_always = false,
+            ),
+        ] {
+            let current = base(set);
+            let mut draft = TableDraft::from_table(&current);
+            clear(&mut draft.columns[0].info);
+            let cs = diff(&current, &draft, dialect);
+            assert!(
+                !cs.changes.is_empty(),
+                "{name}: clearing it raised no change at all, so the edit is                  dropped with nothing on screen"
+            );
+            // And the identity direction still holds: a draft nobody touched
+            // proposes nothing.
+            let untouched = TableDraft::from_table(&current);
+            assert!(
+                diff(&current, &untouched, dialect).changes.is_empty(),
+                "{name}: comparing it made a table differ from itself"
+            );
+        }
     }
 
     #[test]
