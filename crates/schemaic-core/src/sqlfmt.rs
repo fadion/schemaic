@@ -16,6 +16,44 @@
 use crate::intel::SqlDialect;
 use crate::sql::skip_noncode;
 
+/// The byte range Format Code may re-flow, for a caret at `start..end` in
+/// `full` — or `None` when there is nothing safe to do.
+///
+/// **[`format_sql`] lexes what it is handed from byte 0 and takes that for a
+/// real token boundary**, which is true of a whole document and of a selection
+/// that begins and ends in code, and false of one that begins inside a string,
+/// a quoted identifier or a comment. With the document
+/// `select 1 -- keep a, b\nfrom t` and `keep a, b` selected, the fragment lexed
+/// as the words `keep`, `a`, a comma and `b`; the comma broke, and the document
+/// became `select 1 -- keep a,\nb\nfrom t` — `b` now **outside** the comment, a
+/// stray token, and the statement no longer parses.
+///
+/// An empty selection is the whole document, which is what Format Code has
+/// always done with a bare caret. A selection that is not formattable answers
+/// `None`: falling back to the whole document would silently reformat every
+/// line the user did not select, which is the worse of the two surprises.
+///
+/// Here rather than at the call site so the decision is testable — the
+/// `format_sql` caller is a floem view — and beside the lexer whose assumption
+/// it is protecting.
+pub fn formattable_range(
+    full: &str,
+    start: usize,
+    end: usize,
+    dialect: SqlDialect,
+) -> Option<(usize, usize)> {
+    let (lo, hi) = (
+        start.min(end).min(full.len()),
+        start.max(end).min(full.len()),
+    );
+    if lo == hi {
+        return Some((0, full.len()));
+    }
+    let in_code =
+        |at: usize| crate::pairs::region_at(full, at, dialect) == crate::pairs::Region::Code;
+    (in_code(lo) && in_code(hi)).then_some((lo, hi))
+}
+
 /// Format `sql`, indenting each level with `indent_unit` (e.g. `"    "` or
 /// `"\t"`). Token text is preserved verbatim; only whitespace/layout changes.
 /// `dialect` selects the boundary rules (comments/quotes/dollar-quotes) so
@@ -436,9 +474,8 @@ impl<'a> Fmt<'a> {
             self.line_indent = level;
             self.line_has_content = false;
         } else if self.line_has_content
-            && !tight_left
-            && !self.tight_next
-            && self.need_space(kind, text)
+            && (self.would_fuse(text)
+                || (!tight_left && !self.tight_next && self.need_space(kind, text)))
         {
             self.out.push(' ');
         }
@@ -446,6 +483,34 @@ impl<'a> Fmt<'a> {
         self.out.push_str(text);
         self.line_has_content = true;
         self.prev = Some((kind, text.to_string()));
+    }
+
+    /// Would writing `text` with no space in front of it butt two characters
+    /// together into something the lexer reads as one token?
+    ///
+    /// **The case that shipped is `- -1`.** Both signs are unary — the first
+    /// because the previous token is `=` or `*`, the second because
+    /// `unary_context` lists `-` itself — so the first set `tight_next` and the
+    /// second was emitted with no space, giving `--1`. On PostgreSQL and SQLite
+    /// `--` opens a line comment with no whitespace required, so the rest of the
+    /// line is gone: measured on PG 16.15, `select 1 * --1` →
+    /// *syntax error at end of input*. MySQL requires the whitespace, so the
+    /// same output still means `-(-1)` there and the divergence was silent.
+    ///
+    /// Not dialect-gated even so. `- -1` is correct on all three engines and
+    /// the alternative is a formatter whose output means different things on
+    /// different servers, which is the opposite of this module's contract —
+    /// "re-flow whitespace, indentation and line breaks **without changing any
+    /// token's text**". `/*` and `*/` are guarded on the same principle, though
+    /// no valid statement is known to produce either.
+    fn would_fuse(&self, text: &str) -> bool {
+        let Some((_, pt)) = &self.prev else {
+            return false;
+        };
+        matches!(
+            (pt.as_bytes().last(), text.as_bytes().first()),
+            (Some(b'-'), Some(b'-')) | (Some(b'/'), Some(b'*')) | (Some(b'*'), Some(b'/'))
+        )
     }
 
     fn need_space(&self, cur_kind: Kind, cur: &str) -> bool {
@@ -750,6 +815,91 @@ mod tests {
     fn negative_numbers_stay_tight() {
         let got = format_sql("SELECT a FROM t WHERE a = -1", IND);
         assert_eq!(got, "SELECT\n  a\nFROM\n  t\nWHERE\n  a = -1");
+    }
+
+    /// **A selection whose ends are not in code is not formattable.**
+    ///
+    /// `format_sql` lexes what it is handed from byte 0 and takes that for a
+    /// token boundary. Selecting `keep a, b` inside `select 1 -- keep a, b` and
+    /// pressing Format Code lexed the fragment as words and a comma, broke the
+    /// comma, and left the document `select 1 -- keep a,\nb\nfrom t` — `b` now
+    /// outside the comment, and the statement no longer parses.
+    #[test]
+    fn a_selection_inside_a_comment_or_a_string_is_not_formattable() {
+        let full = "select 1 -- keep a, b\nfrom t";
+        let inside = full.find("keep").unwrap();
+        for dialect in [SqlDialect::MySql, SqlDialect::Postgres, SqlDialect::Sqlite] {
+            assert_eq!(
+                super::formattable_range(full, inside, inside + "keep a, b".len(), dialect),
+                None,
+                "{dialect:?}"
+            );
+            // A string literal is the same question.
+            let s = "select 'keep a, b' from t";
+            let at = s.find("keep").unwrap();
+            assert_eq!(
+                super::formattable_range(s, at, at + 4, dialect),
+                None,
+                "{dialect:?}"
+            );
+            // An empty selection is the whole document, which is what Format
+            // Code has always done with a bare caret.
+            assert_eq!(
+                super::formattable_range(full, 3, 3, dialect),
+                Some((0, full.len())),
+                "{dialect:?}"
+            );
+            // And an ordinary selection in code is still formattable, either
+            // way round, including one that *contains* the comment.
+            assert_eq!(
+                super::formattable_range(full, 0, 8, dialect),
+                Some((0, 8)),
+                "{dialect:?}"
+            );
+            assert_eq!(
+                super::formattable_range(full, 8, 0, dialect),
+                Some((0, 8)),
+                "{dialect:?}"
+            );
+            assert_eq!(
+                super::formattable_range(full, 0, full.len(), dialect),
+                Some((0, full.len())),
+                "{dialect:?}"
+            );
+        }
+    }
+
+    /// **Two unary signs must not fuse into a comment opener.** Both are unary
+    /// — the first because the previous token is `*` or `=`, the second because
+    /// `unary_context` lists `-` itself — so the tight-next rule butted them
+    /// together into `--1`, which on PostgreSQL and SQLite opens a line comment
+    /// with no whitespace required. Measured on PG 16.15: `select 1 * --1` →
+    /// *syntax error at end of input*. The formatter had rewritten the user's
+    /// own buffer into that.
+    #[test]
+    fn two_unary_signs_do_not_fuse_into_a_line_comment() {
+        for dialect in [SqlDialect::Postgres, SqlDialect::Sqlite, SqlDialect::MySql] {
+            for (sql, want) in [
+                ("select 1 * - -1", "select\n  1 * - -1"),
+                (
+                    "select a from t where b = - -1",
+                    "select\n  a\nfrom\n  t\nwhere\n  b = - -1",
+                ),
+            ] {
+                assert_eq!(
+                    super::format_sql(sql, IND, dialect),
+                    want,
+                    "{sql} on {dialect:?}"
+                );
+            }
+            // A single unary sign is still tight, which is the case that must
+            // not change.
+            assert_eq!(
+                super::format_sql("select a from t where a = -1", IND, dialect),
+                "select\n  a\nfrom\n  t\nwhere\n  a = -1",
+                "{dialect:?}"
+            );
+        }
     }
 
     #[test]

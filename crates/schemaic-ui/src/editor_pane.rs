@@ -186,11 +186,13 @@ fn format_editor(ed: &Editor, comp: Completion, dialect: SqlDialect) {
     let doc = ed.doc();
     let full = doc.text().to_string();
     let (a, b) = ed.cursor.get_untracked().get_selection().unwrap_or((0, 0));
-    let (sel_lo, sel_hi) = (a.min(b), a.max(b));
-    let (start, end) = if sel_lo != sel_hi {
-        (sel_lo, sel_hi)
-    } else {
-        (0, full.len())
+    // `formattable_range` owns both halves of this: an empty selection is the
+    // whole document, and a selection whose ends are not in code is refused —
+    // `format_sql` lexes its input from byte 0 and takes that for a token
+    // boundary, so a fragment starting inside a comment came back with the
+    // comment's tail turned into code.
+    let Some((start, end)) = schemaic_core::sqlfmt::formattable_range(&full, a, b, dialect) else {
+        return;
     };
     let unit = if theme::editor_soft_tabs() {
         " ".repeat(theme::editor_tab_width())
