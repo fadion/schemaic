@@ -4158,15 +4158,152 @@ impl DbSchema {
     /// [`DbSchema::objects_all`] instead, since flat means "this database has no
     /// schema level", not "these objects have no namespace" — the distinction
     /// that once made keyboard navigation reach no table at all.
+    /// **Filtered before it is cloned**, which is the whole reason this does
+    /// not read `objects_all(kind).into_iter().filter(…)`. That spelling
+    /// materialised every enum, domain and sequence in the *database* — names,
+    /// comments, an enum's whole value list — and then discarded the ones
+    /// outside the namespace. `ui::schema_tree`'s `object_groups` calls this
+    /// once per `ObjectKind::ALL` per namespace, and `nav_rows` rebuilds the
+    /// whole visible row list on **every arrow key**, so on a PostgreSQL
+    /// database with 20 schemas it was tens of thousands of `String`
+    /// allocations per keypress, ≥95% of them thrown away by the very next
+    /// `filter`. It scaled with the number of namespaces, not with what was on
+    /// screen.
+    ///
+    /// Same rule, and the same wording, as [`DbSchema::objects_matching`],
+    /// which was given the cheap path when the palette hit it — this one and
+    /// the tree's two predicates were the sites that did not follow.
     pub fn objects_in(
         &self,
         schema: Option<&str>,
         kind: crate::ddl::ObjectKind,
     ) -> Vec<ObjectItem> {
-        self.objects_all(kind)
+        self.objects_where(kind, &|s, _| s == schema)
+    }
+
+    /// Does **any** object of `kind` satisfy `keep`?
+    ///
+    /// The half of [`DbSchema::objects_where`] that clones nothing at all and
+    /// stops at the first hit. The schema tree asks it per database and per
+    /// namespace on every filter keystroke, and used to answer by building the
+    /// whole owned list and calling `.iter().any(…)` on it.
+    fn objects_any(
+        &self,
+        kind: crate::ddl::ObjectKind,
+        keep: &dyn Fn(Option<&str>, &str) -> bool,
+    ) -> bool {
+        use crate::ddl::ObjectKind as K;
+        match kind {
+            K::Enum => self
+                .enums
+                .iter()
+                .any(|e| keep(e.schema.as_deref(), &e.name)),
+            K::Domain => self
+                .domains
+                .iter()
+                .any(|d| keep(d.schema.as_deref(), &d.name)),
+            K::Sequence => self
+                .sequences
+                .iter()
+                .any(|s| keep(s.schema.as_deref(), &s.name)),
+            k @ (K::Function | K::Procedure) => self
+                .routines
+                .iter()
+                .any(|r| Some(r.kind) == k.routine_kind() && keep(r.schema.as_deref(), &r.name)),
+            K::Event => self
+                .events
+                .iter()
+                .any(|e| keep(e.schema.as_deref(), &e.name)),
+        }
+    }
+
+    /// The objects of `kind` that `keep` accepts, **cloning only those** — the
+    /// one dispatch every list-returning accessor here goes through, so a
+    /// caller cannot accidentally take the expensive route.
+    ///
+    /// `keep` sees a namespace and a name, which is everything the three
+    /// questions asked of it need (which namespace, which name matches a
+    /// needle, all of them).
+    fn objects_where(
+        &self,
+        kind: crate::ddl::ObjectKind,
+        keep: &dyn Fn(Option<&str>, &str) -> bool,
+    ) -> Vec<ObjectItem> {
+        use crate::ddl::ObjectKind as K;
+        match kind {
+            K::Enum => self
+                .enums
+                .iter()
+                .filter(|e| keep(e.schema.as_deref(), &e.name))
+                .cloned()
+                .map(ObjectItem::Enum)
+                .collect(),
+            K::Domain => self
+                .domains
+                .iter()
+                .filter(|d| keep(d.schema.as_deref(), &d.name))
+                .cloned()
+                .map(ObjectItem::Domain)
+                .collect(),
+            K::Sequence => self
+                .sequences
+                .iter()
+                .filter(|s| keep(s.schema.as_deref(), &s.name))
+                .cloned()
+                .map(ObjectItem::Sequence)
+                .collect(),
+            k @ (K::Function | K::Procedure) => self
+                .routines
+                .iter()
+                .filter(|r| Some(r.kind) == k.routine_kind() && keep(r.schema.as_deref(), &r.name))
+                .cloned()
+                .map(ObjectItem::Routine)
+                .collect(),
+            K::Event => self
+                .events
+                .iter()
+                .filter(|e| keep(e.schema.as_deref(), &e.name))
+                .cloned()
+                .map(ObjectItem::Event)
+                .collect(),
+        }
+    }
+
+    /// Does anything in this database match by object name? The schema tree's
+    /// database-row filter, which would otherwise hide the very database that
+    /// defines the type being searched for.
+    ///
+    /// In core, and answering without cloning: it runs per database on every
+    /// keystroke, and the view's version built six owned lists to return a
+    /// `bool`.
+    pub fn any_object_matches(&self, needle_lower: &str) -> bool {
+        crate::ddl::ObjectKind::ALL
             .into_iter()
-            .filter(|o| o.schema() == schema)
-            .collect()
+            .any(|k| self.objects_any(k, &|_, n| object_name_matches(n, needle_lower)))
+    }
+
+    /// [`DbSchema::any_object_matches`], narrowed to one namespace — the
+    /// namespace-row filter, asked once per namespace per keystroke.
+    pub fn any_object_in_matches(&self, schema: Option<&str>, needle_lower: &str) -> bool {
+        crate::ddl::ObjectKind::ALL.into_iter().any(|k| {
+            self.objects_any(k, &|s, n| {
+                s == schema && object_name_matches(n, needle_lower)
+            })
+        })
+    }
+
+    /// Does this namespace hold any standalone object at all?
+    ///
+    /// The question behind the tree's "No tables" hint, which asked it by
+    /// building every group's owned list and testing `.is_empty()`. `None`
+    /// means the flat case — any object anywhere in the database.
+    pub fn has_objects_in(&self, schema: Option<Option<&str>>) -> bool {
+        crate::ddl::ObjectKind::ALL
+            .into_iter()
+            .any(|k| match schema {
+                Some(ns) => self.objects_any(k, &|s, _| s == ns),
+                None => self.objects_any(k, &|_, _| true),
+            })
     }
 
     /// One standalone object by namespace, kind and name — the kind-agnostic
@@ -4248,76 +4385,12 @@ impl DbSchema {
         kind: crate::ddl::ObjectKind,
         needle_lower: &str,
     ) -> Vec<ObjectItem> {
-        match kind {
-            crate::ddl::ObjectKind::Enum => self
-                .enums
-                .iter()
-                .filter(|e| object_name_matches(&e.name, needle_lower))
-                .cloned()
-                .map(ObjectItem::Enum)
-                .collect(),
-            crate::ddl::ObjectKind::Domain => self
-                .domains
-                .iter()
-                .filter(|d| object_name_matches(&d.name, needle_lower))
-                .cloned()
-                .map(ObjectItem::Domain)
-                .collect(),
-            crate::ddl::ObjectKind::Sequence => self
-                .sequences
-                .iter()
-                .filter(|s| object_name_matches(&s.name, needle_lower))
-                .cloned()
-                .map(ObjectItem::Sequence)
-                .collect(),
-            k @ (crate::ddl::ObjectKind::Function | crate::ddl::ObjectKind::Procedure) => self
-                .routines
-                .iter()
-                .filter(|r| {
-                    Some(r.kind) == k.routine_kind() && object_name_matches(&r.name, needle_lower)
-                })
-                .cloned()
-                .map(ObjectItem::Routine)
-                .collect(),
-            crate::ddl::ObjectKind::Event => self
-                .events
-                .iter()
-                .filter(|e| object_name_matches(&e.name, needle_lower))
-                .cloned()
-                .map(ObjectItem::Event)
-                .collect(),
-        }
+        self.objects_where(kind, &|_, n| object_name_matches(n, needle_lower))
     }
 
     /// Every standalone object of one kind, whatever namespace it is in.
     pub fn objects_all(&self, kind: crate::ddl::ObjectKind) -> Vec<ObjectItem> {
-        match kind {
-            crate::ddl::ObjectKind::Enum => {
-                self.enums.iter().cloned().map(ObjectItem::Enum).collect()
-            }
-            crate::ddl::ObjectKind::Domain => self
-                .domains
-                .iter()
-                .cloned()
-                .map(ObjectItem::Domain)
-                .collect(),
-            crate::ddl::ObjectKind::Sequence => self
-                .sequences
-                .iter()
-                .cloned()
-                .map(ObjectItem::Sequence)
-                .collect(),
-            k @ (crate::ddl::ObjectKind::Function | crate::ddl::ObjectKind::Procedure) => self
-                .routines
-                .iter()
-                .filter(|r| Some(r.kind) == k.routine_kind())
-                .cloned()
-                .map(ObjectItem::Routine)
-                .collect(),
-            crate::ddl::ObjectKind::Event => {
-                self.events.iter().cloned().map(ObjectItem::Event).collect()
-            }
-        }
+        self.objects_where(kind, &|_, _| true)
     }
 
     /// Every enum and domain in one namespace, as names a column's type could be.
@@ -5965,6 +6038,47 @@ mod tests {
         assert_eq!(classify_column_type("my_type with trimmings"), Other);
     }
 
+    /// **The gate.** Every question about standalone objects that is *not*
+    /// "give me all of them" has to filter before it clones.
+    ///
+    /// `objects_in` was `objects_all(kind).into_iter().filter(…)`, and the
+    /// schema tree's two match predicates built six owned lists apiece to
+    /// return a `bool` — on a path (`nav_rows`) that rebuilds the whole visible
+    /// row list on every arrow key, per database and per namespace. On a
+    /// PostgreSQL database with 20 schemas that is tens of thousands of
+    /// `EnumInfo`/`DomainInfo`/`SequenceInfo` clones per keypress, ≥95% of them
+    /// discarded by the next `filter`. `objects_matching` had already been
+    /// given the cheap path with a paragraph saying why; these were the sites
+    /// that did not follow.
+    ///
+    /// Scoped to the bodies of the five methods, not to the file: `objects_all`
+    /// is the legitimate "all of them" answer and several callers want it.
+    #[test]
+    fn no_narrowing_object_query_goes_through_the_whole_list() {
+        let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/schema.rs"))
+            .expect("this module's own source");
+        for name in [
+            "objects_in",
+            "objects_matching",
+            "objects_any",
+            "any_object_matches",
+            "any_object_in_matches",
+            "has_objects_in",
+        ] {
+            let at = src
+                .find(&format!("pub fn {name}("))
+                .or_else(|| src.find(&format!("fn {name}(")))
+                .unwrap_or_else(|| panic!("{name} is gone — this gate is stale"));
+            let end = src[at..].find("\n    }\n").expect("the end of the method") + at;
+            let body = &src[at..end];
+            assert!(
+                !body.contains("objects_all("),
+                "{name} routes through `objects_all`, which clones every object \
+                 in the database before the filter runs"
+            );
+        }
+    }
+
     #[test]
     fn matches_search_by_name_or_column() {
         let t = TableInfo {
@@ -7315,6 +7429,43 @@ mod tests {
         // …and each folder scopes to its namespace like every other one.
         assert!(s.objects_in(Some("sales"), ObjectKind::Function).is_empty());
         assert_eq!(s.objects_in(Some("sales"), ObjectKind::Procedure).len(), 1);
+    }
+
+    /// The three `bool` questions the schema tree asks per keystroke, which
+    /// used to be answered by building the owned list and testing it. They are
+    /// in core so they can be tested at all, and because the view keeps a thin
+    /// wrapper over core rather than the logic.
+    ///
+    /// The namespace and the needle both have to bite, and separately: a
+    /// predicate that dropped either term would answer `true` for the whole
+    /// database and the filter would stop hiding anything.
+    #[test]
+    fn the_trees_object_filters_answer_without_building_a_list() {
+        let s = objects();
+        // A name that is there, in the namespace that has it. `email` is the
+        // fixture's one object that lives in exactly one namespace — `mood`
+        // and `settle` are in both, deliberately, and would answer `true`
+        // either way.
+        assert!(s.any_object_matches("email"));
+        assert!(s.any_object_in_matches(Some("sales"), "email"));
+        // The same name, asked of the wrong namespace.
+        assert!(!s.any_object_in_matches(Some("public"), "email"));
+        // …and the mirror, so the namespace term cannot be passing by being
+        // wrong in one direction only.
+        assert!(s.any_object_in_matches(Some("public"), "counter"));
+        assert!(!s.any_object_in_matches(Some("sales"), "counter"));
+        // A name that is nowhere.
+        assert!(!s.any_object_matches("no_such_object"));
+        assert!(!s.any_object_in_matches(Some("sales"), "no_such_object"));
+        // An empty needle matches nothing, following `object_name_matches` —
+        // a caller that means "no filter" is asking `has_objects_in`.
+        assert!(!s.any_object_matches(""));
+
+        // …which is the other question, and it is about presence, not names.
+        assert!(s.has_objects_in(None), "the flat case: anything anywhere");
+        assert!(s.has_objects_in(Some(Some("sales"))));
+        assert!(!s.has_objects_in(Some(Some("nowhere"))));
+        assert!(!DbSchema::default().has_objects_in(None));
     }
 
     /// A remembered palette hit carries `(namespace, kind, name)` and nothing

@@ -246,19 +246,16 @@ pub(crate) fn object_icon(kind: ObjectKind) -> &'static str {
 /// The database and namespace filters both need this, because a search for a
 /// type would otherwise hide the very database that defines it — the level above
 /// is dropped before the folder holding the match is ever reached.
+/// Both are thin wrappers over core, and both were the expensive spelling
+/// before: six owned lists per call, built to return a `bool`, from
+/// `db_row_matches` — which runs per database on every filter keystroke, and
+/// per namespace besides. See `DbSchema::any_object_matches`.
 fn has_object_match(schema: &DbSchema, filt: &str) -> bool {
-    ObjectKind::ALL
-        .into_iter()
-        .any(|k| schema.objects_all(k).iter().any(|o| o.matches_search(filt)))
+    schema.any_object_matches(filt)
 }
 
 fn namespace_has_object_match(schema: &DbSchema, ns: &str, filt: &str) -> bool {
-    ObjectKind::ALL.into_iter().any(|k| {
-        schema
-            .objects_in(Some(ns), k)
-            .iter()
-            .any(|o| o.matches_search(filt))
-    })
+    schema.any_object_in_matches(Some(ns), filt)
 }
 
 /// Does this database's row survive the filter?
@@ -1677,7 +1674,9 @@ fn db_node(conn: ConnNode, ctx: SchemaTreeCtx) -> impl IntoView {
                         // match; otherwise show the empty-schema hint — but a
                         // database can hold types and no tables, and saying "No
                         // tables" above a list of them would be a flat lie.
-                        let none = object_groups(&schema, TableScope::Flat).is_empty();
+                        // Asked, not built: `object_groups` clones every object
+                        // in the database to answer whether there is one.
+                        let none = !schema.has_objects_in(None);
                         return if filtering {
                             objects.into_any()
                         } else if none {
@@ -1838,7 +1837,8 @@ fn schema_node(
                 ctx.clone(),
             );
             if tables.is_empty() {
-                let none = object_groups(&schema, TableScope::Namespace(&ns_children)).is_empty();
+                // Asked, not built — see the flat case above.
+                let none = !schema.has_objects_in(Some(Some(&ns_children)));
                 return if filtering {
                     objects.into_any()
                 } else if none {
