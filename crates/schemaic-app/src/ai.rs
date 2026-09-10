@@ -566,19 +566,39 @@ fn owner_in(name: &str, prefix: &str) -> Option<crate::liveness::Owner> {
 /// assistant reads is text the user did not write, and `../connections.json` was
 /// one relative path away from it.
 ///
-/// `None` when no directory could be created, and the caller must then spawn
-/// with no `current_dir` at all rather than fall back to a shared one.
+/// **`None` is a refusal, not a fallback**, and it used to be neither. The three
+/// spawn sites read `if let Some(d) = &cwd { cmd.current_dir(d); }`, so a `None`
+/// simply did not set one — and "no `current_dir`" is not neutral: the child
+/// inherits *Schemaic's own* process working directory, which is the exact
+/// hazard the two paragraphs above are about. Launch the app from a
+/// world-writable directory another local account has seeded with
+/// `.claude/settings.json` and that file's `hooks` run as this user on the next
+/// Ctrl+K; launch it from a project and every AI turn silently answers to that
+/// project's `.claude/settings.json` and `AGENTS.md`. The state that reaches it
+/// is an unwritable `std::env::temp_dir()` — a read-only `/tmp`, a full disk, a
+/// locked-down `TMPDIR` — which is rare and is not a reason to degrade into the
+/// thing being defended against.
+///
+/// So there are **two** bases before the refusal. The config directory is the
+/// second because `mcp_dir` already proves it usable and it is owner-only by
+/// construction; the session directory sits *inside* a private subdirectory
+/// there rather than beside `connections.json`, which is what the paragraph
+/// above forbids. If neither can produce a fresh exclusive directory, callers
+/// refuse the turn.
 fn session_cwd() -> Option<PathBuf> {
-    let base = std::env::temp_dir();
     let owner = crate::liveness::me();
-    for _ in 0..8 {
-        let path = base.join(format!(
-            "{RUN_DIR_PREFIX}{}-{}",
-            owner_segment(owner),
-            random_tag()
-        ));
-        if create_exclusive_dir(&path).is_ok() {
-            return Some(path);
+    let mut bases = vec![std::env::temp_dir()];
+    bases.extend(persist::private_dir("ai-run"));
+    for base in bases {
+        for _ in 0..8 {
+            let path = base.join(format!(
+                "{RUN_DIR_PREFIX}{}-{}",
+                owner_segment(owner),
+                random_tag()
+            ));
+            if create_exclusive_dir(&path).is_ok() {
+                return Some(path);
+            }
         }
     }
     None
@@ -586,6 +606,20 @@ fn session_cwd() -> Option<PathBuf> {
 
 /// Prefix of the per-session working directories, in the system temp directory.
 const RUN_DIR_PREFIX: &str = "schemaic-run-";
+
+/// What the user is told when [`session_cwd`] can produce no directory.
+///
+/// **A refusal, not a degradation.** Spawning without a `current_dir` is not
+/// "no working directory" — the child inherits Schemaic's own, and a CLI
+/// resolves `.claude/settings.json` and `AGENTS.md` relative to wherever it
+/// finds itself. One wording for all three spawn paths, on the same grounds
+/// [`no_tools_note`] gives: the failure was that each said something different,
+/// and two of them said nothing.
+const NO_CWD: &str = "**The assistant could not start.** Schemaic gives every agent process a \
+     private working directory of its own, and neither the system temp \
+     directory nor the config directory would take one — so there is nowhere to \
+     run it that is not somebody else's directory. Check that the temp \
+     directory is writable and try again.";
 
 /// `mkdir` — **not** `mkdir -p` — at `0o700` where the platform has modes.
 ///
@@ -767,7 +801,12 @@ pub(crate) struct InlinePlan {
     /// Where Codex was told to write its answer; deleted after it is read.
     last_message: Option<PathBuf>,
     /// The working directory this generation's child runs in, removed with it.
-    cwd: Option<PathBuf>,
+    ///
+    /// **Not optional**, because "no working directory" is not neutral: the
+    /// child would inherit Schemaic's own, which is the directory
+    /// `session_cwd`'s doc calls the hazard. A session that cannot get one is
+    /// refused instead.
+    cwd: PathBuf,
     env: Vec<(std::ffi::OsString, std::ffi::OsString)>,
 }
 
@@ -855,13 +894,19 @@ pub(crate) fn inline_plan(
         }
         return Err(why);
     }
+    let Some(cwd) = session_cwd() else {
+        if let Some(p) = &last_message {
+            let _ = std::fs::remove_file(p);
+        }
+        return Err(NO_CWD.to_string());
+    };
     Ok(InlinePlan {
         bin,
         args,
         harness,
         output,
         last_message,
-        cwd: session_cwd(),
+        cwd,
         env,
     })
 }
@@ -895,9 +940,7 @@ pub(crate) async fn run_inline(plan: InlinePlan) -> Result<String, String> {
     // Claude, the default harness, has only the cwd standing between it and
     // that. `plan.cwd` is a directory created for this generation and removed
     // with it.
-    if let Some(d) = &plan.cwd {
-        cmd.current_dir(d);
-    }
+    cmd.current_dir(&plan.cwd);
     // **Clear before set, the same order the session path states in a comment.**
     // The two key sets are disjoint today, which is the only reason the reverse
     // order was harmless — and `OPENCODE_CONFIG_DIR`, already in the cleared
@@ -921,10 +964,8 @@ pub(crate) async fn run_inline(plan: InlinePlan) -> Result<String, String> {
         let _ = std::fs::remove_file(p);
         t
     });
-    if let Some(d) = &plan.cwd {
-        // Empty-only, for the reason `AiSession::drop` gives.
-        let _ = std::fs::remove_dir(d);
-    }
+    // Empty-only, for the reason `AiSession::drop` gives.
+    let _ = std::fs::remove_dir(&plan.cwd);
     let out = ran?;
     let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
     let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
@@ -1289,6 +1330,25 @@ pub(crate) fn start_ai_session(
         return (tx, SessionPrivate::default());
     }
 
+    // **A private working directory, or no session at all.** Both spawn
+    // branches below used to read `if let Some(d) = &cwd`, so a `None` simply
+    // did not set one — and the child then inherited Schemaic's own, which is
+    // the directory `session_cwd`'s doc calls the hazard. Hoisted above both,
+    // and above the endpoint file, so a refusal writes nothing to disk first;
+    // one directory for the whole session, which is what the non-persistent
+    // branch already wanted.
+    let Some(cwd) = session_cwd() else {
+        let why = NO_CWD.to_string();
+        let _ = ai_tx.send(AiStreamMsg {
+            segs: vec![schemaic_core::transcript::Seg::Text(why.clone())],
+            done: true,
+            is_error: true,
+            stats: None,
+        });
+        refuse_every_turn(handle, rx, ai_tx, why);
+        return (tx, SessionPrivate::default());
+    };
+
     let endpoint = endpoint_json(
         &db,
         database.as_deref(),
@@ -1310,8 +1370,7 @@ pub(crate) fn start_ai_session(
         // One directory for the whole session, though the children are one per
         // turn: they run the same conversation, and a directory per turn would
         // be a directory per turn left behind when the app is killed.
-        let cwd = session_cwd();
-        let private = SessionPrivate::of([ep_file.clone()], cwd.clone());
+        let private = SessionPrivate::of([ep_file.clone()], Some(cwd.clone()));
         // **The same list Claude's `--allowedTools` gets**, so no two harnesses
         // can disagree about what this connection's access level offers.
         let allowed = ai_allowed_tools(data.may_query(), schema_scope != SchemaScope::None);
@@ -1472,9 +1531,7 @@ pub(crate) fn start_ai_session(
                     cmd.env_remove(k);
                 }
                 cmd.envs(oc_env.iter().map(|(k, v)| (k, v)));
-                if let Some(d) = &cwd {
-                    cmd.current_dir(d);
-                }
+                cmd.current_dir(&cwd);
                 let child = cmd
                     // **Never piped.** `codex exec` reads stdin when it is a
                     // pipe and appends it to the prompt as a `<stdin>` block —
@@ -1637,8 +1694,7 @@ pub(crate) fn start_ai_session(
     // was `mcp_cfg` alone — `None` for all three of the others — so the
     // Antigravity endpoint file, plaintext password and all, was never unlinked
     // by anything.
-    let private = SessionPrivate::of([mcp_cfg.clone(), agy_ep.clone()], session_cwd());
-    let cwd = private.cwd.clone();
+    let private = SessionPrivate::of([mcp_cfg.clone(), agy_ep.clone()], Some(cwd.clone()));
     let agy_bin = bin.clone();
     let mcp_cfg_arg = mcp_cfg.as_ref().map(|p| p.to_string_lossy().into_owned());
     let spec = schemaic_ai::harness::TurnSpec {
@@ -1716,9 +1772,7 @@ pub(crate) fn start_ai_session(
         let spawn_child = |args: Vec<String>| {
             let mut cmd = Command::new(&bin);
             cmd.args(args);
-            if let Some(d) = &cwd {
-                cmd.current_dir(d);
-            }
+            cmd.current_dir(&cwd);
             cmd.stdin(Stdio::piped())
                 .stdout(Stdio::piped())
                 // Capture stderr (was discarded): a failing CLI — e.g. an expired
@@ -3157,6 +3211,62 @@ mod tests {
     /// because the model falls back to writing the fenced block from the schema
     /// it already has and the user sees a preview either way.
     ///
+    /// **Every agent spawn sets a working directory, unconditionally.**
+    ///
+    /// The three sites read `if let Some(d) = &cwd { cmd.current_dir(d); }`, so
+    /// a `session_cwd()` that could produce nothing simply did not set one —
+    /// and that is not neutral: the child inherits Schemaic's own process
+    /// working directory, where a CLI resolves `.claude/settings.json` and
+    /// `AGENTS.md`. Launch the app from a world-writable directory another
+    /// local account has seeded and that file's `hooks` run as this user on the
+    /// next Ctrl+K; launch it from a project and every turn silently answers to
+    /// that project's configuration.
+    ///
+    /// `InlinePlan::cwd` is now a `PathBuf` and `start_ai_session` resolves one
+    /// before either branch, so the type carries it — but a *fourth* spawn is
+    /// what the type cannot reach, and the conditional form is exactly what it
+    /// would be written as. Hence the source check, in `source_gate`'s idiom.
+    #[test]
+    fn no_agent_spawn_sets_its_working_directory_conditionally() {
+        let src = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("src")
+                .join("ai.rs"),
+        )
+        .expect("this file's own source");
+        let body = production_code(&src);
+        // The needle is split so this assertion is not itself a match — the
+        // same trick `Target::running_sleeps_sql` uses on its own marker.
+        let conditional = format!("cmd.current{}(d)", "_dir");
+        assert!(
+            !body.contains(&conditional),
+            "a spawn sets its working directory behind an `if let Some` — a \
+             session that cannot get a private directory must be refused \
+             (`NO_CWD`), not run in whatever directory the app was launched from"
+        );
+        // And every `Command` built here does set one. Counted rather than
+        // matched pairwise: a new spawn shows up as an imbalance.
+        assert_eq!(
+            body.matches("Command::new(").count(),
+            body.matches("current_dir(").count(),
+            "a `Command` in this file does not set a working directory"
+        );
+    }
+
+    /// This file's production half: comment lines dropped, so prose naming a
+    /// call is not itself one, and everything from the first `#[cfg(test)]`
+    /// onward cut, so a test's own fixtures are not production either.
+    fn production_code(src: &str) -> String {
+        let head = match src.find("#[cfg(test)]") {
+            Some(at) => &src[..at],
+            None => src,
+        };
+        head.lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
     /// **Both axes, and the second one was hard-coded to `true`.** The rule is
     /// stated per *level*, and there are two of them: `AiData` and *Schema
     /// context*. This iterated only the first and passed `schema: true` as a
