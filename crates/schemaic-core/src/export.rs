@@ -3179,6 +3179,21 @@ mod tests {
                 ident_sql(name, MySql)
             );
         }
+        // **The fourth table, which this test's doc already claimed to
+        // cover.** `filter::quote_char` feeds `sqlparser`'s
+        // `Ident::with_quote`, which takes a `char` and so cannot be handed
+        // `ident_sql`'s output — it derives the character from it instead, and
+        // this is what says so. Its SQLite arm had no test anywhere.
+        for d in [MySql, Postgres, Sqlite] {
+            let q = crate::filter::order_by_quote_for_test(d);
+            assert_eq!(
+                ident_sql("", d),
+                format!("{q}{q}"),
+                "the ORDER BY quote disagrees with ident_sql on {d:?}"
+            );
+            // And it really is a quote, not a fallback.
+            assert!(q == '`' || q == '"', "{d:?} -> {q:?}");
+        }
     }
 
     /// The pattern quoter is not a fifth identifier quoter: on a name holding

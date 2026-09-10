@@ -3919,12 +3919,12 @@ mod engine_comparison_gate {
 /// and lit Preview SQL, and the first thing that said no was Apply. Three
 /// findings in one family (B11.1-L2-01, B11.2-L2-01, B11.3-L2-01), found one
 /// editor at a time, because each door is written where its own modal is and
-/// nothing looked at the eleven together.
+/// nothing looked at the fifteen together.
 ///
 /// The gate is spelled over the **stamp**, not over a list of function names:
 /// writing `read_only: ctx.read_only` into a target is what makes a function one
-/// of these doors, so a twelfth editor is caught the moment it is written rather
-/// than when someone remembers to add it here. The refusal has to come *before*
+/// of these doors, so a sixteenth editor is caught the moment it is written
+/// rather than when someone remembers to add it here. The refusal has to come *before*
 /// the stamp, which is also the order that keeps a half-opened modal off the
 /// screen.
 #[cfg(test)]

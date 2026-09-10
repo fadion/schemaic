@@ -287,14 +287,32 @@ fn parse_condition(cond: &str, dialect: SqlDialect) -> Result<Expr, FilterError>
     Ok(expr)
 }
 
-/// Identifier quote character for the dialect (backtick on MySQL, double-quote on
-/// Postgres and SQLite) — used when we emit an `ORDER BY` column via the AST.
-/// Matches what [`crate::export::ident_sql`] emits, which is the authority.
+/// Identifier quote character for the dialect — used when we emit an `ORDER BY`
+/// column via the AST, because `sqlparser`'s `Ident::with_quote` takes a `char`
+/// and cannot be handed a rendered string.
+///
+/// **Derived from [`crate::export::ident_sql`], not restated beside it.** This
+/// was a fourth per-dialect quote table, sitting outside
+/// `every_identifier_quoter_agrees_with_ident_sql` — the test whose own doc
+/// claims to cover every one — with its SQLite arm untested anywhere. The
+/// invariant is "one identifier quoter"; a `char` the authority cannot be asked
+/// for is the same drift with a narrower type. So it is asked: the first
+/// character of a quoted **empty** name is the opening quote, by construction.
+///
+/// The fallback cannot be reached (`ident_sql` always emits a quote pair), and
+/// `the_order_by_quote_is_ident_sqls_own` asserts that for all three engines.
 fn quote_char(dialect: SqlDialect) -> char {
-    match dialect {
-        SqlDialect::MySql => '`',
-        SqlDialect::Postgres | SqlDialect::Sqlite => '"',
-    }
+    crate::export::ident_sql("", dialect)
+        .chars()
+        .next()
+        .unwrap_or('"')
+}
+
+/// [`quote_char`], for the workspace-wide agreement test. Not a second
+/// implementation — it *is* the function above, which is the point.
+#[cfg(test)]
+pub(crate) fn order_by_quote_for_test(dialect: SqlDialect) -> char {
+    quote_char(dialect)
 }
 
 /// Quote an identifier as a string, doubling any embedded quote character.

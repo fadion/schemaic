@@ -228,6 +228,18 @@ existing prose was left alone.
     engine now fills in the table rather than hoping a `!=` falls the right way. `comment_open` is
     the classification half, exposed because `pairs::region_at` has to tell a comment span from a
     string span after the lexer has found one and was answering it with its own byte test.
+    **`noncode_kind` → `NonCode::{Comment, Literal, Identifier}` is the whole of that
+    classification, and it is here for the same privacy wall.** A caller that has to *colour* or
+    label a span rather than skip it needs the same per-dialect predicates the scanner uses, and the
+    syntax highlighter was instead asking `skip_noncode` where a span ran — dialect-aware — and then
+    classifying it by its opening byte with no dialect at all, in a `match` whose arms were
+    `` ` ``, `'`/`"`, and everything else a comment. `skip_noncode` also answers `Some` for `$` on
+    PostgreSQL and `[` on SQLite, so both fell onto the comment arm: **every dollar-quoted function
+    body and `DO` block in a PostgreSQL editor was greyed out as though commented**, every
+    bracket-quoted identifier on SQLite was, and `"Name"` painted as a string on the two engines
+    where it is a name. The highlighter's own field doc promised the opposite — the `#` half worked
+    and the `$tag$` half was exactly inverted. `None` exactly where `skip_noncode` answers `None`,
+    which is what makes a `$` opening no valid tag ordinary punctuation on both sides.
     **The AI read-only gate's allowed heads are a per-dialect list too** — `read_only_heads`, which
     `read_only_reason` both tests against and builds its rejection message from:
     `SELECT/SHOW/DESCRIBE/DESC/EXPLAIN/WITH` on MySQL, `SELECT/SHOW/EXPLAIN/WITH` on PostgreSQL
@@ -307,6 +319,130 @@ existing prose was left alone.
     the user as "fix these 2 problems". Both of its arms are **half-open**, the zero-width one
     included: a point sitting on a statement boundary belongs to the range that starts there, and
     read inclusively it was reported for both neighbours at once.
+    **A keyword's position is not its meaning, and the diagnostics' worst false positives were all
+    that one mistake.** `table_refs_with_pos` reads every `FROM`/`JOIN`/`INTO`/`UPDATE` as opening a
+    table list, which is right for a subquery's `FROM` and wrong inside a call: SQL spells four
+    functions with a `FROM` between their parentheses (`EXTRACT(YEAR FROM order_date)`,
+    `TRIM(BOTH ' ' FROM note)`, `SUBSTRING(note FROM 1 FOR 3)`/`SUBSTR`,
+    `OVERLAY(a PLACING b FROM 1 FOR 2)`), and `SELECT EXTRACT(YEAR FROM order_date) FROM orders`
+    drew a red ``Table `order_date` not found`` on both MySQL and PostgreSQL, on a statement MariaDB
+    10.11 runs. `SUBSTRING(note FROM 1 FOR 3)` escaped only by luck — its operand is a digit, and a
+    digit is not `is_word_start`. `from_separates_call_arguments` is an **allowlist of those
+    functions, not "any call"**, because the tempting rule ("a `(` directly preceded by a word is a
+    call") sorts a subquery onto the wrong side: `FROM (SELECT …)`'s paren is also preceded by a
+    word, namely `FROM`. Naming the functions cannot reach a subquery at all, and the standard's list
+    of them is closed. `enclosing_call_name` — the word before the innermost *unmatched* `(` — is the
+    shared primitive, and `as_introduces_a_type` is its second caller: `CAST(x AS CHAR)` puts a
+    **type** after `AS`, so every MySQL cast target that is also a reserved word (`CHAR`, `UNSIGNED`,
+    `DECIMAL`, `BINARY`, `CHARACTER`) was squiggled as a botched alias; `SIGNED` escaped only by
+    being absent from `MYSQL_RESERVED` and `CONVERT(a, CHAR)` by not using `AS`, which is what says
+    the `AS` form is the whole of it. It is answered off the token walk rather than the AST because
+    `alias_checks` runs unconditionally, parse failure included — gating it on a parse would miss the
+    real thing the diagnostic is for, since sqlparser *accepts* `AS or`.
+    **`INTO` names a table only after `INSERT`/`REPLACE`** (`insert_precedes`), because the word has
+    three other meanings and none of them does: PostgreSQL's legacy `SELECT a INTO newtbl FROM t`
+    names the table it is about to *create*, and MySQL's `SELECT a INTO @x` and
+    `INTO OUTFILE`/`DUMPFILE` name no table at all — `@` is not `is_word_start`, so `@x` tokenized as
+    the bare word `x` and looked exactly like one. Both drew a confident ``Table `x` not found``,
+    with no hedging available, because the active database *is* loaded and `table_status` therefore
+    has no `Unknown` arm to fall back on. It asks the previous word *or* the statement's leading
+    keyword, so `INSERT IGNORE INTO t`, `REPLACE DELAYED INTO t` and PostgreSQL's data-modifying
+    `WITH … INSERT INTO t` all still register their table.
+    **`is_implicit_alias` is "is this bare word an alias" written once instead of three times, and
+    the order of its two tests is the bug it fixes.** `is_table_ref_continuation` first, because
+    a join or clause keyword *ends* a table reference rather than naming it, and only then
+    `is_reserved_word`. Only SQLite showed it: `MYSQL_RESERVED` and `PG_RESERVED` both carry
+    `LEFT`/`INNER`/`CROSS`/`FULL`/`NATURAL`/`RIGHT`, so on those engines the reserved test alone
+    happened to reject them, while `SQLITE_RESERVED` holds only what SQLite refuses *as an alias* and
+    that engine accepts all seven as identifiers. So
+    `SELECT * FROM orders LEFT JOIN customers ON |` registered `orders` under the alias `LEFT`,
+    `ref_qualifier` preferred the alias, and both FK auto-join surfaces inserted
+    `"LEFT".customer_id = customers.id` — `no such column: LEFT.customer_id`. A bare `JOIN` was
+    unaffected, which is why it read as working. `alias_checks` had the right order all along and is
+    the third caller; spelling it three times is what let two of them drift. A **quoted** word is
+    always an alias, so the caller checks `Tk::quoted` before asking.
+    **`is_table_ref_continuation` grew a `RETURNING` arm for the same reason**, one keyword further
+    on: it ends the table reference of a data-modifying statement, and without it the alias check
+    read `RETURNING` as an alias for `zap` in `DELETE FROM zap RETURNING *` — reserved on
+    PostgreSQL, so the standard archive idiom was squiggled as broken. **Not dialect-gated**, because
+    MariaDB has `RETURNING` too.
+    **The typo checker is off where `FUNCTIONS` is not the engine's catalog** —
+    `builtin_functions_are_authoritative`, an exhaustive `match` answering true for MySQL only,
+    beside `ops` and `ident_quote` for the reason those are. That table's own doc says it is the
+    authoritative catalog of *MySQL/MariaDB* builtins, and the checker was spending its `dialect` on
+    `skip_noncode` and `is_sql_keyword` and never on the two catalog questions: on PostgreSQL it
+    failed to recognise the engine's real functions *and* measured its edit distances against another
+    engine's, so `btrim`, `to_number`, `make_date` and `make_time` — core builtins, verified on PG
+    16.15 — were all four squiggled as misspelled. Losing a nicety on two engines beats the app
+    calling correct SQL broken. **Writing `PG_FUNCTIONS`/`SQLITE_FUNCTIONS` is what flips it on** for
+    them, a data task `TODO.md` carries; an incomplete list would reintroduce the same false
+    positives for whatever it omits, which is why it is not attempted halfway.
+    **A builtin's name plus a `_` or a digit is a *derived* name, not a misspelling**, and
+    `is_probable_function_typo` refuses those outright. Its own doc already claimed the design
+    avoided flagging `format_x` as a typo of `FORMAT` — by not loosening the distance threshold —
+    but at length 8 the threshold is already 2, so it flagged it anyway, and `coalesce_x`,
+    `concat_ws2`, `instr2` and `md55` with it, all measured. Nobody misspells `FORMAT` by typing
+    every letter of it and then an underscore. **The separator is what keeps the rule narrow**: a
+    *letter* continuation is how a real typo looks, `SUBSTRIN` being `SUBSTR` plus `IN` and a dropped
+    `G` from `SUBSTRING`, so those are still flagged. It is the same shape as the transposition case
+    the function already carries — a named exception rather than a wider distance, because widening
+    the distance is what produced this class in the first place.
+    **Two facts about a FROM source that the resolver was not recording.** `Src::shadowed` is the
+    table name an alias **replaced**: an alias is a rename for the whole query rather than a second
+    name, and MariaDB 10.11.14 answers `SELECT employees.id FROM employees e` with
+    `ERROR 1054: Unknown column 'employees.id'`, PostgreSQL the same. `quals` used to carry both
+    spellings, so that statement resolved clean — and dropping the bare name from `quals` alone only
+    made the qualifier *unmodelled*, which is deliberately not flagged (a `db.table.col` reference
+    reaches the same arm). Recording what the alias hid is what lets the difference be *stated*, in
+    a message of its own that names the alias to qualify with, and it is
+    checked only after the whole scope chain has failed so `FROM employees e JOIN employees` still
+    resolves. `Src::defines` is the byte range of the subquery a derived table or CTE is the body of,
+    and a reference **inside** that range must not resolve against it: the chain walks outwards so a
+    subquery can see an enclosing scope's tables, but never the source it is itself defining, and
+    `select_output_cols` names an unaliased projection item by the identifier itself — so the outer
+    source's columns *were* the misspelling. `SELECT nope FROM departments` was flagged and
+    `SELECT * FROM (SELECT nope FROM departments) d` was silent, which is the most common place for a
+    wrong column name to be.
+    **`dedup_diagnostics` is the last gate every offline diagnostic passes, and it had no test.** It
+    promises to drop what an earlier, *higher-or-equal severity* diagnostic already covers; the
+    severity half was only in the sort, and only at an equal start offset, so the coverage test read
+    no severity at all and a Warning that happened to start earlier swallowed a real Error inside it.
+    Not hypothetical: `cartesian_check` squiggles the whole derived table, so the unconstrained-join
+    warning hid the unknown column inside the subquery — the user was told the join was
+    unconstrained and not told the statement would fail.
+    `a_warning_does_not_swallow_the_error_inside_it` pins the composition and
+    `dedup_keeps_a_covered_diagnostic_only_when_the_cover_is_no_weaker` the four severity
+    combinations, which is what says the fix is about severity rather than about that one statement.
+    **The false-positive corpus is only half a defence on its own, and that is why there are now two
+    passes over it.** `diag_bare` builds `Catalog::build(&[], None)`, so `unqualified_db_loaded` is
+    false, `table_status` answers `Unknown` for every unqualified reference, and
+    `table_existence_checks` and the column resolver emit **nothing at all** — the whole
+    unknown-table/unknown-column tier is switched off inside the test written to guard against false
+    positives. That is how `SELECT EXTRACT(YEAR FROM hired_at) FROM employees` could squiggle a red
+    ``Table `hired_at` not found`` with the suite green: adding it to the old pass could not have
+    failed. So `valid_corpus` was lifted out of the test, and
+    `corpus_valid_queries_are_clean_against_a_loaded_catalog` re-runs its **catalog-true subset**
+    against `sample_catalog` with the tier on. A subset by necessity: a third of the entries name
+    `order`/`group`/`select` columns that catalog does not have, so there they are *correctly*
+    flagged, and running the whole list would assert the tier is off all over again. A filter that
+    stopped matching would let the test pass by running almost nothing, so it asserts a floor on how
+    many statements reached the catalog — the same failure mode `source_gate::crate_sources` guards
+    against for the UI's gates. The extra cases it carries (the FROM-separated calls, and two
+    subqueries as the control) run on **both** MySQL and PostgreSQL, since every test in that block
+    was MySQL and those bugs were on both.
+    **`FkEdge::table` is the declaring table's name in the case the server reported it**, and it
+    exists because the FK map is keyed on a *lower-cased* name so a reference can be looked up
+    however it was typed. `join_targets_for`'s reverse arm used that key for all three fields of the
+    suggestion it built, so on PostgreSQL a mixed-case table came back as `orderitems`,
+    `ident_if_needed` left an all-lower name unquoted (correctly, by its own rules), and accepting
+    the suggestion produced `relation "orderitems" does not exist`. Reproduced live on PG 16.15, and
+    equally broken on a MySQL server with `lower_case_table_names=0` — the Linux default, which is
+    why it is invisible on Windows. The forward arm was right for exactly the reason this one was
+    not: it takes the name from `FkEdge::ref_table`, stored in the server's own case, and this field
+    is that for the other end of the edge.
+    **`StarExpansion::columns` is carried rather than re-derived**: the completion row counted the
+    commas in the emitted SQL, which is the wrong quantity — a quoted identifier holding one
+    (`` `a,b` ``, legal on MySQL) over-reports — and the expander is the side that built the list.
     **`simple_select_source` is the one definition of "structurally simple enough to aim a write
     at"** — one statement, a `SELECT` body, no CTE, one `FROM` entry, no joins, a plain named table
     — shared by `filter::build_query` (which needs to know it may splice a `WHERE` into the
@@ -1681,6 +1817,19 @@ existing prose was left alone.
     getting either wrong is written down where it lands: two identical databases differ in every
     object holding one, and the migration carries the right database's name into a statement that
     runs against the left.
+    **One more answers for a trigger's *identity*, which is the one place the three engines genuinely
+    disagree about it.** `trigger_names_are_schema_scoped` asks whether a trigger's name has to be
+    unique across the whole schema rather than only within its own table — measured on all four
+    servers with `new_trigger` already sitting on a sibling table in the same database: MariaDB
+    10.11.14 `ERROR 1359: Trigger 'db.new_trigger' already exists`, MySQL 8.4.11 `ERROR 1359`,
+    SQLite 3.45.1 `trigger new_trigger already exists`, PostgreSQL 16.15 **accepted, both triggers
+    created**. `TriggerSetDraft::validate` states the same divergence and deliberately checks only
+    the narrow half, because one modal holds one table's set and that is the only scope it can see;
+    this predicate is asked by whoever *proposes* a name and has the wider list
+    (`ui::TriggerTarget::sibling_triggers`), so the `+` button stops offering a name the server will
+    refuse at apply — after any `DROP` in the same set has already committed on MySQL. Exhaustive
+    `match`, not a comparison: it is a fact about each engine's namespace rather than a capability
+    computed from a statement, so there is no `supports_change` to derive it from.
     `supports_database_editing` and `supports_namespace_editing` are the newest pair, for the
     **container** the rest of this module's objects live in: `CREATE`/`DROP DATABASE` on MySQL and
     PostgreSQL, and PostgreSQL's `CREATE`/`DROP SCHEMA`. They are two predicates rather than one
@@ -4624,6 +4773,18 @@ existing prose was left alone.
   - `sqlfmt.rs` — `format_sql` (Ctrl+Alt+L pretty-printer): re-flows whitespace/indent/line-breaks
     "block" style, **preserving keyword case**; built on `skip_noncode` so comments/strings/backtick
     idents pass through untouched; indent follows editor tab-width/soft-tabs.
+    **`formattable_range` is what decides how much of the document a Format may touch**, and it is
+    here rather than at the call site because `format_sql` lexes what it is handed **from byte 0**
+    and takes that for a real token boundary. True of a whole document and of a selection whose ends
+    are in code; false of one that begins inside a string, a quoted identifier or a comment. With
+    `select 1 -- keep a, b\nfrom t` and `keep a, b` selected, the fragment lexed as the words `keep`,
+    `a`, a comma and `b` — the comma broke, and the document became
+    `select 1 -- keep a,\nb\nfrom t` with `b` now *outside* the comment as a stray token, so the
+    statement no longer parsed. An empty selection is the whole document, which is what a bare caret
+    has always meant; a selection that is not formattable answers `None` rather than falling back to
+    the document, because silently reformatting every line the user did not select is the worse of
+    the two surprises. Both ends are asked through `pairs::region_at`, so the two halves of "is this
+    code" stay one answer.
   - `pairs.rs` — caret-driven, boundary-aware editor highlights + auto-close pairs (via
     `skip_noncode`): `auto_pair` (auto-close `()`/`''`/`""`/`` `` `` [MySQL] at code positions, wrap a
     selection, type-over a closer/quote already at the caret — respects string/comment regions and
@@ -4650,6 +4811,27 @@ existing prose was left alone.
     reaches `tabs.json`. Three lookalikes have named regression tests, since each is one missing
     line from a false positive: PostgreSQL's `::` cast (consumed whole — skipping one byte leaves
     the shape of a placeholder), MySQL's `:=`, and a PostgreSQL array slice `arr[lo:hi]`.
+    **The slice rule is the one that keeps growing, and every gap in it is the same failure: an
+    unrunnable statement, not a cosmetic one.** A phantom row means `prepare_run` answers
+    `Err(Missing)`, which stops the run *before* the guard and so offers no "Run anyway" — there is
+    no way through the app at all. Three shapes say "subscript": a word byte immediately before
+    (`arr[1:2]`), a `]` immediately before (`m[1][2:3]`), and an **open** `[` —
+    `subscript_open_before`, for PostgreSQL's open-ended lower bound `arr[:hi]`, which all three
+    existing slice tests had missed by writing a lower bound. The first two look at the byte
+    *immediately* before rather than the last non-space one, since `SELECT :a` has its `T` a space
+    away and skipping the space would swallow every placeholder in the language. The `[` rule does
+    look past whitespace, and then has to ask **what the bracket hangs off**, which is the whole of
+    that function: `ARRAY[…]` is a *constructor*, not a subscript, and a rule reading every `[` as a
+    slice reported `SELECT ARRAY[:a, :b]` as carrying only `:b` — the bar offered one row and
+    `substitute` left `:a` in the statement verbatim. `arr[` and `ARRAY[` are the same two bytes;
+    only what precedes them tells them apart, which `word_before` answers. Subscriptable hosts now
+    include a **quoted identifier** (`SELECT "my arr"[:hi]`, whose quotes `skip_noncode` has already
+    consumed, so only the closing byte is left to look at — and on SQLite a `[quoted identifier]`'s
+    `]` is the same byte and the same answer) and a **parenthesised expression or call**
+    (`(arr)[:hi]`, `(t.arr)[:hi]`, `f(x)[:hi]`, all legal and verified on PG 16.15), with
+    `ARRAY(SELECT …)` excluded for the constructor reason above. The paren walk refuses an
+    unbalanced input rather than guessing, which is the direction that keeps a real parameter
+    visible.
     `prepare_run` is the pair the run action calls — substitute, then `sql::run_verdict` on the
     result — so the ordering is structural rather than a rule a caller has to remember, and
     `strip_param_diagnostics` drops the reports `neutralize`'s own rewrite caused. Pure +
@@ -7915,9 +8097,35 @@ existing prose was left alone.
     because `min-width: auto` applies to *every* flex item: relaxing it on the container left the
     status inside with taffy's automatic minimum, so it never compressed, `text_ellipsis` never had a
     narrower box to end a line in, and the documented contract could not be kept by a caller who did
-    everything right. Ten of the twelve callers had noticed and were spelling
-    `status.style(|s| s.min_width(0.0))` themselves — a helper whose contract only holds if the
-    caller repeats half of it is one that will keep being called wrong.
+    everything right. Eight of the seventeen call sites had noticed and were spelling
+    `status.style(|s| s.min_width(0.0))` themselves; the other nine were not — a helper whose
+    contract only holds if the caller repeats half of it is one that will keep being called wrong.
+    **`footer_error` is that row's left half when a draft doesn't validate**, and it exists because
+    there were six copies of it — byte-identical in five (`table_designer`, `trigger_editor`,
+    `view_editor`, `event_editor`, `routine_editor`; `object_editor` differed only in the number) and
+    each freezing its box at `max_width(460.0)` while the `font_size` beside it scaled, so at
+    **Huge** the longest messages these render wrapped to two or three lines inside a footer whose
+    height is fixed (see the size invariant). The width is a **wrap hint rather than a demand**:
+    `modal_footer_split` lets the status shrink to nothing and never shrinks the actions, so a modal
+    too narrow for the bound simply wraps earlier — which is why one number serves the 700-wide
+    object editor and the 900-wide rest, and why `object_editor`'s 420 was over-specification rather
+    than a second decision.
+    **`noted_if_empty` is applied inside `open_picker`, so nothing to choose from is an answer
+    rather than silence.** `popup_menu_overlay` builds a panel for any `Some`, and for an empty list
+    its height sums to the padding and border alone while its measured width is zero — so it clamps
+    to the `popup_width` floor and draws an empty bordered box under the control, which then eats the
+    click meant to dismiss it. Declining to open at all is worse in the way that matters: the box
+    looks pressable, answers with nothing, and is indistinguishable from one that is broken, which is
+    how it was reported the first time. So the empty list becomes one **disabled** row reading
+    "Nothing to choose from". `table_designer::suggest_chevron` already had that arm and its own
+    note; its sibling `focusable_owned_dropdown` — the wrapper behind every dropdown in the designer,
+    the object editor, the trigger editor, the view editor, the event editor and the routine editor —
+    did not, and is reachable empty in each of them wherever the list comes from a fetch or a schema
+    that has not loaded (*Create ▸ Table* on an unexpanded database, then Foreign keys ▸ + ▸
+    **References table**). Putting the arm at the **door** rather than in a wrapper's parameter list
+    is what makes it one answer for every picker present and future; a caller with something more
+    specific to say hands over a list that is already non-empty, which is what `suggest_chevron`
+    does and why its own wording still wins.
     Also the **read-only fact panel** — `fact_section` (a heading with its rows under it), `fact_row`
     (one `label: value` line) and `fact_note` (an icon-led caveat), the three views a panel of
     *observed* facts is built from. They were `properties.rs`'s private helpers until `users_view.rs`
@@ -8489,9 +8697,20 @@ existing prose was left alone.
     contain (a floem `Dropdown`, a captured `Color`, a raw pixel inset, an unguarded `exec_after`,
     a menu trigger that doesn't close its siblings, a document edit that doesn't ask whether the
     editor is frozen — `editor_pane`'s `editor_freeze_gate`, two tests, whose subject is under
-    *Floem 0.2 gotchas* — and an engine comparison with no capability behind it, `lib.rs`'s
+    *Floem 0.2 gotchas* — a text box whose `max_width` is a bare float while the `font_size` beside
+    it scales (`lib.rs`'s `scaled_text_width_gate`, whose subject is under *Architecture
+    invariants*, with the empty allowlist it should keep) — and an engine comparison with no
+    capability behind it, `lib.rs`'s
     `engine_comparison_gate`, which is a per-file budget with a written reason rather than a ban and
-    whose subject is under *Architecture invariants*). `production_code` strips every `#[cfg(test)]`
+    whose subject is under *Architecture invariants*).
+    **One of the family fails on a spelling that is *missing* rather than present**, and it reads
+    differently for that reason: `lib.rs`'s `read_only_door_gate` finds every schema-editor door by
+    the stamp it writes (`read_only: ctx.read_only,`) and asserts the refusal appears *above* it in
+    the same `fn`, so what it holds is an ordering rather than an absence. It needs the same two
+    halves regardless — the whole file scanned, and both view crates enumerated — and it carries the
+    other pattern this module made possible, an exemption list holding its reason as data
+    (`overlays.rs`, whose stamps are `PlanTarget`s) with an assertion that the exemption is still
+    *needed*, so a stale entry fails rather than accumulating. `production_code` strips every `#[cfg(test)]`
     **item** — brace-aware, skipping braces inside strings, chars and comments — and every `//`
     line; `crate_sources` enumerates the files to scan. Both halves exist because the idiom was
     written out eleven times across nine files and every copy had the same two holes. It cut each
@@ -9130,9 +9349,29 @@ existing prose was left alone.
     Apply alike, reachable by anything holding the bundle. Both forms re-seed from their target on
     open, so there is nothing to keep. `close_preview` is the same one-door idea for the preview
     itself, because `ddl.sql` is app-lifetime too and held the last plan's script for the life of
-    the process; there were two `set(None)` sites and a third would have had to remember. It is
-    defence in depth rather than the only line, `ddl.sql` being `export_script`'s output rather than
-    the real statement, which is why it is a one-line helper.
+    the process; there were two `set(None)` sites and a third would have had to remember. **That
+    clear is load-bearing rather than defence in depth**, and it changed sides without the helper
+    changing: it was the weaker thing while the box showed `ChangeSet::export_script`'s *redacted*
+    copy, and it now holds `ChangeSet::emit`'s statements, which for an account plan carry the real
+    password — see `open_preview` for why the box shows those. So it is the same rule as
+    `account_draft` and `grant_draft` above rather than a tidy-up beside them.
+    **`has_editor_behind` is the other reader of that same list, and the word on the preview's exit
+    button is what depends on it.** The label was a hand-spelled two-name test —
+    `designer.is_some() || view.is_some()` — while the canonical list of what stacks under the
+    preview sat in `close_peers` just above it, nine entries long. So seven of the nine editors got
+    **Cancel** on a button that does not cancel: `exit` resolves to `close_preview`, which writes
+    only `preview` and `sql`, so whichever editor signal is still `Some` re-renders with the draft
+    intact — and both `object_editor` and `database_editor` carry the comment "Cancel there returns
+    here with the draft intact", the code asserting the button is a **Back** while the button said
+    Cancel. It is one predicate rather than a third spelling, for the reason this file already gives
+    once about the five hand-written copies that had drifted.
+    **What holds the lists together is a test, not the compiler**, and knowing which is the
+    difference between trusting them and checking them: there are *three* nine-entry lists — this
+    one, `close_editors` and `modals::ddl_editors_up` — each hand-written, and
+    `every_editor_reaches_the_three_lists_that_must_know_about_it` raises each of the nine targets
+    **alone** and asserts all three see it. So they agree because something checks, which is the most
+    that is available while the nine are nine signals rather than one enumerable thing; nothing
+    structural stops a tenth editor being added to two of the three.
     **`DdlPreview::qualified` is a *different* question to `scope`, and both are read off the change
     set.** `scope` says which runner a plan takes; `qualified` says whether the plan is *in* a
     database and so whether the title bar writes `db.subject`. An account change is the case where
@@ -9326,6 +9565,19 @@ existing prose was left alone.
     form intact, with no "return to trigger" flag to be a second source of truth. `is_editable_trigger`
     is the entry point's gate: a constraint trigger's deferral settings aren't modelled, so it is
     listed and droppable but not editable, the call a materialized view gets.
+    **`TriggerTarget::sibling_triggers` is read at the door, because the modal cannot see far
+    enough.** On MySQL, MariaDB and SQLite a trigger name is unique across the whole *schema*
+    (`ddl::trigger_names_are_schema_scoped`), so the second table in a database to get a trigger
+    through the `+` button was offered `new_trigger` again — accepted by the form, accepted by
+    `TriggerSetDraft::validate`, which holds one table's set and legitimately checks only the narrow
+    half, and refused by the server at apply with `ERROR 1359`, *after* any `DROP` in the same plan
+    had already committed, naming a table the modal never mentioned. Widening the *scope* is what was
+    wrong; the suffix walk had already been fixed by sharing `unique_name`. So
+    `sibling_trigger_names` gathers every trigger name belonging to some other table in the database
+    off the schema the tree is showing — the way `object_editor` reads a type's dependents — and it is
+    **empty on PostgreSQL**, where the name is scoped to the table and avoiding a sibling's would
+    propose `new_trigger_2` for no reason the user can see; empty too until the database's schema has
+    loaded. Only `blank_trigger` reads it, and only to pick a name.
   - `routine_editor.rs` — the **stored routine** modal: one form for a function or a procedure,
     over `core::ddl`'s `RoutineDraft`, on both engines that have them. Reached from the schema
     tree's Functions/Procedures folders (row **Edit**, folder **Create**), from the database and
@@ -10894,6 +11146,15 @@ existing prose was left alone.
     `themes.rs` holds the data and the three runtime axes, including `UiScale` and the pure
     `scale_at`/`scale_font_at` rounding; `icons.rs` sizes every glyph, scaling the **base** size its
     callers pass.
+    `sql_highlight.rs` decides nothing about *where* a token is — both halves of that are
+    `core::sql`'s, and both used to be re-derived here. `lex_line` asks `skip_noncode` for the span
+    and `noncode_kind` for what the span **is**, instead of classifying it by its opening byte with
+    no dialect (which greyed out every PostgreSQL dollar-quoted body as a comment — see `core/sql.rs`
+    for the whole of that), and its word scan asks `sql::is_word_start`/`is_word_byte` rather than an
+    ASCII rule of its own: this was invariant 11's first site outside `core/sql.rs`, and it painted
+    `select` as a keyword *inside* the legal column name `éselect`, spans that reach the Ctrl+K diff
+    through `highlight_spans` too. `is_keyword` folds ASCII only, so a whole non-ASCII word now
+    correctly matches nothing.
     `preview_bg`/`preview_fg` are the surface and base text of a **syntax-coloured preview**, and
     they are named here rather than spelled at each site so the cross-axis gate in `contrast.rs`
     measures the surface the previews actually paint — the account browser's `GRANT` block is the
@@ -12957,6 +13218,14 @@ Re-introducing the anti-patterns these guard against is a regression:
   `intel::code_names` is `pub` so a *backend* can ask "does this SQL name this identifier, in code"
   through the same lexer rather than reaching for a `contains` — `db::sqlite`'s introspection asks
   it of every trigger in the database to fill `TableInfo::referring_ddl`.
+  **And it binds to a single byte as much as to a span.** `intel::scan_clauses` had to know whether
+  the projection contained a `*` — the tokenizer drops the byte — and asked `str::contains('*')`
+  over the SELECT-clause span: no boundary awareness and no dialect. So a star inside a string or a
+  comment counted as a projection, and `SELECT 'a*b', ` (an *empty* slot after the comma) offered
+  `FROM`, while `SELECT -- *` and `SELECT /* * */` offered `FROM` and suppressed `DISTINCT` with
+  nothing projected at all. It goes through `intel::code_mask` now — this module's own primitive for
+  the rule, and dialect-aware, which a `contains` cannot be — pinned by
+  `a_star_in_a_string_or_comment_is_not_a_projection`, which also asserts a real star still counts.
   **It's dialect-aware:** `skip_noncode`/
   `skip_comment` (and the `sql.rs` helpers built on them — `statement_bounds`/`ranges`/`range`/
   `first_statement`, `statement_bounds_open` (the resumable form the script splitter feeds),
@@ -13026,6 +13295,14 @@ Re-introducing the anti-patterns these guard against is a regression:
   `pub(crate)` so `core::pairs` can ask it at its two sites rather than hand-spelling
   `!= SqlDialect::Postgres`, which agreed for all three engines today and could survive neither a
   fourth nor a change at the definition, since it would move one and not the other.
+  **Two of the newest members answer with an exhaustive `match` rather than being computed**, and
+  they are the shape to copy when there is no statement to probe. `ddl::trigger_names_are_schema_scoped`
+  is a fact about each engine's *namespace* — whether a trigger name is unique per schema or per
+  table — measured on all four servers rather than derived from `supports_change`, and
+  `intel::builtin_functions_are_authoritative` is a fact about whose builtin catalog `FUNCTIONS`
+  actually is. Neither has a capability to be computed from, so the compiler's exhaustiveness is
+  the only thing that will make a fourth engine answer instead of inheriting whichever side a `==`
+  left open — which is exactly what happened to the typo checker on PostgreSQL and SQLite.
   **The rule has a gate now, and it is a ratchet rather than a ban.** `ui::engine_comparison_gate`
   scans both view crates' production source (`source_gate::crate_sources`, so `schemaic-app` is in
   it too) for `SqlDialect::` and holds each file to a **per-file budget with a written reason**,
@@ -13295,6 +13572,28 @@ Re-introducing the anti-patterns these guard against is a regression:
   (`track_h / 2.0`) — the last two were a literal `9.0`, which is a rounded square at 160%. It is
   *not* the `SEGMENT_RADIUS` case (a shape inside a box that scales), and grepping for an unwrapped
   literal cannot tell the two apart.
+  **`max_width` is the sub-class where a frozen number is a legibility bug rather than a cosmetic
+  one, and it turned out to be a class of fourteen.** It is the one geometry property in
+  `schemaic-ui` that always bounds *type* — a validation message, a warning paragraph, a diagnostic
+  tooltip, the completion popup — and the `font_size` beside it scales in every one of those, so a
+  bare literal is a box that stays 460px while the sentence inside it grows ~1.6× at **Huge**, and
+  floem's default `TextOverflow::Wrap` then turns a one-line error into two or three inside a footer
+  whose height is fixed. The messages it happens to are the longest ones each draft produces, which
+  are the ones the user needs to read. The review filed **four** sites in two files; there were
+  fourteen across ten, the other ten being the same line copied into `object_editor`,
+  `event_editor`, `routine_editor`, `completion`, `ddl_preview`, `editor_pane` and `import_view` —
+  a finding filed against two files turning out to be a class. Six of the fourteen were the schema
+  editors' footer status, byte-identical in five, and are now `widgets::footer_error`.
+  `table_designer`'s own `width_scale_tests` block exists for exactly this defect and could see none
+  of them: it enumerates the file's `fn() -> f64` width functions, and a literal written inside a
+  `.style(move |s| …)` closure is not one. `ui::scaled_text_width_gate` is the source gate over
+  `.max_width(`/`.max_height(` with a bare float, and it starts with an **empty** allowlist and
+  should keep one. Deliberately narrow: `min_width`/`min_height` carry 220-odd literals in the
+  crate and nearly all are `0.0` (the flex contract `widgets::modal_footer_split` documents) or a
+  floor in the tens of pixels that keeps a column from vanishing, and `width`/`height` at
+  `1.0`/`2.0` are hairlines and scrollbar geometry — a border's question rather than a font's. Those
+  want their own argument, and a gate that swept them in would have needed a thirty-line allowlist
+  on day one, which is how a ratchet becomes laundering.
 - **Pure logic lives in `schemaic-core` with unit tests** — SQL boundaries, edit-model analysis,
   export (incl. CSV formula-injection guard), diff, DDL. The UI keeps thin wrappers.
   **One function in the crate breaks the no-filesystem rule its tests otherwise keep, and it is a
@@ -13491,6 +13790,27 @@ Re-introducing the anti-patterns these guard against is a regression:
   one-click terminate all ask at the click, through the app-side `may_launch_destructive` re-export
   of the same function, and a refusal says why in the panel's `kill_error` line rather than doing
   nothing.
+  **The rule reaches the schema editors' *doors* as well, and there it has a gate.** Fifteen doors
+  across eight files stamp `EditCtx::read_only` into the target they open; **three already refused**
+  (`account_editor`'s two and `database_editor`'s one, which is where the rule was stated in the
+  imperative) and the other twelve did not. Apply is refused on that same stamp downstream, so **no
+  write ever escaped** — what failed the rule was the door. On a connection marked read-only the
+  schema tree's double-click, its keyboard activation,
+  Find-Anywhere, **Edit table**, **Edit column**, **Edit index**, **Triggers**, **Edit view** and the
+  Properties panel's handoff each opened a fully live form, counted the changes and lit Preview SQL,
+  and the first thing that said no was Apply. That is the same defect as the disabled button: the
+  refusal arrived a step late, and it arrived after the user had done the work. It was filed three
+  times as three findings, one editor at a time, because each door is written where its own modal is
+  and nothing looked at the fifteen together. Each now answers `if ctx.read_only { return; }` before
+  writing any signal — which is also the order that keeps a half-opened modal off the screen — and
+  `ui::read_only_door_gate` holds it. The gate is spelled over the **stamp** (`read_only:
+  ctx.read_only,`) rather than over a list of function names, so a new editor is caught the
+  moment it is written instead of when someone remembers to add it; it asserts it still found all
+  fifteen, since a renamed field would otherwise pass it by finding none, and it holds its
+  one exemption as *data* with the reason attached — `overlays.rs` stamps the flag into two
+  `ddl_preview::PlanTarget`s, which capture the context a Drop-container menu fired in so the
+  confirmation cannot be answered against a connection the user switched to meanwhile; the refusal
+  on that stamp is `preview_container`'s and there is no door there to guard.
 - **No floem `Dropdown` — every `<select>` in the app drops the app's own menu.** A control that
   offers a fixed list is built with `settings::in_ring_picker` (or one of its two thin wrappers,
   `focusable_dropdown` and `table_designer::focusable_owned_dropdown`); nothing constructs a
@@ -13682,6 +14002,28 @@ Re-introducing the anti-patterns these guard against is a regression:
   runs. Don't inline the predicate at a new scanner — there were four copies of each, no test
   comparing them, and the rule had already been regressed and repaired once. `sql.rs` tests both over
   all 256 byte values and asserts they differ on exactly the digits.
+  **Those three tests asked the two predicates and nothing that uses them, and four live violations
+  were sitting behind them** — three inside `core/sql.rs` itself and one in `ui/sql_highlight.rs`,
+  each a hand-rolled ASCII word scan. The one that mattered is `has_top_level_where`, *the
+  missing-`WHERE` safety net*: with the ASCII spelling a byte `>= 0x80` **ended** a word, so the
+  ASCII tail of a non-ASCII identifier was scanned as a word of its own and `DELETE FROM éwhere`
+  answered "this statement has a WHERE" — `unsafe_reason` then returned `None`, `run_verdict` never
+  reached its `Confirm` arm, and with `confirm_writes` off the delete ran unasked. utf8 identifiers
+  are ordinary on MySQL and PostgreSQL, which is what this invariant is for. The other three lose no
+  guard and are repaired anyway, because a wrong copy of the one definition is what the next scanner
+  gets copied from: `leading_keyword_span` read `SELECTé 1`'s keyword as `SELECT` (a syntax error
+  either way, but every `read_only_heads` comparison downstream would have matched it),
+  `word_tokens` split `cafédelete` into two tokens so `contains_write` answered true for a `SELECT`
+  (over-blocking, which is the correct direction for a refusal gate and still a wrong answer), and
+  `sql_highlight::lex_line` stepped over each byte of a multi-byte character and lexed the ASCII
+  tail as a fresh word, so `SELECT éselect FROM t` painted `select` as a keyword *inside* a legal
+  column name — spans that reach the Ctrl+K diff through `highlight_spans` as well. It surfaced only
+  where a keyword happened to follow the non-ASCII byte, which is why nobody saw it.
+  **The tests now ask a *scanner*, which is the half that was missing**:
+  `a_non_ascii_table_name_does_not_hide_a_missing_where` composes `has_top_level_where` with
+  `unsafe_reason` over all three dialects (and asserts a real `WHERE` after a non-ASCII name is
+  still found, so the fix cannot trade a missed guard for a spurious one), and
+  `a_non_ascii_byte_does_not_end_a_word_for_the_other_two_scanners` covers the rest.
 - **A Velopack channel name is app identity, like `--packId`: add a name, never rename one.** The
   three `release.yml` packs with — `win-x64`, `linux-x64`, `osx-arm64` — are explicit because a
   *default* channel (`win`, `linux`) reaches only the manifest name, so both platforms emit one
