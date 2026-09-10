@@ -1776,7 +1776,13 @@ fn lexer_scope(
                                 i += 2;
                             }
                         }
-                        Some(TkKind::Word(a)) if !is_reserved_word(a, dialect) => {
+                        // `is_implicit_alias`, not the reserved test alone — the
+                        // half-typed `FROM orders LEFT JOIN |` reaches *this*
+                        // scanner, which is how `join_targets` came to offer
+                        // `customers ON "LEFT".customer_id = customers.id`.
+                        Some(TkKind::Word(a))
+                            if toks[i].quoted || is_implicit_alias(a, dialect) =>
+                        {
                             alias = Some(a.clone());
                             i += 1;
                         }
@@ -2386,7 +2392,10 @@ fn table_refs_with_pos(
                         i += 2;
                     }
                 }
-                Some(TkKind::Word(a)) if !is_reserved_word(a, dialect) => {
+                // See `is_implicit_alias`: a join or clause keyword here ends the
+                // reference, and asking `is_reserved_word` alone put SQLite's
+                // `LEFT` in the alias slot.
+                Some(TkKind::Word(a)) if toks[i].quoted || is_implicit_alias(a, dialect) => {
                     alias = Some(a.clone());
                     i += 1;
                 }
@@ -3049,6 +3058,72 @@ fn is_table_ref_continuation(word: &str) -> bool {
     )
 }
 
+/// Is `word` an **implicit** table alias — the bare word right after a table
+/// name, with no `AS`?
+///
+/// Both tests, in that order, and it is the order that matters:
+/// [`is_table_ref_continuation`] first, because a join or clause keyword *ends*
+/// the table reference rather than naming it, and only then
+/// [`is_reserved_word`], which asks whether a word meant as an alias is legal
+/// unquoted.
+///
+/// **The order was the bug, and only SQLite showed it.** `MYSQL_RESERVED` and
+/// `PG_RESERVED` both carry `LEFT`/`INNER`/`CROSS`/`FULL`/`NATURAL`/`RIGHT`, so
+/// on those two engines the reserved test alone happened to reject them.
+/// `SQLITE_RESERVED` deliberately holds only what SQLite refuses *as an alias*,
+/// and SQLite genuinely accepts all seven as identifiers — so
+/// `SELECT * FROM orders LEFT JOIN customers ON |` registered `orders` under
+/// the alias `LEFT`, `ref_qualifier` preferred the alias, and both FK auto-join
+/// surfaces inserted `"LEFT".customer_id = customers.id`. Running it is
+/// `no such column: LEFT.customer_id`. A bare `JOIN` was unaffected, which is
+/// why it read as working.
+///
+/// `alias_checks` had the right order all along and is the third caller;
+/// spelling it three times is what let two of the three drift.
+///
+/// A **quoted** word is always an alias — `FROM orders "LEFT" JOIN …` really
+/// does name it — so the caller checks `Tk::quoted` before asking.
+fn is_implicit_alias(word: &str, dialect: SqlDialect) -> bool {
+    !is_table_ref_continuation(word) && !is_reserved_word(word, dialect)
+}
+
+/// Is the `AS` at `toks[i]` a **cast's** `AS` rather than an alias's?
+///
+/// `CAST(x AS CHAR)` puts a **type** after `AS`, and on MySQL every cast target
+/// that is also a reserved word — `CHAR`, `UNSIGNED`, `DECIMAL`, `BINARY`,
+/// `CHARACTER` — was squiggled as a botched alias on a statement MariaDB 10.11
+/// runs without complaint. `SIGNED` escaped only by being absent from the
+/// reserved list, and `CONVERT(a, CHAR)` escaped by not using `AS` at all,
+/// which is what says the `AS` form is the whole of it.
+///
+/// Answered by walking back to the nearest **unmatched** `(` and asking what
+/// word opened it, rather than off the AST: [`alias_checks`] runs
+/// unconditionally, including where the parse failed, because sqlparser accepts
+/// `AS or` and gating on a parse would miss the real thing this diagnostic is
+/// for. The tokenizer already emits `LParen`/`RParen`, so this adds no scanner.
+fn as_introduces_a_type(toks: &[Token], i: usize) -> bool {
+    let mut depth = 0i32;
+    let mut j = i;
+    while j > 0 {
+        j -= 1;
+        match &toks[j].kind {
+            TkKind::RParen => depth += 1,
+            TkKind::LParen if depth > 0 => depth -= 1,
+            // The `(` this `AS` sits inside. Whatever word opened it decides.
+            TkKind::LParen => {
+                return j > 0
+                    && matches!(&toks[j - 1].kind, TkKind::Word(w)
+                    if matches!(
+                        w.to_ascii_uppercase().as_str(),
+                        "CAST" | "CONVERT" | "TRY_CAST" | "SAFE_CAST"
+                    ));
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
 /// Flag a reserved keyword used as an alias — explicit (`orders AS or`, `id AS key`)
 /// or implicit (`orders or`) — a syntax error unless backtick-quoted. Runs
 /// unconditionally: sqlparser is laxer than MySQL here (it *accepts* `AS or`), so
@@ -3076,7 +3151,7 @@ fn alias_checks(sql: &str, lo: usize, hi: usize, dialect: SqlDialect, out: &mut 
         })
         .is_some_and(|w| w == "CREATE");
     // Explicit `AS <reserved>` — table OR column alias, anywhere.
-    for w in toks.windows(2) {
+    for (i, w) in toks.windows(2).enumerate() {
         let (TkKind::Word(a), TkKind::Word(b)) = (&w[0].kind, &w[1].kind) else {
             continue;
         };
@@ -3085,6 +3160,10 @@ fn alias_checks(sql: &str, lo: usize, hi: usize, dialect: SqlDialect, out: &mut 
         }
         // A CTAS/view body isn't an alias (`CREATE TABLE t AS SELECT …`).
         if is_create && is_query_body_keyword(b) {
+            continue;
+        }
+        // Nor is a cast's target type — see `as_introduces_a_type`.
+        if as_introduces_a_type(&toks, i) {
             continue;
         }
         // `AS `select`` is legal — quoting is the whole remedy this diagnostic
@@ -7806,6 +7885,22 @@ mod tests {
             // on it — a known upstream-parser gap, not our bug. Omitted here.
             "SELECT id AS `select` FROM employees;",
             "SELECT `order`, `group` FROM employees;",
+            // **A cast's `AS` introduces a type, not an alias.** Every one of
+            // these was squiggled `` `CHAR` is a reserved keyword and can't be
+            // used as an alias `` — on statements MariaDB 10.11 runs without
+            // complaint. `SIGNED` escaped only by being absent from
+            // `MYSQL_RESERVED`, and `CONVERT(id, CHAR)` by not using `AS`.
+            "SELECT CAST(id AS CHAR) FROM employees;",
+            "SELECT CAST(id AS UNSIGNED) FROM employees;",
+            "SELECT CAST(id AS SIGNED) FROM employees;",
+            "SELECT CAST(id AS DECIMAL(10,2)) FROM employees;",
+            "SELECT CAST(id AS BINARY) FROM employees;",
+            "SELECT CAST(id AS CHARACTER) FROM employees;",
+            "SELECT CONVERT(id, CHAR) FROM employees;",
+            // Nested, and with the cast inside another call — the walk back to
+            // the nearest *unmatched* `(` is what makes these work.
+            "SELECT CONCAT(CAST(id AS CHAR), name) FROM employees;",
+            "SELECT CAST(CAST(id AS CHAR) AS BINARY) FROM employees;",
             // Ordering / grouping / limits.
             "SELECT * FROM employees ORDER BY name;",
             "SELECT * FROM employees ORDER BY name DESC, id ASC;",
@@ -8019,9 +8114,16 @@ mod tests {
     }
 
     fn join_at(sql: &str, caret: usize) -> Option<String> {
+        join_at_on(sql, caret, SqlDialect::MySql)
+    }
+
+    /// `join_at` with the engine named. Every test in this block was MySQL, and
+    /// the one thing the FK-join surfaces got wrong was per dialect — see
+    /// `a_join_modifier_is_not_the_left_table_alias`.
+    fn join_at_on(sql: &str, caret: usize, dialect: SqlDialect) -> Option<String> {
         let (schema, db) = fk_catalog();
         let cat = Catalog::build(&[(db, &schema)], Some(db));
-        join_condition(sql, 0, sql.len(), caret, &cat, SqlDialect::MySql)
+        join_condition(sql, 0, sql.len(), caret, &cat, dialect)
     }
 
     #[test]
@@ -8078,9 +8180,81 @@ mod tests {
     // ── FK-aware JOIN completion targets ──────────────────────────────────────
 
     fn jt(sql: &str) -> Vec<JoinTarget> {
+        jt_on(sql, SqlDialect::MySql)
+    }
+
+    fn jt_on(sql: &str, dialect: SqlDialect) -> Vec<JoinTarget> {
         let (schema, db) = fk_catalog();
         let cat = Catalog::build(&[(db, &schema)], Some(db));
-        join_targets(sql, 0, sql.len(), sql.len(), &cat, SqlDialect::MySql)
+        join_targets(sql, 0, sql.len(), sql.len(), &cat, dialect)
+    }
+
+    /// **A join modifier is not the left table's alias**, on every engine.
+    ///
+    /// The whole join/continuation test block was MySQL, and `MYSQL_RESERVED`
+    /// carries all seven of these words — so the alias slot's `is_reserved_word`
+    /// test happened to reject them there and the suite was green while SQLite,
+    /// whose reserved list holds only what it refuses *as an alias*, registered
+    /// `orders` under the alias `LEFT`. Both FK surfaces then inserted
+    /// `"LEFT".customer_id = customers.id`, which SQLite answers with
+    /// `no such column: LEFT.customer_id`.
+    ///
+    /// Both surfaces, because they reach different scanners: `join_condition`
+    /// reads `table_refs_with_pos` over a parsed statement, and `join_targets`
+    /// reaches `lexer_scope` because a half-typed `JOIN` does not parse.
+    #[test]
+    fn a_join_modifier_is_not_the_left_table_alias() {
+        for dialect in [SqlDialect::MySql, SqlDialect::Postgres, SqlDialect::Sqlite] {
+            for modifier in [
+                "LEFT",
+                "INNER",
+                "CROSS",
+                "RIGHT",
+                "FULL",
+                "NATURAL",
+                "LEFT OUTER",
+            ] {
+                let sql = format!("SELECT * FROM orders {modifier} JOIN customers ON ");
+                assert_eq!(
+                    join_at_on(&sql, sql.len(), dialect).as_deref(),
+                    Some("orders.customer_id = customers.id"),
+                    "{modifier} on {dialect:?}"
+                );
+                let sql = format!("SELECT * FROM orders {modifier} JOIN ");
+                let ts = jt_on(&sql, dialect);
+                let cust = ts
+                    .iter()
+                    .find(|t| t.table == "customers")
+                    .unwrap_or_else(|| panic!("{modifier} on {dialect:?} offers no customers"));
+                assert_eq!(
+                    cust.predicate, "orders.customer_id = customers.id",
+                    "{modifier} on {dialect:?}"
+                );
+            }
+            // A real alias in the same slot still wins, or the fix would have
+            // traded a bogus alias for no alias at all.
+            let sql = "SELECT * FROM orders o LEFT JOIN customers c ON ";
+            assert_eq!(
+                join_at_on(sql, sql.len(), dialect).as_deref(),
+                Some("o.customer_id = c.id"),
+                "{dialect:?}"
+            );
+            // And a *quoted* join word really is an alias — spelled the way
+            // each engine quotes an identifier, since MySQL reads `"x"` as a
+            // string.
+            let typed = if dialect == SqlDialect::MySql {
+                "`LEFT`"
+            } else {
+                "\"LEFT\""
+            };
+            let rendered = crate::export::ident_if_needed("LEFT", dialect);
+            let sql = format!("SELECT * FROM orders {typed} JOIN customers ON ");
+            assert_eq!(
+                join_at_on(&sql, sql.len(), dialect),
+                Some(format!("{rendered}.customer_id = customers.id")),
+                "{dialect:?}"
+            );
+        }
     }
 
     #[test]
