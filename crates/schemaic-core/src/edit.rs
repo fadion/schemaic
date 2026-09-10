@@ -996,6 +996,59 @@ impl GridCells<'_> {
         }
     }
 
+    /// What the selection summary counts for display row `i`, column `ci`:
+    /// `None` for a NULL, `Some(text)` for a value — resolved **as the grid
+    /// draws it**, and unformatted, because the aggregate parses numbers out
+    /// of it.
+    ///
+    /// Distinct from [`GridCells::text`] on exactly one point, and it is the
+    /// point: a NULL has to be *absent*, not the string `NULL`. The painter
+    /// draws a sentinel there; the summary counts a null.
+    ///
+    /// **A staged blob is a value.** `CellEdit::as_text` answers `None` for
+    /// `Bytes` — which every text caller wants (the re-fetch key, the paste
+    /// round-trip, the clipboard) and which read as NULL here, so loading a
+    /// file into a selected cell turned `3 rows` into `3 rows · 1 null` while
+    /// the *stored* blob it replaced counted as a value. That was fixed once,
+    /// for the staged-over-a-real-row arm, and the pending-new-row arm four
+    /// lines below reproduced it verbatim. Three spellings of one cell, one
+    /// summary — so the rule lives here now, beside the painter's own
+    /// resolution, and there is one.
+    ///
+    /// An **unset** cell of a pending new row is `None` on purpose and is not
+    /// the same thing as a NULL of the same shape: what it will hold is a
+    /// server default, previewed as `<auto>`. It counts as neither a value nor
+    /// a null, exactly as it did before.
+    pub fn summary_text(&self, i: usize, ci: usize) -> Option<std::borrow::Cow<'_, str>> {
+        use std::borrow::Cow;
+        // Borrowed wherever there is text to borrow — a Ctrl+A over a
+        // 200,000-row column resolves every cell, and only a staged blob's
+        // `<n bytes>` has to be built.
+        fn staged(v: &CellEdit) -> Option<Cow<'_, str>> {
+            match v {
+                CellEdit::Null => None,
+                CellEdit::Text(t) => Some(Cow::Borrowed(t.as_str())),
+                CellEdit::Bytes(b) => Some(Cow::Owned(crate::model::binary_display(b.len()))),
+            }
+        }
+        let nreal = self.rs.row_count();
+        if i >= nreal {
+            return self
+                .new_rows
+                .get(i - nreal)
+                .and_then(|r| r.get(&ci))
+                .and_then(staged);
+        }
+        let di = self.order.get(i).copied().unwrap_or(i);
+        match self.dirty.get(&(di, ci)) {
+            Some(v) => staged(v),
+            None => self
+                .rs
+                .cell(di, ci)
+                .and_then(|c| (!c.is_null()).then(|| Cow::Borrowed(c.text()))),
+        }
+    }
+
     /// The block `(r0, c0, r1, c1)` as TSV, for the clipboard. Raw values — see
     /// [`GridCells::text`]. [`parse_tsv_block`] inverts it exactly **for cells
     /// that hold neither a tab nor a newline**; [`GridCells::tsv_block`] is the
@@ -3364,6 +3417,79 @@ mod tests {
             dirty,
             new_rows,
         }
+    }
+
+    /// **A staged blob is a value in the selection summary, in a pending new
+    /// row exactly as in a committed one.**
+    ///
+    /// `CellEdit::as_text` answers `None` for `Bytes` — right for every *text*
+    /// reader and wrong for a counter — so loading a file into a selected cell
+    /// reported `3 rows · 1 null` while the stored blob it replaced counted as
+    /// a value. That was fixed once, for the staged-over-a-real-row arm, and
+    /// the pending-new-row arm four lines below it kept the bug. This asserts
+    /// both arms through the one resolution they now share.
+    #[test]
+    fn a_staged_blob_counts_as_a_value_in_both_arms() {
+        let rs = ResultSet::from_rows(
+            vec![col("data", "BLOB", "t", false, true)],
+            vec![vec![Value::Str("stored".into())]],
+        );
+        let order = vec![0usize];
+        let formats: Vec<crate::format::ColumnFormat> = Vec::new();
+
+        // Staged over the committed row.
+        let mut dirty: HashMap<(usize, usize), CellEdit> = HashMap::new();
+        dirty.insert((0, 0), CellEdit::Bytes(vec![0u8; 7].into()));
+        let empty: Vec<HashMap<usize, CellEdit>> = Vec::new();
+        let g = cells(&rs, &order, &formats, &dirty, &empty);
+        assert_eq!(
+            g.summary_text(0, 0).as_deref(),
+            Some(crate::model::binary_display(7).as_str()),
+            "a staged blob shows `<n bytes>`, which is a value"
+        );
+
+        // And in a pending new row, which is where the second spelling was.
+        let mut pending: HashMap<usize, CellEdit> = HashMap::new();
+        pending.insert(0, CellEdit::Bytes(vec![0u8; 7].into()));
+        let rows = vec![pending];
+        let clean = HashMap::new();
+        let g = cells(&rs, &order, &formats, &clean, &rows);
+        assert_eq!(
+            g.summary_text(1, 0).as_deref(),
+            Some(crate::model::binary_display(7).as_str()),
+            "the pending arm read `as_text`, which is None for Bytes"
+        );
+
+        // The three answers that must *not* move.
+        assert_eq!(g.summary_text(0, 0).as_deref(), Some("stored"));
+        let mut nulled: HashMap<(usize, usize), CellEdit> = HashMap::new();
+        nulled.insert((0, 0), CellEdit::Null);
+        let g = cells(&rs, &order, &formats, &nulled, &[]);
+        assert_eq!(g.summary_text(0, 0), None, "a staged NULL is a null");
+        let blank = vec![HashMap::new()];
+        let g = cells(&rs, &order, &formats, &clean, &blank);
+        assert_eq!(
+            g.summary_text(1, 0),
+            None,
+            "an unset pending cell takes a server default — neither value nor null"
+        );
+    }
+
+    /// A stored SQL `NULL` is a null and its text is not `\"NULL\"` — the one
+    /// place `summary_text` must differ from [`GridCells::text`], which paints
+    /// the sentinel.
+    #[test]
+    fn the_summary_counts_a_stored_null_as_absent_not_as_the_word() {
+        let rs = ResultSet::from_rows(
+            vec![col("n", "INT", "t", false, false)],
+            vec![vec![Value::Null], vec![Value::Int(3)]],
+        );
+        let (order, formats) = (vec![0usize, 1], Vec::new());
+        let (dirty, new_rows) = (HashMap::new(), Vec::new());
+        let g = cells(&rs, &order, &formats, &dirty, &new_rows);
+        assert_eq!(g.summary_text(0, 0), None);
+        assert_eq!(g.text(0, 0, false), "NULL", "the painter still draws it");
+        assert_eq!(g.summary_text(1, 0).as_deref(), Some("3"));
     }
 
     /// **An attachment is answered about as though it were the grid**, which is

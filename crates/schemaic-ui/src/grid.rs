@@ -4400,46 +4400,25 @@ fn grid_view(rs: Arc<ResultSet>, gctx: GridCtx) -> impl IntoView {
                 // same five rows reported 5 and 3.
                 gs.dirty.with_untracked(|dirty| {
                     gs.new_rows.with_untracked(|pending| {
-                        // **A staged blob is a value, and it is counted as the
-                        // grid draws it.** `CellEdit::as_text` answers `None`
-                        // for `Bytes`, which every *text* caller wants — the
-                        // re-fetch key, the paste round-trip, the clipboard —
-                        // and which this one read as NULL: loading a file into a
-                        // selected cell turned `3 rows` into `3 rows · 1 null`,
-                        // while the *stored* blob it replaced counted as a value
-                        // (the grid holds `<n bytes>` for it, and that is a
-                        // text). Two spellings of the same cell, one summary.
+                        // **One resolution, in `core::edit`.** A staged blob is
+                        // a value (the grid draws `<n bytes>` for it, just as it
+                        // does for the stored blob it replaced), a staged NULL
+                        // is a null, and an *unset* cell of a pending row is
+                        // neither — it will take a server default. That rule was
+                        // written here twice, once for real rows and once for
+                        // pending ones, and the second copy answered `as_text`,
+                        // which is `None` for `Bytes`: it reported `3 rows ·
+                        // 1 null` over a file the user had just loaded. See
+                        // `GridCells::summary_text`.
                         //
-                        // Materialised here rather than in the pass below so
-                        // that pass stays lazy: `dirty` holds only what the user
-                        // has staged, so this is a handful of short strings, and
-                        // the span may be a whole column.
-                        let byte_texts: std::collections::HashMap<usize, String> = dirty
-                            .iter()
-                            .filter(|((_, c), _)| *c == ci)
-                            .filter_map(|((di, _), v)| {
-                                v.as_bytes()
-                                    .map(|b| (*di, schemaic_core::model::binary_display(b.len())))
-                            })
-                            .collect();
-                        let cells = (r0..=r1).map(|d| match order.get(d).copied() {
-                            Some(di) => match dirty.get(&(di, ci)) {
-                                Some(staged) => match staged.as_bytes() {
-                                    Some(_) => byte_texts.get(&di).map(String::as_str),
-                                    None => staged.as_text(),
-                                },
-                                None => rs
-                                    .cell(di, ci)
-                                    .and_then(|c| (!c.is_null()).then(|| c.text())),
-                            },
-                            // Past the real rows: a pending row, whose unset cells
-                            // are a server default rather than a value.
-                            None => pending
-                                .get(d - order.len())
-                                .and_then(|m| m.get(&ci))
-                                .and_then(|v| v.as_text()),
-                        });
-                        schemaic_core::aggregate::aggregate_texts(column, cells)
+                        // No formats: the summary is deliberately unformatted
+                        // — the aggregate parses numbers out of these strings,
+                        // and a thousands separator or a date rendering is not
+                        // a number. `summary_text` reads none, and handing it
+                        // an empty slice says so at the call site.
+                        let cells = grid_cells(&rs, &order, &[], dirty, pending);
+                        let texts = (r0..=r1).map(|d| cells.summary_text(d, ci));
+                        schemaic_core::aggregate::aggregate_texts(column, texts)
                     })
                 })
             }
@@ -6878,14 +6857,22 @@ fn grid_find(gs: GridState, forward: bool, from_current: bool) {
     let rs = gs.rs.get_untracked();
     let order = gs.order.get_untracked();
     let formats = gs.formats.get_untracked();
-    let nrows = order.len();
     let ncols = rs.col_count();
+    // Taken out of the signals rather than borrowed across them: the writes
+    // below (`set_active`, the scroll) read the grid again, and these are the
+    // staged edits only — a handful of cells, not the result set.
+    let dirty = gs.dirty.get_untracked();
+    let new_rows = gs.new_rows.get_untracked();
+    let cells = grid_cells(&rs, &order, &formats, &dirty, &new_rows);
+    // **Display rows, not stored rows.** A pending `＋ Row`'s cells are on
+    // screen and were unreachable: `order` is the committed rows alone.
+    let nrows = order.len() + new_rows.len();
     if nrows == 0 || ncols == 0 {
         return;
     }
     let total = nrows * ncols;
     let (cr, cc) = gs.active.get_untracked().unwrap_or((0, 0));
-    let start = cr * ncols + cc;
+    let start = (cr * ncols + cc).min(total.saturating_sub(1));
     for off in 0..total {
         let lin = if forward {
             (start + if from_current { off } else { off + 1 }) % total
@@ -6893,15 +6880,11 @@ fn grid_find(gs: GridState, forward: bool, from_current: bool) {
             (start + total * 2 - off - 1) % total
         };
         let (dr, ci) = (lin / ncols, lin % ncols);
-        let data = order[dr];
-        if let Some(c) = rs.cell(data, ci) {
-            let fmt = formats.get(ci).copied().unwrap_or_default();
-            if contains_ignore_ascii_case(&format::apply(fmt, &c.to_value()), &q) {
-                gs.active.set(Some((dr, ci)));
-                gs.anchor.set(Some((dr, ci)));
-                scroll_active_into_view(gs, dr, ci);
-                return;
-            }
+        if contains_ignore_ascii_case(&cells.text(dr, ci, true), &q) {
+            gs.active.set(Some((dr, ci)));
+            gs.anchor.set(Some((dr, ci)));
+            scroll_active_into_view(gs, dr, ci);
+            return;
         }
     }
 }
@@ -6924,7 +6907,9 @@ fn grid_find_hits(gs: GridState) -> (Vec<usize>, bool) {
     let rs = gs.rs.get_untracked();
     let order = gs.order.get_untracked();
     let formats = gs.formats.get_untracked();
-    find_hits(&rs, &order, &formats, &q)
+    let dirty = gs.dirty.get_untracked();
+    let new_rows = gs.new_rows.get_untracked();
+    find_hits(&grid_cells(&rs, &order, &formats, &dirty, &new_rows), &q)
 }
 
 /// Which cells match `q`, as **display** positions (`display_row * ncols + col`),
@@ -6942,34 +6927,27 @@ fn grid_find_hits(gs: GridState) -> (Vec<usize>, bool) {
 ///
 /// `more` is true when either budget cut the scan short, so the bar can say
 /// "500+" rather than reporting a floor as a total.
-fn find_hits(
-    rs: &ResultSet,
-    order: &[usize],
-    formats: &[ColumnFormat],
-    q: &str,
-) -> (Vec<usize>, bool) {
+fn find_hits(cells: &schemaic_core::edit::GridCells<'_>, q: &str) -> (Vec<usize>, bool) {
     if q.is_empty() {
         return (Vec::new(), false);
     }
-    let ncols = rs.col_count();
+    let ncols = cells.rs.col_count();
+    let nrows = cells.order.len() + cells.new_rows.len();
     let mut hits = Vec::new();
     let mut more = false;
     let mut scanned = 0usize;
-    'outer: for (dr, &data) in order.iter().enumerate() {
+    'outer: for dr in 0..nrows {
         for ci in 0..ncols {
             if scanned >= FIND_COUNT_CELL_BUDGET {
                 more = true;
                 break 'outer;
             }
             scanned += 1;
-            if let Some(c) = rs.cell(data, ci) {
-                let fmt = formats.get(ci).copied().unwrap_or_default();
-                if contains_ignore_ascii_case(&format::apply(fmt, &c.to_value()), q) {
-                    hits.push(dr * ncols + ci);
-                    if hits.len() >= FIND_MAX_HITS {
-                        more = true;
-                        break 'outer;
-                    }
+            if contains_ignore_ascii_case(&cells.text(dr, ci, true), q) {
+                hits.push(dr * ncols + ci);
+                if hits.len() >= FIND_MAX_HITS {
+                    more = true;
+                    break 'outer;
                 }
             }
         }
@@ -11739,10 +11717,25 @@ mod find_hits_tests {
         vec![ColumnFormat::None; 2]
     }
 
+    /// The painter's resolver over a grid with nothing staged — what every
+    /// test below except the staged ones is about.
+    fn stored<'a>(
+        rs: &'a ResultSet,
+        order: &'a [usize],
+        formats: &'a [ColumnFormat],
+        dirty: &'a DirtyCells,
+        new_rows: &'a [HashMap<usize, CellEdit>],
+    ) -> schemaic_core::edit::GridCells<'a> {
+        grid_cells(rs, order, formats, dirty, new_rows)
+    }
+
     #[test]
     fn an_empty_query_matches_nothing() {
         let rs = grid(&[["alpha", "beta"]]);
-        assert_eq!(find_hits(&rs, &[0], &fmts(), ""), (Vec::new(), false));
+        assert_eq!(
+            find_hits(&stored(&rs, &[0], &fmts(), &DirtyCells::new(), &[]), ""),
+            (Vec::new(), false)
+        );
     }
 
     #[test]
@@ -11750,7 +11743,10 @@ mod find_hits_tests {
         // `order` is the display→data mapping, so a sorted grid must report the
         // cell where the user is *looking*. Row 1 of the data is shown first.
         let rs = grid(&[["zulu", "x"], ["alpha", "y"]]);
-        let (hits, more) = find_hits(&rs, &[1, 0], &fmts(), "zulu");
+        let (hits, more) = find_hits(
+            &stored(&rs, &[1, 0], &fmts(), &DirtyCells::new(), &[]),
+            "zulu",
+        );
         assert!(!more);
         // "zulu" is data row 0, shown second → display row 1, column 0.
         assert_eq!(hits, vec![2], "display row 1, column 0");
@@ -11759,13 +11755,23 @@ mod find_hits_tests {
     #[test]
     fn matching_is_case_insensitive_and_substring() {
         let rs = grid(&[["Alpha", "beta"]]);
-        assert_eq!(find_hits(&rs, &[0], &fmts(), "LPH").0, vec![0]);
+        assert_eq!(
+            find_hits(&stored(&rs, &[0], &fmts(), &DirtyCells::new(), &[]), "LPH").0,
+            vec![0]
+        );
     }
 
     #[test]
     fn every_matching_cell_in_a_row_is_its_own_hit() {
         let rs = grid(&[["match", "match"]]);
-        assert_eq!(find_hits(&rs, &[0], &fmts(), "match").0, vec![0, 1]);
+        assert_eq!(
+            find_hits(
+                &stored(&rs, &[0], &fmts(), &DirtyCells::new(), &[]),
+                "match"
+            )
+            .0,
+            vec![0, 1]
+        );
     }
 
     /// The two budgets exist so a huge result can't freeze the UI counting, and
@@ -11775,7 +11781,10 @@ mod find_hits_tests {
         let rows: Vec<[&str; 2]> = vec![["hit", "hit"]; FIND_MAX_HITS];
         let rs = grid(&rows);
         let order: Vec<usize> = (0..rows.len()).collect();
-        let (hits, more) = find_hits(&rs, &order, &fmts(), "hit");
+        let (hits, more) = find_hits(
+            &stored(&rs, &order, &fmts(), &DirtyCells::new(), &[]),
+            "hit",
+        );
         assert_eq!(hits.len(), FIND_MAX_HITS);
         assert!(more, "capped, so the count is a floor not a total");
     }
@@ -11786,7 +11795,10 @@ mod find_hits_tests {
         let rows: Vec<[&str; 2]> = vec![["x", "y"]; FIND_COUNT_CELL_BUDGET];
         let rs = grid(&rows);
         let order: Vec<usize> = (0..rows.len()).collect();
-        let (hits, more) = find_hits(&rs, &order, &fmts(), "nomatch");
+        let (hits, more) = find_hits(
+            &stored(&rs, &order, &fmts(), &DirtyCells::new(), &[]),
+            "nomatch",
+        );
         assert!(hits.is_empty());
         assert!(more, "the scan stopped early, so 0 is not a real total");
     }
@@ -11801,10 +11813,84 @@ mod find_hits_tests {
             vec![vec![Value::Int(0)], vec![Value::Int(86_400)]],
         );
         let formats = vec![ColumnFormat::Timestamp];
-        let (hits, _) = find_hits(&rs, &[0, 1], &formats, "1970");
+        let (hits, _) = find_hits(
+            &stored(&rs, &[0, 1], &formats, &DirtyCells::new(), &[]),
+            "1970",
+        );
         assert_eq!(hits.len(), 2, "both epochs render as 1970 dates");
         // And the raw value is not what was searched.
-        assert!(find_hits(&rs, &[0, 1], &formats, "86400").0.is_empty());
+        assert!(
+            find_hits(
+                &stored(&rs, &[0, 1], &formats, &DirtyCells::new(), &[]),
+                "86400"
+            )
+            .0
+            .is_empty()
+        );
+    }
+
+    /// **A staged edit is what the cell shows, so it is what Find must
+    /// search** — and the stored value it replaced must stop being found.
+    ///
+    /// Both halves are the bug. Typing `beta` over `alpha` and pressing Enter
+    /// left the cell painted green reading `beta`; Ctrl+F `beta` answered 0/0
+    /// with the string on screen in front of the user, and Ctrl+F `alpha`
+    /// jumped the selection to that cell and highlighted it as a match while
+    /// it displayed something else. `find_hits`' own doc claimed it "searches
+    /// what is on screen".
+    #[test]
+    fn a_staged_edit_is_found_and_the_value_it_replaced_is_not() {
+        let rs = grid(&[["alpha", "beta"]]);
+        let mut dirty = DirtyCells::new();
+        dirty.insert((0, 0), CellEdit::Text("gamma".into()));
+        let formats = fmts();
+        let cells = stored(&rs, &[0], &formats, &dirty, &[]);
+        assert_eq!(find_hits(&cells, "gamma").0, vec![0], "the staged text");
+        assert!(
+            find_hits(&cells, "alpha").0.is_empty(),
+            "the stored value is not on screen any more"
+        );
+        // The untouched cell beside it is unaffected.
+        assert_eq!(find_hits(&cells, "beta").0, vec![1]);
+    }
+
+    /// A staged `Set to NULL` shows the italic NULL sentinel, and searching
+    /// for it has to reach the cell — the same rule, on the arm where the
+    /// staged value has no text of its own.
+    #[test]
+    fn a_staged_null_is_findable_by_what_it_renders_as() {
+        let rs = grid(&[["alpha", "beta"]]);
+        let mut dirty = DirtyCells::new();
+        dirty.insert((0, 0), CellEdit::Null);
+        let formats = fmts();
+        let cells = stored(&rs, &[0], &formats, &dirty, &[]);
+        assert!(find_hits(&cells, "alpha").0.is_empty());
+        assert_eq!(
+            find_hits(&cells, &CellEdit::Null.display()).0,
+            vec![0],
+            "the sentinel the cell paints"
+        );
+    }
+
+    /// **Nothing typed into a `＋ Row` was searchable at all**: the scan
+    /// iterated `order`, which is the committed rows and nothing else, so the
+    /// pending rows drawn underneath them were not visited — and their display
+    /// positions are exactly the ones past `order.len()`.
+    #[test]
+    fn a_pending_new_rows_cells_are_searchable_at_their_display_positions() {
+        let rs = grid(&[["alpha", "beta"]]);
+        let mut pending: HashMap<usize, CellEdit> = HashMap::new();
+        pending.insert(1, CellEdit::Text("delta".into()));
+        let rows = vec![pending];
+        let (formats, clean) = (fmts(), DirtyCells::new());
+        let cells = stored(&rs, &[0], &formats, &clean, &rows);
+
+        // One real row (display 0) then the pending one (display 1); two
+        // columns, so the pending row's column 1 is linear position 3.
+        assert_eq!(find_hits(&cells, "delta").0, vec![3]);
+        // Its unset column is empty, not a stale read of the committed row
+        // above it — searching the value that *is* there must not hit it.
+        assert_eq!(find_hits(&cells, "alpha").0, vec![0]);
     }
 }
 

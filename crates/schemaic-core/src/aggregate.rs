@@ -201,9 +201,9 @@ pub fn aggregate<'a>(column: &Column, cells: impl Iterator<Item = CellRef<'a>>) 
 /// The readout has to add up what the user can *see*, or it sits under an edit
 /// it silently doesn't include — and the whole point of a total beside a
 /// selection is that the two agree.
-pub fn aggregate_texts<'a>(
+pub fn aggregate_texts<S: AsRef<str>>(
     column: &Column,
-    cells: impl Iterator<Item = Option<&'a str>>,
+    cells: impl Iterator<Item = Option<S>>,
 ) -> Aggregates {
     let numeric_column = column.is_numeric();
     let mut agg = Aggregates::default();
@@ -217,7 +217,7 @@ pub fn aggregate_texts<'a>(
         };
         agg.non_null += 1;
         if numeric_column {
-            match Fixed::parse(text) {
+            match Fixed::parse(text.as_ref()) {
                 Parsed::Value(f) => fold = fold.and_then(|acc| acc.push(f)),
                 // A number too wide to hold degrades the whole aggregate, the
                 // same answer every later overflow gives. Skipping it — which is
