@@ -16,7 +16,7 @@ use floem::event::{Event, EventListener, EventPropagation};
 use floem::keyboard::{Key, NamedKey};
 use floem::kurbo::Point;
 use floem::prelude::*;
-use floem::reactive::{Memo, create_effect};
+use floem::reactive::{Memo, create_effect, create_memo};
 
 use schemaic_core::db_color::DbColorRule;
 use schemaic_core::ddl::ObjectKind;
@@ -387,6 +387,58 @@ pub(crate) fn tables_shown<'a>(
         .filter(|t| t.schema.as_deref() == Some(ns))
         .filter(|t| !filtering || db_hit || ns_hit || t.matches_search(filt))
         .collect()
+}
+
+/// **A `dyn_container` key that actually dedups.**
+///
+/// floem 0.2's `dyn_container` does no value comparison: its key closure is
+/// wrapped in `create_updater`, which is a plain effect — it runs the closure
+/// and calls `on_change` with whatever came back, with no `PartialEq` anywhere
+/// in the chain. So a key that computes the *same* value again still rebuilds
+/// the subtree.
+///
+/// The schema tree pays for that at every level, because `expanded` is one
+/// app-wide `RwSignal<HashSet<String>>` and every children container in the
+/// tree subscribes to it. Expanding one table in a 500-table database re-ran
+/// `db_node`'s children key, which deep-copies every `TableInfo` in the
+/// database (measured, release: 2.77 ms at 500 tables × 25 columns, 6.78 ms at
+/// 1000 × 30 — the clone alone) and then constructs 500 fresh `table_node`s,
+/// each six views with two nested `dyn_container`s and two effects. And it is
+/// not scoped to the database being touched: expanding a table in `analytics`
+/// rebuilt `shop`'s children too, and every chevron in both.
+///
+/// A `create_memo` *does* compare, so routing the key through one collapses
+/// every write that does not change this node's own answer. Same remedy, same
+/// framework fact, as `widgets::overlay_open_key`.
+fn dedup_key<T: PartialEq + Clone + 'static>(
+    key: impl Fn() -> T + 'static,
+) -> impl Fn() -> T + 'static {
+    let memo = create_memo(move |_| key());
+    move || memo.get()
+}
+
+/// A [`SchemaState`] as part of a memo key: compared by **identity**.
+///
+/// `SchemaState` is not `PartialEq`, and giving it one would compare a whole
+/// `DbSchema` by content on every notification — far worse than the rebuild
+/// being avoided. What the container actually needs to know is "is this the
+/// same catalogue I built from", and a refresh replaces the `Arc`, so
+/// `Arc::ptr_eq` is that question. The `Arc` is held rather than reduced to a
+/// pointer so an address cannot be reused by a later allocation, which would
+/// compare equal and leave a stale subtree — the one way this optimisation can
+/// go wrong. (`erd_view::EdgeGeometry` is the same shape.)
+#[derive(Clone, Debug)]
+struct SchemaKey(SchemaState);
+
+impl PartialEq for SchemaKey {
+    fn eq(&self, other: &Self) -> bool {
+        match (&self.0, &other.0) {
+            (SchemaState::Loading, SchemaState::Loading) => true,
+            (SchemaState::Failed(a), SchemaState::Failed(b)) => a == b,
+            (SchemaState::Loaded(a), SchemaState::Loaded(b)) => std::sync::Arc::ptr_eq(a, b),
+            _ => false,
+        }
+    }
 }
 
 /// One object folder's set, with how many of them the current filter leaves.
@@ -1737,16 +1789,18 @@ fn db_node(conn: ConnNode, ctx: SchemaTreeCtx) -> impl IntoView {
     let err_text = node_ui.overlay.error_modal_text;
     let err_fixable = node_ui.overlay.error_modal_fixable;
     let children = dyn_container(
-        move || {
+        // Through `dedup_key`, or every write to the app-wide `expanded` set
+        // rebuilds this whole database's subtree — see it.
+        dedup_key(move || {
             (
                 // `with`, not `get`: every row in the tree reads this set, and
                 // `get` clones all of it to answer one `contains`.
                 expanded.with(|e| e.contains(&key_children)),
-                schema_sig.get(),
+                SchemaKey(schema_sig.get()),
                 filter.get(),
             )
-        },
-        move |(open, state, filt)| {
+        }),
+        move |(open, SchemaKey(state), filt)| {
             let filt = filt.trim().to_lowercase();
             let filtering = !filt.is_empty();
             // The DB itself matched → show all its tables (not just matching ones).
@@ -1974,7 +2028,7 @@ fn schema_node(
     let key_children = key.clone();
     let ns_children = ns.clone();
     let children = dyn_container(
-        move || (expanded.with(|e| e.contains(&key_children)), filter.get()),
+        dedup_key(move || (expanded.with(|e| e.contains(&key_children)), filter.get())),
         move |(open, filt)| {
             let filt = filt.trim().to_lowercase();
             let filtering = !filt.is_empty();
@@ -2195,7 +2249,7 @@ fn object_group_node(
     let key_children = key.clone();
     let ns_hit_base = scope_ns.clone();
     let children = dyn_container(
-        move || (expanded.with(|e| e.contains(&key_children)), filter.get()),
+        dedup_key(move || (expanded.with(|e| e.contains(&key_children)), filter.get())),
         move |(open, filt)| {
             let filt = filt.trim().to_lowercase();
             let filtering = !filt.is_empty();
@@ -2604,7 +2658,7 @@ fn table_node(database: String, table: TableInfo, ctx: SchemaTreeCtx) -> impl In
     let children = dyn_container(
         // Show columns/keys when the table is expanded OR when a column matched the
         // filter (`force_cols`) — so the highlighted column is actually revealed.
-        move || expanded.with(|e| e.contains(&key_children)) || force_cols,
+        dedup_key(move || expanded.with(|e| e.contains(&key_children)) || force_cols),
         move |open| {
             if !open {
                 return empty().into_any();
@@ -2937,7 +2991,10 @@ fn chevron(
     key: String,
     on_toggle: Rc<dyn Fn(String)>,
 ) -> impl IntoView {
-    let glyph = dyn_container(open, move |open| {
+    // Through `dedup_key`: every chevron in the tree subscribes to the one
+    // `expanded` set, so without it a single expand re-ran every one of them
+    // and rebuilt its glyph.
+    let glyph = dyn_container(dedup_key(open), move |open| {
         let svg = if open {
             icons::CHEVRON_DOWN
         } else {
@@ -3711,6 +3768,125 @@ mod tests {
         // A match on the level above shows the whole folder.
         assert_eq!(objects_shown(&enums, true, false, "zzz").len(), enums.len());
         assert_eq!(objects_shown(&enums, false, true, "zzz").len(), enums.len());
+    }
+
+    /// **A key that computes the same answer again does not rebuild.**
+    ///
+    /// floem 0.2's `dyn_container` compares nothing — its key closure is a
+    /// plain effect — so every write to the app-wide `expanded` set rebuilt
+    /// every mounted subtree in the tree, including the databases nobody
+    /// touched. `dedup_key` is the memo that makes the key answer the question
+    /// the container is asking.
+    #[test]
+    fn a_dedup_key_notifies_only_when_its_answer_changes() {
+        let set: RwSignal<HashSet<String>> = RwSignal::new(HashSet::new());
+        let key = dedup_key(move || set.with(|e| e.contains("db:shop")));
+        let runs = std::rc::Rc::new(std::cell::Cell::new(0usize));
+        let count = runs.clone();
+        create_effect(move |_| {
+            key();
+            count.set(count.get() + 1);
+        });
+        assert_eq!(runs.get(), 1, "the effect runs once to subscribe");
+
+        // A write that does not change *this* node's answer — expanding a
+        // table in another database, which is the whole failure mode.
+        set.update(|e| {
+            e.insert("tbl:analytics:orders".to_string());
+        });
+        assert_eq!(runs.get(), 1, "an unrelated expansion rebuilt this subtree");
+
+        // …and one that does.
+        set.update(|e| {
+            e.insert("db:shop".to_string());
+        });
+        assert_eq!(runs.get(), 2, "this node's own expansion must rebuild it");
+
+        // The undeduped shape, for contrast: the same reads without the memo
+        // re-run on every write, which is what `dyn_container` used to get.
+        let raw_runs = std::rc::Rc::new(std::cell::Cell::new(0usize));
+        let raw = raw_runs.clone();
+        create_effect(move |_| {
+            set.with(|e| e.contains("db:shop"));
+            raw.set(raw.get() + 1);
+        });
+        set.update(|e| {
+            e.insert("tbl:analytics:city".to_string());
+        });
+        assert_eq!(
+            raw_runs.get(),
+            2,
+            "the premise: floem itself does not dedup"
+        );
+    }
+
+    /// A catalogue is compared by identity, never by content: a `DbSchema`
+    /// holds every table of a database, and comparing two of them by value on
+    /// each notification would cost more than the rebuild being avoided.
+    #[test]
+    fn a_schema_key_compares_the_catalogue_by_identity() {
+        let a = std::sync::Arc::new(DbSchema::default());
+        let b = std::sync::Arc::new(DbSchema::default());
+        assert_eq!(
+            SchemaKey(SchemaState::Loaded(a.clone())),
+            SchemaKey(SchemaState::Loaded(a.clone()))
+        );
+        // Identical content, different allocation — a refresh. It has to
+        // rebuild, or the tree shows the catalogue it was built from.
+        assert_ne!(
+            SchemaKey(SchemaState::Loaded(a)),
+            SchemaKey(SchemaState::Loaded(b))
+        );
+        assert_eq!(
+            SchemaKey(SchemaState::Loading),
+            SchemaKey(SchemaState::Loading)
+        );
+        assert_ne!(
+            SchemaKey(SchemaState::Failed("gone".into())),
+            SchemaKey(SchemaState::Failed("denied".into()))
+        );
+        assert_ne!(
+            SchemaKey(SchemaState::Loading),
+            SchemaKey(SchemaState::Failed(String::new()))
+        );
+    }
+
+    /// **Every `dyn_container` here whose key reads `expanded` dedups it.**
+    ///
+    /// The behaviour is pinned above; what no test can see is a *seventh*
+    /// container added later with a raw key closure, which is exactly how the
+    /// six came to exist. So this asks the source.
+    #[test]
+    fn no_container_keyed_on_the_expansion_set_skips_the_dedup() {
+        let src = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("src")
+                .join("schema_tree.rs"),
+        )
+        .expect("this file's own source");
+        let body = crate::source_gate::production_code(&src);
+        let lines: Vec<&str> = body.lines().collect();
+        let mut checked = 0;
+        for (i, l) in lines.iter().enumerate() {
+            if !l.contains("dyn_container(") {
+                continue;
+            }
+            // The key is the first argument; twelve lines covers the widest
+            // of them and stops well short of the builder's own body.
+            let window = lines[i..(i + 12).min(lines.len())].join("\n");
+            if !window.contains("expanded") {
+                continue;
+            }
+            checked += 1;
+            assert!(
+                window.contains("dedup_key("),
+                "the container at line {} keys on the expansion set without \
+                 deduping; floem compares nothing, so every expand anywhere in \
+                 the tree rebuilds this subtree",
+                i + 1
+            );
+        }
+        assert!(checked >= 4, "this gate is stale — it found {checked}");
     }
 
     /// **Every schema-search surface in this file asks the one predicate.**
