@@ -324,17 +324,81 @@ fn next_nonce() -> u64 {
 /// told from a pid-reuse, and a claim that cannot expire is worse than none), no
 /// private directory, or the write failed. The caller must not install without
 /// one.
-fn claim() -> Option<Claim> {
+fn claim() -> Claimed {
+    let Some(owner) = crate::liveness::me() else {
+        return Claimed::Refused;
+    };
+    let on_disk = claim_on_disk();
+    let live = on_disk.and_then(|c| crate::liveness::process_start(c.owner.pid));
+    if !may_claim(on_disk, live, owner) {
+        return Claimed::Shared;
+    }
     let c = Claim {
-        owner: crate::liveness::me()?,
+        owner,
         nonce: next_nonce(),
     };
-    let path = marker_path()?;
+    let Some(path) = marker_path() else {
+        return Claimed::Refused;
+    };
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
-    persist::write_file_atomic(&path, claim_text(c).as_bytes()).ok()?;
-    Some(c)
+    match persist::write_file_atomic(&path, claim_text(c).as_bytes()) {
+        Ok(()) => Claimed::Mine(c),
+        Err(_) => Claimed::Refused,
+    }
+}
+
+/// What a session got when it asked for the claim.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Claimed {
+    /// This session owns the marker, and its teardown must clean up.
+    Mine(Claim),
+    /// Another **live** process owns it. Register and grant anyway — both are
+    /// idempotent upserts of the same state, and this session needs the tools
+    /// — but withdraw nothing on the way out: the owner is still the owner.
+    Shared,
+    /// No claim could be made at all, and without one there is nothing to stop
+    /// another instance's sweep withdrawing this grant mid-session and nothing
+    /// to tell this session's teardown whether the state is still its own.
+    Refused,
+}
+
+/// May this session write its own claim over what is on disk?
+///
+/// **The marker is one slot, and `claim` used to overwrite it unconditionally.**
+/// Two Schemaic windows on Antigravity: A installs and claims; B installs and
+/// claims over A's marker; B's *New Chat* then drops its session, sees
+/// `on_disk == mine`, and runs `agy mcp remove schemaic` and withdraws the
+/// allow-rules — machine-global state that A is still using. A's session is
+/// untouched in memory, so `is_installed()` still says true and the panel
+/// still reports its constraint, while every database tool call in A is
+/// refused — and a denied Antigravity turn reports `"status":"SUCCESS"` with
+/// an empty response, so the user watches the assistant silently stop using
+/// the database with no error anywhere. That is verbatim the failure this
+/// module's header says it fixed: *"a second window's session ending disarmed
+/// a live one just as surely as its starting used to"*.
+///
+/// `Claim`'s nonce solves the sibling case — two sessions in **one** process,
+/// where the pid and start time are identical — and cannot see this one, where
+/// they differ.
+///
+/// The four answers, in the order they matter:
+///
+/// - **No claim on disk** — nothing to displace.
+/// - **Our own process** — a respawn. Taking it is right, and the nonce is
+///   what keeps the outgoing session's teardown from disarming the new one.
+/// - **Another process, still running** — refuse. This is the fix.
+/// - **Another process, gone** (or its pid reissued to something with a
+///   different start time) — stale, so take it. Declining to claim is safe
+///   either way: the startup sweep clears the full tool set for a crashed
+///   owner.
+fn may_claim(on_disk: Option<Claim>, live: Option<u64>, me: crate::liveness::Owner) -> bool {
+    match on_disk {
+        None => true,
+        Some(c) if c.owner == me => true,
+        Some(c) => !crate::liveness::is_live(c.owner, live),
+    }
 }
 
 /// Drop a claim, but only if it is still the one on disk.
@@ -389,18 +453,28 @@ impl AgyRegistration {
     /// and [`Claim`] for what the nonce buys on a respawn.
     pub(crate) fn install(bin: &str, exe: &str, endpoint_file: &str, allowed: &[&str]) -> Self {
         let rules = antigravity_allow_rules(allowed);
-        let mine = claim();
+        let claimed = claim();
+        // **Only an owner tears down.** `Shared` means another live window got
+        // here first: this session registers and grants — both are idempotent
+        // upserts of the same state, and it needs the tools — but holds no
+        // claim, so `may_release` refuses and the first owner stays the one
+        // that cleans up. See `may_claim`.
+        let mine = match claimed {
+            Claimed::Mine(c) => Some(c),
+            Claimed::Shared | Claimed::Refused => None,
+        };
         let mut reg = Self {
             bin: bin.to_string(),
             rules,
             mine,
             installed: false,
         };
-        if mine.is_none() {
-            // Without a claim there is nothing to stop another instance's sweep
-            // withdrawing this grant mid-session, and nothing to tell this
-            // session's own teardown whether the state is still its own. The
-            // session runs without database tools instead, which it says.
+        if claimed == Claimed::Refused {
+            // Without a claim *or* a live owner there is nothing to stop
+            // another instance's sweep withdrawing this grant mid-session, and
+            // nothing to tell this session's own teardown whether the state is
+            // still its own. The session runs without database tools instead,
+            // which it says.
             tracing::warn!("could not claim Antigravity's configuration for this session");
             return reg;
         }
@@ -654,6 +728,115 @@ mod tests {
         // An owner comparison alone cannot see this, which is why the nonce is
         // in the marker at all.
         assert_eq!(old.owner, new.owner);
+    }
+
+    /// **A second *window* is two sessions in two processes**, which the nonce
+    /// cannot see: the pids and start times differ, so `on_disk == mine` is
+    /// true for whoever wrote last and the marker is a single slot.
+    ///
+    /// Window A claims and registers. Window B claims over it, registers
+    /// (an upsert) and grants. B's *New Chat* then drops its session, reads
+    /// its own claim back, and runs `agy mcp remove schemaic` plus a rules
+    /// withdrawal — against machine-global state A is still using. A's session
+    /// is untouched in memory, so `is_installed()` still says true and the
+    /// panel still reports its constraint, while every database tool call in A
+    /// is refused; a denied Antigravity turn reports `"status":"SUCCESS"` with
+    /// an empty response, so the user just watches the assistant stop using
+    /// the database.
+    ///
+    /// The sibling test above is this assertion for **one** process and passed
+    /// throughout.
+    #[test]
+    fn a_second_windows_session_does_not_claim_a_live_ones_registration() {
+        let a = Owner {
+            pid: 1000,
+            started: 500,
+        };
+        let b = Owner {
+            pid: 2000,
+            started: 600,
+        };
+        let held_by_a = Claim { owner: a, nonce: 1 };
+        // B asks while A is running: refused, so B holds no claim…
+        assert!(
+            !may_claim(Some(held_by_a), Some(a.started), b),
+            "B overwrote a live window's claim"
+        );
+        // …and therefore B's teardown withdraws nothing, whatever it installed.
+        assert!(
+            !may_release(None, Some(held_by_a), true),
+            "B's Drop disarmed A's live session"
+        );
+        // A's own teardown still works: it is the owner and nobody displaced it.
+        assert!(may_release(Some(held_by_a), Some(held_by_a), true));
+    }
+
+    /// The three cases that must still take the claim, so the refusal above is
+    /// not simply "never claim".
+    #[test]
+    fn a_claim_is_still_taken_when_nothing_live_holds_it() {
+        let me = Owner {
+            pid: 1000,
+            started: 500,
+        };
+        // Nothing on disk.
+        assert!(may_claim(None, None, me));
+        // Our own process, a session earlier — a respawn, which the nonce
+        // handles and which must not be refused here.
+        assert!(may_claim(
+            Some(Claim {
+                owner: me,
+                nonce: 1
+            }),
+            Some(500),
+            me
+        ));
+        // Another process that has exited.
+        let gone = Owner {
+            pid: 2000,
+            started: 600,
+        };
+        assert!(may_claim(
+            Some(Claim {
+                owner: gone,
+                nonce: 1
+            }),
+            None,
+            me
+        ));
+        // Another process whose pid has been reissued to something else: the
+        // start time differs, so the claim is stale.
+        assert!(may_claim(
+            Some(Claim {
+                owner: gone,
+                nonce: 1
+            }),
+            Some(999),
+            me
+        ));
+    }
+
+    /// `install` must map the three outcomes onto ownership the way the
+    /// teardown expects: only `Mine` holds a claim, and only a claim releases.
+    /// `Shared` is the new state and the whole point — it registers and grants
+    /// but owns nothing.
+    #[test]
+    fn only_an_owning_session_is_authorised_to_tear_down() {
+        let me = Owner {
+            pid: 1000,
+            started: 500,
+        };
+        let c = Claim {
+            owner: me,
+            nonce: 7,
+        };
+        let mine_of = |claimed: Claimed| match claimed {
+            Claimed::Mine(c) => Some(c),
+            Claimed::Shared | Claimed::Refused => None,
+        };
+        assert!(may_release(mine_of(Claimed::Mine(c)), Some(c), true));
+        assert!(!may_release(mine_of(Claimed::Shared), Some(c), true));
+        assert!(!may_release(mine_of(Claimed::Refused), Some(c), true));
     }
 
     /// **The registration and the rules must name the same server.** They were
