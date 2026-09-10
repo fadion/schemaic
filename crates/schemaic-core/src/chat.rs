@@ -62,7 +62,26 @@ impl ChatFile {
     /// in [`save`] — so the results still live in memory and switching
     /// connections and back mid-session shows the session's own scrollback
     /// intact. Both write paths go through this, so the rows have no other route
-    /// to the file.
+    /// to the file **as a tool result**.
+    ///
+    /// **What this does not do, said plainly: an answer that quotes rows is
+    /// persisted verbatim.** The assistant's ordinary reply to *"show me the
+    /// newest orders"* is those rows rendered as a markdown table, and that
+    /// table is a [`crate::transcript::Seg::Text`], which passes through
+    /// untouched. So the paragraph above — the config directory, the most
+    /// recent hundred messages of every connection, indefinitely, with nothing
+    /// in the UI saying the conversation is stored — applies word for word to
+    /// the prose this keeps, and *"the rows are re-fetchable"* is not a
+    /// justification for it.
+    ///
+    /// It is written down rather than fixed because the fix is a product
+    /// decision, not a defect: dropping assistant prose would make a restored
+    /// conversation show the questions and none of the answers, which is worse
+    /// than what it costs. What is owed is the other half — the panel saying
+    /// that conversations are stored per connection — and that is a UI change
+    /// nobody has asked for yet.
+    /// `an_answer_that_quotes_rows_is_persisted_verbatim` pins the behaviour so
+    /// this paragraph cannot quietly become false in either direction.
     pub fn of(chats: &[SavedChat]) -> ChatFile {
         ChatFile {
             chats: chats
@@ -403,6 +422,44 @@ mod tests {
         let tc = tool_of(&restored[1], 1);
         assert_eq!(tc.sql.as_deref(), Some("SELECT * FROM orders"));
         assert_eq!(tc.result.as_deref(), Some(RESULT_OMITTED));
+    }
+
+    /// **And the same rows in the assistant's own prose are kept.**
+    ///
+    /// The test above asserts the tool *result* is stripped; the reply that
+    /// quotes those rows back — the ordinary shape of an answer to "show me the
+    /// newest orders" — is a `Seg::Text` and passes through untouched. That is
+    /// not an oversight to fix here: dropping assistant prose would restore a
+    /// conversation showing the questions and none of the answers. It is pinned
+    /// because `ChatFile::of`'s doc argues the strip from "the rows are
+    /// re-fetchable", and a reader who stops at that sentence would take this
+    /// file for one that holds no row data at all.
+    #[test]
+    fn an_answer_that_quotes_rows_is_persisted_verbatim() {
+        let mut chats = Vec::new();
+        let mut msgs = turn(
+            "newest orders?",
+            "here they are:\n\n| id | email |\n| 1 | a@b.c |",
+        );
+        msgs[1].segs.push(tool(
+            "SELECT * FROM orders",
+            Some("| id | email |\n| 1 | a@b.c |"),
+        ));
+        save(&mut chats, 1, &msgs);
+
+        let json = serde_json::to_string(&ChatFile::of(&chats)).unwrap();
+        assert!(
+            json.contains("a@b.c"),
+            "the prose no longer persists — if that is deliberate, this test is \
+             the place to say so and `ChatFile::of`'s doc needs rewriting: {json}"
+        );
+        // The tool result is still stripped, so the two halves are visibly
+        // different decisions rather than one that half-works.
+        assert_eq!(
+            json.matches("a@b.c").count(),
+            1,
+            "the tool result reached the file too: {json}"
+        );
     }
 
     #[test]

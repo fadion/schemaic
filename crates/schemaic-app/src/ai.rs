@@ -32,26 +32,38 @@ use schemaic_ui::{AiEffort, ConnNode, InlineAiRequest, SchemaScope, Tab};
 use crate::agent_cli::{harness_bin, probe};
 
 // ===== moved from main.rs (AI session + context) =====
-/// The MCP tools a session at this data-access level may call, spelled the way
-/// a CLI harness's allow-list wants them.
+/// The MCP tools a session at these two levels may call, spelled the way a CLI
+/// harness's allow-list wants them.
 ///
 /// The `claude` CLI runs non-interactively, so an **MCP** tool that is not named
 /// here has no one to approve it: the call is denied outright. So this must name
 /// every tool `mcp::tools_list` offers at that level, which
 /// `every_offered_tool_is_allow_listed_at_its_level` holds it to.
 ///
+/// **Two levels, not one**, which is what the plural in that test's name means
+/// and what it used to check only half of: `may_query` is the connection's
+/// `AiData`, and `schema` is the app's *Schema context*. This filtered on the
+/// first alone, so at `SchemaScope::None` the harness was handed an allow-list
+/// naming three tools the server offers none of — while the system prompt told
+/// the model in the same breath that `list_schema` and `describe_table` were
+/// unavailable.
+///
 /// **Derived from [`crate::mcp::McpTool`], not typed out.** It used to be two
 /// hand-written `const` lists in this file — two more independent spellings of a
 /// set the compiler related to nothing, on top of the three in `mcp.rs`. A fifth
-/// tool now cannot be added without answering `reads_row_data` for it, and the
-/// answer reaches here.
+/// tool now cannot be added without answering both gates for it, and the answers
+/// reach here.
 ///
-/// `describe_table` and `propose_table_change` stay available with queries off —
-/// they read structure and run nothing, which is not the access `AiData` gates,
-/// and the server drops `describe_table`'s sample-rows section when the endpoint
-/// says samples are off. `run_query` is withheld at both ends: absent from this
-/// list, and absent from the MCP server's own `tools/list`, so the model never
-/// plans a turn around a tool it would only be denied on.
+/// `describe_table` and `propose_table_change` stay available with **queries**
+/// off — they read structure and run nothing, which is not the access `AiData`
+/// gates, and the server drops `describe_table`'s sample-rows section when the
+/// endpoint says samples are off. Structure is what *Schema context* governs,
+/// and all three catalogue tools go with it; `propose_table_change` reads a full
+/// `fetch_schema` of whatever database it is handed, so its absence from that
+/// gate was a hole rather than an exemption. `run_query` is withheld at both
+/// ends: absent from this list, and absent from the MCP server's own
+/// `tools/list`, so the model never plans a turn around a tool it would only be
+/// denied on.
 ///
 /// **Only the MCP surface**, and not by convention: `build_session_args` emits
 /// `--allowedTools` solely alongside `--mcp-config` and solely from these names,
