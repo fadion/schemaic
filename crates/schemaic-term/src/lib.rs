@@ -117,6 +117,10 @@ pub struct Terminal {
     notify: Arc<dyn Fn() + Send + Sync>,
     /// Set by the reader thread when the PTY reaches EOF — see [`Terminal::has_exited`].
     exited: Arc<AtomicBool>,
+    /// Whether the reader has produced grid state nobody has snapshotted yet —
+    /// see [`Pending`]. Shared with the reader thread, which uses it to notify
+    /// once per unread state rather than once per 8 KB read.
+    pending: Arc<Pending>,
 }
 
 impl Terminal {
@@ -178,13 +182,15 @@ impl Terminal {
 
         // Reader thread: pump PTY bytes → VTE parser → grid, then notify.
         let exited = Arc::new(AtomicBool::new(false));
+        let pending = Arc::new(Pending::default());
         {
             let term = term.clone();
             let notify = notify.clone();
             let exited = exited.clone();
+            let pending = pending.clone();
             std::thread::Builder::new()
                 .name("schemaic-term-reader".into())
-                .spawn(move || read_loop(reader, term, notify, exited))
+                .spawn(move || read_loop(reader, term, notify, exited, pending))
                 .ok();
         }
 
@@ -195,6 +201,7 @@ impl Terminal {
             child: Mutex::new(child),
             notify,
             exited,
+            pending,
         })
     }
 
@@ -295,6 +302,11 @@ impl Terminal {
     /// `bake_block` inverts the cursor cell for a block cursor; bar/underline
     /// shapes pass `false` and are drawn by the UI as an overlay using `cursor`.
     pub fn snapshot(&self, cursor_on: bool, bake_block: bool) -> Screen {
+        // Taking the grid is what re-arms the reader's notify — see
+        // [`Pending`]. Before the read, not after: output that arrives while
+        // this snapshot is being built belongs to the *next* one, and clearing
+        // afterwards would swallow the wake-up for it.
+        self.pending.taken();
         let term = self.term.lock();
         let cols = term.columns();
         let lines = term.screen_lines();
@@ -392,11 +404,55 @@ impl Drop for Terminal {
     }
 }
 
+/// One notify per **unread** grid state, not one per read.
+///
+/// The reader's buffer is 8 KB and it notified once per successful read, so
+/// `cat` of a 10 MB log is ~1,280 notifies — and there is no coalescing point
+/// anywhere downstream. `term_notify` sends on an *unbounded* channel; floem's
+/// `create_signal_from_channel` drains its deque with one `set` per queued
+/// message; `Signal::run_effects` runs subscribers synchronously with no
+/// equality check; and `ApplicationHandle::idle` paints only once every queued
+/// trigger has run. So each 8 KB chunk cost one full `snapshot()` — a fresh
+/// `cols × lines` grid plus a `String` per run — and one rebuild of the whole
+/// terminal `dyn_container`, every row and every run, on the UI thread, before
+/// a single frame was painted. The work was O(chunks), not O(frames), and the
+/// window neither repainted nor accepted input until the backlog cleared. With
+/// the panel *closed*, too: the effect lives in `app_view` and the shell is
+/// spawned at launch, so a `.bashrc` that runs `neofetch` spends the same
+/// thread.
+///
+/// The flag is set when the grid changes and cleared when somebody takes a
+/// [`Terminal::snapshot`], so a reader running ahead of the UI notifies once
+/// and then stays quiet until its last output has actually been read. Nothing
+/// is dropped: the state is in the grid, and the pending notify is what says
+/// there is a new one.
+///
+/// **Exit is not coalesced.** `read_loop`'s final `notify` after
+/// `exited.store` must arrive whatever the flag says, or a shell that exits
+/// with its last output already read leaves the panel showing a live prompt
+/// for a process that is gone.
+#[derive(Default)]
+struct Pending(AtomicBool);
+
+impl Pending {
+    /// Announce a change, and say whether the consumer needs waking — `true`
+    /// only on the `false → true` edge.
+    fn mark(&self) -> bool {
+        !self.0.swap(true, Ordering::AcqRel)
+    }
+
+    /// The consumer has read the grid; the next change wakes it again.
+    fn taken(&self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
 fn read_loop(
     mut reader: Box<dyn Read + Send>,
     term: SharedTerm,
     notify: Arc<dyn Fn() + Send + Sync>,
     exited: Arc<AtomicBool>,
+    pending: Arc<Pending>,
 ) {
     let mut parser: Processor = Processor::new();
     let mut buf = [0u8; 8192];
@@ -413,13 +469,21 @@ fn read_loop(
                     let mut term = term.lock();
                     parser.advance(&mut *term, &buf[..n]);
                 }
-                notify();
+                // Only on the edge — see `Pending`. A consumer that has not
+                // yet taken the last snapshot already knows there is more.
+                if pending.mark() {
+                    notify();
+                }
             }
         }
     }
     // Ordered before the wake-up, so whoever the final `notify` brings round
     // reads `true` rather than racing the store.
     exited.store(true, Ordering::Release);
+    // **Unconditionally**, whatever `pending` says: this is not "there is more
+    // output", it is "the shell is gone", and the panel has to be told even if
+    // its last read caught up.
+    pending.mark();
     notify();
 }
 
@@ -831,5 +895,54 @@ mod tests {
         assert!(!in_selection(&r, pt(1, 1))); // left of the column band
         assert!(!in_selection(&r, pt(1, 5))); // right of the column band
         assert!(!in_selection(&r, pt(3, 3))); // below the row band
+    }
+}
+
+#[cfg(test)]
+mod pending_tests {
+    use super::Pending;
+
+    /// **A reader running ahead of the UI wakes it once, not once per chunk.**
+    ///
+    /// `read_loop`'s buffer is 8 KB and it notified per successful read, so
+    /// `cat` of a 10 MB log was ~1,280 notifies — with no coalescing point
+    /// anywhere downstream: an unbounded channel, one `set` per queued message
+    /// out of floem's deque, subscribers run synchronously with no equality
+    /// check, and a paint only after every trigger has run. Each chunk
+    /// therefore cost a full `snapshot()` and a full rebuild of the terminal
+    /// view on the UI thread, so the work was O(chunks) rather than O(frames)
+    /// and the window stopped repainting.
+    #[test]
+    fn a_burst_of_reads_wakes_the_consumer_once() {
+        let p = Pending::default();
+        let notifies = (0..1_280).filter(|_| p.mark()).count();
+        assert_eq!(notifies, 1, "one wake-up for a whole burst");
+    }
+
+    /// …and the next burst wakes it again, once the grid has been read.
+    /// Coalescing that never re-arms is a terminal that stops updating.
+    #[test]
+    fn taking_the_snapshot_re_arms_the_next_wake_up() {
+        let p = Pending::default();
+        assert!(p.mark(), "the first change wakes");
+        assert!(!p.mark(), "the second does not");
+
+        p.taken(); // `Terminal::snapshot`
+        assert!(p.mark(), "a change after the read wakes again");
+        assert!(!p.mark());
+
+        p.taken();
+        p.taken(); // idempotent: two snapshots with nothing between them
+        assert!(p.mark());
+    }
+
+    /// A snapshot taken with nothing pending must not leave the flag set —
+    /// otherwise the *next* real change would be swallowed and the panel would
+    /// sit on stale output until something else woke it.
+    #[test]
+    fn a_snapshot_of_an_idle_terminal_leaves_it_armed() {
+        let p = Pending::default();
+        p.taken();
+        assert!(p.mark(), "the first change after an idle read still wakes");
     }
 }
