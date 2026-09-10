@@ -1024,7 +1024,16 @@ fn pg_action(
             Some(TriggerAction::Function { name, .. }) => name.clone(),
             _ => String::new(),
         });
-        let named = display_of(&sql, &fns.get());
+        // **`with`, not `get`.** This effect is subscribed to the whole trigger
+        // set draft — the `d.with` above — and every `bound_field` in the form
+        // writes that signal on every keystroke, so this line ran per character
+        // typed anywhere. `fns.get()` clones `Vec<RoutineInfo>` whole, and a
+        // `RoutineInfo` carries the routine's `definition`: on a database with
+        // thirty trigger functions averaging a kilobyte of source, typing a
+        // forty-character `WHEN` clause copied over a megabyte to recompute a
+        // display string that had not changed. `display_of` takes the list by
+        // slice, which is what it wanted all along.
+        let named = fns.with(|l| display_of(&sql, l));
         if sel.get_untracked() != named {
             sel.set(named);
         }
