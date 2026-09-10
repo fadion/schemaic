@@ -179,6 +179,36 @@ pub fn recent(entries: &[SearchEntry], conn: u64) -> Vec<SearchEntry> {
         .collect()
 }
 
+/// [`recent`] with the hidden databases left out — what Find-Anywhere shows on
+/// an **empty** query.
+///
+/// **Hiding a database has to reach the history list too.** `db_hidden`'s rule
+/// is that a hidden database is gone from the tree, *from Find-Anywhere*, from
+/// the toolbar's selector, from autocomplete, from what the assistant is told
+/// exists, and from `list_schema`'s overview — and Find-Anywhere honoured it on
+/// exactly one of its two branches. The *typed* branch filtered through
+/// [`crate::schema::db_visible`]; the *empty* branch read [`recent`], which
+/// asks only about `conn_id`, so a row for a hidden database stayed in the
+/// list, opened a tab when activated, and disappeared the moment a single
+/// character was typed.
+///
+/// The visibility test runs **before** the [`MAX_PER_CONN`] take, not after:
+/// filtering a taken window would let a hidden database's ten entries crowd out
+/// every visible one and leave the list empty.
+pub fn recent_visible(
+    entries: &[SearchEntry],
+    conn: u64,
+    hidden: &std::collections::HashSet<String>,
+) -> Vec<SearchEntry> {
+    entries
+        .iter()
+        .filter(|e| e.conn_id == conn)
+        .filter(|e| crate::schema::db_visible(hidden, &e.database))
+        .take(MAX_PER_CONN)
+        .cloned()
+        .collect()
+}
+
 /// Forget every entry for one connection.
 pub fn clear_conn(entries: &mut Vec<SearchEntry>, conn_id: u64) {
     entries.retain(|e| e.conn_id != conn_id);
@@ -215,6 +245,52 @@ mod tests {
         push(&mut v, mk("public"));
         assert_eq!(v.len(), 2);
         assert_eq!(v[0].schema.as_deref(), Some("public"));
+    }
+
+    /// **A hidden database must not answer the empty-query list either.**
+    /// Activate `scratch.orders`, hide `scratch` with the SCHEMA panel's eye,
+    /// reopen Ctrl+P and leave the box empty: the row was still there, still
+    /// opened a tab on the hidden database, and vanished as soon as one
+    /// character was typed — because the typed branch filters and the history
+    /// branch did not.
+    #[test]
+    fn a_hidden_databases_history_row_is_not_offered() {
+        let in_db = |db: &str, table: &str| SearchEntry {
+            database: db.into(),
+            ..entry(1, table, None)
+        };
+        let v = vec![in_db("scratch", "orders"), in_db("app", "users")];
+        let hidden: std::collections::HashSet<String> = ["scratch".to_string()].into();
+
+        let got = recent_visible(&v, 1, &hidden);
+        assert_eq!(got, vec![in_db("app", "users")], "{got:?}");
+        // Unhidden, the same entry is offered — so the filter is the hiding and
+        // not something else about the row.
+        assert_eq!(recent_visible(&v, 1, &Default::default()), v);
+    }
+
+    /// The take is bounded **after** the visibility filter, so a hidden
+    /// database cannot spend the window and leave the list empty.
+    #[test]
+    fn a_hidden_databases_entries_do_not_spend_the_per_connection_window() {
+        let mut v: Vec<SearchEntry> = (0..MAX_PER_CONN)
+            .map(|i| SearchEntry {
+                database: "scratch".into(),
+                ..entry(1, &format!("t{i}"), None)
+            })
+            .collect();
+        v.push(SearchEntry {
+            database: "app".into(),
+            ..entry(1, "users", None)
+        });
+        let hidden: std::collections::HashSet<String> = ["scratch".to_string()].into();
+        assert_eq!(
+            recent_visible(&v, 1, &hidden)
+                .iter()
+                .map(|e| e.table.clone())
+                .collect::<Vec<_>>(),
+            vec!["users".to_string()]
+        );
     }
 
     #[test]

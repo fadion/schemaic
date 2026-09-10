@@ -4108,8 +4108,17 @@ fn build_items(
             let q = q.trim().to_lowercase();
             if q.is_empty() {
                 let conn = active_conn.get_untracked();
-                let recent = search_history
-                    .with_untracked(|v| schemaic_core::search_history::recent(v, conn));
+                // `recent_visible`, not `recent`: a hidden database is gone
+                // from Find-Anywhere on *both* branches. The typed branch a
+                // few lines down filters through `db_visible` inside
+                // `find_matches`; this one used to ask only about `conn_id`,
+                // so hiding a database left its history rows offered until you
+                // typed a character.
+                let recent = hidden.with_untracked(|hidden| {
+                    search_history.with_untracked(|v| {
+                        schemaic_core::search_history::recent_visible(v, conn, hidden)
+                    })
+                });
                 return recent
                     .into_iter()
                     .filter_map(|e| {
@@ -5338,7 +5347,7 @@ fn find_matches(
     // `Vec<ConnNode>`, two `String`s per node, per character typed. On the one
     // path docs/architecture.md names for both rules. `lookup_object` twenty lines below
     // already did it this way.
-    let mut out = Vec::new();
+    let mut loaded: Vec<(String, std::sync::Arc<schemaic_core::schema::DbSchema>)> = Vec::new();
     hidden.with_untracked(|hidden| {
         db_nodes.with_untracked(|nodes| {
             for node in nodes {
@@ -5352,14 +5361,59 @@ fn find_matches(
                 if !db_visible(hidden, &node.database) {
                     continue;
                 }
-                if let SchemaState::Loaded(schema) = node.schema.get_untracked()
-                    && schema_hits(&node.database, &schema, q, limit, &mut out)
-                {
-                    return;
+                if let SchemaState::Loaded(schema) = node.schema.get_untracked() {
+                    loaded.push((node.database.clone(), schema));
                 }
             }
         })
     });
+    matches_across(
+        loaded.iter().map(|(db, s)| (db.as_str(), s.as_ref())),
+        q,
+        limit,
+    )
+}
+
+/// Every visible database's hits, merged under a per-database share of `limit`.
+///
+/// **The cap was spent first-come, by database.** `find_matches` walked the
+/// databases in `db_nodes` order and stopped at the first one to fill the list,
+/// so on a connection holding `analytics` (400 tables, many carrying `order`)
+/// and `shop` (20 tables, one of them literally named `orders`), typing
+/// `orders` returned eighty rows of `analytics` and **`shop.orders` was not in
+/// the list at all** — an exact match on the term typed in full, unreachable by
+/// typing more, since a longer prefix cannot narrow `analytics` faster than it
+/// narrows `shop`. Hiding `analytics` was the only way to see it.
+///
+/// This is [`pass_shares`]' own stated failure one level up: its doc says
+/// ordering alone "decided which category could crowd the others out … Neither
+/// is a *wrong* result — each is an absent one, for something the user typed
+/// precisely." The same sentence describes the per-database case, and the share
+/// mechanism it introduced was applied only *within* one database.
+///
+/// So every database is asked — the early return is gone — each for at most
+/// `limit` hits, and the buckets are merged by the same share. The extra work is
+/// bounded: [`schema_hits`] stops each of its passes at the room it was given,
+/// so a database contributes at most `limit` hits however large it is.
+fn matches_across<'a>(
+    dbs: impl IntoIterator<Item = (&'a str, &'a schemaic_core::schema::DbSchema)>,
+    q: &str,
+    limit: usize,
+) -> Vec<FindHit> {
+    let mut buckets: Vec<Vec<FindHit>> = Vec::new();
+    for (database, schema) in dbs {
+        let mut bucket = Vec::new();
+        schema_hits(database, schema, q, limit, &mut bucket);
+        if !bucket.is_empty() {
+            buckets.push(bucket);
+        }
+    }
+    let want: Vec<usize> = buckets.iter().map(Vec::len).collect();
+    let take = pass_shares(limit, &want);
+    let mut out = Vec::with_capacity(take.iter().sum());
+    for (bucket, n) in buckets.into_iter().zip(take) {
+        out.extend(bucket.into_iter().take(n));
+    }
     out
 }
 
@@ -5499,7 +5553,7 @@ fn schema_hits(
             }
         }
     }
-    let take = pass_shares(room, [names.len(), objects.len(), columns.len()]);
+    let take = pass_shares(room, &[names.len(), objects.len(), columns.len()]);
     for (bucket, n) in [names, objects, columns].into_iter().zip(take) {
         out.extend(bucket.into_iter().take(n));
     }
@@ -5522,9 +5576,15 @@ fn schema_hits(
 /// objects, columns — so a narrow search still fills the list with the most
 /// precise matches first, and only a search broad enough to overflow ever pays
 /// the share.
-fn pass_shares(room: usize, want: [usize; 3]) -> [usize; 3] {
+/// It takes a slice rather than `[usize; 3]` because the same share is now
+/// applied a second time, across **databases** — see [`matches_across`], where
+/// the bucket count is however many are loaded and visible.
+fn pass_shares(room: usize, want: &[usize]) -> Vec<usize> {
+    if want.is_empty() {
+        return Vec::new();
+    }
     let base = room / want.len();
-    let mut take = [0usize; 3];
+    let mut take = vec![0usize; want.len()];
     let mut left = room;
     for i in 0..want.len() {
         take[i] = want[i].min(base);
@@ -6098,6 +6158,72 @@ mod find_tests {
         );
     }
 
+    /// **A later database's exact match is reachable.** The cap used to be
+    /// spent first-come: `find_matches` walked the databases in `db_nodes`
+    /// order and returned at the first one to fill the list, so a connection
+    /// holding a large `analytics` before a small `shop` answered `orders` with
+    /// eighty `analytics` rows and no `shop.orders` — an exact name match on
+    /// the term typed in full, unreachable by typing more.
+    #[test]
+    fn a_later_databases_exact_match_is_not_crowded_out() {
+        let flood = DbSchema {
+            tables: (0..200)
+                .map(|i| TableInfo {
+                    name: format!("orders_part_{i}"),
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        };
+        let small = DbSchema {
+            tables: vec![TableInfo {
+                name: "orders".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let hits = super::matches_across([("analytics", &flood), ("shop", &small)], "orders", 80);
+        assert_eq!(hits.len(), 80, "the list is still full");
+        let names: Vec<String> = hits
+            .iter()
+            .map(|h| match &h.target {
+                FindTarget::Table { source, .. } => format!("{}.{}", source.database, source.table),
+                FindTarget::Object { database, item } => format!("{database}.{}", item.name()),
+            })
+            .collect();
+        assert!(
+            names.contains(&"shop.orders".to_string()),
+            "the small database's exact match was crowded out: {names:?}"
+        );
+        // The large one still gets the lion's share of what is left, so this is
+        // a share and not a round-robin that starves it.
+        assert!(
+            names.iter().filter(|n| n.starts_with("analytics.")).count() >= 40,
+            "{names:?}"
+        );
+    }
+
+    /// One database alone still fills the list — the share must not cap a
+    /// single database at a fraction of `limit`.
+    #[test]
+    fn one_database_still_fills_the_list() {
+        let flood = DbSchema {
+            tables: (0..200)
+                .map(|i| TableInfo {
+                    name: format!("orders_part_{i}"),
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        };
+        assert_eq!(
+            super::matches_across([("analytics", &flood)], "orders", 80).len(),
+            80
+        );
+        // And no database at all is not a panic.
+        assert!(super::matches_across([], "orders", 80).is_empty());
+    }
+
     /// Each pass is guaranteed its third if it can use it; a pass with nothing to
     /// show hands its share on, and the spare goes in pass order, so a narrow
     /// search still fills the list with the most precise matches first.
@@ -6105,17 +6231,35 @@ mod find_tests {
     fn each_pass_gets_a_share_and_the_spare_goes_in_order() {
         use super::pass_shares;
         // Everything fits: nothing is capped.
-        assert_eq!(pass_shares(80, [2, 3, 4]), [2, 3, 4]);
+        assert_eq!(pass_shares(80, &[2, 3, 4]), [2, 3, 4]);
         // One category floods; the others keep their share, and the spare left
         // by a pass that couldn't fill its own goes to the earlier of the two.
-        assert_eq!(pass_shares(9, [1, 40, 40]), [1, 5, 3]);
-        assert_eq!(pass_shares(9, [40, 40, 40]), [3, 3, 3]);
+        assert_eq!(pass_shares(9, &[1, 40, 40]), [1, 5, 3]);
+        assert_eq!(pass_shares(9, &[40, 40, 40]), [3, 3, 3]);
         // A pass with nothing hands its share on, in pass order.
-        assert_eq!(pass_shares(9, [0, 0, 40]), [0, 0, 9]);
-        assert_eq!(pass_shares(9, [40, 0, 40]), [6, 0, 3]);
+        assert_eq!(pass_shares(9, &[0, 0, 40]), [0, 0, 9]);
+        assert_eq!(pass_shares(9, &[40, 0, 40]), [6, 0, 3]);
         // Degenerate rooms don't over-allocate.
-        assert_eq!(pass_shares(0, [5, 5, 5]), [0, 0, 0]);
-        assert_eq!(pass_shares(2, [5, 5, 5]), [2, 0, 0]);
+        assert_eq!(pass_shares(0, &[5, 5, 5]), [0, 0, 0]);
+        assert_eq!(pass_shares(2, &[5, 5, 5]), [2, 0, 0]);
+    }
+
+    /// The same arithmetic at other widths, since the buckets are now however
+    /// many databases are loaded rather than always three.
+    #[test]
+    fn the_share_holds_for_any_number_of_buckets() {
+        use super::pass_shares;
+        assert_eq!(
+            pass_shares(10, &[]),
+            Vec::<usize>::new(),
+            "no divide by zero"
+        );
+        assert_eq!(pass_shares(10, &[40]), [10]);
+        assert_eq!(pass_shares(10, &[40, 40]), [5, 5]);
+        // Five databases, one of them flooding: it gets its fifth and no more
+        // while any other has something to show.
+        assert_eq!(pass_shares(10, &[40, 1, 1, 1, 1]), [6, 1, 1, 1, 1]);
+        assert_eq!(pass_shares(3, &[40, 40, 40, 40]), [3, 0, 0, 0]);
     }
 
     /// **The site the gate is applied at**, not just the predicate. Deleting the
@@ -6586,6 +6730,38 @@ fn ",
             "a Find-Anywhere pass spells the search predicate itself; every \
              schema-search surface matches through `schema::object_name_matches` \
              (or a wrapper of it), or the palette drifts from the tree"
+        );
+    }
+
+    /// **Find-Anywhere's history branch consults `hidden` too.**
+    ///
+    /// The filtering itself is `search_history::recent_visible`, and its unit
+    /// tests are in `core`. What has no unit test is the *composition* —
+    /// whether `build_items`' empty-query arm calls that function rather than
+    /// the unfiltered `recent`, which is exactly where the bug lived. Only a
+    /// running palette can be asked, so this asks the source instead.
+    ///
+    /// A future third branch that reads `recent` is a fresh instance of the
+    /// same bug, which is why the assertion is "this file does not call the
+    /// unfiltered one" and not "the arm calls the filtered one".
+    #[test]
+    fn find_anywhere_never_reads_the_unfiltered_history() {
+        let src = std::fs::read_to_string(this_file()).expect("this file");
+        let body = crate::source_gate::production_code(&src);
+        assert!(
+            body.contains("search_history::recent_visible("),
+            "the palette's empty-query list must filter hidden databases; a \
+             hidden database is gone from Find-Anywhere on both branches"
+        );
+        // `recent_visible(` contains `recent(`'s name but not its call shape,
+        // so the plain spelling is what this looks for.
+        assert!(
+            !body.contains("search_history::recent(&"),
+            "a Find-Anywhere branch reads the history unfiltered by `hidden`"
+        );
+        assert!(
+            !body.contains("search_history::recent(v"),
+            "a Find-Anywhere branch reads the history unfiltered by `hidden`"
         );
     }
 
