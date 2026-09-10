@@ -919,8 +919,23 @@ pub fn dist_point_segment(p: Pt, a: Pt, b: Pt) -> f64 {
 /// Index of the polyline nearest to `p` within `threshold` px (min distance over
 /// its segments), or `None` if none is close enough. Used for edge hover.
 pub fn nearest_polyline(p: Pt, polylines: &[Vec<Pt>], threshold: f64) -> Option<usize> {
+    nearest_polyline_of(p, polylines.iter().map(Vec::as_slice), threshold)
+}
+
+/// [`nearest_polyline`] over any sequence of borrowed polylines.
+///
+/// **For a caller that already holds the geometry.** The ERD's hover hit test
+/// used to rebuild every edge's sampled curve on every raw pointer-move event
+/// just to hand this function a `Vec<Vec<Pt>>`; it now shares one memo with
+/// the painter and passes borrows straight out of it, so a move that changes
+/// nothing but the cursor costs this walk and nothing else.
+pub fn nearest_polyline_of<'a>(
+    p: Pt,
+    polylines: impl IntoIterator<Item = &'a [Pt]>,
+    threshold: f64,
+) -> Option<usize> {
     let mut best: Option<(usize, f64)> = None;
-    for (i, poly) in polylines.iter().enumerate() {
+    for (i, poly) in polylines.into_iter().enumerate() {
         let d = poly
             .windows(2)
             .map(|w| dist_point_segment(p, w[0], w[1]))
@@ -2626,6 +2641,47 @@ mod tests {
             (dist_point_segment(pt(-4.0, 0.0), a, b) - 4.0).abs() < 1e-9,
             "clamps past the start endpoint"
         );
+    }
+
+    /// **The hit test reads borrowed polylines**, which is what lets the ERD
+    /// share one geometry between the painter and the hover handler instead of
+    /// rebuilding every edge's sampled curve on every pointer-move event.
+    ///
+    /// Written as *answers*, not as agreement with `nearest_polyline`:
+    /// that one now delegates here, so comparing the two would be comparing a
+    /// function with itself — the trap that lets a mutated tie-break pass.
+    #[test]
+    fn the_borrowed_hit_test_picks_the_nearest_within_the_threshold() {
+        let a: &[Pt] = &[pt(0.0, 0.0), pt(100.0, 0.0)];
+        let b: &[Pt] = &[pt(0.0, 20.0), pt(100.0, 20.0)];
+        // A degenerate polyline has no segment, and an empty one no points —
+        // both are reachable from a diagram mid-layout.
+        let one: &[Pt] = &[pt(50.0, 50.0)];
+        let none: &[Pt] = &[];
+        let all = [a, b, one, none];
+        let near = |p: Pt, th: f64| nearest_polyline_of(p, all, th);
+
+        assert_eq!(near(pt(50.0, 1.0), 5.0), Some(0), "on the first");
+        assert_eq!(near(pt(50.0, 19.0), 5.0), Some(1), "near the second");
+        // **Strictly nearer wins, and a tie keeps the earlier index.** Equally
+        // between the two, the first is the answer; one pixel past the
+        // midpoint, the second is.
+        assert_eq!(near(pt(50.0, 10.0), 50.0), Some(0), "a tie keeps the first");
+        assert_eq!(near(pt(50.0, 11.0), 50.0), Some(1));
+        // Outside the threshold is nothing, however generous the geometry.
+        assert_eq!(near(pt(50.0, 1.0), 0.5), None);
+        assert_eq!(near(pt(500.0, 0.0), 5.0), None);
+        // A polyline with fewer than two points is never the nearest, even
+        // when the cursor is exactly on it.
+        assert_eq!(near(pt(50.0, 50.0), 5.0), None);
+    }
+
+    /// An empty diagram has nothing to be near — the shape the hit test sees
+    /// before the first layout, and on a single-node diagram with no edges.
+    #[test]
+    fn a_diagram_with_no_edges_hovers_nothing() {
+        let none: Vec<&[Pt]> = Vec::new();
+        assert_eq!(nearest_polyline_of(pt(0.0, 0.0), none, 1000.0), None);
     }
 
     #[test]

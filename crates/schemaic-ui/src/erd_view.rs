@@ -935,33 +935,78 @@ fn export_scene(
 /// calls `request_paint` — a `svg` view updated reactively did not repaint here
 /// and blanked the edges on drag/hover. The hovered edge is stroked heavier in
 /// the accent colour.
-struct EdgeCanvas {
-    id: ViewId,
+/// Every edge's geometry, recomputed when — and only when — something it is
+/// built from moves.
+///
+/// **One derivation for two readers.** `rects` + `visible_map` + `edge_shapes`
+/// is O(cards) + O(edges × 32): a fresh `HashMap<String, Rect>` over every
+/// card, `card_metrics` (O(columns)) per node, and a cubic bezier resampled
+/// into 33 points per edge. It ran in the canvas's `PointerMove` handler on
+/// **every raw pointer-move event over empty canvas** — the gesture by which
+/// the user reaches everything — and again in `EdgeCanvas::paint`, so a move
+/// that did change the hovered edge paid for it twice. The hover write is
+/// dedup-guarded, but the guard sits *after* all of it, so it saved the paint
+/// and none of the work.
+///
+/// This is the cost class the architecture doc records as found and fixed:
+/// the ERD's position map at 8.4 ms per pointer move at 500 cards, because
+/// the *drag* handler cloned it. That handler is fixed; the sibling thirty
+/// lines below it cloned both maps and then did strictly more than the
+/// original bug — every rect, every card's visible-column list, every edge's
+/// sampled curve.
+///
+/// The value is `Rc`-wrapped and compares by pointer, so it never dedups: the
+/// point is to compute once per change of the inputs, not to suppress a
+/// repaint the canvas's own effect already handles.
+#[derive(Clone)]
+struct EdgeGeometry(Rc<Vec<EdgeShapes>>);
+
+impl PartialEq for EdgeGeometry {
+    fn eq(&self, other: &Self) -> bool {
+        Rc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+/// The memo behind [`EdgeGeometry`], over the three signals the geometry
+/// depends on. `with`, not `get`: the maps are read, not kept.
+fn edge_geometry(
     graph: Rc<DiagramGraph>,
     positions: RwSignal<HashMap<String, (f64, f64)>>,
     sizes: RwSignal<HashMap<String, (f64, f64)>>,
     collapsed: RwSignal<HashMap<String, bool>>,
+) -> Memo<EdgeGeometry> {
+    create_memo(move |_| {
+        let r = positions.with(|p| sizes.with(|s| rects(p, s)));
+        let vis = collapsed.with(|c| visible_map(&graph, c));
+        EdgeGeometry(Rc::new(edge_shapes(&graph, &r, &vis)))
+    })
+}
+
+struct EdgeCanvas {
+    id: ViewId,
     hovered: RwSignal<Option<usize>>,
     zoom: RwSignal<f64>,
     pan: RwSignal<(f64, f64)>,
+    /// The edges, already built — see [`EdgeGeometry`]. The graph and the
+    /// three signals it derives from are the memo's now: the canvas held them
+    /// only to rebuild the geometry itself on every paint.
+    geometry: Memo<EdgeGeometry>,
 }
 
 fn edge_canvas(
-    graph: Rc<DiagramGraph>,
-    positions: RwSignal<HashMap<String, (f64, f64)>>,
-    sizes: RwSignal<HashMap<String, (f64, f64)>>,
-    collapsed: RwSignal<HashMap<String, bool>>,
     hovered: RwSignal<Option<usize>>,
     zoom: RwSignal<f64>,
     pan: RwSignal<(f64, f64)>,
+    geometry: Memo<EdgeGeometry>,
 ) -> EdgeCanvas {
     let id = ViewId::new();
     // Repaint whenever a node moves/resizes, its collapse (→ column-precise anchor
     // row) changes, the hovered edge changes, or the view (zoom / pan) changes.
     create_effect(move |_| {
-        positions.track();
-        sizes.track();
-        collapsed.track();
+        // **The geometry, not its three inputs** — tracking the memo is what
+        // orders the recompute before the paint, and it changes on exactly
+        // the same events.
+        geometry.track();
         hovered.track();
         zoom.track();
         pan.track();
@@ -969,13 +1014,10 @@ fn edge_canvas(
     });
     EdgeCanvas {
         id,
-        graph,
-        positions,
-        sizes,
-        collapsed,
         hovered,
         zoom,
         pan,
+        geometry,
     }
 }
 
@@ -993,10 +1035,10 @@ impl View for EdgeCanvas {
         // scale by the zoom factor and offset by the pan (same transform the cards
         // bake into their insets — semantic zoom + free pan, no view transform).
         let sc = |p: Pt| Point::new(panx + p.x * z, pany + p.y * z);
-        let r = rects(&self.positions.get_untracked(), &self.sizes.get_untracked());
-        let vis = visible_map(&self.graph, &self.collapsed.get_untracked());
+        // Already built, by the memo the repaint effect tracks.
+        let shapes = self.geometry.get_untracked().0;
         let hov = self.hovered.get_untracked();
-        for (i, sh) in edge_shapes(&self.graph, &r, &vis).iter().enumerate() {
+        for (i, sh) in shapes.iter().enumerate() {
             let hot = Some(i) == hov;
             let brush = if hot { accent } else { base };
             // Hover changes colour only — width stays constant (no thickening).
@@ -2218,23 +2260,18 @@ pub(crate) fn erd_overlay(ui: Ui) -> impl IntoView {
 
             // Edge layer: fills the viewport and paints edges at pan + logical*zoom
             // (see `EdgeCanvas`); pointer-transparent so drags/pans fall through.
-            let edge_layer = edge_canvas(
-                graph.clone(),
-                positions,
-                sizes,
-                collapsed,
-                hovered,
-                zoom,
-                pan,
-            )
-            .pointer_events(|| false)
-            .style(|s| {
-                s.absolute()
-                    .inset_left(0.0)
-                    .inset_top(0.0)
-                    .width_full()
-                    .height_full()
-            });
+            // One derivation for the painter and the hit test — see
+            // `EdgeGeometry`.
+            let geometry = edge_geometry(graph.clone(), positions, sizes, collapsed);
+            let edge_layer = edge_canvas(hovered, zoom, pan, geometry)
+                .pointer_events(|| false)
+                .style(|s| {
+                    s.absolute()
+                        .inset_left(0.0)
+                        .inset_top(0.0)
+                        .width_full()
+                        .height_full()
+                });
 
             // ── Find (Ctrl+F) ─────────────────────────────────────────────────
             // One search per keystroke for the whole diagram; each card then reads
@@ -2322,7 +2359,6 @@ pub(crate) fn erd_overlay(ui: Ui) -> impl IntoView {
             // explicit size, not `size_full`, or it collapses to 0×0 (blank canvas,
             // no hit area). We measure the flex-grow wrapper (`on_resize`) into
             // `viewport_size` and size this inner clip layer to it.
-            let g_hit = graph.clone();
             let panning = RwSignal::new(false);
             let last = RwSignal::new((0.0_f64, 0.0_f64));
             let base = v_stack_from_iter(children);
@@ -2371,18 +2407,18 @@ pub(crate) fn erd_overlay(ui: Ui) -> impl IntoView {
                     // Edge hover: map the cursor back to logical space (undo pan/zoom).
                     let z = zoom.get_untracked();
                     let (panx, pany) = pan.get_untracked();
-                    let r = rects(&positions.get_untracked(), &sizes.get_untracked());
-                    let vis = visible_map(&g_hit, &collapsed.get_untracked());
-                    let polys: Vec<Vec<Pt>> = edge_shapes(&g_hit, &r, &vis)
-                        .into_iter()
-                        .map(|e| e.poly)
-                        .collect();
-                    let near = erd::nearest_polyline(
+                    // **Borrowed, not rebuilt.** This handler answers one
+                    // question — is the cursor near an edge — and used to
+                    // rebuild the whole diagram's geometry to do it, on every
+                    // raw pointer-move event over empty canvas. See
+                    // `EdgeGeometry`.
+                    let shapes = geometry.get_untracked().0;
+                    let near = erd::nearest_polyline_of(
                         Pt {
                             x: (pe.pos.x - panx) / z,
                             y: (pe.pos.y - pany) / z,
                         },
-                        &polys,
+                        shapes.iter().map(|e| e.poly.as_slice()),
                         EDGE_HOVER_PX / z,
                     );
                     if hovered.get_untracked() != near {
@@ -3385,5 +3421,74 @@ mod toolbar_width_tests {
             counts > chip_w("5 tables") + chip_w("4 relationships") + theme::scaled(CHIP_GAP),
             "dropping the group must give back its leading gap as well: {counts}"
         );
+    }
+}
+
+#[cfg(test)]
+mod edge_geometry_tests {
+    use super::*;
+    use floem::reactive::Scope;
+
+    /// **The geometry is built once per change of what it is built from — not
+    /// once per pointer-move event, and not twice per move that changes the
+    /// hover.**
+    ///
+    /// `rects` + `visible_map` + `edge_shapes` is O(cards) + O(edges × 32): a
+    /// fresh rect map over every card, `card_metrics` per node, and a cubic
+    /// bezier resampled into 33 points per edge. It ran in the canvas's
+    /// `PointerMove` handler on every raw event over empty canvas — the
+    /// gesture by which the user reaches everything — and again in
+    /// `EdgeCanvas::paint`. The hover write is dedup-guarded, but the guard
+    /// sits after all of it.
+    ///
+    /// Counted through a subscriber, because the cost is the *recompute*: the
+    /// memo's value is `Rc`-compared and never dedups, so a subscriber run is
+    /// a rebuild.
+    #[test]
+    fn the_edge_geometry_is_rebuilt_only_when_a_card_moves() {
+        let scope = Scope::new();
+        let graph = Rc::new(DiagramGraph {
+            nodes: vec![DiagramNode {
+                id: "t".into(),
+                kind: NodeKind::Table,
+                columns: Vec::new(),
+            }],
+            ..Default::default()
+        });
+        let positions = scope.create_rw_signal(HashMap::new());
+        let sizes = scope.create_rw_signal(HashMap::new());
+        let collapsed = scope.create_rw_signal(HashMap::new());
+        let geometry = edge_geometry(graph, positions, sizes, collapsed);
+
+        let builds = Rc::new(std::cell::Cell::new(0u32));
+        let c = builds.clone();
+        create_effect(move |_| {
+            let _ = geometry.get();
+            c.set(c.get() + 1);
+        });
+        assert_eq!(builds.get(), 1, "the first build");
+
+        // Reading it — which is all a pointer move over empty canvas does —
+        // costs nothing.
+        for _ in 0..200 {
+            let _ = geometry.get_untracked();
+        }
+        assert_eq!(builds.get(), 1, "200 pointer moves rebuilt the geometry");
+
+        // A card moving, resizing or collapsing is a rebuild, one each.
+        positions.update(|m| {
+            m.insert("t".to_string(), (10.0, 10.0));
+        });
+        assert_eq!(builds.get(), 2, "a drag must rebuild");
+        sizes.update(|m| {
+            m.insert("t".to_string(), (100.0, 50.0));
+        });
+        assert_eq!(builds.get(), 3, "a resize must rebuild");
+        collapsed.update(|m| {
+            m.insert("t".to_string(), true);
+        });
+        assert_eq!(builds.get(), 4, "a collapse must rebuild");
+
+        scope.dispose();
     }
 }
