@@ -6044,8 +6044,8 @@ pub fn key_list_text(cols: &[crate::schema::IndexColumn]) -> String {
 /// The inverse of [`key_list_text`]. Unparseable pieces come back as a plain
 /// column name, so a typo surfaces as "that isn't a column"
 /// ([`TableDraft::validate`]) rather than as silently dropped input.
-pub fn parse_key_list(s: &str) -> Vec<crate::schema::IndexColumn> {
-    split_keys(s)
+pub fn parse_key_list(s: &str, dialect: SqlDialect) -> Vec<crate::schema::IndexColumn> {
+    split_keys(s, dialect)
         .into_iter()
         .map(|p| p.trim())
         .filter(|p| !p.is_empty())
@@ -6074,7 +6074,7 @@ pub fn parse_key_list(s: &str) -> Vec<crate::schema::IndexColumn> {
             // A piece wrapped in its own parentheses is an expression key —
             // `(lower(email))`. Checked before the prefix rule below, which reads
             // `(` as the start of a MySQL prefix length.
-            if let Some(inner) = unwrap_parens(head) {
+            if let Some(inner) = unwrap_parens(head, dialect) {
                 return crate::schema::IndexColumn {
                     descending,
                     collation: collation.clone(),
@@ -6111,42 +6111,51 @@ pub fn parse_key_list(s: &str) -> Vec<crate::schema::IndexColumn> {
 /// and PostgreSQL's index introspection, which both have to decide whether a
 /// piece of SQL is a parenthesised expression, and got different answers when
 /// each had its own copy.
-pub fn unwrap_parens(s: &str) -> Option<&str> {
+pub fn unwrap_parens(s: &str, dialect: SqlDialect) -> Option<&str> {
     let s = s.trim();
-    if !s.starts_with('(') {
-        return None;
-    }
-    let mut depth = 0i32;
-    for (i, ch) in s.char_indices() {
-        match ch {
-            '(' => depth += 1,
-            ')' => {
-                depth -= 1;
-                if depth == 0 {
-                    return (i + 1 == s.len()).then(|| s[1..i].trim());
-                }
-            }
-            _ => {}
-        }
-    }
-    None // unbalanced
+    // **Through `sql::balanced_paren_span`, which goes through `skip_noncode`.**
+    // This counted parens on raw `char_indices`, so a close paren inside a
+    // string literal ended the group two bytes early: a PostgreSQL index keyed
+    // `(lower((name || ')'::text)))` — which is `key_list_text`'s own output —
+    // came back from `parse_key_list` as a plain *column* name, and
+    // `TableDraft::validate` then refused the whole table with "Index ix names
+    // …, which isn't a column". The user is locked out of an edit they never
+    // made, and the round trip `parse_key_list(key_list_text(x)) == x` that this
+    // module asserts twice is broken on any key carrying a quote.
+    //
+    // `peel_parens`, five hundred lines down, already solved this and its doc
+    // names the case: "`name <> ')'` carries a close-paren inside a string
+    // literal and a raw byte scan reads it as the end of the group".
+    let end = crate::sql::balanced_paren_span(s.as_bytes(), 0, dialect)?;
+    (end + 1 == s.len()).then(|| s[1..end].trim())
 }
 
 /// Split a key list on the commas that separate *keys*, ignoring those inside
 /// parentheses — `coalesce(a, b)` is one key, not two.
-fn split_keys(s: &str) -> Vec<&str> {
+///
+/// **Through `sql::skip_noncode`, like its sibling above**, and for the same
+/// reason: counting raw bytes left the depth at 1 after `(f(a, '('))`, so every
+/// key after it was swallowed into the first.
+fn split_keys(s: &str, dialect: SqlDialect) -> Vec<&str> {
+    let b = s.as_bytes();
     let mut out = Vec::new();
     let (mut start, mut depth) = (0usize, 0i32);
-    for (i, ch) in s.char_indices() {
-        match ch {
-            '(' => depth += 1,
-            ')' => depth = (depth - 1).max(0),
-            ',' if depth == 0 => {
+    let mut i = 0usize;
+    while i < b.len() {
+        if let Some(j) = crate::sql::skip_noncode(b, i, dialect) {
+            i = j;
+            continue;
+        }
+        match b[i] {
+            b'(' => depth += 1,
+            b')' => depth = (depth - 1).max(0),
+            b',' if depth == 0 => {
                 out.push(&s[start..i]);
                 start = i + 1;
             }
             _ => {}
         }
+        i += 1;
     }
     out.push(&s[start..]);
     out
@@ -12121,13 +12130,13 @@ mod tests {
         ];
         let text = key_list_text(&cols);
         assert_eq!(text, "bio(20), age DESC, id");
-        assert_eq!(parse_key_list(&text), cols);
+        assert_eq!(parse_key_list(&text, MySql), cols);
     }
 
     #[test]
     fn parse_key_list_is_forgiving_about_spacing_and_case() {
         assert_eq!(
-            parse_key_list("  bio ( 20 ) ,  age  desc , , id "),
+            parse_key_list("  bio ( 20 ) ,  age  desc , , id ", MySql),
             vec![
                 IndexColumn {
                     name: "bio".into(),
@@ -12143,10 +12152,16 @@ mod tests {
             ]
         );
         // An explicit ASC is the default and disappears.
-        assert_eq!(parse_key_list("id ASC"), vec![IndexColumn::plain("id")]);
-        assert!(parse_key_list("   ").is_empty());
+        assert_eq!(
+            parse_key_list("id ASC", MySql),
+            vec![IndexColumn::plain("id")]
+        );
+        assert!(parse_key_list("   ", MySql).is_empty());
         // Junk stays a name, so validation can say it isn't a column.
-        assert_eq!(parse_key_list("bio(x)"), vec![IndexColumn::plain("bio(x)")]);
+        assert_eq!(
+            parse_key_list("bio(x)", MySql),
+            vec![IndexColumn::plain("bio(x)")]
+        );
     }
 
     /// The designer's key-list field is where an index the user *isn't* editing
@@ -12164,7 +12179,7 @@ mod tests {
         ];
         let text = key_list_text(&cols);
         assert_eq!(text, "(lower(email)), (coalesce(nick, name)) DESC, id");
-        assert_eq!(parse_key_list(&text), cols, "read back unchanged");
+        assert_eq!(parse_key_list(&text, MySql), cols, "read back unchanged");
     }
 
     /// A column whose name merely contains brackets is not an expression: only a
@@ -12172,11 +12187,57 @@ mod tests {
     /// writes.
     #[test]
     fn parse_key_list_only_treats_an_enclosed_piece_as_an_expression() {
-        assert_eq!(parse_key_list("bio(x)"), vec![IndexColumn::plain("bio(x)")]);
         assert_eq!(
-            parse_key_list("(a) + (b)"),
+            parse_key_list("bio(x)", MySql),
+            vec![IndexColumn::plain("bio(x)")]
+        );
+        assert_eq!(
+            parse_key_list("(a) + (b)", MySql),
             vec![IndexColumn::plain("(a) + (b)")],
             "not enclosed by one pair, so it stays a (bad) name for validation"
+        );
+    }
+
+    /// **A close paren inside a string literal is not the end of the group.**
+    ///
+    /// `pg_get_indexdef` renders `CREATE INDEX ix ON t (lower((name || ')')))`
+    /// as a key holding a quoted `)`. The scanners counted raw bytes, so the
+    /// literal's paren closed the group two bytes early: `unwrap_parens`
+    /// answered `None`, `parse_key_list` returned the whole thing as a plain
+    /// *column name*, and `TableDraft::validate` then refused the table with
+    /// "Index ix names …, which isn't a column" — locking the user out of an
+    /// edit they never made, on `key_list_text`'s own output. `split_keys` had
+    /// the comma half of it: `(f(a, '(')), b` never split, so the second key
+    /// was swallowed into the first.
+    ///
+    /// `peel_parens` five hundred lines down already solved this, through the
+    /// same `sql::balanced_paren_span` these use now, and its doc names the
+    /// exact case.
+    #[test]
+    fn a_paren_in_a_string_literal_does_not_close_the_group() {
+        assert_eq!(unwrap_parens("(a || ')')", Postgres), Some("a || ')'"));
+        assert_eq!(
+            unwrap_parens("(lower((name || ')')))", Postgres),
+            Some("lower((name || ')'))")
+        );
+        // Still `None` for the cases it was always right about.
+        assert_eq!(unwrap_parens("(a) + (b)", Postgres), None);
+        assert_eq!(unwrap_parens("a", Postgres), None);
+        assert_eq!(unwrap_parens("(a", Postgres), None);
+
+        // And the round trip the module asserts twice, on a key that carries a
+        // quote — which neither existing fixture does.
+        let cols = vec![
+            IndexColumn::expr("lower((name || ')'))"),
+            IndexColumn::plain("id"),
+        ];
+        let text = key_list_text(&cols);
+        assert_eq!(parse_key_list(&text, Postgres), cols, "round trip: {text}");
+
+        // The comma half: a literal paren must not swallow the next key.
+        assert_eq!(
+            parse_key_list("(f(a, '(')), b", Postgres),
+            vec![IndexColumn::expr("f(a, '(')"), IndexColumn::plain("b")]
         );
     }
 

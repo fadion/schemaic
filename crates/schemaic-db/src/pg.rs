@@ -3156,7 +3156,7 @@ async fn query_all(client: &Client, sql: &str) -> Result<Vec<Vec<Option<String>>
 /// parenthesised, rather than each site guessing.
 fn expr_key(def: &str) -> String {
     let s = def.trim();
-    schemaic_core::ddl::unwrap_parens(s)
+    schemaic_core::ddl::unwrap_parens(s, schemaic_core::intel::SqlDialect::Postgres)
         .unwrap_or(s)
         .to_string()
 }

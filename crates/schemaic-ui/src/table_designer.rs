@@ -1599,7 +1599,8 @@ fn index_form(ui: Ui, target: &DesignerTarget, ring: FocusRing) -> AnyView {
     let Some(ix) = draft.indexes.get(i).map(|x| x.info.clone()) else {
         return empty_hint("No index selected. The primary key lives on the columns.").into_any();
     };
-    let pg = target.dialect == SqlDialect::Postgres;
+    let dialect = target.dialect;
+    let pg = dialect == SqlDialect::Postgres;
     let key_hint: &'static str = if pg {
         "Comma-separated, in key order. Add DESC for a descending column."
     } else {
@@ -1686,7 +1687,7 @@ fn index_form(ui: Ui, target: &DesignerTarget, ring: FocusRing) -> AnyView {
                     20,
                     move |d, v| {
                         if let Some(x) = d.indexes.get_mut(i) {
-                            x.info.columns = parse_key_list(v);
+                            x.info.columns = parse_key_list(v, dialect);
                         }
                     },
                 ),
