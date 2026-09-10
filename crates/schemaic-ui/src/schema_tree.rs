@@ -82,6 +82,10 @@ struct Nav {
     ///
     /// Set by [`marking_opener`], cleared by watching the menu itself go away.
     menu_row: RwSignal<Option<String>>,
+    /// The tree container's own view id, published once the view exists — what
+    /// a closing context menu hands the keyboard back to. See
+    /// [`arm_menu_return`].
+    tree_id: RwSignal<Option<floem::ViewId>>,
 }
 
 /// A row's context menu, as a function of **where** to open it: `None` at the
@@ -726,8 +730,42 @@ fn marking_opener(nav: Nav, key: &str, open: CtxOpener) -> CtxOpener {
     let key = key.to_string();
     Rc::new(move |at| {
         nav.menu_row.set(Some(key.clone()));
+        arm_menu_return(nav);
         open(at);
     })
+}
+
+/// Hand the keyboard back to the tree when the menu about to open closes.
+///
+/// **A right-click left the tree with no focus once the menu went away.** A
+/// menu panel is a `focus_root`, and its teardown hands the keyboard to the
+/// innermost *other* focus root — out in the main workspace there is none, so
+/// focus is simply dropped (`widgets::set_menu_return` was written up against
+/// the identical symptom on the grid toolbar). floem focuses a
+/// `keyboard_navigable` view on a **secondary** pointer-down exactly as on a
+/// primary one, so the right-click put focus on the tree and closing the menu
+/// took it away again: arrow keys, Enter and Shift+F10 all stopped answering,
+/// and the nav highlight vanished with them, until something was clicked. The
+/// Shift+F10 route armed a return and said why; the pointer route armed
+/// nothing.
+///
+/// `set_menu_return` is deliberately withheld after a click elsewhere in the
+/// app, and the stated reason is that "moving focus to the control that was
+/// clicked would take the arrow keys away from whatever had them". That
+/// premise is what does not hold here — floem has already moved focus, and the
+/// arrow keys were the tree's — which is why the guard is `nav.focused` rather
+/// than `keyboard_nav()`: the return is armed only when the tree actually held
+/// the keyboard, leaving every other trigger's rule intact.
+fn arm_menu_return(nav: Nav) {
+    if !nav.focused.get_untracked() {
+        return;
+    }
+    let tree_id = nav.tree_id.get_untracked();
+    crate::widgets::set_menu_return(Rc::new(move || {
+        if let Some(id) = tree_id {
+            exec_after(Duration::ZERO, move |_| id.request_focus());
+        }
+    }));
 }
 
 // Attach a self-scroll-into-view effect to a row's view: whenever it becomes the
@@ -1003,12 +1041,11 @@ pub(crate) fn schema_panel(ui: Ui) -> impl IntoView {
         cursor_at: RwSignal::new(None),
         cursor_menu: RwSignal::new(None),
         menu_row: RwSignal::new(None),
+        tree_id: RwSignal::new(None),
     };
     // The mark goes away with the menu, however it went — see
     // `widgets::clear_row_mark_on_close`, which Manage Connections' list shares.
     widgets::clear_row_mark_on_close(context_menu, nav.menu_row);
-
-    let nav_tree_id: RwSignal<Option<floem::ViewId>> = RwSignal::new(None);
 
     // Cloned up front: `on_toggle`/`open_table` are moved into the tree's
     // dyn_stack closure below, but the keyboard-nav handler needs them too
@@ -1114,6 +1151,9 @@ pub(crate) fn schema_panel(ui: Ui) -> impl IntoView {
                     return;
                 }
                 ui.overlay.popup_anchor.set(None);
+                // The blank-space menu is a `focus_root` like any other — see
+                // `arm_menu_return`.
+                arm_menu_return(nav);
                 ui.overlay.popup_menu.set(Some(entries));
             }
         })
@@ -1218,12 +1258,11 @@ pub(crate) fn schema_panel(ui: Ui) -> impl IntoView {
                 });
                 if let Some(open) = nav.cursor_menu.get_untracked().filter(|_| cursor_visible) {
                     let at = nav.cursor_at.get_untracked();
-                    let tree_id = nav_tree_id.get_untracked();
-                    crate::widgets::set_menu_return(Rc::new(move || {
-                        if let Some(id) = tree_id {
-                            exec_after(Duration::ZERO, move |_| id.request_focus());
-                        }
-                    }));
+                    // `marking_opener` arms this too, for the pointer route
+                    // that had no return at all — see `arm_menu_return`. Armed
+                    // here as well because the cursor row's published opener
+                    // is the *inner* one, without the marking wrapper.
+                    arm_menu_return(nav);
                     (open)(at);
                 }
                 return EventPropagation::Stop;
@@ -1362,7 +1401,7 @@ pub(crate) fn schema_panel(ui: Ui) -> impl IntoView {
     // The tree's own id, so a context menu it raised can give the keyboard back
     // when it closes. Filled after the view exists; the handler above reads it
     // through the signal for that reason.
-    nav_tree_id.set(Some(tree.id()));
+    nav.tree_id.set(Some(tree.id()));
 
     // Title row: "SCHEMA" left; the visibility (eye) and settings (gear) menus
     // right. The gear is rightmost; the eye sits 10px to its left. Each icon
@@ -2857,8 +2896,10 @@ fn key_row(
     .style(move |s| s.color(color().multiply_alpha(0.5)).items_center())
     .on_secondary_click_stop(move |_| {
         // This row has no `CtxOpener` to wrap (`marking_opener`) because it has no
-        // keyboard route to share one with, so it marks itself.
+        // keyboard route to share one with, so it marks itself — and arms the
+        // focus return itself for the same reason.
         nav.menu_row.set(Some(menu_key.clone()));
+        arm_menu_return(nav);
         let ai_prompt = format!(
             "In `{database}`.`{table}`, explain the `{ctx_name}` {kind} on ({cols}) — its \
              purpose (uniqueness, faster lookups, or a foreign-key relationship)."
@@ -3710,17 +3751,25 @@ mod tests {
         )
         .expect("this file's own source");
         let body = crate::source_gate::production_code(&src);
-        // One `nav.focused` write per handler, and each preceded by its own
-        // guard — `!get_untracked()` before the `true`, `get_untracked()`
-        // before the `false`. Counted rather than matched pairwise, the way
-        // `every_piped_child` counts: a third writer shows up as an imbalance.
-        let writes = body.matches("nav.focused.set(").count();
-        let guards = body.matches("nav.focused.get_untracked()").count();
-        assert_eq!(
-            writes, guards,
-            "a `nav.focused` write is unguarded; a same-value `set` still \
-             notifies, and every row in the tree reads it in its style closure"
-        );
+        // Every `nav.focused` write sits directly under a line asking what it
+        // already holds. Line-adjacency rather than a global count, because
+        // `arm_menu_return` reads the same signal for a different reason and
+        // must not be able to stand in for a missing guard.
+        let lines: Vec<&str> = body.lines().collect();
+        let mut writes = 0;
+        for (i, l) in lines.iter().enumerate() {
+            if !l.contains("nav.focused.set(") {
+                continue;
+            }
+            writes += 1;
+            assert!(
+                i > 0 && lines[i - 1].contains("nav.focused.get_untracked()"),
+                "line {} writes `nav.focused` unguarded; a same-value `set` \
+                 still notifies, and every row in the tree reads it in its \
+                 style closure",
+                i + 1
+            );
+        }
         assert_eq!(writes, 2, "this gate is stale — the handlers have moved");
         // The seeded cursor is the other half: `resume_cursor` hands back the
         // cursor it was given, so the write has to compare first.
