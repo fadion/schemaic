@@ -151,6 +151,7 @@ live_suite!(
         same_named_tables_in_two_namespaces_stay_distinct,
         a_result_names_the_namespace_it_read_from,
         an_edit_lands_in_the_namespace_it_was_read_from,
+        a_sequence_cannot_be_owned_across_namespaces,
     ],
     views: [
         an_introspected_view_diffs_to_nothing_against_its_own_draft,

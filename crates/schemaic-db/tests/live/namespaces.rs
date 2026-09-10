@@ -243,3 +243,115 @@ async fn cell(scratch: &Scratch, ns: &Namespace, sql: &str) -> String {
         .display()
         .to_string()
 }
+
+/// **A sequence cannot be owned by a table in another namespace**, and this is
+/// the test that says so — because the emitter depends on it.
+///
+/// `SequenceInfo::create_sql` qualifies the `OWNED BY` table with the
+/// *sequence's* schema, which is the one place in `schema.rs` where a namespace
+/// is borrowed from a different object. That reads as a bug — `CREATE SEQUENCE
+/// sales.s; ALTER SEQUENCE sales.s OWNED BY public.orders.id;` would then copy
+/// out as `OWNED BY "sales"."orders"."id"`, either failing or binding the
+/// sequence to the wrong table — and it was filed as one (B10.1-L1-05). It is
+/// not: PostgreSQL 16 refuses the `ALTER` outright with *"sequence must be in
+/// same schema as table it is linked to"*, so the state the emitter would get
+/// wrong is one the server will not create.
+///
+/// Pinned here rather than argued in a comment, because the argument is a fact
+/// about a server and nothing in this repository could otherwise check it. If a
+/// future PostgreSQL relaxes the rule, this test goes red and the emitter needs
+/// the namespace the model does not carry.
+///
+/// PostgreSQL only: MySQL has no sequences owned by a column, and MariaDB's
+/// carry no owner.
+pub async fn a_sequence_cannot_be_owned_across_namespaces(target: &'static Target) {
+    if target.namespace.is_none() {
+        return;
+    }
+    let mut scratch = Scratch::create(target, "ns_seqowner").await;
+    let alt = scratch.alt_namespace().await;
+
+    scratch
+        .exec_in(
+            &alt,
+            &format!(
+                "CREATE TABLE {} (id INTEGER)",
+                scratch.qualified_in(&alt, "owner_t")
+            ),
+        )
+        .await;
+    scratch
+        .exec(&format!(
+            "CREATE TABLE {} (id INTEGER)",
+            scratch.qualified("here_t")
+        ))
+        .await;
+    scratch
+        .exec(&format!("CREATE SEQUENCE {}", scratch.qualified("s")))
+        .await;
+
+    let refused = scratch
+        .try_exec(&format!(
+            "ALTER SEQUENCE {} OWNED BY {}.\"id\"",
+            scratch.qualified("s"),
+            scratch.qualified_in(&alt, "owner_t")
+        ))
+        .await;
+    let err = match refused {
+        Err(e) => e.to_string(),
+        Ok(_) => panic!(
+            "{}: the server accepted a cross-namespace OWNED BY — `SequenceInfo::create_sql` \
+             qualifies the owner with the sequence's own schema and would now name the wrong \
+             table",
+            target.name
+        ),
+    };
+    assert!(
+        err.contains("same schema"),
+        "{}: refused for some other reason: {err}",
+        target.name
+    );
+
+    // And the ownership that *is* constructible — same namespace, which is the
+    // only one there is — reads back and emits with that namespace on both
+    // halves, so this test is not only about the refusal.
+    scratch
+        .exec(&format!(
+            "ALTER SEQUENCE {} OWNED BY {}.\"id\"",
+            scratch.qualified("s"),
+            scratch.qualified("here_t")
+        ))
+        .await;
+    let schema = scratch
+        .db
+        .fetch_schema(&scratch.database, CancellationToken::new())
+        .await
+        .unwrap_or_else(|e| panic!("introspecting {}: {e}", scratch.database));
+    let seq = schema
+        .sequences
+        .iter()
+        .find(|s| s.name == "s")
+        .unwrap_or_else(|| {
+            panic!(
+                "{}: no sequence s; have {:?}",
+                target.name,
+                schema.sequences.iter().map(|s| &s.name).collect::<Vec<_>>()
+            )
+        });
+    assert_eq!(
+        seq.owned_by.as_ref().map(|o| o.table.as_str()),
+        Some("here_t"),
+        "{}: the owning table",
+        target.name
+    );
+    let sql = seq.create_sql(target.engine.dialect());
+    let ns = scratch.namespace.expect("a PostgreSQL namespace");
+    assert!(
+        sql.contains(&format!("OWNED BY \"{ns}\".\"here_t\".\"id\""))
+            || (ns == "public" && sql.contains("OWNED BY \"here_t\".\"id\"")),
+        "{}: {sql}",
+        target.name
+    );
+
+    scratch.teardown().await;
+}

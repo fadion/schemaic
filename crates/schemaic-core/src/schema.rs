@@ -3337,6 +3337,19 @@ impl SequenceInfo {
     /// `OWNED BY` is restated because it is not cosmetic: it is what makes the
     /// sequence get dropped with its column, and a copy of the DDL that omits it
     /// recreates the sequence as an orphan that outlives the table.
+    ///
+    /// **The owner is qualified with the *sequence's* namespace, and that is
+    /// correct** — the one place in this file where a schema is borrowed from a
+    /// different object, so it is worth saying why rather than leaving it to be
+    /// re-raised. [`SequenceOwner`] carries no namespace of its own, and does
+    /// not need one: PostgreSQL 16 refuses
+    /// `ALTER SEQUENCE sales.s OWNED BY public.orders.id` outright with
+    /// *"sequence must be in same schema as table it is linked to"*, measured
+    /// live. There is no state in which the two differ, so there is no
+    /// namespace to lose. `db/tests/live/namespaces.rs`'s
+    /// `a_sequence_cannot_be_owned_across_namespaces` pins the server's
+    /// refusal; if a future release relaxes it, that test goes red and this
+    /// line needs a namespace the model would then have to read.
     pub fn create_sql(&self, dialect: crate::intel::SqlDialect) -> String {
         let qname = qualified_ident(&self.name, self.schema.as_deref(), dialect);
         let mut out = format!("CREATE SEQUENCE {qname}");
