@@ -298,12 +298,14 @@ impl StreamParser {
             out.push(StreamEvent::ToolUse {
                 name: name.to_string(),
                 sql: None,
+                id: Some(id.to_string()),
             });
         }
         if completed && self.first_sight(&format!("{id}\u{0}done")) {
             out.push(StreamEvent::ToolResult {
                 text: text(),
                 is_error,
+                id: Some(id.to_string()),
             });
         }
         out
@@ -537,6 +539,7 @@ impl StreamParser {
             out.push(StreamEvent::ToolUse {
                 name: opencode_tool_name(raw),
                 sql,
+                id: Some(id.clone()),
             });
         }
         match status {
@@ -551,7 +554,11 @@ impl StreamParser {
                     .or_else(|| state.get("output").and_then(|o| o.as_str()))
                     .unwrap_or_default()
                     .to_string();
-                out.push(StreamEvent::ToolResult { text, is_error });
+                out.push(StreamEvent::ToolResult {
+                    text,
+                    is_error,
+                    id: Some(id.clone()),
+                });
             }
         }
         out
@@ -588,7 +595,7 @@ impl StreamParser {
                     // Our own prompt echoed back as a step.
                     "user_input" => Vec::new(),
                     "tool" => {
-                        let evs = agy_tool_step(s);
+                        let evs = agy_tool_step(s, s.get("step_index").map(|i| i.to_string()));
                         // Every `ACTIVE` for one `step_index` is the same call
                         // being restated, so only the first announces a chip —
                         // see `StreamParser::seen_tools`. A step with no index
@@ -743,7 +750,11 @@ impl StreamParser {
                 // `ToolResult` for one call.
                 let mut out = Vec::new();
                 if self.first_sight(id) {
-                    out.push(StreamEvent::ToolUse { name, sql });
+                    out.push(StreamEvent::ToolUse {
+                        name,
+                        sql,
+                        id: Some(id.to_string()),
+                    });
                 }
                 if !completed {
                     return out;
@@ -766,7 +777,11 @@ impl StreamParser {
                     let is_error = err.is_some()
                         || item.get("status").and_then(|s| s.as_str()) == Some("failed");
                     let text = err.unwrap_or_else(|| mcp_result_text(item));
-                    out.push(StreamEvent::ToolResult { text, is_error });
+                    out.push(StreamEvent::ToolResult {
+                        text,
+                        is_error,
+                        id: Some(id.to_string()),
+                    });
                 }
                 out
             }
@@ -912,7 +927,7 @@ fn codex_stats(v: &serde_json::Value) -> TurnStats {
 /// reported under its own name rather than dropped, for the reason in the module
 /// docs — a measured turn ran `list_dir` and `view_file` with no permission
 /// prompt at all, so those are exactly what the user needs to be able to see.
-fn agy_tool_step(s: &serde_json::Value) -> Vec<StreamEvent> {
+fn agy_tool_step(s: &serde_json::Value, id: Option<String>) -> Vec<StreamEvent> {
     let info = s.get("tool_info").unwrap_or(&serde_json::Value::Null);
     let raw = s
         .get("tool_name")
@@ -943,9 +958,10 @@ fn agy_tool_step(s: &serde_json::Value) -> Vec<StreamEvent> {
                 .or_else(|| params.pointer("/sql"))
                 .and_then(|x| x.as_str())
                 .map(|x| x.to_string());
-            vec![StreamEvent::ToolUse { name, sql }]
+            vec![StreamEvent::ToolUse { name, sql, id }]
         }
         "ERROR" => vec![StreamEvent::ToolResult {
+            id,
             text: info
                 .pointer("/error/message")
                 .and_then(|m| m.as_str())
@@ -954,6 +970,7 @@ fn agy_tool_step(s: &serde_json::Value) -> Vec<StreamEvent> {
             is_error: true,
         }],
         "DONE" => vec![StreamEvent::ToolResult {
+            id,
             text: info
                 .get("output")
                 .and_then(|o| o.as_str())
@@ -1228,7 +1245,7 @@ mod tests {
             ],
         );
         match &out[..] {
-            [StreamEvent::ToolUse { name, sql }] => {
+            [StreamEvent::ToolUse { name, sql, .. }] => {
                 assert_eq!(name, "mcp__schemaic__run_query");
                 assert_eq!(sql.as_deref(), Some("SELECT 1"));
             }
@@ -1392,7 +1409,7 @@ mod tests {
         match &ok[..] {
             [
                 StreamEvent::ToolUse { name, .. },
-                StreamEvent::ToolResult { text, is_error },
+                StreamEvent::ToolResult { text, is_error, .. },
             ] => {
                 assert_eq!(name, "mcp__schemaic__run_query");
                 assert_eq!(text, "1 row");
@@ -1410,7 +1427,7 @@ mod tests {
         match &bad[..] {
             [
                 StreamEvent::ToolUse { .. },
-                StreamEvent::ToolResult { text, is_error },
+                StreamEvent::ToolResult { text, is_error, .. },
             ] => {
                 assert_eq!(text, "nope");
                 assert!(is_error);
@@ -1643,7 +1660,7 @@ mod tests {
         assert!(
             out.iter().any(|e| matches!(
                 e,
-                StreamEvent::ToolResult { text, is_error: false } if text.contains("widgets")
+                StreamEvent::ToolResult { text, is_error: false, .. } if text.contains("widgets")
             )),
             "the server's answer never reached the chip: {out:?}"
         );
@@ -1695,7 +1712,7 @@ mod tests {
         match &out[..] {
             [
                 StreamEvent::ToolUse { name, .. },
-                StreamEvent::ToolResult { text, is_error },
+                StreamEvent::ToolResult { text, is_error, .. },
             ] => {
                 assert_eq!(name, "mcp__schemaic__list_schema");
                 assert!(*is_error);
@@ -1780,7 +1797,7 @@ mod tests {
         assert!(
             out.iter().any(|e| matches!(
                 e,
-                StreamEvent::ToolResult { text, is_error: true } if text.contains("denied permission")
+                StreamEvent::ToolResult { text, is_error: true, .. } if text.contains("denied permission")
             )),
             "{out:?}"
         );
@@ -1865,7 +1882,7 @@ mod tests {
         assert!(
             out.iter().any(|e| matches!(
                 e,
-                StreamEvent::ToolResult { text, is_error: false } if text.contains("widgets")
+                StreamEvent::ToolResult { text, is_error: false, .. } if text.contains("widgets")
             )),
             "the server's answer never reached the chip: {out:?}"
         );
@@ -1934,7 +1951,7 @@ mod tests {
             ],
         );
         match &out[..] {
-            [StreamEvent::ToolUse { name, sql }] => {
+            [StreamEvent::ToolUse { name, sql, .. }] => {
                 assert_eq!(name, "list_dir");
                 assert!(sql.is_none());
             }
@@ -1951,7 +1968,7 @@ mod tests {
             ],
         );
         match &out[..] {
-            [StreamEvent::ToolUse { name, sql }] => {
+            [StreamEvent::ToolUse { name, sql, .. }] => {
                 assert_eq!(name, "mcp__schemaic__run_query");
                 assert_eq!(sql.as_deref(), Some("SELECT 1"));
             }
@@ -2010,7 +2027,7 @@ mod tests {
             [
                 StreamEvent::SessionStarted { id },
                 StreamEvent::ToolUse { name, .. },
-                StreamEvent::ToolResult { text, is_error },
+                StreamEvent::ToolResult { text, is_error, .. },
                 StreamEvent::TextDelta(t),
                 StreamEvent::TurnDone { is_error: e2, .. },
             ] => {
@@ -2222,7 +2239,7 @@ mod tests {
             .iter()
             .find(|e| matches!(e, StreamEvent::ToolUse { .. }))
         {
-            Some(StreamEvent::ToolUse { name, sql }) => {
+            Some(StreamEvent::ToolUse { name, sql, .. }) => {
                 assert_eq!(name, "mcp__schemaic__run_query");
                 assert_eq!(sql.as_deref(), Some("select 1"));
             }

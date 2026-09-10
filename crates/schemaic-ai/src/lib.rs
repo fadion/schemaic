@@ -476,9 +476,36 @@ pub enum StreamEvent {
     /// A streamed chunk of assistant text.
     TextDelta(String),
     /// The assistant invoked a tool (SQL captured when it's `run_query`).
-    ToolUse { name: String, sql: Option<String> },
+    ///
+    /// `id` is the harness's own identifier for this call, when it emits one —
+    /// `tool_use.id` on Claude, `item.id` on Codex, `step_index` on
+    /// Antigravity, `callID` on OpenCode. It is what pairs the call with its
+    /// result; see [`StreamEvent::ToolResult`].
+    ToolUse {
+        name: String,
+        sql: Option<String>,
+        id: Option<String>,
+    },
     /// A tool returned a result.
-    ToolResult { text: String, is_error: bool },
+    ///
+    /// **`id` is the pairing key, and every harness puts it on the wire.**
+    /// Without it a result can only be attached by recency — to the most
+    /// recent call still awaiting one — which is exactly backwards when the
+    /// model makes two calls in one step and their results arrive in call
+    /// order: the first result lands on the second chip and the second on the
+    /// first. `is_error` travels with the text, so a query that **failed**
+    /// read as having succeeded and returned another tool's output, under a
+    /// green dot, with the red one on the call that was fine — and
+    /// `chat::drop_tool_results` keeps `is_error` deliberately, so a restored
+    /// conversation showed it permanently the wrong way round.
+    ///
+    /// `None` from a dialect that emits no id degrades to the recency rule
+    /// rather than losing the result.
+    ToolResult {
+        text: String,
+        is_error: bool,
+        id: Option<String>,
+    },
     /// The turn finished, with its cost/usage summary.
     TurnDone { is_error: bool, stats: TurnStats },
     /// The harness named the session/thread it just opened.
@@ -538,7 +565,11 @@ pub fn parse_stream_value(v: &serde_json::Value) -> Vec<StreamEvent> {
                             .or_else(|| b.pointer("/input/query"))
                             .and_then(|s| s.as_str())
                             .map(|s| s.to_string());
-                        out.push(StreamEvent::ToolUse { name, sql });
+                        out.push(StreamEvent::ToolUse {
+                            name,
+                            sql,
+                            id: b.get("id").and_then(|i| i.as_str()).map(str::to_string),
+                        });
                     }
                 }
             }
@@ -553,6 +584,10 @@ pub fn parse_stream_value(v: &serde_json::Value) -> Vec<StreamEvent> {
                         out.push(StreamEvent::ToolResult {
                             text: tool_result_text(b),
                             is_error: b.get("is_error").and_then(|e| e.as_bool()).unwrap_or(false),
+                            id: b
+                                .get("tool_use_id")
+                                .and_then(|i| i.as_str())
+                                .map(str::to_string),
                         });
                     }
                 }
@@ -596,6 +631,13 @@ fn tool_result_text(block: &serde_json::Value) -> String {
 #[derive(Default)]
 pub struct TurnState {
     segs: Vec<Seg>,
+    /// Harness call id → index into `segs` of the chip it opened.
+    ///
+    /// A side map rather than a field on `ToolCall`, because that type is
+    /// `core::transcript`'s and is persisted to `chats.json`: the id is
+    /// plumbing for one turn's pairing and has no meaning in a restored
+    /// conversation.
+    by_id: std::collections::HashMap<String, usize>,
 }
 
 impl TurnState {
@@ -608,7 +650,7 @@ impl TurnState {
                     self.segs.push(Seg::Text(t.clone()));
                 }
             }
-            StreamEvent::ToolUse { name, sql } => {
+            StreamEvent::ToolUse { name, sql, id } => {
                 // De-dup: the assistant often prints the SQL in a fenced block
                 // *and* then runs it. Drop that echoed fence from the prose so
                 // the SQL shows once — in the chip.
@@ -620,6 +662,9 @@ impl TurnState {
                         self.segs.pop();
                     }
                 }
+                if let Some(id) = id {
+                    self.by_id.insert(id.clone(), self.segs.len());
+                }
                 self.segs.push(Seg::Tool(ToolCall {
                     name: name.clone(),
                     sql: sql.clone(),
@@ -627,14 +672,27 @@ impl TurnState {
                     is_error: false,
                 }));
             }
-            StreamEvent::ToolResult { text, is_error } => {
-                // Attach to the most recent tool call still awaiting a result.
-                if let Some(Seg::Tool(tc)) = self
-                    .segs
-                    .iter_mut()
-                    .rev()
-                    .find(|s| matches!(s, Seg::Tool(tc) if tc.result.is_none()))
-                {
+            StreamEvent::ToolResult { text, is_error, id } => {
+                // **By id when the harness gave one.** Two calls open at once
+                // is the ordinary parallel shape — three of the four tools the
+                // panel allow-lists are read-only ones a model routinely
+                // batches — and their results arrive in *call* order, so the
+                // recency rule below paired every one of them with the wrong
+                // chip. Sequential calls are unaffected either way, which is
+                // why the suite was green: every fixture opened one call and
+                // closed it before the next.
+                let by_id = id.as_ref().and_then(|id| self.by_id.get(id).copied());
+                let seg = match by_id {
+                    Some(i) => self.segs.get_mut(i),
+                    // No id from this dialect: the most recent tool call still
+                    // awaiting a result. Degrading rather than losing it.
+                    None => self
+                        .segs
+                        .iter_mut()
+                        .rev()
+                        .find(|s| matches!(s, Seg::Tool(tc) if tc.result.is_none())),
+                };
+                if let Some(Seg::Tool(tc)) = seg {
                     tc.result = Some(text.clone());
                     tc.is_error = *is_error;
                 }
@@ -702,6 +760,145 @@ fn normalize_ws(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **Two tool calls open at once must keep their own results.**
+    ///
+    /// The model making two calls in one assistant message is the ordinary
+    /// parallel shape — three of the four tools the panel allow-lists are
+    /// read-only ones a model routinely batches — and their results arrive in
+    /// *call* order. Attaching each to "the most recent call still awaiting
+    /// one" therefore paired the first result with the second chip and the
+    /// second with the first, on every dialect.
+    ///
+    /// Sequential calls were always right, which is why the suite was green:
+    /// every other fixture here opens one call and closes it before the next.
+    #[test]
+    fn two_open_calls_each_keep_their_own_result() {
+        let mut turn = TurnState::default();
+        for ev in parse_stream_line(
+            r#"{"type":"assistant","message":{"content":[
+                {"type":"tool_use","id":"toolu_A","name":"mcp__schemaic__describe_table","input":{"table":"orders"}},
+                {"type":"tool_use","id":"toolu_B","name":"mcp__schemaic__run_query","input":{"sql":"SELECT 1"}}
+            ]}}"#,
+        ) {
+            turn.apply(&ev);
+        }
+        for line in [
+            r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_A","content":"TABLE orders: id, total"}]}}"#,
+            r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_B","content":"| 1 |"}]}}"#,
+        ] {
+            for ev in parse_stream_line(line) {
+                turn.apply(&ev);
+            }
+        }
+        let segs = turn.segments();
+        let tools: Vec<&ToolCall> = segs
+            .iter()
+            .filter_map(|s| match s {
+                Seg::Tool(tc) => Some(tc),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(tools.len(), 2, "{segs:?}");
+        assert_eq!(tools[0].name, "mcp__schemaic__describe_table");
+        assert_eq!(tools[0].result.as_deref(), Some("TABLE orders: id, total"));
+        assert_eq!(tools[1].sql.as_deref(), Some("SELECT 1"));
+        assert_eq!(tools[1].result.as_deref(), Some("| 1 |"));
+    }
+
+    /// **And the error flag travels with the right one.** `is_error` moved
+    /// with the text, so a query that failed read as having succeeded and
+    /// returned another tool's output — under a green dot, with the red one on
+    /// the call that was fine. `chat::drop_tool_results` keeps `is_error`
+    /// deliberately, so a restored conversation showed it that way for good.
+    #[test]
+    fn the_error_flag_lands_on_the_call_that_failed() {
+        let mut turn = TurnState::default();
+        for ev in parse_stream_line(
+            r#"{"type":"assistant","message":{"content":[
+                {"type":"tool_use","id":"A","name":"mcp__schemaic__run_query","input":{"sql":"SELECT * FROM missing"}},
+                {"type":"tool_use","id":"B","name":"mcp__schemaic__list_schema","input":{}}
+            ]}}"#,
+        ) {
+            turn.apply(&ev);
+        }
+        for line in [
+            r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"A","content":"ERROR 1146: Table 'missing' doesn't exist","is_error":true}]}}"#,
+            r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"B","content":"db: shop"}]}}"#,
+        ] {
+            for ev in parse_stream_line(line) {
+                turn.apply(&ev);
+            }
+        }
+        let segs = turn.segments();
+        let tools: Vec<&ToolCall> = segs
+            .iter()
+            .filter_map(|s| match s {
+                Seg::Tool(tc) => Some(tc),
+                _ => None,
+            })
+            .collect();
+        assert!(tools[0].is_error, "the failed query must read as failed");
+        assert!(
+            tools[0]
+                .result
+                .as_deref()
+                .unwrap()
+                .starts_with("ERROR 1146")
+        );
+        assert!(!tools[1].is_error, "and the one that worked must not");
+        assert_eq!(tools[1].result.as_deref(), Some("db: shop"));
+    }
+
+    /// **A dialect that sends no id still gets its result.** The recency rule
+    /// is the fallback, not a bug to be removed — it is what an id-less
+    /// harness degrades to.
+    #[test]
+    fn a_result_with_no_id_falls_back_to_the_open_call() {
+        let mut turn = TurnState::default();
+        turn.apply(&StreamEvent::ToolUse {
+            name: "t".into(),
+            sql: None,
+            id: None,
+        });
+        turn.apply(&StreamEvent::ToolResult {
+            text: "done".into(),
+            is_error: false,
+            id: None,
+        });
+        match turn.segments().as_slice() {
+            [Seg::Tool(tc)] => assert_eq!(tc.result.as_deref(), Some("done")),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// **An id nothing announced still falls back to recency**, which is what
+    /// this did for every result before ids existed.
+    ///
+    /// Deliberately *not* dropped. A result whose call was never announced is
+    /// the loose-result case the three stream-parser doc blocks are about, and
+    /// each of them guards the *announce* side with `first_sight` rather than
+    /// throwing the result away here — losing it means the user sees no record
+    /// of a query that ran. Recorded because it is the one case where the
+    /// pairing is still a guess, and the guess is the old one.
+    #[test]
+    fn a_result_for_an_unannounced_id_still_reaches_the_open_call() {
+        let mut turn = TurnState::default();
+        turn.apply(&StreamEvent::ToolUse {
+            name: "t".into(),
+            sql: None,
+            id: Some("A".into()),
+        });
+        turn.apply(&StreamEvent::ToolResult {
+            text: "loose".into(),
+            is_error: false,
+            id: Some("never-announced".into()),
+        });
+        match turn.segments().as_slice() {
+            [Seg::Tool(tc)] => assert_eq!(tc.result.as_deref(), Some("loose")),
+            other => panic!("{other:?}"),
+        }
+    }
 
     fn assistant_tool_use(name: &str, sql: &str) -> String {
         serde_json::json!({
@@ -771,6 +968,7 @@ mod tests {
             turn.apply(&ev);
         }
         turn.apply(&StreamEvent::ToolResult {
+            id: None,
             text: "| n |\n| 1 |".into(),
             is_error: false,
         });
@@ -1263,7 +1461,7 @@ mod tests {
         })
         .to_string();
         let evs = parse_stream_line(&line);
-        let StreamEvent::ToolResult { text, is_error } = &evs[0] else {
+        let StreamEvent::ToolResult { text, is_error, .. } = &evs[0] else {
             panic!("expected ToolResult")
         };
         assert_eq!(text, "plain text");
@@ -1281,7 +1479,7 @@ mod tests {
         })
         .to_string();
         let evs = parse_stream_line(&line);
-        let StreamEvent::ToolResult { text, is_error } = &evs[0] else {
+        let StreamEvent::ToolResult { text, is_error, .. } = &evs[0] else {
             panic!("expected ToolResult")
         };
         assert_eq!(text, "line1\nline2");
@@ -1311,7 +1509,7 @@ mod tests {
         })
         .to_string();
         let evs = parse_stream_line(&line);
-        let StreamEvent::ToolUse { name, sql } = &evs[0] else {
+        let StreamEvent::ToolUse { name, sql, .. } = &evs[0] else {
             panic!("expected ToolUse")
         };
         assert_eq!(name, "run_query");
