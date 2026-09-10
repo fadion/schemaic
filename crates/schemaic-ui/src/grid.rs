@@ -595,9 +595,9 @@ impl GridState {
                     .unwrap_or(("", ""));
                 // An explicit saved rule wins; otherwise fall back to the name/type
                 // smart default (e.g. an int `*_at` column → Timestamp).
-                let saved = format_key(&rs, ci).and_then(|(db, table, col)| {
+                let saved = format::rule_key(conn, &rs, ci).and_then(|(c, db, table, col)| {
                     gctx.formats
-                        .with_untracked(|rules| format::lookup(rules, conn, &db, &table, &col))
+                        .with_untracked(|rules| format::lookup(rules, c, &db, &table, &col))
                 });
                 saved.unwrap_or_else(|| format::smart_default(name, ty))
             })
@@ -2506,23 +2506,6 @@ impl ColKey {
             ColKey::Foreign => theme::key_foreign(),
         }
     }
-}
-
-/// Where a persisted column formatter lives for result column `ci`: the real
-/// `(database, table, column)` its value came from, with the table under the name
-/// the UI shows it by (`schema.table` outside PostgreSQL's `public`, so a rule on
-/// `sales.orders` can't leak onto `public.orders`).
-///
-/// The identity is the column's **own** provenance, not the tab's source table.
-/// Keying on the source meant a hand-written query in a table-opened tab both
-/// read and wrote rules under a table its columns never came from: a Timestamp
-/// saved on `customers.created_at` rendered `orders.created_at` as a datetime.
-/// `None` for an expression column — it belongs to no table, so there is nothing
-/// to save a rule against; it still formats for the life of the result.
-fn format_key(rs: &ResultSet, ci: usize) -> Option<(String, String, String)> {
-    let o = rs.columns.get(ci)?.origin.as_ref()?;
-    let table = TableSource::new(o.database.clone(), o.schema.clone(), o.table.clone());
-    Some((o.database.clone(), table.display(), o.column.clone()))
 }
 
 /// The tab's source table and the loaded schema it lives in — the five steps
@@ -8428,8 +8411,14 @@ fn set_format(gs: GridState, ci: usize, fmt: ColumnFormat) {
     // looks it up by — so the rule is found again wherever that column appears,
     // and never applied to a same-named column of another table. An expression
     // column belongs to no table: it formats for this result and is not persisted.
-    if let Some((db, table, col)) = format_key(&gs.rs.get_untracked(), ci) {
-        let conn = gs.conn_id.get_untracked();
+    // **`conn_at_load`, not the live `conn_id`** — the same value the seed
+    // above read, and the field whose own doc states why: a tab can be rebound
+    // to another connection while a result stays on screen. Reading the live one
+    // put the rule on a server the rows never came from, absent where the user
+    // set it and silently applied to a real, different table on the other one.
+    if let Some((conn, db, table, col)) =
+        format::rule_key(gs.conn_at_load, &gs.rs.get_untracked(), ci)
+    {
         gs.fmt_rules
             .update(|rules| format::upsert(rules, conn, &db, &table, &col, fmt));
         if let Some(save) = gs.save_formats.get_untracked() {

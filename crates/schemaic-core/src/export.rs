@@ -1848,29 +1848,30 @@ fn withheld_binary(mask: &[bool], ci: usize, c: &crate::model::CellRef<'_>) -> b
 /// note on every save is a note nobody reads — so an ordinary `Fetched` export
 /// stays quiet, and only a streamed one announces its row count.
 ///
-/// **Two of the three losses override that silence; the third does not.** A
-/// column *blanked* or *cut* is a surprise — the value was there, the file has
-/// less of it than the screen does, and nothing on screen says so. A **withheld**
-/// binary column is not: the grid renders that cell as `<7 bytes>`, so the user
-/// picking CSV or JSON for it can already see what they are asking a text format
-/// to carry, and "a text export cannot hold raw bytes" restated it at a length
-/// that painted past the export modal's own width. So `withheld` is tallied and
-/// not said. It is still a caveat on the tally — [`ExportTally::has_caveat`] and
-/// the SQL writer's `-- binary column` comment both read it — this function just
-/// doesn't spend a sentence on it.
+/// **All three losses override that silence, but the third only when the rows
+/// were never on screen.** A column *blanked* or *cut* is a surprise anywhere —
+/// the value was there, the file has less of it than the screen does, and
+/// nothing on screen says so. A **withheld** binary column is not a surprise on
+/// a *save of the grid*: it renders that cell as `<7 bytes>`, so the user
+/// picking CSV or JSON for it can already see what they are asking a text
+/// format to carry, and "a text export cannot hold raw bytes" restated it at a
+/// length that painted past the export modal's own width.
 ///
-/// The caveats that *are* said read the way the grid's own arena note does — the
-/// column names, then what happened to them — because a user comparing the file
-/// to the screen needs to know *which* part of it to distrust, and "some data was
-/// lost" tells them nothing.
+/// **That premise is false on exactly the paths the tally was built for.** The
+/// grid-mounted export is `SliceChunks`; the paths that reach `withheld` with no
+/// grid at all are `PullChunks` — All rows, the dump, and the folder export.
+/// Those rows were never rendered, so nothing ever showed the user `<7 bytes>`
+/// for them: the file has an empty field where the bytes were, which is also how
+/// every text format writes NULL, and re-importing it writes empty over the
+/// blobs. So `withheld` speaks when `streaming`, and stays quiet otherwise —
+/// which keeps the modal-width argument where it applies and closes the two
+/// paths where it never did.
+///
+/// The caveats read the way the grid's own arena note does — the column names,
+/// then what happened to them — because a user comparing the file to the screen
+/// needs to know *which* part of it to distrust, and "some data was lost" tells
+/// them nothing.
 pub fn export_note(t: &ExportTally, name: &str, streaming: bool) -> Option<String> {
-    // **`withheld` is tallied but not said**, which is why this asks for the
-    // caveats that speak rather than `has_caveat`. A binary column the grid
-    // already renders as `<7 bytes>` gains nothing from a clause explaining that
-    // a text file cannot hold bytes — and that clause was long enough to paint
-    // past the export modal it lands in. The tally still records it: the SQL
-    // writer's `-- binary column` comment and `has_caveat` both read `withheld`,
-    // and this only decides what the *sentence* carries.
     if !streaming && t.blanked.is_empty() && t.cut.is_empty() {
         return None;
     }
@@ -1880,22 +1881,45 @@ pub fn export_note(t: &ExportTally, name: &str, streaming: bool) -> Option<Strin
         crate::text::human_count(n),
         crate::text::plural(n, "row", "rows")
     );
+    // The seam is per-clause and computed from what has already been said, not
+    // from a sibling category: a clause that only ever appeared after another
+    // one would otherwise open with `; ` the day it is the first.
+    let mut said = false;
+    let mut clause = |s: &mut String, text: String| {
+        s.push_str(if said { "; " } else { " — " });
+        s.push_str(&text);
+        said = true;
+    };
+    if streaming && !t.withheld.is_empty() {
+        clause(
+            &mut s,
+            format!(
+                "{} {} bytes this format cannot carry: those cells are empty",
+                t.withheld.join(", "),
+                crate::text::plural(t.withheld.len(), "holds", "hold"),
+            ),
+        );
+    }
     if !t.blanked.is_empty() {
-        s.push_str(" — ");
-        s.push_str(&format!(
-            "{} too large to hold in full: later rows are blank",
-            t.blanked.join(", ")
-        ));
+        clause(
+            &mut s,
+            format!(
+                "{} too large to hold in full: later rows are blank",
+                t.blanked.join(", ")
+            ),
+        );
     }
     if !t.cut.is_empty() {
-        s.push_str(if t.blanked.is_empty() { " — " } else { "; " });
         // The exact figure, not `human_count`'s "32.77k": this is a hard limit
         // a user may want to check a column against, and a rounded one answers
         // no question they would ask it.
-        s.push_str(&format!(
-            "{} cut to Excel's {XLSX_MAX_CELL_CHARS}-character cell limit",
-            t.cut.join(", "),
-        ));
+        clause(
+            &mut s,
+            format!(
+                "{} cut to Excel's {XLSX_MAX_CELL_CHARS}-character cell limit",
+                t.cut.join(", "),
+            ),
+        );
     }
     Some(s)
 }
@@ -3577,6 +3601,12 @@ mod tests {
         // the string would have missed.
         assert_eq!(export_note(&one, "docs.csv", false), None);
         assert!(one.has_caveat(), "the loss is still recorded on the tally");
+        // **But a streamed export says it**, because there the premise above is
+        // false: `PullChunks` — All rows, the dump, the folder export — never
+        // mounted a grid, so nothing ever showed the user `<7 bytes>` for these
+        // rows. The file has an empty field where the bytes were, which is also
+        // how that format writes NULL, and re-importing it writes empty over
+        // the blobs.
         let two = ExportTally {
             rows: 1,
             withheld: vec!["file".to_string(), "thumb".to_string()],
@@ -3584,7 +3614,10 @@ mod tests {
         };
         assert_eq!(
             export_note(&two, "docs.csv", true).as_deref(),
-            Some("Exported 1 row to docs.csv")
+            Some(
+                "Exported 1 row to docs.csv — file, thumb hold bytes this format cannot \
+                 carry: those cells are empty"
+            )
         );
         let blanked = ExportTally {
             rows: 2_000_000,
@@ -3609,6 +3642,14 @@ mod tests {
         };
         assert_eq!(
             export_note(&both, "docs.csv", true).as_deref(),
+            Some(
+                "Exported 3 rows to docs.csv — file holds bytes this format cannot carry: those cells are empty; body too large to hold in full: later rows are blank"
+            )
+        );
+        // And the same pair on a **non-streamed** save says only the blanked
+        // half: there the grid is on screen and the `<7 bytes>` premise holds.
+        assert_eq!(
+            export_note(&both, "docs.csv", false).as_deref(),
             Some(
                 "Exported 3 rows to docs.csv — body too large to hold in full: later rows are blank"
             )
@@ -3636,7 +3677,7 @@ mod tests {
         };
         let msg = export_note(&all_three, "docs.xlsx", true).expect("a caveat is always said");
         assert!(msg.contains("; payload cut to Excel's"), "{msg}");
-        assert!(!msg.contains("raw bytes"), "{msg}");
+        assert!(msg.contains("file holds bytes"), "{msg}");
         // A withheld column alongside a *cut* one — the seam `cut` used to reach
         // through `withheld` to compute. It must open the sentence, not join it.
         let withheld_and_cut = ExportTally {
@@ -3648,7 +3689,7 @@ mod tests {
         assert_eq!(
             export_note(&withheld_and_cut, "docs.xlsx", true).as_deref(),
             Some(
-                "Exported 5 rows to docs.xlsx — payload cut to Excel's 32767-character cell limit"
+                "Exported 5 rows to docs.xlsx — file holds bytes this format cannot carry: those cells are empty; payload cut to Excel's 32767-character cell limit"
             )
         );
     }
@@ -3732,9 +3773,7 @@ mod tests {
     fn a_folder_export_names_what_the_files_could_not_carry() {
         // The whole reason the tally travels with the count: a green "Wrote 12
         // files." over a folder whose every column was truncated is the failure
-        // this sentence exists to prevent. Same rule as `export_note`'s — and the
-        // same exception, since a **withheld** binary column is no longer said
-        // there, so it is not said here either.
+        // this sentence exists to prevent. Same rule as `export_note`'s.
         let t = ExportTally {
             rows: 10,
             blanked: vec!["photo".to_string()],
@@ -3744,16 +3783,22 @@ mod tests {
         assert!(msg.contains("photo"), "{msg}");
         assert!(msg.contains("too large to hold in full"), "{msg}");
 
-        // The folder export is `streaming: true`, so a withheld-only tally still
-        // gets its count sentence — it just carries no caveat, and above all no
-        // dangling em dash where the clause used to be.
+        // **The folder export is `streaming: true`, and it is the path the
+        // withheld clause exists for**: no grid was ever mounted, so nothing
+        // showed the user `<7 bytes>`, and every `photo` field in every file is
+        // empty — indistinguishable from NULL, and re-importing writes empty
+        // over the blobs.
         let withheld_only = ExportTally {
             rows: 10,
             withheld: vec!["photo".to_string()],
             ..Default::default()
         };
         let msg = files_note(12, &withheld_only, "out", &[], &[]);
-        assert_eq!(msg, "Wrote 12 files. Exported 10 rows to out.");
+        assert_eq!(
+            msg,
+            "Wrote 12 files. Exported 10 rows to out — photo holds bytes this format \
+             cannot carry: those cells are empty."
+        );
     }
 
     /// **The two clauses have to be one readable sentence.** `export_note` does

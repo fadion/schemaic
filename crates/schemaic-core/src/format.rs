@@ -77,6 +77,41 @@ pub fn clear_conn(rules: &mut Vec<ColumnFormatRule>, conn_id: u64) {
     rules.retain(|r| r.conn_id != conn_id);
 }
 
+/// The whole identity a persisted formatter is stored under:
+/// `(connection, database, table-as-shown, column)`. `None` for an expression
+/// column — it belongs to no table, so there is nothing to save a rule against;
+/// it still formats for the life of the result.
+///
+/// **One function because the read and the write are one key**, and they were
+/// keyed on two different connections. The grid seeds a column's formatter from
+/// the connection the result was *loaded on*, and saving one read the tab's
+/// *live* `conn_id` — which moves when a tab is rebound while its result stays
+/// on screen. Setting a format then upserted the rule against a server the rows
+/// never came from: absent where the user set it, and silently applied to a
+/// real, different table on the other connection.
+///
+/// The table part is the name the UI shows it by (`schema.table` outside
+/// PostgreSQL's `public`), so a rule on `sales.orders` cannot leak onto
+/// `public.orders`; and the identity is the column's **own** provenance, not the
+/// tab's source table — keying on the source meant a hand-written query in a
+/// table-opened tab read and wrote rules under a table its columns never came
+/// from.
+pub fn rule_key(
+    conn_id: u64,
+    rs: &crate::model::ResultSet,
+    ci: usize,
+) -> Option<(u64, String, String, String)> {
+    let o = rs.columns.get(ci)?.origin.as_ref()?;
+    let table =
+        crate::schema::TableSource::new(o.database.clone(), o.schema.clone(), o.table.clone());
+    Some((
+        conn_id,
+        o.database.clone(),
+        table.display(),
+        o.column.clone(),
+    ))
+}
+
 /// The explicitly-stored format for a column, or `None` if the user has never set
 /// one (in which case the caller falls back to [`smart_default`]). An explicit
 /// `Some(ColumnFormat::None)` means the user deliberately chose "raw", overriding
@@ -373,6 +408,74 @@ mod tests {
         );
     }
     use super::*;
+
+    /// Build a one-column result whose column carries the given provenance.
+    fn rs_of(origin: Option<(&str, Option<&str>, &str, &str)>) -> crate::model::ResultSet {
+        let col = crate::model::Column {
+            name: "c".to_string(),
+            type_name: "int".to_string(),
+            origin: origin.map(|(db, ns, table, column)| crate::model::ColumnOrigin {
+                database: db.to_string(),
+                schema: ns.map(str::to_string),
+                table: table.to_string(),
+                column: column.to_string(),
+                flags: Default::default(),
+                binary: false,
+                implicit_key: false,
+            }),
+        };
+        crate::model::ResultSet::from_rows(vec![col], Vec::new())
+    }
+
+    /// The whole key, connection included — because the read and the write took
+    /// it from two different places and only agreed while the tab stayed on the
+    /// connection it was opened on.
+    #[test]
+    fn a_rule_key_carries_the_connection_it_was_asked_for() {
+        let rs = rs_of(Some(("shop", None, "orders", "created_at")));
+        assert_eq!(
+            rule_key(7, &rs, 0),
+            Some((
+                7,
+                "shop".to_string(),
+                "orders".to_string(),
+                "created_at".to_string()
+            ))
+        );
+        // A different connection is a different key, which is exactly what made
+        // the mismatch silent rather than an error: both keys name real tables.
+        assert_ne!(rule_key(7, &rs, 0), rule_key(8, &rs, 0));
+    }
+
+    /// A rule saved under one connection is not found under another — the
+    /// consequence of the key above, stated where a reader will meet it.
+    #[test]
+    fn a_rule_saved_on_one_connection_is_not_read_on_another() {
+        let rs = rs_of(Some(("shop", None, "orders", "created_at")));
+        let mut rules = Vec::new();
+        let (conn, db, table, col) = rule_key(7, &rs, 0).expect("a real column");
+        upsert(&mut rules, conn, &db, &table, &col, ColumnFormat::Timestamp);
+
+        let (other, db, table, col) = rule_key(8, &rs, 0).expect("a real column");
+        assert_eq!(lookup(&rules, other, &db, &table, &col), None);
+        let (same, db, table, col) = rule_key(7, &rs, 0).expect("a real column");
+        assert_eq!(
+            lookup(&rules, same, &db, &table, &col),
+            Some(ColumnFormat::Timestamp)
+        );
+    }
+
+    /// A namespace is part of the table's identity, and an expression column has
+    /// no identity at all.
+    #[test]
+    fn a_rule_key_separates_namespaces_and_refuses_an_expression() {
+        let public = rs_of(Some(("shop", Some("public"), "orders", "id")));
+        let sales = rs_of(Some(("shop", Some("sales"), "orders", "id")));
+        assert_ne!(rule_key(1, &public, 0), rule_key(1, &sales, 0));
+        assert_eq!(rule_key(1, &rs_of(None), 0), None);
+        // And a column index past the end is nothing, not a panic.
+        assert_eq!(rule_key(1, &public, 9), None);
+    }
 
     #[test]
     fn timestamp_seconds_to_utc_datetime() {
