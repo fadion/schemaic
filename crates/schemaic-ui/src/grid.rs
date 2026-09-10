@@ -1675,7 +1675,10 @@ fn init_widths(rs: &ResultSet, key_map: &HashMap<usize, ColKey>) -> Vec<f64> {
             chars = chars.max(col.type_name.chars().count());
             for r in 0..sample {
                 if let Some(c) = rs.cell(r, ci) {
-                    chars = chars.max(c.display().chars().count().min(60));
+                    // `take` first: `count()` decodes the whole string and the
+                    // cap then throws it away. See `autofit_width`, where the
+                    // same expression walks every row rather than 200.
+                    chars = chars.max(c.display().chars().take(60).count());
                 }
             }
             // A key column's header carries a leading key icon; budget for it so the
@@ -1705,7 +1708,15 @@ fn autofit_width(rs: &ResultSet, ci: usize, has_key: bool) -> f64 {
     }
     for r in 0..rs.row_count() {
         if let Some(c) = rs.cell(r, ci) {
-            chars = chars.max(c.display().chars().count().min(140));
+            // **`take`, not `min` — the cap has to bound the *walk*.**
+            // `chars().count()` decodes every byte of the cell and the `.min`
+            // then discards everything past 140, so double-clicking the
+            // divider of a 1 KiB-per-row `TEXT` column on a 200,000-row result
+            // walked ~200 MB of UTF-8 synchronously inside the click handler,
+            // with no spinner because nothing here expects to be slow. The
+            // answer is unchanged; the `.min(140)` read as a bound and was not
+            // one.
+            chars = chars.max(c.display().chars().take(140).count());
         }
     }
     let icon = if has_key { header_key_icon_w() } else { 0.0 };
@@ -4489,10 +4500,27 @@ fn grid_view(rs: Arc<ResultSet>, gctx: GridCtx) -> impl IntoView {
     let find_more = gctx.find_more;
     let count_gen = Rc::new(std::cell::Cell::new(0u64));
     create_effect(move |_| {
-        // Re-count when the query, sort order, or per-column formatters change.
+        // **Everything the count is computed from is tracked**, which is the
+        // rule the selection aggregate forty-five lines above states and then
+        // points straight here for. Four inputs, not three: the query, the
+        // sort order, the per-column formatters — and the rows themselves.
+        //
+        // `gs.rs` is what a pure-`UPDATE` commit writes (`apply_splice` does
+        // `Arc::make_mut(arc).splice_rows(&rows)` and moves neither `order` nor
+        // `formats`), and what a staged edit is resolved against. Without it,
+        // committing a second `bob` left the bar reading `1/1` over a grid
+        // showing two — and pressing next then moved the selection onto the new
+        // match while `find_pos` binary-searched the stale list and found
+        // nothing, so the bar read **0/1** with the caret on a highlighted
+        // match. `dirty`/`new_rows` are tracked for the same reason: since
+        // `find_hits` reads the cell the grid draws, a staged edit changes the
+        // count.
         let _ = gs.find_query.get();
         let _ = gs.order.get();
         let _ = gs.formats.get();
+        gs.rs.track();
+        gs.dirty.track();
+        gs.new_rows.track();
         if gs.find_query.with(|q| q.is_empty()) {
             find_hits.set(Arc::new(Vec::new()));
             find_total.set(0);
@@ -10034,6 +10062,87 @@ mod cell_preview_tests {
             }],
             vec![vec![Value::Str(text.to_string())]],
         )
+    }
+
+    /// **The cap bounds the walk, not just the answer.**
+    ///
+    /// `chars().count().min(140)` decoded the whole cell and then threw away
+    /// everything past 140, so double-clicking the divider of a 1 KiB-per-row
+    /// `TEXT` column on a 200,000-row result walked ~200 MB of UTF-8 inside
+    /// the click handler. This cannot fail against the unfixed tree — the
+    /// width is identical either way, which is the point — but it pins the cap
+    /// so `take(140)` cannot quietly become `take(4)`.
+    #[test]
+    fn autofit_stops_measuring_at_the_cap() {
+        let col = Column {
+            name: "t".into(),
+            type_name: "TEXT".into(),
+            origin: None,
+        };
+        let w = |n: usize| {
+            let rs = ResultSet::from_rows(vec![col.clone()], vec![vec![Value::Str("x".repeat(n))]]);
+            autofit_width(&rs, 0, false)
+        };
+        assert_eq!(
+            w(140),
+            w(10_000),
+            "past the cap, every cell is the same width"
+        );
+        assert!(
+            w(20) < w(140),
+            "and below it the width still follows the value"
+        );
+        // A multi-byte cell is counted in characters, not bytes — the walk is
+        // over `chars`, so a shorter cap must not cut mid-codepoint.
+        let rs = ResultSet::from_rows(
+            vec![col.clone()],
+            vec![vec![Value::Str("é".repeat(10_000))]],
+        );
+        assert_eq!(autofit_width(&rs, 0, false), w(10_000));
+    }
+
+    /// **The find count is computed from four signals and has to track all
+    /// four.** It tracked three.
+    ///
+    /// `gs.rs` is what a pure-`UPDATE` commit splice writes — `apply_splice`
+    /// does `Arc::make_mut(arc).splice_rows(&rows)` and moves neither `order`
+    /// nor `formats` — so committing a second match left the bar reading `1/1`
+    /// over a grid showing two, and pressing next moved the selection onto the
+    /// new match while `find_pos` binary-searched the stale list and found
+    /// nothing: **0/1** with the caret on a highlighted match. `dirty` and
+    /// `new_rows` join it because the scan now reads the cell the grid draws.
+    ///
+    /// A source gate because the effect lives inside `grid_view` and needs a
+    /// whole `GridState`; the selection aggregate forty-five lines above it
+    /// was fixed for the identical class and its comment points here.
+    #[test]
+    fn the_find_count_tracks_every_signal_it_reads() {
+        let src = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("src")
+                .join("grid.rs"),
+        )
+        .expect("grid.rs");
+        let body = crate::source_gate::production_code(&src);
+        let at = body
+            .find("let count_gen = Rc::new")
+            .expect("the find-count effect is gone — this gate is stale");
+        let end = at + body[at..].find("exec_after").expect("its debounce");
+        let f = &body[at..end];
+        for term in [
+            "gs.find_query.get()",
+            "gs.order.get()",
+            "gs.formats.get()",
+            "gs.rs.track()",
+            "gs.dirty.track()",
+            "gs.new_rows.track()",
+        ] {
+            assert!(
+                f.contains(term),
+                "the find count no longer tracks {term}, so the readout goes \
+                 stale against the grid it is counting:\n{f}"
+            );
+        }
     }
 
     /// **Re-picking the format the menu already shows costs nothing.**
