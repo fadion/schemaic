@@ -706,10 +706,30 @@ pub fn catalogue_key(
 /// `1,000 of ~400`, which reads as a bug rather than as the stale estimate it is.
 fn rows_read_of(loaded: usize, total: Option<RowCount>) -> String {
     let read = human_count(loaded);
-    match total {
-        Some(t) if t.value() > loaded as u64 => format!("{read} of {}", t.label()),
-        _ => read,
+    match names_a_bigger_total(loaded, total) {
+        Some(t) => format!("{read} of {}", t.label()),
+        None => read,
     }
+}
+
+/// The total, if naming it beside `loaded` **says something a reader can
+/// see** — bigger, *and* rendered differently.
+///
+/// The two conditions were one. `human_count` keeps two decimals of its unit,
+/// so its resolution is 10 rows at `k` and 10,000 at `m`: a 200,004-row table
+/// read at the 200,000 cap printed `200k of ~200k rows`, which reads as "every
+/// row is here" — and, because a comparison *had* been made, without the
+/// `(capped)` that is the only word on that line saying otherwise. Same at
+/// every band: 5,004 at a 5,000 cap, 1,002,000 at a million.
+///
+/// [`rows_read_clause`]'s premise — "`200k of ~292.02k rows` cannot mean
+/// anything but a read that stopped short, and `(capped)` after it spends nine
+/// characters restating it" — holds only while the two figures render
+/// distinctly, which is what this asks.
+fn names_a_bigger_total(loaded: usize, total: Option<RowCount>) -> Option<RowCount> {
+    total
+        .filter(|t| t.value() > loaded as u64)
+        .filter(|t| !t.label().ends_with(&human_count(loaded)))
 }
 
 /// The whole row segment of the results toolbar — the figure, its noun, and the
@@ -742,8 +762,11 @@ pub fn rows_read_clause(loaded: usize, total: Option<RowCount>, truncated: bool)
     let figure = rows_read_of(loaded, total);
     // Whether the total was *named* is what decides both the noun and the
     // notice, and only `rows_read_of` knows it — asking `total.is_some()` here
-    // would count a stale figure it dropped.
-    let named = total.filter(|t| t.value() > loaded as u64);
+    // would count a stale figure it dropped, or one that renders as the figure
+    // beside it. One predicate, shared, so the line cannot say `of ~200k` and
+    // then decide the comparison did not happen (or the reverse, which is how
+    // `(capped)` went missing).
+    let named = names_a_bigger_total(loaded, total);
     let noun = crate::text::plural(named.map_or(loaded, |t| t.value() as usize), "row", "rows");
     let cap = if truncated && named.is_none() {
         " (capped)"
@@ -1668,6 +1691,39 @@ mod tests {
         assert_eq!(rows_read_of(1_000, Some(RowCount::Estimate(400))), "1k");
         // Equal is not more: the read already accounts for every row.
         assert_eq!(rows_read_of(1_000, Some(RowCount::Exact(1_000))), "1k");
+    }
+
+    /// **`(capped)` cannot go missing because the two figures happen to
+    /// round the same.**
+    ///
+    /// `human_count` keeps two decimals of its unit — a resolution of 10 rows
+    /// at `k`, 10,000 at `m` — so a 200,004-row table read at the 200,000 cap
+    /// printed `200k of ~200k rows`, and *without* the `(capped)`, because a
+    /// comparison had been made. That line reads as "every row is here", and
+    /// `(capped)` is the only thing on it that says otherwise.
+    #[test]
+    fn a_total_that_renders_as_the_figure_beside_it_says_capped_instead() {
+        // The three bands, at the shipped caps.
+        for (loaded, total) in [(5_000, 5_004), (200_000, 200_004), (1_000_000, 1_002_000)] {
+            let out = rows_read_clause(loaded, Some(RowCount::Estimate(total)), true);
+            assert!(
+                out.ends_with(" (capped)"),
+                "{loaded} of {total} printed {out:?}"
+            );
+            assert!(
+                !out.contains(" of "),
+                "and it does not make a comparison it cannot show: {out:?}"
+            );
+        }
+    }
+
+    /// …and a total that *is* legible still speaks, without the word — the
+    /// behaviour the shortening was for.
+    #[test]
+    fn a_total_that_reads_differently_still_replaces_the_word() {
+        let out = rows_read_clause(200_000, Some(RowCount::Estimate(292_020)), true);
+        assert_eq!(out, "200k of ~292.02k rows");
+        assert!(!out.contains("(capped)"));
     }
 
     /// **The line said "capped" twice.** `200k of ~292.02k rows (capped)` spends

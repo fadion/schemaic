@@ -199,17 +199,39 @@ pub fn push(entries: &mut Vec<HistoryEntry>, entry: HistoryEntry, dialect: SqlDi
 /// [`MAX_PER_CONN`], so a connection holds at most twice that between launch and
 /// verdict; the statements kept under that bound are the **first** ones, because
 /// those are the ones that can already have run.
+///
+/// **A statement repeated inside one batch keeps its first run id**, for the
+/// same reason. `COMMIT;` twice in a dump is ordinary. Deduplicating within
+/// the batch the way [`push`] deduplicates across runs replaced the first
+/// occurrence's entry with the *last* one's — so on `A; B; A;` where `A`
+/// succeeded and `B` failed, the surviving entry carried run 3, which is in
+/// the undispatched set, [`drop_runs`] deleted it, and `finish(run 1)` found
+/// nothing. The `A` that **ran and succeeded** vanished from the log
+/// entirely.
+///
+/// Each function was right alone, which is why this needed the composition to
+/// see: `finish`'s doc reasons about the same seam in the *other* direction —
+/// "a run whose entry has since been de-duplicated away simply finds nothing"
+/// — and is correct there, because the surviving entry describes a *newer*
+/// run of the same statement. Here the survivor was keyed to a run that never
+/// happened.
 pub fn push_batch(
     entries: &mut Vec<HistoryEntry>,
     batch: Vec<HistoryEntry>,
     dialect: SqlDialect,
 ) -> usize {
     let mut wrote = 0usize;
+    // What this batch has already contributed, so a repeat does not displace
+    // the run that can already have landed.
+    let mut mine: std::collections::HashSet<(u64, String)> = std::collections::HashSet::new();
     for entry in batch.into_iter().take(MAX_PER_CONN) {
         if entry.sql.trim().is_empty() || sql::carries_credential(&entry.sql, dialect) {
             continue;
         }
         let conn = entry.conn_id;
+        if !mine.insert((conn, entry.sql.clone())) {
+            continue;
+        }
         entries.retain(|e| !(e.conn_id == conn && e.sql == entry.sql));
         entries.insert(0, entry);
         wrote += 1;
@@ -648,6 +670,75 @@ mod tests {
             rows_capped: false,
             ok: true,
         }
+    }
+
+    /// **A statement repeated in one script is not erased by the copy of it
+    /// that never ran.**
+    ///
+    /// Run Everything on `A; B; A;` — `COMMIT;` twice in a dump is ordinary —
+    /// where `A` succeeds and `B` fails. The batch stops, so the third
+    /// statement is never dispatched. Deduplicating within the batch replaced
+    /// the first `A`'s entry with the third's, `drop_runs` then deleted it as
+    /// undispatched, and `finish(run 1)` found nothing: the `A` that **ran and
+    /// succeeded** was not in the log at all.
+    #[test]
+    fn a_statement_repeated_in_one_batch_keeps_the_run_that_happened() {
+        let mut v = Vec::new();
+        let wrote = push_batch(
+            &mut v,
+            vec![
+                entry(1, "COMMIT", 1),
+                entry(1, "BOOM", 2),
+                entry(1, "COMMIT", 3),
+            ],
+            SqlDialect::MySql,
+        );
+        assert_eq!(wrote, 2, "the repeat contributes no second entry");
+
+        // `B` failed, so the third statement was never dispatched.
+        drop_runs(&mut v, &[3]);
+        assert!(
+            finish(&mut v, 1, ok(12, 0)),
+            "the first COMMIT ran and must still have an entry to land in"
+        );
+        let commit = v
+            .iter()
+            .find(|e| e.sql == "COMMIT")
+            .expect("the statement that ran is in the log");
+        assert_eq!(commit.run_id, 1);
+        assert_eq!(commit.outcome, Outcome::Ok);
+    }
+
+    /// Across *runs* the newest still wins — that dedup is what keeps the list
+    /// short, and only the within-batch case changed.
+    #[test]
+    fn the_same_statement_run_twice_still_keeps_only_the_newer() {
+        let mut v = Vec::new();
+        push(&mut v, entry(1, "SELECT 1", 1));
+        push(&mut v, entry(1, "SELECT 1", 2));
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].run_id, 2);
+
+        // And a batch still displaces an older entry for the same statement.
+        let mut v = Vec::new();
+        push(&mut v, entry(1, "SELECT 1", 1));
+        let _ = push_batch(&mut v, vec![entry(1, "SELECT 1", 5)], SqlDialect::MySql);
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].run_id, 5);
+    }
+
+    /// Two connections running the same statement are two entries — the dedup
+    /// is per connection, and the within-batch guard must not widen it.
+    #[test]
+    fn one_batch_touching_two_connections_keeps_both() {
+        let mut v = Vec::new();
+        let wrote = push_batch(
+            &mut v,
+            vec![entry(1, "COMMIT", 1), entry(2, "COMMIT", 2)],
+            SqlDialect::MySql,
+        );
+        assert_eq!(wrote, 2);
+        assert_eq!(v.len(), 2);
     }
 
     /// A fetch that stopped at the row cap says so, or the entry claims the cap

@@ -518,12 +518,50 @@ pub struct ConnectionsFile {
 ///
 /// Public because the app's log file lives here too, beside the state files —
 /// one directory a user can be pointed at when something needs diagnosing.
+///
+/// **An empty or relative base is no base.** `std::env::var_os` answers
+/// `Some("")` for a variable that is *set and empty* — which is what a login
+/// script clearing one typically leaves, and what a container image or a
+/// launcher writes as `export XDG_CONFIG_HOME=`. `PathBuf::from("").join(
+/// "schemaic")` is the **relative** path `schemaic`, resolved against the
+/// process's working directory: launch from `~/projects/acme`, add three
+/// connections, quit, and `connections.json`, `chats.json`, `history.json` and
+/// `tabs.json` are in that git working tree. Launch from anywhere else and
+/// every one of them reads absent and falls back to defaults — "all my
+/// connections vanished". Where the keyring is unavailable it is worse: that
+/// is the documented fallback in which `connections.json` holds **plaintext**
+/// database passwords, SSH passwords and key passphrases, and the file lands
+/// in a directory the user may be about to `git add`.
+///
+/// The freedesktop Base Directory spec says an empty `$XDG_CONFIG_HOME` must
+/// be treated as unset, and the same reasoning covers `HOME` and `APPDATA`; a
+/// value that resolves against the working directory is refused for the same
+/// reason an empty one is, since nothing about this directory should depend on
+/// where the app was started.
+/// Falling through to the next candidate, and finally to `None`, is what the
+/// callers already handle.
 pub fn config_dir() -> Option<PathBuf> {
-    let dir = std::env::var_os("APPDATA")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from))
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))?;
+    let base = |k: &str| {
+        std::env::var_os(k)
+            .map(PathBuf::from)
+            .filter(|p| usable_base(p))
+    };
+    let dir = base("APPDATA")
+        .or_else(|| base("XDG_CONFIG_HOME"))
+        .or_else(|| base("HOME").map(|h| h.join(".config")))?;
     Some(dir.join("schemaic"))
+}
+
+/// Is this environment variable's value something a config directory can be
+/// built on? — see [`config_dir`].
+fn usable_base(p: &Path) -> bool {
+    // `has_root`, not `is_absolute`: the question is whether the path depends
+    // on the *working directory*, which is the thing that moves. A rooted
+    // Windows path with no drive letter (`\schemaic`) does not, and a
+    // Unix-shaped `HOME` handed to a Windows build by Git Bash is rooted too
+    // — while `C:schemaic`, which is drive-relative, is exactly the shape to
+    // refuse and `has_root` refuses it.
+    !p.as_os_str().is_empty() && p.has_root()
 }
 
 /// Which [`UiState::ai_harness`] key a save should write.
@@ -1356,10 +1394,65 @@ mod tests {
         ConnectionsFile, FileStore, Load, RECOVERIES, Recovered, RightPanelState, Saving, UiState,
         ai_harness_to_persist, classify, legacy_ai_run_queries_in, missing_notice, private_dir_in,
         read_bytes, recover, recovery_notice, sibling, statement_timeout, statement_timeout_label,
-        take_recoveries, write_bytes,
+        take_recoveries, usable_base, write_bytes,
     };
     use std::cell::RefCell;
     use std::collections::HashMap;
+
+    /// **A set-but-empty or relative base is no base.**
+    ///
+    /// `std::env::var_os` answers `Some("")` for a variable a login script
+    /// cleared, and `PathBuf::from("").join("schemaic")` is the *relative*
+    /// path `schemaic` — resolved against wherever the app was launched. Every
+    /// state file then lands in that directory, including the plaintext
+    /// fallback `connections.json`, and the next launch from elsewhere reads
+    /// none of them: "all my connections vanished", with a credential file
+    /// left in whatever tree the user was standing in.
+    ///
+    /// The predicate, not `config_dir` itself: reading it means setting
+    /// process-wide environment variables, which is not something a parallel
+    /// test suite may do.
+    #[test]
+    fn only_an_absolute_non_empty_base_is_usable() {
+        assert!(!usable_base(&PathBuf::from("")));
+        assert!(!usable_base(&PathBuf::from("schemaic")));
+        assert!(!usable_base(&PathBuf::from("./config")));
+        assert!(!usable_base(&PathBuf::from("../config")));
+
+        // The real shapes, on both platforms.
+        assert!(usable_base(&PathBuf::from("/home/u/.config")));
+        assert!(usable_base(&PathBuf::from("/")));
+        if cfg!(windows) {
+            assert!(usable_base(&PathBuf::from(r"C:\Users\u\AppData\Roaming")));
+        }
+    }
+
+    /// And `config_dir` asks it — the predicate alone is a decoration, and the
+    /// bug was three `var_os` calls that did not ask anything.
+    #[test]
+    fn config_dir_filters_every_base_it_considers() {
+        let src = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("src")
+                .join("persist.rs"),
+        )
+        .expect("persist.rs");
+        let at = src
+            .find("pub fn config_dir()")
+            .expect("`config_dir` is gone — this gate is stale");
+        let end = at + src[at..].find("\n}").expect("its end");
+        let f = &src[at..end];
+        assert!(
+            f.contains("usable_base("),
+            "`config_dir` no longer refuses an empty or relative base:\n{f}"
+        );
+        assert_eq!(
+            f.matches("var_os").count(),
+            1,
+            "each candidate must go through the one filtered helper:\n{f}"
+        );
+    }
+
     use std::path::{Path, PathBuf};
 
     /// The one thing that matters about a directory holding a plaintext
