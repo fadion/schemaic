@@ -293,17 +293,73 @@ fn subscript_open_before(b: &[u8], i: usize) -> bool {
         // A `[` with nothing before it subscripts nothing.
         return false;
     };
+    // An earlier subscript's `]` — and, on SQLite, the closing byte of a
+    // `[quoted identifier]`, which is the same byte and the same answer.
     if b[host] == b']' {
         return true;
+    }
+    // **A quoted identifier is subscriptable.** By the time `scan` reaches the
+    // `[`, `skip_noncode` has already consumed `"my arr"` whole, so all that is
+    // left to look at is its closing byte. `SELECT "my arr"[:hi] FROM t` grew a
+    // phantom `hi` row, and `prepare_run` then refused the statement with
+    // `Missing(["hi"])` — which stops the run *before* the guard and offers no
+    // "Run anyway", so the statement was unrunnable through the app.
+    if matches!(b[host], b'"' | b'`') {
+        return true;
+    }
+    // **A parenthesised expression or a function call is subscriptable too**:
+    // `(arr)[:hi]`, `(t.arr)[:hi]`, `f(x)[:hi]` — all legal PostgreSQL, and
+    // `select (a)[:h] from (select array[1,2,3,4] as a, 3 as h) s` returns
+    // `{1,2,3}` on 16.15.
+    //
+    // Except `ARRAY(SELECT …)`, which is a constructor rather than a value
+    // being indexed, for the reason the paragraph above gives about `ARRAY[…]`.
+    // Matched backwards over raw bytes, like the rest of this function: a paren
+    // inside a string literal would mislead it, and the same is already true of
+    // the `[` it started from.
+    if b[host] == b')' {
+        let mut depth = 0usize;
+        let mut k = host;
+        loop {
+            match b[k] {
+                b')' => depth += 1,
+                b'(' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        break;
+                    }
+                }
+                _ => {}
+            }
+            if k == 0 {
+                // Unbalanced — refuse rather than guess, which is the direction
+                // that keeps a real parameter visible.
+                return false;
+            }
+            k -= 1;
+        }
+        return !word_before(b, k).eq_ignore_ascii_case(b"ARRAY");
     }
     if !is_word_byte(b[host]) {
         return false;
     }
-    let start = b[..=host]
+    !word_before(b, host + 1).eq_ignore_ascii_case(b"ARRAY")
+}
+
+/// The word ending immediately before byte `at`, skipping whitespace — empty
+/// when there is no word there.
+fn word_before(b: &[u8], at: usize) -> &[u8] {
+    let Some(end) = b[..at].iter().rposition(|c| !c.is_ascii_whitespace()) else {
+        return &[];
+    };
+    if !is_word_byte(b[end]) {
+        return &[];
+    }
+    let start = b[..=end]
         .iter()
         .rposition(|c| !is_word_byte(*c))
         .map_or(0, |p| p + 1);
-    !b[start..=host].eq_ignore_ascii_case(b"ARRAY")
+    &b[start..=end]
 }
 
 /// The distinct placeholder names, in the order they first appear — the order
@@ -620,6 +676,42 @@ mod tests {
         assert!(found("SELECT myarray[:hi] FROM t", PG).is_empty());
         // A bracket with nothing before it subscripts nothing.
         assert_eq!(found("SELECT f([:a])", PG), ["a"]);
+    }
+
+    /// **A parenthesised or quoted host is subscriptable too**, and the three
+    /// tests above covered only the bare-word one. All of these are legal
+    /// PostgreSQL — `select (a)[:h] from (select array[1,2,3,4] as a, 3 as h) s`
+    /// returns `{1,2,3}` on 16.15 — and each grew a phantom parameter row.
+    /// `prepare_run` then refused the statement with `Missing`, which stops the
+    /// run *before* the guard and offers no "Run anyway", so it was unrunnable
+    /// through the app.
+    #[test]
+    fn a_slice_bound_reads_through_a_paren_or_a_quoted_name() {
+        for sql in [
+            "SELECT (arr)[:hi] FROM t",
+            "SELECT (t.arr)[:hi] FROM t",
+            "SELECT f(x)[:hi]",
+            r#"SELECT "my arr"[:hi] FROM t"#,
+            // A nested paren, so the backward match has to count rather than
+            // stop at the first `(`.
+            "SELECT (f(x, y))[:hi]",
+            // The bare-word and earlier-subscript hosts, unmoved.
+            "SELECT arr[:hi] FROM t",
+            "SELECT arr[1][:hi] FROM t",
+        ] {
+            assert!(found(sql, PG).is_empty(), "{sql} -> {:?}", found(sql, PG));
+        }
+        // `ARRAY(SELECT …)` is a constructor, like `ARRAY[…]`: a placeholder
+        // after it is a placeholder.
+        assert_eq!(found("SELECT ARRAY(SELECT 1)[:a]", PG), ["a"]);
+        // **The counterweight**: a real parameter inside a call must not be
+        // swallowed just because a `)` and a `[` are nearby.
+        assert_eq!(found("SELECT f(x, :a)", PG), ["a"]);
+        assert_eq!(found("SELECT f(x)[1], :a FROM t", PG), ["a"]);
+        assert_eq!(found("SELECT (arr)[:hi] FROM t WHERE id = :id", PG), ["id"]);
+        // An unbalanced paren refuses rather than guessing, which keeps a real
+        // parameter visible.
+        assert_eq!(found("SELECT arr)[:hi]", PG), ["hi"]);
     }
 
     #[test]
