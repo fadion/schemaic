@@ -985,6 +985,28 @@ pub fn function_names() -> impl Iterator<Item = &'static str> {
     FUNCTIONS.iter().map(|f| f.name)
 }
 
+/// Every keyword and builtin function name this crate knows, lowercased —
+/// built **once per process**, because none of it depends on the schema, the
+/// dialect or the statement.
+///
+/// It used to be rebuilt inside `typo_checks`, which runs once per statement
+/// of the buffer on a 120 ms debounce while the user types. The catalog half
+/// of that set was worse still (see [`is_probable_typo`]), but the static half
+/// was pure waste on its own: ~700 `String` allocations per statement, per
+/// tick, for a value that cannot change.
+fn static_words() -> &'static std::collections::HashSet<String> {
+    static WORDS: std::sync::OnceLock<std::collections::HashSet<String>> =
+        std::sync::OnceLock::new();
+    WORDS.get_or_init(|| {
+        SQL_KEYWORDS
+            .iter()
+            .chain(STMT_KEYWORDS.iter())
+            .map(|k| k.to_ascii_lowercase())
+            .chain(function_names().map(|f| f.to_ascii_lowercase()))
+            .collect()
+    })
+}
+
 /// Keywords that begin a statement (offered at statement start).
 pub const STMT_KEYWORDS: &[&str] = &[
     "SELECT", "INSERT", "UPDATE", "DELETE", "CREATE", "DROP", "ALTER", "TRUNCATE", "WITH", "SHOW",
@@ -2517,12 +2539,22 @@ fn table_refs_with_pos(
 /// Is `word` a likely misspelled SQL keyword? Not a known word (keyword/function/
 /// schema ident) but a near-miss of a keyword. Conservative (short words + distant
 /// matches ignored) to avoid flagging legitimate identifiers.
-fn is_probable_typo(word: &str, known: &HashSet<String>) -> bool {
+fn is_probable_typo(word: &str, catalog: &Catalog) -> bool {
     if word.len() < 4 {
         return false;
     }
     let lw = word.to_ascii_lowercase();
-    if known.contains(&lw) {
+    // **Two borrowed sets, not one merged copy.** This took a
+    // `&HashSet<String>` that the caller built per statement by lowercasing
+    // every keyword and every function name *and cloning the whole catalog
+    // into it*. `known_idents` holds one entry per database, table and column
+    // of every loaded schema — ~13,000 on a 600-table MySQL schema — so a
+    // 300-statement script cost ~3.9M `String` allocations and hash inserts on
+    // every 120 ms tick, for the whole time the file was being edited, and
+    // editing one line paid it for every statement in the buffer. The
+    // `Catalog` is memoized precisely because it is expensive to build; the
+    // per-statement copy of its contents was not.
+    if catalog.known_idents.contains(&lw) || static_words().contains(lw.as_str()) {
         return false;
     }
     let up = word.to_ascii_uppercase();
@@ -4334,14 +4366,6 @@ fn typo_checks(
     dialect: SqlDialect,
     out: &mut Vec<Diagnostic>,
 ) {
-    let mut known: HashSet<String> = SQL_KEYWORDS
-        .iter()
-        .chain(STMT_KEYWORDS.iter())
-        .map(|k| k.to_ascii_lowercase())
-        .chain(function_names().map(|f| f.to_ascii_lowercase()))
-        .collect();
-    known.extend(catalog.known_idents.iter().cloned());
-
     let b = sql.as_bytes();
     let mut i = lo;
     while i < hi {
@@ -4357,7 +4381,7 @@ fn typo_checks(
                 j += 1;
             }
             let qualified = s > 0 && b[s - 1] == b'.';
-            if !qualified && is_probable_typo(&sql[s..j], &known) {
+            if !qualified && is_probable_typo(&sql[s..j], catalog) {
                 out.push(Diagnostic {
                     range: (s, j),
                     severity: Severity::Warning,
@@ -8202,6 +8226,119 @@ mod tests {
         // No loaded schema → we can't judge existence, so no unknown-table noise.
         let cat = Catalog::build(&[], Some("company"));
         assert!(diagnostics("SELECT * FROM anything", &cat, SqlDialect::MySql).is_empty());
+    }
+
+    /// **The typo checker's exemption list is three sources, and it now
+    /// borrows all three instead of copying them.**
+    ///
+    /// `typo_checks` built a merged `HashSet<String>` per statement —
+    /// lowercasing every keyword and function name, and **cloning the whole
+    /// catalog** into it. `known_idents` holds one entry per database, table
+    /// and column of every loaded schema, so a 300-statement script cost
+    /// millions of allocations on every 120 ms tick while the file was being
+    /// edited. Nothing about the set varied per statement.
+    ///
+    /// The answer is identical, which is the point — so this pins the three
+    /// sources instead: drop any one of them and a correct word starts being
+    /// squiggled "looks like a misspelled keyword".
+    #[test]
+    fn every_source_of_known_words_still_exempts_its_own() {
+        let (schema, db) = sample_catalog();
+        let cat = Catalog::build(&[(db, &schema)], Some(db));
+        let flagged = |sql: &str| -> Vec<String> {
+            diagnostics(sql, &cat, SqlDialect::MySql)
+                .into_iter()
+                .filter(|d| d.message.contains("misspelled keyword"))
+                .map(|d| sql[d.range.0..d.range.1].to_string())
+                .collect()
+        };
+        // A statement keyword, a clause keyword and a builtin function name.
+        assert!(flagged("SELECT * FROM employees").is_empty());
+        assert!(flagged("SELECT COUNT(name) FROM employees").is_empty());
+        // **A schema identifier that really is a near-miss of a keyword** —
+        // the catalog half, and the expensive one. `orders` is one edit from
+        // `ORDER`, which is exactly what the distance check flags; the only
+        // thing that stops it is its being in the catalog. A table called
+        // `employees` would prove nothing — nothing is near it, so it passes
+        // with the catalog half deleted.
+        let real = DbSchema {
+            tables: vec![tbl("orders", &["id", "wheer"])],
+            ..Default::default()
+        };
+        let with_real = Catalog::build(&[("company", &real)], Some("company"));
+        let flagged_real = |sql: &str| -> Vec<String> {
+            diagnostics(sql, &with_real, SqlDialect::MySql)
+                .into_iter()
+                .filter(|d| d.message.contains("misspelled keyword"))
+                .map(|d| sql[d.range.0..d.range.1].to_string())
+                .collect()
+        };
+        assert!(
+            flagged_real("SELECT wheer FROM orders").is_empty(),
+            "a real table or column must never be a keyword typo"
+        );
+        // …and the identical words are flagged when the catalog does not hold
+        // them, so the exemption above is the catalog's doing and not the
+        // distance check declining.
+        let empty = Catalog::build(&[], Some("company"));
+        let mut got: Vec<String> =
+            diagnostics("SELECT wheer FROM orders", &empty, SqlDialect::MySql)
+                .into_iter()
+                .filter(|d| d.message.contains("misspelled keyword"))
+                .map(|d| d.message)
+                .collect();
+        got.sort();
+        assert_eq!(
+            got,
+            vec!["`orders` looks like a misspelled keyword".to_string()],
+            "without the catalog, the same word is a typo"
+        );
+        // And a genuine typo is still caught, or the exemptions have
+        // swallowed the whole check.
+        assert_eq!(flagged("SELCT * FROM employees"), vec!["SELCT"]);
+    }
+
+    /// **The set no longer belongs to one statement, so every statement in the
+    /// buffer must still be checked against all of it.**
+    ///
+    /// The rebuild being per-statement is what was wasteful; sharing it is
+    /// only safe if nothing about it was per-statement, and the composition —
+    /// `diagnostics` looping over statements — is where that would show.
+    #[test]
+    fn a_shared_word_set_checks_every_statement_the_same() {
+        // No loaded schema, so the unknown-column check stays quiet: a typo
+        // that *also* fails to parse is reported as a syntax error and
+        // `dedup_diagnostics` drops the warning under it, which would leave
+        // this test asserting about the parser instead of the checker. `selct`
+        // in a `WHERE` parses cleanly as a column reference.
+        let cat = Catalog::build(&[], Some("company"));
+        let flagged = |sql: &str| -> Vec<String> {
+            diagnostics(sql, &cat, SqlDialect::MySql)
+                .into_iter()
+                .filter(|d| d.message.contains("misspelled keyword"))
+                .map(|d| sql[d.range.0..d.range.1].to_string())
+                .collect()
+        };
+        assert_eq!(
+            flagged("SELECT 1; SELECT * FROM t WHERE selct = 1; SELECT 2"),
+            vec!["selct"],
+            "the middle statement, and only it"
+        );
+        // The same typo in the *first* and *last* positions, so the order of
+        // the loop is not what makes it work.
+        assert_eq!(
+            flagged("SELECT * FROM t WHERE selct = 1; SELECT 2"),
+            vec!["selct"]
+        );
+        assert_eq!(
+            flagged("SELECT 2; SELECT * FROM t WHERE selct = 1"),
+            vec!["selct"]
+        );
+        // And once per occurrence, not once per statement in the buffer.
+        assert_eq!(
+            flagged("SELECT * FROM t WHERE selct = 1; SELECT * FROM t WHERE selct = 2"),
+            vec!["selct", "selct"]
+        );
     }
 
     #[test]
