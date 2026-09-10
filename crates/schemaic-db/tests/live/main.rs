@@ -136,6 +136,9 @@ live_suite!(
         a_manual_transaction_is_invisible_until_it_commits,
         a_rolled_back_manual_transaction_leaves_nothing,
         a_cancelled_query_stops_at_the_server,
+        a_cancelled_script_stops_at_the_server_and_reports_what_ran,
+        a_cancelled_import_rolls_back_and_says_so,
+        a_cancelled_import_on_a_non_transactional_table_says_the_rows_remain,
     ],
     streaming: [
         a_streamed_export_delivers_every_row,

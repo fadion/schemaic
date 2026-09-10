@@ -416,6 +416,177 @@ pub async fn a_cancelled_query_stops_at_the_server(target: &'static Target) {
     scratch.teardown().await;
 }
 
+/// Cancelling a **`.sql` script** mid-run: the server stops, the run reports
+/// `Cancelled`, and nothing after the cancelled statement is counted or applied.
+///
+/// The tier's one cancellation test above exercises `Db::fetch_query` — a
+/// *read*, through `Db::run_to`. `run_script` shares none of it: it opens its
+/// own connection, has its own `kill_query`, and does its own exit accounting.
+/// That accounting is the part with a history — `ran: fut.await.is_ok()` exists
+/// because throwing the killed future away left `ran` a *floor* while the panel
+/// presents it as the count, on the app's only disclosure of a half-applied
+/// restore.
+///
+/// **`ran` is asserted as a range, and that is the honest assertion.** `KILL
+/// QUERY` on a sleeping `SELECT SLEEP()` is documented to make it *return 1*
+/// rather than fail, so on MySQL the sleep may legitimately have landed and be
+/// counted; on PostgreSQL `pg_sleep` is cancelled and is not. Both are correct.
+/// What must hold on every engine is that the statement the run never reached
+/// is neither counted nor applied — which is what a floor would get wrong.
+pub async fn a_cancelled_script_stops_at_the_server_and_reports_what_ran(target: &'static Target) {
+    let scratch = Scratch::create(target, "scriptcancel").await;
+    let t = scratch.qualified("sc");
+    let stmts = vec![
+        format!("CREATE TABLE {t} (id INTEGER NOT NULL PRIMARY KEY)"),
+        format!("INSERT INTO {t} (id) VALUES (1)"),
+        target.sleep_sql(),
+        format!("INSERT INTO {t} (id) VALUES (2)"),
+    ];
+
+    let cancel = CancellationToken::new();
+    let armed = cancel.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        armed.cancel();
+    });
+
+    let started = Instant::now();
+    let (end, ran) = run_script_with(&scratch, &stmts, cancel).await;
+    let elapsed = started.elapsed();
+
+    assert_eq!(
+        end,
+        ExecEnd::Cancelled,
+        "{}: the run ended as {end:?} rather than cancelled",
+        target.name
+    );
+    assert!(
+        elapsed < Duration::from_secs(SLEEP_SECS) - CANCEL_MARGIN,
+        "{}: the cancel took {elapsed:?}, so the sleep ran to completion",
+        target.name
+    );
+    assert!(
+        (2..=3).contains(&ran),
+        "{}: {ran} statements reported as applied; the two before the sleep ran \
+         and the one after it never did",
+        target.name
+    );
+
+    // The half a client-side `select!` answers on its own is the half that is
+    // worth nothing — polled, as the read cancellation test polls it.
+    let deadline = Instant::now() + (Duration::from_secs(SLEEP_SECS) - CANCEL_MARGIN);
+    let mut still = target.running_sleeps(&scratch.db).await;
+    while still > 0 && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        still = target.running_sleeps(&scratch.db).await;
+    }
+    assert_eq!(
+        still, 0,
+        "{}: the run reported Cancelled but the server is still running the statement",
+        target.name
+    );
+
+    // And the statement past the cancel is not on the server, whatever `ran`
+    // says — read on a fresh connection, since the script's own is gone.
+    assert_eq!(
+        column(&scratch, &format!("SELECT id FROM {t} ORDER BY id")).await,
+        ["1"],
+        "{}: a statement after the cancelled one was applied",
+        target.name
+    );
+
+    scratch.teardown().await;
+}
+
+/// Cancelling an **import** into a transactional table: the rollback completes,
+/// so the error is `Cancelled` — the variant the modal renders as *"nothing was
+/// written"* — and nothing is written.
+///
+/// Both halves are the assertion. `Err(Cancelled)` alone would pass against a
+/// path that killed the query and disconnected without rolling back, which is
+/// what this one used to do.
+pub async fn a_cancelled_import_rolls_back_and_says_so(target: &'static Target) {
+    let scratch = Scratch::create(target, "impcancel").await;
+    seed_import_table_as(&scratch, None).await;
+
+    let cancel = CancellationToken::new();
+    let armed = cancel.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        armed.cancel();
+    });
+
+    let mut rows = slow_rows(4);
+    let outcome = import_with(&scratch, &mut rows, cancel).await;
+
+    assert!(
+        matches!(outcome, Err(DbError::Cancelled)),
+        "{}: a cancelled import into a transactional table reported {:?}",
+        target.name,
+        outcome.map_err(|e| e.to_string())
+    );
+    assert_eq!(
+        count(&scratch).await,
+        "0",
+        "{}: the cancelled import left rows behind",
+        target.name
+    );
+
+    scratch.teardown().await;
+}
+
+/// The same cancel against a table whose storage engine **ignores
+/// `ROLLBACK`** — and the reason [`Target::non_transactional`] exists.
+///
+/// `MyISAM` raises warning 1196 and keeps every batch already executed. The
+/// path used to say "the transaction rolled back, so nothing was written"
+/// unconditionally, so the user re-ran the import and doubled the rows it had
+/// already loaded. `Rollback::Incomplete` is what says otherwise, and this is
+/// the only place either branch is chosen by a real server.
+///
+/// **PostgreSQL returns early**, as the routine-attribute test does for the
+/// same kind of reason: there is no non-transactional table to make there.
+pub async fn a_cancelled_import_on_a_non_transactional_table_says_the_rows_remain(
+    target: &'static Target,
+) {
+    let Some(engine_clause) = target.non_transactional else {
+        return;
+    };
+    let scratch = Scratch::create(target, "impcancelnt").await;
+    seed_import_table_as(&scratch, Some(engine_clause)).await;
+
+    let cancel = CancellationToken::new();
+    let armed = cancel.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        armed.cancel();
+    });
+
+    let mut rows = slow_rows(4);
+    let outcome = import_with(&scratch, &mut rows, cancel).await;
+
+    let left = count(&scratch).await;
+    let message = match outcome {
+        Err(DbError::Cancelled) => panic!(
+            "{}: a cancelled import into a {engine_clause} table claimed nothing \
+             was written, and {left} rows are in it",
+            target.name
+        ),
+        Err(e) => e.to_string(),
+        Ok(n) => panic!(
+            "{}: the cancelled import reported {n} rows loaded",
+            target.name
+        ),
+    };
+    assert!(
+        message.contains("not transactional"),
+        "{}: the error does not say the rows remain: {message}",
+        target.name
+    );
+
+    scratch.teardown().await;
+}
+
 /// A pinned [`Session`] that is closed **on every path out**, including a panic.
 ///
 /// The manual-transaction tests reach `session.close()` on their last line, so
@@ -475,6 +646,16 @@ pub const SLEEP_SECS: u64 = 5;
 /// itself. This is the shape the app itself uses (`script::feed` alongside
 /// `Db::run_script`), so the test now drives the same arrangement it is testing.
 async fn run_script(scratch: &Scratch, stmts: &[String]) -> (ExecEnd, usize) {
+    run_script_with(scratch, stmts, CancellationToken::new()).await
+}
+
+/// The same, with the token the caller holds — the input the whole
+/// cancellation half of this path needs and the tier never supplied.
+async fn run_script_with(
+    scratch: &Scratch,
+    stmts: &[String],
+    cancel: CancellationToken,
+) -> (ExecEnd, usize) {
     let (tx, rx) = tokio::sync::mpsc::channel(16);
     let owned: Vec<String> = stmts.to_vec();
     let feed = tokio::spawn(async move {
@@ -496,19 +677,24 @@ async fn run_script(scratch: &Scratch, stmts: &[String]) -> (ExecEnd, usize) {
             }
         }
     });
-    let out = scratch
-        .db
-        .run_script(&scratch.database, rx, CancellationToken::new())
-        .await;
+    let out = scratch.db.run_script(&scratch.database, rx, cancel).await;
     feed.await.expect("the feeding task must not panic");
     out
 }
 
 async fn seed_import_table(scratch: &Scratch) {
+    seed_import_table_as(scratch, None).await;
+}
+
+/// The import table, optionally on a named storage engine —
+/// [`Target::non_transactional`] for the one test that needs `ROLLBACK` to be
+/// ignored.
+async fn seed_import_table_as(scratch: &Scratch, engine_clause: Option<&str>) {
     scratch
         .exec(&format!(
-            "CREATE TABLE {} (id INTEGER NOT NULL PRIMARY KEY, name VARCHAR(32))",
-            scratch.qualified("imp")
+            "CREATE TABLE {} (id INTEGER NOT NULL PRIMARY KEY, name VARCHAR(32)) {}",
+            scratch.qualified("imp"),
+            engine_clause.unwrap_or_default()
         ))
         .await;
 }
@@ -516,6 +702,14 @@ async fn seed_import_table(scratch: &Scratch) {
 async fn import(
     scratch: &Scratch,
     rows: &mut (dyn Iterator<Item = Result<Vec<Value>, String>> + Send),
+) -> Result<u64, schemaic_db::DbError> {
+    import_with(scratch, rows, CancellationToken::new()).await
+}
+
+async fn import_with(
+    scratch: &Scratch,
+    rows: &mut (dyn Iterator<Item = Result<Vec<Value>, String>> + Send),
+    cancel: CancellationToken,
 ) -> Result<u64, schemaic_db::DbError> {
     let columns = ["id".to_string(), "name".to_string()];
     scratch
@@ -528,9 +722,28 @@ async fn import(
                 columns: &columns,
             },
             rows,
-            CancellationToken::new(),
+            cancel,
         )
         .await
+}
+
+/// Enough rows, handed over slowly enough, that a cancel lands **mid-import**
+/// rather than before it starts or after it finishes.
+///
+/// The source is pulled through `block_in_place`, so a blocking sleep in
+/// `next()` is what the real reader's disk IO looks like from here. `batches`
+/// full batches means at least one is already on the server when the token
+/// fires, which is the whole point on a non-transactional table.
+fn slow_rows(batches: usize) -> impl Iterator<Item = Result<Vec<Value>, String>> + Send {
+    let n = schemaic_core::import::INSERT_BATCH_ROWS * batches;
+    (1..=n).map(move |i| {
+        // Paced so the run outlives the 400 ms cancel without being slow: one
+        // pause per batch boundary rather than one per row.
+        if i % schemaic_core::import::INSERT_BATCH_ROWS == 0 {
+            std::thread::sleep(Duration::from_millis(250));
+        }
+        Ok(vec![Value::Int(i as i64), Value::Str(format!("row {i}"))])
+    })
 }
 
 /// How many rows the import table holds, read on a **fresh** connection.

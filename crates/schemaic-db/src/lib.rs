@@ -4967,43 +4967,55 @@ impl Db {
         }
         let mut conn = self.open(Some(target.database), false).await?;
         let conn_id = conn.id();
-        // `None` = the cancel arm won. The rollback can't happen inside the arm:
-        // `select!` keeps every future alive across its handler, so `import_on`'s
-        // `&mut conn` is still outstanding there — which is why the disconnect
-        // has always been after the block too.
-        let done: Option<Result<u64, DbError>> = tokio::select! {
-            r = import_on(&mut conn, self.engine.dialect(), &target, rows) => Some(r),
-            _ = cancel.cancelled() => {
-                self.kill_query(conn_id).await;
-                None
-            }
-        };
-        // **Cancelling is a write-path exit like any other, so it rolls back
-        // through `rollback()` and reports what that achieved.** It used to
-        // `kill_query` and disconnect, and the modal then said, unconditionally,
-        // "the transaction rolled back, so nothing was written" — which on
-        // `MyISAM`/`MEMORY`/`ARCHIVE`/`CSV` is false: every batch already
-        // executed is durable there, so the user re-ran the import and doubled
-        // the rows it had already loaded. It was the one exit in this path that
-        // skipped `Rollback::note()`, and the only one whose sentence was
-        // composed in the UI, so there was nowhere for the note to attach.
+        // **The cancel is inside the loop, not a race around it.** This was
+        // `tokio::select!` over the whole of `import_on`, and the cancel arm
+        // then *dropped* that future mid-statement — which leaves a
+        // `mysql_async` connection's result stream desynchronised. Measured on
+        // MariaDB 10.11.14 and MySQL 8.4.11: after the drop, `SELECT
+        // CONNECTION_ID()` came back `Ok(None)`, the following `ROLLBACK`
+        // "succeeded" and `SHOW WARNINGS` was empty — so the rollback below
+        // classified `Complete` off a reply that was not its own, and a
+        // cancelled import into a `MyISAM` table reported `DbError::Cancelled`
+        // (the variant the modal renders as *"nothing was written"*) over 1,000
+        // rows that were permanently there. That is the exact failure this
+        // path's `Rollback::note()` was added to prevent, still live on the one
+        // exit that dropped the connection out from under it.
         //
-        // The connection is reused deliberately: the transaction belongs to it,
-        // so a `ROLLBACK` on a fresh one would undo nothing. A `ROLLBACK` that
-        // cannot be sent at all (the killed statement left the protocol mid-
-        // exchange) is `Rollback::Incomplete`, which is the safe reading — it
-        // says the rows may still be there rather than promising they aren't.
-        let outcome = match done {
-            Some(r) => r,
-            None => match rollback(&mut conn, "ROLLBACK").await {
-                Rollback::Complete => Err(DbError::Cancelled),
-                // Not `Cancelled`: that variant is what the modal renders as
-                // "nothing was written", and here something was.
-                undone => Err(DbError::Query(format!("Import cancelled{}", undone.note()))),
-            },
-        };
+        // `import_on` now owns the token and stops at a point where the
+        // protocol is intact: between batches, or after awaiting a statement it
+        // killed — the same "the killed statement is awaited, not dropped"
+        // rule `run_script_mysql` states.
+        let outcome = import_on(
+            self,
+            &mut conn,
+            conn_id,
+            self.engine.dialect(),
+            &target,
+            rows,
+            &cancel,
+        )
+        .await;
         let _ = conn.disconnect().await;
         outcome
+    }
+}
+
+/// What a cancelled import reports, given what its `ROLLBACK` achieved.
+///
+/// **Cancelling is a write-path exit like any other, so it reports what the
+/// rollback achieved.** It used to `kill_query` and disconnect, and the modal
+/// then said, unconditionally, "the transaction rolled back, so nothing was
+/// written" — which on `MyISAM`/`MEMORY`/`ARCHIVE`/`CSV` is false: every batch
+/// already executed is durable there, so the user re-ran the import and doubled
+/// the rows it had already loaded.
+///
+/// [`DbError::Cancelled`] is what the modal renders as "nothing was written",
+/// so it is only for [`Rollback::Complete`]; anything else carries
+/// [`Rollback::note`], which says the rows may still be there.
+fn cancelled_import(undone: Rollback) -> DbError {
+    match undone {
+        Rollback::Complete => DbError::Cancelled,
+        undone => DbError::Query(format!("Import cancelled{}", undone.note())),
     }
 }
 
@@ -5089,10 +5101,13 @@ fn next_batch(
 
 /// The MySQL half of [`Db::import_rows`], on an already-open connection.
 async fn import_on(
+    db: &Db,
     conn: &mut Conn,
+    conn_id: u32,
     dialect: schemaic_core::intel::SqlDialect,
     target: &ImportTarget<'_>,
     rows: RowSource<'_>,
+    cancel: &CancellationToken,
 ) -> Result<u64, DbError> {
     let qerr = |e: mysql_async::Error| DbError::Query(e.to_string());
     let cols: Vec<&str> = target.columns.iter().map(String::as_str).collect();
@@ -5103,6 +5118,13 @@ async fn import_on(
     // `next_batch`. It lives here so it cannot be lost between two of them.
     let mut held: Option<Vec<Value>> = None;
     loop {
+        // **Between batches**, where the connection is idle and a `ROLLBACK`
+        // is the connection's own next statement. A Stop pressed while the
+        // reader is pulling rows lands here — `next_batch_off_executor` blocks
+        // the task, so nothing could have observed the token earlier anyway.
+        if cancel.is_cancelled() {
+            return Err(cancelled_import(rollback(conn, "ROLLBACK").await));
+        }
         // A reader error (a bad record, a value that wouldn't coerce) has to undo
         // the transaction too — returning straight out would leave it open until
         // the connection drops, which is a lock held for no reason.
@@ -5131,10 +5153,34 @@ async fn import_on(
         ) else {
             continue;
         };
-        if let Err(e) = conn.query_drop(&sql).await {
-            let msg = e.to_string();
-            let undone = rollback(conn, "ROLLBACK").await;
-            return Err(DbError::Query(format!("{msg}{}", undone.note())));
+        // **The killed statement is awaited, not dropped** — the same rule
+        // `run_script_mysql` states, and for a sharper reason here: dropping it
+        // desynchronises the result stream, and everything after that
+        // (`ROLLBACK`, the `SHOW WARNINGS` behind `Rollback`) then reads
+        // somebody else's reply. Scoped so the borrow ends before the rollback.
+        let step = {
+            let mut fut = std::pin::pin!(conn.query_drop(&sql));
+            let raced = tokio::select! {
+                r = fut.as_mut() => Some(r),
+                _ = cancel.cancelled() => None,
+            };
+            match raced {
+                Some(r) => Some(r),
+                None => {
+                    db.kill_query(conn_id).await;
+                    let _ = fut.await;
+                    None
+                }
+            }
+        };
+        match step {
+            Some(Ok(())) => {}
+            Some(Err(e)) => {
+                let msg = e.to_string();
+                let undone = rollback(conn, "ROLLBACK").await;
+                return Err(DbError::Query(format!("{msg}{}", undone.note())));
+            }
+            None => return Err(cancelled_import(rollback(conn, "ROLLBACK").await)),
         }
         let affected = conn.affected_rows();
         if affected != batch.len() as u64 {
@@ -5148,6 +5194,11 @@ async fn import_on(
         total += affected;
     }
 
+    // A Stop pressed after the last batch and before the commit is still a
+    // Stop: committing here would land the whole import the user just stopped.
+    if cancel.is_cancelled() {
+        return Err(cancelled_import(rollback(conn, "ROLLBACK").await));
+    }
     conn.query_drop("COMMIT").await.map_err(qerr)?;
     Ok(total)
 }
