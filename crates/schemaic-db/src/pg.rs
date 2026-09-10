@@ -3522,6 +3522,12 @@ pub(crate) async fn commit_writes(
         r = write_on(&client, write, TxScope::Own) => r,
         _ = cancel.cancelled() => {
             cancel_query(db, &token).await;
+            // Explicit, like `import_rows` above and like every error exit in
+            // `write_on` below — the drop aborts the transaction too, but it
+            // leaves it open until the connection actually goes away, holding
+            // every row lock the completed statements took meanwhile. This was
+            // the one exit in the pair that relied on the drop.
+            let _ = client.batch_execute("ROLLBACK").await;
             Err(DbError::Cancelled)
         }
     }
