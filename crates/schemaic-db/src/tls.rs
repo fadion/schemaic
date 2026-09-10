@@ -402,9 +402,7 @@ fn read_key(path: &str) -> Result<PrivateKeyDer<'static>, DbError> {
 /// check a file that is perfectly good. The row is gone (see
 /// `schemaic_core::connection::Tls`) and this says what to do instead.
 fn parse_key(path: &str, pem: &[u8]) -> Result<PrivateKeyDer<'static>, DbError> {
-    if let Ok(text) = std::str::from_utf8(pem)
-        && text.contains("ENCRYPTED PRIVATE KEY")
-    {
+    if std::str::from_utf8(pem).is_ok_and(is_encrypted_key) {
         return Err(DbError::Connect(format!(
             "{path} is a passphrase-protected private key, which Schemaic cannot open. \
              Decrypt it first: openssl pkcs8 -in {path} -out client-key.pem"
@@ -412,6 +410,34 @@ fn parse_key(path: &str, pem: &[u8]) -> Result<PrivateKeyDer<'static>, DbError> 
     }
     PrivateKeyDer::from_pem_slice(pem)
         .map_err(|e| DbError::Connect(format!("{path} is not a PEM private key: {e}")))
+}
+
+/// Does this PEM text hold a key that cannot be read without a passphrase?
+///
+/// **There are two spellings, and only PKCS#8's was recognised.** PKCS#8 says
+/// it in the header — `-----BEGIN ENCRYPTED PRIVATE KEY-----` — but the legacy
+/// RFC 1421 form keeps the ordinary `EC PRIVATE KEY` / `RSA PRIVATE KEY`
+/// header and puts the fact in a `Proc-Type: 4,ENCRYPTED` line above the
+/// base64, with no occurrence of the string that was being matched. That is
+/// what `openssl ec -aes256` and `openssl rsa -aes256 -traditional` produce —
+/// the plain commands, no extra flag — and what an OpenSSL 1.x-era toolchain
+/// left behind.
+///
+/// Unrecognised, those reached [`PrivateKeyDer::from_pem_slice`], which cannot
+/// base64-decode a header line and answers `Base64Decode(InvalidCharacter(45))`
+/// — reported as *"… is not a PEM private key"*, the very message [`parse_key`]
+/// exists to stop emitting, for a file that is perfectly good. `openssl pkcs8`
+/// is the right remedy for these keys too, and was the one thing never shown.
+///
+/// It keys on `Proc-Type` rather than the header, because the *header* is
+/// shared with the unencrypted legacy key that must still be read, and on
+/// `Proc-Type` rather than `DEK-Info`, because that is the field which says
+/// encrypted — `DEK-Info` only names the cipher.
+fn is_encrypted_key(text: &str) -> bool {
+    text.contains("ENCRYPTED PRIVATE KEY")
+        || text
+            .lines()
+            .any(|l| l.trim_start().starts_with("Proc-Type:") && l.contains("ENCRYPTED"))
 }
 
 /// Verifies nothing at all — for `prefer` and `require`, which encrypt without
@@ -678,6 +704,63 @@ mod tests {
         // An ordinary malformed key keeps the old message, which is right for it.
         let err = parse_key("/tmp/client.key", b"hello").expect_err("not a key");
         assert!(format!("{err:?}").contains("not a PEM private key"));
+    }
+
+    /// **…in both spellings, not just PKCS#8's.** The check above matched the
+    /// string `ENCRYPTED PRIVATE KEY`, which appears only in the PKCS#8 header.
+    /// `openssl ec -aes256` and `openssl rsa -aes256 -traditional` — the plain
+    /// commands — emit the legacy RFC 1421 form instead: an ordinary
+    /// `EC PRIVATE KEY` header with `Proc-Type: 4,ENCRYPTED` above the base64,
+    /// and not one occurrence of the string being looked for.
+    ///
+    /// So the arm never fired for them, `from_pem_slice` tried to base64-decode
+    /// the header line and answered `Base64Decode("InvalidCharacter(45)")`, and
+    /// the user was told their key "is not a PEM private key" — the exact
+    /// message this function exists to stop emitting, for a file that is
+    /// perfectly good and for which `openssl pkcs8` is the right advice.
+    #[test]
+    fn a_legacy_encrypted_key_is_named_too() {
+        for pem in [
+            &b"-----BEGIN EC PRIVATE KEY-----\n\
+                Proc-Type: 4,ENCRYPTED\n\
+                DEK-Info: AES-256-CBC,9A1B2C3D4E5F60718293A4B5C6D7E8F9\n\
+                \n\
+                MIIBxxxx\n\
+                -----END EC PRIVATE KEY-----\n"[..],
+            &b"-----BEGIN RSA PRIVATE KEY-----\n\
+                Proc-Type: 4,ENCRYPTED\n\
+                DEK-Info: DES-EDE3-CBC,0123456789ABCDEF\n\
+                \n\
+                MIIBxxxx\n\
+                -----END RSA PRIVATE KEY-----\n"[..],
+        ] {
+            let err = parse_key("/tmp/client.key", pem)
+                .expect_err("an encrypted key cannot be opened here");
+            let DbError::Connect(msg) = err else {
+                panic!("a connect error is what preflight reports");
+            };
+            assert!(msg.contains("passphrase"), "{msg}");
+            assert!(msg.contains("openssl pkcs8"), "the way out: {msg}");
+            assert!(
+                !msg.contains("is not a PEM private key"),
+                "that message blames the file: {msg}"
+            );
+        }
+    }
+
+    /// The other half of the same rule: an *unencrypted* legacy key carries the
+    /// same `EC PRIVATE KEY` header and must still be read, so the widened
+    /// check has to key on `Proc-Type`, not on the header.
+    #[test]
+    fn an_unencrypted_legacy_key_is_not_mistaken_for_an_encrypted_one() {
+        assert!(
+            parse_key(
+                "/tmp/client.key",
+                b"-----BEGIN EC PRIVATE KEY-----\nMIIBxxxx\n-----END EC PRIVATE KEY-----\n",
+            )
+            .is_ok(),
+            "an unencrypted legacy key must still be read"
+        );
     }
 
     /// A named CA file that isn't there is a *connect* error naming the path,
