@@ -1669,8 +1669,8 @@ pub(crate) fn signature_popup(comp: Completion, viewport: RwSignal<Rect>) -> imp
 mod tests {
     use super::{
         KeyKind, SuggestKind, Suggestion, call_parens_follow, completion_insertion,
-        database_suggestion_visible, natural_width, popup_may_open, popup_placement, popup_w,
-        popup_x, recency_bonus, row_width, snippet_abbrev_rows, statement_identifiers,
+        database_suggestion_visible, fuzzy_score, natural_width, popup_may_open, popup_placement,
+        popup_w, popup_x, recency_bonus, row_width, snippet_abbrev_rows, statement_identifiers,
         types_a_character,
     };
     use crate::consts::{
@@ -2056,5 +2056,94 @@ mod tests {
         let p = popup_placement(197.0, 221.0, 5, 0.0);
         assert_eq!(p.top, 221.0 + COMPLETION_LINE_H);
         assert_eq!(p.max_h, completion_max_h());
+    }
+    // ── fuzzy_score ───────────────────────────────────────────────────────────
+    //
+    // **What Enter and Tab splice.** `recompute_completions` sorts by
+    // `(tier, score, text.len())` and sets `sel` to 0, so whatever this ranks
+    // first is what goes into the user's buffer — and it had no test at all.
+    // The scores themselves are free to change, so these are written as
+    // comparisons and as answers (`Some`/`None`), never as absolute numbers.
+
+    /// An **empty query scores every candidate the same**, which is the
+    /// property `snippet_abbrev_rows`' own doc identifies as the mechanism of a
+    /// shipped bug: `SELECT * FROM ` auto-opened the popup with the
+    /// two-character built-in `ps` preselected, and Enter spliced a whole
+    /// `;`-terminated statement into the one being typed. The guard that
+    /// shipped lives in `snippet_abbrev_rows` — which is tested — and this is
+    /// the behaviour that made it necessary.
+    #[test]
+    fn an_empty_query_ranks_nothing_above_anything() {
+        for cand in ["orders", "ps", "customer_id", ""] {
+            assert_eq!(fuzzy_score(cand, ""), Some(0), "{cand}");
+        }
+    }
+
+    /// A candidate that is not a subsequence of the query answers `None`, which
+    /// is the only thing keeping non-matches out of the list.
+    #[test]
+    fn a_non_subsequence_does_not_match_at_all() {
+        assert_eq!(fuzzy_score("orders", "zx"), None);
+        assert_eq!(fuzzy_score("orders", "sr"), None, "order matters");
+        // The length guard, which is also the one place the function could
+        // index out of bounds.
+        assert_eq!(fuzzy_score("a", "ab"), None);
+        assert_eq!(fuzzy_score("", "a"), None);
+        // A subsequence that is not contiguous still matches — that is the
+        // whole point of a fuzzy score.
+        assert!(fuzzy_score("customer_id", "cid").is_some());
+    }
+
+    /// **A prefix outranks a match buried inside a longer name.** Typing `cus`
+    /// has to preselect `customer_id`, not `account_customs`.
+    #[test]
+    fn a_prefix_match_outranks_an_interior_one() {
+        let better = |a: &str, b: &str, q: &str| {
+            let (sa, sb) = (fuzzy_score(a, q), fuzzy_score(b, q));
+            assert!(
+                sa > sb,
+                "{q:?}: {a} scored {sa:?}, {b} scored {sb:?} — the prefix must win"
+            );
+        };
+        better("customer_id", "account_customs", "cus");
+        better("orders", "line_orders", "ord");
+        // A word-boundary match outranks one mid-word, at equal position.
+        better("order_total", "reordertotal", "ot");
+        // And a shorter candidate outranks a longer one that matches as well.
+        better("id", "identifier_column", "id");
+    }
+
+    /// Case is folded, and only over ASCII — the scan compares bytes, so a
+    /// candidate with a non-ASCII letter matches byte-for-byte and its case is
+    /// not folded. Recorded rather than desired: `is_word_byte` admits
+    /// `>= 0x80`, so such candidates do reach here.
+    #[test]
+    fn matching_folds_ascii_case_only() {
+        assert!(fuzzy_score("Orders", "ord").is_some());
+        assert!(fuzzy_score("orders", "ORD").is_some());
+        assert!(fuzzy_score("café", "café").is_some());
+        assert_eq!(fuzzy_score("café", "CAFÉ"), None);
+        // The ASCII head of the same name still folds.
+        assert!(fuzzy_score("café", "CAF").is_some());
+    }
+
+    /// **The composition, not the function.** The seam that matters is
+    /// `fuzzy_score` plus the caller's comparator, since it is the sort that
+    /// decides what Enter inserts: highest score first, ties broken by the
+    /// shorter text.
+    #[test]
+    fn the_callers_comparator_preselects_the_prefix_match() {
+        let mut rows: Vec<(i32, &str)> = ["account_customs", "customer_id", "custom", "orders"]
+            .into_iter()
+            .filter_map(|t| fuzzy_score(t, "cus").map(|s| (s, t)))
+            .collect();
+        // `recompute_completions`' comparator, minus the tier every row here
+        // shares: score descending, then the shorter text.
+        rows.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.len().cmp(&b.1.len())));
+        assert_eq!(rows.first().map(|r| r.1), Some("custom"));
+        // `orders` is not a match and never reaches the list.
+        assert!(!rows.iter().any(|r| r.1 == "orders"));
+        // And the interior match sorts last of the three that do.
+        assert_eq!(rows.last().map(|r| r.1), Some("account_customs"));
     }
 }
