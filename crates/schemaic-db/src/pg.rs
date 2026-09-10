@@ -3223,12 +3223,29 @@ fn pg_type_name(t: &Type) -> String {
     pg_type_name_str(t.name())
 }
 
-/// Map a PostgreSQL *internal* type name (`pg_type.typname` / `information_schema`'s
-/// `udt_name` — e.g. `varchar`, `timestamptz`, `int4`) to a short, human SQL type
-/// name. This is the **single** type-name mapping: the grid feeds it the wire
-/// `Type` (via [`pg_type_name`]) and the schema panel feeds it `udt_name`, so the
-/// two always agree (rather than the grid showing `VARCHAR` while the schema panel
-/// shows the verbose `information_schema.data_type` "character varying"). Integer/
+/// Map a PostgreSQL *internal* type name (`pg_type.typname` — e.g. `varchar`,
+/// `timestamptz`, `int4`) to a short, human SQL type name.
+///
+/// **The grid's mapping, and only the grid's.** It used to be described here as
+/// "the single type-name mapping", fed the wire `Type` by [`pg_type_name`] and
+/// `udt_name` by the schema panel so the two agreed on screen. The schema side
+/// has since moved to `format_type(a.atttypid, a.atttypmod)`, and rightly:
+/// `udt_name` drops the length, so a `varchar(45)` came back as `varchar` and
+/// made the DDL this app generates wrong. [`pg_type_name`] is now this
+/// function's only non-test caller.
+///
+/// So the two producers do **not** agree on the spelling any more — the grid
+/// header says `VARCHAR` where the schema tree and the completion popup say
+/// `character varying(45)` — and that display question is open. What they must
+/// agree on is the *reading*: both spellings have to reach
+/// `schema::classify_column_type`, `ddl::normalize_type` and
+/// `model::type_is_binary` as the same type, or one surface's icon, diff or
+/// binary-cell guard answers differently from the other's for one column. That
+/// is what `the_two_type_spellings_are_read_as_one_type` pins, and it is the
+/// property the old test claimed to hold while comparing this function with
+/// itself.
+///
+/// Integer/
 /// float names are chosen so [`crate::parse_typed`] recognizes them (its `starts_with`
 /// checks key off `INT`/`SMALLINT`/`BIGINT` and `FLOAT`/`DOUBLE`); `NUMERIC` stays a
 /// string so it's never coerced to a lossy float. `timestamp`/`timestamptz` keep
@@ -4553,22 +4570,86 @@ mod tests {
     }
 
     #[test]
-    fn pg_type_name_str_matches_grid_for_udt_names() {
-        // The schema panel feeds `udt_name` (internal pg type names) through the
-        // SAME mapper the grid uses for wire types, so both agree on the short form
-        // instead of the verbose `information_schema.data_type`.
-        assert_eq!(pg_type_name_str("varchar"), "VARCHAR"); // not "character varying"
+    fn pg_type_name_str_maps_the_internal_names_to_short_ones() {
+        assert_eq!(pg_type_name_str("varchar"), "VARCHAR");
         assert_eq!(pg_type_name_str("bpchar"), "CHAR");
         assert_eq!(pg_type_name_str("timestamp"), "TIMESTAMP"); // not "… without time zone"
         assert_eq!(pg_type_name_str("timestamptz"), "TIMESTAMPTZ"); // not "… with time zone"
         assert_eq!(pg_type_name_str("int4"), "INTEGER");
         assert_eq!(pg_type_name_str("numeric"), "NUMERIC");
-        // The wire-type path routes through the string mapper → identical output.
-        assert_eq!(pg_type_name(&Type::VARCHAR), pg_type_name_str("varchar"));
-        assert_eq!(
-            pg_type_name(&Type::TIMESTAMP),
-            pg_type_name_str("timestamp")
-        );
+    }
+
+    /// **The grid and the schema panel spell a PostgreSQL type differently,
+    /// and everything that *reads* one has to read the other the same way.**
+    ///
+    /// This replaces `pg_type_name_str_matches_grid_for_udt_names`, which was
+    /// named for an agreement that had stopped existing and could not have
+    /// reported it either way. Its four `pg_type_name_str("varchar")` lines
+    /// fed hand-typed internal names down a path no caller takes — the schema
+    /// side moved to `format_type` — and its two cross-checks compared
+    /// `pg_type_name(&Type::VARCHAR)` with `pg_type_name_str("varchar")`,
+    /// which is `pg_type_name`'s own body against `pg_type_name`. Deleting the
+    /// `udt_name` premise entirely left it green.
+    ///
+    /// The agreement that is real, and load-bearing, is between the two
+    /// *readers*: `classify_column_type` picks the schema tree's, the ER
+    /// diagram's and the completion popup's icon, `normalize_type` decides
+    /// whether the differ thinks a column changed, and `type_is_binary` is
+    /// what keeps a `bytea` from dumping hex into a cell. A grid header
+    /// reading `VARCHAR` and a tree reading `character varying(45)` is a
+    /// display question; the same column classifying two different ways is a
+    /// defect, and this is the seam where it would appear.
+    #[test]
+    fn the_two_type_spellings_are_read_as_one_type() {
+        use schemaic_core::intel::SqlDialect;
+        // (internal name, what `format_type(atttypid, atttypmod)` renders).
+        // Measured on PG 16.15 for
+        // `CREATE TABLE ft(a varchar(45), b timestamp, c int, d numeric(10,2))`.
+        let pairs = [
+            ("varchar", "character varying(45)"),
+            ("timestamp", "timestamp without time zone"),
+            ("timestamptz", "timestamp with time zone"),
+            ("int4", "integer"),
+            ("numeric", "numeric(10,2)"),
+            ("bpchar", "character(8)"),
+            ("float8", "double precision"),
+            ("bytea", "bytea"),
+        ];
+        for (internal, verbose) in pairs {
+            let grid = pg_type_name_str(internal);
+            assert_eq!(
+                schemaic_core::schema::classify_column_type(&grid),
+                schemaic_core::schema::classify_column_type(verbose),
+                "{internal}: the grid says {grid:?}, the tree says {verbose:?}, \
+                 and they take different icons"
+            );
+            assert_eq!(
+                schemaic_core::model::type_is_binary(&grid),
+                schemaic_core::model::type_is_binary(verbose),
+                "{internal}: one of the two spellings would dump hex into a cell"
+            );
+            // The **base**, not the whole normalised name: the wire type
+            // carries no `atttypmod`, so the grid's spelling genuinely cannot
+            // know the 45 in `varchar(45)` and it is not a disagreement that
+            // it doesn't. What would be one is the two naming different base
+            // types — `character varying` normalising to something other than
+            // `varchar`, which is exactly what B9.2's measurement found the
+            // *icon* path doing before `classify_column_type` learned to read
+            // a two-word name.
+            let base = |t: &str| {
+                schemaic_core::ddl::normalize_type(t, SqlDialect::Postgres)
+                    .split('(')
+                    .next()
+                    .unwrap_or("")
+                    .trim()
+                    .to_string()
+            };
+            assert_eq!(
+                base(&grid),
+                base(verbose),
+                "{internal}: the differ would see a type change that is not one"
+            );
+        }
     }
 
     /// `pg_type_name(&Type::BYTEA)` is what the cell renderer gates on, so if
@@ -5367,6 +5448,51 @@ mod index_key_tests {
         // Held bare: `check_predicate` peels the server's wrapping `CHECK (…)`.
         assert_eq!(domains[0].checks[0].expression, "VALUE > 0");
         assert!(domains[0].checks[0].enforced);
+    }
+
+    /// **The one column of this fold with a rule stated in a comment, and the
+    /// one no fixture reached.**
+    ///
+    /// Every domain row in this module was nine cells long, so `cell(r, 9)`
+    /// was always the out-of-range `""` and `collation_schema` was
+    /// unconditionally `None`. Deleting `&& s != "pg_catalog"` kept the module
+    /// green; so did changing the index to `cell(r, 8)`, which would have
+    /// returned the *has default* flag `"1"` as a schema name. The producing
+    /// query's column 9 is `COALESCE(cn.nspname, '')`, and the ordinal is the
+    /// only thing binding the two.
+    ///
+    /// **A pin, not a fix.** The rule is right today; this cannot fail against
+    /// the current code, and the point is that it can fail against a wrong
+    /// one.
+    #[test]
+    fn a_domains_collation_keeps_its_namespace_unless_it_is_pg_catalog() {
+        let of = |ns: &str| {
+            let types = vec![row(&[
+                "public", "d", "d", "text", "", "0", "en_US", "", "0", ns,
+            ])];
+            pg_fold_types(&types, &[], &[]).1[0]
+                .collation_schema
+                .clone()
+        };
+        // A user collation is qualified, because a search path can shadow it.
+        assert_eq!(of("myschema").as_deref(), Some("myschema"));
+        // A built-in is not: `pg_catalog` is searched first and cannot be
+        // shadowed, so qualifying it would rewrite the DDL of every domain
+        // that already round-trips.
+        assert_eq!(of("pg_catalog"), None);
+        // And a domain with no collation at all names no namespace either.
+        assert_eq!(of(""), None);
+        // The ordinal, pinned against the neighbour that would otherwise pass:
+        // column 8 is the has-default flag, and reading it here would answer
+        // `Some("1")`.
+        let shifted = vec![row(&[
+            "public", "d", "d", "text", "x", "0", "en_US", "", "1", "",
+        ])];
+        assert_eq!(
+            pg_fold_types(&shifted, &[], &[]).1[0].collation_schema,
+            None,
+            "the has-default flag is not a schema name"
+        );
     }
 
     fn seq_row(extra: &[&str]) -> Vec<Option<String>> {
