@@ -47,7 +47,7 @@ fn md_font_size() -> f32 {
 
 /// Inline run style flags — emphasis nests, so these compose (bold *and* italic,
 /// code inside a link, …). Built from the CommonMark event stream.
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
 struct Inline {
     bold: bool,
     italic: bool,
@@ -235,19 +235,80 @@ fn md_table(
 /// an unterminated block at the end of input — so a proposal would render as a
 /// card full of half-arrived JSON, flickering "couldn't read this" on every
 /// chunk. Until the turn settles, a proposal block is just a code block.
-pub(crate) fn render_markdown(src: &str, actions: CodeActions, settled: bool) -> impl IntoView {
+/// One rendered block of a markdown reply, in the order it belongs on screen.
+///
+/// **Split out from the view builder so the order can be tested at all.** The
+/// module had no test on `render_markdown` — its nine were all on
+/// `code_is_sql`/`sql_leading_keyword` — and the order was wrong in four
+/// separate ways, the worst of them putting a *Run* button under the wrong
+/// numbered step of a destructive plan. A `Vec<MdBlock>` is assertable with no
+/// window; the mapper below turns each one into a view and decides nothing.
+#[derive(Clone, Debug, PartialEq)]
+enum MdBlock {
+    Heading {
+        runs: Runs,
+        size: f32,
+        quote: usize,
+    },
+    Para {
+        runs: Runs,
+        quote: usize,
+    },
+    Item {
+        runs: Runs,
+        marker: String,
+        depth: f64,
+        quote: usize,
+    },
+    Code {
+        text: String,
+        lang: String,
+        /// A settled proposal fence — rendered as a card rather than a block.
+        proposal: bool,
+    },
+    Table {
+        rows: Vec<Vec<Runs>>,
+        head_rows: usize,
+    },
+    Rule,
+}
+
+/// Inline runs of one leaf block: `(text, style)` in reading order.
+type Runs = Vec<(String, Inline)>;
+
+/// Parse `src` into the blocks a reply renders as, in screen order.
+///
+/// **An open list item's text is flushed before anything else is emitted.**
+/// An item's inline runs accumulate and used to be flushed only at
+/// `TagEnd::Item`, so every block that emitted itself immediately — a code
+/// block, a table, a rule — came out *above* the item that introduced it. In
+/// the shape an assistant reply about a destructive change actually takes —
+/// "1. Back up the table first:" with a fenced `CREATE TABLE … AS SELECT`
+/// under it, then "2. Then delete:" with a fenced `DELETE` — the `CREATE`
+/// block was drawn above step 1, and the block directly under "1. Back up the
+/// table first:" was the **`DELETE`**, with Insert and Run on it.
+///
+/// A table inside an item was worse: `Tag::TableCell` *cleared* the pending
+/// runs, so the item's sentence never appeared at all. And a loose list's
+/// second paragraph concatenated onto the first with no separator
+/// (`Step oneDetails about step one.`), because `TagEnd::Paragraph` flushed
+/// only at top level.
+///
+/// So `flush_item` runs at the top of every arm that emits, and the marker is
+/// *consumed* when it does — a continuation row of the same item is indented
+/// under its number rather than repeating it.
+fn md_blocks(src: &str, settled: bool) -> Vec<MdBlock> {
     use pulldown_cmark::{CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 
-    let base = theme::bubble_claude_text();
     let mut opts = Options::empty();
     opts.insert(Options::ENABLE_TABLES);
     opts.insert(Options::ENABLE_STRIKETHROUGH);
 
-    let mut out: Vec<AnyView> = Vec::new();
+    let mut out: Vec<MdBlock> = Vec::new();
 
-    // Inline accumulation for the current leaf block (paragraph / heading / item /
-    // table cell). Emphasis counters compose into `Inline` flags per run.
-    let mut runs: Vec<(String, Inline)> = Vec::new();
+    // Inline accumulation for the current leaf block (paragraph / heading /
+    // item / table cell). Emphasis counters compose into `Inline` flags per run.
+    let mut runs: Runs = Vec::new();
     let (mut bold, mut italic, mut strike, mut link) = (0u32, 0u32, 0u32, 0u32);
     let inline_now = |bold: u32, italic: u32, strike: u32, link: u32| Inline {
         bold: bold > 0,
@@ -269,9 +330,9 @@ pub(crate) fn render_markdown(src: &str, actions: CodeActions, settled: bool) ->
     let mut code_lang = String::new();
 
     // Table.
-    let mut table_rows: Vec<Vec<Vec<(String, Inline)>>> = Vec::new();
+    let mut table_rows: Vec<Vec<Runs>> = Vec::new();
     let mut table_head_rows = 0usize;
-    let mut cur_row: Vec<Vec<(String, Inline)>> = Vec::new();
+    let mut cur_row: Vec<Runs> = Vec::new();
 
     let heading_size = |lvl: HeadingLevel| match lvl {
         HeadingLevel::H1 => 18.0_f32,
@@ -309,6 +370,9 @@ pub(crate) fn render_markdown(src: &str, actions: CodeActions, settled: bool) ->
                     item_stack.push(marker);
                 }
                 Tag::Table(_) => {
+                    // Before the first cell clears `runs`: the item's own
+                    // sentence introduces the table and used to vanish.
+                    flush_item(&mut out, &mut runs, &mut item_stack, quote);
                     table_rows.clear();
                     table_head_rows = 0;
                 }
@@ -325,54 +389,43 @@ pub(crate) fn render_markdown(src: &str, actions: CodeActions, settled: bool) ->
                 TagEnd::Link => link = link.saturating_sub(1),
                 TagEnd::Heading(_) => {
                     if let Some(lvl) = heading.take() {
-                        let fs = heading_size(lvl);
-                        let block = inline_text(std::mem::take(&mut runs), base, true, fs)
-                            .style(move |s| {
-                                md_quote_wrap(s.width_full().padding_top(theme::scaled(2.0)), quote)
-                            })
-                            .into_any();
-                        out.push(block);
+                        out.push(MdBlock::Heading {
+                            runs: std::mem::take(&mut runs),
+                            size: heading_size(lvl),
+                            quote,
+                        });
                     }
                 }
                 TagEnd::Paragraph => {
-                    // Inside a list item, the item's text flushes on End(Item) (or
-                    // before a nested list); a top-level paragraph flushes here.
-                    if item_stack.is_empty() && !runs.is_empty() {
-                        let block =
-                            inline_text(std::mem::take(&mut runs), base, false, md_font_size())
-                                .style(move |s| md_quote_wrap(s.width_full(), quote))
-                                .into_any();
-                        out.push(block);
+                    if item_stack.is_empty() {
+                        if !runs.is_empty() {
+                            out.push(MdBlock::Para {
+                                runs: std::mem::take(&mut runs),
+                                quote,
+                            });
+                        }
+                    } else {
+                        // A loose list's paragraphs are separate rows of the
+                        // item, not one run of concatenated text.
+                        flush_item(&mut out, &mut runs, &mut item_stack, quote);
                     }
                 }
                 TagEnd::CodeBlock => {
                     in_code = false;
+                    flush_item(&mut out, &mut runs, &mut item_stack, quote);
                     let code = std::mem::take(&mut code_buf);
                     let trimmed = code.trim_end_matches('\n').to_string();
                     if !trimmed.trim().is_empty() {
-                        if settled && schemaic_core::propose::is_proposal_tag(&code_lang) {
-                            out.push(proposal_card(trimmed, actions.clone()).into_any());
-                        } else {
-                            let is_sql = code_is_sql(&code_lang, &trimmed);
-                            out.push(
-                                code_block(trimmed, actions.clone(), &code_lang, is_sql, settled)
-                                    .into_any(),
-                            );
-                        }
+                        out.push(MdBlock::Code {
+                            proposal: settled
+                                && schemaic_core::propose::is_proposal_tag(&code_lang),
+                            text: trimmed,
+                            lang: code_lang.clone(),
+                        });
                     }
                 }
                 TagEnd::Item => {
-                    if !runs.is_empty() {
-                        let depth = item_stack.len().saturating_sub(1) as f64;
-                        let marker = item_stack.last().cloned().unwrap_or_default();
-                        out.push(md_item(
-                            std::mem::take(&mut runs),
-                            marker,
-                            depth,
-                            base,
-                            quote,
-                        ));
-                    }
+                    flush_item(&mut out, &mut runs, &mut item_stack, quote);
                     item_stack.pop();
                 }
                 TagEnd::List(_) => {
@@ -388,11 +441,10 @@ pub(crate) fn render_markdown(src: &str, actions: CodeActions, settled: bool) ->
                 }
                 TagEnd::TableRow => table_rows.push(std::mem::take(&mut cur_row)),
                 TagEnd::Table if !table_rows.is_empty() => {
-                    out.push(md_table(
-                        std::mem::take(&mut table_rows),
-                        table_head_rows,
-                        base,
-                    ));
+                    out.push(MdBlock::Table {
+                        rows: std::mem::take(&mut table_rows),
+                        head_rows: table_head_rows,
+                    });
                 }
                 _ => {}
             },
@@ -408,6 +460,17 @@ pub(crate) fn render_markdown(src: &str, actions: CodeActions, settled: bool) ->
                 st.code = true;
                 runs.push((t.to_string(), st));
             }
+            // **Raw HTML is text, not nothing.** Dropping it changed what the
+            // user read: `2<sup>24</sup> bytes` — how a model writes
+            // MEDIUMTEXT's limit — became `224 bytes`, and every `<hostname>`
+            // placeholder vanished from the sentence telling the user to
+            // replace it. CommonMark's own fallback for a renderer that emits
+            // no HTML is to show the characters the author wrote.
+            Event::Html(t) | Event::InlineHtml(t) => {
+                if !in_code {
+                    runs.push((t.to_string(), inline_now(bold, italic, strike, link)));
+                }
+            }
             Event::SoftBreak => {
                 if !in_code {
                     runs.push((" ".to_string(), inline_now(bold, italic, strike, link)));
@@ -419,33 +482,87 @@ pub(crate) fn render_markdown(src: &str, actions: CodeActions, settled: bool) ->
                 }
             }
             Event::Rule => {
-                out.push(
-                    empty()
-                        .style(|s| {
-                            s.width_full()
-                                .height(1.0)
-                                .background(theme::border())
-                                .margin_vert(theme::scaled(4.0))
-                        })
-                        .into_any(),
-                );
+                flush_item(&mut out, &mut runs, &mut item_stack, quote);
+                out.push(MdBlock::Rule);
             }
             _ => {}
         }
-        // When a nested list opens while an item still has un-flushed lead text,
-        // emit that text as the item row first.
-        if !item_stack.is_empty() && !runs.is_empty() && list_stack.len() > item_stack.len() {
-            let depth = item_stack.len().saturating_sub(1) as f64;
-            let marker = item_stack.last().cloned().unwrap_or_default();
-            out.push(md_item(
-                std::mem::take(&mut runs),
-                marker,
-                depth,
-                base,
-                quote,
-            ));
+        // When a nested list opens while an item still has un-flushed lead
+        // text, emit that text as the item row first.
+        if list_stack.len() > item_stack.len() {
+            flush_item(&mut out, &mut runs, &mut item_stack, quote);
         }
     }
+    out
+}
+
+/// Emit the open item's pending text as its own row, if there is any.
+///
+/// **Consumes the marker.** A second row of the same item — a continuation
+/// paragraph, or the text after a nested list — is indented under the number
+/// rather than repeating it.
+fn flush_item(out: &mut Vec<MdBlock>, runs: &mut Runs, item_stack: &mut [String], quote: usize) {
+    if runs.is_empty() || item_stack.is_empty() {
+        return;
+    }
+    let depth = item_stack.len().saturating_sub(1) as f64;
+    let marker = item_stack
+        .last_mut()
+        .map(std::mem::take)
+        .unwrap_or_default();
+    out.push(MdBlock::Item {
+        runs: std::mem::take(runs),
+        marker,
+        depth,
+        quote,
+    });
+}
+
+pub(crate) fn render_markdown(src: &str, actions: CodeActions, settled: bool) -> impl IntoView {
+    let base = theme::bubble_claude_text();
+    // **The order is [`md_blocks`]', and nothing here changes it.** This maps
+    // one block to one view; every decision about *what* comes out and in what
+    // sequence lives in the pure builder, where it is tested.
+    let out: Vec<AnyView> = md_blocks(src, settled)
+        .into_iter()
+        .map(|b| match b {
+            MdBlock::Heading { runs, size, quote } => inline_text(runs, base, true, size)
+                .style(move |s| {
+                    md_quote_wrap(s.width_full().padding_top(theme::scaled(2.0)), quote)
+                })
+                .into_any(),
+            MdBlock::Para { runs, quote } => inline_text(runs, base, false, md_font_size())
+                .style(move |s| md_quote_wrap(s.width_full(), quote))
+                .into_any(),
+            MdBlock::Item {
+                runs,
+                marker,
+                depth,
+                quote,
+            } => md_item(runs, marker, depth, base, quote),
+            MdBlock::Code {
+                text,
+                lang,
+                proposal,
+            } => {
+                if proposal {
+                    proposal_card(text, actions.clone()).into_any()
+                } else {
+                    let is_sql = code_is_sql(&lang, &text);
+                    code_block(text, actions.clone(), &lang, is_sql, settled).into_any()
+                }
+            }
+            MdBlock::Table { rows, head_rows } => md_table(rows, head_rows, base),
+            MdBlock::Rule => empty()
+                .style(|s| {
+                    s.width_full()
+                        .height(1.0)
+                        .background(theme::border())
+                        .margin_vert(theme::scaled(4.0))
+                })
+                .into_any(),
+        })
+        .collect();
     v_stack_from_iter(out).style(|s| s.flex_col().gap(theme::scaled(6.0)).width_full())
 }
 
@@ -501,12 +618,18 @@ fn code_is_sql(lang: &str, code: &str) -> bool {
 }
 
 fn sql_leading_keyword(code: &str) -> bool {
-    let word: String = code
-        .trim_start()
-        .chars()
-        .take_while(|c| c.is_ascii_alphabetic())
-        .collect::<String>()
-        .to_ascii_uppercase();
+    // **`is_word_byte`, not `is_ascii_alphabetic`** — the invariant's one
+    // definition, and the third live site of it. An ASCII-only scan stops at
+    // the first byte `>= 0x80`, so `SELECTé 1` yields the word `SELECT` and an
+    // untagged block whose first word is *not* a SQL keyword gets Insert and
+    // **Run**. The test below asserts exactly the opposite property in ASCII
+    // and states it as a rule: a whole-word match, not a prefix one.
+    let rest = code.trim_start();
+    let end = rest
+        .bytes()
+        .position(|b| !schemaic_core::sql::is_word_byte(b))
+        .unwrap_or(rest.len());
+    let word = rest[..end].to_ascii_uppercase();
     matches!(
         word.as_str(),
         "SELECT"
@@ -917,6 +1040,14 @@ mod tests {
         assert!(!sql_leading_keyword("CREATED_AT is the column"));
         // …and the word still ends at a non-letter that is not a space.
         assert!(sql_leading_keyword("SELECT(1)"));
+        // **Above U+007F too.** An ASCII-only scan stopped at the accent and
+        // read the word as `SELECT`, so a block that is not SQL got Insert and
+        // Run — the same property, on the byte range the invariant names.
+        assert!(!sql_leading_keyword("SELECTé 1"));
+        assert!(!sql_leading_keyword("CREATEé TABLE t (id INT)"));
+        assert!(!sql_leading_keyword("DROPé"));
+        // And a non-ASCII byte *before* the word does not turn it into one.
+        assert!(!sql_leading_keyword("éSELECT 1"));
     }
 
     /// The known limits, pinned so a change to them is a decision rather than a
@@ -932,5 +1063,197 @@ mod tests {
         assert!(!sql_leading_keyword("/* note */ SELECT 1"));
         assert!(!sql_leading_keyword("(SELECT 1)"));
         assert!(!sql_leading_keyword("1 + 1"));
+    }
+}
+
+#[cfg(test)]
+mod md_block_tests {
+    use super::*;
+
+    /// A one-line sketch of each block, for assertions that are about
+    /// **order** rather than styling.
+    fn sketch(src: &str) -> Vec<String> {
+        md_blocks(src, true)
+            .into_iter()
+            .map(|b| match b {
+                MdBlock::Heading { runs, .. } => format!("H[{}]", flat(&runs)),
+                MdBlock::Para { runs, .. } => format!("PARA[{}]", flat(&runs)),
+                MdBlock::Item {
+                    runs,
+                    marker,
+                    depth,
+                    ..
+                } => format!("ITEM({marker}@{depth})[{}]", flat(&runs)),
+                MdBlock::Code { text, lang, .. } => format!("CODE<{lang}>[{text}]"),
+                MdBlock::Table { rows, .. } => format!("TABLE[{} rows]", rows.len()),
+                MdBlock::Rule => "RULE".to_string(),
+            })
+            .collect()
+    }
+
+    fn flat(runs: &Runs) -> String {
+        runs.iter().map(|(t, _)| t.as_str()).collect()
+    }
+
+    /// **The finding, in the shape a reply about a destructive change takes.**
+    ///
+    /// A code block inside a list item was emitted the moment its fence
+    /// closed, while the item's own text waited for `TagEnd::Item` — so the
+    /// `CREATE` came out above step 1, and the block drawn directly under
+    /// "1. Back up the table first:" was the **`DELETE`**, with Insert and Run
+    /// on it. Every code block in a numbered list of SQL steps carried its
+    /// buttons under the wrong instruction.
+    #[test]
+    fn a_code_block_in_a_list_item_comes_after_the_step_that_introduces_it() {
+        let md = concat!(
+            "Here is the plan:\n\n",
+            "1. Back up the table first:\n",
+            "   ```sql\n",
+            "   CREATE TABLE t_bak AS SELECT * FROM t;\n",
+            "   ```\n",
+            "2. Then delete:\n",
+            "   ```sql\n",
+            "   DELETE FROM t WHERE id = 1;\n",
+            "   ```\n",
+        );
+        assert_eq!(
+            sketch(md),
+            vec![
+                "PARA[Here is the plan:]",
+                "ITEM(1.@0)[Back up the table first:]",
+                "CODE<sql>[CREATE TABLE t_bak AS SELECT * FROM t;]",
+                "ITEM(2.@0)[Then delete:]",
+                "CODE<sql>[DELETE FROM t WHERE id = 1;]",
+            ]
+        );
+    }
+
+    /// **A table inside an item used to delete the item's sentence.**
+    /// `Tag::TableCell` cleared the pending runs, so "The columns are:" never
+    /// reached the screen at all.
+    #[test]
+    fn a_table_in_a_list_item_keeps_the_sentence_that_introduces_it() {
+        let md = concat!(
+            "1. The columns are:\n\n",
+            "   | a | b |\n",
+            "   | - | - |\n",
+            "   | 1 | 2 |\n",
+        );
+        assert_eq!(
+            sketch(md),
+            vec!["ITEM(1.@0)[The columns are:]", "TABLE[2 rows]"]
+        );
+    }
+
+    /// **A loose list's second paragraph is its own row**, not the first one's
+    /// text with nothing between: `TagEnd::Paragraph` flushed only at top
+    /// level, so both paragraphs accumulated into one run and rendered as
+    /// `Step oneDetails about step one.`
+    ///
+    /// The continuation row carries **no marker** — the number belongs to the
+    /// item once, and the indent is what says the row is still inside it.
+    #[test]
+    fn a_loose_list_items_second_paragraph_is_its_own_row() {
+        let md = "1. Step one\n\n   Details about step one.\n";
+        assert_eq!(
+            sketch(md),
+            vec!["ITEM(1.@0)[Step one]", "ITEM(@0)[Details about step one.]"]
+        );
+        // Same for a bullet list, whose marker is not a number.
+        let md = "- Step one\n\n  Details.\n";
+        assert_eq!(
+            sketch(md),
+            vec!["ITEM(•@0)[Step one]", "ITEM(@0)[Details.]"]
+        );
+    }
+
+    /// A rule inside an item is the third emitter with the same gap.
+    #[test]
+    fn a_rule_in_a_list_item_comes_after_it_too() {
+        let md = "1. Before the line:\n\n   ---\n";
+        assert_eq!(sketch(md), vec!["ITEM(1.@0)[Before the line:]", "RULE"]);
+    }
+
+    /// The nested-list case that already worked must keep working — and the
+    /// marker is consumed there too, so text *after* the nested list does not
+    /// repeat the parent's number.
+    #[test]
+    fn a_nested_list_still_comes_under_its_parents_text() {
+        let md = "1. Parent text\n   - child a\n   - child b\n";
+        assert_eq!(
+            sketch(md),
+            vec![
+                "ITEM(1.@0)[Parent text]",
+                "ITEM(•@1)[child a]",
+                "ITEM(•@1)[child b]",
+            ]
+        );
+    }
+
+    /// **Raw HTML is text, not nothing.** `2<sup>24</sup> bytes` — how a model
+    /// writes MEDIUMTEXT's limit — rendered as `224 bytes`, and every
+    /// `<hostname>` placeholder vanished from the sentence telling the user to
+    /// replace it.
+    #[test]
+    fn raw_html_reaches_the_reader_instead_of_disappearing() {
+        let md = "Replace <hostname> with your server. Also 2<sup>24</sup> bytes.\n";
+        let blocks = sketch(md);
+        assert_eq!(blocks.len(), 1, "{blocks:?}");
+        assert!(
+            blocks[0].contains("<hostname>"),
+            "the placeholder vanished: {}",
+            blocks[0]
+        );
+        assert!(
+            blocks[0].contains("2<sup>24</sup>"),
+            "the exponent read as 224: {}",
+            blocks[0]
+        );
+    }
+
+    /// Nothing above disturbed the ordinary shapes: a heading, a paragraph, a
+    /// top-level fence and a top-level table still come out in source order,
+    /// and a fence inside no list is unaffected.
+    #[test]
+    fn top_level_blocks_keep_their_order() {
+        let md = concat!(
+            "# Title\n\n",
+            "Some prose.\n\n",
+            "```sql\nSELECT 1;\n```\n\n",
+            "| a |\n| - |\n| 1 |\n\n",
+            "---\n",
+        );
+        assert_eq!(
+            sketch(md),
+            vec![
+                "H[Title]",
+                "PARA[Some prose.]",
+                "CODE<sql>[SELECT 1;]",
+                "TABLE[2 rows]",
+                "RULE",
+            ]
+        );
+    }
+
+    /// A proposal fence is a card only once the turn has settled — mid-stream
+    /// the fence is still open and the JSON half-arrived, so it stays a plain
+    /// block. Unchanged by the reordering, and asserted here because the flag
+    /// moved into the pure builder with it.
+    #[test]
+    fn a_proposal_fence_is_a_card_only_when_settled() {
+        let md = "```schemaic-proposal\n{}\n```\n";
+        let settled = md_blocks(md, true);
+        let streaming = md_blocks(md, false);
+        assert!(matches!(
+            settled.as_slice(),
+            [MdBlock::Code { proposal: true, .. }]
+        ));
+        assert!(matches!(
+            streaming.as_slice(),
+            [MdBlock::Code {
+                proposal: false,
+                ..
+            }]
+        ));
     }
 }
