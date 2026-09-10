@@ -46,7 +46,7 @@ mod script_view;
 /// The tree-node key builders. Public because the persisted expanded-node set is
 /// the app's to edit (collapsing a database drops every `tbl:<db>:*` key), and
 /// the format belongs to exactly one module.
-pub use schema_tree::{column_key_named, db_key, table_key_named, table_key_prefix};
+pub use schema_tree::{column_key_named, db_key, key_under, table_key_named, wants_db_stats};
 mod settings;
 mod shortcuts;
 mod snippet_edit;

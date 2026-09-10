@@ -141,10 +141,57 @@ pub fn table_key_named(database: &str, table: &str) -> String {
     format!("tbl:{database}:{table}")
 }
 
-/// The prefix every one of `database`'s table keys starts with — what
-/// "collapse this database" matches on.
-pub fn table_key_prefix(database: &str) -> String {
-    format!("tbl:{database}:")
+/// Should the tree's size column fetch `database`'s table statistics?
+///
+/// **Expanded is not the same as visible.** The effect that fills the column
+/// filtered on `expanded` alone, while its own header said "only for the ones
+/// the user can actually see" — and putting a database away with the SCHEMA
+/// eye does not prune its `db:` key, nor drop its node from `db_nodes` (the
+/// tree filters visibility at *render*). So an expanded-then-hidden database
+/// kept being asked for an `information_schema.tables` aggregate — the
+/// expensive one on a large MySQL instance — on every connect, every
+/// connection switch and every SCHEMA Refresh, for output rendered nowhere.
+///
+/// Here rather than in `core::stats` because the expansion key is
+/// [`db_key`]'s, and asking the question a second way is the drift the key
+/// builders are gathered to prevent.
+pub fn wants_db_stats(
+    open: &std::collections::HashSet<String>,
+    hidden: &std::collections::HashSet<String>,
+    database: &str,
+) -> bool {
+    open.contains(&db_key(database)) && schemaic_core::schema::db_visible(hidden, database)
+}
+
+/// The expansion-set key families that live **under** a database node —
+/// everything "Collapse all" on that database has to drop.
+///
+/// `db:` is absent because the database row itself stays open, `obj:` because
+/// an object leaf has no children to close, and `keyrow:` because it never
+/// reaches the expansion set at all (see [`key_row_menu_key`]).
+const CHILD_KEY_PREFIXES: [&str; 4] = ["sch:", "tbl:", "col:", "objgrp:"];
+
+/// Is `key` an expansion-set key for something *inside* `database`?
+///
+/// **"Collapse all" collapsed only the tables.** `collapse_db` retained
+/// `!k.starts_with(&table_key_prefix(&db))`, which is `tbl:{db}:` — but the
+/// same set also holds `col:`, `sch:` and `objgrp:` keys written by the very
+/// same `on_toggle`. So on MariaDB's `sakila`, whose six routines give it a
+/// **Procedures** folder, the entry left that folder open with its rows on
+/// screen; on a multi-schema PostgreSQL database, where the namespace level
+/// sits *above* the tables, it left every namespace group open with its full
+/// table list rendered and read as doing nothing at all. The gear's entry of
+/// the same name clears the whole set, so two identically labelled entries did
+/// different amounts of work.
+///
+/// Matching is on the `{prefix}{database}:` boundary rather than on
+/// `{prefix}{database}` alone, so collapsing `shop` leaves `shopify` alone.
+pub fn key_under(database: &str, key: &str) -> bool {
+    CHILD_KEY_PREFIXES.iter().any(|p| {
+        key.strip_prefix(p)
+            .and_then(|rest| rest.strip_prefix(database))
+            .is_some_and(|rest| rest.starts_with(':'))
+    })
 }
 
 fn column_key(database: &str, t: &TableInfo, column: &str) -> String {
@@ -3257,6 +3304,61 @@ mod tests {
         }
     }
 
+    /// **A hidden database gets no statistics query.** Expanding `sakila` and
+    /// then putting it away with the SCHEMA eye leaves `db:sakila` in the
+    /// expansion set and its node in `db_nodes`, so the size effect kept
+    /// asking the server for an `information_schema.tables` aggregate whose
+    /// result is rendered nowhere.
+    #[test]
+    fn the_size_column_asks_only_for_databases_that_are_both_open_and_visible() {
+        let open: std::collections::HashSet<String> =
+            [db_key("sakila"), db_key("world")].into_iter().collect();
+        let hidden: std::collections::HashSet<String> = ["sakila".to_string()].into();
+
+        assert!(!wants_db_stats(&open, &hidden, "sakila"), "hidden");
+        assert!(wants_db_stats(&open, &hidden, "world"), "open and visible");
+        // A visible database nobody expanded is still not asked — the other
+        // half of the rule, so the fix cannot be "drop the expansion test".
+        assert!(!wants_db_stats(&open, &hidden, "chinook"));
+        // And with nothing hidden, the expansion test alone decides.
+        assert!(wants_db_stats(&open, &Default::default(), "sakila"));
+    }
+
+    /// **"Collapse all" on a database means everything under it.** It used to
+    /// mean `tbl:{db}:*` alone, so a Procedures folder or a PostgreSQL
+    /// namespace group stayed open with its rows on screen — with the
+    /// namespace level sitting above the tables, the entry read as broken
+    /// rather than partial.
+    #[test]
+    fn collapsing_a_database_drops_every_key_under_it() {
+        let under = [
+            table_key_named("shop", "users"),
+            column_key_named("shop", "users", "id"),
+            schema_key("shop", "sales"),
+            object_group_key("shop", TableScope::Flat, ObjectKind::Sequence),
+            object_group_key("shop", TableScope::Namespace("sales"), ObjectKind::Sequence),
+        ];
+        for k in &under {
+            assert!(key_under("shop", k), "{k} survived Collapse all");
+        }
+        // The database row itself stays open — that is the entry's whole
+        // difference from the gear's "Collapse all".
+        assert!(!key_under("shop", &db_key("shop")));
+        // Another database is untouched, including one whose name this one is
+        // a prefix of.
+        for k in [
+            table_key_named("other", "users"),
+            table_key_named("shopify", "users"),
+            schema_key("shopify", "sales"),
+            db_key("shopify"),
+        ] {
+            assert!(
+                !key_under("shop", &k),
+                "{k} was collapsed by the wrong database"
+            );
+        }
+    }
+
     #[test]
     fn the_by_name_builders_agree_with_the_table_ones() {
         // Three call sites formatted these keys inline — a focus handler with a
@@ -3271,11 +3373,11 @@ mod tests {
                 column_key("shop", &t, "id"),
                 column_key_named("shop", &display, "id")
             );
-            // The collapse prefix must match the keys it is meant to drop.
-            assert!(table_key("shop", &t).starts_with(&table_key_prefix("shop")));
+            // The collapse predicate must match the keys it is meant to drop.
+            assert!(key_under("shop", &table_key("shop", &t)));
         }
         // …and must not match a database whose name merely starts the same way.
-        assert!(!table_key("shop", &tbl(None, "users")).starts_with(&table_key_prefix("sho")));
+        assert!(!key_under("sho", &table_key("shop", &tbl(None, "users"))));
     }
 
     #[test]

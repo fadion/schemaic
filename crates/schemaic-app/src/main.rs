@@ -6852,13 +6852,14 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
         })
     };
 
-    // Collapse just one database's tables (keep the DB node itself open):
-    // drop every `tbl:<database>:*` key.
+    // Collapse everything under one database, keeping the DB node itself open.
+    // `key_under` owns which key families that is — this used to drop
+    // `tbl:<database>:*` alone, leaving object folders and PostgreSQL
+    // namespace groups open with their rows on screen.
     let collapse_db: Rc<dyn Fn(String)> = {
         let save_ui = save_ui.clone();
         Rc::new(move |db: String| {
-            let prefix = schemaic_ui::table_key_prefix(&db);
-            expanded.update(|set| set.retain(|k| !k.starts_with(&prefix)));
+            expanded.update(|set| set.retain(|k| !schemaic_ui::key_under(&db, k)));
             save_ui();
         })
     };
@@ -8239,15 +8240,26 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             // A connection-wide refresh bumps `stats_gen` once per database, so it
             // was one full clone per database per refresh. Tracking is identical
             // either way.
+            //
+            // `wants_db_stats`, not `open.contains(db_key(..))`: hiding a
+            // database with the SCHEMA eye leaves its `db:` key in the set and
+            // its node in `db_nodes` (the tree filters visibility at render),
+            // so this kept paying for an `information_schema.tables` aggregate
+            // nothing renders. Tracking `hidden_dbs` is what makes
+            // hiding/unhiding re-decide.
             let pending: Vec<(String, RwSignal<schemaic_ui::DbStatsState>)> =
-                expanded.with(|open| {
-                    db_nodes.with(|nodes| {
-                        nodes
-                            .iter()
-                            .filter(|n| open.contains(&schemaic_ui::db_key(&n.database)))
-                            .filter(|n| n.stats.get_untracked() == schemaic_ui::DbStatsState::Idle)
-                            .map(|n| (n.database.clone(), n.stats))
-                            .collect()
+                hidden_dbs.with(|hidden| {
+                    expanded.with(|open| {
+                        db_nodes.with(|nodes| {
+                            nodes
+                                .iter()
+                                .filter(|n| schemaic_ui::wants_db_stats(open, hidden, &n.database))
+                                .filter(|n| {
+                                    n.stats.get_untracked() == schemaic_ui::DbStatsState::Idle
+                                })
+                                .map(|n| (n.database.clone(), n.stats))
+                                .collect()
+                        })
                     })
                 });
             for (database, slot) in pending {
