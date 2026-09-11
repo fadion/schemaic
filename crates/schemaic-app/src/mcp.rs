@@ -643,6 +643,14 @@ async fn list_schema(
         // fifty of them is the case this split exists for, and one of them being
         // slow must not hold the other forty-nine — nor the serve loop, which is
         // sequential and answers nothing while this runs.
+        //
+        // **Bounded in time, but not cancelled at the server**, and that is the
+        // one of the four reads where those differ: `fetch_table_list` takes no
+        // `CancellationToken` — it is a name listing, not the full
+        // introspection — so the token handed in here reaches no driver and the
+        // statement runs to completion on the server after we stop waiting. The
+        // wedge this is about is *ours*, so bounding the wait is the whole of
+        // the fix here; giving it a real token is a `schemaic-db` change.
         let schema = match with_deadline(db.fetch_table_list(&name), CancellationToken::new()).await
         {
             Some(r) => r.map_err(|e| e.to_string()),
