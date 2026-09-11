@@ -2351,18 +2351,6 @@ fn export_column_csv(gs: GridState, ci: usize) -> String {
     schemaic_core::export::export_column_csv(&rs, order.as_slice(), ci)
 }
 
-/// Save the whole result to a file the user picks. Opens the system save dialog
-/// (pre-filled with the source table's name + the format's extension), then
-/// streams the rendering straight into the file; a cancelled dialog does nothing.
-/// A write failure surfaces in the grid's error bar — the same place a failed
-/// commit reports.
-///
-/// The rows are **snapshotted** before the dialog opens, not rendered: the dialog
-/// is modal and slow, and the grid's result could be re-run or the tab switched
-/// while it's up, so the export has to be of what the user was looking at when
-/// they asked. `ResultSet` and the display order are behind `Arc`s, so holding
-/// that snapshot costs a refcount rather than a copy — and a cancelled dialog now
-/// costs nothing at all, where it used to pay a full render first.
 /// The Download icon's menu: a format per entry, or — when there is more of the
 /// result than the grid fetched — a scope step in front of them.
 ///
@@ -2457,6 +2445,19 @@ fn export_menu(
     ]
 }
 
+/// Save the whole result to a file the user picks. Opens the system save dialog
+/// (pre-filled with the source table's name + the format's extension), then
+/// streams the rendering straight into the file; a cancelled dialog does nothing.
+/// A write failure surfaces in the grid's error bar — the same place a failed
+/// commit reports.
+///
+/// The rows are **snapshotted** before the dialog opens, not rendered: the dialog
+/// is modal and slow, and the grid's result could be re-run or the tab switched
+/// while it's up, so the export has to be of what the user was looking at when
+/// they asked. That snapshot is [`exported_rows`]', so an edit staged while the
+/// dialog stands open does not change what was asked for either. A cancelled
+/// dialog costs nothing at all, where it used to pay a full render first.
+///
 /// `estimate` is the catalogue's row count for the statement, when the menu had
 /// one — the progress modal's denominator, and nothing else. See
 /// [`crate::ExportTarget::total`], which is why it is an `Option` shown with a

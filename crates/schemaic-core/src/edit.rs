@@ -1280,13 +1280,6 @@ impl GridCells<'_> {
         TsvBlock { text: out, split }
     }
 
-    /// The block `(r0, c0, r1, c1)` as an AI attachment: its column names, its
-    /// rows **as the user sees them**, and how many rows were selected in all.
-    ///
-    /// Two figures, and the header says the second: `cap`
-    /// ([`crate::prompt::ATTACH_ROW_CAP`]) is about the context window, not
-    /// about consent, so going over it is *reported* rather than silently
-    /// applied.
     /// The grid's rows as a `ResultSet` a reader that speaks cells can take:
     /// the stored result with the staged edits applied and the pending rows
     /// appended, plus the display order to read it in.
@@ -1349,6 +1342,14 @@ impl GridCells<'_> {
         (out, order)
     }
 
+    /// The block `(r0, c0, r1, c1)` as an AI attachment: its column names, its
+    /// rows **as the user sees them**, and how many rows were selected in all.
+    ///
+    /// Two figures, and the header says the second: `cap`
+    /// ([`crate::prompt::ATTACH_ROW_CAP`]) is about the context window, not
+    /// about consent, so going over it is *reported* rather than silently
+    /// applied.
+    ///
     /// Columns in the order they are **drawn** ([`visual_cols`]), for the same
     /// reason [`GridCells::tsv`] is: the model reads the block as a table, and a
     /// table whose columns are in an order the user never saw is answered about

@@ -59,7 +59,16 @@ existing prose was left alone.
     strong count of 2; with the columns inline that deep-copied every arena (30 ms and ~160 MB at
     200k×50, on the UI thread, on the one path built to avoid a rebuild). `splice_rows` replaces
     only the column `Arc`s whose values actually changed, so an untouched column is never copied
-    (29.6 ms → 1.8 ms at 200k×50, measured). `retained_bytes` sums what a result costs to *hold* —
+    (29.6 ms → 1.8 ms at 200k×50, measured).
+    **`splice_cells` is its per-cell sibling, and the difference is not convenience.** The grid's
+    staged edits are keyed by cell, so a row with one edited cell would have to supply the other
+    forty-nine to `splice_rows` — read back out with `CellRef::to_value` and pushed again, which
+    *re-formats* every numeric it round-trips: a `FLOAT` stored as the text `1.0` comes back as
+    `Value::Float(1.0)` and is written `1`. Here an unlisted cell is copied verbatim, tag **and**
+    text, under the same copy-on-write rule, so nothing but the listed cells can differ.
+    `append_rows` is the other half of the same caller's need — the grid's *pending* rows, which the
+    server has never seen, padded with NULL exactly as `from_rows` pads. Both exist for
+    `edit::GridCells::exported`. `retained_bytes` sums what a result costs to *hold* —
     each column's arena plus its packed offset word per cell, as allocated — which is what the
     results strip shows on a kept result, and the reason a result of nothing but NULLs is still
     megabytes: the cost is per cell, not per character.
@@ -175,7 +184,13 @@ existing prose was left alone.
     clipboard — and a byte string decoded lossily into one of those is the mojibake `binary_display`
     exists to have stopped. `display` renders `Bytes` as that same `<n bytes>`, so a cell a file has
     just been loaded into reads the way it will read after the commit and is no more copyable back
-    into the column than a stored blob is. Only the blob panel produces `Bytes`; `from_opt` is the
+    into the column than a stored blob is. `to_value` is that same question answered for a reader
+    that speaks **cells** rather than text — the export, which hands a `ResultSet` on and never asks
+    the painter — and it parts company with `display` on exactly one variant: `Null` becomes
+    `Value::Null`, not the word. A sentinel is the point where a cell is *drawn*; a file is written
+    by a format that already knows what a null is, so the string `NULL` would land inside a JSON
+    string and in an SQL `INSERT` where `null` belongs. Only the blob panel produces `Bytes`;
+    `from_opt` is the
     widening for the text paths that still speak `Option<String>`. One type the whole way down —
     `StagedEdits`, `RowEdit::set`, `RowInsert::cols`, `edit::DirtyCells` and the grid's `dirty` /
     `new_rows` all carry it — so there is no seam where bytes would have to be re-encoded to cross.
@@ -894,6 +909,21 @@ existing prose was left alone.
     and an auto-increment column the server assigns. Watched failing:
     `a_clone_copies_the_staged_value_not_the_stored_one` reports `Some(Text("Alice"))` against the
     unstaged lookup where `Some(Text("Bob"))` is what the user is looking at.
+    **How large that gesture may get before it asks is here too.** `DUPLICATE_CONFIRM_FLOOR` (500),
+    `duplicate_needs_confirm` — strictly above it, so the floor itself still goes through without a
+    modal — and `duplicate_prompt`, which names the count and says the rows are *staged*: the
+    question is about the size of a gesture, and a prompt implying a statement had reached the
+    server would be the wrong warning on the one grid action that commits nothing. The gutter menu
+    acts on the whole selection, so Ctrl+A on a 200,000-row result offers *Duplicate 200,000 rows*,
+    and taking it builds 200,000 `HashMap`s — one per row, every text-editable column cloned into
+    each — on the UI thread. The write is already one batched update rather than N, which is what
+    keeps the *staging* from being quadratic; nothing bounded its size. A **floor** rather than a
+    cap because the count is in the entry's own label: the user asked for this number and can see
+    it, so the honest answer is to make them say yes, not to refuse. `stats::CONFIRM_ROW_FLOOR`
+    (1,000) is the neighbouring idea for a destructive figure worth naming; this one gates whether
+    the question is asked at all and sits lower, staging being undoable and merely expensive. Which
+    caller asks it is the load-bearing half and lives in the view — `grid::clone_rows`, the action,
+    never the menu entry (*Data grid*).
     **The staged-cells → `RowEdit` grouping is here for the same reason, and it is the step a paste
     stresses.** `build_edits(model, rs, dirty)` folds a `DirtyCells` map — `(data row, result
     column) → new value`, each a `model::CellEdit`, the shape `GridState::dirty` holds — into one
@@ -932,7 +962,21 @@ existing prose was left alone.
     and `attached(rect, cap, frozen)` is an AI attachment's column names, rows and pre-cap
     total — both emitting the selected columns in the order they are **drawn** (`visual_cols`) rather
     than in index order, because whoever receives the block reads it left to right and a copy across
-    a freeze reached a spreadsheet transposed. One rule,
+    a freeze reached a spreadsheet transposed.
+    **`exported()` is the fourth surface, and it is the one this list did not have.** The export
+    could not ask this type for a cell at all: it renders through `core::export`, which walks a
+    `ResultSet` and a display order and has no notion of an overlay — so `Copy ▸ CSV`, the two
+    column copies and the saved file each wrote the pre-edit value while Ctrl+C on the same
+    selection wrote the staged one, and a pending row appeared in none of them. It resolves
+    *first* instead of teaching a second reader what `dirty` means: `exported` returns the stored
+    `ResultSet` with the staged edits spliced in per cell (`model::ResultSet::splice_cells`) and the
+    pending rows appended (`append_rows`), plus the display order to read it in, with the pending
+    rows past that order's end exactly as they are drawn past the real ones. Per *cell* because
+    supplying whole rows re-formats the untouched numerics it round-trips — `model`'s entry has
+    that. Unformatted, like `tsv`: a formatter is how a value is shown and an export writes the
+    value, so `formats` is the one field of this struct the method does not consult. Cheap on a
+    clean grid, since the columns are refcounted and `splice_cells` rebuilds only a column whose
+    listed cell really differs. One rule,
     because this resolution kept going out one source short where nothing could test it:
     `attached_rows` first read `rs.cell` and never `dirty`, so a green uncommitted edit was on
     screen while the pre-edit value went to the model, and the fix for *that* left the rule in
@@ -1469,8 +1513,13 @@ existing prose was left alone.
     the order the columns arrive in, and only a *generated* suffix steps around the reservation: a
     column always keeps its own name.
     And
-    `all_rows_label(size, sorted, manual_tx)` is the Download menu's `All rows` entry, three
+    `all_rows_label(size, sorted, manual_tx, staged)` is the Download menu's `All rows` entry, four
     disclosures made at the point of choice in place of an untested `match` in the view (*Data grid*).
+    `staged` is the newest and reads *"without your staged edits"*: the **fetched** scope now renders
+    the rows in hand through `edit::GridCells` exactly as Ctrl+C does, so it carries the green edits
+    and the pending rows, while this scope asks the server again and the server has never been told.
+    It became worth saying at precisely the moment the other scope stopped diverging — before that it
+    was covered by "an export is of what was fetched".
   - `import.rs` — the inverse of `export.rs`: CSV/TSV, JSON (array *or* NDJSON) and Excel
     `.xlsx` → table. Format
     inference, delimiter/header `sniff` (by *consistency*, quote-aware), `auto_map` (name-match with
@@ -2024,7 +2073,8 @@ existing prose was left alone.
     "1 Change", listed it, and showed an empty SQL box under a dimmed Apply: a change described with
     nothing behind it. The form's Apply asks `GrantDraft::is_ready` first, so this is reachable only
     by a caller that builds the change directly. `risks` speaks for `DropAccount`,
-    `RevokePrivileges`, `RevokeRole` and **`CreateAccount`**, and the account drop's sentence says
+    `RevokePrivileges`, `RevokeRole`, **`CreateAccount`** and — narrowly — `GrantPrivileges`, and
+    the account drop's sentence says
     what is actually lost — **its privileges, not its data**, with no record of them left anywhere
     to put back — plus the surprise that anything still connected as it keeps running until it
     disconnects. **Creating an account destroys nothing and is still the highest-consequence thing
@@ -2032,11 +2082,26 @@ existing prose was left alone.
     from now on" already makes: a blank password on MySQL is an account anyone who can reach the
     server can log in as, with no `IDENTIFIED BY` for `validate_password` to fire on, and a blank
     host means `%` — every machine on the network. The form discloses the host default and that the
-    password shows in the preview; nothing said what leaving it *blank* produces. So the risk block
+    password shows in the preview; nothing said what leaving it *blank* produces.
+    **One grant carries a consequence too, where no grant carried one at all.** Every arm above
+    describes what a plan takes away or rewrites; a `GrantPrivileges` whose level is
+    `GrantLevel::Global` is the case where what it *gives* is the risk. `GRANT DROP ON *.*` reaches
+    every database on the server — including databases that do not exist yet, which is the half the
+    sentence says out loud — and it showed an empty risk block two entries from a revoke of `SELECT`
+    on one table that warned. It was also the shortest path through that screen, the form having
+    opened pre-set to that level (`users::default_grant_level` is the other half of the fix). The arm
+    is narrow on purpose: a grant at a named database or table is scoped to a thing the user typed,
+    and warning every time would train the block to be ignored where it means something. So the risk
+    block
     can no longer head itself "This can't be undone": `ChangeSet::risk_heading` reads **"Before you
-    apply"** when every change in the set is `risk_is_reversible` — the two revokes and the create,
+    apply"** when every change in the set is `risk_is_reversible` — the two revokes, the create and
+    now the grant,
     a deliberately narrow list so a fourth change inherits the strong heading rather than losing it
-    by omission. A revoke's own sentence says it destroys no data and is undone by granting it back,
+    by omission. The grant joins it for the revoke's reason read backwards: it destroys nothing and
+    is undone by revoking it, only the whole-server case has a risk sentence for the heading to head
+    at all, and "This can't be undone" over a widened privilege would spend, on the one plan that is
+    genuinely a keystroke from being taken back, the heading `DROP USER` needs to keep.
+    A revoke's own sentence says it destroys no data and is undone by granting it back,
     and it appeared under the strong heading two entries away from `DROP USER`, which is the one
     modal where that heading has to keep its meaning. It is here rather than in the view because it
     is a claim about the changes.
@@ -3588,6 +3653,15 @@ existing prose was left alone.
     powers are role *attributes* (`SUPERUSER`, `CREATEDB`, `REPLICATION`) carried on the role and set
     with `ALTER ROLE`, not privileges `GRANT` can express. SQLite gets an empty list rather than a
     panic, `supports_user_admin` being the gate that should have stopped the caller.
+    **`default_grant_level` is the level a grant form opens on, and it is deliberately not
+    `levels_for(dialect).first()`** — the widest level that is *not* `Global`, and `None` only where
+    the engine grants at no level at all. The first-entry spelling is right on PostgreSQL by
+    accident, its list starting at `Database` for the reason just given; MySQL's does start at
+    `Global`, and that level takes **no name fields**, so the form opened already satisfied at the
+    widest scope the server has and its shortest path was `GRANT … ON *.*` from two clicks — tick a
+    privilege, press Preview SQL. Asked as a capability so the answer is one the engine gives rather
+    than one its list order gives, and so a fourth dialect inherits it by saying what it grants at
+    instead of by where an entry happens to sit.
     `privileges_for(dialect, level)` is **curated, not exhaustive, on MySQL's global level**:
     `GRANT` there also takes the server-administration privileges (`SHUTDOWN`, `SUPER`, and MySQL
     8's few dozen dynamic ones), a list that differs by server *and by version*, that no catalogue
@@ -8208,8 +8282,27 @@ existing prose was left alone.
     `the_two_spawn_shapes_do_not_overlap` walks `Harness::ALL` holding both builders to
     `is_persistent`. Claude's `session_args` arm delegates to `build_session_args`, which is what
     that function always was. **Where the prompt sits differs and is not a detail to generalise from
-    one of them**: Codex and OpenCode take it as the last *positional*, last on purpose since a flag
-    after it reads as part of it, while neither persistent harness carries a prompt in argv at all.
+    one of them**: OpenCode takes it as the last *positional*, last on purpose since a flag after it
+    reads as part of it; neither persistent harness carries a prompt in argv at all; and **Codex
+    takes it on stdin**, which is `Harness::prompt_on_stdin`. That capability is true of Codex alone,
+    on the strength of `codex exec --help` (codex-cli 0.153.4): instructions are read from stdin when
+    no positional is given, *and* a piped stdin alongside a positional is appended as a `<stdin>`
+    block rather than obeyed — so the prompt has to **leave** argv rather than merely be duplicated
+    onto it. The reason is that argv is world-readable and the prompt is the payload: on the packaged
+    Linux targets `/proc/<pid>/cmdline` is readable by any local account, so a `ps auxww` during a
+    turn read up to `ATTACH_ROW_CAP` attached rows, an AI Seed's twenty sampled rows and the table's
+    full `CREATE TABLE` — a judgement this codebase had already made for the MCP endpoint
+    (`codex_mcp_overrides` keeps it out of `-c` for exactly that) while the rows the `AiData` ladder
+    exists to protect went to the same place. The other three keep argv and each reason is written at
+    the capability: OpenCode's `run` documents a `message..` positional and no stdin, Antigravity
+    reads stdin only under its *session* shape, and Claude's stdin form passes context *alongside* a
+    positional rather than replacing one. `turn_stdin_prompt` and `inline_stdin_prompt` build what
+    goes there from the same `prefixed_prompt` call the argv arm would have pushed — one
+    construction, two destinations — and both Codex arms omit the positional under the same
+    predicate, which is what `the_prompt_travels_exactly_once` and
+    `an_inline_prompt_travels_exactly_once` hold together over `Harness::ALL` (each asserts the two
+    are exclusive, so a harness that claims stdin and still pushes sends the payload twice, and one
+    that lost its push sends nothing).
     **Antigravity is a persistent harness now, and that was measured before it was driven.**
     `--input-format stream-json` reads one NDJSON message per line and runs a turn for each, which is
     what the flag's own help promises and not the same thing as having watched it work: a two-turn
@@ -8382,8 +8475,8 @@ existing prose was left alone.
     regardless of the picker, and is now one of four.
     Measured against the installed binaries, Codex is `exec --ephemeral --skip-git-repo-check
     --sandbox read-only --color never`, then `--ignore-user-config` when the probe saw it, then
-    `--model`, then `-c sandbox_mode="read-only"`, then `-c mcp_servers={}`, then `-o <file>`, then
-    the prompt as the last positional;
+    `--model`, then `-c sandbox_mode="read-only"`, then `-c mcp_servers={}`, then `-o <file>` — and
+    **no prompt at all**, `inline_stdin_prompt` carrying it on stdin (`Harness::prompt_on_stdin`);
     Antigravity is `-p <prompt> --output-format text --sandbox --disable-slash-commands`
     plus `--model` and `--effort`; OpenCode is `run --pure --agent schemaic --format default` plus
     `--model` and `--variant`, prompt last. **`--output-format text` is named on Antigravity although
@@ -10887,8 +10980,12 @@ existing prose was left alone.
     `PrivilegeChange` and `ddl::grant_change` read and that their tests pin, and the free
     `action_label(bool) -> &'static str` gives it its two words. An enum invented for the form would
     be a second spelling of the same fact sitting one conversion away from the tested one.
-    It opens pre-picked to the widest level the engine has, so the name fields mean something before
-    the user has noticed the picker, and **changing the level clears the ticked privileges**: kept,
+    It opens pre-picked to the widest level **below the whole server** (`users::default_grant_level`),
+    so the name fields mean something before the user has noticed the picker — it read
+    `levels_for(dialect).first()` until that argument turned out to be true on PostgreSQL and false
+    on MySQL, whose list starts at `Global`, a level with no name fields to mean anything: the form
+    opened already satisfied at server scope and two clicks emitted `GRANT … ON *.*`. And **changing
+    the level clears the ticked privileges**: kept,
     they would carry `EVENT` down to a table level that has no such privilege and emit a statement
     the server refuses. That pre-picking is `initial_grant_draft(dialect)`, its own function beside
     the openers rather than a literal inside `open_for_grant`, because the **Level row exists only
@@ -10902,7 +10999,8 @@ existing prose was left alone.
     exactly *an engine with no levels*, which cannot reach this form at all
     (`users::supports_user_admin` gates the browser's button). The coupling is pinned by
     `the_grant_form_opens_holding_a_level_wherever_the_engine_has_one` and
-    `the_level_it_opens_on_is_the_first_the_picker_offers`.
+    `the_level_it_opens_on_is_never_the_whole_server`, which pins the *composition*: the capability
+    answering `Database` is worth nothing while the opener still reads the picker's first entry.
     **The privileges are a wrapping tag cloud** — `h_stack_from_iter` under `FlexWrap::Wrap` at 6px,
     where they were one per line. Eighteen is a legal selection at MySQL's database level, and
     eighteen rows is a column of short words taller than the panel: a set you have to scroll to see
@@ -13154,8 +13252,8 @@ existing prose was left alone.
   `Db` (a tunnel still coming up) the previous session is dropped and the panel says the database
   is unreachable, because answering through a session built for the previous level is this control
   failing open. The grid
-  asks `ai_data_of` (the *result's* connection, not the active one) and checks it at each action as
-  well as when building the menu.
+  asks `ai_data_of` (`GridState::conn_at_load` — the connection the rows were *loaded* under, not
+  the tab's live one) and checks it at each action as well as when building the menu.
   **A session may only start on a binary the probe established can be restricted, and that gate is
   the first thing `start_ai_session` does** — ahead of the MCP config being written and ahead of the
   oversize check. `ai::spawn_refusal` is the rule: a `Constraint` that is not runnable is refused
@@ -13232,10 +13330,17 @@ existing prose was left alone.
   per-turn branch's Antigravity arm and its `_registration` block were **deleted rather than left
   unreachable**, because configuration for a harness that no longer takes that path is the copy that
   quietly stops matching the one that runs.
-  **The per-turn child's stdin is `Stdio::null()`, never piped**: measured, and still true on
-  codex-cli 0.153.4, `codex exec` prints *"Reading additional input from stdin…"* when stdin is a
-  pipe at EOF, and appends piped stdin to the prompt as a `<stdin>`
-  block, so a pipe we never wrote to would silently append itself to every turn.
+  **The per-turn child's stdin is piped exactly when the prompt travels on it**
+  (`Harness::turn_stdin_prompt`, which is `Harness::prompt_on_stdin` — Codex alone) **and
+  `Stdio::null()` otherwise**, and the old unconditional `null()` is the reason the "otherwise" has
+  to stay: measured, and still true on codex-cli 0.153.4, `codex exec` prints *"Reading additional
+  input from stdin…"* when stdin is a pipe at EOF, and appends piped stdin to the prompt as a
+  `<stdin>`
+  block, so a pipe nobody writes to would silently append itself to every turn — and so would a pipe
+  written to while the positional was also there, which is why the argv builder *drops* the
+  positional under the same predicate rather than duplicating the prompt. The write happens
+  immediately after the spawn and the pipe is then shut down, because the CLI waits on EOF to know
+  the instructions are whole.
   And every harness folds its events through **one**
   `TurnPump` — prose and chips accumulate, a snapshot goes out when anything changed, `TurnDone`
   closes the turn and resets, and `fail()` always sends so the panel cannot spin. Claude was
@@ -13423,7 +13528,13 @@ existing prose was left alone.
   back from, and OpenCode's environment — or hands back the reason it will not run, and `run_inline`
   executes it. Each of Ctrl+K, AI Fill and AI Seed carried its own copy of that before: two passed
   `Stdio::null()` and Ctrl+K did not, so Ctrl+K alone paid the CLI's wait on a stdin that was never
-  going to arrive. It takes the effort setting alongside the model now — each of the three call sites
+  going to arrive. That null is now conditional for the same reason the session path's is —
+  `InlinePlan::stdin_prompt` is `Harness::inline_stdin_prompt`, so the pipe exists only where the
+  prompt travels on it — and where it does, `run_inline` **`spawn`s rather than `output()`s**:
+  `output()` closes the child's stdin before anything can reach it, so the prompt would never arrive
+  and the CLI would answer an empty instruction. `stdout`/`stderr` are then stated explicitly, since
+  a bare `spawn` inherits them and would put the CLI's output on Schemaic's own stdout while
+  `wait_with_output` read two empty buffers. It takes the effort setting alongside the model now — each of the three call sites
   passes `ai_effort.get_untracked().cli()`, and `harness::inline_argv` is what clamps that to the
   selected harness's own vocabulary. **It also carries the gate the inline paths never had.** They read the probe for
   Claude's seal flags and spawned whatever it said about the *constraint*, which was survivable while
@@ -13620,7 +13731,16 @@ existing prose was left alone.
     for a harness that was installed. `cmd.exe` and `where.exe` consider only `PATHEXT` extensions,
     so this does too: the bare name is taken only when its own extension is already one of them
     (`foo.exe` asked for by full name), and `PATHEXT`'s order *is* the preference order, which is
-    what puts `.CMD` ahead of a `.ps1` nobody can spawn directly. Off Windows `exts` is empty and
+    what puts `.CMD` ahead of a `.ps1` nobody can spawn directly. **With one departure from
+    `where.exe`: a batch shim goes last**, which is two passes over `PATHEXT` in its own order —
+    everything that is not `.BAT`/`.CMD`, then those. Rust runs a batch file through `cmd.exe` and
+    refuses any argument it cannot escape for it, and every prompt this app builds is multi-line by
+    construction (`harness::prefixed_prompt` joins with `\n\n`), so a harness resolved to a `.cmd`
+    answered `InvalidInput: batch file arguments are invalid` for *every* generation — Ctrl+K,
+    Optimize, Fix with AI and each chat turn — reported as a batch-file problem rather than a prompt
+    one. A default `PATHEXT` lists `.EXE` before `.CMD` and hid it; the variable is editable and
+    installers edit it. The shim is still taken when it is the only candidate, which is npm's layout.
+    Off Windows `exts` is empty and
     the bare name is the only candidate, which is correct there — the executable bit is the test,
     not the name.
     **One `--help`, three answers.** `probe(h, bin)` returns a `Probe { seal, constraint,
@@ -14654,7 +14774,19 @@ Re-introducing the anti-patterns these guard against is a regression:
   Every path that can put a cell value in a prompt — `run_query`, `describe_table`'s samples, the
   grid's attach-to-chat, AI Summary, AI Fill, AI Seed — is gated on
   `connection::AiData::{may_query, may_attach}`, resolved from **the connection the data came
-  from** (`grid::ai_data_of` reads the result's `conn_id`, not the active one). Don't add a path
+  from** — `grid::ai_data_of` keys on `GridState::conn_at_load`, the id snapshotted when the rows
+  arrived, and not on the tab's live `conn_id`. It read the live one until this was the last consumer
+  still doing so, which was true only in the narrow sense of not reading the *globally* active
+  connection: a tab can be rebound while its result stays on screen, so rows fetched on a
+  schema-only connection became attachable the moment the tab was pointed somewhere more permissive,
+  with nothing refetched. The policy for rows already in hand belongs to the server they came from,
+  which is the argument the export scope, the blob re-read and `set_format` already make. **The
+  connection *list* is still read live, and that half is deliberate**: locking a connection down has
+  to take effect on a grid already on screen. What is fixed at load is which connection is looked
+  up, not what that connection currently allows. The source gate is
+  `the_assistants_data_level_is_the_one_the_rows_were_loaded_under` — a source gate because the
+  decision is one line inside a view with no pure half: the lookup is right either way, and which id
+  performs it is the whole of the bug. Don't add a path
   that samples, quotes or forwards result values without asking, and don't answer the question
   from a new flag: three unrelated toggles is precisely how a user comes to believe they are
   protected while a fourth path ships samples anyway — which is the state this replaced, where the
@@ -18123,6 +18255,18 @@ this bundle's.
   tell them apart, and a split cell keeps the row count right so the paste's counters stay quiet
   while every later column of that row shifts left by one — green, and one Commit from a real
   `UPDATE`. `grid.rs`'s gate asserts `copy_selection` still calls the helper.
+  **The export reaches the same resolution through `exported_rows`**, the only export-side function
+  that reads `gs.rs`/`gs.order` raw: it hands them to `grid_cells` and returns `GridCells::exported`'s
+  `ResultSet` + order, which `core::export` can walk without knowing an overlay exists. Four sites
+  rendered the raw pair before — `render_export` (the Copy ▸ format menu), `export_column_json`,
+  `export_column_csv` and `save_export` (the file) — so Ctrl+C wrote the staged value while every
+  export wrote the one it replaced, and a pending row appeared in neither, with the export modal
+  reporting a clean row count and no caveat. `save_export` takes that resolved snapshot **before**
+  the save dialog opens, for the reason the statement beside it is snapshotted: the dialog is modal
+  and slow, and an edit typed while it stands open must not change what was asked for. The gate is
+  `no_export_path_renders_the_unresolved_result`, which holds all four to calling `exported_rows`
+  and holds `exported_rows` to `grid_cells` — fixing one of four is exactly how this class comes
+  back.
   The reason is under `core::edit`: the rule went out one source
   short twice in the view, most recently without `format::apply`, so a `Timestamp` column attached
   the epoch integer the cell does not show. The **painter** is the exception and stays one:
@@ -18241,7 +18385,7 @@ this bundle's.
   and the attach entry — because a row-number click has picked out no cell, and offering
   Edit field / Filter by this value there would answer a gesture about rows with actions about a
   column. Its row actions take **every selected row** (`selected_data_rows` → `set_rows_deleted` /
-  `clone_row`) and count them in the label: the same menu naming five rows in one entry and acting
+  `clone_rows`) and count them in the label: the same menu naming five rows in one entry and acting
   on one in the next is how four deletions go missing unnoticed. **`set_rows_deleted` batches, and
   it was the one row action in that pair that did not** — the Del key's handler and
   `add_cloned_rows` both already wrote once for the whole selection while this called
@@ -18654,21 +18798,28 @@ this bundle's.
   result. It reads `gs.order` rather than the result set, because `order` is what an export actually
   writes; the two agree today and the one that decides the file is the honest thing to ask.
   **Every way the file will differ from the grid is declared at the point of choice, not discovered
-  in the file**, and the label is `export::all_rows_label(size, sorted, manual_tx)` — one tested
-  function in place of the `match` the menu used to hold, which had none. Two differences, neither of
+  in the file**, and the label is `export::all_rows_label(size, sorted, manual_tx, staged)` — one
+  tested
+  function in place of the `match` the menu used to hold, which had none. Three differences, none of
   them visible in the result. A **client-side sort**: `Fetched` honours `gs.order`, while `AllRows`
   streams the *server's* order, because a column-header sort is a permutation of the rows in hand
   (`compute_order`) that no re-run reproduces — the menu had presented the two as one export at two
   sizes. And a **manual-transaction tab**: `AllRows` is a second read on a fresh connection
   (`Db::stream_query`, deliberately outside the tab's pinned session), so a `TxMode::Manual` tab's
   uncommitted rows are on screen and absent from the file, and rows it deleted are in the file and
-  gone from the screen. So the label reads `All rows (~16k, server order)`,
+  gone from the screen. And **staged edits**: this scope asks the server again, and the server has
+  not been told, so it reads `without your staged edits` — a disclosure that became load-bearing at
+  precisely the moment the *fetched* scope stopped diverging, since that file now goes through
+  `exported_rows` and carries the green cells and the pending rows exactly as Ctrl+C does. Before
+  that, both scopes were wrong the same way and "an export is of what was fetched" covered it. So
+  the label reads `All rows (~16k, server order)`,
   `All rows (~16k, committed rows only)`, `All rows (server order)` where there is no estimate, or
-  plain `All rows` when neither applies. `size` is pre-rendered by the caller, since the estimate and
+  plain `All rows` when none applies. `size` is pre-rendered by the caller, since the estimate and
   its `~` belong to the stats line's vocabulary rather than to this decision; `sorted` comes in as a
   parameter of `export_menu` rather than off `GridState`, because the sort does not
-  live there — it is `grid_view`'s, threaded to the header and the toolbar — and `manual_tx` reaches
-  it through the `tx_mode` signal `GridCtx`/`GridState` gained for exactly this. **The estimate
+  live there — it is `grid_view`'s, threaded to the header and the toolbar — `manual_tx` reaches
+  it through the `tx_mode` signal `GridCtx`/`GridState` gained for exactly this, and `staged` is the
+  menu asking `gs.dirty` and `gs.new_rows` whether either holds anything. **The estimate
   travels with the choice**: `export_menu` hands the same figure to `save_export`, which puts it on
   `ExportTarget::total`, so the number the user chose from and the number they then watch tick up are
   one read of the catalogue rather than two taken minutes apart.
@@ -18971,7 +19122,19 @@ this bundle's.
     - **Clone:** right-click **Duplicate row** seeds a pending row via `add_cloned_rows`, which is a
       loop over `edit::cloned_row` — every editable column as the **grid is showing it**, staged
       edits included, except auto-increment and the binary columns whose displayed `<n bytes>` is a
-      placeholder rather than a value (`core::edit`).
+      placeholder rather than a value (`core::edit`). **Past `edit::DUPLICATE_CONFIRM_FLOOR` (500)
+      it asks first**, and where it asks is the load-bearing part: the question sits in the action,
+      `clone_rows`, not on the gutter menu entry, so the cell menu's *Duplicate row* and the toolbar
+      clone icon — both arriving through `clone_row` — cannot route around it, and neither can a
+      fourth caller written later. `stage_cloned_rows` is the staging half past the question, and
+      the `Confirm`'s resolver re-checks `gs.alive()` before reaching it, the modal outliving the
+      click. The modal is the window's: `GridCtx`/`GridState` carry a `confirm` field holding
+      `ui.overlay.confirm`, the same one the destructive actions raise.
+      The gutter menu acts on the whole selection, so Ctrl+A on a large result is one click from
+      building a `HashMap` per row on the UI thread; a floor rather than a cap because the count is
+      in the entry's own label. `grid.rs`'s source gate
+      `a_large_duplicate_is_confirmed_before_a_single_row_is_staged` asserts the ask precedes the
+      staging call and that `clone_rows` does not reach `add_cloned_rows` itself.
     - **Delete:** right-click **Delete row** or the **Del** key marks a real row (`gs.del_rows`) with a
       red wash; marking clears its staged edits. `build_deletes` keys each `RowDelete` by the table's
       `key_cols` + original values.
