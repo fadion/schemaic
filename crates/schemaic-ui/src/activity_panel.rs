@@ -382,9 +382,9 @@ fn interval_button(
 /// healthy server is an alarm about nothing, and four such zeros would be the
 /// permanent state of the line.
 fn counts_line(sessions: &[SessionInfo], truncated: bool) -> impl IntoView {
-    let sum = activity::summarize(sessions);
+    let sum = activity::summarize(sessions, truncated);
     let mut parts: Vec<floem::AnyView> = vec![
-        text(sum.total_label(truncated))
+        text(sum.total_label())
             .style(|s| s.font_size(font_label()).color(theme::text_muted()))
             .into_any(),
     ];
@@ -400,8 +400,12 @@ fn counts_line(sessions: &[SessionInfo], truncated: bool) -> impl IntoView {
         if n == 0 {
             continue;
         }
+        // Through `state_label`, not `format!`, so the `+` a capped list earns
+        // reaches all four figures and not only the total. This loop used to
+        // print the bare number beside a `500+ sessions` that was honest about
+        // the very same list.
         parts.push(
-            text(format!("{n} {word}"))
+            text(sum.state_label(n, word))
                 .style(move |s| s.font_size(font_label()).color(color()))
                 .into_any(),
         );

@@ -389,41 +389,91 @@ pub fn render_slice<T>(rows: &[T]) -> (&[T], usize) {
 }
 
 /// The counts line above the list.
+///
+/// **`truncated` is a field rather than a parameter to one method**, and that is
+/// the whole of the fix it carries. It used to be an argument to
+/// [`ActivitySummary::total_label`] alone, so the total was the only one of the
+/// four figures that could say the list behind it was cut: a pooled server at
+/// 700 connections all idle in transaction rendered `500+ sessions   500 idle in
+/// txn`, the second figure counting a list [`prepare`] had already truncated and
+/// stating it in the same shape and colour an uncapped server's would wear.
+/// `500+` is honest and `500` beside it is not, and it is the unqualified one a
+/// person is being asked to act on.
+///
+/// Every count in here is a count of the *prepared* list, so no reader of this
+/// type can honestly present one as a server figure while `truncated`. Holding
+/// it on the struct is what makes that expressible at all.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ActivitySummary {
     pub total: usize,
     pub running: usize,
     pub blocked: usize,
     pub idle_in_tx: usize,
+    /// [`prepare`]'s verdict: the server had more than [`MAX_SESSIONS`] and the
+    /// list these counts were folded from is a prefix of it.
+    pub truncated: bool,
 }
 
 impl ActivitySummary {
     /// `18 sessions` — the only part of the line that is always shown, because
     /// zero of it is itself the answer.
     ///
-    /// `truncated` is [`prepare`]'s verdict, and it turns the figure into
-    /// `500+ sessions`. Without it the line states the *cap* as though it were
-    /// the server's count: a box holding four thousand connections read
-    /// "500 sessions", which is not a rounding error but a different fact. The
-    /// `+` is the whole of what this side of the wire can honestly say, since
-    /// the fetch stopped counting at `MAX_SESSIONS + 1`.
-    pub fn total_label(&self, truncated: bool) -> String {
-        let plus = if truncated { "+" } else { "" };
+    /// A truncated list turns the figure into `500+ sessions`. Without it the
+    /// line states the *cap* as though it were the server's count: a box holding
+    /// four thousand connections read "500 sessions", which is not a rounding
+    /// error but a different fact. The `+` is the whole of what this side of the
+    /// wire can honestly say, since the fetch stopped counting at
+    /// `MAX_SESSIONS + 1`.
+    pub fn total_label(&self) -> String {
         format!(
-            "{}{plus} {}",
-            self.total,
+            "{} {}",
+            self.figure(self.total),
             // A capped list is always plural, whatever `total` happens to be.
             plural(self.total, "session", "sessions")
         )
+    }
+
+    /// `4 running`, or `500+ idle in txn` on a capped list — one state figure,
+    /// wearing the same caveat the total wears.
+    ///
+    /// The word is the caller's because the colour is too: the panel draws each
+    /// figure in the colour that state has on the rows below, so the pairing
+    /// lives there. What must not live there is the `+`, which is the decision
+    /// [`total_label`] was already making alone.
+    ///
+    /// [`total_label`]: ActivitySummary::total_label
+    pub fn state_label(&self, n: usize, word: &str) -> String {
+        format!("{} {word}", self.figure(n))
+    }
+
+    /// One figure with the truncation caveat, if there is one.
+    ///
+    /// **A zero keeps its bare shape** even on a capped list. `0+ running` reads
+    /// as a count of nothing that might be more, which is true but is not what
+    /// the panel is doing with it: the line omits a zero entirely rather than
+    /// printing `0 blocked` in warning red on a healthy server. That the omitted
+    /// zero is itself unreliable while `truncated` — the 200 rows past the cap
+    /// could hold every running session on the box — is a real residue of
+    /// capping the list, and it is a different fix from this one: it wants a
+    /// state tally the *server* computes, not a caveat on a figure the panel
+    /// has decided not to draw.
+    fn figure(&self, n: usize) -> String {
+        let plus = if self.truncated && n > 0 { "+" } else { "" };
+        format!("{n}{plus}")
     }
 }
 
 /// Count the states for the summary line. A blocked session is *not* also
 /// counted as idle-in-transaction even though it holds one open: the two figures
 /// sit side by side and would double-count the same row.
-pub fn summarize(sessions: &[SessionInfo]) -> ActivitySummary {
+///
+/// `truncated` is [`prepare`]'s verdict about the very list being folded here,
+/// and is carried onto the summary rather than taken separately by one of its
+/// methods — see [`ActivitySummary`].
+pub fn summarize(sessions: &[SessionInfo], truncated: bool) -> ActivitySummary {
     let mut out = ActivitySummary {
         total: sessions.len(),
+        truncated,
         ..Default::default()
     };
     for s in sessions {
@@ -465,6 +515,19 @@ pub fn should_poll(panel_is_activity: bool, fits: bool, focused: bool) -> bool {
 /// it. `history::matches_query` solved exactly this, one module over, and this
 /// one was written without that half — so it borrows the same collapser rather
 /// than growing a second.
+///
+/// **And it is [`SessionInfo::running_sql`] that is matched, not `sql`.** The
+/// two differ on exactly the rows PostgreSQL produces most of: an `idle`
+/// backend keeps its last statement in `pg_stat_activity.query` indefinitely, so
+/// `sql` is populated for every connection in a pool while the row deliberately
+/// draws nothing. Filtering on `sql` listed all of them — no statement, no
+/// highlight, nothing anywhere saying why they matched — with the one session
+/// actually running the phrase somewhere among them. MariaDB was immune
+/// (`PROCESSLIST.INFO` is NULL on a `Sleep` thread), so the panel behaved one
+/// way per engine, which is what [`SessionInfo`]'s "engine-neutral by
+/// construction" exists to prevent. *Copy statement* still reads `sql`: it is
+/// the one consumer that genuinely wants the last statement, and it is a menu
+/// entry rather than a match.
 pub fn matches_query(s: &SessionInfo, query: &str) -> bool {
     let q = query.trim();
     if q.is_empty() {
@@ -476,8 +539,7 @@ pub fn matches_query(s: &SessionInfo, query: &str) -> bool {
         || s.database
             .as_deref()
             .is_some_and(|d| contains_ignore_ascii_case(d, q))
-        || s.sql
-            .as_deref()
+        || s.running_sql()
             .is_some_and(|sql| contains_ignore_ascii_case(&crate::history::full_preview(sql), q))
 }
 
@@ -1328,8 +1390,8 @@ mod tests {
     fn prepare_is_fine_with_nothing() {
         let mut v: Vec<SessionInfo> = Vec::new();
         assert!(!prepare(&mut v));
-        assert_eq!(summarize(&v), ActivitySummary::default());
-        assert_eq!(summarize(&v).total_label(false), "0 sessions");
+        assert_eq!(summarize(&v, false), ActivitySummary::default());
+        assert_eq!(summarize(&v, false).total_label(), "0 sessions");
         assert!(lock_wait(&v).is_none());
     }
 
@@ -1385,7 +1447,7 @@ mod tests {
             sess(4, SessionState::Running, 0.0),
             sess(5, SessionState::Idle, 0.0),
         ];
-        let s = summarize(&v);
+        let s = summarize(&v, false);
         assert_eq!(
             s,
             ActivitySummary {
@@ -1393,10 +1455,82 @@ mod tests {
                 running: 1,
                 blocked: 1,
                 idle_in_tx: 2,
+                truncated: false,
             }
         );
-        assert_eq!(s.total_label(false), "5 sessions");
-        assert_eq!(summarize(&v[..1]).total_label(false), "1 session");
+        assert_eq!(s.total_label(), "5 sessions");
+        assert_eq!(summarize(&v[..1], false).total_label(), "1 session");
+    }
+
+    /// **The whole line is about the same truncated list, so the whole line has
+    /// to say so.** `total_label` took `truncated` and the three state figures
+    /// did not, so a pooled server at 700 sessions all idle in transaction
+    /// rendered `500+ sessions   500 idle in txn` — the honest figure and the
+    /// dishonest one side by side, and the number a person acts on is the
+    /// second.
+    ///
+    /// Stated over `MAX_SESSIONS` itself, with a real `prepare` doing the
+    /// truncating, because the defect was the *composition*: `summarize` folded
+    /// whatever slice it was handed, and the slice it was handed here is the
+    /// post-`prepare` one. A fixture that hand-set `truncated` would pass
+    /// against the bug.
+    #[test]
+    fn every_figure_on_a_capped_line_carries_the_cap() {
+        let mut v: Vec<SessionInfo> = (0..MAX_SESSIONS + 200)
+            .map(|i| sess(i as i64 + 1, SessionState::IdleInTx, 0.0))
+            .collect();
+        // One running session. It sorts *behind* every idle-in-transaction one
+        // (`rank`: IdleInTx 2, Running 3), so the cut takes it — which is the
+        // second half of what this fixture is here to show.
+        v[0].state = SessionState::Running;
+        let truncated = prepare(&mut v);
+        assert!(truncated, "the fixture has to overflow the cap");
+        assert_eq!(v.len(), MAX_SESSIONS);
+
+        let s = summarize(&v, truncated);
+        assert_eq!(s.total_label(), "500+ sessions");
+        assert_eq!(
+            s.state_label(s.idle_in_tx, "idle in txn"),
+            "500+ idle in txn",
+            "the count of a cut list must not be stated as the server's"
+        );
+
+        // **The residue, pinned rather than claimed fixed.** The one running
+        // session fell past the cap, so `running` is 0 and the panel omits the
+        // figure — the line says nothing at all about a state the server does
+        // have. No caveat on a figure can repair that; it wants a tally the
+        // server computes. `figure`'s doc says so, and this is the assertion
+        // that will go red the day someone makes it true.
+        assert_eq!(s.running, 0, "the cut took it");
+        assert_eq!(s.state_label(s.running, "running"), "0 running");
+    }
+
+    /// And an uncapped line states plain figures — the `+` is news, so it must
+    /// not be permanent furniture.
+    #[test]
+    fn an_uncapped_line_carries_no_caveat_anywhere() {
+        let v = vec![
+            sess(1, SessionState::Running, 0.0),
+            sess(2, SessionState::Blocked, 0.0),
+        ];
+        let s = summarize(&v, false);
+        assert_eq!(s.total_label(), "2 sessions");
+        assert_eq!(s.state_label(s.running, "running"), "1 running");
+        assert_eq!(s.state_label(s.blocked, "blocked"), "1 blocked");
+    }
+
+    /// A zero stays bare on a capped list: the panel omits it rather than
+    /// drawing `0 blocked` in warning red, so `0+` would be a caveat on a
+    /// figure nobody is shown. See [`ActivitySummary::figure`].
+    #[test]
+    fn a_zero_figure_takes_no_plus_even_when_the_list_is_capped() {
+        let s = ActivitySummary {
+            total: 500,
+            truncated: true,
+            ..Default::default()
+        };
+        assert_eq!(s.state_label(s.blocked, "blocked"), "0 blocked");
+        assert_eq!(s.total_label(), "500+ sessions");
     }
 
     #[test]
@@ -1406,7 +1540,7 @@ mod tests {
         assert!(!SessionState::Running.in_transaction());
         assert!(!SessionState::Idle.in_transaction());
         let v = vec![sess(1, SessionState::Blocked, 0.0)];
-        assert_eq!(summarize(&v).idle_in_tx, 0);
+        assert_eq!(summarize(&v, false).idle_in_tx, 0);
     }
 
     #[test]
@@ -1427,6 +1561,46 @@ mod tests {
             "an empty filter matches everything"
         );
         assert!(!matches_query(&s, "nothing-like-this"));
+    }
+
+    /// **The filter and the row have to answer one question.** `matches_query`
+    /// asked `s.sql` while `session_row` draws `s.running_sql()`, which is
+    /// `None` for `Idle` by design — and on PostgreSQL 16
+    /// `pg_stat_activity.query` keeps an idle backend's last statement
+    /// indefinitely, so a connection pool filtered to a phrase listed a wall of
+    /// otherwise-identical idle rows with no statement, no highlight and nothing
+    /// saying why they matched. MariaDB is immune (`INFO` is NULL on `Sleep`),
+    /// which made this an engine divergence in a type whose module doc says it
+    /// is "engine-neutral by construction".
+    ///
+    /// `running_sql`'s own doc already says the decision is made once, centrally,
+    /// so *"a second surface that draws a statement should not have to
+    /// rediscover this"*. `matches_query` was that second surface.
+    ///
+    /// The test module had no idle-with-a-statement fixture, which is why
+    /// introducing `running_sql` broke nothing.
+    #[test]
+    fn the_search_does_not_match_a_statement_the_row_will_not_draw() {
+        let idle = sess(1148, SessionState::Idle, 0.0);
+        assert!(
+            idle.sql.is_some(),
+            "the fixture is a PG idle backend: the last statement is still there"
+        );
+        assert_eq!(idle.running_sql(), None, "and the row draws none of it");
+        assert!(
+            !matches_query(&idle, "select"),
+            "so the filter must not list it either"
+        );
+        // Everything else on the row still matches — this narrows the statement
+        // clause, it does not turn the filter off for idle sessions.
+        for q in ["1148", "app@10", "employees", "idle"] {
+            assert!(matches_query(&idle, q), "{q:?} is drawn and must match");
+        }
+
+        // And a session that *is* running the phrase still matches, which is the
+        // row the user was looking for among them.
+        let running = sess(1149, SessionState::Running, 0.0);
+        assert!(matches_query(&running, "select"));
     }
 
     #[test]

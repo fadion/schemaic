@@ -4820,6 +4820,27 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
     // reason switching connections twice doesn't leave two loops polling.
     let activity_gen = RwSignal::new(0_u64);
 
+    // **Defined here, above every `rearm_activity` caller, because all of them
+    // have to ask it.** It used to sit further down, past the kill handler — so
+    // the one arming site that could not reach it passed a literal `true`
+    // instead, and a successful kill restarted auto-refresh on a panel the user
+    // had switched away from or a window that had lost focus. That is precisely
+    // the "connect every two seconds for nobody" load `should_poll` was written
+    // to remove, reinstated by the one action on this panel that is guaranteed
+    // to be followed by the user looking somewhere else.
+    //
+    // Every read is **tracked**, which is what the poll effect needs — crossing
+    // the responsive breakpoint or losing focus must re-run it. The callers
+    // outside any effect (`reset_activity`, the kill report) simply find the
+    // tracking inert, and the answer is the same.
+    let activity_polling = move || {
+        schemaic_core::activity::should_poll(
+            right_panel.get() == RightPanel::Activity,
+            schemaic_ui::right_panel_visible(),
+            window_focused.get(),
+        )
+    };
+
     let refresh_activity: Rc<dyn Fn()> = {
         let db_for = db_for.clone();
         let handle = handle.clone();
@@ -5080,11 +5101,21 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                                 // successful kill, on the panel whose subject is
                                 // a live server, immediately after the one
                                 // action that changes it.
+                                //
+                                // **Re-arms to `activity_polling()`, not to
+                                // `true`.** A literal here says "there is
+                                // someone watching" on the strength of a reply
+                                // that has just come back from the network —
+                                // by which time the panel may be closed, the
+                                // window unfocused or the column collapsed to
+                                // zero width, all three of which `should_poll`
+                                // exists to answer No to. The two sibling
+                                // callers below already pass it.
                                 rearm_activity(
                                     activity_gen,
                                     activity_interval,
                                     refresh.clone(),
-                                    true,
+                                    activity_polling(),
                                 );
                                 (refresh)();
                             }
@@ -5120,19 +5151,9 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
     // before: `right_panel_visible()` was added as the conjunct that was missing,
     // after a 0px panel went on polling because it could be neither watched nor
     // stopped from inside the app. A second copy is how the next conjunct reaches
-    // one asker and not the other.
-    //
-    // Every read is **tracked**, which is what the effect needs — crossing the
-    // responsive breakpoint or losing focus must re-run it. `reset_activity` calls
-    // this from outside any effect, where the tracking is simply inert and the
-    // answer is the same.
-    let activity_polling = move || {
-        schemaic_core::activity::should_poll(
-            right_panel.get() == RightPanel::Activity,
-            schemaic_ui::right_panel_visible(),
-            window_focused.get(),
-        )
-    };
+    // one asker and not the other — and a *third* asker that could not reach the
+    // closure at all is how the kill handler came to arm the loop with a bare
+    // `true`. `activity_polling` is now defined above all three.
     {
         let refresh = refresh_activity.clone();
         create_effect(move |prev: Option<(u64, bool, u64)>| {
@@ -11706,6 +11727,79 @@ mod app_tests {
             ["run(req.into_sql());", "run(sql);"],
             "the raw `run` gained or lost a caller: every one must take its SQL \
              from a `RerunRequest`, which only `sql::rerunnable_for_export` mints"
+        );
+    }
+
+    /// **No arming site decides for itself that someone is watching.**
+    ///
+    /// `rearm_activity`'s last argument is "should the loop run", and
+    /// `activity::should_poll` is the function that answers it — three
+    /// conjuncts, the third (`right_panel_visible`) added after a zero-width
+    /// panel went on connecting every two seconds for nobody. The kill
+    /// handler passed a literal `true`, because `activity_polling` was defined
+    /// eighty lines *below* it: a successful kill restarted auto-refresh on a
+    /// panel switched away from or a window that had lost focus, reinstating
+    /// exactly the load the third conjunct removed — and doing it right after
+    /// the one action on this panel that is reliably followed by looking
+    /// somewhere else.
+    ///
+    /// A source gate rather than a unit test because the defect was a literal
+    /// at one call site out of three. Nothing about the value is wrong; the
+    /// wrong thing is asking the question by hand.
+    #[test]
+    fn every_poll_arming_asks_whether_anyone_is_watching() {
+        let src = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("src")
+                .join("main.rs"),
+        )
+        .expect("this file's own source");
+        let body = src
+            .split("#[cfg(test)]")
+            .next()
+            .expect("production code")
+            .to_string();
+        // `rearm_activity(…)` spans several lines at two of the three sites and
+        // its arguments carry parens of their own (`refresh.clone()`), so the
+        // call is read by balancing rather than by matching a line or the first
+        // `)`. The `fn` definition is skipped — it is not an arming site.
+        let mut args: Vec<String> = Vec::new();
+        for (i, _) in body.match_indices("rearm_activity(") {
+            if body[..i].trim_end().ends_with("fn") {
+                continue;
+            }
+            let rest = &body[i + "rearm_activity(".len()..];
+            let mut depth = 0usize;
+            let end = rest
+                .char_indices()
+                .find(|&(_, c)| {
+                    match c {
+                        '(' => depth += 1,
+                        ')' if depth == 0 => return true,
+                        ')' => depth -= 1,
+                        _ => {}
+                    }
+                    false
+                })
+                .map(|(j, _)| j)
+                .expect("a call, closed");
+            let last = rest[..end]
+                .rsplit(',')
+                .map(str::trim)
+                .find(|a| !a.is_empty())
+                .expect("four arguments");
+            args.push(last.to_string());
+        }
+        assert_eq!(
+            args.len(),
+            3,
+            "an arming site appeared or vanished: {args:?}"
+        );
+        assert!(
+            args.iter()
+                .all(|a| a == "open" || a == "activity_polling()"),
+            "a poll was armed on something other than `should_poll`'s answer: \
+             {args:?}"
         );
     }
 

@@ -606,10 +606,21 @@ fn header_row() -> impl IntoView {
 /// long change list scrolls horizontally instead of wrapping.
 fn entry_row(entry: MonitorEntry, cols: RwSignal<Vec<String>>) -> impl IntoView {
     let names = cols.get_untracked();
-    let (label, color) = match entry.change.kind {
-        ChangeKind::Insert => ("INSERT", new_color()),
-        ChangeKind::Update => ("UPDATE", theme::chip_active()),
-        ChangeKind::Delete => ("DELETE", old_color()),
+    // **`fn() -> Color`, not a `Color`** — the same rule `data_view` states two
+    // functions below and for the same reason: these rows are keyed on
+    // `entry.seq`, so a theme switch rebuilds none of them. `theme::chip_active()`
+    // called *here* was resolved once, when the row was built, and the UPDATE
+    // labels then stayed in the previous theme's colour for as long as the modal
+    // stayed open — beside INSERT and DELETE labels that repainted, because
+    // `new_color`/`old_color` are fixed literals. Two themes at once, in the one
+    // place where colour is the only thing telling the three kinds apart.
+    //
+    // All three arms are `fn`-shaped, so the destructuring is one shape and the
+    // call happens inside the style closure where it is re-run.
+    let (label, color): (&str, fn() -> Color) = match entry.change.kind {
+        ChangeKind::Insert => ("INSERT", new_color),
+        ChangeKind::Update => ("UPDATE", theme::chip_active),
+        ChangeKind::Delete => ("DELETE", old_color),
     };
     let key_text = entry.change.key.join(", ");
     h_stack((
@@ -620,7 +631,7 @@ fn entry_row(entry: MonitorEntry, cols: RwSignal<Vec<String>>) -> impl IntoView 
                 .flex_shrink(0.0_f32)
         }),
         text(label).style(move |s| {
-            s.color(color)
+            s.color(color())
                 .font_size(font_label())
                 .font_bold()
                 .width(act_w())
