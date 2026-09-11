@@ -663,9 +663,14 @@ mod modal_backdrop_gate {
     /// And the other direction, which `07bda98`'s "loud failure" argument covers
     /// and which is worth pinning next to it: every term of `modal_backdrop_up` is
     /// a predicate the layer also uses to size itself, so a modal in the layer with
-    /// no term gets a zero box. All nine terms are named here — the three grouped
-    /// predicates and the six signals the layer raises directly — so a tenth
-    /// added without joining `modal_backdrop_up` fails.
+    /// no term gets a zero box.
+    ///
+    /// **Two halves, and this used to have only one.** The array below names the
+    /// terms and so catches one being *deleted* — a stale-list check. The claim
+    /// made here, that "a tenth added without joining `modal_backdrop_up`
+    /// fails", was not something the array could do: a tenth child changes
+    /// nothing it reads. The count derived from `modal_layer` at the end is that
+    /// second half.
     ///
     /// **Both of the loose entries arrived here late, and the second proves the
     /// first was not a one-off.** Hoisting the shared confirm out of the DDL
@@ -675,7 +680,9 @@ mod modal_backdrop_gate {
     /// the same thing again. Both are named now, because the list only guards
     /// what it names — and the shape to watch for is exactly this one: a modal
     /// leaving a group is invisible from here, since the group predicate it left
-    /// still exists and still passes.
+    /// still exists and still passes — invisible to the *array*, that is. The
+    /// count sees it, which is why it is here: both times, the list was extended
+    /// after the fact by someone who had already found the bug.
     #[test]
     fn the_predicate_names_every_group_the_layer_raises() {
         let src = std::fs::read_to_string(src_dir().join("modals.rs")).expect("modals.rs");
@@ -711,6 +718,30 @@ mod modal_backdrop_gate {
                  under it"
             );
         }
+
+        // **And the completeness half, which the list alone cannot do.** The
+        // nine terms above are a stale-*list* check: they catch a term being
+        // deleted and say nothing about a tenth child arriving. That is the
+        // direction the doc claims and the direction this block's own history
+        // ran — the shared confirm and the grid export's progress modal each
+        // left the DDL group, each needed a new term, and this array was
+        // extended after the fact both times, because a modal leaving a group is
+        // invisible from here: the group predicate it left still exists and
+        // still passes.
+        //
+        // So the count is derived from the layer instead of written down. One
+        // direct child of `modal_layer`'s `stack` is one thing that can raise a
+        // backdrop, and one term answers for it.
+        let children = super::modal_group_gate::layer_child_count(&src);
+        let terms = closure.matches("||").count() + 1;
+        assert_eq!(
+            terms, children,
+            "`modal_layer` has {children} direct children and \
+             `modal_backdrop_up` ORs {terms} terms. A child with no term paints \
+             a backdrop the layer does not know is up — it gets a zero box and \
+             renders nothing. If a new child genuinely raises none, it still \
+             needs a term saying so, or a reason written here."
+        );
     }
 }
 
@@ -769,6 +800,51 @@ mod modal_group_gate {
             }
         }
         panic!("unbalanced parentheses after the `stack(` at byte {at}");
+    }
+
+    /// How many direct children `modal_layer`'s own `stack` has — one per thing
+    /// that can raise a backdrop.
+    ///
+    /// Top-level commas inside the outer `stack((` … `))`, counted at tuple
+    /// depth, so a group's own nested `stack((a, b))` and every comma inside a
+    /// closure or a call are skipped. `pub(crate)` because the predicate gate
+    /// two modules over needs the same number and must not re-derive it.
+    pub(crate) fn layer_child_count(src: &str) -> usize {
+        // **Comments out first.** Every entry in this tuple carries a paragraph
+        // explaining its place in the paint order, and English has commas in it —
+        // counting them raised the answer from 10 to 48.
+        let body: String = layer_body(src)
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join(
+                "
+",
+            );
+        let body = body.as_str();
+        let at = body.find("stack((").expect("the layer's own stack is gone");
+        let bytes = body.as_bytes();
+        // One past the `stack(`, i.e. sitting on the tuple's `(`.
+        let mut depth = 0usize;
+        let mut items = 1usize;
+        for &b in bytes.iter().skip(at + "stack".len()) {
+            match b {
+                b'(' | b'[' | b'{' => depth += 1,
+                b')' | b']' | b'}' => {
+                    depth -= 1;
+                    // Depth 0 closes the `stack(` itself; the tuple closed just
+                    // before it.
+                    if depth == 0 {
+                        break;
+                    }
+                }
+                // Depth 2 is inside the tuple but outside anything nested in it:
+                // 1 is `stack(`, 2 is the tuple's own `(`.
+                b',' if depth == 2 => items += 1,
+                _ => {}
+            }
+        }
+        items
     }
 
     #[test]
