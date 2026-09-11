@@ -477,6 +477,47 @@ fn dialect_of(db: &Db) -> SqlDialect {
 /// heavy scans holding the connection open.
 const QUERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// Await a database read with [`QUERY_TIMEOUT`] over it, cancelling the token on
+/// expiry so the statement is killed **server-side** rather than merely
+/// abandoned.
+///
+/// **A property of the server, not of one tool.** The deadline lived inside
+/// `run_query`, so three of the four database reads this server performs had
+/// none: `describe_table`'s sample, `list_schema`'s `fetch_schema` and its
+/// per-database table-list loop, and `propose_table_change`'s `fetch_schema`.
+/// Each built a fresh `CancellationToken` that nothing ever cancelled and
+/// awaited it bare.
+///
+/// The serve loop is strictly sequential — it awaits `call_tool` inline before
+/// reading the next line — so one slow read wedges the **whole** server, not
+/// just its own call. Measured against PostgreSQL 16.15 through the shipped
+/// binary with a view over `pg_sleep(120)`: `describe_table` on it returned
+/// nothing for over 100 seconds and the `ping` queued behind it was never
+/// answered either, so the agent's tool call never returned and the turn hung
+/// with Stop — which ends the whole session — as the only way out. MySQL was
+/// *accidentally* bounded at ~15 s by the driver, which made it a silent
+/// per-engine divergence in a refusal path as well.
+///
+/// `None` is the timeout, and the caller words it: a timed-out `run_query` is an
+/// error the model must see, while a timed-out sample is a bonus the table's DDL
+/// and keys do not depend on.
+async fn with_deadline<F>(fut: F, token: CancellationToken) -> Option<F::Output>
+where
+    F: std::future::Future,
+{
+    tokio::pin!(fut);
+    tokio::select! {
+        r = &mut fut => Some(r),
+        _ = tokio::time::sleep(QUERY_TIMEOUT) => {
+            token.cancel();
+            // Kept alive across the cancel so the driver's KILL branch runs —
+            // abandoning the future leaves the statement running on the server.
+            let _ = fut.await;
+            None
+        }
+    }
+}
+
 async fn run_query(db: &Db, database: Option<&str>, sql: &str) -> (String, bool) {
     let Some(stmt) = normalize_stmt(sql) else {
         return ("Empty query.".to_string(), true);
@@ -487,21 +528,16 @@ async fn run_query(db: &Db, database: Option<&str>, sql: &str) -> (String, bool)
     if let Err(reason) = schemaic_core::sql::read_only_reason(stmt, dialect_of(db)) {
         return (format!("Rejected: {reason}."), true);
     }
-    // Run with a deadline; on timeout, cancel so the query is killed server-side
-    // (keep the future alive across the cancel so its KILL branch runs).
     let token = CancellationToken::new();
-    let fut = db.fetch_query(database, stmt, MCP_ROW_CAP, token.clone());
-    tokio::pin!(fut);
-    tokio::select! {
-        r = &mut fut => match r {
-            Ok(rs) => (format_table(&rs), false),
-            Err(e) => (format!("Query error: {e}"), true),
-        },
-        _ = tokio::time::sleep(QUERY_TIMEOUT) => {
-            token.cancel();
-            let _ = fut.await; // let fetch_query KILL the query server-side
-            ("Query timed out (30s) and was cancelled.".to_string(), true)
-        }
+    match with_deadline(
+        db.fetch_query(database, stmt, MCP_ROW_CAP, token.clone()),
+        token,
+    )
+    .await
+    {
+        Some(Ok(rs)) => (format_table(&rs), false),
+        Some(Err(e)) => (format!("Query error: {e}"), true),
+        None => ("Query timed out (30s) and was cancelled.".to_string(), true),
     }
 }
 
@@ -583,9 +619,14 @@ async fn list_schema(
     hidden: &HashSet<String>,
 ) -> (String, bool) {
     if let Some(name) = database {
-        return match db.fetch_schema(name, CancellationToken::new()).await {
-            Ok(schema) => (format_database_schema(name, &schema), false),
-            Err(e) => (format!("Error reading schema for {name}: {e}"), true),
+        let token = CancellationToken::new();
+        return match with_deadline(db.fetch_schema(name, token.clone()), token).await {
+            Some(Ok(schema)) => (format_database_schema(name, &schema), false),
+            Some(Err(e)) => (format!("Error reading schema for {name}: {e}"), true),
+            None => (
+                format!("Reading the schema for {name} timed out (30s) and was cancelled."),
+                true,
+            ),
         };
     }
     let names = match db.fetch_databases().await {
@@ -597,7 +638,16 @@ async fn list_schema(
         // The *list*, not the schema: this prints table names, and introspecting
         // every column of every table of every database to do that is the whole
         // server's catalogue for an answer that doesn't use it.
-        let schema = db.fetch_table_list(&name).await.map_err(|e| e.to_string());
+        //
+        // **Per database, and the deadline is per database too.** A server with
+        // fifty of them is the case this split exists for, and one of them being
+        // slow must not hold the other forty-nine — nor the serve loop, which is
+        // sequential and answers nothing while this runs.
+        let schema = match with_deadline(db.fetch_table_list(&name), CancellationToken::new()).await
+        {
+            Some(r) => r.map_err(|e| e.to_string()),
+            None => Err("timed out (30s)".to_string()),
+        };
         dbs.push((name, schema));
     }
     (format_database_list(&dbs), false)
@@ -779,9 +829,16 @@ async fn describe_table(
             true,
         );
     };
-    let schema = match db.fetch_schema(database, CancellationToken::new()).await {
-        Ok(s) => s,
-        Err(e) => return (format!("Error reading schema for {database}: {e}"), true),
+    let token = CancellationToken::new();
+    let schema = match with_deadline(db.fetch_schema(database, token.clone()), token).await {
+        Some(Ok(s)) => s,
+        Some(Err(e)) => return (format!("Error reading schema for {database}: {e}"), true),
+        None => {
+            return (
+                format!("Reading the schema for {database} timed out (30s) and was cancelled."),
+                true,
+            );
+        }
     };
     let Some(info) = find_described(&schema, table) else {
         return (
@@ -816,14 +873,22 @@ async fn describe_table(
     );
     out.push_str(&format!("\nSample rows (up to {SAMPLE_ROWS}):\n"));
     let token = CancellationToken::new();
-    match db
-        .fetch_query(Some(database), &sql, SAMPLE_ROWS, token)
-        .await
+    // **The read this whole finding is about.** A view over an aggregate is the
+    // ordinary expensive case and a steered model can pick one deliberately;
+    // with no deadline it held the sequential serve loop open for as long as the
+    // server took — measured over 100 s on PG 16.15, with the `ping` behind it
+    // never answered. A sample is a bonus, so a timeout degrades to the same
+    // "(unavailable: …)" line an unselectable view already produces: the table's
+    // DDL and keys are still returned.
+    match with_deadline(
+        db.fetch_query(Some(database), &sql, SAMPLE_ROWS, token.clone()),
+        token,
+    )
+    .await
     {
-        Ok(rs) => out.push_str(&format_table(&rs)),
-        // A sample is a bonus, not the point — a view we can't select from still
-        // returns its DDL and keys.
-        Err(e) => out.push_str(&format!("(unavailable: {e})")),
+        Some(Ok(rs)) => out.push_str(&format_table(&rs)),
+        Some(Err(e)) => out.push_str(&format!("(unavailable: {e})")),
+        None => out.push_str("(unavailable: timed out after 30s and was cancelled)"),
     }
     (out, false)
 }
@@ -873,9 +938,16 @@ async fn propose_change(
         Err(e) => return (e, true),
     };
 
-    let schema = match db.fetch_schema(database, CancellationToken::new()).await {
-        Ok(s) => s,
-        Err(e) => return (format!("Error reading schema for {database}: {e}"), true),
+    let token = CancellationToken::new();
+    let schema = match with_deadline(db.fetch_schema(database, token.clone()), token).await {
+        Some(Ok(s)) => s,
+        Some(Err(e)) => return (format!("Error reading schema for {database}: {e}"), true),
+        None => {
+            return (
+                format!("Reading the schema for {database} timed out (30s) and was cancelled."),
+                true,
+            );
+        }
     };
     let dialect = dialect_of(db);
     // **The same resolver the proposal card uses**, so the table this validates
@@ -935,6 +1007,112 @@ mod tests {
         format_table_heading, listed_databases, negotiate_protocol, normalize_stmt,
         proposal_from_args, refusal_for,
     };
+
+    /// **A read that finishes in time comes back whole**, and the clock is not
+    /// consulted for it — a deadline that answered `None` for a fast query would
+    /// be worse than none at all.
+    #[tokio::test(start_paused = true)]
+    async fn a_read_that_beats_the_deadline_is_returned() {
+        let token = tokio_util::sync::CancellationToken::new();
+        let got = super::with_deadline(
+            async {
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                "rows"
+            },
+            token.clone(),
+        )
+        .await;
+        assert_eq!(got, Some("rows"));
+        assert!(!token.is_cancelled(), "a read in time must not be killed");
+    }
+
+    /// **And a slow one is cancelled, not merely abandoned.** The token is what
+    /// makes the driver KILL the statement server-side; dropping the future
+    /// instead leaves it running on the server for as long as it takes, which is
+    /// the whole reason the deadline keeps the future alive across the cancel.
+    ///
+    /// The serve loop is sequential — it awaits `call_tool` inline before reading
+    /// the next line — so this is the difference between one slow read and a
+    /// wedged server. Measured on PG 16.15 through the shipped binary: a
+    /// `describe_table` on a view over `pg_sleep(120)` returned nothing for over
+    /// 100 seconds and the `ping` queued behind it was never answered either.
+    #[tokio::test(start_paused = true)]
+    async fn a_read_past_the_deadline_is_cancelled_server_side() {
+        let token = tokio_util::sync::CancellationToken::new();
+        let killed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let saw = killed.clone();
+        let inner = token.clone();
+        let got = super::with_deadline(
+            async move {
+                // What a driver does: run long, and on cancellation issue the
+                // KILL before returning.
+                tokio::select! {
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(600)) => "rows",
+                    _ = inner.cancelled() => {
+                        saw.store(true, std::sync::atomic::Ordering::SeqCst);
+                        "killed"
+                    }
+                }
+            },
+            token.clone(),
+        )
+        .await;
+        assert_eq!(got, None, "the caller must see the timeout");
+        assert!(token.is_cancelled(), "the token was never cancelled");
+        assert!(
+            killed.load(std::sync::atomic::Ordering::SeqCst),
+            "the future was dropped rather than awaited across the cancel, so \
+             the statement is still running on the server"
+        );
+    }
+
+    /// **The deadline is a property of the server, not of one tool** — and it
+    /// was a property of one tool. Three of the four database reads built a
+    /// fresh `CancellationToken` that nothing ever cancelled and awaited it
+    /// bare: `describe_table`'s sample, `list_schema`'s two, and
+    /// `propose_table_change`'s.
+    ///
+    /// A unit test of `with_deadline` cannot see that, because the defect was
+    /// entirely in who called it — so the subject is the source: every
+    /// `CancellationToken::new()` in this module belongs to a `with_deadline`.
+    #[test]
+    fn every_database_read_carries_the_deadline() {
+        let src = include_str!("mcp.rs");
+        let body = src.split("#[cfg(test)]").next().expect("production code");
+        // Comments stripped before the window is measured: a paragraph
+        // explaining *why* a read has a deadline would otherwise push the
+        // `with_deadline` that proves it out of view, which is exactly what it
+        // did on the first run of this gate.
+        let code: Vec<(u32, &str)> = body
+            .split('\n')
+            .enumerate()
+            .map(|(n, l)| (n as u32 + 1, l))
+            .filter(|(_, l)| !l.trim_start().starts_with("//"))
+            .collect();
+        let mut offenders: Vec<u32> = Vec::new();
+        for (i, (line_no, line)) in code.iter().enumerate() {
+            if !line.contains("CancellationToken::new()") {
+                continue;
+            }
+            // Either the token is handed straight to `with_deadline` here, or it
+            // is bound here and used by one a few lines of *code* below.
+            let window = code[i..(i + 5).min(code.len())]
+                .iter()
+                .map(|(_, l)| *l)
+                .collect::<Vec<_>>()
+                .join("\n");
+            if !window.contains("with_deadline(") {
+                offenders.push(*line_no);
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "database reads at {offenders:?} build a cancellation token nothing \
+             ever cancels and await it with no deadline — the serve loop is \
+             sequential, so one slow read answers nothing and wedges every \
+             request queued behind it"
+        );
+    }
 
     /// Tool names the server advertises, in order.
     fn offered(engine: schemaic_db::Engine, reads_data: bool) -> Vec<String> {
