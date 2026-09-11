@@ -128,8 +128,8 @@ pub fn table_upsert(
 /// **The decision, separated from the clock that used to be inside it.** The
 /// caller read `SystemTime::now().subsec_nanos()` in the middle of the
 /// function, so neither branch had a deterministic entry point and the whole
-/// thing had no test anywhere in the workspace, in the UI crate, with all three
-/// callers in a third one. A wrong answer here is silent and durable: the
+/// thing had no test anywhere in the workspace, in the UI crate, with every one
+/// of its callers in a third one. A wrong answer here is silent and durable: the
 /// identity colour is what the environment badge, the tab-strip rule and the
 /// editor frame use to tell production from local, so a regression that starts
 /// handing out duplicates makes two connections look alike with nothing to

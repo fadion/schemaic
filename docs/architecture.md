@@ -878,6 +878,22 @@ existing prose was left alone.
     all is `(None, true)`, which is what an out-of-range index silently meant in the view.
     `GridState::stage_many` is a loop over it and counts exactly the entries it answers `Stage` for,
     so the report and the dirty map cannot disagree about what landed.
+    **`cloned_row` is *Duplicate row*'s rule, and it sits here beside `staged_cell` because it is the
+    same question — what does this cell say — asked by a path that answered it for itself.**
+    `add_cloned_rows` read `rs.cell` unconditionally and never consulted `dirty`, so typing `Bob`
+    into a cell, watching it go green, and duplicating that row seeded the copy with `Alice`, the
+    value still on the server, with nothing saying the copy differed from the row that was copied;
+    commit, and the table gained a row the user had never previewed. Every neighbouring reader had
+    already been fixed the other way — `ai_fill_value`'s row context prefers the staged edit,
+    `blob_value` subscribes to `dirty`, and the aggregates bar's own note is that it reads each cell
+    *as the grid draws it* — and `GridCells` exists to be the one resolver they all go through. It
+    is core rather than a `GridState` method for the reason that split shipped the bug: no test can
+    construct a `GridState`. The clone's two exclusions moved with the rule and keep their reasons —
+    a column that is not `text_editable` (a binary cell *displays* `<n bytes>`, and copying that
+    would put the placeholder into the new row as text, so the `INSERT` takes the default instead)
+    and an auto-increment column the server assigns. Watched failing:
+    `a_clone_copies_the_staged_value_not_the_stored_one` reports `Some(Text("Alice"))` against the
+    unstaged lookup where `Some(Text("Bob"))` is what the user is looking at.
     **The staged-cells → `RowEdit` grouping is here for the same reason, and it is the step a paste
     stresses.** `build_edits(model, rs, dirty)` folds a `DirtyCells` map — `(data row, result
     column) → new value`, each a `model::CellEdit`, the shape `GridState::dirty` holds — into one
@@ -2332,7 +2348,17 @@ existing prose was left alone.
     (SQLite refuses to drop a column an index still names, so the two in one plan only work in
     that order) and filters every change through `supports_change`, so a gate that drifts open
     shows an empty preview instead of handing SQLite MySQL's spelling of the change
-    (`ddl::sqlite_drop_tests`). Its `AddColumn` arm writes
+    (`ddl::sqlite_drop_tests`). **Every loop, and one of them was not.** The table-rename loop
+    iterated `&self.changes` where every loop above it iterates `supported()`, and
+    `supports_change(Sqlite, RenameTable)` is *false* — so a set holding a bare rename reported it
+    in `unsupported()`, printed the `-- INCOMPLETE … would leave out: Rename the table` header,
+    refused Apply, and still put the `ALTER TABLE … RENAME TO` in the script the escape hatch hands
+    over. That is the shape `container_creates`' own doc records this codebase having paid for once
+    already, where a `DROP SCHEMA` went into a script under a header saying that very change had
+    been left out. It is not reachable through today's menus — `diff`'s SQLite collapse always pairs
+    a rename with a `RebuildTable` — which is why it is Low and why the test says so, and the
+    rebuild branch returns before this loop, so the rename it inserts *deliberately*, as the native
+    statement that re-points dependent objects, is untouched. Its `AddColumn` arm writes
     `ALTER TABLE <t> ADD COLUMN <definition>` from `ColumnInfo::definition_sql` — the same column
     emitter the rebuild's `CREATE TABLE` uses, so the two can't disagree about what the column is,
     only about how it gets there — and adds come **after** drops, so a column replacing a dropped
@@ -2584,7 +2610,13 @@ existing prose was left alone.
     emitter: `emit_sqlite`'s `supported()` filter is the only `supports_change` in any of
     the three emitters, and this builder runs before even that one, so an engine with no
     materialized view would otherwise be handed a
-    statement it has no word for. It carries no `risks`, so the preview's Apply stays
+    statement it has no word for. **Its `DropView` neighbour now asks the same question, and it
+    needed it more**: `supports_change` distinguishes `DropView { materialized: false }` (SQLite
+    can) from `{ materialized: true }` (it cannot), so the arm answering precisely that question was
+    the one emitting without asking — a `DROP MATERIALIZED VIEW` in the handed-over script under an
+    INCOMPLETE header naming that change as left out. Unreachable today, a SQLite view never being
+    materialized, and guarded anyway for the reason the rename loop next door was. It carries no
+    `risks`, so the preview's Apply stays
     `Primary` and no confirmation is asked; the lock is stated in `summary()` instead,
     where the SQL alone doesn't show it. MySQL's `CREATE OR REPLACE VIEW`
     replaces the *whole* view, so the emitter restates `ALGORITHM`/`DEFINER`/
@@ -3655,6 +3687,20 @@ existing prose was left alone.
     `Scope` is a **preserving** persisted enum: `Unknown(String)` keeps the text it didn't
     recognise and the hand-written `Serialize` writes it back verbatim, the rule
     `search_history::ObjectTag` states, because this file is rewritten whole on every change.
+    **`edits`/`SnippetEdits` is what the editor modal's Save writes**, and it is here rather than in
+    the dialog because the dialog compared the body *trimmed* and wrote it *untrimmed*. An edit
+    living entirely in the leading or trailing whitespace was therefore invisible to the guard:
+    deleting the two blank lines off the end of a body closed the modal as if it had saved, and
+    reopening it showed them still there. The two sibling guards four lines above have no such
+    asymmetry — name and abbrev are trimmed on both sides of the comparison *and* in the write —
+    which is exactly what made this look covered. `SnippetEdits`' three `Option`s are "did it
+    change, and with what", so the comparison and the payload are the same value by construction;
+    name and abbrev stay trimmed because they are looked up and matched on, the body is stored
+    verbatim because its whitespace is part of what gets inserted, and an emptied name is *no
+    change* rather than a rename to nothing. The decision could not be tested where it lived — the
+    closure needs a Floem scope — and
+    `a_body_edit_that_is_only_whitespace_is_still_a_change` reports `None` against the trimmed
+    comparison where `Some("SELECT 1")` is the edit the user made.
     `next_id` is max-plus-one **over the user's snippets only** — it filters out anything at or
     above `BUILTIN_ID_BASE`, so the pack's ids never raise the counter and a careless caller
     passing the merged `library()` list gets the same answer as one passing the user's. It
@@ -4146,6 +4192,26 @@ existing prose was left alone.
     and honoured by `schema::first_bindable` (which is what makes a tab open where the form says it
     will) — and deliberately not the same thing as "no database at all", which `schemaic_db`'s
     `Scope::Server` spells separately.
+    **`Connection::trimmed` is the padding rule, and it is one answer because the form had made it
+    seven times and omitted it five.** `to_connection` trimmed `port`, `file`, `database`, the SSH
+    port and all three TLS paths and stored `host`, `user`, `ssh.host`, `ssh.user` and
+    `ssh.key_path` verbatim — three lines apart, so the intent was established and those five were
+    the oversight, `ssh.key_path` being a file path sitting between two groups of trimmed file
+    paths. A hostname copied out of a hosting console or a wrapped email arrives with a trailing
+    space, a trailing space is invisible in a text field, and neither `sanitized()` nor
+    `schemaic_db` trims anything, so every operation on the connection failed on name resolution for
+    a host that looks correct on screen — which Manage Connections' Test renders as a bare red ✗
+    with the message discarded. The same shape for the user (an auth failure) and for the key path,
+    where the stray space is a file-not-found for a path the file picker may itself have produced.
+    **The three secrets are deliberately not trimmed**, and that is asserted as hard as the rest: a
+    leading or trailing space is a legal character in a password, an SSH password and a key
+    passphrase, and mangling a credential the user cannot see is the worse failure of the two;
+    `name` is left alone too, being a label rather than a coordinate. `conn_import` trims a host of
+    its own, so a connection *imported* from DBeaver got one and a connection *typed* did not —
+    routing that path through here as well is a separate change and has not been made. The defect is
+    a composition, so `trimmed`'s own unit test cannot see it: the call site reads eighteen signals
+    and needs a Floem scope, which is why the second half is the source gate
+    `the_connection_form_trims_through_core` (under `ui/lib.rs`).
   - `schema.rs` — the introspected model. `ColumnInfo` carries the **full** column definition
     (type *with* parameters, default as ready-to-emit SQL text, auto-increment/identity, generated
     expression, `ON UPDATE`, comment, collation) because MySQL's `MODIFY COLUMN` replaces a column
@@ -4900,6 +4966,14 @@ existing prose was left alone.
     - `transcript.rs` — the rendered shape of one AI turn (`ChatMessage`/`Seg::{Text,Tool}`/
       `TurnStats`), kept here rather than in `schemaic-ai` so the UI crate needn't depend on the
       CLI-integration crate. `ChatMessage::prose` is what copy *and* conversation replay use.
+      **`ToolCall::bare_name` is the one `mcp__schemaic__run_query` → `run_query` derivation**, and
+      `short_name` is it asked of a call that already exists. It lives here, below `schemaic-ai`,
+      because both answers have to name the same tool: this expression produces the chip label the
+      user reads *and* — through `harness::bare_tool_name`, which delegates to it rather than
+      re-spelling it — the key Codex approves, the rule Antigravity allows and the list OpenCode
+      advertises. The two had been written out separately under a doc arguing against exactly that,
+      so a change to the `__` separator would have made the approval grant and the label name
+      different tools, with the grant being the half nobody can see.
       A user turn may carry an `Attachment` — the result rows sent with that question. Its
       `summary` persists so a reopened conversation still shows that data went with the turn, but
       the cells are `#[serde(skip)]`: sending the rows was the consent, keeping a client's customers
@@ -5418,6 +5492,21 @@ existing prose was left alone.
       the bare name on MySQL/SQLite and inside PostgreSQL's `public`, `schema.table` outside it)
       rather than a separate `schema` field, because that spelling is already the identity an
       ER-diagram node id carries, so the diagram looks a colour up by node id with no reparsing.
+      **`pick_color(presets, used, seed)` is a different question in the same file** — which
+      identity colour a *new connection* gets — and it is here because it could not be tested where
+      it was. `ui::pick_connection_color` read `SystemTime::now().subsec_nanos()` in the middle of
+      its own body, so neither branch had a deterministic entry point and a decision function in the
+      UI crate, with every one of its callers in `schemaic-app`, had no test anywhere in the
+      workspace. That wrapper is now the two lines that read the clock and flatten
+      `CONN_COLOR_PRESETS`. Getting this wrong is silent and durable: the identity colour is what
+      the environment badge, the tab-strip rule and the editor frame use to tell production from
+      local, so a regression handing out duplicates makes two connections look alike with nothing to
+      notice it. One behaviour changed with the move — an unused preset is taken **in order** rather
+      than by the seed, since the old spelling indexed the free pool by the clock too and two
+      connections made in the same second could take the same colour with six others standing
+      free; the seed still picks when every preset is taken. Matching is
+      ASCII-case-insensitive, so a hand-typed `#e05252` counts against `#E05252`, and an empty
+      preset list answers with the empty string rather than dividing by zero.
     - `resultsel.rs` — the same rules one strip lower: which **result** panel is shown, and which
       ones a run is allowed to replace. `after_run` is the feature in one function — the pinned
       panels, in their order, then the run's fresh ones — and `active_after_run` answers the other
@@ -5590,6 +5679,32 @@ existing prose was left alone.
         `IndexStats::cardinality`: it is an InnoDB sample of ~20 index pages, and printed through the
         *exact* branch it read as a measurement — `3,996,120`, on the clipboard as well as in the
         panel, four lines under a row count carefully marked `~4.21m (estimated)`.
+      - **`TableStats::has_any` counts figures, and a creation timestamp is not one.** Measured on
+        MySQL 8.4.11 against MariaDB 10.11: `information_schema.TABLES` returns every figure NULL
+        for a view on both, *except* `CREATE_TIME`, which MySQL fills in. Counting `created` made
+        `has_any` true there, so on MySQL the properties panel took its full `Loaded` arm instead of
+        the arm written for this exact case — "A view has no storage of its own, so the server
+        reports no statistics for it" — and printed two em-dashes under *these figures may be up to
+        24h old*: a staleness claim about numbers the server never reports and never will, on one
+        code path where two engines gave two different answers with nothing on screen to say which
+        had happened. `to_markdown` diverged identically, so **Copy** put it in a ticket. The fix is
+        in the predicate rather than in either surface, which is what keeps the two moving together;
+        the timestamps are still shown by `options_section`, which has its own emptiness guard.
+        `any_single_figure_counts_as_something` — the test that should have caught it — walks
+        `rows`/`data_bytes`/`engine`/`indexes` and never `created`, which is why it shipped;
+        `a_view_whose_only_figure_is_a_creation_timestamp_reports_nothing` is the one that fails
+        against the old predicate, with its Markdown half beside it.
+      - **Three `pub` functions were deleted here rather than left as a map of wiring that does not
+        exist**: `SchemaStats::total_bytes`, `SchemaStats::tables` and `TableStats::unused_indexes`.
+        Each was documented and tested and had no caller outside this module, and two of them read
+        as live wiring — `total_bytes`' doc named "the 'this database is N on disk' figure", which
+        the app does not show anywhere, so a reader of the module or of this document had reason to
+        believe the schema tree carried one; and `unused_indexes` read as the panel's source for the
+        unused flag while `properties.rs` and `to_markdown` each call `IndexStats::is_unused` per
+        row, so a change to the rule there would have landed nowhere. That is the drift
+        `index_facts`, `unused_note` and `shows_free` all exist to prevent. `TableStats::total_bytes`
+        — the *table's* data plus indexes, which `storage_section` really does print — is a
+        different function and is still here.
 - `schemaic-db` — MySQL/MariaDB (`mysql_async`) + SSH tunnels (`ssh.rs`), PostgreSQL in `pg.rs`,
   SQLite in `sqlite.rs`, and
   the pinned manual-transaction connection in `session.rs`. **`Db::fetch_sessions`/
@@ -5714,7 +5829,19 @@ existing prose was left alone.
   `GENERATION_EXPRESSION`) + `STATISTICS` (`SUB_PART`/`COLLATION` for prefix + `DESC`, and
   `schema::index_disabled_sql`'s interpolated `CASE` for an index the DBA has switched off — the
   same hold-the-row-shape trick the view `ALGORITHM` below plays, and what makes `IdxRow::lossy`
-  read `expression || disabled` rather than the functional key part alone); PostgreSQL
+  read `expression || disabled` rather than the functional key part alone). **A functional key part
+  is the one row where `STATISTICS.COLUMN_NAME` comes back NULL**, which is why that bind is
+  `Option<String>` with `EXPRESSION` selected beside it — the non-`Option` `String` it used to be
+  panicked `mysql_async`'s `from_row` *inside the spawned fetch task*, before any `Result` existed
+  to map, so one such index anywhere left the whole database unbrowsable: the schema tree spun on
+  "loading" for ever, with no error row and nothing to retry against. It was fixed collaterally by
+  a commit that cited only the two findings it set out to close, so it stood fixed and untested;
+  `mysql::a_functional_index_does_not_stop_the_schema_being_read`
+  asserts on `fetch_schema` itself rather than on the fold, because a unit test of the fold is green
+  against the unfixed tree. MariaDB 10.11 rejects `((a + b))` outright and PostgreSQL keeps
+  `pg_get_indexdef`'s whole text so is correctly not lossy — two of the three legs could not
+  reproduce it, which is the same reason two servers hid it originally
+  (`Target::expression_index_sql`). PostgreSQL
   from **`pg_catalog`, not `information_schema`** — `format_type(atttypid, atttypmod)` is the only
   source of the *declared* type (`udt_name` gives `varchar`, losing the `(45)`), plus
   `pg_get_expr` for defaults and `attidentity`/`attgenerated`. **That leaves two PostgreSQL
@@ -5784,6 +5911,13 @@ existing prose was left alone.
   plus `reloptions` for the storage params a replace would reset (`pg_view_options`) — all
   folded on *after* the shared `assemble_schema` (which both engines share and neither's
   extras belong in).
+  **`table_list_sql` returns four columns, and the fourth is the table comment.** It is the one
+  table option PostgreSQL has and nothing was reading it: the designer emits `COMMENT ON TABLE`
+  correctly and this query never selected `obj_description`, so a comment set through the app was
+  **write-only** — it vanished from the app the moment it landed, and re-applying could not restore
+  it either, a draft whose comment matches the empty read raising no change at all. Found by
+  writing the live tier's `a_table_comment_lands_and_reads_back`, which failed on exactly that
+  before the four-line read was added.
   **`index_list_sql` reports one row per key position, and its `lossy` term is what the model
   admits it did not read.** It was a non-default opclass and a non-default `indoption`; it is now
   also `ix.indnatts > ix.indnkeyatts` (an `INCLUDE` column, which lives past the key columns and is
@@ -6112,6 +6246,19 @@ existing prose was left alone.
   printed `0 B` in the panel and exported it — the exact reading the sibling query's comment says it
   avoids. Its *scan* count is deliberately unguarded: `pg_stat_all_indexes` has no row for such an
   index, and NULL there is the truth ("nobody counted"), which is what stops `is_unused` flagging it.
+  **How much to trust that estimate is `pg_freshness`, lifted out of the fold's closure** — the
+  three-arm `match (&analyzed, rows)` deciding whether the properties panel captions a row estimate
+  with "never analyzed", with a timestamp, or with nothing at all. It was the module's one
+  exception: `pg.rs` extracts this kind of decision everywhere else and says why each time
+  (`pg_no_default`: "so the rule the flag's contract states has a test standing on it"), while this
+  one sat inside a `.map(|r| …)` in an `async fn` that owns a `Client`, where nothing could reach
+  it. Its arms encode two catalogue quirks that are easy to get backwards — `reltuples` is `-1` for
+  unanalyzed on PG 14+ and `0` on 13 and earlier, and `GREATEST(last_analyze, last_autoanalyze)` is
+  NULL after a stats reset on a table that *has* been analyzed — so "never analyzed" explains a
+  *missing* estimate and must never be printed beside a number that contradicts it. All four input
+  combinations are table-tested, including the freshly `REFRESH`ed materialized view measured on PG
+  16.15 (`reltuples = 2`, both timestamps NULL). No behaviour changed: this is the seam, not a
+  defect behind it.
   Both builders are string-tested beside `user_schema_filter_excludes_only_postgres_internals` —
   that convention exists precisely to catch a guard present in one query and absent from its sibling,
   which is what shipped. On the MySQL side the three queries are named constants and the
@@ -6851,6 +6998,18 @@ existing prose was left alone.
   failure the floor was added to catch, one size down. The expected count is derived from the leg's
   own slices (`Target::type_cases`), so it needs no maintenance and there is nothing to be gained by
   weakening it back.
+  **The write-back half is about `export::sql_literal`, and until recently not one case held a `'`
+  or a `\`** — the two characters that quoter's *only* per-dialect branch is about. Whether the
+  escaping this crate emits is what the server accepts is a fact about the server
+  (`NO_BACKSLASH_ESCAPES` inverts the MySQL arm, `standard_conforming_strings` the PostgreSQL one),
+  so no pure test can reach it, and the pure tests pin the string `sql_literal` produces while
+  nothing pinned that a server round-trips it. Four cases, two per family, both halves watched
+  failing: deleting the backslash doubling from the MySQL arm gives
+  `text_backslash … showed "a\b", wrote 'a\b', read back Some("a\u{8}")` on MariaDB and MySQL with
+  PostgreSQL unaffected, and deleting the `''` doubling from the PostgreSQL/SQLite arm gives
+  `text_quote … writing 'it's' back failed: syntax error at or near "s"`. The per-leg
+  `expected_cases`/`expected_writable_cases` move with the lists, which is the hand-maintained
+  guard `every_leg_declares_the_number_of_cases_it_has` exists to keep honest.
   **`editable.rs` is the other half nothing else reaches.** Every `edit::analyze_edit` unit test
   hands the ladder a `ColumnOrigin` written out by hand, so what they prove is that it works on
   metadata a test *imagined*; whether a real driver reports `org_table` for an aliased column, a
@@ -6871,8 +7030,26 @@ existing prose was left alone.
   allows one — asked by *trying* it and falling back, not by a hand-kept exception list, since
   PostgreSQL has no btree operator class for `json` and MySQL refuses a `TEXT` key without a
   length — resolves the key through `analyze_edit`, writes through `GridWrite` and reads the row
-  back. It asserts every writable case was reached **and** that at least one really went through a
-  resolved key, so a leg where nothing could be one does not pass by exercising nothing.
+  back. It asserts every writable case was reached **and** how many really went through a resolved
+  key — `Target::expected_keyed_cases`, declared per leg (19 / 19 / 24) the way `expected_cases` is.
+  **That was `assert!(keyed > 0)` and it guarded nothing**, which is `suite.rs`'s `TYPE_CASE_FLOOR`
+  failure one file over: the test rebuilds the fixture on an `INTEGER` key whenever the model
+  refuses the case's own type — correctly, that being C2/C4 — so a change to `edit.rs`'s refusal
+  that widened it from float/binary to every non-integer type would send every case down that path
+  and leave the test green, `tinyint_min` alone keeping the count above zero. Widening the
+  FLOAT/DOUBLE refusal to `!ty.contains("INT")` drops all three legs to **4** and the failure
+  message lists the nineteen (MySQL family) / twenty-three (PostgreSQL) types that fell back; the
+  old assertion passes that mutation unmoved.
+  **A composite key reached a real server for the first time here too.** Every fixture in
+  `editable` and `writeback` had a one-column key — the type matrix records more than one as a
+  *failure* — so `build_update`'s `WHERE` construction had only ever met one predicate and one
+  parameter, and with one of each, four implementations are indistinguishable: joining with `", "`
+  instead of `" AND "`, pushing the key parameters before the `SET` ones, and emitting only
+  `key[0]`. The last corrupts quietly, a partial key matching a superset that the 1-row net waves
+  through whenever that superset happens to be one row. The fixture is therefore two rows **sharing
+  `a`**, which is the shape the net can still refuse, and both builders were watched failing:
+  `.take(1)` on `build_update`'s key loop fails the two MySQL legs and the same on `pg::where_key`
+  fails PostgreSQL, all three with `affected 2 rows (expected exactly 1) — rolled back all changes`.
   **`writeback.rs` asserts the number the 1-row net reads, where `model.rs` asserts the verdict
   given one.** Two of its claims exist only at this seam. `CLIENT_FOUND_ROWS`: MySQL counts
   *changed* rows by default, so an edit setting a cell to the value it already holds affects 0, the
@@ -6881,7 +7058,28 @@ existing prose was left alone.
   tell the flag is still set, and clearing it fails exactly the two MySQL legs. And `Rollback::note`:
   the same doomed batch runs twice on the MySQL legs, once on `InnoDB` and once on `MyISAM`, and the
   error has to promise a complete rollback in the first case and admit the surviving rows in the
-  second. **`ddl.rs`** carries the designer's round trip — introspect → draft → diff → emit → run →
+  second. **And both of those claims were being asserted for the outer transaction only.** Every
+  live write went through `Db::commit_writes` on a fresh connection, which runs `write_on` with
+  `TxScope::Own`, while a Manual tab's Commit goes through `Session::commit_writes` — the same
+  `write_on` with `TxScope::Savepoint`, a different begin/rollback/commit triple where the undo is
+  `ROLLBACK TO SAVEPOINT` and MySQL's warning-1196 reading is applied to a savepoint rather than to
+  a transaction. `TxScope` and `Savepoint` appeared nowhere in the tier. All three halves of
+  `StmtOutcome::FailedIsolated`'s promise are now asserted against a real server — the batch is
+  undone, the statement the user already ran inside the transaction is *not*, and the transaction is
+  still committable, the last proved from outside by committing and reading through a fresh
+  connection. Handing `write_on` `TxScope::Own` in `Session::commit_writes` reports `Failed` where
+  `FailedIsolated` is required on all three legs, which on PostgreSQL is the difference between a
+  recoverable batch and telling the user every uncommitted statement is gone.
+  **One premise here turned out to be wrong and is recorded rather than papered over**: deleting the
+  explicit `rollback` from `one_row_verdict`'s arm does **not** fail the >1-row test, on any leg.
+  `write_on` never reaches its `COMMIT` on that path, so the connection's own implicit rollback
+  undoes the batch regardless. The explicit `ROLLBACK` earns its place on the non-transactional
+  table, where `Rollback::note` is the whole point and
+  `a_failed_batch_says_what_the_rollback_actually_undid` is what asserts it. What that test's second
+  statement *does* catch is a per-statement commit, or an undo reaching only the offending
+  statement — which is why it now holds the two-statement batch its 0-row sibling already had and
+  asserts the earlier successful write was reverted too, rather than promising a "rest" it did not
+  have. **`ddl.rs`** carries the designer's round trip — introspect → draft → diff → emit → run →
   introspect — whose real subject is the *asymmetric* failure: an emitter writing something the
   introspector reads back differently leaves a table that is correct on the server and permanently
   dirty in the designer, and neither half's own tests can see it. Inverting `ddl::defaults_equal`
@@ -6924,7 +7122,36 @@ existing prose was left alone.
   the column's **data** arrived with it, since a reorder implemented as a drop-and-add would pass a
   test that checked only the order. PostgreSQL returns early with a comment, having no column order
   to change, rather than quietly asserting nothing.
-  **Six capability differences are recorded as leg data rather than discovered per test**, since a
+  **Every change class the designer can raise now reaches a server, and for a long time only one
+  did.** All seven tests mutated `draft.columns` and nothing else across all three legs, so
+  `AddIndex`, `DropForeignKey`, `AddCheck`, `RenameTable` and `TableOptions` — every change that is
+  not about one column's own definition — had been applied nowhere, while the module doc named only
+  views and triggers as absent and so made the rest read as covered. Six tests close that, each
+  asserting the half a catalogue read cannot see: the unique index refuses its duplicate, the check
+  refuses both the row its numeric half forbids and the row its quoted half does (the escaping MySQL
+  8 and MariaDB disagree about), the dropped foreign key stops being enforced, and the renamed table
+  keeps its rows and its index. `a_column_inserted_in_the_middle_lands_there` is the one with a
+  defect behind it — every other test appends, the one insertion position that raises no reposition,
+  and the reorder test moves an existing column with no `AddColumn` beside it, so the plan carrying
+  both (where `MODIFY … AFTER <the new column>` was emitted before the `ADD COLUMN` that creates it,
+  ERROR 1054) was unreachable here. That defect was already fixed, so the test is green on arrival
+  and closes the gap in the tier rather than implying a red it did not have. **Writing them found
+  that a PostgreSQL table comment set through the designer was write-only** — see `pg.rs`'s
+  `table_list_sql` for the four-line read that fixed it.
+  **And three of the five column-change tests ran against *empty* tables**, so the tier's "did the
+  data survive?" property held for two of the five change kinds it exercised and for none at all on
+  PostgreSQL, whose reorder returns early and took the only other data assertion with it. A table
+  with no rows cannot tell a preserved column from a recreated one: the plan applies cleanly, the
+  column is there afterwards with the right type and nullability, and every other assertion in the
+  file is satisfied. `assert_row_survived` is the shared shape so a new test inherits the check
+  rather than having to remember it, and the add, drop and retype tests seed a row and read it back.
+  `clearing_a_generated_expression_keeps_the_column_values` is the case the helper exists for and
+  the one with a measured red behind it: with `pg_column_clauses`' `from.generated.is_some() &&
+  to.generated.is_none()` arm disabled, the PostgreSQL leg fails with
+  `left: ["3", "NULL"], right: ["3", "6"]` on 16.15, while MariaDB and MySQL stay green through that
+  mutation, both reaching the column through `MODIFY` with the clause left off.
+  **Capability differences are recorded as leg data rather than discovered per test** — the count
+  grows, so it is not stated here — since a
   test asserting one answer would be wrong on two servers out of three: `Target::non_transactional`
   (MySQL's `MyISAM`, which accepts `BEGIN` and ignores it), `Target::transactional_ddl`
   (PostgreSQL wraps a DDL plan, so a refused one applies **nothing** and `DdlError::applied` is 0,
@@ -6940,7 +7167,15 @@ existing prose was left alone.
   `Target::error_names_the_value`, whether a refused write carries a **separate detail field**
   naming the offending value, which is PostgreSQL's `DETAIL` and nobody else's: MySQL and MariaDB
   put everything in one message and name the constraint rather than the value, so the value is not
-  theirs to lose.
+  theirs to lose. The rest are the same shape and are listed here so a new one is added beside them
+  rather than as an `if engine ==` in a test body: `Target::expression_index_sql` (a functional key
+  part, `None` on MariaDB 10.11, which rejects `((a + b))` outright and has no clause to give),
+  `Target::view_prefix_options`/`view_suffix_options` (the clauses a seeded view carries — the check
+  option on all three, `SQL SECURITY INVOKER` on the MySQL family — two fields because the two
+  families put them on opposite sides of the body), `Target::trigger_condition` and
+  `trigger_update_columns` (a `WHEN` guard and an `UPDATE OF` column list, PostgreSQL's alone), and
+  `Target::accounts_have_hosts`, which replaced an inline `engine == MySql` so the host assertions
+  and the host fixture cannot disagree about which legs have one.
   **`runtime.rs` covers the four paths that need a connection to *behave*** — `.sql` scripts, bulk
   imports, the pinned manual-transaction `Session`, and cancelling a statement already running — and
   every one of them is an exception to something, which is precisely what a pure test cannot check.
@@ -6989,12 +7224,47 @@ existing prose was left alone.
   **`views.rs` and `triggers.rs`** carry the same round trip for the two objects the engines model
   differently. A view's body is never the text that went in — MySQL fully qualifies and back-quotes
   it, PostgreSQL re-prints it from the parse tree — so the identity diff is doing real work there;
-  perturbing `ViewDraft::from_table`'s body by one space fails it on all three legs. A trigger is
+  perturbing `ViewDraft::from_table`'s body by one space fails it on all three legs.
+  **The settle assertions had to stop comparing a value with itself.** `diff_view` computes its old
+  body by calling `ViewDraft::from_table(current)`, so `diff_view(&after, &from_table(&read_again()))`
+  is one expression against itself and answers "no change" for any body the server could return, an
+  empty one included. The identity test says exactly that in its own doc and is built around a
+  deliberately stale reading to escape it; `an_edited_view_body_lands_and_settles` and
+  `a_view_that_drops_a_column_takes_the_destructive_arm_where_it_must` took their second reading
+  *after* the apply and walked straight back into it. `assert_writes_back_unchanged` is the shared
+  escape — stale copy, emit, run, compare two readings the server produced at different times.
+  **And no fixture carried a view option**, so `diff_view`'s `draft.options != old_options` half and
+  `create_view_sql`'s restatement of them had no live assertion anywhere; `seed_view` now puts each
+  leg's own options on it (`Target::view_prefix_options`/`view_suffix_options`). The two halves fail
+  together for one reason: disabling `create_view_sql`'s check-option clause leaves all three legs
+  reporting `check_option: None` after the write-back, on both tests — a view created to refuse
+  writes silently stops refusing them, the rows it returns are unchanged, and the old
+  self-comparison sees nothing, neither reading having the option. The writable-view key builder in
+  this file goes through `export::sql_literal` with `IS NULL` for a NULL now, rather than a
+  hand-rolled `''` escape on the family where `\` is also an escape; that branch is unreachable on
+  all three legs today — no driver here attributes a view column to a base table — so **no test can
+  be made to fail on it**, which is said rather than implied. A trigger is
   the object they disagree about most (MySQL carries the body, PostgreSQL calls a function with its
   own lifetime), so every trigger test ends by making it fire or proving it no longer does: a
   trigger that sits in the catalogue doing nothing is the failure that reads as success everywhere
   else. Dropping `TriggerDraft::from_info`'s `original` — the same identity-field class as
-  `ColumnDraft::original` — fails the trigger round trips on every leg. **A view result is
+  `ColumnDraft::original` — fails the trigger round trips on every leg.
+  **The fixture was at the narrow end of the width the identity test was checking.** `new_trigger`
+  set `timing = Before`, one event, row level and an action and nothing else, so `TriggerInfo`'s
+  `condition` and `update_columns` — the two fields the model widened itself for — were at their
+  defaults on every leg, and `AFTER` never occurred at all. The whole-struct
+  `assert_eq!(after.triggers, table.triggers)` is strong enough to catch an emitter that dropped
+  either on the drop-and-create every trigger edit performs; it was simply never handed one to
+  catch. `wide_trigger` is a second trigger carrying whatever its leg's grammar has — `UPDATE OF
+  name`, `WHEN (NEW.name IS NOT NULL)`, and `AFTER` where the action allows it — with the timing
+  riding on the same `(body, function)` distinction `new_trigger` already switches on rather than a
+  new field, because MySQL's body assigns to `NEW` (which `AFTER` may not do) and PostgreSQL's
+  function returns `NEW` (which an `AFTER ROW` trigger ignores). Both halves were watched failing on
+  the PostgreSQL leg on their own mutations — dropping `when_group` from the non-SQLite emitter, and
+  emitting `UPDATE` in place of `UPDATE OF {cols}` — with MariaDB and MySQL green through both,
+  having neither clause. What is still uncovered is named in `wide_trigger`'s own doc rather than
+  left to be re-derived: `TriggerLevel::Statement` needs a per-leg action that references no row,
+  and `InsteadOf` needs a view to be on. **A view result is
   read-only on all three**, and that is asserted rather than assumed: the test that meant to check
   it returned early instead and was a no-op on every leg until a probe said so. Its other branch
   still stands, because a driver may reasonably start attributing a view's columns to the table
@@ -7057,7 +7327,9 @@ existing prose was left alone.
   catalogues, and a `mysql.user` column set that differs between MySQL 8 and MariaDB 10 in both
   directions, where a query naming a column the server hasn't got fails outright and only a live
   server says so. Four read tests — the connected account is in the list and carries a host part on
-  exactly the engines where an account *is* the pair; its privileges come back as `GRANT` statements
+  exactly the engines where an account *is* the pair (`Target::accounts_have_hosts`, which replaced
+  an inline `engine == MySql` so the assertions and the fixtures agree about which legs have one);
+  its privileges come back as `GRANT` statements
   on both catalogues; the note is present exactly where `grants_are_database_scoped` says and names
   the database it covers; and `no_password_material_survives_the_fetch`, which is the assertion that
   the redaction is on the fetch rather than on one view that happens to call it.
@@ -7072,6 +7344,24 @@ existing prose was left alone.
   `a_grant_at_every_level_reads_back_naming_that_object` and
   `a_dropped_account_is_gone_from_the_list`, twenty-one in all across MariaDB 10.11, MySQL 8.4 and
   PostgreSQL 16.
+  **What none of them checked was the *host* an account is listed at.** `from_mysql_rows` folds
+  `mysql.user.Host` into `Principal::host` and `users.rs`'s own doc calls that the one place the two
+  catalogues genuinely disagree about what an account *is* — yet one site asked `host.is_some()`,
+  two matched on `p.name` alone, and `drop_named` named the *drafted* principal rather than the
+  listed one. A fold returning the wrong field passed all of it: `Some(r.user.clone())`, or
+  `Some(String::new())`, which is what MariaDB stores for a role and which this file records as
+  having produced ERROR 1141, ERROR 1133 and a `DROP ROLE` syntax error. The connected-account test
+  now asserts the host is a host and that `display` is built from both halves; the created-account
+  test finds the **listed** principal, compares its host to the drafted one and drops through it,
+  the way the role test already did. And a leg-gated test creates an account at `10.0.0.%`, which no
+  fixture had ever done — `AccountDraft::host` was empty everywhere, so `account_sql`'s host
+  literal, quoted through `ddl_string` precisely because a host of `it's` would close the quote and
+  change the statement, had never round-tripped through a server and no `DROP USER` had ever named a
+  real host. With the fold returning `Some(r.user.clone())` both create tests fail on MariaDB and
+  MySQL with the account listed at a host equal to its own name, while
+  `the_account_we_connected_as_is_in_the_list` passes that mutation unmoved (`schemaic@schemaic`
+  being a non-empty host that displays consistently) — which is why the assertion that matters is on
+  an account whose host the test chose.
   **The second of those is the one branch that writes a credential to a server, and until it existed
   nothing in the workspace took it.** `ScratchAccount::create` drafted an empty password and
   `account_draft_sql` emits the `IDENTIFIED BY`/`PASSWORD` clause only for a non-empty one, so every
@@ -7206,7 +7496,16 @@ existing prose was left alone.
   **Getting the tools to each harness is four different mechanisms, and only Claude's is per
   invocation.** Claude gets a `--mcp-config` file in a directory of Schemaic's own (`ai::mcp_dir()`,
   and it was the temp dir until the credentials in it were moved somewhere only this user can
-  list); Codex gets `-c` overrides on its own command
+  list). **That the flag is handed a *path* is an invariant, not a call-site habit**, and this crate
+  used to specify the other thing: `build_session_args`' parameter was `mcp_config_json`, its doc
+  said "passed to `--mcp-config`", and the test pinning the flag asserted inline JSON as the
+  expected argv value. The CLI accepts either form, and the config Schemaic hands it carries the
+  already-tunnelled database endpoint with its password — so the shape this crate documented was the
+  credential-carrying one, on argv, readable by every process listing on the machine. `app/ai.rs`
+  writes an owner-only private file and passes the file name for exactly that reason, and said so
+  only at its own call site; the parameter is `mcp_config_path`, and the doc and the fixtures say
+  path too. No behaviour changed — the one caller always passed a `PathBuf`.
+  Codex gets `-c` overrides on its own command
   line; Antigravity has no per-invocation configuration at all and needs **two pieces of its own
   global state** written instead — an `agy mcp add` registration *and* a per-tool
   `permissions.allow` rule in its `settings.json` — which is what `app/antigravity.rs` owns and
@@ -7502,6 +7801,19 @@ existing prose was left alone.
     it is now three capabilities, described below, and there is no `== Harness::` left in that
     `match` — the comment paragraph that used to defend the identity check as "a harness question"
     went with it, since it stood next to the paragraph explaining why it was not.
+    **And every capability is an exhaustive `match`, not a `matches!`**, for the reason `env_seal`'s
+    own doc gives ten lines from three of them: a fifth harness is then a compile error here rather
+    than a silent default there. Five were still `matches!` beside five that were not, and what the
+    default would have cost is written on each — `supports_model_choice` answering `false` hides the
+    model field for the new CLI entirely, which is the failure `suggested_models`' doc records one
+    step over; `session_system_in_first_turn` gives a persistent fifth harness no schema outline on
+    its first turn, so it answers about a catalogue it was never shown; `seals_by_flag` routes
+    `Constraint::Restricted.notice` to the arm written "to promise nothing rather than to be
+    unreachable, because 'unreachable' is what the arm above assumed too"; and
+    `is_persistent`/`streams_deltas` simply answer wrongly and quietly. No behaviour changed and
+    nothing could be watched failing — every arm answers what the `matches!` answered, and what it
+    buys is the compile error. `supports_model_choice` reads oddly as a result — one arm, every
+    variant, `true` — so its doc says why it is still a `match`.
     **`suggested_models` is a menu, never a permitted set**, and the distinction is the whole reason
     it returns a slice rather than the field being a dropdown: the model id is a free string, so a
     list here is the aliases each CLI documents as stable and anything dated, private or newer than
@@ -7731,6 +8043,10 @@ existing prose was left alone.
     *bare* name the server advertises while the app's list holds the qualified one, so
     `bare_tool_name` derives one from the other rather than a second hand-written list, which would
     be one rename away from approving a tool that no longer exists while refusing one that does.
+    It **delegates to `transcript::ToolCall::bare_name`** rather than re-spelling the expression
+    under that very paragraph, which is what it used to do: the grant and the chip label the user
+    reads have to name the same tool, and a change to the `__` separator would have split them with
+    the grant being the half nobody can see.
     (`--ignore-user-config` does not discard these overrides — confirmed against the binary.)
     **When the endpoint file cannot be written the override becomes `mcp_servers={}`, not nothing.**
     That is `codex_isolation_only`, taken by `ai.rs`'s `(Harness::Codex, None)` arm: the session
@@ -8165,8 +8481,18 @@ existing prose was left alone.
     and only the first sighting announces a chip (`a_restated_tool_call_does_not_add_a_second_chip`,
     `a_restated_agy_tool_step_does_not_add_a_second_chip`, and
     `two_distinct_tool_calls_still_get_a_chip_each` for the direction that would break by
-    over-suppressing). **An Antigravity step with no `step_index` is announced anyway**: every
-    measured step carried one, and silently dropping a call is the worse of the two failures.
+    over-suppressing). **An item with no id of its own is announced anyway, on both dialects**: every
+    measured Antigravity step carried a `step_index`, and silently dropping a call is the worse of
+    the two failures. Codex's arm answered the opposite way and did not say so — `codex_item` reads
+    the id as `unwrap_or("")`, so every id-less item in a turn shared the single key `""` (and
+    `"\0done"` for the completion half), and measured, two `mcp_tool_call` items with no `id`
+    produced **one** chip: the second query ran and left no trace at all, not a chip, not its SQL,
+    not its result. The same collision reaches `command_execution` and `file_change` through
+    `side_effect`. `first_sight` now answers true for an empty id and for the `"\0done"` an empty id
+    produces, neither of which a real id can reach. Defensive rather than observed — no captured
+    Codex turn omits `id` — and what it fixes is the direction the default fails in;
+    `codex_two_items_with_no_id_are_two_calls` returns `["A"]` against the old guard where
+    `["A", "B"]` is what ran.
     OpenCode is the third and does not restate: a measured call arrived **once, already
     `completed`**, with its `input` and its `output` in the same event, so `opencode_tool` emits the
     chip and fills it from one line. It is keyed on `callID` all the same — the part id changes
@@ -8206,6 +8532,17 @@ existing prose was left alone.
     arm exists to surface. `codex_mcp_tool_result_reads_content_blocks_and_flags_failure` is the other
     pin; both fed a lone `item.completed` and asserted `[ToolResult]`, and both now expect
     `[ToolUse, ToolResult]`.
+    **Antigravity's dedupe had the same asymmetry and now has the same pair.** It matched on
+    `(Some(ToolUse{..}), Some(i))`, so it suppressed a repeated *announcement* and let a repeated
+    *result* through — and `TurnState::apply` attaches a loose result to the most recent tool call
+    still awaiting one. Step 0 opens, step 1 opens, step 0 completes twice, and step 1 — which has
+    not finished and may never — is shown as complete carrying step 0's output. Both Codex arms in
+    the same file already guard their result half and key it the same way (`{id}\0done`), and
+    `seen_tools`' own doc states the rule for *both* per-turn dialects; the guard had followed the
+    shape the captured turns happen to restate rather than the rule. Low, and the confidence is
+    medium in one direction only: the captured Antigravity fixtures record only `ACTIVE` being
+    restated, never `DONE`, so this is the arm matching its sibling rather than a reproduced break.
+    With the new arm removed, the first chip reads `OUT0-again`.
     **The sibling arms had neither guard, which is the same bug twice over.** `command_execution` and
     `file_change` were decoded inline while `mcp_tool_call` alone was given `first_sight` on each
     half, so a *streamed* step emitted an unconditional `ToolUse` on every `!completed` line — four
@@ -8401,6 +8738,25 @@ existing prose was left alone.
     fixture was added**: a 300-word near-duplicate of a shape that one already pins would hold
     nothing it does not.
 - `schemaic-term` — terminal panel + shell (`shell.rs`).
+  **`shell::shell_to_persist(loaded, detected, selected)` is which shell profile a settings save
+  writes, and it exists because a saved choice has to survive a launch that could not detect it.**
+  The picker's index is an index into `detect_shells()`, and that list is short whenever the shell
+  is unreachable at startup: on Windows `wsl.exe -l -q` exiting non-zero yields no WSL rows at all,
+  and on Unix a program that has left `/etc/shells` (or an unreadable `/etc/shells`) leaves a single
+  `/bin/bash`. `init_selected` matched the saved profile by `(program, args)`, found nothing and
+  `.unwrap_or(0)` gave **0** — and because the appearance-saving `create_effect` runs its body
+  immediately on creation, `terminal.json` was rewritten with `detected[0]` **before the window was
+  drawn, with no user action**. The choice was then gone for good: WSL coming back could not restore
+  it, because nothing remembered it any more. There was no visible symptom until the next launch,
+  the session itself spawning from `TerminalSettings::shell` directly — except on **Restart**, which
+  read the same index and replaced the user's running shell with `detected[0]` unexplained. The rule
+  is the loaded profile when the detected list does not contain it, the picker's row otherwise, and
+  three tests fail against the bare `detected.get(selected).cloned()` it replaces — including two
+  WSL distros told apart by their `-d` args, since matching on the program alone would let one
+  distro's presence vouch for another's. The app holds `current_shell` beside the index (*what is
+  running*, which is not the same thing); `term_apply_shell` is its one writer, so the moment the
+  user picks something the saved preference gives way — which is the half a saved-profile fix can
+  get wrong, and is a hand check in `review/user-verify-fix.md` rather than a test.
   **The reader notifies once per *unread* grid state, not once per read** (`Pending`, an
   `AtomicBool` with `mark`/`taken`). Its buffer is 8 KB and it used to notify on every successful
   read, so `cat` of a 10 MB log is ~1,280 notifies with no coalescing point anywhere downstream:
@@ -8428,8 +8784,18 @@ existing prose was left alone.
     preview's script box, the view editor's definition). Most of the file is `fn() -> f64` rather than
     `const`, because the interface scale multiplies anything that boxes text; the module doc lists
     what stays a `const` and why — hairlines, editor-relative metrics, seeds for persisted widths,
-    icon bases, `TERM_FONT_SIZES`, and the two floating-bar insets — and **that list is the copy to
-    extend**, since a prose list has been found short three times.
+    icon bases, `TERM_FONT_SIZES`, and the two floating-bar insets — and that list is still the
+    explanation, but **the exemptions are data now**: `unscaled_const_gate` scans this file's own
+    production code for `const <NAME>: f32|f64` and fails unless each is in `EXEMPT` with the bullet
+    it belongs to and why. The prose could not fail, and it was found short five times — three by
+    hand, then `TOOLBAR_ICON_BASE`, a third icon base whose own doc said it was one while the "Icon
+    bases" bullet did not know it existed, and `COMPLETION_LINE_H`, named by no bullet at all. A
+    sixth was mis-filed rather than missing: `TREE_ROW_MIN_W` sat under "seeds for persisted,
+    user-dragged sizes" and is not one — nothing persists or drags it; it is a floor on a signal
+    carrying unscaled user px, which is a different reason for the same answer. The array carries
+    the liveness floor `float_inset_gate` already has, so a rename cannot leave a stale licence
+    behind for the next constant at that spelling; dropping `TOOLBAR_ICON_BASE` from it reports that
+    name.
     `field_input_h()` is the same idea for the
     **compact single-line field** every transient bar wears (the editor's find/replace/goto, the
     grid's find/goto, the row panel's inputs): `FieldCfg::height` is an `Option`, and leaving it
@@ -8598,7 +8964,11 @@ existing prose was left alone.
     preview, so the clause guards nothing that arises today; it is written down anyway, because the
     alternative is a member of this group whose correctness rests on a caller remembering to close
     itself first.
-  - `markdown.rs` — AI-chat `render_markdown`/`CodeActions`/`code_block` (pulldown-cmark). A code
+  - `markdown.rs` — AI-chat `render_markdown`/`CodeActions`/`code_block` (pulldown-cmark). Its
+    prose colour and its font size are both **baked into a text `AttrsList`** rather than read in a
+    style closure, which an `AttrsList` is not — so this module's correctness depends on
+    `ai_panel`'s bubble container being keyed on `theme::ui_generation()`; see the themable-colour
+    invariant for the whole of that bargain. A code
     block carries a **standing** 24px header — the language on the left, `Copy` and (for SQL only)
     `Insert` / `Run` on the right, as words rather than icons, since a permanent icon row over every
     block is noise. The header repeats the block's own `border_radius`: floem does not clip a child
@@ -8873,7 +9243,16 @@ existing prose was left alone.
     Ctrl+Shift+letter bindings live and was missed; the gate was green only because `p`/`t` are
     bound a second time in the unshifted arms. `KEY_FILES` pairs each file with the `SHORTCUTS`
     **groups** its bindings may be documented in, because a table-wide lookup let the editor's
-    Ctrl+D vouch for a grid Ctrl+D — a different key doing a different thing. Deliberately
+    Ctrl+D vouch for a grid Ctrl+D — a different key doing a different thing. **It is
+    hand-maintained, and it was short rather than merely short-able**: the ER diagram binds Ctrl+F,
+    that binding is the find bar's *only* affordance (no toolbar button, no menu entry), and because
+    `erd_view.rs` was not on the array `bound_letters` never read the file — so the module whose doc
+    opens "a binding missing here is a feature nobody can find" passed green over exactly that,
+    beside a `SHORTCUTS` table with no ER-diagram group at all. Adding the row with the group still
+    missing turns both `every_bound_letter_is_documented` and
+    `every_key_file_names_real_shortcut_groups` red, which is also the demonstration that the gate
+    works once the file is in scope. The stronger, non-list-based form — walk `src_dir()` with an
+    EXEMPT list — is still not written. Deliberately
     **weak**, like `doc_coverage`: it catches the binding nobody wrote down, not an inaccurate
     row, and a *named* modified key (`Ctrl+Tab`, `Ctrl+Enter`, Ctrl+1‑9) is matched as a
     `NamedKey` and so is outside the scan entirely. Two rules
@@ -9100,7 +9479,10 @@ existing prose was left alone.
     editors wear (`modal_title_owned` / `modal_footer` / `panel_style`) and the same multi-line
     mono field with `tab_indents`. **Save writes only the fields that changed, through the same
     per-field actions the inline edits use** — there is deliberately no fourth "save everything"
-    action, because two paths writing one field is how the two drift. It is painted inside the
+    action, because two paths writing one field is how the two drift. *Which* fields changed is
+    `core::snippet::edits`, not three comparisons written here: the body's comparison and its
+    payload had drifted apart, and the whitespace-only edit that got lost to it is written up under
+    `core/snippet.rs`. It is painted inside the
     `ddl_modals_up` group and is therefore *in* that predicate: an overlay in that group whose flag
     the predicate doesn't know about resolves its `inset(0)` against a zero-by-zero box and paints
     nothing, which is exactly how the event editor once shipped invisible.
@@ -9111,8 +9493,12 @@ existing prose was left alone.
     editor is frozen — `editor_pane`'s `editor_freeze_gate`, two tests, whose subject is under
     *Floem 0.2 gotchas* — a text box whose `max_width` is a bare float while the `font_size` beside
     it scales (`lib.rs`'s `scaled_text_width_gate`, whose subject is under *Architecture
-    invariants*, with the empty allowlist it should keep) — and an engine comparison with no
-    capability behind it, `lib.rs`'s
+    invariants*, with the empty allowlist it should keep), an unscaled `const` length in
+    `consts.rs` that says nowhere why (`consts::unscaled_const_gate`), a connection form that
+    decides its own trimming instead of going through `Connection::trimmed` (`lib.rs`'s
+    `the_connection_form_trims_through_core`, which is a gate because `to_connection` reads eighteen
+    signals and needs a Floem scope) — and an engine comparison with no capability behind it,
+    `lib.rs`'s
     `engine_comparison_gate`, which is a per-file budget with a written reason rather than a ban and
     whose subject is under *Architecture invariants*).
     **One of the family fails on a spelling that is *missing* rather than present**, and it reads
@@ -9122,10 +9508,10 @@ existing prose was left alone.
     halves regardless — the whole file scanned, and both view crates enumerated — and it carries the
     other pattern this module made possible, an exemption list holding its reason as data
     (`overlays.rs`, whose stamps are `PlanTarget`s) with an assertion that the exemption is still
-    *needed*, so a stale entry fails rather than accumulating. `production_code` strips every `#[cfg(test)]`
-    **item** — brace-aware, skipping braces inside strings, chars and comments — and every `//`
-    line; `crate_sources` enumerates the files to scan. Both halves exist because the idiom was
-    written out eleven times across nine files and every copy had the same two holes. It cut each
+    *needed*, so a stale entry fails rather than accumulating. `production_code` blanks every
+    `#[cfg(test)]` **item** — brace-aware, skipping braces inside strings, chars and comments — and
+    every `//` line; `crate_sources` enumerates the files to scan. Both halves exist because the
+    idiom was written out eleven times across nine files and every copy had the same two holes. It cut each
     file at the **first** `#[cfg(test)]`, which is right only for a file whose tests are all at the
     bottom: `widgets.rs` has an inline test-only `fn` a tenth of the way in, so its gates read 929
     of 7,259 lines and a planted `Dropdown` at line 2000 passed. And it walked
@@ -9133,6 +9519,20 @@ existing prose was left alone.
     are stated app-wide, so a violation added to `schemaic-app` (which builds views too, in
     `app_view`) passed the whole suite. A copy each also meant that fixing either hole reached one
     gate of eleven.
+    **The cut *blanks* rather than deletes, so a line number means something.** It used to remove
+    the lines, and the result then bore no relation at all to the file's own numbering: measured
+    over the tree, `widgets.rs` went 7,881 source lines → 2,990, `lib.rs` 11,402 → 5,811,
+    `shortcuts.rs` 727 → 113. Two gates print a position from that text as if it were a file
+    position, so a violation at `widgets.rs:6500` was reported at roughly `widgets.rs:2500` and the
+    reader opened the wrong function — and `popup_anchor_gate`'s exemption array was *keyed* on that
+    number. Every gate scans with `contains`/`find`, so the blank lines cost nothing and the numbers
+    are right by construction, for any future gate as well as these two.
+    `stripping_a_file_keeps_its_line_numbering` asserts it over every file of this crate's own `src`
+    rather than over a fixture, because the property is about what the gates are actually handed,
+    and every one of them fails against the old helper. It is also what caught the off-by-one the
+    obvious fix leaves behind: a file whose last line falls inside a cut test module ends on an
+    empty one, and `str::lines()` drops a trailing empty segment, so the round trip has to split on
+    the newline rather than iterate lines.
     Two details in there are load-bearing and read as tidiable. **Not every `#[cfg(test)]` sits on a
     block**: it can be on a `use` (ends at `;`), on a struct field, an enum variant or a match arm
     (ends at the `,`, or at the enclosing `}` when it is the last member), so `item_end` reading only
@@ -9142,9 +9542,24 @@ existing prose was left alone.
     them a `,` at "depth 0" lands inside `fn f(a: u32, b: u32)` and hands the body of a test-only
     function back as production code. An unbalanced file is refused rather than guessed at — the rest
     is scanned, because a false positive fails loudly and a silent truncation is the failure this
-    module exists to end. `crate_sources` closes the same hole at the other end with
-    `assert!(out.len() > 20)`: a moved or renamed `src` would otherwise pass every gate by finding
-    no files at all.
+    module exists to end. `crate_sources` closes the same hole at the other end with a floor on how
+    many files it found: a moved or renamed `src` would otherwise pass every gate by finding no
+    files at all. **That floor is near the real count rather than a token one.** It was
+    `out.len() > 20` against **65** files, so two thirds of the corpus could vanish and every gate
+    over it would still report green — the same shape as the floors those gates carry, one level up.
+    It is `>= 60` now, with `the_scan_reaches_both_crates_that_build_views` (which `.expect`s
+    `lib.rs` and `schemaic-app/main.rs` by name) doing the precise half. `read_dir` is deliberately
+    non-recursive and both crates are flat today, so a future `src/<subdir>/*.rs` would fall outside
+    every gate silently and this floor is what would notice.
+    **Four gates spelled the walk themselves and have been pointed at `crate_sources` too** —
+    `consts::float_inset_gate`, `modals::modal_backdrop_gate`, `widgets::popup_anchor_gate` and
+    `widgets::menu_trigger_gate`'s `crate_source`, the last of which also put text `crate_sources`
+    had already stripped through `production_code` a second time. All four repeated verbatim the mistake
+    this helper's doc describes: they walked `schemaic-ui` alone, and it is the two menu gates the
+    gap bites hardest, since `schemaic-app`'s `main.rs` constructs `context_menu`, `popup_menu`,
+    `popup_anchor` and `date_pick` — the very channels they police. Checked at the time: no such
+    opener existed there, so the gap was structural rather than live, and all four stay green over
+    the wider corpus.
     **`no_continuation_typed_as_newline_gate` lives in this module rather than beside a subject**,
     because its subject is the whole tree: Rust's `\`-before-newline strips the newline *and* the
     next line's indentation, while `\n` inserts a newline and keeps the indentation, so a sentence
@@ -9164,7 +9579,15 @@ existing prose was left alone.
     nothing — which snippets apply, how they group and sort, and what the filter matches are all
     `core::snippet`'s answers, under test. Its **dialect comes from the active connection**, not
     the active tab: a tab keeps the connection it was opened on, while the library sits under the
-    connection selected above it. **A row click inserts the body at the caret** (`Tab::insert_req`),
+    connection selected above it. That memo is `ConnUi::dialect` — one memo on the bundle, which
+    this panel and `history_panel` both read — because it had been written out three times
+    identically and only the app's copy carried the ten-line reason it must be a **tracked** memo:
+    the built-in pack is `snippet::builtins(dialect)`, so an untracked read recomputes only when
+    `snippets` changes and every writer of that signal is a user action. Switching to a connection
+    of another engine therefore left the whole shipped pack of the *previous* engine in place, which
+    `snippet::applies` then filtered out entirely — the panel, abbrev expansion and Find-Anywhere
+    all lost their built-ins until the next time a user snippet happened to be written. The two
+    copies without that note were the ones most likely to be "simplified" to a `get_untracked`. **A row click inserts the body at the caret** (`Tab::insert_req`),
     where a history row opens a new tab — a record of a past run wants its own tab, a snippet is
     something you compose *with*; "Open in new tab" is on the row's menu for when it isn't. The
     parameter chips under a body are read live from `params::names`, never stored, so they cannot
@@ -9292,7 +9715,19 @@ existing prose was left alone.
       uncapped `COUNT(*)`. Its result is folded into the loaded `TableStats::exact_rows` rather
       than kept beside it, so the headline and the Markdown copy read one figure. Its lifecycle is
       separate from the fetch's (`properties_counting`/`properties_count_err`) for the opposite
-      reason: a failed count must not replace statistics that loaded.
+      reason: a failed count must not replace statistics that loaded. **It is offered from all four
+      of `stats_body`'s arms, and the `Failed` one used to be the exception.** A `COUNT(*)` needs no
+      catalogue — which is `count_row`'s whole argument, made twice more in this module and once in
+      `stats::count_rows_sql` — so the state with least to show is not the state to withhold the one
+      figure still obtainable from; and it was the only arm in which `CountHint::Error` could never
+      appear, so a count error raised elsewhere and then followed by a failed re-fetch was
+      swallowed. The decision itself already had a core test
+      (`the_count_row_disappears_only_when_it_has_nothing_to_say`); the gap was the view's
+      composition with it, which no test here can reach.
+    - **A MySQL view reached the full `Loaded` arm on a creation timestamp alone**, printing two
+      em-dashes under a staleness caveat about figures the server never publishes. The fix is in
+      `stats::TableStats::has_any`, so the panel and the Markdown copy move together — see
+      `core/stats.rs` for the measurement and for why it could not be fixed in this file.
     - Both requests outlive a close, so each checks `overlay.properties` still holds the target it
       was asked about before writing.
   - `users_view.rs` — the **Users and privileges** browser (`users_overlay`), over `core::users`.
@@ -9461,7 +9896,12 @@ existing prose was left alone.
     is in turn why `run_import` may send a fresh `read_config` beside the *stored* mapping.
     A schema change goes through `import::target_survives`: closing needs positive evidence the
     table is gone, since `load_schema` empties `db_nodes` before it fetches, and a running load is
-    *cancelled* rather than abandoned. The effect that re-probes on a settings change tracks only settings
+    *cancelled* rather than abandoned. `ImportTargetInfo::display` calls `schema::display_name` like
+    the four sibling `display()`s in `lib.rs` (the fifth, `object_location`, deliberately does not
+    and says why); it used to be that rule expanded by hand, inline `"public"` and all. It *agreed*,
+    which is exactly the cost — `sql_qualifier`'s doc carries a live-reproduced bug as the reason
+    for its shape, a schema literally named `"PUBLIC"` being a different schema — so the next change
+    to that rule would have reached five of the six spellings. The effect that re-probes on a settings change tracks only settings
     that change how the file *parses* — the NULL rules apply at coercion time, so tracking them
     would re-read the file per keystroke and stamp over a hand-edited mapping.
     **Excel adds an `xlsx_settings` block beside `csv_settings`**, built and torn down rather than
@@ -14272,7 +14712,18 @@ Re-introducing the anti-patterns these guard against is a regression:
   arms are all `fn`-shaped now (`fn() -> Color` on the binding), so the call happens inside the
   style closure that re-runs. A never-rebuilt view is the amplifier to look for: a captured `Color`
   in something floem tears down often is a flicker, and in something it never tears down is two
-  themes on screen at once.
+  themes on screen at once. `ai_panel::tool_chip`'s status dot was the same tuple spelling — three
+  `theme::…()` calls resolved at build time and closed over, thirty lines above `result_view`, which
+  asks the same question and calls them *inside* its own closure — and is the selector now.
+  **There is exactly one place the rule cannot be followed, and it is written down at the site
+  rather than treated as an exception to be re-derived.** `markdown::render_markdown` resolves
+  `theme::bubble_claude_text()` once and bakes it into a `rich_text` `AttrsList`, which is not a
+  style closure and cannot take a `fn`. What makes that safe is the caller: `ai_panel`'s bubble
+  `dyn_container` is keyed on `theme::ui_generation()`, which `set_ui` and `set_ui_scale` bump — the
+  only two things that change a UI colour or size — so every bubble is rebuilt on a theme change,
+  and that key's own comment names this baked colour as the reason it exists. Narrowing the key is
+  therefore a change to that function's correctness from 900 lines away, which is what the note now
+  says at both ends.
 - **And so do sizes**: a design token that boxes, indents or spaces text is a `fn() -> f32`/`fn() ->
   f64` reading the interface scale (`theme::font_body()`, `consts::row_h()`, `theme::scaled(…)`),
   never a `const`. Same mechanism, same reason — the `.style` closure that *calls* the metric re-runs
@@ -14281,9 +14732,9 @@ Re-introducing the anti-patterns these guard against is a regression:
   that resolves `theme::font_body()` at build time freezes the value just as surely as a `const`
   would. If a size ends up inside something that isn't a style closure (a text `Attrs` list, an
   editor `Styling`), pass the fn and read it *there*. **The exception list lives on `consts.rs`'s
-  module doc** — extend it there, not here: it is prose, prose is the wrong shape for it, and it has
-  been found short three times (a source-gate test holding the exceptions as *data* is the form that
-  gets updated when it fails, and is proposed but not written). What it says today is that an
+  module doc, and is enforced from `unscaled_const_gate::EXEMPT` beside it** — extend both there,
+  not here. The prose alone was found short five times, because prose cannot fail; the array is what
+  fails now, and the doc stays as the explanation. What it says today is that an
   unscaled length is a hairline, an editor-relative metric (the code font has its own size setting
   and the scale doesn't touch it), the seed for a persisted width the user dragged, an **icon base**,
   or `TERM_FONT_SIZES` (the terminal font, which the scale deliberately doesn't reach either).
@@ -14410,7 +14861,17 @@ Re-introducing the anti-patterns these guard against is a regression:
   they are per-object questions the menus ask per object, and what differs between engines has
   moved down to the narrower predicates that decide how an edit is *performed* rather than whether
   it is offered — `supports_or_replace_view` and `supports_view_rename`, both false on SQLite and
-  only there. **What a per-object capability must not do is answer for an object it wasn't asked
+  only there, plus `supports_column_reorder`, `alter_column_disturbs_checks`,
+  `publishes_index_ddl` and `stats::supports_table_stats`; and, for the *comparison* rather than
+  any editor, `ref_schema_is_database` and `view_definition_is_qualified`. **The same rule applies
+  inside the emitter, and two loops there answered it by not asking.** `emit_sqlite`'s table-rename
+  loop iterated `&self.changes` where every loop above it iterates `supported()`, and
+  `view_statements`' `DropView` arm had no `supports_change` guard while its `RefreshView`
+  neighbour three lines below does; both therefore reported the change in `unsupported()`, printed
+  the INCOMPLETE header, refused Apply and still put the statement in the script the escape hatch
+  hands over — which is the shape `container_creates`' own doc records a `DROP SCHEMA` reaching a
+  MariaDB through. Neither was reachable through today's menus, and a filter that is applied
+  everywhere but one loop is not a filter. **What a per-object capability must not do is answer for an object it wasn't asked
   about**: `field_entries` and `key_entries` take `is_view` because the tree renders a column row
   under a view exactly as under a table, and a constant `true` there offered Edit column and a red
   Drop for something that has neither — opening the *table* designer on a view, whose every edit all
@@ -14974,6 +15435,23 @@ Re-introducing the anti-patterns these guard against is a regression:
   to whole pixels (`themes::scale_at`, unit-tested: **`Normal` is the exact identity**, results are
   integral, and a positive size never rounds to nothing). The air between things grows with the
   things, which is what stops a 160% window reading as big type crammed into 100% boxes.
+  - **That rounding is not size-preserving below 1.0, and the type scale collapsed at 80%.** Four
+    base values a single pixel apart (14/13/13/12/12) all came back **10.0** at `UiScale::Small`, so
+    `font_body`, `font_label`, `font_hint` and `font_status` were one size. Two statements in
+    `theme.rs` were then false: `font_hint`'s own doc, "one step under the label it explains", and
+    the section header's "nothing smaller than `font_body()` anywhere except the status-bar footer",
+    whose carve-out was empty because the footer was no longer smaller either. Every form hint and
+    every footer segment rendered at label size, at the one setting chosen by someone who wants more
+    on screen and can least afford four type sizes reading as one. The fix is
+    `min(font_body() - 1.0)` on the two accessors rather than a wider base, and **only the scale
+    that collapsed moves**: 80% goes 10 → 9, while 100% (12), 130% (16) and 160% (19) are the
+    numbers the app already shipped and a base change would have moved everywhere.
+    `themes.rs` already pinned each token's rounding individually (13 → 10 at Small is asserted
+    there) and nothing compared two, which is why the collapse was pinned and unexamined;
+    `the_type_scale_keeps_its_steps_at_every_scale` asks the property through the accessors at every
+    `UiScale` and reports *"80%: a hint 10 is not one step under the label 10 it explains"* without
+    the `min`. Whether 9px reads acceptably is a judgement, and is a hand check in
+    `review/user-verify-fix.md` rather than something a test can hold.
   - **What it deliberately doesn't touch**: the SQL editor's code font and the terminal font, both of
     which already have their own size setting (and the editor a per-tab Ctrl+scroll zoom whose
     override is an absolute px that a second multiplication would double-apply); persisted panel
@@ -15287,7 +15765,8 @@ Re-introducing the anti-patterns these guard against is a regression:
   bug the layer was written to fix — the backdrop over the title bar, the drag band never rising, and
   a window that cannot be moved, minimised or closed with nothing on screen saying why. Three of the
   layer's members are loose children with no group wrapper to remind anyone, so that is the shape the
-  next overlay will take. `modals::modal_backdrop_gate` asserts **which files** paint one, with
+  next overlay will take. `modals::modal_backdrop_gate` asserts **which files** paint one — over
+  both view crates now, through `source_gate::crate_sources` — with
   `window_chrome.rs` as the documented exception (`over_backdrop` paints the same scrim across the
   title bar while a modal is up and is mounted in the workspace root, after the layer and before the
   overlay menus). Only `theme.rs`/`themes.rs` are skipped, as the colour's own definition:
@@ -16599,7 +17078,13 @@ renders the themed panel; the caller positions it absolutely. Used by the schema
   breaks the long ones at the `.`, so the scan joins a continuation onto its owner — getting that
   wrong reported two correct openers as offenders. Deliberately weak, like `shortcuts`' `KEY_FILES`
   and `core/tests/doc_coverage.rs`, and it asserts a floor on how many openers it found so a rename
-  can't make it pass by seeing nothing. Folding the pair into one `open_popup(anchor, entries)`
+  can't make it pass by seeing nothing. Its `EXEMPT` — openers that deliberately write no anchor —
+  is **keyed on the call text**, like `consts.rs`'s and `dividers.rs`', and used to be
+  `(file, line, reason)` against a number taken from `production_code`'s output, which before that
+  helper preserved the file's numbering bore no relation to the file at all. Even with the numbering
+  right a position key moves whenever anything above it does, so an exemption would silently re-arm
+  the gate on the site it was written for, or licence a different one. The array is empty, which is
+  the healthy state and is why this was latent — and it was the documented way to add one. Folding the pair into one `open_popup(anchor, entries)`
   constructor, so the anchor *cannot* be omitted, is still the better end state and is a change to
   make with the app running.
   `open` (is the channel non-empty) is checked **before** the anchor, which is the reason this is a
@@ -17946,7 +18431,14 @@ this bundle's.
   and made the clamp stop one short of the last one that does. It
   **clamps** to the nearest end when the number is outside the grid: past the last row goes to the
   last, `0` goes to the first, and a number too wide for a `usize` clamps with every other overshoot
-  rather than falling through to the not-a-number path. A row of 9s is how people ask for the bottom
+  rather than falling through to the not-a-number path. **An empty integer part is the other way
+  `parse` fails, and it is a zero rather than an overflow** — the branch's own comment is about a
+  number too wide for the machine, and `.5k` took it: the suffix set the multiplier,
+  `split_once('.')` yielded `("", "5")`, the emptiness test rejects only when *both* halves are
+  empty, and `int_part.parse().unwrap_or(u128::MAX)` then saturated the count so a `.5k` in a
+  200,000-row result jumped to the **last** row instead of row 500. The clamp is what made it
+  silent, the box doing something plausible rather than nothing;
+  `goto_row_index(".5k", 200_000)` answers `Some(499)` now and answered `Some(199999)` before. A row of 9s is how people ask for the bottom
   of a long result, and a silent no-op there can't be told apart from a broken feature, while
   overshooting is cheap to recover from — the gutter number and the row highlight say where you
   landed. **It accepts exactly the forms the grid prints**, which is why it isn't a
@@ -18018,8 +18510,10 @@ this bundle's.
       via `stage_new` (unset = server default; `Some("")` clears to default). Unset cells preview
       `<auto>`/`<required>`/`<null>`/`<default>` (from wire `auto_increment`/`no_default`/`not_null`).
       Tab/Enter hop cells (`advance_edit`).
-    - **Clone:** right-click **Duplicate row** seeds a pending row via `add_cloned_row` (every editable
-      column except auto-increment).
+    - **Clone:** right-click **Duplicate row** seeds a pending row via `add_cloned_rows`, which is a
+      loop over `edit::cloned_row` — every editable column as the **grid is showing it**, staged
+      edits included, except auto-increment and the binary columns whose displayed `<n bytes>` is a
+      placeholder rather than a value (`core::edit`).
     - **Delete:** right-click **Delete row** or the **Del** key marks a real row (`gs.del_rows`) with a
       red wash; marking clears its staged edits. `build_deletes` keys each `RowDelete` by the table's
       `key_cols` + original values.

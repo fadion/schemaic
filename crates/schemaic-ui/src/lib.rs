@@ -7041,7 +7041,7 @@ fn parse_preset(hex: &str) -> floem::peniko::Color {
 /// `db_color::pick_color`, where it can be tested: the seed used to be read in
 /// the middle of the body, so neither branch had a deterministic entry point
 /// and the whole function had no test anywhere in the workspace — a decision
-/// function in the UI crate with all three of its callers in `schemaic-app`.
+/// function in the UI crate with every one of its callers in `schemaic-app`.
 pub fn pick_connection_color(used: &[String]) -> String {
     let seed = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
