@@ -797,13 +797,13 @@ pub type BlobLoadFn = Rc<dyn Fn(BlobLoadRequest)>;
 /// column that does or does not get written.
 #[derive(Clone)]
 pub struct BlobStage {
-    put: Rc<dyn Fn(Vec<u8>) -> bool>,
+    put: Rc<dyn Fn(std::sync::Arc<[u8]>) -> bool>,
     live: Rc<dyn Fn() -> bool>,
 }
 
 impl BlobStage {
     pub fn new(
-        put: impl Fn(Vec<u8>) -> bool + 'static,
+        put: impl Fn(std::sync::Arc<[u8]>) -> bool + 'static,
         live: impl Fn() -> bool + 'static,
     ) -> BlobStage {
         BlobStage {
@@ -836,7 +836,22 @@ impl BlobStage {
 
     /// Hand the bytes over, returning whether they were staged. The liveness
     /// check is inside, so no caller can skip it.
-    pub fn put(&self, bytes: Vec<u8>) -> bool {
+    /// **Takes an `Arc<[u8]>`, not a `Vec<u8>`.** The seam used to force a copy:
+    /// the panel read the file into a `Vec`, cloned it to hand over here, and
+    /// `CellEdit::bytes` then built an `Arc<[u8]>` by copying *that* — three
+    /// 64 MiB buffers live at once for one 64 MiB cell, at the cap the picker
+    /// allows, on the path a `LONGBLOB` column exists for. `BlobState::Ready`'s
+    /// own doc says the value is `Arc`'d "because the buffer is up to
+    /// `FETCH_CAP` and every read of the signal would otherwise copy it" — the
+    /// type was chosen to avoid exactly this, and the clone one screen down
+    /// reintroduced it before the `Arc` was built.
+    ///
+    /// With the `Arc` made once and shared, the middle buffer is gone: peak
+    /// falls from ~192 MiB to ~128 MiB. The remaining two are `BlobValue::bytes`
+    /// (still a `Vec`) and the grid's staged `Arc`; collapsing those wants
+    /// `BlobValue` to hold an `Arc<[u8]>` too, which is a wider change than this
+    /// one.
+    pub fn put(&self, bytes: std::sync::Arc<[u8]>) -> bool {
         self.is_live() && (self.put)(bytes)
     }
 }

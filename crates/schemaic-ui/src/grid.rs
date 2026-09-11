@@ -1007,7 +1007,7 @@ impl GridState {
     ///
     /// Returns whether it staged, because the panel reports either way — see
     /// [`crate::BlobStage`].
-    fn stage_bytes(&self, di: usize, ci: usize, bytes: Vec<u8>) -> bool {
+    fn stage_bytes(&self, di: usize, ci: usize, bytes: std::sync::Arc<[u8]>) -> bool {
         // **`alive`, and it is the first line for a reason.** This runs from the
         // binary-cell panel, whose sink is an `Rc` over this state on a
         // *window*-scoped signal — so the grid can be gone while the sink is
@@ -1034,7 +1034,7 @@ impl GridState {
     /// [`GridState::stage_bytes`] for a pending new row — same gate, and the row
     /// has to still be there: `new_rows` can shrink between the dialog opening
     /// and the file arriving (Discard, a commit, a removed skeleton row).
-    fn stage_new_bytes(&self, pidx: usize, ci: usize, bytes: Vec<u8>) -> bool {
+    fn stage_new_bytes(&self, pidx: usize, ci: usize, bytes: std::sync::Arc<[u8]>) -> bool {
         // See `stage_bytes`: a window-scoped sink over a grid-scoped state.
         if !self.alive() {
             return false;
@@ -8594,11 +8594,11 @@ fn blob_launch(
     let stage: Option<crate::BlobStage> = match model.takes_bytes(ci, deleted) {
         true => Some(match pending {
             Some(p) => crate::BlobStage::new(
-                move |bytes: Vec<u8>| gs.stage_new_bytes(p, ci, bytes),
+                move |bytes: std::sync::Arc<[u8]>| gs.stage_new_bytes(p, ci, bytes),
                 move || gs.alive(),
             ),
             None => crate::BlobStage::new(
-                move |bytes: Vec<u8>| gs.stage_bytes(data_idx, ci, bytes),
+                move |bytes: std::sync::Arc<[u8]>| gs.stage_bytes(data_idx, ci, bytes),
                 move || gs.alive(),
             ),
         }),

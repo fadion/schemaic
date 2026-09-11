@@ -345,7 +345,12 @@ impl BlobUi {
         // been marked for deletion, the result may have been re-run read-only.
         // A refusal reported as "Loaded file." is the one outcome worse than
         // either — it looks exactly like a write that will happen and is not.
-        if !stage.put(bytes.clone()) {
+        // **The `Arc` is built once, here, and shared with the sink.** This
+        // used to be `stage.put(bytes.clone())` — a second full copy of the file
+        // — which `CellEdit::bytes` then copied a third time into the
+        // `Arc<[u8]>` it stores. See `BlobStage::put`.
+        let shared: Arc<[u8]> = Arc::from(&bytes[..]);
+        if !stage.put(shared) {
             self.note.set(Some(Err(
                 "That cell is no longer accepting a value — nothing was staged.".to_string(),
             )));
@@ -1116,8 +1121,8 @@ mod tests {
         let sink = |log: &Rc<RefCell<Vec<Vec<u8>>>>| -> crate::BlobStage {
             let log = log.clone();
             crate::BlobStage::new(
-                move |b: Vec<u8>| {
-                    log.borrow_mut().push(b);
+                move |b: Arc<[u8]>| {
+                    log.borrow_mut().push(b.to_vec());
                     true
                 },
                 || true,
@@ -1195,8 +1200,8 @@ mod tests {
         let sink = {
             let staged = staged.clone();
             crate::BlobStage::new(
-                move |b: Vec<u8>| {
-                    staged.borrow_mut().push(b);
+                move |b: Arc<[u8]>| {
+                    staged.borrow_mut().push(b.to_vec());
                     true
                 },
                 || true,
@@ -1261,8 +1266,8 @@ mod tests {
         let sink = {
             let staged = staged.clone();
             crate::BlobStage::new(
-                move |b: Vec<u8>| {
-                    staged.borrow_mut().push(b);
+                move |b: Arc<[u8]>| {
+                    staged.borrow_mut().push(b.to_vec());
                     true
                 },
                 || true,
@@ -1317,8 +1322,8 @@ mod tests {
         let sink = {
             let staged = staged.clone();
             crate::BlobStage::new(
-                move |b: Vec<u8>| {
-                    staged.borrow_mut().push(b);
+                move |b: Arc<[u8]>| {
+                    staged.borrow_mut().push(b.to_vec());
                     true
                 },
                 || true,
@@ -1425,18 +1430,21 @@ mod tests {
         let sink = {
             let (landed, alive) = (landed.clone(), alive.clone());
             crate::BlobStage::new(
-                move |b: Vec<u8>| {
-                    landed.borrow_mut().push(b);
+                move |b: Arc<[u8]>| {
+                    landed.borrow_mut().push(b.to_vec());
                     true
                 },
                 move || alive.get(),
             )
         };
-        assert!(sink.put(vec![1, 2, 3]), "a live sink takes the bytes");
+        assert!(
+            sink.put(Arc::from(&[1, 2, 3][..])),
+            "a live sink takes the bytes"
+        );
         assert_eq!(landed.borrow().len(), 1);
 
         alive.set(false);
-        assert!(!sink.put(vec![4, 5, 6]), "a dead one refuses");
+        assert!(!sink.put(Arc::from(&[4, 5, 6][..])), "a dead one refuses");
         assert_eq!(
             landed.borrow().len(),
             1,
@@ -1450,7 +1458,7 @@ mod tests {
     #[test]
     fn a_dead_sink_is_reported_rather_than_dressed_as_a_load() {
         let ui = BlobUi::new();
-        let dead = crate::BlobStage::new(|_: Vec<u8>| true, || false);
+        let dead = crate::BlobStage::new(|_: Arc<[u8]>| true, || false);
         let epoch = ui.open(
             tgt("t.payload".into(), "t_payload".into()),
             Some(dead),
@@ -1473,7 +1481,7 @@ mod tests {
     #[test]
     fn a_sink_that_refuses_is_reported_rather_than_dressed_as_a_load() {
         let ui = BlobUi::new();
-        let refusing = crate::BlobStage::new(|_: Vec<u8>| false, || true);
+        let refusing = crate::BlobStage::new(|_: Arc<[u8]>| false, || true);
         let epoch = ui.open(
             tgt("t.payload".into(), "t_payload".into()),
             Some(refusing),
@@ -1521,8 +1529,8 @@ mod tests {
         let sink = {
             let staged = staged.clone();
             crate::BlobStage::new(
-                move |b: Vec<u8>| {
-                    staged.borrow_mut().push(b);
+                move |b: Arc<[u8]>| {
+                    staged.borrow_mut().push(b.to_vec());
                     true
                 },
                 || true,
