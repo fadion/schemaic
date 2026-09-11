@@ -1138,6 +1138,64 @@ fn tx_engine(db: &Db) -> TxEngine {
     schemaic_db::session::tx_engine_of(db.engine())
 }
 
+/// Which of our own query tabs holds the server session `server_id` on the
+/// connection `killed_conn` — the decision behind both halves of *Kill session*.
+///
+/// `sessions` is `(tab id, that tab's pinned server id)`, `tabs` is
+/// `(tab id, its connection id)`, and the answer is a tab id.
+///
+/// **A free function because the composition is where the bug was, and the
+/// composition could not be tested.** `Connection::targets_same_server` is
+/// exhaustively covered — a dozen assertions, including the "an edit in place is
+/// still the same server" cases — and it was never wrong. What was wrong was the
+/// lookup around it: it compared `conn_id`, and two Schemaic connections
+/// routinely point at one server (`local (app)` and `local (root)`, or two
+/// entries differing only in default database), so a true match was rejected and
+/// the tab was left holding a dead socket with Commit and Rollback still
+/// offered. That is the seam CLAUDE.md names — "a pure function's composition
+/// with its caller" — and while this lived as an `Rc<dyn Fn>` bound inside
+/// `app_view` it had no name anything could call, so the same substitution could
+/// be made again with the suite green.
+///
+/// **A server id is only unique on its own server**, which is why `killed_conn`
+/// is half the key and not a formality: MySQL thread ids and PostgreSQL backend
+/// pids are small integers each server hands out from its own counter, so two
+/// Manual tabs on two connections routinely hold the same one. Matching on the
+/// id alone closed a transaction on a server nobody had touched.
+///
+/// Both callers consequential: `repair_killed_session` puts a tab's `TxState`
+/// back together and reopens its session, and the kill confirm names the tab so
+/// the modal does not describe the user's own uncommitted work as somebody
+/// else's client.
+///
+/// Ties are resolved by the order `sessions` arrives in, which is a `HashMap`'s
+/// — arbitrary, and the same as before this was extracted. Two tabs pinned to
+/// one session on one server is not a state the app can reach.
+fn owning_tab_of(
+    sessions: &[(usize, Option<i64>)],
+    tabs: &[(usize, u64)],
+    connections: &[schemaic_core::connection::Connection],
+    killed_conn: u64,
+    server_id: i64,
+) -> Option<usize> {
+    let conn_of = |id: u64| connections.iter().find(|c| c.id == id);
+    let killed_on = conn_of(killed_conn);
+    sessions
+        .iter()
+        .filter(|(_, sid)| *sid == Some(server_id))
+        .find_map(|(tab_id, _)| {
+            let tab_conn = tabs.iter().find(|(id, _)| id == tab_id).map(|(_, c)| *c)?;
+            if tab_conn == killed_conn {
+                return Some(*tab_id);
+            }
+            // Not the same connection — but possibly the same *server*, which is
+            // the whole point of this function.
+            conn_of(tab_conn)?
+                .targets_same_server(killed_on?)
+                .then_some(*tab_id)
+        })
+}
+
 fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> impl IntoView {
     let cx = Scope::current();
 
@@ -4951,34 +5009,25 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
     // from that connection, so without this the modal described the user's own
     // uncommitted work as somebody else's client. One lookup rather than two
     // spellings of it.
+    // **Reads the three registries and hands them to [`owning_tab_of`]**, which
+    // is where the decision lives and where it can be tested. This closure's only
+    // job is the gathering; nothing here chooses anything.
     let owning_tab: Rc<dyn Fn(u64, i64) -> Option<schemaic_ui::Tab>> = {
         let sessions = sessions.clone();
         Rc::new(move |conn_id: u64, id: i64| {
-            let owners: Vec<usize> = sessions
+            let pinned: Vec<(usize, Option<i64>)> = sessions
                 .borrow()
                 .iter()
-                .filter(|(_, s)| s.server_id() == Some(id))
-                .map(|(tab_id, _)| *tab_id)
+                .map(|(tab_id, s)| (*tab_id, s.server_id()))
                 .collect();
-            // The tab has to be on **the same server**, which is not the same
-            // question as the same `conn_id`. Two Schemaic connections routinely
-            // point at one server — `local (app)` and `local (root)`, or two
-            // entries differing only in default database — and a `conn_id`
-            // comparison rejected exactly that true match, leaving the tab
-            // holding a dead socket with Commit and Rollback still offered.
-            let killed_on =
-                connections.with_untracked(|cs| cs.iter().find(|c| c.id == conn_id).cloned());
-            owners.into_iter().find_map(|tab_id| {
-                let tab = tabs.with_untracked(|v| v.iter().find(|t| t.id == tab_id).copied())?;
-                let tab_conn = tab.conn_id.get_untracked();
-                if tab_conn == conn_id {
-                    return Some(tab);
-                }
-                let killed_on = killed_on.as_ref()?;
-                let owner_conn = connections
-                    .with_untracked(|cs| cs.iter().find(|c| c.id == tab_conn).cloned())?;
-                owner_conn.targets_same_server(killed_on).then_some(tab)
-            })
+            let tab_conns: Vec<(usize, u64)> = tabs.with_untracked(|v| {
+                v.iter()
+                    .map(|t| (t.id, t.conn_id.get_untracked()))
+                    .collect()
+            });
+            let owner = connections
+                .with_untracked(|cs| owning_tab_of(&pinned, &tab_conns, cs, conn_id, id))?;
+            tabs.with_untracked(|v| v.iter().find(|t| t.id == owner).copied())
         })
     };
 
@@ -11708,7 +11757,7 @@ mod app_tests {
 
     use super::{
         Action, CliLauncher, ConnGate, RunTimeout, gate1, gate1_on_tab, inline_outcome,
-        mysql_shell_config, psql_database, psql_shell_config, resolve_native_cli,
+        mysql_shell_config, owning_tab_of, psql_database, psql_shell_config, resolve_native_cli,
         sqlite_shell_config, timeout_message, tx_engine, unique_name,
     };
     use floem::prelude::{SignalGet, SignalUpdate};
@@ -11783,6 +11832,95 @@ mod app_tests {
             ["run(req.into_sql());", "run(sql);"],
             "the raw `run` gained or lost a caller: every one must take its SQL \
              from a `RerunRequest`, which only `sql::rerunnable_for_export` mints"
+        );
+    }
+
+    /// **The regression the fix that introduced `targets_same_server` could not
+    /// have.**
+    ///
+    /// Two Schemaic connections pointing at one server is ordinary —
+    /// `local (app)` and `local (root)`, or two entries differing only in
+    /// default database. A killed session on one of them belongs to a Manual tab
+    /// bound to the *other*, and the lookup used to compare `conn_id`: it
+    /// rejected that true match, so the tab kept a dead socket with Commit and
+    /// Rollback still offered, while the confirm modal described the user's own
+    /// uncommitted work as somebody else's client.
+    ///
+    /// `targets_same_server` was never wrong and is exhaustively tested. The
+    /// composition around it was, and while it lived as an `Rc<dyn Fn>` inside
+    /// `app_view` nothing could call it — which is the whole reason
+    /// `owning_tab_of` is a free function now.
+    #[test]
+    fn a_tab_on_a_second_connection_to_the_same_server_still_owns_its_session() {
+        let base = conn();
+        // Same host, port, user, engine — a different Schemaic entry for one
+        // server, which is what `targets_same_server` exists to recognise.
+        let other = Connection {
+            id: 2,
+            name: "the same box, again".to_string(),
+            database: "reporting".to_string(),
+            ..base.clone()
+        };
+        let conns = vec![base.clone(), other.clone()];
+        // Tab 7 is pinned to a session whose server id is 42, and the tab is
+        // bound to connection 2. The kill arrives naming connection 1.
+        let sessions = [(7usize, Some(42i64))];
+        let tabs = [(7usize, 2u64)];
+
+        assert_eq!(
+            owning_tab_of(&sessions, &tabs, &conns, 1, 42),
+            Some(7),
+            "the tab is on the same server, so it owns the killed session"
+        );
+        // And the same connection is of course still a match.
+        assert_eq!(owning_tab_of(&sessions, &[(7, 2)], &conns, 2, 42), Some(7));
+    }
+
+    /// **A server id is only unique on its own server.** Thread ids and backend
+    /// pids are small integers from each server's own counter, so two tabs on
+    /// two *different* servers routinely hold the same one — matching on the id
+    /// alone closed a transaction on a server nobody had touched.
+    #[test]
+    fn a_matching_id_on_a_different_server_is_not_a_match() {
+        let here = conn();
+        let elsewhere = Connection {
+            id: 2,
+            name: "a different box".to_string(),
+            host: "10.9.9.9".to_string(),
+            ..here.clone()
+        };
+        let conns = vec![here, elsewhere];
+        assert_eq!(
+            owning_tab_of(&[(7, Some(42))], &[(7, 2)], &conns, 1, 42),
+            None,
+            "thread 42 on one server is not thread 42 on another"
+        );
+    }
+
+    /// The ordinary negatives: no tab pinned to that session, and a tab pinned
+    /// to a different one.
+    #[test]
+    fn a_session_no_tab_holds_owns_nothing() {
+        let conns = vec![conn()];
+        assert_eq!(owning_tab_of(&[], &[], &conns, 1, 42), None);
+        assert_eq!(
+            owning_tab_of(&[(7, Some(43))], &[(7, 1)], &conns, 1, 42),
+            None,
+            "another session's tab is not this one's"
+        );
+        assert_eq!(
+            owning_tab_of(&[(7, None)], &[(7, 1)], &conns, 1, 42),
+            None,
+            "an auto-commit tab pins no session at all"
+        );
+        // A session whose tab has since closed: the id is in the map, the tab is
+        // gone. Reaching for it must not panic or invent an owner.
+        assert_eq!(owning_tab_of(&[(7, Some(42))], &[], &conns, 1, 42), None);
+        // And a kill naming a connection that has been deleted, where the tab is
+        // on a *different* one — there is nothing left to compare against.
+        assert_eq!(
+            owning_tab_of(&[(7, Some(42))], &[(7, 2)], &conns, 99, 42),
+            None
         );
     }
 
