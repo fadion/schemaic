@@ -1455,7 +1455,7 @@ impl Harness {
     /// What to write to a **chat turn's** stdin, or `None` when the prompt rides
     /// in argv for this harness.
     ///
-    /// The counterpart to [`Harness::turn_args`], and deliberately built from
+    /// The counterpart to [`turn_args`], and deliberately built from
     /// the same [`prefixed_prompt`] call that arm would have pushed: the prompt
     /// has one construction and two possible destinations, never two
     /// constructions. `the_prompt_travels_exactly_once` holds the pair together.
@@ -1465,7 +1465,7 @@ impl Harness {
     }
 
     /// [`Harness::turn_stdin_prompt`] for a one-shot generation — Ctrl+K, AI
-    /// Fill, AI Seed — against [`Harness::inline_argv`].
+    /// Fill, AI Seed — against [`inline_argv`].
     pub fn inline_stdin_prompt(self, spec: &InlineSpec) -> Option<String> {
         self.prompt_on_stdin()
             .then(|| prefixed_prompt(&spec.system, &spec.intent))
