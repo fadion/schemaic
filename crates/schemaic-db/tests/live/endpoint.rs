@@ -347,6 +347,16 @@ impl Target {
         )
     }
 
+    /// Is an account on this server a **name and a host**, rather than a name?
+    ///
+    /// The one place the two catalogues genuinely disagree about what an account
+    /// *is*: `DROP USER 'n'@'h'` names both halves on the MySQL family, and
+    /// PostgreSQL has no host part at all. One definition, because the host
+    /// assertions and the host fixtures have to agree about which legs have one.
+    pub fn accounts_have_hosts(&self) -> bool {
+        self.engine == Engine::MySql
+    }
+
     /// The account the suite connects as — which is also the one account every
     /// leg is guaranteed to have, and so the one a read-only test can name.
     pub fn user(&self) -> String {

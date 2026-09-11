@@ -57,11 +57,35 @@ pub async fn the_account_we_connected_as_is_in_the_list(target: &'static Target)
     // is, and the fold is what has to keep it straight.
     assert_eq!(
         me.host.is_some(),
-        target.engine == schemaic_db::Engine::MySql,
+        target.accounts_have_hosts(),
         "{}: host part on {}",
         target.endpoint(),
         me.display()
     );
+    // **The value, not just its presence.** Three sites in this file asked
+    // `host.is_some()` or matched on `p.name` alone, so a fold returning the
+    // wrong field passed all of them — including `Some(String::new())`, the
+    // shape MariaDB actually stores for a role and the one this file's own doc
+    // records as having produced `ERROR 1141` on `SHOW GRANTS`, `ERROR 1133` on
+    // `GRANT` and a syntax error on `DROP ROLE`. The suite connects over TCP
+    // from this machine, so the host is whatever the server matched the login
+    // against; what can be asserted without pinning the machine is that it is a
+    // host at all, and that `Principal::display` is built from both halves.
+    if let Some(host) = me.host.as_deref() {
+        assert!(
+            !host.is_empty(),
+            "{}: the account's host came back empty, which is not a host — \
+             `DROP USER '{}'@''` names no account",
+            target.endpoint(),
+            me.name
+        );
+        assert_eq!(
+            me.display(),
+            format!("{}@{host}", me.name),
+            "{}: display is not built from the pair the catalogue returned",
+            target.endpoint()
+        );
+    }
     assert!(!me.display().is_empty());
 }
 
@@ -245,7 +269,24 @@ impl ScratchAccount {
     ) -> ScratchAccount {
         // 32 bytes on MySQL 8, 80 on MariaDB, 63 on PostgreSQL. Checked in
         // `create_with_password`, which every account goes through.
-        Self::create_with_password(target, scratch, suffix, kind, "").await
+        Self::create_with_password(target, scratch, suffix, kind, "", "").await
+    }
+
+    /// The same, at a **host that is not the default**.
+    ///
+    /// `AccountDraft::host` was left `""` by every fixture here, which
+    /// `principal()` turns into `%` — so `account_sql`'s host literal, quoted
+    /// through `ddl_string` for the reason its own doc gives ("a host of `it's`
+    /// would otherwise close the quote and change the statement"), had never
+    /// round-tripped through a server, and neither had a `DROP USER` naming a
+    /// host the account really has.
+    async fn create_at_host(
+        target: &'static Target,
+        scratch: &Scratch,
+        suffix: &str,
+        host: &str,
+    ) -> ScratchAccount {
+        Self::create_with_password(target, scratch, suffix, PrincipalKind::User, "", host).await
     }
 
     /// The same path, with a password — the branch of `account_draft_sql` that
@@ -265,6 +306,7 @@ impl ScratchAccount {
         suffix: &str,
         kind: PrincipalKind,
         password: &str,
+        host: &str,
     ) -> ScratchAccount {
         let name = format!("{PREFIX}{}_{}_{suffix}", std::process::id(), target.name);
         assert_scratch_name(&name);
@@ -276,6 +318,7 @@ impl ScratchAccount {
         let dialect = scratch.dialect();
         let draft = AccountDraft {
             name: name.clone(),
+            host: host.to_string(),
             kind,
             password: password.to_string(),
             ..Default::default()
@@ -452,19 +495,100 @@ pub async fn a_created_account_is_one_the_server_then_lists(target: &'static Tar
     let scratch = Scratch::create(target, "mkuser").await;
     let account = ScratchAccount::create(target, &scratch, "u", PrincipalKind::User).await;
 
+    let listed = listed_principal(target, &account).await;
+    // **The host it was created at, read back.** Matching on `p.name` alone —
+    // which is what this did — passes a fold returning the wrong field, and the
+    // host is half of what `DROP USER 'n'@'h'` names.
+    assert_eq!(
+        listed.host,
+        account.principal.host,
+        "{}: the server lists {} at a different host from the one it was \
+         created at",
+        target.endpoint(),
+        listed.display()
+    );
+
+    // …and the drop goes through the **listed** principal rather than the
+    // drafted one, the way the role test already does: the two are not the same
+    // value, and the difference is what a create-and-drop pair that never
+    // consults the catalogue cannot see.
+    account.drop_as(&listed).await;
+    scratch.teardown().await;
+}
+
+/// An account created at a **specific host** is listed at that host, and is
+/// dropped by naming it.
+///
+/// Every fixture here left `AccountDraft::host` empty, which `principal()`
+/// turns into `%` — so `account_sql`'s host literal had never round-tripped
+/// through a server, and a `DROP USER` naming a real host had never run. On
+/// PostgreSQL an account has no host at all, which is what
+/// `accounts_have_hosts` says, so its leg returns rather than asserting a
+/// property the engine does not have.
+pub async fn an_account_created_at_a_host_is_listed_and_dropped_at_it(target: &'static Target) {
+    if !target.accounts_have_hosts() {
+        return;
+    }
+    let scratch = Scratch::create(target, "userhost").await;
+    let account = ScratchAccount::create_at_host(target, &scratch, "h", "10.0.0.%").await;
+    assert_eq!(
+        account.principal.host.as_deref(),
+        Some("10.0.0.%"),
+        "{}: the draft did not carry the host into the principal",
+        target.endpoint()
+    );
+
+    let listed = listed_principal(target, &account).await;
+    assert_eq!(
+        listed.host.as_deref(),
+        Some("10.0.0.%"),
+        "{}: the server lists {} at the wrong host",
+        target.endpoint(),
+        listed.display()
+    );
+
+    // The drop names the pair. Against a host the fold got wrong this either
+    // refuses outright or drops nothing, and `teardown`'s own
+    // `assert_scratch_name` is what keeps it away from anything else.
+    account.drop_as(&listed).await;
+    let still_there = target
+        .base_db()
+        .fetch_principals()
+        .await
+        .unwrap_or_else(|e| panic!("fetch_principals: {e}"))
+        .list
+        .into_iter()
+        .any(|p| p.name == listed.name && p.host == listed.host);
+    assert!(
+        !still_there,
+        "{}: the account is still listed after being dropped by name and host",
+        target.endpoint()
+    );
+
+    scratch.teardown().await;
+}
+
+/// The principal the **server** lists for a scratch account, by name and (where
+/// the engine has one) host — not the one the test drafted.
+async fn listed_principal(target: &'static Target, account: &ScratchAccount) -> Principal {
     let list = target
         .base_db()
         .fetch_principals()
         .await
         .unwrap_or_else(|e| panic!("fetch_principals: {e}"));
-    assert!(
-        list.list.iter().any(|p| p.name == account.principal.name),
-        "{}: the account this test created is not in the list",
-        target.endpoint()
-    );
-
-    account.teardown().await;
-    scratch.teardown().await;
+    list.list
+        .iter()
+        .find(|p| p.name == account.principal.name)
+        .cloned()
+        .unwrap_or_else(|| {
+            let names: Vec<String> = list.list.iter().map(|p| p.display()).collect();
+            panic!(
+                "{}: the account this test created ({}) is not in the list; it \
+                 listed: {names:?}",
+                target.endpoint(),
+                account.principal.display()
+            )
+        })
 }
 
 /// **The one branch that writes a credential to a server, and a login to prove
@@ -492,9 +616,15 @@ pub async fn a_created_account_can_log_in_with_the_password_it_was_given(target:
     let scratch = Scratch::create(target, "pwlogin").await;
     // Awkward rather than representative, for the reason the DDL shapes are.
     let password = r"p'w\d***x";
-    let account =
-        ScratchAccount::create_with_password(target, &scratch, "p", PrincipalKind::User, password)
-            .await;
+    let account = ScratchAccount::create_with_password(
+        target,
+        &scratch,
+        "p",
+        PrincipalKind::User,
+        password,
+        "",
+    )
+    .await;
 
     let as_them = target.db_as(&account.principal.name, password);
     as_them
