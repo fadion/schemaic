@@ -6872,8 +6872,16 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
     let collapse_all: Rc<dyn Fn()> = {
         let save_ui = save_ui.clone();
         Rc::new(move || {
-            expanded.update(|set| set.clear());
-            save_ui();
+            // **Guarded**, like every clear in `schemaic-ui`. `update` notifies
+            // unconditionally, so collapsing an already-collapsed tree rebuilt
+            // every mounted subtree *and* wrote `ui.json` to disk for a click
+            // that changed nothing. The guard was module-private to `grid.rs`
+            // and unreachable from here until it moved to `widgets`.
+            let before = expanded.with_untracked(|set| set.is_empty());
+            schemaic_ui::clear_if_any(expanded);
+            if !before {
+                save_ui();
+            }
         })
     };
 
@@ -6884,8 +6892,17 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
     let collapse_db: Rc<dyn Fn(String)> = {
         let save_ui = save_ui.clone();
         Rc::new(move |db: String| {
-            expanded.update(|set| set.retain(|k| !schemaic_ui::key_under(&db, k)));
-            save_ui();
+            // Same rule as `collapse_all` above, and the reason `retain_if_any`
+            // exists: a `retain` reads as conditional but is not — one that
+            // keeps everything still calls `update`, and `update` still
+            // notifies. Collapsing a database with nothing expanded under it
+            // rebuilt the whole tree and saved to disk.
+            let had_any =
+                expanded.with_untracked(|set| set.iter().any(|k| schemaic_ui::key_under(&db, k)));
+            schemaic_ui::retain_if_any(expanded, move |k| !schemaic_ui::key_under(&db, k));
+            if had_any {
+                save_ui();
+            }
         })
     };
 
@@ -9310,7 +9327,14 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                     tok.cancel();
                 }
             }
-            tabs.update(|v| v.retain(|t| t.conn_id.get_untracked() != id));
+            // **Guarded on `doomed`, which is already the answer.** Deleting a
+            // connection with no open tabs is ordinary, and an unconditional
+            // `update` would rebuild the whole tab strip for it — `update`
+            // notifies whether or not the value changed. No second scan: the
+            // list above *is* "which tabs would this remove".
+            if !doomed.is_empty() {
+                tabs.update(|v| v.retain(|t| t.conn_id.get_untracked() != id));
+            }
             recently_closed.borrow_mut().retain(|s| s.conn_id != id);
             last_tab.borrow_mut().remove(&id);
             // Whatever is active now may have just been removed; make sure it's

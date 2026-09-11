@@ -66,6 +66,15 @@ mod trigger_editor;
 mod users_view;
 mod view_editor;
 mod widgets;
+/// **The never-write-a-no-op guards, reachable from the app crate.**
+///
+/// `clear_if_any` lived module-private in `grid.rs` and was re-exported from
+/// nowhere, so the one crate that had live violations of the rule it enforces —
+/// `schemaic-app`, which builds views too — could not have called it if it had
+/// wanted to. `retain_if_any` is its partial-clear sibling, written for
+/// `collapse_db`, whose `retain` notified every subscriber and wrote `ui.json`
+/// to disk on a database that had nothing expanded under it.
+pub use widgets::{Clearable, clear_if_any, retain_if_any};
 mod window_chrome;
 
 use activity_panel::activity_panel;
@@ -2966,10 +2975,15 @@ impl PanelView {
     /// [`Tab::bump_panel_load`]. A fresh run needs none — `begin_run` builds new
     /// panels, so their trio is empty by construction — and a commit splice
     /// deliberately bumps nothing, which is why it keeps its own state.
+    ///
+    /// Guarded, like `grid::discard_edits`' four: this runs on every panel load,
+    /// and the overwhelmingly common case is a trio that is already empty —
+    /// where `update` still notifies every subscriber, and the grid body is
+    /// keyed on one of them.
     fn clear_staged(&self) {
-        self.dirty.update(|d| d.clear());
-        self.new_rows.update(|r| r.clear());
-        self.del_rows.update(|d| d.clear());
+        clear_if_any(self.dirty);
+        clear_if_any(self.new_rows);
+        clear_if_any(self.del_rows);
     }
 }
 

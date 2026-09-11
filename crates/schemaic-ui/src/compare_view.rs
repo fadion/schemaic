@@ -719,8 +719,7 @@ fn filter_bar(ui: Ui, c: Rc<SchemaComparison>, ring: FocusRing) -> impl IntoView
             let keys_now = keys_now.clone();
             move || {
                 let shown: HashSet<String> = keys_now().into_iter().collect();
-                o.compare_selected
-                    .update(|sel| sel.retain(|k| !shown.contains(k)));
+                crate::widgets::retain_if_any(o.compare_selected, move |k| !shown.contains(k));
             }
         }),
     ))

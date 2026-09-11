@@ -5250,6 +5250,127 @@ pub(crate) fn overlay_open_key<A: 'static, B: 'static>(
     })
 }
 
+/// Anything [`clear_if_any`] can ask whether it is already empty.
+///
+/// A trait rather than three call-site guards so the question is asked the same
+/// way of every staging collection, `Option` included — an editor that is already
+/// closed and a set that is already empty are the same case.
+///
+/// The bodies below read as infinite recursion and are not: an **inherent** method
+/// wins name resolution over a trait method, so `self.is_empty()` in
+/// `impl Clearable for Vec<T>` is `Vec::is_empty`. `grid::clear_tests` calls all
+/// three, which is what says so rather than the reader having to trust it.
+///
+/// **In `widgets`, and `pub`, because it was neither.** It lived module-private
+/// in `grid.rs` and was re-exported from nowhere, so the guard was structurally
+/// unreachable from `schemaic-app` — the crate the source gates were deliberately
+/// widened to cover, on the grounds that "`schemaic-app` builds views too … so a
+/// violation added there passed the whole suite". Two live violations were
+/// sitting in it.
+pub trait Clearable {
+    fn is_empty(&self) -> bool;
+    fn clear(&mut self);
+}
+
+impl<T> Clearable for Option<T> {
+    fn is_empty(&self) -> bool {
+        self.is_none()
+    }
+    fn clear(&mut self) {
+        *self = None;
+    }
+}
+
+impl<T> Clearable for Vec<T> {
+    fn is_empty(&self) -> bool {
+        self.is_empty()
+    }
+    fn clear(&mut self) {
+        self.clear();
+    }
+}
+
+impl<K: Eq + std::hash::Hash, V> Clearable for std::collections::HashMap<K, V> {
+    fn is_empty(&self) -> bool {
+        self.is_empty()
+    }
+    fn clear(&mut self) {
+        self.clear();
+    }
+}
+
+impl<T: Eq + std::hash::Hash> Clearable for std::collections::HashSet<T> {
+    fn is_empty(&self) -> bool {
+        self.is_empty()
+    }
+    fn clear(&mut self) {
+        self.clear();
+    }
+}
+
+/// Empty a signal's collection, **notifying only if it held anything**.
+///
+/// `RwSignal::update` runs its subscribers unconditionally — floem_reactive's
+/// `update_value` calls `run_effects()` with no equality check — so clearing what
+/// is already empty is not the no-op it reads as: it rebuilds every
+/// `dyn_container` keyed on the signal. `discard_edits` clears three collections
+/// and the grid body is keyed on one of them, so discarding a single cell edit
+/// tore the body down, recomputed the sort order over every row and built it
+/// again, to arrive at the same `0` — and took the keyboard with it (see
+/// `grid::refocus_grid`). Unit-tested in `grid::clear_tests`, including the floem
+/// fact.
+pub fn clear_if_any<C: Clearable + 'static>(sig: RwSignal<C>) {
+    if sig.with_untracked(|c| c.is_empty()) {
+        return;
+    }
+    sig.update(|c| c.clear());
+}
+
+/// [`clear_if_any`] for a **partial** clear: retain, notifying only if something
+/// would actually go.
+///
+/// `retain` has the same property as `clear` and is easier to miss, because it
+/// reads as conditional already — but a `retain` whose predicate keeps
+/// everything still calls `update`, and `update` still notifies. The schema
+/// tree's "collapse this database" ran one over the app-wide expansion set on
+/// every invocation: on a database with nothing expanded under it, that rebuilt
+/// the whole tree **and wrote the UI state to disk**, for a click that changed
+/// nothing.
+///
+/// The predicate has to run twice — once to ask, once to do — which is the
+/// price of not being able to see inside `update`. It is a membership test over
+/// a few hundred short strings against a rebuild of every mounted subtree, so
+/// the trade is not close.
+///
+/// **Two functions rather than one trait**, unlike [`Clearable`]. There the
+/// question really is identical for every collection — "is this empty" needs no
+/// predicate. Here a `HashSet<T>` hands the predicate a `&T` and a
+/// `HashMap<K, V>` a `(&K, &V)`, so a trait covering both wants a generic
+/// associated type, and the lifetime bounds it needs are more machinery than
+/// the two bodies it would save.
+pub fn retain_if_any<T: Eq + std::hash::Hash + 'static>(
+    sig: RwSignal<std::collections::HashSet<T>>,
+    keep: impl Fn(&T) -> bool,
+) {
+    if sig.with_untracked(|set| set.iter().all(&keep)) {
+        return;
+    }
+    sig.update(|set| set.retain(&keep));
+}
+
+/// [`retain_if_any`] over a map — the grid's three `dirty`/`new_rows` filters,
+/// which drop the staged edits belonging to rows being deleted and whose common
+/// case is that there are none.
+pub fn retain_pairs_if_any<K: Eq + std::hash::Hash + 'static, V: 'static>(
+    sig: RwSignal<std::collections::HashMap<K, V>>,
+    keep: impl Fn(&K, &V) -> bool,
+) {
+    if sig.with_untracked(|m| m.iter().all(|(k, v)| keep(k, v))) {
+        return;
+    }
+    sig.update(|m| m.retain(|k, v| keep(k, v)));
+}
+
 /// **A `dyn_container` key that actually dedups.**
 ///
 /// floem 0.2's `dyn_container` does no value comparison: its key closure is

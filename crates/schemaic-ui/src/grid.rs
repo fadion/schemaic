@@ -1199,8 +1199,7 @@ impl GridState {
             }
         });
         if now_marked == Some(true) {
-            self.dirty
-                .update(|m| m.retain(|(di, _), _| *di != data_idx));
+            crate::widgets::retain_pairs_if_any(self.dirty, move |(di, _), _| *di != data_idx);
         }
         self.clear_bar();
     }
@@ -4773,74 +4772,6 @@ fn reclaim_keyboard(pointer: (f64, f64), grid: Rect) -> bool {
     grid.contains(Point::new(pointer.0, pointer.1))
 }
 
-/// Anything [`clear_if_any`] can ask whether it is already empty.
-///
-/// A trait rather than three call-site guards so the question is asked the same
-/// way of every staging collection, `Option` included — an editor that is already
-/// closed and a set that is already empty are the same case.
-///
-/// The bodies below read as infinite recursion and are not: an **inherent** method
-/// wins name resolution over a trait method, so `self.is_empty()` in
-/// `impl Clearable for Vec<T>` is `Vec::is_empty`. `clear_tests` calls all three,
-/// which is what says so rather than the reader having to trust it.
-trait Clearable {
-    fn is_empty(&self) -> bool;
-    fn clear(&mut self);
-}
-
-impl<T> Clearable for Option<T> {
-    fn is_empty(&self) -> bool {
-        self.is_none()
-    }
-    fn clear(&mut self) {
-        *self = None;
-    }
-}
-
-impl<T> Clearable for Vec<T> {
-    fn is_empty(&self) -> bool {
-        self.is_empty()
-    }
-    fn clear(&mut self) {
-        self.clear();
-    }
-}
-
-impl<K: Eq + std::hash::Hash, V> Clearable for HashMap<K, V> {
-    fn is_empty(&self) -> bool {
-        self.is_empty()
-    }
-    fn clear(&mut self) {
-        self.clear();
-    }
-}
-
-impl<T: Eq + std::hash::Hash> Clearable for HashSet<T> {
-    fn is_empty(&self) -> bool {
-        self.is_empty()
-    }
-    fn clear(&mut self) {
-        self.clear();
-    }
-}
-
-/// Empty a signal's collection, **notifying only if it held anything**.
-///
-/// `RwSignal::update` runs its subscribers unconditionally — floem_reactive's
-/// `update_value` calls `run_effects()` with no equality check — so clearing what
-/// is already empty is not the no-op it reads as: it rebuilds every
-/// `dyn_container` keyed on the signal. `discard_edits` clears three collections
-/// and the grid body is keyed on one of them, so discarding a single cell edit
-/// tore the body down, recomputed the sort order over every row and built it
-/// again, to arrive at the same `0` — and took the keyboard with it (see
-/// [`refocus_grid`]). Unit-tested in `clear_tests`, including the floem fact.
-fn clear_if_any<C: Clearable + 'static>(sig: RwSignal<C>) {
-    if sig.with_untracked(|c| c.is_empty()) {
-        return;
-    }
-    sig.update(|c| c.clear());
-}
-
 /// The result's source table, qualified, for an AI prompt's context — `None`
 /// for an arbitrary SELECT that isn't backed by one table.
 fn source_table(gs: GridState) -> Option<String> {
@@ -6983,18 +6914,18 @@ fn edit_row_panel(gs: GridState, max_rows: RwSignal<usize>) -> impl IntoView {
 fn discard_edits(gs: GridState) {
     // Every one of these is guarded, because a discard mostly throws away *one*
     // kind of staged change and announcing the other two anyway is what rebuilt
-    // the grid body under the keyboard — see [`clear_if_any`].
-    clear_if_any(gs.edit_cell);
-    clear_if_any(gs.dirty);
+    // the grid body under the keyboard — see [`crate::widgets::clear_if_any`].
+    crate::widgets::clear_if_any(gs.edit_cell);
+    crate::widgets::clear_if_any(gs.dirty);
     if gs.new_rows.with_untracked(|r| !r.is_empty()) {
-        clear_if_any(gs.new_rows);
+        crate::widgets::clear_if_any(gs.new_rows);
         // The pending-row indices are about to be handed out again from zero, so an
         // in-flight AI seed must be told the ones it captured no longer mean what
         // they meant. Only when rows were actually thrown away: with none staged
         // there is nothing whose indices could have moved.
         gs.new_rows_gen.update(|g| *g = g.wrapping_add(1));
     }
-    clear_if_any(gs.del_rows);
+    crate::widgets::clear_if_any(gs.del_rows);
     // **The whole bar, not just its error surface.** Discard's meaning is "none of
     // that is true any more", and the bar's *note* surface is the one that can hold
     // a sentence about the edits it just threw away — `Pasted 5 cells, skipping 1
@@ -7312,7 +7243,9 @@ fn grid_key(gs: GridState, nrows: usize, ncols: usize, e: &Event) -> EventPropag
                 // `DELETE`d in one commit.
                 if mark {
                     let doomed: std::collections::HashSet<usize> = rows.into_iter().collect();
-                    gs.dirty.update(|m| m.retain(|(di, _), _| !doomed.contains(di)));
+                    crate::widgets::retain_pairs_if_any(gs.dirty, move |(di, _), _| {
+                        !doomed.contains(di)
+                    });
                 }
                 gs.clear_bar();
             }
@@ -8555,8 +8488,7 @@ fn set_rows_deleted(gs: GridState, idxs: &[usize], deleted: bool) {
     // in one commit. One `retain` over the whole selection, not one per row.
     if deleted {
         let doomed: std::collections::HashSet<usize> = idxs.iter().copied().collect();
-        gs.dirty
-            .update(|m| m.retain(|(di, _), _| !doomed.contains(di)));
+        crate::widgets::retain_pairs_if_any(gs.dirty, move |(di, _), _| !doomed.contains(di));
     }
     gs.clear_bar();
 }
@@ -12701,12 +12633,12 @@ mod clear_tests {
         });
         assert_eq!(runs.get(), 1, "the effect's first run");
 
-        clear_if_any(sig);
+        crate::widgets::clear_if_any(sig);
         assert_eq!(runs.get(), 1, "nothing to clear, so nothing was rebuilt");
 
         sig.update(|v| v.push(7));
         assert_eq!(runs.get(), 2, "a real change notifies");
-        clear_if_any(sig);
+        crate::widgets::clear_if_any(sig);
         assert_eq!(runs.get(), 3, "and so does a real clear");
         assert!(sig.get_untracked().is_empty(), "which actually cleared it");
 
@@ -12798,12 +12730,12 @@ mod clear_tests {
         });
         assert_eq!(runs.get(), 1);
 
-        clear_if_any(sig);
+        crate::widgets::clear_if_any(sig);
         assert_eq!(runs.get(), 1, "already None");
 
         sig.set(Some((1, 2)));
         assert_eq!(runs.get(), 2);
-        clear_if_any(sig);
+        crate::widgets::clear_if_any(sig);
         assert_eq!(runs.get(), 3);
         assert_eq!(sig.get_untracked(), None);
     }
@@ -12818,12 +12750,197 @@ mod clear_tests {
             RwSignal::new(vec![HashMap::new()]);
         let del: RwSignal<HashSet<usize>> = RwSignal::new(HashSet::from([3]));
 
-        clear_if_any(dirty);
-        clear_if_any(rows);
-        clear_if_any(del);
+        crate::widgets::clear_if_any(dirty);
+        crate::widgets::clear_if_any(rows);
+        crate::widgets::clear_if_any(del);
 
         assert!(dirty.get_untracked().is_empty());
         assert!(rows.get_untracked().is_empty());
         assert!(del.get_untracked().is_empty());
+    }
+
+    /// **Nothing in either view crate writes a clear or a retain by hand.**
+    ///
+    /// The tests above assert `clear_if_any` behaves, over a signal they create.
+    /// That is not the rule. The rule is about *call sites* —
+    /// `review/floem-rules.md`'s grep is `\.update\(\|.*\.clear\(\)` — and
+    /// running it found two live violations, both in `schemaic-app`, neither of
+    /// which any test could see:
+    ///
+    /// - `collapse_all`: `expanded.update(|set| set.clear())` then `save_ui()`.
+    ///   On an already-collapsed tree that notified every dependent of the
+    ///   app-wide expansion set *and wrote the UI state to disk*, for a no-op
+    ///   click.
+    /// - `collapse_db`: the same with a `retain` that removes nothing —
+    ///   `update` does not care whether the predicate kept everything.
+    ///
+    /// **And they were in `schemaic-app` for a structural reason**, which is the
+    /// point: `clear_if_any` and `Clearable` were module-private to `grid.rs`
+    /// and re-exported from nowhere, so the guard was unreachable from the one
+    /// crate that had violations. It lives in `widgets` now and is `pub`.
+    ///
+    /// Floored on finding the guarded sites, so a rename or a moved `src`
+    /// cannot make this pass by matching nothing — `crate_sources` carries its
+    /// own floor underneath that.
+    /// **`retain_if_any` has to hold the same property `clear_if_any` does**, and
+    /// a `retain` is where it is easiest to lose: the predicate reads as a
+    /// condition, so it is natural to assume the write is one too. It is not —
+    /// `update` notifies whether or not the predicate removed anything.
+    ///
+    /// Asserted for both shapes, and — as `clear_tests` does throughout — the
+    /// **unguarded** spelling is asserted to misbehave beside it, so the test
+    /// cannot pass by floem quietly acquiring a dedup of its own.
+    #[test]
+    fn a_retain_that_removes_nothing_does_not_notify() {
+        let set: RwSignal<std::collections::HashSet<String>> =
+            RwSignal::new(["db:shop".to_string()].into_iter().collect());
+        let runs = std::rc::Rc::new(std::cell::Cell::new(0usize));
+        let n = runs.clone();
+        create_effect(move |_| {
+            set.track();
+            n.set(n.get() + 1);
+        });
+        assert_eq!(runs.get(), 1);
+
+        // Nothing under `analytics` — the collapse that changes nothing.
+        crate::widgets::retain_if_any(set, |k| !k.starts_with("db:analytics"));
+        assert_eq!(runs.get(), 1, "a retain that keeps everything notified");
+
+        // And one that does remove something still must.
+        crate::widgets::retain_if_any(set, |k| !k.starts_with("db:shop"));
+        assert_eq!(runs.get(), 2);
+        assert!(set.with_untracked(|s| s.is_empty()));
+
+        // The unguarded spelling, for contrast: this is the floem fact the
+        // guard exists for, and `set` is empty now so the retain is a no-op.
+        let before = runs.get();
+        set.update(|s| s.retain(|k| !k.starts_with("db:anything")));
+        assert_eq!(
+            runs.get() - before,
+            1,
+            "`update` notifies with nothing to do — if this stops being true,              the guards above are no longer what is buying anything"
+        );
+    }
+
+    /// The map shape, which is the grid's three `dirty` filters: dropping the
+    /// staged edits of rows being deleted, where the common case is that the
+    /// deleted rows had none.
+    #[test]
+    fn a_pair_retain_that_removes_nothing_does_not_notify_either() {
+        let dirty: RwSignal<std::collections::HashMap<(usize, usize), String>> =
+            RwSignal::new([((7, 0), "x".to_string())].into_iter().collect());
+        let runs = std::rc::Rc::new(std::cell::Cell::new(0usize));
+        let n = runs.clone();
+        create_effect(move |_| {
+            dirty.track();
+            n.set(n.get() + 1);
+        });
+        assert_eq!(runs.get(), 1);
+
+        // Deleting row 3, which has no staged edit — the ordinary case.
+        crate::widgets::retain_pairs_if_any(dirty, |(di, _), _| *di != 3);
+        assert_eq!(runs.get(), 1, "a row with no staged edit rebuilt the body");
+
+        // Deleting row 7, which does.
+        crate::widgets::retain_pairs_if_any(dirty, |(di, _), _| *di != 7);
+        assert_eq!(runs.get(), 2);
+        assert!(dirty.with_untracked(|m| m.is_empty()));
+    }
+
+    /// Writes the rule does **not** cover, each with the reason it is not a
+    /// no-op — `(file, a fragment of the line, why)`. `scaled_arg_gate`'s
+    /// triple, and `every_clear_exemption_still_names_a_real_write` below is the
+    /// floor that keeps this from becoming a hole.
+    ///
+    /// The rule is "do not notify for nothing". Every entry here notifies for
+    /// something.
+    const EXEMPT: &[(&str, &str, &str)] = &[
+        (
+            "grid.rs",
+            "gs.grid_query.update(|q| q.filter.clear())",
+            "Not a collection signal: `q` is the query struct and `filter` is a              `String` field on it. `Clearable` is over the signal's own value,              and a guard here would have to ask about a field — a different              question, and one the caller can see the answer to (this runs from              the filter bar's clear button, where the filter is non-empty).",
+        ),
+        (
+            "object_editor.rs",
+            "errs.update(|e| e.retain(|m| m != &msg))",
+            "Removes one known message from the error list — the caller is              dismissing the very error it is naming, so the retain always              removes it and the notification is the point. Two sites, one per              editor arm.",
+        ),
+        (
+            "schemaic-app/main.rs",
+            "tabs.update(|v| v.retain(|t| t.id != id))",
+            "Closing a tab by id. The tab is in the list by construction — the              id came from it — so this always removes one, and the rebuild it              notifies is the tab strip redrawing without it.",
+        ),
+        (
+            "schemaic-app/main.rs",
+            "tabs.update(|v| v.retain(|t| t.conn_id.get_untracked() != id))",
+            "Dropping a deleted connection's tabs. This one *can* remove              nothing — a connection with no open tabs — so it is guarded, but              by an `if !doomed.is_empty()` rather than by `retain_if_any`: the              caller has already built `doomed` to dispose those tabs' scopes,              so the answer is in hand and a second scan would be waste.",
+        ),
+        (
+            "schemaic-app/main.rs",
+            "connections.update(|cs| cs.retain(|c| c.id != id))",
+            "Deleting a connection by id, same shape: the id came from the list              being filtered.",
+        ),
+    ];
+
+    /// **An exemption that no longer matches anything is a hole, not a     /// permission.**
+    ///
+    /// `scaled_arg_gate::every_exemption_still_names_a_real_parameter`'s
+    /// reason, and the same instrument: without this, renaming a signal or
+    /// moving a call site leaves `EXEMPT` quietly covering nothing while the
+    /// gate above reports success.
+    #[test]
+    fn every_clear_exemption_still_names_a_real_write() {
+        let sources = crate::source_gate::crate_sources();
+        for (file, frag, why) in EXEMPT {
+            assert!(!why.trim().is_empty(), "{file}: {frag} carries no reason");
+            let found = sources
+                .iter()
+                .any(|(f, body)| f == file && body.contains(frag));
+            assert!(
+                found,
+                "the exemption `{file}: {frag}` matches nothing any more —                  either the write moved and the exemption should move with it,                  or it is gone and this line is a hole in the gate"
+            );
+        }
+    }
+
+    #[test]
+    fn no_view_code_clears_or_retains_a_signal_unguarded() {
+        let mut offenders: Vec<String> = Vec::new();
+        let mut guarded = 0usize;
+        for (file, body) in crate::source_gate::crate_sources() {
+            for (i, line) in body.lines().enumerate() {
+                let l = line.trim();
+                if l.contains("clear_if_any(") || l.contains("retain_if_any(") {
+                    guarded += 1;
+                    continue;
+                }
+                // `.update(|x| x.clear())` / `.update(|x| x.retain(…))`, the two
+                // spellings the rule names. The guards' own bodies are exempt:
+                // they are what everything else is supposed to call.
+                if file == "widgets.rs" {
+                    continue;
+                }
+                let is_clear = l.contains(".update(|") && l.contains(".clear()");
+                let is_retain = l.contains(".update(|") && l.contains(".retain(");
+                if (is_clear || is_retain)
+                    && !EXEMPT
+                        .iter()
+                        .any(|(f, frag, _)| *f == file && l.contains(frag))
+                {
+                    offenders.push(format!("{file}:{}: {l}", i + 1));
+                }
+            }
+        }
+        assert!(
+            guarded >= 6,
+            "the scan stopped finding the guarded sites — it saw {guarded};              four are `discard_edits`' and two are the schema tree's collapses"
+        );
+        assert!(
+            offenders.is_empty(),
+            "`update` notifies whether or not the value changed, so an              unconditional clear/retain rebuilds every subscriber for nothing.              Use `widgets::clear_if_any` / `retain_if_any`:
+{}",
+            offenders.join("
+")
+        );
     }
 }
