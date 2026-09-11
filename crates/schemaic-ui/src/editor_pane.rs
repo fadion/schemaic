@@ -4131,6 +4131,10 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                                     "Explain",
                                     theme::err_fix_btn,
                                     theme::err_fix_btn_hover,
+                                    // The bar is workspace furniture, not a
+                                    // modal: it has no ring, and joins floem's
+                                    // own traversal instead.
+                                    None,
                                     move || (explain_error)(),
                                 )
                                 // The gap to *AI fix* belongs to the button, not
@@ -4152,6 +4156,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                                 "AI fix",
                                 theme::err_fix_btn,
                                 theme::err_fix_btn_hover,
+                                None,
                                 move || (ai_fix)(),
                             )
                             .into_any()

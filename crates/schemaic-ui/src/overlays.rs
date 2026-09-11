@@ -5264,11 +5264,15 @@ pub(crate) fn error_modal_overlay(ui: Ui) -> impl IntoView {
             // the pair as exactly that) and is a pale pink — on the light theme's
             // panel it would be all but invisible. `accent` is the panel's own
             // action colour.
+            // Explain first, then AI fix — left to right as they sit, so the
+            // first Tab lands on the action that only reads.
+            let ring = crate::widgets::FocusRing::new();
             let fix = if let Some(err) = fixable_error.clone() {
                 crate::widgets::sparkle_action(
                     "AI fix",
                     theme::accent,
                     theme::accent_hover,
+                    Some((ring.clone(), ACTION_TAB + 10)),
                     move || {
                         // **Close first.** Signals notify synchronously, so
                         // the request runs the pane's effect on the spot —
@@ -5325,22 +5329,28 @@ pub(crate) fn error_modal_overlay(ui: Ui) -> impl IntoView {
                         sql.get(lo..hi).map(str::to_string)
                     })
                 });
-                crate::widgets::sparkle_action("Explain", theme::accent, theme::accent_hover, {
-                    move || {
-                        let Some(p) = schemaic_core::prompt::explain_error_prompt(
-                            statement.as_deref(),
-                            &explain_msg,
-                            ai_data,
-                        ) else {
-                            return;
-                        };
-                        // Close before revealing, for the reason the fix does:
-                        // the panel takes the keyboard when it opens.
-                        close();
-                        crate::reveal_ai_panel(right_panel);
-                        (ai_send)(p);
-                    }
-                })
+                crate::widgets::sparkle_action(
+                    "Explain",
+                    theme::accent,
+                    theme::accent_hover,
+                    Some((ring.clone(), ACTION_TAB)),
+                    {
+                        move || {
+                            let Some(p) = schemaic_core::prompt::explain_error_prompt(
+                                statement.as_deref(),
+                                &explain_msg,
+                                ai_data,
+                            ) else {
+                                return;
+                            };
+                            // Close before revealing, for the reason the fix does:
+                            // the panel takes the keyboard when it opens.
+                            close();
+                            crate::reveal_ai_panel(right_panel);
+                            (ai_send)(p);
+                        }
+                    },
+                )
                 .into_any()
             } else {
                 empty().into_any()
@@ -5375,16 +5385,19 @@ pub(crate) fn error_modal_overlay(ui: Ui) -> impl IntoView {
                     .padding(theme::scaled(20.0))
                     .border_color(theme::modal_border())
             });
-            focus_root(stack((crate::widgets::dismiss_layer(close), panel)))
-                .on_key_down(Key::Named(NamedKey::Escape), |_| true, move |_| close())
-                .style(|s| {
-                    s.size_full()
-                        .flex_col()
-                        .items_center()
-                        .justify_center()
-                        .background(theme::modal_backdrop())
-                })
-                .into_any()
+            crate::widgets::focus_root_with_ring(
+                stack((crate::widgets::dismiss_layer(close), panel)),
+                ring,
+            )
+            .on_key_down(Key::Named(NamedKey::Escape), |_| true, move |_| close())
+            .style(|s| {
+                s.size_full()
+                    .flex_col()
+                    .items_center()
+                    .justify_center()
+                    .background(theme::modal_backdrop())
+            })
+            .into_any()
         },
     )
     .style(move |s| {

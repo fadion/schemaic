@@ -1999,17 +1999,27 @@ fn text_button(
 /// row sits on: `err_fix_btn` is picked against the error bar's red fill and is
 /// a pale pink anywhere else. `fn`s, not `Color`s, so a live theme switch is
 /// picked up inside the style closure (§7.4).
+///
+/// **`ring` is `Option` because this is the one button family with a caller on
+/// each side of that line**: the error *modal* has a [`FocusRing`], the editor's
+/// error *bar* sits in the workspace and joins floem's own traversal. Both
+/// needed answering, and neither was — the row was a bare `h_stack` with an
+/// `on_click_stop`, and floem's `can_focus` requires membership in
+/// `keyboard_navigable`, so its own `view_tab_navigation` skipped it too. The
+/// error modal's only two actions, AI fix and Explain, could not be pressed by
+/// any key. `dialog_button`'s doc, a few dozen lines above, called itself the
+/// last ring-less button family in the app; it was not.
 pub(crate) fn sparkle_action(
     label: &'static str,
     color: fn() -> floem::peniko::Color,
     hover: fn() -> floem::peniko::Color,
+    ring: Option<(FocusRing, u32)>,
     on_click: impl Fn() + 'static,
-) -> impl IntoView {
-    h_stack((
+) -> AnyView {
+    let face = h_stack((
         icons::icon(icons::SPARKLES, 16.0).style(|s| s.margin_right(theme::scaled(5.0))),
         text(label).style(|s| s.font_size(theme::font_body())),
     ))
-    .on_click_stop(move |_| on_click())
     .style(move |s| {
         // No cursor of its own: the arrow stays, per *UI conventions*. And
         // `flex_shrink(0)`, because a button squeezed by a long label beside it
@@ -2020,7 +2030,26 @@ pub(crate) fn sparkle_action(
             .flex_shrink(0.0_f32)
             .color(color())
             .hover(move |s| s.color(hover()))
-    })
+    });
+    match ring {
+        // The ring's contract: the caller's own view carries the click, the
+        // wrapper `in_ring_button` builds carries the keyboard and the outline.
+        Some((ring, tabindex)) => {
+            let on_click = Rc::new(on_click);
+            let pressed = on_click.clone();
+            in_ring_button(
+                face.on_click_stop(move |_| on_click()),
+                ring,
+                tabindex,
+                true,
+                CONTROL_RADIUS,
+                move || pressed(),
+            )
+        }
+        // No ring to join — `key_pressable` owns both listeners itself, and puts
+        // them on two `ViewId`s so one Space does not run the action twice.
+        None => key_pressable(face, CONTROL_RADIUS, on_click),
+    }
 }
 
 /// The bordered bar a modal's actions sit in — quiet actions on the right, the
@@ -8383,6 +8412,119 @@ mod list_skip_tests {
     }
 }
 
+/// **A modal root without a ring leaks the keyboard out of its own modal.**
+///
+/// [`innermost_ring_root`] answers the innermost root *that has a ring*, and the
+/// window's Tab backstop asks it. A root registered `(id, None)` therefore makes
+/// that backstop answer `None` with the modal still up: `modal_up()` returns
+/// `Continue`, nothing marks the key processed, and floem's own
+/// `view_tab_navigation` walks the **whole window tree** and focuses a control
+/// behind the backdrop. Escape then no longer reaches the modal at all — the
+/// newly-focused view consumes nothing and the window handler returns `Continue`
+/// — so the modal is dismissable only with the mouse, while Space or Enter
+/// activates whatever the leak landed on. It is verbatim the failure
+/// [`ring_step`]'s own doc says the ring exists to prevent.
+///
+/// The error modal was the crate's one ring-less modal root, and it shipped that
+/// way because nothing asked. So the gate asks: a bare [`focus_root`] call is a
+/// **menu panel** — which drives itself with arrow keys and is exempt — or it is
+/// a modal and must be [`focus_root_with_ring`].
+///
+/// Keyed on the enclosing top-level function, not a line number: a position key
+/// moves whenever anything above it does, which silently re-arms the gate on the
+/// site the exemption was written for and licences a different one.
+#[cfg(test)]
+mod focus_root_gate {
+    /// `(file, enclosing fn, why this root needs no ring)`.
+    const EXEMPT: &[(&str, &str, &str)] = &[
+        (
+            "widgets.rs",
+            "menu_panel",
+            "the menu itself — ↑/↓/Enter/Escape are its own, and `menu_stack` \
+             owns the cursor",
+        ),
+        (
+            "overlays.rs",
+            "conn_menu_overlay",
+            "a dropdown's menu panel, driven by `menu_panel`'s keys",
+        ),
+        (
+            "overlays.rs",
+            "active_db_menu_overlay",
+            "a dropdown's menu panel",
+        ),
+        (
+            "overlays.rs",
+            "db_visibility_overlay",
+            "a checklist popup, arrow-driven",
+        ),
+        (
+            "overlays.rs",
+            "activity_menu_overlay",
+            "a dropdown's menu panel",
+        ),
+        (
+            "overlays.rs",
+            "schema_settings_overlay",
+            "a dropdown's menu panel",
+        ),
+        (
+            "editor_pane.rs",
+            "query_pane",
+            "the Run split-button's two-row menu, with its own ↑/↓/Enter/Escape",
+        ),
+    ];
+
+    /// The nearest preceding item at column 0 — deep inside a view closure, that
+    /// is the function a reader would name the site by.
+    fn enclosing_fn(src: &str, upto: usize) -> String {
+        let mut name = String::from("<top level>");
+        for line in src[..upto].split('\n') {
+            let head = line
+                .strip_prefix("pub(crate) fn ")
+                .or_else(|| line.strip_prefix("pub fn "))
+                .or_else(|| line.strip_prefix("fn "));
+            if let Some(rest) = head {
+                name = rest
+                    .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+                    .next()
+                    .unwrap_or("")
+                    .to_string();
+            }
+        }
+        name
+    }
+
+    #[test]
+    fn every_modal_root_publishes_a_ring() {
+        let mut offenders: Vec<String> = Vec::new();
+        for (file, src) in crate::source_gate::crate_sources() {
+            let mut from = 0;
+            while let Some(at) = src[from..].find("focus_root(") {
+                let at = from + at;
+                from = at + "focus_root(".len();
+                // `innermost_focus_root()` merely ends the same way.
+                if src[..at].ends_with("innermost_") {
+                    continue;
+                }
+                let who = enclosing_fn(&src, at);
+                if EXEMPT.iter().any(|(f, fun, _)| *f == file && *fun == who) {
+                    continue;
+                }
+                offenders.push(format!("{file}::{who}"));
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "these roots register no ring, so the window's Tab backstop answers \
+             `None` with the modal up and floem walks the whole window tree — \
+             Tab leaves the modal and Escape stops closing it: {offenders:?}. \
+             Use `focus_root_with_ring`, or add the site to EXEMPT with the \
+             reason it drives its own keys"
+        );
+    }
+}
+
 /// **A button contract owes the pointer and the keyboard the same answer.**
 ///
 /// [`key_pressable`] and [`in_ring_button`] both bind `on_press` to KeyDown. The
@@ -8467,6 +8609,30 @@ mod key_pressable_gate {
             "key_pressable chains `on_click_stop` and `keyboard_navigable` onto \
              one view, so floem's synthesised Click for Enter/Space lands on the \
              same id as the KeyDown arm and one press runs the action twice"
+        );
+    }
+
+    /// **And the third button family owes the same answer.** `sparkle_action`
+    /// — the app's "hand this to the model" control — was an `h_stack` with an
+    /// `on_click_stop` and nothing else, so floem's `can_focus` (which requires
+    /// membership in `keyboard_navigable`) skipped it and its own
+    /// `view_tab_navigation` did too. The error modal's *only* two actions, AI
+    /// fix and Explain, were unreachable from the keyboard by any route.
+    ///
+    /// That is why `every_modal_root_publishes_a_ring`'s fix is not enough on
+    /// its own: giving that modal a ring with nothing registered in it hands it
+    /// an **empty** one, and `ring_step(0, …)` returns `None`. Both halves are
+    /// one change, and this is the half that says so.
+    #[test]
+    fn a_sparkle_action_can_be_pressed_from_the_keyboard() {
+        let src = production_code(include_str!("widgets.rs"));
+        let body = body_of(&src, "sparkle_action");
+        assert!(
+            body.contains("in_ring_button") || body.contains("key_pressable"),
+            "sparkle_action binds the pointer only, so the error modal's AI fix \
+             and Explain cannot be reached by any key. Route it through \
+             `in_ring_button` where the caller has a ring and `key_pressable` \
+             where it has not"
         );
     }
 
