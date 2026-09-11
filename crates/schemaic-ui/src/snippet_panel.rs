@@ -34,23 +34,15 @@ pub(crate) fn snippet_panel(ui: Ui) -> impl IntoView {
     let items = ui.snippets.items;
     let actions = ui.snippet_actions.clone();
     let active_conn = ui.conn.active_conn;
-    let connections = ui.conn.connections;
     let overlay = ui.overlay;
     let menus = crate::widgets::MenuFlags::of(&ui);
     // The panel is scoped to the **active connection**, so its dialect comes
     // from that connection rather than from the active tab: a tab keeps the
     // connection it was opened on, and the library in front of you is the one
-    // for the connection selected above it.
-    let dialect = create_memo(move |_| {
-        let cid = active_conn.get();
-        connections
-            .with(|cs| {
-                cs.iter()
-                    .find(|c| c.id == cid)
-                    .map(|c| SqlDialect::from_db_type(&c.db_type))
-            })
-            .unwrap_or_default()
-    });
+    // for the connection selected above it. One memo on `ConnUi`, shared with
+    // the history panel and the app — see `ConnUi::dialect` for why it has to
+    // be tracked.
+    let dialect = ui.conn.dialect;
 
     // Panel-local, like the history panel's: the filter resets when the panel is
     // re-opened, and the rename buffer belongs to this build of the list.

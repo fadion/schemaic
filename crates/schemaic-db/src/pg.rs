@@ -1515,17 +1515,7 @@ pub(crate) async fn fetch_table_stats(db: &Db, database: &str) -> Result<SchemaS
         .map(|r| {
             let (ns, name) = (cell(&r, 0), cell(&r, 1));
             let rows = num(&r, 2);
-            let analyzed = opt(&r, 6);
-            // "Never analyzed" is a claim about the table, and it explains a
-            // *missing* estimate. With an estimate in hand and no timestamp —
-            // a stats reset, or a figure VACUUM set — saying it would
-            // contradict the number right next to it, so that case says
-            // nothing instead.
-            let freshness = match (&analyzed, rows) {
-                (Some(_), _) => Freshness::Analyzed(analyzed.clone()),
-                (None, None) => Freshness::Analyzed(None),
-                (None, Some(_)) => Freshness::Unknown,
-            };
+            let freshness = pg_freshness(opt(&r, 6), rows);
             TableStats {
                 indexes: by_table
                     .remove(&(ns.clone(), name.clone()))
@@ -3440,6 +3430,36 @@ async fn fetch_col_meta(
     Ok(out)
 }
 
+/// How much to trust a PostgreSQL row estimate, from the analyze timestamp
+/// and the estimate itself.
+///
+/// **Pure and here rather than inside the fold's closure**, for the reason
+/// `pg_no_default` gives: the rule the caption states is then a rule a test
+/// can check. This was the one decision in the module still fused to an
+/// `async fn` that owns a `Client`, so nothing could reach it — while its
+/// three arms encode two catalogue quirks that are easy to get backwards.
+///
+/// "Never analyzed" is a claim about the table, and it explains a *missing*
+/// estimate. With an estimate in hand and no timestamp — a
+/// `pg_stat_reset()`, or a figure `VACUUM` set — saying it would contradict
+/// the number right next to it, so that case says nothing instead.
+///
+/// Both inputs are catalogue quirks rather than plain facts: `reltuples` is
+/// `-1` for "unanalyzed" on PostgreSQL 14+ and `0` on 13 and earlier (which
+/// the caller maps to `None`), and `GREATEST(last_analyze, last_autoanalyze)`
+/// is NULL after a stats reset on a table that *has* been analyzed.
+/// Verified on PG 16.15: a freshly `REFRESH`ed materialized view reports
+/// `reltuples = 2` with both timestamps NULL — the `(None, Some(_))` arm —
+/// and a newly created table reports `-1` with both NULL, the
+/// `(None, None)` arm.
+fn pg_freshness(analyzed: Option<String>, rows: Option<u64>) -> Freshness {
+    match (&analyzed, rows) {
+        (Some(_), _) => Freshness::Analyzed(analyzed),
+        (None, None) => Freshness::Analyzed(None),
+        (None, Some(_)) => Freshness::Unknown,
+    }
+}
+
 /// Must the user supply a value for this column, or will the server?
 ///
 /// This is [`schemaic_core::model::ColumnFlags::no_default`]'s contract, and it
@@ -5271,6 +5291,36 @@ mod tests {
         // So does an identity column, either form.
         assert!(!pg_no_default(true, false, "a"));
         assert!(!pg_no_default(true, false, "d"));
+    }
+
+    /// **"Never analyzed" explains a missing estimate, and must not contradict
+    /// one that is present.** All four input combinations, because the arms
+    /// encode two catalogue quirks rather than plain facts and each was
+    /// verified against PG 16.15.
+    #[test]
+    fn pg_freshness_says_never_analyzed_only_when_there_is_no_estimate() {
+        use schemaic_core::stats::Freshness;
+        let ts = || Some("2026-09-01 12:00:00+00".to_string());
+
+        // A timestamp answers for itself, estimate or not.
+        assert_eq!(pg_freshness(ts(), Some(42)), Freshness::Analyzed(ts()));
+        assert_eq!(pg_freshness(ts(), None), Freshness::Analyzed(ts()));
+
+        // Neither: a newly created table, `reltuples = -1` on PG 14+ and `0` on
+        // 13, which the caller maps to `None`. This is the one case that may
+        // say "never analyzed".
+        assert_eq!(pg_freshness(None, None), Freshness::Analyzed(None));
+
+        // An estimate with no timestamp — a `pg_stat_reset()`, or a figure
+        // `VACUUM` set, or a freshly `REFRESH`ed materialized view (measured:
+        // `reltuples = 2`, both timestamps NULL). Saying "never analyzed" here
+        // would contradict the number printed beside it, so it says nothing.
+        assert_eq!(pg_freshness(None, Some(2)), Freshness::Unknown);
+        assert_eq!(
+            pg_freshness(None, Some(0)),
+            Freshness::Unknown,
+            "an estimate of zero is still an estimate"
+        );
     }
 }
 

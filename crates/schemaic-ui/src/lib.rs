@@ -890,11 +890,19 @@ pub struct ImportTargetInfo {
 
 impl ImportTargetInfo {
     /// `schema.table` on PostgreSQL outside `public`, else just the table name.
+    ///
+    /// Through `schema::display_name`, like the four sibling `display()`s in
+    /// this file — the fifth, `object_location`, deliberately does not and
+    /// spends three sentences saying why. This one used to be the rule expanded
+    /// by hand, inline `"public"` included, with nothing to say why. It agreed,
+    /// which is the cost: `sql_qualifier`'s own doc carries a live-reproduced
+    /// bug as the reason for its exact shape (a schema literally named
+    /// `"PUBLIC"` is a different schema, and folding it away addressed
+    /// `public`'s same-named object instead), so the *next* change to that rule
+    /// — a `search_path` setting, a second default namespace — would have
+    /// reached five of the six spellings.
     pub fn display(&self) -> String {
-        match &self.schema {
-            Some(s) if s != "public" => format!("{s}.{}", self.table.name),
-            _ => self.table.name.clone(),
-        }
+        schemaic_core::schema::display_name(self.schema.as_deref(), &self.table.name)
     }
 }
 
@@ -4775,6 +4783,23 @@ pub enum GrantsState {
 pub struct ConnUi {
     pub connections: RwSignal<Vec<Connection>>,
     pub active_conn: RwSignal<u64>,
+    /// The **active connection's** dialect — what the snippet library, the
+    /// library panel, the history panel and the palette all group and colour
+    /// by.
+    ///
+    /// One memo, on the bundle, because it was written out three times
+    /// identically — here, in `history_panel` and in `snippet_panel` — and only
+    /// the app's copy carried the reason it must be a *tracked* memo: the
+    /// built-in snippet pack is `snippet::builtins(dialect)`, so a memo reading
+    /// the dialect untracked recomputed only when `snippets` changed, and every
+    /// writer of that signal is a user action. Switching to a connection of
+    /// another engine therefore left the whole shipped pack of the *previous*
+    /// engine in place, which `snippet::applies` then filtered out entirely —
+    /// the panel, abbrev expansion and Find-Anywhere all lost their built-ins
+    /// until the next time a user snippet happened to be written. The two
+    /// copies without that note were the ones most likely to be "simplified" to
+    /// a `get_untracked`.
+    pub dialect: Memo<schemaic_core::intel::SqlDialect>,
     pub conn_menu_open: RwSignal<bool>,
     /// Live reachability of the active connection (health-checked periodically).
     pub conn_status: RwSignal<ConnStatus>,

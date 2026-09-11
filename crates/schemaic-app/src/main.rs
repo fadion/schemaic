@@ -11079,6 +11079,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
         conn: ConnUi {
             connections,
             active_conn,
+            dialect: conn_dialect_memo,
             conn_menu_open,
             conn_status,
             manage_open,

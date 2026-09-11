@@ -38,7 +38,6 @@ fn now_millis() -> u64 {
 pub(crate) fn history_panel(ui: Ui) -> impl IntoView {
     let entries = ui.history.entries;
     let active_conn = ui.conn.active_conn;
-    let connections = ui.conn.connections;
     let open_history = ui.history_actions.open.clone();
     let clear = ui.history_actions.clear.clone();
     let db_colors = ui.db_colors;
@@ -67,19 +66,10 @@ pub(crate) fn history_panel(ui: Ui) -> impl IntoView {
 
     // Which lexer colours the previews. The list is filtered to the **active
     // connection**, so every row on screen ran against it and its dialect is the
-    // right one for all of them — the same reasoning (and the same memo) the
-    // snippet library uses, and for the same reason it reads the connection
-    // rather than the active tab.
-    let dialect = create_memo(move |_| {
-        let cid = active_conn.get();
-        connections
-            .with(|cs| {
-                cs.iter()
-                    .find(|c| c.id == cid)
-                    .map(|c| SqlDialect::from_db_type(&c.db_type))
-            })
-            .unwrap_or_default()
-    });
+    // right one for all of them — and it is now literally the same memo the
+    // snippet library reads, rather than a third copy of it. See
+    // `ConnUi::dialect` for why it has to be tracked.
+    let dialect = ui.conn.dialect;
 
     // Panel-local search filter (matched against SQL / database / tab name). Local
     // to this panel build — resets when the History panel is re-opened.
