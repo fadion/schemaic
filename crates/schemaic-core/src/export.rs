@@ -4975,7 +4975,38 @@ mod tests {
                 .stream_to(w, &mut src, None, MySql)
                 .map(|_| ())
         });
-        assert_eq!(whole, chunked, "the two paths must write one workbook");
+        // **Compared up to `docProps/core.xml`, because that part is a clock.**
+        // A workbook records when it was created, `rust_xlsxwriter` fills it
+        // from the wall clock, and the two renders here are two calls — so the
+        // full byte comparison this used to make was green only while both
+        // landed in the same second. It did, in isolation, ~always; under a
+        // loaded `cargo test --workspace` it did not, and the suite went red on
+        // something no change had broken. Measured: the differing bytes begin
+        // exactly at the compressed `docProps/core.xml` entry and run to the end
+        // of the central directory, which carries that entry's CRC.
+        //
+        // Everything before it is the workbook *content* — `[Content_Types]`,
+        // the rels, the theme, the styles, `xl/workbook.xml`,
+        // `xl/worksheets/sheet1.xml` — which is what "the two paths write one
+        // workbook" means. Truncating there asserts that, and nothing about the
+        // minute.
+        let upto_clock = |b: &[u8]| {
+            let at = b
+                .windows(b"docProps/core.xml".len())
+                .position(|w| w == b"docProps/core.xml")
+                .expect("a workbook records its properties");
+            b[..at].to_vec()
+        };
+        assert_eq!(
+            upto_clock(&whole),
+            upto_clock(&chunked),
+            "the two paths must write one workbook"
+        );
+        assert_eq!(
+            whole.len(),
+            chunked.len(),
+            "and the timestamped tail is the same size either way"
+        );
         assert!(
             whole.len() > 1000,
             "an empty result is still a whole workbook, not a stub: {} bytes",

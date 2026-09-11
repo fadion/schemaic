@@ -2804,6 +2804,10 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                 key_cols: monitor_key_cols.clone(),
                 generation: monitor_gen.clone(),
                 started: Instant::now(),
+                // **Once, here, before the first fetch** — see
+                // `MonitorCtx::order_by`. `source` is moved into `target` below,
+                // so this reads it while it is still in hand.
+                order_by: monitor_order_key(db_nodes, &source),
                 target: (conn_id, source),
                 dialect: connections
                     .with_untracked(|cs| {
@@ -11181,6 +11185,30 @@ struct MonitorCtx {
     /// the UI thread with no `Db` in hand, and the identity key it asks for must
     /// not depend on connecting again.
     dialect: SqlDialect,
+    /// The poll's `ORDER BY`, resolved **once** at open — `None` when the
+    /// schema could not answer, in which case the whole session polls unordered.
+    ///
+    /// **Pinned for the same reason `key_cols` is, and it was the one identity
+    /// input that wasn't.** It used to be recomputed from the live `db_nodes` on
+    /// every tick, *and again* on every reply to decide
+    /// [`Snapshot::ordered`] — two evaluations of a signal that moves under
+    /// them. On a fresh connect the schema routinely lands between the two: poll
+    /// 1 goes out with no `ORDER BY`, the schema arrives while it is in flight,
+    /// and its reply is stamped ordered. `diff_snapshots` then reads an
+    /// arbitrary sample as an ordered prefix and reports every row of it the
+    /// real first page does not hold as a DELETE, cells and all, into an
+    /// exportable log — see
+    /// `monitor::tests::an_arbitrary_window_called_ordered_reports_deletes_of_rows_that_are_still_there`.
+    /// The second consequence needs no race: recomputed per tick, the *window*
+    /// itself changes mid-session, which is the same diff by another door.
+    ///
+    /// Resolving once also settles a latent gap. `monitor_order_key` reads
+    /// `db_nodes`, which every other consumer in this file treats as the
+    /// **active** connection's tree and guards accordingly (`db_stats`), while
+    /// the monitor's target is the captured `target.0`. Asked once, at open,
+    /// the two are the same connection by construction; the modal's backdrop is
+    /// what made that unreachable rather than anything here.
+    order_by: Option<Vec<String>>,
     /// Poll interval (seconds), read fresh on each re-arm so the popup's dropdown
     /// takes effect on the next tick.
     interval: RwSignal<u64>,
@@ -11233,10 +11261,9 @@ fn monitor_tick(ctx: MonitorCtx, my_gen: u64) {
         }
     };
     // The window has to be the *same* window each poll, or the diff reports the
-    // window sliding as data changing. Ordering needs the key before the first
-    // fetch, and `analyze_edit` can only answer after one — so take it from the
-    // already-introspected schema, which is where `analyze_edit` would get it too.
-    let order_by = monitor_order_key(ctx.db_nodes, &source);
+    // window sliding as data changing — so the key is `MonitorCtx`'s, resolved
+    // once at open, not re-derived here from a signal that moves between ticks.
+    let order_by = ctx.order_by.clone();
     let ctx2 = ctx.clone();
     let send = create_ext_action(ctx.cx, move |out: Result<ResultSet, String>| {
         monitor_apply(ctx2.clone(), my_gen, out);
@@ -11337,7 +11364,12 @@ fn monitor_apply(ctx: MonitorCtx, my_gen: u64, out: Result<ResultSet, String>) {
             // whole is what put inserts and deletes that never happened into
             // an exportable log — see `Snapshot::window_full`.
             let full = rs.row_count() >= MONITOR_LIMIT;
-            let ordered = monitor_order_key(ctx.db_nodes, &ctx.target.1).is_some();
+            // **The field the fetch used**, so the flag cannot describe a query
+            // it did not shape. This asked `monitor_order_key` a second time,
+            // here, on the reply — and answered `Some` for a window that had
+            // gone out with no `ORDER BY` at all whenever the schema landed in
+            // between. See `MonitorCtx::order_by`.
+            let ordered = ctx.order_by.is_some();
             ctx.partial.set(full);
             let snap = Snapshot::from_result(&rs, &key_cols).window(ordered, full);
             if let Some(prev) = ctx.prev.borrow().as_ref() {
@@ -11727,6 +11759,52 @@ mod app_tests {
             ["run(req.into_sql());", "run(sql);"],
             "the raw `run` gained or lost a caller: every one must take its SQL \
              from a `RerunRequest`, which only `sql::rerunnable_for_export` mints"
+        );
+    }
+
+    /// **The monitor's order key is resolved once, and the resolver has one
+    /// caller.**
+    ///
+    /// `MonitorCtx` pins every identity input for the life of a session —
+    /// `key_cols` is written exactly once on the baseline poll, `dialect` is
+    /// carried with a doc saying the key "must not depend on connecting again".
+    /// `order_by` was the one that wasn't: `monitor_order_key` was called from
+    /// `monitor_tick` to shape the fetch **and again** from `monitor_apply` to
+    /// stamp `Snapshot::ordered` on the reply, both reading a `db_nodes` that
+    /// moves under them. On a fresh connect the schema lands between the two,
+    /// and the flag then describes a query it did not shape — which
+    /// `diff_snapshots` reads as licence to compare an arbitrary sample as an
+    /// ordered prefix. What that costs is pinned in
+    /// `monitor::an_arbitrary_window_called_ordered_reports_deletes_of_rows_that_are_still_there`.
+    ///
+    /// A source gate because the defect is *a second call*, not a wrong value:
+    /// both calls were individually correct. The one that remains is in
+    /// `open_monitor`, before the first tick.
+    #[test]
+    fn the_monitors_order_key_is_resolved_at_open_and_nowhere_else() {
+        let src = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("src")
+                .join("main.rs"),
+        )
+        .expect("this file's own source");
+        let body = src
+            .split("#[cfg(test)]")
+            .next()
+            .expect("production code")
+            .to_string();
+        let calls: Vec<&str> = body
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.starts_with("//") && !l.starts_with("///"))
+            .filter(|l| l.contains("monitor_order_key(") && !l.starts_with("fn "))
+            .collect();
+        assert_eq!(
+            calls,
+            ["order_by: monitor_order_key(db_nodes, &source),"],
+            "the order key must be resolved once, at open, and carried on \
+             `MonitorCtx` — a second call can answer differently from the one \
+             that shaped the fetch"
         );
     }
 

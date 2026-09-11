@@ -638,6 +638,87 @@ mod tests {
 
     // ── a bounded window is not the whole table ──────────────────────────────
 
+    /// **What it costs to call an arbitrary window an ordered prefix.**
+    ///
+    /// Every other `window()` fixture here builds *both* sides as honest ordered
+    /// prefixes, so nothing pinned the price of `ordered` being wrong — which is
+    /// how the Live Monitor came to stamp it from a **second** evaluation of the
+    /// order key, taken on the reply, after the fetch the flag describes had
+    /// already been sent. Poll 1 goes out unordered because the schema has not
+    /// landed; the schema lands while it is in flight; the reply is stamped
+    /// ordered.
+    ///
+    /// `ordered` is what licenses `last_common`: two windows that really are
+    /// prefixes of one sequence can be compared up to the last row they share,
+    /// and beyond it the window merely slid. An arbitrary window shares rows
+    /// with the ordered page by coincidence, so that cut lands wherever the
+    /// coincidence ends — and every row of the arbitrary sample before it that
+    /// the ordered page does not hold is reported as a **DELETE**, cells and
+    /// all, into a log the modal's own docs call the only remaining record of
+    /// what a deleted row held. The rows are still in the table; they sort past
+    /// position `ROW_CAP`.
+    ///
+    /// Told the truth, `diff_snapshots` attributes nothing at either edge — an
+    /// arbitrary window's silence means nothing, which is the third state
+    /// `window_full` was split out to express.
+    #[test]
+    fn an_arbitrary_window_called_ordered_reports_deletes_of_rows_that_are_still_there() {
+        // The arbitrary sample poll 1 came back with, and the ordered first page
+        // poll 2 fetched. They share `a` and `d`; `b` and `c` sort past the cap.
+        let old_rows = vec![
+            row("a", &[Some("1")]),
+            row("b", &[Some("2")]),
+            row("c", &[Some("3")]),
+            row("d", &[Some("4")]),
+        ];
+        let new_rows = vec![
+            row("a", &[Some("1")]),
+            row("d", &[Some("4")]),
+            row("e", &[Some("5")]),
+            row("f", &[Some("6")]),
+        ];
+        let lie = diff_snapshots(
+            &Snapshot {
+                rows: old_rows.clone(),
+                ordered: true,
+                window_full: true,
+            },
+            &Snapshot {
+                rows: new_rows.clone(),
+                ordered: true,
+                window_full: true,
+            },
+        );
+        let deleted: Vec<&Vec<String>> = lie
+            .iter()
+            .filter(|c| c.kind == ChangeKind::Delete)
+            .map(|c| &c.key)
+            .collect();
+        assert_eq!(
+            deleted,
+            vec![&vec!["b".to_string()], &vec!["c".to_string()]],
+            "this is the damage the second evaluation buys: {lie:?}"
+        );
+
+        let honest = diff_snapshots(
+            &Snapshot {
+                rows: old_rows,
+                ordered: false,
+                window_full: true,
+            },
+            &Snapshot {
+                rows: new_rows,
+                ordered: true,
+                window_full: true,
+            },
+        );
+        assert!(
+            honest.is_empty(),
+            "an arbitrary window's silence means nothing, at either edge: \
+             {honest:?}"
+        );
+    }
+
     #[test]
     fn a_row_promoted_into_the_window_is_not_an_insert() {
         // Case A from the finding: a 1,001-row table watched with LIMIT 3.
