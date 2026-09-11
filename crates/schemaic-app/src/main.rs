@@ -1548,8 +1548,52 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
 
     // Schema tree (one ConnNode per database of the active connection).
     let db_nodes: RwSignal<Vec<ConnNode>> = RwSignal::new(Vec::new());
-    let expanded: RwSignal<HashSet<String>> =
-        RwSignal::new(ui_state.expanded.into_iter().collect());
+    // Expanded tree nodes, keyed by connection — see `core::expanded` for why
+    // the key has to carry one. **The third store to need this fix**, after
+    // `db_hidden` and `schema::tab_target`'s remembered database, and the same
+    // shape: every key here is name-only (`db:sys`), so expanding `sys` on one
+    // MySQL-family connection left it expanded on all of them, built the second
+    // one's whole table list, and with the size column on fired a stats query
+    // against a database nobody had opened there.
+    //
+    // `expanded` is the set for the connection currently being *looked at* —
+    // the question the tree asks — and `expanded_rules` is the persisted truth.
+    // The effect below writes one back into the other, and `switch_conn` reloads
+    // it; see both for the ordering that keeps them honest.
+    //
+    // The legacy list is cleared only once it has actually been read, for
+    // `hidden_dbs`' reason immediately below.
+    let mut pending_legacy_expanded = ui_state.expanded;
+    let expanded_rules: RwSignal<Vec<schemaic_core::expanded::ExpandedRule>> = RwSignal::new({
+        let mut rules = ui_state.expanded_rules;
+        if rules.is_empty()
+            && !pending_legacy_expanded.is_empty()
+            && let Some(migrated) = schemaic_core::expanded::migrate_flat(
+                &pending_legacy_expanded,
+                &cf.connections.iter().map(|c| c.id).collect::<Vec<_>>(),
+            )
+        {
+            rules = migrated;
+            pending_legacy_expanded = Vec::new();
+        }
+        rules
+    });
+    let pending_legacy_expanded = Rc::new(pending_legacy_expanded);
+    let expanded: RwSignal<HashSet<String>> = RwSignal::new(
+        expanded_rules.with_untracked(|r| schemaic_core::expanded::keys_for(r, active_id)),
+    );
+    // **Writes through on every change, reading the active connection
+    // untracked.** Untracked is the load-bearing half: tracking it would fire
+    // this on a connection *switch* and store the outgoing connection's set
+    // under the incoming one, before `switch_conn` had a chance to replace it.
+    // Tracking only `expanded` means the order is always "the set changed, file
+    // it under whoever is active" — and `switch_conn` sets `active_conn` first,
+    // then `expanded`, so its own write lands in the right place.
+    create_effect(move |_| {
+        let keys = expanded.get();
+        let conn = active_conn.get_untracked();
+        expanded_rules.update(|r| schemaic_core::expanded::set_keys(r, conn, &keys));
+    });
     // Hidden databases, keyed by connection — see `core::db_hidden` for why the
     // key has to carry one, and `migrate_flat` for what a file written before
     // this means. The rules are the persisted truth; `hidden_dbs` is the set for
@@ -6698,7 +6742,13 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
         let pending_legacy_hidden = pending_legacy_hidden.clone();
         move || {
             persist::save_ui_state(&UiState {
-                expanded: expanded.with_untracked(|s| s.iter().cloned().collect()),
+                // Same bargain as `hidden_dbs` below: the legacy flat field is
+                // written empty only once the migration has read it, and carried
+                // back out unchanged until then, so a launch that could not
+                // migrate leaves the upgrade to a later one rather than
+                // collapsing every tree permanently.
+                expanded: (*pending_legacy_expanded).clone(),
+                expanded_rules: expanded_rules.get_untracked(),
                 // The legacy flat field is written empty **once the migration has
                 // actually read it** — `hidden_db_rules` is the truth after that.
                 // Until then it is carried back out unchanged, so a launch that
@@ -8720,6 +8770,16 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                 .borrow_mut()
                 .insert(active_conn.get_untracked(), active.get_untracked());
             active_conn.set(id);
+            // **After `active_conn`, and this order is the whole of it.** The
+            // write-through effect reads the active connection *untracked*, so
+            // it files whatever `expanded` becomes under whoever is active now —
+            // which, one line up, is the connection being switched to. The
+            // outgoing connection's set is already stored: the effect ran on
+            // every change that made it. Without this the tree opened the new
+            // connection with the old one's nodes expanded, built their table
+            // lists, and with the size column on queried them.
+            expanded
+                .set(expanded_rules.with_untracked(|r| schemaic_core::expanded::keys_for(r, id)));
             persist_conns(Some(id));
             // The strip shows only this connection's tabs, so the active tab has
             // to become one of them. A connection with none gets a fresh tab —
@@ -9446,6 +9506,11 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             // replaced could not do it at all, so a deleted connection's hidden
             // names went on hiding same-named databases forever.
             hidden_db_rules.update(|v| schemaic_core::db_hidden::clear_conn(v, id));
+            // And what it had open in the tree, for the same reason — the flat
+            // set could not do this either, so a deleted connection's expanded
+            // nodes went on auto-opening same-named databases on connections
+            // created later.
+            expanded_rules.update(|v| schemaic_core::expanded::clear_conn(v, id));
             (save_ui)();
             formats.update(|v| schemaic_core::format::clear_conn(v, id));
             (save_formats)();

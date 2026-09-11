@@ -23,6 +23,7 @@ pub mod dump;
 pub mod edit;
 pub mod erd;
 pub mod erd_export;
+pub mod expanded;
 pub mod export;
 pub mod favorite;
 pub mod filter;

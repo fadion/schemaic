@@ -152,9 +152,19 @@ fn default_tab_width() -> usize {
 /// Everything we remember about the UI between sessions.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct UiState {
-    /// Keys of expanded schema-tree nodes (`db:<name>`, `tbl:<db>:<name>`).
+    /// **Legacy.** Keys of expanded schema-tree nodes (`db:<name>`,
+    /// `tbl:<db>:<name>`) with no connection dimension — read once at startup and
+    /// folded into `expanded_rules` by [`crate::expanded::migrate_flat`], then
+    /// never written again. Kept as a field for `hidden_dbs`' reason: an upgrade
+    /// must not lose the setting, and removing it silently would make a
+    /// `Vec<String>` where a `Vec<Rule>` is expected fail the whole file's parse.
     #[serde(default)]
     pub expanded: Vec<String>,
+    /// Expanded schema-tree nodes, keyed by connection — see
+    /// [`crate::expanded`] for why the key has to carry one. Default: nothing
+    /// expanded.
+    #[serde(default)]
+    pub expanded_rules: Vec<crate::expanded::ExpandedRule>,
     /// Show each table's on-disk size in the schema tree. Default: off — it
     /// costs a catalogue query per expanded database (see
     /// [`crate::stats`]), so it is something the user asks for rather than
@@ -358,6 +368,7 @@ impl Default for UiState {
     fn default() -> Self {
         Self {
             expanded: Vec::new(),
+            expanded_rules: Vec::new(),
             show_table_sizes: false,
             hidden_dbs: Vec::new(),
             hidden_db_rules: Vec::new(),
@@ -1909,6 +1920,48 @@ mod tests {
         let json = br#"{"activity_intervals":[{"conn_id":3,"secs":0}]}"#;
         let s: UiState = serde_json::from_slice(json).expect("parses");
         assert_eq!(crate::activity::interval_for(&s.activity_intervals, 3), 0);
+    }
+
+    /// **The expansion set's upgrade, both directions.**
+    ///
+    /// A file written before the set gained a connection dimension carries a
+    /// flat `expanded` list; one written after carries `expanded_rules` and an
+    /// empty flat field. Both must read, and the legacy one must not be dropped
+    /// on the floor — the flat list is removed only once the migration has
+    /// actually consumed it, which needs the connection ids to be loaded.
+    #[test]
+    fn the_expanded_set_reads_both_the_flat_list_and_the_keyed_rules() {
+        // A pre-upgrade file.
+        let json = br#"{"expanded":["db:sys","db:world"]}"#;
+        let s: UiState = serde_json::from_slice(json).expect("parses");
+        assert_eq!(s.expanded.len(), 2);
+        assert!(s.expanded_rules.is_empty());
+        let migrated =
+            crate::expanded::migrate_flat(&s.expanded, &[1, 2]).expect("connections are loaded");
+        assert!(crate::expanded::is_expanded(&migrated, 1, "db:sys"));
+        assert!(
+            crate::expanded::is_expanded(&migrated, 2, "db:sys"),
+            "the flat list meant everywhere, so the migration means everywhere"
+        );
+
+        // A post-upgrade file: the flat field is empty and the rules carry it.
+        let json = br#"{"expanded":[],"expanded_rules":[{"conn_id":2,"key":"db:sys"}]}"#;
+        let s: UiState = serde_json::from_slice(json).expect("parses");
+        assert!(s.expanded.is_empty());
+        assert!(crate::expanded::is_expanded(&s.expanded_rules, 2, "db:sys"));
+        assert!(
+            !crate::expanded::is_expanded(&s.expanded_rules, 1, "db:sys"),
+            "which is the whole point of the upgrade"
+        );
+
+        // And a file from before either existed.
+        let s: UiState = serde_json::from_slice(br"{}").expect("parses");
+        assert!(s.expanded.is_empty() && s.expanded_rules.is_empty());
+        assert_eq!(
+            crate::expanded::migrate_flat(&s.expanded, &[]),
+            None,
+            "no connections is 'not yet', so the flat field stays on disk"
+        );
     }
 
     /// The case that costs the most: a connection file is the one whose loss the
