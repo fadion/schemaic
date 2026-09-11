@@ -369,7 +369,7 @@ impl WindowChrome {
             Edge::SouthWest,
             Edge::SouthEast,
         ]
-        .map(|edge| zone(edge).into_any())
+        .map(|edge| zone(edge, self.maximized).into_any())
     }
 }
 
@@ -529,15 +529,47 @@ impl Edge {
     }
 }
 
-fn zone(edge: Edge) -> impl IntoView {
+/// One resize edge or corner, hidden while the window is **maximized**.
+///
+/// A maximized window has no frame to grab, and these are mounted outside the
+/// app root, so they are hit first and each one stops the press. The `NorthEast`
+/// corner sits on the extreme top-right pixel — the Fitts's-law gesture for
+/// closing a maximized window — and `North` is the top 5px of all three caption
+/// buttons, so both swallowed clicks that belonged to the buttons underneath and
+/// did nothing with them: `drag_resize_window` sends a sizing message a
+/// maximized window has no response to.
+///
+/// **`hide()`, not `pointer_events(false)`** — a hidden view is not laid out, so
+/// the walk skips it entirely and reaches the button beneath; a
+/// `pointer_events(false)` sibling would still have to be rejected by
+/// `should_send`, and would take its subtree with it. That is the trap
+/// [`WindowChrome::resize_zones`]' own doc spells out one level up.
+///
+/// `maximized` is a signal read inside the style closure, so this follows the
+/// window with no rebuild — and it is the same flag `sync` keeps true to the OS
+/// on every route into maximization, rather than a second answer to the question.
+fn zone(edge: Edge, maximized: RwSignal<bool>) -> impl IntoView {
     empty()
         .on_event_stop(EventListener::PointerDown, move |e| {
             let Event::PointerDown(p) = e else { return };
             if p.button.is_primary() {
                 drag_resize_window(edge.direction());
+                // **A press on window chrome is not a focus change.** Floem
+                // clears `app_state.focus` on every pointer-down and only a
+                // `keyboard_navigable` view re-takes it during the walk — this
+                // is neither, and it stops the walk. Both siblings in this file
+                // hand it back for the same reason; without it, resizing the
+                // window with a modal open left Escape unable to close it, and
+                // with no modal dropped the next keystroke typed at the editor.
+                give_the_keyboard_back();
             }
         })
-        .style(move |s| edge.style(s).cursor(edge.cursor()))
+        .style(move |s| {
+            if maximized.get() {
+                return s.hide();
+            }
+            edge.style(s).cursor(edge.cursor())
+        })
 }
 
 #[cfg(test)]
@@ -590,6 +622,116 @@ mod tests {
              the wrong width at the trailing edge",
             Chrome::of(Host::Windows).own_control_count()
         );
+    }
+
+    /// **A press on window chrome is not a focus change, so it owes the
+    /// keyboard back.**
+    ///
+    /// Floem clears `app_state.focus` at the top of *every* `PointerDown`
+    /// dispatch, and only a `keyboard_navigable` view re-takes it during the
+    /// walk that follows. A resize zone is a bare `empty()` with an
+    /// `on_event_stop` — not navigable, inside nothing navigable, and it stops
+    /// the walk — so dragging a window edge left focus `None`. With a modal up
+    /// that means Escape stops closing it (Tab recovers through the workspace
+    /// root's ring backstop, which is why it reads as intermittent rather than
+    /// as a dead modal); with no modal, the next keystroke after a resize is
+    /// dropped instead of landing at the caret.
+    ///
+    /// Both siblings in this file — the drag band and the caption buttons —
+    /// already call `give_the_keyboard_back()`, and the helper's own doc names
+    /// the modal case as the visible one and Escape as the branch with no
+    /// backstop. So the rule is every pointer-down handler in this file, with a
+    /// floor so a rename fails red rather than passing on an empty scan.
+    #[test]
+    fn every_chrome_press_hands_the_keyboard_back() {
+        let src = src();
+        let code = crate::source_gate::production_code(&src);
+        // Both spellings a press arrives by in this file: the drag band and the
+        // resize zones take `PointerDown` (they must — `on_click_stop` stops
+        // *Click*, not the press a drag begins with), the caption buttons take
+        // the click. All three are presses on chrome.
+        let marks: Vec<usize> = ["on_event_stop(EventListener::PointerDown", "on_click_stop("]
+            .iter()
+            .flat_map(|m| code.match_indices(m).map(|(i, _)| i).collect::<Vec<_>>())
+            .collect();
+        let mut sorted = marks.clone();
+        sorted.sort_unstable();
+        let mut offenders: Vec<u32> = Vec::new();
+        for (n, &at) in sorted.iter().enumerate() {
+            // To the next handler, or 1,200 bytes — whichever comes first, so a
+            // neighbour's call cannot answer for this one.
+            let end = sorted
+                .get(n + 1)
+                .copied()
+                .unwrap_or(code.len())
+                .min(at + 1200)
+                .min(code.len());
+            if !code[at..end].contains("give_the_keyboard_back()") {
+                offenders.push(code[..at].matches('\n').count() as u32 + 1);
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "window chrome presses at {offenders:?} take the keyboard and never \
+             hand it back — floem clears focus on every pointer-down, so after \
+             one of these Escape stops reaching an open modal"
+        );
+        assert!(
+            sorted.len() >= 3,
+            "only {} chrome press handlers found — this gate has stopped seeing \
+             the sites it is written about",
+            sorted.len()
+        );
+    }
+
+    /// **A maximized window has no frame to grab.**
+    ///
+    /// The eight zones are mounted outside the app root, so they are hit first,
+    /// and each `on_event_stop`s the press. On a maximized window the
+    /// `NorthEast` corner is a 14×14 square over the extreme top-right pixel —
+    /// the Fitts's-law gesture for closing a maximized window — and the `North`
+    /// edge is the top 5px of all three caption buttons. `drag_resize_window`
+    /// sends a sizing message a maximized window has no response to, so the
+    /// press was swallowed and did nothing at all.
+    ///
+    /// The flag that answers this is a field of the same struct, kept true to
+    /// the OS by `sync` on every route into maximization, and was read by
+    /// nothing but the caption glyph. Hiding is the right spelling and not
+    /// `pointer_events(false)`: a hidden view is not laid out, so the walk skips
+    /// it and reaches the button underneath, where a `pointer_events(false)`
+    /// sibling would still have to be rejected by `should_send` — the trap
+    /// `resize_zones`' own doc spells out.
+    #[test]
+    fn a_maximized_window_hides_its_resize_zones() {
+        let src = src();
+        let zone = body_of(&src, "fn zone(");
+        assert!(
+            zone.contains("maximized") && zone.contains("hide()"),
+            "the resize zones do not ask whether the window is maximized, so \
+             the top band and the top-right corner swallow every press that \
+             belongs to the caption buttons underneath"
+        );
+    }
+
+    /// And all eight still exist in both states — hidden, not dropped. Getting
+    /// this wrong leaves an undecorated window that cannot be resized at all,
+    /// winit having stripped `WS_SIZEBOX`.
+    #[test]
+    fn every_edge_still_has_a_zone() {
+        let src = src();
+        let zones = body_of(&src, "pub fn resize_zones(self)");
+        for edge in [
+            "Edge::North",
+            "Edge::South",
+            "Edge::West",
+            "Edge::East",
+            "Edge::NorthWest",
+            "Edge::NorthEast",
+            "Edge::SouthWest",
+            "Edge::SouthEast",
+        ] {
+            assert!(zones.contains(edge), "{edge} is no longer built");
+        }
     }
 
     /// The band and the buttons it stops short of are the same width, on every
