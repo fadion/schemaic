@@ -1612,7 +1612,24 @@ existing prose was left alone.
     the very first column. **`ImportFormat::has_own_nulls` is the capability the null rules ask** — true for JSON
     and Excel, false for CSV — because a worksheet's empty cell is a real null and `NullRule`'s token
     list must not apply to it; it replaced two separate `match format` expressions, in `validate` and
-    in `row_iter`, that had to agree with each other. `RowSourceIter::Json` is now
+    in `row_iter`, that had to agree with each other.
+    **`preview_field` is the third asker, and it exists because the mapping step could not render a
+    CSV NULL at all.** The view decided nullness from the `Field` alone, and a `Field` is `None` only
+    for a *format-level* null — `read_csv_sample` builds every field as `Some(..)` and never reads
+    `cfg.nulls`, because for CSV whether empty text means NULL is `NullRule`'s call and that call is
+    made at coercion, which the preview does not run. So `id,note` / `1,NULL` / `2,` with the defaults
+    previewed row 1's `note` as the plain text `NULL` and row 2's as an empty cell, both in the
+    ordinary colour and both indistinguishable from the string values `'NULL'` and `''` — while the
+    import stored NULL in both; and turning *Empty field is NULL* off left the preview byte-identical
+    while row 2 now stored `''`, so the control whose entire reason to exist is that distinction
+    changed nothing on screen, at any setting, for any value. The one arm that did draw the faint
+    italic was reachable only for a record shorter than the header, which for CSV is an
+    `IssueKind::FieldCount` rather than a null. `preview_field(field, nulls, format) -> PreviewCell`
+    is that decision, in core beside the rule it asks and asking `has_own_nulls` exactly as `validate`
+    and `row_iter` do, so a JSON empty string is not swept up with it. Its tests run from
+    `read_sample` rather than from a hand-built `Field`: a hand-built `None` would have hidden the
+    defect entirely, and `NullRule::matches` passed its own tests from the day it was written — the
+    bug was the composition. `RowSourceIter::Json` is now
     `RowSourceIter::Buffered` and carries both: the same buffering for two different causes, JSON not
     knowing its columns before EOF and an `.xlsx` not being readable as a prefix at all.
     `trim_to_mapping` puts Excel on **CSV's** side rather than JSON's, the used range fixing the
@@ -3139,7 +3156,10 @@ existing prose was left alone.
     arranges the same way; `edge_anchors`/`cubic_controls`/`sample_cubic`/`nearest_polyline` are the
     pure bezier geometry + hover hit-test the custom paint canvas uses. `DiagramLayoutsFile`
     persists manual drags per `(conn_id, database)` to `diagrams.json`, falling back to auto-layout
-    for an unknown or stale id.
+    for an unknown or stale id. That file is read **lazily**, from inside `erd_view`'s drag handlers
+    rather than at startup, which is why both of its loads and `delete_conn_now`'s layout prune call
+    `schemaic_ui::report_recoveries` themselves — see `core/persist.rs` for the contract they were
+    breaking.
     **Find-in-diagram** is the pure half of the modal's Ctrl+F bar. `search(graph, needle)` returns
     one `NodeMatch { node, name, columns }` per node the term touches, kept per-card because both
     things the diagram does with a search are per-card: highlight the matched parts of a card, and
@@ -3658,7 +3678,10 @@ existing prose was left alone.
   - `snippet.rs` — the snippet library: named saved queries, persisted to `snippets.json`.
     `applies` answers whether a snippet may be offered on a connection, `grouped` builds the
     panel's headings (**narrowest bucket first** — this connection, this engine, everywhere — each
-    snippet under exactly one, empty buckets omitted), `matches_query` is the panel's filter
+    snippet under exactly one, empty buckets omitted; that last clause is load-bearing outside this
+    module, since it makes two connections with no connection-scoped snippet group *identically*,
+    which `two_connections_group_identically_when_neither_has_a_scoped_snippet` asserts as the
+    precondition behind the snippet panel's frozen-`active_conn` defect), `matches_query` is the panel's filter
     (name/abbrev/body, the body whitespace-collapsed the way `history::matches_query` reads a
     statement), `by_abbrev` is the completion trigger (whole-word, case-insensitive, **a snippet
     the user wrote wins, then the narrowest scope**), `scope_options` is the scope picker's three
@@ -4503,6 +4526,27 @@ existing prose was left alone.
     re-created database gets a **fresh** id rather than colliding with a live node, that reordering
     the server's list renumbers nothing (the tree keys on id), and that a reload against an empty
     list still works.
+    **`departed_nodes` is the complement `plan_nodes` never answered, and it is the half that holds
+    memory.** The nodes in `existing` that no plan keeps are the databases dropped from another
+    client between two reloads; on a reload the node scope is deliberately kept alive, so each of
+    those vanished from `db_nodes` with its `RwSignal<SchemaState>` still installed in the surviving
+    scope — and a `Loaded` holds an `Arc<DbSchema>`, every table, column, index, key, view, check and
+    trigger of that database, unreachable and retained until the app exited or a connection switch
+    happened to replace the whole scope. One full model retained per scratch database per refresh.
+    The load disposes those nodes' own scopes **deferred**, and only when the scope above them is
+    staying: on a switch the existing `old.dispose()` already takes the whole generation, children
+    included. That per-node scope is `ConnNode::cx` — see the child-`Scope` invariant, which this
+    type was the last exception to.
+    **And emptying the tree is one closure, `clear_schema_tree`, because three steps that must not
+    come apart were spelled out at three sites and only one of them had all three.** Of the three
+    `db_nodes.set(Vec::new())` sites only the failed-connect arm in `load_schema` also forgot
+    `nodes_conn` and disposed `nodes_scope`. So a switch the user reversed before the first load
+    landed — seconds wide over a tunnel — left `reload` reading true against an already-empty node
+    list, `kept_scope` `Some`, the deferred dispose skipped, and the whole set rebuilt inside the
+    scope that still owned the first one; deleting the last connection orphaned one outright. The
+    rule is `rearm_activity`'s, and the gate is that the signal has no other writer:
+    `app_tests::emptying_the_schema_tree_lets_go_of_its_scope` asserts the closure still does all
+    three and that nothing else writes `db_nodes` empty.
   - `persist.rs` — the small on-disk state that survives a restart, and the one place that decides
     **how a config file is written and how it comes back**. `config_dir` is `%APPDATA%/schemaic` or
     `$XDG_CONFIG_HOME`/`~/.config`, and each candidate is filtered through **`usable_base`, because
@@ -4575,6 +4619,23 @@ existing prose was left alone.
     drawn has the same problem — there is no surface yet to say anything on — so one channel beats
     each loader inventing its own, and `app/secrets.rs` is the second caller (a locked keyring is
     *the* reason connections stop authenticating and used to reach neither a banner nor a log line).
+    **The drain is no longer startup-only**, and believing it was is what made the contract false for
+    `diagrams.json`. The app drained the queue exactly once, after the `Ui` literal, under the
+    comment *"Every config file has been loaded by now."* — and three loads are lazy and run long
+    after that line: the ER diagram's layout read and its save-side re-read, both inside drag
+    handlers, and the layout prune inside `delete_conn_now`'s click handler. A truncated
+    `diagrams.json` was therefore renamed aside and reported to nobody, the user's saved arrangements
+    simply gone. On the save side it is worse than silent: with the `.bak` unreadable too, the very
+    next drag's `save_json` writes the defaulted empty file over the recovered nothing, so the notice
+    has to reach the user *before* that save, which is where the call sits.
+    `schemaic_ui::report_recoveries(text, open)` is the one reporter and the startup site calls it
+    too rather than keeping a second spelling; it takes the two signals rather than an `OverlayUi`
+    because the app's own lazy load is in a closure built long before the `Ui` literal exists, and it
+    is cheap on an empty queue so a lazy loader can call it unconditionally. The rule is
+    **positional** — "is this load inside `app_view`'s build?" is not a question a scan can answer —
+    so `app_tests::every_lazy_config_load_reports_what_it_recovered` is a *count* instead: the lazy
+    `diagrams.json` loads across both crates must be outnumbered by the `report_recoveries` calls,
+    the extra one being the startup drain.
     `recovery_notice` is the corrupt-file sentence; `missing_notice` is the vanished-file one, and
     it says the disappearance rather than repairing it quietly, because the sibling the file came
     back from is the only copy until the next save lands and a user who does not know that has no
@@ -5533,6 +5594,21 @@ existing prose was left alone.
       `guard_close` asks it *before* prompting: one rule, two shapes, held together by
       `all_to_close_is_every_closable_tab`, because a tab the menu offers and the gate refuses (or
       the reverse) is a click that does nothing.
+      `rebind_needed(tab, active_conn, picked, known)` is the **database selector's** half: does
+      picking a row in it actually move the tab? Three ways the answer is no and the app asked only
+      the first — the name is not one the selector lists, or the tab is already on it *on the
+      connection the pick is made against*. The selector invites the second, because it renders the
+      current row accented rather than disabled, unlike every other already-in-that-state entry in
+      the app — and re-picking it is not free: the rebind cancels the tab's in-flight query (a
+      30-second `SELECT` goes `Cancelled` with nothing saying why and the database unchanged), raises
+      the Commit/Rollback/Cancel prompt on a Manual tab holding an uncommitted `INSERT` — where
+      answering Rollback discards a transaction for a move that is not one — and either answer then
+      drops and re-opens the pinned session. The connection is half the question: a tab keeps the
+      connection it was opened on and the rebind writes `conn_id` as well as `database`, so the same
+      name on another connection *is* a move. `set_tx_mode`, the sibling action that also settles a
+      transaction and re-pins a session, opens with exactly this refusal;
+      `app_tests::set_active_db_refuses_a_rebind_that_is_not_one` is the half the core tests cannot
+      see, which is whether the caller asks.
       `scoped_database(tab, active_conn, fallback)` answers the other question about the focused
       tab: the database a request about "the current tab" should run against — the tab's own, but
       **only when that tab is on the active connection**, otherwise the caller's already-scoped
@@ -6317,8 +6393,12 @@ existing prose was left alone.
   on. `Db::fetch_schema` refuses at the door as well, before any engine opens anything: a token
   cancelled before the call would otherwise pay for a connection handshake and then a *second*
   connection to `KILL` a query that was never issued. A caller with no Stop of its own —
-  `app/main.rs`'s tree refresh, the three `mcp.rs` sites — passes `CancellationToken::new()`, which
-  is never cancelled. `run_ddl` is the schema-editing apply path and is **honest about
+  `app/main.rs`'s tree refresh — passes `CancellationToken::new()`, which is never cancelled. The
+  three `mcp.rs` sites that call *this* function used to be in that company and no longer are: each
+  now hands its token to `mcp::with_deadline`, which cancels it at `QUERY_TIMEOUT` and keeps the
+  future alive across the cancel so the engine's own KILL branch runs. Nothing there has a Stop
+  either — what it has is a clock, because the serve loop is sequential and one un-deadlined read
+  wedges the whole server. `run_ddl` is the schema-editing apply path and is **honest about
   atomicity**: PostgreSQL runs the whole plan in one transaction (transactional DDL), MySQL runs
   it sequentially and reports which statement failed *and how many already stuck*
   (`DdlError::applied`) — every MySQL DDL statement commits implicitly, so a transaction there
@@ -8831,7 +8911,20 @@ existing prose was left alone.
     error bar and the error modal both offer, in one definition because the two had already drifted
     to different colours by the time there were two of them; **neither half sets a colour**, so the
     row's own tints the SVG's `currentColor` and the words together and one `hover` covers the pair
-    (set per child, as the first copy did, the icon stays dark while the label lights up). Also
+    (set per child, as the first copy did, the icon stays dark while the label lights up).
+    **Its `ring` is `Option<(FocusRing, u32)>` because this is the one button family with a caller on
+    each side of that line** — the error *modal* has a ring, the editor's error *bar* sits in the
+    workspace and joins floem's own traversal — and neither was answered before: the row was a bare
+    `h_stack` with an `on_click_stop`, and floem's `can_focus` requires membership in
+    `keyboard_navigable`, so its own `view_tab_navigation` skipped it too and the error modal's
+    **only** two actions, AI fix and Explain, could not be pressed by any key. `Some` goes through
+    `in_ring_button` (the caller's face carries the click, the wrapper carries the keyboard and the
+    outline) and `None` through `key_pressable`, which owns both listeners itself; it returns
+    `AnyView` for that reason. That fix is two halves and needed both:
+    `focus_root_gate::every_modal_root_publishes_a_ring` finds a modal root with no ring — the error
+    modal was one — while `key_pressable_gate::a_sparkle_action_can_be_pressed_from_the_keyboard`
+    holds this function to one of the two helpers, because giving that modal a ring with nothing
+    registered in it hands it an **empty** one and `ring_step(0, …)` returns `None`. Also
     `MenuId`/`MenuFlags` —
     the single list of the app's mutually-exclusive dropdowns, which every trigger closes the others
     through (*Popup menus*), and `row_menu_mark`/`row_menu_mark_pad`/`clear_row_mark_on_close` — the
@@ -8906,6 +8999,24 @@ existing prose was left alone.
     block of stops starts), and the `PopupToken`-tagged `set_open_popup`/`clear_open_popup`/
     `dismiss_open_popup` slot. A field joins through `FieldCfg::focus` instead, since nothing
     outside floem's editor can see a key it has.
+    **Two free predicates decide what a key *is*, and each was missing its modifier term.**
+    `presses(key, mods)` is "does this press a button": a bare Space or Enter and nothing else,
+    because the two arms that asked it used to match the logical key alone — so `Ctrl+Enter`, which
+    is the grid's **Commit**, pressed a ringed button instead, and with focus on the results strip's
+    ✗ (one keypress away, `step_from` resuming where the strip was left) that ran `discard_edits`:
+    every staged cell edit, every pending new row and every pending delete gone, unconfirmed and
+    unrecoverable, under the key the ✓ beside it advertises as Commit. `steps_ring(key, mods)` is its
+    sibling — Tab with no `shortcuts::primary_held`, Shift being the *direction* rather than a
+    modifier — and it was missing the same term: floem forwards a KeyDown to the window root only if
+    nothing consumed it, so once **F6** put the keyboard in the results toolbar strip, `Ctrl+Tab`
+    stepped to the next toolbar icon and tab switching stopped, as did `Ctrl+Shift+Tab` and, on
+    macOS, `Cmd+Tab`. Inside a modal the same consumption is harmless, because the window root
+    returns `Continue` for everything while one is up — which is why the strip is the surface it bit
+    on, and why the rule was already written at the one Tab handler that applied it, the window
+    root's own backstop. Both are free functions so the two arms ask **one** question rather than two
+    `matches!`es that could gain the term separately, and
+    `press_tests::every_tab_arm_asks_the_one_predicate` holds every Tab arm in the file to
+    `steps_ring`.
   - `modals.rs` — **the modal layer** (`modal_layer`) and the four predicates that raise it
     (`ddl_modals_up`, `ddl_editors_up`, `workspace_modals_up`, `settings_modals_up`,
     `modal_backdrop_up`), plus the `modal_backdrop_gate` tests. It mounts no modal of its own and
@@ -8972,7 +9083,16 @@ existing prose was left alone.
     block carries a **standing** 24px header — the language on the left, `Copy` and (for SQL only)
     `Insert` / `Run` on the right, as words rather than icons, since a permanent icon row over every
     block is noise. The header repeats the block's own `border_radius`: floem does not clip a child
-    to a rounded parent, so a square-cornered fill would paint over the wrapper's arc. Also
+    to a rounded parent, so a square-cornered fill would paint over the wrapper's arc.
+    **`Insert` and `Run` are gated on `settled` as well as on `is_sql`, and that bar was left out of
+    the gate its own body and the proposal card both take.** While a turn streams, a fenced block is
+    whatever has arrived so far — pulldown-cmark closes the unterminated fence at end of input, which
+    is exactly why the body withholds its colouring — so an assistant answering "delete the draft
+    orders" streams `DELETE FROM orders` and then `WHERE status = 'draft';`, and between the two
+    chunks **Run** was live on the unqualified DELETE. `run_verdict` answers `Confirm` there, not a
+    refusal, so the only thing between the click and an emptied table was a confirmation the
+    assistant's prose had just primed the user to accept. `Copy` stays live: it is the one action
+    that does not commit to the text being complete. Also
     `proposal_card`: a fenced block tagged `core::propose::FENCE_TAG` renders as the AI's **proposed
     table change** — the table, the model's own summary line, the change count, and a Review button
     that hands the parsed `Proposal` to `CodeActions::propose`. The card is the offer, the DDL
@@ -9424,7 +9544,20 @@ existing prose was left alone.
     app root. Both handles are absolute children positioned from an **effective** (clamped or
     floored) edge rather than from the dimension they set: a width the window is too narrow to
     honour, or a height persisted under a lower floor, would otherwise leave the handle floating
-    away from the edge it drags. Both capture the pointer on press (`request_active`), and **both
+    away from the edge it drags. **Both move their dimension through `nudge`, which publishes only if
+    the value actually moved.** They used to write straight through
+    (`dim.update(|w| *w = (*w + d).clamp(lo, hi))`), and a drag is 60–120 `PointerMove`s a second:
+    past the clamp every one of them computes the same number and floem notifies regardless. `lib.rs`
+    guards the two *width* republishes it owns, which is what kept the schema tree still, but that is
+    one consumer's protection and not the publisher's — `editor_h` has no republished twin, its
+    readers take it raw, and nothing below it held the line. One guard where the value is produced
+    answers for all three. `hi.max(lo)` stays the caller's job: on a window too small to hold both
+    panels' minimums the ceiling really is below the floor, and `clamp` panics on an inverted range.
+    `clamp_tests::a_drag_held_past_the_clamp_publishes_once` counts the notifications — ten publishes
+    where one is due, and a *moving* drag still publishing every frame, so the guard cannot swallow
+    the gesture it exists to carry. That test replaced this file's own note saying a notification
+    count was something no `#[test]` could see; it is (*Floem 0.2 gotchas*, `RwSignal::set` never
+    dedups). Both capture the pointer on press (`request_active`), and **both
     undo the whole gesture inside `on_double_click_stop`** — the double-click eats the second
     `PointerUp`, so that handler is the only one that runs and anything the `PointerUp` handler
     would have cleared has to be cleared there. Two things qualify, found a year apart in the same
@@ -9508,7 +9641,13 @@ existing prose was left alone.
     halves regardless — the whole file scanned, and both view crates enumerated — and it carries the
     other pattern this module made possible, an exemption list holding its reason as data
     (`overlays.rs`, whose stamps are `PlanTarget`s) with an assertion that the exemption is still
-    *needed*, so a stale entry fails rather than accumulating. `production_code` blanks every
+    *needed*, so a stale entry fails rather than accumulating.
+    **`widgets::focus_root_gate::every_modal_root_publishes_a_ring` is the second of that shape**:
+    it finds every bare `focus_root(` across both view crates and fails unless the site is a
+    `focus_root_with_ring`, naming the offender by its enclosing `fn` — a modal root with no ring is
+    a modal whose Tab does nothing at all, which is how the error modal shipped. Its `EXEMPT` list is
+    `(file, enclosing fn, why)` and holds the seven roots that legitimately have no ring, every one
+    of them a popup driving its own arrows, Enter and Escape. `production_code` blanks every
     `#[cfg(test)]` **item** — brace-aware, skipping braces inside strings, chars and comments — and
     every `//` line; `crate_sources` enumerates the files to scan. Both halves exist because the
     idiom was written out eleven times across nine files and every copy had the same two holes. It cut each
@@ -9628,6 +9767,25 @@ existing prose was left alone.
     to the band it lands under. The current one is tinted rather than ticked, the convention
     `cell_editors::pick_entries` set. A built-in offers none of the three: Duplicate is how you get
     an editable copy of one.
+    **Its *This connection* choice means the connection you are on, and `snippet_row` therefore takes
+    `active_conn` as a `RwSignal<u64>` rather than a `u64`.** The row list is a `dyn_container` keyed
+    on `(groups, search, dialect)` — `active_conn` is in none of the three — and the id was read
+    *inside* the child builder, which does not track, so *Show in → This connection* wrote
+    `Scope::Conn(previous)`: the snippet vanished from the panel in front of the user with no
+    message and came back only after switching away and back. That was survivable only while `groups`
+    changed on a connection switch, and the ordinary case is that it does not — with no `Scope::Conn`
+    snippet on either connection the empty bucket is dropped, the `Bucket::Conn` band is absent from
+    both results and the two `Vec<Group>` compare equal, so the memo never notified. The file's own
+    comment says that mechanism is why `search` and `dialect` joined the tuple, and stops one term
+    short. The fix is **not** a fourth key term: `row_menu` is built inside
+    `on_secondary_click_stop`, so the row takes the signal and the menu reads it with
+    `get_untracked` when it is *raised*, which is when the answer is wanted — the same shape Server
+    Activity's row menu takes. In `core::snippet`,
+    `two_connections_group_identically_when_neither_has_a_scoped_snippet` asserts the **cause**
+    rather than the fix, because it is the precondition that made the missing key term
+    load-bearing and would otherwise have to be rediscovered; its second half pins that
+    `grouped` does read `conn_id`, so the equality is a statement about the library and not about an
+    ignored argument.
   - `activity_panel.rs` — the **Server Activity** right-column panel (`RightPanel::Activity`, the
     footer's pulse-line toggle): the sessions on the active *connection's* server, a counts line, a
     lock-wait banner and a search box, over the same chrome as the History panel. It paints
@@ -9653,7 +9811,24 @@ existing prose was left alone.
     its label: a button reading just *Kill* on a panel where several sessions are killable is the one
     misread that cannot be undone. The **per-row** Kill and Cancel hang off a right-click menu with no
     keyboard opener and are still pointer-only, which is why `README.md`'s accessibility sentence was
-    narrowed to claim only what is true. The clock in the title bar wears the same grey as
+    narrowed to claim only what is true.
+    **The read-only flag reaches all three kill surfaces as a `Memo`, never as its value**, and that
+    distinction is the whole of a bug the memo's own comment had already predicted in the imperative:
+    it says "the two containers below read it inside their own bodies, and a value captured at build
+    would freeze", and both call sites then passed `read_only.get()` from inside a `dyn_container`
+    *child builder*, which is not a tracking context (*Floem 0.2 gotchas*: only the key closure is
+    wrapped in an effect). With the poll interval set to **Off** — which the panel offers — marking
+    the connection read-only changed nothing: the banner's `Kill <id>` stayed in full danger fill,
+    tooltipped "Terminate session N", and the row menu's Cancel query / Kill session stayed enabled,
+    so the only way to learn the action was unavailable was to try it. The inverse was worse: built
+    while read-only, the button's action captured `false` and stayed inert after the flag was
+    cleared, producing no kill *and* no message until something rebuilt the panel. No write ever
+    escaped — `kill_session` refuses before the confirm — so what was missing is the half
+    `accept_launch`'s contract asks this side to supply, the disabled button being what *says* the
+    action is unavailable. The memo is now read where reading is meaningful: `.get()` in the style
+    closure, which re-runs; `.get_untracked()` in the press and in the tip, which want the answer at
+    the moment they are asked; and again in the right-click handler that builds the row menu, which
+    is later still than the row. The clock in the title bar wears the same grey as
     the refresh icon beside it: it was tinted while polling, on the reasoning that "Off" and "every
     2s" look identical between ticks, but two icons a few pixels apart in different colours read as
     one of them being *active* in the toggle sense. The interval is stated where a state belongs —
@@ -9768,6 +9943,12 @@ existing prose was left alone.
     identity was the reporter's only guard, so the later request was not guaranteed to be the last
     writer and the list could settle on the **pre-mutation** snapshot: an account just created
     missing, or one just dropped listed again with a live Drop beside it.
+    **The footer's Refresh resets the selection and the grants, not only the list**, and it was the
+    one path that did not. Its stated job is noticing a `DROP USER` applied from another client, so
+    the account it names is precisely the one the refresh may be about to find gone — left standing,
+    the detail pane went on describing a dropped account with a live **Drop** button over it while
+    the list beside it no longer had the row. The app's DDL-apply path does exactly this and says the
+    same thing.
     **Opened from the SCHEMA gear and from a right-click on the tree's blank space, for the reason
     `Create database` sits in both**: an account belongs to the *server*, not to any row in the tree,
     so the modal has no object and takes none, and the gear is not a duplicate of the blank-space
@@ -9904,6 +10085,27 @@ existing prose was left alone.
     to that rule would have reached five of the six spellings. The effect that re-probes on a settings change tracks only settings
     that change how the file *parses* — the NULL rules apply at coercion time, so tracking them
     would re-read the file per keystroke and stamp over a hand-edited mapping.
+    **Which is why the NULL settings join the *preview's* `dyn_container` key instead.** They cannot
+    change what a probe returns, so the rule has to be applied at render time over the sample already
+    in hand — costing no file read, and making the tokens box live-verifiable for the first time.
+    Each cell goes through `import::preview_field` (see `core/import.rs` for the defect that bought
+    it) and a NULL is drawn the way the grid draws one, faint italic, so it cannot be mistaken for
+    the text that spells it. `null_rule(empty_is_null, tokens)` is the two controls as one
+    `NullRule`, kept separate from `read_config` because the preview needs it from *tracked* reads
+    and a second spelling is how the screen and the load come to disagree.
+    **`ImportUi::begin_probe` clears where the question changes, not where the answer does.** `issues`
+    is written in one place — the check refusing an import — and used to be cleared in two, a new
+    modal *open* and the next launch, neither of which is a new file: importing `bad.csv`, pressing
+    Back and picking `clean.csv` showed `clean.csv`'s columns and preview under `bad.csv`'s problems
+    and line numbers, attributed to "the file", and fixing the cause by typing a NULL token left the
+    list up too. One call on the probe covers both triggers, because a file pick and every tracked
+    settings change both route through it, and it deliberately keeps `path`, `format`, `sample` and
+    `sheets` so the step does not blank while the new read is in flight. `ImportUi::new` is the
+    bundle's opening state, extracted so the decision has a subject at all — the app used to spell
+    all twenty-four signals out at the call site — and
+    `a_probe_invalidates_the_previous_read_through_the_bundle` pins that `probe` asks the bundle
+    rather than reaching for the one signal it happened to remember; asserting that `begin_probe`
+    empties `issues` would prove nothing.
     **Excel adds an `xlsx_settings` block beside `csv_settings`**, built and torn down rather than
     hidden, for that section's Tab-order reason: a Sheet picker and the "First row is a header"
     toggle, which is all a workbook has to be asked (there is no delimiter and no quote). The header
@@ -10377,6 +10579,28 @@ existing prose was left alone.
     needs to know neither. Deferred because the clear happens *before* the listeners run, so a
     request inside the same dispatch would be undone by it. **Close is excluded** — it is the one
     press after which there is no window to hand a keyboard back to.
+    **The eight resize zones owe it too, and that is the instance it bit on.** A zone is a bare
+    `empty()` with an `on_event_stop`, so it is neither navigable nor inside anything that is and it
+    ends the walk — dragging a window edge therefore left focus `None`. With a modal open Escape
+    stopped closing it, recoverable only with Tab through the workspace root's ring backstop, which
+    is why it read as intermittent rather than as a dead modal; with no modal the next keystroke
+    after a resize was dropped instead of landing at the caret.
+    `window_chrome::tests::every_chrome_press_hands_the_keyboard_back` covers both spellings (the
+    caption buttons take the *click* rather than the press, so there are two `PointerDown` handlers
+    and not the three the finding sketched) and floors at three handlers overall.
+    **And a maximized window's zones are hidden, because it has no frame to grab.** The `NorthEast`
+    zone is a 14×14 square pinned to the extreme top-right pixel — the Fitts's-law gesture for
+    closing a maximized window — and `North` is the top 5px of all three caption buttons; both
+    swallowed the press and did nothing with it, `drag_resize_window` sending a sizing message a
+    maximized window has no response to. The flag that answers this is the `maximized` mirror in the
+    same struct, kept true to the OS by `sync` on every route into maximization and read by nothing
+    but the caption glyph until now, and it is read *inside* the zone's style closure so the window
+    is followed with no rebuild. **`hide()` rather than `pointer_events(false)`**, for the reason
+    `resize_zones`' own doc already spells out: a hidden view is not laid out, so the walk skips it
+    and reaches the button underneath, where a `pointer_events(false)` sibling would still have to be
+    rejected by `should_send` and would take its subtree with it. Hidden and **not dropped** —
+    `a_maximized_window_hides_its_resize_zones` and `every_edge_still_has_a_zone` are the two halves,
+    the second because dropping them leaves a window winit has already stripped `WS_SIZEBOX` from.
   - `trigger_editor.rs` — the **trigger** modal, over `core::ddl`'s
     `TriggerSetDraft`. Reached from the schema context menu's per-table
     **Triggers…** entry — and from a **view's**, on every engine but MySQL, since `INSTEAD OF`
@@ -12068,7 +12292,11 @@ existing prose was left alone.
     the target it was asked for — but dropping the *answer* goes on paying for the *read*, and this
     read is two full `fetch_schema` sweeps across two servers: picking a different right-hand side
     three times left three of them running to completion for nobody. Each ask cancels the one it
-    supersedes. The dialect refusal happens **before either round
+    supersedes — **and `SchemaActions::compare_cancel` is the other canceller, because "each ask" was
+    all there was.** `compare_fetch` cancels its predecessor on the way *in*, which made every
+    canceller a new fetch, so closing the modal — the one path that starts nothing — discharged eight
+    signals and left two full sweeps reading a catalogue nobody would see. The token is the app's, so
+    the modal asks for the cancellation rather than holding one of its own. The dialect refusal happens **before either round
     trip**, through `compare::comparable` (see its entry for why that is by dialect and not by
     engine).
     **The five view-state signals are kept apart from the comparison, for the properties modal's
@@ -12301,6 +12529,29 @@ existing prose was left alone.
     shared model/state
     types, `workspace`/`body`/`center`/`header`/`footer`, `edit_field`/`FieldCfg`,
     terminal panel.
+    **The terminal's geometry is three pure functions, and two of them take the padding as a
+    parameter because it is `theme::scaled(6.0)` and not 6.** `term_cell_wh(font)` is the IBM Plex
+    Mono cell metrics; `term_fit(w, h, pad, cw, ch)` is how many columns and rows a surface holds;
+    `term_cell_at(x, y, pad, …)` is which viewport cell a surface-local point falls on. The last two
+    **restated** the inset as literals — the PTY fit subtracted `12.0`, `cell_at` `6.0` — which is
+    exact at 100% and wrong at every other scale, which is why they shipped. At 200% the surface
+    takes 24 logical px and the fit took off 12, so the PTY was told it had about one and a half
+    columns and two thirds of a row the panel cannot draw: the shell wraps at a width the user cannot
+    see and the bottom row can be clipped. `cell_at` mapped a click against a 6px inset where the
+    real one is 12, so the reported column drifted further the further along a row the pointer went —
+    by a whole cell across the right-hand part of every line, and with copy-on-select enabled that is
+    the wrong text on the clipboard. The cursor overlay a few dozen lines below already did it
+    correctly and states the rule ("the padding is scaled and this overlay is the surface's
+    *sibling*, so it has to read the same metric rather than restate it"), as does the scrollbar;
+    these were the two that restated it. Taking `pad` as a parameter is what makes the arithmetic
+    testable at a scale a test can name — `term_geometry_tests::at_one_hundred_percent_nothing_moves`
+    pins that nothing changed where it was already right, and the 200% cases assert both halves.
+    **`term_cell_wh` is deliberately *not* scaled**: the terminal font is the user's own size fed
+    raw to `.font_size` rather than through `scaled_font`, so the cell metrics are already in the
+    right units and putting them through the scale would double-apply it.
+    One test had to be rewritten and the reason is written down at it: its first shape put the probe
+    exactly on a cell **edge**, and `2.0 * cw` divided back by `cw` is a coin toss in binary floating
+    point — it reported column 1 for the boundary of column 2. Probes sit mid-cell now.
     Two things about `edit_field`'s **multiline** boxes, both found in a body field and both fixed
     in the shared helper rather than at one call site. **Enter is only swallowed when there is
     something to submit to**: a multiline field with no `on_submit` lets it through and breaks the
@@ -12789,6 +13040,17 @@ existing prose was left alone.
   `close_tab_now`'s keep-≥1 branch clears `path`/`disk_sql`/
   `file_format` along with the text: the blank slate it leaves behind must not still point at a
   file, or the next Ctrl+S would overwrite that file with an empty document.
+  **It drops the tab out of `TxMode::Manual` too, and that is a rule about every release rather than
+  about this branch.** `session_for` matches `Manual` and then looks the tab up in `sessions`; with
+  the entry gone it returns `None` and the run fails before dispatch with *"the transaction
+  connection isn't ready — switch to Auto-commit and back"*, and nothing re-opens it —
+  `open_session`'s callers are `set_tx_mode`, `set_active_db` and `repair_killed_session`, and a
+  closed-and-reused tab is on none of those paths. That branch resets nine pieces of tab state and
+  `tx_mode`/`tx` were the two it did not touch, which are exactly the two the release invalidates;
+  both siblings that drop a session while keeping the tab (`save_conn`'s repoint, `delete_conn_now`)
+  set `TxMode::Auto` in the same breath. `app_tests::releasing_a_session_drops_its_tab_out_of_manual`
+  holds every `(drop_session)` call site to it, with `open_session`'s own release exempt as data —
+  it drops only in order to re-pin, and its `Err` arm is what falls back to Auto.
   A file tab survives both kinds of restore. `persist::SavedTab` carries `path`, `file_crlf`,
   `file_bom`, `file_lossy` and
   `file_dirty`, each `#[serde(default, skip_serializing_if = …)]` so a session file written before
@@ -13066,6 +13328,21 @@ existing prose was left alone.
   both halves at once: each harness carries the endpoint exactly one way, *and* whichever carrier
   that is reaches `SessionPrivate`. The second half is the composition, and the composition was the
   bug.
+  **`tools_missing(plumbing, wrote_config, wrote_endpoint)` asks whether the session that is about to
+  start has any database tools at all, and it asks it off the *plumbing* rather than the harness.**
+  `TurnPump::note`'s doc enumerates three ways to reach that state and says all three were silent;
+  four arms actually produce it, and the fourth had no arm at all — and it was Claude's, the default.
+  Claude's plumbing is an MCP config file, so when `write_mcp_config` returns `None` (an unwritable
+  profile directory) `build_session_args` emits neither `--mcp-config` nor `--allowedTools`, the
+  session has no database tools, and the system prompt goes on telling the model it can list the
+  schema, describe a table and run a query. No note, no `tracing::warn!`: the user watched the
+  assistant refuse to look anything up with nothing anywhere saying why. Asking the plumbing means a
+  fifth harness lands in the same question rather than adding a fifth silence, and the Antigravity
+  endpoint-file arm folds into it, leaving that `match` to do only what it is for. The Antigravity
+  *registration* failure stays separate and has to: it is known only after two `agy` invocations,
+  i.e. after an await. `a_harness_that_lost_its_endpoint_plumbing_says_so_whichever_one_it_is` walks
+  `Harness::ALL` rather than testing Claude, because the defect was a harness nobody wrote an arm
+  for.
   **And the subprocess reading that file fails closed.** `mcp_endpoint_from_env` returns
   `Result<McpEndpoint, String>`; the decision is the pure `endpoint_blob(file, read, env)`, which
   takes the filesystem and the environment as arguments because the only way to reach the real
@@ -13259,6 +13536,41 @@ existing prose was left alone.
   the dialect, and a **view** fell through to `ddl::view_ddl`'s MySQL shape, which was only cosmetic
   because SQLite accepts backticks and its views carry no `view_options`. `app/secrets.rs` is the
   keyring-backed `SecretStore` behind `core::secrets`.
+  **The statement deadline is a property of the server, not of one tool.** `QUERY_TIMEOUT` (30 s)
+  existed, its doc named the reason — "a backstop against `SLEEP()` / heavy scans holding the
+  connection open" — and it was wired to exactly one of the **four** database reads this server
+  performs: `describe_table`'s sample, `list_schema`'s `fetch_schema` and its per-database table-list
+  loop, and `propose_table_change`'s `fetch_schema` each built a fresh `CancellationToken` that
+  nothing ever cancelled and awaited it bare. The serve loop awaits `call_tool` inline before reading
+  the next line, so one slow read wedges the **whole** server rather than its own call — the agent's
+  tool call never returns, the turn hangs, and the user's only exit is Stop, which ends the session;
+  a view over an aggregate is the ordinary expensive case, and a steered model can pick one
+  deliberately. `with_deadline(fut, token)` is that deadline, and it **cancels rather than abandons**:
+  on expiry it cancels the token and keeps the future alive across the cancel, so the driver's KILL
+  branch runs. Measured against PostgreSQL 16.15 through the built binary, with
+  `CREATE VIEW zz_slowview AS SELECT pg_sleep(120)::text AS x, 1 AS y` and a `ping` queued behind a
+  `describe_table` on it: **before** — killed at 100 s by the harness, zero bytes on stdout, neither
+  request answered; **after** — 30 s, the view's DDL returned with
+  *"(unavailable: timed out after 30s and was cancelled)"* for the sample, and the ping answered. And
+  `pg_stat_activity` showed **zero** active backends running `pg_sleep` once the call returned, which
+  is what keeping the future alive buys. MySQL was *accidentally* bounded at ~15 s by its driver,
+  which made this a silent per-engine divergence in a refusal path as well. `None` is the timeout and
+  the **caller words it**, because the four do not mean the same thing: a timed-out `run_query` is an
+  error the model must see, while a timed-out sample degrades to the same "(unavailable: …)" line an
+  unselectable view already produces, with the table's DDL and keys still returned.
+  **One of the four is bounded in time but *not* cancelled at the server, and the call site says so
+  rather than letting the paragraph above cover for it.** `list_schema`'s per-database table-list
+  loop calls `fetch_table_list`, which takes no `CancellationToken` at all — it is a name listing,
+  not the full introspection — so the token handed to `with_deadline` there reaches no driver and the
+  statement runs to completion after the server stops being waited on. The wedge this whole change is
+  about is *ours*, so bounding the wait is the whole of the fix on that leg; giving it a real token
+  is a `schemaic-db` change and has not been made.
+  `a_read_past_the_deadline_is_cancelled_server_side` asserts the cancelling half under a paused
+  clock — the token fires *and* the future observes it, so dropping the future instead would fail —
+  and `every_database_read_carries_the_deadline` is the composition. That one took two goes: its
+  first shape measured a six-line window including comments, so the eight-line paragraph explaining
+  the sample's deadline pushed the proof out of view and it reported a correct site. Comments are
+  stripped before the window is measured now.
   `propose_table_change` is the odd one out and stays read-only like the rest: it takes a
   `core::propose::Proposal`, introspects the table, runs `propose::apply` → `ddl::diff` → `emit`,
   and hands the model back the change list in the *preview's own words* plus the SQL and anything
@@ -14677,6 +14989,20 @@ Re-introducing the anti-patterns these guard against is a regression:
   `exec_after(Duration::ZERO, …)` — one tick later, after the keyed `dyn_container` has unmounted
   the old view. Synchronous disposal frees signals a still-mounted view reads this frame → panic.
   Same for any "replace + free" of scoped state.
+  **`ConnNode` was the exception and is not any more**, and what it cost is the shape to recognise.
+  Its three signals were created directly on the scope `new` was *handed* — the schema tree's shared
+  node scope — which is deliberately kept alive across a **reload**, so that surviving rows hold
+  their schema up while the re-introspection runs. A database dropped from another client therefore
+  vanished from `db_nodes` with its `RwSignal<SchemaState>` still installed, and a `Loaded` holds an
+  `Arc<DbSchema>`: every table, column, index, key, view, check and trigger of that database,
+  unreachable and retained until the app exited or a connection switch happened to replace the whole
+  scope. `ConnNode::cx` is `cx.create_child()`, and the load disposes the departed nodes' scopes
+  deferred and only when the scope above them is staying — on a switch the existing `old.dispose()`
+  takes the generation, children included. `disposing_one_node_frees_its_schema_and_leaves_its_neighbours`
+  is the pin, and it fails on the **survivor** assertion with `create_child()` removed: that is the
+  property separating a child scope from its parent, and the one a test of `Scope::dispose` alone
+  would not see. A long-lived shared scope is the amplifier to look for — the leak is invisible for
+  as long as nothing replaces it.
   **The mirror image is a callback that outlives the scope it reads**, and a window-global menu is
   the usual carrier: an entry on the shared popup channel is an `Rc` closure over a cell's signals,
   and nothing clears that channel when the cell goes away. Two defences and both are needed — the
@@ -14964,6 +15290,20 @@ Re-introducing the anti-patterns these guard against is a regression:
   **two** bulk loads of the same file, both committing, with the second launch overwriting the
   cancellation token so the first could no longer be stopped. A new destructive action asks the same function; a guard re-derived per site
   is one that will be derived differently.
+  **The half the rule asks of the *other* side is that the disabled button be honest about it**, and
+  two surfaces were failing that half rather than the launch half. The DDL preview's Apply asked the
+  live flag inside `apply` while the footer's enable term and the "This connection is read-only."
+  note beside it both read the `DdlPreview::read_only` **stamp** taken when the plan was built — so
+  flipping the connection read-only from the status bar with a `DROP DATABASE` plan on screen left
+  Apply lit, saying nothing, and doing nothing when pressed, with the note that exists to explain a
+  dead Apply hidden. `ddl_preview::plan_read_only(conns, p)` is the one expression all three ask now
+  — the stamp *or* the plan's own connection's live flag, the stamp staying a term because a preview
+  built while read-only says so for its whole life — and the footer's `dyn_container` carries the
+  live answer in its **key**, since a builder is not a tracking scope in floem 0.2 and reading it
+  inside would have frozen it at whichever rebuild last happened to run. Its three tests include
+  `only_the_plans_own_connection_is_asked`: a tab keeps the connection it was opened on, so another
+  connection going read-only must not refuse this plan. Server Activity's kills were the second
+  instance of the same shape and are written up under `activity_panel.rs`.
   **The Drop was the plainest instance of failing it**, and it is the one of that pane's three
   actions the rule bites on — its neighbours refuse read-only inside `open_for_new` /
   `open_for_grant`. Its launch read an `enabled` `bool` captured when the account row was *built*, so
@@ -15403,6 +15743,19 @@ Re-introducing the anti-patterns these guard against is a regression:
   it returns when there is nothing to say is a `display: none` root, which the chrome cannot
   override — floem hands each `.style()` closure a fresh `Style` and merges results per property by
   push order, and `tooltip_style` sets no `display`.
+  **It is generic over the tip's text (`S: Into<String>`), and it was not, which is how the rule got
+  restated wrongly at the two sites that could not use it.** The header's connection switcher shows
+  the connection's *name* — an owned `String`, filtered to `None` when nothing was elided — so it
+  went round this helper with a bare `.tooltip(|| text(conn_tip()))` returning `""`, under a comment
+  claiming that an ordinary name raised no tooltip at all. Every name of fifteen characters or fewer,
+  which is nearly all of them, therefore drew a small empty bordered chip on the app's most-hovered
+  control; the results strip's chip had the same shape, falling back to `String::new()` for a panel
+  already removed. Both go through `tip_when` now. **This class has no gate, and the gate that was
+  written for it is why**: it scanned each `.tooltip(` closure for an emptiable expression and
+  *passed against both of the bugs it was written for*, because both spelled the emptiness in the tip
+  binding above rather than inside the closure — and nothing mechanical distinguishes "a tip that can
+  be absent" from "a tip that is a non-empty `&'static str`". It was deleted rather than shipped, and
+  that is said here rather than implied by a green test.
 - **Labels aren't selectable** — Floem's `Selectable` defaults to *true*, so every caption/header/tree
   row would drag-highlight like a web page. The workspace root sets `.class(LabelClass, |s|
   s.selectable(false))`, which cascades to the whole tree (and, via the captured context style, into
@@ -15419,9 +15772,12 @@ Re-introducing the anti-patterns these guard against is a regression:
 - **Theming (`themes.rs`)**: three independent axes — `UiTheme` (chrome: dark/light), `EditorTheme`
   (editor surface + syntax tokens: One Dark Pro / Tokyo Night / Catppuccin Latte) and `UiScale`
   (how large the chrome is drawn). A theme is a flat struct of named colour roles (hex). All three
-  live in `Scope`-owned global `RwSignal`s; `theme::set_ui`/`set_editor`/`set_ui_scale` swap them.
-  The choices are persisted (`ui_theme`/`editor_theme`/`ui_scale` in `UiState`) and seeded via
-  `theme::init` before the view builds. Editor tokens re-highlight on switch because
+  live in `Scope`-owned global `RwSignal`s; `theme::set_ui`/`set_editor`/`set_ui_scale` swap them,
+  and all three are **idempotent** — a re-pick of the value already in effect does nothing, which is
+  the guard's own entry under *Floem 0.2 gotchas* (`RwSignal::set` never dedups) and the reason
+  `ThemeState` stores `ui_kind`/`editor_kind` beside the built themes at all: a built `UiTheme` has
+  no identity to compare against. The choices are persisted (`ui_theme`/`editor_theme`/`ui_scale` in
+  `UiState`) and seeded via `theme::init` before the view builds. Editor tokens re-highlight on switch because
   `SqlStyling::id()` returns `theme::editor_generation()`.
   - **Live-switch caveat**: a colour read *inside* a reactive `.style` closure updates instantly; one
     captured *by value* freezes at build time. Prefer `fn() -> Color` for anything themable (see
@@ -15457,7 +15813,17 @@ Re-introducing the anti-patterns these guard against is a regression:
     override is an absolute px that a second multiplication would double-apply); persisted panel
     widths, which are px the user dragged — the *minimums* they clamp against scale, which is what
     keeps a panel from being narrower than its own text; and the ER diagram's canvas, which has its
-    own zoom.
+    own zoom. The terminal's **cell metrics** ride on that first exemption: `term_cell_wh` derives
+    the cell from a font size that never went through `scaled_font`, so it is already in the right
+    units and must stay unwrapped.
+  - **The other half of a mixed surface is the trap: a *scaled* length beside an unscaled one must be
+    read, never restated.** The terminal is exactly that surface — unscaled cells inside a scaled
+    `term_pad()` — and the two functions that wrote `6.0`/`12.0` instead of reading the metric were
+    right at 100% and wrong everywhere else, handing the PTY columns the panel could not draw and
+    mapping clicks a whole cell off across the right-hand part of every row. A literal that equals a
+    scaled token at `Normal` is the one kind of wrong number that survives review, because the only
+    scale most reading happens at is the one where it is correct. `term_fit`/`term_cell_at` take the
+    padding as a parameter for that reason; the whole of it is under `ui/lib.rs`.
   - **Shapes and hairlines stay literal**, which is the line the padding sweep stopped at. A
     `border_radius` is a *shape*, not air — scaling a 5px corner to 8px reads as a different design
     rather than a larger one — and a 1px rule or border is a hairline at every scale, so `.height(1)`,
@@ -15701,6 +16067,12 @@ Re-introducing the anti-patterns these guard against is a regression:
     exactly like a control that ignores the keyboard. It claims only Up/Down, which are not
     keyboard triggers and so have no click to collide with, and lets the synthesised click carry
     Enter and Space.
+  - **Going the other way — dropping a KeyDown arm and letting the synthesised Click be the whole
+    keyboard answer — is not a valid simplification, and it reads like the shorter fix.**
+    `Event::is_keyboard_trigger` has **no modifier term**, so it fires for `Ctrl+Enter` and
+    `Ctrl+Space` too: it presses exactly the chords `widgets::presses` exists to refuse, and
+    `Ctrl+Enter` is the grid's Commit. The two must therefore be kept on **two `ViewId`s** rather
+    than collapsed onto one, which is what `widgets::key_pressable` and `in_ring_button` both do.
 - **A child that overflows *left* or *up* of its parent is painted but never hit-tested.** Floem
   hit-tests a subtree through `EventCx::should_send` (`floem-0.2.0/src/context.rs`), which builds the
   rect it tests as `id.layout_rect().with_origin(layout.location)` — it takes the **size** of the
@@ -15875,6 +16247,25 @@ Re-introducing the anti-patterns these guard against is a regression:
   for **not** memoising that per-row closure true: a restyle is a theme switch, a scale change or a
   panel resize, not a frame — and a resize *is* frames, so the guard buys the premise back instead
   of paying for a memo.
+  **A consumer's guard is not the publisher's, and the third dimension had no consumer to hide
+  behind.** Those two are republished widths; `editor_h` has no republished twin, its readers take it
+  raw, and nothing below it held the line — so the guard now sits where the value is produced, in
+  `dividers::nudge`, which both handles move through and which publishes only when the clamped result
+  actually differs. One guard at the source answers for all three.
+  **And the three theme setters are guarded on their argument, inside the setter rather than at each
+  picker**, because the callers were what proved unreliable: of the three controls reaching
+  `theme::set_ui`/`set_editor`/`set_ui_scale`, the two dropdowns guarded and the interface-scale
+  segments did not. A `set` on `ui` re-runs every reactive style closure in the window, the `ui_gen`
+  bump beside it rebuilds every view that cannot re-read a colour, and the settings modal persists
+  `ui_state.json` synchronously off the same change — a whole-window rebuild and a disk write for
+  clicking the row that is already highlighted. A built theme has no identity to compare, so what is
+  stored is the **kind** (`ThemeState::ui_kind`/`editor_kind`), as `Option` so `init`'s seeding
+  always applies however it compares to the default the frame before it painted with.
+  **A guard beside an unguarded write in the same closure is the spelling to look for.**
+  `edit_field`'s document callback guarded its `text_sig.set` and not the `rows.set` three lines
+  below it — same closure, same keystroke — while the viewport twin computing the identical number
+  *does* carry the term; and in a single-line field that count is a constant by construction, so
+  every keystroke in every field in the app republished it and re-ran the box's style for nothing.
   **`update` doesn't dedup either, and can't** — `floem_reactive`'s `update_value` calls
   `run_effects()` with no equality check, so `sig.update(|c| c.clear())` on an *already empty*
   collection is not the no-op it reads as. `discard_edits` cleared all three staging collections
@@ -15916,6 +16307,33 @@ Re-introducing the anti-patterns these guard against is a regression:
   user — a thousand rows, one notification, where the per-row spelling made it 1,001 — and it counts
   rather than times, because a wall-clock assertion is a flake on a busy machine and the count is
   what was wrong. What still needs the app is anything that has to be *laid out* or painted.
+  **Two notes in this tree said the opposite, and both were wrong.** `dividers::clamp_tests` carried
+  one saying a notification count was something no `#[test]` could see;
+  `a_drag_held_past_the_clamp_publishes_once` now counts them, ten publishes where one is due, with a
+  moving drag still publishing every frame so the guard cannot swallow the gesture. And
+  `typing_over_a_clean_result_republishes_nothing` counts them for `ShownResult::dismiss_error`,
+  because a test of the *outcome* is green against that defect — the state ends up `Idle` either way,
+  which is why the neighbouring `typing_clears_a_live_failure_but_never_a_kept_one` passed before and
+  after. It was watched red at 11 publishes where 1 was due.
+  **`dismiss_error` is the editor's document callback — once per keystroke — and `update` notifies
+  whether or not the closure changed anything.** Its three real conditions sat *inside* the closure,
+  so every character typed republished the whole result-panel list: the strip's `dyn_stack`
+  re-cloning every `ResultPanel` and two `String`s apiece, the pinned-bytes fold over every `Loaded`
+  panel, the body's key memo, every mounted grid's frozen memo. This file's own measurement for that
+  notification is **0.67 ms at 400 panels**, which Run Everything on a migration file reaches, and it
+  falls on the keystroke path three other findings have already measured as budget-constrained. The
+  early return that was there caught only "no shown panel", which a tab cannot be in — it always
+  holds one — while `Tab::set_panel_state` three methods up asks first, under a comment stating this
+  rule verbatim.
+  **And `right_content` is the publisher whose input is a same-value write *by construction*.** It
+  exists to hold the last *non-None* right panel, so closing and reopening the same one writes it
+  over itself: Ctrl+Shift+A twice takes `right_panel` Ai → None → Ai, the `None` edge was already
+  skipped and the way back was not. So `right_inner`'s `dyn_container` disposed the panel's child
+  scope and rebuilt it — `ai_panel`'s child-scoped `elapsed_ms` freed and the "thinking" timer
+  restarted from zero mid-turn, every bubble's markdown re-parsed, the reader's scroll gone — and the
+  whole point of `right_content`, that the content lingers clipped through the collapse rather than
+  popping out, defeated. The two publishers immediately above it in the same function both carry the
+  term.
   **`set` doesn't dedup either, and the active tab is where that costs most.** `RwSignal::set` to the
   value already there still notifies every dependent (floem 0.2 compares nothing, in `set` or in
   `create_updater`), and `TabsUi::active` is `results_area`'s and `editor_area`'s `dyn_container`
@@ -16041,6 +16459,29 @@ Re-introducing the anti-patterns these guard against is a regression:
   multiplied by `level_indent()` *inside* each style closure, and a count cannot be frozen at a scale
   because it does not know about one. The grid's stored column widths are the same fact where the
   fix has to be an effect instead — see `rescale_widths` under *Data grid*.
+  **A *signal* read in a builder freezes the same way, and a `create_memo` is no protection.** Only
+  the key closure is wrapped in `create_updater`; the child comes from `swap_val` inside
+  `View::update`, so `memo.get()` at a call site inside a builder is exactly as frozen as a captured
+  `Color`. Server Activity's kill surfaces were the second instance after the schema tree's, and its
+  memo's own comment already said in the imperative that the two containers below must read it
+  inside their own bodies — which they did, having been handed the *value*. The remedy is to carry
+  the `Memo` in and read it where reading means something: `.get()` in a style closure, which
+  re-runs, and `.get_untracked()` in a press or a tip closure, which are called when asked rather
+  than when built. The Snippet Library's rows are the third, and the one that shows what makes the
+  class hard to see: its list is keyed on `(groups, search, dialect)` and the frozen read is
+  `active_conn`, which is in none of them — but `groups` is *computed from* `active_conn`, so the key
+  looks as if it covers the read. It does not whenever the grouping happens to come out equal, which
+  `snippet::grouped` makes the ordinary case by dropping an empty bucket: with no connection-scoped
+  snippet on either side the two `Vec<Group>` compare equal, the memo never notifies, and *Show in →
+  This connection* wrote the connection the panel was opened on. **A key term derived from the signal
+  you are reading is not the same as the signal**, and that is the version of this bug to look for.
+  **No gate came out of any of the three.** A crude scan finds **61** `dyn_container` builders
+  across `schemaic-ui` + `schemaic-app` that read a signal with `.get()`; most are reading something
+  already in their own key, which is harmless, and nothing mechanical separates those from the frozen
+  ones. Sorting them is its own pass, and it is in `TODO.md` rather than here.
+  Where the read has a *later* moment that wants it — a press, a tip, a right-click that builds a
+  menu — the remedy is to move the read there rather than to widen the key, which is what both the
+  activity panel's row menu and the snippet row's do.
   **The opposite error costs as much and reads as tidier**: a key narrower than what the child
   renders never rebuilds it at all. `dump_view::export_progress_overlay` keys on
   `(target, done, error)` for exactly that reason — keyed on `target` alone, which is the one signal
@@ -16251,6 +16692,12 @@ Re-introducing the anti-patterns these guard against is a regression:
   terminal cursor-blink tick reschedules forever; at shutdown the scope disposes its signals and the
   last timer panics on `get_untracked`. Guard every read with `try_get_untracked` and stop
   rescheduling once any returns `None`.
+  **And *every* read goes inside the guard, not just the one that raised it.** `edit_field`'s
+  caret-to-end timer asked `try_get_untracked` for the editor's view id, requested focus, and then
+  called `ed2.doc()` — which is `get_untracked().unwrap()` on the same signal — **outside** the
+  guard, so it detected a disposed field and panicked on it one line later. The autofocus twin
+  forty-five lines above has both reads inside the guard, which is what the second one was copied
+  from and what it dropped. A guard that names one read is a guard a second read walks past.
 - **A deferred action's generation guard must live in the same scope as the state it clears, or in a
   longer-lived one.** The idiom above usually has a second half: the timer compares itself against a
   generation before acting (`if save_gen.try_get_untracked() == Some(g)`), which asks *did something
@@ -16550,6 +16997,17 @@ Re-introducing the anti-patterns these guard against is a regression:
   here is what shipped the row panel's *Set NULL* and the activity panel's lock-wait Kill dead to a
   mouse click, and `widgets::key_pressable_gate` now holds the helper to both listeners and rejects a
   caller that binds the click a second time (one press, two actions).
+  **Both listeners must sit on two different views, and that is the correctness half rather than a
+  layout one.** Chained onto one container they ran the action *twice* per keypress, by the exact
+  mechanism above: floem applies `Click` to the focused view for any physical Enter/NumpadEnter/Space
+  and **discards the result**, then folds that same view's KeyDown listeners without short-circuiting.
+  The row panel's blob affordance takes the caret on mount when its column is the first editable one,
+  so one **Space** on it issued two `view_blob` reads of up to `FETCH_CAP` — the second cancelling
+  the first's token mid-transfer, on a Manual tab's pinned session — and the activity panel's
+  lock-wait **Kill** raised `Confirm` twice into a single-slot signal.
+  `key_pressable_gate::the_click_and_the_key_arm_are_not_on_the_same_view` pins the split, and
+  `::a_sparkle_action_can_be_pressed_from_the_keyboard` holds the third button family
+  (`widgets::sparkle_action`) to one of the two helpers.
   Order is `NAV_TAB` → `LIST_TAB` → the form (10, 20, … within a section, by 100 between them, up
   to `FIXED_TAB_END`) → `VALUE_TAB` + `i * ROW_TAB_STRIDE` for a growing list → `ACTION_TAB` for
   the footer → `TITLE_CLOSE_TAB` for the title bar's ✕ (last, since
