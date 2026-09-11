@@ -25,16 +25,14 @@ use floem::views::editor::core::editor::EditType;
 use floem::views::editor::core::selection::Selection;
 
 use schemaic_core::intel::{self, ClauseCtx, SqlDialect};
-use schemaic_core::schema::{DbSchema, SchemaState, classify_column_type, db_contributes};
+use schemaic_core::schema::{DbSchema, SchemaState, db_contributes};
 use schemaic_core::snippet;
 use schemaic_core::sql::statement_range;
 
-use crate::schema_tree::column_type_icon;
-
-// The keyword/function sets now live in `schemaic_core::intel` (so the core
-// analysis + diagnostics share one authoritative copy); used here to seed the
-// suggestion pool.
-use schemaic_core::intel::{FUNCTIONS, SQL_KEYWORDS, STMT_KEYWORDS};
+// The keyword/function sets live in `schemaic_core::intel` (so the core analysis
+// + diagnostics share one authoritative copy), and the ranking that seeds itself
+// from them lives in `schemaic_core::rank`.
+use schemaic_core::rank;
 
 use floem::AnyView;
 
@@ -86,56 +84,30 @@ pub(crate) struct Completion {
     pub(crate) sig_point: RwSignal<Point>,
 }
 
-/// What an autocomplete row represents (drives its color + the detail shown).
-#[derive(Clone, Copy, PartialEq)]
-pub(crate) enum SuggestKind {
-    Keyword,
-    Function,
-    Table,
-    Column,
-    Database,
-    /// A saved snippet, offered by its abbrev. Its row inserts the snippet's
-    /// *body*, not the abbrev — the `insert` override every FK-JOIN row uses.
-    Snippet,
+/// The ranking vocabulary, which lives in `core::rank` — see that module for why
+/// the policy is not in this file.
+pub(crate) use schemaic_core::rank::{
+    ColMeta, KeyKind, SchemaIndex, SuggestGlyph, SuggestKind, Suggestion,
+};
+
+/// The SVG a ranked row's [`SuggestGlyph`] asks for.
+///
+/// **The mapping is here and the reason is there.** `core::rank` decides *why* a
+/// row gets the glyph it gets — a column's type family, an FK target, an in-scope
+/// alias — and this turns that into a picture, because an icon body is a
+/// `&'static str` of SVG and core has no business holding one. It is the same
+/// split `schema_tree::column_type_icon` already is on the other side of.
+fn glyph_icon(glyph: SuggestGlyph, kind: SuggestKind) -> &'static str {
+    match glyph {
+        SuggestGlyph::Kind => kind_icon(kind),
+        SuggestGlyph::ColumnType(class) => crate::schema_tree::column_type_icon(class),
+        SuggestGlyph::ForeignKey => icons::KEY_SQUARE,
+        SuggestGlyph::Alias => icons::TAG,
+        SuggestGlyph::Table => icons::TABLE,
+    }
 }
 
-/// Whether a column suggestion participates in a key — tints its leading icon gold
-/// (PK) / purple (FK), mirroring the schema tree. Non-columns are always `None`.
-#[derive(Clone, Copy, PartialEq)]
-pub(crate) enum KeyKind {
-    None,
-    Primary,
-    Foreign,
-}
-
-/// One ranked autocomplete row: the text inserted, its kind, a dim detail (a
-/// column's type + nullability, or a table's database), the owning table + in-scope
-/// alias for a column (so a column row reads `id   orders o   int`), and whether
-/// it's a primary key (drives the gold key glyph on column rows).
-#[derive(Clone)]
-pub(crate) struct Suggestion {
-    text: String,
-    kind: SuggestKind,
-    detail: String,
-    /// Owning table of a column suggestion (empty otherwise) — the mid annotation.
-    table: String,
-    /// In-scope alias of that table, if any (empty otherwise).
-    alias: String,
-    /// The leading schema-style glyph (a column's type family, a table/db icon, or
-    /// the `square-function` mark for keywords/functions).
-    icon: &'static str,
-    /// Key membership — tints a column's icon gold/purple like the schema tree.
-    key: KeyKind,
-    /// Text spliced on accept when it differs from `text` — e.g. an FK JOIN target
-    /// displays `orders` but inserts `orders ON o.customer_id = orders.id`. `None`
-    /// inserts `text` verbatim.
-    insert: Option<String>,
-    /// Absolute byte range to replace on accept, overriding the default word range —
-    /// used by `SELECT *` expansion to swap the `*` (or `t.*`) for the column list.
-    replace: Option<(usize, usize)>,
-}
-
-use schemaic_core::sql::{is_word_byte, is_word_start};
+use schemaic_core::sql::is_word_byte;
 
 /// Byte offset where the identifier ending at `offset` begins.
 fn word_start(text: &str, offset: usize) -> usize {
@@ -229,7 +201,7 @@ fn schema_index(
         {
             return Rc::clone(&hit.index);
         }
-        let index = Rc::new(SchemaIndex::build(&nodes, hidden, active_db));
+        let index = Rc::new(index::build(&nodes, hidden, active_db));
         *cell = Some(CachedIndex {
             nodes,
             hidden: hidden.clone(),
@@ -299,38 +271,12 @@ fn catalog_of(
     CATALOG.with(|c| c.borrow_mut().get(&loaded, active_db))
 }
 
-/// One column's completion-relevant metadata.
-#[derive(Clone)]
-struct ColMeta {
-    name: String,
-    type_name: String,
-    nullable: bool,
-    primary_key: bool,
-    foreign_key: bool,
-}
+/// Building the index is this crate's half — its input is the schema tree's
+/// signals. The *shape* is [`SchemaIndex`], in `core::rank`, because ranking is
+/// what reads it.
+mod index {
+    use super::*;
 
-/// A schema view built once per recompute: which databases/tables exist and each
-/// table's columns, all indexed case-insensitively. Columns of same-named tables
-/// across databases are merged (dedup by column name).
-struct SchemaIndex {
-    databases: Vec<String>,
-    /// (table name, database it lives in).
-    tables: Vec<(String, String)>,
-    /// table name (lowercase) → its columns — the *active-database* unqualified pool.
-    columns: HashMap<String, Vec<ColMeta>>,
-    /// (database, table) (both lowercase) → its columns, for *every* loaded database.
-    /// Backs qualified completion of a cross-database table (`otherdb.t` or an alias
-    /// pointing at one), which the active-db-only `columns` map can't answer.
-    ///
-    /// `Rc` because the same `Vec` also feeds the unqualified merge below, and
-    /// this map is populated for every loaded database on every recompute —
-    /// storing it by value cloned each table's columns a second time.
-    columns_by_db: HashMap<(String, String), Rc<Vec<ColMeta>>>,
-    /// database name (lowercase) → its table names.
-    tables_by_db: HashMap<String, Vec<String>>,
-}
-
-impl SchemaIndex {
     /// Build the completion index. When `active_db` is `Some`, the *unqualified*
     /// suggestion pool (`tables`/`columns`) is scoped to that database, so a tab with
     /// a selected database isn't polluted by every other database's tables.
@@ -341,7 +287,7 @@ impl SchemaIndex {
     /// A database the SCHEMA eye has hidden contributes nothing at all — not its
     /// name, not its tables, not its columns — unless it is the active one; see
     /// [`schemaic_core::schema::db_contributes`].
-    fn build(
+    pub(super) fn build(
         nodes: &[LoadedNode],
         hidden: &HashSet<String>,
         active_db: Option<&str>,
@@ -423,206 +369,6 @@ impl SchemaIndex {
             tables_by_db,
         }
     }
-}
-
-/// Fuzzy subsequence score of `query` against `cand` (case-insensitive), or None
-/// if `query`'s chars don't appear in order in `cand`. Higher is better: prefix,
-/// word-boundary (after `_`), and contiguous matches are rewarded; a later first
-/// match and a longer candidate are penalized. Empty query matches everything at
-/// score 0 (so ranking falls to the caller's tiers).
-/// Would this candidate survive the ranking below? — the one question a
-/// builder needs before it allocates a [`Cand`].
-///
-/// It **must** stay `fuzzy_score(...).is_some()` and nothing else: the ranking
-/// filters on exactly that, so any other predicate here either drops a
-/// suggestion the user would have seen or spends the allocation anyway.
-/// `recompute_completions`' scoring pass is the second half of the pair, and
-/// `the_pre_filter_admits_exactly_what_the_ranking_keeps` is what holds the two
-/// together.
-fn worth_offering(name: &str, prefix: &str) -> bool {
-    fuzzy_score(name, prefix).is_some()
-}
-
-fn fuzzy_score(cand: &str, query: &str) -> Option<i32> {
-    if query.is_empty() {
-        return Some(0);
-    }
-    let c = cand.as_bytes();
-    let q = query.as_bytes();
-    let lc = |x: u8| x.to_ascii_lowercase();
-    let mut score = 0i32;
-    let mut qi = 0usize;
-    let mut prev: Option<usize> = None;
-    let mut first: Option<usize> = None;
-    for ci in 0..c.len() {
-        if qi >= q.len() {
-            break;
-        }
-        if lc(c[ci]) == lc(q[qi]) {
-            if first.is_none() {
-                first = Some(ci);
-            }
-            let boundary = ci == 0 || c[ci - 1] == b'_';
-            score += if boundary { 18 } else { 4 };
-            if let Some(p) = prev {
-                if ci == p + 1 {
-                    score += 12;
-                } else {
-                    score -= (ci - p - 1).min(10) as i32;
-                }
-            }
-            prev = Some(ci);
-            qi += 1;
-        }
-    }
-    if qi < q.len() {
-        return None;
-    }
-    let is_prefix = c.len() >= q.len() && (0..q.len()).all(|k| lc(c[k]) == lc(q[k]));
-    if is_prefix {
-        score += 40;
-    }
-    score -= first.unwrap_or(0) as i32;
-    score -= (c.len() as i32) / 5;
-    Some(score)
-}
-
-/// Lowercased identifier words already present in `text[lo..hi]`, excluding the
-/// word being typed at `skip` — a recency signal for ranking (you tend to reference
-/// the same columns/tables again in a statement). Strings/comments aren't filtered
-/// out; a stray hit only mildly reorders suggestions, never changes correctness.
-fn statement_identifiers(
-    text: &str,
-    lo: usize,
-    hi: usize,
-    skip: (usize, usize),
-) -> HashSet<String> {
-    let b = text.as_bytes();
-    let mut out = HashSet::new();
-    let mut i = lo;
-    while i < hi {
-        let c = b[i];
-        if is_word_start(c) {
-            let s = i;
-            let mut j = i + 1;
-            while j < hi && is_word_byte(b[j]) {
-                j += 1;
-            }
-            if (s, j) != skip {
-                out.insert(text[s..j].to_ascii_lowercase());
-            }
-            i = j;
-        } else {
-            i += 1;
-        }
-    }
-    out
-}
-
-/// Whether a database name should be offered at a table position. Only once the
-/// user has typed a prefix — so an empty `FROM`/`JOIN` list stays tables-only — and
-/// never the database already in use (qualifying a table with the current database is
-/// redundant). Cross-database `otherdb.table` completion stays reachable: start
-/// typing the other database's name and it surfaces.
-fn database_suggestion_visible(db: &str, prefix: &str, active_db: Option<&str>) -> bool {
-    !prefix.is_empty() && active_db.is_none_or(|a| !a.eq_ignore_ascii_case(db))
-}
-
-/// One snippet-abbrev row for the popup: what the row shows, its snippet's name,
-/// and the body accepting it splices.
-pub(crate) struct AbbrevRow {
-    pub abbrev: String,
-    pub name: String,
-    pub body: String,
-}
-
-/// The snippet abbrevs to offer at a caret with `prefix` already typed.
-///
-/// **Only once something has been typed.** An abbrev is a name its owner chose
-/// *in order to type it*, so one nobody has started typing is not a match — and
-/// on an empty prefix it is not merely a weak row, it is the **selected** one:
-/// `fuzzy_score` answers `Some(0)` for every candidate, snippets take no recency
-/// bonus, and the sort falls through to shortest-text. On a stock install with no
-/// snippets of the user's own, `SELECT * FROM ` auto-opened the popup with the
-/// two-character built-in `ps` preselected, and Enter — for a line break — or Tab
-/// — for the first table — spliced a whole `;`-terminated statement into the one
-/// being typed.
-///
-/// Not offered after a `qualifier.` either: there the only sensible answers are
-/// that table's columns.
-///
-/// One row per distinct spelling, resolved through [`snippet::by_abbrev`] so the
-/// narrowest scope wins a shared abbrev by the same rule everywhere rather than
-/// by whichever the list happened to reach first.
-///
-/// **It deliberately does not claim the caller's `seen` set.** That set is shared
-/// by every candidate producer and first writer wins, and this block runs before
-/// all of them — so a table named `locks`, a column named `idx` or a lookup table
-/// named `sizes` (all shipped abbrevs) never reached the popup at all, at any
-/// position, with no way out: a built-in cannot be deleted or re-spelled. Two rows
-/// of one spelling is the right answer; they differ by icon and detail.
-pub(crate) fn snippet_abbrev_rows(
-    all: &[snippet::Snippet],
-    prefix: &str,
-    qualified: bool,
-    dialect: SqlDialect,
-    conn_id: u64,
-) -> Vec<AbbrevRow> {
-    if qualified || prefix.is_empty() {
-        return Vec::new();
-    }
-    let mut spellings: Vec<String> = Vec::new();
-    for s in all.iter().filter(|s| snippet::applies(s, dialect, conn_id)) {
-        if let Some(a) = s.abbrev.as_deref().filter(|a| !a.is_empty())
-            && !spellings.iter().any(|s| s.eq_ignore_ascii_case(a))
-        {
-            spellings.push(a.to_string());
-        }
-    }
-    spellings
-        .into_iter()
-        .filter_map(|spelling| {
-            let s = snippet::by_abbrev(all, &spelling, dialect, conn_id)?;
-            Some(AbbrevRow {
-                abbrev: spelling,
-                name: s.name.clone(),
-                body: s.body.clone(),
-            })
-        })
-        .collect()
-}
-
-/// Ranking bonus for a candidate identifier (table/column/database) already used
-/// elsewhere in the statement. Keywords/functions don't get it — repeating `SELECT`
-/// or `COUNT` isn't a relevance signal. Modest, so a strong prefix match on a fresh
-/// name still wins.
-fn recency_bonus(text: &str, kind: SuggestKind, used: &HashSet<String>) -> i32 {
-    let is_ident = matches!(
-        kind,
-        SuggestKind::Table | SuggestKind::Column | SuggestKind::Database
-    );
-    if is_ident && used.contains(&text.to_ascii_lowercase()) {
-        18
-    } else {
-        0
-    }
-}
-
-/// A raw completion candidate before scoring: `tier` is its context priority
-/// (lower ranks higher; ties break by fuzzy score then length).
-struct Cand {
-    text: String,
-    kind: SuggestKind,
-    detail: String,
-    table: String,
-    alias: String,
-    icon: &'static str,
-    key: KeyKind,
-    tier: u8,
-    /// Splice-on-accept override (see [`Suggestion::insert`]).
-    insert: Option<String>,
-    /// Replace-range override (see [`Suggestion::replace`]).
-    replace: Option<(usize, usize)>,
 }
 
 /// Pin the suggestion popup to the caret's line: the line's top and bottom edges,
@@ -957,7 +703,7 @@ pub(crate) fn recompute_completions(
                     table: String::new(),
                     alias: String::new(),
                     // A purple key-square marks the ready-to-insert FK join predicate.
-                    icon: icons::KEY_SQUARE,
+                    glyph: SuggestGlyph::ForeignKey,
                     key: KeyKind::Foreign,
                     insert: None,
                     replace: None,
@@ -979,446 +725,52 @@ pub(crate) fn recompute_completions(
         return;
     }
 
+    // ── Everything below the caret reads is `core::rank`'s ──────────────────
+    //
+    // The schema view, the statement's scope, the snippet rows, the FK join
+    // targets and the star expansion are this crate's to gather — each reads a
+    // signal or the schema tree — and the *policy* over them is not. See
+    // `core::rank`'s module doc for why: all of it used to live here, inside a
+    // function taking `&Editor`, where nothing could call it.
     let schema = hidden_dbs.with_untracked(|h| schema_index(db_nodes, h, active_db));
     let scope = intel::statement_scope(&text, lo, hi, offset, dialect).tables;
-    let pl = prefix.to_ascii_lowercase();
 
-    // Collect raw candidates (dedup by text, first/lowest tier wins), then score.
-    let mut cands: Vec<Cand> = Vec::new();
-    let mut seen: HashSet<String> = HashSet::new();
-    let add = |cands: &mut Vec<Cand>,
-               seen: &mut HashSet<String>,
-               text: &str,
-               kind: SuggestKind,
-               detail: String,
-               tier: u8| {
-        let tl = text.to_ascii_lowercase();
-        if tl == pl || !seen.insert(tl) {
-            return;
-        }
-        cands.push(Cand {
-            text: text.to_string(),
-            kind,
-            detail,
-            table: String::new(),
-            alias: String::new(),
-            icon: kind_icon(kind),
-            key: KeyKind::None,
-            tier,
-            insert: None,
-            replace: None,
-        });
+    // Gathered on exactly the paths that used to gather them, which is what keeps
+    // the cost where it was: the FK catalog is a walk of the whole schema tree,
+    // and only a table slot ever wanted it.
+    let join_targets = if matches!(ctx, ClauseCtx::Table) {
+        let catalog = hidden_dbs.with_untracked(|h| build_offer_catalog(db_nodes, h, active_db));
+        intel::join_targets(&text, lo, hi, offset, &catalog, dialect)
+    } else {
+        Vec::new()
     };
-    // The detail string for a column typed against its own metadata: the type,
-    // suffixed with a dim `· NULL` for nullable columns (NOT NULL stays clean).
-    let col_type_detail = |c: &ColMeta| -> String {
-        if c.nullable {
-            format!("{} · NULL", c.type_name)
-        } else {
-            c.type_name.clone()
-        }
-    };
-    // Column candidates carry their owning `table` (+ in-scope `alias`) as the mid
-    // annotation and the type as `detail`. The leading glyph is the column's *type
-    // family* (schema-tree style), tinted gold (PK) / purple (FK) via `key`. Deduped
-    // by column name (first table in scope wins).
-    let add_col = |cands: &mut Vec<Cand>,
-                   seen: &mut HashSet<String>,
-                   c: &ColMeta,
-                   table: &str,
-                   alias: Option<&str>,
-                   tier: u8| {
-        let tl = c.name.to_ascii_lowercase();
-        if tl == pl || !seen.insert(tl) {
-            return;
-        }
-        // **Ask the question that decides it before paying for the answer.**
-        // Every `Cand` costs four fresh `String`s, and the ranking below drops
-        // any candidate `fuzzy_score` refuses — so building one for a column
-        // that cannot match is pure waste, and with no FROM yet that is *every
-        // column in the database* on every keystroke. Same predicate, same
-        // argument (`Cand::text` is `c.name`), so nothing that would have been
-        // offered stops being offered; an empty prefix still matches
-        // everything, which is the case that keeps the no-FROM list complete.
-        // The dedup above stays where it is: skipping it here would let a
-        // same-named column from a later table take the slot.
-        if !worth_offering(&c.name, &prefix) {
-            return;
-        }
-        let key = if c.primary_key {
-            KeyKind::Primary
-        } else if c.foreign_key {
-            KeyKind::Foreign
-        } else {
-            KeyKind::None
-        };
-        cands.push(Cand {
-            text: c.name.clone(),
-            kind: SuggestKind::Column,
-            detail: col_type_detail(c),
-            table: table.to_string(),
-            alias: alias.unwrap_or("").to_string(),
-            icon: column_type_icon(classify_column_type(&c.type_name)),
-            key,
-            tier,
-            insert: None,
-            replace: None,
-        });
-    };
-    // In-scope table references as qualifier candidates: an alias (`ac`, tag icon,
-    // detail = the table it stands for) or, for an unaliased table, its name (table
-    // icon). Offered in column contexts so `ON a` suggests `ac` before you type `.`.
-    let add_aliases = |cands: &mut Vec<Cand>, seen: &mut HashSet<String>| {
-        for r in &scope {
-            let qtext = r.alias.as_deref().unwrap_or(&r.name);
-            let tl = qtext.to_ascii_lowercase();
-            if tl == pl || !seen.insert(tl) {
-                continue;
-            }
-            let detail = match (&r.alias, &r.db) {
-                (Some(_), Some(db)) => format!("{db}.{}", r.name),
-                (Some(_), None) => r.name.clone(),
-                (None, _) => String::new(),
-            };
-            cands.push(Cand {
-                text: qtext.to_string(),
-                kind: SuggestKind::Table,
-                detail,
-                table: String::new(),
-                alias: String::new(),
-                icon: if r.alias.is_some() {
-                    icons::TAG
-                } else {
-                    icons::TABLE
-                },
-                key: KeyKind::None,
-                tier: 0,
-                insert: None,
-                replace: None,
-            });
-        }
-    };
-    // A table's columns: keyed by (db, table) when the table is database-qualified
-    // (incl. a cross-database one), else the active-database unqualified pool.
-    // **A borrow, not a copy.** This runs once per table, and the unqualified
-    // arm runs once per table *in the database* when there is no FROM yet — so
-    // returning `Vec<ColMeta>` deep-copied every column of every table on every
-    // keystroke, 4.0 ms at 500×25 and 11.4 ms at 1,000×30, with the popup often
-    // showing nothing. The `Rc` at `columns_by_db` exists precisely to stop a
-    // second copy of each table's columns, and this took one anyway.
-    let cols_of = |db: Option<&str>, name: &str| -> &[ColMeta] {
-        match db {
-            Some(db) => schema
-                .columns_by_db
-                .get(&(db.to_ascii_lowercase(), name.to_ascii_lowercase()))
-                .map_or(&[][..], |m| m.as_slice()),
-            None => schema
-                .columns
-                .get(&name.to_ascii_lowercase())
-                .map_or(&[][..], Vec::as_slice),
-        }
-    };
-    // Snippet abbrevs, in the top tier and ahead of the keyword continuations: an
-    // abbrev is a name its owner chose *in order to type it*, so when one matches
-    // what is being typed it is not a guess the way a ranked keyword is.
-    for row in snippet_abbrev_rows(
+    let star = hidden_dbs
+        .with_untracked(|h| star_expansion(&text, lo, hi, offset, db_nodes, h, active_db, dialect));
+    let snippet_rows = rank::snippet_abbrev_rows(
         &snippets.get_untracked(),
         &prefix,
-        qualified,
+        matches!(ctx, ClauseCtx::Qualified(_)),
         dialect,
         conn_id,
-    ) {
-        cands.push(Cand {
-            text: row.abbrev,
-            kind: SuggestKind::Snippet,
-            detail: row.name,
-            table: String::new(),
-            alias: String::new(),
-            icon: kind_icon(SuggestKind::Snippet),
-            key: KeyKind::None,
-            tier: 0,
-            // The row shows the abbrev and inserts the query.
-            insert: Some(row.body),
-            replace: None,
-        });
-    }
-    // Expected clause-keyword continuations go in the *top* tier (above columns,
-    // functions, and — after a complete table ref — schema table names), so the
-    // legal next keyword the grammar predicts wins ties. Added before the
-    // per-context candidates so they claim tier 0 (dedup keeps the first entry).
-    // Skipped after a `qualifier.` (there we want only that table's columns).
-    if !qualified {
-        for kw in &cont.keywords {
-            add(
-                &mut cands,
-                &mut seen,
-                kw,
-                SuggestKind::Keyword,
-                String::new(),
-                0,
-            );
-        }
-    }
-    // Once a clause continuation is expected (a complete table ref sits before the
-    // caret), the schema table names are no longer the primary suggestion — demote
-    // them below the keyword continuations.
-    let table_tier: u8 = if cont.keywords.is_empty() { 0 } else { 1 };
-
-    // A qualifier resolves to a table — (name, its database, the alias to annotate
-    // with) — via an in-scope alias, else a bare table name (whether or not it's in
-    // FROM). The database is carried so a cross-database table's columns resolve.
-    let resolve = |q: &str| -> Option<(String, Option<String>, Option<String>)> {
-        for r in &scope {
-            if r.alias
-                .as_deref()
-                .is_some_and(|a| a.eq_ignore_ascii_case(q))
-            {
-                return Some((r.name.clone(), r.db.clone(), r.alias.clone()));
-            }
-        }
-        for r in &scope {
-            if r.alias.is_none() && r.name.eq_ignore_ascii_case(q) {
-                return Some((r.name.clone(), r.db.clone(), None));
-            }
-        }
-        if schema.columns.contains_key(&q.to_ascii_lowercase()) {
-            return Some((q.to_string(), None, None));
-        }
-        None
-    };
-
-    match &ctx {
-        ClauseCtx::Qualified(q) => {
-            // A qualifier is either a table/alias (→ its columns) or a database name
-            // (→ its tables, for `db.table`). The scope resolver no longer misparses a
-            // dangling `db.` as a table (fixed in `intel::lexer_scope`), so the natural
-            // table-first order is safe.
-            if let Some((table, db, alias)) = resolve(q) {
-                for c in cols_of(db.as_deref(), &table) {
-                    add_col(&mut cands, &mut seen, c, &table, alias.as_deref(), 0);
-                }
-            } else if let Some(tbls) = schema.tables_by_db.get(&q.to_ascii_lowercase()) {
-                for t in tbls {
-                    add(&mut cands, &mut seen, t, SuggestKind::Table, q.clone(), 0);
-                }
-            }
-        }
-        ClauseCtx::Table => {
-            // FK-aware JOIN targets first (top tier): a table connected by a foreign
-            // key to something in scope, inserting `table ON <predicate>` in one go.
-            let catalog =
-                hidden_dbs.with_untracked(|h| build_offer_catalog(db_nodes, h, active_db));
-            let mut fk_added = false;
-            for jt in intel::join_targets(&text, lo, hi, offset, &catalog, dialect) {
-                let tl = jt.table.to_ascii_lowercase();
-                if tl == pl || !seen.insert(tl) {
-                    continue;
-                }
-                fk_added = true;
-                cands.push(Cand {
-                    text: jt.table.clone(),
-                    kind: SuggestKind::Table,
-                    detail: "foreign key".to_string(),
-                    table: String::new(),
-                    alias: String::new(),
-                    icon: icons::KEY_SQUARE,
-                    key: KeyKind::Foreign,
-                    tier: 0,
-                    insert: Some(format!("{} ON {}", jt.table_sql, jt.predicate)),
-                    replace: None,
-                });
-            }
-            // With FK targets present, keep them strictly above the plain table list.
-            let plain_tier = if fk_added {
-                table_tier.max(1)
-            } else {
-                table_tier
-            };
-            for (name, db) in &schema.tables {
-                add(
-                    &mut cands,
-                    &mut seen,
-                    name,
-                    SuggestKind::Table,
-                    db.clone(),
-                    plain_tier,
-                );
-            }
-            // Databases are offered only once a prefix is typed (so an empty
-            // FROM/JOIN list stays tables-only) and never the active one — cross-db
-            // `otherdb.table` stays reachable by typing the other database's name.
-            for db in &schema.databases {
-                if database_suggestion_visible(db, &prefix, active_db) {
-                    add(
-                        &mut cands,
-                        &mut seen,
-                        db,
-                        SuggestKind::Database,
-                        String::new(),
-                        table_tier + 1,
-                    );
-                }
-            }
-        }
-        ClauseCtx::Column => {
-            if scope.is_empty() {
-                // No FROM yet: offer every column, annotated by its owning table so
-                // the broader list stays navigable.
-                for (name, _) in &schema.tables {
-                    for c in cols_of(None, name) {
-                        add_col(&mut cands, &mut seen, c, name, None, 1);
-                    }
-                }
-            } else {
-                // In-scope aliases/table names as qualifier candidates (`ac`, `ord`).
-                add_aliases(&mut cands, &mut seen);
-                // Bias toward the most recently added (last) table in the FROM/JOIN
-                // list — the one you're most likely about to reference: its columns
-                // rank first (tier 0) and claim shared names; earlier tables fall to
-                // tier 1 (still above functions/keywords).
-                let last = scope.len() - 1;
-                for (i, r) in scope.iter().enumerate().rev() {
-                    let tier = if i == last { 0 } else { 1 };
-                    for c in cols_of(r.db.as_deref(), &r.name) {
-                        add_col(&mut cands, &mut seen, c, &r.name, r.alias.as_deref(), tier);
-                    }
-                }
-            }
-            for fun in FUNCTIONS {
-                add(
-                    &mut cands,
-                    &mut seen,
-                    fun.name,
-                    SuggestKind::Function,
-                    fun.signature.to_string(),
-                    2,
-                );
-            }
-            for &k in SQL_KEYWORDS {
-                add(
-                    &mut cands,
-                    &mut seen,
-                    k,
-                    SuggestKind::Keyword,
-                    String::new(),
-                    3,
-                );
-            }
-        }
-        ClauseCtx::Start => {
-            for &k in STMT_KEYWORDS {
-                add(
-                    &mut cands,
-                    &mut seen,
-                    k,
-                    SuggestKind::Keyword,
-                    String::new(),
-                    0,
-                );
-            }
-            for &k in SQL_KEYWORDS {
-                add(
-                    &mut cands,
-                    &mut seen,
-                    k,
-                    SuggestKind::Keyword,
-                    String::new(),
-                    1,
-                );
-            }
-        }
-        ClauseCtx::Other => {
-            add_aliases(&mut cands, &mut seen);
-            for r in &scope {
-                for c in cols_of(r.db.as_deref(), &r.name) {
-                    add_col(&mut cands, &mut seen, c, &r.name, r.alias.as_deref(), 0);
-                }
-            }
-            for (name, db) in &schema.tables {
-                add(
-                    &mut cands,
-                    &mut seen,
-                    name,
-                    SuggestKind::Table,
-                    db.clone(),
-                    1,
-                );
-            }
-            for &k in SQL_KEYWORDS {
-                add(
-                    &mut cands,
-                    &mut seen,
-                    k,
-                    SuggestKind::Keyword,
-                    String::new(),
-                    2,
-                );
-            }
-        }
-    }
-
-    // SELECT * expansion: when the caret sits right after a projection `*`/`t.*`,
-    // offer an item that rewrites it into the explicit column list (shown when the
-    // popup opens here — e.g. via Ctrl+Space, since the list doesn't auto-open on `*`).
-    if let Some(exp) = hidden_dbs
-        .with_untracked(|h| star_expansion(&text, lo, hi, offset, db_nodes, h, active_db, dialect))
-    {
-        // `exp.columns`, not the commas in the SQL: a quoted identifier holding
-        // one (`` `a,b` ``, legal on MySQL) over-reported. And `plural`, which
-        // this crate has 33 other call sites for — a one-column table is
-        // ordinary (an id-only join table, a `settings(key)` lookup) and the row
-        // read "1 columns".
-        let ncols = exp.columns;
-        cands.push(Cand {
-            text: "expand *".to_string(),
-            kind: SuggestKind::Column,
-            detail: format!(
-                "{ncols} {}",
-                schemaic_core::text::plural(ncols, "column", "columns")
-            ),
-            table: String::new(),
-            alias: String::new(),
-            icon: icons::TABLE,
-            key: KeyKind::None,
-            tier: 0,
-            insert: Some(exp.replacement),
-            replace: Some(exp.range),
-        });
-    }
-
+    );
     // Identifiers already written in this statement rank a little higher (recency):
     // you tend to reference the same columns/tables again.
-    let used = statement_identifiers(&text, lo, hi, (word_lo, offset));
+    let used = rank::statement_identifiers(&text, lo, hi, (word_lo, offset));
 
-    // Score by fuzzy match (+ recency bonus); sort by tier (context priority), then
-    // score, then a shorter candidate. Non-matches drop out.
-    let mut scored: Vec<(u8, i32, Cand)> = cands
-        .into_iter()
-        .filter_map(|c| {
-            fuzzy_score(&c.text, &prefix)
-                .map(|s| (c.tier, s + recency_bonus(&c.text, c.kind, &used), c))
-        })
-        .collect();
-    scored.sort_by(|a, b| {
-        a.0.cmp(&b.0)
-            .then(b.1.cmp(&a.1))
-            .then(a.2.text.len().cmp(&b.2.text.len()))
-    });
-    let items: Vec<Suggestion> = scored
-        .into_iter()
-        .take(40)
-        .map(|(_, _, c)| Suggestion {
-            text: c.text,
-            kind: c.kind,
-            detail: c.detail,
-            table: c.table,
-            alias: c.alias,
-            icon: c.icon,
-            key: c.key,
-            insert: c.insert,
-            replace: c.replace,
-        })
-        .collect();
+    let items = rank::rank(
+        &schema,
+        &rank::RankInput {
+            ctx: &ctx,
+            cont: &cont,
+            scope: &scope,
+            prefix: &prefix,
+            snippets: &snippet_rows,
+            join_targets: &join_targets,
+            star: star.as_ref(),
+            used: &used,
+            active_db,
+        },
+    );
 
     set_anchor(ed, comp, offset);
     let open = !items.is_empty();
@@ -1617,7 +969,7 @@ pub(crate) fn completion_popup(
                         detail,
                         table,
                         alias,
-                        icon,
+                        glyph,
                         key,
                         insert: _,
                         replace: _,
@@ -1625,8 +977,9 @@ pub(crate) fn completion_popup(
                     // Schema-style leading glyph, coloured by kind/key (see
                     // `suggest_icon_color`): a column's type family tinted gold (PK) /
                     // purple (FK), a table/db icon, or the muted `square-function`
-                    // mark for keywords/functions.
-                    let lead: AnyView = icons::icon(icon, COMPLETION_ICON_BASE)
+                    // mark for keywords/functions. The *reason* for the glyph comes
+                    // ranked (`SuggestGlyph`); `glyph_icon` is the picture.
+                    let lead: AnyView = icons::icon(glyph_icon(glyph, kind), COMPLETION_ICON_BASE)
                         .style(move |s| {
                             s.color(suggest_icon_color(kind, key))
                                 .margin_right(completion_icon_w() - completion_icon_size())
@@ -1873,11 +1226,12 @@ pub(crate) fn signature_popup(comp: Completion, viewport: RwSignal<Rect>) -> imp
 #[cfg(test)]
 mod tests {
     use super::{
-        KeyKind, SuggestKind, Suggestion, call_parens_follow, completion_insertion,
-        database_suggestion_visible, fuzzy_score, natural_width, popup_may_open, popup_placement,
-        popup_w, popup_x, recency_bonus, row_width, snippet_abbrev_rows, statement_identifiers,
-        types_a_character, worth_offering,
+        KeyKind, SuggestGlyph, SuggestKind, Suggestion, call_parens_follow, completion_insertion,
+        natural_width, popup_may_open, popup_placement, popup_w, popup_x, row_width,
+        types_a_character,
     };
+    // These moved to `core::rank` with the policy that reads them; the tests stay
+    // here because what they pin is this pane's behaviour, and the popup is here.
     use crate::consts::{
         COMPLETION_BORDER, COMPLETION_GUTTER, COMPLETION_LINE_H, completion_detail_gap,
         completion_edge_pad, completion_gap_w, completion_icon_w, completion_max_h,
@@ -1886,6 +1240,10 @@ mod tests {
     };
     use floem::keyboard::{Key, NamedKey};
     use schemaic_core::intel::SqlDialect;
+    use schemaic_core::rank::{
+        database_suggestion_visible, fuzzy_score, recency_bonus, snippet_abbrev_rows,
+        statement_identifiers,
+    };
     use schemaic_core::snippet::{Scope, Snippet, Source};
     use std::collections::HashSet;
 
@@ -2172,7 +1530,7 @@ mod tests {
             detail: detail.to_string(),
             table: table.to_string(),
             alias: String::new(),
-            icon: "",
+            glyph: SuggestGlyph::Kind,
             key: KeyKind::None,
             insert: None,
             replace: None,
@@ -2282,52 +1640,6 @@ mod tests {
         for cand in ["orders", "ps", "customer_id", ""] {
             assert_eq!(fuzzy_score(cand, ""), Some(0), "{cand}");
         }
-    }
-
-    /// **The pre-filter admits exactly what the ranking keeps.**
-    ///
-    /// `add_col` now asks `worth_offering` before building a `Cand`, so that a
-    /// no-FROM `SELECT ` stops allocating four `String`s for every column in
-    /// the database only to have the ranking drop them (4.0 ms per keystroke
-    /// at 500 tables × 25 columns, 11.4 ms at 1,000 × 30, and the same cost
-    /// when nothing matches and the popup is empty). That is only safe while
-    /// the two predicates are the *same* predicate, and the empty-prefix case
-    /// is the one that matters most: it must admit everything, or the no-FROM
-    /// list — which exists to be browsed, not filtered — would come back
-    /// empty.
-    #[test]
-    fn the_pre_filter_admits_exactly_what_the_ranking_keeps() {
-        let names = ["orders", "customer_id", "Orders", "café", "", "id", "ps"];
-        for name in names {
-            // The list the user browses before typing anything.
-            assert!(
-                worth_offering(name, ""),
-                "{name} withheld at an empty prefix"
-            );
-            for prefix in ["", "o", "ord", "cid", "zx", "sr", "ORD", "CAFÉ", "ab"] {
-                assert_eq!(
-                    worth_offering(name, prefix),
-                    fuzzy_score(name, prefix).is_some(),
-                    "{name:?} / {prefix:?}"
-                );
-            }
-        }
-
-        // And the ranking still filters on that same call, so the pre-filter
-        // cannot start admitting a superset or a subset of it unnoticed.
-        let src = std::fs::read_to_string(
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("src")
-                .join("completion.rs"),
-        )
-        .expect("completion.rs");
-        let body = crate::source_gate::production_code(&src);
-        assert!(
-            body.contains("fuzzy_score(&c.text, &prefix)"),
-            "the ranking no longer filters on `fuzzy_score` — `worth_offering` \
-             is now dropping candidates the list would have shown, or paying \
-             for ones it would not"
-        );
     }
 
     /// A candidate that is not a subsequence of the query answers `None`, which

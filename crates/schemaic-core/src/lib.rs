@@ -43,6 +43,7 @@ pub mod persist;
 pub mod plan;
 pub mod prompt;
 pub mod propose;
+pub mod rank;
 pub mod resource;
 pub mod resultsel;
 pub mod rowjson;

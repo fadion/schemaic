@@ -5727,6 +5727,23 @@ existing prose was left alone.
       free; the seed still picks when every preset is taken. Matching is
       ASCII-case-insensitive, so a hand-typed `#e05252` counts against `#E05252`, and an empty
       preset list answers with the empty string rather than dividing by zero.
+    - `rank.rs` — the autocomplete **ranking policy**: which candidates a caret position offers and
+      in what order. `rank(&SchemaIndex, &RankInput)` collects candidates into context tiers (dedup
+      by text, first/lowest tier wins, and a candidate equal to the typed prefix is dropped), scores
+      each by `fuzzy_score` plus `recency_bonus`, and sorts by tier, then score, then length,
+      capped at `MAX_ROWS`. `SchemaIndex`/`ColMeta`/`Suggestion`/`SuggestKind`/`KeyKind` are the
+      vocabulary; `worth_offering`, `statement_identifiers`, `database_suggestion_visible` and
+      `snippet_abbrev_rows` are the leaf rules it composes. **It is here because it could not be
+      tested where it was** — all of it was the middle of `completion::recompute_completions`, a
+      519-line function taking `&Editor`, so the tier rules, the FK demotion, the last-table-in-scope
+      bias, qualifier resolution and the comparator were unreachable from any test, and two
+      performance findings had to re-implement parts of it in a replica to measure them. What stayed
+      in `completion.rs` is what genuinely needs a mounted editor: the caret offset, the document
+      text, the popup anchor and the signal writes, plus the gathering of the schema index, the
+      statement scope, the snippet rows, the FK join targets and the star expansion — each of which
+      reads a signal. **A `Suggestion` carries a `SuggestGlyph` rather than an icon**: the *reason*
+      for its leading glyph (a column's type family, an FK target, an in-scope alias), which
+      `completion::glyph_icon` turns into an SVG, so no `&'static str` icon body reaches core.
     - `resultsel.rs` — the same rules one strip lower: which **result** panel is shown, and which
       ones a run is allowed to replace. `after_run` is the feature in one function — the pinned
       panels, in their order, then the run's fresh ones — and `active_after_run` answers the other
