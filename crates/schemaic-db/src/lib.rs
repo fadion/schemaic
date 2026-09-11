@@ -1,15 +1,34 @@
-//! Database access for Schemaic.
+//! Database access for Schemaic: the [`Db`] façade, the engine dispatch behind
+//! it, and the **MySQL/MariaDB backend**.
 //!
-//! Connect, run a statement over the MySQL **text protocol**, and stop at a row
-//! cap (ARCHITECTURE §8). The query runs on a **dedicated connection** whose id
-//! we capture up front, so it can be cancelled server-side with `KILL QUERY`
-//! from a second connection (ARCHITECTURE §7).
+//! **Three engines, and they are not equal.** Every public method here connects,
+//! runs, disconnects (the one-connection-per-operation invariant, with its two
+//! stated exceptions in [`session`] and [`Db::run_script`]), and dispatches on
+//! [`Engine`]: PostgreSQL to [`pg`], SQLite to [`sqlite`], and MySQL to the code
+//! in this file. That asymmetry is the thing to know before reading it —
+//! `pg.rs` and `sqlite.rs` are peers of each other and *not* of a `mysql.rs`,
+//! because there isn't one. What makes it bearable is that [`Engine`] is an
+//! enum: a fourth variant is a compiler error at every dispatch site. What it
+//! does not catch is a fourth engine *module* that omits a function, since the
+//! engine interface here is a **naming convention rather than a trait** —
+//! deliberately, because the signatures genuinely differ (`sqlite::fetch_query`
+//! takes no database, since there is one). `ENGINE_ENTRY_POINTS` is that
+//! convention written down, and `every_engine_module_answers_the_whole_interface`
+//! is what holds a module to it.
 //!
-//! Built on [`mysql_async`] (not sqlx): we need the per-column wire metadata —
-//! `org_table` / `org_name` / key flags — that the MySQL protocol sends in every
-//! column-definition packet, which is the foundation of the editing system.
-//! sqlx's MySQL driver parses that packet but keeps only the alias name + type,
-//! so it can't tell which real table/column a result cell came from.
+//! A query runs on a **dedicated connection** whose id is captured up front, so
+//! it can be cancelled server-side from a second connection — `KILL QUERY` on
+//! MySQL, `pg_cancel_backend` on PostgreSQL, the interrupt handle on SQLite —
+//! and stops at a row cap.
+//!
+//! # The MySQL backend
+//!
+//! Statements go over the **text protocol**. Built on [`mysql_async`] (not
+//! sqlx): we need the per-column wire metadata — `org_table` / `org_name` / key
+//! flags — that the MySQL protocol sends in every column-definition packet,
+//! which is the foundation of the editing system. sqlx's MySQL driver parses
+//! that packet but keeps only the alias name + type, so it can't tell which real
+//! table/column a result cell came from.
 
 pub mod pg;
 pub mod session;
@@ -198,9 +217,45 @@ fn writer_gone() -> DbError {
 /// bytes (BLOB/BINARY/VARBINARY) rather than text.
 const BINARY_CHARSET: u16 = 63;
 
+/// What an engine module has to answer, by name.
+///
+/// **The engine interface is a convention, not a trait**, and this is the
+/// convention. A trait is not obviously right here — `sqlite::fetch_query` takes
+/// no `database` because there is only one, and `pg::run_script` and
+/// `sqlite::run_script` differ in what a statement boundary is — so the shapes
+/// are per engine on purpose. What that costs is the check a trait gives for
+/// free: adding a fourth [`Engine`] variant is a compiler error at all ~25
+/// dispatch sites, while adding a fourth engine *module* that simply omits
+/// `fetch_blob` is no error at all until somebody writes that arm.
+///
+/// So the list is written down, and
+/// `every_engine_module_answers_the_whole_interface` holds each module to it.
+/// MySQL is not in that check because it has no module of its own — its bodies
+/// are inline in this file, which is the asymmetry the crate doc opens with.
+///
+/// Test-only: it is a statement *about* the code rather than something the code
+/// reads, which is the same reason `source_gate`'s machinery next door is.
+#[cfg(test)]
+pub(crate) const ENGINE_ENTRY_POINTS: &[&str] = &[
+    "fetch_query",
+    "fetch_schema",
+    "fetch_databases",
+    "fetch_table_list",
+    "fetch_blob",
+    "count_rows",
+    "refetch_rows",
+    "commit_writes",
+    "import_rows",
+    "run_ddl",
+    "run_script",
+    "prepare_check",
+    "ping",
+];
+
 /// Which database engine a [`Db`] speaks. Selected from the saved connection's
 /// `db_type` at [`Db::connect`] time; each public method dispatches to the
-/// engine-specific backend (MySQL bodies inline here, Postgres in [`pg`]).
+/// engine-specific backend (MySQL bodies inline here, Postgres in [`pg`],
+/// SQLite in [`sqlite`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum Engine {
     #[default]
@@ -5971,6 +6026,53 @@ pub(crate) fn parse_typed(s: String, type_name: &str) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **A fourth engine variant is a compiler error; a fourth engine module is
+    /// not.** [`ENGINE_ENTRY_POINTS`] is the interface the dispatcher expects by
+    /// name, and this is the only thing that notices a module answering thirteen
+    /// of it — the case the crate doc names is a `sqlite.rs` peer with no
+    /// `fetch_blob`, which compiles until somebody writes that dispatch arm.
+    ///
+    /// Reading the source is the subject because the thing under test is a
+    /// *file*, exactly as `core/tests/doc_coverage.rs` reads `src/*.rs`. MySQL
+    /// is absent on purpose: it has no module, which is the asymmetry rather
+    /// than an omission.
+    #[test]
+    fn every_engine_module_answers_the_whole_interface() {
+        for (name, src) in [
+            ("pg.rs", include_str!("pg.rs")),
+            ("sqlite.rs", include_str!("sqlite.rs")),
+        ] {
+            for f in ENGINE_ENTRY_POINTS {
+                let sync = format!("\npub(crate) fn {f}(");
+                let asyn = format!("\npub(crate) async fn {f}(");
+                assert!(
+                    src.contains(&sync) || src.contains(&asyn),
+                    "{name} does not answer `{f}` — the engine interface is a \
+                     naming convention (see `ENGINE_ENTRY_POINTS`), so a module \
+                     that omits one compiles cleanly until the dispatch arm for \
+                     it is written"
+                );
+            }
+        }
+    }
+
+    /// And the dispatcher reaches all three engines for each of them, so the
+    /// convention is not a list of names nothing calls.
+    #[test]
+    fn the_dispatcher_calls_both_engine_modules_for_every_entry_point() {
+        let me = include_str!("lib.rs");
+        for f in ENGINE_ENTRY_POINTS {
+            for module in ["pg", "sqlite"] {
+                assert!(
+                    me.contains(&format!("{module}::{f}(")),
+                    "nothing in the dispatcher calls `{module}::{f}` — either the \
+                     arm is missing or `ENGINE_ENTRY_POINTS` has a name the \
+                     interface no longer has"
+                );
+            }
+        }
+    }
 
     /// **A `Db` must not print its password**, in any formatting, ever.
     ///
