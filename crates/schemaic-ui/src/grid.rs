@@ -2179,8 +2179,21 @@ fn attached_rows(
 /// The result's own connection, not the active one: a tab keeps the connection
 /// it was opened on, so reading the active one would let a grid of production
 /// rows be judged by a local database's setting.
+///
+/// **`conn_at_load`, not the live `conn_id`** — the same distinction
+/// [`GridState::set_format`] makes, and the field's own doc states why. A tab
+/// can be rebound while its result stays on screen: reading the live signal let
+/// rows fetched on a schema-only connection be attached to the assistant as
+/// soon as the tab was pointed somewhere more permissive, without refetching a
+/// thing. The policy for rows already in hand belongs to the server they came
+/// from.
+///
+/// The connection *list* is still read live, which is the other half and is
+/// deliberate — see [`GridState::connections`]: locking a connection down takes
+/// effect on the grid already on screen. What is fixed at load is which
+/// connection is looked up, not what that connection currently allows.
 fn ai_data_of(gs: GridState) -> AiData {
-    let id = gs.conn_id.get_untracked();
+    let id = gs.conn_at_load;
     gs.connections
         .with_untracked(|cs| cs.iter().find(|c| c.id == id).and_then(|c| c.ai_data))
         .unwrap_or_default()
@@ -10325,6 +10338,45 @@ mod cell_preview_tests {
         // A column the result does not have proceeds — see the doc.
         assert!(format_change_needed(&formats, 9, ColumnFormat::None));
         assert!(format_change_needed(&[], 0, ColumnFormat::None));
+    }
+
+    /// **The assistant's gate asks the connection the rows came from.**
+    ///
+    /// A tab can be rebound while its result stays on screen, and `conn_id`
+    /// moves with it — so a grid fetched on a schema-only connection became
+    /// attachable the moment the tab was pointed at a data-allowed one, with
+    /// the rows on screen unchanged. `conn_at_load` is the field that exists
+    /// for exactly this, and the export scope, the blob panel and `set_format`
+    /// already read it; `ai_data_of` was the last consumer on the live signal.
+    ///
+    /// A source gate because the decision is one line inside a view with no
+    /// pure half: the lookup it performs is right either way, and *which id it
+    /// performs it with* is the whole of the bug.
+    #[test]
+    fn the_assistants_data_level_is_the_one_the_rows_were_loaded_under() {
+        let src = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("src")
+                .join("grid.rs"),
+        )
+        .expect("grid.rs");
+        let body = crate::source_gate::production_code(&src);
+        let at = body
+            .find("fn ai_data_of(")
+            .expect("`ai_data_of` is gone — this gate is stale");
+        let end = body[at..]
+            .find("\n}")
+            .expect("`ai_data_of` has no end — this gate is stale");
+        let f = &body[at..at + end];
+        assert!(
+            f.contains("conn_at_load"),
+            "`ai_data_of` must key on the connection the result was loaded on:\n{f}"
+        );
+        assert!(
+            !f.contains("conn_id"),
+            "`ai_data_of` reads the tab's live connection, which a rebind moves \
+             out from under the rows already on screen:\n{f}"
+        );
     }
 
     /// And `set_format` still opens with it. The predicate alone is a
