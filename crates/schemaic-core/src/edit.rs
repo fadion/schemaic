@@ -1287,6 +1287,68 @@ impl GridCells<'_> {
     /// ([`crate::prompt::ATTACH_ROW_CAP`]) is about the context window, not
     /// about consent, so going over it is *reported* rather than silently
     /// applied.
+    /// The grid's rows as a `ResultSet` a reader that speaks cells can take:
+    /// the stored result with the staged edits applied and the pending rows
+    /// appended, plus the display order to read it in.
+    ///
+    /// **For the export, which is the one grid reader that could not come
+    /// through here.** The clipboard, the AI attachment and the painter all ask
+    /// this type for a cell, and the export could not: it renders through
+    /// `core::export`, which walks a `ResultSet` and a display order and has no
+    /// notion of an overlay — so `Copy ▸ CSV` and a saved file wrote the
+    /// pre-edit value while Ctrl+C on the same selection wrote the staged one,
+    /// and a pending row appeared in neither. This closes that by *resolving
+    /// first* rather than by teaching a second reader the overlay, which is the
+    /// second spelling this type's own doc exists to refuse.
+    ///
+    /// Cheap where nothing is staged: the columns are refcounted, and
+    /// [`ResultSet::splice_cells`] rebuilds only a column whose listed cell
+    /// really differs, so a clean grid clones no cell text at all.
+    ///
+    /// Unformatted, like [`GridCells::tsv`] — a column formatter is how a value
+    /// is *shown*, and an export writes the value. `formats` is therefore unread
+    /// here, which is the one field of this struct this method does not consult.
+    pub fn exported(&self) -> (ResultSet, Vec<usize>) {
+        let mut out = self.rs.clone();
+        let nreal = out.row_count();
+
+        let edits: Vec<(usize, usize, crate::model::Value)> = self
+            .dirty
+            .iter()
+            .map(|(&(di, ci), e)| (di, ci, e.to_value()))
+            .collect();
+        out.splice_cells(&edits);
+
+        let ncols = out.col_count();
+        let pending: Vec<Vec<crate::model::Value>> = self
+            .new_rows
+            .iter()
+            .map(|r| {
+                (0..ncols)
+                    .map(|ci| match r.get(&ci) {
+                        Some(e) => e.to_value(),
+                        // An unset cell of a pending row takes the server's
+                        // default, which no value here can stand for — the same
+                        // blank `with_text` draws.
+                        None => crate::model::Value::Null,
+                    })
+                    .collect()
+            })
+            .collect();
+        out.append_rows(&pending);
+
+        // The display order is a permutation of the stored rows, so the pending
+        // rows go past its end exactly as they are drawn past the real ones. A
+        // shorter order would drop rows rather than reorder them, and
+        // `with_text` already treats that case as the identity.
+        let mut order = match self.order.len() == nreal {
+            true => self.order.to_vec(),
+            false => (0..nreal).collect(),
+        };
+        order.extend(nreal..nreal + pending.len());
+        (out, order)
+    }
+
     /// Columns in the order they are **drawn** ([`visual_cols`]), for the same
     /// reason [`GridCells::tsv`] is: the model reads the block as a table, and a
     /// table whose columns are in an order the user never saw is answered about
@@ -3676,6 +3738,116 @@ mod tests {
             dirty,
             new_rows,
         }
+    }
+
+    /// **The clipboard and the file answer the same question the same way.**
+    ///
+    /// The disagreement this closes: `Copy ▸ CSV` and a saved export rendered
+    /// the raw `ResultSet`, so a staged edit went out as its pre-edit value and
+    /// a pending row went out not at all — while Ctrl+C over the same selection,
+    /// which resolves here, wrote what is on screen. Asserted against the export
+    /// renderer rather than against `exported()` alone, because the two being
+    /// composed is the whole of it.
+    #[test]
+    fn a_staged_edit_and_a_pending_row_reach_the_file_as_they_reach_the_clipboard() {
+        let rs = crate::model::ResultSet::from_rows(
+            vec![
+                col("id", "INT", "t", true, false),
+                col("name", "VARCHAR", "t", false, false),
+            ],
+            vec![
+                vec![Value::Int(1), Value::Str("Alice".into())],
+                vec![Value::Int(2), Value::Str("Bob".into())],
+            ],
+        );
+        let order = vec![0, 1];
+        let formats = vec![crate::format::ColumnFormat::None; 2];
+        let mut dirty = HashMap::new();
+        dirty.insert((0, 1), CellEdit::Text("Alicia".into()));
+        let mut pending = HashMap::new();
+        pending.insert(0, CellEdit::Text("3".into()));
+        pending.insert(1, CellEdit::Text("Carol".into()));
+        let new_rows = vec![pending];
+
+        let c = cells(&rs, &order, &formats, &dirty, &new_rows);
+        let (out, ord) = c.exported();
+        let csv = crate::export::ExportFormat::Csv.render(
+            &out,
+            &ord,
+            None,
+            crate::intel::SqlDialect::MySql,
+        );
+
+        assert!(csv.contains("Alicia"), "the staged edit is missing:\n{csv}");
+        assert!(
+            !csv.contains("Alice,"),
+            "the pre-edit value went to the file:\n{csv}"
+        );
+        assert!(csv.contains("Carol"), "the pending row is missing:\n{csv}");
+        // And the row that was never touched is untouched.
+        assert!(csv.contains("Bob"), "{csv}");
+
+        // The clipboard's own reader agrees, which is the claim.
+        let tsv = c.tsv((0, 0, 2, 1), None);
+        assert!(tsv.contains("Alicia") && tsv.contains("Carol"), "{tsv}");
+    }
+
+    /// A clean grid exports exactly what it fetched — the resolution is not
+    /// allowed to *change* anything on the way through, which a round trip
+    /// through `Value` would: a `FLOAT` stored as the text `1.0` comes back
+    /// `1`, and every numeric in the result would go out re-formatted.
+    #[test]
+    fn resolving_an_unedited_grid_changes_no_cell() {
+        let rs = crate::model::ResultSet::from_rows(
+            vec![
+                col("n", "DECIMAL", "t", false, false),
+                col("s", "VARCHAR", "t", false, false),
+            ],
+            vec![
+                vec![Value::Str("1.50".into()), Value::Str("x".into())],
+                vec![Value::Null, Value::Str("y".into())],
+            ],
+        );
+        let order = vec![0, 1];
+        let formats = vec![crate::format::ColumnFormat::None; 2];
+        let dirty = HashMap::new();
+        let new_rows: Vec<HashMap<usize, CellEdit>> = Vec::new();
+        let (out, ord) = cells(&rs, &order, &formats, &dirty, &new_rows).exported();
+        assert_eq!(ord, order);
+        let one = |r: &ResultSet| {
+            crate::export::ExportFormat::Csv.render(
+                r,
+                &order,
+                None,
+                crate::intel::SqlDialect::MySql,
+            )
+        };
+        assert_eq!(one(&out), one(&rs), "a clean grid exported differently");
+    }
+
+    /// A staged NULL is a null in the file, not the word — the mapping
+    /// [`CellEdit::to_value`]'s doc argues for, asserted where it lands.
+    #[test]
+    fn a_staged_null_exports_as_a_null_and_not_as_the_word() {
+        let rs = crate::model::ResultSet::from_rows(
+            vec![col("name", "VARCHAR", "t", false, false)],
+            vec![vec![Value::Str("Alice".into())]],
+        );
+        let order = vec![0];
+        let formats = vec![crate::format::ColumnFormat::None];
+        let mut dirty = HashMap::new();
+        dirty.insert((0, 0), CellEdit::Null);
+        let new_rows: Vec<HashMap<usize, CellEdit>> = Vec::new();
+        let (out, ord) = cells(&rs, &order, &formats, &dirty, &new_rows).exported();
+        assert!(out.cell(0, 0).is_some_and(|c| c.is_null()));
+        let json = crate::export::ExportFormat::Json.render(
+            &out,
+            &ord,
+            None,
+            crate::intel::SqlDialect::MySql,
+        );
+        assert!(json.contains("null"), "{json}");
+        assert!(!json.contains("\"NULL\""), "{json}");
     }
 
     /// **A staged blob is a value in the selection summary, in a pending new

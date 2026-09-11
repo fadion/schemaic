@@ -793,6 +793,78 @@ impl ResultSet {
             *cd = Arc::new(nb);
         }
     }
+
+    /// Replace individual **cells** — `(data_row, column, value)`.
+    ///
+    /// [`ResultSet::splice_rows`]'s per-cell sibling, and the difference is not
+    /// convenience. The grid's staged edits are keyed by cell, so a row with one
+    /// edited cell would have to supply the other forty-nine to `splice_rows` —
+    /// read back out with [`CellRef::to_value`] and pushed again, which
+    /// *re-formats* every numeric it round-trips: a `FLOAT` stored as the text
+    /// `1.0` comes back as `Value::Float(1.0)` and is written `1`. Here an
+    /// unlisted cell is copied verbatim (tag **and** text), so nothing but the
+    /// listed cells can differ.
+    ///
+    /// Same copy-on-write rule as `splice_rows`: a column is rebuilt only when
+    /// one of its listed cells really differs from what is stored, and the
+    /// rebuilt column replaces the shared one, so another holder of this
+    /// `ResultSet` keeps seeing its own values. Out-of-range rows are ignored.
+    pub fn splice_cells(&mut self, edits: &[(usize, usize, Value)]) {
+        if edits.is_empty() {
+            return;
+        }
+        let n = self.n_rows;
+        for (ci, cd) in self.cols.iter_mut().enumerate() {
+            let mine: std::collections::HashMap<usize, &Value> = edits
+                .iter()
+                .filter(|(di, c, _)| *c == ci && *di < n)
+                .map(|(di, _, v)| (*di, v))
+                .collect();
+            if mine.is_empty() {
+                continue;
+            }
+            let changed = mine
+                .iter()
+                .any(|(di, v)| !cd.cell(*di).is_some_and(|c| c.matches(v)));
+            if !changed {
+                continue;
+            }
+            let mut nb = ColumnData::with_capacity(n);
+            nb.arena.reserve(cd.arena.len());
+            for r in 0..n {
+                match mine.get(&r) {
+                    Some(v) => nb.push(v),
+                    None => match cd.cell(r) {
+                        Some(c) => nb.push_ref(c),
+                        None => nb.push(&Value::Null),
+                    },
+                }
+            }
+            *cd = Arc::new(nb);
+        }
+    }
+
+    /// Append whole rows to the end.
+    ///
+    /// For the one caller that has rows the server has not seen: the grid's
+    /// **pending** rows, when a reader has to answer with what is on screen
+    /// rather than with what was fetched. A row shorter than the column count is
+    /// padded with NULL, as [`ResultSet::from_rows`] pads.
+    pub fn append_rows(&mut self, rows: &[Vec<Value>]) {
+        if rows.is_empty() || self.cols.is_empty() {
+            return;
+        }
+        for (ci, cd) in self.cols.iter_mut().enumerate() {
+            let c = Arc::make_mut(cd);
+            for row in rows {
+                match row.get(ci) {
+                    Some(v) => c.push(v),
+                    None => c.push(&Value::Null),
+                }
+            }
+        }
+        self.n_rows += rows.len();
+    }
 }
 
 /// Assembles a columnar [`ResultSet`] one row at a time, so a large result never
@@ -1018,6 +1090,24 @@ impl CellEdit {
             CellEdit::Null => "NULL".to_string(),
             CellEdit::Text(t) => t.clone(),
             CellEdit::Bytes(b) => binary_display(b.len()),
+        }
+    }
+
+    /// This staged value as a [`Value`], for a reader that speaks cells rather
+    /// than text — the export, which asks a `ResultSet` and not the painter.
+    ///
+    /// **`Null` becomes `Value::Null`, not the word.** [`CellEdit::display`] is
+    /// the answer for a surface that *draws* a cell, and there the sentinel is
+    /// the point; a file is written by a format that already knows what a null
+    /// is, so handing it the string `NULL` would put that word in a JSON string
+    /// and an SQL `INSERT` where `null` and `NULL` belong. `Bytes` keeps
+    /// `display`'s placeholder, which is what the grid shows and what the export
+    /// would drop the column over anyway.
+    pub fn to_value(&self) -> Value {
+        match self {
+            CellEdit::Null => Value::Null,
+            CellEdit::Text(t) => Value::Str(t.clone()),
+            CellEdit::Bytes(b) => Value::Str(binary_display(b.len())),
         }
     }
 

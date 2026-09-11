@@ -2194,11 +2194,19 @@ pub fn files_failure_note(
 ///   (`Db::stream_query`, deliberately outside the tab's pinned session), so a
 ///   manual-transaction tab's uncommitted rows are on screen and absent from the
 ///   file, and rows it deleted are in the file and gone from the screen.
+/// - `staged` — the grid holds uncommitted edits or pending rows. The
+///   *fetched* scope writes them, because it renders the rows in hand through
+///   `edit::GridCells` exactly as Ctrl+C does; this scope cannot, because it
+///   asks the server again and the server has never been told. It is the one
+///   remaining way a file differs from the screen, and it became the only one
+///   the moment the fetched scope stopped diverging — which is precisely when
+///   it stopped being covered by "an export is of what was fetched" and started
+///   needing to be said.
 ///
 /// `size` is pre-rendered by the caller (`~16k`, or empty when the total is not
 /// known) because the estimate and its `~` belong to the stats line's vocabulary,
 /// not to this decision.
-pub fn all_rows_label(size: &str, sorted: bool, manual_tx: bool) -> String {
+pub fn all_rows_label(size: &str, sorted: bool, manual_tx: bool, staged: bool) -> String {
     let mut notes: Vec<&str> = Vec::new();
     if !size.is_empty() {
         notes.push(size);
@@ -2208,6 +2216,9 @@ pub fn all_rows_label(size: &str, sorted: bool, manual_tx: bool) -> String {
     }
     if manual_tx {
         notes.push("committed rows only");
+    }
+    if staged {
+        notes.push("without your staged edits");
     }
     if notes.is_empty() {
         "All rows".to_string()
@@ -4006,32 +4017,58 @@ mod tests {
     /// from the file.
     #[test]
     fn the_all_rows_label_discloses_every_way_the_file_differs() {
-        assert_eq!(all_rows_label("", false, false), "All rows");
-        assert_eq!(all_rows_label("~16k", false, false), "All rows (~16k)");
+        assert_eq!(all_rows_label("", false, false, false), "All rows");
         assert_eq!(
-            all_rows_label("", true, false),
+            all_rows_label("~16k", false, false, false),
+            "All rows (~16k)"
+        );
+        assert_eq!(
+            all_rows_label("", true, false, false),
             "All rows (server order)",
             "the sort was already disclosed and must stay so"
         );
         assert_eq!(
-            all_rows_label("~16k", true, false),
+            all_rows_label("~16k", true, false, false),
             "All rows (~16k, server order)"
         );
         assert_eq!(
-            all_rows_label("", false, true),
+            all_rows_label("", false, true, false),
             "All rows (committed rows only)"
         );
         assert_eq!(
-            all_rows_label("~16k", false, true),
+            all_rows_label("~16k", false, true, false),
             "All rows (~16k, committed rows only)"
         );
         assert_eq!(
-            all_rows_label("", true, true),
+            all_rows_label("", true, true, false),
             "All rows (server order, committed rows only)"
         );
         assert_eq!(
-            all_rows_label("~16k", true, true),
+            all_rows_label("~16k", true, true, false),
             "All rows (~16k, server order, committed rows only)"
+        );
+    }
+
+    /// **The one divergence that is left, and it became load-bearing by the
+    /// others being closed.** The fetched scope now writes the staged edits, so
+    /// this scope — which asks the server again — is the only export that can
+    /// still differ from the screen, and the entry says so before it is chosen.
+    #[test]
+    fn the_all_rows_label_says_the_re_read_cannot_carry_staged_edits() {
+        assert_eq!(
+            all_rows_label("", false, false, true),
+            "All rows (without your staged edits)"
+        );
+        assert_eq!(
+            all_rows_label("~16k", false, false, true),
+            "All rows (~16k, without your staged edits)"
+        );
+        // A clean grid is not told about edits it does not have.
+        assert!(!all_rows_label("~16k", true, true, false).contains("staged"));
+        // And it is last, after the scope's own two.
+        assert_eq!(
+            all_rows_label("~16k", true, true, true),
+            "All rows (~16k, server order, committed rows only, without your staged edits)"
         );
     }
 

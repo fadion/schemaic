@@ -2303,14 +2303,34 @@ fn attach_to_chat(gs: GridState, whole: bool) {
 // Thin clipboard-facing wrappers over `schemaic_core::export` — unwrap the
 // grid's live `ResultSet` + display order and delegate to the pure functions.
 
+/// The rows **every** export reads: the fetched result with this grid's staged
+/// edits applied and its pending rows appended, plus the display order.
+///
+/// The one place the overlay meets the export, so the copy menu, the two column
+/// copies and the saved file cannot answer differently from each other or from
+/// Ctrl+C. They used to: all four rendered `gs.rs` raw, so a green uncommitted
+/// edit went to the clipboard through [`copy_selection`] and its pre-edit value
+/// went to the file, with the export modal reporting a clean row count and no
+/// caveat. `edit::GridCells` is where a grid cell is resolved — this hands the
+/// export a `ResultSet` that has already been through it rather than teaching a
+/// second reader what `dirty` means.
+///
+/// Costs nothing on a clean grid: the columns are refcounted and
+/// `ResultSet::splice_cells` rebuilds only a column that really changes.
+fn exported_rows(gs: GridState) -> (ResultSet, Vec<usize>) {
+    let (rs, order) = (gs.rs.get_untracked(), gs.order.get_untracked());
+    let (dirty, new_rows) = (gs.dirty.get_untracked(), gs.new_rows.get_untracked());
+    let formats = gs.formats.get_untracked();
+    grid_cells(&rs, &order, &formats, &dirty, &new_rows).exported()
+}
+
 /// Render the whole result in `format`. The single dispatch point for both the
 /// copy menu and the save-to-file menu, so the two can't drift.
 fn render_export(gs: GridState, format: ExportFormat) -> String {
-    let rs = gs.rs.get_untracked();
-    let order = gs.order.get_untracked();
+    let (rs, order) = exported_rows(gs);
     let source = gs.source.get_untracked();
     format.render(
-        rs.as_ref(),
+        &rs,
         order.as_slice(),
         source
             .as_ref()
@@ -2322,19 +2342,13 @@ fn render_export(gs: GridState, format: ExportFormat) -> String {
 }
 
 fn export_column_json(gs: GridState, ci: usize) -> String {
-    schemaic_core::export::export_column_json(
-        gs.rs.get_untracked().as_ref(),
-        gs.order.get_untracked().as_slice(),
-        ci,
-    )
+    let (rs, order) = exported_rows(gs);
+    schemaic_core::export::export_column_json(&rs, order.as_slice(), ci)
 }
 
 fn export_column_csv(gs: GridState, ci: usize) -> String {
-    schemaic_core::export::export_column_csv(
-        gs.rs.get_untracked().as_ref(),
-        gs.order.get_untracked().as_slice(),
-        ci,
-    )
+    let (rs, order) = exported_rows(gs);
+    schemaic_core::export::export_column_csv(&rs, order.as_slice(), ci)
 }
 
 /// Save the whole result to a file the user picks. Opens the system save dialog
@@ -2425,10 +2439,17 @@ fn export_menu(
                 // tab's uncommitted inserts are on screen and absent from the
                 // file, and rows it deleted are in the file and gone from the
                 // screen.
+                // The staged one is the newest and exists because the *fetched*
+                // scope stopped diverging: that file is now rendered through
+                // `exported_rows`, so it carries the green edits and the pending
+                // rows. This scope asks the server again and cannot, which makes
+                // it the one remaining difference between a file and the screen.
                 schemaic_core::export::all_rows_label(
                     &size,
                     sorted,
                     gs.tx_mode.get_untracked() == schemaic_core::tx::TxMode::Manual,
+                    gs.dirty.with_untracked(|d| !d.is_empty())
+                        || gs.new_rows.with_untracked(|r| !r.is_empty()),
                 )
             },
             per_format(true),
@@ -2456,8 +2477,14 @@ fn save_export(gs: GridState, format: ExportFormat, all_rows: bool, estimate: Op
             name: format.label(),
             extensions: format.extensions(),
         }]);
-    let rs = gs.rs.get_untracked();
-    let order = gs.order.get_untracked();
+    // **Resolved here, with the rows.** The snapshot is what the export writes,
+    // and it is taken before the dialog opens for the reason the statement below
+    // is: the dialog is modal and slow, and an edit typed while it stood open
+    // must not change what was asked for. See `exported_rows` — the file and
+    // Ctrl+C are two surfaces of one grid and used to disagree about it.
+    let (resolved, resolved_order) = exported_rows(gs);
+    let rs = std::sync::Arc::new(resolved);
+    let order = std::sync::Arc::new(resolved_order);
     let source = gs.source.get_untracked();
     let dialect = gs.dialect;
     // The statement is snapshotted with the rows and for the same reason: the
@@ -10413,6 +10440,59 @@ mod cell_preview_tests {
             "`ai_data_of` reads the tab's live connection, which a rebind moves \
              out from under the rows already on screen:\n{f}"
         );
+    }
+
+    /// **Every export renders the resolved rows, not the fetched ones.**
+    ///
+    /// The bug this guards was one argument wide and appeared at four sites:
+    /// `render_export` (the Copy ▸ format menu), both column copies, and
+    /// `save_export` (the file) each handed `core::export` `gs.rs` and
+    /// `gs.order` straight, so a staged edit went to the clipboard through
+    /// `copy_selection` and its pre-edit value went to the file. Fixing one is
+    /// what makes the class come back: `core::edit`'s own test pins the
+    /// resolution, and this pins that these four reach it.
+    ///
+    /// `exported_rows` is the only place allowed to read the raw pair, and it is
+    /// the one that resolves.
+    #[test]
+    fn no_export_path_renders_the_unresolved_result() {
+        let src = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("src")
+                .join("grid.rs"),
+        )
+        .expect("grid.rs");
+        let body = crate::source_gate::production_code(&src);
+        for name in [
+            "fn render_export(",
+            "fn export_column_json(",
+            "fn export_column_csv(",
+            "fn save_export(",
+        ] {
+            let at = body
+                .find(name)
+                .unwrap_or_else(|| panic!("`{name}` is gone — this gate is stale"));
+            let end = body[at..]
+                .find("\n}")
+                .unwrap_or_else(|| panic!("`{name}` has no end — this gate is stale"));
+            let f = &body[at..at + end];
+            assert!(
+                f.contains("exported_rows("),
+                "`{name}` does not resolve the grid's staged edits before \
+                 rendering, so it disagrees with Ctrl+C:\n{f}"
+            );
+            assert!(
+                !f.contains("gs.rs.get_untracked()"),
+                "`{name}` still reads the fetched result directly:\n{f}"
+            );
+        }
+        // And the resolver itself goes through `GridCells`, rather than
+        // reaching for the overlay a second time.
+        let at = body
+            .find("fn exported_rows(")
+            .expect("`exported_rows` is gone");
+        let end = body[at..].find("\n}").expect("no end");
+        assert!(body[at..at + end].contains("grid_cells("));
     }
 
     /// **And `clone_rows` asks the size question before it stages anything.**
