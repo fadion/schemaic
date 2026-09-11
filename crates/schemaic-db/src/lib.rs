@@ -1664,20 +1664,53 @@ impl Db {
     /// added to [`Engine`] stops here with one honest error instead of falling
     /// through to `information_schema.PROCESSLIST` and failing three catalogue
     /// lookups deep.
+    /// **Bounded by [`PING_TIMEOUT`], around the whole thing** — and it is the
+    /// one method here that most needed it, because it is the only one that runs
+    /// **on a timer, forever**.
+    ///
+    /// Every sibling in this file already bounds itself for a host that stops
+    /// answering at the packet level: [`Db::ping`] and [`Db::fetch_databases`]
+    /// take the same five seconds, [`Db::kill_query`] takes [`CANCEL_TIMEOUT`],
+    /// and the unbounded reads all take a `CancellationToken`. This took
+    /// neither, so a poll against a black-holed host blocked for the OS TCP
+    /// connect timeout — 21.0 s on MySQL, 63 s on PostgreSQL, this file's own
+    /// measurement at [`PING_TIMEOUT`] — showing the previous snapshot with no
+    /// error, beside a health check that had already said *Disconnected* at five
+    /// seconds.
+    ///
+    /// **Hung polls stacked.** Regaining window focus re-runs the panel effect,
+    /// which bumps the activity generation and then refreshes because it woke;
+    /// the in-flight guard is keyed on that generation, so by construction it
+    /// cannot suppress a refresh that follows a bump. Three alt-tabs inside one
+    /// 21-second connect left three connects hanging at once, each holding a
+    /// socket and a spawned task. A deadline is the fix that does not depend on
+    /// the guard: a poll that has not answered inside the app's own "the server
+    /// is not responding" window has nothing to add to a panel that will ask
+    /// again in two seconds.
+    ///
+    /// Around the dispatch rather than inside each arm, for
+    /// [`Db::fetch_databases`]' reason: PostgreSQL's `connect_maintenance` tries
+    /// three candidate databases in turn, so a per-attempt bound is three times
+    /// the deadline it claims.
     pub async fn fetch_sessions(&self) -> Result<Vec<SessionInfo>, DbError> {
         if !activity::supports_activity(self.engine.dialect()) {
             return Err(DbError::Query(NO_SESSIONS_MSG.to_string()));
         }
-        match self.engine {
-            Engine::Postgres => return pg::fetch_sessions(self).await,
-            Engine::MySql => {}
-            // Unreachable — `supports_activity` above is the gate.
-            Engine::Sqlite => return Err(DbError::Query(NO_SESSIONS_MSG.to_string())),
-        }
-        let mut conn = self.open(None, false).await?;
-        let out = collect_sessions(&mut conn).await;
-        let _ = conn.disconnect().await;
-        out
+        let poll = async {
+            match self.engine {
+                Engine::Postgres => return pg::fetch_sessions(self).await,
+                Engine::MySql => {}
+                // Unreachable — `supports_activity` above is the gate.
+                Engine::Sqlite => return Err(DbError::Query(NO_SESSIONS_MSG.to_string())),
+            }
+            let mut conn = self.open(None, false).await?;
+            let out = collect_sessions(&mut conn).await;
+            let _ = conn.disconnect().await;
+            out
+        };
+        tokio::time::timeout(PING_TIMEOUT, poll)
+            .await
+            .map_err(|_| DbError::Connect("timed out".to_string()))?
     }
 
     /// Cancel a statement, or terminate a session outright, by server id.
@@ -1690,29 +1723,49 @@ impl Db {
     /// Gated on [`supports_kill`](schemaic_core::activity::supports_kill), the
     /// capability the panel's own menu asks — see [`Db::fetch_sessions`] for why
     /// that is not the same thing as the engine `match` below it.
+    ///
+    /// **Bounded by [`CANCEL_TIMEOUT`]**, for the reason that constant exists and
+    /// [`Db::kill_query`] already cites: the whole premise of reaching this is
+    /// that something on that server is not behaving, and the answer is to open
+    /// a *fresh* connection to it — full TCP, a TLS handshake, possibly a second
+    /// connect on `prefer`. Unbounded, a Kill against a host that has stopped
+    /// answering hangs the modal button for the OS connect timeout with no way
+    /// to say so.
+    ///
+    /// The timeout is reported as an error, which is the honest reading and not
+    /// a claim the kill failed: the statement may well have landed. The panel
+    /// polls, so the list settles the question within the interval — and
+    /// `activity_kill_error` exists precisely so a refused or unanswered kill
+    /// leaves the snapshot on screen rather than replacing it.
     pub async fn kill_session(&self, id: i64, kind: KillKind) -> Result<(), DbError> {
         if !activity::supports_kill(self.engine.dialect()) {
             return Err(DbError::Query(NO_SESSIONS_MSG.to_string()));
         }
-        match self.engine {
-            Engine::Postgres => return pg::kill_session(self, id, kind).await,
-            Engine::MySql => {}
-            // Unreachable — `supports_kill` above is the gate.
-            Engine::Sqlite => return Err(DbError::Query(NO_SESSIONS_MSG.to_string())),
-        }
-        // `id` is an `i64` the server itself reported and is formatted back as a
-        // decimal, so there is nothing here a quoter would have to escape.
-        let sql = match kind {
-            KillKind::Query => format!("KILL QUERY {id}"),
-            KillKind::Session => format!("KILL CONNECTION {id}"),
+        let kill = async {
+            match self.engine {
+                Engine::Postgres => return pg::kill_session(self, id, kind).await,
+                Engine::MySql => {}
+                // Unreachable — `supports_kill` above is the gate.
+                Engine::Sqlite => return Err(DbError::Query(NO_SESSIONS_MSG.to_string())),
+            }
+            // `id` is an `i64` the server itself reported and is formatted back
+            // as a decimal, so there is nothing here a quoter would have to
+            // escape.
+            let sql = match kind {
+                KillKind::Query => format!("KILL QUERY {id}"),
+                KillKind::Session => format!("KILL CONNECTION {id}"),
+            };
+            let mut conn = self.open(None, false).await?;
+            let out = conn
+                .query_drop(sql)
+                .await
+                .map_err(|e| DbError::Query(e.to_string()));
+            let _ = conn.disconnect().await;
+            out
         };
-        let mut conn = self.open(None, false).await?;
-        let out = conn
-            .query_drop(sql)
+        tokio::time::timeout(CANCEL_TIMEOUT, kill)
             .await
-            .map_err(|e| DbError::Query(e.to_string()));
-        let _ = conn.disconnect().await;
-        out
+            .map_err(|_| DbError::Connect("timed out".to_string()))?
     }
 
     /// Every account the server will tell us about.
@@ -7144,6 +7197,58 @@ mod tests {
         ];
         for (raw, want) in cases {
             assert_eq!(mysql_check_clause(raw, false), want, "for {raw}");
+        }
+    }
+
+    /// **Every method that opens a connection to a server the user is waiting on
+    /// carries a deadline.**
+    ///
+    /// A host that stops answering at the packet level — a dropped VPN, a laptop
+    /// off the network, a firewall `DROP` — does not refuse the connect, it
+    /// swallows it, and the `open` then takes the OS TCP timeout: 21.0 s on
+    /// MySQL, 63 s on PostgreSQL, this file's own measurement (see
+    /// `PING_TIMEOUT`). `ping` and `fetch_databases` were bounded for exactly
+    /// that; `fetch_sessions` and `kill_session` were not, and `fetch_sessions`
+    /// is the only method in the app that runs **on a timer, forever**, with a
+    /// de-dup guard keyed on a generation that a window-focus regain bumps
+    /// before refreshing — so hung polls stacked one per alt-tab.
+    ///
+    /// A source gate because the failure is a host that never answers, which no
+    /// unit test can stage: a closed port is *refused*, instantly, and the only
+    /// way to reproduce the hang is a packet filter. What is checkable is that
+    /// the deadline is applied, and that is what this reads.
+    #[test]
+    fn every_reachability_path_is_bounded_by_a_timeout() {
+        let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/lib.rs"))
+            .expect("this module's own source");
+        // The method body as text: from its signature to the next one at the
+        // same indent. Enough to see whether a `timeout` wraps it.
+        let body_of = |name: &str| -> String {
+            let at = src
+                .find(&format!("    pub async fn {name}("))
+                .unwrap_or_else(|| panic!("{name} is gone or was renamed"));
+            let rest = &src[at..];
+            let end = rest[1..]
+                .find("\n    pub async fn ")
+                .map_or(rest.len(), |i| i + 1);
+            rest[..end].to_string()
+        };
+        for (name, deadline) in [
+            // `ping` takes its deadline as a parameter — the callers pass
+            // `PING_TIMEOUT` — so what is checked here is that it applies the
+            // one it was given.
+            ("ping", "timeout"),
+            ("fetch_databases", "PING_TIMEOUT"),
+            ("fetch_sessions", "PING_TIMEOUT"),
+            ("kill_session", "CANCEL_TIMEOUT"),
+        ] {
+            let body = body_of(name);
+            assert!(
+                body.contains(&format!("tokio::time::timeout({deadline}")),
+                "`{name}` opens a connection for someone who is waiting and must \
+                 bound it with {deadline} — a dark host otherwise costs the OS \
+                 connect timeout, and this one repeats"
+            );
         }
     }
 
