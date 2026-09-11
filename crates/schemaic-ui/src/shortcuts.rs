@@ -144,6 +144,12 @@ pub(crate) const SHORTCUTS: &[ShortcutGroup] = &[
         "Terminal",
         &[("Ctrl+Shift+C / Ctrl+Shift+V", "Copy / paste")],
     ),
+    (
+        "ER diagram",
+        // Ctrl+F is the find bar's only opener — there is no button for it — so
+        // this modal is the one place it is written down.
+        &[("Ctrl+F", "Find in the diagram")],
+    ),
 ];
 
 /// The keys a **command palette** entry should display, by the command's `name`.
@@ -272,6 +278,13 @@ mod tests {
         ("ai_panel.rs", &["Global"]),
         ("schema_tree.rs", &["Schema tree", "Global"]),
         ("overlays.rs", &["Global"]),
+        // **Short until it wasn't.** The ER diagram binds Ctrl+F and that
+        // binding is the find bar's *only* affordance — no toolbar button, no
+        // menu entry — and because this array is hand-maintained and the file
+        // was not on it, `bound_letters` never read the file, the `f` was never
+        // seen, and the module whose doc opens "a binding missing here is a
+        // feature nobody can find" passed green over exactly that.
+        ("erd_view.rs", &["ER diagram"]),
     ];
 
     /// Letters bound to something that is not a user-facing shortcut, each with

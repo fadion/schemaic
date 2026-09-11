@@ -19,8 +19,8 @@
 //! A copy each also meant a fix reached one of eleven. So the cut lives here,
 //! once, and it is brace-aware rather than positional.
 
-/// `src` with every `#[cfg(test)]` item removed, and every `//` comment line
-/// dropped.
+/// `src` with every `#[cfg(test)]` item blanked, and every `//` comment line
+/// blanked.
 ///
 /// **Brace-aware, not positional.** Each `#[cfg(test)]` attribute is followed to
 /// the `{` that opens the item it applies to and the matching `}` that closes it;
@@ -32,28 +32,59 @@
 /// scans nothing while reporting success. An item with no block of its own — a
 /// `use`, a struct field, an enum variant, a match arm — ends at its `;` or `,`
 /// instead; see [`item_end`].
+///
+/// **Blanked, not deleted, so a line number means something.** This used to
+/// remove the lines, and the result then had no relationship at all to the
+/// file's own numbering — measured over the tree, `widgets.rs` went 7,881
+/// source lines → 2,990, `lib.rs` 11,402 → 5,811, `shortcuts.rs` 727 → 113. Two
+/// gates print positions from this text as if they were file positions, so a
+/// violation at `widgets.rs:6500` was reported at roughly `widgets.rs:2500` and
+/// the reader opened the wrong function; `popup_anchor_gate`'s `EXEMPT` array
+/// is *keyed* on that number, so an exemption moved whenever an unrelated
+/// comment was added anywhere above it — silently re-arming the gate on the
+/// exempted site, or licensing a different one. Every gate scans with
+/// `contains`/`find`, so the blank lines cost nothing and the numbers are right
+/// by construction.
 pub(crate) fn production_code(src: &str) -> String {
     let b = src.as_bytes();
     let mut out = String::with_capacity(src.len());
     let mut i = 0usize;
+    /// Keep the newlines of a removed span so the line count does not move.
+    fn blank(out: &mut String, cut: &str) {
+        for _ in cut.bytes().filter(|c| *c == b'\n') {
+            out.push('\n');
+        }
+    }
     while i < b.len() {
         let Some(at) = next_cfg_test(src, i) else {
             out.push_str(&src[i..]);
             break;
         };
         out.push_str(&src[i..at]);
-        i = match item_end(src, at + "#[cfg(test)]".len()) {
+        let end = match item_end(src, at + "#[cfg(test)]".len()) {
             Some(end) => end,
             // Unbalanced: refuse to guess, and let the rest be scanned. A false
             // positive fails loudly; a silent truncation is what this exists to
             // stop.
             None => at + "#[cfg(test)]".len(),
         };
+        blank(&mut out, &src[at..end]);
+        i = end;
     }
-    out.lines()
-        .filter(|l| !l.trim_start().starts_with("//"))
-        .collect::<Vec<_>>()
-        .join("\n")
+    // `split('\n')` rather than `lines()`, so the round trip is exact: `lines()`
+    // drops a trailing empty segment, and a file whose last line is inside a cut
+    // test module ends on one — which cost the whole text a line and put every
+    // number after it out by one again.
+    let mut kept = String::with_capacity(out.len());
+    for (n, line) in out.split('\n').enumerate() {
+        if n > 0 {
+            kept.push('\n');
+        }
+        if !line.trim_start().starts_with("//") {
+            kept.push_str(line);
+        }
+    }
+    kept
 }
 
 /// The offset of the next `#[cfg(test)]` reached **as code**, from `from`.
@@ -332,6 +363,41 @@ mod no_continuation_typed_as_newline_gate {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **The stripped text has the file's own line numbering**, so a gate that
+    /// reports a position reports one the reader can open.
+    ///
+    /// It did not. Measured before the fix: `widgets.rs` 7,881 source lines →
+    /// 2,990 stripped (0.38), `lib.rs` 11,402 → 5,811, `shortcuts.rs` 727 →
+    /// 113. `no_floem_dropdown_gate` and `popup_anchor_gate` both print a
+    /// number from this text as if it were a file position — off by a factor
+    /// that varies per file — and `popup_anchor_gate`'s `EXEMPT` array is keyed
+    /// on it, so an exemption moved whenever an unrelated comment or test item
+    /// was added anywhere above it.
+    ///
+    /// Over the whole corpus rather than a fixture, because the property is
+    /// about what the gates are actually handed.
+    #[test]
+    fn stripping_a_file_keeps_its_line_numbering() {
+        let ui = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut checked = 0usize;
+        for entry in std::fs::read_dir(&ui).expect("the crate's src") {
+            let path = entry.expect("a dir entry").path();
+            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                continue;
+            }
+            let src = std::fs::read_to_string(&path).expect("a source file");
+            let name = path.file_name().unwrap().to_string_lossy().to_string();
+            assert_eq!(
+                production_code(&src).lines().count(),
+                src.lines().count(),
+                "{name}: the stripped text is a different length from the file, \
+                 so every line number a gate prints from it is wrong"
+            );
+            checked += 1;
+        }
+        assert!(checked > 20, "only {checked} files checked");
+    }
 
     /// **A doc comment that *mentions* `#[cfg(test)]` deleted the item it
     /// documents from every gate's view.**

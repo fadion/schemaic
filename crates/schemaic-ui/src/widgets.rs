@@ -7864,7 +7864,17 @@ mod popup_anchor_gate {
     /// Openers that deliberately don't write the anchor, each with the reason.
     /// Empty is the healthy state — a site leaves this list the moment it starts
     /// setting one, and joins it only with a reason a reader can check.
-    const EXEMPT: &[(&str, u32, &str)] = &[];
+    ///
+    /// **Keyed on the call text, like `consts.rs`'s and `dividers.rs`'s**, not
+    /// on a line number. It used to be `(file, line, reason)` against a number
+    /// taken from `production_code`'s output — which, before that helper
+    /// preserved the file's numbering, bore no relation to the file at all
+    /// (`widgets.rs` 7,881 source lines → 2,990 stripped). Even with the
+    /// numbering right, a position key moves whenever anything above it does:
+    /// an exemption would silently re-arm the gate on the site it was written
+    /// for, or licence a different one. It was empty, so this was latent —
+    /// and it was the documented way to add one.
+    const EXEMPT: &[(&str, &str, &str)] = &[];
 
     fn src_dir() -> PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR")).join("src")
@@ -7947,7 +7957,7 @@ mod popup_anchor_gate {
 
     #[test]
     fn every_opener_sets_the_anchor_before_filling_the_popup_channel() {
-        let exempt: BTreeSet<(&str, u32)> = EXEMPT.iter().map(|(f, l, _)| (*f, *l)).collect();
+        let exempt: BTreeSet<(&str, &str)> = EXEMPT.iter().map(|(f, c, _)| (*f, *c)).collect();
         let mut offenders: Vec<String> = Vec::new();
         let mut fills = 0usize;
 
@@ -7968,7 +7978,7 @@ mod popup_anchor_gate {
                 }
                 if fills_channel(&line) {
                     fills += 1;
-                    if !anchored && !exempt.contains(&(name.as_str(), lineno)) {
+                    if !anchored && !exempt.contains(&(name.as_str(), line.trim())) {
                         offenders.push(format!(
                             "{name}:{lineno} fills the popup channel with no \
                              `popup_anchor.set` since the previous opener"
