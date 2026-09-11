@@ -671,8 +671,14 @@ impl StreamParser {
                             .to_string(),
                     ));
                 }
+                // **A denial is not the turn failing.** `is_error` paints the
+                // whole bubble as a plain-text error — see
+                // `opencode_is_failure` — and a refused *side* tool can sit
+                // beside an answer that is complete. The note above is what
+                // says the refusal happened; the status is what says the turn
+                // did not produce one.
                 out.push(StreamEvent::TurnDone {
-                    is_error: failed || denied,
+                    is_error: failed,
                     stats: antigravity_stats(r),
                 });
                 out
@@ -871,10 +877,24 @@ impl StreamParser {
     }
 }
 
-/// Did an OpenCode step finish badly? Pure, so the rule has a test that does not
-/// have to drive a whole turn.
+/// Did an OpenCode step finish with **nothing to show**? Pure, so the rule has a
+/// test that does not have to drive a whole turn.
+///
+/// **`is_error` is a rendering decision, not a diagnosis.** Its only consumer
+/// sets `Role::Error`, and an error turn renders every `Seg::Text` as plain
+/// `text()` in `theme::error()` and never calls `render_markdown` — headings and
+/// tables become raw `#`/`|`, and fenced SQL loses the Insert/Run/Propose bar.
+/// That is right for what it was built for (a spawn failure, a `turn.failed`
+/// with nothing but a message) and wrong for a turn that carries an answer.
+///
+/// So `length` and `content-filter` are **not** failures here, though they are
+/// certainly not clean endings either: the answer on screen is real prose that
+/// simply stops, and what says so is [`opencode_cutoff_note`], whose own doc
+/// promises *"The answer stays on screen either way"*. It did stay — unreadable,
+/// with the advisory sentence itself rendering as its literal `_underscores_`,
+/// because nothing parsed it any more.
 fn opencode_is_failure(reason: Option<&str>) -> bool {
-    matches!(reason, Some("error" | "length" | "content-filter"))
+    matches!(reason, Some("error"))
 }
 
 /// What to tell the user when a turn stopped for a reason that is not the model
@@ -1850,7 +1870,7 @@ mod tests {
     ];
 
     #[test]
-    fn a_real_denied_antigravity_tool_call_names_the_tool_and_fails_the_turn() {
+    fn a_real_denied_antigravity_tool_call_names_the_tool_and_says_so_in_prose() {
         let out = drive(Harness::Antigravity, AGY_REAL_DENIED_TOOL);
 
         // The chip must name the database tool, not the built-in wrapper.
@@ -1868,11 +1888,16 @@ mod tests {
             )),
             "{out:?}"
         );
-        // **The turn is an error even though `status` says SUCCESS.**
+        // **The refusal is told in prose, not by repainting the turn.**
+        // `status` says SUCCESS and the tool was refused all the same, so the
+        // note is what carries it — and `is_error` stays false because a refused
+        // *side* tool can sit beside an answer that is complete, and `is_error`
+        // would render that whole answer as plain red text. See
+        // `opencode_is_failure`.
         match out.last() {
             Some(StreamEvent::TurnDone { is_error, .. }) => assert!(
-                *is_error,
-                "a turn whose only tool call was refused is not a success"
+                !*is_error,
+                "a denied side tool must not repaint the answer beside it"
             ),
             other => panic!("{other:?}"),
         }
@@ -2204,13 +2229,20 @@ mod tests {
         }
     }
 
-    /// **A truncated answer is not a clean success.** `reason: "length"` means
-    /// the model hit its output cap mid-sentence and `"content-filter"` means
-    /// the rest was withheld; both used to close the turn with `is_error: false`
-    /// and nothing on screen to say the last sentence was not the end of one.
-    /// The Antigravity arm applies the opposite rule to the same question.
+    /// **A truncated answer is not a clean success, and it is not an error
+    /// either.** `reason: "length"` means the model hit its output cap
+    /// mid-sentence and `"content-filter"` means the rest was withheld; both
+    /// used to close the turn with `is_error: false` and nothing on screen to
+    /// say the last sentence was not the end of one, which is what the note
+    /// fixed.
+    ///
+    /// Flagging them `is_error` as well went too far: that is the *rendering*
+    /// switch, and it repainted the whole answer — headings and tables as raw
+    /// `#`/`|`, code blocks stripped of their action bar, and the advisory
+    /// sentence itself showing its literal `_underscores_`. The note says it;
+    /// `is_error` is for a turn with nothing to show.
     #[test]
-    fn an_opencode_turn_cut_off_by_the_token_cap_says_so() {
+    fn an_opencode_turn_cut_off_by_the_token_cap_says_so_without_repainting_it() {
         for (reason, must_mention) in [("length", "output limit"), ("content-filter", "withheld")] {
             let line = format!(
                 r#"{{"type":"step_finish","timestamp":1,"sessionID":"s1","part":{{"reason":"{reason}","tokens":{{"input":5,"output":5}}}}}}"#
@@ -2226,9 +2258,12 @@ mod tests {
             assert!(
                 matches!(
                     out.last(),
-                    Some(StreamEvent::TurnDone { is_error: true, .. })
+                    Some(StreamEvent::TurnDone {
+                        is_error: false,
+                        ..
+                    })
                 ),
-                "{reason} filed as a clean success: {out:?}"
+                "{reason} repainted an answer that is real prose: {out:?}"
             );
         }
         // …and an ordinary end is still an ordinary end, in both spellings.
@@ -2240,7 +2275,70 @@ mod tests {
         // the same reasoning `push_opencode`'s doc gives for reading an absent
         // reason as terminal.
         assert!(!opencode_is_failure(Some("other")));
+        // The one that really has nothing to show.
         assert!(opencode_is_failure(Some("error")));
+        assert_eq!(
+            opencode_cutoff_note(Some("error")),
+            None,
+            "an error turn's own message is what it says; there is no answer to \
+             annotate"
+        );
+    }
+
+    /// **The composition, across all three links.** The decoder's `is_error`,
+    /// `Role::settled` and `Role::carries_an_answer` lived in three crates with
+    /// nothing joining them, and each was defensible alone —
+    /// `opencode_is_failure`'s own doc argued correctly that a cut-off turn is
+    /// not a clean one. Together they turned a complete, formatted reply into
+    /// red monochrome plain text: headings and tables as raw `#`/`|`, fenced SQL
+    /// stripped of its Insert / Run / Propose bar, and the advisory sentence
+    /// about the cut-off rendering its own literal `_underscores_`.
+    #[test]
+    fn an_answer_cut_off_at_the_output_cap_still_renders_as_markdown() {
+        for reason in ["length", "content-filter"] {
+            let line = format!(
+                r#"{{"type":"step_finish","timestamp":1,"sessionID":"s1","part":{{"reason":"{reason}","tokens":{{"input":5,"output":5}}}}}}"#
+            );
+            let out = drive(Harness::OpenCode, &[&line]);
+            let is_error = out
+                .iter()
+                .find_map(|e| match e {
+                    StreamEvent::TurnDone { is_error, .. } => Some(*is_error),
+                    _ => None,
+                })
+                .expect("the step closes the turn");
+            assert!(
+                schemaic_core::transcript::Role::Assistant
+                    .settled(is_error)
+                    .carries_an_answer(),
+                "{reason}: the answer is real prose and would lose its formatting"
+            );
+            // And the sentence that says so is in the prose, where it will be
+            // rendered as the markdown it is written in.
+            assert!(text_of(&out).contains('_'), "{out:?}");
+        }
+    }
+
+    /// And a turn that really has nothing to show still goes the other way —
+    /// without this the fix would pass by never marking anything an error.
+    #[test]
+    fn a_turn_with_nothing_to_show_is_still_rendered_as_an_error() {
+        use schemaic_core::transcript::Role;
+        let out = drive(
+            Harness::OpenCode,
+            &[r#"{"type":"step_finish","timestamp":1,"sessionID":"s1","part":{"reason":"error"}}"#],
+        );
+        let is_error = out
+            .iter()
+            .find_map(|e| match e {
+                StreamEvent::TurnDone { is_error, .. } => Some(*is_error),
+                _ => None,
+            })
+            .expect("the step closes the turn");
+        assert!(!Role::Assistant.settled(is_error).carries_an_answer());
+        // A turn already settled as an error is not un-settled by a later
+        // snapshot carrying `is_error: false`.
+        assert_eq!(Role::Error.settled(false), Role::Error);
     }
 
     #[test]

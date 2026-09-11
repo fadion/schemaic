@@ -9830,8 +9830,13 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                         last.segs = msg.segs;
                         last.stats = msg.stats;
                         last.pending = !msg.done;
-                        if msg.done && msg.is_error {
-                            last.role = Role::Error;
+                        // `Role::settled` is the middle link of the chain the
+                        // decoder's `is_error` starts and
+                        // `Role::carries_an_answer` ends. It only ever *raises*
+                        // to Error — a turn already marked one is not un-marked
+                        // by a later snapshot.
+                        if msg.done {
+                            last.role = last.role.settled(msg.is_error);
                         }
                     }
                 });

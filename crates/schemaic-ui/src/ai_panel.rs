@@ -1221,7 +1221,10 @@ fn render_segments(
     actions: CodeActions,
     settled: bool,
 ) -> impl IntoView {
-    let error_color = role == Role::Error;
+    // **Not `role == Role::Error`.** The question is whether this turn has an
+    // answer to format — see `Role::carries_an_answer`, which is the same
+    // question the decoders answer at the other end.
+    let error_color = !role.carries_an_answer();
     v_stack_from_iter(segs.into_iter().map(move |seg| match seg {
         Seg::Text(t) => {
             if error_color {

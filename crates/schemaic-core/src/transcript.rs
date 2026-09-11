@@ -16,7 +16,46 @@ use serde::{Deserialize, Serialize};
 pub enum Role {
     User,
     Assistant,
+    /// The turn produced no answer — a spawn failure, a `turn.failed` carrying
+    /// nothing but a message. **Not** "something went wrong during the turn":
+    /// see [`Role::carries_an_answer`].
     Error,
+}
+
+impl Role {
+    /// Does a turn in this role carry an **answer**?
+    ///
+    /// **This is what `Role::Error` actually decides**, and it had no name: the
+    /// AI panel renders every `Seg::Text` of an error turn as plain `text()` in
+    /// the error colour and never reaches the markdown renderer — headings and
+    /// tables become raw `#`/`|` characters, and fenced SQL loses the
+    /// Insert / Run / Propose bar. (`Seg::Tool` chips are unaffected, so the
+    /// bubble ends up half-styled.)
+    ///
+    /// That is right for a turn with nothing to show and wrong for one whose
+    /// answer is real prose that merely stopped short — an OpenCode turn ending
+    /// at the model's output cap, or an Antigravity turn whose *side* tool was
+    /// refused. Both were flagged as errors by their decoders, and the whole
+    /// formatted reply snapped to red monochrome, the advisory sentence about
+    /// the cut-off included, rendering its own literal `_underscores_`.
+    ///
+    /// The decoders answer the same question at the other end
+    /// (`stream::opencode_is_failure`), and [`Role::settled`] is the link
+    /// between them.
+    pub fn carries_an_answer(self) -> bool {
+        match self {
+            Role::User | Role::Assistant => true,
+            Role::Error => false,
+        }
+    }
+
+    /// What a finished turn settles into, given the decoder's verdict.
+    ///
+    /// Only ever raises: a turn already marked [`Role::Error`] is not un-marked
+    /// by a later snapshot.
+    pub fn settled(self, is_error: bool) -> Role {
+        if is_error { Role::Error } else { self }
+    }
 }
 
 /// Result rows the user attached to one question.
