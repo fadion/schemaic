@@ -160,6 +160,12 @@ pub async fn an_added_column_lands_and_reads_back_as_drafted(target: &'static Ta
             scratch.qualified("t")
         ))
         .await;
+    scratch
+        .exec(&format!(
+            "INSERT INTO {} (id, name) VALUES (1, 'kept')",
+            scratch.qualified("t")
+        ))
+        .await;
 
     let current = table_of(&scratch, "t").await;
     let mut draft = TableDraft::from_table(&current);
@@ -204,6 +210,17 @@ pub async fn an_added_column_lands_and_reads_back_as_drafted(target: &'static Ta
         target.name,
         col.type_name
     );
+    // The row that was there before the add, and the value the new column's
+    // `DEFAULT` had to fill in for it.
+    assert_row_survived(
+        &scratch,
+        "t",
+        &["name", "added"],
+        &["kept", "7"],
+        target,
+        "adding a column",
+    )
+    .await;
 
     scratch.teardown().await;
 }
@@ -321,6 +338,12 @@ pub async fn a_dropped_column_goes_and_the_rest_stays(target: &'static Target) {
             scratch.qualified("t")
         ))
         .await;
+    scratch
+        .exec(&format!(
+            "INSERT INTO {} (id, keep, go) VALUES (1, 'kept', 'gone')",
+            scratch.qualified("t")
+        ))
+        .await;
 
     let current = table_of(&scratch, "t").await;
     let mut draft = TableDraft::from_table(&current);
@@ -337,6 +360,17 @@ pub async fn a_dropped_column_goes_and_the_rest_stays(target: &'static Target) {
         "{}: what is left",
         target.name
     );
+    // …and the column that stayed still holds what it held. A drop emitted as a
+    // table rebuild is the shape that loses this.
+    assert_row_survived(
+        &scratch,
+        "t",
+        &["keep"],
+        &["kept"],
+        target,
+        "dropping a column",
+    )
+    .await;
 
     scratch.teardown().await;
 }
@@ -404,6 +438,12 @@ pub async fn a_retyped_column_reads_back_as_the_new_type(target: &'static Target
             scratch.qualified("t")
         ))
         .await;
+    scratch
+        .exec(&format!(
+            "INSERT INTO {} (id, n) VALUES (1, 'kept')",
+            scratch.qualified("t")
+        ))
+        .await;
 
     let current = table_of(&scratch, "t").await;
     let mut draft = TableDraft::from_table(&current);
@@ -436,6 +476,18 @@ pub async fn a_retyped_column_reads_back_as_the_new_type(target: &'static Target
         target.name,
         col.type_name
     );
+    // A widening retype keeps every value. A retype emitted as a drop-and-add
+    // is the same table afterwards and an empty column, which is why the empty
+    // fixture this test used to run against could not tell them apart.
+    assert_row_survived(
+        &scratch,
+        "t",
+        &["n"],
+        &["kept"],
+        target,
+        "retyping a column",
+    )
+    .await;
 
     scratch.teardown().await;
 }
@@ -589,6 +641,54 @@ pub async fn a_renamed_column_keeps_its_indexs_kind(target: &'static Target) {
 async fn apply(scratch: &Scratch, current: &TableInfo, draft: &TableDraft, target: &Target) {
     let set = ddl::diff(current, draft, target.engine.dialect());
     scratch.apply_plan(&set, "table").await;
+}
+
+/// After applying, the row seeded before it still holds what was put there.
+///
+/// **The property this tier was thinnest on, and the one its expensive failure
+/// is about.** Three of the five column-change tests ran against *empty*
+/// tables, so a plan that nulls a column applies cleanly, leaves it there with
+/// the right type and nullability, and satisfies every other assertion in the
+/// file — which is how `DROP COLUMN "c", ADD COLUMN "c"` for a cleared
+/// generated expression reached PostgreSQL 16.15 and emptied three cells. A
+/// table with no rows cannot tell a preserved value from a recreated column.
+///
+/// The columns are named rather than `SELECT *` so the assertion survives a
+/// change to the column set, which is what several of these tests are about.
+async fn assert_row_survived(
+    scratch: &Scratch,
+    table: &str,
+    columns: &[&str],
+    expected: &[&str],
+    target: &Target,
+    what: &str,
+) {
+    let dialect = scratch.dialect();
+    let list = columns
+        .iter()
+        .map(|c| schemaic_core::export::ident_if_needed(c, dialect))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let rs = scratch
+        .exec(&format!(
+            "SELECT {list} FROM {} WHERE id = 1",
+            scratch.qualified(table)
+        ))
+        .await;
+    let got: Vec<String> = (0..columns.len())
+        .map(|i| {
+            rs.cell(0, i)
+                .map(|c| c.display().to_string())
+                .unwrap_or_else(|| "<no row>".to_string())
+        })
+        .collect();
+    assert_eq!(
+        got,
+        expected.iter().map(|e| e.to_string()).collect::<Vec<_>>(),
+        "{}: after {what} the row's data did not survive ({})",
+        target.name,
+        columns.join(", ")
+    );
 }
 
 /// After applying, the table read back must round-trip through **its own**
@@ -1068,6 +1168,82 @@ pub async fn a_functional_index_does_not_stop_the_schema_being_read(target: &'st
         ix.lossy,
         ix.create_sql
     );
+
+    scratch.teardown().await;
+}
+
+/// Clearing a column's **generated expression** keeps the values that are in
+/// it.
+///
+/// The one change in the designer whose careless emission is silent data loss,
+/// and the reason [`assert_row_survived`] exists. `pg_column_clauses` opened
+/// with `from.generated != to.generated` and emitted `DROP COLUMN` +
+/// `ADD COLUMN`, on the reasoning that a generated column's values are derived
+/// anyway and will be recomputed — true when the draft names a *new*
+/// expression, and false when it names none: the column becomes plain and there
+/// is nothing left to derive them from. Measured on PostgreSQL 16.15, a
+/// `doubled` holding 6 came back empty.
+///
+/// Asserted on every leg because every leg can do it and each does it its own
+/// way — PostgreSQL 13's `ALTER COLUMN … DROP EXPRESSION`, the MySQL family's
+/// `MODIFY` with the clause left off — and the property is the same one: the
+/// column stops being derived and keeps what it last held.
+pub async fn clearing_a_generated_expression_keeps_the_column_values(target: &'static Target) {
+    let scratch = Scratch::create(target, "ddl_drop_generated").await;
+    let t = scratch.qualified("t");
+    scratch
+        .exec(&format!(
+            "CREATE TABLE {t} (id INTEGER NOT NULL PRIMARY KEY, n INTEGER NOT NULL, \
+             doubled INTEGER GENERATED ALWAYS AS (n * 2) STORED)"
+        ))
+        .await;
+    scratch
+        .exec(&format!("INSERT INTO {t} (id, n) VALUES (1, 3)"))
+        .await;
+
+    let current = table_of(&scratch, "t").await;
+    assert!(
+        current
+            .columns
+            .iter()
+            .any(|c| c.name == "doubled" && c.generated.is_some()),
+        "{}: the fixture's generated column was not read back as generated, so \
+         clearing it below would assert nothing",
+        target.name
+    );
+    let mut draft = TableDraft::from_table(&current);
+    draft
+        .columns
+        .iter_mut()
+        .find(|c| c.info.name == "doubled")
+        .unwrap_or_else(|| panic!("{}: the draft lost the column", target.name))
+        .info
+        .generated = None;
+
+    apply(&scratch, &current, &draft, target).await;
+    assert_round_trips(&scratch, "t", target, "clearing a generated expression").await;
+
+    let after = table_of(&scratch, "t").await;
+    let col = after
+        .columns
+        .iter()
+        .find(|c| c.name == "doubled")
+        .unwrap_or_else(|| panic!("{}: the column is gone", target.name));
+    assert!(
+        col.generated.is_none(),
+        "{}: the column is still generated, from {:?}",
+        target.name,
+        col.generated
+    );
+    assert_row_survived(
+        &scratch,
+        "t",
+        &["n", "doubled"],
+        &["3", "6"],
+        target,
+        "clearing a generated expression",
+    )
+    .await;
 
     scratch.teardown().await;
 }

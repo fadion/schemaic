@@ -124,6 +124,7 @@ live_suite!(
         a_partly_read_index_says_so_and_is_emitted_whole,
         a_switched_off_index_is_not_silently_brought_back,
         a_functional_index_does_not_stop_the_schema_being_read,
+        clearing_a_generated_expression_keeps_the_column_values,
         a_column_inserted_in_the_middle_lands_there,
         an_added_index_lands_as_the_index_drafted,
         a_dropped_foreign_key_goes_and_the_column_stays,
