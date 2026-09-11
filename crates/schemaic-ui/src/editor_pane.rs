@@ -4677,11 +4677,44 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
 
     // Wavy underlines under diagnostics: red for definite errors (unknown table/
     // column, syntax), amber for probable keyword typos. Overlay laid over the
-    // editor; each squiggle carries a hover tooltip with the diagnostic message.
-    // The container is click-through (`pointer_events(false)`) so text selection is
-    // unaffected — only the individual squiggle strips re-enable pointer events so
-    // hovering the underline (drawn in the descender gap, below the glyphs) reveals
-    // the message without stealing clicks meant for the text.
+    // editor, drawn in the descender gap below the glyphs. The container is
+    // click-through (`pointer_events(false)`) so text selection is unaffected.
+    //
+    // **There is no hover tooltip, and there cannot be one in this shape.** This
+    // comment used to say the opposite — "only the individual squiggle strips
+    // re-enable pointer events so hovering the underline reveals the message" —
+    // and so did `docs/architecture.md`, which listed the squiggles among the
+    // things `pointer_events(false)` is right for. Both were wrong, and the
+    // rule that says so is written down three sections away:
+    // `pointer_events` is **not inheritable**. `should_send` is asked about the
+    // *child*, and answering no `continue`s past that whole subtree — so the
+    // flag on this `dyn_container` meant the `v_stack`, every `svg`, and the
+    // `Tooltip` node `.tooltip()` mints around each one were never offered a
+    // pointer event. `Tooltip` arms its timer from `PointerMove` in
+    // `event_before_children`, which therefore never ran. A `.pointer_events(||
+    // true)` on each squiggle was dead: a child cannot re-enter a walk its
+    // ancestor was skipped in. Both it and the `.tooltip()` are gone rather than
+    // left looking like a feature.
+    //
+    // **And the obvious fix does not work either.** Taking the flag off this
+    // container and leaving the `v_stack` eligible trades a dead tooltip for a
+    // dead *band*: floem unions a view's `layout_rect` with its children's
+    // (`context.rs:837-846`), so the stack's hit rect becomes the bounding box
+    // of every squiggle on screen — and the parent's child walk `break`s on a
+    // pointer event after the first child whose rect contains the point,
+    // **whether or not that child consumed it**. Two errors twenty lines apart
+    // would make the rectangle between them dead to selection, scrolling and
+    // the caret.
+    //
+    // What it actually needs is the remedy the invariant states: "an overlay
+    // that both covers the window and contains something clickable cannot be
+    // one view: it has to be spread as loose siblings, each small enough to be
+    // skipped on a miss." That means the squiggles becoming direct children of
+    // `editor_area`'s own `stack` — which takes at most 16 children and is
+    // already near that — so it is a restructure of the overlay composition and
+    // an attended one, not a decorator moved. `erd_view`'s card header is the
+    // same lesson solved the easy way: it drops the opt-out on the branch that
+    // has a tooltip, because there the tooltip's owner *is* the small view.
     let syntax_view = {
         let ed = ed_syntax;
         // The squiggle's *width* is baked into the SVG markup (floem's `svg()`
@@ -4711,39 +4744,37 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                     // `None` = off screen. Rendering nothing is the point: this
                     // used to collapse to a 2px stub at the editor's top-left
                     // carrying the tooltip of an error twenty lines away.
+                    // **No `d.message`.** Nothing renders it since the tooltip
+                    // came out, so carrying it here was a `String` clone per
+                    // diagnostic on a memo that re-runs on every scroll tick and
+                    // every keystroke, and it made the memo rebuild the whole
+                    // container for a message change that alters nothing drawn.
+                    // Restoring the tooltip means putting it back.
                     underline_seg_at(&points, content_x, d.range.0, d.range.1, vp)
-                        .map(|(x, y, w)| (x, y, w, d.severity, d.message.clone()))
+                        .map(|(x, y, w)| (x, y, w, d.severity))
                 })
                 .collect::<Vec<_>>()
         });
         dyn_container(
             move || segs.get(),
-            move |segs: Vec<(f64, f64, f64, Severity, String)>| {
+            move |segs: Vec<(f64, f64, f64, Severity)>| {
                 if segs.is_empty() {
                     return empty().into_any();
                 }
-                v_stack_from_iter(segs.into_iter().map(|(x, y, w, sev, msg)| {
-                    floem::views::svg(wavy_svg(w))
-                        .style(move |s| {
-                            s.absolute()
-                                .inset_left(x)
-                                .inset_top(y)
-                                // A slightly taller hit area than the wave so the
-                                // hover is catchable, still within the descender gap.
-                                .height(WAVE_H + 4.0)
-                                .width(w)
-                                .color(match sev {
-                                    Severity::Error => theme::diag_error(),
-                                    Severity::Warning => theme::syntax_underline(),
-                                })
-                        })
-                        .pointer_events(|| true)
-                        .tooltip(move || {
-                            text(msg.clone()).style(|s| {
-                                s.font_size(theme::scaled_font(12.0))
-                                    .max_width(theme::scaled(360.0))
+                v_stack_from_iter(segs.into_iter().map(|(x, y, w, sev)| {
+                    floem::views::svg(wavy_svg(w)).style(move |s| {
+                        s.absolute()
+                            .inset_left(x)
+                            .inset_top(y)
+                            // A slightly taller hit area than the wave so the
+                            // hover is catchable, still within the descender gap.
+                            .height(WAVE_H + 4.0)
+                            .width(w)
+                            .color(match sev {
+                                Severity::Error => theme::diag_error(),
+                                Severity::Warning => theme::syntax_underline(),
                             })
-                        })
+                    })
                 }))
                 .style(|s| s.absolute().inset(0.0))
                 .into_any()

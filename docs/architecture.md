@@ -15582,6 +15582,23 @@ Re-introducing the anti-patterns these guard against is a regression:
   **`pointer_events(false)`** otherwise: it takes the view out of `should_send` entirely, and is
   right for something with nothing to click — the inline-diff band strips, the statement highlight,
   the squiggles.
+  **The squiggles are in that list because they have nothing to hover, and they used to be listed
+  there while also carrying a tooltip.** Each diagnostic strip had `.pointer_events(|| true)` and a
+  `.tooltip()` with the diagnostic's message, under a container comment claiming the strips
+  "re-enable pointer events so hovering the underline reveals the message". They never did, and
+  could not: the flag is not inheritable, so the container's `false` `continue`d past the whole
+  subtree and the `Tooltip` node never saw a `PointerMove`. The message the squiggle is drawn *for*
+  had no surface in the editor at all. Both decorators are gone, and the message no longer travels
+  in the memo that positions the strips.
+  **And the repair is not to move the flag down**, which is the reading this bullet invites: a
+  view's `layout_rect` is unioned with its children's, so leaving the intermediate `v_stack`
+  eligible gives it the bounding box of every squiggle on screen — and the walk `break`s on the
+  first child containing the point whether or not that child consumes it, so two errors twenty lines
+  apart would make the rectangle between them dead to selection, scrolling and the caret. It wants
+  the loose-siblings remedy stated above, which for this overlay means the strips becoming direct
+  children of `editor_area`'s `stack` — already at its 16-child limit. `erd_view`'s card header is
+  the same lesson where it happens to be easy: the tooltip's owner *is* the small view, so it simply
+  drops the opt-out.
   **A container introduced for layout or arity reasons is a hit target too**, and this is the trap
   rather than any one overlay. `absolute().inset(0)` on a wrapper whose children are small and
   edge-pinned turns a few thin overlays into a single pane-sized one, and nothing about it says so:
