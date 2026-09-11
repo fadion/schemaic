@@ -537,8 +537,74 @@ fn wrap_launcher(
 type Action = Rc<dyn Fn()>;
 /// Runs an [`Action`], but only against a connection that answers.
 type ConnGate = Rc<dyn Fn(Action)>;
+/// [`ConnGate`], with the refusal handed back to the caller.
+///
+/// The second action runs *instead of* the first, and only when the gate has
+/// decided the connection is unreachable. [`ConnGate`] is this with a no-op
+/// refusal, which is why there is one gate and not two.
+type ConnGateElse = Rc<dyn Fn(Action, Action)>;
 /// Reports a health check's outcome.
 type CheckDoneFn = Rc<dyn Fn(bool)>;
+
+/// Why a gated launch never happened.
+///
+/// A [`ConnGate`] refusal answers the *error modal* and nothing else, which is
+/// enough for an action that leaves nothing behind — a refused Run has simply
+/// not run, and the modal says so. It is not enough for an action whose caller
+/// has already moved a state machine into "in flight" **before** the gate sees
+/// it: `open_plan` sets `PlanState::Running` and *then* calls the gated action,
+/// so a refusal that speaks only to the error modal leaves the query-plan modal
+/// rendering `loading_dots("Explaining")` for ever behind it. Dismissing the
+/// error left a modal claiming work was in flight over a connection that was
+/// down, and only Escape got out of it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Refusal {
+    /// The connection is down, and the health re-check did not revive it.
+    NotConnected,
+    /// The user left the tab the action was started on while the gate held it.
+    TabMovedOn,
+}
+
+/// The query-plan modal's answer to a refused launch.
+///
+/// A free function rather than a closure inside `app_view` so that the
+/// *composition* has a test subject: `plan_refusal_text` on its own says only
+/// what the words are, and the defect was never in the words — it was in nobody
+/// calling them. Fed to [`gate1_on_tab_answered`], this is what turns a refusal
+/// into something the modal can render.
+fn plan_refused(plan_state: RwSignal<PlanState>, moved_on: &Rc<dyn Fn()>) -> Rc<dyn Fn(Refusal)> {
+    let moved_on = moved_on.clone();
+    Rc::new(move |why: Refusal| {
+        // The tab case owes the same modal every other pinned action raises; the
+        // connection case has already had one from the gate. Both owe the plan
+        // modal an answer, which is the half that was missing.
+        if why == Refusal::TabMovedOn {
+            (moved_on)();
+        }
+        plan_state.set(PlanState::Failed(plan_refusal_text(why).to_string()));
+    })
+}
+
+/// What the query-plan modal is left saying when its launch was refused.
+///
+/// Pure, and separate from the wiring, because it is the *answer* the modal's
+/// state machine was missing: every other exit from `run_plan` reports into
+/// `plan_state` (its `db_for` failure, its timeout — whose own comment says
+/// "nothing is coming to replace this state"), and these two are the exits that
+/// happen before `run_plan` is reached at all.
+fn plan_refusal_text(why: Refusal) -> &'static str {
+    match why {
+        Refusal::NotConnected => {
+            "Not connected — the plan was not run. The server didn't answer the \
+             health check, so nothing was sent to it."
+        }
+        Refusal::TabMovedOn => {
+            "You switched tabs while the connection was being re-checked, so the \
+             plan was not run. It describes the tab it was asked from — go back \
+             to that tab and ask again."
+        }
+    }
+}
 
 /// Wrap a one-argument action behind the live-connection gate.
 ///
@@ -611,6 +677,46 @@ fn gate1_on_tab<A: Clone + 'static>(
             }
             action(arg.clone())
         }));
+    })
+}
+
+/// [`gate1_on_tab`], for an action whose caller has **already started a state
+/// machine** and so needs an answer when the launch is refused.
+///
+/// Same pinning, same reasons; the difference is that both refusals — the gate's
+/// own "still unreachable" and the tab having moved on — are reported back as a
+/// [`Refusal`] rather than only to the error modal. The caller decides what that
+/// means: the query-plan modal turns it into `PlanState::Failed`, and also
+/// raises `run_moved_on` for the tab case, so the two channels stay one apiece.
+///
+/// **The refusal is not optional.** Making it a separate `moved_on` callback
+/// plus a silent gate is exactly the shape that shipped the spinning modal: the
+/// gate wrapped *around* the action answered nobody, while every early exit
+/// inside it answered the caller.
+fn gate1_on_tab_answered<A: Clone + 'static>(
+    gate: &ConnGateElse,
+    action: &Rc<dyn Fn(A)>,
+    active: RwSignal<usize>,
+    refused: &Rc<dyn Fn(Refusal)>,
+) -> Rc<dyn Fn(A)> {
+    let gate = gate.clone();
+    let action = action.clone();
+    let refused = refused.clone();
+    Rc::new(move |arg: A| {
+        let started_on = active.get_untracked();
+        let action = action.clone();
+        let moved = refused.clone();
+        let unreachable = refused.clone();
+        (gate)(
+            Rc::new(move || {
+                if active.get_untracked() != started_on {
+                    (moved)(Refusal::TabMovedOn);
+                    return;
+                }
+                action(arg.clone())
+            }),
+            Rc::new(move || (unreachable)(Refusal::NotConnected)),
+        );
     })
 }
 
@@ -7193,9 +7299,13 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
     // server that came back. A blocked attempt therefore pings first; if it
     // still fails, the reason is surfaced rather than the action silently doing
     // nothing.
-    let with_conn: ConnGate = {
+    //
+    // The refusal-carrying form is the real one; `with_conn` is it with nobody
+    // listening. Any caller that has already told the user something is in
+    // flight takes this instead — see [`Refusal`].
+    let with_conn_else: ConnGateElse = {
         let check_conn_then = check_conn_then.clone();
-        Rc::new(move |action: Rc<dyn Fn()>| {
+        Rc::new(move |action: Rc<dyn Fn()>, refused: Rc<dyn Fn()>| {
             if !conn_status.get_untracked().is_down() {
                 action();
                 return;
@@ -7225,9 +7335,14 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                          right."
                     )));
                     error_modal_open.set(true);
+                    refused();
                 }
             })));
         })
+    };
+    let with_conn: ConnGate = {
+        let g = with_conn_else.clone();
+        Rc::new(move |action: Rc<dyn Fn()>| (g)(action, Rc::new(|| {})))
     };
 
     // ── The write guard ─────────────────────────────────────────────────────
@@ -10990,23 +11105,19 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             run_plan: {
                 // Pinned to the tab for the reason `gate1_on_tab` gives:
                 // `run_plan` re-resolves `active` when it lands, and the gate can
-                // hold it for five seconds. Two arguments rather than one, so it
-                // spells the wrapper out instead of taking it.
-                let g = with_conn.clone();
+                // hold it for five seconds. **And answered on refusal**, which
+                // the plain pinning cannot do: `open_plan` has already set
+                // `PlanState::Running` by the time this is called, so a gate
+                // that refuses silently leaves the modal on "Explaining…" for
+                // ever. Two arguments, carried as a pair so the generic wrapper
+                // still applies.
+                let g = with_conn_else.clone();
                 let f = run_plan.clone();
-                let moved_on = run_moved_on.clone();
-                Rc::new(move |sql: String, analyze: bool| {
-                    let started_on = active.get_untracked();
-                    let f = f.clone();
-                    let moved_on = moved_on.clone();
-                    (g)(Rc::new(move || {
-                        if active.get_untracked() != started_on {
-                            (moved_on)();
-                            return;
-                        }
-                        f(sql.clone(), analyze)
-                    }))
-                })
+                let pair: Rc<dyn Fn((String, bool))> =
+                    Rc::new(move |(sql, analyze)| f(sql, analyze));
+                let refused = plan_refused(plan_state, &run_moved_on);
+                let gated = gate1_on_tab_answered(&g, &pair, active, &refused);
+                Rc::new(move |sql: String, analyze: bool| gated((sql, analyze)))
             },
             validate_stmt,
             open_monitor,
@@ -11960,8 +12071,9 @@ mod app_tests {
     use std::rc::Rc;
 
     use super::{
-        Action, CliLauncher, ConnGate, RunTimeout, gate1, gate1_on_tab, inline_outcome,
-        mysql_shell_config, owning_tab_of, psql_database, psql_shell_config, resolve_native_cli,
+        Action, CliLauncher, ConnGate, ConnGateElse, Refusal, RunTimeout, gate1, gate1_on_tab,
+        gate1_on_tab_answered, inline_outcome, mysql_shell_config, owning_tab_of,
+        plan_refusal_text, plan_refused, psql_database, psql_shell_config, resolve_native_cli,
         sqlite_shell_config, timeout_message, tx_engine, unique_name,
     };
     use floem::prelude::{SignalGet, SignalUpdate};
@@ -12396,6 +12508,153 @@ mod app_tests {
             1,
             "gate1 runs whatever it was handed, wherever the user now is"
         );
+    }
+
+    /// A gate that behaves like `with_conn_else` when the ping comes back
+    /// **failed**: the action is dropped and the refusal is taken. That is the
+    /// branch the query-plan modal was never told about.
+    fn refusing_gate() -> ConnGateElse {
+        Rc::new(move |_action: Action, refused: Action| refused())
+    }
+
+    /// The same, holding both halves so the caller decides which one lands —
+    /// `with_conn_else` on a `Disconnected` connection, before the ping answers.
+    #[allow(clippy::type_complexity)]
+    fn deferring_gate_else() -> (ConnGateElse, Rc<RefCell<Option<(Action, Action)>>>) {
+        let held: Rc<RefCell<Option<(Action, Action)>>> = Rc::new(RefCell::new(None));
+        let slot = held.clone();
+        let gate: ConnGateElse =
+            Rc::new(move |a: Action, r: Action| *slot.borrow_mut() = Some((a, r)));
+        (gate, held)
+    }
+
+    /// **The query-plan modal spun on "Explaining…" for ever when the connection
+    /// was down.**
+    ///
+    /// `open_plan` sets `PlanState::Running` and *then* calls the gated action.
+    /// `with_conn` saw `is_down()`, pinged, the ping failed, and it took the
+    /// refusal branch: error modal, and the action never called. The inner
+    /// `run_plan` is the only writer of `PlanState::Failed` on that route, so
+    /// `plan_state` stayed `Running` and the body rendered `loading_dots`
+    /// indefinitely behind the error. Dismissing the error left a modal claiming
+    /// work was in flight over a server that was down; only Escape got out.
+    ///
+    /// This asserts the **composition** — the gate, the pinned wrapper and the
+    /// modal's answer together — because each piece was individually fine: every
+    /// early exit *inside* `run_plan` already reported into `plan_state`, and it
+    /// was the gate wrapped *around* it that answered nobody.
+    #[test]
+    fn a_refused_plan_launch_leaves_the_modal_saying_so() {
+        let active = RwSignal::new(7usize);
+        let plan_state = RwSignal::new(schemaic_ui::PlanState::Running);
+        let ran: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
+        let moved_on_said = RwSignal::new(0usize);
+
+        let sink = ran.clone();
+        let action: Rc<dyn Fn((String, bool))> =
+            Rc::new(move |(sql, _analyze)| sink.borrow_mut().push(sql));
+        let moved_on: Rc<dyn Fn()> = Rc::new(move || moved_on_said.update(|n| *n += 1));
+
+        let gated = gate1_on_tab_answered(
+            &refusing_gate(),
+            &action,
+            active,
+            &plan_refused(plan_state, &moved_on),
+        );
+        gated(("SELECT 1".to_string(), false));
+
+        assert!(ran.borrow().is_empty(), "the gate refused, so nothing ran");
+        match plan_state.get_untracked() {
+            schemaic_ui::PlanState::Failed(msg) => assert_eq!(
+                msg,
+                plan_refusal_text(Refusal::NotConnected),
+                "and the modal says which refusal it was"
+            ),
+            other => panic!("the modal is still spinning: {other:?}"),
+        }
+        assert_eq!(
+            moved_on_said.get_untracked(),
+            0,
+            "the tab didn't move — that modal belongs to the other refusal"
+        );
+    }
+
+    /// The second refusal, and the one the pinned wrapper owns rather than the
+    /// gate: the check takes up to five seconds, the user clicks another tab
+    /// while it does, and the deferred launch is dropped. It owes the modal the
+    /// same answer — and *additionally* the "you switched tabs" error every
+    /// other pinned action raises, which is why both channels are asserted.
+    #[test]
+    fn a_plan_launch_that_outlived_its_tab_also_answers_the_modal() {
+        let active = RwSignal::new(7usize);
+        let plan_state = RwSignal::new(schemaic_ui::PlanState::Running);
+        let ran: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
+        let moved_on_said = RwSignal::new(0usize);
+
+        let sink = ran.clone();
+        let action: Rc<dyn Fn((String, bool))> =
+            Rc::new(move |(sql, _analyze)| sink.borrow_mut().push(sql));
+        let moved_on: Rc<dyn Fn()> = Rc::new(move || moved_on_said.update(|n| *n += 1));
+
+        let (gate, held) = deferring_gate_else();
+        let gated =
+            gate1_on_tab_answered(&gate, &action, active, &plan_refused(plan_state, &moved_on));
+        gated(("SELECT 1".to_string(), false));
+        active.set(9);
+        // The ping came back *good*, so the gate runs the action half — and the
+        // pinning is what refuses.
+        (held.borrow_mut().take().expect("the gate held it").0)();
+
+        assert!(ran.borrow().is_empty(), "it was judged against tab 7");
+        assert_eq!(moved_on_said.get_untracked(), 1, "and said why, once");
+        match plan_state.get_untracked() {
+            schemaic_ui::PlanState::Failed(msg) => {
+                assert_eq!(msg, plan_refusal_text(Refusal::TabMovedOn))
+            }
+            other => panic!("the modal is still spinning: {other:?}"),
+        }
+    }
+
+    /// And the ordinary case: the gate lets it through on the tab it was started
+    /// from, so the action runs and the modal is left alone to be answered by
+    /// `run_plan` itself. Without this the wrapper could pass by refusing
+    /// everything.
+    #[test]
+    fn an_allowed_plan_launch_runs_and_writes_no_refusal() {
+        let active = RwSignal::new(7usize);
+        let plan_state = RwSignal::new(schemaic_ui::PlanState::Running);
+        let ran: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
+
+        let sink = ran.clone();
+        let action: Rc<dyn Fn((String, bool))> =
+            Rc::new(move |(sql, analyze)| sink.borrow_mut().push(format!("{sql}|{analyze}")));
+        let moved_on: Rc<dyn Fn()> = Rc::new(|| {});
+
+        let (gate, held) = deferring_gate_else();
+        let gated =
+            gate1_on_tab_answered(&gate, &action, active, &plan_refused(plan_state, &moved_on));
+        gated(("SELECT 1".to_string(), true));
+        (held.borrow_mut().take().expect("the gate held it").0)();
+
+        assert_eq!(ran.borrow().as_slice(), ["SELECT 1|true"]);
+        assert!(
+            matches!(plan_state.get_untracked(), schemaic_ui::PlanState::Running),
+            "nothing refused it, so the state machine is still `run_plan`'s"
+        );
+    }
+
+    /// The two refusals do not share wording. They are different facts — one is
+    /// about the server, one about the tab — and the modal is the only place
+    /// either is said.
+    #[test]
+    fn the_two_plan_refusals_say_different_things() {
+        let a = plan_refusal_text(Refusal::NotConnected);
+        let b = plan_refusal_text(Refusal::TabMovedOn);
+        assert_ne!(a, b);
+        assert!(!a.trim().is_empty() && !b.trim().is_empty());
+        // Each names what did *not* happen; a modal that only says "error" is
+        // the thing being replaced.
+        assert!(a.contains("was not run") && b.contains("was not run"));
     }
 
     /// **The pill and the session read one mapping.** These are the two halves of
