@@ -421,7 +421,9 @@ fn source_step(ui: Ui, ring: FocusRing) -> impl IntoView {
             // toggle sitting one gap under "Reading" and two.
             .style(move |s| {
                 let s = s.width_full();
-                if i.sheets.get().len() < 2 {
+                // `with`, not `get`: a length comparison does not need a copy of
+                // the workbook's sheet list, and this is inside a style closure.
+                if i.sheets.with(|v| v.len() < 2) {
                     s.hide()
                 } else {
                     s

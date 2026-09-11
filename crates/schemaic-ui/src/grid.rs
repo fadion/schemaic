@@ -3509,7 +3509,10 @@ pub(crate) fn grid_find_bar(
             let count = dyn_container(
                 move || {
                     (
-                        find_query.get().is_empty(),
+                        // `with`, not `get` — this is a `dyn_container` key, so it
+                        // runs on every find keystroke, and `get` clones the whole
+                        // query string to ask whether it is blank.
+                        find_query.with(String::is_empty),
                         find_pos.get(),
                         find_total.get(),
                         find_more.get(),

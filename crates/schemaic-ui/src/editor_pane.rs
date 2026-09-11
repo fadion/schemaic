@@ -947,7 +947,9 @@ fn params_bar(
     // an autohiding bar under a row of 24px fields is chrome taller than the gap
     // it lives in.
     container(wheel_hscroll(list).style(|s| s.width_full())).style(move |s| {
-        if names.get().is_empty() {
+        // `with`, not `get`: this asks whether the list is empty and `get`
+        // clones the whole `Vec<String>` to answer, on every restyle of the bar.
+        if names.with(Vec::is_empty) {
             return s.height(0.0).width_full();
         }
         s.width_full()

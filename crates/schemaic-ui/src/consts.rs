@@ -1274,3 +1274,56 @@ mod float_inset_gate {
         }
     }
 }
+
+/// **`.get()` clones the whole value; `.with(|v| …)` borrows it.**
+///
+/// `docs/architecture.md` calls this "the review's most-repeated mechanical
+/// defect", and cites what it cost on the ER diagram's position map: 8.4 ms per
+/// pointer move at 500 cards, to read one entry out of it. The shape that gives
+/// it away is a clone made *only* to ask a cheap question about the collection
+/// — `.get().is_empty()`, `.get().len()`, `.get().contains(…)`, `.get().iter()`
+/// — which is always `.with(…)` written the long way.
+///
+/// A gate rather than a note because the population is now **zero**. Three sites
+/// were found and fixed (a parameter-name list restyled per frame, a find query
+/// cloned per keystroke inside a `dyn_container` key, a workbook's sheet list
+/// cloned to compare a length); the review's own pass declined to propose a lint
+/// on the grounds that three instances did not justify one. At zero it does: a
+/// gate that starts empty costs nothing to keep and catches the fourth.
+///
+/// Deliberately narrow. It says nothing about `.get()` in general — a closure
+/// that really does want the value has to clone it — only about a clone
+/// immediately thrown away. The `_untracked` variants are excluded by the same
+/// reasoning applied to the *tracking*: they are the same waste, but they are
+/// not in a closure that re-runs, so they are not this defect.
+#[cfg(test)]
+mod get_clone_gate {
+    /// A method that reads the collection without consuming it, so calling it on
+    /// a fresh clone means the clone was pure waste.
+    const ASKS: &[&str] = &[".is_empty()", ".len()", ".contains(", ".iter()"];
+
+    #[test]
+    fn no_reactive_read_clones_a_collection_to_ask_about_it() {
+        let mut offenders: Vec<String> = Vec::new();
+        for (file, body) in crate::source_gate::crate_sources() {
+            for (i, line) in body.lines().enumerate() {
+                let l = line.trim();
+                for ask in ASKS {
+                    // `.get()` immediately followed by the question. Assembled
+                    // rather than written out, so this line is not its own first
+                    // offender.
+                    let needle = format!("{}(){ask}", ".get");
+                    if l.contains(&needle) {
+                        offenders.push(format!("{file}:{}: {l}", i + 1));
+                    }
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "`.get()` clones the whole value — these ask a question about the \
+             clone and drop it. Write `.with(|v| …)`:\n{}",
+            offenders.join("\n")
+        );
+    }
+}
