@@ -38,8 +38,7 @@ use floem::prelude::*;
 use floem::views::{VirtualDirection, VirtualItemSize, VirtualVector, virtual_stack};
 
 use schemaic_core::blob::{
-    BlobKind, BlobValue, FETCH_CAP, HEX_COLS, PreviewVerdict, hex_line, hex_row_count,
-    preview_verdict,
+    BlobKind, BlobValue, HEX_COLS, PreviewVerdict, hex_line, hex_row_count, preview_verdict,
 };
 use schemaic_core::format::{contrasting_bytes, human_bytes};
 
@@ -115,7 +114,7 @@ pub enum BlobState {
     Loading,
     /// Bytes, and what they turned out to be.
     ///
-    /// `Arc` because the buffer is up to [`FETCH_CAP`] and every read of the
+    /// `Arc` because the buffer is up to [`schemaic_core::blob::FETCH_CAP`] and every read of the
     /// signal would otherwise copy it — the hex view reads it once per visible
     /// line.
     Ready {
@@ -243,8 +242,14 @@ impl BlobUi {
         if self.epoch.get_untracked() != epoch {
             return;
         }
-        if let BlobState::Ready { kind, .. } = &state
+        // **And not for a truncated one**, however much it looks like an image.
+        // A short read's header parses, so the preview cleared every gate and
+        // then drew nothing — see `PreviewVerdict::Truncated`. Choosing Preview
+        // for a pane that cannot draw is worse than leaving Hex, which shows the
+        // bytes that did arrive.
+        if let BlobState::Ready { kind, value, .. } = &state
             && kind.is_image()
+            && !value.truncated()
         {
             self.pane.set(BlobPane::Preview);
         }
@@ -431,12 +436,27 @@ fn body_h() -> f64 {
 /// The truncation clause is not decoration. It is the difference between a
 /// panel showing a value and a panel showing the front of one, and the same
 /// fact disables Save below.
+///
+/// **It reports the buffer's own length, not [`schemaic_core::blob::FETCH_CAP`].** The constant is
+/// only the cut point on PostgreSQL and SQLite. On MySQL the `SELECT` asks for
+/// `SUBSTRING(col, 1, LEAST(?, PACKET_ROOM))` where the room is
+/// `max_allowed_packet − 1 MiB` — measured 15,728,640 on stock MariaDB 10.11
+/// and 66,060,288 on MySQL 8.4, the second below `FETCH_CAP` on that engine's
+/// *default*, so this is not a misconfiguration. A 20 MiB `LONGBLOB` therefore
+/// read "Binary data · 20.0 MB · showing the first 64.0 MB": a 20 MB value
+/// cannot have a 64 MB front, and the sentence was right on two engines and
+/// wrong on the third.
+///
+/// Nothing here can learn *why* it was cut — `PACKET_ROOM` is evaluated inside
+/// the statement, so the number never crosses back, and `BlobValue` carries no
+/// field for it. But it does not need to: how much arrived is the fact the
+/// reader wants, and it is `bytes.len()`.
 fn summary_line(value: &BlobValue, kind: BlobKind) -> String {
     let mut s = format!("{} · {}", kind.label(), human_bytes(value.len as i64));
     if value.truncated() {
         s.push_str(&format!(
             " · showing the first {}",
-            human_bytes(FETCH_CAP as i64)
+            human_bytes(value.bytes.len() as i64)
         ));
     }
     s
@@ -450,7 +470,7 @@ fn summary_line(value: &BlobValue, kind: BlobKind) -> String {
 /// that is the whole value: a truncated buffer would write a file that is the
 /// front of a blob and looks like the blob. The verdict reads the **server's**
 /// length rather than the buffer's, which is what keeps it right for a value
-/// that happens to be exactly [`FETCH_CAP`] long.
+/// that happens to be exactly [`schemaic_core::blob::FETCH_CAP`] long.
 ///
 /// Pure and here rather than inline in the footer, because the composition it
 /// stands on cannot be reached from a test any other way: `FETCH_CAP` is a
@@ -462,11 +482,17 @@ fn save_offer(value: Option<&BlobValue>) -> (bool, Option<String>) {
         // Nothing read yet, or nothing there: no button, and no explanation
         // owed — the panel's body already says what state it is in.
         None => (false, None),
+        // **States what was read, not a ceiling.** This named `FETCH_CAP`, which
+        // is the cut point on two engines out of three — see `summary_line`. A
+        // 20 MB value refused "over 64.0 MB" is false about the value and points
+        // the user at a limit they cannot change, away from the one they can
+        // (`max_allowed_packet`). The two figures it has are both true.
         Some(v) if v.truncated() => (
             false,
             Some(format!(
-                "Too large to save from here — over {}.",
-                human_bytes(FETCH_CAP as i64)
+                "Only the first {} of {} could be read, so this would save the front of the value.",
+                human_bytes(v.bytes.len() as i64),
+                human_bytes(v.len as i64)
             )),
         ),
         Some(_) => (true, None),
@@ -562,7 +588,14 @@ fn image_dims(bytes: &[u8]) -> Option<(u32, u32)> {
 /// scale by hand from these very dimensions, and scrolling a large image is a
 /// smaller cost than showing every image stretched.
 fn preview_view(value: Arc<BlobValue>, kind: BlobKind) -> impl IntoView {
-    let body: floem::AnyView = match preview_verdict(image_dims(&value.bytes)) {
+    // **`value.truncated()` is the first thing the verdict is told.** It was
+    // never asked at all: `image_dims` reads a PNG's IHDR, which is bytes 16..24
+    // and always present, so a 16 MiB scan cut at 15 MiB by MySQL's packet room
+    // measured 3000 × 2400, cleared every cap, and was handed to `img()` as a
+    // PNG whose IDAT ends mid-chunk — floem turns that decode error into a 0 × 0
+    // image, so the user got a blank pane, with no explanation, on the pane the
+    // panel had chosen for them.
+    let body: floem::AnyView = match preview_verdict(image_dims(&value.bytes), value.truncated()) {
         // **`min_size_full`, and the alignment below does nothing without it.**
         // A scroll measures its child against unbounded space, so this container
         // hugged the image: on a 16 × 16 favicon it was 40 px across inside a
@@ -587,6 +620,15 @@ fn preview_view(value: Arc<BlobValue>, kind: BlobKind) -> impl IntoView {
             format!(
                 "This image is {width} × {height} — too large to preview here. \
                  The bytes are intact: read them as Hex, or save them to a file."
+            ),
+            false,
+        )
+        .into_any(),
+        PreviewVerdict::Truncated => note_view(
+            format!(
+                "Only the first {} of this {} was read, so it cannot be drawn.                  Read the bytes as Hex.",
+                human_bytes(value.bytes.len() as i64),
+                kind.label()
             ),
             false,
         )
@@ -961,6 +1003,10 @@ pub(crate) fn blob_overlay(ui: Ui) -> impl IntoView {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // `FETCH_CAP` is no longer used by the production code in this file — the
+    // two truncation sentences stopped naming it — but the fixtures still want
+    // it, because it is the cut point on PostgreSQL and SQLite.
+    use schemaic_core::blob::FETCH_CAP;
 
     /// A target with no size cap — the shape every test here wants, and a
     /// constructor rather than a literal so a new field on `BlobTarget` does not
@@ -1314,8 +1360,12 @@ mod tests {
             "the buffer is the front of the value, not the value"
         );
         let hint = hint.expect("a disabled button owes a reason");
-        assert!(hint.contains("Too large to save"), "{hint}");
-        assert!(hint.contains("64.0 MB"), "it names the cap: {hint}");
+        // **It names what was read and what is there, not a ceiling.** This used
+        // to assert "Too large to save … over 64.0 MB", which is only the cut
+        // point on PostgreSQL and SQLite — see `summary_line`. Both figures here
+        // are true on every engine.
+        assert!(hint.contains("Only the first 16 B"), "{hint}");
+        assert!(hint.contains("of 64.0 MB"), "{hint}");
     }
 
     /// The boundary, which is the case a buffer-length check would get wrong: a
@@ -1493,6 +1543,57 @@ mod tests {
         );
     }
 
+    /// **A truncated image stays on Hex.**
+    ///
+    /// The pane is chosen once, when the bytes arrive, from `kind.is_image()` —
+    /// and `sniff` reads the signature, which any cut past byte 8 leaves intact.
+    /// So a 16 MiB PNG that arrived 15 MiB long was opened on Preview, where
+    /// `image_dims` read its IHDR, every cap passed, and floem drew a 0 × 0
+    /// image: a blank pane, no explanation, on the pane the panel picked. Hex
+    /// shows the bytes that did arrive, which is the honest thing to open on.
+    #[test]
+    fn a_truncated_image_opens_on_hex_rather_than_a_pane_that_cannot_draw() {
+        let ui = BlobUi::new();
+        let whole = ui.open(
+            tgt("t.png".into(), "t_png".into()),
+            None,
+            BlobState::Loading,
+        );
+        ui.loaded(
+            whole,
+            BlobState::Ready {
+                value: Arc::new(value(2048, 2048)),
+                kind: BlobKind::Png,
+            },
+        );
+        assert_eq!(
+            ui.pane.get_untracked(),
+            BlobPane::Preview,
+            "a whole image still opens on its preview"
+        );
+
+        let ui = BlobUi::new();
+        let cut = ui.open(
+            tgt("t.png".into(), "t_png".into()),
+            None,
+            BlobState::Loading,
+        );
+        let v = value(16 * 1024 * 1024, 15_728_640);
+        assert!(v.truncated());
+        ui.loaded(
+            cut,
+            BlobState::Ready {
+                value: Arc::new(v),
+                kind: BlobKind::Png,
+            },
+        );
+        assert_eq!(
+            ui.pane.get_untracked(),
+            BlobPane::Hex,
+            "the front of an image cannot be drawn, so do not open on the pane              that would try"
+        );
+    }
+
     /// Opening a second cell clears the first one's save sentence.
     #[test]
     fn opening_another_cell_does_not_inherit_the_previous_saved_line() {
@@ -1569,7 +1670,7 @@ mod tests {
              would pass this test without exercising the cap"
         );
         assert_eq!(
-            preview_verdict(image_dims(&bomb)),
+            preview_verdict(image_dims(&bomb), false),
             PreviewVerdict::TooLarge {
                 width: 65_535,
                 height: 65_535
@@ -1583,7 +1684,10 @@ mod tests {
     fn the_same_fixture_within_budget_is_shown() {
         let ok = bomb_png(4_000, 4_000);
         assert_eq!(image_dims(&ok), Some((4_000, 4_000)));
-        assert_eq!(preview_verdict(image_dims(&ok)), PreviewVerdict::Show);
+        assert_eq!(
+            preview_verdict(image_dims(&ok), false),
+            PreviewVerdict::Show
+        );
     }
 
     /// An ordinary image measures and passes. Encoded here rather than pasted
@@ -1596,7 +1700,10 @@ mod tests {
             .expect("encode a 3x2 png");
         let bytes = png.into_inner();
         assert_eq!(image_dims(&bytes), Some((3, 2)));
-        assert_eq!(preview_verdict(image_dims(&bytes)), PreviewVerdict::Show);
+        assert_eq!(
+            preview_verdict(image_dims(&bytes), false),
+            PreviewVerdict::Show
+        );
     }
 
     /// **Unmeasurable is a refusal, not a shrug.** `sniff` matches magic bytes
@@ -1615,7 +1722,7 @@ mod tests {
         );
         assert_eq!(image_dims(truncated), None);
         assert_eq!(
-            preview_verdict(image_dims(truncated)),
+            preview_verdict(image_dims(truncated), false),
             PreviewVerdict::Unmeasurable
         );
     }
@@ -1635,6 +1742,63 @@ mod tests {
         let line = summary_line(&value(200 * 1024 * 1024, FETCH_CAP), BlobKind::Opaque);
         assert!(line.starts_with("Binary data · 200.0 MB"), "{line}");
         assert!(line.contains("showing the first 64.0 MB"), "{line}");
+    }
+
+    /// **The cut point is not `FETCH_CAP` on MySQL, and both sentences said it
+    /// was.**
+    ///
+    /// `build_blob_select` asks for `SUBSTRING(col, 1, LEAST(?, PACKET_ROOM))`,
+    /// where the room is `max_allowed_packet − 1 MiB` — measured **15,728,640**
+    /// on stock MariaDB 10.11 and **66,060,288** on MySQL 8.4, the second of
+    /// which is below `FETCH_CAP` on that engine's *default*, so the window is
+    /// not a misconfiguration. A 20 MiB `LONGBLOB` therefore comes back cut at
+    /// 15 MB, and the panel read:
+    ///
+    /// > Binary data · 20.0 MB · showing the first 64.0 MB
+    ///
+    /// — a 20 MB value cannot have a 64 MB front — with Save disabled as "Too
+    /// large to save from here — over 64.0 MB", which is false about a 20 MB
+    /// value and points the user at a limit they cannot change instead of the
+    /// one they can.
+    ///
+    /// The existing fixture above (`len = 200 MB`, `bytes = FETCH_CAP`) is the
+    /// only shape ever tested, and it is precisely the shape in which the
+    /// constant happens to be the right answer. On PostgreSQL and SQLite the cut
+    /// really is `FETCH_CAP`, so the sentences were right on two engines and
+    /// wrong on the third — a per-backend divergence in a statement the app
+    /// makes about the user's own data.
+    ///
+    /// The fix is to stop naming a constant: the buffer's own length is the
+    /// honest answer and is already in hand.
+    #[test]
+    fn a_blob_cut_by_the_packet_room_reports_the_length_it_actually_got() {
+        // The measured MariaDB 10.11 shape: a 20 MiB value cut at
+        // `max_allowed_packet − 1 MiB`.
+        let v = value(20 * 1024 * 1024, 15_728_640);
+        assert!(v.truncated(), "the fixture has to be a short read");
+
+        let line = summary_line(&v, BlobKind::Opaque);
+        assert!(line.starts_with("Binary data · 20.0 MB"), "{line}");
+        assert!(
+            !line.contains("64.0 MB"),
+            "a 20 MB value has no 64 MB front: {line}"
+        );
+        assert!(
+            line.contains("showing the first 15.0 MB"),
+            "it must say how much it actually has: {line}"
+        );
+
+        let (offered, why) = save_offer(Some(&v));
+        assert!(!offered, "a front is not the value, so Save stays off");
+        let why = why.expect("a refusal owes a reason");
+        assert!(
+            !why.contains("64.0 MB"),
+            "the refusal must not assert a ceiling this value is nowhere near: {why}"
+        );
+        assert!(
+            why.contains("15.0 MB") && why.contains("20.0 MB"),
+            "it must say what was read and what is there: {why}"
+        );
     }
 
     #[test]

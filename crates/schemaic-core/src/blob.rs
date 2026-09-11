@@ -157,6 +157,23 @@ pub enum PreviewVerdict {
     /// renderer draws *nothing at all*, silently, and the panel becomes a
     /// caption over an empty box. Saying so is strictly better than showing it.
     Unmeasurable,
+    /// These bytes are the **front** of an image, not an image.
+    ///
+    /// **Checked before the dimensions, because the dimensions are fine.** A
+    /// PNG's IHDR is bytes 16..24 and a JPEG's SOF is near the top, so a 16 MiB
+    /// scan cut at 15 MiB by MySQL's packet room still measures 3000 × 2400 and
+    /// still passes every cap — [`PreviewVerdict::Unmeasurable`] catches a
+    /// corrupt *header* and cannot catch a missing *body*, which is the case the
+    /// app produces itself (see [`BlobValue::truncated`]). floem's `img` is
+    /// `load_from_memory(..).ok()` with the width defaulting to `0`, so the
+    /// decode error becomes a 0 × 0 image and an empty `Blob`: a blank pane, no
+    /// explanation, on the pane the panel chose for the user. That is exactly
+    /// the outcome `Unmeasurable` exists to prevent, arrived at by the one route
+    /// it does not cover.
+    ///
+    /// A decoder that renders what it has — some JPEG decoders do — is no
+    /// better: a partial image with nothing saying so is worse than a sentence.
+    Truncated,
 }
 
 /// [`PreviewVerdict`] for the dimensions a caller managed to read.
@@ -164,7 +181,14 @@ pub enum PreviewVerdict {
 /// Multiplied as `u64`, deliberately: `u32 * u32` overflows at a little over
 /// four gigapixels, and a header declaring 65536 × 65536 would otherwise wrap
 /// to zero and pass a cap it exceeds by two orders of magnitude.
-pub fn preview_verdict(dims: Option<(u32, u32)>) -> PreviewVerdict {
+///
+/// `truncated` is [`BlobValue::truncated`] — whether the buffer is the whole
+/// value. It is asked **first**: a truncated image's header parses, so every
+/// check below it would be answering about an image these bytes do not contain.
+pub fn preview_verdict(dims: Option<(u32, u32)>, truncated: bool) -> PreviewVerdict {
+    if truncated {
+        return PreviewVerdict::Truncated;
+    }
     let Some((width, height)) = dims else {
         return PreviewVerdict::Unmeasurable;
     };
@@ -706,11 +730,14 @@ mod tests {
 
     #[test]
     fn an_ordinary_image_is_shown() {
-        assert_eq!(preview_verdict(Some((1920, 1080))), PreviewVerdict::Show);
-        assert_eq!(preview_verdict(Some((1, 1))), PreviewVerdict::Show);
+        assert_eq!(
+            preview_verdict(Some((1920, 1080)), false),
+            PreviewVerdict::Show
+        );
+        assert_eq!(preview_verdict(Some((1, 1)), false), PreviewVerdict::Show);
         // The largest image that can be drawn: square at the edge cap.
         assert_eq!(
-            preview_verdict(Some((PREVIEW_EDGE_CAP, PREVIEW_EDGE_CAP))),
+            preview_verdict(Some((PREVIEW_EDGE_CAP, PREVIEW_EDGE_CAP)), false),
             PreviewVerdict::Show
         );
     }
@@ -733,7 +760,7 @@ mod tests {
             "the point of this test is that the area cap does not catch it"
         );
         assert_eq!(
-            preview_verdict(Some((w, h))),
+            preview_verdict(Some((w, h)), false),
             PreviewVerdict::TooLarge {
                 width: w,
                 height: h
@@ -741,7 +768,7 @@ mod tests {
         );
         // Either edge, not just the first.
         assert_eq!(
-            preview_verdict(Some((h, w))),
+            preview_verdict(Some((h, w)), false),
             PreviewVerdict::TooLarge {
                 width: h,
                 height: w
@@ -753,18 +780,18 @@ mod tests {
     fn the_cap_is_the_boundary_and_not_one_past_it() {
         // Exactly the edge cap is allowed; one pixel more is not.
         assert_eq!(
-            preview_verdict(Some((PREVIEW_EDGE_CAP, 1))),
+            preview_verdict(Some((PREVIEW_EDGE_CAP, 1)), false),
             PreviewVerdict::Show
         );
         assert_eq!(
-            preview_verdict(Some((PREVIEW_EDGE_CAP + 1, 1))),
+            preview_verdict(Some((PREVIEW_EDGE_CAP + 1, 1)), false),
             PreviewVerdict::TooLarge {
                 width: PREVIEW_EDGE_CAP + 1,
                 height: 1
             }
         );
         assert_eq!(
-            preview_verdict(Some((1, PREVIEW_EDGE_CAP + 1))),
+            preview_verdict(Some((1, PREVIEW_EDGE_CAP + 1)), false),
             PreviewVerdict::TooLarge {
                 width: 1,
                 height: PREVIEW_EDGE_CAP + 1
@@ -800,7 +827,7 @@ mod tests {
     #[test]
     fn a_decompression_bomb_is_refused_by_its_dimensions() {
         assert_eq!(
-            preview_verdict(Some((30_000, 30_000))),
+            preview_verdict(Some((30_000, 30_000)), false),
             PreviewVerdict::TooLarge {
                 width: 30_000,
                 height: 30_000
@@ -816,14 +843,14 @@ mod tests {
         let (w, h) = (65_536u32, 65_536u32);
         assert_eq!(w.wrapping_mul(h), 0, "the premise: this wraps in 32 bits");
         assert_eq!(
-            preview_verdict(Some((w, h))),
+            preview_verdict(Some((w, h)), false),
             PreviewVerdict::TooLarge {
                 width: w,
                 height: h
             }
         );
         assert_eq!(
-            preview_verdict(Some((u32::MAX, u32::MAX))),
+            preview_verdict(Some((u32::MAX, u32::MAX)), false),
             PreviewVerdict::TooLarge {
                 width: u32::MAX,
                 height: u32::MAX
@@ -833,14 +860,48 @@ mod tests {
 
     #[test]
     fn unreadable_dimensions_are_not_treated_as_permission() {
-        assert_eq!(preview_verdict(None), PreviewVerdict::Unmeasurable);
+        assert_eq!(preview_verdict(None, false), PreviewVerdict::Unmeasurable);
+    }
+
+    /// **A truncated image measures perfectly well, which is the whole
+    /// problem.** A PNG's IHDR is bytes 16..24 and survives any cut past byte
+    /// 24, so `image_dims` answers `Some((3000, 2400))` for a 16 MiB scan that
+    /// arrived 15 MiB long — every cap passes, `Show` is returned, and floem
+    /// draws a 0 × 0 image because the IDAT ends mid-chunk.
+    ///
+    /// So the check has to come **before** the dimensions, not after: there is
+    /// nothing wrong with them.
+    #[test]
+    fn a_truncated_image_is_refused_however_well_its_header_reads() {
+        // Dimensions that would otherwise be `Show`, on a short read.
+        assert_eq!(
+            preview_verdict(Some((3000, 2400)), true),
+            PreviewVerdict::Truncated
+        );
+        // And the same dimensions whole.
+        assert_eq!(
+            preview_verdict(Some((3000, 2400)), false),
+            PreviewVerdict::Show
+        );
+
+        // Truncation outranks every other verdict, because each of them is a
+        // statement about an image these bytes do not contain.
+        assert_eq!(preview_verdict(None, true), PreviewVerdict::Truncated);
+        assert_eq!(
+            preview_verdict(Some((30_000, 30_000)), true),
+            PreviewVerdict::Truncated
+        );
+        assert_eq!(
+            preview_verdict(Some((0, 100)), true),
+            PreviewVerdict::Truncated
+        );
         // A zero dimension draws nothing; it is a header this cannot use.
         assert_eq!(
-            preview_verdict(Some((0, 100))),
+            preview_verdict(Some((0, 100)), false),
             PreviewVerdict::Unmeasurable
         );
         assert_eq!(
-            preview_verdict(Some((100, 0))),
+            preview_verdict(Some((100, 0)), false),
             PreviewVerdict::Unmeasurable
         );
     }
