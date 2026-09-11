@@ -121,6 +121,97 @@ pub fn table_upsert(
     }
 }
 
+/// Which identity colour a **new connection** should get: the first preset
+/// nobody is using, or — once every preset is taken — one of them chosen by
+/// `seed`.
+///
+/// **The decision, separated from the clock that used to be inside it.** The
+/// caller read `SystemTime::now().subsec_nanos()` in the middle of the
+/// function, so neither branch had a deterministic entry point and the whole
+/// thing had no test anywhere in the workspace, in the UI crate, with all three
+/// callers in a third one. A wrong answer here is silent and durable: the
+/// identity colour is what the environment badge, the tab-strip rule and the
+/// editor frame use to tell production from local, so a regression that starts
+/// handing out duplicates makes two connections look alike with nothing to
+/// notice it.
+///
+/// **The first unused preset, not a random one.** The old spelling indexed the
+/// unused pool by the seed too, so two connections made in the same second
+/// could take the same colour while six others sat free. Comparison is
+/// ASCII-case-insensitive, since a colour the user typed by hand is stored as
+/// they typed it.
+///
+/// `presets` is empty only if a caller has nothing to offer, and the empty
+/// string is the honest answer to that rather than a panic on `% 0`.
+pub fn pick_color<'a>(presets: &[&'a str], used: &[String], seed: usize) -> &'a str {
+    if presets.is_empty() {
+        return "";
+    }
+    let is_used = |c: &str| used.iter().any(|u| u.eq_ignore_ascii_case(c));
+    match presets.iter().find(|c| !is_used(c)) {
+        Some(free) => free,
+        None => presets[seed % presets.len()],
+    }
+}
+
+#[cfg(test)]
+mod pick_color_tests {
+    use super::pick_color;
+
+    const PRESETS: [&str; 3] = ["#E05252", "#E0C24B", "#52C77A"];
+
+    fn used(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// With nothing taken, the **first** preset — not whatever the seed lands
+    /// on. Two connections made in the same second used to be able to take the
+    /// same colour with six others free.
+    #[test]
+    fn an_unused_preset_is_taken_in_order_whatever_the_seed() {
+        for seed in [0, 1, 7, usize::MAX] {
+            assert_eq!(pick_color(&PRESETS, &[], seed), "#E05252", "seed {seed}");
+        }
+        assert_eq!(pick_color(&PRESETS, &used(&["#E05252"]), 2), "#E0C24B");
+        assert_eq!(
+            pick_color(&PRESETS, &used(&["#E05252", "#E0C24B"]), 0),
+            "#52C77A",
+            "one left"
+        );
+    }
+
+    /// A colour the user typed by hand is stored as they typed it, so the
+    /// comparison cannot be case-sensitive or the palette hands out a duplicate
+    /// that only differs in spelling.
+    #[test]
+    fn a_used_colour_counts_however_it_is_cased() {
+        assert_eq!(pick_color(&PRESETS, &used(&["#e05252"]), 0), "#E0C24B");
+        assert_eq!(pick_color(&PRESETS, &used(&["#E05252"]), 0), "#E0C24B");
+    }
+
+    /// Everything taken: fall back to the whole palette, and never panic on the
+    /// modulo.
+    #[test]
+    fn a_full_palette_falls_back_to_the_seed_and_never_panics() {
+        let all = used(&["#E05252", "#E0C24B", "#52C77A"]);
+        assert_eq!(pick_color(&PRESETS, &all, 0), "#E05252");
+        assert_eq!(pick_color(&PRESETS, &all, 4), "#E0C24B");
+        assert_eq!(
+            pick_color(&PRESETS, &all, usize::MAX),
+            PRESETS[usize::MAX % 3]
+        );
+        // A single-entry palette has one answer at every seed.
+        assert_eq!(pick_color(&["#E05252"], &used(&["#E05252"]), 99), "#E05252");
+    }
+
+    /// An empty pool answers with nothing rather than dividing by zero.
+    #[test]
+    fn an_empty_palette_is_an_empty_answer() {
+        assert_eq!(pick_color(&[], &[], 0), "");
+        assert_eq!(pick_color(&[], &used(&["#E05252"]), 3), "");
+    }
+}
+
 #[cfg(test)]
 mod table_tests {
     use super::*;

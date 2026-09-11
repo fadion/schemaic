@@ -7010,17 +7010,20 @@ fn parse_preset(hex: &str) -> floem::peniko::Color {
 
 /// Pick an identity colour for a new connection: a preset not already used by an
 /// existing connection (so colours stay distinct), or — once every preset is
-/// taken — one at random from the full palette. `used` is the existing colours.
+/// taken — one from the full palette. `used` is the existing colours.
+///
+/// **A wrapper over the clock, and nothing else.** The decision is
+/// `db_color::pick_color`, where it can be tested: the seed used to be read in
+/// the middle of the body, so neither branch had a deterministic entry point
+/// and the whole function had no test anywhere in the workspace — a decision
+/// function in the UI crate with all three of its callers in `schemaic-app`.
 pub fn pick_connection_color(used: &[String]) -> String {
     let seed = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.subsec_nanos() as usize)
         .unwrap_or(0);
-    let is_used = |c: &str| used.iter().any(|u| u.eq_ignore_ascii_case(c));
     let all: Vec<&str> = CONN_COLOR_PRESETS.iter().map(|(_, hex, _)| *hex).collect();
-    let unused: Vec<&str> = all.iter().copied().filter(|c| !is_used(c)).collect();
-    let pool = if unused.is_empty() { &all } else { &unused };
-    pool[seed % pool.len()].to_string()
+    schemaic_core::db_color::pick_color(&all, used, seed).to_string()
 }
 
 // A vertical divider between two side-by-side panels: absolute, full-height,
