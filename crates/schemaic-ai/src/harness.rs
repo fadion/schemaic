@@ -615,6 +615,49 @@ impl Harness {
         }
     }
 
+    /// Does this harness take its prompt on **stdin** rather than in argv?
+    ///
+    /// **argv is world-readable, and the prompt is the payload.** On the
+    /// packaged Linux targets `/proc/<pid>/cmdline` is readable by any local
+    /// account, so a `ps auxww` during a turn read whatever the prompt carried:
+    /// up to `ATTACH_ROW_CAP` attached rows, the twenty sampled rows an AI Seed
+    /// builds on, and the table's full `CREATE TABLE`. This codebase had already
+    /// made that judgement for one payload and one only —
+    /// [`codex_mcp_overrides`] keeps the *endpoint* out of `-c` because it is
+    /// "visible to every process listing on the machine" — while the rows the
+    /// `AiData` ladder exists to protect went to the same place with nothing
+    /// recorded about the difference.
+    ///
+    /// **True for Codex alone, because it is the only one whose CLI says so.**
+    /// `codex exec --help` (codex-cli 0.153.4): *"Initial instructions for the
+    /// agent. If not provided as an argument (or if `-` is used), instructions
+    /// are read from stdin. If stdin is piped and a prompt is also provided,
+    /// stdin is appended as a `<stdin>` block"* — which is also the measured
+    /// behaviour the per-turn spawn's own comment records, and the reason the
+    /// prompt has to leave argv rather than merely be duplicated onto stdin.
+    ///
+    /// The other three keep argv, and it is not an oversight:
+    ///
+    /// - **OpenCode** `run` documents a `message..` positional and no stdin at
+    ///   all;
+    /// - **Antigravity** reads stdin only under `--input-format stream-json`,
+    ///   which is its *session* shape — already off argv for that reason — and
+    ///   its one-shot `-p` takes the prompt as an argument;
+    /// - **Claude**'s session path is likewise already on stdin; its inline
+    ///   `-p` is argv, and its stdin form is a documented way to pass *context*
+    ///   alongside a positional rather than a promise about replacing one.
+    ///
+    /// Each of those is a claim about a CLI this app does not own, so it is
+    /// written here as what was read rather than assumed, and moving one is a
+    /// measurement against the installed binary — the rule every other
+    /// behavioural claim in this module was established by.
+    pub fn prompt_on_stdin(self) -> bool {
+        match self {
+            Harness::Codex => true,
+            Harness::Claude | Harness::Antigravity | Harness::OpenCode => false,
+        }
+    }
+
     /// Can a previous turn be continued by id?
     ///
     /// **No longer the complement of [`Harness::is_persistent`], and the reason
@@ -906,8 +949,15 @@ pub fn turn_args(h: Harness, spec: &TurnSpec) -> Vec<String> {
             // goes last so nothing a caller adds can displace it.
             a.push("-c".into());
             a.push("sandbox_mode=\"read-only\"".into());
-            // Prompt last of all: it is the positional argument.
-            a.push(prefixed_prompt(turn_system(spec), &spec.prompt));
+            // **The prompt is not here.** It goes on stdin — see
+            // `Harness::prompt_on_stdin`, and `Harness::turn_stdin_prompt`,
+            // which builds the same string this arm used to push last. Omitted
+            // rather than duplicated: with a positional *and* a pipe, Codex
+            // appends stdin as a `<stdin>` block instead of taking it as the
+            // instructions.
+            if !h.prompt_on_stdin() {
+                a.push(prefixed_prompt(turn_system(spec), &spec.prompt));
+            }
             a
         }
         // Antigravity took a per-turn command line until its bidirectional mode
@@ -1293,8 +1343,11 @@ pub fn inline_argv(h: Harness, spec: &InlineSpec) -> Vec<String> {
             // be written" — so the parser reads that and never the pipe.
             a.push("-o".into());
             a.push(spec.last_message.clone());
-            // Prompt last: it is the positional argument.
-            a.push(prefixed_prompt(&spec.system, &spec.intent));
+            // Not here either — `Harness::inline_stdin_prompt`. Same reason as
+            // the session arm's.
+            if !h.prompt_on_stdin() {
+                a.push(prefixed_prompt(&spec.system, &spec.intent));
+            }
             a
         }
         Harness::Antigravity => {
@@ -1396,6 +1449,27 @@ fn sealed_tools() -> serde_json::Map<String, serde_json::Value> {
     .iter()
     .map(|t| ((*t).to_string(), serde_json::Value::Bool(false)))
     .collect()
+}
+
+impl Harness {
+    /// What to write to a **chat turn's** stdin, or `None` when the prompt rides
+    /// in argv for this harness.
+    ///
+    /// The counterpart to [`Harness::turn_args`], and deliberately built from
+    /// the same [`prefixed_prompt`] call that arm would have pushed: the prompt
+    /// has one construction and two possible destinations, never two
+    /// constructions. `the_prompt_travels_exactly_once` holds the pair together.
+    pub fn turn_stdin_prompt(self, spec: &TurnSpec) -> Option<String> {
+        self.prompt_on_stdin()
+            .then(|| prefixed_prompt(turn_system(spec), &spec.prompt))
+    }
+
+    /// [`Harness::turn_stdin_prompt`] for a one-shot generation — Ctrl+K, AI
+    /// Fill, AI Seed — against [`Harness::inline_argv`].
+    pub fn inline_stdin_prompt(self, spec: &InlineSpec) -> Option<String> {
+        self.prompt_on_stdin()
+            .then(|| prefixed_prompt(&spec.system, &spec.intent))
+    }
 }
 
 /// Fold the system context into the prompt for harnesses with no
@@ -1953,6 +2027,40 @@ mod tests {
     /// the weaker rule that actually matters, which is that every harness has at
     /// least one way to continue a conversation. See
     /// `persistence_and_resume_are_no_longer_complements`.
+    /// **The prompt travels exactly once, and every harness says where.**
+    ///
+    /// The capability and the argv builders are two functions that have to
+    /// agree: a harness that claims stdin but still pushes the positional sends
+    /// the payload twice (and Codex would then append its own stdin as a
+    /// `<stdin>` block rather than obey it), and one that claims argv but has
+    /// had its push removed sends no prompt at all — a turn that hangs or
+    /// answers nothing. Asked over `Harness::ALL` so a fifth harness cannot be
+    /// added with the question unanswered.
+    #[test]
+    fn the_prompt_travels_exactly_once() {
+        for h in Harness::ALL {
+            let s = spec();
+            let argv = spawn_argv(h, &s);
+            let in_argv = argv.iter().any(|a| a.contains("count rows"));
+            let on_stdin = h
+                .turn_stdin_prompt(&s)
+                .is_some_and(|p| p.contains("count rows"));
+            // A persistent harness carries it in neither: its turns are lines
+            // written to a pipe that is already open (`session_turn_line`).
+            if h.is_persistent() {
+                assert!(!in_argv, "{h:?} puts a session prompt in argv: {argv:?}");
+                continue;
+            }
+            assert!(
+                in_argv ^ on_stdin,
+                "{h:?}: prompt in argv = {in_argv}, on stdin = {on_stdin} — it must be \
+                 exactly one, and `prompt_on_stdin` says {}",
+                h.prompt_on_stdin()
+            );
+            assert_eq!(on_stdin, h.prompt_on_stdin(), "{h:?}");
+        }
+    }
+
     #[test]
     fn every_harness_can_continue_a_conversation_somehow() {
         for h in Harness::ALL {
@@ -1971,9 +2079,18 @@ mod tests {
         assert_eq!(a[sandbox + 1], "read-only");
         assert!(a.contains(&"--json".to_string()));
         assert!(a.contains(&"--skip-git-repo-check".to_string()));
-        // The prompt is the positional and must be last, or a later flag reads
-        // as part of it.
-        assert!(a.last().expect("a prompt").contains("count rows"));
+        // **And it is not given one in argv at all**: Codex reads the prompt
+        // from stdin, so the positional this used to assert on is gone. What
+        // replaced the assertion is `the_prompt_travels_exactly_once`, which
+        // asks the stronger question for every harness.
+        assert!(
+            !a.iter().any(|s| s.contains("count rows")),
+            "the prompt is in argv, where every process listing can read it: {a:?}"
+        );
+        assert_eq!(
+            Harness::Codex.turn_stdin_prompt(&spec()).as_deref(),
+            Some(prefixed_prompt(turn_system(&spec()), &spec().prompt)).as_deref()
+        );
     }
 
     #[test]
@@ -2192,6 +2309,20 @@ mod tests {
     /// green, and `agy … --model ""` then dies as "Couldn't launch the `agy`
     /// CLI" — the one explanation that is not the problem. The same vacuity is
     /// named as a past bug a hundred lines away in `ai/lib.rs`.
+    /// **Everything a per-turn spawn hands the model**: its argv, plus the
+    /// prompt it writes to stdin.
+    ///
+    /// Which of the two channels carries the prompt is
+    /// [`Harness::prompt_on_stdin`]'s business and has its own tests. A test
+    /// about *content* — does the outline reach the first turn and not the
+    /// rest — asks this instead, so moving a harness between channels does not
+    /// look like losing the payload.
+    pub(super) fn turn_payload(h: Harness, s: &TurnSpec) -> Vec<String> {
+        let mut a = turn_args(h, s);
+        a.extend(h.turn_stdin_prompt(s));
+        a
+    }
+
     pub(super) fn spawn_argv(h: Harness, s: &TurnSpec) -> Vec<String> {
         let a = match h.is_persistent() {
             true => session_args(h, s, crate::CliSeal::ALL, &[]),
@@ -2228,18 +2359,19 @@ mod tests {
         }
     }
 
-    /// The composition, not the predicate: what matters is whether the *argv*
-    /// carries the outline, and on which turns.
+    /// The composition, not the predicate: what matters is whether the *spawn*
+    /// carries the outline, and on which turns — in argv or on stdin, which
+    /// `turn_payload` folds together on purpose.
     #[test]
     fn the_schema_outline_rides_the_first_turn_of_a_thread_and_not_the_rest() {
-        // The harnesses that still take a per-turn argv. Antigravity used to be
-        // one of them and now holds the outline in the first stdin message
-        // instead (`session_system_in_first_turn`).
+        // The harnesses spawned once per turn. Antigravity used to be one of
+        // them and now holds the outline in the first stdin message instead
+        // (`session_system_in_first_turn`).
         for h in [Harness::Codex, Harness::OpenCode] {
             let mut first = spec();
             first.system = "tables: users(id)".into();
             first.resume = None;
-            let a = turn_args(h, &first);
+            let a = turn_payload(h, &first);
             assert!(
                 a.iter().any(|x| x.contains("users(id)")),
                 "{h:?} dropped the outline from the opening turn: {a:?}"
@@ -2249,7 +2381,7 @@ mod tests {
             // the outline from the turn above.
             let mut later = first.clone();
             later.resume = Some("thread_1".into());
-            let b = turn_args(h, &later);
+            let b = turn_payload(h, &later);
             assert!(
                 !b.iter().any(|x| x.contains("users(id)")),
                 "{h:?} sent the outline again on a resumed turn: {b:?}"
@@ -2290,7 +2422,7 @@ mod tests {
         s.system = "tables: users(id)".into();
         s.resume = Some(String::new());
         for h in [Harness::Codex, Harness::OpenCode] {
-            let a = turn_args(h, &s);
+            let a = turn_payload(h, &s);
             assert!(a.iter().any(|x| x.contains("users(id)")), "{h:?}: {a:?}");
         }
     }
@@ -3249,6 +3381,31 @@ mod inline_tests {
             .map(|i| args[i + 1].clone())
     }
 
+    /// **The prompt travels exactly once**, on the one-shot shape every harness
+    /// has — the sibling of `the_prompt_travels_exactly_once` above.
+    ///
+    /// `Harness::prompt_on_stdin` and the argv builders are two functions that
+    /// must agree. One claiming stdin while still pushing the positional sends
+    /// the payload twice — and Codex then appends its own stdin as a `<stdin>`
+    /// block rather than obeying it — while one that lost its push sends no
+    /// prompt at all.
+    #[test]
+    fn an_inline_prompt_travels_exactly_once() {
+        for h in Harness::ALL {
+            let s = spec();
+            let argv = inline_argv(h, &s);
+            let in_argv = argv.iter().any(|a| a.contains(&s.intent));
+            let on_stdin = h
+                .inline_stdin_prompt(&s)
+                .is_some_and(|p| p.contains(&s.intent));
+            assert!(
+                in_argv ^ on_stdin,
+                "{h:?}: in argv = {in_argv}, on stdin = {on_stdin}: {argv:?}"
+            );
+            assert_eq!(on_stdin, h.prompt_on_stdin(), "{h:?}");
+        }
+    }
+
     /// The invariant, on every harness at once: nothing here can reach a tool,
     /// a server or an earlier session.
     #[test]
@@ -3432,10 +3589,15 @@ mod inline_tests {
 
     /// The prompt carries the schema outline on the three harnesses with no
     /// `--append-system-prompt`, and Claude keeps its own flag.
+    ///
+    /// Over argv **and** the stdin prompt, for `turn_payload`'s reason: this is
+    /// a test about whether the context reaches the model, not about which
+    /// channel carries it.
     #[test]
     fn the_system_context_reaches_every_harness() {
         for h in Harness::ALL {
-            let a = inline_argv(h, &spec());
+            let mut a = inline_argv(h, &spec());
+            a.extend(h.inline_stdin_prompt(&spec()));
             let joined = a.join("\u{1}");
             assert!(
                 joined.contains("tables: users(id)"),

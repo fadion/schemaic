@@ -848,6 +848,10 @@ fn write_endpoint_file(endpoint: &str) -> Option<PathBuf> {
 pub(crate) struct InlinePlan {
     bin: String,
     args: Vec<String>,
+    /// The prompt, when this harness reads it from stdin rather than from argv
+    /// — see [`Harness::prompt_on_stdin`]. `None` means it is in `args`, and
+    /// the child's stdin stays null.
+    stdin_prompt: Option<String>,
     harness: Harness,
     output: schemaic_ai::harness::InlineOutput,
     /// Where Codex was told to write its answer; deleted after it is read.
@@ -933,6 +937,9 @@ pub(crate) fn inline_plan(
             .unwrap_or_default(),
     };
     let args = schemaic_ai::harness::inline_argv(harness, &spec);
+    // See `Harness::prompt_on_stdin`: on a harness that takes it there, the
+    // prompt is absent from `args` above and travels here instead.
+    let stdin_prompt = harness.inline_stdin_prompt(&spec);
     // The same pre-spawn check the chat panel makes: it is the same argv entry
     // and the same platform limit, and an oversize prompt otherwise surfaces as
     // `os error 206`, which names the one cause that isn't the problem.
@@ -955,6 +962,7 @@ pub(crate) fn inline_plan(
     Ok(InlinePlan {
         bin,
         args,
+        stdin_prompt,
         harness,
         output,
         last_message,
@@ -981,9 +989,20 @@ fn inline_reply_path() -> Option<PathBuf> {
 pub(crate) async fn run_inline(plan: InlinePlan) -> Result<String, String> {
     let mut cmd = Command::new(&plan.bin);
     cmd.args(&plan.args)
-        // Nothing is ever written to these children's stdin — every one of them
-        // takes its prompt in argv — and a CLI that waits for it costs seconds.
-        .stdin(Stdio::null())
+        // **Null unless the prompt travels on it.** A CLI that waits on a stdin
+        // nobody will write costs seconds, which is why this was unconditional;
+        // on a harness that takes the prompt there (`Harness::prompt_on_stdin`)
+        // the pipe is the prompt, and it is closed the moment it is written.
+        .stdin(match plan.stdin_prompt.is_some() {
+            true => Stdio::piped(),
+            false => Stdio::null(),
+        })
+        // Stated rather than left to `output()`, which sets both itself: the
+        // stdin arm below has to `spawn` instead, and a bare `spawn` **inherits**
+        // them — which would put the CLI's output on Schemaic's own stdout and
+        // hand `wait_with_output` two empty buffers.
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
         .kill_on_drop(true);
     // **The same guard both session spawns apply**, and this path had none: the
     // child inherited the app's own process working directory, so a user who
@@ -1007,7 +1026,23 @@ pub(crate) async fn run_inline(plan: InlinePlan) -> Result<String, String> {
     for (k, v) in &plan.env {
         cmd.env(k, v);
     }
-    let ran = cmd.output().await.map_err(|e| e.to_string());
+    let ran = match &plan.stdin_prompt {
+        // **`spawn`, not `output`**: `output()` closes the child's stdin before
+        // anything can reach it, so the prompt would never arrive and the CLI
+        // would answer an empty instruction. Written and then shut down, because
+        // the CLI waits on EOF to know the prompt is whole.
+        Some(p) => match cmd.spawn() {
+            Ok(mut child) => {
+                if let Some(mut si) = child.stdin.take() {
+                    let _ = si.write_all(p.as_bytes()).await;
+                    let _ = si.shutdown().await;
+                }
+                child.wait_with_output().await.map_err(|e| e.to_string())
+            }
+            Err(e) => Err(e.to_string()),
+        },
+        None => cmd.output().await.map_err(|e| e.to_string()),
+    };
     // Read and remove the file whatever happened: a failed run that still wrote
     // one would otherwise leave it for the sweeper, which collects only once the
     // owning process is gone.
@@ -1558,6 +1593,11 @@ pub(crate) fn start_ai_session(
                     isolate_config: isolate,
                 };
                 let args = schemaic_ai::harness::turn_args(harness, &spec);
+                // The prompt, when this harness takes it on stdin instead of in
+                // argv — see `Harness::prompt_on_stdin`. Built before the size
+                // check below deliberately: what leaves argv is exactly what no
+                // longer counts against the command-line limit.
+                let turn_stdin = harness.turn_stdin_prompt(&spec);
                 if let Some(why) =
                     schemaic_ai::oversize_reason(harness, &args, schemaic_ai::arg_limit())
                 {
@@ -1585,12 +1625,24 @@ pub(crate) fn start_ai_session(
                 cmd.envs(oc_env.iter().map(|(k, v)| (k, v)));
                 cmd.current_dir(&cwd);
                 let child = cmd
-                    // **Never piped.** `codex exec` reads stdin when it is a
-                    // pipe and appends it to the prompt as a `<stdin>` block —
-                    // measured: a run with stdin at EOF still printed "Reading
-                    // additional input from stdin…". Piping it would silently
-                    // append whatever we never wrote to every turn.
-                    .stdin(Stdio::null())
+                    // **Piped exactly when the prompt travels on it**, which is
+                    // `Harness::prompt_on_stdin` — Codex today, whose own help
+                    // says the instructions are read from stdin when no
+                    // positional is given.
+                    //
+                    // Null otherwise, and the old comment here is the reason it
+                    // must stay null: `codex exec` reads stdin when it is a pipe
+                    // and *appends* it to the prompt as a `<stdin>` block —
+                    // measured, a run with stdin at EOF still printed "Reading
+                    // additional input from stdin…". So a pipe nobody writes to
+                    // is not neutral, and neither is a pipe written to while the
+                    // positional is also present. The argv builder drops the
+                    // positional under the same predicate, and
+                    // `the_prompt_travels_exactly_once` holds the two together.
+                    .stdin(match turn_stdin.is_some() {
+                        true => Stdio::piped(),
+                        false => Stdio::null(),
+                    })
                     .stdout(Stdio::piped())
                     .stderr(Stdio::piped())
                     .kill_on_drop(true)
@@ -1607,6 +1659,17 @@ pub(crate) fn start_ai_session(
                         continue;
                     }
                 };
+                // **Write it, then close the pipe.** The CLI waits on EOF to know
+                // the instructions are complete, so a pipe left open is a turn
+                // that never starts. A failed write means the child is already
+                // gone; the loop below reports that with its exit status rather
+                // than guessing here.
+                if let Some(p) = &turn_stdin
+                    && let Some(mut si) = child.stdin.take()
+                {
+                    let _ = si.write_all(p.as_bytes()).await;
+                    let _ = si.shutdown().await;
+                }
                 let mut reader = BufReader::new(child.stdout.take().expect("stdout piped")).lines();
                 let stderr_buf = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
                 drain_stderr(&mut child, &stderr_buf);
