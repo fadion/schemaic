@@ -7846,13 +7846,19 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                             // ticked — a comparison is opened to migrate the
                             // difference, so making the common case the default
                             // beats an empty tree with a dead button under it.
-                            // The bodies MySQL mangles are left out, because
-                            // they cannot be emitted faithfully yet.
+                            //
+                            // **Through `selectable_keys`, not a filter written
+                            // here.** That is the function for "every difference
+                            // a plan could include" — the same question the
+                            // footer's count and the Apply button ask through
+                            // `is_planned` — and this seed used to re-spell half
+                            // of it (`!needs_source()`, without `unplannable()`),
+                            // in a third crate and outside every test. No filter
+                            // is on screen yet, so `RowFilter::default()`.
                             compare_expanded.set(c.default_expanded());
                             compare_selected.set(
-                                c.differences()
-                                    .filter(|e| !e.needs_source())
-                                    .map(|e| e.key())
+                                c.selectable_keys(schemaic_core::compare::RowFilter::default())
+                                    .into_iter()
                                     .collect(),
                             );
                             compare_state
@@ -11700,6 +11706,53 @@ mod app_tests {
             ["run(req.into_sql());", "run(sql);"],
             "the raw `run` gained or lost a caller: every one must take its SQL \
              from a `RerunRequest`, which only `sql::rerunnable_for_export` mints"
+        );
+    }
+
+    /// **Nothing here re-spells "which differences can a plan carry".**
+    ///
+    /// `compare::is_planned`'s doc argues the case at length — the footer's
+    /// count, the button's enabled state and the statements actually built have
+    /// to ask one question, and the cheapest guarantee is that there be only one
+    /// spelling of it. It says specifically that the predicate lives in
+    /// `schemaic-core` *"rather than in the view that calls it"*, because the
+    /// decision was untestable where it sat.
+    ///
+    /// The compare seed then re-spelled it in a **third** crate:
+    /// `c.differences().filter(|e| !e.needs_source()).map(|e| e.key())`, which
+    /// drops `unplannable()` — so the tree would open with objects ticked that
+    /// the footer refuses to count. Nothing diverges today only because
+    /// `unplannable` has no reachable producer; the seed now calls
+    /// `selectable_keys(RowFilter::default())`, the function written to answer
+    /// exactly this.
+    ///
+    /// A source gate rather than a unit test because the defect is a *site*,
+    /// not a value: a fifth spelling compiles and passes every assertion in the
+    /// workspace. `compare_view.rs`' own `needs_source()` is not one — it draws
+    /// the tick-box's absence, which is the reason the exclusion exists.
+    #[test]
+    fn the_compare_seed_does_not_respell_the_plannable_predicate() {
+        let src = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("src")
+                .join("main.rs"),
+        )
+        .expect("this file's own source");
+        let body = src
+            .split("#[cfg(test)]")
+            .next()
+            .expect("production code")
+            .to_string();
+        let hits: Vec<&str> = body
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.starts_with("//"))
+            .filter(|l| l.contains("needs_source") || l.contains("unplannable"))
+            .collect();
+        assert!(
+            hits.is_empty(),
+            "this crate must ask `SchemaComparison` which entries a plan can \
+             carry, not re-derive it: {hits:?}"
         );
     }
 

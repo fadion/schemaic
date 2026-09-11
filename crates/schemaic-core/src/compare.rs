@@ -1127,9 +1127,24 @@ impl SchemaPlan {
     /// next caller's trap. Those six tests now assert what Copy and Open in
     /// editor produce.
     ///
-    /// [`ddl::client_script`] is what makes a MySQL routine or trigger body
-    /// survive that split, and a compare plan is the most likely thing to carry
-    /// several of them.
+    /// **A compare plan carries no MySQL body at all**, and this doc used to
+    /// say the opposite — that it was "the most likely thing to carry several
+    /// of them". Since [`CompareEntry::needs_source`], `plan` excludes every
+    /// MySQL routine, trigger and event that is being created or redefined and
+    /// discloses them through [`SchemaPlan::omitted`] instead, because the body
+    /// `information_schema` hands back has had its escapes resolved. Only a
+    /// `DROP` gets through, and a `DROP` has no body. So
+    /// [`ddl::client_script`]'s `DELIMITER` branch is **unreachable from here**:
+    /// it is gated on `MySql`, and no MySQL statement reaching this function
+    /// carries an internal `;`.
+    ///
+    /// Its other rule — terminate every statement — is reachable in principle
+    /// and a no-op in practice: on the two engines whose bodies *do* reach a
+    /// plan, the emitters already end each statement in `;`. The call stays
+    /// because this is not the place that gets to know that. `client_script` is
+    /// the one function that owns "what a client splitting on `;` needs", and
+    /// the day a re-read MySQL body reaches a plan — the fix `needs_source`
+    /// defers rather than forecloses — the wrapping has to be here already.
     pub fn editor_script(&self) -> String {
         format!(
             "{}{}",
@@ -3761,15 +3776,17 @@ mod tests {
 
     #[test]
     fn the_editor_script_keeps_a_trigger_body_runnable() {
-        // `client_script` wraps a body in DELIMITER so the app's own splitter
-        // doesn't cut it at the semicolons inside BEGIN … END. On SQLite, where
-        // `sqlite_master.sql` hands back the original text, a created trigger
-        // reaches the plan and this composition runs end to end.
-        //
         // **Deliberately not MySQL**, which is where this test used to be: a
         // MySQL body arrives escape-mangled, so no compare plan can carry one
         // and `plan` now says so rather than emitting it — see
-        // `a_mysql_body_is_kept_out_of_the_plan_and_disclosed_by_it`.
+        // `a_mysql_body_is_kept_out_of_the_plan_and_disclosed_by_it`. That
+        // move takes `client_script`'s DELIMITER wrapping out of reach from
+        // here, so this is **not** a test of it; `editor_script`'s doc says so.
+        //
+        // What is left to pin is the composition SQLite actually runs: a body
+        // full of `;` has to leave `editor_script` as one statement the app's
+        // own splitter keeps whole. The assertion used to be
+        // `script.contains("t_ins")`, which held for any join of any emit.
         let mut t = table("city", &[("id", "int")]);
         t.triggers = vec![trigger(
             "t_ins",
@@ -3783,6 +3800,22 @@ mod tests {
         );
         let script = c.plan(|_| true).editor_script();
         assert!(script.contains("t_ins"), "{script}");
+
+        // The property the name claims, rather than a substring: the app's own
+        // splitter has to hand this back as **one** statement with the body
+        // whole, and terminated. The two `;` between BEGIN and END are what
+        // would cut it into three.
+        let stmts = crate::sql::executable_statements(&script, SqlDialect::Sqlite);
+        assert_eq!(stmts.len(), 1, "the splitter cut the body up: {stmts:?}");
+        assert!(
+            stmts[0].contains("SET @b = 2; END"),
+            "the tail of the body did not survive: {}",
+            stmts[0]
+        );
+        assert!(
+            script.trim_end().ends_with(';'),
+            "a client splitting on `;` needs the last statement terminated: {script}"
+        );
     }
 
     /// **The disclosure the preview modal was missing.** On MySQL every
