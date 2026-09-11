@@ -6652,9 +6652,16 @@ fn header(ui: Ui, chrome: window_chrome::WindowChrome) -> impl IntoView {
     let badge = dyn_container(
         move || active_conn_env(connections, active_conn),
         move |env| match env.badge_label() {
-            Some(lbl) => container(text(lbl).style(|s| {
-                s.color(theme::env_badge_text())
-                    .font_size(theme::font_body())
+            // **The label's colour is read from the fill it lands on**, inside
+            // the style closure like the fill itself — so a colour switch moves
+            // both together and neither is frozen at build time. It used to be a
+            // fixed white, which measured 1.75:1 on the Amber preset.
+            Some(lbl) => container(text(lbl).style(move |s| {
+                s.color(theme::env_badge_text_on(active_conn_color(
+                    connections,
+                    active_conn,
+                )))
+                .font_size(theme::font_body())
             }))
             .style(move |s| {
                 s.margin_left(theme::scaled(12.0))

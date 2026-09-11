@@ -50,9 +50,15 @@ pub fn caption_hover() -> Color {
 pub fn caption_close_hover() -> Color {
     ui().caption_close_hover
 }
-/// The close glyph while its red hover is showing. Fixed white, like
-/// [`env_badge_text`] and for the same reason: the fill underneath is a
-/// saturated colour in every theme, so the mark on it doesn't vary with one.
+/// The close glyph while its red hover is showing. Fixed white, because the fill
+/// underneath is one saturated red in every theme — `caption_close_hover`
+/// `#C42B1C`, which measures 5.66:1 against white.
+///
+/// This used to cite [`env_badge_text_on`] as the same case. It was not: the
+/// badge's fill is *eight* colours the app hands out itself, three of them pale,
+/// and fixed white measured 1.75:1 on one of them. One fixed red and a palette
+/// of eight are different questions, and the shared comment is what made the
+/// badge's exclusion read as considered.
 pub fn caption_close_glyph() -> Color {
     Color::rgb8(0xFF, 0xFF, 0xFF)
 }
@@ -129,10 +135,44 @@ pub fn diag_error() -> Color {
     editor().diag_error
 }
 
-/// Text on the top-bar environment badge — always white; it sits on the
-/// connection's identity colour, so it reads the same across UI themes.
-pub fn env_badge_text() -> Color {
-    Color::rgb8(0xFF, 0xFF, 0xFF)
+/// Text on the top-bar environment badge, **for the fill it is drawn on**.
+///
+/// This was a fixed white, on the reasoning that the badge "sits on the
+/// connection's identity colour, so it reads the same across UI themes". It read
+/// the same and it read badly: measured against the eight shipped
+/// `CONN_COLOR_PRESETS`, white is **1.75:1 on Amber** — under
+/// `contrast::Legibility::Recessive`'s 2.0, the floor that exists only to catch
+/// outright invisibility — and under Body on **eight of eight**. The badge's
+/// whole job is to say which environment the active connection is, which is the
+/// label you least want unreadable on a production connection.
+///
+/// The exclusion that let it ship said no theme can promise a ratio on "an
+/// arbitrary connection colour". It is not arbitrary: the connection form's
+/// colour control is a row of swatches over `CONN_COLOR_PRESETS` and has no
+/// free-hex entry, and the very next clause of that same sentence says so about
+/// the ERD card header, which washes *the same eight* and is measured. The badge
+/// is the easier case — an undiluted fill, no wash alpha.
+///
+/// So the decision is made per fill, and it is made by **measuring** rather than
+/// by a luminance threshold. A threshold is a guess at where the crossover is;
+/// `contrast_ratio` is the function the pairing tables already hold every other
+/// colour in this app to, and asking it directly cannot be off by a preset. On
+/// the eight shipped today it answers dark for all eight — white's best is
+/// 3.82:1 on Red, against dark's worst of 5.02:1 — and a darker ninth preset
+/// would correctly get white without this being touched.
+///
+/// **A near-black rather than `#000`.** Nothing in this app's chrome is pure
+/// black in any theme, and the margin is there: the worst case is 5.02:1
+/// against Body's 4.5. `the_env_badge_label_is_legible_on_every_connection_preset`
+/// is what says so, rather than this comment claiming it.
+pub fn env_badge_text_on(fill: Color) -> Color {
+    const DARK: Color = Color::rgb8(0x1A, 0x1A, 0x1F);
+    const LIGHT: Color = Color::rgb8(0xFF, 0xFF, 0xFF);
+    let (dark, light) = (
+        crate::contrast::contrast_ratio(DARK, fill),
+        crate::contrast::contrast_ratio(LIGHT, fill),
+    );
+    if dark >= light { DARK } else { LIGHT }
 }
 
 // AI-panel message send/stop icon (inside the message field).

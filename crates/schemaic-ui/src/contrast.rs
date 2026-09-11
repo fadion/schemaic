@@ -24,10 +24,18 @@
 //! handles, dot grids, focus rings and the modal scrim are graphical furniture
 //! whose whole job is to stay quiet, and holding them to a text floor would
 //! either fail permanently or force the floor down until it meant nothing. The
-//! two other exclusions are named at their entries: `env_badge_text` sits on a
-//! user-chosen connection colour (no theme can promise a ratio there), and the
-//! *syntax token* colours of the editor themes are faithful reproductions of
-//! upstream palettes — see [`EDITOR_PAIRINGS`].
+//! remaining exclusion is named at its entry: the *syntax token* colours of the
+//! editor themes are faithful reproductions of upstream palettes — see
+//! [`EDITOR_PAIRINGS`].
+//!
+//! **The environment badge used to be a third**, excused because it "sits on a
+//! user-chosen connection colour (no theme can promise a ratio there)". The
+//! premise was false — the connection form's colour control is a row of swatches
+//! over `CONN_COLOR_PRESETS` with no free-hex entry, which is the same closed
+//! set the ERD header test beside it measures, and the badge is the easier case
+//! of the two because the fill is undiluted. Fixed white measured 1.75:1 on
+//! Amber. `theme::env_badge_text_on` picks per fill now and
+//! `the_env_badge_label_is_legible_on_every_connection_preset` holds it to Body.
 //!
 //! One real pairing is missing on purpose. The completion popup draws **editor**
 //! token colours on a **chrome** surface (`bg_deepest`, and `completion_active`
@@ -854,10 +862,14 @@ mod tests {
     /// The one surface where a *user-chosen* colour is a fill under text, so the
     /// table can't express it: an ER-diagram card header carries the table's
     /// identity colour washed over `erd_node_header`, and the table name is drawn
-    /// on the composite. `env_badge_text` is excused from this question because no
-    /// theme can promise a ratio on an arbitrary connection colour — here the
-    /// colours are a closed set (the presets) and the wash strength is ours, so the
-    /// promise *can* be kept and this measures it.
+    /// on the composite. The colours are a closed set (the presets) and the wash
+    /// strength is ours, so the promise *can* be kept and this measures it.
+    ///
+    /// This sentence used to end by excusing `env_badge_text` "because no theme
+    /// can promise a ratio on an arbitrary connection colour" — the opposite of
+    /// what the rest of it argues, about the same eight presets, with less to go
+    /// on (the badge's fill has no wash over it at all). It is measured now too,
+    /// by `the_env_badge_label_is_legible_on_every_connection_preset`.
     ///
     /// A failure means [`crate::erd_view::HEADER_TINT_ALPHA`] is too high, not that
     /// a preset is wrong.
@@ -900,6 +912,52 @@ mod tests {
             bad.is_empty(),
             "the ERD header tint costs too much contrast:\n  {}",
             bad.join("\n  ")
+        );
+    }
+
+    /// **The badge is the easier half of a question its neighbour already
+    /// answers.**
+    ///
+    /// `env_badge_text` was excused from the pairing tables on the grounds that
+    /// it "sits on a user-chosen connection colour (no theme can promise a ratio
+    /// there)". The very next clause of that same sentence says the opposite
+    /// about the ERD card header — "here the colours are a closed set (the
+    /// presets) and the wash strength is ours, so the promise *can* be kept and
+    /// this measures it" — and `an_erd_header_tint_keeps_the_table_name_legible`
+    /// above does measure it, over **the same eight presets**.
+    ///
+    /// The fill really is a closed set: the connection form's colour control is
+    /// a row of swatches over `CONN_COLOR_PRESETS` and there is no free-hex
+    /// entry anywhere in it. And the badge is the *easier* case of the two — an
+    /// undiluted fill, no wash alpha over a theme surface.
+    ///
+    /// Fixed white measured 1.75:1 on Amber — under `Legibility::Recessive`'s
+    /// 2.0, which exists only to catch outright invisibility — and under Body on
+    /// eight presets of eight.
+    #[test]
+    fn the_env_badge_label_is_legible_on_every_connection_preset() {
+        let mut bad = Vec::new();
+        for (name, hex, _) in crate::CONN_COLOR_PRESETS {
+            let fill = crate::theme::parse_hex(hex).expect("a preset is a valid hex");
+            // Through the accessor, so this measures the decision rather than a
+            // copy of it — the same reason the preview test below asks
+            // `theme::preview_fg`.
+            let r = contrast_ratio(crate::theme::env_badge_text_on(fill), fill);
+            if r < Legibility::Body.floor() {
+                bad.push(format!(
+                    "the environment badge's label on {name} = {r:.2}:1 (needs {:.1}:1)",
+                    Legibility::Body.floor()
+                ));
+            }
+        }
+        assert!(
+            bad.is_empty(),
+            "the environment badge is unreadable on a colour the app hands out              itself:
+  {}",
+            bad.join(
+                "
+  "
+            )
         );
     }
 
