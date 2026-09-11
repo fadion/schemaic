@@ -92,15 +92,18 @@ pub(crate) fn open_script(
 /// assembled with a *made-up* value would be one that quietly starts lying the
 /// day the verdict does.
 fn policy(ui: &Ui, dialect: SqlDialect, conn_id: u64) -> GuardPolicy {
-    GuardPolicy {
-        read_only: ui
-            .conn
-            .connections
-            .with_untracked(|cs| schemaic_core::connection::read_only_of(cs, conn_id)),
-        confirm_writes: ui.layout.confirm_writes.get_untracked(),
-        dialect,
-        no_database: false,
-    }
+    // **`GuardPolicy::of`, the same constructor the editor's runs go through.**
+    // This used to be a struct literal, which made it a second policy that
+    // happened to agree rather than the same one — and the modal's `dialect` is
+    // the target's, captured at open, so it is restated over the constructor's.
+    let base = ui.conn.connections.with_untracked(|cs| {
+        GuardPolicy::of(
+            schemaic_core::connection::by_id(cs, conn_id),
+            false,
+            ui.layout.confirm_writes.get_untracked(),
+        )
+    });
+    GuardPolicy { dialect, ..base }
 }
 
 /// Ask for a file and probe it. The probe is what the second half of the panel

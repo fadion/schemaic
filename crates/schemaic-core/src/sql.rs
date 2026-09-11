@@ -1350,6 +1350,40 @@ pub struct GuardPolicy {
     pub no_database: bool,
 }
 
+impl GuardPolicy {
+    /// Assemble the policy from the connection the run will go to.
+    ///
+    /// **The decision the write guard acts on, lifted out of the window.** It was
+    /// the closure `guard_policy` inside `app_view` — a 9,600-line function, so
+    /// nothing in it was nameable, callable or testable — while the invariant it
+    /// serves says the *decision* (`run_verdict`) is pure and tested. The
+    /// decision was; its three inputs were not, and that is what this ends.
+    ///
+    /// **And `script_view` assembles the same policy**, which is the other half
+    /// of why this is a constructor rather than a struct literal at each site:
+    /// two independent assemblies that happen to agree are not the same policy,
+    /// they are two policies nobody is comparing.
+    ///
+    /// `conn` is `None` when the tab's connection is gone. The engine then falls
+    /// back to [`SqlDialect::default`] and `read_only` to `false`, matching
+    /// `connection::read_only_of`'s documented fail-open: the run that follows
+    /// fails on the missing connection rather than on a flag nobody set.
+    pub fn of(
+        conn: Option<&crate::connection::Connection>,
+        no_database: bool,
+        confirm_writes: bool,
+    ) -> GuardPolicy {
+        GuardPolicy {
+            read_only: conn.is_some_and(|c| c.read_only),
+            confirm_writes,
+            dialect: conn.map_or_else(SqlDialect::default, |c| {
+                SqlDialect::from_db_type(&c.db_type)
+            }),
+            no_database,
+        }
+    }
+}
+
 /// What the write guards say about a run request.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RunVerdict {
@@ -2026,6 +2060,102 @@ mod tests {
     /// fourth engine is added to the suite by adding it here.
     const EVERY_DIALECT: [SqlDialect; 3] =
         [SqlDialect::MySql, SqlDialect::Postgres, SqlDialect::Sqlite];
+
+    /// **The test A2-L3-01 names, and it could not be compiled before.**
+    ///
+    /// The write guard's policy assembly was the closure `guard_policy` inside
+    /// `app_view` — 9,600 lines, so nothing in it is nameable, callable or
+    /// testable. The invariant says the *decision* is pure and tested, and
+    /// `run_verdict` is; its three inputs were assembled where no test could
+    /// reach them, which is the whole of the finding.
+    ///
+    /// The case that matters most is `no_database` on **PostgreSQL**: there it
+    /// does not mean "nowhere to run", it means the connection lands in a hidden
+    /// maintenance database, so an unscoped `CREATE TABLE` succeeds into a
+    /// database Schemaic can never show again — and one landing in `template1` is
+    /// inherited by every database made afterwards.
+    #[test]
+    fn a_tab_with_no_database_says_so_on_every_engine() {
+        use crate::connection::Connection;
+        for (db_type, expect) in [
+            ("PostgreSQL", SqlDialect::Postgres),
+            ("SQLite", SqlDialect::Sqlite),
+            ("MySQL", SqlDialect::MySql),
+        ] {
+            let c = Connection {
+                id: 1,
+                name: "c".into(),
+                db_type: db_type.into(),
+                host: String::new(),
+                port: 0,
+                user: String::new(),
+                password: String::new(),
+                file: String::new(),
+                database: String::new(),
+                ssh: Default::default(),
+                tls: Default::default(),
+                color: None,
+                prominent_color: false,
+                read_only: false,
+                environment: crate::connection::Environment::None,
+                ai_data: None,
+            };
+            let p = GuardPolicy::of(Some(&c), true, false);
+            assert!(p.no_database, "{db_type}");
+            assert_eq!(p.dialect, expect, "{db_type}");
+            assert!(!p.read_only, "{db_type}");
+
+            // And a bound database is the other answer, so this cannot pass by
+            // always saying yes.
+            assert!(!GuardPolicy::of(Some(&c), false, false).no_database);
+        }
+    }
+
+    /// A connection the registry has lost falls back to the default engine and to
+    /// *writable*, matching `connection::read_only_of` — the same documented
+    /// fail-open, so the two cannot drift.
+    #[test]
+    fn a_policy_for_a_vanished_connection_is_the_documented_fallback() {
+        let p = GuardPolicy::of(None, false, true);
+        assert!(!p.read_only);
+        assert_eq!(p.dialect, SqlDialect::default());
+        assert!(p.confirm_writes, "the user's setting is still the user's");
+    }
+
+    /// A read-only connection produces a read-only policy, which is the term
+    /// `run_verdict` turns into the one refusal with no "Run anyway".
+    #[test]
+    fn a_read_only_connection_produces_a_blocking_policy() {
+        use crate::connection::Connection;
+        let mut c = Connection {
+            id: 1,
+            name: "c".into(),
+            db_type: "MySQL".into(),
+            host: String::new(),
+            port: 0,
+            user: String::new(),
+            password: String::new(),
+            file: String::new(),
+            database: String::new(),
+            ssh: Default::default(),
+            tls: Default::default(),
+            color: None,
+            prominent_color: false,
+            read_only: true,
+            environment: crate::connection::Environment::None,
+            ai_data: None,
+        };
+        assert!(GuardPolicy::of(Some(&c), false, false).read_only);
+        assert!(matches!(
+            run_verdict(
+                &["DELETE FROM t WHERE id = 1".to_string()],
+                GuardPolicy::of(Some(&c), false, false)
+            ),
+            RunVerdict::Block(_)
+        ));
+        c.read_only = false;
+        assert!(!GuardPolicy::of(Some(&c), false, false).read_only);
+    }
 
     /// The composition the two correct functions got wrong: a preview folds the
     /// statement to one line, which removes the newline a `--` comment ends on,

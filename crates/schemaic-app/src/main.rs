@@ -7389,27 +7389,15 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                 .find(|t| t.id == id)
                 .is_none_or(|t| t.database.get_untracked().is_none())
         });
-        // Both answers out of one borrow, and `read_only` out of
-        // `connection::read_only_of` rather than off the clone — see that
-        // function for the fail-open default an absent id gets, which this was
-        // one of seven places to decide for itself.
-        let (conn, read_only) = cid.map_or((None, false), |cid| {
-            connections.with_untracked(|cs| {
-                (
-                    schemaic_core::connection::by_id(cs, cid).cloned(),
-                    schemaic_core::connection::read_only_of(cs, cid),
-                )
-            })
+        let conn = cid.and_then(|cid| {
+            connections.with_untracked(|cs| schemaic_core::connection::by_id(cs, cid).cloned())
         });
-        GuardPolicy {
-            read_only,
-            confirm_writes: confirm_writes.get_untracked(),
-            dialect: conn
-                .as_ref()
-                .map(|c| SqlDialect::from_db_type(&c.db_type))
-                .unwrap_or_default(),
-            no_database,
-        }
+        // **This closure gathers signals; it does not decide.** The decision is
+        // `GuardPolicy::of`, in core with its tests — it was here, inside a
+        // 9,600-line function where nothing is nameable, callable or testable,
+        // which is why the write guard's *verdict* was pure and tested while its
+        // three *inputs* were neither.
+        GuardPolicy::of(conn.as_ref(), no_database, confirm_writes.get_untracked())
     };
     // Said when a deferred run lands on a tab the user has since left. It is a
     // refusal, so it has to be visible: the alternative — running anyway — is
