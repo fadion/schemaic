@@ -49,6 +49,51 @@ thread_local! {
     /// Bumped every time something deliberately takes the keyboard — see
     /// [`claim_keyboard`].
     static KEYBOARD_CLAIM: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// True from a pointer-driven menu dismissal until the tick after it — see
+    /// [`begin_pointer_dismissal`].
+    static POINTER_DISMISSAL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// **A press dismissed a menu, and the press has already placed focus.**
+///
+/// [`menu_panel`]'s own comment states this as the design — "a click-away
+/// dismissal sets the channel to `None` directly and skips this, which is right:
+/// the pointer put focus wherever it clicked" — and until this existed the
+/// panel's teardown took it away again. [`focus_root`]'s cleanup calls
+/// [`hand_keyboard_back`] however the panel died, and out in the workspace
+/// `innermost_focus_root()` is `None`, so it fell through to `KEYBOARD_HOME`,
+/// which is `grid::refocus_grid`. Run a query, right-click in the SQL editor,
+/// then left-click back in the editor: the caret was placed where you clicked
+/// and the keyboard was on the grid body, so typing inserted nothing and the
+/// arrow keys moved the cell selection.
+///
+/// **A flag rather than a [`claim_keyboard`] call**, which is what it looks like
+/// it should be, and is not — because the claim is a *generation* and
+/// `refocus_grid` snapshots it when it schedules. The cleanup that schedules it
+/// runs in `process_update`, after this handler has already returned, so a claim
+/// taken here is inside that snapshot and `keyboard_claim_unchanged` still
+/// answers true. The question here is not "has someone taken the keyboard since
+/// I was scheduled" but "should this teardown hand the keyboard anywhere at
+/// all", and only the dismissal knows.
+///
+/// It is cleared on the next tick rather than at the end of the handler, because
+/// the teardown it has to cover happens in between: floem applies the channel
+/// write in `process_update` at the end of event handling, and `exec_after`
+/// timers fire on a later loop iteration. The window is one pass — a focus root
+/// unmounting inside it for an unrelated reason would skip its hand-back too,
+/// which is the cost, and the gesture that opens the window is a press that
+/// closes menus.
+pub(crate) fn begin_pointer_dismissal() {
+    POINTER_DISMISSAL.with(|d| d.set(true));
+    floem::action::exec_after(std::time::Duration::ZERO, |_| {
+        POINTER_DISMISSAL.with(|d| d.set(false));
+    });
+}
+
+/// Whether a [`focus_root`] tearing down right now should hand the keyboard
+/// back, or leave it where the press that dismissed it put it.
+pub(crate) fn hand_back_wanted() -> bool {
+    !POINTER_DISMISSAL.with(|d| d.get())
 }
 
 /// **"I am taking the keyboard now."** Announce a deliberate focus move, so a
@@ -147,7 +192,13 @@ fn focus_root_inner<V: IntoView + 'static>(view: V, ring: Option<FocusRing>) -> 
             FOCUS_ROOTS.with_borrow_mut(|s| s.retain(|(x, _)| *x != id));
             // A root has no place in a ring, so there is nothing to remember —
             // the ring it *carried* went with it.
-            hand_keyboard_back(None);
+            //
+            // Unless a press is what dismissed it, in which case the pointer has
+            // already placed focus and handing it back would override the click
+            // — see [`begin_pointer_dismissal`].
+            if hand_back_wanted() {
+                hand_keyboard_back(None);
+            }
         })
 }
 
@@ -3920,6 +3971,36 @@ pub(crate) fn set_menu_return(f: Rc<dyn Fn()>) {
     MENU_RETURN.with_borrow_mut(|s| *s = Some(f));
 }
 
+/// Build a [`set_menu_return`] closure that restores focus on the next tick and
+/// **claims the keyboard as it lands**.
+///
+/// Every return wants this exact shape and all three spelled it out themselves,
+/// none of them claiming — which left the restore racing the panel's own
+/// hand-back. Both are `exec_after(Duration::ZERO)` scheduled in the same pass:
+/// the return's, here, and `refocus_grid`'s, queued when `focus_root`'s cleanup
+/// calls [`hand_keyboard_back`]. floem keeps timers in a `HashMap<TimerToken,
+/// Timer>` and collects every due token by iterating that map, so they fire in
+/// an arbitrary order and the last `UpdateMessage::Focus` queued wins. Tab to
+/// the results toolbar's Copy icon, Enter, Escape, and focus landed either back
+/// on the icon or on the grid body, differently on different presses.
+///
+/// **The claim is inside the timer, not before it.** `refocus_grid` snapshots
+/// the generation when it *schedules*, so a claim taken synchronously at Escape
+/// time is already in that snapshot and changes nothing. Claiming when this
+/// lands settles both orders: run first and `refocus_grid` finds the generation
+/// moved and stands down; run second and it simply lands on top. That is the
+/// property `claim_keyboard`'s own doc describes — "the race is settled either
+/// way round" — applied at the sites that had not applied it.
+pub(crate) fn menu_return(restore: impl Fn() + Clone + 'static) -> Rc<dyn Fn()> {
+    Rc::new(move || {
+        let restore = restore.clone();
+        floem::action::exec_after(std::time::Duration::ZERO, move |_| {
+            claim_keyboard();
+            restore();
+        });
+    })
+}
+
 fn take_menu_return() -> Option<Rc<dyn Fn()>> {
     MENU_RETURN.with_borrow_mut(|s| s.take())
 }
@@ -5914,6 +5995,81 @@ mod destructive_launch_gate {
     }
 }
 
+/// **The wiring the three tests beside `menu_return` cannot reach.**
+///
+/// Both halves of this defect live in *which closure is stored* and *whether a
+/// cleanup asks a question* — neither is a value a unit test can call, which is
+/// exactly the shape CLAUDE.md warns produces tests that are green against the
+/// bug they were written for. So the composition is asserted from the source,
+/// and this gate is red at the commit before it: no caller went through
+/// `menu_return`, and `focus_root`'s cleanup handed back unconditionally.
+#[cfg(test)]
+mod menu_return_gate {
+    /// Every `set_menu_return` argument is built by `menu_return`, so the claim
+    /// cannot be forgotten at a fourth site the way it was at the first three.
+    #[test]
+    fn every_menu_return_is_built_by_the_helper() {
+        // Assembled, so this module's own mentions are not hits.
+        let set = format!("{}_menu_return(", "set");
+        let build = format!("{}_return(", "menu");
+        let mut seen = 0usize;
+        for (file, body) in crate::source_gate::crate_sources() {
+            for call in body.split(&set).skip(1) {
+                // `fn set_menu_return(` is the definition, not a call.
+                let arg = call.trim_start();
+                if arg.starts_with("f: Rc<") {
+                    continue;
+                }
+                seen += 1;
+                assert!(
+                    arg.starts_with(&build) || arg.starts_with("crate::widgets::menu_return("),
+                    "{file}: a menu return is built by hand — it must come from \
+                     `menu_return`, which owns the deferral *and* the claim that \
+                     stops it racing `refocus_grid`'s hand-back. Got: {}",
+                    arg.lines().next().unwrap_or("")
+                );
+            }
+        }
+        assert!(
+            seen >= 3,
+            "only {seen} `set_menu_return` calls found — the grid toolbar, the \
+             schema tree and settings' picker each have one"
+        );
+    }
+
+    /// A focus root's teardown asks whether the keyboard should move at all.
+    #[test]
+    fn a_focus_root_teardown_asks_before_handing_the_keyboard_back() {
+        let body = crate::source_gate::production_code(include_str!("widgets.rs"));
+        let asks = format!("if {}() {{", "hand_back_wanted");
+        assert!(
+            body.contains(&asks),
+            "`focus_root`'s cleanup hands the keyboard back unconditionally, so \
+             a click-away dismissal overrides the focus the click just placed"
+        );
+    }
+
+    /// And the workspace root marks the press *before* it closes the menus, so
+    /// the flag is already set when the teardown runs in `process_update`.
+    #[test]
+    fn the_root_marks_a_pointer_dismissal_before_closing() {
+        let body = crate::source_gate::production_code(include_str!("lib.rs"));
+        let mark = format!("{}_pointer_dismissal()", "begin");
+        let close = format!("close_except({})", "None");
+        let at_mark = body.find(&mark).expect(
+            "the workspace root no longer marks a pointer dismissal — every \
+             click-away now hands the keyboard to the results grid",
+        );
+        let at_close = body[at_mark..]
+            .find(&close)
+            .expect("the mark is not on the path that closes the menus");
+        assert!(
+            at_close < 600,
+            "the mark and the close have drifted apart; they are one gesture"
+        );
+    }
+}
+
 #[cfg(test)]
 mod jump_hover_tests {
     use super::{hover_should_clear, jump_icon_tint};
@@ -6821,6 +6977,83 @@ mod menu_key_tests {
 
         (taken.unwrap())();
         assert_eq!(fired.get(), 1);
+    }
+
+    // ── The restore's race with the hand-back (B21.3-L1-02) ───────────────
+
+    /// **The pin at `a_menu_return_is_taken_once_and_only_once` passes against
+    /// the bug**, which is why this one exists beside it: that test checks the
+    /// slot is consumed and never that the closure in it claims the keyboard,
+    /// so the race it was written near went untested.
+    ///
+    /// `menu_return`'s restore is deferred, so what can be asserted
+    /// synchronously is that running the composed closure has *not* claimed yet
+    /// — the claim belongs to the tick, where `refocus_grid` can still see it.
+    /// A claim taken here instead would already be inside `refocus_grid`'s
+    /// snapshot and settle nothing.
+    #[test]
+    fn a_menu_return_claims_the_keyboard_in_its_tick_not_before_it() {
+        let before = keyboard_claim();
+        let restored = Rc::new(Cell::new(0));
+        let r = restored.clone();
+        let back = menu_return(move || r.set(r.get() + 1));
+
+        back();
+        assert_eq!(
+            keyboard_claim(),
+            before,
+            "the claim was taken at schedule time, where `refocus_grid` has \
+             already snapshotted it and the stand-down cannot see it"
+        );
+        assert_eq!(restored.get(), 0, "and the restore is deferred with it");
+    }
+
+    /// The guard `refocus_grid` asks, against the two orders floem's
+    /// `HashMap<TimerToken, Timer>` can deliver. Either way the return wins:
+    /// first, and the hand-back stands down; second, and it lands on top.
+    #[test]
+    fn either_timer_order_leaves_the_return_holding_the_keyboard() {
+        // The hand-back schedules, snapshotting the generation.
+        let since = keyboard_claim();
+
+        // Order A — the return's tick runs first and claims.
+        claim_keyboard();
+        assert!(
+            !keyboard_claim_unchanged(since),
+            "the hand-back must stand down once the return has claimed"
+        );
+
+        // Order B — the hand-back's tick runs first, finds nothing has claimed,
+        // and focuses the grid; the return then lands after it.
+        let since = keyboard_claim();
+        assert!(
+            keyboard_claim_unchanged(since),
+            "with no claim yet the hand-back is still the latest word"
+        );
+        claim_keyboard();
+        assert!(!keyboard_claim_unchanged(since));
+    }
+
+    /// **A press dismissing a menu leaves focus where it landed** (B21.3-L1-01).
+    ///
+    /// Not a claim, and the test says why: the flag has to survive into the
+    /// `process_update` pass that runs the panel's cleanup, which is after the
+    /// handler that sets it has returned.
+    #[test]
+    fn a_pointer_dismissal_suppresses_the_hand_back() {
+        assert!(
+            hand_back_wanted(),
+            "a teardown with no press behind it still hands the keyboard back"
+        );
+        begin_pointer_dismissal();
+        assert!(
+            !hand_back_wanted(),
+            "the press placed focus; the teardown must not move it"
+        );
+        // Cleared on the next tick, not at the end of the handler — so this is
+        // still set when the cleanup runs.
+        POINTER_DISMISSAL.with(|d| d.set(false));
+        assert!(hand_back_wanted());
     }
 
     // The grid toolbar's Copy icon, and Save's a few px to its right.

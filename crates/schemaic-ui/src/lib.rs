@@ -6378,6 +6378,12 @@ pub fn workspace(ui: Ui, window: WindowId) -> impl IntoView {
     // right-click on another row closes the old menu here (on down) while that
     // row's own handler opens the new one (on up) — one gesture.
     .on_event(EventListener::PointerDown, move |_| {
+        // **This press is what places focus, not the teardown that follows it.**
+        // Marked before the close, so the panel's `focus_root` cleanup — which
+        // runs in `process_update` at the end of this pass — leaves the keyboard
+        // where the click put it instead of handing it to the results grid. See
+        // `widgets::begin_pointer_dismissal`.
+        widgets::begin_pointer_dismissal();
         // The shared list, so a menu added later is closed here without anyone
         // remembering to extend this.
         root_menus.close_except(None);

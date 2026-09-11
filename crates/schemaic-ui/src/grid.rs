@@ -7469,16 +7469,21 @@ fn grid_toolbar(
     // the strip may have been rebuilt by the action just run, and floem's focus
     // request has no existence check, so a captured id can park the keyboard on a
     // removed view.
+    // `menu_return` owns the deferral *and* the claim — without the claim this
+    // restore was racing `refocus_grid`'s hand-back, and which one landed last
+    // was floem's `HashMap` timer order.
     let focus_icon = move |tabindex: u32, ring: &crate::widgets::FocusRing| {
         let ring = ring.clone();
-        floem::action::exec_after(std::time::Duration::ZERO, move |_| ring.focus_at(tabindex));
+        (crate::widgets::menu_return(move || ring.focus_at(tabindex)))();
     };
     let publish_return = move |tabindex: u32, ring: &crate::widgets::FocusRing| {
         if !crate::widgets::keyboard_nav().get_untracked() {
             return;
         }
         let ring = ring.clone();
-        crate::widgets::set_menu_return(Rc::new(move || focus_icon(tabindex, &ring)));
+        crate::widgets::set_menu_return(crate::widgets::menu_return(move || {
+            ring.focus_at(tabindex)
+        }));
     };
     // The three dropdown icons all place their panel the same way, and this is the
     // one spelling of it — because the *same* value is what tells an icon the menu

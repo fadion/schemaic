@@ -792,11 +792,12 @@ fn arm_menu_return(nav: Nav) {
         return;
     }
     let tree_id = nav.tree_id.get_untracked();
-    crate::widgets::set_menu_return(Rc::new(move || {
-        if let Some(id) = tree_id {
-            exec_after(Duration::ZERO, move |_| id.request_focus());
-        }
-    }));
+    let Some(id) = tree_id else {
+        return;
+    };
+    // Deferred *and* claiming — see `widgets::menu_return`. Without the claim
+    // this restore raced the panel's own hand-back to the grid.
+    crate::widgets::set_menu_return(crate::widgets::menu_return(move || id.request_focus()));
 }
 
 // Attach a self-scroll-into-view effect to a row's view: whenever it becomes the

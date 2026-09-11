@@ -692,14 +692,13 @@ pub(crate) fn in_ring_picker(
             };
             if crate::widgets::keyboard_nav().get_untracked() {
                 let ring = ring.clone();
-                crate::widgets::set_menu_return(Rc::new(move || {
-                    let ring = ring.clone();
-                    // Deferred: the panel is removed during this same update
-                    // pass, and a focus request into it would be undone by the
-                    // removal.
-                    floem::action::exec_after(std::time::Duration::ZERO, move |_| {
-                        ring.focus_at(tabindex)
-                    });
+                // Deferred: the panel is removed during this same update pass,
+                // and a focus request into it would be undone by the removal.
+                // Claiming too, so it does not race the panel's hand-back —
+                // both are `exec_after(ZERO)` and floem's timer order is a
+                // `HashMap`'s. See `widgets::menu_return`.
+                crate::widgets::set_menu_return(crate::widgets::menu_return(move || {
+                    ring.focus_at(tabindex)
                 }));
             }
             let id = anchor_id.get_untracked();
