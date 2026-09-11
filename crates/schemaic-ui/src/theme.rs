@@ -789,3 +789,254 @@ pub fn font_hint() -> f32 {
 pub fn font_status() -> f32 {
     scaled_font(12.0).min(font_body() - 1.0)
 }
+
+/// **The gateable half of "themable colours reach reactive styles as
+/// `fn() -> Color`, never a captured `Color`".**
+///
+/// The rule itself cannot be checked by scanning for `theme::` tokens, and five
+/// review passes were spent establishing that before it was written down: a
+/// `theme::` accessor returns a `Color` by value, so a site is wrong iff the
+/// colour is produced *outside* the closure that paints it **and** the view
+/// holding it is not rebuilt on that colour's axis — both properties of the
+/// enclosing construct rather than of the line the token is on. The fully
+/// corrected grep is ~2% precise (six true violations in 273 candidates), and
+/// worse, the deciding site frequently holds no `theme::` token at all: the
+/// crate has fifteen helpers returning a bare `Color`, each correct in itself,
+/// with the rule decided at the caller. `monitor_view`'s was the proof — the
+/// violation was `("INSERT", new_color())` in a tuple destructure while
+/// `new_color`'s body, the only place a grep hits, was fine.
+///
+/// What *can* be asserted is the half that is **empty by construction**: every
+/// colour a view is *given* is declared `fn() -> Color` in this crate, and the
+/// five bare `: Color` parameter positions outside `themes.rs` are all in code
+/// that measures or tints rather than paints. That emptiness is worth a gate
+/// precisely because it would grow silently — `fn row(c: Color) -> impl IntoView`
+/// compiles and reads fine, and is the argument-position capture the invariant
+/// exists to prevent.
+///
+/// The template is `dividers::scaled_arg_gate`, which enforces the *size* half
+/// of this same invariant, down to the `EXEMPT` triple and the floor test that
+/// stops an exemption outliving what it licensed.
+#[cfg(test)]
+mod color_arg_gate {
+    /// `(file, parameter, why a bare `Color` is right for it)`.
+    ///
+    /// Each of these is code that *computes with* a colour rather than painting
+    /// one: nothing here is handed a colour to draw with later, so there is
+    /// nothing to freeze at a theme.
+    const EXEMPT: &[(&str, &str, &str)] = &[
+        (
+            "contrast.rs",
+            "c",
+            "`relative_luminance` — a measurement over a colour it is given, \
+             with no view and no closure anywhere near it.",
+        ),
+        (
+            "contrast.rs",
+            "a",
+            "`contrast_ratio`'s first operand, same reason.",
+        ),
+        (
+            "contrast.rs",
+            "b",
+            "`contrast_ratio`'s second operand, same reason.",
+        ),
+        (
+            "contrast.rs",
+            "fg",
+            "`over` composites two colours and returns one; the caller reads \
+             both live and hands the result straight to a style closure.",
+        ),
+        (
+            "contrast.rs",
+            "bg",
+            "`over`'s background operand, same reason.",
+        ),
+        (
+            "sql_highlight.rs",
+            "bg",
+            "`band`, a closure **inside** the styling hook — re-entered on every \
+             restyle, so the colour it takes was read live by its caller in the \
+             same pass.",
+        ),
+        (
+            "sql_highlight.rs",
+            "c",
+            "`tint`, the other closure inside the same hook: it fades a colour \
+             its caller read live in this pass and hands the result straight \
+             back.",
+        ),
+        (
+            "theme.rs",
+            "fill",
+            "`env_badge_text_on` picks black or white *for* a fill it is given. \
+             Its answer is a function of the argument, not of the theme, and the \
+             caller reads the fill live.",
+        ),
+        (
+            "erd_view.rs",
+            "canvas",
+            "`border_tint_alpha` measures the canvas's luminance, and \
+             `tinted_border`'s third operand is what the tint is composited \
+             over. Both return a number or a colour, never a view.",
+        ),
+        (
+            "erd_view.rs",
+            "tint",
+            "`tinted_border` composites and returns a `Color`; its own doc tells \
+             the caller to call it *inside* the style closure, which is where \
+             the operands are read.",
+        ),
+        (
+            "erd_view.rs",
+            "header",
+            "`tinted_border`'s surface operand, same reason.",
+        ),
+        (
+            "erd_view.rs",
+            "c",
+            "`hex` formats a colour as `#rrggbb(aa)` for the SVG export — a \
+             string, and nothing on screen.",
+        ),
+        (
+            "overlays.rs",
+            "c",
+            "the two `fade` closures, which dim a colour their *caller* read \
+             live in the same style closure (`fade(theme::match_highlight())`). \
+             The read is reactive; this only multiplies an alpha.",
+        ),
+        (
+            "settings.rs",
+            "bg_hover",
+            "`toggle_focus_ring` takes a `Style` and returns one, so it runs \
+             inside the style closure by construction and its operand was read \
+             there.",
+        ),
+        (
+            "markdown.rs",
+            "base",
+            "**The known latent instance of the rule itself**, threaded: \
+             `render_markdown` reads `bubble_claude_text()` once and passes it \
+             down to `inline_text`, `md_list` and `md_table`. Graded latent by \
+             A1.3-L2-01 on three verified counts — the only caller \
+             (`ai_panel.rs`) sits inside a `dyn_container` whose key is a \
+             *tracked* `(msg, theme::ui_generation())`, the capture is a \
+             descendant of it, and `bubble_claude_text` is a **UI**-axis colour, \
+             which is the axis `set_ui`/`set_ui_scale` bump. Listed rather than \
+             fixed so that the day any of those three stops holding, this entry \
+             is what a reader finds.",
+        ),
+    ];
+
+    /// A colour a **view** is given is one it cannot re-read.
+    #[test]
+    fn no_view_is_handed_a_colour_it_cannot_re_read() {
+        let mut offenders: Vec<String> = Vec::new();
+        let mut checked = 0usize;
+        for (file, code) in crate::source_gate::crate_sources() {
+            // `themes.rs` is where the palettes are *defined* — structs of bare
+            // `Color`s by definition, and the one thing every accessor reads.
+            if file == "themes.rs" {
+                continue;
+            }
+            for (n, line) in code.lines().enumerate() {
+                let t = line.trim();
+                if t.starts_with("//") || t.starts_with("///") {
+                    continue;
+                }
+                // Every `<name>: Color` in the line — a parameter or a field —
+                // however the type is spelled: bare, `peniko::Color`, or
+                // `floem::peniko::Color`. `fn() -> Color`, the prescribed
+                // spelling, has no `:` before the type and so never matches; nor
+                // does a `-> Color` return, which is fine (the rule is about
+                // what a view is *given*).
+                let b = t.as_bytes();
+                for at in 0..b.len() {
+                    // An annotation colon: a single `:`, not the `::` of a path.
+                    if b[at] != b':'
+                        || b.get(at + 1) == Some(&b':')
+                        || (at > 0 && b[at - 1] == b':')
+                    {
+                        continue;
+                    }
+                    // The type it annotates, whatever path it is spelled with.
+                    let ty: String = t[at + 1..]
+                        .trim_start()
+                        .chars()
+                        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == ':')
+                        .collect();
+                    if ty.rsplit("::").next() != Some("Color") {
+                        continue;
+                    }
+                    let before = &t[..at];
+                    let name: String = before
+                        .chars()
+                        .rev()
+                        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                        .collect::<Vec<_>>()
+                        .into_iter()
+                        .rev()
+                        .collect();
+                    if name.is_empty() {
+                        continue;
+                    }
+                    // `const WHITE: Color` / `static` / `let` are values, not
+                    // things handed to a view.
+                    let head = before[..before.len() - name.len()].trim_end();
+                    if head.ends_with("const") || head.ends_with("static") || head.ends_with("let")
+                    {
+                        continue;
+                    }
+                    checked += 1;
+                    if EXEMPT.iter().any(|(f, p, _)| *f == file && *p == name) {
+                        continue;
+                    }
+                    offenders.push(format!(
+                        "{file}:{}: `{name}: Color` is resolved where the caller \
+                     built it, so it freezes at the theme that was active then — \
+                     and a live theme switch repaints everything around it. Take \
+                     it as `fn() -> Color` and call it inside the style closure, \
+                     the way `FieldCfg::background` does. If it genuinely \
+                     measures or composites rather than paints, add it to EXEMPT \
+                     with the reason.",
+                        n + 1
+                    ));
+                }
+            }
+        }
+        assert!(
+            checked >= EXEMPT.len(),
+            "found only {checked} bare `Color` positions — fewer than the \
+             exemptions claim, so this gate is no longer scanning what it thinks"
+        );
+        assert!(offenders.is_empty(), "\n{}", offenders.join("\n"));
+    }
+
+    /// An exemption that no longer names a real parameter is a stale licence the
+    /// next `Color` at that spelling would inherit — `scaled_arg_gate`'s floor,
+    /// for the same reason.
+    #[test]
+    fn every_exemption_still_names_a_real_parameter() {
+        let sources = crate::source_gate::crate_sources();
+        for (file, param, why) in EXEMPT {
+            let code = sources
+                .iter()
+                .find(|(f, _)| f == file)
+                .map(|(_, c)| c.as_str())
+                .unwrap_or_else(|| panic!("EXEMPT names {file}, which is not in this crate"));
+            // Spelled however the site spells the type — bare, `peniko::Color`
+            // or the full path — which is what the scan above allows too.
+            let still_there = code.split(&format!("{param}: ")).skip(1).any(|rest| {
+                rest.chars()
+                    .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == ':')
+                    .collect::<String>()
+                    .ends_with("Color")
+            });
+            assert!(
+                still_there,
+                "EXEMPT licenses `{param}: Color` in {file} ({why}), but nothing \
+                 there takes it any more — drop the entry"
+            );
+        }
+    }
+}
