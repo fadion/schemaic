@@ -422,6 +422,31 @@ pub(crate) fn presses(key: &Key, mods: floem::keyboard::Modifiers) -> bool {
         )
 }
 
+/// Does this key event ask a [`FocusRing`] to **step**?
+///
+/// [`presses`]'s sibling, and it was missing the same term. `Ctrl+Tab` is the
+/// app's global "next query tab" ([`crate::shortcuts`]), but the two Tab arms
+/// below matched the logical key alone and returned `Stop` — and floem forwards
+/// a KeyDown to the window root's listeners only if nothing consumed it
+/// (`window_handle.rs`). So once **F6** put the keyboard in the results toolbar
+/// strip — the app's first ring outside an overlay, and the documented way in —
+/// `Ctrl+Tab` stepped to the next toolbar icon and tab switching stopped, as did
+/// `Ctrl+Shift+Tab` and, on macOS, `Cmd+Tab` through [`shortcuts::primary_held`].
+/// Inside a modal the same consumption is harmless, because the window root
+/// returns `Continue` for everything once a modal is up — which is why the strip
+/// is the surface where it bit.
+///
+/// The rule was already written down at the one Tab handler that applied it: the
+/// window root's own backstop is guarded `… Tab && !primary_held(m) &&
+/// innermost_ring_root()`, precisely so a primary-modified Tab falls through to
+/// `navkeys.handle`. Neither ring arm asked it.
+///
+/// **Shift is not a modifier here, it is the direction** — `step_from` takes it
+/// as the "backwards" flag, so `Shift+Tab` must still step.
+pub(crate) fn steps_ring(key: &Key, mods: floem::keyboard::Modifiers) -> bool {
+    *key == Key::Named(NamedKey::Tab) && !crate::shortcuts::primary_held(mods)
+}
+
 pub(crate) fn in_ring_button<V: IntoView + 'static>(
     view: V,
     ring: FocusRing,
@@ -471,6 +496,23 @@ pub(crate) fn in_ring_button<V: IntoView + 'static>(
 /// each of which *replaced* an `on_click_stop` with this helper to gain the
 /// keyboard and lost the mouse in the same line. `key_pressable_gate` holds this
 /// to both listeners, and checks no caller binds the click a second time.
+///
+/// **The two listeners sit on two views, and that is the correctness half.**
+/// Chained onto one container they ran the action *twice* per keypress, by the
+/// same mechanism [`in_ring_button`]'s doc records as the reason its ring member
+/// is a wrapper: floem applies [`EventListener::Click`] to the **focused** view
+/// for any physical Enter / NumpadEnter / Space and discards the result, then
+/// folds that view's `KeyDown` listeners without short-circuiting. The row
+/// panel's blob affordance takes the caret on mount when its column is the first
+/// editable one, so one **Space** on it issued two `view_blob` reads of up to
+/// `FETCH_CAP` — the second cancelling the first's token mid-transfer, on a
+/// Manual tab's pinned session — and the activity panel's lock-wait **Kill**
+/// raised `Confirm` twice into a single-slot signal.
+///
+/// Dropping the `KeyDown` arm and letting floem's synthesised Click be the
+/// keyboard answer would have been the shorter fix and is the wrong one:
+/// `Event::is_keyboard_trigger` has no modifier term, so it presses the button
+/// on `Ctrl+Enter` too — the press [`presses`] exists to refuse.
 pub(crate) fn key_pressable<V: IntoView + 'static>(
     view: V,
     radius: f64,
@@ -480,10 +522,13 @@ pub(crate) fn key_pressable<V: IntoView + 'static>(
     // KeyDown handler cannot see a click.
     let on_press = Rc::new(on_press);
     let clicked = on_press.clone();
-    container(view)
+    // The pointer half, on an id of its own. It fills the wrapper exactly — the
+    // ring is an `outline`, which floem inflates outward, and adds no padding —
+    // so every pixel the button occupies still answers a click.
+    let pressable = container(view).on_click_stop(move |_| (clicked)());
+    container(pressable)
         .style(move |s| button_focus_ring(s, radius).flex_shrink(0.0_f32))
         .keyboard_navigable()
-        .on_click_stop(move |_| (clicked)())
         .on_event(EventListener::KeyDown, move |e| {
             let Event::KeyDown(ke) = e else {
                 return EventPropagation::Continue;
@@ -1029,7 +1074,16 @@ impl FocusRing {
         // Every keyboard-driven focus change in the app arrives here, which is
         // what makes this the whole "set" half of [`keyboard_nav`] — see there
         // for why it isn't a key listener on the window root.
-        keyboard_nav().set(true);
+        //
+        // Guarded, like `menu_trigger_press`'s identical write: after the first
+        // Tab the flag is already `true`, and `button_focus_ring` reads it in
+        // every ringed button's own `.style` closure — so an unguarded `set`
+        // re-ran the style of every button in the window on each subsequent Tab,
+        // which is exactly the traffic reading it reactively was meant to avoid.
+        let kbd = keyboard_nav();
+        if !kbd.get_untracked() {
+            kbd.set(true);
+        }
         id.request_focus();
     }
 
@@ -1087,7 +1141,7 @@ pub(crate) fn focus_root_with_ring<V: IntoView + 'static>(view: V, ring: FocusRi
         let Event::KeyDown(ke) = e else {
             return EventPropagation::Continue;
         };
-        if ke.key.logical_key == Key::Named(NamedKey::Tab) {
+        if steps_ring(&ke.key.logical_key, ke.modifiers) {
             ring.step_from(id, ke.modifiers.shift());
             return EventPropagation::Stop;
         }
@@ -1145,7 +1199,7 @@ pub(crate) fn in_focus_ring_with<V: IntoView + 'static>(
             let Event::KeyDown(ke) = e else {
                 return EventPropagation::Continue;
             };
-            if ke.key.logical_key == Key::Named(NamedKey::Tab) {
+            if steps_ring(&ke.key.logical_key, ke.modifiers) {
                 step_ring.step_from(id, ke.modifiers.shift());
                 return EventPropagation::Stop;
             }
@@ -5481,7 +5535,7 @@ pub fn may_launch_destructive(in_flight: bool, read_only: bool) -> bool {
 
 #[cfg(test)]
 mod press_tests {
-    use super::presses;
+    use super::{presses, steps_ring};
     use floem::keyboard::{Key, Modifiers, NamedKey};
 
     /// **A modified Enter is somebody else's key.** Without the modifier term,
@@ -5521,6 +5575,71 @@ mod press_tests {
             assert!(!presses(&key, Modifiers::empty()), "{key:?}");
             assert!(!presses(&key, Modifiers::CONTROL), "{key:?}");
         }
+    }
+
+    /// **Shift steps; the primary modifier does not.** `Ctrl+Tab` /
+    /// `Ctrl+Shift+Tab` are the app's own next/previous query tab, and a ring
+    /// that consumed them stopped the window root ever seeing them.
+    #[test]
+    fn only_an_unprimaried_tab_steps_the_ring() {
+        let tab = Key::Named(NamedKey::Tab);
+        // Bare and Shift+Tab are the ring's two directions.
+        assert!(steps_ring(&tab, Modifiers::empty()));
+        assert!(steps_ring(&tab, Modifiers::SHIFT));
+        // Alt is nobody's tab switcher, so it is still a step.
+        assert!(steps_ring(&tab, Modifiers::ALT));
+        // The primary modifier belongs to the global tab nav — including with
+        // Shift, which is its *backwards* direction, not the ring's.
+        assert!(!steps_ring(&tab, Modifiers::CONTROL));
+        assert!(!steps_ring(&tab, Modifiers::CONTROL | Modifiers::SHIFT));
+        // And nothing else steps a ring, modified or not.
+        for key in [
+            Key::Named(NamedKey::Enter),
+            Key::Named(NamedKey::Space),
+            Key::Named(NamedKey::Escape),
+            Key::Character("a".into()),
+        ] {
+            assert!(!steps_ring(&key, Modifiers::empty()), "{key:?}");
+            assert!(!steps_ring(&key, Modifiers::SHIFT), "{key:?}");
+        }
+    }
+
+    /// **A modified Tab is somebody else's key too**, and this is the half the
+    /// unit test above cannot reach: it proves [`steps_ring`] answers, not that
+    /// the two Tab arms ask it.
+    ///
+    /// Both arms used to spell the condition themselves, with no modifier term —
+    /// so once F6 put the keyboard in the results toolbar strip, `Ctrl+Tab`
+    /// stepped to the next toolbar icon and returned `Stop`, and the window
+    /// root's global "next query tab" never ran. The root's own Tab backstop
+    /// (`lib.rs`) carries `!primary_held` for exactly this reason; neither of
+    /// these did.
+    ///
+    /// So the gate is a count, not a search for the term: `NamedKey::Tab` occurs
+    /// **once** in this file's production code, inside `steps_ring`. A third arm
+    /// that spells its own condition fails here rather than shipping a fourth
+    /// answer to the same question.
+    #[test]
+    fn every_tab_arm_asks_the_one_predicate() {
+        let src = crate::source_gate::production_code(include_str!("widgets.rs"));
+        let sites: Vec<u32> = src
+            .split('\n')
+            .enumerate()
+            .filter(|(_, l)| l.contains("NamedKey::Tab"))
+            .map(|(n, _)| n as u32 + 1)
+            .collect();
+        assert_eq!(
+            sites.len(),
+            1,
+            "`NamedKey::Tab` is spelled at {sites:?}; every Tab arm in this file \
+             must go through `steps_ring`, which is the only place the \
+             `primary_held` term lives"
+        );
+        let body = &src[src.find("fn steps_ring").expect("steps_ring is gone")..];
+        assert!(
+            body[..body.find("\n}\n").expect("the end of steps_ring")].contains("NamedKey::Tab"),
+            "the one `NamedKey::Tab` left is not the one in `steps_ring`"
+        );
     }
 }
 
@@ -7171,6 +7290,46 @@ mod ring_tests {
         assert!(keyboard_nav().get_untracked());
     }
 
+    /// **And the second Tab publishes nothing**, because the flag is already
+    /// what it is about to be set to.
+    ///
+    /// [`button_focus_ring`] reads this signal in *every* button's own `.style`
+    /// closure — deliberately, so the outline appears and disappears without a
+    /// rebuild — so a same-value `set` re-runs the style of every ringed control
+    /// in the window, on every Tab after the first. `menu_trigger_press` guards
+    /// the identical write in this file and states the rule; this write, which
+    /// is the one on the hot path, did not.
+    #[test]
+    fn a_second_tab_republishes_nothing() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+        let (ring, ids) = ring_of(&[10, 20]);
+        keyboard_nav().set(false);
+        // The first step is a real transition and must still publish.
+        let runs = Rc::new(Cell::new(0usize));
+        let counted = runs.clone();
+        let kbd = keyboard_nav();
+        floem::reactive::create_effect(move |_| {
+            kbd.get();
+            counted.set(counted.get() + 1);
+        });
+        let armed = runs.get();
+        ring.step_from(ids[0], false);
+        assert_eq!(
+            runs.get(),
+            armed + 1,
+            "the Tab that arms the ring has to publish"
+        );
+        // Every Tab after it finds the flag already true.
+        ring.step_from(ids[1], false);
+        ring.step_from(ids[0], true);
+        assert_eq!(
+            runs.get(),
+            armed + 1,
+            "a Tab with the flag already set re-runs every ringed button's style"
+        );
+    }
+
     /// **Handing the keyboard back is not a keyboard gesture.** A dropdown
     /// returning focus once its popup closes, and a field unmounting under the
     /// user, both move focus on behalf of something they may have reached with
@@ -8269,6 +8428,45 @@ mod key_pressable_gate {
             "key_pressable binds on_press to the keyboard alone, so every button \
              built through it is dead to a mouse click. It owns the container it \
              wraps, so no caller can add the pointer half from outside"
+        );
+    }
+
+    /// **Both listeners, but not on one `ViewId`** — and that second half is
+    /// what the assertion above was missing while pinning the bug in place.
+    ///
+    /// Floem fires [`EventListener::Click`] on the **focused view** for any
+    /// physical Enter / NumpadEnter / Space and discards the result
+    /// (`context.rs`'s keyboard-trigger path), then folds that view's `KeyDown`
+    /// listeners without short-circuiting. With the click and the key arm
+    /// chained onto the *same* container, one Space ran `on_press` twice: the
+    /// row panel's blob affordance issued two `view_blob` reads, the second
+    /// cancelling the first's token mid-transfer, and the activity panel's
+    /// lock-wait Kill raised `Confirm` twice into a single-slot signal. It is
+    /// the same mechanism [`in_ring_button`]'s doc records 700 lines above as
+    /// the reason its ring member is a wrapper it builds itself.
+    ///
+    /// A new view between them is the fix, so a new view between them is the
+    /// assertion: the focused view carries the keyboard, an inner container
+    /// carries the pointer, and floem's synthesised Click lands on a view that
+    /// has no Click listener at all.
+    ///
+    /// Dropping the `KeyDown` arm instead would not do — `is_keyboard_trigger`
+    /// has no modifier term, so the synthesised Click answers `Ctrl+Enter` too,
+    /// which is the whole of what [`presses`] exists to refuse.
+    #[test]
+    fn the_click_and_the_key_arm_are_not_on_the_same_view() {
+        let src = production_code(include_str!("widgets.rs"));
+        let body = body_of(&src, "key_pressable");
+        let click = body.find("on_click_stop").expect("the pointer half");
+        let key = body
+            .find("keyboard_navigable")
+            .expect("the keyboard registration");
+        let (lo, hi) = (click.min(key), click.max(key));
+        assert!(
+            body[lo..hi].contains("container("),
+            "key_pressable chains `on_click_stop` and `keyboard_navigable` onto \
+             one view, so floem's synthesised Click for Enter/Space lands on the \
+             same id as the KeyDown arm and one press runs the action twice"
         );
     }
 
