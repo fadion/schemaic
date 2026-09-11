@@ -1346,14 +1346,24 @@ fn tick_elapsed(start: std::time::Instant, elapsed_ms: RwSignal<u64>, busy: RwSi
 // A tool invocation rendered as a chip: a labeled header (tool name + status
 // dot), the SQL it ran (if any), and its result once it returns.
 fn tool_chip(tc: ToolCall) -> impl IntoView {
-    let (dot_color, dot) = match (tc.result.is_some(), tc.is_error) {
-        (false, _) => (theme::text_muted(), "○"), // running
-        (true, false) => (theme::accent(), "●"),  // done ok
-        (true, true) => (theme::error(), "●"),    // done error
-    };
+    // **The selector, not the colour.** These were three `theme::…()` calls
+    // resolved at build time and captured into the style closure below —
+    // "Themable colours reach reactive styles as `fn() -> Color`, never a
+    // captured `Color`" — thirty lines above `result_view`, which asks the same
+    // question and calls `theme::error()` / `theme::text_dim()` *inside* its
+    // closure. Latent rather than a live wrong pixel, because the bubble is
+    // rebuilt on `theme::ui_generation()` — but that makes this chip's
+    // correctness a property of a container 900 lines away whose key is
+    // documented as existing for something else entirely.
+    let (dot_color, dot): (fn() -> floem::peniko::Color, &str) =
+        match (tc.result.is_some(), tc.is_error) {
+            (false, _) => (theme::text_muted, "○"), // running
+            (true, false) => (theme::accent, "●"),  // done ok
+            (true, true) => (theme::error, "●"),    // done error
+        };
     let name = tc.short_name().to_string();
     let header = h_stack((
-        text(dot).style(move |s| s.font_size(theme::scaled_font(9.0)).color(dot_color)),
+        text(dot).style(move |s| s.font_size(theme::scaled_font(9.0)).color(dot_color())),
         text(name).style(|s| {
             s.font_size(theme::font_label())
                 .font_bold()

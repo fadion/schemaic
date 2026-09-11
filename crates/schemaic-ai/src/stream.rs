@@ -617,9 +617,27 @@ impl StreamParser {
                         // is announced rather than swallowed: silently dropping
                         // a call is the worse failure of the two, and every
                         // measured step carried one.
+                        //
+                        // **And the result half is guarded too**, keyed apart
+                        // the way `codex_item`'s is, for the reason that arm's
+                        // own doc gives: a second `ToolResult` for one call is
+                        // attached by `TurnState::apply` to *the most recent
+                        // tool call still awaiting one*. Measured: step 0
+                        // opens, step 1 opens, step 0 completes twice — and
+                        // step 1, which has not finished and may never, was
+                        // shown as complete carrying step 0's output. The
+                        // dedupe matched only on a `ToolUse` first event, so it
+                        // followed the shape the captured turns happen to
+                        // restate rather than the rule `seen_tools` states for
+                        // both per-turn dialects.
                         match (evs.first(), s.get("step_index")) {
                             (Some(StreamEvent::ToolUse { .. }), Some(i))
                                 if !self.first_sight(&i.to_string()) =>
+                            {
+                                Vec::new()
+                            }
+                            (Some(StreamEvent::ToolResult { .. }), Some(i))
+                                if !self.first_sight(&format!("{i}\u{0}done")) =>
                             {
                                 Vec::new()
                             }
@@ -1941,6 +1959,46 @@ mod tests {
                 assert!(!is_error, "no denial this time");
                 assert_eq!(stats.duration_ms, Some(4657));
                 assert_eq!(stats.output_tokens, Some(597));
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// **A restated `DONE` resolves one chip, not the nearest open one.**
+    ///
+    /// The dedupe matched only on a `ToolUse` first event, so it suppressed a
+    /// repeated *announcement* and let a repeated *result* through — and
+    /// `TurnState::apply` attaches a loose result to the most recent tool call
+    /// still awaiting one. Measured: step 0 opens, step 1 opens, step 0
+    /// completes twice, and step 1 — which has not finished and may never — is
+    /// shown as complete carrying step 0's output.
+    ///
+    /// Both Codex arms in this file already guard their result half and say
+    /// why, keyed the same way; `seen_tools`' own doc states the rule for both
+    /// per-turn dialects. The guard followed the shape the captured turns
+    /// happen to restate rather than the rule.
+    #[test]
+    fn an_antigravity_step_restating_done_does_not_resolve_another_steps_chip() {
+        let mut p = StreamParser::new(Harness::Antigravity);
+        let mut st = crate::TurnState::default();
+        for line in [
+            r#"{"event":"step_update","step_update":{"step_index":0,"state":"ACTIVE","step_type":"tool","tool_name":"call_mcp_tool","tool_info":{"name":"call_mcp_tool","parameters":{"Arguments":{"sql":"S"},"ServerName":"schemaic","ToolName":"run_query"}}}}"#,
+            r#"{"event":"step_update","step_update":{"step_index":1,"state":"ACTIVE","step_type":"tool","tool_name":"read_file","tool_info":{"name":"read_file","parameters":{}}}}"#,
+            r#"{"event":"step_update","step_update":{"step_index":0,"state":"DONE","step_type":"tool","tool_name":"call_mcp_tool","tool_info":{"name":"call_mcp_tool","parameters":{"Arguments":{"sql":"S"},"ServerName":"schemaic","ToolName":"run_query"},"output":"OUT0"}}}"#,
+            r#"{"event":"step_update","step_update":{"step_index":0,"state":"DONE","step_type":"tool","tool_name":"call_mcp_tool","tool_info":{"name":"call_mcp_tool","parameters":{"Arguments":{"sql":"S"},"ServerName":"schemaic","ToolName":"run_query"},"output":"OUT0-again"}}}"#,
+        ] {
+            for ev in p.push(line) {
+                st.apply(&ev);
+            }
+        }
+        let segs = st.segments();
+        match &segs[..] {
+            [Seg::Tool(first), Seg::Tool(second)] => {
+                assert_eq!(first.result.as_deref(), Some("OUT0"));
+                assert_eq!(
+                    second.result, None,
+                    "step 1 has not finished, and is wearing step 0's output"
+                );
             }
             other => panic!("{other:?}"),
         }

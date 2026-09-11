@@ -203,8 +203,22 @@ fn seal_args(seal: CliSeal) -> Vec<String> {
 
 /// Build the args for a persistent streaming session.
 ///
-/// `mcp_config_json` (if set) is passed to `--mcp-config` and its tools are
+/// `mcp_config_path` (if set) is passed to `--mcp-config` and its tools are
 /// allow-listed so the assistant can call them without an interactive prompt.
+///
+/// **A path, and that is load-bearing.** The Claude CLI accepts inline JSON
+/// there too, and the config Schemaic hands it carries the already-tunnelled
+/// database endpoint — password included. `app/ai.rs` writes it to an
+/// owner-only private file and passes the file name for exactly that reason,
+/// stated at its own call site: "written to a temp file so the credentials
+/// never appear on a command line". Nothing in *this* crate said so — the
+/// parameter was named `mcp_config_json`, its doc said "passed to
+/// `--mcp-config`", and the test pinning the flag asserted inline JSON as the
+/// expected argv value, so the crate's own specification of this argument was
+/// the credential-carrying shape and the only thing upholding
+/// "no credential in a URL, argv or log" was a comment in another crate. If
+/// the inline form is ever wanted it needs its own arm and its own refusal for
+/// a config holding a password.
 ///
 /// `seal` is what the detected CLI accepts — see [`CliSeal`]. A flag it does not
 /// know is left out rather than killing the spawn; `DISALLOWED_TOOLS` is passed
@@ -243,7 +257,7 @@ pub fn build_session_args(
     system_context: &str,
     model: Option<&str>,
     effort: Option<&str>,
-    mcp_config_json: Option<&str>,
+    mcp_config_path: Option<&str>,
     mcp_tools: &[&str],
     seal: CliSeal,
 ) -> Vec<String> {
@@ -278,7 +292,7 @@ pub fn build_session_args(
         a.push("--append-system-prompt".into());
         a.push(system_context.into());
     }
-    if let Some(cfg) = mcp_config_json {
+    if let Some(cfg) = mcp_config_path {
         a.push("--mcp-config".into());
         a.push(cfg.into());
         if !mcp_tools.is_empty() {
@@ -1086,7 +1100,7 @@ mod tests {
 
     #[test]
     fn session_args_allowlist_mcp_tools_only_with_config() {
-        // Tools without a config are NOT allow-listed (guarded on mcp_config_json).
+        // Tools without a config are NOT allow-listed (guarded on mcp_config_path).
         let a = build_session_args(
             "",
             None,
@@ -1101,12 +1115,13 @@ mod tests {
             "",
             None,
             None,
-            Some("{\"mcpServers\":{}}"),
+            // A **path**, as the only caller passes — see `build_session_args`.
+            Some("/tmp/schemaic-mcp-1.json"),
             &["mcp__schemaic__run_query", "mcp__schemaic__list_schema"],
             CliSeal::ALL,
         );
         let cfg = pos(&a, "--mcp-config").unwrap();
-        assert_eq!(a[cfg + 1], "{\"mcpServers\":{}}");
+        assert_eq!(a[cfg + 1], "/tmp/schemaic-mcp-1.json");
         let al = pos(&a, "--allowedTools").unwrap();
         let dis = pos(&a, "--disallowedTools").unwrap();
         assert!(al < dis, "allowed before disallowed");
@@ -1120,7 +1135,7 @@ mod tests {
             "",
             None,
             None,
-            Some("{\"mcpServers\":{}}"),
+            Some("/tmp/schemaic-mcp-1.json"),
             &["mcp__schemaic__run_query"],
             CliSeal::ALL,
         );
@@ -1301,7 +1316,7 @@ mod tests {
             "",
             None,
             None,
-            Some("{\"mcpServers\":{}}"),
+            Some("/tmp/schemaic-mcp-1.json"),
             &["mcp__schemaic__run_query"],
             CliSeal::ALL,
         );
