@@ -2867,6 +2867,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
     let ed_run = ed.clone(); // run menu: re-focus the editor after running
     let ed_hl = ed.clone(); // statement-highlight overlay geometry
     let ed_band = ed.clone(); // inline-diff band strips (gutter + right padding)
+    let ed_comp = ed.clone(); // completion popup: accept the row that was clicked
     let ed_syntax = ed.clone(); // syntax-squiggle overlay geometry
     let ed_bm = ed.clone(); // bracket-matching: recompute offsets on caret/text
     let ed_bm2 = ed.clone(); // bracket-matching overlay geometry
@@ -5315,7 +5316,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
         bracket_match_view,
         occurrences_view,
         run_overlay,
-        completion_popup(comp, area_h, area_w, ed_vp),
+        completion_popup(comp, ed_comp, area_h, area_w, ed_vp),
         signature_popup(comp, ed_vp),
         error_bar,
         guard_bar,

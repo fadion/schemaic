@@ -1566,8 +1566,20 @@ fn suggest_icon_color(kind: SuggestKind, key: KeyKind) -> floem::peniko::Color {
 /// live scroll rect. Between them the popup follows the caret while it scrolls,
 /// flips above the line rather than spilling over the results grid, and slides left
 /// rather than off the pane's right edge.
+/// `editor` is here so a **click** can accept a suggestion. It could not before:
+/// the rows carried `.hover(|s| s.background(theme::completion_active()))` and
+/// no click handler, so clicking one highlighted it, did nothing, and did not
+/// dismiss the list either — while the popup, having no handler, swallowed that
+/// click from the editor underneath.
+///
+/// The list is **not** `pointer_events(false)`, unlike `signature_popup`: it
+/// wraps a `scroll` and wants the wheel. The fix for an overlay that has
+/// something to interact with is to make the interaction real, not to opt the
+/// overlay out — see `editor_pane`'s squiggles for what opting out costs when
+/// there *is* something to hover.
 pub(crate) fn completion_popup(
     comp: Completion,
+    editor: floem::views::editor::Editor,
     area_h: RwSignal<f64>,
     area_w: RwSignal<f64>,
     viewport: RwSignal<Rect>,
@@ -1589,6 +1601,11 @@ pub(crate) fn completion_popup(
             if !open || items.is_empty() {
                 return empty().into_any();
             }
+            // The builder is an `Fn` — it runs on every rebuild — so the handle
+            // is cloned per rebuild and again per row below. `Editor` is a
+            // handle over signals; `editor_pane` already keeps a dozen clones of
+            // it for the same reason.
+            let editor = editor.clone();
             let rows_n = items.len();
             let rows: Vec<AnyView> = items
                 .into_iter()
@@ -1665,6 +1682,18 @@ pub(crate) fn completion_popup(
                                 .text_ellipsis()
                         }),
                     ))
+                    // **Clicking a row picks it**, which is what the hover
+                    // highlight has always promised. `on_click_stop` so the
+                    // press does not also travel to the editor and move the
+                    // caret out from under the insertion; `accept_completion`
+                    // closes the list itself.
+                    .on_click_stop({
+                        let editor = editor.clone();
+                        move |_| {
+                            comp.sel.set(i);
+                            accept_completion(&editor, comp);
+                        }
+                    })
                     .style(move |s| {
                         let s = s
                             .flex_row()
@@ -1827,6 +1856,18 @@ pub(crate) fn signature_popup(comp: Completion, viewport: RwSignal<Rect>) -> imp
             s
         }
     })
+    // **Click-through.** This is a hint: it has no handler of its own, so every
+    // click and wheel landing in its rect was not handled but *swallowed* —
+    // floem stops a pointer event at the first eligible view under it, and this
+    // is a later sibling of the editor in `editor_area`. The hint is up to 48px
+    // tall and 560px wide and sits directly above the caret's line, so the code
+    // it covered was the code being typed next to: clicking a word there did not
+    // move the caret, and the wheel did not scroll.
+    //
+    // Safe precisely because it is paint-only — the trap `pointer_events(false)`
+    // sets is an overlay that has something to hover, and this has nothing. See
+    // `editor_pane`'s squiggles for the other side of that.
+    .pointer_events(|| false)
 }
 
 #[cfg(test)]
