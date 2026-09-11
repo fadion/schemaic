@@ -342,12 +342,30 @@ pub async fn a_key_that_matches_two_rows_fails_the_batch_and_undoes_the_rest(
     let err = commit(
         &scratch,
         GridWrite {
-            updates: vec![edit(
-                &scratch,
-                "w",
-                &[("note", Some("touched"))],
-                &[("name", Value::Str("dup".to_string()))],
-            )],
+            updates: vec![
+                // **Runs first and succeeds**, so there is a "rest" for the
+                // refusal to undo. The batch used to hold the doomed statement
+                // alone, which made the name and the doc a promise the body did
+                // not keep: what was asserted was that the *offending*
+                // statement left nothing behind, and its 0-row sibling above
+                // does stage a preceding write and check it was reverted. The
+                // two reach the rollback from different places — this one from
+                // `one_row_verdict` after a **successful** `exec_drop` — so a
+                // rollback dropped from the verdict arm while the batch still
+                // held earlier work left this test green.
+                edit(
+                    &scratch,
+                    "w",
+                    &[("note", Some("first"))],
+                    &[("id", Value::Int(2))],
+                ),
+                edit(
+                    &scratch,
+                    "w",
+                    &[("note", Some("touched"))],
+                    &[("name", Value::Str("dup".to_string()))],
+                ),
+            ],
             ..Default::default()
         },
     )
@@ -369,6 +387,18 @@ pub async fn a_key_that_matches_two_rows_fails_the_batch_and_undoes_the_rest(
     assert_eq!(
         touched, "0",
         "{}: rows were rewritten despite the refusal",
+        target.name
+    );
+    // …and the statement that ran *before* the refusal is gone too — the half
+    // the name promises and nothing checked.
+    assert_eq!(
+        rows(&scratch, "w").await,
+        [
+            ("dup".to_string(), "n1".to_string()),
+            ("two".to_string(), "n2".to_string()),
+            ("dup".to_string(), "n3".to_string()),
+        ],
+        "{}: the successful statement before the refusal was not undone",
         target.name
     );
 

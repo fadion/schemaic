@@ -188,6 +188,20 @@ pub struct Target {
     /// the reason the first one exists: anything derived from the slices moves
     /// with them.
     expected_writable_cases: usize,
+    /// How many of this leg's writable cases can be a **primary key** — and so
+    /// how many of them reach `row_key` on a value the server rendered, rather
+    /// than on an `INTEGER` the test wrote down itself.
+    ///
+    /// A hand-written number for the reason [`Target::expected_cases`] is one,
+    /// and this is the second instance of the same failure: the guard was
+    /// `assert!(keyed > 0)` — a floor of **one** over eighteen keyable types.
+    /// A change to `edit.rs`'s read-only key refusal that widened it from
+    /// float/binary to every non-integer type would send every case down the
+    /// fallback path and leave the test green, `tinyint_min` alone keeping the
+    /// count above zero; `row_key` would then be exercised on nothing but
+    /// integers. The project has already paid for a floor like this once, at
+    /// `suite.rs`'s `TYPE_CASE_FLOOR`.
+    expected_keyed_cases: usize,
 }
 
 pub static MARIADB: Target = Target {
@@ -214,6 +228,7 @@ pub static MARIADB: Target = Target {
     extra_types: cases::MARIADB_ONLY,
     expected_cases: 24,
     expected_writable_cases: 23,
+    expected_keyed_cases: 19,
 };
 
 pub static MYSQL: Target = Target {
@@ -240,6 +255,7 @@ pub static MYSQL: Target = Target {
     extra_types: cases::MYSQL_ONLY,
     expected_cases: 24,
     expected_writable_cases: 23,
+    expected_keyed_cases: 19,
 };
 
 pub static POSTGRES: Target = Target {
@@ -268,6 +284,7 @@ pub static POSTGRES: Target = Target {
     extra_types: &[],
     expected_cases: 28,
     expected_writable_cases: 27,
+    expected_keyed_cases: 24,
 };
 
 /// Every leg, in the order the suite reports them.
@@ -328,6 +345,12 @@ impl Target {
     /// [`Target::expected_cases`] for the write-back matrix.
     pub fn expected_writable_cases(&self) -> usize {
         self.expected_writable_cases
+    }
+
+    /// [`Target::expected_keyed_cases`] — how many writable cases this leg can
+    /// key on their own type.
+    pub fn expected_keyed_cases(&self) -> usize {
+        self.expected_keyed_cases
     }
 
     /// The statement that makes this server wait for

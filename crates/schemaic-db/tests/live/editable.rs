@@ -322,6 +322,11 @@ pub async fn a_write_built_from_the_resolved_key_lands_on_that_row(target: &'sta
     let mut failures = Vec::new();
     let mut keyed = 0usize;
     let mut plain = 0usize;
+    // **Which cases fell back, not just how many.** The counters alone cannot
+    // say whether the fallback absorbed a whole family, and the fallback is the
+    // path where the key the write goes through is an `INTEGER` this test wrote
+    // down rather than the server's rendering of the case's own type.
+    let mut fell_back: Vec<&str> = Vec::new();
 
     for case in target.type_cases().filter(|c| c.writable) {
         let table = format!("kw_{}", case.name);
@@ -353,6 +358,7 @@ pub async fn a_write_built_from_the_resolved_key_lands_on_that_row(target: &'sta
                 .await;
         } else {
             plain += 1;
+            fell_back.push(case.name);
             scratch
                 .exec(&format!(
                     "CREATE TABLE {qualified} (id INTEGER NOT NULL PRIMARY KEY, v {},                      payload VARCHAR(32))",
@@ -381,6 +387,7 @@ pub async fn a_write_built_from_the_resolved_key_lands_on_that_row(target: &'sta
             as_key = false;
             keyed -= 1;
             plain += 1;
+            fell_back.push(case.name);
             scratch.exec(&format!("DROP TABLE {qualified}")).await;
             scratch
                 .exec(&format!(
@@ -495,10 +502,14 @@ pub async fn a_write_built_from_the_resolved_key_lands_on_that_row(target: &'sta
         target.name,
         keyed + plain
     );
-    assert!(
-        keyed > 0,
-        "{}: no type could be a key at all, so nothing exercised `row_key` on a          value the server rendered",
-        target.name
+    assert_eq!(
+        keyed,
+        target.expected_keyed_cases(),
+        "{}: {keyed} of this leg's writable types went through `row_key` on a \
+         value the server rendered; it declares {}. The rest fell back to an \
+         INTEGER key the test wrote down itself: {fell_back:?}",
+        target.name,
+        target.expected_keyed_cases()
     );
     assert!(
         failures.is_empty(),
