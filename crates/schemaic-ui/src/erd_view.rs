@@ -683,6 +683,31 @@ fn visible_map(
 /// node id to its shown column indices, so each edge end anchors on the exact FK
 /// (child) / referenced (parent) column row when that row is visible, falling back
 /// to the card's vertical centre when the column is collapsed away.
+///
+/// **Two callers spell the `rects` → `visible_map` → `edge_shapes` prologue, and
+/// that is now the right number.** There were three. The canvas's `PointerMove`
+/// edge hit-test was the third, and it had drifted in a way nobody chose: it
+/// discarded `markers` (`.map(|e| e.poly)`) while still paying `marker_lines`'
+/// per-edge build in here — 12,000 `Line`s constructed and dropped per pointer
+/// move at 500 edges, on the gesture by which the user reaches everything. That
+/// site borrows [`edge_geometry`]'s memo now and rebuilds nothing, which is what
+/// closed it; the measured 0.76 ms prologue (500 nodes × 500 edges; 0.34 ms at
+/// 200, 1.31 ms at 1000) is no longer on any per-event path.
+///
+/// The two that remain are the canvas's memo and `export_scene`, and they must
+/// **not** be folded into one:
+///
+/// - They cannot share the memo. The export deliberately reads untracked current
+///   values; routing a save through the canvas's reactivity is a different
+///   behaviour, not a tidier spelling of the same one.
+/// - They cannot share a `(graph, positions, sizes, collapsed) -> Vec<EdgeShapes>`
+///   helper either, because `export_scene` needs `rects` and `visible_map`
+///   themselves — it places every card from the first and every column row from
+///   the second. A helper that recomputed them behind it would make the export
+///   do that work twice to save three lines.
+///
+/// What actually has to hold is that the two agree, and that is asserted rather
+/// than assumed — see `the_export_draws_the_same_edges_the_canvas_does`.
 fn edge_shapes(
     graph: &DiagramGraph,
     rect: &HashMap<String, Rect>,
@@ -1038,6 +1063,50 @@ fn edge_canvas(
     }
 }
 
+/// One edge's whole drawing as a **single** [`BezPath`] — the flattened curve
+/// plus every marker segment, each marker a subpath of its own.
+///
+/// **This is the batching, and it is a function so the batching can be
+/// asserted.** The curve was already accumulated into one path and stroked once;
+/// the markers were not, each being a `Line` with a `cx.stroke` of its own. A
+/// marker set is the parent bar, three crow's-foot strokes, and — for a
+/// **nullable** FK — a 20-segment polygon standing in for the optionality
+/// circle, so the totals were 4,800 draw calls at 200 edges, 12,000 at 500 and
+/// 24,000 at 1,000, against **one** for the curve beside them. Every FK declared
+/// on a nullable column is optional, which is most of them.
+///
+/// It is paid per frame, not per action: the repaint effect tracks `pan` and
+/// `zoom`, so this ran on every pointer-move while panning, every pointer-move
+/// while dragging a card, and every wheel tick. Memoising the geometry does not
+/// help — the draw calls happen after the shapes are in hand.
+///
+/// Nothing about the result changes. A `move_to` opens a new subpath, so the
+/// segments are still disjoint; the curve and the markers share the path because
+/// they already shared a brush and a stroke width.
+///
+/// `sc` is the logical→screen mapping (zoom scale + pan offset), passed in so
+/// this stays independent of the signals `paint` reads.
+fn edge_path(sh: &EdgeShapes, sc: impl Fn(Pt) -> Point) -> BezPath {
+    let mut path = BezPath::new();
+    if let Some((first, rest)) = sh.poly.split_first() {
+        path.move_to(sc(*first));
+        for p in rest {
+            path.line_to(sc(*p));
+        }
+    }
+    for m in &sh.markers {
+        path.move_to(sc(Pt {
+            x: m.p0.x,
+            y: m.p0.y,
+        }));
+        path.line_to(sc(Pt {
+            x: m.p1.x,
+            y: m.p1.y,
+        }));
+    }
+    path
+}
+
 impl View for EdgeCanvas {
     fn id(&self) -> ViewId {
         self.id
@@ -1060,28 +1129,9 @@ impl View for EdgeCanvas {
             let brush = if hot { accent } else { base };
             // Hover changes colour only — width stays constant (no thickening).
             let stroke = Stroke::new(1.4 * z);
-            // Stroke the flattened curve as a polyline path (line segments — vger
-            // can't stroke cubic segments).
-            if let Some((first, rest)) = sh.poly.split_first() {
-                let mut path = BezPath::new();
-                path.move_to(sc(*first));
-                for p in rest {
-                    path.line_to(sc(*p));
-                }
+            let path = edge_path(sh, sc);
+            if !path.is_empty() {
                 cx.stroke(&path, brush, &stroke);
-            }
-            for m in &sh.markers {
-                let line = Line::new(
-                    sc(Pt {
-                        x: m.p0.x,
-                        y: m.p0.y,
-                    }),
-                    sc(Pt {
-                        x: m.p1.x,
-                        y: m.p1.y,
-                    }),
-                );
-                cx.stroke(&line, brush, &stroke);
             }
         }
     }
@@ -3674,5 +3724,252 @@ mod collapse_key_tests {
             );
         }
         assert_eq!(checked, 1, "this gate is stale — it found {checked}");
+    }
+}
+
+#[cfg(test)]
+mod edge_path_tests {
+    use super::*;
+    use floem::kurbo::PathEl;
+
+    /// A marker segment as the fixtures write one: `((x0, y0), (x1, y1))`.
+    type Seg = ((f64, f64), (f64, f64));
+
+    fn shape(poly: &[(f64, f64)], markers: &[Seg]) -> EdgeShapes {
+        EdgeShapes {
+            poly: poly.iter().map(|&(x, y)| Pt { x, y }).collect(),
+            markers: markers
+                .iter()
+                .map(|&((x0, y0), (x1, y1))| Line::new(Point::new(x0, y0), Point::new(x1, y1)))
+                .collect(),
+        }
+    }
+
+    /// **One path per edge, whatever the marker count.**
+    ///
+    /// The curve was batched into a `BezPath` and stroked once; every marker
+    /// segment beside it was its own `Line` and its own `cx.stroke`. A nullable
+    /// FK's optionality circle alone is 20 segments, so an all-optional graph
+    /// issued 12,000 draw calls per repaint at 500 edges against 500 for the
+    /// curves — per pointer-move while panning, per drag move, per wheel tick.
+    ///
+    /// Asserted as "a `move_to` per disjoint run and no more", which is the
+    /// property that makes it one `cx.stroke`: the builder cannot return two
+    /// paths, and a caller that strokes per marker again would have to stop
+    /// using it.
+    #[test]
+    fn an_edge_is_one_path_however_many_markers_it_has() {
+        let poly = [(0.0, 0.0), (1.0, 1.0), (2.0, 2.0)];
+        let markers: Vec<Seg> = (0..20)
+            .map(|i| ((i as f64, 0.0), (i as f64 + 1.0, 1.0)))
+            .collect();
+        let path = edge_path(&shape(&poly, &markers), |p| Point::new(p.x, p.y));
+
+        let moves = path
+            .elements()
+            .iter()
+            .filter(|e| matches!(e, PathEl::MoveTo(_)))
+            .count();
+        let lines = path
+            .elements()
+            .iter()
+            .filter(|e| matches!(e, PathEl::LineTo(_)))
+            .count();
+        // One `move_to` to open the curve, one per marker subpath.
+        assert_eq!(moves, 1 + markers.len(), "{:?}", path.elements());
+        // Two curve segments, one per marker.
+        assert_eq!(lines, (poly.len() - 1) + markers.len());
+    }
+
+    /// Every segment still reaches the path, and through the same transform —
+    /// the rewrite must not drop a marker or leave one unscaled.
+    #[test]
+    fn every_segment_survives_the_batching_and_takes_the_transform() {
+        let path = edge_path(
+            &shape(
+                &[(0.0, 0.0), (10.0, 0.0)],
+                &[((4.0, 4.0), (6.0, 6.0)), ((1.0, 2.0), (3.0, 4.0))],
+            ),
+            // zoom 2, pan (100, 200) — the same shape `paint` builds.
+            |p| Point::new(100.0 + p.x * 2.0, 200.0 + p.y * 2.0),
+        );
+        let els: Vec<PathEl> = path.elements().to_vec();
+        assert_eq!(
+            els,
+            vec![
+                PathEl::MoveTo(Point::new(100.0, 200.0)),
+                PathEl::LineTo(Point::new(120.0, 200.0)),
+                PathEl::MoveTo(Point::new(108.0, 208.0)),
+                PathEl::LineTo(Point::new(112.0, 212.0)),
+                PathEl::MoveTo(Point::new(102.0, 204.0)),
+                PathEl::LineTo(Point::new(106.0, 208.0)),
+            ]
+        );
+    }
+
+    /// An edge with no polyline still draws its markers, and one with neither
+    /// produces an empty path the caller skips rather than stroking.
+    #[test]
+    fn an_edge_with_no_curve_still_carries_its_markers() {
+        let only_markers = edge_path(&shape(&[], &[((0.0, 0.0), (1.0, 1.0))]), |p| {
+            Point::new(p.x, p.y)
+        });
+        assert_eq!(only_markers.elements().len(), 2);
+        assert!(!only_markers.is_empty());
+
+        assert!(
+            edge_path(&shape(&[], &[]), |p| Point::new(p.x, p.y)).is_empty(),
+            "nothing to draw must stay nothing to stroke"
+        );
+    }
+}
+
+#[cfg(test)]
+mod export_canvas_parity_tests {
+    use super::*;
+    use schemaic_core::erd::{Cardinality, DiagramEdge, DiagramGraph, DiagramNode, NodeKind};
+
+    fn col(name: &str, pk: bool, fk: bool) -> schemaic_core::erd::DiagramColumn {
+        schemaic_core::erd::DiagramColumn {
+            name: name.to_string(),
+            type_name: "int".into(),
+            nullable: !pk,
+            pk,
+            fk,
+        }
+    }
+
+    /// **The exported diagram's edges must be the edges on screen.**
+    ///
+    /// The `rects` → `visible_map` → `edge_shapes` prologue is spelled twice —
+    /// once in `edge_geometry`'s memo for the canvas, once in `export_scene` —
+    /// and they cannot be folded into one, for the reasons `edge_shapes`' doc
+    /// gives: the export reads untracked values on purpose, and it needs the two
+    /// intermediate maps itself to place cards and rows. So what has to hold is
+    /// that they agree, and this asserts it directly rather than trusting two
+    /// call sites to stay in step.
+    ///
+    /// A third spelling, in the pointer-move hit-test, had already drifted from
+    /// these two — it dropped the markers while still building them — which is
+    /// what this is here to catch next time.
+    #[test]
+    fn the_export_draws_the_same_edges_the_canvas_does() {
+        let users = DiagramNode {
+            id: "users".into(),
+            kind: NodeKind::Table,
+            columns: vec![col("id", true, false)],
+        };
+        // Wide enough that collapsing it actually collapses something —
+        // `card_metrics` only hides rows on a node whose column count exceeds
+        // `COLLAPSED_COLS`, so a two-column card would have made the second
+        // iteration below a copy of the first. The FK sits last, so its index
+        // among the *visible* rows moves when the card collapses, which is what
+        // moves the edge's anchor with it.
+        let mut cols = vec![col("id", true, false)];
+        cols.extend((0..COLLAPSED_COLS + 2).map(|i| col(&format!("f{i}"), false, false)));
+        cols.push(col("user_id", false, true));
+        let orders = DiagramNode {
+            id: "orders".into(),
+            kind: NodeKind::Table,
+            columns: cols,
+        };
+        let graph = DiagramGraph {
+            nodes: vec![orders, users],
+            edges: vec![DiagramEdge {
+                from: "orders".into(),
+                from_columns: vec!["user_id".into()],
+                to: "users".into(),
+                to_columns: vec!["id".into()],
+                cardinality: Cardinality::OneToMany,
+                // Nullable: this is the arm whose markers are the 20-segment
+                // optionality polygon, and the one the hit-test was discarding.
+                optional: true,
+            }],
+            hidden_islands: vec![],
+        };
+        let positions: HashMap<String, (f64, f64)> = [
+            ("orders".to_string(), (0.0, 0.0)),
+            ("users".to_string(), (400.0, 0.0)),
+        ]
+        .into_iter()
+        .collect();
+
+        // Collapsed and not, because `visible_map` is the term the two spellings
+        // most easily disagree about — it decides whether an end anchors on the
+        // key column's row or falls back to the card's centre.
+        let mut geometries: Vec<Vec<Pt>> = Vec::new();
+        for collapsed in [
+            HashMap::new(),
+            [("orders".to_string(), true)]
+                .into_iter()
+                .collect::<HashMap<String, bool>>(),
+        ] {
+            // **Sized the way the layout sizes it**, from `card_metrics` for
+            // this very collapse state — a card whose `sizes` entry disagrees
+            // with its column count puts the anchor outside its own rect, where
+            // `edge_shapes` clamps it to the card edge in *both* states and the
+            // comparison below stops being about anything.
+            let sizes: HashMap<String, (f64, f64)> = graph
+                .nodes
+                .iter()
+                .map(|n| {
+                    let c = collapsed.get(&n.id).copied().unwrap_or(false);
+                    (n.id.clone(), (200.0, card_metrics(n, c).2))
+                })
+                .collect();
+
+            // The canvas's prologue, as `edge_geometry`'s memo body runs it.
+            let canvas = edge_shapes(
+                &graph,
+                &rects(&positions, &sizes),
+                &visible_map(&graph, &collapsed),
+            );
+            // The export's, as `export_scene` runs it.
+            let scene = export_scene(&graph, &positions, &sizes, &collapsed, &|_| None)
+                .expect("the fixture has content bounds");
+
+            assert_eq!(
+                scene.edges.len(),
+                canvas.len(),
+                "edge counts differ (collapsed: {collapsed:?})"
+            );
+            geometries.push(canvas.iter().flat_map(|c| c.poly.clone()).collect());
+            for (e, c) in scene.edges.iter().zip(canvas.iter()) {
+                assert_eq!(e.poly, c.poly, "the curve differs");
+                let canvas_markers: Vec<(Pt, Pt)> = c
+                    .markers
+                    .iter()
+                    .map(|l| {
+                        (
+                            Pt {
+                                x: l.p0.x,
+                                y: l.p0.y,
+                            },
+                            Pt {
+                                x: l.p1.x,
+                                y: l.p1.y,
+                            },
+                        )
+                    })
+                    .collect();
+                assert_eq!(e.markers, canvas_markers, "the markers differ");
+                assert!(
+                    !canvas_markers.is_empty(),
+                    "an optional FK has markers on both surfaces, or this proves \
+                     nothing"
+                );
+            }
+        }
+
+        // **The premise.** Both surfaces agreeing means nothing if the collapse
+        // state does not move the geometry in the first place — the loop would
+        // be running the same comparison twice. `visible_map` is what decides
+        // whether the child end anchors on `user_id`'s row or falls back to the
+        // card's edge, so collapsing `orders` has to change the curve.
+        assert_ne!(
+            geometries[0], geometries[1],
+            "collapsing a card must move the edge, or this fixture is testing \
+             one case twice"
+        );
     }
 }
