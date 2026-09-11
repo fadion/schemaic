@@ -670,7 +670,7 @@ pub(crate) fn manage_modal(ui: Ui) -> impl IntoView {
     let test_gen: RwSignal<u64> = RwSignal::new(0);
     floem::reactive::create_effect(move |_| {
         match conn_test.get() {
-            crate::TestState::Ok | crate::TestState::Fail => {
+            st if st.landed() => {
                 let g = test_gen.get_untracked().wrapping_add(1);
                 test_gen.set(g);
                 test_flash.set(true);
@@ -1645,7 +1645,7 @@ fn conn_form(
                 crate::TestState::Ok if flashing => icons::icon(icons::CIRCLE_CHECK, 16.0)
                     .style(|s| s.color(theme::conn_test_ok()))
                     .into_any(),
-                crate::TestState::Fail if flashing => icons::icon(icons::CIRCLE_X, 16.0)
+                crate::TestState::Fail(_) if flashing => icons::icon(icons::CIRCLE_X, 16.0)
                     .style(|s| s.color(theme::conn_test_fail()))
                     .into_any(),
                 // Centred, like every other face here. It deliberately does *not*
@@ -1702,6 +1702,34 @@ fn conn_form(
             });
         },
     );
+    // **Why the test failed, in words, above the row that failed it.**
+    //
+    // The icon is a flash: `TEST_FLASH` takes it away again, and its own comment
+    // says a failure "is worth going back and looking at, and unlike Save there
+    // is nothing else on screen that says how it went". That was exactly true —
+    // the several sentences `ssh::refusal_message` composes about a host key
+    // that has *changed* were dropped by the caller, and the one message in this
+    // app that matters most read as a red X. So this line is **not** tied to
+    // `test_flash`: it stays until the next test or the next edit, both of which
+    // move `conn_test` off `Fail`.
+    let failure_line = dyn_container(
+        move || conn_test.get(),
+        move |st| match st.failure() {
+            // The padding is inside the arm: on the container it would leave a
+            // permanent band above the footer, since a hidden child still gives
+            // its parent that parent's own padding.
+            Some(msg) => container(widgets::footer_error(msg.to_string()))
+                .style(|s| {
+                    s.width_full()
+                        .padding_horiz(theme::scaled(14.0))
+                        .padding_top(theme::scaled(10.0))
+                })
+                .into_any(),
+            None => widgets::nothing(),
+        },
+    )
+    .style(|s| s.width_full());
+
     let right_actions =
         h_stack((test_btn, save_btn)).style(|s| s.flex_row().items_center().gap(action_gap()));
     let buttons = h_stack((
@@ -1721,6 +1749,7 @@ fn conn_form(
 
     v_stack((
         autohide(scroll(fields)).style(|s| s.flex_grow(1.0_f32).width_full().min_height(0.0)),
+        failure_line,
         buttons,
     ))
     .style(|s| s.flex_grow(1.0_f32).height_full().flex_col().min_width(0.0))

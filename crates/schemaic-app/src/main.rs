@@ -565,6 +565,24 @@ enum Refusal {
     TabMovedOn,
 }
 
+/// What a finished connection test leaves on the Test button.
+///
+/// The failure arm carries the engine's or the tunnel's own words. It used to be
+/// a `bool`, and `open_tunnel`'s `Err(_) => { send(false); return; }` was where
+/// `ssh::refusal_message` — several sentences naming the host, both
+/// fingerprints, that the key *"has CHANGED since Schemaic first trusted it"*,
+/// and the out-of-band check to perform — stopped existing. `ssh::authenticate`'s
+/// doc names this button as the surface for exactly those errors.
+///
+/// The real connect path never had the gap (`Err(e) => send(Err(e.to_string()))`),
+/// so only the *diagnostic* control lost the diagnosis.
+fn test_outcome(res: Result<(), String>) -> TestState {
+    match res {
+        Ok(()) => TestState::Ok,
+        Err(why) => TestState::Fail(why),
+    }
+}
+
 /// The query-plan modal's answer to a refused launch.
 ///
 /// A free function rather than a closure inside `app_view` so that the
@@ -9109,8 +9127,15 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
         Rc::new(move || {
             conn_test.set(TestState::Testing);
             let conn = draft.to_connection(0);
-            let send = create_ext_action(cx, move |ok: bool| {
-                conn_test.set(if ok { TestState::Ok } else { TestState::Fail });
+            // **The reason, not a bool.** The tunnel's failure is sometimes a
+            // security control firing — `ssh::refusal_message`'s several
+            // sentences about a host key that has *changed*, composed out of
+            // band from russh for exactly this reason — and discarding it with
+            // `Err(_)` made a machine-in-the-middle refusal, an unreadable trust
+            // store, a wrong password and an unreachable host one red X.
+            // `ssh::authenticate`'s doc names this button as their surface.
+            let send = create_ext_action(cx, move |res: Result<(), String>| {
+                conn_test.set(test_outcome(res));
             });
             handle.spawn(async move {
                 // Keep the tunnel handle alive for the duration of the ping; it
@@ -9118,8 +9143,8 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                 let tunnel = if conn.uses_tunnel() {
                     match schemaic_db::ssh::open_tunnel(&conn.ssh, &conn.host, conn.port).await {
                         Ok(h) => Some(h),
-                        Err(_) => {
-                            send(false);
+                        Err(e) => {
+                            send(Err(e.to_string()));
                             return;
                         }
                     }
@@ -9127,9 +9152,12 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                     None
                 };
                 let db = Db::connect(&conn, tunnel.as_ref().map(|h| h.port()));
-                let ok = db.ping(schemaic_db::PING_TIMEOUT).await.is_ok();
+                let res = db
+                    .ping(schemaic_db::PING_TIMEOUT)
+                    .await
+                    .map_err(|e| e.to_string());
                 drop(tunnel);
-                send(ok);
+                send(res);
             });
         })
     };
@@ -12074,12 +12102,12 @@ mod app_tests {
         Action, CliLauncher, ConnGate, ConnGateElse, Refusal, RunTimeout, gate1, gate1_on_tab,
         gate1_on_tab_answered, inline_outcome, mysql_shell_config, owning_tab_of,
         plan_refusal_text, plan_refused, psql_database, psql_shell_config, resolve_native_cli,
-        sqlite_shell_config, timeout_message, tx_engine, unique_name,
+        sqlite_shell_config, test_outcome, timeout_message, tx_engine, unique_name,
     };
     use floem::prelude::{SignalGet, SignalUpdate};
     use floem::reactive::RwSignal;
     use schemaic_core::connection::Connection;
-    use schemaic_ui::InlineAiState;
+    use schemaic_ui::{InlineAiState, TestState};
     use tokio_util::sync::CancellationToken;
 
     /// **The raw `run` binding has exactly two callers, and both hold an
@@ -12641,6 +12669,52 @@ mod app_tests {
             matches!(plan_state.get_untracked(), schemaic_ui::PlanState::Running),
             "nothing refused it, so the state machine is still `run_plan`'s"
         );
+    }
+
+    /// **The SSH host-key refusal was thrown away by the one control whose job
+    /// is to report it.**
+    ///
+    /// `open_tunnel`'s failure arm was `Err(_) => { send(false); return; }`, and
+    /// the form's only rendering of a failure was a red glyph — so
+    /// `ssh::refusal_message`'s several sentences about a key that has *changed*
+    /// looked exactly like a wrong password. `ssh::authenticate`'s own doc says
+    /// these errors are *"surfaced by the Manage-Connections Test button"*.
+    ///
+    /// The structural half of the fix is that `TestState::Fail` now takes a
+    /// `String`, so `send(false)` no longer type-checks; this pins the mapping.
+    #[test]
+    fn a_failed_test_always_carries_its_reason() {
+        let refusal = "The host key for bastion.example.com has CHANGED since \
+                       Schemaic first trusted it.";
+        let failed = test_outcome(Err(refusal.to_string()));
+        assert_eq!(failed.failure(), Some(refusal));
+        assert!(
+            failed.landed(),
+            "a failure is a result, and flashes like one"
+        );
+
+        let ok = test_outcome(Ok(()));
+        assert_eq!(
+            ok.failure(),
+            None,
+            "nothing to say about a test that passed"
+        );
+        assert!(ok.landed());
+    }
+
+    /// The states that are not a finished test say nothing and flash nothing —
+    /// which is what the "editing a field withdraws the last result" effect
+    /// depends on.
+    #[test]
+    fn an_unfinished_test_reports_neither_way() {
+        for st in [TestState::Idle, TestState::Testing] {
+            assert!(!st.landed(), "{:?}", st.failure());
+            assert_eq!(st.failure(), None);
+        }
+        // An empty reason is not a sentence: the icon still says it failed, and
+        // the line below the footer stays away rather than opening blank.
+        assert_eq!(TestState::Fail(String::new()).failure(), None);
+        assert!(TestState::Fail(String::new()).landed());
     }
 
     /// The two refusals do not share wording. They are different facts — one is

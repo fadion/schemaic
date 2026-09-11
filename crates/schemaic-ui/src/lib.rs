@@ -4765,7 +4765,7 @@ pub struct SchemaActions {
 
 /// Result of a "Test" of the Manage-Connections draft (host + credentials),
 /// shown as an icon on the Test button. Transient — never persisted.
-#[derive(Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Clone, PartialEq, Eq, Default)]
 pub enum TestState {
     /// No test run yet (or the draft was edited since the last one).
     #[default]
@@ -4774,8 +4774,38 @@ pub enum TestState {
     Testing,
     /// The connection succeeded.
     Ok,
-    /// The connection failed (unreachable / auth / tunnel).
-    Fail,
+    /// The connection failed, **and why**.
+    ///
+    /// The reason is carried rather than dropped because one of the failures
+    /// this button reports is a security control firing: `ssh::refusal_message`
+    /// composes several sentences naming the host, both fingerprints, that the
+    /// key *"has CHANGED since Schemaic first trusted it"*, and the
+    /// out-of-band check to perform. `ssh::authenticate`'s own doc says those
+    /// errors are *"surfaced by the Manage-Connections Test button"*, and the
+    /// button had only ever had an icon — so a machine-in-the-middle refusal, an
+    /// unreadable trust store, a wrong SSH password and an unreachable host were
+    /// one identical red X with no text anywhere. The message was moved out of
+    /// band from russh precisely so a caller could show it.
+    ///
+    /// Empty is allowed and renders nothing extra; it is never the *expected*
+    /// state, which is what `a_failed_test_always_carries_its_reason` holds.
+    Fail(String),
+}
+
+impl TestState {
+    /// Has a test finished — either way? The flash timer keys on this, and it is
+    /// the one question that does not care which answer came back.
+    pub fn landed(&self) -> bool {
+        matches!(self, TestState::Ok | TestState::Fail(_))
+    }
+
+    /// The reason a test failed, if it failed and gave one.
+    pub fn failure(&self) -> Option<&str> {
+        match self {
+            TestState::Fail(msg) if !msg.trim().is_empty() => Some(msg.as_str()),
+            _ => None,
+        }
+    }
 }
 
 /// UI-facing lifecycle of the query-plan modal's EXPLAIN run.
