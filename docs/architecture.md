@@ -4285,6 +4285,25 @@ existing prose was left alone.
     `pg` and `PostgreSQL`, and as do `MySQL` and the empty label that predates the field — so the
     question is not a string comparison. It is what the connection form's Type picker tells its own
     change apart from a load with.
+    **The registry itself had no accessor at all**, and `by_id`/`read_only_of`/`label_of` are it.
+    `connections: RwSignal<Vec<Connection>>` is one of the app's two central registries, and every
+    consumer reached into the `Vec` — sixty-one hand-written `find(|c| c.id == …)` across two crates,
+    with nothing to grep for and nothing to change in one place. `read_only_of` is the question most
+    of those scans were asking, and it had **seven** spellings: two byte-identical ten-line memos
+    3,100 lines apart in `ui/lib.rs` (the second's comment, *"Same derivation as `center`"*, an
+    acknowledgement of the copy rather than a link to it), a module-private `conn_read_only` in
+    `overlays.rs` nobody else could find, and four more — and two of the seven feed a *write gate*
+    rather than a dimmed button, `ddl_preview` handing its answer straight to `widgets::accept_launch`
+    and `compare_view` to `preview_of_plan`. **An unknown id is writable, and that is now a decision
+    instead of a coincidence**: all seven defaulted that way, five as `is_some_and` and two as
+    `map(…).unwrap_or(false)`, with no single site at which anyone could review it. It is right
+    today — the ids come from tabs, so an absent one means the connection was deleted while something
+    still referred to it, and the write that follows fails on the missing connection rather than on
+    this flag — and `an_unknown_connection_is_writable_deliberately` is the test the next person to
+    change it has to change with it. `label_of` is the same shape for a name, where the *fallback* is
+    the decision: a plan, a comparison or a preview that has lost its connection still has to name
+    what it is about, and `connection 7` is a worse name than the one the user gave it and a far
+    better one than a title reading *"Apply to  "*.
     `AiData` is the connection's **AI data-access level** — `SchemaOnly` / `OnRequest` (the
     default) / `Full` — and the single gate over every path that can carry this connection's rows
     off the machine: the `run_query` tool, `describe_table`'s sample rows, the grid's
@@ -6783,7 +6802,17 @@ existing prose was left alone.
   tunnel site asks (there are six), and `Connection::sanitized()` — which `DraftSignals::to_connection`
   returns through — drops the server side on save so the state cannot exist. `is_networked` likewise
   has a single definition in `core::connection`, which `db::Engine` and the form's `DbKind` both
-  delegate to; it had two, and the third consumer not asking at all is what this cost. **The driver is blocking**, so every call runs in
+  delegate to; it had two, and the third consumer not asking at all is what this cost. That third
+    consumer asks now, and so do the two beside it: `Connection::uses_tunnel`, `Connection::uses_tls`
+    and `conn_import::needs_password` read `is_networked(&db_type)` where each spelled `!is_sqlite`
+    for itself, thirty lines from the predicate whose own doc already said the tunnel decision was
+    not asking. Nothing changes today — the hand-spelling was the same boolean — and what the
+    delegation buys is that a fifth engine with no server is **one** edit;
+    `a_server_less_engine_reaches_no_server_by_any_route` fails if a site goes back to deciding for
+    itself, and `a_networked_engine_still_reaches_its_server` is its floor, so the predicate cannot
+    pass by refusing everything. `SslMode::caveat` is deliberately **not** among them: its
+    `!is_postgres && !is_sqlite` asks which engine *family* this is, for a MySQL/MariaDB driver
+    defect, not whether there is a server to reach. **The driver is blocking**, so every call runs in
   `spawn_blocking` and opens its own connection there — which is not a compromise but exactly the
   one-connection-per-operation invariant, at microsecond cost on a local file; cancellation goes
   through `Connection::get_interrupt_handle`, the analogue of `KILL QUERY` that needs no second
@@ -9882,7 +9911,10 @@ existing prose was left alone.
     signals and needs a Floem scope) — and an engine comparison with no capability behind it,
     `lib.rs`'s
     `engine_comparison_gate`, which is a per-file budget with a written reason rather than a ban and
-    whose subject is under *Architecture invariants*).
+    whose subject is under *Architecture invariants*; and more of the root `Ui` bundle than the file
+    already took — `lib.rs`'s `whole_ui_gate`, a per-file budget too, written up under `lib.rs`
+    below). The captured-`Color` member is `theme::color_arg_gate`, and it holds only the
+    *parameter* half of its invariant — see that rule for why the rest is not greppable at all.
     **One of the family fails on a spelling that is *missing* rather than present**, and it reads
     differently for that reason: `lib.rs`'s `read_only_door_gate` finds every schema-editor door by
     the stamp it writes (`read_only: ctx.read_only,`) and asserts the refusal appears *above* it in
@@ -12852,6 +12884,28 @@ existing prose was left alone.
     shared model/state
     types, `workspace`/`body`/`center`/`header`/`footer`, `edit_field`/`FieldCfg`,
     terminal panel.
+    **How far the root `Ui` bundle travels is a ratchet now — `whole_ui_gate`.** `Ui` has 36 fields
+    and transitively pulls `OverlayUi`'s 51 and `DdlUi`'s 40, and it was passed *unnarrowed* into
+    roughly 140 signatures across this crate while the per-domain child bundles that exist for
+    exactly this purpose narrowed a call at **two** sites in the whole of it. Two costs, both
+    concrete. No such function can be unit-tested: `ddl_preview::connection_label` touched 1 of the
+    36 and encoded a real decision — the `connection N` fallback — and testing that fallback meant
+    building a 36-field bundle inside a Floem reactive scope. And a signature stops saying what it
+    depends on: `schema_tree::object_row` takes `ui: Ui` and dereferences it *zero* times, the only
+    use being a clone forwarded into `object_editor::open_for_object`, so it holds live handles to
+    ~127 signals it never reads and a change to `OverlayUi` has no readable blast radius. Four
+    one-field views went first — `connection_label` takes the one `RwSignal<Vec<Connection>>` and
+    its decision is `core::connection::label_of` with a three-line test, and
+    `compare_view::left_db_type`/`side_label` and `event_editor::taken_names` were the same shape.
+    It is a **budget, not a ban**, because narrowing 140 signatures is a campaign and a gate that
+    fails on the day it lands teaches nothing: `BUDGET` holds what each file declares *now* and the
+    only legal direction is down, so a new `ui: Ui` in a listed file fails and a file not on the list
+    may not take one at all. The second test is the floor —
+    `no_budget_entry_is_looser_than_the_file_it_governs` asserts each entry is *exactly* the count,
+    since a number left high after a narrowing is a licence the next `ui: Ui` would inherit, which is
+    the same floor `dividers::scaled_arg_gate` and `theme::color_arg_gate` keep on their exemptions.
+    App-crate sources come through `source_gate::crate_sources` too and are skipped by path here: the
+    bundle is this crate's, and `app_view` builds it rather than taking it.
     **The terminal's geometry is three pure functions, and two of them take the padding as a
     parameter because it is `theme::scaled(6.0)` and not 6.** `term_cell_wh(font)` is the IBM Plex
     Mono cell metrics; `term_fit(w, h, pad, cw, ch)` is how many columns and rows a surface holds;
@@ -14871,6 +14925,20 @@ Re-introducing the anti-patterns these guard against is a regression:
   in `ui.overlay.run_guard` and execute **nothing**. The unguarded actions never leave
   `schemaic-app`; `TabsActions::run_anyway` is the only way back to them, and it replays only what
   the guard parked. The editor pane renders the bar — it does not own the guard.
+  **The policy it judges against is assembled in core as well, by `sql::GuardPolicy::of`.** The
+  verdict was pure and tested; its three inputs — read-only off the connection, the dialect off its
+  `db_type`, and whether the tab has a database — were assembled by a closure called `guard_policy`
+  *inside* `app_view`, a 9,600-line function where nothing is nameable, callable or testable, so the
+  half of the guard that reads the world had no test and no name. The window's closure now gathers
+  signals and decides nothing. `script_view` assembles the same policy, which is the other half of
+  why this is a constructor and not a struct literal at each site: two independent assemblies that
+  happen to agree are not one policy, they are two policies nobody is comparing. It restates one
+  field over the constructor — the modal's `dialect` is the *target's*, captured when the modal
+  opened — and passes `confirm_writes` as the user set it even though `script_verdict` does not
+  consult it, because a policy assembled with a made-up value is one that starts lying silently the
+  day the verdict does start consulting it. With no connection the policy falls back to
+  `SqlDialect::default` and `read_only: false`, which is `connection::read_only_of`'s documented
+  fail-open: the run then fails on the connection that is gone rather than on a flag nobody set.
   **What the guard judges is the statement after parameter substitution**, never the template the
   editor holds. The pair call `params::prepare_run`, which substitutes and *then* asks
   `run_verdict`, and hand back both halves — so the statements that run, the ones parked for "Run
@@ -15431,6 +15499,29 @@ Re-introducing the anti-patterns these guard against is a regression:
   and that key's own comment names this baked colour as the reason it exists. Narrowing the key is
   therefore a change to that function's correctness from 900 lines away, which is what the note now
   says at both ends.
+  **The half of this rule a scan can settle has a gate — `theme::color_arg_gate` — and the other
+  half deliberately does not.** Five review passes were spent establishing that before it was
+  written down: a `theme::` accessor returns a `Color` by value, so a site is wrong iff the colour is
+  produced *outside* the closure that paints it **and** the view holding it is not rebuilt on that
+  colour's axis — both properties of the enclosing construct rather than of the line the token sits
+  on. The fully corrected grep is ~2% precise (six true violations in 273 candidates), and worse, the
+  deciding site frequently holds no `theme::` token at all: the crate has fifteen helpers returning a
+  bare `Color`, each correct in itself, with the rule decided at the caller. `monitor_view`'s was the
+  proof — the violation was `("INSERT", new_color())` in the tuple destructure above, while
+  `new_color`'s body, the only place a grep hits, was fine. What *can* be asserted is the half that
+  is **empty by construction**: every colour a view is *given* is declared `fn() -> Color`, so the
+  gate fails on any `name: Color` parameter or field outside `themes.rs` — where the palettes are
+  defined, and are bare `Color`s by definition — unless it is in `EXEMPT` with its reason. That
+  emptiness is worth a gate precisely because it would grow silently: `fn row(c: Color) -> impl
+  IntoView` compiles and reads fine and is the argument-position capture this invariant exists to
+  prevent. The exemptions are all code that *computes with* a colour rather than painting one —
+  `contrast.rs`'s luminance and `over`, `erd_view`'s `tinted_border` and its `#rrggbb` SVG
+  formatter, the `fade` closures in `overlays.rs` — and `markdown.rs`'s `base`, the one exception
+  above, is in the list as the **known latent instance** with the three conditions that make it safe,
+  so the day one of them stops holding a reader finds an entry rather than nothing.
+  `every_exemption_still_names_a_real_parameter` is the floor `dividers::scaled_arg_gate` keeps for
+  the size half: an exemption naming a parameter that no longer exists is a stale licence the next
+  `Color` at that spelling would inherit.
 - **And so do sizes**: a design token that boxes, indents or spaces text is a `fn() -> f32`/`fn() ->
   f64` reading the interface scale (`theme::font_body()`, `consts::row_h()`, `theme::scaled(…)`),
   never a `const`. Same mechanism, same reason — the `.style` closure that *calls* the metric re-runs
