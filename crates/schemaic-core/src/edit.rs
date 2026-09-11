@@ -1022,6 +1022,44 @@ pub fn cloned_row(
     map
 }
 
+/// Above how many rows Duplicate asks before it stages anything.
+///
+/// **The gesture is one click away from being enormous.** The gutter menu acts
+/// on the whole selection, so Ctrl+A on a 200,000-row result offers "Duplicate
+/// 200,000 rows" — and taking it builds 200,000 `HashMap`s, one per row, every
+/// text-editable column cloned into each, on the UI thread. The write itself is
+/// already one batched update rather than N, which is what keeps the *staging*
+/// from being quadratic; nothing bounds the size of the thing being staged.
+///
+/// It is a floor rather than a cap because the count is in the entry's own label
+/// — the user asked for this number and can see it — so the honest answer is to
+/// make them say yes, not to refuse. `stats::CONFIRM_ROW_FLOOR` is the
+/// neighbouring idea for a destructive figure worth naming; this one gates
+/// whether the question is asked at all, and sits lower because staging is
+/// undoable and merely expensive.
+pub const DUPLICATE_CONFIRM_FLOOR: usize = 500;
+
+/// Is this Duplicate big enough to ask about first? See
+/// [`DUPLICATE_CONFIRM_FLOOR`] — strictly above, so the floor itself still goes
+/// through without a modal.
+pub fn duplicate_needs_confirm(n: usize) -> bool {
+    n > DUPLICATE_CONFIRM_FLOOR
+}
+
+/// What that confirmation asks.
+///
+/// It names the count, and says the rows are staged rather than written: the
+/// question is about the size of a gesture, not about a statement reaching the
+/// server, and a prompt that implied otherwise would be the wrong warning on the
+/// one grid action that commits nothing.
+pub fn duplicate_prompt(n: usize) -> String {
+    format!(
+        "Duplicate {} rows? They are staged as pending rows and nothing is \
+         written until you commit.",
+        crate::stats::group_digits(n as u64)
+    )
+}
+
 /// The grid's cell values as plain data: what the view's signals hold, borrowed
 /// for one read.
 ///
@@ -3381,6 +3419,30 @@ mod tests {
 
         // Out of range is an empty row, not a panic.
         assert!(cloned_row(&m, &r, &dirty, 9).is_empty());
+    }
+
+    /// The floor is a floor: at it, nothing is asked; one past it, it is.
+    #[test]
+    fn only_a_large_duplicate_asks_first() {
+        assert!(!duplicate_needs_confirm(0));
+        assert!(!duplicate_needs_confirm(1));
+        assert!(!duplicate_needs_confirm(DUPLICATE_CONFIRM_FLOOR - 1));
+        assert!(!duplicate_needs_confirm(DUPLICATE_CONFIRM_FLOOR));
+        assert!(duplicate_needs_confirm(DUPLICATE_CONFIRM_FLOOR + 1));
+        assert!(duplicate_needs_confirm(200_000));
+    }
+
+    /// And the question names the number the menu named, grouped, and says what
+    /// duplicating actually does — nothing reaches the server.
+    #[test]
+    fn the_duplicate_question_names_the_count_and_what_it_stages() {
+        let p = duplicate_prompt(200_000);
+        assert!(p.contains("200,000"), "{p}");
+        assert!(p.contains("staged"), "{p}");
+        assert!(
+            !p.contains("can't be undone"),
+            "staging rows is not the irreversible kind of warning: {p}"
+        );
     }
 
     #[test]

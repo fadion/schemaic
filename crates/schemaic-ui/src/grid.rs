@@ -344,6 +344,9 @@ struct GridState {
     menus: crate::widgets::MenuFlags,
     /// The pointer in window coords — read only by [`reclaim_keyboard`].
     last_mouse: RwSignal<(f64, f64)>,
+    /// The window's confirmation modal — what [`clone_rows`] asks through when
+    /// the selection is large enough to be worth a question.
+    confirm: RwSignal<Option<crate::Confirm>>,
     /// The result's source `(database, table)` — for the cell "AI Summary" context.
     source: RwSignal<Option<TableSource>>,
     /// Callbacks wrapped in signals so `GridState` stays `Copy`. `summarize`
@@ -684,6 +687,7 @@ impl GridState {
             popup_width: gctx.popup_width,
             menus: gctx.menus,
             last_mouse: gctx.last_mouse,
+            confirm: gctx.confirm,
             source: gctx.source,
             summarize: RwSignal::new(Some(gctx.summarize.clone())),
             view_blob: RwSignal::new(gctx.view_blob.clone()),
@@ -3001,6 +3005,8 @@ pub(crate) struct GridCtx {
     /// The pointer in window coords, for the one question the grid cannot ask
     /// floem: where the keyboard went — see [`reclaim_keyboard`].
     pub(crate) last_mouse: RwSignal<(f64, f64)>,
+    /// The window's confirmation modal — see [`GridState::confirm`].
+    pub(crate) confirm: RwSignal<Option<crate::Confirm>>,
     /// Reveal the AI panel + send a message (used for the cell "AI Summary").
     pub(crate) summarize: Rc<dyn Fn(String)>,
     /// Stage result rows as an attachment on the AI panel's next question.
@@ -5166,10 +5172,40 @@ fn clone_row(gs: GridState, data_idx: usize) {
 
 /// [`clone_row`] for a gutter selection: one `new_rows` write for the whole
 /// batch, one scroll, one selection — see [`GridState::add_cloned_rows`].
+///
+/// **The size question is asked here, not at the menu entry.** The gutter menu
+/// acts on the whole selection, so Ctrl+A on a large result offers to duplicate
+/// all of it in one click; past [`schemaic_core::edit::DUPLICATE_CONFIRM_FLOOR`]
+/// that becomes a modal first. Putting it on the action rather than on the entry
+/// is the same rule the run guard follows — a second caller (the cell menu's
+/// "Duplicate row", the toolbar's clone icon, both of which go through
+/// [`clone_row`]) cannot reach the staging without passing it, and neither can a
+/// third one written later.
 fn clone_rows(gs: GridState, data_idxs: &[usize]) {
     if data_idxs.is_empty() {
         return;
     }
+    if schemaic_core::edit::duplicate_needs_confirm(data_idxs.len()) {
+        let idxs = data_idxs.to_vec();
+        let message = schemaic_core::edit::duplicate_prompt(idxs.len());
+        gs.confirm.set(Some(crate::Confirm {
+            title: "Duplicate rows".to_string(),
+            message,
+            // `alive` again on the way back: the modal outlives the click, and
+            // the panel it belongs to can be closed while it is up.
+            resolve: Rc::new(move |yes| {
+                if yes && gs.alive() {
+                    stage_cloned_rows(gs, &idxs);
+                }
+            }),
+        }));
+        return;
+    }
+    stage_cloned_rows(gs, data_idxs);
+}
+
+/// The staging half of [`clone_rows`], past its size question.
+fn stage_cloned_rows(gs: GridState, data_idxs: &[usize]) {
     let pidx = gs.add_cloned_rows(data_idxs);
     let rs = gs.rs.get_untracked();
     let nrows = rs.row_count();
@@ -10376,6 +10412,45 @@ mod cell_preview_tests {
             !f.contains("conn_id"),
             "`ai_data_of` reads the tab's live connection, which a rebind moves \
              out from under the rows already on screen:\n{f}"
+        );
+    }
+
+    /// **And `clone_rows` asks the size question before it stages anything.**
+    ///
+    /// `edit::duplicate_needs_confirm` on its own is a decoration; the gesture
+    /// it exists for is one click on a menu entry that acts on the whole
+    /// selection. Pinned on the *action* rather than on the gutter entry so the
+    /// cell menu's "Duplicate row" and the toolbar icon — which both arrive
+    /// through `clone_row` — cannot reach the staging around it.
+    #[test]
+    fn a_large_duplicate_is_confirmed_before_a_single_row_is_staged() {
+        let src = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("src")
+                .join("grid.rs"),
+        )
+        .expect("grid.rs");
+        let body = crate::source_gate::production_code(&src);
+        let at = body
+            .find("fn clone_rows(")
+            .expect("`clone_rows` is gone — this gate is stale");
+        let end = body[at..]
+            .find("\n}")
+            .expect("`clone_rows` has no end — this gate is stale");
+        let f = &body[at..at + end];
+        let guard = f
+            .find("duplicate_needs_confirm(")
+            .expect("`clone_rows` no longer asks whether the selection is worth a question");
+        let stage = f
+            .find("stage_cloned_rows(")
+            .expect("`clone_rows` stages nothing — this gate is stale");
+        assert!(
+            guard < stage,
+            "the size question must come before the first staging call:\n{f}"
+        );
+        assert!(
+            !f.contains("add_cloned_rows("),
+            "`clone_rows` stages directly, so the question can be walked around:\n{f}"
         );
     }
 

@@ -98,7 +98,7 @@ impl RowCount {
 
 /// `4213551` → `4,213,551`. Thousands separators, for a figure precise enough to
 /// deserve them.
-fn group_digits(n: u64) -> String {
+pub(crate) fn group_digits(n: u64) -> String {
     let digits = n.to_string();
     let mut out = String::with_capacity(digits.len() + digits.len() / 3);
     let lead = digits.len() % 3;

@@ -7933,6 +7933,7 @@ fn center(ui: Ui) -> impl IntoView {
                     popup_width,
                     menus: all_menus,
                     last_mouse: ui.overlay.last_mouse,
+                    confirm: ui.overlay.confirm,
                     summarize: summarize.clone(),
                     attach: attach.clone(),
                     follow_fk: follow_fk.clone(),
