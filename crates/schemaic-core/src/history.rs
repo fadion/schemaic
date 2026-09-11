@@ -543,29 +543,35 @@ pub fn preview_for_highlight(sql: &str, dialect: crate::intel::SqlDialect) -> St
     preview(&crate::sql::inline_line_comments(sql, dialect))
 }
 
-/// [`preview`] without the clamp — what a *search* reads.
-///
-/// The two are separate so a term past [`PREVIEW_MAX`] still finds its entry:
-/// clamping what is drawn is a rendering decision, and it must not quietly become
-/// a decision about what is findable.
-/// `pub(crate)` for [`crate::activity::matches_query`], which had the same
-/// problem for the same reason and must not grow a second collapser.
-pub(crate) fn full_preview(sql: &str) -> String {
-    sql.split_whitespace().collect::<Vec<_>>().join(" ")
-}
+// **`full_preview` used to live here** — `preview` without the clamp, so a term
+// past `PREVIEW_MAX` could still find its entry. That rule has not changed; what
+// changed is that nobody needs the collapsed *string*. Its two callers were both
+// searches, and both now ask
+// `text_ops::contains_collapsed_ignore_ascii_case`, which applies the same
+// collapse during the comparison and allocates nothing. Deleting it rather than
+// leaving it `pub(crate)` and unused: this crate has already paid for a dead
+// function kept alive by its tests (`compare::SchemaPlan::script`, which six
+// tests read a plan through and no production caller reached).
 
 /// Whether a history entry matches a free-text filter (ASCII case-insensitive),
 /// checking the SQL, the database name, and the originating tab name. An empty
 /// (or whitespace-only) query matches everything. The SQL is matched against its
 /// whitespace-collapsed [`preview`], so a multi-word query reads across the
 /// statement's original newlines — matching what the panel shows.
+///
+/// The collapse happens *during* the comparison rather than into a `String`
+/// first: collapsing into a `String` allocates twice the size of the statement, per entry,
+/// per keystroke, and the SQL clause is the one that runs for every entry that
+/// did not match on database or tab name. See
+/// [`crate::text_ops::contains_collapsed_ignore_ascii_case`], which
+/// `activity::matches_query` shares for the same reason at a worse scale.
 pub fn matches_query(entry: &HistoryEntry, query: &str) -> bool {
     use crate::text_ops::contains_ignore_ascii_case;
     let q = query.trim();
     if q.is_empty() {
         return true;
     }
-    contains_ignore_ascii_case(&full_preview(&entry.sql), q)
+    crate::text_ops::contains_collapsed_ignore_ascii_case(&entry.sql, q)
         || entry
             .database
             .as_deref()

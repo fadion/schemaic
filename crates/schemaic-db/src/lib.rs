@@ -2144,16 +2144,32 @@ async fn collect_sessions(conn: &mut Conn) -> Result<Vec<SessionInfo>, DbError> 
     // polls find none — from "the view does not exist", so on MySQL 8 every
     // quiet poll went on to run `information_schema.INNODB_LOCK_WAITS`, which
     // 8.0 removed, and paid a guaranteed round-trip failure forever.
-    let waits: Vec<(i64, i64)> = match conn
-        .query_map(MY_LOCK_WAITS_PS_SQL, |r: (i64, i64)| r)
-        .await
-    {
-        Ok(v) => v,
-        Err(_) => conn
-            .query_map(MY_LOCK_WAITS_IS_SQL, |r: (i64, i64)| r)
-            .await
-            .unwrap_or_default(),
-    };
+    //
+    // **And it is not reached at all unless a transaction is actually waiting.**
+    // That fix removed the wasted round-trip for MySQL 8 by putting its spelling
+    // first; it could not remove it for MariaDB, where the first statement can
+    // never succeed — `MY_LOCK_WAITS_IS_SQL`'s doc says outright that neither
+    // statement works on both servers, so with a fixed order exactly one engine
+    // always pays. Measured on 10.11: ERROR 1146, every poll, 1,800 an hour at
+    // the two-second interval. `trx` is `INNODB_TRX`, which is where a waiter
+    // announces itself, so `wait_graph_is_worth_fetching` answers from a table
+    // already in hand and the quiet poll — nearly every poll, on either engine —
+    // now asks nothing.
+    let waits: Vec<(i64, i64)> =
+        if activity::wait_graph_is_worth_fetching(trx.values().map(String::as_str)) {
+            match conn
+                .query_map(MY_LOCK_WAITS_PS_SQL, |r: (i64, i64)| r)
+                .await
+            {
+                Ok(v) => v,
+                Err(_) => conn
+                    .query_map(MY_LOCK_WAITS_IS_SQL, |r: (i64, i64)| r)
+                    .await
+                    .unwrap_or_default(),
+            }
+        } else {
+            Vec::new()
+        };
     // The fold is `activity::from_mysql_rows` — it is where every decision about
     // what a `SessionInfo` *says* lives, and it needs to be reachable from a
     // test with a literal row vector.

@@ -292,6 +292,94 @@ pub fn contains_ignore_ascii_case(hay: &str, needle: &str) -> bool {
     (0..=hb.len() - n).any(|i| hb[i..i + n].eq_ignore_ascii_case(nb))
 }
 
+/// [`contains_ignore_ascii_case`] against `hay` **as if its whitespace runs were
+/// collapsed to single spaces**, without building the collapsed string.
+///
+/// The two search boxes that read SQL — Query History and Server Activity — both
+/// want this: a statement is stored as the user typed it, over several lines,
+/// and is drawn as one collapsed line, so a phrase visibly on screen has to find
+/// the row it is on. Both got there by allocating the collapsed form
+/// (`history`'s since-deleted `full_preview`: a `Vec<&str>` and a `String`, both the size of the
+/// statement) **per candidate, per keystroke**. The activity panel is the one
+/// where that bites: `information_schema.PROCESSLIST.INFO` is the *untruncated*
+/// statement, unlike `SHOW PROCESSLIST`'s 100 characters, it holds up to
+/// `MAX_SESSIONS` of them, the statement test is last in the `||` chain so the
+/// common while-typing case (a partial word matching nothing yet) pays for every
+/// row, and the filter re-runs on every two-second poll besides.
+///
+/// Leading and trailing whitespace is dropped and each internal run counts as
+/// one space — exactly `split_whitespace().collect::<Vec<_>>().join(" ")`, which
+/// is what this replaces. The **needle** is used as given, which is also what it
+/// replaces: it comes from a single-line search box.
+///
+/// `O(n·m)` like its uncollapsed sibling and for the same reason — these are
+/// short needles over a bounded list, and a two-way search would be a different
+/// function's job.
+pub fn contains_collapsed_ignore_ascii_case(hay: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    let mut cur = Collapsed::new(hay.as_bytes());
+    loop {
+        let mut probe = cur;
+        if needle
+            .bytes()
+            .all(|n| probe.next().is_some_and(|h| h.eq_ignore_ascii_case(&n)))
+        {
+            return true;
+        }
+        if cur.next().is_none() {
+            return false;
+        }
+    }
+}
+
+/// The bytes of a string with whitespace runs collapsed, produced on the fly.
+///
+/// `Copy`, which is what lets the search above restart from a position without
+/// re-deriving it.
+#[derive(Clone, Copy)]
+struct Collapsed<'a> {
+    b: &'a [u8],
+    i: usize,
+}
+
+impl<'a> Collapsed<'a> {
+    /// Positioned past any **leading** whitespace, which the collapsed form does
+    /// not have.
+    fn new(b: &'a [u8]) -> Self {
+        let mut i = 0;
+        while i < b.len() && b[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        Self { b, i }
+    }
+}
+
+impl Iterator for Collapsed<'_> {
+    type Item = u8;
+
+    fn next(&mut self) -> Option<u8> {
+        let c = *self.b.get(self.i)?;
+        if !c.is_ascii_whitespace() {
+            self.i += 1;
+            return Some(c);
+        }
+        // A run. It becomes one space — unless nothing follows it, in which case
+        // it is trailing whitespace and the collapsed form ends here.
+        let mut j = self.i;
+        while j < self.b.len() && self.b[j].is_ascii_whitespace() {
+            j += 1;
+        }
+        if j == self.b.len() {
+            self.i = j;
+            return None;
+        }
+        self.i = j;
+        Some(b' ')
+    }
+}
+
 /// Byte offset where each line begins (line 0 at 0, then one past each `\n`).
 fn line_start_offsets(text: &str) -> Vec<usize> {
     let mut starts = vec![0usize];
@@ -1056,5 +1144,73 @@ mod tests {
         let e = move_line("a\nb\nc", 0, 2, false).unwrap();
         assert_eq!(e.text, "b\na\nc");
         assert_eq!(e.sel, (2, 4));
+    }
+}
+
+#[cfg(test)]
+mod collapsed_search_tests {
+    use super::contains_collapsed_ignore_ascii_case as find;
+
+    /// The property both search boxes are built on: the phrase as it is *drawn*
+    /// (one line) finds the statement as it is *stored* (several).
+    #[test]
+    fn a_phrase_reads_across_the_statements_own_newlines() {
+        let sql = "SELECT *\n  FROM   orders\n WHERE id = 1";
+        assert!(find(sql, "select * from orders"));
+        assert!(find(sql, "FROM ORDERS WHERE"));
+        assert!(find(sql, "orders where id = 1"));
+    }
+
+    /// It must agree with the allocating form it replaces, run by run, on the
+    /// shapes that distinguish them — leading, trailing, tabs, newlines, and a
+    /// run in the middle of the needle's span.
+    #[test]
+    fn it_agrees_with_the_allocating_collapse_it_replaces() {
+        let collapse = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
+        let hays = [
+            "",
+            "   ",
+            "a",
+            "  a  ",
+            "a  b",
+            "a\n\tb\r\nc",
+            "\n\n select  1 \t\n",
+            "one",
+            "  ",
+        ];
+        let needles = ["", " ", "a", "a b", "ab", "select 1", "one two", "c"];
+        for h in hays {
+            let flat = collapse(h);
+            for n in needles {
+                assert_eq!(
+                    find(h, n),
+                    super::contains_ignore_ascii_case(&flat, n),
+                    "hay {h:?} needle {n:?} (collapsed {flat:?})"
+                );
+            }
+        }
+    }
+
+    /// Leading and trailing whitespace is not matchable, because the collapsed
+    /// form does not have it. A needle that is only a space finds a *run*.
+    #[test]
+    fn the_edges_collapse_away_and_an_internal_run_is_one_space() {
+        assert!(!find("  a", " a"), "the leading run is gone");
+        assert!(!find("a  ", "a "), "and so is the trailing one");
+        assert!(find("a \t\n b", "a b"), "however long the internal run");
+        assert!(!find("a b", "a  b"), "which is one space, not two");
+        assert!(find("a b", " "));
+        assert!(!find("ab", " "));
+    }
+
+    /// An empty needle matches anything, as the uncollapsed sibling has it, and
+    /// case is ignored on both sides.
+    #[test]
+    fn an_empty_needle_matches_and_case_is_ignored() {
+        assert!(find("", ""));
+        assert!(find("anything", ""));
+        assert!(find("SeLeCt\n1", "select 1"));
+        assert!(find("select\n1", "SELECT 1"));
+        assert!(!find("", "a"));
     }
 }

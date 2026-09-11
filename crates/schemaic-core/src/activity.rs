@@ -516,6 +516,17 @@ pub fn should_poll(panel_is_activity: bool, fits: bool, focused: bool) -> bool {
 /// one was written without that half — so it borrows the same collapser rather
 /// than growing a second.
 ///
+/// **Collapsed on the fly, not into a `String`.** It used to call
+/// `history`'s `full_preview`, which allocated a `Vec<&str>` and a joined `String`
+/// the size of the statement — per session, per call. Every part of that is the
+/// bad case here: `INFO` is the *untruncated* statement (`SHOW PROCESSLIST`
+/// truncates at 100 characters; `information_schema.PROCESSLIST` does not), the
+/// list holds up to [`MAX_SESSIONS`] of them, the statement test is last in this
+/// chain so a partial word matching nothing yet pays for all of them, and the
+/// filter re-runs on every two-second poll besides a keystroke.
+/// [`crate::text_ops::contains_collapsed_ignore_ascii_case`] answers the same
+/// question with no allocation at all, and `history::matches_query` shares it.
+///
 /// **And it is [`SessionInfo::running_sql`] that is matched, not `sql`.** The
 /// two differ on exactly the rows PostgreSQL produces most of: an `idle`
 /// backend keeps its last statement in `pg_stat_activity.query` indefinitely, so
@@ -540,7 +551,7 @@ pub fn matches_query(s: &SessionInfo, query: &str) -> bool {
             .as_deref()
             .is_some_and(|d| contains_ignore_ascii_case(d, q))
         || s.running_sql()
-            .is_some_and(|sql| contains_ignore_ascii_case(&crate::history::full_preview(sql), q))
+            .is_some_and(|sql| crate::text_ops::contains_collapsed_ignore_ascii_case(sql, q))
 }
 
 /// The lock wait worth putting a banner on, if there is one.
@@ -635,6 +646,46 @@ pub fn lock_wait_text(waiter: &SessionInfo, holder: &SessionInfo) -> String {
     )
 }
 
+/// Is this `information_schema.INNODB_TRX.trx_state` a thread waiting on a lock?
+///
+/// The one spelling of the server's word, because two readers ask: the state
+/// normalizer below, and [`wait_graph_is_worth_fetching`], which decides whether
+/// the lock-wait query is run at all. Those two disagreeing would mean a panel
+/// that marks a row `Blocked` and then never fetches what it is blocked by.
+pub fn is_lock_wait(trx_state: &str) -> bool {
+    trx_state.trim().eq_ignore_ascii_case("LOCK WAIT")
+}
+
+/// Is there anything for the lock-wait query to find?
+///
+/// **The answer is No on almost every poll, and asking it saves a round-trip on
+/// both engines.** The wait graph is derived from `INNODB_TRX`, which the caller
+/// has already read: a thread appears in it as a waiter only while its
+/// `trx_state` is `LOCK WAIT`, so with no such row the graph is empty by
+/// construction and the query can only confirm that at the cost of a round-trip.
+///
+/// This is here because of what that round-trip costs on MariaDB. Neither
+/// engine has both lock-wait views — MySQL 8 removed
+/// `information_schema.INNODB_LOCK_WAITS`, MariaDB never had
+/// `performance_schema.data_lock_waits` — so the two spellings are tried in
+/// order and one engine always pays a guaranteed failure. MySQL 8's spelling is
+/// first, so the engine paying is MariaDB, and a panel watching one at the two
+/// second interval issued **1,800 failing statements an hour** (measured, 10.11:
+/// ERROR 1146, the table does not exist), indefinitely, to learn nothing. The
+/// comment on that fallback already records removing this exact cost for MySQL 8
+/// and did not remove it here.
+///
+/// Asked rather than answered by remembering which spelling worked, which is
+/// where the obvious fix goes: a `Db` is built fresh by `Db::connect` for every
+/// operation, so a cache on the handle would be discarded between polls. This
+/// costs nothing, needs no state, and removes the round-trip on *both* engines
+/// rather than one. A poll that does find a lock wait still pays MariaDB's
+/// failure — that is the rare case the panel exists for, and one extra
+/// round-trip is the right price for not carrying flavour state through it.
+pub fn wait_graph_is_worth_fetching<'a>(trx_states: impl IntoIterator<Item = &'a str>) -> bool {
+    trx_states.into_iter().any(is_lock_wait)
+}
+
 /// Normalize a MySQL/MariaDB `PROCESSLIST` row to a [`SessionState`].
 ///
 /// `command` is the thread's current command word; `trx_state` is the matching
@@ -650,7 +701,7 @@ pub fn lock_wait_text(waiter: &SessionInfo, holder: &SessionInfo) -> String {
 /// `SHOW PROCESSLIST`.
 pub fn mysql_state(command: &str, trx_state: Option<&str>) -> SessionState {
     let trx = trx_state.map(str::trim);
-    if trx.is_some_and(|s| s.eq_ignore_ascii_case("LOCK WAIT")) {
+    if trx.is_some_and(is_lock_wait) {
         return SessionState::Blocked;
     }
     if command.trim().eq_ignore_ascii_case("Sleep") {
@@ -1561,6 +1612,45 @@ mod tests {
             "an empty filter matches everything"
         );
         assert!(!matches_query(&s, "nothing-like-this"));
+    }
+
+    /// **The quiet poll asks nothing.** A wait graph has a waiter in it only
+    /// while some `INNODB_TRX` row says `LOCK WAIT`, and the caller has that
+    /// table in hand already — so on the overwhelming majority of polls the
+    /// lock-wait query can only confirm an emptiness the transaction view
+    /// already proved. On MariaDB that confirmation is a guaranteed ERROR 1146,
+    /// 1,800 times an hour at the two-second interval.
+    #[test]
+    fn the_lock_wait_query_is_skipped_when_no_transaction_is_waiting() {
+        assert!(
+            !wait_graph_is_worth_fetching(["RUNNING", "RUNNING"]),
+            "nothing is waiting, so there is no graph to fetch"
+        );
+        assert!(
+            !wait_graph_is_worth_fetching([]),
+            "and no open transactions at all is the same answer"
+        );
+        assert!(wait_graph_is_worth_fetching(["RUNNING", "LOCK WAIT"]));
+        // The server's own spelling, as it arrives: case and padding vary by
+        // build, and `mysql_state` has always accepted both.
+        assert!(wait_graph_is_worth_fetching([" lock wait "]));
+    }
+
+    /// One spelling of the server's word, read by the state normalizer and by
+    /// the fetch decision. The two disagreeing would mean a row marked
+    /// `Blocked` whose "waiting on…" note is never fetched.
+    #[test]
+    fn the_two_readers_of_lock_wait_agree() {
+        for s in ["LOCK WAIT", "lock wait", "  Lock Wait  "] {
+            assert!(is_lock_wait(s), "{s:?}");
+            assert_eq!(mysql_state("Query", Some(s)), SessionState::Blocked);
+            assert!(wait_graph_is_worth_fetching([s]));
+        }
+        for s in ["RUNNING", "COMMITTING", ""] {
+            assert!(!is_lock_wait(s), "{s:?}");
+            assert_ne!(mysql_state("Query", Some(s)), SessionState::Blocked);
+            assert!(!wait_graph_is_worth_fetching([s]));
+        }
     }
 
     /// **The filter and the row have to answer one question.** `matches_query`
