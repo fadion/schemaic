@@ -1344,7 +1344,14 @@ pub fn goto_row_index(input: &str, total: usize) -> Option<usize> {
     let scale = 10u128.checked_pow(frac_part.len() as u32)?;
     // All digits but too wide for the machine is still just "past the end" — it
     // must clamp with every other overshoot, not fall through to the miss above.
-    let int = int_part.parse::<u128>().unwrap_or(u128::MAX);
+    // **An empty integer part is the other way `parse` fails**, and it is a
+    // zero, not an overflow: `.5k` is row 500, and folding it to `u128::MAX`
+    // saturated the count and clamped it to the *last* row of the result.
+    let int = if int_part.is_empty() {
+        0
+    } else {
+        int_part.parse::<u128>().unwrap_or(u128::MAX)
+    };
     let frac = frac_part.parse::<u128>().unwrap_or(0);
     let n = int
         .saturating_mul(mult)
@@ -2670,6 +2677,32 @@ mod tests {
             "a suffix with no number"
         );
         assert_eq!(goto_row_index("1.k", 200_000), Some(999));
+    }
+
+    /// A **missing integer part** is a zero, not an overflow.
+    ///
+    /// `.5k` survives every rejection above the parse — the suffix sets the
+    /// multiplier, `split_once('.')` yields `("", "5")`, and the emptiness test
+    /// rejects only when *both* halves are empty — and then landed on
+    /// `parse().unwrap_or(u128::MAX)`, whose comment is about a number too wide
+    /// for the machine. An empty string is the other way `parse` fails, and it
+    /// took the same branch: the count saturated and clamped, so typing `.5k`
+    /// into the go-to-row box flung the viewport to the **last** row of a
+    /// 200,000-row result instead of to row 500. The clamp is what made it
+    /// silent — the box did something plausible rather than nothing.
+    #[test]
+    fn goto_row_reads_a_missing_integer_part_as_zero() {
+        assert_eq!(goto_row_index(".5k", 200_000), Some(499));
+        assert_eq!(
+            goto_row_index(".5m", 200_000),
+            Some(199_999),
+            "still clamps"
+        );
+        assert_eq!(
+            goto_row_index(".0k", 200_000),
+            Some(0),
+            "which rounds to row 0 and clamps to the first row"
+        );
     }
 
     /// Separators are accepted for anything pasted in from elsewhere — the app
