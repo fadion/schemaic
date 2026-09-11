@@ -674,6 +674,102 @@ pub async fn one_table_offers_itself_as_the_insert_target(target: &'static Targe
 
 /// Create `name` with `ddl` and put one row in it, so a result over it has a row
 /// to carry.
+/// A **composite** key names one row, and the write lands on that row alone.
+///
+/// Every fixture in this tier and in `writeback` had a one-column key, and
+/// `editable.rs`'s own type matrix records more than one key column as a
+/// *failure* — so `build_update`'s `WHERE` construction met a real server only
+/// ever with one key predicate and one key parameter. With one of each, four
+/// different implementations are textually identical or indistinguishable in
+/// effect: joining the predicates with `", "` instead of `" AND "`, pushing the
+/// key parameters before the `SET` ones instead of after, and emitting only
+/// `key[0]`. The last is the dangerous one — a partial key matches a *superset*,
+/// which the 1-row net waves through whenever the superset happens to be one
+/// row, and the write lands on a row the user did not name.
+///
+/// So the fixture is two rows **sharing `a`**: a key that emits only `a` matches
+/// both, which is the one shape the net can still refuse. Asserted from the
+/// model outwards — two key columns, two key values in key order, one row
+/// written — and then from the table back: the sibling row is untouched.
+pub async fn a_composite_key_names_one_row_and_writes_only_it(target: &'static Target) {
+    use schemaic_core::edit;
+    use schemaic_core::model::GridWrite;
+    use tokio_util::sync::CancellationToken;
+
+    let scratch = Scratch::create(target, "composite_key").await;
+    let t = scratch.qualified("ck");
+    scratch
+        .exec(&format!(
+            "CREATE TABLE {t} (a INTEGER NOT NULL, b INTEGER NOT NULL, \
+             payload VARCHAR(32), PRIMARY KEY (a, b))"
+        ))
+        .await;
+    scratch
+        .exec(&format!(
+            "INSERT INTO {t} (a, b, payload) VALUES (1, 1, 'first'), (1, 2, 'sibling')"
+        ))
+        .await;
+
+    let (rs, model) = scratch
+        .edit_model(&format!("SELECT a, b, payload FROM {t} ORDER BY b"))
+        .await;
+    let table = sole_table(&model, target);
+    assert_eq!(
+        key_names(&rs, table),
+        ["a", "b"],
+        "{}: the model's key over a two-column primary key",
+        target.name
+    );
+
+    let payload = index_of(&rs, "payload", target);
+    let dirty: edit::DirtyCells = [(
+        (0usize, payload),
+        schemaic_core::model::CellEdit::Text("changed".to_string()),
+    )]
+    .into_iter()
+    .collect();
+    let edits = edit::build_edits(&model, &rs, &dirty);
+    assert_eq!(edits.len(), 1, "{}: edits built", target.name);
+    assert_eq!(
+        edits[0]
+            .key
+            .iter()
+            .map(|(c, v)| (c.as_str(), v.display().to_string()))
+            .collect::<Vec<_>>(),
+        [("a", "1".to_string()), ("b", "1".to_string())],
+        "{}: the key the edit carries",
+        target.name
+    );
+
+    let written = scratch
+        .db
+        .commit_writes(
+            &GridWrite {
+                updates: edits,
+                ..Default::default()
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("{}: the composite-key write failed: {e}", target.name));
+    assert_eq!(written, 1, "{}: rows written", target.name);
+
+    let back = scratch
+        .exec(&format!("SELECT payload FROM {t} ORDER BY b"))
+        .await;
+    let payloads: Vec<String> = (0..back.row_count())
+        .map(|r| back.cell(r, 0).expect("payload").display().to_string())
+        .collect();
+    assert_eq!(
+        payloads,
+        ["changed", "sibling"],
+        "{}: the write did not land on the row its two-column key names",
+        target.name
+    );
+
+    scratch.teardown().await;
+}
+
 async fn seed(scratch: &Scratch, name: &str, ddl: &str) {
     scratch
         .exec(&format!("CREATE TABLE {} {ddl}", scratch.qualified(name)))

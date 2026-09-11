@@ -99,6 +99,7 @@ live_suite!(
         a_join_with_one_unkeyed_side_still_offers_no_insert_target,
         a_primary_key_becomes_the_write_key,
         a_write_built_from_the_resolved_key_lands_on_that_row,
+        a_composite_key_names_one_row_and_writes_only_it,
         a_not_null_unique_index_is_the_fallback_key,
         a_nullable_unique_index_is_no_key_at_all,
         a_table_with_no_key_is_read_only,
