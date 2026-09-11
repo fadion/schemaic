@@ -1476,8 +1476,14 @@ pub fn codex_isolation_only() -> Vec<String> {
 /// `--allowedTools` both speak. Deriving one from the other keeps a single source
 /// of truth: a second hand-written list of bare names is one rename away from
 /// approving a tool that no longer exists while refusing one that does.
+///
+/// **And the derivation itself is `ToolCall::bare_name`'s**, not a second copy
+/// of it. This function used to re-spell the expression — under the paragraph
+/// above — while the chip label the user reads came from `short_name`, so a
+/// change to the `__` separator would have made the approval grant and the
+/// label name different tools, the grant being the half nobody can see.
 fn bare_tool_name(qualified: &str) -> &str {
-    qualified.rsplit("__").next().unwrap_or(qualified)
+    schemaic_core::transcript::ToolCall::bare_name(qualified)
 }
 
 /// A TOML basic string: quoted, with backslashes and quotes escaped.

@@ -398,7 +398,25 @@ pub struct ToolCall {
 impl ToolCall {
     /// A short human label for the chip (strips the `mcp__server__` prefix).
     pub fn short_name(&self) -> &str {
-        self.name.rsplit("__").next().unwrap_or(&self.name)
+        ToolCall::bare_name(&self.name)
+    }
+
+    /// `mcp__schemaic__run_query` → `run_query`, for a name that is not on a
+    /// `ToolCall` yet.
+    ///
+    /// **One derivation, because the two answers have to agree about which tool
+    /// they are naming.** This produces the chip label the user reads *and* —
+    /// through `schemaic-ai` — the key Codex approves
+    /// (`tools.<name>.approval_mode`), the rule Antigravity allows
+    /// (`mcp(schemaic/<name>)`) and the list OpenCode advertises. `harness.rs`
+    /// re-spelled the expression under a doc arguing the opposite: "a second
+    /// hand-written list of bare names is one rename away from approving a tool
+    /// that no longer exists while refusing one that does". A change to the
+    /// separator, or a server prefix that gains a segment, would have made the
+    /// grant and the label name different tools — with the grant being the half
+    /// nobody can see.
+    pub fn bare_name(qualified: &str) -> &str {
+        qualified.rsplit("__").next().unwrap_or(qualified)
     }
 }
 

@@ -252,7 +252,22 @@ impl StreamParser {
     /// Antigravity numbers its steps from zero on each turn, so on a persistent
     /// one the second turn reuses the first's ids. [`StreamParser::push`] clears
     /// this at every turn boundary for that reason.
+    ///
+    /// **An item with no id of its own is announced rather than swallowed.**
+    /// Codex's `id` is read as `unwrap_or("")`, so every id-less item in a turn
+    /// shared one key — the second `run_query` ran and left no chip, no SQL and
+    /// no result behind it. The Antigravity arm answers the identical question
+    /// the other way and says why: silently dropping a call is the worse failure
+    /// of the two, and `push`'s own comment calls it "the one failure this whole
+    /// dialect is decoded carefully to avoid".
+    ///
+    /// Both keys such an item produces are listed, since the completion half is
+    /// keyed `"{id}\0done"` and an empty id makes that `"\0done"` rather than
+    /// empty. Neither is reachable for a real id.
     fn first_sight(&mut self, id: &str) -> bool {
+        if id.is_empty() || id == "\u{0}done" {
+            return true;
+        }
         self.seen_tools.insert(id.to_string())
     }
 
@@ -1522,6 +1537,40 @@ mod tests {
             })
             .count();
         assert_eq!(pending, 0, "a chip is still spinning: {segs:?}");
+    }
+
+    /// **Two id-less items are two calls, not one.** `codex_item` reads the id
+    /// as `unwrap_or("")`, so every item in a turn that carries none shared the
+    /// single `first_sight` key `""` (and `"\0done"`): the second `run_query`
+    /// ran and left no trace at all — no chip, no SQL, no result. The sibling
+    /// Antigravity arm answers the identical question the other way and says so
+    /// in writing: "a step with no index is announced rather than swallowed:
+    /// silently dropping a call is the worse failure of the two."
+    ///
+    /// Defensive rather than observed: no captured Codex turn omits `id`. The
+    /// point is the direction the default fails in.
+    #[test]
+    fn codex_two_items_with_no_id_are_two_calls() {
+        let out = drive(
+            Harness::Codex,
+            &[
+                r#"{"type":"item.completed","item":{"type":"mcp_tool_call","server":"schemaic","tool":"run_query","arguments":{"sql":"A"},"result":"RA","status":"completed"}}"#,
+                r#"{"type":"item.completed","item":{"type":"mcp_tool_call","server":"schemaic","tool":"run_query","arguments":{"sql":"B"},"result":"RB","status":"completed"}}"#,
+            ],
+        );
+        let sqls: Vec<&str> = out
+            .iter()
+            .filter_map(|e| match e {
+                StreamEvent::ToolUse { sql, .. } => sql.as_deref(),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(sqls, ["A", "B"], "{out:?}");
+        let results = out
+            .iter()
+            .filter(|e| matches!(e, StreamEvent::ToolResult { .. }))
+            .count();
+        assert_eq!(results, 2, "{out:?}");
     }
 
     #[test]
