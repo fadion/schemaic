@@ -898,8 +898,13 @@ impl Connection {
     ///
     /// One answer, asked everywhere: [`crate::connection`]'s five tunnel sites,
     /// rather than a sixth spelling of it at each.
+    ///
+    /// **And it asks [`is_networked`] rather than spelling `!is_sqlite`**, which
+    /// is the point that predicate's own doc makes about *this* function — "the
+    /// tunnel decision quietly did not ask at all". It said so while this line
+    /// still read `!is_sqlite(&self.db_type)`.
     pub fn uses_tunnel(&self) -> bool {
-        self.ssh.enabled && !is_sqlite(&self.db_type)
+        self.ssh.enabled && is_networked(&self.db_type)
     }
 
     /// Should opening this connection negotiate TLS?
@@ -914,7 +919,7 @@ impl Connection {
     /// One answer, asked everywhere, rather than a second spelling of it at each
     /// driver.
     pub fn uses_tls(&self) -> bool {
-        self.tls.mode.negotiates_tls() && !is_sqlite(&self.db_type)
+        self.tls.mode.negotiates_tls() && is_networked(&self.db_type)
     }
 
     /// The database this connection opens in, or `None` for "let the driver
@@ -2242,6 +2247,51 @@ mod tests {
                 SqlDialect::MySql
             };
             assert_eq!(SqlDialect::from_db_type(label), by_predicate, "{label}");
+        }
+    }
+
+    /// **Every "does a server mean anything here" decision asks one predicate.**
+    ///
+    /// `is_networked`'s own doc says it exists because there were two spellings,
+    /// and that having two is what let *the tunnel decision* quietly not ask at
+    /// all — while `uses_tunnel`, thirty lines away, still read
+    /// `self.ssh.enabled && !is_sqlite(&self.db_type)`. So did `uses_tls`, and so
+    /// did `conn_import::needs_password`, whose question is verbatim one of the
+    /// three that doc enumerates.
+    ///
+    /// Nothing fails today — the hand-spelling was the same boolean. What this
+    /// holds is the thing that makes the delegation worth having: a fifth engine
+    /// with no server is **one** edit, to `is_networked`, and this is what fails
+    /// if a call site went on deciding for itself.
+    #[test]
+    fn a_server_less_engine_reaches_no_server_by_any_route() {
+        for label in ["SQLite", "sqlite3", "  SQLITE "] {
+            assert!(!is_networked(label), "{label}");
+            // Everything the server side could carry, set — the engine picker is
+            // editable on a saved connection, so this is a real shape rather
+            // than a contrived one.
+            let mut c = conn();
+            c.db_type = label.to_string();
+            c.ssh.enabled = true;
+            c.tls.mode = SslMode::Require;
+            assert!(!c.uses_tunnel(), "{label}: a file has nothing to tunnel to");
+            assert!(!c.uses_tls(), "{label}: a file has no transport to secure");
+            assert!(c.tls_plan().is_none(), "{label}: and no handshake to plan");
+        }
+    }
+
+    /// And the networked engines still say yes, so the predicate cannot pass by
+    /// refusing everything.
+    #[test]
+    fn a_networked_engine_still_reaches_its_server() {
+        for label in ["MySQL", "MariaDB", "PostgreSQL", "", "something else"] {
+            assert!(is_networked(label), "{label}");
+            let mut c = conn();
+            c.db_type = label.to_string();
+            c.ssh.enabled = true;
+            c.tls.mode = SslMode::Require;
+            assert!(c.uses_tunnel(), "{label}");
+            assert!(c.uses_tls(), "{label}");
         }
     }
 

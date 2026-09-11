@@ -39,8 +39,8 @@
 //! four string comparisons libpq already specifies.
 
 use crate::connection::{
-    Connection, Environment, SshAuth, SshTunnel, SslMode, Tls, default_port, is_postgres,
-    is_sqlite, same_engine,
+    Connection, Environment, SshAuth, SshTunnel, SslMode, Tls, default_port, is_networked,
+    is_postgres, is_sqlite, same_engine,
 };
 // Every source here is a file somebody else's tool wrote, on a platform where
 // the editors write a BOM. Each parser strips one at its own door, so calling a
@@ -538,8 +538,13 @@ pub fn scan(files: &[SourceFile], existing: &[Connection]) -> ImportScan {
 /// SQLite has no server and therefore no credentials, and a connection with no
 /// user named isn't authenticating as anybody either — flagging those would put
 /// a warning on every local file the user imports.
+///
+/// The first half is [`is_networked`], asked rather than re-spelled: *"does a
+/// host, a port, a user, a password or an SSH tunnel mean anything for it"* is
+/// verbatim the question here, and a `!is_sqlite` in its place is a spelling
+/// nothing can grep for when a fourth server-less engine arrives.
 fn needs_password(c: &Connection) -> bool {
-    !is_sqlite(&c.db_type) && !c.user.trim().is_empty()
+    is_networked(&c.db_type) && !c.user.trim().is_empty()
 }
 
 // ---------------------------------------------------------------------------
