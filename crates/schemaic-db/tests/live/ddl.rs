@@ -19,9 +19,20 @@
 //! view column's provenance and a trigger's restatement diverge by engine in
 //! ways that need their own cases, and folding them in here would mean pinning
 //! whatever these three servers happen to answer today.
+//!
+//! **That list used to be the whole of it, and it read as a promise it did not
+//! keep.** Every test here mutated `draft.columns` and nothing else, so
+//! `AddIndex`, `DropForeignKey`, `AddCheck`, `RenameTable` and `TableOptions`
+//! — every change the designer raises that is not about one column's own
+//! definition — reached no server on any leg, while the paragraph above named
+//! only views and triggers as absent. They are covered now. What is still
+//! uncovered, stated so the next reader does not have to re-derive it:
+//! **dropping** an index or a check (the add is asserted, the drop is not),
+//! `Change::PrimaryKey`, and MySQL's `engine`/`collation` table options — the
+//! comment is the one all three legs carry.
 
-use schemaic_core::ddl::{self, ColumnDraft, TableDraft};
-use schemaic_core::schema::{ColumnInfo, TableInfo};
+use schemaic_core::ddl::{self, CheckDraft, ColumnDraft, IndexDraft, TableDraft};
+use schemaic_core::schema::{CheckInfo, ColumnInfo, IndexColumn, IndexInfo, TableInfo};
 use tokio_util::sync::CancellationToken;
 
 use crate::endpoint::Target;
@@ -1056,6 +1067,369 @@ pub async fn a_functional_index_does_not_stop_the_schema_being_read(target: &'st
         target.name,
         ix.lossy,
         ix.create_sql
+    );
+
+    scratch.teardown().await;
+}
+
+/// A column added **in the middle** lands where it was put, with the rest of
+/// the table intact.
+///
+/// The gap this fills is narrow and was expensive: every other test here
+/// *appends* (`draft.columns.push`), which is the one insertion position that
+/// raises no reposition at all, and the reorder test moves an existing column,
+/// which raises a reposition with no `AddColumn` beside it. One plan carrying
+/// both is the composition neither reaches — and it is where MySQL's
+/// `MODIFY … AFTER <the new column>` was emitted **before** the `ADD COLUMN`
+/// that creates it (`ERROR 1054: Unknown column`, measured on MariaDB 10.11.14
+/// and MySQL 8.4.11).
+///
+/// Gated on `supports_column_reorder` for the reason the reorder test is:
+/// PostgreSQL has no column order, so "the middle" is not a place there.
+pub async fn a_column_inserted_in_the_middle_lands_there(target: &'static Target) {
+    let dialect = target.engine.dialect();
+    if !ddl::supports_column_reorder(dialect) {
+        return;
+    }
+    let scratch = Scratch::create(target, "ddl_mid_insert").await;
+    let t = scratch.qualified("t");
+    scratch
+        .exec(&format!(
+            "CREATE TABLE {t} (id INTEGER NOT NULL PRIMARY KEY, name VARCHAR(32) NOT NULL)"
+        ))
+        .await;
+    scratch
+        .exec(&format!("INSERT INTO {t} (id, name) VALUES (1, 'one')"))
+        .await;
+
+    let current = table_of(&scratch, "t").await;
+    let mut draft = TableDraft::from_table(&current);
+    draft.columns.insert(
+        1,
+        ColumnDraft::new(ColumnInfo {
+            name: "added".to_string(),
+            type_name: "INTEGER".to_string(),
+            nullable: true,
+            ..Default::default()
+        }),
+    );
+
+    apply(&scratch, &current, &draft, target).await;
+    assert_round_trips(&scratch, "t", target, "inserting a column mid-table").await;
+    assert_matches_draft(
+        &scratch,
+        "t",
+        &draft,
+        target,
+        "inserting a column mid-table",
+    )
+    .await;
+
+    let after = table_of(&scratch, "t").await;
+    assert_eq!(
+        column_names(&after),
+        ["id", "added", "name"],
+        "{}: the new column is not where it was put",
+        target.name
+    );
+    let rows = scratch
+        .exec(&format!("SELECT name FROM {t} WHERE id = 1"))
+        .await;
+    assert_eq!(
+        rows.cell(0, 0).expect("name").display().to_string(),
+        "one",
+        "{}: the insert lost the row's data",
+        target.name
+    );
+
+    scratch.teardown().await;
+}
+
+/// An index **added** through the designer lands, as the index that was
+/// drafted.
+///
+/// Nothing in this tier ever wrote `draft.indexes` before, so `Change::AddIndex`
+/// — one of the designer's commonest edits — reached no server on any leg. The
+/// two attributes asserted beyond the name are the ones an emitter loses
+/// silently: `unique`, which turns a constraint into a hint, and the key's
+/// **order**, which decides whether the index answers the query it was added
+/// for at all.
+pub async fn an_added_index_lands_as_the_index_drafted(target: &'static Target) {
+    let scratch = Scratch::create(target, "ddl_add_index").await;
+    let t = scratch.qualified("t");
+    scratch
+        .exec(&format!(
+            "CREATE TABLE {t} (id INTEGER NOT NULL PRIMARY KEY, a INTEGER NOT NULL, \
+             b INTEGER NOT NULL)"
+        ))
+        .await;
+
+    let current = table_of(&scratch, "t").await;
+    let mut draft = TableDraft::from_table(&current);
+    draft.indexes.push(IndexDraft::new(IndexInfo {
+        name: "ix_ba".to_string(),
+        columns: vec![IndexColumn::plain("b"), IndexColumn::plain("a")],
+        unique: true,
+        ..Default::default()
+    }));
+
+    apply(&scratch, &current, &draft, target).await;
+    assert_round_trips(&scratch, "t", target, "adding an index").await;
+    assert_matches_draft(&scratch, "t", &draft, target, "adding an index").await;
+
+    let after = table_of(&scratch, "t").await;
+    let ix = after
+        .indexes
+        .iter()
+        .find(|i| i.name == "ix_ba")
+        .unwrap_or_else(|| {
+            panic!(
+                "{}: the index was not added — indexes are {:?}",
+                target.name,
+                after.indexes.iter().map(|i| &i.name).collect::<Vec<_>>()
+            )
+        });
+    assert!(ix.unique, "{}: the index came back non-unique", target.name);
+    assert_eq!(
+        ix.columns
+            .iter()
+            .map(|c| c.name.as_str())
+            .collect::<Vec<_>>(),
+        ["b", "a"],
+        "{}: the index's key order is not the one drafted",
+        target.name
+    );
+    // Unique means the server refuses the duplicate — the half a catalogue read
+    // cannot tell from a plain `KEY` that happens to be flagged.
+    scratch
+        .exec(&format!("INSERT INTO {t} (id, a, b) VALUES (1, 1, 2)"))
+        .await;
+    assert!(
+        scratch
+            .try_exec(&format!("INSERT INTO {t} (id, a, b) VALUES (2, 1, 2)"))
+            .await
+            .is_err(),
+        "{}: the server accepted a duplicate through a UNIQUE index",
+        target.name
+    );
+
+    scratch.teardown().await;
+}
+
+/// A foreign key **dropped** through the designer goes, and its column stays.
+///
+/// `Change::DropForeignKey` had no live coverage either, and the failure it
+/// guards is asymmetric in the expensive direction: a drop implemented as a
+/// column drop takes the data with it, and a drop that silently does nothing
+/// leaves the table refusing the very writes the user removed the key to allow.
+/// So both halves are asserted — the key is gone from the catalogue, **and** a
+/// row the key would have refused is now accepted.
+pub async fn a_dropped_foreign_key_goes_and_the_column_stays(target: &'static Target) {
+    let scratch = Scratch::create(target, "ddl_drop_fk").await;
+    let parent = scratch.qualified("par");
+    let t = scratch.qualified("t");
+    scratch
+        .exec(&format!(
+            "CREATE TABLE {parent} (id INTEGER NOT NULL PRIMARY KEY)"
+        ))
+        .await;
+    scratch
+        .exec(&format!(
+            "CREATE TABLE {t} (id INTEGER NOT NULL PRIMARY KEY, pid INTEGER, \
+             CONSTRAINT t_par_fk FOREIGN KEY (pid) REFERENCES {parent} (id))"
+        ))
+        .await;
+    scratch
+        .exec(&format!("INSERT INTO {parent} (id) VALUES (1)"))
+        .await;
+    scratch
+        .exec(&format!("INSERT INTO {t} (id, pid) VALUES (1, 1)"))
+        .await;
+
+    let current = table_of(&scratch, "t").await;
+    assert!(
+        current.foreign_keys.iter().any(|f| f.name == "t_par_fk"),
+        "{}: the fixture's foreign key was not read back, so the drop below \
+         would assert nothing",
+        target.name
+    );
+    let mut draft = TableDraft::from_table(&current);
+    draft.foreign_keys.retain(|f| f.info.name != "t_par_fk");
+
+    apply(&scratch, &current, &draft, target).await;
+    assert_round_trips(&scratch, "t", target, "dropping a foreign key").await;
+
+    let after = table_of(&scratch, "t").await;
+    assert!(
+        !after.foreign_keys.iter().any(|f| f.name == "t_par_fk"),
+        "{}: the foreign key is still there",
+        target.name
+    );
+    assert!(
+        column_names(&after).contains(&"pid".to_string()),
+        "{}: dropping the key took its column with it",
+        target.name
+    );
+    // The key really is not enforced any more — a value with no parent row.
+    scratch
+        .exec(&format!("INSERT INTO {t} (id, pid) VALUES (2, 99)"))
+        .await;
+
+    scratch.teardown().await;
+}
+
+/// A `CHECK` **added** through the designer is enforced by the server.
+///
+/// The catalogue half alone would be worth little here: MySQL 8 and MariaDB
+/// hand `CHECK_CLAUSE` back with different escaping — the divergence this
+/// file's own module doc names — so a constraint can read back under its name
+/// and still have been created from mangled text. The assertion is therefore
+/// behavioural: the row the check forbids is refused, and the row it allows is
+/// not.
+pub async fn an_added_check_is_enforced_by_the_server(target: &'static Target) {
+    let scratch = Scratch::create(target, "ddl_add_check").await;
+    let t = scratch.qualified("t");
+    scratch
+        .exec(&format!(
+            "CREATE TABLE {t} (id INTEGER NOT NULL PRIMARY KEY, n INTEGER NOT NULL, \
+             s VARCHAR(8) NOT NULL)"
+        ))
+        .await;
+
+    let current = table_of(&scratch, "t").await;
+    let mut draft = TableDraft::from_table(&current);
+    // A quote inside the predicate on purpose: the escaping is what diverges
+    // between these servers, and a check on a number alone would never meet it.
+    draft.check_constraints.push(CheckDraft::new(CheckInfo {
+        name: "n_positive".to_string(),
+        expression: "n > 0 AND s <> 'no'".to_string(),
+        enforced: true,
+        validated: true,
+        ..Default::default()
+    }));
+
+    apply(&scratch, &current, &draft, target).await;
+    assert_round_trips(&scratch, "t", target, "adding a check").await;
+
+    let after = table_of(&scratch, "t").await;
+    assert!(
+        after
+            .check_constraints
+            .iter()
+            .any(|c| c.name == "n_positive"),
+        "{}: the check is not in the catalogue — checks are {:?}",
+        target.name,
+        after
+            .check_constraints
+            .iter()
+            .map(|c| &c.name)
+            .collect::<Vec<_>>()
+    );
+    scratch
+        .exec(&format!("INSERT INTO {t} (id, n, s) VALUES (1, 1, 'ok')"))
+        .await;
+    assert!(
+        scratch
+            .try_exec(&format!("INSERT INTO {t} (id, n, s) VALUES (2, 0, 'ok')"))
+            .await
+            .is_err(),
+        "{}: the server accepted a row the check forbids (the number half)",
+        target.name
+    );
+    assert!(
+        scratch
+            .try_exec(&format!("INSERT INTO {t} (id, n, s) VALUES (3, 1, 'no')"))
+            .await
+            .is_err(),
+        "{}: the server accepted a row the check forbids (the quoted half)",
+        target.name
+    );
+
+    scratch.teardown().await;
+}
+
+/// A **renamed table** lands under its new name, with its rows and its keys.
+///
+/// `Change::RenameTable` reached no server here either, and it is the change
+/// whose failure is least recoverable: the rename is emitted first in the plan
+/// on MySQL, so everything after it names a table that no longer exists under
+/// the name the plan used.
+pub async fn a_renamed_table_keeps_its_rows_and_its_keys(target: &'static Target) {
+    let scratch = Scratch::create(target, "ddl_rename_table").await;
+    let t = scratch.qualified("t");
+    scratch
+        .exec(&format!(
+            "CREATE TABLE {t} (id INTEGER NOT NULL PRIMARY KEY, code VARCHAR(8) NOT NULL)"
+        ))
+        .await;
+    scratch
+        .exec(&format!("CREATE INDEX ix_code ON {t} (code)"))
+        .await;
+    scratch
+        .exec(&format!("INSERT INTO {t} (id, code) VALUES (1, 'keep')"))
+        .await;
+
+    let current = table_of(&scratch, "t").await;
+    let mut draft = TableDraft::from_table(&current);
+    draft.name = "t_renamed".to_string();
+
+    apply(&scratch, &current, &draft, target).await;
+    assert_round_trips(&scratch, "t_renamed", target, "renaming a table").await;
+
+    let after = table_of(&scratch, "t_renamed").await;
+    assert!(
+        after.indexes.iter().any(|i| i.name == "ix_code"),
+        "{}: the rename lost the table's index — indexes are {:?}",
+        target.name,
+        after.indexes.iter().map(|i| &i.name).collect::<Vec<_>>()
+    );
+    let rows = scratch
+        .exec(&format!(
+            "SELECT code FROM {} WHERE id = 1",
+            scratch.qualified("t_renamed")
+        ))
+        .await;
+    assert_eq!(
+        rows.cell(0, 0).expect("code").display().to_string(),
+        "keep",
+        "{}: the rename lost the table's rows",
+        target.name
+    );
+
+    scratch.teardown().await;
+}
+
+/// A **table comment** written through the designer lands.
+///
+/// Gated on the table having read one back at all rather than on the engine:
+/// `TableDraft::comment` is the one table option all three legs in this tier
+/// carry, and a leg whose introspection does not return it has nothing here to
+/// assert. `Change::TableOptions` had no live coverage on any leg.
+pub async fn a_table_comment_lands_and_reads_back(target: &'static Target) {
+    let scratch = Scratch::create(target, "ddl_table_opts").await;
+    let t = scratch.qualified("t");
+    scratch
+        .exec(&format!(
+            "CREATE TABLE {t} (id INTEGER NOT NULL PRIMARY KEY)"
+        ))
+        .await;
+
+    let current = table_of(&scratch, "t").await;
+    let mut draft = TableDraft::from_table(&current);
+    // An apostrophe on purpose: a table comment goes through the same literal
+    // quoting a column comment does, and it is the one table option that is
+    // free text.
+    draft.comment = Some("what it's for".to_string());
+
+    apply(&scratch, &current, &draft, target).await;
+    assert_round_trips(&scratch, "t", target, "setting a table comment").await;
+
+    let after = table_of(&scratch, "t").await;
+    assert_eq!(
+        after.comment.as_deref(),
+        Some("what it's for"),
+        "{}: the table comment did not land",
+        target.name
     );
 
     scratch.teardown().await;

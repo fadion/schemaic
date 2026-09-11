@@ -1282,9 +1282,16 @@ fn user_schema_filter(ns: &str) -> String {
 }
 
 /// Every browsable object in the database, as `(namespace, name, "BASE TABLE" |
-/// "VIEW")` — the list that **decides what exists**, since `assemble_schema`
-/// builds its tables from it alone and drops every other row set whose table
-/// isn't in it.
+/// "VIEW", comment)` — the list that **decides what exists**, since
+/// `assemble_schema` builds its tables from it alone and drops every other row
+/// set whose table isn't in it.
+///
+/// The comment rides here because it is the one table option PostgreSQL has and
+/// nothing was reading it: the designer emitted `COMMENT ON TABLE` perfectly
+/// well and then read `None` back for ever, so a comment written through the
+/// app was invisible in the app the moment it landed — and re-applying could
+/// not restore it either, since a draft whose comment matches the (empty) read
+/// raises no change at all.
 ///
 /// From `pg_catalog`, not `information_schema.tables`, and that is the point:
 /// PostgreSQL 16's own catalogue definition filters that view to
@@ -1302,7 +1309,8 @@ fn user_schema_filter(ns: &str) -> String {
 fn table_list_sql() -> String {
     format!(
         "SELECT n.nspname, c.relname, \
-                CASE WHEN c.relkind IN ('v','m') THEN 'VIEW' ELSE 'BASE TABLE' END \
+                CASE WHEN c.relkind IN ('v','m') THEN 'VIEW' ELSE 'BASE TABLE' END, \
+                COALESCE(obj_description(c.oid, 'pg_class'), '') \
          FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
          WHERE c.relkind IN ('r','v','m','p','f') AND {} \
          ORDER BY n.nspname, c.relname",
@@ -1754,10 +1762,10 @@ async fn collect_schema(client: &Client) -> Result<DbSchema, DbError> {
     // Every browsable object (BASE TABLE / VIEW / materialized view), across
     // every user schema. See `table_list_sql` for why this can't come from
     // `information_schema`.
-    let table_rows: Vec<(String, String, String)> = query_all(client, &table_list_sql())
+    let table_rows: Vec<(String, String, String, String)> = query_all(client, &table_list_sql())
         .await?
         .into_iter()
-        .map(|r| (cell(&r, 0), cell(&r, 1), cell(&r, 2)))
+        .map(|r| (cell(&r, 0), cell(&r, 1), cell(&r, 2), cell(&r, 3)))
         .collect();
 
     // Indexes via `pg_catalog` (every index, not just constraint-backed ones),
@@ -2020,7 +2028,7 @@ async fn collect_schema(client: &Client) -> Result<DbSchema, DbError> {
         let t: Vec<(String, String)> = table_rows
             .iter()
             .filter(|(s, ..)| s == ns)
-            .map(|(_, name, ty)| (name.clone(), ty.clone()))
+            .map(|(_, name, ty, _)| (name.clone(), ty.clone()))
             .collect();
         let schema = assemble_schema(
             Some(ns),
@@ -2139,8 +2147,14 @@ async fn collect_schema(client: &Client) -> Result<DbSchema, DbError> {
             )
         })
         .collect();
+    let table_comments: HashMap<(String, String), String> = table_rows
+        .iter()
+        .filter(|(.., cm)| !cm.is_empty())
+        .map(|(ns, name, _, cm)| ((ns.clone(), name.clone()), cm.clone()))
+        .collect();
     for t in &mut tables {
         let ns = t.schema.clone().unwrap_or_default();
+        t.comment = table_comments.get(&(ns.clone(), t.name.clone())).cloned();
         if t.is_view {
             t.view_options = view_options.get(&(ns.clone(), t.name.clone())).cloned();
         }

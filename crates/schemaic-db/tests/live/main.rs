@@ -124,6 +124,12 @@ live_suite!(
         a_partly_read_index_says_so_and_is_emitted_whole,
         a_switched_off_index_is_not_silently_brought_back,
         a_functional_index_does_not_stop_the_schema_being_read,
+        a_column_inserted_in_the_middle_lands_there,
+        an_added_index_lands_as_the_index_drafted,
+        a_dropped_foreign_key_goes_and_the_column_stays,
+        an_added_check_is_enforced_by_the_server,
+        a_renamed_table_keeps_its_rows_and_its_keys,
+        a_table_comment_lands_and_reads_back,
     ],
     runtime: [
         a_script_runs_every_statement_in_order,
