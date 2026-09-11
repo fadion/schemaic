@@ -33,7 +33,9 @@ use floem::prelude::*;
 use floem::reactive::create_effect;
 
 use schemaic_core::export::{ExportFormat, suggested_filename};
-use schemaic_core::monitor::{ChangeKind, LOG_FORMATS, RowChange, log_result_set};
+use schemaic_core::monitor::{
+    ChangeKind, DATA_COLS_SHOWN, LOG_FORMATS, RowChange, data_overflow_label, log_result_set,
+};
 
 use crate::settings::focusable_dropdown;
 use crate::theme::{font_body, font_label};
@@ -473,10 +475,25 @@ pub(crate) fn monitor_overlay(ui: Ui) -> impl IntoView {
                     // freeze the rendered list at the first thousand while Export
                     // went on sliding. Nothing hid that before because the whole
                     // table was being rebuilt per poll.
+                    //
+                    // **And the stack iterates the sequence numbers, not the
+                    // entries.** `log.get()` deep-copies the whole
+                    // `Vec<MonitorEntry>` — every entry carries the watched
+                    // row's full `Vec<Option<String>>` — and `dyn_stack` copies
+                    // it again into its own `SmallVec`: measured 1.19 / 2.81 /
+                    // 5.34 ms per landing poll at 10 / 30 / 60 table columns,
+                    // on the UI thread, at an interval as short as a second.
+                    // A `Vec<u64>` at `LOG_CAP` is 8 KiB and copies in
+                    // microseconds, and the row builder then clones the *one*
+                    // entry it is for — which floem asks for only when the key
+                    // is new.
+                    let seqs = floem::reactive::create_memo(move |_| {
+                        log.with(|l| l.iter().map(|e| e.seq).collect::<Vec<u64>>())
+                    });
                     let list = dyn_stack(
-                        move || log.get(),
-                        |entry| entry.seq,
-                        move |entry| entry_row(entry, cols),
+                        move || seqs.get(),
+                        |seq| *seq,
+                        move |seq| entry_row(log, seq, cols),
                     )
                     .style(|s| {
                         s.flex_col()
@@ -604,7 +621,25 @@ fn header_row() -> impl IntoView {
 
 /// One change row: `[time] [KIND] [key] [data]` — content-sized (no wrap) so a
 /// long change list scrolls horizontally instead of wrapping.
-fn entry_row(entry: MonitorEntry, cols: RwSignal<Vec<String>>) -> impl IntoView {
+///
+/// **Takes the log and a sequence number rather than the entry**, so the list
+/// above can iterate 8 KiB of `u64` instead of deep-copying every entry's cells
+/// twice per landing poll. The log is appended in ascending `seq` and never
+/// reordered, so the lookup is a binary search; a `seq` the log no longer holds
+/// (the window slid while this was being built) renders nothing, which is what
+/// the row would have shown anyway.
+fn entry_row(
+    log: RwSignal<Vec<MonitorEntry>>,
+    seq: u64,
+    cols: RwSignal<Vec<String>>,
+) -> impl IntoView {
+    let Some(entry) = log.with_untracked(|l| {
+        l.binary_search_by_key(&seq, |e| e.seq)
+            .ok()
+            .map(|i| l[i].clone())
+    }) else {
+        return crate::widgets::nothing();
+    };
     let names = cols.get_untracked();
     // **`fn() -> Color`, not a `Color`** — the same rule `data_view` states two
     // functions below and for the same reason: these rows are keyed on
@@ -650,6 +685,7 @@ fn entry_row(entry: MonitorEntry, cols: RwSignal<Vec<String>>) -> impl IntoView 
             .gap(col_gap())
             .padding_vert(theme::scaled(7.0))
     })
+    .into_any()
 }
 
 /// The Data column, as one non-wrapping line of coloured spans: for an update,
@@ -672,10 +708,19 @@ fn data_view(change: &RowChange, cols: &[String]) -> impl IntoView + use<> {
     let span = move |t: String, c: fn() -> Color| {
         text(t).style(move |s| s.color(c()).font_size(font_body()))
     };
+    // **Bounded at `DATA_COLS_SHOWN`, and it says so** — see that constant. Two
+    // to four views per column times `LOG_CAP` rows is ~123,000 views in a
+    // mounted list showing twenty, and nothing here is wide enough to read past
+    // a dozen `col=value` pairs anyway. The log and the export keep every
+    // column; this is the line, not the record.
     let mut spans: Vec<AnyView> = Vec::new();
+    let shown;
+    let total;
     match change.kind {
         ChangeKind::Update => {
-            for (i, f) in change.fields.iter().enumerate() {
+            total = change.fields.len();
+            shown = total.min(DATA_COLS_SHOWN);
+            for (i, f) in change.fields.iter().take(shown).enumerate() {
                 if i > 0 {
                     spans.push(span(",   ".to_string(), dim).into_any());
                 }
@@ -693,7 +738,9 @@ fn data_view(change: &RowChange, cols: &[String]) -> impl IntoView + use<> {
             } else {
                 old_color
             };
-            for (i, (n, c)) in cols.iter().zip(&change.cells).enumerate() {
+            total = cols.len().min(change.cells.len());
+            shown = total.min(DATA_COLS_SHOWN);
+            for (i, (n, c)) in cols.iter().zip(&change.cells).take(shown).enumerate() {
                 if i > 0 {
                     spans.push(span(", ".to_string(), dim).into_any());
                 }
@@ -701,6 +748,9 @@ fn data_view(change: &RowChange, cols: &[String]) -> impl IntoView + use<> {
                 spans.push(span(cell(c), value_color).into_any());
             }
         }
+    }
+    if let Some(more) = data_overflow_label(total) {
+        spans.push(span(more, dim).into_any());
     }
     h_stack_from_iter(spans).style(|s| s.flex_row().items_center().flex_shrink(0.0_f32))
 }

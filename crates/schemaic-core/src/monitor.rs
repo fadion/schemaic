@@ -393,6 +393,34 @@ pub fn append_changes(log: &mut Vec<MonitorEntry>, at: &str, changes: Vec<RowCha
     trim_log(log)
 }
 
+/// How many of a change's columns the modal's **Data** column renders before it
+/// stops and counts the rest.
+///
+/// **A bound on views, not on the log.** The log holds every column and
+/// [`log_result_set`] exports every column; this is only what one row of the
+/// change table builds. An `Insert`/`Delete` row renders one span per column
+/// *name* plus one per *value* and an `Update` four per changed field, uncapped
+/// in the table's width — so at `LOG_CAP` entries a 60-column table put ~123,000
+/// views in a mounted list showing about twenty of them, paid by every layout and
+/// paint pass for as long as the modal is open (23,000 at 10 columns, 63,000 at
+/// 30 — counted, not estimated).
+///
+/// Twelve because the Data column is one non-wrapping line that is already
+/// scrolled horizontally to read: past a dozen `col=value` pairs nobody is
+/// reading it as a line, they are reading the export.
+pub const DATA_COLS_SHOWN: usize = 12;
+
+/// What the Data column says in place of the columns it did not render, or
+/// `None` when it rendered them all.
+///
+/// The disclosure is the tested half: a line that silently stops at twelve of
+/// sixty is the defect this would otherwise introduce, and the caller has the
+/// whole export one button away.
+pub fn data_overflow_label(total: usize) -> Option<String> {
+    let hidden = total.checked_sub(DATA_COLS_SHOWN).filter(|n| *n > 0)?;
+    Some(format!(", +{hidden} more"))
+}
+
 /// Separates a changed column's old and new value in an exported cell
 /// (`old → new`), matching what the modal renders as two coloured spans.
 const TRANSITION: &str = " → ";
@@ -1521,6 +1549,75 @@ mod tests {
         assert!(
             !csv.contains(",=cmd"),
             "the leading `=` must not survive bare\n{csv}"
+        );
+    }
+
+    /// **The Data column is a line, not the record.** One span per column name
+    /// plus one per value — four per field on an update — uncapped in the
+    /// table's width, times `LOG_CAP` rows: 23,000 views at 10 columns, 63,000
+    /// at 30, 123,000 at 60, in a mounted list showing about twenty, paid by
+    /// every layout and paint pass while the modal is open.
+    ///
+    /// What must not happen is the quiet version: a line that stops at twelve of
+    /// sixty and looks like the whole change.
+    #[test]
+    fn a_wide_change_says_how_much_of_it_is_off_the_line() {
+        assert_eq!(data_overflow_label(0), None);
+        assert_eq!(data_overflow_label(DATA_COLS_SHOWN), None, "exactly full");
+        assert_eq!(
+            data_overflow_label(DATA_COLS_SHOWN + 1).as_deref(),
+            Some(", +1 more")
+        );
+        assert_eq!(
+            data_overflow_label(60).as_deref(),
+            Some(&format!(", +{} more", 60 - DATA_COLS_SHOWN)[..])
+        );
+    }
+
+    /// **The bound is on the view, and on nothing else.** The export is the
+    /// record, and it must still carry every column of every change — which is
+    /// the property that makes truncating the line acceptable at all.
+    #[test]
+    fn the_export_still_carries_the_columns_the_line_does_not() {
+        let wide: Vec<String> = (0..60).map(|i| format!("c{i}")).collect();
+        let cells: Vec<Option<String>> = (0..60).map(|i| Some(format!("v{i}"))).collect();
+        let mut log: Vec<MonitorEntry> = Vec::new();
+        append_changes(
+            &mut log,
+            "12:00:00",
+            vec![RowChange {
+                kind: ChangeKind::Insert,
+                key: vec!["1".to_string()],
+                fields: Vec::new(),
+                cells,
+            }],
+        );
+
+        let rs = log_result_set(&log, &wide);
+        assert_eq!(rs.row_count(), 1, "one change, one row");
+        let order: Vec<usize> = (0..rs.row_count()).collect();
+        let data = crate::export::ExportFormat::Csv.render(
+            &rs,
+            &order,
+            None,
+            crate::intel::SqlDialect::MySql,
+        );
+        // The export gives every watched column a column of its own, so the
+        // header names all sixty and the row carries all sixty values —
+        // including the forty-eight the modal's one-line Data column stops at.
+        for i in [0usize, DATA_COLS_SHOWN, DATA_COLS_SHOWN + 1, 59] {
+            assert!(
+                data.contains(&format!("c{i}")),
+                "column {i} is missing from the export: {data}"
+            );
+            assert!(
+                data.contains(&format!("v{i}")),
+                "column {i}'s value is missing from the export: {data}"
+            );
+        }
+        assert!(
+            !data.contains("more"),
+            "the export is the record, not the line: {data}"
         );
     }
 }
