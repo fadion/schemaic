@@ -39,6 +39,7 @@ use floem::reactive::{create_effect, create_memo};
 use schemaic_core::compare::{
     CompareEntry, CompareKind, CompareRow, ObjectStatus, RowFilter, SchemaComparison, is_planned,
 };
+use schemaic_core::connection::Connection;
 use schemaic_core::diff::{DiffTag, line_diff};
 
 use crate::widgets::{
@@ -213,7 +214,7 @@ pub(crate) fn compare_overlay(ui: Ui) -> impl IntoView {
 /// migration that runs on the wrong server.
 fn sources_bar(ui: Ui, t: CompareTarget, ring: FocusRing) -> impl IntoView {
     let target = ui.overlay.compare;
-    let left_label = side_label(&ui, &t.left);
+    let left_label = side_label(ui.conn.connections, &t.left);
 
     // An inline list rather than the popup menu, which anchors itself to a
     // measured rect: this control sits in a fixed header where a plain
@@ -246,7 +247,7 @@ fn sources_bar(ui: Ui, t: CompareTarget, ring: FocusRing) -> impl IntoView {
             // spelled out because the asymmetry is invisible from the call.
             container(
                 label(move || match target.get().and_then(|t| t.right.clone()) {
-                    Some(s) => side_label(&ui, &s),
+                    Some(s) => side_label(ui.conn.connections, &s),
                     None => "Choose a database".to_string(),
                 })
                 .style(|s| {
@@ -277,7 +278,7 @@ fn sources_bar(ui: Ui, t: CompareTarget, ring: FocusRing) -> impl IntoView {
         // The modal's own ring, like every other focusable here. A fresh
         // `FocusRing::new()` belongs to no focus root, so Tab cannot reach the
         // control and it paints no ring — invisible until clicked.
-        let left_type = left_db_type(&ui, &t.left);
+        let left_type = left_db_type(ui.conn.connections, &t.left);
         dyn_container(
             move || (picking.get(), o.compare_dbs.get()),
             move |(open, listed)| {
@@ -421,10 +422,11 @@ fn side_chip(label: String, note: &'static str) -> impl IntoView {
 /// connection list against. Empty when the connection has gone — an empty label
 /// predates the field, and `same_engine` reads it as MySQL, which is the same
 /// answer the connection form's own picker gives it.
-fn left_db_type(ui: &Ui, left: &CompareSide) -> String {
-    ui.conn.connections.with_untracked(|cs| {
-        cs.iter()
-            .find(|c| c.id == left.conn_id)
+/// **Takes the one signal it reads**, not the whole `Ui` — see
+/// `ddl_preview::connection_label` for why that matters.
+fn left_db_type(connections: RwSignal<Vec<Connection>>, left: &CompareSide) -> String {
+    connections.with_untracked(|cs| {
+        schemaic_core::connection::by_id(cs, left.conn_id)
             .map(|c| c.db_type.clone())
             .unwrap_or_default()
     })
@@ -457,11 +459,15 @@ fn pick_row(
 /// `connection · database`, which is the only unambiguous way to name a side:
 /// two connections routinely hold a database of the same name, and that pair is
 /// exactly the comparison this feature is for.
-fn side_label(ui: &Ui, side: &CompareSide) -> String {
-    let conn = ui.conn.connections.with_untracked(|cs| {
-        cs.iter()
-            .find(|c| c.id == side.conn_id)
-            .map(|c| c.name.clone())
+/// **Takes the one signal it reads**, not the whole `Ui`.
+///
+/// The fallback is deliberately *not* `connection::label_of`'s: a comparison side
+/// whose connection is gone reads as the bare database name rather than as
+/// `connection 7 · shop`, because the database is the half that still means
+/// something here.
+fn side_label(connections: RwSignal<Vec<Connection>>, side: &CompareSide) -> String {
+    let conn = connections.with_untracked(|cs| {
+        schemaic_core::connection::by_id(cs, side.conn_id).map(|c| c.name.clone())
     });
     match conn {
         Some(name) => format!("{name} · {}", side.database),

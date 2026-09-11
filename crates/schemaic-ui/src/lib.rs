@@ -13333,3 +13333,148 @@ mod window_key_gate {
         );
     }
 }
+
+/// **A ratchet on how far the root `Ui` bundle travels.**
+///
+/// `Ui` has 36 fields and transitively pulls `OverlayUi`'s 51 and `DdlUi`'s 40,
+/// and it is passed *unnarrowed* into roughly 140 function signatures across this
+/// crate — while the per-domain child bundles that exist for exactly this purpose
+/// narrow a call at **two** sites in the whole crate. Two costs, both concrete:
+///
+/// * **No such function can be unit-tested.** `ddl_preview::connection_label`
+///   touched 1 of the 36 and encoded a real decision — the `connection N`
+///   fallback — and testing that fallback meant constructing a 36-field bundle
+///   inside a Floem reactive scope. It takes `RwSignal<Vec<Connection>>` now and
+///   the decision is `connection::label_of`, in core, with a three-line test.
+///   `compare_view::left_db_type`/`side_label` and `event_editor::taken_names`
+///   were the same shape and went the same way.
+/// * **A signature stops saying what it depends on.** `schema_tree::object_row`
+///   takes `ui: Ui` and dereferences it *zero* times — the only use is a clone
+///   forwarded into `object_editor::open_for_object` — so it holds live handles
+///   to ~127 signals it never reads, and a change to `OverlayUi` has no readable
+///   blast radius.
+///
+/// **This is a budget, not a ban**, because narrowing 140 signatures is a
+/// campaign and a gate that fails today teaches nothing. Every number below is
+/// what that file declares *now*, and the only legal direction is **down**:
+/// narrowing a function to the signals it reads lowers its file's count, and the
+/// entry is then lowered with it. A new `ui: Ui` in any of them fails here, and a
+/// file not on the list may not take one at all.
+#[cfg(test)]
+mod whole_ui_gate {
+    /// `(file, how many `ui: Ui` parameters it still declares)`.
+    ///
+    /// Lower an entry when you narrow one; never raise one. A file that reaches
+    /// zero comes off the list, and then cannot take `Ui` again.
+    const BUDGET: &[(&str, usize)] = &[
+        ("account_editor.rs", 6),
+        ("activity_panel.rs", 1),
+        ("ai_panel.rs", 1),
+        ("blob_view.rs", 1),
+        ("compare_view.rs", 6),
+        ("connection_form.rs", 1),
+        ("connection_import.rs", 6),
+        ("database_editor.rs", 7),
+        ("ddl_preview.rs", 6),
+        ("dump_view.rs", 9),
+        ("erd_view.rs", 1),
+        ("event_editor.rs", 11),
+        ("history_panel.rs", 1),
+        ("import_view.rs", 9),
+        ("lib.rs", 6),
+        ("modals.rs", 5),
+        ("monitor_view.rs", 1),
+        ("object_editor.rs", 14),
+        ("overlays.rs", 15),
+        ("plan_view.rs", 1),
+        ("properties.rs", 5),
+        ("routine_editor.rs", 12),
+        ("schema_tree.rs", 6),
+        ("script_view.rs", 6),
+        ("settings.rs", 4),
+        ("snippet_edit.rs", 1),
+        ("snippet_panel.rs", 1),
+        ("table_designer.rs", 33),
+        ("tabs.rs", 1),
+        ("trigger_editor.rs", 12),
+        ("users_view.rs", 9),
+        ("view_editor.rs", 10),
+    ];
+
+    /// How many `ui: Ui` / `ui: &Ui` parameters a file declares.
+    ///
+    /// Both spellings the crate uses: a multi-line signature puts the parameter
+    /// on its own line, a short one puts it first inside the parens.
+    fn whole_ui_params(code: &str) -> usize {
+        code.lines()
+            .filter(|l| {
+                let t = l.trim();
+                if t.starts_with("//") {
+                    return false;
+                }
+                let own_line = t == "ui: Ui," || t == "ui: &Ui," || t == "_ui: Ui,";
+                let inline = t.contains("(ui: Ui,")
+                    || t.contains("(ui: &Ui,")
+                    || t.contains("(ui: Ui)")
+                    || t.contains("(ui: &Ui)");
+                own_line || inline
+            })
+            .count()
+    }
+
+    #[test]
+    fn no_view_module_takes_more_of_the_root_bundle_than_it_did() {
+        let mut over: Vec<String> = Vec::new();
+        for (file, code) in crate::source_gate::crate_sources() {
+            // App-crate sources come through this too; the bundle is this
+            // crate's, and `app_view` builds it rather than taking it.
+            if !file.ends_with(".rs") || file.contains('/') {
+                continue;
+            }
+            let found = whole_ui_params(&code);
+            let allowed = BUDGET
+                .iter()
+                .find(|(f, _)| *f == file)
+                .map(|(_, n)| *n)
+                .unwrap_or(0);
+            if found > allowed {
+                over.push(format!(
+                    "{file}: {found} `ui: Ui` parameters, budget {allowed}"
+                ));
+            }
+        }
+        assert!(
+            over.is_empty(),
+            "the root `Ui` bundle reaches further than it did:\n    {}\n\n\
+             Take the signals the function actually reads instead — see \
+             `ddl_preview::connection_label`, which went from `&Ui` to the one \
+             `RwSignal<Vec<Connection>>` it touched and took its decision to \
+             `core::connection::label_of` with a test. If the function really \
+             needs a whole domain, take the child bundle (`ui.overlay`, \
+             `ui.ddl`), which is what those bundles are for.",
+            over.join("\n    ")
+        );
+    }
+
+    /// A budget entry that is higher than the file needs is a licence the next
+    /// `ui: Ui` would inherit — the same floor `dividers::scaled_arg_gate` and
+    /// `theme::color_arg_gate` keep on their exemptions.
+    #[test]
+    fn no_budget_entry_is_looser_than_the_file_it_governs() {
+        let sources = crate::source_gate::crate_sources();
+        for (file, allowed) in BUDGET {
+            let code = sources
+                .iter()
+                .find(|(f, _)| f == file)
+                .map(|(_, c)| c.as_str())
+                .unwrap_or_else(|| panic!("BUDGET names {file}, which is not in this crate"));
+            let found = whole_ui_params(code);
+            assert_eq!(
+                found, *allowed,
+                "{file} declares {found} `ui: Ui` parameters but is budgeted \
+                 {allowed} — lower the entry to {found} (that is the point of \
+                 the ratchet), or drop it if {found} is zero"
+            );
+        }
+    }
+}

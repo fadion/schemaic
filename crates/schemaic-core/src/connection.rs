@@ -1346,6 +1346,17 @@ pub fn read_only_of(list: &[Connection], id: u64) -> bool {
     by_id(list, id).is_some_and(|c| c.read_only)
 }
 
+/// What to call this connection in a sentence about it.
+///
+/// **The fallback is the decision.** A plan, a comparison or a preview that has
+/// lost its connection still has to name the thing it is about, and
+/// `connection 7` is a worse name than the one the user gave it but a far better
+/// one than an empty string — a title reading *"Apply to  "* is the state this
+/// exists to end.
+pub fn label_of(list: &[Connection], id: u64) -> String {
+    by_id(list, id).map_or_else(|| format!("connection {id}"), |c| c.name.clone())
+}
+
 /// Is this engine reached **over the network** — i.e. does a host, a port, a
 /// user, a password or an SSH tunnel mean anything for it?
 ///
@@ -2304,6 +2315,26 @@ mod tests {
         assert!(!read_only_of(&list, 2));
         assert_eq!(by_id(&list, 1).map(|c| c.id), Some(1));
         assert_eq!(by_id(&list, 9), None);
+    }
+
+    /// **The test A2-L7-01 says is the whole point.**
+    ///
+    /// `connection_label` touched 1 of `Ui`'s 36 fields and encoded a real
+    /// decision — the `connection N` fallback its own doc calls "the state this
+    /// exists to end" — and writing this test was impossible while calling it
+    /// meant constructing a 36-field bundle inside a Floem reactive scope. The
+    /// decision moved here; the view takes the one signal it reads.
+    #[test]
+    fn a_connection_label_falls_back_to_the_id() {
+        let mut c = conn();
+        c.id = 4;
+        c.name = "prod".to_string();
+        assert_eq!(label_of(&[c], 4), "prod");
+        assert_eq!(
+            label_of(&[], 7),
+            "connection 7",
+            "a title reading `Apply to  ` is what this refuses"
+        );
     }
 
     /// **The fail-open default, asserted on purpose.**

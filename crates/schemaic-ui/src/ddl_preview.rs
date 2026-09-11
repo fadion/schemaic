@@ -17,6 +17,7 @@ use floem::AnyView;
 use floem::keyboard::{Key, NamedKey};
 use floem::prelude::*;
 
+use schemaic_core::connection::Connection;
 use schemaic_core::intel::SqlDialect;
 use schemaic_core::text::plural;
 
@@ -798,13 +799,13 @@ fn apply(ui: Ui) {
 ///
 /// Falls back to the id rather than to nothing: a title that silently drops the
 /// connection is the state this exists to end.
-fn connection_label(ui: &Ui, conn_id: u64) -> String {
-    ui.conn.connections.with_untracked(|list| {
-        list.iter()
-            .find(|c| c.id == conn_id)
-            .map(|c| c.name.clone())
-            .unwrap_or_else(|| format!("connection {conn_id}"))
-    })
+/// **Takes the one signal it reads, not the whole `Ui`.** It touched 1 of 36
+/// fields and encoded a real decision — the `connection N` fallback — which
+/// could not be tested at all while constructing a 36-field bundle inside a
+/// Floem scope was the price of calling it. The decision itself is now
+/// `connection::label_of`, in core with its test.
+fn connection_label(connections: RwSignal<Vec<Connection>>, conn_id: u64) -> String {
+    connections.with_untracked(|list| schemaic_core::connection::label_of(list, conn_id))
 }
 
 /// The preview modal's title bar.
@@ -908,7 +909,7 @@ pub(crate) fn ddl_preview_overlay(ui: Ui) -> impl IntoView {
                 return empty().into_any();
             };
             // Read before `ui` is moved into the footer's closures.
-            let title = preview_title(&connection_label(&ui, p.conn_id), &p);
+            let title = preview_title(&connection_label(ui.conn.connections, p.conn_id), &p);
 
             // The script box, then the footer. The box is read-only, but it is
             // the thing this modal exists to be *read*, and Tab is how a keyboard

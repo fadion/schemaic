@@ -146,7 +146,10 @@ pub(crate) fn open_for_new(ui: &Ui, database: &str, schema: Option<&str>) {
             read_only: ctx.read_only,
         },
         EventDraft::blank(
-            unique_name(&taken_names(ui, database, schema), "new_event"),
+            unique_name(
+                &taken_names(ui.schema.db_nodes, database, schema),
+                "new_event",
+            ),
             schema.map(str::to_string),
         ),
     );
@@ -156,8 +159,15 @@ pub(crate) fn open_for_new(ui: &Ui, database: &str, schema: Option<&str>) {
 /// of them and a rename can be refused before it round-trips. Read off the
 /// schema the tree is showing, so the proposal agrees with what the user can
 /// see.
-fn taken_names(ui: &Ui, database: &str, schema: Option<&str>) -> Vec<String> {
-    ui.schema.db_nodes.with_untracked(|nodes| {
+///
+/// **Takes the one signal it reads**, not the whole `Ui` — see
+/// `ddl_preview::connection_label` for why that matters.
+fn taken_names(
+    db_nodes: RwSignal<Vec<crate::ConnNode>>,
+    database: &str,
+    schema: Option<&str>,
+) -> Vec<String> {
+    db_nodes.with_untracked(|nodes| {
         let Some(node) = nodes.iter().find(|n| n.database == database) else {
             return Vec::new();
         };
@@ -864,7 +874,7 @@ pub(crate) fn event_editor_overlay(ui: Ui) -> impl IntoView {
             // is the same `db_nodes` snapshot the tree is drawing from, and the
             // reload that would change it runs after Apply, which closes this.
             let taken = taken_names(
-                &ui,
+                ui.schema.db_nodes,
                 &target.database,
                 d.event_draft
                     .with_untracked(|e| e.info.schema.clone())
