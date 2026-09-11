@@ -40,6 +40,43 @@ impl ShellProfile {
     }
 }
 
+/// Which shell profile a settings save should write: the picker's row, or —
+/// when the **loaded** profile is not among the detected ones — the loaded one,
+/// untouched.
+///
+/// **A saved choice must survive a launch on which it could not be detected.**
+/// The picker index is an index into a list built by `detect_shells()`, and
+/// that list is short whenever the shell is not reachable at startup: on
+/// Windows `wsl.exe -l -q` exiting non-zero yields no WSL rows at all, and on
+/// Unix a program that has left `/etc/shells` (or an unreadable `/etc/shells`)
+/// leaves a single `/bin/bash`. The index then resolved to `0`, and the
+/// appearance-saving effect — which floem runs **immediately on creation** —
+/// rewrote `terminal.json` with `detected[0]` before the window was drawn, with
+/// no user action. The choice was then gone for good: WSL coming back could not
+/// restore it, because nothing remembered it any more. The same index sent the
+/// Restart icon into a different shell mid-session.
+///
+/// The session itself was always right — the terminal spawns from
+/// `TerminalSettings::shell` directly — so there was no visible symptom until
+/// the next launch, or the first Restart.
+///
+/// Once the user picks a shell, `selected` names a row of `detected` and that
+/// row wins; `loaded` only answers for a profile the list does not contain.
+pub fn shell_to_persist(
+    loaded: Option<&ShellProfile>,
+    detected: &[ShellProfile],
+    selected: usize,
+) -> Option<ShellProfile> {
+    if let Some(saved) = loaded
+        && !detected
+            .iter()
+            .any(|d| d.program == saved.program && d.args == saved.args)
+    {
+        return Some(saved.clone());
+    }
+    detected.get(selected).cloned()
+}
+
 fn default_font_size() -> u16 {
     13
 }
@@ -244,6 +281,91 @@ fn parse_wsl_list(stdout: &[u8]) -> Vec<String> {
         })
         .filter(|l| !l.is_empty())
         .collect()
+}
+
+#[cfg(test)]
+mod persist_tests {
+    use super::{ShellProfile, shell_to_persist};
+
+    fn p(name: &str, program: &str) -> ShellProfile {
+        ShellProfile {
+            name: name.to_string(),
+            program: program.to_string(),
+            args: Vec::new(),
+        }
+    }
+
+    /// **A saved shell survives a launch that could not detect it.**
+    ///
+    /// The saved profile was found by matching `(program, args)` against the
+    /// detected list, and a miss resolved to index `0` — so on a launch where
+    /// `wsl.exe -l -q` exits non-zero (or a Unix shell has left
+    /// `/etc/shells`), the appearance-saving effect, which floem runs
+    /// immediately on creation, rewrote `terminal.json` with `detected[0]`
+    /// before the window was drawn and with no user action. The choice was
+    /// gone for good: the shell coming back could not restore it, because
+    /// nothing remembered it any more.
+    #[test]
+    fn a_saved_shell_the_launch_could_not_detect_is_kept() {
+        let wsl = ShellProfile {
+            name: "WSL · Ubuntu".into(),
+            program: "wsl.exe".into(),
+            args: vec!["-d".into(), "Ubuntu".into()],
+        };
+        let detected = [
+            p("PowerShell 7", "pwsh.exe"),
+            p("Command Prompt", "cmd.exe"),
+        ];
+
+        assert_eq!(
+            shell_to_persist(Some(&wsl), &detected, 0),
+            Some(wsl.clone()),
+            "the index fell back to 0 and PowerShell overwrote the user's choice"
+        );
+        // …and on an empty detection too, which is what an unreadable
+        // `/etc/shells` and a failed `wsl -l` both look like.
+        assert_eq!(shell_to_persist(Some(&wsl), &[], 0), Some(wsl.clone()));
+    }
+
+    /// A profile the list **does** contain is the picker's business: the row
+    /// wins, which is what makes picking a different shell take effect.
+    #[test]
+    fn a_detected_shell_follows_the_picker() {
+        let ps = p("PowerShell 7", "pwsh.exe");
+        let cmd = p("Command Prompt", "cmd.exe");
+        let detected = [ps.clone(), cmd.clone()];
+
+        assert_eq!(shell_to_persist(Some(&ps), &detected, 1), Some(cmd.clone()));
+        assert_eq!(shell_to_persist(Some(&cmd), &detected, 0), Some(ps.clone()));
+        // Nothing loaded yet: the row, as before.
+        assert_eq!(shell_to_persist(None, &detected, 1), Some(cmd));
+        // A row that is not there answers nothing rather than panicking.
+        assert_eq!(shell_to_persist(None, &detected, 9), None);
+        assert_eq!(shell_to_persist(None, &[], 0), None);
+    }
+
+    /// **The args are half the identity.** Two WSL distros differ only by
+    /// `-d <name>`, so matching on the program alone would call a saved
+    /// `Ubuntu` detected because `Debian` is in the list, and the picker's row
+    /// would then overwrite it.
+    #[test]
+    fn two_profiles_of_one_program_are_told_apart_by_their_args() {
+        let ubuntu = ShellProfile {
+            name: "WSL · Ubuntu".into(),
+            program: "wsl.exe".into(),
+            args: vec!["-d".into(), "Ubuntu".into()],
+        };
+        let debian = ShellProfile {
+            name: "WSL · Debian".into(),
+            program: "wsl.exe".into(),
+            args: vec!["-d".into(), "Debian".into()],
+        };
+        assert_eq!(
+            shell_to_persist(Some(&ubuntu), &[debian], 0),
+            Some(ubuntu),
+            "one distro's presence vouched for another's"
+        );
+    }
 }
 
 #[cfg(all(test, windows))]

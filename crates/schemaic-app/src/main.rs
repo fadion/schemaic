@@ -10407,6 +10407,13 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                 .position(|d| d.program == p.program && d.args == p.args)
         })
         .unwrap_or(0);
+    // **The shell this session is actually running**, which is not the same as
+    // the picker's row: `term_shell_selected` is an index into
+    // `detect_shells()`, and a saved profile this launch could not detect is
+    // not in that list at all. Both the save and the Restart read this, so
+    // neither can silently swap the user's shell for `detected[0]` — see
+    // `shell::shell_to_persist`. `term_apply_shell` is the only writer.
+    let current_shell = RwSignal::new(term_prefs.shell.clone());
     let term_shell_selected = RwSignal::new(init_selected);
     // Terminal appearance/behaviour, restored from `terminal.json`.
     let term_font_size = RwSignal::new(term_prefs.font_size);
@@ -10460,10 +10467,20 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
     // Persist all terminal prefs (shell + appearance) as one file. Reading the
     // selected shell here keeps `terminal.json` whole when any field changes.
     let save_term_prefs: Rc<dyn Fn()> = Rc::new(move || {
-        let shell = term_shells
-            .get_untracked()
-            .get(term_shell_selected.get_untracked())
-            .cloned();
+        // **Through `shell_to_persist`, which keeps a saved profile this launch
+        // could not detect.** The picker index is an index into
+        // `detect_shells()`, and that list is short whenever the shell is not
+        // reachable at startup — a `wsl.exe -l -q` that exits non-zero returns
+        // no WSL rows at all. The index then resolved to `0`, and the effect
+        // below (which floem runs *immediately on creation*) rewrote
+        // `terminal.json` with `detected[0]` before the window was drawn, with
+        // no user action. The choice was gone for good, and the Restart icon
+        // dropped the same session into a different shell.
+        let shell = schemaic_term::shell::shell_to_persist(
+            current_shell.get_untracked().as_ref(),
+            &term_shells.get_untracked(),
+            term_shell_selected.get_untracked(),
+        );
         persist::save_json(
             "terminal.json",
             &schemaic_term::TerminalSettings {
@@ -10568,11 +10585,17 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
         let term_dims = term_dims.clone();
         let term_notify = term_notify.clone();
         Rc::new(move || {
-            let cfg = term_shells
-                .get_untracked()
-                .get(term_shell_selected.get_untracked())
-                .map(|p| p.config())
-                .unwrap_or_else(schemaic_term::shell::default_shell);
+            // The shell that is running, not the picker's row: on a launch
+            // that could not detect the saved profile the index is `0`, and
+            // Restart replaced the user's session with `detected[0]`
+            // unexplained.
+            let cfg = schemaic_term::shell::shell_to_persist(
+                current_shell.get_untracked().as_ref(),
+                &term_shells.get_untracked(),
+                term_shell_selected.get_untracked(),
+            )
+            .map(|p| p.config())
+            .unwrap_or_else(schemaic_term::shell::default_shell);
             let (cols, rows) = term_dims.get();
             match schemaic_term::Terminal::spawn(&cfg, cols, rows, term_notify.clone()) {
                 Ok(t) => {
@@ -10698,6 +10721,9 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                     *terminal.borrow_mut() = Some(t);
                     term_db_label.set(None); // a shell profile, not a client
                     term_shell_selected.set(idx);
+                    // The picked profile is what runs now, so it is also what a
+                    // save and a Restart must name — this is the one writer.
+                    current_shell.set(Some(profile.clone()));
                     // Persist the whole prefs file (shell + appearance).
                     (save_term_prefs)();
                 }
