@@ -1898,6 +1898,9 @@ existing prose was left alone.
     how the two come to disagree; and `folder_replace_prompt` writes the question, beside the three
     report sentences and for the same reason — a message with arms (one file, a few, more than fit)
     is a decision, and not one to make inside a callback the suite cannot reach.
+    **`Listing`/`PickerBody`/`picker_body` are here for that same reason** — what the table picker
+    says when it has no rows is a decision, and it was a `bool` plus an `if` in the view that told a
+    failed read from an empty database wrongly. `dump_view.rs`'s entry has the bug in full.
     **Ordering is a topological sort over `TableInfo::foreign_keys`** (`order_tables`): a referenced
     table before the table referencing it, views last — a view's body selects from the tables above
     it and it holds no rows to order against anything — and ties broken by name, so two dumps of one
@@ -3377,6 +3380,19 @@ existing prose was left alone.
     rather than in a modal: the log is the only record of what a deleted row held and no poll
     re-reports a change, so throwing it away is irreversible — unless it is empty, or already on
     disk, which is why the confirmation isn't unconditional.
+    **`DATA_COLS_SHOWN` (12) is a third bound, and it is on *views* rather than on the log.** The
+    modal's Data column renders one span per column name plus one per value — four per changed field
+    on an update — uncapped in the table's width, times `LOG_CAP` rows: **23,000 views at 10 table
+    columns, 63,000 at 30 and 123,000 at 60** (counted, not estimated), in a mounted list showing
+    about twenty, paid by every layout and paint pass for as long as the modal is open. Twelve
+    because that column is one non-wrapping line already being scrolled horizontally to read: past a
+    dozen `col=value` pairs nobody is reading it as a line, they are reading the export. The log
+    keeps every column and `log_result_set` exports every column, which is what makes truncating the
+    line acceptable at all — `the_export_still_carries_the_columns_the_line_does_not` is the pin on
+    that half. `data_overflow_label(total)` is the disclosure (`, +48 more`) and is separate from the
+    constant for the reason `row_overflow_sentence` is separate from `ROW_VIEW_CAP`: a line that
+    silently stops at twelve of sixty and looks like the whole change is the defect this would
+    otherwise introduce.
   - `activity.rs` — the **Server Activity** panel's model and every decision it makes about a
     snapshot of server sessions: no DB, no timer, no UI. `SessionInfo` is engine-neutral by
     construction (`id`/`user`/`client`/`database`/`state`/`sql`/`seconds`/`blocked_by`), so a third
@@ -3804,6 +3820,27 @@ existing prose was left alone.
     therefore **reuses a deleted snippet's id**; that is safe only while no id outlives the file,
     which is why snippet activations are not recorded in `search_history.json` — a test pins both
     limits.
+    **Four decisions came down here out of closures in `app_view`, where nothing could call them.**
+    `snippet_text(sql, selection)` is *what* to save — the selection if there is one, else the whole
+    buffer — and `can_save(sql)` is whether the `+` is offered at all; they are one function apart
+    rather than two reads at a call site because a whitespace-only selection made them disagree, and
+    `+` was enabled for a click that saved nothing. What refuses a blank selection is
+    `text_ops::selected_text`, which answers `None` for a range that is empty, reversed,
+    whitespace-only or out of bounds — that last being the mirrored range having drifted a keystroke
+    out of step with the text, so a stale range saves the buffer rather than a slice of the wrong
+    statement. The call site used to re-filter the blank case on top of it with a
+    `.filter(|s| !s.is_empty())`; that was **dead code** — `selected_text` had already refused every
+    input it could have caught — which is not what the change was written believing, and running the
+    revert is what settled it. Removing it leaves one guard worth pointing a revert at, and
+    `snippet_save_agrees_with_the_button_that_offers_it` is the pin over the inputs that separate
+    the two. `is_builtin(id)` is the `>= BUILTIN_ID_BASE` test read as a
+    question — a shipped snippet has nothing to record and nothing to persist, so `touch` would find
+    nothing and the save behind it would rewrite the file for no change on every insert of one. And
+    `duplicate(src, new_id)` is the copy **Duplicate** makes, with the five things it does not carry:
+    `source` becomes `User` even from a built-in (that is what Duplicate is *for* on a shipped
+    snippet that cannot be edited in place), `abbrev` is dropped because two snippets answering to
+    one spelling is a coin toss, `last_used` is `None`, the name gains ` copy`, and `scope` is
+    inherited because the copy is for the same place as the original.
   - `history.rs` — query-history model (`push`/`clear_conn`/`preview`/`relative_time`),
     persisted to `history.json`. An entry is written in **two passes** — `push` when the run
     launches, `finish` when it lands (duration, rows, `Outcome`) — because the two moments
@@ -4137,7 +4174,32 @@ existing prose was left alone.
     it, ticking through `Imported::preselected` so a row duplicating a *saved* connection arrives
     unticked whatever produced it. `merge_skipped` is the other half, and exists because it was
     missing: without it a second scan turned three Oracle data sources into "6 entries were not
-    imported", naming each one twice. `fill_missing_passwords` **retracts
+    imported", naming each one twice.
+    **Both of those are now bounded, and the bound is on what is *kept*, never on what is counted.**
+    *Choose a file…* has no type filter and an unrecognised name is read as a list of URLs by
+    design — "a `.env`, or a scratch file of connection strings" — so pointing it at a shell history,
+    a log or a large `.csv` produces one `Skipped` per line: ~140,000 of them at the 4 MiB read cap
+    and ~30 bytes a line, every one allocated and deduped against every other, handed to a modal that
+    shows about five at a time. `SKIPPED_CAP` (200) is how many are kept and
+    `ImportScan::skipped_hidden` counts the rest, because *"N entries were not imported"* is exactly
+    what tells someone they pointed the picker at the wrong thing, and the case where N is enormous
+    is the one that has to survive. The cap is applied in `ImportScan::skip` — the same constructor
+    that redacts the name, and for the same reason: a parser that grew its own bound is a parser that
+    can forget one —
+    and again in `merge` and `merge_skipped`, which `skip` cannot see into (two files of 150 junk
+    lines each must not put 300 on the list because neither reached the bound alone). **That the cap
+    is in three places is why `a_file_of_junk_lines_yields_a_bounded_skip_list` asserts on
+    `parse_url_scan`'s output *before* the folded one**: its first version asserted only the folded
+    result and passed against the unfixed tree, because `merge` capped while the parser went on
+    allocating 50,000 `Skipped` structs on the way in — which is the memory the cap exists to refuse.
+    Removing `skip`'s own cap fails that first assertion and nowhere else. `merge_skipped`
+    also dedupes through a `HashSet` rather than `contains`, which was O(n²) in the number of skipped
+    entries: measured on this exact shape at 10,000 → 74 ms, 20,000 → 184 ms, 40,000 → 989 ms, on the
+    UI thread with no cancel and no progress. `Skipped`/`SkipReason` gained `Hash` for it. The cap
+    makes that belt and braces, which is the point — a cap is a policy that could be raised, and the
+    shape underneath it should still be right. `ROW_VIEW_CAP` (500) and `row_overflow_sentence` are
+    the same rule for the rows the modal *offers*; `connection_import.rs`'s entry has what they
+    bound. `fill_missing_passwords` **retracts
     `ImportNote::NoPassword`** when it fills — the order inside `scan` would do on its own, but a
     caller completing an already-scanned row (a hand-picked file, whose passwords arrive
     afterwards) would otherwise show "No password in the source" on a row that has one.
@@ -5122,7 +5184,17 @@ existing prose was left alone.
       An assistant or error turn also carries a `harness` — the `Harness::key` of the CLI that
       produced *it*, stamped by `main.rs`'s send path when the turn starts rather than read from the
       live setting at render time, because switching CLI in Settings does not start a new
-      conversation. A `String` and not the `Harness` itself: this crate sits below `schemaic-ai` and
+      conversation. **Which value is stamped is `ai::turn_harness(live, selected, need_new)`, and it
+      is the live session's, not the selected one.** `needs_respawn`'s harness term is gated on
+      reachability on purpose — choosing a harness that is not installed keeps the working
+      conversation rather than trading it for a binary that cannot be spawned — so there is a
+      supported state in which the *setting* says Codex and the process answering is Claude.
+      Stamping the setting put CODEX over Claude's reply, in the transcript and then in
+      `chats.json`, which is the worse of the two failures `harness_label`'s own doc exists to avoid:
+      the transcript is then wrong about history rather than merely wrong about now. The selected
+      harness is the answer only when one is about to be spawned from it, and the two agree on every
+      path except the one the reachability gate creates.
+      A `String` and not the `Harness` itself: this crate sits below `schemaic-ai` and
       cannot name that type, so `schemaic_ai::harness::speaker_label` is the only thing that turns it
       back into a name. `#[serde(default)]` is load-bearing rather than habit — every conversation
       already on disk predates the field, and without it the user's saved history stops parsing.
@@ -5131,6 +5203,19 @@ existing prose was left alone.
       author to record, and so does the app's own "can't reach the database" refusal, which no CLI
       answered. A turn that *fails* keeps its stamp, because the stream flips the already-stamped
       pending message to `Role::Error` rather than pushing a new one.
+      **`Role::carries_an_answer` is what `Role::Error` actually decides, and it had no name.** An
+      error turn's `Seg::Text`s render as plain `text()` in the error colour and never reach
+      `render_markdown`; `ai_panel::render_segments` therefore asks the predicate rather than
+      `role == Role::Error`, so the question the view is answering is *does this turn have an answer
+      to format* rather than *which variant is it*. `Role::settled(is_error)` is the other half — the
+      decoders' flag applied to a turn, only ever raising, so a turn already marked `Error` is not
+      un-marked by a later snapshot carrying `false`. The two are here rather than in the view
+      because the decoders answer the same question at the far end of the stream
+      (`schemaic-ai`'s `stream::opencode_is_failure`) and the link between the two ends is what was
+      missing: an OpenCode turn cut off at the model's output cap, and an Antigravity turn whose
+      *side* tool was refused, were both flagged, and the whole formatted reply snapped to red
+      monochrome — the advisory sentence about the cut-off included, rendering its own literal
+      `_underscores_`.
       Also the message box's **prompt recall** (Ctrl+Up/Down): `user_prompts` (the user's own
       questions, newest first, blanks dropped and a repeat kept only at its newest spot) +
       `recall_step`, which is a **cycle** — `None → newest → … → oldest → None` — rather than a
@@ -8785,8 +8870,13 @@ existing prose was left alone.
     whose only tool call was *refused* still reported `"status":"SUCCESS"` with an empty `response`,
     recording the refusal nowhere but in a `denied_actions` array — read on `status` alone, a turn
     that did nothing renders as a silent success and the user is left asking why the assistant
-    ignored them. So `is_error` is `status != SUCCESS` **or** a non-empty `denied_actions`, and the
-    refusal is also emitted as prose, because the body it would otherwise be explained in was empty.
+    ignored them. So the refusal is emitted **as prose**, because the body it would otherwise be
+    explained in was empty. It is deliberately *not* also `is_error`: that flag is a rendering
+    decision (below), `status != SUCCESS` is what says the turn produced no answer, and a refused
+    **side** tool can sit beside an answer that is complete — repainting that answer red and
+    unformatted is the failure the arm now avoids
+    (`a_real_denied_antigravity_tool_call_names_the_tool_and_says_so_in_prose`, which asserts the
+    prose arrives and the answer beside it is left alone).
     The rest of the dialect: `conversation_id` sits at the **top level**, not inside `init`, and is
     what `SessionStarted` carries here; wall time is `duration_seconds`, a **float**, where every
     other dialect reports whole milliseconds or nothing, so `antigravity_stats` **rounds** rather
@@ -8811,6 +8901,20 @@ existing prose was left alone.
     printer's only failure event and nothing follows it either, so the `TurnDone` comes from there or
     not at all (`an_opencode_session_error_ends_the_turn_and_says_why`, which also emits the message
     as prose — there is no body it would otherwise be explained in).
+    **`is_error` is a rendering decision, not a diagnosis, and `opencode_is_failure` is where that
+    was settled**: it answers true for `"error"` and for nothing else. Its only consumer sets
+    `core::transcript::Role::Error`, and an error turn renders every `Seg::Text` as plain `text()` in
+    `theme::error()` and never reaches `render_markdown` — headings and tables come out as raw
+    `#`/`|`, fenced SQL loses its Insert / Run / Propose bar, and `Seg::Tool` chips are unaffected,
+    so the bubble ends up half-styled. That is right for a turn with nothing to show and wrong for
+    one whose answer is real prose that merely stopped short. `length` and `content-filter` are such
+    turns: the answer is on screen, `opencode_cutoff_note` is the sentence saying the last line was
+    not the end of it, and flagging them snapped the whole formatted reply to red monochrome with
+    that advisory sentence rendering its own literal `_underscores_`. The three links —
+    the decoder's flag, `Role::settled`, `Role::carries_an_answer` — sit in three crates and each was
+    defensible alone, which is why `an_answer_cut_off_at_the_output_cap_still_renders_as_markdown`
+    drives the composition, and `a_turn_with_nothing_to_show_is_still_rendered_as_an_error` holds the
+    other direction so the fix cannot pass by never marking anything.
     The rest of the dialect follows from the same shape. **Tokens are reported per *step*, not per
     turn** — a measured two-step turn reported input 2497 and then 637 — so `OpenCodeTurn` accumulates
     them across `step_finish` events and a footer reading only the last would understate that turn by
@@ -8868,7 +8972,7 @@ existing prose was left alone.
     (`codex exec --json`, `agy -p --output-format stream-json`,
     `opencode run --pure --agent schemaic --format json`) — including a matched Antigravity
     pair where the harness and the prompt are identical and permission is the only difference
-    (`a_real_denied_antigravity_tool_call_names_the_tool_and_fails_the_turn`,
+    (`a_real_denied_antigravity_tool_call_names_the_tool_and_says_so_in_prose`,
     `a_real_completed_antigravity_tool_call_fills_its_chip_and_succeeds`), which is what makes the
     `"status":"SUCCESS"` refusal above evidence rather than a story. `OC_REAL_TOOL_CYCLE` is the
     OpenCode one, and it is the fixture carrying the two facts that dialect turns on: a `step_finish`
@@ -8879,7 +8983,7 @@ existing prose was left alone.
     on. Its response body is empty, so the *only* thing the user reads is the prose this parser
     synthesises, and a `TurnState` regression that swallowed that prose would have restored the
     silent success with the parser test still green. Both
-    `a_real_denied_antigravity_tool_call_names_the_tool_and_fails_the_turn` and
+    `a_real_denied_antigravity_tool_call_names_the_tool_and_says_so_in_prose` and
     `a_real_codex_tool_cycle_fills_its_chip_and_answers` fold their events through `TurnState` now
     and assert on the rendered segments and on the chip — its name, its result, and that it is no
     longer spinning — rather than on the event list alone. Keep them byte-for-byte: tidying an id or a usage key turns evidence back into a fixture
@@ -9570,6 +9674,22 @@ existing prose was left alone.
     does fire, but a close-and-reopen inside `TEST_FLASH` still shows the previous visit's result
     icon, and `test_flash` is also driven by `conn_test` state that would likely need resetting with
     it.
+    **Why the test failed is printed in words above the button row, and that line is deliberately
+    *not* tied to `test_flash`.** `TestState::Fail` carries a `String` (so the enum is no longer
+    `Copy`), `TestState::{landed, failure}` are the two questions asked of it, and `main.rs`'s
+    `test_outcome` is the one mapping from the round trip's `Result`. It used to be a bare `bool`:
+    `open_tunnel`'s failure arm was `Err(_) => { send(false); return; }`, which is where
+    `ssh::refusal_message` — several sentences naming the host, both fingerprints, that the key *"has
+    CHANGED since Schemaic first trusted it"*, and the out-of-band check to perform — stopped
+    existing. `ssh::authenticate`'s own doc names this button as the surface for exactly those
+    errors, and the *real* connect path never had the gap (`Err(e) => send(Err(e.to_string()))`), so
+    only the diagnostic control lost the diagnosis: an unreadable trust store, a wrong SSH password
+    and an unreachable host were one identical red X with no text anywhere. The icon is a flash and
+    `TEST_FLASH` takes it away again, so the sentence stays until the next test or the next edit —
+    both of which move `conn_test` off `Fail` — and its padding lives inside the `Some` arm, since a
+    hidden child still gives its parent that parent's own padding and would leave a permanent band
+    above the footer. An empty reason renders nothing extra and is never the expected state
+    (`a_failed_test_always_carries_its_reason`, `an_unfinished_test_reports_neither_way`).
     **`tls_fields` is always visible on a networked engine, not behind a toggle like the SSH
     block**: a database that enforces TLS is the ordinary case rather than the advanced one, and a
     checkbox marked "use SSL" is the control that leaves people believing a connection is verified
@@ -9597,9 +9717,14 @@ existing prose was left alone.
     *Choose a file…* and *Scan installed clients* beneath it, then — only once one of them has
     produced something — the review list. Opening does **not** scan: the walk reads the user's home
     directory, and a dialog that goes through it because it was opened is doing something nobody
-    asked for. The three sources all append through the app's one `add_import_rows`, so a scan
+    asked for. The three sources all append through the app's one `add_import_result`, so a scan
     cannot discard a URL pasted before it and the three cannot disagree about ticking or about
-    duplicates. `empty_message` (pure, tested) is why the scan button doesn't look dead on a
+    duplicates. **Two of the three run off the UI thread** — the client scan always did, and the
+    picked file now does: its read, its parse, its `~/.pgpass` completion and its merge all used to
+    happen inside the file-picker callback, with a frozen window and no cancel, over the one input
+    whose size and shape the app controls least. It is a `handle.spawn_blocking` reporting through
+    `create_ext_action`, the shape `scan_installed_clients` beside it already had.
+    `empty_message` (pure, tested) is why the scan button doesn't look dead on a
     machine with none of those clients: an empty list means three different things — an invitation,
     progress, an answer — and `ConnImportUi::scanned` is the bool that tells the first from the
     third.
@@ -9628,9 +9753,23 @@ existing prose was left alone.
     the sentence it carries runs to ~190 characters, so the user read `Added 3 connections.
     Read-only and the en…` and the warning the line exists to deliver — that read-only and the
     environment badge are *not* carried over — never reached the screen at all. The slot had been
-    sized for the sentence it was first given. `skipped_sentence` (pure, tested) names up to
-    three left-out entries and counts the rest, returning `None` for an empty list so a stray
-    "0 entries were not imported" can't reach the screen.
+    sized for the sentence it was first given. `skipped_sentence(skipped, hidden)` (pure, tested)
+    names up to three left-out entries and counts the rest, returning `None` for an empty list *and*
+    a zero `hidden` so a stray "0 entries were not imported" can't reach the screen. `hidden` is what
+    `conn_import::SKIPPED_CAP` kept out of the list; it counts toward the total and nowhere else,
+    since the whole point of the cap is that those entries were never worth keeping and the whole
+    point of the count is that a large one is the signal the user needs.
+    **The row list is bounded at `conn_import::ROW_VIEW_CAP` (500), and says so when it bites.** Not
+    a cap on the import — `rows` holds every connection and Import creates all of them — but on what
+    is *constructed*: the list is a plain `v_stack_from_iter` of one `h_stack` with a check box,
+    three texts and two capsules per row, inside a `scroll` showing about five, rebuilt whole on
+    every change to `rows`. A `.env` that really is a list of 140,000 URLs would build close to a
+    million views to show five. `conn_import::row_overflow_sentence` is the disclosure and is
+    separate from the cap so the *disclosure* is the tested half: a list that silently stops at 500
+    of 140,000 is the failure this would otherwise introduce. A cap rather than a `virtual_stack`,
+    because an import row is two lines or three depending on whether it carries notes, so
+    virtualizing means a `VirtualItemSize::Fn` restating the layout — and there is no screenshot
+    harness here to catch it being wrong.
   - `dividers.rs` — the two **panel** dividers: `h_resize_handle` (the schema tree's and the right
     panel's edges) and `v_resize_handle` (the editor/results split), plus the `DelayedHover` they
     share. Not `window_chrome::resize_zones`, which resizes the *window* and is mounted outside the
@@ -10335,6 +10474,19 @@ existing prose was left alone.
     table is missing** in its error line. A click that names a table the server no longer reports
     (dropped or renamed since the tree was last refreshed) otherwise opened a full list with nothing
     ticked and a dead `Export` button, which reads as broken rather than as an answer.
+    **What the picker says when it has no rows to show is `dump::picker_body`, matched
+    exhaustively** — `Reading`, `NoTables`, `Unreadable`, `Tables` — over a `dump::Listing` of
+    `Reading`/`Done`/`Failed` that `DumpUi::listing` carries in place of the `bool` it used to be. A
+    `bool` was enough while the read could only be "out" or "back", and it is not enough to tell
+    "back, and the database really is empty" from "never came back": the view branched on the flag
+    and then on `names.is_empty()`, so a listing that *failed* landed in the reassuring arm and
+    printed **"This database has no tables."** four lines above the connection error explaining why
+    the list was empty — two contradictory statements about one database, with the wrong one in the
+    panel the user is reading. It is the same shape and the same reason as `script::ProbeSummary`
+    next door, whose `== 0` branch described a file its probe had never finished reading as holding
+    *"no statements Schemaic can run"*. An enum rather than a second `if` so a fourth state cannot
+    fall into the reassuring arm by default, and the failing arm is the only place that knows: the
+    callback sets `Listing::Done`/`Failed` off the `Result` before it looks at the names.
     The picker's rows read the selection through a `create_memo` of it as a `HashSet` and draw
     `widgets::check_box`, the app's one checkbox, which fills and empties by style (`s.hide()` on
     the tick), never a per-row `dyn_container`. It wore a check-glyph-and-hollow-square pair of its
@@ -10351,8 +10503,9 @@ existing prose was left alone.
     It follows `import_view`'s discipline for the same reasons: `widgets::accept_launch` in the same
     synchronous step as the launch — inside the save dialog's callback (titled `Export to SQL`,
     defaulting to `{database}.sql`), since that is where the launch is, and with `read_only` false
-    because a dump writes to the local disk and never to the server — a `listing`/`running` pair
-    that is what the buttons gate on, and `DumpUi::generation` bumped on every open so a table list
+    because a dump writes to the local disk and never to the server — a `running` flag that is what
+    the buttons gate on (`listing` says only how far the table read has got, and is read by the
+    picker's body), and `DumpUi::generation` bumped on every open so a table list
     or an outcome that lands after the modal was reopened elsewhere reports into nothing. Every exit
     — the footer's dismissive button, Escape, the ✕ — **stops the export rather than closing**
     (`widgets::exit_action` with `cancellable: true`), the import modal's rule and for its reason:
@@ -10933,6 +11086,25 @@ existing prose was left alone.
     read-only refusal is inside `open_for_new`/`open_for_grant` rather than at the button, the same
     rule `database_editor::open_for_new` follows: a launch guards itself in the step that launches
     it, and the browser's dimming is what *says* the action is unavailable.
+    **A form's *address* comes from the browser that raised it, not from the connection switcher.**
+    Both launchers take the browser's own `&UsersTarget` and stamp `conn_id` and `dialect` off it;
+    they read `edit_ctx` instead, which resolves `ui.conn.active_conn` at the moment the button is
+    pressed, so a `GrantTarget` paired a `Principal` read out of connection A's `mysql.user` with B's
+    connection and B's grammar — the plan was emitted at B's dialect and `GRANT … TO 'app'@'%'` ran
+    on B for an account that lives on A. `UsersTarget`'s own doc had already stated the rule in the
+    imperative ("the browser describes the server it was opened on, even if the switcher has since
+    moved", and that its two sibling targets carry one for the same reason), and the module's *third*
+    write action, Drop, was already spelled this way eight lines below. **`read_only` deliberately
+    stays live**: it is the refusal, not the address — a connection marked read-only while the
+    browser is open must stop the write it is about to authorise — and it is also the stamp
+    `read_only_door_gate` finds these two doors by. `account_editor::anchor_gate` holds both halves,
+    and it is a **source** gate because the decision is two struct literals inside `fn`s that take
+    the whole `Ui`: building one in a test is 36 fields and 91 more transitively. What it can see
+    mechanically is the spelling — `ctx.conn_id`/`ctx.dialect` must not appear in this file's
+    production code, `conn_id: from.conn_id,` and `dialect: from.dialect,` must appear once per door,
+    and `edit_ctx(ui)` must still be called at all, which is the floor that stops a rename leaving
+    nothing to look for. Scoped to this file on purpose: every other editor is launched from the
+    schema tree, where the active connection *is* the target.
     The account form **only ever creates** — the shape `database_editor` has and for the same
     reasons: an account is dropped from its own row in the browser, and neither engine offers a
     rename that is safe to perform. Its Kind picker comes first because it decides what the rest of
@@ -11730,6 +11902,25 @@ existing prose was left alone.
     style closures that each call `ed.text_layout(line)` — a real refactor with its own failure
     modes, for a transient overlay of usually under ten rows. The per-call cost dropped a long way
     when the strips moved to `block_at`, which is what made leaving it the reasonable trade.
+    **The find bar's hit-recompute effect has two reasons to run, and they are split because only
+    one of them is worth a frame.** It tracks the document deliberately — an edit while the bar is
+    open moves every later match, and the hit list is what Replace edits *by*, so reading the
+    document untracked meant a hit computed before an edit was used after it: typing `-- ` at the
+    head of a query turned `SELECT a FROM t;` into `-- SELECT a FRx t;`, destroying the `OM` of
+    `FROM` while the `t;` the user searched for was left alone. The effect's previous value is the
+    query it last ran for, which is what separates the two. A **new query** recomputes now and
+    reveals the first match, because the user is watching `n/total` and waiting to be taken there;
+    a delay in that path is a find bar that feels broken. It reads the haystack with `query.with`
+    rather than `get`, since the scan borrows the document and cloning a 16 MiB buffer to hand to a
+    function taking `&str` was 2.4 ms of a 20.3 ms keystroke. An **edit** rides a 120 ms
+    generation-counter debounce, the same one the diagnostics pass beside it uses (the live-DB
+    validation next to that is 500 ms) — rescanning the whole document synchronously is 17 ms at
+    16 MiB, on the UI thread, on every keystroke. That is safe rather than merely cheaper because
+    nothing reads `find_hits` until Enter, an arrow or Replace, and **`replace_one` revalidates
+    against the live document** instead of trusting the list ("one stale offset here rewrites text
+    the user never searched for"), so a list that lags a tick cannot become an edit. The empty-query
+    arm still calls `query.track()`, or typing a needle after clearing one would read a document the
+    effect had stopped following.
   - `inline_diff.rs` — the Ctrl+K suggestion rendered **in the editor's own line flow**: the lines
     it replaces stay where they are, faded, and the lines it proposes appear directly below them,
     pushing the rest of the document down. They are Floem *phantom text* (the facility inlay hints
@@ -12085,7 +12276,24 @@ existing prose was left alone.
     list index: at the cap the log slides, so `{0..999}` describes a different thousand changes after
     every poll while the key set stays identical — floem reuses a view whose key didn't change, so
     memoising the selector alone would have frozen the rendered list at the first thousand changes
-    while the log and its export went on moving. The unconditional rebuild was what hid that. Three icon buttons sit in the sub-header between the status line and
+    while the log and its export went on moving. The unconditional rebuild was what hid that.
+    **And the stack iterates the sequence numbers, not the entries.** `log.get()` deep-copies the
+    whole `Vec<MonitorEntry>` — every entry carries the watched row's full `Vec<Option<String>>` —
+    and `dyn_stack` copies it again into its own `SmallVec`: **1.19 / 2.81 / 5.34 ms per landing
+    poll at 10 / 30 / 60 table columns**, on the UI thread, at an interval as short as a second. A
+    memo of `Vec<u64>` is 8 KiB at `LOG_CAP` and copies in microseconds, and `entry_row(log, seq,
+    cols)` then clones the *one* entry it is for — which floem asks for only when the key is new.
+    The log is appended in ascending `seq` and never reordered, so that lookup is a binary search; a
+    `seq` the log no longer holds (the window slid while the row was being built) renders nothing,
+    which is what the row would have shown anyway. The Data column inside it is bounded at
+    `monitor::DATA_COLS_SHOWN` with `data_overflow_label` saying so — see that entry for the view
+    counts.
+    **A `virtual_stack` over the log is deliberately not done**, and this is the paragraph to read
+    before reaching for one: the rows are content-sized so a long change list scrolls horizontally
+    instead of wrapping, and the table header mirrors the body's `hscroll`. Windowing vertically
+    means the widest row in the *window* sets the content width, so scrolling would make that width
+    — and the header sitting on it — jump. The cap on what each row builds is the bound taken
+    instead. Three icon buttons sit in the sub-header between the status line and
     the interval dropdown — Pause, Clear, Export — and they join the modal's `FocusRing` at
     tabindex 10/11/12 with the dropdown moved to 13, so a monitor is watchable with both hands off
     the mouse. **Pause holds the fetch, not the loop**: `monitor_tick` reads the three signals and
@@ -13225,8 +13433,10 @@ existing prose was left alone.
   one that cannot start. So they count only when the result is spawnable —
   `agent_cli::harness_reachable`, asked of the **new** settings: an override that resolves, or an
   empty value whose auto-detect succeeds for that harness. Choosing a harness that is not installed
-  therefore keeps the live conversation instead of trading it for a binary nothing can spawn, and
-  the AI settings modal is where the user finds out it is unreachable — its `cli_ok` reads the
+  therefore keeps the live conversation instead of trading it for a binary nothing can spawn — and
+  **that gate is why the pending bubble cannot stamp the selected harness**, which is
+  `ai::turn_harness`'s job and is in `core::transcript`'s entry. The
+  AI settings modal is where the user finds out it is unreachable — its `cli_ok` reads the
   harness *signal* rather than closing over a value, so the hint follows the selection rather than
   validating against whichever CLI was chosen when the closure was built. Two corollaries, both
   easy to get wrong in
@@ -14179,8 +14389,9 @@ existing prose was left alone.
     that reads a single file: a hand-picked DataGrip export would otherwise arrive with twelve
     blank passwords that libpq's file, on the same machine, holds every one of, and whether a row
     can be completed must not depend on how its file was found. Four `is_file` checks and one small
-    read, cheap enough to run inside a file-picker callback where the two directory walks would
-    not be.
+    read — it used to run inside the file-picker callback on the strength of being that cheap, and
+    now rides the `spawn_blocking` the picked file's read and parse were moved onto anyway, since the
+    parse beside it is the part with no bound on how long it takes.
   - `app/script.rs` — the I/O half of `core::script`, and `dump.rs`'s mirror image: that module
     reads a database and writes a file, this reads a file and writes a database. Two halves at once — a
     **blocking reader** walks the file in `BLOCK`-sized reads, feeds `script::Splitter` and pushes
@@ -14674,6 +14885,27 @@ Re-introducing the anti-patterns these guard against is a regression:
   halves are pinned in `main.rs`'s tests, over a gate that holds its action until the test releases
   it (`a_deferred_run_does_not_land_on_a_tab_the_user_switched_to`, and the ordinary case beside it,
   without which the wrapper could pass by refusing everything).
+  **A caller that has already started a state machine needs the refusal handed back, and that is
+  `gate1_on_tab_answered` over `ConnGateElse`** — a `ConnGate` whose *second* action runs instead of
+  the first, and only when the gate has decided the connection is unreachable. `with_conn` is now
+  `with_conn_else` with a no-op refusal, so there is one gate and one "Not connected to X" message
+  rather than two that can drift apart. What it is for: `open_plan` sets `PlanState::Running` and
+  *then* calls the gated action, so a gate that refused silently left the query-plan modal rendering
+  `loading_dots("Explaining")` for ever behind the error modal — dismissing the error left a modal
+  claiming work was in flight over a server that was down, and only Escape got out of it. Both
+  refusals come back as a `Refusal`: `NotConnected` from the gate, `TabMovedOn` from the pinning.
+  `plan_refused` turns either into the `PlanState::Failed` the modal can render, raising
+  `run_moved_on` for the tab case as well so each channel is said once, and `plan_refusal_text`
+  writes the two sentences — separate from the wiring because the words were never the defect,
+  nobody calling them was. `run_plan`'s two arguments are carried as a `(String, bool)` pair so the
+  generic wrapper still applies. **The refusal is not optional**, and a separate `moved_on` callback
+  beside a silent gate is exactly the shape that shipped the spinning modal: every early exit
+  *inside* `run_plan` already reported into `plan_state`, and it was the gate wrapped *around* it
+  that answered nobody. That is why all three pins assert the composition rather than a piece of it
+  — `a_refused_plan_launch_leaves_the_modal_saying_so`,
+  `a_plan_launch_that_outlived_its_tab_also_answers_the_modal`, and
+  `an_allowed_plan_launch_runs_and_writes_no_refusal` for the direction that would break by refusing
+  everything.
   This is written down because the guard used to be two closures inside `editor_pane.rs`'s *view
   body*, so it protected exactly one caller: the command palette's `>run` and the AI chat's
   **Insert & Run** both reached the raw action and ran writes past all three protections — the
@@ -15485,6 +15717,11 @@ Re-introducing the anti-patterns these guard against is a regression:
   `ddl_preview::PlanTarget`s, which capture the context a Drop-container menu fired in so the
   confirmation cannot be answered against a connection the user switched to meanwhile; the refusal
   on that stamp is `preview_container`'s and there is no door there to guard.
+  **`account_editor`'s two doors keep `read_only: ctx.read_only,` even though their `conn_id` and
+  `dialect` no longer come from `ctx`** — the flag is the refusal, not the address, and it has to
+  follow a connection marked read-only while the browser is open. `anchor_gate` asserts the same two
+  lines from the other side, because the fix that moved their address moved the lines this gate
+  finds them by.
 - **No floem `Dropdown` — every `<select>` in the app drops the app's own menu.** A control that
   offers a fixed list is built with `settings::in_ring_picker` (or one of its two thin wrappers,
   `focusable_dropdown` and `table_designer::focusable_owned_dropdown`); nothing constructs a
