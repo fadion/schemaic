@@ -570,8 +570,17 @@ fn results_offer_export(rows: usize) -> bool {
 /// A modal still up on a **finished** export is not busy: it is a report the
 /// user has not dismissed, and starting another export is a perfectly good way
 /// to dismiss it.
+///
+/// **It asks `accept_launch` rather than re-deriving it**, which it used to: the
+/// three arguments here are how *this* surface computes "in flight", and that is
+/// genuinely its own — a modal up on a running export — but the answer to "may a
+/// destructive action launch" is one function, and "a guard that has to be
+/// re-derived at each site is one that will be derived differently" is that
+/// function's own doc. There is no `read_only` term because an export writes a
+/// file, not a server.
 fn export_may_launch(modal_up: bool, done: bool, error: bool) -> bool {
-    !modal_up || done || error
+    let writing = modal_up && !done && !error;
+    crate::widgets::accept_launch(writing, false)
 }
 
 /// May the run that just reported write into the export modal?

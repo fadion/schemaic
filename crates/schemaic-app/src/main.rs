@@ -5313,6 +5313,11 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                     .find(|c| c.id == conn_id)
                     .is_some_and(|c| c.read_only)
             });
+            // The `false` is not a placeholder: a kill is fire-and-forget and
+            // this action has no in-flight state of its own to read, which is
+            // the one thing that would make a literal here the failure
+            // CLAUDE.md warns about ("a constant in place of a capability").
+            // `read_only`, the term that does vary, is read live above.
             if !schemaic_ui::may_launch_destructive(false, read_only) {
                 // Per kind: this refusal answered *Cancel query* with a sentence
                 // about terminating sessions, which is a different action.

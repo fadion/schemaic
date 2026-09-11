@@ -522,7 +522,14 @@ fn banner(
         move || {
             // Live at the moment of the press, which is the only moment that
             // matters for a launch — the same rule `ddl_preview::apply` follows.
-            if !read_only.get_untracked() {
+            // **Asked, not re-spelled.** This was `if !read_only.get_untracked()`
+            // — the right answer, derived here rather than taken from the one
+            // function that owns the question, beside a comment that already
+            // quoted that function's contract for the *disabled-button* half.
+            // Nothing of this action's own is ever in flight (a kill is
+            // fire-and-forget: there is no signal to read), which is what the
+            // `false` says.
+            if crate::widgets::accept_launch(false, read_only.get_untracked()) {
                 (kill)(holder_id, KillKind::Session);
             }
         },

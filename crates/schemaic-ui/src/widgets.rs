@@ -5655,6 +5655,152 @@ pub fn may_launch_destructive(in_flight: bool, read_only: bool) -> bool {
     accept_launch(in_flight, read_only)
 }
 
+/// **The destructive-launch invariant, enforced from outside the predicate.**
+///
+/// [`accept_launch`] is a pure two-argument function with no side effect and no
+/// way to observe that a launch happened, so nothing *in* it can tell that a
+/// launch site exists and did not ask — while its own doc argues in the
+/// imperative that this is exactly what must not be left to memory: "A guard
+/// that has to be re-derived at each site is one that will be derived
+/// differently."
+///
+/// It already had been, three times. The gate below is the fifth of this file's
+/// source gates and is what those three now fail.
+#[cfg(test)]
+mod destructive_launch_gate {
+    /// Every spelling that **is** the guard. Each is [`super::accept_launch`] or
+    /// delegates to it in one line; any other shape of the question is what this
+    /// module exists to refuse.
+    const GUARDS: &[&str] = &[
+        "accept_launch(",
+        "accept_dialog_launch(",
+        "may_launch_destructive(",
+    ];
+
+    /// Files that compute their own *in-flight* term before asking, with the
+    /// reason. **The term is theirs; the answer is not** — each of these ends in
+    /// a `GUARDS` call on the same line or the next.
+    ///
+    /// `grid.rs`'s `export_may_launch` is the worked example: "a modal up on a
+    /// running export" is genuinely this surface's own notion of busy, and it
+    /// has no `read_only` term because an export writes a file rather than a
+    /// server — but the verdict still comes from `accept_launch`.
+    const OWN_IN_FLIGHT_TERM: &[(&str, &str)] = &[(
+        "grid.rs",
+        "`export_may_launch` folds (modal_up, done, error) into `writing` and \
+         asks; the save dialog is not window-modal, so two can stand open.",
+    )];
+
+    /// **No fifth shape of the question.** A predicate whose *name* says it
+    /// decides a destructive launch, and whose body does not end at
+    /// [`super::accept_launch`], is the defect: `export_may_launch` was one, and
+    /// it is in `OWN_IN_FLIGHT_TERM` now because it asks.
+    #[test]
+    fn nothing_answers_the_launch_question_for_itself() {
+        for (file, code) in crate::source_gate::crate_sources() {
+            // This file *is* the guards; their own definitions are not sites.
+            if file == "widgets.rs" {
+                continue;
+            }
+            for (n, line) in code.lines().enumerate() {
+                // A `fn` whose name claims this decision.
+                let claims = line.contains("fn ")
+                    && (line.contains("_may_launch(")
+                        || line.contains("may_launch_")
+                        || line.contains("_launch_ok("));
+                if !claims {
+                    continue;
+                }
+                // Its body, to the next top-level `}` at column 0 — these are
+                // all free functions.
+                let body: String = code
+                    .lines()
+                    .skip(n)
+                    .take_while(|l| !l.starts_with('}'))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                assert!(
+                    GUARDS.iter().any(|g| body.contains(g)),
+                    "{file}:{}: this names itself a launch decision and answers \
+                     it without `accept_launch`. That is the fourth shape the \
+                     invariant was written against — fold whatever is genuinely \
+                     this surface's own into an `in_flight` term and ask.",
+                    n + 1
+                );
+                assert!(
+                    OWN_IN_FLIGHT_TERM.iter().any(|(f, _)| *f == file),
+                    "{file}:{}: a launch predicate outside OWN_IN_FLIGHT_TERM — \
+                     add it there with the reason its in-flight term is its own, \
+                     or call `accept_launch` at the launch instead of wrapping it",
+                    n + 1
+                );
+            }
+        }
+        // A floor: if the names change, this has nothing left to scan and would
+        // pass by finding none.
+        assert!(
+            crate::source_gate::crate_sources()
+                .iter()
+                .any(|(_, c)| c.contains("fn export_may_launch(")),
+            "no launch predicate found at all — did `export_may_launch` get \
+             renamed? Rewrite this gate rather than deleting it."
+        );
+    }
+
+    /// **A read-only connection is refused through the guard, not through an
+    /// `if`.** `activity_panel`'s lock-wait Kill spelled it `if !read_only`,
+    /// beside a comment quoting `accept_launch`'s contract for the
+    /// disabled-button half while not calling it for the launch half; that is
+    /// the same failure one level down from the one above.
+    ///
+    /// **Deliberately narrow**, and worth saying why rather than widening it. A
+    /// broad "`if !read_only` anywhere" scan is *noisy in the wrong direction*:
+    /// `editor_pane`'s right-click menu reads the same flag to decide whether to
+    /// **offer** Create view at all ("shown rather than disabled: on a `DELETE`,
+    /// or on a read-only connection, the entry has nothing to offer"), which is
+    /// a correct and different decision. What this matches is the launch shape
+    /// alone — the flag as the whole condition, wrapping a call to an action —
+    /// and a gate that is narrow and true is worth more than one that has to be
+    /// argued with.
+    #[test]
+    fn no_launch_decides_read_only_for_itself() {
+        for (file, code) in crate::source_gate::crate_sources() {
+            let lines: Vec<&str> = code.lines().collect();
+            for (n, line) in lines.iter().enumerate() {
+                let dense: String = line.chars().filter(|c| !c.is_whitespace()).collect();
+                // The flag as the *whole* condition — not one term of a chain,
+                // which is how an offering decision reads.
+                let gate_only = matches!(
+                    dense.as_str(),
+                    "if!read_only{"
+                        | "if!read_only.get_untracked(){"
+                        | "if!read_only.get(){"
+                        | "if!ctx.read_only{"
+                );
+                if !gate_only {
+                    continue;
+                }
+                // …wrapping a call to an action closure, which is what makes it
+                // a launch rather than a branch.
+                let next: String = lines
+                    .get(n + 1)
+                    .map(|l| l.chars().filter(|c| !c.is_whitespace()).collect())
+                    .unwrap_or_default();
+                if !next.starts_with('(') {
+                    continue;
+                }
+                panic!(
+                    "{file}:{}: `{}` — a destructive launch must ask \
+                     `accept_launch(in_flight, read_only)` rather than deciding \
+                     the read-only half itself, so the two halves cannot drift",
+                    n + 1,
+                    line.trim()
+                );
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod press_tests {
     use super::{presses, steps_ring};
