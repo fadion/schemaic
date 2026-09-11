@@ -5250,6 +5250,48 @@ pub(crate) fn overlay_open_key<A: 'static, B: 'static>(
     })
 }
 
+/// **A `dyn_container` key that actually dedups.**
+///
+/// floem 0.2's `dyn_container` does no value comparison: its key closure is
+/// wrapped in `create_updater`, which is a plain effect — it runs the closure
+/// and calls `on_change` with whatever came back, with no `PartialEq` anywhere
+/// in the chain. `DynamicContainer::swap_val` then unconditionally builds a new
+/// child, removes the old view and disposes its scope. So a key that computes
+/// the *same* value again still tears down and rebuilds the subtree.
+///
+/// A `create_memo` *does* compare, so routing the key through one collapses
+/// every write that does not change this node's own answer.
+///
+/// **Two places pay for it, for one reason: a shared map keyed by node.** Every
+/// container subscribes to every node's entry.
+///
+/// - The schema tree's `expanded` is one app-wide `RwSignal<HashSet<String>>`.
+///   Expanding one table in a 500-table database re-ran `db_node`'s children
+///   key, which deep-copies every `TableInfo` in the database (measured,
+///   release: 2.77 ms at 500 tables × 25 columns, 6.78 ms at 1000 × 30 — the
+///   clone alone) and then constructs 500 fresh `table_node`s. And not only in
+///   the database being touched: expanding a table in `analytics` rebuilt
+///   `shop`'s children and every chevron in both.
+/// - The ER diagram's `collapsed` is a `RwSignal<HashMap<String, bool>>`, and
+///   each card's row stack keys on it. Clicking one card's "+N more" toggle
+///   rebuilt **every** card's rows — ~3,000 rows, ~12,000 views and 3,000
+///   memos at 500 nodes × 25 columns, for a change concerning six of them
+///   (clone-only floor, release: 0.313 ms at that size, 0.662 ms at 1000×30).
+///   That file had already applied this remedy to the *other half of the same
+///   key*: the find's matched columns used to be in the tuple, which made a
+///   highlight a rebuild, and they travel in as a `Memo` answered in a style
+///   closure instead. The collapse half kept the raw shared read.
+///
+/// Same remedy, same framework fact, as [`overlay_open_key`] — which is a memo
+/// over a specific key rather than the generic wrapper, because its third term
+/// exists to keep the dedup honest.
+pub(crate) fn dedup_key<T: PartialEq + Clone + 'static>(
+    key: impl Fn() -> T + 'static,
+) -> impl Fn() -> T + 'static {
+    let memo = floem::reactive::create_memo(move |_| key());
+    move || memo.get()
+}
+
 /// Whether a modal's **destructive** action may launch: only when nothing of its
 /// own is already in flight, and only when the plan isn't marked read-only.
 ///

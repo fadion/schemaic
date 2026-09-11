@@ -16,7 +16,7 @@ use floem::event::{Event, EventListener, EventPropagation};
 use floem::keyboard::{Key, NamedKey};
 use floem::kurbo::Point;
 use floem::prelude::*;
-use floem::reactive::{Memo, create_effect, create_memo};
+use floem::reactive::{Memo, create_effect};
 
 use schemaic_core::db_color::DbColorRule;
 use schemaic_core::ddl::ObjectKind;
@@ -31,7 +31,8 @@ use schemaic_core::text::plural;
 use crate::consts::*;
 use crate::widgets;
 use crate::widgets::{
-    autohide, debounced, highlight_text, loading_dots, row_menu_mark, section_title, shift_hscroll,
+    autohide, debounced, dedup_key, highlight_text, loading_dots, row_menu_mark, section_title,
+    shift_hscroll,
 };
 use crate::{
     ConnNode, CtxKind, CtxMenu, FieldCfg, Ui, db_color_dot, edit_field, favorite_star, icons, theme,
@@ -399,34 +400,6 @@ pub(crate) fn tables_shown<'a>(
         .filter(|t| t.schema.as_deref() == Some(ns))
         .filter(|t| !filtering || db_hit || ns_hit || t.matches_search(filt))
         .collect()
-}
-
-/// **A `dyn_container` key that actually dedups.**
-///
-/// floem 0.2's `dyn_container` does no value comparison: its key closure is
-/// wrapped in `create_updater`, which is a plain effect — it runs the closure
-/// and calls `on_change` with whatever came back, with no `PartialEq` anywhere
-/// in the chain. So a key that computes the *same* value again still rebuilds
-/// the subtree.
-///
-/// The schema tree pays for that at every level, because `expanded` is one
-/// app-wide `RwSignal<HashSet<String>>` and every children container in the
-/// tree subscribes to it. Expanding one table in a 500-table database re-ran
-/// `db_node`'s children key, which deep-copies every `TableInfo` in the
-/// database (measured, release: 2.77 ms at 500 tables × 25 columns, 6.78 ms at
-/// 1000 × 30 — the clone alone) and then constructs 500 fresh `table_node`s,
-/// each six views with two nested `dyn_container`s and two effects. And it is
-/// not scoped to the database being touched: expanding a table in `analytics`
-/// rebuilt `shop`'s children too, and every chevron in both.
-///
-/// A `create_memo` *does* compare, so routing the key through one collapses
-/// every write that does not change this node's own answer. Same remedy, same
-/// framework fact, as `widgets::overlay_open_key`.
-fn dedup_key<T: PartialEq + Clone + 'static>(
-    key: impl Fn() -> T + 'static,
-) -> impl Fn() -> T + 'static {
-    let memo = create_memo(move |_| key());
-    move || memo.get()
 }
 
 /// A [`SchemaState`] as part of a memo key: compared by **identity**.

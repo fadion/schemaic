@@ -1472,7 +1472,18 @@ fn node_card(
             // The highlight travels into the rows as a memo instead and is answered
             // in a style closure — the same shape the card's own name highlight
             // already had, one screen up.
-            move || collapsed.with(|m| m.get(&id_k).copied().unwrap_or(false)),
+            //
+            // **And the collapse half goes through `dedup_key`.** It was the raw
+            // shared read, and `collapsed` is one map every card subscribes to —
+            // so one card's "+N more" toggle tore down and rebuilt *every* card's
+            // rows: ~3,000 rows, ~12,000 views and 3,000 memos at 500 nodes × 25
+            // columns, for a change concerning six of them. floem's
+            // `create_updater` compares nothing, so the 499 cards whose answer
+            // did not move were rebuilt with the identical value. Same root cause
+            // as the schema tree's expansion set, and now the same remedy.
+            crate::widgets::dedup_key(move || {
+                collapsed.with(|m| m.get(&id_k).copied().unwrap_or(false))
+            }),
             move |is_collapsed| {
                 column_rows(
                     node.clone(),
@@ -3556,5 +3567,112 @@ mod edge_geometry_tests {
         assert_eq!(builds.get(), 4, "a collapse must rebuild");
 
         scope.dispose();
+    }
+}
+
+#[cfg(test)]
+mod collapse_key_tests {
+    use super::*;
+    use floem::reactive::create_effect;
+    use std::collections::HashMap;
+
+    /// **One card's collapse must not rebuild every card's rows.**
+    ///
+    /// `collapsed` is one `HashMap<String, bool>` and each card's row stack is a
+    /// `dyn_container` keyed on it, so every card subscribes to every card's
+    /// entry — and floem 0.2 compares nothing on the way through, handing the
+    /// recomputed value to `swap_val`, which unconditionally builds a new child
+    /// and disposes the old one's scope. Clicking one "+N more" toggle therefore
+    /// rebuilt ~3,000 rows at 500 nodes × 25 columns for a change concerning six
+    /// of them.
+    ///
+    /// Asserted over `widgets::dedup_key` with this file's own key expression,
+    /// **and over the undeduped shape beside it**, so the premise is pinned too:
+    /// without the memo the same reads really do re-run on an unrelated write.
+    /// A test of the memo alone would pass against a call site that never
+    /// acquired one, which is the failure mode this campaign has already paid
+    /// for twice.
+    #[test]
+    fn one_cards_collapse_does_not_notify_another_cards_rows() {
+        {
+            let collapsed: RwSignal<HashMap<String, bool>> = RwSignal::new(HashMap::new());
+            let id_k = "orders".to_string();
+            let key = crate::widgets::dedup_key(move || {
+                collapsed.with(|m| m.get(&id_k).copied().unwrap_or(false))
+            });
+            let runs = std::rc::Rc::new(std::cell::Cell::new(0usize));
+            let n = runs.clone();
+            create_effect(move |_| {
+                key();
+                n.set(n.get() + 1);
+            });
+            assert_eq!(runs.get(), 1, "the effect runs once to subscribe");
+
+            // Another card's toggle — the whole failure mode.
+            collapsed.update(|m| {
+                m.insert("customers".to_string(), true);
+            });
+            assert_eq!(runs.get(), 1, "another card's collapse rebuilt these rows");
+
+            // This card's own toggle must still rebuild them.
+            collapsed.update(|m| {
+                m.insert("orders".to_string(), true);
+            });
+            assert_eq!(runs.get(), 2, "this card's own collapse must rebuild it");
+
+            // The premise: the raw read, which is what the container had.
+            let raw_runs = std::rc::Rc::new(std::cell::Cell::new(0usize));
+            let r = raw_runs.clone();
+            let id_raw = "orders".to_string();
+            create_effect(move |_| {
+                collapsed.with(|m| m.get(&id_raw).copied().unwrap_or(false));
+                r.set(r.get() + 1);
+            });
+            assert_eq!(raw_runs.get(), 1);
+            collapsed.update(|m| {
+                m.insert("invoices".to_string(), true);
+            });
+            assert_eq!(
+                raw_runs.get(),
+                2,
+                "floem itself does not dedup — if this stops being true the memo \
+                 above is no longer what is buying the saving"
+            );
+        }
+    }
+
+    /// And the call site keeps it. The property above holds of `dedup_key`; what
+    /// a container does with it is a *site*, and a site is what regressed here
+    /// once already — the find's matched columns were taken out of this same key
+    /// for the same reason, and the collapse half was left raw.
+    #[test]
+    fn every_container_keyed_on_the_collapse_map_dedups() {
+        let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/erd_view.rs"))
+            .expect("this module's own source");
+        let body = src.split("#[cfg(test)]").next().expect("production code");
+        let lines: Vec<&str> = body.lines().collect();
+        let mut checked = 0;
+        for (i, l) in lines.iter().enumerate() {
+            if !l.contains("dyn_container(") {
+                continue;
+            }
+            // The key is the first argument. Thirty lines, because this one
+            // carries a long comment ahead of it — and still short of anything
+            // that could produce a false hit: `collapsed` reaches the builder as
+            // a value, so a `collapsed.with(` inside the window is the key.
+            let window = lines[i..(i + 30).min(lines.len())].join("\n");
+            if !window.contains("collapsed.with(") {
+                continue;
+            }
+            checked += 1;
+            assert!(
+                window.contains("dedup_key("),
+                "the container at line {} keys on the shared collapse map \
+                 without deduping; floem compares nothing, so one card's toggle \
+                 rebuilds every card's rows",
+                i + 1
+            );
+        }
+        assert_eq!(checked, 1, "this gate is stale — it found {checked}");
     }
 }
