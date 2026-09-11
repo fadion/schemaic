@@ -1999,6 +1999,12 @@ pub(crate) fn erd_overlay(ui: Ui) -> impl IntoView {
             let auto_positions = pos_map.clone();
             let saved: schemaic_core::erd::DiagramLayoutsFile =
                 schemaic_core::persist::load_json("diagrams.json");
+            // **A lazy load owes the same report a startup one does.** The app's
+            // single drain runs after the `Ui` literal, under a comment saying
+            // every config file has been loaded by then — and this one has not.
+            // A truncated `diagrams.json` was renamed `.corrupt` here and
+            // reported to nobody.
+            crate::report_recoveries(ui.overlay.error_modal_text, ui.overlay.error_modal_open);
             if let Some(s) =
                 schemaic_core::erd::get_layout(&saved, target.conn_id, &target.database)
             {
@@ -2033,9 +2039,16 @@ pub(crate) fn erd_overlay(ui: Ui) -> impl IntoView {
             let persist: Rc<dyn Fn()> = {
                 let db = target.database.clone();
                 let cid = target.conn_id;
+                let (err_text, err_open) =
+                    (ui.overlay.error_modal_text, ui.overlay.error_modal_open);
                 Rc::new(move || {
                     let mut f: schemaic_core::erd::DiagramLayoutsFile =
                         schemaic_core::persist::load_json("diagrams.json");
+                    // Before the save, and it matters here more than on the read
+                    // side: if the `.bak` was unreadable too, this `save_json`
+                    // writes the defaulted empty file over the recovered
+                    // nothing — so the notice has to reach the user either way.
+                    crate::report_recoveries(err_text, err_open);
                     schemaic_core::erd::upsert_layout(&mut f, cid, &db, positions.get_untracked());
                     schemaic_core::persist::save_json("diagrams.json", &f);
                 })

@@ -7286,6 +7286,38 @@ pub(crate) fn reveal_ai_panel(right_panel: RwSignal<RightPanel>) {
     reveal_panel(right_panel, RightPanel::Ai);
 }
 
+/// Show the user any recovery notices `persist` has queued, and drain them.
+///
+/// **A config file recovered from `.corrupt` is news, whenever it happens.**
+/// `persist` renames an unreadable file aside, falls back to the `.bak` or to
+/// defaults, and queues a notice — because, as the code that queues it says, "a
+/// released GUI build discards stderr, so also queue it for the error modal —
+/// otherwise the user just sees their settings gone."
+///
+/// The app drained that queue exactly once, after the `Ui` literal, under the
+/// comment *"Every config file has been loaded by now."* Three loads are **not**
+/// covered by that claim, because they are lazy: the ER diagram's layout read
+/// and its save-side re-read, both inside drag handlers, and the layout prune
+/// inside `delete_conn_now`'s click handler. So a truncated `diagrams.json` was
+/// renamed away and reported to nobody — the user's saved arrangements simply
+/// gone, and if the `.bak` was unreadable too, the very next drag wrote the
+/// defaulted empty file over the recovered nothing.
+///
+/// Cheap when there is nothing to say (`take_recoveries` on an empty queue), so
+/// a lazy loader can call it unconditionally.
+///
+/// Takes the two signals rather than [`OverlayUi`] because the app's own lazy
+/// load — the layout prune inside `delete_conn_now` — runs in a closure built
+/// long before the `Ui` literal exists.
+pub fn report_recoveries(text: RwSignal<Option<String>>, open: RwSignal<bool>) {
+    let notices = schemaic_core::persist::take_recoveries();
+    if notices.is_empty() {
+        return;
+    }
+    text.set(Some(notices.join("\n\n")));
+    open.set(true);
+}
+
 /// Show `which` in the right column — the one door, for every panel.
 ///
 /// Two guards, and both have bitten. A redundant `set` still notifies (floem

@@ -9641,8 +9641,13 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             snippets.update(|v| schemaic_core::snippet::clear_conn(v, id));
             (save_snippets)();
             // Diagram layouts live only on disk (no signal) — load, prune, save.
+            // The third lazy load, and the third that owes the user the recovery
+            // notice the startup drain cannot carry: the prune-and-save here is
+            // unconditional, so a `.corrupt` rename would otherwise be followed
+            // immediately by writing the defaulted file back.
             let mut layouts: schemaic_core::erd::DiagramLayoutsFile =
                 persist::load_json("diagrams.json");
+            schemaic_ui::report_recoveries(error_modal_text, error_modal_open);
             schemaic_core::erd::clear_conn_layouts(&mut layouts, id);
             persist::save_json("diagrams.json", &layouts);
         })
@@ -11394,15 +11399,19 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
         apply_update,
         open_config_dir: Rc::new(open_config_dir),
     };
-    // Every config file has been loaded by now. If any of them was unreadable it
-    // was preserved as `.corrupt` and recovered from the backup or defaults —
-    // which from the user's side looks like their connections or preferences just
-    // vanished, so say so instead of only logging it.
-    let recoveries = persist::take_recoveries();
-    if !recoveries.is_empty() {
-        error_modal_text.set(Some(recoveries.join("\n\n")));
-        error_modal_open.set(true);
-    }
+    // Every config file loaded *during this build* has been loaded by now. If any
+    // of them was unreadable it was preserved as `.corrupt` and recovered from
+    // the backup or defaults — which from the user's side looks like their
+    // connections or preferences just vanished, so say so instead of only
+    // logging it.
+    //
+    // **Not the only drain any more, and that was the bug.** Three loads are
+    // lazy and run long after this line — the ER diagram's layout read and its
+    // save-side re-read, and the layout prune in `delete_conn_now` — so a
+    // corrupt `diagrams.json` was renamed aside and reported to nobody. They
+    // call `report_recoveries` too; this is the same function, not a fourth
+    // spelling of it.
+    schemaic_ui::report_recoveries(error_modal_text, error_modal_open);
     // **The session write that has to happen even though nobody asked for it.**
     // Quitting the window is the one way of losing a tab that never reaches
     // `guard_close`, and floem 0.2 handles `CloseRequested` by closing
@@ -12501,6 +12510,78 @@ mod app_tests {
     /// the way `core/tests/doc_coverage.rs` takes a file as its subject: the
     /// signal has no direct writer left, because `rearm_activity` — which cannot
     /// be spelled without the arm — is the only thing that writes it.
+    /// **A config load that is not covered by the startup drain owes its own
+    /// report.**
+    ///
+    /// `persist` renames an unreadable file to `.corrupt`, falls back to the
+    /// `.bak` or to defaults, and queues a notice — because a released GUI build
+    /// discards stderr, so without the modal the user just sees their settings
+    /// gone. The app drained that queue once, after the `Ui` literal, under a
+    /// comment saying every config file had been loaded by then.
+    ///
+    /// Three were not: the ER diagram's layout read and its save-side re-read,
+    /// both in drag handlers, and the layout prune inside `delete_conn_now`'s
+    /// click handler. So a truncated `diagrams.json` was renamed away and
+    /// reported to nobody — and on the save side, if the `.bak` was unreadable
+    /// too, the very next drag wrote the defaulted empty file over the recovered
+    /// nothing.
+    ///
+    /// The rule is positional and cannot be: "is this load inside `app_view`'s
+    /// build?" is not a question a scan can answer. So the gate is the
+    /// **count** — every `load_json` outside the build sequence pairs with a
+    /// `report_recoveries`, and the two crates hold as many reporters as they
+    /// have lazy loads.
+    #[test]
+    fn every_lazy_config_load_reports_what_it_recovered() {
+        let mut loads = 0usize;
+        let mut reports = 0usize;
+        for (name, code) in [
+            ("main.rs", production_main()),
+            (
+                "erd_view.rs",
+                // `CARGO_MANIFEST_DIR` is `<root>/crates/schemaic-app`, so one
+                // parent is the crates dir.
+                std::fs::read_to_string(
+                    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                        .parent()
+                        .expect("the crates dir")
+                        .join("schemaic-ui")
+                        .join("src")
+                        .join("erd_view.rs"),
+                )
+                .expect("erd_view.rs"),
+            ),
+        ] {
+            let body = code.split("#[cfg(test)]").next().unwrap_or(&code);
+            let code: String = body
+                .lines()
+                .filter(|l| !l.trim_start().starts_with("//"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            // The lazy ones are exactly the `diagrams.json` loads: every other
+            // config file is read once, during `app_view`'s build, before the
+            // drain.
+            loads += code.matches("load_json(\"diagrams.json\")").count()
+                + code
+                    .matches("load_json::<schemaic_core::erd::DiagramLayoutsFile>")
+                    .count();
+            reports += code.matches("report_recoveries(").count();
+            let _ = name;
+        }
+        assert!(
+            loads >= 3,
+            "only {loads} lazy `diagrams.json` loads found — this gate has \
+             stopped seeing the sites it is written about"
+        );
+        assert!(
+            reports > loads,
+            "{loads} lazy config loads and only {reports} `report_recoveries` \
+             calls (one of which is the startup drain) — a load that recovers a \
+             `.corrupt` file and says nothing leaves the user's settings gone \
+             with no explanation"
+        );
+    }
+
     /// This file's production text — every source gate below reads it.
     fn production_main() -> String {
         let src = std::fs::read_to_string(
