@@ -182,17 +182,23 @@ pub(crate) struct EditCtx {
 
 pub(crate) fn edit_ctx(ui: &Ui) -> EditCtx {
     let conn_id = ui.conn.active_conn.get_untracked();
-    let conn = ui
-        .conn
-        .connections
-        .with_untracked(|cs| cs.iter().find(|c| c.id == conn_id).cloned());
+    // Both answers out of one borrow, and `read_only` out of
+    // `connection::read_only_of` rather than off the clone: the fail-open default
+    // for an id the registry has lost is documented and tested there, and this
+    // was one of seven places that decided it independently.
+    let (conn, read_only) = ui.conn.connections.with_untracked(|cs| {
+        (
+            schemaic_core::connection::by_id(cs, conn_id).cloned(),
+            schemaic_core::connection::read_only_of(cs, conn_id),
+        )
+    });
     EditCtx {
         conn_id,
         dialect: conn
             .as_ref()
             .map(|c| SqlDialect::from_db_type(&c.db_type))
             .unwrap_or_default(),
-        read_only: conn.as_ref().is_some_and(|c| c.read_only),
+        read_only,
         exists: conn.is_some(),
     }
 }

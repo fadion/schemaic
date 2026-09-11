@@ -121,9 +121,7 @@ pub(crate) fn risk_prompt(
 /// missing item reads as "not supported", a dimmed one as "not here".
 fn conn_read_only(connections: &RwSignal<Vec<Connection>>, active_conn: RwSignal<u64>) -> bool {
     connections.with_untracked(|cs| {
-        cs.iter()
-            .find(|c| c.id == active_conn.get_untracked())
-            .is_some_and(|c| c.read_only)
+        schemaic_core::connection::read_only_of(cs, active_conn.get_untracked())
     })
 }
 

@@ -93,11 +93,10 @@ pub(crate) fn open_script(
 /// day the verdict does.
 fn policy(ui: &Ui, dialect: SqlDialect, conn_id: u64) -> GuardPolicy {
     GuardPolicy {
-        read_only: ui.conn.connections.with_untracked(|cs| {
-            cs.iter()
-                .find(|c| c.id == conn_id)
-                .is_some_and(|c| c.read_only)
-        }),
+        read_only: ui
+            .conn
+            .connections
+            .with_untracked(|cs| schemaic_core::connection::read_only_of(cs, conn_id)),
         confirm_writes: ui.layout.confirm_writes.get_untracked(),
         dialect,
         no_database: false,

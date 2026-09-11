@@ -728,11 +728,7 @@ pub(crate) fn plan_read_only(
     conns: &[schemaic_core::connection::Connection],
     p: &DdlPreview,
 ) -> bool {
-    p.read_only
-        || conns
-            .iter()
-            .find(|c| c.id == p.conn_id)
-            .is_some_and(|c| c.read_only)
+    p.read_only || schemaic_core::connection::read_only_of(conns, p.conn_id)
 }
 
 /// Hand the plan to the app, and fold the outcome back into the modal.

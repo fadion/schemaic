@@ -77,7 +77,7 @@ pub(crate) fn activity_panel(ui: Ui) -> impl IntoView {
         floem::reactive::create_memo(move |_| {
             let id = conn.active_conn.get();
             conn.connections
-                .with(|cs| cs.iter().find(|c| c.id == id).is_some_and(|c| c.read_only))
+                .with(|cs| schemaic_core::connection::read_only_of(cs, id))
         })
     };
 

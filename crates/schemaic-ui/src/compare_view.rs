@@ -1144,11 +1144,10 @@ fn open_plan_preview(ui: &Ui, close: Rc<dyn Fn()>) {
         return;
     }
 
-    let read_only = ui.conn.connections.with_untracked(|cs| {
-        cs.iter()
-            .find(|c| c.id == t.left.conn_id)
-            .is_some_and(|c| c.read_only)
-    });
+    let read_only = ui
+        .conn
+        .connections
+        .with_untracked(|cs| schemaic_core::connection::read_only_of(cs, t.left.conn_id));
     let preview = crate::ddl_preview::preview_of_plan(
         t.left.conn_id,
         &t.left.database,

@@ -7609,6 +7609,68 @@ fn body(
 // DDL generation from the introspected schema lives in
 // `schemaic_core::schema::TableInfo::create_ddl` (pure, unit-tested there).
 
+/// **"Is this connection read-only" is `connection::read_only_of`, and nothing
+/// else.**
+///
+/// It had seven spellings across two crates — two byte-identical ten-line memos
+/// 3,100 lines apart in this file, a module-private `conn_read_only` in
+/// `overlays.rs` that nobody else could find, and four more — every one of which
+/// independently decided that an *unknown* id is writable. Two of them fed write
+/// gates rather than dimming.
+///
+/// The spelling is what this catches, because the registry is a bare
+/// `RwSignal<Vec<Connection>>` and reaching into it is always going to compile.
+#[cfg(test)]
+mod read_only_gate {
+    #[test]
+    fn nothing_answers_the_read_only_question_for_itself() {
+        // Assembled so this module's own prose is not a hit.
+        let respelling = format!("{}(|c| c.read_only)", "is_some_and");
+        let mut offenders: Vec<String> = Vec::new();
+        for (file, code) in crate::source_gate::crate_sources() {
+            for (n, line) in code.lines().enumerate() {
+                let dense: String = line.chars().filter(|c| !c.is_whitespace()).collect();
+                if dense.contains(&respelling.replace(' ', "")) {
+                    offenders.push(format!("{file}:{}", n + 1));
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "these decide `read_only` for themselves instead of asking \
+             `schemaic_core::connection::read_only_of`, which is where the \
+             fail-open default for an unknown id is documented and tested: {}",
+            offenders.join(", ")
+        );
+    }
+}
+
+/// Is the active tab's connection read-only?
+///
+/// **The derivation, not the memo.** Two `create_memo`s 3,100 lines apart in this
+/// file both need this answer, and the second's comment — *"Same derivation as
+/// `center`"* — was an acknowledgement of a byte-identical copy rather than a
+/// link to it. They stay two memos, because they are consumed by different
+/// subtrees (the centre column and the footer) and one shared memo would move
+/// which scope owns it, which is Floem lifetime territory; what is shared is the
+/// ten lines that were duplicated.
+///
+/// **Tracked**, deliberately — it has to follow the tab's `conn_id` *and* a live
+/// toggle of the connection, which is the whole reason each site is a memo. The
+/// fail-open default for an id the registry has lost is
+/// `connection::read_only_of`'s, documented there.
+fn active_tab_read_only(
+    tabs: RwSignal<Vec<Tab>>,
+    active: RwSignal<usize>,
+    connections: RwSignal<Vec<Connection>>,
+) -> bool {
+    let id = active.get();
+    let Some(cid) = tabs.with(|v| v.iter().find(|t| t.id == id).map(|t| t.conn_id.get())) else {
+        return false;
+    };
+    connections.with(|cs| schemaic_core::connection::read_only_of(cs, cid))
+}
+
 // The center column: tab bar, then the active tab's query editor over its
 // Results grid. The content is keyed on the active tab id, so switching tabs
 // rebuilds the editor from that tab's buffer.
@@ -7621,16 +7683,7 @@ fn center(ui: Ui) -> impl IntoView {
     let conn_status = ui.conn.conn_status;
     // Is the active tab's connection read-only? (Reactive — follows the tab's
     // `conn_id` and a live toggle of the connection.) Gates cell edits + write runs.
-    let read_only = create_memo(move |_| {
-        let id = active.get();
-        let cid = tabs.with(|v| v.iter().find(|t| t.id == id).map(|t| t.conn_id.get()));
-        match cid {
-            Some(cid) => connections
-                .with(|cs| cs.iter().find(|c| c.id == cid).map(|c| c.read_only))
-                .unwrap_or(false),
-            None => false,
-        }
-    });
+    let read_only = create_memo(move |_| active_tab_read_only(tabs, active, connections));
     // The active tab's SQL dialect (MySQL/PostgreSQL), from its connection's
     // `db_type` — drives completion + diagnostics parsing. Same derivation shape as
     // `read_only`.
@@ -10808,17 +10861,10 @@ fn footer(ui: Ui) -> impl IntoView {
         })
         .unwrap_or(0)
     });
-    // Is the active tab's connection read-only? (Same derivation as `center`.)
-    let read_only = create_memo(move |_| {
-        let id = active.get();
-        let cid = tabs.with(|v| v.iter().find(|t| t.id == id).map(|t| t.conn_id.get()));
-        match cid {
-            Some(cid) => connections
-                .with(|cs| cs.iter().find(|c| c.id == cid).map(|c| c.read_only))
-                .unwrap_or(false),
-            None => false,
-        }
-    });
+    // Is the active tab's connection read-only? Its own memo, because this
+    // subtree is the footer's and `center`'s is the centre column's — see
+    // `active_tab_read_only`, which is the derivation both share.
+    let read_only = create_memo(move |_| active_tab_read_only(tabs, active, connections));
 
     // AI/Terminal toggles are mutually exclusive: turning one on replaces the
     // other; clicking the active one hides it (right column freed). A no-op while

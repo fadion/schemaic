@@ -1312,6 +1312,40 @@ pub fn engine_label(db_type: &str) -> String {
     }
 }
 
+/// The saved connection with this id, if the list still holds one.
+///
+/// **The registry had no accessor at all.** `connections: RwSignal<Vec<Connection>>`
+/// is one of the app's two central registries and every consumer reached into the
+/// `Vec` itself — sixty-one hand-written `find(|c| c.id == …)` across two crates,
+/// with nothing to grep for and nothing to change in one place. This is that
+/// accessor; [`read_only_of`] is the question most of those scans were asking.
+pub fn by_id(list: &[Connection], id: u64) -> Option<&Connection> {
+    list.iter().find(|c| c.id == id)
+}
+
+/// Is this connection marked **read-only**?
+///
+/// **One answer, because there were seven.** Two byte-identical ten-line memos
+/// 3,100 lines apart in `ui/lib.rs` (the second's comment — *"Same derivation as
+/// `center`"* — an acknowledgement of the copy rather than a link to it), a
+/// module-private `conn_read_only` in `overlays.rs` that nobody else could find,
+/// and four more spellings besides. Two of them feed write gates rather than
+/// dimming: `ddl_preview` passes the result straight to `widgets::accept_launch`,
+/// and `compare_view` into `preview_of_plan`.
+///
+/// **An unknown id is writable, and that is a decision.** All seven spellings
+/// defaulted this way — five as `is_some_and`, two as `map(…).unwrap_or(false)` —
+/// the same fail-open answer chosen seven times with no single site at which to
+/// review it. It is right today: the ids come from tabs, so an absent one means
+/// the connection was deleted while something still referred to it, and the
+/// write that follows will fail on the missing connection rather than on this
+/// flag. It is written down here so the next person to change it has a test to
+/// change with it, which is what `an_unknown_connection_is_writable_deliberately`
+/// is for.
+pub fn read_only_of(list: &[Connection], id: u64) -> bool {
+    by_id(list, id).is_some_and(|c| c.read_only)
+}
+
 /// Is this engine reached **over the network** — i.e. does a host, a port, a
 /// user, a password or an SSH tunnel mean anything for it?
 ///
@@ -2248,6 +2282,48 @@ mod tests {
             };
             assert_eq!(SqlDialect::from_db_type(label), by_predicate, "{label}");
         }
+    }
+
+    /// **"Is this connection read-only" had seven spellings and no home.**
+    ///
+    /// Two of them fed write gates rather than dimming, and all seven
+    /// independently decided that an *unknown* id is writable — the same
+    /// fail-open default chosen seven times, with no single site at which to
+    /// review it.
+    #[test]
+    fn a_read_only_connection_is_read_only_by_its_id() {
+        let mut ro = conn();
+        ro.id = 1;
+        ro.read_only = true;
+        let mut rw = conn();
+        rw.id = 2;
+        rw.read_only = false;
+        let list = [ro, rw];
+
+        assert!(read_only_of(&list, 1));
+        assert!(!read_only_of(&list, 2));
+        assert_eq!(by_id(&list, 1).map(|c| c.id), Some(1));
+        assert_eq!(by_id(&list, 9), None);
+    }
+
+    /// **The fail-open default, asserted on purpose.**
+    ///
+    /// An id the list no longer holds answers *writable*. That is right today —
+    /// the ids come from tabs, so an absent one means the connection was deleted
+    /// while something still referred to it, and the write that follows fails on
+    /// the missing connection rather than on this flag — and the point of the
+    /// test is that changing it means changing a test that says why, rather than
+    /// editing whichever of seven copies you happened to find.
+    #[test]
+    fn an_unknown_connection_is_writable_deliberately() {
+        assert!(!read_only_of(&[], 1), "nothing to be read-only");
+        let mut c = conn();
+        c.id = 1;
+        c.read_only = true;
+        assert!(
+            !read_only_of(&[c], 7),
+            "an id the registry has lost is not read-only — see `read_only_of`"
+        );
     }
 
     /// **Every "does a server mean anything here" decision asks one predicate.**

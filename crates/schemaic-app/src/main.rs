@@ -5308,11 +5308,8 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             // under it — is the most destructive thing this app can do to a
             // server it has been told not to write to. Every other destructive
             // modal action asks this function; this one asked nothing at all.
-            let read_only = connections.with_untracked(|cs| {
-                cs.iter()
-                    .find(|c| c.id == conn_id)
-                    .is_some_and(|c| c.read_only)
-            });
+            let read_only = connections
+                .with_untracked(|cs| schemaic_core::connection::read_only_of(cs, conn_id));
             // The `false` is not a placeholder: a kill is fire-and-forget and
             // this action has no in-flight state of its own to read, which is
             // the one thing that would make a literal here the failure
@@ -7392,11 +7389,20 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                 .find(|t| t.id == id)
                 .is_none_or(|t| t.database.get_untracked().is_none())
         });
-        let conn = cid.and_then(|cid| {
-            connections.with_untracked(|cs| cs.iter().find(|c| c.id == cid).cloned())
+        // Both answers out of one borrow, and `read_only` out of
+        // `connection::read_only_of` rather than off the clone — see that
+        // function for the fail-open default an absent id gets, which this was
+        // one of seven places to decide for itself.
+        let (conn, read_only) = cid.map_or((None, false), |cid| {
+            connections.with_untracked(|cs| {
+                (
+                    schemaic_core::connection::by_id(cs, cid).cloned(),
+                    schemaic_core::connection::read_only_of(cs, cid),
+                )
+            })
         });
         GuardPolicy {
-            read_only: conn.as_ref().is_some_and(|c| c.read_only),
+            read_only,
             confirm_writes: confirm_writes.get_untracked(),
             dialect: conn
                 .as_ref()
