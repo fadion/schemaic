@@ -4875,26 +4875,65 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
         // The effect's previous value is the query it last ran for, which is what
         // separates the two reasons it runs: a *new query* starts at match 1 and
         // reveals it, an *edit* keeps the user where they are and scrolls nothing.
+        // The generation guard for the edit path below, in the shape the
+        // diagnostics and live-validation passes in this file already use.
+        let find_gen: Rc<std::cell::Cell<u64>> = Rc::new(std::cell::Cell::new(0));
         create_effect(move |prev: Option<String>| {
             if !find_open.get() {
                 return prev.unwrap_or_default();
             }
             let q = find_query.get();
-            let hits = if q.is_empty() {
-                Vec::new()
-            } else {
-                find_matches(&query.get(), &q)
-            };
+            if q.is_empty() {
+                // Still a dependency on the document: the effect has to keep
+                // running through edits, or typing a needle after clearing one
+                // would read a document it stopped following.
+                query.track();
+                find_idx.set(0);
+                if !find_hits.with_untracked(Vec::is_empty) {
+                    find_hits.set(Vec::new());
+                }
+                return q;
+            }
             if prev.as_deref() != Some(q.as_str()) {
+                // **A new query recomputes now.** The user is watching `n/total`
+                // and waiting to be taken to the first match; a delay here is a
+                // find bar that feels broken. `with`, not `get`: the scan borrows
+                // the document, and cloning a 16 MiB buffer to hand it to a
+                // function that takes `&str` was 2.4 ms of a 20.3 ms keystroke.
+                let hits = query.with(|text| find_matches(text, &q));
                 find_idx.set(0);
                 if let Some(&first) = hits.first() {
                     reveal(first, q.len());
                 }
-            } else if !hits.is_empty() {
-                // Same query, edited document: hold the position, clamped.
-                find_idx.update(|i| *i = (*i).min(hits.len() - 1));
+                find_hits.set(hits);
+                return q;
             }
-            find_hits.set(hits);
+            // **An edit debounces.** Rescanning the whole document synchronously
+            // on every keystroke is 17 ms at 16 MiB, on the UI thread, while the
+            // two passes beside this one coalesce at 120 ms and 500 ms for
+            // exactly that reason. Nothing reads `find_hits` until the user
+            // presses Enter, an arrow or Replace — and `replace_one` revalidates
+            // against the live document rather than trusting the list ("one
+            // stale offset here rewrites text the user never searched for"), so
+            // a list that lags a tick is safe by construction.
+            query.track();
+            let g = find_gen.get().wrapping_add(1);
+            find_gen.set(g);
+            let fgen = find_gen.clone();
+            let needle = q.clone();
+            floem::action::exec_after(std::time::Duration::from_millis(120), move |_| {
+                // A later edit has superseded this one, or the pane was closed
+                // while the tick was out.
+                if fgen.get() != g || find_hits.try_get_untracked().is_none() {
+                    return;
+                }
+                let hits = query.with_untracked(|text| find_matches(text, &needle));
+                // Same query, edited document: hold the position, clamped.
+                if !hits.is_empty() {
+                    find_idx.update(|i| *i = (*i).min(hits.len() - 1));
+                }
+                find_hits.set(hits);
+            });
             q
         });
     }
