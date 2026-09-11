@@ -2401,24 +2401,15 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             .unwrap_or_default()
     });
     // What the editor would contribute to a snippet: the selection if there is
-    // one, else the whole buffer. The same rule Format follows, and the same
-    // `selected_text` that degrades to `None` when the mirrored range has
-    // drifted a keystroke out of step with the text.
-    // A selection that is only whitespace falls back to the whole buffer rather
-    // than saving nothing: otherwise `can_save` (which asks whether the *tab*
-    // has text) and this (which asks what to save) disagree, and the `+` is
-    // enabled for a click that does nothing.
+    // one, else the whole buffer. The rule — including the whitespace-only
+    // selection that used to disagree with `can_save_snippet` — is
+    // `snippet::snippet_text`, with the test that composes it with the button's
+    // own predicate. It was three rules in a closure inside `app_view`, where
+    // nothing could call it.
     let editor_snippet_text = move || {
         let tab = active_tab()?;
         let sql = tab.query.get_untracked();
-        let selected = tab
-            .selection
-            .get_untracked()
-            .and_then(|range| schemaic_core::text_ops::selected_text(&sql, Some(range)))
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty());
-        let picked = selected.unwrap_or_else(|| sql.trim().to_string());
-        (!picked.is_empty()).then_some(picked)
+        schemaic_core::snippet::snippet_text(&sql, tab.selection.get_untracked())
     };
     // Wall-clock millis, for "last used". The same reading `record_history`
     // takes, and the same reason: it is when the user did the thing.
@@ -2429,13 +2420,13 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             .unwrap_or(0)
     };
     // "This was used just now", for the row's `3d ago` and the recently-used
-    // sort. A **built-in has nothing to record**: it lives in code, not in the
-    // file, so `touch` would find nothing and the save would rewrite the file
-    // for no change — on every insert of a shipped snippet.
+    // sort. The gate is `snippet::is_builtin` — a built-in has nothing to
+    // record, and without it every insert of a shipped snippet rewrote
+    // `snippets.json` for no change.
     let record_snippet_use: Rc<dyn Fn(u64)> = {
         let save_snippets = save_snippets.clone();
         Rc::new(move |id: u64| {
-            if id >= schemaic_core::snippet::BUILTIN_ID_BASE {
+            if schemaic_core::snippet::is_builtin(id) {
                 return;
             }
             snippets.update(|v| schemaic_core::snippet::touch(v, id, snippet_now()));
@@ -2499,7 +2490,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
         tabs.with(|v| {
             v.iter()
                 .find(|t| t.id == id)
-                .is_some_and(|t| !t.query.get().trim().is_empty())
+                .is_some_and(|t| schemaic_core::snippet::can_save(&t.query.get()))
         })
     });
     let rename_snippet: Rc<dyn Fn(u64, String)> = {
@@ -2558,21 +2549,10 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                 return;
             };
             let new_id = snippets.with_untracked(|v| schemaic_core::snippet::next_id(v));
-            snippets.update(|v| {
-                v.push(schemaic_core::snippet::Snippet {
-                    id: new_id,
-                    name: format!("{} copy", src.name),
-                    // The copy is a user snippet even when the original is
-                    // shipped — that is what Duplicate is *for*, on a built-in
-                    // that can't be edited in place.
-                    source: schemaic_core::snippet::Source::User,
-                    last_used: None,
-                    // An abbrev is a trigger, and two snippets answering to one
-                    // spelling is a coin toss; the copy starts without it.
-                    abbrev: None,
-                    ..src
-                })
-            });
+            // The five things the copy does and does not inherit are
+            // `snippet::duplicate`'s, with the tests: they were a struct literal
+            // here, where nothing could call them.
+            snippets.update(|v| v.push(schemaic_core::snippet::duplicate(&src, new_id)));
             (save_snippets)();
         })
     };

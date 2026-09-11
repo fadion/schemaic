@@ -572,6 +572,76 @@ pub fn new_saved(id: u64, name: String, body: String, conn_id: u64, now: u64) ->
     }
 }
 
+/// What the editor would contribute to a snippet: the selection if there is
+/// one, else the whole buffer. `None` when there is nothing to save.
+///
+/// **The whitespace-only selection is the rule with a bug behind it**, and it is
+/// why this composition is one function rather than two reads at a call site:
+/// [`can_save`] asks whether the *tab* has text and this asks *what to save*,
+/// and a selection of three spaces made them disagree — so `+` was enabled for a
+/// click that saved nothing. The fallback to the whole buffer is what keeps the
+/// two answers in step, and `snippet_save_agrees_with_the_button_that_offers_it`
+/// is the assertion that they are, over the inputs that separate them.
+///
+/// **What refuses a blank selection is [`crate::text_ops::selected_text`]**,
+/// which returns `None` for a range that is empty, reversed, whitespace-only or
+/// out of bounds — the last of those being the mirrored range having drifted a
+/// keystroke out of step with the text, so a stale range saves the buffer rather
+/// than a slice of the wrong statement. The call site used to re-filter the
+/// blank case on top of that; it was dead, and removing it is what makes the
+/// remaining guard a single one worth pointing a revert at.
+pub fn snippet_text(sql: &str, selection: Option<(usize, usize)>) -> Option<String> {
+    let selected = crate::text_ops::selected_text(sql, selection).map(|s| s.trim().to_string());
+    let picked = selected.unwrap_or_else(|| sql.trim().to_string());
+    (!picked.is_empty()).then_some(picked)
+}
+
+/// Whether the `+` that saves a snippet is offered at all.
+///
+/// The reactive half of [`snippet_text`]'s question — is there anything to
+/// save — asked of the tab rather than of the click. The two must agree on every
+/// input, which is the whole reason they are named next to each other here
+/// instead of being a memo in one file and a closure in another.
+pub fn can_save(sql: &str) -> bool {
+    !sql.trim().is_empty()
+}
+
+/// Is this a snippet that ships with the app rather than one the user owns?
+///
+/// **A built-in has nothing to record and nothing to persist**: it lives in
+/// code, not in `snippets.json`, so [`touch`] would find nothing and the save
+/// behind it would rewrite the file for no change — on every insert of a shipped
+/// snippet. See [`BUILTIN_ID_BASE`].
+pub fn is_builtin(id: u64) -> bool {
+    id >= BUILTIN_ID_BASE
+}
+
+/// The copy **Duplicate** makes, and the five things that are not copied.
+///
+/// - `source` is [`Source::User`] even from a built-in — that is what Duplicate
+///   is *for*, on a shipped snippet that cannot be edited in place.
+/// - `abbrev` is dropped: an abbrev is a completion trigger, and two snippets
+///   answering to one spelling is a coin toss.
+/// - `last_used` is `None`: the copy has never been used, whatever the original
+///   had done.
+/// - the name gains ` copy`.
+/// - `scope` is inherited, because the copy is for the same place as the
+///   original.
+///
+/// Five choices in a struct literal inside `app_view`, where nothing could call
+/// them.
+pub fn duplicate(src: &Snippet, new_id: u64) -> Snippet {
+    Snippet {
+        id: new_id,
+        name: format!("{} copy", src.name),
+        abbrev: None,
+        body: src.body.clone(),
+        scope: src.scope.clone(),
+        source: Source::User,
+        last_used: None,
+    }
+}
+
 /// Record that a snippet was just used. No-op for an id that is gone.
 pub fn touch(all: &mut [Snippet], id: u64, now: u64) {
     if let Some(s) = all.iter_mut().find(|s| s.id == id) {
@@ -587,6 +657,125 @@ pub fn remove(all: &mut Vec<Snippet>, id: u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A real selection is what gets saved, and the rest of the buffer does not.
+    #[test]
+    fn a_selection_is_what_a_save_saves() {
+        let sql = "SELECT 1;\nSELECT 2;";
+        assert_eq!(
+            snippet_text(sql, Some((10, 19))).as_deref(),
+            Some("SELECT 2;")
+        );
+        assert_eq!(
+            snippet_text(sql, None).as_deref(),
+            Some("SELECT 1;\nSELECT 2;"),
+            "no selection saves the whole buffer"
+        );
+    }
+
+    /// **The rule with a named defect behind it.** A selection of nothing but
+    /// whitespace is not a selection: without the fallback, the `+` was enabled
+    /// (the tab has text) for a click that saved nothing (the selection is
+    /// blank). Reverting `snippet_text`'s `.filter(|s| !s.is_empty())` fails
+    /// this.
+    #[test]
+    fn a_whitespace_only_selection_saves_the_buffer_instead_of_nothing() {
+        let sql = "SELECT 1;\n\n   \n";
+        assert_eq!(
+            snippet_text(sql, Some((9, 14))).as_deref(),
+            Some("SELECT 1;")
+        );
+    }
+
+    /// Nothing to save is `None` however it is asked — an empty buffer, and a
+    /// buffer that is only whitespace.
+    #[test]
+    fn an_empty_buffer_contributes_nothing() {
+        assert_eq!(snippet_text("", None), None);
+        assert_eq!(snippet_text("   \n\t\n", None), None);
+        assert_eq!(snippet_text("   \n\t\n", Some((0, 5))), None);
+    }
+
+    /// **The seam, and the reason both halves live here.** The button asks
+    /// whether the tab has text; the click asks what to save. They were a memo
+    /// in one file and a closure in another, and the disagreement between them
+    /// is the defect — so this asserts the pair over the inputs that separate
+    /// them, rather than each alone.
+    #[test]
+    fn snippet_save_agrees_with_the_button_that_offers_it() {
+        // (buffer, selection) — every shape the pair can disagree on.
+        let cases: &[(&str, Option<(usize, usize)>)] = &[
+            ("SELECT 1", None),
+            ("SELECT 1", Some((0, 6))),
+            // The one that shipped the bug: text in the tab, whitespace selected.
+            ("SELECT 1\n   ", Some((8, 12))),
+            ("  ", None),
+            ("", None),
+            ("", Some((0, 0))),
+            // A stale range, which `selected_text` refuses.
+            ("SELECT 1", Some((99, 200))),
+            ("SELECT 1", Some((5, 3))),
+        ];
+        for (sql, sel) in cases {
+            assert_eq!(
+                can_save(sql),
+                snippet_text(sql, *sel).is_some(),
+                "the `+` and the save disagree on {sql:?} / {sel:?}"
+            );
+        }
+    }
+
+    /// A built-in is not in `snippets.json`, so touching one would rewrite the
+    /// file for no change on every insert.
+    #[test]
+    fn only_a_user_snippet_is_worth_recording_a_use_of() {
+        assert!(is_builtin(BUILTIN_ID_BASE));
+        assert!(is_builtin(BUILTIN_ID_BASE + 40));
+        assert!(!is_builtin(BUILTIN_ID_BASE - 1));
+        assert!(!is_builtin(1));
+        // And it agrees with what `builtins` actually allocates.
+        for s in builtins(SqlDialect::MySql) {
+            assert!(
+                is_builtin(s.id),
+                "{} is shipped but reads as a user's",
+                s.id
+            );
+        }
+    }
+
+    /// The five identity choices a Duplicate makes, asserted together — they
+    /// were a struct literal inside `app_view`.
+    #[test]
+    fn a_duplicate_is_an_editable_copy_that_triggers_nothing() {
+        let src = Snippet {
+            id: BUILTIN_ID_BASE + 3,
+            name: "Top rows".to_string(),
+            abbrev: Some("top".to_string()),
+            body: "SELECT * FROM t LIMIT 10".to_string(),
+            scope: Scope::Dialect(SqlDialect::MySql),
+            source: Source::Builtin,
+            last_used: Some(1_700_000_000_000),
+        };
+        let copy = duplicate(&src, 12);
+
+        assert_eq!(copy.id, 12);
+        assert_eq!(copy.name, "Top rows copy");
+        assert_eq!(
+            copy.source,
+            Source::User,
+            "Duplicate exists to make a built-in editable"
+        );
+        assert_eq!(
+            copy.abbrev, None,
+            "two snippets on one trigger is a toss-up"
+        );
+        assert_eq!(copy.last_used, None, "the copy has never been used");
+        assert_eq!(copy.body, src.body);
+        assert_eq!(copy.scope, src.scope, "the copy is for the same place");
+        // And it is now a snippet the user owns, by the same predicate the
+        // recording gate asks.
+        assert!(!is_builtin(copy.id));
+    }
 
     /// **The composition is the whole of `collapsed_for_highlight`**, and it
     /// had no test — the same gap as `history::preview_for_highlight`, in the
