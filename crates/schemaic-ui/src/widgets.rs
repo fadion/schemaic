@@ -3239,6 +3239,10 @@ fn menu_stack(
     close: Rc<dyn Fn()>,
     width: f64,
 ) -> impl IntoView {
+    // Taken before the entries become views, which consumes them — the kinds are
+    // all `cursor_row_span` needs, and keeping them is cheaper than cloning the
+    // entries (each `Sub` carries its children).
+    let kinds: Rc<Vec<MenuRowKind>> = Rc::new(entries.iter().map(MenuRowKind::of).collect());
     let rows: Vec<AnyView> = entries
         .into_iter()
         .enumerate()
@@ -3267,6 +3271,25 @@ fn menu_stack(
     // floor are in — and as a *minimum*, so a row wider than the panel still
     // pushes out and scrolls horizontally instead of being clipped.
     scroll(v_stack_from_iter(rows).style(|s| s.min_width_full()))
+        // **The keyboard cursor is scrolled into view.** The panel caps at
+        // `menu_max_h()` and scrolls, and nothing moved the viewport with the
+        // cursor: on the FK designer's "References table" picker over a 34-table
+        // database at 160% — the case `menu_stack`'s own comment names, 21 rows
+        // visible — End jumped the cursor to entry 34 below the fold, nothing on
+        // screen changed, and Enter then selected a table the user never saw.
+        // Holding Down past the last visible row did the same, and the menu
+        // looked frozen.
+        //
+        // This is the idiom `table_designer::list_pane` already uses; the
+        // difference is that its rows are a fixed height and a menu's are not,
+        // which is what `cursor_row_span` is for. It tracks the cursor only, so
+        // a wheel scroll is not fought — and it covers the submenu level too,
+        // which builds the same `menu_stack` with its own cursor.
+        .ensure_visible(move || {
+            let span = level.cursor.get().and_then(|i| cursor_row_span(i, &kinds));
+            let (top, bottom) = span.unwrap_or((0.0, 0.0));
+            Rect::new(0.0, top, 1.0, bottom)
+        })
         .on_event_stop(EventListener::PointerDown, |_| {})
         .style(move |s| {
             let cap = menu_max_h();
@@ -3318,24 +3341,71 @@ pub(crate) fn menu_panel_height(entries: &[MenuEntry]) -> f64 {
         .into_iter()
         .zip(entries)
         .filter(|(keep, _)| *keep)
-        .map(|(_, e)| match e {
-            MenuEntry::Separator => SEPARATOR_RULE_H + theme::scaled(SEPARATOR_MARGIN) * 2.0,
+        .map(|(_, e)| MenuRowKind::of(e).h())
+        .sum::<f64>()
+        + theme::scaled(MENU_PANEL_PAD) * 2.0
+        + MENU_PANEL_BORDER * 2.0
+}
+
+/// How a menu row is laid out vertically — the only thing its height depends on,
+/// and the one definition of it.
+///
+/// It exists because two things need per-row heights and only one of them had
+/// them: [`menu_panel_height`] sums them to place the panel, and
+/// [`cursor_row_span`] accumulates them to scroll a keyboard cursor into view.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum MenuRowKind {
+    Separator,
+    Line,
+    Detail,
+}
+
+impl MenuRowKind {
+    pub(crate) fn of(e: &MenuEntry) -> Self {
+        match e {
+            MenuEntry::Separator => Self::Separator,
+            MenuEntry::Action {
+                detail: Some(_), ..
+            } => Self::Detail,
+            _ => Self::Line,
+        }
+    }
+
+    /// Its height at the **active interface scale** — read where it is used, not
+    /// captured, for the reason `themes.rs` spells out.
+    pub(crate) fn h(self) -> f64 {
+        match self {
+            Self::Separator => SEPARATOR_RULE_H + theme::scaled(SEPARATOR_MARGIN) * 2.0,
             // A detail line is a second line box in the same row, plus the gap
             // `menu_row`'s column puts between the two — both scaled separately,
             // for the reason `MENU_ROW_PAD` gives.
-            MenuEntry::Action {
-                detail: Some(_), ..
-            } => {
+            Self::Detail => {
                 theme::scaled(MENU_LINE_H)
                     + theme::scaled(MENU_ROW_PAD) * 2.0
                     + theme::scaled(MENU_DETAIL_LINE_H)
                     + theme::scaled(MENU_DETAIL_GAP)
             }
-            _ => theme::scaled(MENU_LINE_H) + theme::scaled(MENU_ROW_PAD) * 2.0,
-        })
-        .sum::<f64>()
-        + theme::scaled(MENU_PANEL_PAD) * 2.0
-        + MENU_PANEL_BORDER * 2.0
+            Self::Line => theme::scaled(MENU_LINE_H) + theme::scaled(MENU_ROW_PAD) * 2.0,
+        }
+    }
+}
+
+/// The vertical span of row `index` inside a menu panel's scrolled list, in that
+/// list's own coordinates — what `ensure_visible` needs to bring the keyboard
+/// cursor onto the screen.
+///
+/// **Accumulated rather than multiplied**, because menu rows are not a fixed
+/// height: a separator is about a third of a row and a row with a detail line is
+/// half again taller, so `index * row_h` — the arithmetic `list_pane` can use
+/// because its rows really are uniform — would drift by the height of every
+/// separator above the cursor.
+///
+/// `kinds` is the panel's rows *after* `tidy_separators`, which is the list the
+/// cursor indexes into.
+pub(crate) fn cursor_row_span(index: usize, kinds: &[MenuRowKind]) -> Option<(f64, f64)> {
+    let h = kinds.get(index)?.h();
+    let top: f64 = kinds.iter().take(index).map(|k| k.h()).sum();
+    Some((top, top + h))
 }
 
 /// [`menu_panel_height`] as the panel will actually be **drawn** — clamped to
@@ -3991,6 +4061,41 @@ pub(crate) fn set_menu_return(f: Rc<dyn Fn()>) {
 /// moved and stands down; run second and it simply lands on top. That is the
 /// property `claim_keyboard`'s own doc describes — "the race is settled either
 /// way round" — applied at the sites that had not applied it.
+/// **Put the keyboard back on `tabindex` after a rebuild that disposed the
+/// control holding it.**
+///
+/// A list action that writes the draft notifies the very signal its own
+/// `dyn_container` is keyed on, and a `dyn_container` key re-runs on
+/// *notification*, not on change — so the press disposes the child scope and
+/// rebuilds it, taking the pressed button with it. `in_ring_button` registers
+/// through `in_focus_ring`, whose cleanup calls [`hand_keyboard_back`], and that
+/// hands to `innermost_focus_root()` — the modal's root, not a control. It does
+/// `ring.remember(id)` first, so *one* Tab resumes at the button; nothing
+/// returns the keyboard to it directly, which is why moving a column from
+/// position 8 to 1 cost seven Tab+Space pairs instead of seven Space presses.
+///
+/// **Deferred**, because the rebuild happens in this same update pass and a
+/// focus request into the old subtree would be undone by its removal — and **by
+/// tabindex**, resolved inside the tick, because the control that comes back is
+/// a different `ViewId` and floem's focus request has no existence check.
+/// **Claiming**, because the cleanup's hand-back is racing it on the same
+/// `exec_after(ZERO)` queue; see [`menu_return`], which is the same three
+/// properties for the menu-return slot.
+///
+/// Asked of [`keyboard_nav`] because it is only right for a keyboard press: after
+/// a click, taking focus to the button would take the arrow keys away from
+/// whatever had them.
+pub(crate) fn reclaim_focus_at(ring: &FocusRing, tabindex: u32) {
+    if !keyboard_nav().get_untracked() {
+        return;
+    }
+    let ring = ring.clone();
+    floem::action::exec_after(std::time::Duration::ZERO, move |_| {
+        claim_keyboard();
+        ring.focus_at(tabindex);
+    });
+}
+
 pub(crate) fn menu_return(restore: impl Fn() + Clone + 'static) -> Rc<dyn Fn()> {
     Rc::new(move || {
         let restore = restore.clone();
@@ -7834,6 +7939,87 @@ mod menu_placement_tests {
             short_detail,
             menu_panel_width(&[MenuEntry::action("Windows PowerShell", || {})]),
             "a short detail must not widen the panel"
+        );
+    }
+
+    // ── Scrolling the keyboard cursor into view (B21.3-L1-03) ─────────────
+
+    /// The first row starts at the top of the list, and a row's span is its own
+    /// height — the two ends `ensure_visible` compares against the viewport.
+    #[test]
+    fn the_first_row_spans_from_the_top() {
+        let kinds = [MenuRowKind::Line, MenuRowKind::Line];
+        let (top, bottom) = cursor_row_span(0, &kinds).expect("row 0 exists");
+        assert_eq!(top, 0.0);
+        assert_eq!(bottom, MenuRowKind::Line.h());
+    }
+
+    /// **Separators are not rows, which is why this accumulates.** Multiplying
+    /// an index by a row height — the arithmetic a uniform list can use —
+    /// over-counts every separator above the cursor by the difference between
+    /// the two heights, and a menu with three group rules would put the cursor
+    /// most of a row out.
+    #[test]
+    fn a_separator_above_the_cursor_shifts_it_by_less_than_a_row() {
+        let kinds = [MenuRowKind::Line, MenuRowKind::Separator, MenuRowKind::Line];
+        let (top, _) = cursor_row_span(2, &kinds).expect("row 2 exists");
+        assert_eq!(top, MenuRowKind::Line.h() + MenuRowKind::Separator.h());
+        assert!(
+            top < MenuRowKind::Line.h() * 2.0,
+            "a separator was counted as a full row"
+        );
+    }
+
+    /// A row with a detail line is taller, and the rows below it start lower by
+    /// exactly that much.
+    #[test]
+    fn a_detail_row_pushes_what_follows_it_down() {
+        let kinds = [MenuRowKind::Detail, MenuRowKind::Line];
+        let (top, _) = cursor_row_span(1, &kinds).expect("row 1 exists");
+        assert_eq!(top, MenuRowKind::Detail.h());
+        assert!(MenuRowKind::Detail.h() > MenuRowKind::Line.h());
+    }
+
+    /// The last row of a long list ends at the panel's full content height —
+    /// which is the End case, and the one that was off-screen.
+    #[test]
+    fn the_last_row_of_a_long_list_ends_at_the_content_height() {
+        let kinds = vec![MenuRowKind::Line; 34];
+        let (_, bottom) = cursor_row_span(33, &kinds).expect("row 33 exists");
+        assert_eq!(bottom, MenuRowKind::Line.h() * 34.0);
+        // And it is below a 21-row fold, which is the reported case.
+        assert!(bottom > MenuRowKind::Line.h() * 21.0);
+    }
+
+    /// An index past the end has no span — a cursor on a menu that has since
+    /// been rebuilt shorter must not scroll to an invented position.
+    #[test]
+    fn a_cursor_past_the_end_has_no_span() {
+        assert_eq!(cursor_row_span(2, &[MenuRowKind::Line]), None);
+        assert_eq!(cursor_row_span(0, &[]), None);
+    }
+
+    /// The kinds come off the entries, and the three that matter are told
+    /// apart — a plain action, one with a detail line, and a rule.
+    #[test]
+    fn the_row_kinds_come_off_the_entries() {
+        assert_eq!(
+            MenuRowKind::of(&MenuEntry::action("Copy", || {})),
+            MenuRowKind::Line
+        );
+        assert_eq!(
+            MenuRowKind::of(&MenuEntry::Separator),
+            MenuRowKind::Separator
+        );
+        let sub = MenuEntry::Sub {
+            label: "More".into(),
+            icon: None,
+            children: vec![MenuEntry::action("CSV", || {})],
+        };
+        assert_eq!(
+            MenuRowKind::of(&sub),
+            MenuRowKind::Line,
+            "a submenu row is one line, whatever it opens"
         );
     }
 

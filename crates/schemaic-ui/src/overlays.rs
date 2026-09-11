@@ -13,7 +13,7 @@ use floem::AnyView;
 use floem::event::EventListener;
 use floem::keyboard::{Key, NamedKey};
 use floem::prelude::*;
-use floem::reactive::{Memo, create_effect};
+use floem::reactive::{Memo, create_effect, create_memo};
 
 use schemaic_core::connection::Connection;
 use schemaic_core::model::QueryState;
@@ -2863,6 +2863,27 @@ pub(crate) fn date_pick_overlay(ui: Ui) -> impl IntoView {
 }
 
 /// Generic popup-menu overlay (the results-grid header/cell menus). Renders a
+/// Which point a cursor-anchored popup menu is placed at, across one opening.
+///
+/// `held` is what the previous run of the memo decided, and returning it
+/// unchanged is the whole behaviour: the point is sampled **once**, when the
+/// channel goes from empty to full, and kept until it empties again. `pointer`
+/// is read lazily so a run that is going to keep `held` does not sample at all.
+///
+/// Closing forgets it, which is what makes the next opening sample afresh —
+/// without that, a menu opened by the keyboard after one opened by the pointer
+/// would inherit the earlier gesture's position.
+fn menu_open_point(
+    open: bool,
+    held: Option<(f64, f64)>,
+    pointer: impl FnOnce() -> (f64, f64),
+) -> Option<(f64, f64)> {
+    if !open {
+        return None;
+    }
+    Some(held.unwrap_or_else(pointer))
+}
+
 /// `menu_panel` from `ui.overlay.popup_menu` at the cursor, flipping the whole panel left
 /// / up if it would spill past the window edge (the grid sits mid-window, unlike
 /// the left-anchored schema menu). Submenus edge-flip themselves.
@@ -2871,6 +2892,31 @@ pub(crate) fn popup_menu_overlay(ui: Ui) -> impl IntoView {
     let last_mouse = ui.overlay.last_mouse;
     let anchor = ui.overlay.popup_anchor;
     let popup_width = ui.overlay.popup_width;
+    // **Where the menu was opened, not where the pointer is now.**
+    //
+    // The placement closure below tracks `window_size()` and so re-runs on any
+    // resize — a Win+Up, an OS snap, a window-manager drag, none of which
+    // involves a pointer-down. Its cursor arm read `last_mouse` untracked, and
+    // `last_mouse` is written on *every* pointer move at the workspace root, so
+    // by then it was the entry the pointer had wandered onto. The panel jumped
+    // so its corner sat under the pointer, taking that entry out from under it.
+    //
+    // A memo rather than an effect, and that is not a preference: a memo is
+    // computed when it is *read*, so the style closure below cannot run against
+    // a stale sample on the opening pass. Keyed on open-ness alone, so a menu
+    // whose entries are patched while it stands keeps the point it opened at.
+    //
+    // This is `CtxMenu::at`'s answer for the other channel (B16.1-L1-01),
+    // reached without a fourth `PopupAnchor` variant: the anchored arms all
+    // store their anchor already, and the cursor arm is the `None` case, which
+    // stores nothing anywhere. Doing it here keeps all twelve openers — in ten
+    // files, several with no `last_mouse` in scope — as they are.
+    let open = create_memo(move |_| popup.with(|p| p.is_some()));
+    let opened_at = create_memo(move |prev: Option<&Option<(f64, f64)>>| {
+        menu_open_point(open.get(), prev.copied().flatten(), || {
+            last_mouse.get_untracked()
+        })
+    });
     dyn_container(
         move || popup.get(),
         move |entries| match entries {
@@ -2967,12 +3013,13 @@ pub(crate) fn popup_menu_overlay(ui: Ui) -> impl IntoView {
             // other side of it at either edge — the shared rule, which the schema
             // tree's menu now uses too.
             None => {
-                let (x, y) = cursor_menu_insets(
-                    last_mouse.get_untracked(),
-                    (pw, ph),
-                    (ww, wh),
-                    CURSOR_MENU_GAP,
-                );
+                // The point the menu opened at — see `opened_at`. A resize must
+                // re-clamp the panel to the new window bounds, never move it to
+                // wherever the pointer has since gone.
+                let Some(at) = opened_at.get() else {
+                    return s;
+                };
+                let (x, y) = cursor_menu_insets(at, (pw, ph), (ww, wh), CURSOR_MENU_GAP);
                 y.apply_y(x.apply_x(s.absolute()))
             }
         }
@@ -7387,5 +7434,52 @@ fn ",
             vec!["Drop", "Drop foreign key", "Drop index", "Truncate"],
             "an entry gained or lost the irreversible marking"
         );
+    }
+}
+
+#[cfg(test)]
+mod menu_open_point_tests {
+    use super::menu_open_point;
+
+    /// A closed channel holds no point — which is what makes the next opening
+    /// sample afresh rather than inheriting the last gesture's.
+    #[test]
+    fn a_closed_menu_holds_no_point() {
+        assert_eq!(
+            menu_open_point(false, Some((10.0, 20.0)), || panic!()),
+            None
+        );
+        assert_eq!(menu_open_point(false, None, || panic!()), None);
+    }
+
+    /// Opening samples the pointer once.
+    #[test]
+    fn opening_samples_the_pointer() {
+        assert_eq!(
+            menu_open_point(true, None, || (1350.0, 400.0)),
+            Some((1350.0, 400.0))
+        );
+    }
+
+    /// **The bug.** The menu is open and the pointer has moved onto an entry;
+    /// the placement closure re-runs because it tracks `window_size()`. It must
+    /// re-clamp against the new window from the point it opened at, not jump so
+    /// its corner sits under the pointer.
+    #[test]
+    fn a_standing_menu_keeps_the_point_it_opened_at() {
+        let opened = menu_open_point(true, None, || (1350.0, 400.0));
+        let after_the_pointer_moved =
+            menu_open_point(true, opened, || panic!("the pointer was read again"));
+        assert_eq!(after_the_pointer_moved, opened);
+    }
+
+    /// And a menu re-opened somewhere else takes the new gesture's point, which
+    /// is what the closed run in between is for.
+    #[test]
+    fn the_next_opening_samples_again() {
+        let first = menu_open_point(true, None, || (1350.0, 400.0));
+        let closed = menu_open_point(false, first, || panic!());
+        let second = menu_open_point(true, closed, || (200.0, 90.0));
+        assert_eq!(second, Some((200.0, 90.0)));
     }
 }

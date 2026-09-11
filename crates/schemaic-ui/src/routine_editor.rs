@@ -646,7 +646,6 @@ fn routine_form(ui: Ui, target: &RoutineTarget, ring: FocusRing) -> AnyView {
             form_setting(
                 "Settings",
                 value_rows(
-                    &ui,
                     "search_path=public, pg_temp",
                     "Add setting",
                     true,

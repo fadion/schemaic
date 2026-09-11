@@ -918,6 +918,20 @@ pub(crate) fn list_actions(
 ) -> impl IntoView {
     let btn = move |glyph: &'static str, tip: &'static str, slot: u32, act: Rc<dyn Fn()>| {
         let pressed = act.clone();
+        // **Every one of these four writes the draft, and the draft is half the
+        // key of the `dyn_container` this bar lives inside** — so each press
+        // disposes the button that was pressed. `in_focus_ring`'s cleanup then
+        // hands the keyboard to `innermost_focus_root()`, the designer's modal
+        // root, and the next Space did nothing: moving a column from position 8
+        // to 1 cost seven Tab+Space pairs instead of seven Space presses, and
+        // adding five columns meant Tab, Space, Tab, Space, …
+        //
+        // The tabindex is fixed here (`LIST_TAB + 1 + slot` — the bar's four
+        // slots do not move), so unlike the trigger editor's Add this lands
+        // back on the same control. Only from the keyboard; see
+        // `widgets::reclaim_focus_at`.
+        let back_at = LIST_TAB + 1 + slot;
+        let back_ring = ring.clone();
         // Everything the pointer touches — the padding that *is* the hitbox, the
         // click listener, the hover colour — stays on the face, and only the
         // face goes into `in_ring_button`. Styling the *returned* view instead
@@ -941,7 +955,10 @@ pub(crate) fn list_actions(
             LIST_TAB + 1 + slot,
             true,
             0.0,
-            move || (pressed)(),
+            move || {
+                (pressed)();
+                crate::widgets::reclaim_focus_at(&back_ring, back_at);
+            },
         )
     };
     let arrows: Vec<AnyView> = match (move_up, move_down) {

@@ -503,7 +503,6 @@ fn bound_choice(
 /// each block happened to be last in its form.
 #[allow(clippy::too_many_arguments)] // a UI builder; grouping into a struct adds no clarity
 pub(crate) fn value_rows(
-    ui: &Ui,
     placeholder: &'static str,
     add_label: &'static str,
     mono: bool,
@@ -512,10 +511,24 @@ pub(crate) fn value_rows(
     read: impl Fn() -> Vec<String> + Clone + 'static,
     write: impl Fn(Vec<String>) + Clone + 'static,
 ) -> AnyView {
-    let rev = ui.ddl.rev;
+    // **This block's own structural counter, not the modal's `rev`.**
+    //
+    // `rev = ui.ddl.rev` is half the *detail form's* container key
+    // (`dyn_container(move || (selected.get(), rev.get()), …)`), whose child is
+    // the whole right-hand pane. Bumping it to restructure four argument rows
+    // therefore disposed and rebuilt the Name field, the Timing and Fires
+    // pickers, the `WHEN` field, the function picker and its Edit / New function
+    // buttons as well — so adding one argument cost a full walk back through the
+    // form, and the Add button had moved to a different tabindex on the way
+    // (`tabindex + n * ROW_TAB_STRIDE`).
+    //
+    // A local signal is enough because this block is *inside* that form: when
+    // the modal's `rev` really does change, the form is rebuilt and `value_rows`
+    // is created afresh with a counter of its own.
+    let rows_rev = RwSignal::new(0u64);
     dyn_container(
         // Structural only, as in the object editor.
-        move || rev.get(),
+        move || rows_rev.get(),
         move |_| {
             let (read, write) = (read.clone(), write.clone());
             let (read_a, write_a) = (read.clone(), write.clone());
@@ -540,6 +553,7 @@ pub(crate) fn value_rows(
                     t
                 });
                 let (read_d, write_d) = (read.clone(), write.clone());
+                let remove_ring = ring.clone();
                 h_stack((
                     edit_field(
                         sig,
@@ -561,8 +575,18 @@ pub(crate) fn value_rows(
                             if i < all.len() {
                                 all.remove(i);
                             }
+                            let left = all.len();
                             write_d(all);
-                            rev.update(|r| *r += 1);
+                            rows_rev.update(|r| *r += 1);
+                            // The rebuild disposes this button. Land on the row
+                            // that took its place, or on Add when the last row
+                            // went — see `widgets::reclaim_focus_at`.
+                            let land = if i < left {
+                                base + crate::widgets::ROW_BUTTON_TAB
+                            } else {
+                                tabindex + left as u32 * crate::widgets::ROW_TAB_STRIDE
+                            };
+                            crate::widgets::reclaim_focus_at(&remove_ring, land);
                         },
                     ),
                 ))
@@ -576,17 +600,20 @@ pub(crate) fn value_rows(
             .style(|s| s.flex_col().gap(theme::scaled(6.0)).width_full());
             // Last in the block, above every row — what you reach after walking
             // them.
-            let add = control_button(
-                add_label,
-                add_ring,
-                tabindex + n as u32 * crate::widgets::ROW_TAB_STRIDE,
-                move || {
-                    let mut all = read_a();
-                    all.push(String::new());
-                    write_a(all);
-                    rev.update(|r| *r += 1);
-                },
-            );
+            let add_at = tabindex + n as u32 * crate::widgets::ROW_TAB_STRIDE;
+            let add_back = add_ring.clone();
+            let add = control_button(add_label, add_ring, add_at, move || {
+                let mut all = read_a();
+                all.push(String::new());
+                write_a(all);
+                rows_rev.update(|r| *r += 1);
+                // Add moves one stride further along as the row it added
+                // takes its old place, so this is not `add_at`.
+                crate::widgets::reclaim_focus_at(
+                    &add_back,
+                    add_at + crate::widgets::ROW_TAB_STRIDE,
+                );
+            });
             v_stack((
                 rows,
                 container(add).style(|s| s.width_full().margin_top(theme::scaled(2.0))),
@@ -1137,7 +1164,6 @@ fn pg_action(
         form_setting(
             "Arguments",
             value_rows(
-                ui,
                 "col_a",
                 "Add argument",
                 false,

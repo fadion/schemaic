@@ -13736,7 +13736,7 @@ mod whole_ui_gate {
         ("snippet_panel.rs", 1),
         ("table_designer.rs", 33),
         ("tabs.rs", 1),
-        ("trigger_editor.rs", 12),
+        ("trigger_editor.rs", 11),
         ("users_view.rs", 9),
         ("view_editor.rs", 10),
     ];
