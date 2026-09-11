@@ -213,6 +213,16 @@ pub(crate) fn pathext() -> Vec<String> {
 /// preference order — which is what puts `.CMD` ahead of a `.ps1` nobody can
 /// spawn directly.
 ///
+/// **With one departure from `where.exe`: a batch shim goes last.** Rust runs a
+/// `.bat`/`.cmd` through `cmd.exe` and refuses any argument it cannot escape for
+/// it, and every prompt this app builds is multi-line by construction
+/// (`harness::prefixed_prompt` joins with `\n\n`), so a harness resolved to a
+/// `.cmd` answers `InvalidInput: batch file arguments are invalid` for *every*
+/// generation — Ctrl+K, Optimize, Fix with AI and each chat turn, reported as a
+/// batch-file problem rather than a prompt one. A default `PATHEXT` lists `.EXE`
+/// before `.CMD` and hid this; the variable is editable and installers edit it.
+/// The shim is still taken when it is the only candidate, which is npm's layout.
+///
 /// Off Windows `exts` is empty and the bare name is the only candidate, which
 /// is correct there: the executable bit is the test, not the name.
 pub(crate) fn pick_executable<'a>(
@@ -230,7 +240,17 @@ pub(crate) fn pick_executable<'a>(
     if already_extended && let Some(hit) = has(name) {
         return Some(hit);
     }
-    exts.iter().find_map(|e| has(&format!("{name}{e}")))
+    // Two passes over `PATHEXT` in its own order: everything that is not a batch
+    // shim, then the shims. See the doc above for why the second pass exists.
+    let is_batch = |e: &str| e.eq_ignore_ascii_case(".BAT") || e.eq_ignore_ascii_case(".CMD");
+    exts.iter()
+        .filter(|e| !is_batch(e))
+        .find_map(|e| has(&format!("{name}{e}")))
+        .or_else(|| {
+            exts.iter()
+                .filter(|e| is_batch(e))
+                .find_map(|e| has(&format!("{name}{e}")))
+        })
 }
 
 /// Minimal `which`: locate `name` on `PATH`, honoring `PATHEXT` on Windows.
@@ -630,6 +650,42 @@ mod pick_executable_tests {
         assert_eq!(
             pick_executable("claude", &present, &win()),
             Some("claude.exe")
+        );
+    }
+
+    /// **A batch shim is the last resort, whatever `PATHEXT` says.**
+    ///
+    /// Rust runs a `.bat`/`.cmd` through `cmd.exe` and refuses any argument it
+    /// cannot escape for it — and every prompt this app builds is multi-line by
+    /// construction, so a harness resolved to a `.cmd` answers
+    /// `InvalidInput: batch file arguments are invalid` for *every* generation.
+    /// `PATHEXT` order gave the right answer on a default install by luck
+    /// (`.EXE` precedes `.CMD` there); a machine whose `PATHEXT` is ordered
+    /// otherwise — they are editable, and installers do edit them — resolved to
+    /// the shim with a real `.exe` sitting beside it.
+    #[test]
+    fn a_real_executable_beats_a_batch_shim_whatever_pathext_prefers() {
+        let cmd_first: Vec<String> = ".CMD;.BAT;.COM;.EXE"
+            .split(';')
+            .map(str::to_string)
+            .collect();
+        let present = ["claude.cmd", "claude.exe"];
+        assert_eq!(
+            pick_executable("claude", &present, &cmd_first),
+            Some("claude.exe"),
+            "a batch shim won because PATHEXT happened to list it first"
+        );
+        // The shim is still the answer when it is the only one — npm's layout,
+        // which `an_npm_shim_directory_resolves_to_the_cmd_not_the_sh_script`
+        // pins from the other side.
+        assert_eq!(
+            pick_executable("claude", &["claude.cmd"], &cmd_first),
+            Some("claude.cmd")
+        );
+        // And among batch shims, PATHEXT order still decides.
+        assert_eq!(
+            pick_executable("claude", &["claude.bat", "claude.cmd"], &cmd_first),
+            Some("claude.cmd")
         );
     }
 
