@@ -1041,6 +1041,29 @@ fn plan_nodes(existing: &[(usize, String)], names: &[String], reload: bool) -> V
         .collect()
 }
 
+/// The nodes a landed load leaves behind: in `existing`, kept by no plan.
+///
+/// **The half [`plan_nodes`] does not answer, and the half that holds memory.**
+/// A `ConnNode` owns a `RwSignal<SchemaState>` whose `Loaded` arm is an
+/// `Arc<DbSchema>` — every table, column, index, key, view, check and trigger of
+/// one database, the largest single value the app caches. On a *reload* the node
+/// scope is deliberately reused, so that the surviving rows keep their schema up
+/// while the re-introspection runs; a database dropped from another client
+/// between two reloads therefore vanished from `db_nodes` with its signals still
+/// installed in that surviving scope, unreachable and retained until the app
+/// exited or a connection switch happened to replace the scope. A scratch
+/// database per refresh retained one full model per refresh.
+///
+/// `load_schema`'s own comment named this leak and named the fix — a scope per
+/// node — and the ids are the half of it that can be tested.
+fn departed_nodes(existing: &[(usize, String)], plans: &[NodePlan]) -> Vec<usize> {
+    existing
+        .iter()
+        .map(|(id, _)| *id)
+        .filter(|id| !plans.contains(&NodePlan::Keep(*id)))
+        .collect()
+}
+
 /// May a landed **per-database** introspection write its result?
 ///
 /// [`load_landing`]'s counterpart, one level down, and the level that had no
@@ -1539,6 +1562,37 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
 
     // Schema tree (one ConnNode per database of the active connection).
     let db_nodes: RwSignal<Vec<ConnNode>> = RwSignal::new(Vec::new());
+    // **Emptying the tree, in the one place that also lets go of the generation
+    // behind it.** `nodes_scope` owns every node's `RwSignal<SchemaState>`, and
+    // each of those holds an `Arc<DbSchema>` — every column, index, key, view,
+    // check and trigger of every database on the connection. Clearing
+    // `db_nodes` alone leaves that scope installed and `nodes_conn` still naming
+    // the connection, so the *next* load of it takes the reuse path against an
+    // empty node list: `kept_scope` is `Some`, the deferred `dispose()` is
+    // skipped, and the whole set is rebuilt inside a scope that still owns the
+    // previous one — unreachable, and never freed.
+    //
+    // The failed-connect arm in `load_schema` diagnosed exactly that and fixed
+    // it for its own path; the other two clears reached the same state and did
+    // not. A connection switch the user reverses before the first load lands
+    // orphans one generation per A→B→A round trip (seconds wide over a tunnel),
+    // and deleting the last connection orphans one outright. Three steps that
+    // must not come apart is one closure, not a comment asking three callers to
+    // remember — the rule `rearm_activity` follows for the same reason.
+    //
+    // **Deferred, like every other dispose of this scope**, so the tree rebuilds
+    // off the now-empty node list before the signals it was reading are freed.
+    let clear_schema_tree: Rc<dyn Fn()> = {
+        let nodes_scope = nodes_scope.clone();
+        let nodes_conn = nodes_conn.clone();
+        Rc::new(move || {
+            db_nodes.set(Vec::new());
+            *nodes_conn.borrow_mut() = None;
+            if let Some(old) = nodes_scope.borrow_mut().take() {
+                exec_after(Duration::ZERO, move |_| old.dispose());
+            }
+        })
+    };
     // Expanded tree nodes, keyed by connection — see `core::expanded` for why
     // the key has to carry one. **The third store to need this fix**, after
     // `db_hidden` and `schema::tab_target`'s remembered database, and the same
@@ -7488,6 +7542,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
         let nodes_conn = nodes_conn.clone();
         let schema_gen = schema_gen.clone();
         let start_fetch = start_fetch.clone();
+        let clear_schema_tree = clear_schema_tree.clone();
         Rc::new(move |conn: Connection| {
             // Reloading the connection already on screen (the SCHEMA header's
             // Refresh) keeps its databases visible while the list is re-fetched;
@@ -7503,13 +7558,20 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                 .as_ref()
                 .is_some_and(|c| c.is_reload_of(&conn));
             if !reload {
-                db_nodes.set(Vec::new());
+                // **The whole clear, not just the rows.** Leaving the scope and
+                // `nodes_conn` behind is what let a switch away and back inside
+                // one `fetch_databases` orphan a generation: the return trip
+                // reads `is_reload_of` as true against an already-empty node
+                // list, so the load that lands rebuilds every node inside the
+                // scope that still owns the first set's signals.
+                (clear_schema_tree)();
             }
             let stamp = (conn.id, schema_gen.get() + 1);
             schema_gen.set(stamp.1);
             let gen_cb = schema_gen.clone();
             let nodes_scope_cb = nodes_scope.clone();
             let nodes_conn_cb = nodes_conn.clone();
+            let clear_schema_tree_cb = clear_schema_tree.clone();
             let start_fetch_cb = start_fetch.clone();
             let cached_port = tunnels.borrow().get(&conn.id).map(|h| h.port());
             let tunnels_cache = tunnels.clone();
@@ -7554,8 +7616,10 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                             .iter()
                             .map(|n| (n.id, n.database.clone()))
                             .collect();
-                        let nodes: Vec<ConnNode> = plan_nodes(&by_id, &names, reload)
-                            .into_iter()
+                        let plans = plan_nodes(&by_id, &names, reload);
+                        let nodes: Vec<ConnNode> = plans
+                            .iter()
+                            .copied()
                             .zip(names.iter())
                             .map(|(plan, name)| match plan {
                                 NodePlan::Keep(id) => existing
@@ -7566,7 +7630,32 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                                 NodePlan::Create(id) => ConnNode::new(node_cx, id, name, name),
                             })
                             .collect();
+                        // **The nodes the plan left behind, when the scope above
+                        // them is staying.** A database dropped from another
+                        // client disappears from the tree while its
+                        // `Arc<DbSchema>` sits in the kept scope, unreachable and
+                        // retained for the session — the leak this arm's own
+                        // comment below named and said needed a scope per node.
+                        // On a *switch* nothing is asked: `node_cx` is fresh and
+                        // the deferred `old.dispose()` a few lines down takes the
+                        // whole previous generation, children included.
+                        let departing: Vec<floem::reactive::Scope> = kept_scope
+                            .map(|_| departed_nodes(&by_id, &plans))
+                            .unwrap_or_default()
+                            .into_iter()
+                            .filter_map(|id| existing.iter().find(|n| n.id == id).map(|n| n.cx))
+                            .collect();
                         db_nodes.set(nodes.clone());
+                        if !departing.is_empty() {
+                            // Deferred, like every other dispose of these: the
+                            // tree rebuilds off the new list first, so nothing
+                            // reads a freed signal on the way past.
+                            exec_after(Duration::ZERO, move |_| {
+                                for cx in departing {
+                                    cx.dispose();
+                                }
+                            });
+                        }
                         if kept_scope.is_none()
                             && let Some(old) = nodes_scope_cb.borrow_mut().replace(node_cx)
                         {
@@ -7633,25 +7722,15 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                         // Same rule on this side: clearing the tree here would empty
                         // it for a connection that loaded perfectly well.
                         if landing == LoadLanding::Install {
-                            db_nodes.set(Vec::new());
-                            // **And forget which connection the tree was for.**
-                            // Nothing references the node scope once the tree is
-                            // empty, and leaving it in place made the *next* load
-                            // of this connection take the reuse path against an
-                            // empty node list: `kept_scope` was `Some`, so the
-                            // deferred `dispose()` was skipped, and every node was
-                            // rebuilt inside a scope that still owned the previous
-                            // set's `RwSignal<SchemaState>` — each holding an
-                            // `Arc<DbSchema>`, unreachable and never freed. One
-                            // set per failed connect, indefinitely.
+                            // **And forget which connection the tree was for** —
+                            // this arm is where that was first diagnosed, and
+                            // `clear_schema_tree` is where the three steps now
+                            // live so the other two clears cannot omit them.
                             //
                             // A database *dropped* between two successful reloads
                             // still leaves its signals in the surviving scope; that
                             // one needs a scope per node and is not this fix.
-                            *nodes_conn_cb.borrow_mut() = None;
-                            if let Some(old) = nodes_scope_cb.borrow_mut().take() {
-                                exec_after(Duration::ZERO, move |_| old.dispose());
-                            }
+                            (clear_schema_tree_cb)();
                         }
                     }
                 }
@@ -9423,7 +9502,10 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                         load_schema(conn);
                     }
                     None => {
-                        db_nodes.set(Vec::new());
+                        // The whole clear: with no connection left there is
+                        // nothing the node scope could be reused for, and
+                        // leaving it installed orphaned it outright.
+                        (clear_schema_tree)();
                         // No connection left to restore a conversation from, so
                         // the panel empties — the same reset, with nothing to
                         // put back.
@@ -12560,6 +12642,58 @@ mod app_tests {
         );
     }
 
+    /// **Emptying the schema tree has to let go of the generation behind it**,
+    /// and two of the three clears did not.
+    ///
+    /// `nodes_scope` owns every node's `RwSignal<SchemaState>`, each holding an
+    /// `Arc<DbSchema>` — every column, index, key, view, check and trigger of
+    /// every database on the connection. Clear `db_nodes` and leave the scope
+    /// and `nodes_conn` behind, and the *next* load of that connection takes the
+    /// reuse path against an empty node list: `kept_scope` is `Some`, so the
+    /// deferred `dispose()` is skipped, and the whole set is rebuilt inside a
+    /// scope that still owns the previous one. Unreachable, and never freed.
+    ///
+    /// The failed-connect arm already carried that diagnosis in full and fixed
+    /// it **for itself**. The same state is reached by a connection switch that
+    /// the user reverses before the first load lands — one orphaned generation
+    /// per A→B→A round trip, which is seconds wide over a tunnel — and by
+    /// deleting the last connection.
+    ///
+    /// So the signal has no direct writer left: `clear_schema_tree`, which
+    /// cannot be spelled without all three steps, is the only thing that empties
+    /// it. The same shape as `every_activity_generation_bump_arms_the_poll_loop`
+    /// below, and for the same reason — the pairing has no runtime subject.
+    #[test]
+    fn emptying_the_schema_tree_lets_go_of_its_scope() {
+        let src = production_main();
+        let (name, at) = ("let clear_schema_tree", src.find("let clear_schema_tree"));
+        let at = at.unwrap_or_else(|| panic!("{name} is gone — this gate is stale"));
+        let body = closure_body(&src, src[..at].rfind('\n').map_or(0, |i| i + 1));
+        for step in [
+            "db_nodes.set(Vec::new())",
+            "*nodes_conn.borrow_mut() = None",
+            "nodes_scope.borrow_mut().take()",
+        ] {
+            assert!(
+                body.contains(step),
+                "`clear_schema_tree` no longer does `{step}`, so a caller of it \
+                 leaves a generation of schema signals orphaned"
+            );
+        }
+        let writes: Vec<&str> = src
+            .lines()
+            .map(str::trim)
+            .filter(|l| l.starts_with("db_nodes.set(Vec::new())"))
+            .collect();
+        assert_eq!(
+            writes.len(),
+            1,
+            "db_nodes is emptied outside `clear_schema_tree`, so that caller \
+             orphans the node scope and `nodes_conn` goes on naming a tree that \
+             is not there"
+        );
+    }
+
     #[test]
     fn every_activity_generation_bump_arms_the_poll_loop() {
         let writes: Vec<&str> = include_str!("main.rs")
@@ -12812,6 +12946,60 @@ mod app_tests {
             plan_nodes(&existing, &dbs(&["world", "sakila"]), false),
             vec![NodePlan::Create(1), NodePlan::Create(2)]
         );
+    }
+
+    /// **And the nodes the plan leaves behind own the memory.** A database
+    /// dropped from another client between two reloads vanishes from the tree
+    /// while its `RwSignal<SchemaState>` — holding an `Arc<DbSchema>`, the whole
+    /// model of that database — stays installed in the node scope the reload
+    /// deliberately keeps alive. `plan_nodes` never names it, because it maps
+    /// the *server's* list; the departing set is the complement, and it is what
+    /// the caller disposes.
+    #[test]
+    fn a_database_that_is_gone_leaves_its_node_behind_to_be_disposed() {
+        use super::{departed_nodes, plan_nodes};
+        let existing = nodes(&[(1, "world"), (2, "sakila")]);
+        let plans = plan_nodes(&existing, &dbs(&["world", "chinook"]), true);
+        assert_eq!(departed_nodes(&existing, &plans), vec![2]);
+    }
+
+    /// A reload where nothing was dropped disposes nothing — the surviving
+    /// nodes keep their schema up while the re-introspection runs, which is the
+    /// whole reason the scope is reused.
+    #[test]
+    fn a_reload_that_drops_nothing_disposes_nothing() {
+        use super::{departed_nodes, plan_nodes};
+        let existing = nodes(&[(1, "world"), (2, "sakila")]);
+        let plans = plan_nodes(&existing, &dbs(&["sakila", "world"]), true);
+        assert!(departed_nodes(&existing, &plans).is_empty());
+        // Nor does a reload that only *gains* a database.
+        let plans = plan_nodes(&existing, &dbs(&["world", "sakila", "chinook"]), true);
+        assert!(departed_nodes(&existing, &plans).is_empty());
+    }
+
+    /// A database dropped and re-created between two reloads takes a fresh id,
+    /// so the **old** node departs even though the name came back — and its
+    /// signals are a stale model of a different database.
+    #[test]
+    fn a_recreated_database_leaves_its_old_node_behind() {
+        use super::{departed_nodes, plan_nodes};
+        let existing = nodes(&[(1, "world"), (2, "scratch")]);
+        // `scratch` was dropped and made again: not found by name in one pass,
+        // so it is a `Create` at a fresh id and node 2 is departing.
+        let plans = plan_nodes(&existing, &dbs(&["world"]), true);
+        assert_eq!(departed_nodes(&existing, &plans), vec![2]);
+    }
+
+    /// On a **switch** nothing is kept, so every node departs. The caller does
+    /// not ask on that path — the parent scope is replaced whole and disposing
+    /// it takes the children with it — but the answer has to be the honest one
+    /// rather than depend on who asks.
+    #[test]
+    fn a_switch_leaves_every_node_behind() {
+        use super::{departed_nodes, plan_nodes};
+        let existing = nodes(&[(1, "world"), (2, "sakila")]);
+        let plans = plan_nodes(&existing, &dbs(&["world", "sakila"]), false);
+        assert_eq!(departed_nodes(&existing, &plans), vec![1, 2]);
     }
 
     /// The case a failed connect leaves behind: `reload` is true and there is

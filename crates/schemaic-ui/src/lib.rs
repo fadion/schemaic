@@ -3049,10 +3049,30 @@ pub struct ConnNode {
     /// lifecycle rather than a field on `schema`, because it is fetched by a
     /// **separate, slower and optional** query — see [`DbStatsState`].
     pub stats: RwSignal<DbStatsState>,
+    /// The child scope this node's three signals live in.
+    ///
+    /// **A per-entity scope, like [`Tab`]'s and [`ResultPanel`]'s**, and this
+    /// was the one per-entity type in the crate without one. The three signals
+    /// used to be created directly on the scope `new` was *handed*, which is the
+    /// tree's shared node scope — and that scope is deliberately kept alive
+    /// across a reload, so the surviving rows keep their schema up while the
+    /// re-introspection runs. A database dropped from another client therefore
+    /// vanished from `db_nodes` with its signals still installed: `schema`'s
+    /// `Loaded` arm is an `Arc<DbSchema>` — every table, column, index, key,
+    /// view, check and trigger of that database — unreachable and retained until
+    /// the app exited or a connection switch happened to replace the whole
+    /// scope. One retained model per scratch database per refresh.
+    ///
+    /// Disposed **deferred** by the load that drops the node, so the tree
+    /// rebuilds off the new list before the signals it was reading are freed.
+    pub cx: Scope,
 }
 
 impl ConnNode {
     pub fn new(cx: Scope, id: usize, name: &str, database: &str) -> ConnNode {
+        // A child of what we were handed, never the thing itself: disposing this
+        // node must free this node, and the scope above it outlives a reload.
+        let cx = cx.create_child();
         ConnNode {
             id,
             name: name.to_string(),
@@ -3060,6 +3080,7 @@ impl ConnNode {
             schema: cx.create_rw_signal(SchemaState::Loading),
             refreshing: cx.create_rw_signal(false),
             stats: cx.create_rw_signal(DbStatsState::Idle),
+            cx,
         }
     }
 }
@@ -12225,6 +12246,70 @@ mod field_key_tests {
         ] {
             assert!(!is_modifier_key(&Key::Named(k)), "{k:?}");
         }
+    }
+}
+
+#[cfg(test)]
+mod conn_node_scope_tests {
+    use super::{ConnNode, SchemaState};
+    use floem::prelude::{SignalGet, SignalUpdate};
+    use floem::reactive::Scope;
+
+    /// **A node's signals must go with the node, and not with the tree.**
+    ///
+    /// The scope `ConnNode::new` is handed is the tree's shared one, kept alive
+    /// across a reload on purpose so surviving rows keep their schema up. Built
+    /// directly on it — which is what this did — a database dropped from another
+    /// client left its `RwSignal<SchemaState>` installed there, and `Loaded`
+    /// holds an `Arc<DbSchema>`: the whole model of that database, unreachable
+    /// and never freed.
+    ///
+    /// Asserted through the two nodes together, because that is the property
+    /// that separates a child scope from the parent: if `new` created its
+    /// signals on what it was handed, disposing one node's `cx` would be
+    /// disposing the shared scope, and the *survivor* would go dark too.
+    #[test]
+    fn disposing_one_node_frees_its_schema_and_leaves_its_neighbours() {
+        let tree = Scope::new();
+        let gone = ConnNode::new(tree, 1, "scratch", "scratch");
+        let kept = ConnNode::new(tree, 2, "world", "world");
+        assert!(gone.schema.try_get_untracked().is_some(), "the premise");
+        assert!(kept.schema.try_get_untracked().is_some(), "the premise");
+
+        gone.cx.dispose();
+        assert!(
+            gone.schema.try_get_untracked().is_none(),
+            "the dropped database's schema signal outlived its node — an \
+             `Arc<DbSchema>` retained for the session"
+        );
+        assert!(
+            gone.stats.try_get_untracked().is_none(),
+            "and its statistics with it"
+        );
+        assert!(
+            kept.schema.try_get_untracked().is_some(),
+            "disposing one node took the whole tree's scope with it — the \
+             signals are on the shared scope, not on a child of it"
+        );
+        assert!(kept.refreshing.try_get_untracked().is_some());
+        // And the survivor is still writable, not merely readable.
+        kept.schema.set(SchemaState::Loading);
+        assert!(matches!(
+            kept.schema.try_get_untracked(),
+            Some(SchemaState::Loading)
+        ));
+    }
+
+    /// Disposing the tree's scope still takes every node with it — the child
+    /// relationship is what makes the switch path's single `dispose()` enough.
+    #[test]
+    fn disposing_the_tree_still_frees_every_node() {
+        let tree = Scope::new();
+        let a = ConnNode::new(tree, 1, "world", "world");
+        let b = ConnNode::new(tree, 2, "sakila", "sakila");
+        tree.dispose();
+        assert!(a.schema.try_get_untracked().is_none());
+        assert!(b.schema.try_get_untracked().is_none());
     }
 }
 

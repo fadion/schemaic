@@ -11211,6 +11211,10 @@ mod tests {
             schema: RwSignal::new(state),
             refreshing: RwSignal::new(false),
             stats: RwSignal::new(crate::DbStatsState::Idle),
+            // The signals above are on the ambient scope rather than this one;
+            // nothing here disposes a node, and a fixture that owned a real
+            // child scope would outlive the test either way.
+            cx: floem::reactive::Scope::new(),
         }
     }
 
