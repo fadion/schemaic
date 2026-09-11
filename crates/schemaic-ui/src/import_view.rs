@@ -239,7 +239,7 @@ fn probe(ui: Ui, sniff: bool) {
                         i.sheet.set(None);
                         i.applying.set(false);
                     }
-                    i.sheets.set(sheets);
+                    i.publish_sheets(sheets);
                     // Re-propose the mapping whenever the columns change: after a
                     // delimiter fix the old mapping refers to columns that no
                     // longer exist.

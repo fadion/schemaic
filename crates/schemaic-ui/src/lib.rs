@@ -2828,6 +2828,33 @@ pub struct ImportUi {
 }
 
 impl ImportUi {
+    /// Publish the workbook's sheet list — **only when it differs from the one
+    /// already held**, and that guard is the whole function.
+    ///
+    /// A probe fires whenever a reading setting changes, and picking a sheet is
+    /// such a change, so choosing "Sheet2" launches a probe that re-reads the
+    /// same workbook and writes back the *same* list. `dyn_container` has no
+    /// `PartialEq` bound and `create_updater` does not dedup (this file says so
+    /// at the sibling site), so that equal write rebuilt the sheet picker —
+    /// the one control whose own action triggers the probe. `in_ring_picker`
+    /// restores focus to the picker's tabindex on the next tick via
+    /// `exec_after(ZERO, …)`, but a workbook is inflated whole and the probe
+    /// returns tens of milliseconds to seconds later, long after that restore
+    /// has run: focus was then on a removed view id and the next Tab did not
+    /// continue from the picker.
+    ///
+    /// It also stops every CSV and JSON probe touching the signal at all, where
+    /// the list is empty before and after.
+    ///
+    /// Returns whether it wrote, so a test can count.
+    pub fn publish_sheets(&self, sheets: Vec<String>) -> bool {
+        if self.sheets.get_untracked() == sheets {
+            return false;
+        }
+        self.sheets.set(sheets);
+        true
+    }
+
     /// The bundle in its opening state. One place the defaults live, so a test
     /// can hold one — the app used to spell all twenty-four out at the call
     /// site, which is why [`begin_probe`](Self::begin_probe)'s decision had no
@@ -6156,6 +6183,29 @@ fn term_cell_at(
 /// (`WindowConfig::show_titlebar(false)`): the caption buttons in the header are
 /// ours, and they need the window to minimize, maximize and close it. See
 /// `window_chrome`.
+/// Should a failed statement un-collapse the editor? — the guard on
+/// `workspace`'s un-collapse effect, keyed by the tab the failure belongs to.
+///
+/// `prev` is floem's previous-return-value parameter, `now` is `(active tab id,
+/// is that tab's shown statement failed)`, and `collapsed` is whether the editor
+/// is currently at height 0.
+///
+/// **The tab id is the fix.** The guard exists so a second read of the *same*
+/// error does not fight a user who deliberately re-collapsed the editor, and as
+/// a bare `bool` it was correct for that and wrong across a tab switch: tab A
+/// fails and un-collapses, tab B fails in the background, and switching to B
+/// re-runs the effect with `failed == true` and the carried flag still `true`
+/// from A — so B keeps its red chip over a zero-height editor with the server's
+/// text, **View**, **AI fix** and **Explain** all unreachable, which is the
+/// exact state the effect exists to prevent. Everything else this function keys
+/// per tab does so explicitly (`tab.results_maximized`, `Tab::panel_frozen_memo`,
+/// the editor's `(id, flashing, reloads)` key); the carried flag was the one
+/// piece of the state that was per-*effect*.
+fn should_uncollapse(prev: Option<(usize, bool)>, now: (usize, bool), collapsed: bool) -> bool {
+    let (id, failed) = now;
+    failed && prev != Some((id, true)) && collapsed
+}
+
 pub fn workspace(ui: Ui, window: WindowId) -> impl IntoView {
     let chrome = window_chrome::WindowChrome::new(window);
     let last_mouse = ui.overlay.last_mouse;
@@ -7779,6 +7829,8 @@ fn center(ui: Ui) -> impl IntoView {
             }
         }
     });
+    // See [`should_uncollapse`] for the decision this effect makes.
+    //
     // **A failed statement un-collapses the editor.**
     //
     // A statement's own error lives in the editor's error bar, under the SQL
@@ -7796,21 +7848,22 @@ fn center(ui: Ui) -> impl IntoView {
     // The per-tab `results_maximized` is written too, so the state the mirror
     // above restores on a tab switch agrees with what is on screen. Guarded on
     // the transition into `Failed`, so a second read of the same error does not
-    // fight a user who deliberately re-collapses it.
-    create_effect(move |was_failed: Option<bool>| {
+    // fight a user who deliberately re-collapses it — see [`should_uncollapse`],
+    // which is that guard and is keyed by tab.
+    create_effect(move |prev: Option<(usize, bool)>| {
         let id = active.get();
         // `shown()`, whose reads are **tracked** — `shown_result()` samples, so
         // this effect would never re-run when a statement actually failed.
         let failed = tabs
             .with(|v| v.iter().find(|t| t.id == id).map(|t| t.shown()))
             .is_some_and(|s| matches!(s.get(), QueryState::Failed(_)));
-        if failed && was_failed != Some(true) && editor_collapsed.get_untracked() {
+        if should_uncollapse(prev, (id, failed), editor_collapsed.get_untracked()) {
             editor_collapsed.set(false);
             if let Some(tab) = active_tab() {
                 tab.results_maximized.set(false);
             }
         }
-        failed
+        (id, failed)
     });
     // Reveal the AI panel + send a message (the grid cell "AI Summary" builds a
     // context-rich prompt itself, so this just reveals + forwards).
@@ -12795,6 +12848,55 @@ mod import_probe_tests {
         assert_eq!(i.file_bytes.get_untracked(), 4096);
         assert_eq!(i.delimiter.get_untracked(), ";");
     }
+
+    // ── Publishing the sheet list (B6.2-L1-04) ────────────────────────────
+
+    /// **Re-probing one workbook must not rewrite its sheet list.** Picking a
+    /// sheet *is* a reading-setting change, so it launches a probe that finds
+    /// the same two sheets — and the equal write rebuilt the picker the user
+    /// had just chosen in, after `in_ring_picker`'s deferred focus restore had
+    /// already run.
+    #[test]
+    fn re_probing_the_same_workbook_does_not_rewrite_the_sheet_list() {
+        let i = ImportUi::new();
+        let two = || vec!["Sheet1".to_string(), "Sheet2".to_string()];
+
+        assert!(i.publish_sheets(two()), "the first probe has news");
+        assert!(
+            !i.publish_sheets(two()),
+            "an equal list was written again — which disposes the sheet \
+             picker's `dyn_container` child under the focus that was just \
+             restored to it"
+        );
+        assert_eq!(i.sheets.get_untracked(), two());
+    }
+
+    /// A workbook whose sheets really did change still publishes — order
+    /// included, since the list is the picker's options in workbook order.
+    #[test]
+    fn a_different_workbook_publishes_its_own_sheets() {
+        let i = ImportUi::new();
+        i.publish_sheets(vec!["Sheet1".into(), "Sheet2".into()]);
+
+        assert!(i.publish_sheets(vec!["Q1".into(), "Q2".into()]));
+        assert!(
+            i.publish_sheets(vec!["Q2".into(), "Q1".into()]),
+            "the same names in a different order is a different list"
+        );
+        assert!(i.publish_sheets(vec!["Q2".into()]));
+    }
+
+    /// And a CSV or JSON probe, whose list is empty before and after, does not
+    /// touch the signal at all — every probe of every format went through this
+    /// write, not just Excel's.
+    #[test]
+    fn a_probe_with_no_sheets_at_all_is_silent() {
+        let i = ImportUi::new();
+        assert!(
+            !i.publish_sheets(Vec::new()),
+            "an empty list onto an empty list still notified"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -13331,6 +13433,63 @@ mod window_key_gate {
             "`workspace()` is the argument of `{prev}` — same failure as above, \
              written across two lines."
         );
+    }
+}
+
+#[cfg(test)]
+mod uncollapse_tests {
+    use super::should_uncollapse;
+
+    const A: usize = 1;
+    const B: usize = 2;
+
+    /// The case the guard was written for, and which it always got right: the
+    /// same tab's same error, read a second time, must not fight a user who
+    /// deliberately re-collapsed the editor.
+    #[test]
+    fn a_second_read_of_one_tabs_error_leaves_the_editor_alone() {
+        assert!(!should_uncollapse(Some((A, true)), (A, true), true));
+    }
+
+    /// A *new* failure in the tab already showing one still un-collapses —
+    /// the guard is on the transition, not on the error.
+    #[test]
+    fn a_fresh_failure_in_the_same_tab_still_un_collapses() {
+        assert!(should_uncollapse(Some((A, false)), (A, true), true));
+    }
+
+    /// **The bug.** Tab A failed and un-collapsed; tab B failed in the
+    /// background; switching to B re-runs the effect, and the carried flag is
+    /// still A's. Keyed by tab this is a different pair and B un-collapses;
+    /// keyed by a bare `bool` it read `Some(true)` and B was left with its
+    /// error unreachable under a zero-height editor.
+    #[test]
+    fn switching_to_a_second_failed_tab_un_collapses_it_too() {
+        assert!(should_uncollapse(Some((A, true)), (B, true), true));
+    }
+
+    /// And switching to a tab that has *not* failed changes nothing, however
+    /// the tab left behind was doing.
+    #[test]
+    fn switching_to_a_clean_tab_leaves_the_editor_where_it_is() {
+        assert!(!should_uncollapse(Some((A, true)), (B, false), true));
+        assert!(!should_uncollapse(Some((A, false)), (B, false), true));
+    }
+
+    /// An editor that is already open is never re-opened — the third term,
+    /// which is what stops this effect writing on every failure.
+    #[test]
+    fn an_open_editor_is_left_open() {
+        assert!(!should_uncollapse(Some((A, false)), (A, true), false));
+        assert!(!should_uncollapse(None, (A, true), false));
+    }
+
+    /// The effect's first run carries nothing, and a failure waiting on screen
+    /// at that moment must still be reachable.
+    #[test]
+    fn the_first_run_un_collapses_a_failure_it_finds() {
+        assert!(should_uncollapse(None, (A, true), true));
+        assert!(!should_uncollapse(None, (A, false), true));
     }
 }
 
