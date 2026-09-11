@@ -212,8 +212,8 @@ pub static MARIADB: Target = Target {
     running_sleeps_sql: "SELECT COUNT(*) FROM information_schema.PROCESSLIST \n         WHERE INFO LIKE CONCAT('%schemaicItCancel', 'Marker%')",
     types: cases::MYSQL_FAMILY,
     extra_types: cases::MARIADB_ONLY,
-    expected_cases: 22,
-    expected_writable_cases: 21,
+    expected_cases: 24,
+    expected_writable_cases: 23,
 };
 
 pub static MYSQL: Target = Target {
@@ -238,8 +238,8 @@ pub static MYSQL: Target = Target {
     running_sleeps_sql: "SELECT COUNT(*) FROM information_schema.PROCESSLIST \n         WHERE INFO LIKE CONCAT('%schemaicItCancel', 'Marker%')",
     types: cases::MYSQL_FAMILY,
     extra_types: cases::MYSQL_ONLY,
-    expected_cases: 22,
-    expected_writable_cases: 21,
+    expected_cases: 24,
+    expected_writable_cases: 23,
 };
 
 pub static POSTGRES: Target = Target {
@@ -266,8 +266,8 @@ pub static POSTGRES: Target = Target {
     running_sleeps_sql: "SELECT count(*) FROM pg_stat_activity \n         WHERE state = 'active' AND query LIKE '%schemaicItCancel' || 'Marker%'",
     types: cases::POSTGRES,
     extra_types: &[],
-    expected_cases: 26,
-    expected_writable_cases: 25,
+    expected_cases: 28,
+    expected_writable_cases: 27,
 };
 
 /// Every leg, in the order the suite reports them.

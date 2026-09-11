@@ -149,6 +149,16 @@ pub static MYSQL_FAMILY: &[TypeCase] = &[
     case("varchar_unicode", "VARCHAR(32)", "'héllo 🌍'", "héllo 🌍"),
     case("text_newline", "TEXT", "'a\\nb'", "a\nb"),
     case("text_empty", "VARCHAR(8)", "''", ""),
+    // **The two characters `export::sql_literal`'s only per-dialect branch is
+    // about**, and neither was in this matrix. The write-back assertion runs a
+    // real cell's rendered text back through that quoter against a real server,
+    // which is the only place the question is decided — whether the escaping
+    // this crate emits is what the server accepts is a fact about the server,
+    // and `NO_BACKSLASH_ESCAPES` inverts the MySQL arm's correctness. Without
+    // these, deleting `.replace('\\', "\\\\")` from the MySQL arm — or
+    // `.replace('\'', "''")` from either — left all three legs green.
+    case("text_quote", "VARCHAR(32)", "'it''s'", "it's"),
+    case("text_backslash", "VARCHAR(32)", "'a\\\\b'", "a\\b"),
     case("enum", "ENUM('a','b')", "'b'", "b"),
     case("set", "SET('a','b')", "'a,b'", "a,b"),
     // **A bit-field is not a blob, though MySQL sends one as bytes.**
@@ -229,6 +239,13 @@ pub static POSTGRES: &[TypeCase] = &[
     case("text_unicode", "text", "'héllo 🌍'", "héllo 🌍"),
     case("text_newline", "text", "E'a\\nb'", "a\nb"),
     case("text_empty", "text", "''", ""),
+    // The other half of the pair above. `standard_conforming_strings` is what
+    // makes a backslash ordinary here, so the literal needs no doubling and
+    // `sql_literal`'s PostgreSQL arm must not add one — the assertion is that
+    // the value survives the round trip, not that the two servers spell it the
+    // same way.
+    case("text_quote", "text", "'it''s'", "it's"),
+    case("text_backslash", "text", "'a\\b'", "a\\b"),
     // `json` keeps the source text and `jsonb` reparses it — the pair is the
     // reason the JSON fixtures for this project live on PostgreSQL.
     case("json", "json", "'{\"b\":1, \"a\":2}'", "{\"b\":1, \"a\":2}"),
