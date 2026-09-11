@@ -177,20 +177,7 @@ pub(crate) fn snippet_panel(ui: Ui) -> impl IntoView {
 /// The panel's filter box — the same look and placeholder as the history
 /// panel's. Non-empty narrows by name / abbrev / body.
 fn snippet_search(filter: RwSignal<String>) -> impl IntoView {
-    edit_field(
-        filter,
-        FieldCfg {
-            placeholder: "Search…",
-            background: theme::bg_chrome,
-            clearable: true,
-            ..Default::default()
-        },
-    )
-    .style(|s| {
-        s.margin_left(theme::scaled(12.0))
-            .margin_right(theme::scaled(12.0))
-            .flex_shrink(0.0_f32)
-    })
+    crate::widgets::panel_search(filter)
 }
 
 /// Nothing to show, which — since every engine ships a built-in pack — can only
@@ -207,9 +194,12 @@ fn empty_state() -> impl IntoView {
 }
 
 /// A scope band — `THIS CONNECTION` / `MYSQL` / `ALL CONNECTIONS` — and how many
-/// are under it. Same weights and colours as the history panel's recency bands,
-/// including the top rule on the first one only (floem doesn't collapse adjacent
-/// borders, so every other header follows a row that already drew one).
+/// are under it.
+///
+/// The band is `widgets::panel_group_header`, shared with the history panel's
+/// recency bands, which is where the design rulings behind it are written down —
+/// including the top rule on the first one only. What is this panel's own is the
+/// naming below.
 fn group_header(bucket: Bucket, count: usize, first: bool) -> floem::AnyView {
     let title = match bucket {
         // Named for what it *means* rather than for the connection: the panel is
@@ -219,25 +209,7 @@ fn group_header(bucket: Bucket, count: usize, first: bool) -> floem::AnyView {
         Bucket::Dialect(d) => d.engine_label().to_uppercase(),
         Bucket::Global => "ALL CONNECTIONS".to_string(),
     };
-    let label = text(title).style(|s| s.font_size(font_label()).font_bold().color(theme::accent()));
-    let n = text(count.to_string()).style(|s| {
-        s.font_size(font_label())
-            .color(theme::text_dim())
-            .flex_shrink(0.0_f32)
-    });
-    h_stack((label, empty().style(|s| s.flex_grow(1.0_f32)), n))
-        .style(move |s| {
-            let s = s
-                .width_full()
-                .items_center()
-                .padding_horiz(theme::scaled(12.0))
-                .padding_vert(theme::scaled(8.0))
-                .background(theme::group_header_bg())
-                .border_bottom(1.0)
-                .border_color(theme::border());
-            if first { s.border_top(1.0) } else { s }
-        })
-        .into_any()
+    crate::widgets::panel_group_header(title, count, first)
 }
 
 /// One snippet row.

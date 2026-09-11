@@ -25,7 +25,7 @@ use crate::widgets::{
     MenuEntry, autohide, debounced, highlight_sql_mono, highlight_text, menu_panel_width,
     section_title, toolbar_icon,
 };
-use crate::{FieldCfg, Ui, db_color_dot, edit_field, icons, theme};
+use crate::{Ui, db_color_dot, icons, theme};
 
 /// Current wall-clock time, unix millis (for relative "x ago" labels).
 fn now_millis() -> u64 {
@@ -227,70 +227,20 @@ pub(crate) fn history_panel(ui: Ui) -> impl IntoView {
     })
 }
 
-// The history search box — same look/dimensions/placeholder as the schema tree's
-// `schema_search`. Non-empty narrows the list by SQL / database / tab name.
+// The history search box — `widgets::panel_search`, shared with the snippet
+// panel. Non-empty narrows the list by SQL / database / tab name, which is the
+// only part of it that is this panel's.
 fn history_search(filter: RwSignal<String>) -> impl IntoView {
-    edit_field(
-        filter,
-        FieldCfg {
-            placeholder: "Search…",
-            background: theme::bg_chrome,
-            clearable: true,
-            ..Default::default()
-        },
-    )
-    .style(|s| {
-        s.margin_left(theme::scaled(12.0))
-            .margin_right(theme::scaled(12.0))
-            .flex_shrink(0.0_f32)
-    })
+    crate::widgets::panel_search(filter)
 }
 
 /// A recency group's header — `TODAY` and how many ran in it.
 ///
-/// The same weight as the panel's own `section_title`, one step down in size: it
-/// divides a list *inside* a section rather than naming one, and at equal size
-/// the two read as competing titles. In the accent, which is where this list
-/// differs from a section title — the bands are the only thing a long history
-/// is scanned by, so they get the colour the eye already uses to find the start
-/// of a thing (it is the same accent the AI panel names Claude's turns in). The
-/// count rides along at 60%: it belongs to the band rather than beside it, and
-/// at full strength two accents of equal weight compete across the row.
-/// `first` is the topmost header in the list, and the only one that draws its own
-/// top rule: every other one follows a row that already ends in the same 1px
-/// border, and two of them stacked is a 2px seam at every group boundary but the
-/// first — floem doesn't collapse adjacent borders.
+/// The band itself is `widgets::panel_group_header`, shared with the snippet
+/// panel, which is where the design rulings behind it are written down. What is
+/// this panel's own is only the naming: [`history::Bucket::label`].
 fn group_header(bucket: history::Bucket, count: usize, first: bool) -> floem::AnyView {
-    let label = text(bucket.label())
-        .style(|s| s.font_size(font_label()).font_bold().color(theme::accent()));
-    // **`text_dim`, not a faded accent.** The count has to recede from the bold
-    // label beside it — two accents of equal weight compete across the row —
-    // but it is also a number the reader is meant to read, and an alpha on the
-    // accent got there by making it *dimmer than legible*: 2.32:1 in Light,
-    // under AA and under the large/bold level both. This is the same colour the
-    // AI panel's code-block actions use on this exact surface, where the gate
-    // already holds it to `Body`.
-    let n = text(count.to_string()).style(|s| {
-        s.font_size(font_label())
-            .color(theme::text_dim())
-            .flex_shrink(0.0_f32)
-    });
-    h_stack((label, empty().style(|s| s.flex_grow(1.0_f32)), n))
-        .style(move |s| {
-            let s = s
-                .width_full()
-                .items_center()
-                .padding_horiz(theme::scaled(12.0))
-                .padding_vert(theme::scaled(8.0))
-                // A band, so the group it opens is legible as a group: a shade of
-                // the panel rather than another colour, and not the hover — a
-                // header painted in it would read as a hovered row.
-                .background(theme::group_header_bg())
-                .border_bottom(1.0)
-                .border_color(theme::border());
-            if first { s.border_top(1.0) } else { s }
-        })
-        .into_any()
+    crate::widgets::panel_group_header(bucket.label().to_string(), count, first)
 }
 
 /// A history row's right-click menu: what the single click already does, and the

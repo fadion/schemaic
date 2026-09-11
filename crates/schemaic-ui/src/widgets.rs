@@ -4592,6 +4592,89 @@ pub(crate) fn section_title(t: &'static str) -> impl IntoView {
     })
 }
 
+/// The right-hand panels' search box — same look, dimensions and placeholder as
+/// the schema tree's `schema_search`.
+///
+/// One copy, because there were two byte-identical ones: the history panel's and
+/// the snippet panel's, same `FieldCfg`, same placeholder, same two margins,
+/// same `flex_shrink`. What each panel keeps is *what* a non-empty filter
+/// narrows, which is the only part that differs.
+pub(crate) fn panel_search(filter: RwSignal<String>) -> impl IntoView {
+    crate::edit_field(
+        filter,
+        crate::FieldCfg {
+            placeholder: "Search…",
+            background: theme::bg_chrome,
+            clearable: true,
+            ..Default::default()
+        },
+    )
+    .style(|s| {
+        s.margin_left(theme::scaled(12.0))
+            .margin_right(theme::scaled(12.0))
+            .flex_shrink(0.0_f32)
+    })
+}
+
+/// A band dividing one of the right-hand panels' lists, and how many are under
+/// it — `TODAY` in the history panel, `THIS CONNECTION` / `MYSQL` /
+/// `ALL CONNECTIONS` in the snippet panel.
+///
+/// **Takes the title, not the bucket**, so neither `history::Bucket` nor
+/// `snippet::Bucket` leaks into this module: each panel keeps its own naming
+/// (the history panel's `bucket.label()`, the snippet panel's three-arm match),
+/// which is the part that is genuinely per panel.
+///
+/// The rulings below lived in prose attached to **one** of the two copies, which
+/// made the other the one a reader would change without seeing why it was that
+/// way:
+///
+/// * The same weight as a panel's own [`section_title`], one step down in size:
+///   it divides a list *inside* a section rather than naming one, and at equal
+///   size the two read as competing titles.
+/// * In the accent, which is where these lists differ from a section title — the
+///   bands are the only thing a long history is scanned by, so they get the
+///   colour the eye already uses to find the start of a thing (the same accent
+///   the AI panel names Claude's turns in).
+/// * **The count is `text_dim`, not a faded accent.** It has to recede from the
+///   bold label beside it — two accents of equal weight compete across the row —
+///   but it is a number the reader is meant to read, and an alpha on the accent
+///   got there by making it *dimmer than legible*: 2.32:1 in Light, under AA and
+///   under the large/bold level both. This is the same colour the AI panel's
+///   code-block actions use on this exact surface.
+/// * The background is a band so the group it opens is legible as a group: a
+///   shade of the panel rather than another colour, and **not** the hover — a
+///   header painted in it would read as a hovered row.
+/// * `first` is the topmost header in the list and the only one that draws its
+///   own top rule. Every other follows a row that already ends in the same 1px
+///   border, and two stacked is a 2px seam at every group boundary but the
+///   first — floem does not collapse adjacent borders.
+pub(crate) fn panel_group_header(title: String, count: usize, first: bool) -> AnyView {
+    let label = text(title).style(|s| {
+        s.font_size(theme::font_label())
+            .font_bold()
+            .color(theme::accent())
+    });
+    let n = text(count.to_string()).style(|s| {
+        s.font_size(theme::font_label())
+            .color(theme::text_dim())
+            .flex_shrink(0.0_f32)
+    });
+    h_stack((label, empty().style(|s| s.flex_grow(1.0_f32)), n))
+        .style(move |s| {
+            let s = s
+                .width_full()
+                .items_center()
+                .padding_horiz(theme::scaled(12.0))
+                .padding_vert(theme::scaled(8.0))
+                .background(theme::group_header_bg())
+                .border_bottom(1.0)
+                .border_color(theme::border());
+            if first { s.border_top(1.0) } else { s }
+        })
+        .into_any()
+}
+
 /// A centred status line filling its container (empty state, failure, cancel).
 ///
 /// `color` is a **function**, not a `Color`: a colour read once at build freezes
@@ -5831,6 +5914,52 @@ mod measure_tests {
 #[cfg(test)]
 mod exit_tests {
     use super::*;
+
+    /// **The two right-hand panels share their chrome, and the rulings behind
+    /// it are written once.**
+    ///
+    /// `history_search` and `snippet_search` were byte-identical bodies — same
+    /// `FieldCfg`, same placeholder, same two margins, same `flex_shrink` — and
+    /// `group_header` differed only in how the title string was produced: the
+    /// label style, the count style, the spacer, all six style calls and the
+    /// `if first { border_top }` rule were the same 25 lines twice. The cost was
+    /// not the duplication, it was that the two panels' shared *decisions* (the
+    /// `text_dim`-not-a-faded-accent contrast ruling at 2.32:1, the
+    /// no-double-border rule that exists because floem does not collapse
+    /// adjacent borders) were attached in prose to **one** copy, making the
+    /// other the one a reader would change without seeing why.
+    ///
+    /// Nothing can fail against a duplicate that has not been written yet, so
+    /// this is a gate rather than a behavioural test: it says the panels ask
+    /// rather than re-spell.
+    #[test]
+    fn the_right_hand_panels_do_not_respell_their_shared_chrome() {
+        for (file, src) in [
+            ("history_panel.rs", include_str!("history_panel.rs")),
+            ("snippet_panel.rs", include_str!("snippet_panel.rs")),
+        ] {
+            let body = crate::source_gate::production_code(src);
+            for shared in ["panel_search(", "panel_group_header("] {
+                assert!(
+                    body.contains(shared),
+                    "{file} no longer calls `{shared}` — if the chrome really has \
+                     diverged, move the rulings with it rather than leaving them \
+                     on the copy that stayed"
+                );
+            }
+            // The two spellings that *were* the duplicates: the band's
+            // background, and the field's placeholder. Either reappearing here
+            // is a third copy.
+            let dense: String = body.chars().filter(|c| !c.is_whitespace()).collect();
+            for respelled in ["theme::group_header_bg()", "placeholder:\"Search…\""] {
+                assert!(
+                    !dense.contains(respelled),
+                    "{file} spells `{respelled}` again — that is the copy \
+                     `widgets::panel_group_header` / `panel_search` replaced"
+                );
+            }
+        }
+    }
 
     /// The property both [B7.2-L1-01] and [B2-L1-01] are about: while work the
     /// modal started is still running, **no exit closes it**. Two modals had
