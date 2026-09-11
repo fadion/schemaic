@@ -1219,15 +1219,13 @@ mod float_inset_gate {
     fn no_floating_box_writes_its_own_inset() {
         let mut offenders: Vec<String> = Vec::new();
         let mut files = 0usize;
-        for entry in std::fs::read_dir(src_dir()).expect("the crate's own src") {
-            let path = entry.expect("a dir entry").path();
-            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
-                continue;
-            }
+        // **Both crates that build views**, through `source_gate::crate_sources`
+        // rather than a `read_dir` of this crate's `src` — which is the mistake
+        // that helper's own doc describes: `schemaic-app` builds views too
+        // (`app_view`), so a violation added there passed the whole suite.
+        for (name, code) in crate::source_gate::crate_sources() {
             files += 1;
-            let name = path.file_name().unwrap().to_string_lossy().to_string();
-            let src = std::fs::read_to_string(&path).expect("a source file");
-            for line in production_code(&src).lines() {
+            for line in code.lines() {
                 for call in inset_calls(line) {
                     // The argument, between the first `(` and the last `)`.
                     let arg = call[call.find('(').unwrap() + 1..call.len() - 1].trim();

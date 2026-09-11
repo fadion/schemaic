@@ -7859,7 +7859,6 @@ mod menu_exclusivity {
 #[cfg(test)]
 mod popup_anchor_gate {
     use std::collections::BTreeSet;
-    use std::path::{Path, PathBuf};
 
     /// Openers that deliberately don't write the anchor, each with the reason.
     /// Empty is the healthy state — a site leaves this list the moment it starts
@@ -7875,17 +7874,6 @@ mod popup_anchor_gate {
     /// for, or licence a different one. It was empty, so this was latent —
     /// and it was the documented way to add one.
     const EXEMPT: &[(&str, &str, &str)] = &[];
-
-    fn src_dir() -> PathBuf {
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("src")
-    }
-
-    /// The file with its `#[cfg(test)]` items cut off — test data is full of
-    /// `.set(Some(…))` and a gate that cries wolf gets deleted.
-    ///
-    /// [`crate::source_gate`] owns the cut. Cutting at the *first*
-    /// `#[cfg(test)]`, as this used to, reads 929 lines of **this** file.
-    use crate::source_gate::production_code;
 
     /// The file's *logical* lines, each with the 1-based number it starts at.
     ///
@@ -7961,18 +7949,14 @@ mod popup_anchor_gate {
         let mut offenders: Vec<String> = Vec::new();
         let mut fills = 0usize;
 
-        let mut files: Vec<PathBuf> = std::fs::read_dir(src_dir())
-            .expect("the crate's own src")
-            .filter_map(|e| e.ok().map(|e| e.path()))
-            .filter(|p| p.extension().is_some_and(|x| x == "rs"))
-            .collect();
-        files.sort();
-
-        for path in files {
-            let name = path.file_name().unwrap().to_string_lossy().to_string();
-            let src = std::fs::read_to_string(&path).expect("readable");
+        // **Both crates that build views**, through `crate_sources`: the
+        // channels this polices — `context_menu`, `popup_menu`, `popup_anchor`,
+        // `date_pick` — are constructed in `schemaic-app`'s `main.rs`, and
+        // `app_view` builds views, so an opener written there was invisible
+        // here. (Checked: none is, at this SHA. The gap was structural.)
+        for (name, code) in crate::source_gate::crate_sources() {
             let mut anchored = false;
-            for (lineno, line) in logical_lines(&production_code(&src)) {
+            for (lineno, line) in logical_lines(&code) {
                 if sets_anchor(&line) {
                     anchored = true;
                 }
@@ -8021,8 +8005,6 @@ mod popup_anchor_gate {
 /// them on the hook for this call.
 #[cfg(test)]
 mod menu_trigger_gate {
-    use std::path::{Path, PathBuf};
-
     /// The menus a **trigger** opens by click, and which therefore owe both the
     /// pointer-down absorb and the `close_except`. `Popup` and `Context` are
     /// not here: they are opened on `SecondaryClick`, where the root's dismissal
@@ -8039,21 +8021,16 @@ mod menu_trigger_gate {
         "DatePick",
     ];
 
+    /// Both view-building crates' production code, as one string.
+    ///
+    /// `crate_sources` has already cut the tests out of each file — test data
+    /// names every id, and only production sites count — so this does not put
+    /// the text through `production_code` a second time, which is what it used
+    /// to do while also walking only this crate's `src`.
     fn crate_source() -> String {
-        let dir: PathBuf = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-        let mut files: Vec<PathBuf> = std::fs::read_dir(dir)
-            .expect("the crate's own src")
-            .filter_map(|e| e.ok().map(|e| e.path()))
-            .filter(|p| p.extension().is_some_and(|x| x == "rs"))
-            .collect();
-        files.sort();
-        files
-            .iter()
-            .map(|p| {
-                let src = std::fs::read_to_string(p).expect("readable");
-                // Test data names every id; only production sites count.
-                crate::source_gate::production_code(&src)
-            })
+        crate::source_gate::crate_sources()
+            .into_iter()
+            .map(|(_, code)| code)
             .collect::<Vec<_>>()
             .join("\n")
     }

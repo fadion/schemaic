@@ -644,22 +644,14 @@ mod modal_backdrop_gate {
     #[test]
     fn every_backdrop_in_the_crate_is_one_the_layer_knows_about() {
         let mut found: BTreeSet<String> = BTreeSet::new();
-        let dir = std::fs::read_dir(src_dir()).expect("the crate's own src");
-        for entry in dir {
-            let path = entry.expect("a dir entry").path();
-            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
-                continue;
-            }
-            let name = path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .expect("a file name")
-                .to_string();
+        // **Both crates that build views**, through `crate_sources` rather than
+        // a `read_dir` of this crate's `src`: `schemaic-app` builds views too
+        // (`app_view`), so a backdrop painted there was invisible to this gate.
+        for (name, code) in crate::source_gate::crate_sources() {
             if NOT_A_PAINT_SITE.contains(&name.as_str()) {
                 continue;
             }
-            let src = std::fs::read_to_string(&path).expect("a source file");
-            if production_code(&src).contains("modal_backdrop()") {
+            if code.contains("modal_backdrop()") {
                 found.insert(name);
             }
         }

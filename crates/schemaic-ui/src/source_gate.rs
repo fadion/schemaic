@@ -303,7 +303,18 @@ pub(crate) fn crate_sources() -> Vec<(String, String)> {
     }
     // The scan has to still be reading something: a moved `src` would pass every
     // gate by finding no files at all.
-    assert!(out.len() > 20, "only {} source files scanned", out.len());
+    //
+    // **Near the real count, not a token floor.** This was `> 20` against 65
+    // files, so two thirds of the corpus could vanish and every gate over it
+    // would still report green — the same shape as the floors those gates
+    // carry, one level up. The real landmark is
+    // `the_scan_reaches_both_crates_that_build_views`, which `.expect`s
+    // `lib.rs` and `schemaic-app/main.rs` by name; this is the blunt half.
+    //
+    // `read_dir` is deliberately non-recursive and both crates are flat today.
+    // A future `src/<subdir>/*.rs` would fall outside every gate silently —
+    // this floor is what would notice.
+    assert!(out.len() >= 60, "only {} source files scanned", out.len());
     out
 }
 
