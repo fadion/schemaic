@@ -1674,8 +1674,17 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
     // Editor content settings (font / indentation) + query/behaviour settings.
     // Seed the global editor-config registry before the view builds, then mirror the
     // signals into it live (a change re-lays out the editor / re-applies indent).
-    let editor_font = RwSignal::new(ui_state.editor_font_size);
-    let tab_width = RwSignal::new(ui_state.tab_width);
+    // **Healed here, not only where they are used.** `ui_state.json` carries
+    // both as raw numbers under `#[serde(default)]`, which fills in an absent
+    // field and validates nothing — so a hand-edited config could put a `0` font
+    // size or a tab width of 99 straight into the editor. The setters clamped
+    // what they *stored*, which left the signal, the Settings picker and the
+    // file all still saying 99 while the editor indented by 8; `save_ui` writes
+    // these signals back, so the clamp has to reach them or it never sticks.
+    let editor_font = RwSignal::new(schemaic_ui::theme::clamped_editor_font(
+        ui_state.editor_font_size,
+    ));
+    let tab_width = RwSignal::new(schemaic_ui::theme::clamped_tab_width(ui_state.tab_width));
     let soft_tabs = RwSignal::new(ui_state.soft_tabs);
     let word_wrap = RwSignal::new(ui_state.word_wrap);
     let row_limit = RwSignal::new(ui_state.row_limit);

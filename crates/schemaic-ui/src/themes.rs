@@ -966,7 +966,7 @@ fn with_state<R>(f: impl FnOnce(&ThemeState) -> R) -> R {
                 editor: scope.create_rw_signal(Rc::new(EditorTheme::tokyo_night())),
                 ui_gen: scope.create_rw_signal(0u64),
                 editor_gen: scope.create_rw_signal(0u64),
-                editor_font: scope.create_rw_signal(14.0_f32),
+                editor_font: scope.create_rw_signal(DEFAULT_EDITOR_FONT),
                 editor_tab_width: scope.create_rw_signal(4usize),
                 editor_soft_tabs: scope.create_rw_signal(true),
                 editor_word_wrap: scope.create_rw_signal(false),
@@ -1083,10 +1083,50 @@ pub fn editor_font_size() -> f32 {
     with_state(|st| st.editor_font.get())
 }
 
+/// The bounds the editor's font size is held to — the same pair Ctrl+scroll
+/// already enforces, named here because the *other* door into this value has no
+/// bound at all.
+pub const EDITOR_FONT_MIN: f32 = 6.0;
+pub const EDITOR_FONT_MAX: f32 = 48.0;
+/// What a config with no usable font size falls back to — the same 14 the state
+/// is built with.
+pub const DEFAULT_EDITOR_FONT: f32 = 14.0;
+
+/// `px` brought inside [`EDITOR_FONT_MIN`]..=[`EDITOR_FONT_MAX`], and **NaN
+/// answered with the default** rather than passed through.
+///
+/// `ui_state.json` carries `editor_font_size` as a raw `f32` under
+/// `#[serde(default)]`, which fills in an *absent* field and validates nothing,
+/// so a hand-edited or newer-build config reached `SqlStyling::font_size`
+/// unchecked: `0` laid every SQL editor out at zero, `-5` did the same (`as
+/// usize` saturates), and `1e40` deserialises to `f32::INFINITY` and saturates
+/// the other way to `usize::MAX`. None is reachable through the UI — Ctrl+scroll
+/// clamps — but this module already treats a hand-written config as a real input
+/// class, which is why `parse_hex` carries a non-ASCII guard.
+///
+/// `clamp` alone would not do: it **panics** on a NaN bound and returns NaN for a
+/// NaN input, and `serde_json` will hand over a NaN for a bare `nan` token.
+pub fn clamped_editor_font(px: f32) -> f32 {
+    if px.is_nan() {
+        return DEFAULT_EDITOR_FONT;
+    }
+    px.clamp(EDITOR_FONT_MIN, EDITOR_FONT_MAX)
+}
+
+/// `w` brought inside the range `set_editor_tab_width` has always stored.
+///
+/// Public so the caller that *persists* the value can heal it too. The clamp
+/// used to live only inside the setter, which meant the editor indented by 8
+/// while `ui_state.json` and the Settings picker both went on saying 99 — the
+/// stored value was corrected and the source of it never was.
+pub fn clamped_tab_width(w: usize) -> usize {
+    w.clamp(1, 8)
+}
+
 /// Set the SQL-editor font size (px); bumps the generation so it re-lays out.
 pub fn set_editor_font(px: f32) {
     with_state(|st| {
-        st.editor_font.set(px);
+        st.editor_font.set(clamped_editor_font(px));
         st.editor_gen.update(|g| *g += 1);
     });
 }
@@ -1100,7 +1140,7 @@ pub fn editor_tab_width() -> usize {
 /// Set the editor tab width; bumps the generation so it re-lays out.
 pub fn set_editor_tab_width(w: usize) {
     with_state(|st| {
-        st.editor_tab_width.set(w.clamp(1, 8));
+        st.editor_tab_width.set(clamped_tab_width(w));
         st.editor_gen.update(|g| *g += 1);
     });
 }
@@ -1345,5 +1385,55 @@ mod tests {
         assert_eq!(parse_hex(""), None);
         assert_eq!(parse_hex("#"), None);
         assert_eq!(parse_hex("#aaaa"), None, "no 4-digit form");
+    }
+
+    /// **The values a hand-edited `ui_state.json` can actually carry.**
+    ///
+    /// `editor_font_size` is a raw `f32` under `#[serde(default)]`, which fills
+    /// in an *absent* field and validates nothing, and `main.rs` piped it
+    /// straight through. Each of these reached `SqlStyling::font_size`
+    /// (`effective_px().round() as usize`) unchecked:
+    ///
+    /// * `0` and `-5` → `0`, because `as usize` saturates downward — every SQL
+    ///   editor lays out at zero.
+    /// * `1e40` → `serde_json` yields `f32::INFINITY`, and the same saturating
+    ///   cast goes the other way to `usize::MAX`.
+    ///
+    /// None is reachable through the UI (Ctrl+scroll clamps), which is exactly
+    /// the shape `parse_hex`'s non-ASCII guard is here for.
+    #[test]
+    fn a_hand_edited_font_size_is_brought_back_inside_the_bounds() {
+        assert_eq!(clamped_editor_font(0.0), EDITOR_FONT_MIN);
+        assert_eq!(clamped_editor_font(-5.0), EDITOR_FONT_MIN);
+        assert_eq!(clamped_editor_font(f32::NEG_INFINITY), EDITOR_FONT_MIN);
+        // `1e40` is out of `f32` range as a literal; what `serde_json` hands
+        // over for that token is exactly this.
+        assert_eq!(
+            clamped_editor_font("1e40".parse().unwrap()),
+            EDITOR_FONT_MAX
+        );
+        assert_eq!(clamped_editor_font(f32::INFINITY), EDITOR_FONT_MAX);
+        // NaN would make `clamp` **panic** on the bound comparison, and a bare
+        // `nan` token is something `serde_json` will hand over.
+        assert_eq!(clamped_editor_font(f32::NAN), DEFAULT_EDITOR_FONT);
+        // And an ordinary value is untouched, including both ends.
+        assert_eq!(clamped_editor_font(14.0), 14.0);
+        assert_eq!(clamped_editor_font(EDITOR_FONT_MIN), EDITOR_FONT_MIN);
+        assert_eq!(clamped_editor_font(EDITOR_FONT_MAX), EDITOR_FONT_MAX);
+    }
+
+    /// The tab width's clamp existed but only reached the value it *stored*, so
+    /// a 99 in the file was corrected for the editor and never for the file:
+    /// `save_ui` writes the signal back, the Settings picker reads the signal,
+    /// and both went on saying 99 while the editor indented by 8 forever. The
+    /// function is public now so the loader can heal the signal too.
+    #[test]
+    fn a_hand_edited_tab_width_is_healed_at_the_source() {
+        assert_eq!(clamped_tab_width(99), 8);
+        assert_eq!(clamped_tab_width(0), 1);
+        assert_eq!(clamped_tab_width(usize::MAX), 8);
+        for w in 1..=8 {
+            assert_eq!(clamped_tab_width(w), w, "{w} is already legal");
+        }
     }
 }
