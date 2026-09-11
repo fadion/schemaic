@@ -258,12 +258,22 @@ fn row_list(ui: Ui, ring: FocusRing) -> impl IntoView {
             if rows.is_empty() {
                 return form_hint(empty_message(scanning, scanned)).into_any();
             }
+            // **Bounded**, and said so when it bites — see
+            // `conn_import::ROW_VIEW_CAP`. The cap is on the views, not on the
+            // import: `rows` still holds every connection and Import still
+            // creates all of them.
+            let overflow = schemaic_core::conn_import::row_overflow_sentence(rows.len());
             let list = v_stack_from_iter(
                 rows.into_iter()
                     .enumerate()
+                    .take(schemaic_core::conn_import::ROW_VIEW_CAP)
                     .map(move |(i, r)| import_row(imp.chosen, i, r)),
             )
             .style(|s| s.flex_col().width_full());
+            let overflow_note = match overflow {
+                Some(sentence) => form_hint(sentence).into_any(),
+                None => crate::widgets::nothing(),
+            };
 
             v_stack((
                 found_header(imp, ring.clone()),
@@ -275,6 +285,7 @@ fn row_list(ui: Ui, ring: FocusRing) -> impl IntoView {
                         .border_color(theme::border())
                         .border_radius(8.0)
                 }),
+                overflow_note,
             ))
             .style(|s| s.flex_col().width_full().gap(theme::scaled(8.0)))
             .into_any()
@@ -460,8 +471,8 @@ fn capsule(label: String) -> impl IntoView {
 fn skipped_note(ui: Ui) -> impl IntoView {
     let imp = ui.conn.import;
     dyn_container(
-        move || imp.skipped.get(),
-        move |skipped| match skipped_sentence(&skipped) {
+        move || (imp.skipped.get(), imp.skipped_hidden.get()),
+        move |(skipped, hidden)| match skipped_sentence(&skipped, hidden) {
             Some(sentence) => form_hint(sentence).into_any(),
             None => crate::widgets::nothing(),
         },
@@ -478,24 +489,29 @@ fn skipped_note(ui: Ui) -> impl IntoView {
 /// `None` for an empty list — the "nothing was skipped" case is the common one,
 /// and making it a value the caller matches on is what stops a stray "0 entries
 /// were not imported" ever reaching the screen.
-fn skipped_sentence(skipped: &[Skipped]) -> Option<String> {
+/// `hidden` is what `conn_import::SKIPPED_CAP` kept out of the list. It counts
+/// toward the total and nowhere else — the whole point of the cap is that those
+/// entries were never worth keeping, and the whole point of the count is that a
+/// large one is the signal the user needs.
+fn skipped_sentence(skipped: &[Skipped], hidden: usize) -> Option<String> {
     /// Past this many, the names stop being a sentence and start being a list
     /// nobody reads.
     const NAMED: usize = 3;
-    if skipped.is_empty() {
+    if skipped.is_empty() && hidden == 0 {
         return None;
     }
+    let total = skipped.len() + hidden;
     let head = skipped
         .iter()
         .take(NAMED)
         .map(|s| format!("{} ({})", s.name, s.reason.message()))
         .collect::<Vec<_>>()
         .join(", ");
-    let rest = skipped.len().saturating_sub(NAMED);
-    let opening = if skipped.len() == 1 {
+    let rest = total.saturating_sub(NAMED);
+    let opening = if total == 1 {
         "1 entry was not imported".to_string()
     } else {
-        format!("{} entries were not imported", skipped.len())
+        format!("{total} entries were not imported")
     };
     Some(if rest == 0 {
         format!("{opening}: {head}.")
@@ -684,14 +700,14 @@ mod tests {
     #[test]
     fn one_skipped_entry_is_named_in_the_singular() {
         assert_eq!(
-            skipped_sentence(&[skip("Warehouse")]).as_deref(),
+            skipped_sentence(&[skip("Warehouse")], 0).as_deref(),
             Some("1 entry was not imported: Warehouse (unsupported engine (oracle.16)).")
         );
     }
 
     #[test]
     fn three_skipped_entries_are_all_named() {
-        let s = skipped_sentence(&[skip("A"), skip("B"), skip("C")]).expect("a sentence");
+        let s = skipped_sentence(&[skip("A"), skip("B"), skip("C")], 0).expect("a sentence");
         assert!(s.starts_with("3 entries were not imported: A ("), "{s}");
         assert!(s.contains("B ("), "{s}");
         assert!(s.ends_with("C (unsupported engine (oracle.16))."), "{s}");
@@ -700,7 +716,7 @@ mod tests {
 
     #[test]
     fn past_three_the_rest_are_counted_not_listed() {
-        let s = skipped_sentence(&[skip("A"), skip("B"), skip("C"), skip("D"), skip("E")])
+        let s = skipped_sentence(&[skip("A"), skip("B"), skip("C"), skip("D"), skip("E")], 0)
             .expect("a sentence");
         assert!(s.starts_with("5 entries were not imported: "), "{s}");
         assert!(s.ends_with(", and 2 more."), "{s}");
@@ -711,6 +727,29 @@ mod tests {
     fn nothing_skipped_produces_no_sentence_at_all() {
         // The `None` is what the view matches on; a `Some("0 entries…")` here
         // would put a line on screen saying nothing went wrong.
-        assert_eq!(skipped_sentence(&[]), None);
+        assert_eq!(skipped_sentence(&[], 0), None);
+    }
+
+    /// **The count is a claim about the file, not about the list.** `SKIPPED_CAP`
+    /// stops the app keeping 140,000 `Skipped` structs from a shell history
+    /// somebody pointed the picker at — and the one thing that must survive the
+    /// cap is the number, because a huge number is exactly what tells the user
+    /// they picked the wrong file.
+    #[test]
+    fn entries_the_cap_kept_out_are_still_counted() {
+        let s = skipped_sentence(&[skip("A"), skip("B"), skip("C")], 139_997).expect("a sentence");
+        assert!(
+            s.starts_with("140000 entries were not imported: A ("),
+            "{s}"
+        );
+        assert!(s.ends_with(", and 139997 more."), "{s}");
+    }
+
+    /// And a cap that swallowed *everything* still says so, rather than falling
+    /// into the "nothing went wrong" arm.
+    #[test]
+    fn a_count_with_no_names_is_still_a_sentence() {
+        let s = skipped_sentence(&[], 4).expect("a sentence");
+        assert!(s.starts_with("4 entries were not imported"), "{s}");
     }
 }

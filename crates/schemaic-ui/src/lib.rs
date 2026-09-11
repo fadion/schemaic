@@ -5003,7 +5003,17 @@ pub struct ConnImportUi {
     pub chosen: RwSignal<std::collections::HashSet<usize>>,
     /// Entries a source held that are not on offer, so the modal can say what it
     /// left behind instead of quietly shortening the list.
+    ///
+    /// Bounded by `conn_import::SKIPPED_CAP` — see [`ConnImportUi::skipped_hidden`].
     pub skipped: RwSignal<Vec<schemaic_core::conn_import::Skipped>>,
+    /// Skipped entries not kept, because the list hit the cap.
+    ///
+    /// Separate from the list because the *count* is the honest part: pointing
+    /// the picker at a shell history produces one skipped entry per line, and
+    /// "140,000 entries were not imported" is precisely what tells the user they
+    /// picked the wrong file. Keeping 140,000 `Skipped` structs to say so is
+    /// what does not.
+    pub skipped_hidden: RwSignal<usize>,
     /// The paste field's contents.
     pub paste: RwSignal<String>,
     /// Why the pasted text isn't a connection URL, if it isn't one.

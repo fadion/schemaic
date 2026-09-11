@@ -951,8 +951,14 @@ fn add_import_result(ui: ConnImportUi, scan: conn_import::ImportScan) {
     // then created the connections they had just refused. A repeat's tick
     // belongs to the user; see `conn_import::Merged`.
     ui.chosen.update(|c| c.extend(merged.added));
+    // The entries the cap kept out are still counted — see
+    // `conn_import::SKIPPED_CAP`. Both halves of the total move together, so the
+    // sentence stays a claim about the file rather than about the list.
+    let mut over_cap = 0usize;
     ui.skipped
-        .update(|s| conn_import::merge_skipped(s, scan.skipped));
+        .update(|s| over_cap = conn_import::merge_skipped(s, scan.skipped));
+    ui.skipped_hidden
+        .update(|n| *n += scan.skipped_hidden + over_cap);
 }
 
 /// First name of the form `base`, `base 1`, `base 2`, … not already present.
@@ -2062,6 +2068,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
         rows: RwSignal::new(Vec::new()),
         chosen: RwSignal::new(std::collections::HashSet::new()),
         skipped: RwSignal::new(Vec::new()),
+        skipped_hidden: RwSignal::new(0),
         paste: RwSignal::new(String::new()),
         paste_error: RwSignal::new(None),
         file_error: RwSignal::new(None),
@@ -9199,6 +9206,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
         import_ui.rows.set(Vec::new());
         import_ui.chosen.set(std::collections::HashSet::new());
         import_ui.skipped.set(Vec::new());
+        import_ui.skipped_hidden.set(0);
         import_ui.scanned.set(false);
         import_ui.done.set(None);
         import_ui.open.set(true);
@@ -9250,58 +9258,83 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
     // Read a source file the user pointed at, for a layout `conn_sources`
     // doesn't search — a project's own `.idea/dataSources.xml`, an export, a
     // `.env`. Which parser to use is decided from the file's name.
-    let choose_import_file: Rc<dyn Fn()> = Rc::new(move || {
-        use floem::file::FileDialogOptions;
-        use floem::file_action::open_file;
-        open_file(
-            FileDialogOptions::new().title("Choose a connections file"),
-            move |picked| {
-                let Some(path) = picked.and_then(|i| i.path.first().cloned()) else {
-                    return;
-                };
-                let source = conn_sources::source_for_path(&path);
-                // The one read the user asked for by name, so its failure is
-                // theirs to see — unlike the search, which opens files nobody
-                // named. **Its own message and its own slot:** one sentence for
-                // three causes, written into the *paste* field's error line,
-                // where it then outlived the URL typed after it.
-                let file = match conn_sources::open_source(&path, source) {
-                    Ok(f) => f,
-                    Err(e) => {
-                        import_ui.file_error.set(Some(e.message(&path)));
+    let choose_import_file: Rc<dyn Fn()> = {
+        let handle = handle.clone();
+        Rc::new(move || {
+            use floem::file::FileDialogOptions;
+            use floem::file_action::open_file;
+            let handle = handle.clone();
+            open_file(
+                FileDialogOptions::new().title("Choose a connections file"),
+                move |picked| {
+                    let Some(path) = picked.and_then(|i| i.path.first().cloned()) else {
                         return;
-                    }
-                };
-                import_ui.file_error.set(None);
-                let existing = connections.get_untracked();
-                let mut scan = conn_import::scan(&[file], &existing);
-                // **Then complete it from the password files.** Read on its own,
-                // a hand-picked DataGrip export arrives with every password
-                // blank while `~/.pgpass` on the same machine holds them — and
-                // whether a row can be completed must not depend on how its file
-                // was found. Applied *after* `scan` rather than by handing it
-                // both files: `scan` would offer `.pgpass`'s own servers as rows
-                // too, and the user asked to import one file.
-                //
-                // **`PickedFile`, because these two halves have different
-                // authors.** The rows came out of a file the user was handed;
-                // the passwords are the user's own. A wildcard `.pgpass` line
-                // may therefore only complete a row for a server that file
-                // already names outright, and a row it does complete says so
-                // and arrives unticked.
-                for pw in conn_sources::password_sources() {
-                    conn_import::fill_missing_passwords(
-                        &mut scan.found,
-                        &conn_import::pgpass_entries(&pw.text),
-                        conn_import::PgpassScope::PickedFile,
+                    };
+                    // **Off the UI thread, for the reason `scan_installed_clients`
+                    // gives one line up** — and more so: this is the one input
+                    // whose size and shape the app controls least. The picker has
+                    // no type filter and an unrecognised name is read as a list
+                    // of URLs by design, so a shell history or a log produces one
+                    // skipped entry per line. Every step below used to run inside
+                    // this callback: the read, the parse, the `~/.pgpass` read
+                    // and the merge, with a fully frozen window and no cancel.
+                    let existing = connections.get_untracked();
+                    let send = create_ext_action(
+                        cx,
+                        move |res: Result<conn_import::ImportScan, String>| match res {
+                            Ok(scan) => {
+                                import_ui.file_error.set(None);
+                                import_ui.paste_error.set(None);
+                                import_ui.done.set(None);
+                                add_import_result(import_ui, scan);
+                            }
+                            // The one read the user asked for by name, so its
+                            // failure is theirs to see — unlike the search, which
+                            // opens files nobody named. **Its own message and its
+                            // own slot:** one sentence for three causes, written
+                            // into the *paste* field's error line, where it then
+                            // outlived the URL typed after it.
+                            Err(msg) => import_ui.file_error.set(Some(msg)),
+                        },
                     );
-                }
-                import_ui.paste_error.set(None);
-                import_ui.done.set(None);
-                add_import_result(import_ui, scan);
-            },
-        )
-    });
+                    handle.spawn_blocking(move || {
+                        let source = conn_sources::source_for_path(&path);
+                        let file = match conn_sources::open_source(&path, source) {
+                            Ok(f) => f,
+                            Err(e) => {
+                                send(Err(e.message(&path)));
+                                return;
+                            }
+                        };
+                        let mut scan = conn_import::scan(&[file], &existing);
+                        // **Then complete it from the password files.** Read on
+                        // its own, a hand-picked DataGrip export arrives with
+                        // every password blank while `~/.pgpass` on the same
+                        // machine holds them — and whether a row can be completed
+                        // must not depend on how its file was found. Applied
+                        // *after* `scan` rather than by handing it both files:
+                        // `scan` would offer `.pgpass`'s own servers as rows too,
+                        // and the user asked to import one file.
+                        //
+                        // **`PickedFile`, because these two halves have different
+                        // authors.** The rows came out of a file the user was
+                        // handed; the passwords are the user's own. A wildcard
+                        // `.pgpass` line may therefore only complete a row for a
+                        // server that file already names outright, and a row it
+                        // does complete says so and arrives unticked.
+                        for pw in conn_sources::password_sources() {
+                            conn_import::fill_missing_passwords(
+                                &mut scan.found,
+                                &conn_import::pgpass_entries(&pw.text),
+                                conn_import::PgpassScope::PickedFile,
+                            );
+                        }
+                        send(Ok(scan));
+                    });
+                },
+            )
+        })
+    };
 
     // **The only step that writes.** Everything above builds proposals.
     //

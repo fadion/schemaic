@@ -182,7 +182,10 @@ impl Imported {
 }
 
 /// Why an entry a source *did* contain is not on offer.
-#[derive(Clone, PartialEq, Eq, Debug)]
+///
+/// `Hash` because [`merge_skipped`] dedupes through a set; the derive has to
+/// agree with `PartialEq`, which it does by construction.
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub enum SkipReason {
     /// The driver names an engine this app has no support for (Oracle, SQL
     /// Server, Snowflake…). Carries the driver/provider string as written.
@@ -223,7 +226,7 @@ impl SkipReason {
 
 /// An entry that was found and is **not** being offered, so the count in the
 /// modal is honest about what the file held.
-#[derive(Clone, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub struct Skipped {
     /// The entry's name, or the file's path when the file as a whole failed.
     pub name: String,
@@ -231,20 +234,85 @@ pub struct Skipped {
     pub reason: SkipReason,
 }
 
+/// How many skipped entries an [`ImportScan`] will name before it stops keeping
+/// them and starts counting them.
+///
+/// **A bound on entries, where `MAX_BYTES` is a bound on bytes.** *Choose a
+/// file…* has no type filter and an unrecognised name is read as a list of URLs
+/// by design — "a `.env`, or a scratch file of connection strings" — so pointing
+/// it at a shell history, a log or a large `.csv` produces one `Skipped` per
+/// line. At 4 MiB and ~30 bytes a line that is ~140,000 of them: every one
+/// allocated, deduped against every other, and then handed to a modal that shows
+/// about five at a time. The user sees "N entries were not imported" either way;
+/// what changes is that the app keeps 200 of them rather than 140,000.
+///
+/// Well above any real import — the largest client export the scanner has met is
+/// in the dozens — so nothing legitimate is ever truncated.
+pub const SKIPPED_CAP: usize = 200;
+
+/// How many found rows the modal **builds views for**.
+///
+/// Not a cap on the import: `rows` keeps every connection and Import still
+/// creates all of them. This bounds only what is constructed, because the list
+/// is a plain `v_stack_from_iter` — one `h_stack` with a check box, three texts
+/// and two capsules per row — inside a `scroll` that shows about five, and it is
+/// rebuilt whole on every change to `rows`. A `.env` that really is a list of
+/// 140,000 URLs would build close to a million views to show five.
+///
+/// A cap rather than a `virtual_stack`: an import row is two lines or three
+/// depending on whether it carries notes, so virtualizing it means
+/// `VirtualItemSize::Fn` computing a height that restates the layout — and
+/// there is no screenshot harness here to catch it being wrong.
+pub const ROW_VIEW_CAP: usize = 500;
+
+/// What to say when the list shows fewer rows than the import holds, or `None`
+/// when it shows all of them.
+///
+/// Separate from the cap so the *disclosure* is the tested part: a list that
+/// silently stops at 500 of 140,000 is the failure this exists to avoid, not the
+/// one it introduces.
+pub fn row_overflow_sentence(total: usize) -> Option<String> {
+    let hidden = total.checked_sub(ROW_VIEW_CAP).filter(|n| *n > 0)?;
+    Some(format!(
+        "Showing the first {ROW_VIEW_CAP} of {total}. The other {hidden} are \
+         still imported if they are ticked — this list stops here so the window \
+         stays responsive."
+    ))
+}
+
 /// What one parse — or a whole [`scan`] — produced.
 #[derive(Clone, PartialEq, Debug, Default)]
 pub struct ImportScan {
     /// Connections on offer, in the order the sources listed them.
     pub found: Vec<Imported>,
-    /// Entries deliberately left out; see [`Skipped`].
+    /// Entries deliberately left out; see [`Skipped`]. Bounded by
+    /// [`SKIPPED_CAP`]; anything past it is counted in [`ImportScan::skipped_hidden`].
     pub skipped: Vec<Skipped>,
+    /// Skipped entries not kept, because the list was already at
+    /// [`SKIPPED_CAP`].
+    ///
+    /// Carried rather than dropped so the count the user is shown stays a claim
+    /// about the *file* — "N entries were not imported" is what tells someone
+    /// they pointed the picker at the wrong thing, and it is exactly the case
+    /// where N is enormous.
+    pub skipped_hidden: usize,
 }
 
 impl ImportScan {
     /// Fold another scan's results into this one, preserving order.
+    ///
+    /// The cap applies to the fold too: two files of 150 junk lines each must
+    /// not put 300 entries on the list because neither reached the bound alone.
     pub fn merge(&mut self, other: ImportScan) {
         self.found.extend(other.found);
-        self.skipped.extend(other.skipped);
+        self.skipped_hidden += other.skipped_hidden;
+        for entry in other.skipped {
+            if self.skipped.len() >= SKIPPED_CAP {
+                self.skipped_hidden += 1;
+            } else {
+                self.skipped.push(entry);
+            }
+        }
     }
 
     /// **Every skipped entry's display name is redacted here, at the point it
@@ -261,7 +329,14 @@ impl ImportScan {
     /// Doing it in the constructor rather than at the two call sites is the
     /// point: fixing one site left the other live, and a third would be added
     /// by whoever writes the next parser.
+    /// **And the cap is here too**, for the same reason the redaction is: a
+    /// parser that grew its own bound would be a parser that could forget one.
+    /// See [`SKIPPED_CAP`].
     fn skip(&mut self, name: impl Into<String>, reason: SkipReason) {
+        if self.skipped.len() >= SKIPPED_CAP {
+            self.skipped_hidden += 1;
+            return;
+        }
         self.skipped.push(Skipped {
             name: redacted(&name.into()),
             reason,
@@ -1874,12 +1949,30 @@ pub struct Merged {
 /// twice, must not turn three Oracle data sources into six. [`merge_rows`]
 /// collapses repeats by endpoint and this is its other half — without it the two
 /// halves of one scan's result disagree about what a second scan means.
-pub fn merge_skipped(into: &mut Vec<Skipped>, more: Vec<Skipped>) {
-    for entry in more {
-        if !into.contains(&entry) {
-            into.push(entry);
+/// **A set, not `contains`.** The dedupe used to be `if !into.contains(&entry)`,
+/// which is O(n²) in the number of skipped entries — measured on this exact
+/// shape at 10,000 entries → 74 ms, 20,000 → 184 ms, 40,000 → 989 ms, on the UI
+/// thread with no cancel and no progress. [`SKIPPED_CAP`] now bounds `n` as
+/// well, so this is belt and braces; it is still the right shape, and the cap is
+/// a policy that could be raised.
+///
+/// The cap is enforced here too: [`ImportScan::skip`] cannot see the list this
+/// is folding into.
+pub fn merge_skipped(into: &mut Vec<Skipped>, more: Vec<Skipped>) -> usize {
+    let mut seen: std::collections::HashSet<&Skipped> = into.iter().collect();
+    let mut fresh: Vec<Skipped> = Vec::new();
+    let mut hidden = 0usize;
+    for entry in &more {
+        if seen.insert(entry) {
+            if into.len() + fresh.len() >= SKIPPED_CAP {
+                hidden += 1;
+            } else {
+                fresh.push(entry.clone());
+            }
         }
     }
+    into.extend(fresh);
+    hidden
 }
 
 /// Flag every row the user already has, so the list can leave it unticked
@@ -3605,5 +3698,100 @@ mod tests {
         let scan = scan(&files, &[]);
         assert!(!scan.found.is_empty());
         assert!(scan.found.iter().all(|i| i.connection.id == 0));
+    }
+
+    /// **A junk file must not turn into 140,000 structs.** *Choose a file…* has
+    /// no type filter and an unrecognised name is read as a list of URLs by
+    /// design, so pointing it at a shell history, a log or a big `.csv` emitted
+    /// one `Skipped` per non-empty line — every one allocated, every one deduped
+    /// against every other (measured: 40,000 → 989 ms), and then handed to a
+    /// modal that shows five at a time.
+    ///
+    /// The property is the **cap**, not a timing: it fails on the number, which
+    /// is what makes it a test rather than a benchmark.
+    #[test]
+    fn a_file_of_junk_lines_yields_a_bounded_skip_list() {
+        let junk: String = (0..50_000).map(|i| format!("line number {i}\n")).collect();
+
+        // **The parser's own output first.** `scan` folds through `merge`, which
+        // caps too — so asserting only the folded result would pass with the
+        // parser still allocating 50,000 `Skipped` structs on the way, which is
+        // the memory the cap exists to refuse. Removing `skip`'s cap fails here
+        // and nowhere else.
+        let one = parse_url_scan(&junk);
+        assert_eq!(one.skipped.len(), SKIPPED_CAP);
+        assert_eq!(one.skipped_hidden, 50_000 - SKIPPED_CAP);
+
+        let files = [SourceFile {
+            source: ImportSource::Url,
+            path: "history.txt".into(),
+            text: junk,
+        }];
+        let scan = scan(&files, &[]);
+
+        assert!(scan.found.is_empty(), "none of it is a connection URL");
+        assert_eq!(
+            scan.skipped.len(),
+            SKIPPED_CAP,
+            "the list is bounded, whatever the file holds"
+        );
+        // And the count survives the cap, because a huge count is exactly what
+        // tells the user they picked the wrong file.
+        assert_eq!(scan.skipped.len() + scan.skipped_hidden, 50_000);
+    }
+
+    /// The cap holds across a fold too — two files under the bound must not add
+    /// up to a list over it.
+    #[test]
+    fn merging_two_capped_scans_stays_capped() {
+        let mut a = ImportScan::default();
+        let mut b = ImportScan::default();
+        for i in 0..150 {
+            a.skip(format!("a{i}"), SkipReason::Unreadable("no".into()));
+            b.skip(format!("b{i}"), SkipReason::Unreadable("no".into()));
+        }
+        let total = a.skipped.len() + b.skipped.len();
+        a.merge(b);
+        assert_eq!(a.skipped.len(), SKIPPED_CAP);
+        assert_eq!(a.skipped.len() + a.skipped_hidden, total);
+    }
+
+    /// [`merge_skipped`] enforces it as well, since it folds into a list
+    /// [`ImportScan::skip`] cannot see — and it still dedupes, which is the job
+    /// it was written for: scanning twice must not turn three Oracle data
+    /// sources into six.
+    #[test]
+    fn the_fold_into_the_modal_dedupes_and_stays_capped() {
+        let entry = |n: usize| Skipped {
+            name: format!("src{n}"),
+            reason: SkipReason::Unreadable("no".into()),
+        };
+
+        let mut into: Vec<Skipped> = (0..3).map(entry).collect();
+        assert_eq!(merge_skipped(&mut into, (0..3).map(entry).collect()), 0);
+        assert_eq!(into.len(), 3, "a second read of the same source adds none");
+
+        assert_eq!(merge_skipped(&mut into, vec![entry(99)]), 0);
+        assert_eq!(into.len(), 4, "a new one is still added");
+
+        // Over the bound, and the overflow is reported rather than dropped.
+        let hidden = merge_skipped(&mut into, (1000..1000 + SKIPPED_CAP).map(entry).collect());
+        assert_eq!(into.len(), SKIPPED_CAP);
+        assert_eq!(hidden, 4, "the four it could not keep");
+    }
+
+    /// The row list is bounded too, and says so. **Only the views** — the
+    /// connections are all still in `rows` and all still imported.
+    #[test]
+    fn a_row_list_past_the_view_cap_discloses_it() {
+        assert_eq!(row_overflow_sentence(0), None);
+        assert_eq!(row_overflow_sentence(ROW_VIEW_CAP), None, "exactly full");
+        let s = row_overflow_sentence(ROW_VIEW_CAP + 7).expect("a sentence");
+        assert!(s.contains(&(ROW_VIEW_CAP + 7).to_string()), "{s}");
+        assert!(s.contains(" 7 "), "the hidden count, not the total: {s}");
+        assert!(
+            s.contains("still imported"),
+            "a cap nobody is told about is the bug, not the fix: {s}"
+        );
     }
 }
