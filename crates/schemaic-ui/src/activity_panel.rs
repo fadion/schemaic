@@ -117,7 +117,10 @@ pub(crate) fn activity_panel(ui: Ui) -> impl IntoView {
                 truncated,
             } => {
                 let counts = counts_line(&sessions, truncated).into_any();
-                let warn = banner(&sessions, kill.clone(), read_only.get());
+                // The memo itself: a `.get()` here is read inside a
+                // `dyn_container` *builder*, which does not track — see
+                // `banner`.
+                let warn = banner(&sessions, kill.clone(), read_only);
                 v_stack((counts, warn))
                     .style(|s| s.width_full().flex_col())
                     .into_any()
@@ -200,7 +203,7 @@ pub(crate) fn activity_panel(ui: Ui) -> impl IntoView {
                         kill.clone(),
                         overlay,
                         menus,
-                        read_only.get(),
+                        read_only,
                     )
                 })
                 .collect::<Vec<_>>();
@@ -442,10 +445,28 @@ fn counts_line(sessions: &[SessionInfo], truncated: bool) -> impl IntoView {
 /// that ends the wait. Cancelling the holder's *statement* does not: an
 /// idle-in-transaction holder has no statement, and one that does keeps its locks
 /// until the transaction ends either way.
+/// `read_only` is the **memo**, not its value.
+///
+/// This is built inside a `dyn_container` child builder, which is not a tracking
+/// context — floem 0.2 wraps only the *key* closure in `create_updater`, and the
+/// child comes from `swap_val` inside `View::update`. So `read_only.get()` at
+/// the call site was exactly as frozen as the captured `Color` the memo's own
+/// comment contrasts itself with, and the button kept whatever enablement it had
+/// when the snapshot last landed: marked read-only with the poll interval set to
+/// **Off**, the Kill stayed in full danger fill, tooltipped "Terminate session
+/// 1148", for as long as the panel stayed up. The inverse was worse — read-only
+/// at build meant the button stayed inert after the flag was cleared, producing
+/// no kill *and* no message.
+///
+/// Carried in, read in the closures that *are* reactive: the style, which
+/// repaints, and the press and the tip, which want the answer at the moment they
+/// are asked. No write ever escaped — `kill_session` refuses — but the disabled
+/// button is what *says* the action is unavailable, which is the half
+/// `accept_launch`'s contract asks this side to supply.
 fn banner(
     sessions: &[SessionInfo],
     kill: Rc<dyn Fn(i64, KillKind)>,
-    read_only: bool,
+    read_only: floem::reactive::Memo<bool>,
 ) -> floem::AnyView {
     let Some((waiter, holder)) = activity::lock_wait(sessions) else {
         return empty().into_any();
@@ -499,7 +520,9 @@ fn banner(
         // thing it rings rather than drifting from it at 130% and 160%.
         5.0,
         move || {
-            if !read_only {
+            // Live at the moment of the press, which is the only moment that
+            // matters for a launch — the same rule `ddl_preview::apply` follows.
+            if !read_only.get_untracked() {
                 (kill)(holder_id, KillKind::Session);
             }
         },
@@ -513,7 +536,9 @@ fn banner(
             .border_radius(5.0)
             .flex_shrink(0.0_f32)
             .cursor(floem::style::CursorStyle::Default);
-        if read_only {
+        // Tracked: a style closure re-runs on a change, which is what makes the
+        // fill follow the flag without the panel rebuilding.
+        if read_only.get() {
             s.background(theme::btn_danger().multiply_alpha(0.45))
                 .color(theme::btn_danger_text().multiply_alpha(0.6))
         } else {
@@ -522,7 +547,9 @@ fn banner(
         }
     })
     .tooltip(move || {
-        text(if read_only {
+        // Read when the hover delay fires, not when the row was built — the tip
+        // closure is called fresh on every hover (see `widgets::tip_when`).
+        text(if read_only.get_untracked() {
             "This connection is marked read-only.".to_string()
         } else {
             format!("Terminate session {holder_id}")
@@ -567,7 +594,9 @@ fn session_row(
     kill: Rc<dyn Fn(i64, KillKind)>,
     overlay: crate::OverlayUi,
     menus: crate::widgets::MenuFlags,
-    read_only: bool,
+    // The memo, for the reason `banner` takes it: this is built in a
+    // `dyn_container` builder, and the menu it raises is built later still.
+    read_only: floem::reactive::Memo<bool>,
 ) -> floem::AnyView {
     let color = state_color(s.state);
     // The identity group, then the age hard against the right edge.
@@ -705,7 +734,14 @@ fn session_row(
             overlay.popup_width.set(160.0);
             overlay
                 .popup_menu
-                .set(Some(row_menu(&menu_session, kill.clone(), read_only)));
+                // Read **here**, when the menu is raised, not when the row was
+                // built: a right-click is the moment the entries' enablement is
+                // about.
+                .set(Some(row_menu(
+                    &menu_session,
+                    kill.clone(),
+                    read_only.get_untracked(),
+                )));
         })
         .style(|s| {
             s.flex_col()
