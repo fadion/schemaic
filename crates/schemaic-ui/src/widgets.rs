@@ -3076,7 +3076,12 @@ fn menu_entry_view(i: usize, entry: MenuEntry, level: MenuLevel, close: Rc<dyn F
                 (close)();
             })
             .on_event(EventListener::PointerEnter, move |_| {
-                open_sub.set(None);
+                // Guarded, per `close_except`'s rule: on a menu with no
+                // submenus this is `None` → `None` on every row entered, and
+                // the effect it wakes drives `submenu_layer`'s container.
+                if open_sub.get_untracked().is_some() {
+                    open_sub.set(None);
+                }
                 // A disabled row is not a stop, so the keyboard can't rest there
                 // and the pointer must not park the cursor there either.
                 if !disabled {
@@ -3127,7 +3132,11 @@ fn menu_entry_view(i: usize, entry: MenuEntry, level: MenuLevel, close: Rc<dyn F
                     row_rect.update(|r| *r = Rect::from_origin_size(r.origin(), b.size()))
                 })
                 .on_event(EventListener::PointerEnter, move |_| {
-                    open_sub.set(Some(i));
+                    // Same guard as the leaf arm: re-entering the row that is
+                    // already open rebuilds the panel it is already showing.
+                    if open_sub.get_untracked() != Some(i) {
+                        open_sub.set(Some(i));
+                    }
                     take_cursor();
                     EventPropagation::Continue
                 })
@@ -3509,7 +3518,14 @@ pub(crate) fn menu_inset(anchor: f64, size: f64, win: f64, gap: f64) -> MenuInse
     if anchor - gap - size >= 0.0 {
         // Its trailing edge `gap` before the anchor, expressed from the window's
         // trailing edge so the panel's real size decides its start.
-        return MenuInset::End(win - anchor + gap);
+        //
+        // **Floored**, because the anchor can be outside the window: the
+        // placement closure tracks `window_size()` while re-reading the pointer
+        // untracked, so a shrink re-asks this arithmetic with the anchor the
+        // menu opened at. An unfloored `win - anchor` is then negative and
+        // `inset_right` puts the panel wholly off-screen — still open, still
+        // holding its `focus_root`. Same floor as [`submenu_insets`].
+        return MenuInset::End((win - anchor + gap).max(0.0));
     }
     if size >= win {
         MenuInset::Start(0.0)
@@ -3539,7 +3555,9 @@ pub(crate) fn box_menu_inset(top: f64, bottom: f64, size: f64, win: f64, gap: f6
     if top - gap - size >= 0.0 {
         // Its trailing edge `gap` before the box's *top*, expressed from the
         // window's bottom so the panel's real size decides where it starts.
-        return MenuInset::End(win - top + gap);
+        // Floored for [`menu_inset`]'s reason: the box can be below a window
+        // that has since shrunk.
+        return MenuInset::End((win - top + gap).max(0.0));
     }
     if size >= win {
         MenuInset::Start(0.0)
@@ -3686,6 +3704,28 @@ thread_local! {
 /// A **detached scope**, deliberately: the signal has to outlive any individual
 /// menu, since what publishes into it is a row inside a panel that is disposed the
 /// moment the menu closes. The same arrangement [`window_size`] uses.
+/// Does the hoisted-submenu channel need clearing? — the decision
+/// [`menu_panel`]'s clearing effect asks, lifted out so the guard is a thing
+/// with a name rather than a line inside a view.
+///
+/// **The second term is the whole point.** The effect re-runs on every write to
+/// `open_sub`, and every leaf row's `PointerEnter` writes it — `set(None)` onto
+/// a signal already `None`, which floem's `RwSignal` does not dedup. So moving
+/// the pointer down a ten-row menu with no submenus at all ran this effect ten
+/// times, and an unguarded `set(None)` on the channel notified
+/// `submenu_layer`'s `dyn_container` ten times. That container does not diff
+/// (`create_updater`), so each notification was a `remove_view` + a scope
+/// dispose + a `request_all` + a re-run of the layer's placement closure — all
+/// to replace `empty()` with `empty()`.
+///
+/// `MenuFlags::close_except` states the rule 300 lines above and guards every
+/// one of its eight writes: "`RwSignal::set` never dedups and an unguarded
+/// write re-runs every style closure reading it". Here it drives a *container*
+/// rather than a style, which is the more expensive half.
+pub(crate) fn submenu_channel_needs_clearing(open_sub: Option<usize>, channel_open: bool) -> bool {
+    open_sub.is_none() && channel_open
+}
+
 pub(crate) fn hoisted_submenu() -> RwSignal<Option<OpenSubmenu>> {
     OPEN_SUBMENU.with(|cell| {
         if cell.borrow().is_none() {
@@ -4093,7 +4133,10 @@ pub(crate) fn menu_panel(
     // side. This is the root level only; a submenu's own `menu_stack` never gets
     // this effect, and must not, or it would clear the channel it is drawn from.
     create_effect(move |_| {
-        if level.open_sub.get().is_none() {
+        if submenu_channel_needs_clearing(
+            level.open_sub.get(),
+            hoisted_submenu().get_untracked().is_some(),
+        ) {
             hoisted_submenu().set(None);
         }
     });
@@ -6736,6 +6779,88 @@ mod menu_key_tests {
         assert!(!m.press(NamedKey::Enter));
         assert_eq!(m.closed.get(), 0);
     }
+
+    // ── The hover path's same-value writes (B21.3-L2-01) ──────────────────
+
+    /// An already-empty channel is not cleared again — which is the arm that
+    /// fires on every row of a menu with no submenus in it at all.
+    #[test]
+    fn an_empty_submenu_channel_is_not_cleared_again() {
+        assert!(!submenu_channel_needs_clearing(None, false));
+        // …and is, when there is something to clear.
+        assert!(submenu_channel_needs_clearing(None, true));
+    }
+
+    /// With a submenu open, the clearing effect stands down whatever the
+    /// channel holds — closing is the *row's* business, not this effect's.
+    #[test]
+    fn an_open_submenu_is_never_cleared_by_the_level_effect() {
+        assert!(!submenu_channel_needs_clearing(Some(0), true));
+        assert!(!submenu_channel_needs_clearing(Some(3), false));
+    }
+
+    /// **The floem fact both guards exist for**, so the guard's absence is a
+    /// bug rather than a style opinion: a `set` of the value a signal already
+    /// holds still notifies every dependent.
+    #[test]
+    fn a_same_value_set_still_notifies() {
+        let sig: RwSignal<Option<usize>> = RwSignal::new(None);
+        let runs = Rc::new(Cell::new(0u32));
+        let r = runs.clone();
+        create_effect(move |_| {
+            sig.get();
+            r.set(r.get() + 1);
+        });
+        assert_eq!(runs.get(), 1, "the effect's first run");
+        sig.set(None);
+        sig.set(None);
+        assert_eq!(
+            runs.get(),
+            3,
+            "floem deduped a same-value write — if this ever fails, both guards \
+             below are redundant and can go"
+        );
+    }
+
+    /// The composition the two unit tests above cannot reach: the writes live
+    /// in `PointerEnter` handlers and an effect inside `menu_panel`, none of
+    /// which is callable without a window. So this asks the source whether the
+    /// guards are still at the sites, and it is red against the unguarded tree.
+    ///
+    /// Needles are assembled rather than written, so this test's own text is
+    /// not one of the hits — the trap every source gate in this workspace has
+    /// to dodge, and one that has already let two gates pass on their own
+    /// quotation.
+    #[test]
+    fn the_menu_hover_path_guards_every_write_it_makes() {
+        let src = crate::source_gate::production_code(include_str!("widgets.rs"));
+
+        let leaf_write = format!("open_sub.{}(None);", "set");
+        let leaf_guard = format!("if open_sub.{}().is_some() {{", "get_untracked");
+        assert!(
+            src.contains(&leaf_guard),
+            "the leaf row's `PointerEnter` writes `{leaf_write}` unguarded — on a \
+             menu with no submenus that is `None` onto `None` once per row \
+             hovered, and it wakes the effect that drives `submenu_layer`"
+        );
+
+        let sub_guard = format!("if open_sub.{}() != Some(i) {{", "get_untracked");
+        assert!(
+            src.contains(&sub_guard),
+            "the submenu row's `PointerEnter` re-opens the panel it is already \
+             showing when the pointer re-enters the same row"
+        );
+
+        let asks = format!("{}(", "submenu_channel_needs_clearing");
+        assert_eq!(
+            src.matches(&asks).count(),
+            2,
+            "`submenu_channel_needs_clearing` should be defined once and asked \
+             once, by `menu_panel`'s clearing effect — a bare \
+             `hoisted_submenu().set(None)` in an effect is the unguarded \
+             spelling this replaced"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -7382,6 +7507,56 @@ mod menu_placement_tests {
         assert_eq!(
             menu_panel_height(std::slice::from_ref(&sub)),
             menu_panel_height(&[MenuEntry::action("Copy", || {})])
+        );
+    }
+
+    /// **A flipped inset is never negative**, which is the floor
+    /// [`submenu_insets`] has and these two did not.
+    ///
+    /// The reachable path is a *stale* anchor: the placement closure tracks
+    /// `window_size()` and re-reads `last_mouse` untracked, so shrinking the
+    /// window asks the arithmetic again with the pointer where the menu was
+    /// opened. Anchor 1350 in a window since narrowed to 800 takes arm 2 —
+    /// `1350 − 3 − 170 ≥ 0` — and returned `End(800 − 1350 + 3)` = `End(-547)`,
+    /// i.e. `inset_right(-547)`: the panel's left edge at x = 1177 in an 800px
+    /// window, wholly off-screen while still holding its `focus_root`.
+    ///
+    /// `a_flipped_submenu_never_pins_outside_the_window` already claimed this
+    /// of the cursor menu — "`cursor_menu_pos`, the sibling that places the
+    /// cursor menu, **has always clamped**" — and it was true of the function
+    /// that name referred to. `menu_inset` replaced it without the clamp.
+    #[test]
+    fn a_flipped_menu_never_pins_outside_the_window() {
+        // The window shrank under a standing menu; the anchor is beyond it.
+        let x = menu_inset(1350.0, 170.0, 800.0, 3.0);
+        let MenuInset::End(from_end) = x else {
+            panic!("an anchor past the window's width flips: {x:?}")
+        };
+        assert!(
+            from_end >= 0.0,
+            "a flipped menu pinned {from_end} from the window's trailing edge — \
+             off-screen, and still holding the keyboard"
+        );
+
+        // Same for a box-anchored panel, whose flip measures from the box's top.
+        let y = box_menu_inset(900.0, 930.0, 170.0, 800.0, 3.0);
+        let MenuInset::End(from_bottom) = y else {
+            panic!("a box above the window's height flips: {y:?}")
+        };
+        assert!(
+            from_bottom >= 0.0,
+            "a flipped panel pinned {from_bottom} from the window's bottom"
+        );
+    }
+
+    /// The clamp must not disturb a flip that was already on-screen — the floor
+    /// is a floor, not a repositioning.
+    #[test]
+    fn the_flip_clamp_leaves_an_on_screen_pin_alone() {
+        assert_eq!(menu_inset(1150.0, 170.0, 1200.0, 3.0), MenuInset::End(53.0));
+        assert_eq!(
+            box_menu_inset(700.0, 728.0, 350.0, 800.0, 3.0),
+            MenuInset::End(103.0)
         );
     }
 }
