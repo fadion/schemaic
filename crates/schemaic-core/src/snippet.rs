@@ -161,6 +161,47 @@ pub struct Group {
     pub items: Vec<Snippet>,
 }
 
+/// What the snippet editor's Save should write, given the snippet it opened on
+/// and the three fields as typed.
+///
+/// `None` means the field is unchanged and no action fires for it; `Some` is
+/// the value to write, already in the form it will be stored in.
+///
+/// **The point is that the comparison and the payload are the same value.**
+/// The dialog compared the body *trimmed* and wrote it *untrimmed* — four lines
+/// below two sibling guards that trim on both sides of the comparison and in
+/// the write — so an edit living entirely in the leading or trailing whitespace
+/// was invisible to the guard. Deleting the two blank lines off the end of a
+/// body closed the dialog as if it had saved, and reopening it showed them
+/// still there.
+///
+/// Name and abbrev are trimmed because they are looked up and matched on; the
+/// body is stored verbatim because its whitespace is part of what gets
+/// inserted. An emptied name is *no change*, not a rename to nothing — a
+/// snippet with no name is not a snippet, which is also what the Save button's
+/// own enablement says.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SnippetEdits {
+    pub name: Option<String>,
+    /// The outer `Option` is "did it change"; the inner one is the stored
+    /// value, `None` being a snippet with no abbrev at all.
+    pub abbrev: Option<Option<String>>,
+    pub body: Option<String>,
+}
+
+/// The [`SnippetEdits`] a Save should apply — see that type for why the
+/// comparison and the payload have to be the same value.
+pub fn edits(before: &Snippet, name: &str, abbrev: &str, body: &str) -> SnippetEdits {
+    let name = name.trim();
+    let abbrev = abbrev.trim();
+    let next_abbrev = (!abbrev.is_empty()).then(|| abbrev.to_string());
+    SnippetEdits {
+        name: (!name.is_empty() && name != before.name).then(|| name.to_string()),
+        abbrev: (next_abbrev != before.abbrev).then_some(next_abbrev),
+        body: (body != before.body).then(|| body.to_string()),
+    }
+}
+
 /// May this snippet be offered on this connection?
 pub fn applies(snippet: &Snippet, dialect: SqlDialect, conn_id: u64) -> bool {
     match &snippet.scope {
@@ -587,6 +628,67 @@ mod tests {
             source: Source::User,
             last_used: None,
         }
+    }
+
+    // ── edits ───────────────────────────────────────────────────────────────
+
+    /// **A whitespace-only body edit is a real edit.** The dialog compared the
+    /// body trimmed and wrote it untrimmed, so deleting the blank lines off the
+    /// end of a body closed the modal as if it had saved and changed nothing —
+    /// reopening it showed them still there. The two siblings four lines above
+    /// did not have the asymmetry, which is what made this look covered.
+    #[test]
+    fn a_body_edit_that_is_only_whitespace_is_still_a_change() {
+        let mut before = snip(1, "q", Scope::Global);
+        before.body = "SELECT 1\n\n\n".to_string();
+
+        let e = edits(&before, "q", "", "SELECT 1");
+        assert_eq!(
+            e.body.as_deref(),
+            Some("SELECT 1"),
+            "the trailing blank lines were deleted and the save dropped it"
+        );
+        assert_eq!(e.name, None, "the name did not change");
+        assert_eq!(e.abbrev, None, "the abbrev did not change");
+
+        // Leading indentation is the same class.
+        let e = edits(&before, "q", "", "  SELECT 1\n\n\n");
+        assert_eq!(e.body.as_deref(), Some("  SELECT 1\n\n\n"));
+
+        // …and an identical body is still no change, which is what keeps Save
+        // from writing on every open.
+        assert_eq!(edits(&before, "q", "", "SELECT 1\n\n\n").body, None);
+    }
+
+    /// The name and abbrev are trimmed on both sides *and* in the payload, and
+    /// an emptied name is no change rather than a rename to nothing.
+    #[test]
+    fn a_name_and_an_abbrev_are_compared_as_they_will_be_stored() {
+        let mut before = snip(2, "report", Scope::Global);
+        before.abbrev = Some("rep".to_string());
+
+        assert_eq!(
+            edits(&before, "  report  ", " rep ", &before.body),
+            SnippetEdits::default(),
+            "padding alone is not an edit to either field"
+        );
+        assert_eq!(
+            edits(&before, " daily ", "rep", &before.body)
+                .name
+                .as_deref(),
+            Some("daily"),
+            "and the payload is the trimmed value, not what was typed"
+        );
+        assert_eq!(
+            edits(&before, "report", "  ", &before.body).abbrev,
+            Some(None),
+            "clearing the abbrev is an edit, to no abbrev at all"
+        );
+        assert_eq!(
+            edits(&before, "   ", "rep", &before.body).name,
+            None,
+            "an emptied name is no change — a snippet with no name is not one"
+        );
     }
 
     // ── applies ─────────────────────────────────────────────────────────────

@@ -21,6 +21,8 @@ use crate::widgets::{
     ACTION_TAB, ActionKind, FocusRing, action_button, action_gap, focus_root_with_ring, form_gap,
     form_setting, modal_footer, modal_h, modal_pad_h, modal_title_owned, modal_w, panel_style,
 };
+use schemaic_core::snippet;
+
 use crate::{FieldCfg, Ui, edit_field, theme};
 
 fn panel_w() -> f64 {
@@ -139,18 +141,27 @@ pub(crate) fn snippet_edit_overlay(ui: Ui) -> impl IntoView {
                 let actions = actions.clone();
                 let before = snip.clone();
                 move || {
-                    let typed_name = name.get_untracked().trim().to_string();
-                    if !typed_name.is_empty() && typed_name != before.name {
-                        (actions.rename)(id, typed_name);
+                    // Which fields changed is `core::snippet::edits`' decision,
+                    // not three comparisons written out here. Two of the three
+                    // agreed with their payload and the body's did not — it
+                    // compared trimmed and wrote untrimmed, so an edit living
+                    // entirely in the leading or trailing whitespace was
+                    // invisible to the guard and the modal closed as if it had
+                    // saved.
+                    let e = snippet::edits(
+                        &before,
+                        &name.get_untracked(),
+                        &abbrev.get_untracked(),
+                        &body.get_untracked(),
+                    );
+                    if let Some(n) = e.name {
+                        (actions.rename)(id, n);
                     }
-                    let typed_abbrev = abbrev.get_untracked().trim().to_string();
-                    let next_abbrev = (!typed_abbrev.is_empty()).then_some(typed_abbrev);
-                    if next_abbrev != before.abbrev {
-                        (actions.set_abbrev)(id, next_abbrev);
+                    if let Some(a) = e.abbrev {
+                        (actions.set_abbrev)(id, a);
                     }
-                    let typed_body = body.get_untracked();
-                    if typed_body.trim() != before.body.trim() {
-                        (actions.set_body)(id, typed_body);
+                    if let Some(b) = e.body {
+                        (actions.set_body)(id, b);
                     }
                     open.set(None);
                 }
