@@ -6057,6 +6057,54 @@ fn term_cell_wh(font: u16) -> (f64, f64) {
     (f * 0.6023, (f * 1.3846).round())
 }
 
+/// How many columns and rows fit a terminal surface of `w` × `h`, given the cell
+/// metrics and the surface's own padding.
+///
+/// **`pad` is a parameter because it is `theme::scaled(6.0)`, not 6.** This
+/// restated the inset as a literal `12.0` — one padding's worth doubled at 100%,
+/// where it is exact, and short of the truth at every other scale. At 200% the
+/// surface takes 24 logical px and this subtracted 12, so the PTY was told it
+/// had about one-and-a-half columns and two-thirds of a row the panel cannot
+/// draw: the shell wraps at a width the user cannot see, and the bottom row can
+/// be clipped. The cursor overlay a few dozen lines below gets it right and
+/// states the rule — "the padding is scaled … so it has to read the same metric
+/// rather than restate it" — as does the scrollbar.
+///
+/// `w`/`h` are the padded box, which is what `on_resize` reports, so **both**
+/// insets come off.
+///
+/// `term_cell_wh` is not part of this: the terminal font is the user's own size
+/// fed raw to `.font_size`, deliberately not put through `scaled_font`, so the
+/// cell metrics are already in the right units.
+fn term_fit(w: f64, h: f64, pad: f64, cw: f64, ch: f64) -> (u16, u16) {
+    let cols = ((w - 2.0 * pad) / cw).floor().max(1.0) as u16;
+    let rows = ((h - 2.0 * pad) / ch).floor().max(1.0) as u16;
+    (cols, rows)
+}
+
+/// Which viewport `(row, col)` a surface-local pixel point falls on, clamped to
+/// the grid the PTY currently has.
+///
+/// Same rule as [`term_fit`] and the same defect: it took `x - 6.0` against a
+/// real inset of `pad`. At 200% a click on the first visible column reported a
+/// column about 0.77 too low — off by one cell across the right-hand part of
+/// every row, and by up to a row near a row boundary — and with copy-on-select
+/// enabled the wrong text is what reached the clipboard.
+fn term_cell_at(
+    x: f64,
+    y: f64,
+    pad: f64,
+    (cw, ch): (f64, f64),
+    (cols, rows): (u16, u16),
+) -> (usize, usize) {
+    let cx = ((x - pad).max(0.0) / cw) as usize;
+    let cy = ((y - pad).max(0.0) / ch) as usize;
+    (
+        cy.min(rows.max(1) as usize - 1),
+        cx.min(cols.max(1) as usize - 1),
+    )
+}
+
 /// Root view: the app shell (header / body / footer) with any open overlays
 /// (connection menu, Find Anywhere, Manage Connections) stacked on top, and the
 /// window's own resize border over all of it.
@@ -8925,13 +8973,14 @@ fn terminal_panel(ui: Ui) -> impl IntoView {
 
     // Map a surface-local pixel point to a viewport (row, col), clamped.
     let cell_at = move |x: f64, y: f64| -> (usize, usize) {
-        let (cols, rows) = last_dims.get_untracked();
-        let (cw, ch) = term_cell_wh(font_size.get_untracked());
-        let cx = ((x - 6.0).max(0.0) / cw) as usize;
-        let cy = ((y - 6.0).max(0.0) / ch) as usize;
-        (
-            cy.min(rows.max(1) as usize - 1),
-            cx.min(cols.max(1) as usize - 1),
+        term_cell_at(
+            x,
+            y,
+            // The surface's own metric, not a restatement of it — see
+            // `term_cell_at`.
+            term_pad(),
+            term_cell_wh(font_size.get_untracked()),
+            last_dims.get_untracked(),
         )
     };
 
@@ -8943,8 +8992,7 @@ fn terminal_panel(ui: Ui) -> impl IntoView {
         if w <= 0.0 || h <= 0.0 {
             return;
         }
-        let cols = ((w - 12.0) / cw).floor().max(1.0) as u16;
-        let rows = ((h - 12.0) / ch).floor().max(1.0) as u16;
+        let (cols, rows) = term_fit(w, h, term_pad(), cw, ch);
         if last_dims.get_untracked() != (cols, rows) {
             last_dims.set((cols, rows));
             (resize)(cols, rows);
@@ -12488,6 +12536,113 @@ mod field_key_tests {
         ] {
             assert!(!is_modifier_key(&Key::Named(k)), "{k:?}");
         }
+    }
+}
+
+#[cfg(test)]
+mod term_geometry_tests {
+    use super::{term_cell_at, term_cell_wh, term_fit};
+
+    /// The default terminal font: 13px ⇒ cw ≈ 7.83, ch = 18.
+    fn cell() -> (f64, f64) {
+        term_cell_wh(13)
+    }
+
+    /// **100% is exact either way, which is why the literals shipped.** Both
+    /// helpers must answer identically to the old `6.0`/`12.0` when
+    /// `term_pad()` really is 6.
+    #[test]
+    fn at_one_hundred_percent_nothing_moves() {
+        let (cw, ch) = cell();
+        assert_eq!(
+            term_fit(600.0, 400.0, 6.0, cw, ch),
+            (
+                ((600.0 - 12.0) / cw).floor() as u16,
+                ((400.0 - 12.0) / ch).floor() as u16
+            )
+        );
+        let dims = term_fit(600.0, 400.0, 6.0, cw, ch);
+        assert_eq!(
+            term_cell_at(6.0, 6.0, 6.0, (cw, ch), dims),
+            (0, 0),
+            "the top-left pixel inside the padding is cell (0, 0)"
+        );
+    }
+
+    /// **At 200% the padding is 12, and both insets come off.** The surface
+    /// takes 24 logical px; subtracting one padding's worth told the PTY it had
+    /// about one and a half columns and two thirds of a row the panel cannot
+    /// draw, so the shell wrapped at a width the user could not see.
+    #[test]
+    fn a_scaled_padding_is_taken_from_both_sides() {
+        let (cw, ch) = cell();
+        let scaled = term_fit(600.0, 400.0, 12.0, cw, ch);
+        let literal = (
+            ((600.0 - 12.0) / cw).floor() as u16,
+            ((400.0 - 12.0) / ch).floor() as u16,
+        );
+        assert!(
+            scaled.0 < literal.0,
+            "the PTY is still being given columns the panel cannot draw: \
+             {scaled:?} vs {literal:?}"
+        );
+        assert_eq!(
+            scaled,
+            (
+                ((600.0 - 24.0) / cw).floor() as u16,
+                ((400.0 - 24.0) / ch).floor() as u16
+            )
+        );
+    }
+
+    /// And the click maps to the cell under the pointer, not one to its left.
+    /// With copy-on-select on, the wrong cell is the wrong text on the clipboard.
+    #[test]
+    fn a_click_at_a_scaled_padding_lands_on_the_first_cell() {
+        let (cw, ch) = cell();
+        let dims = term_fit(600.0, 400.0, 12.0, cw, ch);
+        assert_eq!(
+            term_cell_at(12.0, 12.0, 12.0, (cw, ch), dims),
+            (0, 0),
+            "the first drawn cell is at the padding, wherever the padding is"
+        );
+        // The middle of the third column, at 200%. Deliberately not a cell
+        // *edge*: `2.0 * cw` divided back by `cw` is a coin toss in binary
+        // floating point, and a test that lands on one is testing the rounding.
+        let x = 12.0 + 2.5 * cw;
+        assert_eq!(term_cell_at(x, 12.0, 12.0, (cw, ch), dims).1, 2);
+        let far = 12.0 + 9.0 * cw + cw / 2.0;
+        assert_eq!(term_cell_at(far, 12.0, 12.0, (cw, ch), dims).1, 9);
+        assert_eq!(
+            term_cell_at(far, 12.0, 6.0, (cw, ch), dims).1,
+            10,
+            "the literal padding reads one cell to the right — this is the \
+             selection landing on the wrong text"
+        );
+    }
+
+    /// A point above or left of the padding clamps to the first cell rather
+    /// than underflowing, and a point past the end clamps to the last.
+    #[test]
+    fn a_point_outside_the_grid_clamps_at_both_ends() {
+        let (cw, ch) = cell();
+        let dims = term_fit(600.0, 400.0, 12.0, cw, ch);
+        assert_eq!(term_cell_at(0.0, 0.0, 12.0, (cw, ch), dims), (0, 0));
+        let (r, c) = term_cell_at(9_999.0, 9_999.0, 12.0, (cw, ch), dims);
+        assert_eq!(
+            (r, c),
+            (dims.1 as usize - 1, dims.0 as usize - 1),
+            "a drag past the surface must land on the last cell, not past it"
+        );
+    }
+
+    /// A surface too small for one cell still asks for one — a zero-column PTY
+    /// is not a thing a shell can be resized to.
+    #[test]
+    fn a_surface_with_no_room_still_asks_for_one_cell() {
+        let (cw, ch) = cell();
+        assert_eq!(term_fit(1.0, 1.0, 12.0, cw, ch), (1, 1));
+        assert_eq!(term_fit(0.0, 0.0, 12.0, cw, ch), (1, 1));
     }
 }
 
