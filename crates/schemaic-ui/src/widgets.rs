@@ -6019,10 +6019,21 @@ mod exit_tests {
     /// distinction — it is which closure a signal is read in — so the subject is
     /// the source text, the way `core/tests/doc_coverage.rs` takes a file as
     /// its subject.
+    ///
+    /// **And the subject list is derived, not typed.** It was a literal
+    /// two-element array while `overlay_open_key` had three production callers:
+    /// `event_editor.rs` has the same precondition — a `fetch_source` that
+    /// patches `d.event` after the modal is up — and its two footers were
+    /// correct and invisible to this, so rewriting either to
+    /// `move || d.event_draft.get()` left the whole suite green and reproduced
+    /// the shipped bug verbatim. A hand-written subject list that was extended
+    /// after the fact each time is the shape B21.1-L3-01 raised; the file's
+    /// other gates (`popup_anchor_gate`, `menu_trigger_gate`, `menu_panel_gate`)
+    /// derive theirs instead, which is what this does now.
     #[test]
     fn the_ddl_editors_footers_key_on_the_target_they_diff_against() {
         let dense = |s: &str| -> String { s.chars().filter(|c| !c.is_whitespace()).collect() };
-        for (file, src, keyed, bare) in [
+        let subjects = [
             (
                 "view_editor.rs",
                 include_str!("view_editor.rs"),
@@ -6038,7 +6049,33 @@ mod exit_tests {
                 "(d.routine.get(),d.routine_draft.get(),",
                 "move||(d.routine_draft.get(),d.routine_source_pending.get()),",
             ),
-        ] {
+            (
+                "event_editor.rs",
+                include_str!("event_editor.rs"),
+                "(d.event.get(),d.event_draft.get(),",
+                "move||(d.event_draft.get(),d.event_source_pending.get()),",
+            ),
+        ];
+
+        // **Every caller of `overlay_open_key` is a subject.** Walking the crate
+        // for the call is what makes a fourth editor fail this the day it is
+        // written, rather than the day someone remembers to add it.
+        let mut callers: Vec<String> = crate::source_gate::crate_sources()
+            .into_iter()
+            .filter(|(_, code)| code.contains("widgets::overlay_open_key("))
+            .map(|(file, _)| file)
+            .collect();
+        callers.sort();
+        let mut named: Vec<String> = subjects.iter().map(|(f, ..)| f.to_string()).collect();
+        named.sort();
+        assert_eq!(
+            callers, named,
+            "every caller of `overlay_open_key` keys a footer on its target and \
+             must be checked here — add it to `subjects` (or, if the call moved, \
+             rewrite this gate rather than deleting it)"
+        );
+
+        for (file, src, keyed, bare) in subjects {
             let d = dense(src);
             assert_eq!(
                 d.matches(keyed).count(),
