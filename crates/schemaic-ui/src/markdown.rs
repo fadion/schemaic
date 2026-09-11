@@ -879,7 +879,21 @@ fn code_block(
         })
         .into_any(),
     );
-    if is_sql {
+    // **`settled`, not `is_sql` alone — this bar acts on the text.** While a
+    // turn streams, a fenced block is whatever has arrived so far:
+    // pulldown-cmark closes the unterminated fence at end of input, which is the
+    // reason the body above withholds colouring and `render_markdown` withholds
+    // the proposal card. This bar was left out of that gate, and it is the one
+    // that *runs* the block. An assistant answering "delete the draft orders"
+    // streams `DELETE FROM orders` and then `WHERE status = 'draft';`, and
+    // between the two chunks Run was live on the unqualified DELETE —
+    // `run_verdict` answers Confirm, not a refusal, so the only thing between
+    // the click and an emptied table was a confirmation the assistant's own
+    // prose had just primed the user to accept.
+    //
+    // Copy stays live: copying a partial block is harmless, and it is the one
+    // action that does not commit to the text being complete.
+    if is_sql && settled {
         let insert_code = code.clone();
         let insert = actions.insert.clone();
         links.push(

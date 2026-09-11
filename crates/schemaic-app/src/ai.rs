@@ -198,6 +198,27 @@ fn endpoint_plumbing(harness: Harness) -> EndpointPlumbing {
     }
 }
 
+/// Does a session whose plumbing is `plumbing` start with **no database tools**,
+/// given which private files were actually written?
+///
+/// **The question every spawn path owes the user**, and the one the default
+/// harness's path never asked. `TurnPump::note`'s doc enumerates three ways to
+/// reach this state and says all three were silent; four arms actually produce
+/// it and the fourth — a harness whose plumbing is an MCP config file, where
+/// writing that file failed — had no arm at all. `build_session_args` then emits
+/// neither `--mcp-config` nor `--allowedTools`, so the session has no database
+/// tools, while the system prompt goes on telling the model it can list the
+/// schema, describe a table and run a query. The user watched Claude refuse to
+/// look anything up with nothing anywhere saying why.
+///
+/// Asked off the plumbing rather than the harness, so a fifth harness lands in
+/// the same question rather than adding a fifth silence. The Antigravity
+/// *registration* failure is not here and cannot be: it is known only after two
+/// `agy` invocations, i.e. after an await.
+fn tools_missing(plumbing: &EndpointPlumbing, wrote_config: bool, wrote_endpoint: bool) -> bool {
+    (plumbing.mcp_config && !wrote_config) || (plumbing.endpoint_file && !wrote_endpoint)
+}
+
 impl Drop for AiSession {
     fn drop(&mut self) {
         for p in &self.private.files {
@@ -1802,15 +1823,25 @@ pub(crate) fn start_ai_session(
         // *user* through `TurnPump::note` below, not only to the log — see that
         // method for what the silence cost.
         let mut degraded: Option<String> = None;
+        // **Whichever private file this harness needed and did not get.** The
+        // Antigravity arm below used to be the only one that asked, so Claude —
+        // the default — spawned with no database tools in silence. `tools_missing`
+        // is the question off the plumbing, so a fifth harness lands in it.
+        if tools_missing(&plumbing, mcp_cfg.is_some(), agy_ep.is_some()) {
+            tracing::warn!(
+                "no endpoint plumbing for {harness:?}; this session has no database tools"
+            );
+            degraded = Some(no_tools_note(
+                "Schemaic could not create the private file that tells the assistant \
+                 how to reach your database",
+            ));
+        }
         let _registration = match (needs_agy, agy_install) {
             (false, _) => None,
             // The endpoint file could not be written, so there is nothing to
-            // register a server against.
-            (true, None) => {
-                tracing::warn!("no endpoint file for Antigravity; this session has no database tools");
-                degraded = Some(no_tools_note("Schemaic could not create the private file that tells the assistant how to reach your database"));
-                None
-            }
+            // register a server against. `tools_missing` above has already said
+            // so to the user; this arm is the `None` registration.
+            (true, None) => None,
             (true, Some((exe, ep))) => {
                 let for_agy = tools.clone();
                 let reg = tokio::task::spawn_blocking(move || {
@@ -3195,6 +3226,44 @@ mod session_tests {
         // One wording for all three paths that reach this state — they used to
         // say nothing, a log line, and nothing again.
         assert!(no_tools_note("x").contains("no database tools"));
+    }
+
+    /// **Every harness's missing plumbing is reported, including the default
+    /// one's.** Four arms can start a session with no database tools and the
+    /// fourth had no arm at all: Claude's plumbing is an MCP config file, and a
+    /// failed write left `--mcp-config` and `--allowedTools` both unemitted
+    /// while the system prompt went on promising `list_schema`,
+    /// `describe_table` and `run_query`. No note, no `tracing::warn!`, nothing.
+    ///
+    /// Asserted across `Harness::ALL` rather than on Claude alone, because the
+    /// defect was a harness nobody wrote an arm for — so the test has to be the
+    /// one a fifth harness fails.
+    #[test]
+    fn a_harness_that_lost_its_endpoint_plumbing_says_so_whichever_one_it_is() {
+        for harness in Harness::ALL {
+            let p = super::endpoint_plumbing(harness);
+            // The premise: every harness carries the endpoint exactly one way.
+            assert!(
+                p.mcp_config ^ p.endpoint_file,
+                "{harness:?} carries the endpoint neither way, or both"
+            );
+            // Everything written: tools are there.
+            assert!(
+                !super::tools_missing(&p, true, true),
+                "{harness:?} reports missing tools with both files written"
+            );
+            // The file this harness actually needs, missing: reported.
+            assert!(
+                super::tools_missing(&p, !p.mcp_config, !p.endpoint_file),
+                "{harness:?} starts with no database tools and says nothing — the \
+                 shape the default harness shipped with"
+            );
+            // And the file it does *not* use, missing: not its problem.
+            assert!(
+                !super::tools_missing(&p, p.mcp_config, p.endpoint_file),
+                "{harness:?} reports a file it does not use"
+            );
+        }
     }
 
     /// **The rule no test named, which is why one of the three returns broke
