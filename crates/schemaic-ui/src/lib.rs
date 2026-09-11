@@ -2542,15 +2542,31 @@ impl ShownResult {
     /// frozen panel would be the keyboard.
     pub fn dismiss_error(&self) {
         let active = self.active.get_untracked();
-        let id = self
-            .panels
-            .with_untracked(|p| shown_panel(p, active).map(|p| p.id));
-        let Some(id) = id else { return };
+        // **Asked before writing**, like `Tab::set_panel_state` three methods up
+        // and for the reason its comment gives: `update` notifies whether or not
+        // the closure changed anything, and this is called from the editor's
+        // document callback — **once per keystroke**. The three real conditions
+        // sat *inside* the closure, so every character typed republished the
+        // whole panel list for a write that almost always does nothing.
+        //
+        // What that notification costs is measured in this file:
+        // `set_panel_states`' doc puts it at 0.67 ms at 400 panels, which a
+        // migration file run with Run Everything reaches. It re-runs the strip's
+        // `dyn_stack` — cloning every `ResultPanel`, two `String`s apiece — the
+        // pinned-bytes fold over every `Loaded` panel, the body's key memo and
+        // every mounted grid's frozen memo. On the keystroke path, which three
+        // other findings have already measured as budget-constrained.
+        //
+        // The early return that was here only caught "no shown panel", which a
+        // tab cannot be in: it always holds one.
+        let stale = self.panels.with_untracked(|p| {
+            shown_panel(p, active)
+                .filter(|p| !p.frozen() && matches!(p.state, QueryState::Failed(_)))
+                .map(|p| p.id)
+        });
+        let Some(id) = stale else { return };
         self.panels.update(|panels| {
-            if let Some(p) = panels
-                .iter_mut()
-                .find(|p| p.id == id && !p.frozen() && matches!(p.state, QueryState::Failed(_)))
-            {
+            if let Some(p) = panels.iter_mut().find(|p| p.id == id) {
                 p.state = QueryState::Idle;
             }
         });
@@ -7386,7 +7402,22 @@ fn body(
     });
     create_effect(move |_| {
         let p = right_panel.get();
-        if p != RightPanel::None {
+        // **Guarded, and this is the publisher whose input is a same-value write
+        // by construction** — `right_content` exists to hold the last *non-None*
+        // panel, so closing and reopening the same one writes it over itself.
+        // Ctrl+Shift+A twice takes `right_panel` Ai → None → Ai; the `None` edge
+        // is skipped and the way back was an unguarded `set(Ai)` over `Ai`.
+        // floem never dedups, so `right_inner`'s `dyn_container` disposed the
+        // panel's child scope and rebuilt it: `ai_panel`'s child-scoped
+        // `elapsed_ms` was freed and the "thinking" timer restarted from zero
+        // mid-turn, every bubble's markdown was re-parsed and re-laid out, and
+        // the reader's scroll position went. It also defeated the point of
+        // `right_content` itself — the content is meant to *linger*, clipped,
+        // through the collapse rather than pop out.
+        //
+        // The two publishers immediately above in this function both carry the
+        // term; `reveal_panel` a few lines up states the cost in as many words.
+        if p != RightPanel::None && right_content.get_untracked() != p {
             right_content.set(p);
         }
     });
@@ -12120,6 +12151,79 @@ mod result_panel_tab_tests {
             matches!(t.shown_result(), QueryState::Failed(_)),
             "a kept failure is a record, not a stale bar"
         );
+    }
+
+    /// **And typing when there is nothing to dismiss publishes nothing.**
+    ///
+    /// `dismiss_error` is the editor's document callback — once per keystroke —
+    /// and `update` notifies whether or not the closure changed anything, so the
+    /// three real conditions sitting *inside* the closure meant every character
+    /// typed republished the whole panel list. What that costs is measured in
+    /// this file: `set_panel_states`' doc puts the notification at 0.67 ms at
+    /// 400 panels, which Run Everything on a migration file reaches, and it
+    /// falls on the keystroke path three other findings have measured as
+    /// budget-constrained. `Tab::set_panel_state` three methods up asks first,
+    /// under a comment stating exactly this rule.
+    ///
+    /// Counted rather than reasoned: the claim is about notifications, and a
+    /// test of the *outcome* is green against the defect — the state is already
+    /// `Idle` either way, which is why `typing_clears_a_live_failure_but_never_a_kept_one`
+    /// above passes both before and after.
+    #[test]
+    fn typing_over_a_clean_result_republishes_nothing() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+        let t = tab();
+        let live = t.begin_run(&["SELECT 1".to_string()])[0];
+
+        let runs = Rc::new(Cell::new(0usize));
+        let counted = runs.clone();
+        let panels = t.result_tabs;
+        floem::reactive::create_effect(move |_| {
+            panels.with(|_| ());
+            counted.set(counted.get() + 1);
+        });
+        let base = runs.get();
+
+        // Nothing has failed: ten keystrokes, no news.
+        for _ in 0..10 {
+            t.shown().dismiss_error();
+        }
+        assert_eq!(
+            runs.get(),
+            base,
+            "typing over a clean result republished the whole panel list"
+        );
+
+        // A real failure is dismissed, and that is news — once.
+        t.set_panel_state(live, QueryState::Failed("boom".into()));
+        let before = runs.get();
+        t.shown().dismiss_error();
+        assert_eq!(
+            runs.get(),
+            before + 1,
+            "dismissing a live error has to publish"
+        );
+        assert!(matches!(t.shown_result(), QueryState::Idle));
+
+        // And the keystrokes after it are quiet again.
+        let after = runs.get();
+        for _ in 0..5 {
+            t.shown().dismiss_error();
+        }
+        assert_eq!(runs.get(), after);
+
+        // A *kept* failure is a record, not a stale bar — so it is not news
+        // either, and must not be republished on every keystroke.
+        let kept = t.begin_run(&["SELECT 2".to_string()])[0];
+        t.set_panel_state(kept, QueryState::Failed("boom".into()));
+        t.set_pinned(kept, true);
+        let pinned = runs.get();
+        for _ in 0..5 {
+            t.shown().dismiss_error();
+        }
+        assert_eq!(runs.get(), pinned);
+        assert!(matches!(t.shown_result(), QueryState::Failed(_)));
     }
 
     #[test]
