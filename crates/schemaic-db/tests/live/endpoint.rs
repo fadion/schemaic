@@ -150,6 +150,18 @@ pub struct Target {
     pub trigger_body: Option<&'static str>,
     pub trigger_function_ddl: Option<&'static str>,
     pub trigger_function_name: Option<&'static str>,
+    /// A `WHEN` guard this server accepts on a trigger, and the columns an
+    /// `UPDATE OF` may name — or `None`/empty where the engine has neither.
+    ///
+    /// `TriggerInfo::condition` and `TriggerInfo::update_columns` are the two
+    /// fields the model widened itself for, and every fixture in the tier left
+    /// them at their defaults: an emitter that dropped either on the
+    /// drop-and-create every trigger edit performs would pass every test here,
+    /// leaving a trigger that fires on every row and every column instead of
+    /// the ones it was written for. `schema.rs` records that exact loss for
+    /// SQLite, and PostgreSQL is the only leg in this tier that can catch it.
+    pub trigger_condition: Option<&'static str>,
+    pub trigger_update_columns: &'static [&'static str],
     /// A statement that does nothing for a given number of seconds, in this
     /// server's spelling, with `{}` where the count goes — what the cancellation
     /// test interrupts. There is no portable way to ask a server to wait.
@@ -241,6 +253,8 @@ pub static MARIADB: Target = Target {
     trigger_body: Some("SET NEW.name = UPPER(NEW.name)"),
     trigger_function_ddl: None,
     trigger_function_name: None,
+    trigger_condition: None,
+    trigger_update_columns: &[],
     sleep_template: "SELECT SLEEP({}) /* schemaicItCancelMarker */",
     running_sleeps_sql: "SELECT COUNT(*) FROM information_schema.PROCESSLIST \n         WHERE INFO LIKE CONCAT('%schemaicItCancel', 'Marker%')",
     types: cases::MYSQL_FAMILY,
@@ -270,6 +284,8 @@ pub static MYSQL: Target = Target {
     trigger_body: Some("SET NEW.name = UPPER(NEW.name)"),
     trigger_function_ddl: None,
     trigger_function_name: None,
+    trigger_condition: None,
+    trigger_update_columns: &[],
     sleep_template: "SELECT SLEEP({}) /* schemaicItCancelMarker */",
     running_sleeps_sql: "SELECT COUNT(*) FROM information_schema.PROCESSLIST \n         WHERE INFO LIKE CONCAT('%schemaicItCancel', 'Marker%')",
     types: cases::MYSQL_FAMILY,
@@ -301,6 +317,8 @@ pub static POSTGRES: Target = Target {
         "CREATE FUNCTION upper_name() RETURNS trigger AS $$          BEGIN NEW.name := UPPER(NEW.name); RETURN NEW; END $$ LANGUAGE plpgsql",
     ),
     trigger_function_name: Some("upper_name"),
+    trigger_condition: Some("NEW.name IS NOT NULL"),
+    trigger_update_columns: &["name"],
     sleep_template: "SELECT pg_sleep({}) /* schemaicItCancelMarker */",
     running_sleeps_sql: "SELECT count(*) FROM pg_stat_activity \n         WHERE state = 'active' AND query LIKE '%schemaicItCancel' || 'Marker%'",
     types: cases::POSTGRES,

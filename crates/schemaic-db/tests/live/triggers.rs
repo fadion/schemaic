@@ -41,13 +41,44 @@ pub async fn an_introspected_trigger_diffs_to_nothing_against_its_own_draft(
     seed(&scratch, target).await;
     add_trigger(&scratch, target, "up").await;
 
+    // …and a second one carrying every field this leg's grammar has, so the
+    // whole-struct compare below is handed something to lose. See
+    // `wide_trigger`.
+    {
+        let table = table_of(&scratch).await;
+        let mut draft = TriggerSetDraft::from_table(&table);
+        draft.triggers.push(wide_trigger(&scratch, target, "wide"));
+        apply(&scratch, &table, &draft, target).await;
+    }
+
     let table = table_of(&scratch).await;
     assert_eq!(
         table.triggers.len(),
-        1,
-        "{}: introspection did not find the trigger",
+        2,
+        "{}: introspection did not find both triggers",
         target.name
     );
+    // The fixture is only worth what the server read back off it: on a leg with
+    // a `WHEN` guard, a `condition` that came back `None` means the assertion
+    // below is comparing two defaults.
+    if target.trigger_condition.is_some() {
+        let wide = table
+            .triggers
+            .iter()
+            .find(|t| t.name == "wide")
+            .unwrap_or_else(|| panic!("{}: the wide trigger is not in the model", target.name));
+        assert!(
+            wide.condition.is_some(),
+            "{}: the WHEN guard was not read back, so the round trip below \
+             asserts nothing about it",
+            target.name
+        );
+        assert_eq!(
+            wide.update_columns, target.trigger_update_columns,
+            "{}: the UPDATE OF columns were not read back",
+            target.name
+        );
+    }
 
     // Drop it, then put the server's *own* reading of it back through the
     // emitter. Dropping first because a `CREATE TRIGGER` of a name that already
@@ -335,6 +366,42 @@ fn new_trigger(scratch: &Scratch, target: &Target, name: &str) -> TriggerDraft {
             target.name
         ),
     };
+    draft
+}
+
+/// The same trigger with **everything this leg's grammar has on it**: an
+/// `UPDATE OF <columns>` event, a `WHEN` guard, and — where the action allows
+/// it — `AFTER` rather than `BEFORE`.
+///
+/// `TriggerInfo::condition` and `TriggerInfo::update_columns` are two of the
+/// fields the model widened itself for, and every fixture here left them at
+/// their defaults, so an emitter that dropped either on the drop-and-create
+/// every trigger edit performs would pass every test in this file — leaving a
+/// trigger that fires on every row and every column instead of the ones it was
+/// written for. The whole-struct `assert_eq!` in the identity test is strong
+/// enough to see it; it was being handed a fixture at the narrow end of the
+/// model's width.
+///
+/// `AFTER` rides on the same `(body, function)` distinction `new_trigger`
+/// already switches on rather than a new field: MySQL's body assigns to `NEW`,
+/// which an `AFTER` trigger may not do, while PostgreSQL's function returns
+/// `NEW` and an `AFTER ROW` trigger simply ignores it.
+///
+/// Still uncovered, and said here rather than left to be re-derived:
+/// `TriggerLevel::Statement`, which needs a per-leg action that references no
+/// row, and `TriggerTiming::InsteadOf`, which needs a view to be on.
+fn wide_trigger(scratch: &Scratch, target: &Target, name: &str) -> TriggerDraft {
+    let mut draft = new_trigger(scratch, target, name);
+    draft.info.events = vec![TriggerEvent::Update];
+    draft.info.update_columns = target
+        .trigger_update_columns
+        .iter()
+        .map(|c| c.to_string())
+        .collect();
+    draft.info.condition = target.trigger_condition.map(str::to_string);
+    if target.trigger_body.is_none() {
+        draft.info.timing = TriggerTiming::After;
+    }
     draft
 }
 
