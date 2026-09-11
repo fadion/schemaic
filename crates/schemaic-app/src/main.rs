@@ -97,10 +97,9 @@ struct ClosedTab {
     disk_sql: Option<String>,
     file_format: schemaic_core::sqlfile::SqlFormat,
 }
-/// Record one executed query into history: `(conn_id, database, sql, tab_name)`,
-/// returning the **run id** it was recorded under — what
-/// [`FinishHistoryFn`] later reports that run's outcome against.
-/// Record a run's statements and hand back one run id each, in order.
+/// Record a run's statements and hand back one run id each, in order —
+/// `(conn_id, database, statements, tab_name)`. The ids are what
+/// [`FinishHistoryFn`] later reports those runs' outcomes against.
 ///
 /// A **slice**, and one file write for the lot. It took a single statement and
 /// wrote the whole of `history.json` each time — clone the cross-connection
@@ -133,13 +132,12 @@ type GuardCloseFn = GuardTxFn;
 /// initial load, the connection-wide Refresh and the per-database Refresh all
 /// take, so what the tree shows while a fetch is out is decided once.
 type FetchSchemaFn = Rc<dyn Fn(&ConnNode, Db)>;
-/// Record how one or more runs turned out — `(run id, outcome)` per run — onto
-/// the history entries their launch already wrote.
+/// Fill in how runs went — `(run id, outcome)` per run, onto the history
+/// entries their launch already wrote — and delete the entries of runs that
+/// never happened.
 ///
 /// A **slice**, not one run, because Run Everything lands a whole batch at once
-/// and each recorded run costs a full rewrite of `history.json`.
-/// Fill in how runs went, and delete the entries of runs that never happened.
-///
+/// and each recorded run would otherwise cost a full rewrite of `history.json`.
 /// One call for the whole slice, and one file write for both halves.
 type FinishHistoryFn = Rc<dyn Fn(&[(u64, schemaic_core::history::RunResult)], &[u64])>;
 use schemaic_ai::harness::Harness;
@@ -534,16 +532,6 @@ fn wrap_launcher(
     }
 }
 
-/// Map a finished inline-AI (`Ctrl+K`) generation's output to a UI state: on
-/// success, the fence-stripped SQL (or "No SQL returned" if blank); on failure,
-/// the first stderr line. Pure so the parsing of untrusted subprocess output is
-/// unit-tested (the closure keeps only the spawn + the spawn-error arm).
-/// Settle the in-flight assistant bubble after the user stops a turn.
-///
-/// Keeps whatever partial answer had streamed in and adds a `(stopped)` marker.
-/// The CLI reports an interrupted turn as an error `result`, so this also undoes
-/// the error styling that would otherwise make a deliberate stop look like a
-/// failure. Usage stats are left alone — the tokens were really spent.
 /// An action with no arguments, held by the connection gate across an async
 /// re-check.
 type Action = Rc<dyn Fn()>;
@@ -626,6 +614,12 @@ fn gate1_on_tab<A: Clone + 'static>(
     })
 }
 
+/// Settle the in-flight assistant bubble after the user stops a turn.
+///
+/// Keeps whatever partial answer had streamed in and adds a `(stopped)` marker.
+/// The CLI reports an interrupted turn as an error `result`, so this also undoes
+/// the error styling that would otherwise make a deliberate stop look like a
+/// failure. Usage stats are left alone — the tokens were really spent.
 fn mark_stopped(messages: RwSignal<Vec<ChatMessage>>) {
     messages.update(|v| {
         if let Some(last) = v.last_mut() {
@@ -690,9 +684,6 @@ fn sample_rows(rs: &schemaic_core::model::ResultSet) -> Vec<schemaic_core::seed:
         .collect()
 }
 
-/// Look up a base table in the loaded schema, returning its `CREATE TABLE`
-/// skeleton (prompt structure) + its primary-key column names (to order the
-/// bottom-sample). Empty/`([], "")` when the schema hasn't been introspected yet.
 /// Map a resolved `Db`'s engine to the SQL dialect (for dialect-aware DDL).
 ///
 /// The same `Engine::dialect()` [`dialect_for`] uses, which is exhaustive. This
@@ -702,15 +693,6 @@ fn dialect_of(db: &Db) -> SqlDialect {
     dialect_for(db.engine())
 }
 
-/// One loaded table's DDL, the columns that identify one of its rows, and the
-/// implicit row key it has if it has none of its own
-/// ([`schemaic_core::schema::TableInfo::implicit_key`] — SQLite's rowid, `None`
-/// on the other two engines). Everything empty when the schema isn't loaded yet.
-///
-/// The middle value is `schema::browse_key_columns`, **not** the primary key:
-/// the same precedence `edit::resolve_key` uses, so the statement the grid runs
-/// and the key the write path resolves cannot disagree about whether the table
-/// has a key of its own.
 /// The DDL to put in an AI prompt, or `None` where the user's *Schema context*
 /// says to send none.
 ///
@@ -740,6 +722,15 @@ fn ai_data_of_conn(
         .unwrap_or_default()
 }
 
+/// One loaded table's DDL, the columns that identify one of its rows, and the
+/// implicit row key it has if it has none of its own
+/// ([`schemaic_core::schema::TableInfo::implicit_key`] — SQLite's rowid, `None`
+/// on the other two engines). Everything empty when the schema isn't loaded yet.
+///
+/// The middle value is `schema::browse_key_columns`, **not** the primary key:
+/// the same precedence `edit::resolve_key` uses, so the statement the grid runs
+/// and the key the write path resolves cannot disagree about whether the table
+/// has a key of its own.
 fn table_ddl_and_pk(
     db_nodes: RwSignal<Vec<ConnNode>>,
     source: &TableSource,
@@ -855,10 +846,6 @@ fn unique_name(base: &str, existing: &[String]) -> String {
     }
 }
 
-/// Smallest positive "Query N" number not present in `used` (a tab's display
-/// number, its `label`). New tabs pick the lowest free number so closing and
-/// opening keeps numbering compact instead of climbing forever — the display
-/// number is decoupled from the ever-incrementing tab `id`.
 /// The "Query N" numbers already taken **on one connection**.
 ///
 /// Numbering is per connection because everything else about a tab is: the
@@ -872,6 +859,10 @@ fn used_labels(tabs: &[Tab], conn: u64) -> Vec<usize> {
         .collect()
 }
 
+/// Smallest positive "Query N" number not present in `used` (a tab's display
+/// number, its `label`). New tabs pick the lowest free number so closing and
+/// opening keeps numbering compact instead of climbing forever — the display
+/// number is decoupled from the ever-incrementing tab `id`.
 fn smallest_free_label(used: &[usize]) -> usize {
     let mut n = 1;
     while used.contains(&n) {
@@ -12521,11 +12512,6 @@ mod app_tests {
         }
     }
 
-    /// The level `load_landing` doesn't reach. `try_update` guards a *disposed*
-    /// scope — a connection switch — and says nothing about a **superseded**
-    /// fetch of the same node, which is the interleaving that leaves the tree,
-    /// the completion index and the schema editors holding a pre-`ALTER` model
-    /// indefinitely.
     /// The whole of the run-id allocator's correctness argument, which was
     /// untested: deleting the `+ 1` at the call site or narrowing the seed to the
     /// active connection left the suite green.
@@ -12555,6 +12541,11 @@ mod app_tests {
         assert_eq!(run_id_seed(&[e(1, 0), e(1, 0)]), 0);
     }
 
+    /// The level `load_landing` doesn't reach. `try_update` guards a *disposed*
+    /// scope — a connection switch — and says nothing about a **superseded**
+    /// fetch of the same node, which is the interleaving that leaves the tree,
+    /// the completion index and the schema editors holding a pre-`ALTER` model
+    /// indefinitely.
     #[test]
     fn an_older_introspection_of_the_same_database_writes_nothing() {
         use super::fetch_landing;

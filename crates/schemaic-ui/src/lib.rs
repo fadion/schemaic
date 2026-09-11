@@ -251,15 +251,6 @@ pub enum ExportOutcome {
     Failed { message: String, partial: bool },
 }
 
-/// What an ER-diagram export writes.
-///
-/// Captured **before** the save dialog opens, not after: the dialog is modal and
-/// the diagram's signals belong to the modal behind it, so a callback that went
-/// back for them would be reading a scope that may already be gone. It also means
-/// the file is a picture of what the user was looking at when they chose the
-/// format — the same rule the results grid's snapshot follows.
-///
-/// What is captured is as little as the UI thread is *obliged* to do. For a
 /// What a schema + data dump writes, and where.
 ///
 /// The **plan** it will follow is built in the app from a freshly introspected
@@ -683,11 +674,9 @@ pub enum DumpOutcome {
     },
 }
 
-/// picture that is the measured [`SvgScene`](schemaic_core::erd_export::SvgScene)
-/// and nothing more: the measuring goes through floem's font system and so cannot
-/// leave this thread, but building the document out of it is pure — 34 ms of
-/// string work and a 5 MB allocation at 500 tables — and joins the rasterise and
-/// the write on the worker.
+/// An exported diagram, at whichever stage of being a file it has reached on
+/// the UI thread — see [`ErdExportRequest`] for why that is as little as
+/// possible.
 #[derive(Clone)]
 pub enum ErdDoc {
     /// A finished document, written as-is (Mermaid, DBML, PlantUML, Graphviz).
@@ -727,7 +716,21 @@ impl ErdDoc {
     }
 }
 
-/// What to write, and where.
+/// What an ER-diagram export writes.
+///
+/// Captured **before** the save dialog opens, not after: the dialog is modal and
+/// the diagram's signals belong to the modal behind it, so a callback that went
+/// back for them would be reading a scope that may already be gone. It also means
+/// the file is a picture of what the user was looking at when they chose the
+/// format — the same rule the results grid's snapshot follows.
+///
+/// What is captured is as little as the UI thread is *obliged* to do. For a text
+/// format that is the finished document; for a picture that is the measured
+/// [`SvgScene`](schemaic_core::erd_export::SvgScene) and nothing more: the
+/// measuring goes through floem's font system and so cannot leave this thread,
+/// but building the document out of it is pure — 34 ms of string work and a 5 MB
+/// allocation at 500 tables — and joins the rasterise and the write on the
+/// worker.
 pub struct ErdExportRequest {
     pub path: std::path::PathBuf,
     pub doc: ErdDoc,
@@ -3586,9 +3589,11 @@ pub struct AiUi {
     /// Override path to the selected harness's CLI (empty = auto-detect, via
     /// [`AiActions::detect_path`]).
     ///
-    /// Cleared when [`AiUi::harness`] changes: one field serves every harness,
-    /// so a path left behind would point the new CLI's spawn at the old CLI's
-    /// binary.
+    /// Cleared when [`AiUi::harness`] changes to one this session has **not**
+    /// configured: one field serves every harness, so a path left behind would
+    /// point the new CLI's spawn at the old CLI's binary. Returning to a
+    /// harness already configured restores what it had instead — see
+    /// `harness_switch`, whose `remembered` argument exists for exactly that.
     pub cli_path: RwSignal<String>,
     /// The model id passed to the harness's `--model`, verbatim.
     ///
@@ -5662,6 +5667,23 @@ impl AiEffort {
         }
     }
 
+    /// The levels a harness taking exactly `levels` should offer in the box, in
+    /// this enum's own order.
+    ///
+    /// **Lifted out of the view closure, where it was an expression.** The
+    /// settings dropdown filtered `AiEffort::ALL` inline, and the test that
+    /// claimed to guard it re-performed the same filter in its own body — so
+    /// changing the view's filter to `.take(3)`, or to `AiEffort::ALL`
+    /// unfiltered, left the workspace green while the dropdown offered `xhigh`
+    /// under a harness whose flag does not take it. The test calls *this* now,
+    /// and the view calls nothing else.
+    pub fn offered_by(levels: &[&str]) -> Vec<AiEffort> {
+        AiEffort::ALL
+            .into_iter()
+            .filter(|e| levels.contains(&e.cli()))
+            .collect()
+    }
+
     /// This level if `levels` contains it, else the **nearest** one that does.
     ///
     /// **What the settings box shows must be a level the harness takes.** The
@@ -5692,23 +5714,6 @@ impl AiEffort {
     ///
     /// `None` when the harness has no effort flag at all — there is no level to
     /// show, and the row is hidden.
-    /// The levels a harness taking exactly `levels` should offer in the box, in
-    /// this enum's own order.
-    ///
-    /// **Lifted out of the view closure, where it was an expression.** The
-    /// settings dropdown filtered `AiEffort::ALL` inline, and the test that
-    /// claimed to guard it re-performed the same filter in its own body — so
-    /// changing the view's filter to `.take(3)`, or to `AiEffort::ALL`
-    /// unfiltered, left the workspace green while the dropdown offered `xhigh`
-    /// under a harness whose flag does not take it. The test calls *this* now,
-    /// and the view calls nothing else.
-    pub fn offered_by(levels: &[&str]) -> Vec<AiEffort> {
-        AiEffort::ALL
-            .into_iter()
-            .filter(|e| levels.contains(&e.cli()))
-            .collect()
-    }
-
     pub fn clamped_to(self, levels: &[&str]) -> Option<AiEffort> {
         if levels.contains(&self.cli()) {
             return Some(self);
