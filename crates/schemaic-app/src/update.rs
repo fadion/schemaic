@@ -280,7 +280,25 @@ fn apply_action(
     staged: Rc<RefCell<Option<VelopackAsset>>>,
 ) -> Rc<dyn Fn()> {
     Rc::new(move || {
-        let Some(asset) = staged.borrow().clone() else {
+        // **Taken, not cloned — this is the in-flight guard.** The chip is a
+        // plain clickable label with no feedback, and the window only goes once
+        // Velopack's handover has returned and `close_window` has run, which is a
+        // visible pause — so a second click during it is the ordinary
+        // double-click. Each click used to clone the asset and start a whole
+        // second handover, leaving two `Update.exe` processes waiting on this
+        // pid. However Velopack arbitrates them, the second is the one that
+        // returns `Err` (the first has taken the staging directory) — and the
+        // `Err` arm below sets `Failed`, which renders *nothing*. The user's last
+        // frame before the window closed was the restart offer vanishing, with no
+        // way to tell whether the update was being applied.
+        //
+        // Taking it makes the second click a no-op by construction, which is the
+        // same shape `should_recheck` uses to keep the *check* path from
+        // disturbing a staged offer.
+        //
+        // **The `Err` arm puts it back**, so a genuine failure to launch leaves
+        // the offer standing and clickable rather than consuming it.
+        let Some(asset) = staged.borrow_mut().take() else {
             return;
         };
         // Built per click rather than once up front: `create_ext_action` hands
@@ -288,6 +306,7 @@ fn apply_action(
         // the chip stays on screen until the window actually goes. We're on the
         // UI thread here (it's a click handler), which is where `create_ext_action`
         // must be called from anyway.
+        let (staged_err, asset_err) = (staged.clone(), asset.clone());
         let handover = create_ext_action(cx, move |launched: Result<(), String>| match launched {
             Ok(()) => {
                 // **`close_window`, not `apply_updates_and_restart`.** Velopack's
@@ -300,9 +319,20 @@ fn apply_action(
                 // there waiting for this process to go away.
                 floem::close_window(window);
             }
+            // **The offer goes back up, rather than to `Failed`.** The launch
+            // did not happen, so nothing has taken the staging directory and a
+            // retry is exactly as valid as the first attempt — while `Failed`
+            // renders *nothing* (`UpdateState::label`), so setting it here made
+            // a click the user did make look like it had removed the update.
+            // That state's invisibility is reasoned about the *check* path — "a
+            // background poll that couldn't reach GitHub is not the user's
+            // problem" — and an apply the user asked for is not that.
             Err(e) => {
                 tracing::error!("could not launch the updater: {e}");
-                state.set(UpdateState::Failed { message: e });
+                *staged_err.borrow_mut() = Some(asset_err.clone());
+                state.set(UpdateState::Ready {
+                    version: asset_err.Version.clone(),
+                });
             }
         });
         handle.spawn_blocking(move || {
