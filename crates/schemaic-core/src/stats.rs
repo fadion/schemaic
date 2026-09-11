@@ -348,9 +348,23 @@ pub struct TableStats {
 }
 
 impl TableStats {
-    /// Did the engine say anything at all? `false` drives the properties
-    /// surface's "this engine doesn't publish these" state, which must not look
-    /// like a table of zeros.
+    /// Did the engine publish a **figure** at all? `false` drives the
+    /// properties surface's "this engine doesn't publish these" state, which
+    /// must not look like a table of zeros.
+    ///
+    /// **`created` and `updated` are not figures, and counting them made a
+    /// MySQL view look like a table with statistics.** Measured on MySQL 8.4.11
+    /// against MariaDB 10.11: `information_schema.TABLES` returns every column
+    /// NULL for a view on both, *except* `CREATE_TIME`, which MySQL fills in. So
+    /// `has_any` answered `true` there, the panel took its full `Loaded` arm
+    /// instead of the one written for this exact case, and printed two
+    /// em-dashes under "these figures may be up to 24h old" — a staleness claim
+    /// about numbers the server never reports and never will. One code path,
+    /// two engines, two different answers.
+    ///
+    /// The timestamps are still shown, by `options_section`, which has its own
+    /// emptiness guard; this predicate is only about whether the engine said
+    /// anything worth a statistics panel.
     pub fn has_any(&self) -> bool {
         self.rows.is_some()
             || self.exact_rows.is_some()
@@ -361,8 +375,6 @@ impl TableStats {
             || self.auto_increment.is_some()
             || self.row_format.is_some()
             || self.engine.is_some()
-            || self.created.is_some()
-            || self.updated.is_some()
             || !self.indexes.is_empty()
     }
 
@@ -430,12 +442,6 @@ impl TableStats {
     /// Is the dead-row share worth mentioning? See [`DEAD_ROW_WARN`].
     pub fn needs_vacuum(&self) -> bool {
         self.dead_ratio().is_some_and(|r| r >= DEAD_ROW_WARN)
-    }
-
-    /// Indexes [`IndexStats::is_unused`] flags, in the order the engine listed
-    /// them.
-    pub fn unused_indexes(&self) -> Vec<&IndexStats> {
-        self.indexes.iter().filter(|i| i.is_unused()).collect()
     }
 
     /// The whole thing as Markdown, for the modal's **Copy** — the same summary
@@ -568,11 +574,6 @@ impl SchemaStats {
         Self { tables, by_name }
     }
 
-    /// Every table's statistics, in the order the engine listed them.
-    pub fn tables(&self) -> &[TableStats] {
-        &self.tables
-    }
-
     /// Find one table's stats. Matches on namespace **and** name, because
     /// `sales.orders` and `archive.orders` are different tables.
     pub fn get(&self, schema: Option<&str>, table: &str) -> Option<&TableStats> {
@@ -607,15 +608,6 @@ impl SchemaStats {
         let mut hits = self.rows_named(table);
         let first = hits.next()?;
         hits.next().is_none().then_some(first)
-    }
-
-    /// Every table's total added up — the "this database is N on disk" figure.
-    /// `None` when no table reported a size.
-    pub fn total_bytes(&self) -> Option<u64> {
-        self.tables
-            .iter()
-            .filter_map(TableStats::total_bytes)
-            .reduce(u64::saturating_add)
     }
 
     pub fn is_empty(&self) -> bool {
@@ -1137,25 +1129,6 @@ mod tests {
         assert!(!uq.is_unused(), "a unique index is a constraint");
     }
 
-    #[test]
-    fn unused_indexes_come_back_in_engine_order() {
-        let s = TableStats {
-            indexes: vec![
-                IndexStats {
-                    is_primary: true,
-                    ..idx("PRIMARY", Some(0))
-                },
-                idx("idx_a", Some(0)),
-                idx("idx_b", Some(42)),
-                idx("idx_c", None),
-                idx("idx_d", Some(0)),
-            ],
-            ..Default::default()
-        };
-        let names: Vec<&str> = s.unused_indexes().iter().map(|i| i.name.as_str()).collect();
-        assert_eq!(names, ["idx_a", "idx_d"]);
-    }
-
     // ── Sizes ────────────────────────────────────────────────────────────────
 
     #[test]
@@ -1291,6 +1264,60 @@ mod tests {
         }
     }
 
+    /// **A creation timestamp is not a statistic**, and MySQL 8 gives one to a
+    /// *view*.
+    ///
+    /// Measured on MySQL 8.4.11 and MariaDB 10.11: `information_schema.TABLES`
+    /// returns every figure NULL for a view on both, except `CREATE_TIME`,
+    /// which MySQL fills in. `has_any` counted `created`, so the properties
+    /// panel took its full `Loaded` arm on MySQL instead of the arm written for
+    /// exactly this case — "A view has no storage of its own, so the server
+    /// reports no statistics for it" — and printed two em-dashes under a
+    /// caveat that the figures "may be up to 24h old". A staleness claim about
+    /// numbers the server never reports and never will, and `to_markdown`
+    /// diverged identically, so **Copy** put it in a ticket. One code path, two
+    /// engines, two different answers, with nothing in either to say which
+    /// happened.
+    ///
+    /// `created`/`updated` are still *shown* — by `options_section`, which has
+    /// its own emptiness guard — and this is only about whether they make the
+    /// panel claim the engine published statistics.
+    #[test]
+    fn a_view_whose_only_figure_is_a_creation_timestamp_reports_nothing() {
+        let view = TableStats {
+            table: "v_orders".into(),
+            created: Some("2026-08-12 19:40:24".into()),
+            freshness: Freshness::CachedUpTo(86_400),
+            ..Default::default()
+        };
+        assert!(
+            !view.has_any(),
+            "MySQL 8's CREATE_TIME on a view reads as a published statistic"
+        );
+        assert!(
+            view.to_markdown("app.v_orders")
+                .contains("no statistics for this table"),
+            "Copy carries the staleness caveat into a ticket: {}",
+            view.to_markdown("app.v_orders")
+        );
+
+        // …and an `updated` alone is the same answer, so the two move together.
+        let touched = TableStats {
+            updated: Some("2026-08-12 19:41:00".into()),
+            ..Default::default()
+        };
+        assert!(!touched.has_any());
+
+        // A real table is untouched: MySQL reports its engine and its bytes
+        // beside the timestamp, and any one of those is a figure.
+        let table = TableStats {
+            created: Some("2026-08-12 19:40:24".into()),
+            engine: Some("InnoDB".into()),
+            ..Default::default()
+        };
+        assert!(table.has_any());
+    }
+
     // ── Lookup ───────────────────────────────────────────────────────────────
 
     fn named(schema: Option<&str>, table: &str, rows: u64) -> TableStats {
@@ -1337,7 +1364,6 @@ mod tests {
         assert_eq!(set.find(None, "t0"), None, "three namespaces carry it");
         let one = SchemaStats::new(vec![named(Some("public"), "solo", 1)]);
         assert_eq!(one.find(None, "solo"), one.get(Some("public"), "solo"));
-        assert_eq!(set.tables().len(), tables.len());
     }
 
     #[test]
@@ -1380,24 +1406,6 @@ mod tests {
         // MySQL, where nothing carries a namespace at all.
         let my = SchemaStats::new(vec![named(None, "orders", 40)]);
         assert_eq!(my.find(None, "orders").unwrap().rows, Some(40));
-    }
-
-    #[test]
-    fn a_database_total_adds_up_what_reported_a_size() {
-        let set = SchemaStats::new(vec![
-            TableStats {
-                data_bytes: Some(1_000),
-                index_bytes: Some(200),
-                ..named(None, "orders", 10)
-            },
-            TableStats {
-                data_bytes: Some(500),
-                ..named(None, "customers", 5)
-            },
-            named(None, "sizeless", 1),
-        ]);
-        assert_eq!(set.total_bytes(), Some(1_700));
-        assert_eq!(SchemaStats::default().total_bytes(), None);
     }
 
     // ── Markdown ─────────────────────────────────────────────────────────────

@@ -225,6 +225,15 @@ fn stats_body(
         PropertiesState::Failed(e) => [
             Some(note_line(icons::TRIANGLE_ALERT, theme::error, e)),
             structure_section(target, info),
+            // **The state with least to show is not the state to withhold the
+            // one figure still obtainable from.** A `COUNT(*)` needs no
+            // catalogue, which is `count_row`'s whole argument and is made three
+            // times in this module — and this was the one arm of four that did
+            // not call it, so the doc was a false statement about the code under
+            // it. It was also the only state in which `CountHint::Error` could
+            // never appear, so a count error raised in another state and then
+            // followed by a failed re-fetch was swallowed.
+            count_row(target, None, counting, count_err, ui, ring),
         ]
         .into_iter()
         .flatten()
