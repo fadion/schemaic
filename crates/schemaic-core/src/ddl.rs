@@ -4621,7 +4621,17 @@ impl ChangeSet {
         }
         // A table rename is the same statement on every engine and has no
         // rebuild to ride inside here.
-        for c in &self.changes {
+        //
+        // Through `supported()` like every loop above it, and not
+        // `&self.changes`: `supports_change(Sqlite, RenameTable)` is **false**,
+        // so a set holding a bare rename reported it in `unsupported()`, printed
+        // the `-- INCOMPLETE … would leave out: Rename the table` header,
+        // refused Apply — and still put the `ALTER TABLE … RENAME TO` in the
+        // script the escape hatch hands over. The rebuild branch above returns
+        // before reaching here, so the rename it inserts *deliberately* — the
+        // native statement that re-points the views and triggers naming the
+        // table — is untouched by this.
+        for c in supported() {
             if let Change::RenameTable { to } = c {
                 out.push(format!(
                     "ALTER TABLE {} RENAME TO {};",
@@ -4681,7 +4691,14 @@ impl ChangeSet {
                         out.push(create_view_sql(draft, server_name, d, true));
                     }
                 }
-                Change::DropView { materialized } => {
+                // Guarded for the reason the `RefreshView` arm three lines down
+                // is, and it is the arm that needed it more: `supports_change`
+                // distinguishes `DropView { materialized: false }` (SQLite can)
+                // from `{ materialized: true }` (it cannot), so the arm
+                // answering exactly that question was the one emitting without
+                // asking — a `DROP MATERIALIZED VIEW` in the script, under an
+                // INCOMPLETE header saying that change had been left out.
+                Change::DropView { materialized } if supports_change(d, c) => {
                     out.push(drop_view_sql(&self.qname(), *materialized))
                 }
                 // Gated here rather than left to the emitter that called it:
@@ -21598,6 +21615,81 @@ mod database_tests {
     fn utf8mb4_leads_the_charset_list() {
         assert_eq!(MYSQL_CHARSETS[0], "utf8mb4");
         assert!(MYSQL_COLLATIONS[0].starts_with("utf8mb4_"));
+    }
+
+    /// **What the script hands over and what the INCOMPLETE header says were
+    /// left out must agree** — for a change the dialect does not support, on
+    /// the two arms that were emitting without asking.
+    ///
+    /// Nothing reaches either today, which is the point: this is the guard
+    /// against the edit that makes them reachable, and it is the shape the
+    /// codebase has already been bitten by once. `container_creates`' own doc
+    /// records it — a MySQL set emitted ``DROP SCHEMA `sales`;`` under a header
+    /// saying that very change had been left out, and on MariaDB `SCHEMA` is a
+    /// synonym for `DATABASE`, so the statement the risk sentence promised the
+    /// server would refuse removed a database and the table in it.
+    ///
+    /// A bare SQLite `RenameTable` is unreachable because `diff`'s SQLite
+    /// collapse always inserts a `RebuildTable` beside it, and `emit_sqlite`
+    /// then takes its early-return branch — where the rename is inserted
+    /// **deliberately**, as the native statement that re-points the views and
+    /// triggers naming the table. So the half that is a real fix here is the
+    /// view drop; the rename half is asserted so that a future change to
+    /// `supports_change` cannot make the script and the header disagree without
+    /// a test noticing.
+    #[test]
+    fn an_unsupported_change_is_left_out_of_the_script_it_is_reported_missing_from() {
+        // A materialized view drop on an engine that has no materialized view.
+        // `supports_change` distinguishes the two `DropView` shapes, and the arm
+        // answering that question was the one with no guard on it.
+        let cs = single("v", None, Sqlite, Change::DropView { materialized: true });
+        assert!(
+            !supports_change(Sqlite, &cs.changes[0]),
+            "the fixture is not an unsupported change at all"
+        );
+        assert!(
+            !cs.unsupported().is_empty(),
+            "the header does not report it as left out"
+        );
+        assert_eq!(
+            cs.emit(),
+            Vec::<String>::new(),
+            "the script carries a statement the header says was left out: {:?}",
+            cs.emit()
+        );
+
+        // …and the plain drop, which SQLite does support, still emits — the
+        // guard must filter, not blanket-refuse.
+        let cs = single(
+            "v",
+            None,
+            Sqlite,
+            Change::DropView {
+                materialized: false,
+            },
+        );
+        assert_eq!(cs.emit(), vec!["DROP VIEW \"v\";".to_string()]);
+
+        // The rename half. Unreachable, asserted so it stays honest.
+        let cs = single(
+            "t",
+            None,
+            Sqlite,
+            Change::RenameTable {
+                to: "t2".to_string(),
+            },
+        );
+        assert!(
+            !supports_change(Sqlite, &cs.changes[0]),
+            "SQLite gained a RenameTable arm — re-read `emit_sqlite`'s rebuild \
+             branch before changing this test, the rename there is deliberate"
+        );
+        assert!(!cs.unsupported().is_empty());
+        assert_eq!(
+            cs.emit(),
+            Vec::<String>::new(),
+            "the script renames the table the header says it left alone"
+        );
     }
 
     /// **A container is created before its contents and dropped after them**,
