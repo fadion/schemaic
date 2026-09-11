@@ -367,13 +367,30 @@ fn find_bar(find: Find, matches: Memo<erd::Matches>) -> impl IntoView {
                 // id. Reaching that id needs a `FieldCfg` hook that doesn't exist,
                 // and the padding is 8px, so the nicety isn't worth one.
                 .on_event_stop(EventListener::PointerDown, move |e| {
-                    // `pe.pos` is relative to this bar, whose left padding is 8px,
-                    // so the field's own band is `[8, 8 + width)`. Read from the
-                    // laid-out view rather than from the 190.0 above, so a change to
-                    // one doesn't leave the other describing a field that moved.
+                    // `pe.pos` is relative to this bar, whose left padding is
+                    // `theme::scaled(8.0)`, so the field's own band is
+                    // `[pad, pad + width)`. Read from the laid-out view rather than
+                    // from the 190.0 above, so a change to one doesn't leave the
+                    // other describing a field that moved.
+                    //
+                    // **Both terms scaled.** The padding was written `8.0` and the
+                    // fallback width `190.0`, against a `theme::scaled(8.0)` five
+                    // lines up and a `.width(theme::scaled(190.0))` on the field
+                    // itself — so the band was right at 100% and wrong at every
+                    // other interface scale, and here that is behaviour rather than
+                    // pixels. At 160% a press in the rightmost 4.8 px *inside* the
+                    // box was judged a miss and handed the keyboard away, undoing
+                    // the focus the click had just set; at 80% the mirror hole
+                    // treated a press 1.6 px *past* the field as on it, so the
+                    // keyboard was not handed back and the diagram went
+                    // keyboard-dead — the exact state this handler exists to
+                    // prevent.
                     if let Event::PointerDown(pe) = e {
-                        let w = input_id.get_size().map(|s| s.width).unwrap_or(190.0);
-                        if pe.pos.x > 8.0 + w {
+                        let w = input_id
+                            .get_size()
+                            .map(|s| s.width)
+                            .unwrap_or_else(|| theme::scaled(190.0));
+                        if pe.pos.x > theme::scaled(8.0) + w {
                             crate::widgets::hand_keyboard_back(None);
                         }
                     }
@@ -1298,7 +1315,16 @@ fn node_card(
     if p.node.kind == NodeKind::Stub {
         let id_s = id.clone();
         let id_flash = id.clone();
-        return container(text(p.node.id.clone()).style(move |s| {
+        // **No truncation tooltip here, deliberately.** The real header gets one,
+        // and the obvious move is to copy it — but that tooltip hangs on the
+        // header *row inside* a draggable card, so the card still takes the
+        // press. A stub card has no inner row: the tooltip would go on the whole
+        // card, which is the one thing standing between a press and the canvas's
+        // pan. Making a 340 px box swallow drags to reveal a name is the trade
+        // B19.2-L1-02 is filed about, and nothing here can check it without the
+        // app. The overflow is the defect; the tooltip is a nicety, and it can
+        // be added with the hand check that belongs to it.
+        let card = container(text(p.node.id.clone()).style(move |s| {
             s.font_size(13.0 * zoom.get() as f32)
                 // A stub carries no tint, so the match colour is the gated
                 // pairing here (`match_highlight on erd_node_bg`).
@@ -1307,6 +1333,23 @@ fn node_card(
                     NamePaint::Plain => theme::text_dim(),
                 })
                 .padding_horiz(10.0 * zoom.get())
+                // **The three pieces the real header already carries** — without
+                // them the name painted straight past the card's own border onto
+                // the canvas. `stub_width` clamps the card at `NODE_MAX_W`, and a
+                // stub's id is the one label that is *always* database-qualified
+                // (`analytics_warehouse.customer_order_line_items`), so it is the
+                // longest thing any diagram holds and the clamp is routinely
+                // reached. `min_width(0)` is the load-bearing one: taffy's
+                // automatic minimum for a flex item is its content size, so
+                // nothing shrinks the text node without it.
+                //
+                // And it is a correctness fix, not a tidy: `export_scene`
+                // ellipsizes this same name against the same 320 px, so the saved
+                // picture read `…customer_order_line_i…` where the screen showed
+                // the whole thing overflowing its box — the canvas/export drift
+                // that path's own doc says it exists to prevent.
+                .min_width(0.0)
+                .text_ellipsis()
         }))
         .style(move |s| {
             let z = zoom.get();
@@ -1331,8 +1374,8 @@ fn node_card(
             } else {
                 s
             }
-        })
-        .into_any();
+        });
+        return card.into_any();
     }
 
     let name = p.node.id.clone();
@@ -2152,10 +2195,33 @@ pub(crate) fn erd_overlay(ui: Ui) -> impl IntoView {
                 // in the copy menu at all.
                 Rc::new(
                     move |fmt| match (render)(fmt).and_then(crate::ErdDoc::into_text) {
-                        Some(s) => {
-                            let _ = floem::Clipboard::set_contents(s);
-                            (say)(format!("Copied as {}", fmt.label()), false);
-                        }
+                        // **The write is checked.** It was `let _ = …` followed
+                        // unconditionally by the green confirmation, so a host
+                        // whose clipboard provider never initialised
+                        // (`NotAvailable`) or whose backend refused the write
+                        // (`ProviderError`) was told "Copied as Mermaid" with
+                        // nothing on the clipboard. The file half of this same
+                        // menu routes its failure through this very `say`, which
+                        // exists because "the modal has no error bar, and the
+                        // app's shared error modal is painted *under* this one,
+                        // so the diagram reports for itself" — the channel was
+                        // there and this caller declined to use it.
+                        //
+                        // `ClipboardError` has no `Display`, and its `Debug` is
+                        // not a sentence, so the two arms are spelled out.
+                        // `NotAvailable` means the provider never initialised —
+                        // nothing about this diagram — while `ProviderError`
+                        // carries the platform's own words and is worth
+                        // repeating.
+                        Some(s) => match floem::Clipboard::set_contents(s) {
+                            Ok(()) => (say)(format!("Copied as {}", fmt.label()), false),
+                            Err(floem::ClipboardError::NotAvailable) => {
+                                (say)("The clipboard is not available.".to_string(), true)
+                            }
+                            Err(floem::ClipboardError::ProviderError(e)) => {
+                                (say)(format!("Couldn't copy: {e}"), true)
+                            }
+                        },
                         None => (say)("Nothing to copy.".to_string(), true),
                     },
                 )
