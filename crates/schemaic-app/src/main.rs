@@ -5360,11 +5360,30 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
         Rc::new(move |name: String| {
             // The DB selector lists the active connection's databases, so picking
             // one binds the active tab to the active connection + that database.
-            let exists = db_nodes.with_untracked(|ns| ns.iter().any(|n| n.database == name));
-            if !exists {
+            //
+            // **And picking the one you are on is not a pick.** The menu offers
+            // it — the current row is accented rather than disabled — and the
+            // rebind below is not free: it cancels the tab's running query,
+            // settles its transaction through `guard_tx`, and re-pins its
+            // session. `tabsel::rebind_needed` is that decision, with the
+            // existence check folded in so there is one answer and not two;
+            // `set_tx_mode` opens with the same refusal for the same reason.
+            let id = active.get_untracked();
+            let known: Vec<String> =
+                db_nodes.with_untracked(|ns| ns.iter().map(|n| n.database.clone()).collect());
+            let tab_binding = tabs.with_untracked(|v| {
+                v.iter()
+                    .find(|t| t.id == id)
+                    .map(|t| (t.conn_id.get_untracked(), t.database.get_untracked()))
+            });
+            if !schemaic_core::tabsel::rebind_needed(
+                tab_binding.as_ref().map(|(c, d)| (*c, d.as_deref())),
+                active_conn.get_untracked(),
+                &name,
+                &known,
+            ) {
                 return;
             }
-            let id = active.get_untracked();
             let open_session = open_session.clone();
             let tokens = tokens.clone();
             // A pinned session belongs to one database — PostgreSQL can't switch
@@ -5496,10 +5515,6 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
         let recently_closed = recently_closed.clone();
         let drop_session = drop_session.clone();
         Rc::new(move |id: usize| {
-            // A Manual tab's pinned connection goes with it. By the time we get
-            // here any open transaction has been settled by `close_tab`'s prompt,
-            // so this is just releasing the connection.
-            (drop_session)(id);
             // Snapshot a closing tab into the reopen ring (most-recent first,
             // capped at 10) — but only if it holds something worth restoring.
             let record = |tab: &Tab| {
@@ -5546,6 +5561,16 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             {
                 return;
             }
+            // A Manual tab's pinned connection goes with it. By the time we get
+            // here any open transaction has been settled by `close_tab`'s prompt,
+            // so this is just releasing the connection.
+            //
+            // **Below the pinned backstop, not above it.** Releasing first meant
+            // the `return` above could hand back a tab whose session had already
+            // gone — unreachable today, because `guard_close` refuses a pinned
+            // close through `tabsel::can_close` before anything is asked, but the
+            // ordering is not something the next caller should have to know.
+            (drop_session)(id);
             // H5: cancel this tab's in-flight query so it can't complete onto
             // cleared/freed signals (and stops the server-side work).
             if let Some((_, tok)) = tokens.borrow_mut().remove(&id) {
@@ -5582,6 +5607,19 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                 // one empty result, and the pins go with the rest — they belong
                 // to the tab that was closed, not to the one respawning here.
                 tab.reset_results();
+                // **And out of Manual**, because the release above took its
+                // pinned session with it. `session_for` matches `TxMode::Manual`,
+                // looks the tab up in `sessions`, finds nothing and refuses the
+                // run before dispatch — "the transaction connection isn't ready
+                // — switch to Auto-commit and back" — and nothing on this path
+                // re-opens one, so the blank slate could not run a statement
+                // until the user noticed the footer pill and toggled it twice.
+                // The same two lines the connection-repointed path and
+                // `delete_conn_now` fold into their own release, for the same
+                // reason: the tab dropping to Auto-commit is what stops its
+                // footer claiming a transaction that no longer exists.
+                tab.tx_mode.set(TxMode::Auto);
+                tab.tx.set(TxState::closed());
                 // Drop any temporary font zoom so the respawned tab starts at the
                 // user's configured size (the post-flash rebuild reads this).
                 tab.font_zoom.set(None);
@@ -12398,6 +12436,130 @@ mod app_tests {
     /// the way `core/tests/doc_coverage.rs` takes a file as its subject: the
     /// signal has no direct writer left, because `rearm_activity` — which cannot
     /// be spelled without the arm — is the only thing that writes it.
+    /// This file's production text — every source gate below reads it.
+    fn production_main() -> String {
+        let src = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("src")
+                .join("main.rs"),
+        )
+        .expect("this file's own source");
+        src.split("#[cfg(test)]")
+            .next()
+            .expect("production code")
+            .to_string()
+    }
+
+    /// The closure binding a line sits in — `let <name>: Rc<dyn Fn…> = {` at
+    /// `app_view`'s own indent. Deep inside a nested closure that is the name a
+    /// reader would call the site by, and unlike a line number it does not move
+    /// when something above it does.
+    fn owning_closure(src: &str, upto: usize) -> (String, usize) {
+        let (mut name, mut at) = (String::from("<app_view>"), 0usize);
+        let mut off = 0usize;
+        for line in src[..upto].split('\n') {
+            if let Some(rest) = line.strip_prefix("    let ")
+                && let Some(id) = rest.split([':', ' ', '=']).next()
+                && !id.is_empty()
+                && id.chars().all(|c| c.is_alphanumeric() || c == '_')
+                && rest[id.len()..].starts_with(':')
+            {
+                name = id.to_string();
+                at = off;
+            }
+            off += line.len() + 1;
+        }
+        (name, at)
+    }
+
+    /// That closure's whole body — to the `};` back at `app_view`'s own indent.
+    ///
+    /// A proximity window answers about the wrong thing here: the reset that
+    /// pairs with a release legitimately sits far below it, in the branch that
+    /// is *keeping* the tab, while the branch that removes the tab outright
+    /// needs no reset at all.
+    fn closure_body(src: &str, at: usize) -> &str {
+        let end = src[at..].find("\n    };").map_or(src.len(), |i| at + i);
+        &src[at..end]
+    }
+
+    /// **Releasing a tab's pinned session without dropping it out of Manual
+    /// leaves a tab that refuses every statement.**
+    ///
+    /// `session_for` matches `TxMode::Manual` and then looks the tab up in
+    /// `sessions`; with the entry gone it returns `None` and the run fails before
+    /// dispatch with *"the transaction connection isn't ready — switch to
+    /// Auto-commit and back"*. Nothing re-opens it — `open_session`'s callers are
+    /// `set_tx_mode`, `set_active_db` and `repair_killed_session`, and a closed
+    /// tab is on none of those paths.
+    ///
+    /// `close_tab_now`'s keep-≥1 branch is an explicit blank-slate rebuild — its
+    /// own comment says so, and it resets nine pieces of tab state. `tx_mode` and
+    /// `tx` were the two it did not touch, and they are the two the release
+    /// invalidates. Both siblings that drop a session while keeping the tab
+    /// (`save_conn`'s repoint, `delete_conn_now`) set `TxMode::Auto` in the same
+    /// breath and say why.
+    ///
+    /// The behavioural half is GUI-only — `app_view`'s closures are not reachable
+    /// from a test — so the subject is the source text, as
+    /// `every_activity_generation_bump_arms_the_poll_loop` below takes it.
+    #[test]
+    fn releasing_a_session_drops_its_tab_out_of_manual() {
+        /// `open_session` releases in order to *re-pin*: the tab is staying in
+        /// Manual on purpose, and its own error arm drops to Auto if the
+        /// re-open cannot happen.
+        const EXEMPT: &[(&str, &str)] = &[(
+            "open_session",
+            "drops only to re-open; the Err arm is what falls back to Auto",
+        )];
+        let src = production_main();
+        let mut offenders: Vec<String> = Vec::new();
+        let mut from = 0;
+        while let Some(at) = src[from..].find("(drop_session)(") {
+            let at = from + at;
+            from = at + "(drop_session)(".len();
+            let (who, opens_at) = owning_closure(&src, at);
+            if EXEMPT.iter().any(|(name, _)| *name == who) {
+                continue;
+            }
+            if !closure_body(&src, opens_at).contains("TxMode::Auto") {
+                offenders.push(who);
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "these release a tab's pinned session and leave it in Manual, so the \
+             tab refuses every statement until the user toggles the mode twice: \
+             {offenders:?}"
+        );
+    }
+
+    /// **Picking the database you are already on is not a change**, and
+    /// `set_active_db` treated it as one: it cancelled the tab's in-flight
+    /// query, raised the Commit/Rollback prompt on a Manual tab, and dropped and
+    /// re-opened its pinned connection. The menu offers it — the current row is
+    /// *accented*, not disabled — so the click is one the UI invites.
+    ///
+    /// `set_tx_mode`, the sibling action that also calls `guard_tx` and
+    /// `open_session`, opens with exactly this refusal. The decision now lives in
+    /// `tabsel::rebind_needed` where it has tests; this is the half those tests
+    /// cannot see, which is whether the caller asks.
+    #[test]
+    fn set_active_db_refuses_a_rebind_that_is_not_one() {
+        let src = production_main();
+        let at = src
+            .find("let set_active_db:")
+            .expect("set_active_db is gone — this gate is stale");
+        let body = &src[at..];
+        let end = body.find("\n    };").expect("the end of set_active_db");
+        assert!(
+            body[..end].contains("rebind_needed("),
+            "set_active_db does not ask whether the pick is a change, so \
+             re-picking the accented row cancels the running query, prompts to \
+             settle a transaction that is not moving, and re-pins the session"
+        );
+    }
+
     #[test]
     fn every_activity_generation_bump_arms_the_poll_loop() {
         let writes: Vec<&str> = include_str!("main.rs")

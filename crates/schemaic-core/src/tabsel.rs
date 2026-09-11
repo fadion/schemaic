@@ -140,6 +140,41 @@ pub fn others_to_close(tabs: &[ClosableRef], conn: u64, keep: usize) -> Vec<usiz
         .collect()
 }
 
+/// Does picking `picked` in the database selector actually **move** the tab?
+///
+/// Three ways the answer is no, and the app asked only the first:
+///
+/// - `picked` is not one of the databases the selector lists, so there is
+///   nothing to bind to;
+/// - the tab is already on `picked`, on the connection the pick is made
+///   against — the selector *offers* this, because it renders the current row
+///   accented rather than disabled, unlike every other already-in-that-state
+///   entry in the app.
+///
+/// **Re-picking the row you are on is not free.** The rebind cancels the tab's
+/// in-flight query (a 30-second `SELECT` goes `Cancelled` with nothing saying
+/// why, and the database has not changed), it raises the
+/// Commit/Rollback/Cancel prompt on a Manual tab with an uncommitted `INSERT` —
+/// where answering Rollback discards the user's transaction for a move that is
+/// not one — and either answer then drops and re-opens the pinned connection.
+/// The sibling action that also settles a transaction and re-pins a session,
+/// `set_tx_mode`, opens with exactly this refusal.
+///
+/// **The connection is half the question.** A tab keeps the connection it was
+/// opened on, and the rebind writes `conn_id` as well as `database`, so a tab
+/// naming `world` on another connection still has somewhere to move to.
+pub fn rebind_needed(
+    tab: Option<(u64, Option<&str>)>,
+    active_conn: u64,
+    picked: &str,
+    known: &[String],
+) -> bool {
+    if !known.iter().any(|n| n == picked) {
+        return false;
+    }
+    tab != Some((active_conn, Some(picked)))
+}
+
 /// The database a question about "the current tab" should be answered with:
 /// the focused tab's, but **only when that tab is on `active_conn`** —
 /// otherwise `fallback`, which the caller has already scoped to the active
@@ -173,6 +208,62 @@ pub fn scoped_database(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn dbs() -> Vec<String> {
+        ["world", "classicmodels"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect()
+    }
+
+    #[test]
+    fn picking_a_different_database_rebinds() {
+        let tab = Some((7, Some("world")));
+        assert!(rebind_needed(tab, 7, "classicmodels", &dbs()));
+    }
+
+    /// The one the selector invites: the current row is accented, not disabled.
+    #[test]
+    fn re_picking_the_database_the_tab_is_already_on_does_nothing() {
+        let tab = Some((7, Some("world")));
+        assert!(!rebind_needed(tab, 7, "world", &dbs()));
+    }
+
+    /// A tab that names the same database on a *different* connection still has
+    /// somewhere to go — the rebind writes `conn_id` as well as `database`.
+    #[test]
+    fn the_same_name_on_another_connection_is_still_a_move() {
+        let tab = Some((9, Some("world")));
+        assert!(rebind_needed(tab, 7, "world", &dbs()));
+    }
+
+    /// A tab bound to no database yet, and a tab that no longer exists.
+    #[test]
+    fn a_tab_with_no_database_binds() {
+        assert!(rebind_needed(Some((7, None)), 7, "world", &dbs()));
+        assert!(rebind_needed(None, 7, "world", &dbs()));
+    }
+
+    /// The existence check the app already had, kept here so there is one
+    /// answer rather than two.
+    #[test]
+    fn a_database_the_selector_does_not_list_binds_to_nothing() {
+        assert!(!rebind_needed(
+            Some((7, Some("world"))),
+            7,
+            "chinook",
+            &dbs()
+        ));
+        // Including when it is the tab's own — a stale name after the list
+        // reloaded. There is still nothing to move to.
+        assert!(!rebind_needed(
+            Some((7, Some("chinook"))),
+            7,
+            "chinook",
+            &dbs()
+        ));
+        assert!(!rebind_needed(Some((7, Some("world"))), 7, "world", &[]));
+    }
 
     #[test]
     fn scoped_database_takes_the_tab_database_on_the_active_connection() {
