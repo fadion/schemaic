@@ -839,6 +839,51 @@ impl Connection {
         self
     }
 
+    /// This connection with the padding taken off every **coordinate** — and
+    /// off nothing else.
+    ///
+    /// A hostname copied out of a hosting console or a wrapped email arrives
+    /// with a trailing space, and a trailing space is invisible in a text
+    /// field: every operation on the connection then fails on name resolution
+    /// for a host that looks correct on screen, and Manage Connections' Test
+    /// renders it as a bare red ✗. The same for the user (an auth failure), and
+    /// for the SSH key path, where a stray space is a file-not-found for a path
+    /// the file picker itself may have produced.
+    ///
+    /// The form had decided this seven times and omitted it five, three lines
+    /// apart — `port`, `file`, `database`, the SSH port and all three TLS paths
+    /// were trimmed; `host`, `user`, `ssh.host`, `ssh.user` and `ssh.key_path`
+    /// were not, the last a file path sitting between two groups of trimmed
+    /// file paths. `conn_import` trims a host too, so a connection *imported*
+    /// from DBeaver got one and a connection *typed* did not. This is the one
+    /// answer both ask.
+    ///
+    /// **The three secrets are deliberately left alone.** A leading or trailing
+    /// space is a legal character in a password, an SSH password and a key
+    /// passphrase; trimming one would silently mangle a credential the user
+    /// cannot see, which is a worse failure than the one this fixes. `name` is
+    /// also untouched — it is a label, not a coordinate, and nothing resolves
+    /// it.
+    pub fn trimmed(mut self) -> Connection {
+        fn trim(s: &mut String) {
+            let t = s.trim();
+            if t.len() != s.len() {
+                *s = t.to_string();
+            }
+        }
+        trim(&mut self.host);
+        trim(&mut self.user);
+        trim(&mut self.file);
+        trim(&mut self.database);
+        trim(&mut self.ssh.host);
+        trim(&mut self.ssh.user);
+        trim(&mut self.ssh.key_path);
+        trim(&mut self.tls.ca_path);
+        trim(&mut self.tls.client_cert_path);
+        trim(&mut self.tls.client_key_path);
+        self
+    }
+
     /// Should opening this connection open an SSH tunnel first?
     ///
     /// **Not `ssh.enabled` on its own.** The engine picker can be changed on a
@@ -1810,6 +1855,59 @@ mod tests {
         assert!(saved.password.is_empty(), "nothing reaches the keyring");
         assert_eq!(saved.ssh, SshTunnel::default());
         assert!(!saved.uses_tunnel());
+    }
+
+    /// **Every coordinate is trimmed, and the three secrets are not.**
+    ///
+    /// The form trimmed seven fields and not five, three lines apart — `host`,
+    /// `user`, `ssh.host`, `ssh.user` and `ssh.key_path`, the last a file path
+    /// sitting between two groups of trimmed file paths. A hostname pasted with
+    /// the trailing space a copy picks up was stored verbatim, and every
+    /// operation on the connection then failed on name resolution for a host
+    /// that looks correct on screen, a trailing space being invisible in a text
+    /// field.
+    ///
+    /// The password half is the trap the fix has to avoid and is asserted as
+    /// hard as the rest: a leading or trailing space is a legal character in a
+    /// credential, and trimming one would silently mangle a secret the user
+    /// cannot see.
+    #[test]
+    fn trimmed_strips_padding_from_every_coordinate_and_from_no_secret() {
+        let mut c = tunnelled();
+        c.host = " db.example.com ".into();
+        c.user = " root\t".into();
+        c.file = "  C:/data/app.db ".into();
+        c.database = " app ".into();
+        c.ssh.host = " bastion.example.com ".into();
+        c.ssh.user = "\tdeploy ".into();
+        c.ssh.key_path = " C:/keys/id_ed25519 ".into();
+        c.tls.ca_path = " C:/certs/ca.pem ".into();
+        c.tls.client_cert_path = " C:/certs/client.pem ".into();
+        c.tls.client_key_path = " C:/certs/client.key ".into();
+        c.password = " secret ".into();
+        c.ssh.password = " ssh-secret ".into();
+        c.ssh.key_passphrase = " key-secret ".into();
+
+        let t = c.clone().trimmed();
+        assert_eq!(t.host, "db.example.com");
+        assert_eq!(t.user, "root");
+        assert_eq!(t.file, "C:/data/app.db");
+        assert_eq!(t.database, "app");
+        assert_eq!(t.ssh.host, "bastion.example.com");
+        assert_eq!(t.ssh.user, "deploy");
+        assert_eq!(t.ssh.key_path, "C:/keys/id_ed25519");
+        assert_eq!(t.tls.ca_path, "C:/certs/ca.pem");
+        assert_eq!(t.tls.client_cert_path, "C:/certs/client.pem");
+        assert_eq!(t.tls.client_key_path, "C:/certs/client.key");
+
+        assert_eq!(t.password, " secret ", "a password is stored verbatim");
+        assert_eq!(t.ssh.password, " ssh-secret ");
+        assert_eq!(t.ssh.key_passphrase, " key-secret ");
+
+        // And it is idempotent, so routing a saved connection through it twice
+        // cannot change one.
+        assert_eq!(t.clone().trimmed(), t);
+        assert_eq!(tunnelled().trimmed(), tunnelled());
     }
 
     /// And a real server connection is returned exactly as it was — the whole

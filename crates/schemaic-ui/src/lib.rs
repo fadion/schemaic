@@ -3313,8 +3313,13 @@ impl DraftSignals {
             db_type,
             user: self.user.get_untracked(),
             password: self.password.get_untracked(),
-            file: self.file.get_untracked().trim().to_string(),
-            database: self.database.get_untracked().trim().to_string(),
+            // The per-field `.trim()`s that used to be scattered through here
+            // are `Connection::trimmed()`'s job now — this function had decided
+            // it seven times and omitted it five, and `conn_import` had its own
+            // sixth spelling. What is left here is the parse, which needs the
+            // trim before it.
+            file: self.file.get_untracked(),
+            database: self.database.get_untracked(),
             ssh: schemaic_core::connection::SshTunnel {
                 enabled: self.ssh_enabled.get_untracked(),
                 host: self.ssh_host.get_untracked(),
@@ -3327,9 +3332,9 @@ impl DraftSignals {
             },
             tls: schemaic_core::connection::Tls {
                 mode: self.tls_mode.get_untracked(),
-                ca_path: self.tls_ca_path.get_untracked().trim().to_string(),
-                client_cert_path: self.tls_client_cert_path.get_untracked().trim().to_string(),
-                client_key_path: self.tls_client_key_path.get_untracked().trim().to_string(),
+                ca_path: self.tls_ca_path.get_untracked(),
+                client_cert_path: self.tls_client_cert_path.get_untracked(),
+                client_key_path: self.tls_client_key_path.get_untracked(),
             },
             color: self.color.get_untracked(),
             prominent_color: self.prominent_color.get_untracked(),
@@ -3337,6 +3342,7 @@ impl DraftSignals {
             environment: self.environment.get_untracked(),
             ai_data: Some(self.ai_data.get_untracked()),
         }
+        .trimmed()
         .sanitized()
     }
 }
@@ -12470,6 +12476,54 @@ mod window_key_gate {
     /// before the returned stack. A precise one would need to parse the builder
     /// chain; this one costs nothing and fails on exactly the mistake that was
     /// made.
+    /// **The connection form routes what it builds through
+    /// `Connection::trimmed`**, and does not decide the trimming field by field
+    /// again.
+    ///
+    /// `trimmed` has its own unit tests in `schemaic-core`; what they cannot
+    /// reach is this call site — `to_connection` reads eighteen signals and
+    /// needs a Floem scope, so a test of the composition has to be a gate. And
+    /// the composition is where the bug was: the function trimmed `port`,
+    /// `file`, `database`, the SSH port and all three TLS paths, and left
+    /// `host`, `user`, `ssh.host`, `ssh.user` and `ssh.key_path` verbatim —
+    /// three lines apart, so the intent was established and those five were the
+    /// omission. A hostname pasted with the trailing space a copy picks up was
+    /// saved as typed, and every operation on the connection failed on name
+    /// resolution for a host that looks correct on screen.
+    #[test]
+    fn the_connection_form_trims_through_core() {
+        let src = std::fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("src")
+                .join("lib.rs"),
+        )
+        .expect("lib.rs");
+        let body = crate::source_gate::production_code(&src);
+        let at = body
+            .find("pub fn to_connection(")
+            .expect("`to_connection` is gone — this gate is stale");
+        let end = body[at..]
+            .find("\n    }")
+            .expect("`to_connection`'s end — this gate is stale");
+        let f = &body[at..at + end];
+
+        assert!(
+            f.contains(".trimmed()"),
+            "`to_connection` no longer routes through `Connection::trimmed`, so \
+             the padding on a pasted host or SSH key path reaches the driver \
+             verbatim:\n{f}"
+        );
+        // The per-field spelling is what `trimmed` replaced. One `.trim()`
+        // remains and must: the port is parsed, and `"3306 ".parse()` fails.
+        let trims = f.matches(".trim()").count();
+        assert_eq!(
+            trims, 2,
+            "`to_connection` has {trims} field-level `.trim()` calls; the two \
+             that belong are the port parses, and anything else is the \
+             field-by-field decision `Connection::trimmed` exists to end:\n{f}"
+        );
+    }
+
     #[test]
     fn the_window_key_handler_is_on_the_view_workspace_returns() {
         let src = std::fs::read_to_string(
