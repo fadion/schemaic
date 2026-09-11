@@ -1097,6 +1097,27 @@ pub fn levels_for(dialect: SqlDialect) -> &'static [GrantLevelKind] {
     }
 }
 
+/// The level a grant form opens on — **the widest one that is not the whole
+/// server**, and `None` only where the engine grants at no level at all.
+///
+/// A capability rather than `levels_for(dialect).first()`, which is what the
+/// opener used to read. That spelling is right on PostgreSQL by accident:
+/// its list starts at `Database` because its cluster-wide powers are role
+/// attributes rather than privileges, so there is no `Global` entry to land on.
+/// MySQL's list *does* start at `Global`, and that level takes no name fields —
+/// so the form opened already satisfied, and its shortest path was
+/// `GRANT … ON *.*` from two clicks: tick a privilege, press Preview SQL.
+///
+/// Stated here so the answer is one the engine gives rather than one its list
+/// order gives, and so a fourth dialect inherits it by saying what it grants at
+/// rather than by the position of an entry.
+pub fn default_grant_level(dialect: SqlDialect) -> Option<GrantLevelKind> {
+    levels_for(dialect)
+        .iter()
+        .copied()
+        .find(|k| *k != GrantLevelKind::Global)
+}
+
 /// Every privilege `dialect` accepts at `level`, in the order its own
 /// documentation lists them.
 ///
@@ -2269,6 +2290,45 @@ mod tests {
         assert!(pg.contains(&GrantLevelKind::Schema));
 
         assert!(levels_for(SqlDialect::Sqlite).is_empty());
+    }
+
+    /// **The level a grant form opens on is never the whole server.** Asked as
+    /// a capability, so an engine whose `levels_for` list happens to start at
+    /// its widest entry does not decide it by list order.
+    #[test]
+    fn no_engine_opens_a_grant_on_the_whole_server() {
+        for d in [SqlDialect::MySql, SqlDialect::Postgres, SqlDialect::Sqlite] {
+            assert_ne!(
+                default_grant_level(d),
+                Some(GrantLevelKind::Global),
+                "{d:?} opens a grant form at the widest scope it has"
+            );
+        }
+    }
+
+    /// And it is still a level the engine actually offers — `None` only where
+    /// there are none at all, which is the shape the form relies on to decide
+    /// whether to show its Level row.
+    #[test]
+    fn the_level_a_grant_opens_on_is_one_the_picker_lists() {
+        for d in [SqlDialect::MySql, SqlDialect::Postgres, SqlDialect::Sqlite] {
+            match default_grant_level(d) {
+                Some(k) => assert!(levels_for(d).contains(&k), "{d:?} offers no {k:?}"),
+                None => assert!(
+                    levels_for(d).is_empty(),
+                    "{d:?} has levels but opens on none"
+                ),
+            }
+        }
+        // The two the form is reachable on both land on a named database.
+        assert_eq!(
+            default_grant_level(SqlDialect::MySql),
+            Some(GrantLevelKind::Database)
+        );
+        assert_eq!(
+            default_grant_level(SqlDialect::Postgres),
+            Some(GrantLevelKind::Database)
+        );
     }
 
     /// Every level an engine offers has something to grant at it — a picker

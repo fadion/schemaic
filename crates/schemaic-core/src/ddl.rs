@@ -3553,6 +3553,28 @@ impl Change {
                 }
                 out
             }
+            // **The one grant that carries a consequence.** Every arm above
+            // describes what a plan takes away or rewrites; this is the case
+            // where what it *gives* is the risk. `GRANT DROP ON *.*` reached
+            // every database on the server and showed an empty risk block,
+            // two entries from a revoke of `SELECT` on one table that warned —
+            // and the form opened pre-set to this level, so it was also the
+            // shortest path through that screen (`users::default_grant_level`
+            // is the other half of the fix).
+            //
+            // Narrow on purpose: a grant at a named database or table is scoped
+            // to a thing the user typed, and saying so every time would train
+            // the block to be ignored where it means something.
+            Change::GrantPrivileges(c)
+                if c.level.kind() == crate::users::GrantLevelKind::Global =>
+            {
+                vec![format!(
+                    "Grants {} to {} on every database on this server — including \
+                     databases that do not exist yet, not just the one being browsed.",
+                    Self::privilege_words(&c.privileges),
+                    c.account.display()
+                )]
+            }
             _ => Vec::new(),
         }
     }
@@ -3573,10 +3595,20 @@ impl Change {
     ///
     /// The *reversible* list is the narrow one, so a fourth change inherits the
     /// strong heading rather than losing it by omission.
+    ///
+    /// A **grant** joins it for the revoke's reason read backwards: it destroys
+    /// nothing and is undone by revoking it. Only the whole-server case reaches
+    /// this at all — the others carry no risk sentence for the heading to head —
+    /// and "This can't be undone" over a widened privilege would spend, on the
+    /// one plan that is genuinely a keystroke away from being taken back, the
+    /// heading `DROP USER` needs to keep.
     fn risk_is_reversible(&self) -> bool {
         matches!(
             self,
-            Change::RevokePrivileges(_) | Change::RevokeRole(_) | Change::CreateAccount(_)
+            Change::RevokePrivileges(_)
+                | Change::RevokeRole(_)
+                | Change::CreateAccount(_)
+                | Change::GrantPrivileges(_)
         )
     }
 }
@@ -21279,6 +21311,73 @@ mod database_tests {
                 }
             )))
             .is_empty()
+        );
+    }
+
+    /// **A grant at the whole-server level is the one grant that carries a
+    /// consequence**, and it had no arm: `GRANT DROP ON *.*` showed an empty
+    /// risk block while revoking `SELECT` on one table warned. What it *gives*
+    /// is the risk — every database on the server, including ones that do not
+    /// exist yet.
+    #[test]
+    fn a_grant_on_the_whole_server_says_which_databases_it_reaches() {
+        let global = Box::new(crate::users::PrivilegeChange {
+            account: an_account(),
+            level: crate::users::GrantLevel::Global,
+            privileges: vec!["DROP".into()],
+            with_grant_option: false,
+        });
+        let risks = account("app@%", MySql, Change::GrantPrivileges(global)).destructive();
+        assert_eq!(risks.len(), 1, "{risks:?}");
+        assert!(risks[0].contains("DROP"), "{risks:?}");
+        assert!(
+            risks[0].contains("every database"),
+            "the sentence names the scope: {risks:?}"
+        );
+    }
+
+    /// And the arm is **narrow** — a grant at a named level still carries none,
+    /// which is the assertion `revokes_and_drops_carry_a_consequence_and_grants_do_not`
+    /// makes for the database level and this one repeats for the table level, so
+    /// widening the arm by accident is caught here rather than in the preview.
+    #[test]
+    fn a_grant_at_a_named_level_carries_no_consequence() {
+        for level in [
+            crate::users::GrantLevel::Database("shop".into()),
+            crate::users::GrantLevel::Table {
+                qualifier: "shop".into(),
+                name: "orders".into(),
+            },
+        ] {
+            let c = Box::new(crate::users::PrivilegeChange {
+                account: an_account(),
+                level: level.clone(),
+                privileges: vec!["DROP".into()],
+                with_grant_option: false,
+            });
+            assert!(
+                account("app@%", MySql, Change::GrantPrivileges(c))
+                    .destructive()
+                    .is_empty(),
+                "{level:?} warns"
+            );
+        }
+    }
+
+    /// **A grant is undone by revoking it**, so the block over it reads "Before
+    /// you apply" — the same answer a revoke gets for the mirror-image reason,
+    /// and not the `DROP USER` heading.
+    #[test]
+    fn a_global_grant_is_not_headed_as_irreversible() {
+        let global = Box::new(crate::users::PrivilegeChange {
+            account: an_account(),
+            level: crate::users::GrantLevel::Global,
+            privileges: vec!["DROP".into()],
+            with_grant_option: false,
+        });
+        assert_eq!(
+            account("app@%", MySql, Change::GrantPrivileges(global)).risk_heading(),
+            "Before you apply"
         );
     }
 

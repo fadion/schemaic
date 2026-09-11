@@ -174,20 +174,27 @@ pub(crate) fn open_for_grant(ui: &Ui, database: &str, account: &Principal) {
 
 /// The draft the grant form opens on.
 ///
-/// **Pre-picked to the widest level the engine has**, so the form opens with its
-/// name fields already meaning something rather than with a picker the user has
-/// to notice first — and so `level` is `None` *only* on an engine that has no
-/// levels at all. The form relies on that: it shows the Level row exactly when
-/// the draft holds a level, with no fallback to `levels_for(…).first()` of its
-/// own, because a dropdown displaying a level the draft does not hold would
+/// **Pre-picked to the widest level below the whole server**, so the form opens
+/// with its name fields already meaning something rather than with a picker the
+/// user has to notice first — and so `level` is `None` *only* on an engine that
+/// has no levels at all. The form relies on that: it shows the Level row exactly
+/// when the draft holds a level, with no fallback to `levels_for(…).first()` of
+/// its own, because a dropdown displaying a level the draft does not hold would
 /// leave the rest of the form hidden and picking the entry already shown would
 /// not be a change that unstuck it.
+///
+/// It reads [`users::default_grant_level`] rather than `levels_for(…).first()`,
+/// which is what it used to. That rationale above is true on PostgreSQL and was
+/// false on MySQL: `Global` heads MySQL's list and takes *no* name fields, so
+/// the form opened already satisfied at the widest scope the engine has, and
+/// two clicks — tick a privilege, press Preview SQL — emitted
+/// `GRANT … ON *.*`.
 ///
 /// Its own function so that coupling is one call and one test rather than a
 /// literal in an opener and an assumption in a view.
 pub(crate) fn initial_grant_draft(dialect: SqlDialect) -> GrantDraft {
     GrantDraft {
-        level: users::levels_for(dialect).first().copied(),
+        level: users::default_grant_level(dialect),
         ..Default::default()
     }
 }
@@ -1222,17 +1229,32 @@ mod form_shape_tests {
         }
     }
 
-    /// And it is the *widest* level, which is the one a form should open on: the
-    /// picker's first entry, so the box agrees with the menu behind it.
+    /// **And it is never the whole server.** The composition, not the capability
+    /// on its own: `users::default_grant_level` answering `Database` is worth
+    /// nothing if the opener still reads `levels_for(…).first()`, which is what
+    /// it did — and on MySQL that first entry is `Global`, a level taking no
+    /// name fields, so the form's shortest path was `GRANT … ON *.*` in two
+    /// clicks.
     #[test]
-    fn the_level_it_opens_on_is_the_first_the_picker_offers() {
+    fn the_level_it_opens_on_is_never_the_whole_server() {
         for d in [SqlDialect::MySql, SqlDialect::Postgres] {
             assert_eq!(
                 initial_grant_draft(d).level,
-                users::levels_for(d).first().copied(),
+                users::default_grant_level(d),
                 "{d:?}"
             );
+            assert_ne!(
+                initial_grant_draft(d).level,
+                Some(users::GrantLevelKind::Global),
+                "{d:?} opens the grant form at the widest scope it has"
+            );
         }
+        // The one that regressed: MySQL lists Global first, and the opener used
+        // to take it.
+        assert_eq!(
+            initial_grant_draft(SqlDialect::MySql).level,
+            Some(users::GrantLevelKind::Database)
+        );
     }
 
     /// The three dropdowns, and only they. Each rebuilds the form because each
