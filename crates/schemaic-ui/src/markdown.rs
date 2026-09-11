@@ -224,17 +224,6 @@ fn md_table(
         .into_any()
 }
 
-/// Render Claude's markdown into Floem views via pulldown-cmark (CommonMark +
-/// tables + strikethrough), so tables, nested lists, blockquotes, links, and
-/// backslash escapes render correctly. Fenced code blocks become `code_block`s
-/// (with the action bar); everything else maps onto `inline_text`/`md_item`/
-/// `md_table`.
-///
-/// `settled` is whether the turn has finished streaming, and it gates the
-/// proposal card. Mid-stream the fence is still open, and pulldown-cmark closes
-/// an unterminated block at the end of input — so a proposal would render as a
-/// card full of half-arrived JSON, flickering "couldn't read this" on every
-/// chunk. Until the turn settles, a proposal block is just a code block.
 /// One rendered block of a markdown reply, in the order it belongs on screen.
 ///
 /// **Split out from the view builder so the order can be tested at all.** The
@@ -518,7 +507,28 @@ fn flush_item(out: &mut Vec<MdBlock>, runs: &mut Runs, item_stack: &mut [String]
     });
 }
 
+/// Render Claude's markdown into Floem views via pulldown-cmark (CommonMark +
+/// tables + strikethrough), so tables, nested lists, blockquotes, links, and
+/// backslash escapes render correctly. Fenced code blocks become `code_block`s
+/// (with the action bar); everything else maps onto `inline_text`/`md_item`/
+/// `md_table`.
+///
+/// `settled` is whether the turn has finished streaming, and it gates the
+/// proposal card. Mid-stream the fence is still open, and pulldown-cmark closes
+/// an unterminated block at the end of input — so a proposal would render as a
+/// card full of half-arrived JSON, flickering "couldn't read this" on every
+/// chunk. Until the turn settles, a proposal block is just a code block.
 pub(crate) fn render_markdown(src: &str, actions: CodeActions, settled: bool) -> impl IntoView {
+    // **A captured `Color`, deliberately, and this is the one place it is
+    // written down.** The rule is that a themable colour reaches a reactive
+    // style as `fn() -> Color`; a `rich_text` `AttrsList` is not a style
+    // closure and cannot take one, so the body colour is resolved here and
+    // baked in. What makes that safe is the caller: `ai_panel`'s bubble
+    // `dyn_container` is keyed on `theme::ui_generation()`, which `set_ui` and
+    // `set_ui_scale` bump — the only two things that change a UI colour or
+    // size — so every bubble is rebuilt on a theme change. That key's own
+    // comment names *this* baked colour as the reason it exists. Narrowing the
+    // key is therefore a change to this function's correctness, 900 lines away.
     let base = theme::bubble_claude_text();
     // **The order is [`md_blocks`]', and nothing here changes it.** This maps
     // one block to one view; every decision about *what* comes out and in what
