@@ -1137,45 +1137,15 @@ impl GridState {
     fn add_cloned_rows(&self, data_idxs: &[usize]) -> usize {
         let model = self.edit_model.get_untracked();
         let rs = self.rs.get_untracked();
-        let ncols = rs.col_count();
+        // **Through `edit::cloned_row`, with `dirty` in hand.** This used to
+        // read `rs.cell` unconditionally, so duplicating a row whose cell the
+        // user had just typed into seeded the copy with the *pre-edit* value —
+        // the one still on the server — with nothing saying the copy differed
+        // from the row that was copied.
+        let dirty = self.dirty.get_untracked();
         let maps: Vec<HashMap<usize, CellEdit>> = data_idxs
             .iter()
-            .map(|&data_idx| {
-                let mut map: HashMap<usize, CellEdit> = HashMap::new();
-                if data_idx < rs.row_count() {
-                    for ci in 0..ncols {
-                        // `text_editable`, not `editable`: a clone copies the
-                        // cell's **displayed** value, and a binary cell displays
-                        // `<n bytes>`. Copying that would put the placeholder in
-                        // the new row as text — the clone's bytes are not in the
-                        // grid to copy, so the honest clone leaves the column
-                        // unset and the `INSERT` takes its default.
-                        if !model.text_editable(ci) {
-                            continue;
-                        }
-                        let auto = rs
-                            .columns
-                            .get(ci)
-                            .and_then(|c| c.origin.as_ref())
-                            .map(|o| o.flags.auto_increment)
-                            .unwrap_or(false);
-                        if auto {
-                            continue; // server assigns the auto-increment key
-                        }
-                        if let Some(c) = rs.cell(data_idx, ci) {
-                            map.insert(
-                                ci,
-                                if c.is_null() {
-                                    CellEdit::Null
-                                } else {
-                                    CellEdit::Text(c.display().to_string())
-                                },
-                            );
-                        }
-                    }
-                }
-                map
-            })
+            .map(|&data_idx| edit::cloned_row(&model, &rs, &dirty, data_idx))
             .collect();
         let mut idx = 0;
         self.new_rows.update(|rows| {

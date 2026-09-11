@@ -956,6 +956,72 @@ pub fn staged_cell(orig: Option<&str>, is_null: bool, val: Option<&str>) -> Stag
     }
 }
 
+/// The pending row a **Duplicate row** should produce from data row `di`: every
+/// editable column's value as the grid is *showing* it, keyed by result column.
+///
+/// **As the grid draws it, not as the server stored it.** The clone read
+/// `rs.cell` unconditionally and never consulted `dirty`, so typing `Bob` into
+/// a cell, seeing it green, and duplicating that row seeded the copy with
+/// `Alice` — the value still on the server — with nothing saying the copy
+/// differed from the row that was copied. Commit, and the table gained a row
+/// the user never previewed. Every neighbouring reader had already been fixed
+/// the other way (`ai_fill_value`'s row context, `blob_value`'s subscription,
+/// and the aggregates bar, whose own note is "reads each cell **as the grid
+/// draws it** … a staged green edit was never in it at all"), and
+/// [`GridCells`] exists to be the single resolver they all go through.
+///
+/// Two columns are left unset, and both were already the clone's rules:
+///
+/// - a column that is not [`EditModel::text_editable`] — a binary cell
+///   *displays* `<n bytes>`, and copying that would put the placeholder into
+///   the new row as text. The clone's bytes are not in the grid to copy, so the
+///   honest clone leaves the column out and the `INSERT` takes its default;
+/// - an **auto-increment** column, which the server assigns.
+///
+/// `dirty` is keyed by (data row, column), as [`DirtyCells`] is. Pending rows
+/// are not clonable and so are not an input: they live past the real rows and
+/// the gutter offers Duplicate only on committed ones.
+pub fn cloned_row(
+    model: &EditModel,
+    rs: &ResultSet,
+    dirty: &DirtyCells,
+    di: usize,
+) -> HashMap<usize, CellEdit> {
+    let mut map: HashMap<usize, CellEdit> = HashMap::new();
+    if di >= rs.row_count() {
+        return map;
+    }
+    for ci in 0..rs.col_count() {
+        if !model.text_editable(ci) {
+            continue;
+        }
+        let auto = rs
+            .columns
+            .get(ci)
+            .and_then(|c| c.origin.as_ref())
+            .map(|o| o.flags.auto_increment)
+            .unwrap_or(false);
+        if auto {
+            continue; // server assigns the auto-increment key
+        }
+        if let Some(staged) = dirty.get(&(di, ci)) {
+            map.insert(ci, staged.clone());
+            continue;
+        }
+        if let Some(c) = rs.cell(di, ci) {
+            map.insert(
+                ci,
+                if c.is_null() {
+                    CellEdit::Null
+                } else {
+                    CellEdit::Text(c.display().to_string())
+                },
+            );
+        }
+    }
+    map
+}
+
 /// The grid's cell values as plain data: what the view's signals hold, borrowed
 /// for one read.
 ///
@@ -3256,6 +3322,65 @@ mod tests {
         };
         let m = analyze_edit(&r, schema);
         assert_eq!(m.insert_target().map(|t| t.table.as_str()), Some("users"));
+    }
+
+    /// **A clone copies what is on screen**, which is the staged value where
+    /// there is one.
+    ///
+    /// Duplicate row read `rs.cell` unconditionally, so a cell the user had
+    /// typed into — green, uncommitted, right there on the row being copied —
+    /// was cloned with its *pre-edit* value and nothing said so. Commit, and
+    /// the table gained a row the user had never seen a preview of.
+    #[test]
+    fn a_clone_copies_the_staged_value_not_the_stored_one() {
+        let r = ResultSet::from_rows(
+            vec![
+                col("id", "INT", "users", true, false),
+                col("name", "VARCHAR", "users", false, false),
+                col("note", "VARCHAR", "users", false, false),
+            ],
+            vec![vec![Value::Int(2), Value::Str("Alice".into()), Value::Null]],
+        );
+        let schema = |_db: &str, _s: Option<&str>, t: &str| {
+            (t == "users").then(|| {
+                schema_with_pk(
+                    "users",
+                    &["id"],
+                    &[("id", "int"), ("name", "varchar"), ("note", "varchar")],
+                )
+            })
+        };
+        let m = analyze_edit(&r, schema);
+
+        // Nothing staged: the stored values, and a NULL as an explicit NULL
+        // rather than the four characters the cell displays.
+        let clean = cloned_row(&m, &r, &DirtyCells::new(), 0);
+        assert_eq!(clean.get(&1), Some(&CellEdit::Text("Alice".into())));
+        assert_eq!(clean.get(&2), Some(&CellEdit::Null));
+
+        // Staged: the typed value, on both the edited column and a column
+        // staged to NULL.
+        let mut dirty = DirtyCells::new();
+        dirty.insert((0, 1), CellEdit::Text("Bob".into()));
+        dirty.insert((0, 2), CellEdit::Text("kept".into()));
+        let staged = cloned_row(&m, &r, &dirty, 0);
+        assert_eq!(
+            staged.get(&1),
+            Some(&CellEdit::Text("Bob".into())),
+            "the clone carries the pre-edit value the user cannot see"
+        );
+        assert_eq!(staged.get(&2), Some(&CellEdit::Text("kept".into())));
+
+        // A staged edit on a *different* row is not this row's.
+        let mut elsewhere = DirtyCells::new();
+        elsewhere.insert((1, 1), CellEdit::Text("Carol".into()));
+        assert_eq!(
+            cloned_row(&m, &r, &elsewhere, 0).get(&1),
+            Some(&CellEdit::Text("Alice".into()))
+        );
+
+        // Out of range is an empty row, not a panic.
+        assert!(cloned_row(&m, &r, &dirty, 9).is_empty());
     }
 
     #[test]
