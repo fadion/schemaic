@@ -43,7 +43,9 @@ use crate::widgets::{
     focus_root_with_ring, form_gap, form_section, form_setting, modal_footer_split, modal_h,
     modal_pad_h, modal_title_owned, modal_w, panel_style,
 };
-use crate::{AccountTarget, FieldCfg, GrantTarget, Ui, ddl_preview, edit_field, theme};
+use crate::{
+    AccountTarget, FieldCfg, GrantTarget, Ui, UsersTarget, ddl_preview, edit_field, theme,
+};
 
 fn panel_w() -> f64 {
     modal_w(540.0)
@@ -134,7 +136,12 @@ fn reset_then_seed<T: 'static>(d: crate::DdlUi, draft: floem::reactive::RwSignal
 ///
 /// `database` is where the plan will run — see [`AccountTarget::database`]. The
 /// caller has already asked `users::supports_user_admin`.
-pub(crate) fn open_for_new(ui: &Ui, database: &str) {
+///
+/// **`from` is the browser's own [`UsersTarget`], and it is where `conn_id` and
+/// `dialect` come from** — not `edit_ctx`, which reads the switcher *now*. The
+/// reasoning is written out once, over `open_for_grant`'s copy of the same four
+/// lines, and `anchor_gate` is what holds both to it.
+pub(crate) fn open_for_new(ui: &Ui, from: &UsersTarget, database: &str) {
     let ctx = edit_ctx(ui);
     if ctx.read_only {
         return;
@@ -147,27 +154,53 @@ pub(crate) fn open_for_new(ui: &Ui, database: &str) {
     // nobody typed this time.
     reset_then_seed(d, d.account_draft, AccountDraft::default());
     d.account.set(Some(AccountTarget {
-        conn_id: ctx.conn_id,
+        // **`from`, not `ctx`** — see the note above `open_for_grant`'s twin
+        // line. `read_only` is the one field that stays live.
+        conn_id: from.conn_id,
         database: database.to_string(),
-        dialect: ctx.dialect,
+        dialect: from.dialect,
         read_only: ctx.read_only,
     }));
 }
 
-/// Open the grant form for one account. Same refusal at the same door.
-pub(crate) fn open_for_grant(ui: &Ui, database: &str, account: &Principal) {
+/// Open the grant form for one account. Same refusal at the same door, and the
+/// same anchor — the account was fetched from `from`'s server, so the grant has
+/// to run there.
+pub(crate) fn open_for_grant(ui: &Ui, from: &UsersTarget, database: &str, account: &Principal) {
     let ctx = edit_ctx(ui);
     if ctx.read_only {
         return;
     }
     let d = ui.ddl;
     d.session.update(|g| *g += 1);
-    reset_then_seed(d, d.grant_draft, initial_grant_draft(ctx.dialect));
+    reset_then_seed(d, d.grant_draft, initial_grant_draft(from.dialect));
     d.grant.set(Some(GrantTarget {
-        conn_id: ctx.conn_id,
+        // **The browser's captured target, not the live connection.**
+        // `UsersTarget`'s own doc states the rule in the imperative — *"the
+        // browser describes the server it was opened on, even if the switcher
+        // has since moved"*, and *"Its two sibling targets (`AccountTarget`,
+        // `GrantTarget`) carry one for the same reason"* — and both launchers
+        // read `edit_ctx` instead, which resolves the switcher at the moment the
+        // button is pressed. This target then paired a `Principal` fetched from
+        // connection A's `mysql.user` with B's `conn_id` and dialect: the plan
+        // was emitted at B's grammar and `GRANT … TO 'app'@'%'` ran on B, for an
+        // account that lives on A.
+        //
+        // The module's third write action already spells it this way, eight
+        // lines away — the Drop path captures `let plan_conn_id =
+        // target.conn_id;` *"so the preview is built for the server this account
+        // lives on, not for whichever the switcher points at by the time the
+        // confirm is answered"*.
+        //
+        // **`read_only` stays live**, and deliberately: it is the refusal, not
+        // the address, and `WriteGate` reads it the same way. A connection
+        // marked read-only while the browser is open must stop the write it is
+        // about to authorise — which is also why it is still the stamp
+        // `read_only_door_gate` finds these two doors by.
+        conn_id: from.conn_id,
         database: database.to_string(),
         account: account.clone(),
-        dialect: ctx.dialect,
+        dialect: from.dialect,
         read_only: ctx.read_only,
     }));
 }
@@ -1345,5 +1378,92 @@ mod form_shape_tests {
         assert_eq!(d.account_draft.get_untracked(), AccountDraft::default());
 
         scope.dispose();
+    }
+}
+
+/// **A form's *address* comes from the browser that raised it, not from the
+/// connection switcher.**
+///
+/// The two launchers above stamped `conn_id` and `dialect` off `edit_ctx`, which
+/// resolves `ui.conn.active_conn` at the moment the button is pressed, while the
+/// `UsersTarget` beside them carries both captured at open — and its own doc
+/// states the rule in the imperative: *"the browser describes the server it was
+/// opened on, even if the switcher has since moved"*, *"Its two sibling targets
+/// ([`AccountTarget`], [`GrantTarget`]) carry one for the same reason"*. A
+/// `GrantTarget` therefore paired a `Principal` read out of connection A's
+/// `mysql.user` with B's connection and B's grammar, and Apply ran the grant on
+/// B for an account that lives on A. The module's third write action, Drop, was
+/// already correct and says so eight lines away.
+///
+/// **A source gate, because there is nothing else to point a test at.** The
+/// decision is two struct literals inside `fn`s that take the whole `Ui`, and
+/// building one in a test means 36 fields and 91 more transitively (A2-L7-01).
+/// What *can* be asserted mechanically is the spelling — that `edit_ctx`'s
+/// answer never becomes a target's address in this file — and that is exactly
+/// the regression, since `edit_ctx` is the only way to reach the switcher from
+/// here. Scoped to this file on purpose: every other editor is launched from the
+/// schema tree, where the active connection *is* the target, so
+/// `read_only: ctx.read_only` beside `conn_id: ctx.conn_id` is right there.
+#[cfg(test)]
+mod anchor_gate {
+    /// What must not appear: the switcher, used as an address.
+    const FORBIDDEN: &[&str] = &["ctx.conn_id", "ctx.dialect"];
+    /// What must appear instead, once per door.
+    const REQUIRED: &[&str] = &["conn_id: from.conn_id,", "dialect: from.dialect,"];
+
+    #[test]
+    fn no_account_form_takes_its_address_from_the_switcher() {
+        let src = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("src")
+                .join("account_editor.rs"),
+        )
+        .expect("account_editor.rs");
+        // Comments quote both spellings — including this module's own prose, if
+        // it ever moves out of a `#[cfg(test)]` item — so scan production code.
+        let body = crate::source_gate::production_code(&src);
+
+        // The floor, which is the failure mode a source gate is most prone to:
+        // a rename would leave nothing to look for and pass silently.
+        assert!(
+            body.contains("edit_ctx(ui)"),
+            "the launchers no longer call `edit_ctx` — rewrite this gate rather \
+             than deleting it: `read_only` is still supposed to come from there"
+        );
+        for want in REQUIRED {
+            assert_eq!(
+                body.matches(want).count(),
+                2,
+                "`{want}` should appear once in each of the two doors — did one \
+                 of them stop reading the browser's captured target?"
+            );
+        }
+        for bad in FORBIDDEN {
+            assert!(
+                !body.contains(bad),
+                "`{bad}` is back in account_editor.rs: a form's address must come \
+                 from the browser's captured `UsersTarget`, not from whichever \
+                 connection the switcher points at when the button is pressed. \
+                 `read_only` is the one field that stays live — it is the \
+                 refusal, not the address."
+            );
+        }
+    }
+
+    /// And the refusal is untouched by all of it: both doors still guard
+    /// themselves in the step that launches, which is `read_only_door_gate`'s
+    /// rule for all fifteen. Asserted here too because this fix moved the two
+    /// lines that gate finds them by.
+    #[test]
+    fn both_doors_still_refuse_a_read_only_connection_first() {
+        let src = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("src")
+                .join("account_editor.rs"),
+        )
+        .expect("account_editor.rs");
+        let body = crate::source_gate::production_code(&src);
+        assert_eq!(body.matches("if ctx.read_only {").count(), 2);
+        assert_eq!(body.matches("read_only: ctx.read_only,").count(), 2);
     }
 }

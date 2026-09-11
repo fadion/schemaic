@@ -731,11 +731,15 @@ fn new_account_row(ui: &Ui, target: &UsersTarget, gate: WriteGate, ring: FocusRi
     let enabled = gate.enabled();
     let ui = ui.clone();
     let database = target.database.clone().unwrap_or_default();
+    // The whole target, not just its database: the form is for the server the
+    // browser was opened on, and the switcher may have moved. See
+    // `account_editor::account_anchor`.
+    let anchor = target.clone();
     let open = move || {
         // The read-only refusal is inside `open_for_new`, so this launch is
         // guarded in the same step that launches it — the dimming says the
         // action is unavailable, this is what makes it so.
-        crate::account_editor::open_for_new(&ui, &database);
+        crate::account_editor::open_for_new(&ui, &anchor, &database);
     };
     let open_click = open.clone();
     in_ring_button(
@@ -820,8 +824,11 @@ fn actions_row(
         // footer's `ACTION_TAB`.
         12,
         move || {
+            // `grant_target` whole, not only its database — the account was
+            // read off *this* server's catalog, so the grant has to run there.
             crate::account_editor::open_for_grant(
                 &grant_ui,
+                &grant_target,
                 &grant_target.database.clone().unwrap_or_default(),
                 &grant_who,
             );
