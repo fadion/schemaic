@@ -767,9 +767,25 @@ pub fn font_label() -> f32 {
     scaled_font(13.0)
 }
 /// A form hint — one step under the label it explains.
+///
+/// **The step is taken, not assumed.** Four base values a single pixel apart
+/// (14/13/13/12/12) go through a rounding that is not size-preserving below
+/// 1.0, so at 80% `font_body`, `font_label`, `font_hint` and `font_status` all
+/// came back 10.0 — this doc was false, and the section header's "nothing
+/// smaller than `font_body()` anywhere except the status-bar footer" had an
+/// empty carve-out, because the footer was no longer smaller either. Every form
+/// hint and every footer segment rendered at label size, at the one setting
+/// chosen by someone who can least afford four type sizes reading as one.
+///
+/// `min` rather than a wider base: it changes **only** the scale that
+/// collapsed. 80% goes 10 → 9; 100% (12), 130% (16) and 160% (19) are the
+/// numbers the app already shipped, which a base change would have moved
+/// everywhere.
 pub fn font_hint() -> f32 {
-    scaled_font(12.0)
+    scaled_font(12.0).min(font_body() - 1.0)
 }
+/// The status-bar footer — the one carve-out the type scale's rule names, so it
+/// keeps its step for [`font_hint`]'s reason and in the same way.
 pub fn font_status() -> f32 {
-    scaled_font(12.0)
+    scaled_font(12.0).min(font_body() - 1.0)
 }

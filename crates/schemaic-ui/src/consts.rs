@@ -18,16 +18,20 @@
 //!   • **Hairlines** (`GRID_CELL_DIVIDER`, `COMPLETION_BORDER`) — a rule is one
 //!     physical line at every size; 2px of it reads as a border, not a seam.
 //!   • **Editor-relative metrics** (`EDITOR_PAD_TOP`, `COMPLETION_GUTTER`,
-//!     `HL_GUTTER`, `HL_DIGIT_W`, `WAVE_H`, `HL_PAD`) — they measure against the
-//!     *code* font, which has its own size setting and which the interface scale
-//!     deliberately doesn't touch. Scaling them would slide the statement
-//!     highlight and the squiggles off the glyphs they mark.
+//!     `COMPLETION_LINE_H`, `HL_GUTTER`, `HL_DIGIT_W`, `WAVE_H`, `HL_PAD`) —
+//!     they measure against the *code* font, which has its own size setting and
+//!     which the interface scale deliberately doesn't touch. Scaling them would
+//!     slide the statement highlight and the squiggles off the glyphs they mark.
 //!   • **Seeds for persisted, user-dragged sizes** (`theme::SCHEMA_W`,
-//!     `theme::AI_W`, `EDITOR_H`, `TREE_ROW_MIN_W`) — see
-//!     [`crate::theme::SCHEMA_W`].
-//!   • **Icon bases** (`SCHEMA_ICON_BASE`, `COMPLETION_ICON_BASE`) — the
-//!     unscaled figure a `scaled()` is *applied to* at the call site, so scaling
-//!     the constant too would square the factor.
+//!     `theme::AI_W`, `EDITOR_H`) — see [`crate::theme::SCHEMA_W`].
+//!   • **Floors on a signal of unscaled user px** (`TREE_ROW_MIN_W`) — it is
+//!     not a seed and nothing drags or persists it; it is the pre-publication
+//!     floor of `schema_tree::tree_row_min_w`, and it is unscaled because the
+//!     signal it floors carries the user's own px. (It was filed under the
+//!     bullet above, which gave the right answer for the wrong reason.)
+//!   • **Icon bases** (`SCHEMA_ICON_BASE`, `COMPLETION_ICON_BASE`,
+//!     `TOOLBAR_ICON_BASE`) — the unscaled figure a `scaled()` is *applied to*
+//!     at the call site, so scaling the constant too would square the factor.
 //!   • **The terminal's own font ladder** (`TERM_FONT_SIZES`) — the terminal
 //!     font has its own size setting, like the editor's, and the interface scale
 //!     deliberately doesn't touch either.
@@ -41,10 +45,15 @@
 //! carry a literal `9.0` over a `scaled(18.0)` box, which is the F10a sweep's
 //! (`S7.3-L2-01`).
 //!
-//! The list is prose, and prose is the wrong shape for it — it has been found
-//! short three times, once by the site comment below pointing at a bullet that
-//! wasn't here. `S7.1-L3-03` proposes a source-gate test with the exceptions as
-//! *data*, which is the form that gets updated when it fails.
+//! **The list above is prose, and prose is the wrong shape for it.** It was
+//! found short three times — once by a site comment pointing at a bullet that
+//! wasn't here — and then twice more: `TOOLBAR_ICON_BASE` was a third icon base
+//! the "Icon bases" bullet did not know about while its own doc said it was one,
+//! and `COMPLETION_LINE_H` was named by no bullet at all. So the exemptions are
+//! **data** now as well, in `unscaled_const_gate::EXEMPT`, and a new `const`
+//! length in this file does not compile past the suite until it has said which
+//! bullet it belongs to and why. The prose stays as the explanation; the array
+//! is what fails.
 
 use crate::theme;
 use crate::theme::scaled;
@@ -759,6 +768,55 @@ mod scale_tests {
         });
     }
 
+    /// **The type scale keeps its steps at every scale**, which is the claim
+    /// two paragraphs in `theme.rs` make and neither was true at 80%.
+    ///
+    /// The five tokens are four base values a single pixel apart
+    /// (14/13/13/12/12) taken through a rounding step that is not
+    /// size-preserving below 1.0, so at `UiScale::Small` `font_body`,
+    /// `font_label`, `font_hint` and `font_status` all came back **10.0**.
+    /// `font_hint`'s own doc — "one step under the label it explains" — was
+    /// then false, and the section header's rule ("nothing smaller than
+    /// `font_body()` anywhere except the status-bar footer") had an empty
+    /// carve-out, because the footer was no longer smaller than body either.
+    /// Every hint in every form and every footer segment rendered at label
+    /// size, at the one setting chosen by someone who wants more on screen and
+    /// can least afford four type sizes reading as one.
+    ///
+    /// `themes.rs` pins each token's arithmetic individually (13 → 10 at Small
+    /// is asserted there); nothing compared two, which is why the collapse was
+    /// pinned and unexamined.
+    #[test]
+    fn the_type_scale_keeps_its_steps_at_every_scale() {
+        use crate::theme::{font_body, font_hint, font_label, font_status, font_title};
+        for scale in UiScale::ALL {
+            at(scale, || {
+                let (title, body, label, hint, status) = (
+                    font_title(),
+                    font_body(),
+                    font_label(),
+                    font_hint(),
+                    font_status(),
+                );
+                let what = scale.label();
+                assert!(
+                    body < title,
+                    "{what}: body {body} is not under title {title}"
+                );
+                assert_eq!(label, body, "{what}: a label is body-sized");
+                assert!(
+                    hint < body,
+                    "{what}: a hint {hint} is not one step under the label {label} it explains"
+                );
+                assert!(
+                    status < body,
+                    "{what}: the footer {status} is not smaller than body {body}, so the \
+                     design rule's only carve-out is empty"
+                );
+            });
+        }
+    }
+
     /// A derived indent is summed from **scaled parts**, not scaled after the
     /// fact, so it lands on the pixel the glyphs it aligns under actually
     /// occupy. The two are not the same number: at 80% the six parts round up
@@ -1126,6 +1184,122 @@ mod virtual_space_tests {
 /// track it rides in, which is code-font-relative, so it is not panel air and
 /// does not follow the interface scale.
 ///
+/// **Every unscaled `const` length in this file has said why.**
+///
+/// The module doc's bullets are what a reader consults to decide whether an
+/// unscaled `const` here is a decision or an oversight, and prose cannot fail.
+/// It was found short five times: three by hand, then `TOOLBAR_ICON_BASE` — a
+/// third icon base whose own doc said it was one while the "Icon bases" bullet
+/// did not know it existed — and `COMPLETION_LINE_H`, named by no bullet at all
+/// and combined with a scaled sibling in one expression at
+/// `completion.rs:661`. A sixth was mis-filed rather than missing:
+/// `TREE_ROW_MIN_W` sat under "seeds for persisted, user-dragged sizes" and is
+/// not one, so the list gave the right answer for the wrong reason.
+///
+/// Until this is data, every future `const` in this file is a judgement call
+/// re-made from scratch — and this file is the home of the app's dimensions.
+#[cfg(test)]
+mod unscaled_const_gate {
+    /// `(const name, which bullet it belongs to and why)`. A length that is not
+    /// here fails the gate; an entry naming a constant that no longer exists
+    /// fails the liveness test below, so a rename cannot leave a stale licence
+    /// behind for the next constant at that spelling to inherit.
+    const EXEMPT: &[(&str, &str)] = &[
+        (
+            "GRID_CELL_DIVIDER",
+            "hairline — one physical rule at every size",
+        ),
+        ("COMPLETION_BORDER", "hairline, on both axes"),
+        (
+            "EDITOR_PAD_TOP",
+            "editor-relative: measured against the code font",
+        ),
+        (
+            "COMPLETION_GUTTER",
+            "editor-relative: the line-number gutter",
+        ),
+        (
+            "COMPLETION_LINE_H",
+            "editor-relative: a gap from the caret's own line geometry",
+        ),
+        ("HL_GUTTER", "editor-relative"),
+        ("HL_DIGIT_W", "editor-relative"),
+        ("WAVE_H", "editor-relative: squiggle amplitude"),
+        ("HL_PAD", "editor-relative"),
+        ("EDITOR_H", "seed for a persisted, user-dragged height"),
+        (
+            "TREE_ROW_MIN_W",
+            "floor on a signal carrying unscaled user px — not a seed",
+        ),
+        (
+            "SCHEMA_ICON_BASE",
+            "icon base: `scaled()` is applied at the call site",
+        ),
+        ("COMPLETION_ICON_BASE", "icon base"),
+        ("TOOLBAR_ICON_BASE", "icon base"),
+    ];
+
+    /// This file's production code — the gate is about *this* module's own
+    /// constants, so it is the one scan that is legitimately crate-local.
+    fn own_source() -> String {
+        let src = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("src")
+                .join("consts.rs"),
+        )
+        .expect("consts.rs");
+        crate::source_gate::production_code(&src)
+    }
+
+    /// Every `const <NAME>: f32|f64` declared here, in source order.
+    fn const_lengths(code: &str) -> Vec<String> {
+        code.lines()
+            .filter_map(|l| {
+                let t = l
+                    .trim_start()
+                    .strip_prefix("pub(crate) ")
+                    .unwrap_or(l.trim_start());
+                let rest = t.strip_prefix("const ")?;
+                let (name, ty) = rest.split_once(": ")?;
+                (ty.starts_with("f32 =") || ty.starts_with("f64 =")).then(|| name.to_string())
+            })
+            .collect()
+    }
+
+    #[test]
+    fn every_unscaled_length_constant_says_why() {
+        let names = const_lengths(&own_source());
+        assert!(
+            names.len() >= 12,
+            "the scan found only {} constants — has the declaration shape changed?",
+            names.len()
+        );
+        let missing: Vec<&String> = names
+            .iter()
+            .filter(|n| !EXEMPT.iter().any(|(e, _)| *e == n.as_str()))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "these `const` lengths are unscaled and say nowhere why: {missing:?}
+             Anything that boxes, indents or spaces text is a `fn() -> f64`              reading the interface scale. If this one genuinely must not scale,              add it to `unscaled_const_gate::EXEMPT` with its bullet and put the              name in the module doc beside its peers."
+        );
+    }
+
+    /// An entry naming a constant that is gone is a stale licence — and the next
+    /// constant at that spelling would inherit it. Same floor
+    /// `float_inset_gate::every_exemption_still_names_a_real_call` carries.
+    #[test]
+    fn every_exemption_still_names_a_real_const() {
+        let names = const_lengths(&own_source());
+        for (name, why) in EXEMPT {
+            assert!(
+                names.iter().any(|n| n == name),
+                "EXEMPT still licenses `{name}` ({why}), and no such `const` is                  declared here any more — drop the entry"
+            );
+        }
+    }
+}
+
 /// A literal `0.0` is exempt without an entry — zero has no scale, and
 /// `inset_left(0.0)` is the flex idiom for "pin to this edge" rather than a gap.
 #[cfg(test)]
