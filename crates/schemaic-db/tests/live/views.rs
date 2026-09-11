@@ -139,17 +139,7 @@ pub async fn an_edited_view_body_lands_and_settles(target: &'static Target) {
     );
     // …and re-applying what the server now reports settles: the second reading
     // is stable, which is the "permanently dirty in the editor" claim.
-    let settled = ddl::diff_view(
-        &after,
-        &ViewDraft::from_table(&view_of(&scratch).await).expect("a view draft"),
-        target.engine.dialect(),
-    );
-    assert!(
-        settled.changes.is_empty(),
-        "{}: after the edit the view no longer round-trips: {:?}",
-        target.name,
-        settled.changes
-    );
+    assert_writes_back_unchanged(&scratch, target, "the body edit").await;
 
     let rows = scratch
         .exec(&format!(
@@ -229,17 +219,7 @@ pub async fn a_view_that_drops_a_column_takes_the_destructive_arm_where_it_must(
         target.name
     );
     // …and it round-trips, which a re-create that lost an option would not.
-    let settled = ddl::diff_view(
-        &after,
-        &ViewDraft::from_table(&view_of(&scratch).await).expect("a view draft"),
-        dialect,
-    );
-    assert!(
-        settled.changes.is_empty(),
-        "{}: the narrowed view no longer round-trips: {:?}",
-        target.name,
-        settled.changes
-    );
+    assert_writes_back_unchanged(&scratch, target, "narrowing the column list").await;
 
     scratch.teardown().await;
 }
@@ -343,12 +323,24 @@ pub async fn a_view_is_never_writable_through_a_key_that_does_not_identify_a_row
         .iter()
         .map(|&ci| {
             let col = &rs.columns[ci];
-            let value = rs.cell(0, ci).expect("the first row").display().to_string();
-            format!(
-                "{} = '{}'",
-                schemaic_core::export::ident_if_needed(&col.name, target.engine.dialect()),
-                value.replace('\'', "''")
-            )
+            let dialect = target.engine.dialect();
+            let name = schemaic_core::export::ident_if_needed(&col.name, dialect);
+            let cell = rs.cell(0, ci).expect("the first row");
+            // **Through the shared quoter, and a NULL as `IS NULL`.** This was
+            // `'{}'` with a hand-rolled `''` escape, on the family where `\` is
+            // also a string escape by default: a cell holding `a\` builds an
+            // unterminated literal that fails the `COUNT(*)`, and one holding
+            // `a\'b` shifts the quoting and counts the wrong rows — reporting
+            // the key resolver as broken when it is the fixture's quoting that
+            // is. `=` against a rendered NULL was the same class one step over.
+            if cell.is_null() {
+                format!("{name} IS NULL")
+            } else {
+                format!(
+                    "{name} = {}",
+                    schemaic_core::export::sql_literal(&cell.to_value(), dialect)
+                )
+            }
         })
         .collect();
     assert!(
@@ -470,8 +462,19 @@ async fn seed_view(scratch: &Scratch, body: &str) {
         ))
         .await;
     let body = body.replace("{}", &scratch.qualified("t"));
+    // **With this leg's view options on it**, not bare. `TableInfo::view_options`
+    // was at its default in every fixture here, so `diff_view`'s options half
+    // and `create_view_sql`'s restatement of them had no live assertion at all —
+    // a redefinition that silently dropped `WITH CHECK OPTION` left a view that
+    // no longer refuses the writes it was created to refuse, and every test
+    // passed.
     scratch
-        .exec(&format!("CREATE VIEW {} AS {body}", scratch.qualified("v")))
+        .exec(&format!(
+            "CREATE {}VIEW {} AS {body}{}",
+            scratch.target.view_prefix_options,
+            scratch.qualified("v"),
+            scratch.target.view_suffix_options
+        ))
         .await;
 }
 
@@ -479,6 +482,94 @@ async fn seed_view(scratch: &Scratch, body: &str) {
 async fn apply_view(scratch: &Scratch, current: &TableInfo, draft: &ViewDraft, target: &Target) {
     let set = ddl::diff_view(current, draft, target.engine.dialect());
     scratch.apply_plan(&set, "view").await;
+}
+
+/// The view the server now reports, written back through the emitter, comes
+/// back **byte-identical** — and the editor is then clean against the reading
+/// it started from.
+///
+/// **This is the shape a settle assertion has to have here, and two tests had
+/// the other one.** `diff_view` computes its old body by calling
+/// `ViewDraft::from_table(current)` itself, so
+/// `diff_view(&after, &from_table(&read_again()))` compares one expression with
+/// itself: it answers "no change" for any body the server could return, an
+/// empty one included, and the message — "after the edit the view no longer
+/// round-trips" — is not a claim the code makes. This file's own identity test
+/// says so in as many words and is built around a deliberately stale reading to
+/// escape it; the two tests below took their second reading *after* the apply
+/// and walked back into it.
+///
+/// So the same escape, shared: a stale copy forces the emitter to emit, the
+/// statement runs, and the two assertions compare values the server produced at
+/// two different times.
+async fn assert_writes_back_unchanged(scratch: &Scratch, target: &Target, what: &str) {
+    let dialect = target.engine.dialect();
+    let before = view_of(scratch).await;
+    let draft = ViewDraft::from_table(&before)
+        .unwrap_or_else(|| panic!("{}: the view did not draft after {what}", target.name));
+
+    let mut stale = before.clone();
+    stale.view_definition = Some("SELECT id FROM nothing_at_all".to_string());
+    let set = ddl::diff_view(&stale, &draft, dialect);
+    assert!(
+        !set.changes.is_empty(),
+        "{}: the settle gate is vacuous after {what} — a differing body proposed \
+         no change",
+        target.name
+    );
+    let stmts = set.emit();
+    scratch
+        .db
+        .run_ddl(&scratch.database, &stmts, CancellationToken::new())
+        .await
+        .unwrap_or_else(|e| {
+            panic!(
+                "{}: re-applying the server's own view after {what} failed at \
+                 statement {} of {stmts:?}: {}",
+                target.name, e.at, e.message
+            )
+        });
+
+    let after = view_of(scratch).await;
+    assert_eq!(
+        after.view_definition, before.view_definition,
+        "{}: after {what} the view's definition changed by being written back \
+         through the emitter",
+        target.name
+    );
+    // **And its options.** They are not part of `view_definition`, so the
+    // comparison above cannot see a dropped `WITH CHECK OPTION` or a reset
+    // `SQL SECURITY` — the view would still return the same rows and would have
+    // stopped refusing the writes it was created to refuse.
+    assert_eq!(
+        after.view_options, before.view_options,
+        "{}: after {what} the view's options changed by being written back \
+         through the emitter",
+        target.name
+    );
+    assert!(
+        after
+            .view_options
+            .as_ref()
+            .is_some_and(|o| o.check_option.is_some()),
+        "{}: the fixture's check option was never read back, so the assertion \
+         above compares two defaults — options are {:?}",
+        target.name,
+        after.view_options
+    );
+    let settled = ddl::diff_view(
+        &before,
+        &ViewDraft::from_table(&after)
+            .unwrap_or_else(|| panic!("{}: the view did not draft after {what}", target.name)),
+        dialect,
+    );
+    assert!(
+        settled.changes.is_empty(),
+        "{}: after {what} the view no longer round-trips: {:?}\n      emitting {:?}",
+        target.name,
+        settled.changes,
+        settled.emit()
+    );
 }
 
 async fn view_of(scratch: &Scratch) -> TableInfo {

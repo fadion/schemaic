@@ -123,6 +123,23 @@ pub struct Target {
     /// Data on the target rather than an `if engine == Postgres` in a test
     /// body, for the reason at the top of [`crate::suite`].
     pub error_names_the_value: bool,
+    /// The **view options** this server has, split where its grammar puts
+    /// them: what goes between `CREATE ` and `VIEW `, and what goes after the
+    /// body.
+    ///
+    /// Every view in the tier was a bare `CREATE VIEW … AS <body>`, so
+    /// `TableInfo::view_options` was at its default in every fixture — and
+    /// `diff_view` compares `draft.options != old_options` as one of the two
+    /// triggers for a redefinition while `create_view_sql` restates them on the
+    /// way out, neither half with a live assertion. A view created
+    /// `WITH CHECK OPTION` that comes back without it stops refusing the writes
+    /// it was created to refuse, and nothing would have said so.
+    ///
+    /// Two fields rather than one template because the two families put their
+    /// clauses on opposite sides of the body: MySQL's `SQL SECURITY` is a
+    /// prefix, the check option is a suffix on all three.
+    pub view_prefix_options: &'static str,
+    pub view_suffix_options: &'static str,
     /// How a trigger on this server says "uppercase the name being inserted".
     ///
     /// **The two engines model a trigger differently, not just spell it
@@ -219,6 +236,8 @@ pub static MARIADB: Target = Target {
     grants_are_database_scoped: false,
     primary_key_include: None,
     error_names_the_value: false,
+    view_prefix_options: "SQL SECURITY INVOKER ",
+    view_suffix_options: " WITH CASCADED CHECK OPTION",
     trigger_body: Some("SET NEW.name = UPPER(NEW.name)"),
     trigger_function_ddl: None,
     trigger_function_name: None,
@@ -246,6 +265,8 @@ pub static MYSQL: Target = Target {
     grants_are_database_scoped: false,
     primary_key_include: None,
     error_names_the_value: false,
+    view_prefix_options: "SQL SECURITY INVOKER ",
+    view_suffix_options: " WITH CASCADED CHECK OPTION",
     trigger_body: Some("SET NEW.name = UPPER(NEW.name)"),
     trigger_function_ddl: None,
     trigger_function_name: None,
@@ -273,6 +294,8 @@ pub static POSTGRES: Target = Target {
     grants_are_database_scoped: true,
     primary_key_include: Some(" INCLUDE (payload)"),
     error_names_the_value: true,
+    view_prefix_options: "",
+    view_suffix_options: " WITH CASCADED CHECK OPTION",
     trigger_body: None,
     trigger_function_ddl: Some(
         "CREATE FUNCTION upper_name() RETURNS trigger AS $$          BEGIN NEW.name := UPPER(NEW.name); RETURN NEW; END $$ LANGUAGE plpgsql",
