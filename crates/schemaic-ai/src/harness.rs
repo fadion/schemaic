@@ -363,11 +363,18 @@ impl Harness {
     /// True everywhere today, and still a predicate: it is the question the
     /// settings field asks, and a harness that pins its own model would answer
     /// it differently without any call site changing shape.
+    ///
+    /// An exhaustive `match` even though every arm answers the same — for
+    /// [`Harness::env_seal`]'s reason, which is the whole point of the shape: a
+    /// fifth harness is a compile error here rather than a silent `false`
+    /// there, and a silent `false` here hides the model field for the new CLI
+    /// entirely. That is the failure `suggested_models`' own doc records one
+    /// step over — "a closed three-variant enum, so a model released after the
+    /// build could not be selected at all".
     pub fn supports_model_choice(self) -> bool {
-        matches!(
-            self,
-            Harness::Claude | Harness::Codex | Harness::Antigravity | Harness::OpenCode
-        )
+        match self {
+            Harness::Claude | Harness::Codex | Harness::Antigravity | Harness::OpenCode => true,
+        }
     }
 
     /// Model ids worth offering as one-click suggestions for this harness.
@@ -486,7 +493,10 @@ impl Harness {
     /// but does it by configuration, so "updating the CLI restores the full seal"
     /// would be advice that fixes nothing there.
     pub fn seals_by_flag(self) -> bool {
-        matches!(self, Harness::Claude)
+        match self {
+            Harness::Claude => true,
+            Harness::Codex | Harness::Antigravity | Harness::OpenCode => false,
+        }
     }
 
     /// Is this harness's seal an **environment** Schemaic must set on the child
@@ -579,7 +589,10 @@ impl Harness {
     /// not a lever.
     #[allow(dead_code)]
     pub fn streams_deltas(self) -> bool {
-        matches!(self, Harness::Claude | Harness::Antigravity)
+        match self {
+            Harness::Claude | Harness::Antigravity => true,
+            Harness::Codex | Harness::OpenCode => false,
+        }
     }
 
     /// Does one process serve the whole conversation?
@@ -596,7 +609,10 @@ impl Harness {
     /// held the same `conversation_id`, counted `num_turns` up, and answered the
     /// second question from the first one's context.
     pub fn is_persistent(self) -> bool {
-        matches!(self, Harness::Claude | Harness::Antigravity)
+        match self {
+            Harness::Claude | Harness::Antigravity => true,
+            Harness::Codex | Harness::OpenCode => false,
+        }
     }
 
     /// Can a previous turn be continued by id?
@@ -665,7 +681,10 @@ impl Harness {
     /// re-send the whole schema outline on every question, which is most of what
     /// persistence was for.
     pub fn session_system_in_first_turn(self) -> bool {
-        matches!(self, Harness::Antigravity)
+        match self {
+            Harness::Antigravity => true,
+            Harness::Claude | Harness::Codex | Harness::OpenCode => false,
+        }
     }
 }
 
