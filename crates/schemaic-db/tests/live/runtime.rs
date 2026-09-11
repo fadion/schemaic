@@ -619,7 +619,7 @@ pub async fn a_cancelled_import_on_a_non_transactional_table_says_the_rows_remai
 /// transaction on the server. `DROP DATABASE` then waits on it — measured on
 /// MariaDB — so a failing assertion here took the scratch teardown with it, and
 /// the first failure was reported as a teardown that hung rather than as itself.
-struct OpenSession(Option<std::sync::Arc<Session>>);
+pub struct OpenSession(pub Option<std::sync::Arc<Session>>);
 
 impl std::ops::Deref for OpenSession {
     type Target = Session;

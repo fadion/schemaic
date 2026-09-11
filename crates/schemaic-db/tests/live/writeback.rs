@@ -705,6 +705,161 @@ async fn rows(scratch: &Scratch, table: &str) -> Vec<(String, String)> {
 
 /// One cell from a one-row query. `sql` carries a single `{}` where the
 /// qualified `table` goes.
+/// A refused batch inside a **manual transaction** undoes only itself: the
+/// transaction survives, and the statements the user already ran in it stay.
+///
+/// **The Manual-mode write path had no live test at all.** Every other test
+/// here reaches `write_on` with `TxScope::Transaction`, through
+/// `Db::commit_writes` on a fresh connection. A Manual tab's Commit goes
+/// through `Session::commit_writes`, which runs the same `write_on` with
+/// `TxScope::Savepoint` — a different `begin_sql`/`rollback_sql`/`commit_sql`
+/// triple, where the undo is `ROLLBACK TO SAVEPOINT` and MySQL's warning-1196
+/// reading is being applied to a savepoint rather than to a transaction. So the
+/// two claims this file's header says "exist only at this seam" were asserted
+/// for the outer transaction and not for the nested one.
+///
+/// The property is `StmtOutcome::FailedIsolated`'s, and it is the one the
+/// savepoint exists to make true: on PostgreSQL a bare failure aborts the whole
+/// transaction, and reporting the isolated case as the bare one tells a user
+/// their uncommitted work is lost and offers only the action that loses it. So
+/// all three halves are asserted — the batch is undone, the earlier statement
+/// is not, and the transaction is still committable — and the commit at the end
+/// is what proves the third from outside.
+pub async fn a_refused_write_in_a_transaction_undoes_only_itself(target: &'static Target) {
+    use crate::runtime::OpenSession;
+    use schemaic_core::tx::StmtOutcome;
+    use schemaic_db::Session;
+
+    let scratch = Scratch::create(target, "savepoint_write").await;
+    seed_rows(&scratch, "w", WRITABLE).await;
+
+    let session = OpenSession(Some(
+        Session::open(&scratch.db, Some(&scratch.database))
+            .await
+            .unwrap_or_else(|e| panic!("{}: could not pin a session: {e}", target.name)),
+    ));
+    session
+        .ensure_tx()
+        .await
+        .unwrap_or_else(|e| panic!("{}: could not begin: {e}", target.name));
+
+    // What the user has already done in this transaction, and what the refused
+    // batch below must not take with it.
+    session
+        .fetch_query(
+            &format!(
+                "UPDATE {} SET note = 'in tx' WHERE id = 1",
+                scratch.qualified("w")
+            ),
+            10,
+            CancellationToken::new(),
+        )
+        .await
+        .result
+        .unwrap_or_else(|e| panic!("{}: the in-transaction update failed: {e}", target.name));
+
+    let out = session
+        .commit_writes(
+            &GridWrite {
+                updates: vec![
+                    // Succeeds, and is part of what the savepoint must undo.
+                    edit(
+                        &scratch,
+                        "w",
+                        &[("name", Some("changed"))],
+                        &[("id", Value::Int(2))],
+                    ),
+                    // Then this, whose row does not exist.
+                    edit(
+                        &scratch,
+                        "w",
+                        &[("name", Some("ghost"))],
+                        &[("id", Value::Int(99))],
+                    ),
+                ],
+                ..Default::default()
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+    let err = out
+        .result
+        .as_ref()
+        .err()
+        .unwrap_or_else(|| panic!("{}: a key matching no row must fail the batch", target.name))
+        .to_string();
+    assert!(
+        err.contains("affected 0 rows"),
+        "{}: the error should say what the guard saw, got {err:?}",
+        target.name
+    );
+    assert_eq!(
+        out.stmt,
+        StmtOutcome::FailedIsolated,
+        "{}: a savepoint-isolated failure was reported as {:?}, which tells the \
+         user the whole transaction is lost",
+        target.name,
+        out.stmt
+    );
+
+    // Through the session's own connection, which is the only place the
+    // uncommitted statement is visible at all.
+    let seen = session
+        .fetch_query(
+            &format!(
+                "SELECT name, note FROM {} ORDER BY id",
+                scratch.qualified("w")
+            ),
+            10,
+            CancellationToken::new(),
+        )
+        .await
+        .result
+        .unwrap_or_else(|e| panic!("{}: reading back inside the tx failed: {e}", target.name));
+    let inside: Vec<(String, String)> = (0..seen.row_count())
+        .map(|r| {
+            let cell = |c| {
+                seen.cell(r, c)
+                    .expect("a selected cell")
+                    .display()
+                    .to_string()
+            };
+            (cell(0), cell(1))
+        })
+        .collect();
+    assert_eq!(
+        inside,
+        [
+            ("one".to_string(), "in tx".to_string()),
+            ("two".to_string(), "n2".to_string()),
+            ("three".to_string(), "n3".to_string()),
+        ],
+        "{}: the savepoint rollback did not leave the transaction where it was",
+        target.name
+    );
+
+    // And the transaction is still committable, which is the claim
+    // `FailedIsolated` makes and the one a caller acts on.
+    session
+        .commit()
+        .await
+        .unwrap_or_else(|e| panic!("{}: the transaction was not committable: {e}", target.name));
+    assert_eq!(
+        rows(&scratch, "w").await,
+        [
+            ("one".to_string(), "in tx".to_string()),
+            ("two".to_string(), "n2".to_string()),
+            ("three".to_string(), "n3".to_string()),
+        ],
+        "{}: what a fresh connection sees after the commit",
+        target.name
+    );
+    drop(session);
+
+    scratch.teardown().await;
+}
+
 async fn one_cell(scratch: &Scratch, table: &str, sql: &str) -> String {
     let sql = sql.replace("{}", &scratch.qualified(table));
     let rs = scratch.exec(&sql).await;
