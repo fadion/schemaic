@@ -632,9 +632,18 @@ impl Harness {
     /// `codex exec --help` (codex-cli 0.153.4): *"Initial instructions for the
     /// agent. If not provided as an argument (or if `-` is used), instructions
     /// are read from stdin. If stdin is piped and a prompt is also provided,
-    /// stdin is appended as a `<stdin>` block"* — which is also the measured
-    /// behaviour the per-turn spawn's own comment records, and the reason the
-    /// prompt has to leave argv rather than merely be duplicated onto stdin.
+    /// stdin is appended as a `<stdin>` block"* — the second sentence being why
+    /// the prompt has to *leave* argv rather than merely be copied onto stdin.
+    ///
+    /// **And measured against that binary, not taken from its help.** Both
+    /// shapes were driven with the argv these builders produce and the prompt
+    /// written to stdin: the per-turn shape answered over `--json`
+    /// (`item.completed` carrying the asked-for text, then `turn.completed`),
+    /// and the one-shot wrote the same answer to its `-o` file. Both printed
+    /// `Reading prompt from stdin...` — note *prompt*, where the appended-block
+    /// path says `Reading additional input from stdin…` — and the one-shot's
+    /// echoed transcript showed the text under `user`, which is the part that
+    /// distinguishes "taken as the instructions" from "appended as context".
     ///
     /// The other three keep argv, and it is not an oversight:
     ///
