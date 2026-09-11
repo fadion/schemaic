@@ -2862,8 +2862,16 @@ existing prose was left alone.
     `a_plan_that_withholds_nothing_has_no_header`). That header is a `pub` free function in
     `ddl.rs` over any `&[String]` — `ChangeSet::withheld_header` delegates to it — because a second
     copy of that sentence is a second thing to keep true. `editor_script` is the same header over
-    `ddl::client_script`, so a MySQL trigger or routine body survives the app's `;` splitter, and
-    several such bodies in one plan is exactly this module's case. The engine it asks is
+    `ddl::client_script` — and **a compare plan carries no MySQL body at all**, which is the
+    opposite of what this passage used to claim ("several such bodies in one plan is exactly this
+    module's case"). `CompareEntry::needs_source` had already made that false: `plan` excludes every
+    MySQL routine, trigger and event being created or redefined and discloses them through
+    `omitted`, so only a `DROP` gets through and a `DROP` has no body. `client_script`'s `DELIMITER`
+    branch is therefore unreachable from here, and its terminate-every-statement rule is a no-op in
+    practice — on the two engines whose bodies *do* reach a plan, the emitters already end each
+    statement in `;`. The call stays because this is not the place that gets to know that, and
+    because the day a re-read body reaches a plan — the fix `needs_source` defers rather than
+    forecloses — the wrapping has to be here already. The engine it asks is
     `SchemaPlan`'s own `dialect` field rather than the first set's, so an empty plan still answers as
     the engine it was built for.
     `export_script` is `ChangeSet::export_script`'s counterpart and is what a preview's `script`
@@ -3026,7 +3034,9 @@ existing prose was left alone.
     same bar as the filter box* took the footer to 312, every one of them a tick nobody had looked at.
     The view's **None** link reads the same keys, so the pair is symmetric: it clears only what is
     shown, and a filtered-out selection is not silently discarded either. A `needs_source` body is
-    left out for the reason its row has no tick at all.
+    left out for the reason its row has no tick at all. It is also **what the app's compare landing
+    seeds the tick set from**, with `RowFilter::default()` because no filter is on screen yet — see
+    `compare_view.rs` below for the fourth spelling of the plannable predicate that replaced.
     **`left_ddl`/`right_ddl` are the two `CREATE` texts captured at comparison time**, so a view
     showing both sides is one `diff::line_diff` over two strings. Handing a renderer the two
     `TableInfo`s and letting it ask would put a second opinion about what an object *is* in a view;
@@ -3206,7 +3216,22 @@ existing prose was left alone.
     arbitrary and absence means nothing. The boundary is positional (`last_common`) and not a key
     comparison — the keys are text, and comparing them here would order `"1000"` before `"500"`
     where the server did not. Rows both windows hold are diffed either way, so a real change to a
-    visible row is still seen. This matters more than a display nicety because the log is
+    visible row is still seen.
+    **`ordered` has to describe the query that was actually sent, and the app is where that came
+    apart.** The order key is resolved by `main.rs`'s `monitor_order_key` off the live `db_nodes`,
+    and it was asked **twice**: once in `monitor_tick` to shape the fetch and again in
+    `monitor_apply` to stamp `Snapshot::ordered` on the reply. On a fresh connect the schema
+    routinely lands between the two — poll 1 goes out with no `ORDER BY`, the catalogue arrives while
+    it is in flight, and the reply is stamped ordered — after which `diff_snapshots` reads an
+    arbitrary sample as an ordered prefix and reports every row of it the real first page does not
+    hold as a DELETE, cells and all, into a log that is exportable and treated as a record
+    (`an_arbitrary_window_called_ordered_reports_deletes_of_rows_that_are_still_there`). The second
+    consequence needs no race at all: recomputed per tick, the *window* moves mid-session, which is
+    the same false diff by another door. It is now `MonitorCtx::order_by`, resolved once in
+    `open_monitor` before the first tick and read by both — pinned for the reason `key_cols` and
+    `dialect` already were, and the gate is
+    `the_monitors_order_key_is_resolved_at_open_and_nowhere_else`, a source gate because both calls
+    were individually correct and the defect was that there were two. This matters more than a display nicety because the log is
     exportable, and `discard_needs_asking` exists precisely because it is treated as a record
     somebody keeps.
     The **log** lives here too, not just the diff. `MonitorEntry { at, change }` — a change plus the
@@ -3250,7 +3275,21 @@ existing prose was left alone.
     which means a server holding five hundred and one sessions and one holding four thousand arrive
     here identical: any number derived from them is `1`, and "500 sessions · 1 more not shown" in
     front of four thousand is a figure that looks precise and is off by three and a half thousand.
-    `ActivitySummary::total_label(truncated)` prints `500+ sessions` for the same reason. The dedup
+    **That verdict rides on `ActivitySummary` as a field, not as an argument to one of its
+    methods**, and `total_label` prints `500+ sessions` off it. It was a parameter to `total_label`
+    alone, so the total was the only one of the four figures that could say the list behind it had
+    been cut: a pooled server at 700 connections all idle in transaction rendered
+    `500+ sessions   500 idle in txn`, the second figure counting a list `prepare` had already
+    truncated and stating it in the shape and the colour an uncapped server's would wear. `500+` is honest and the `500`
+    beside it is not, and it is the unqualified one a person is being asked to act on. The other
+    three go through `state_label(n, word)`, which takes the word from the caller because the
+    *colour* is the caller's too — the panel draws each figure in the colour that state wears on the
+    rows below — while the `+` is the one thing that must not be spelled there. A zero keeps its
+    bare shape: the line omits a zero rather than printing `0 blocked` in warning red on a healthy
+    server, and that the omitted zero is itself unreliable while `truncated` — the rows past the cap
+    could hold every running session on the box — is a real residue of capping the list and a
+    different fix, wanting a state tally the *server* computes rather than a caveat on a figure the
+    panel has decided not to draw. The dedup
     is the other half of the same honesty: MySQL answers the blocking graph out of
     `performance_schema.data_lock_waits` (or `INNODB_LOCK_WAITS`), which is one row per *lock* pair
     rather than per transaction pair, so a holder sitting on both a record lock and a gap lock the
@@ -3294,6 +3333,28 @@ existing prose was left alone.
     the wait worth a banner and write its sentence — deliberately `None` when the holder isn't in
     the snapshot, since a banner offering to kill a session that isn't there is worse than no
     banner.
+    **`is_lock_wait` is the one spelling of the server's `LOCK WAIT` word**, because two readers ask
+    it: `mysql_state`, which marks the row `Blocked`, and `wait_graph_is_worth_fetching`, which
+    decides whether the lock-wait query runs at all. Those two disagreeing would be a panel that
+    marks a session blocked and then never fetches what it is blocked by. The second is an answer
+    about a table the backend already holds — a thread appears in `INNODB_TRX` as a waiter only
+    while its `trx_state` is `LOCK WAIT`, so with no such row the wait graph is empty by
+    construction — and what it saves is a guaranteed round-trip failure per poll on MariaDB; the
+    measurement and the trade are under `schemaic-db` below.
+    **`matches_query` matches `SessionInfo::running_sql()`, not `sql`**, and the two differ on
+    exactly the rows PostgreSQL produces most of: an `idle` backend keeps its last statement in
+    `pg_stat_activity.query` indefinitely, so `sql` is populated for every connection in a pool
+    while the row deliberately draws nothing. Filtering on `sql` listed all of them — no statement,
+    no highlight, nothing on screen saying why they matched — with the one session actually running
+    the phrase lost among them. MariaDB was immune (`PROCESSLIST.INFO` is NULL on a `Sleep` thread),
+    so the panel behaved one way per engine, which is the failure `SessionInfo` being "engine-neutral
+    by construction" exists to prevent. *Copy statement* still reads `sql`: it is the one consumer
+    that genuinely wants the last statement, and it is a menu entry rather than a match. The
+    statement is compared **whitespace-collapsed and without allocating**, through
+    `text_ops::contains_collapsed_ignore_ascii_case` — `INFO` is the *untruncated* statement where
+    `SHOW PROCESSLIST` stops at 100 characters, there are up to `MAX_SESSIONS` of them, this test is
+    last in the `||` chain so a partial word matching nothing yet pays for all of them, and the
+    filter re-runs on every two-second poll as well as on every keystroke.
     **`SessionInfo::seconds` is `Option<f64>`, and `None` is not zero.** PostgreSQL masks
     `state_change`, `query_start` and `backend_start` for a backend the role may not inspect, so
     its age arrives NULL; folded to `0.0` it drew as **"0s"**, and a connection open for three
@@ -3670,7 +3731,9 @@ existing prose was left alone.
     `failed` own the rows-vs-`affected` choice and the `rows_capped` rule, and `outcome_line` the
     facts line's composition, so both are in core rather than in a view builder: a wrong
     `rows_capped` writes a number into a log read long after the grid it came from. `preview`
-    clamps at `PREVIEW_MAX` while `matches_query` searches the unclamped text — `max_height` and
+    clamps at `PREVIEW_MAX` while `matches_query` searches the unclamped text, through
+    `text_ops::contains_collapsed_ignore_ascii_case` so the collapse the panel draws happens during
+    the comparison rather than into a `String` first — `max_height` and
     `clip()` bound *paint*, not layout, so a multi-MB `INSERT` was laid out whole on every rebuild
     of the panel, but clamping what is drawn must not become a decision about what is findable.
   - `health.rs` — connection health-poll policy: `tick(HealthCfg, TickCtx) -> Tick` decides
@@ -4923,6 +4986,16 @@ existing prose was left alone.
       both.
   - `text_ops.rs` — Ctrl+/ `toggle_line_comment` + `find_matches`/`replace_all`/
     `contains_ignore_ascii_case` (find bars). Pure, ASCII-case-insensitive, byte-offset-preserving.
+    **`contains_collapsed_ignore_ascii_case` is the same search against a haystack read *as if* its
+    whitespace runs were collapsed, without building the collapsed string** — exactly
+    `split_whitespace().collect::<Vec<_>>().join(" ")`, which is what it replaces. The two search
+    boxes that read SQL want it for the same reason: a statement is stored as the user typed it,
+    over several lines, and drawn as one collapsed line, so a phrase visibly on screen has to find
+    the row it is on. Both got there by allocating that collapsed form per candidate per keystroke
+    (`history`'s since-deleted `full_preview`: a `Vec<&str>` and a `String`, each the size of the
+    statement). The activity panel is where that bites — see `activity::matches_query` above for the
+    four things that make it the bad case — and `history::matches_query` shares the helper. The
+    needle is used as given, since it comes from a single-line search box.
     `selected_text` resolves a mirrored byte range against the buffer for the AI panel: the range
     comes from the mounted editor while the text comes from the tab's own signal, so the two can
     disagree by a keystroke — an empty, reversed, out-of-range or mid-character range yields `None`
@@ -5485,14 +5558,25 @@ existing prose was left alone.
 - `schemaic-db` — MySQL/MariaDB (`mysql_async`) + SSH tunnels (`ssh.rs`), PostgreSQL in `pg.rs`,
   SQLite in `sqlite.rs`, and
   the pinned manual-transaction connection in `session.rs`. **`Db::fetch_sessions`/
-  `Db::kill_session`** are the Server Activity panel's whole backend, and they are three queries per
-  engine rather than one: MySQL runs `information_schema.PROCESSLIST` (required — without it there
+  `Db::kill_session`** are the Server Activity panel's whole backend, and they are up to three
+  queries per engine rather than one: MySQL runs `information_schema.PROCESSLIST` (required —
+  without it there
   is no panel) plus `INNODB_TRX` and a lock-wait join, both *best effort*, because those two are
   what need `PROCESS` privileges and what differ by server. The lock-wait join has no single
   spelling — MySQL 8 removed `information_schema.INNODB_LOCK_WAITS` and MariaDB has no
   `performance_schema.data_lock_waits` — so the pair is tried in turn, and when neither works the
   panel still knows *who* is blocked (`trx_state = 'LOCK WAIT'`) and simply cannot say by whom,
-  which is the honest degradation. PostgreSQL needs one query: `pg_stat_activity` filtered to
+  which is the honest degradation.
+  **On a quiet poll — nearly every poll — the join is not run at all.** With a fixed order exactly
+  one engine always pays a guaranteed failure, and since MySQL 8's spelling goes first that engine
+  is MariaDB: measured on 10.11, ERROR 1146 on every tick, 1,800 an hour at the two-second interval,
+  forever, to learn nothing. `collect_sessions` asks `activity::wait_graph_is_worth_fetching` over
+  the `INNODB_TRX` states it has already read — a thread announces itself as a waiter there — so the
+  question is answered from a table in hand and the round-trip goes away on *both* engines. It is
+  asked rather than remembered because a `Db` is built fresh by `Db::connect` per operation, so a
+  cache of which spelling worked would be discarded between polls; a poll that does find a wait
+  still pays MariaDB's failure, which is the rare case the panel exists for.
+  PostgreSQL needs one query: `pg_stat_activity` filtered to
   `backend_type = 'client backend'` (the checkpointer and the WAL writer are processes, not
   sessions, and would sort to the top forever) with `pg_blocking_pids(pid)` for the graph, which
   resolves the transitive case a hand-written `pg_locks` join gets wrong. A row whose `pid` won't
@@ -5519,6 +5603,26 @@ existing prose was left alone.
   pid is asked for at open, and holding it is what lets the app recognise one of its own pinned
   Manual-mode connections in a list of session ids — see the repair below. SQLite errors rather
   than answering empty (`core::activity::supports_activity`); the app is gated not to ask.
+  **Both are bounded by a deadline around the whole engine dispatch** — `fetch_sessions` by
+  `PING_TIMEOUT`, `kill_session` by `CANCEL_TIMEOUT` — and neither was. A host that stops answering
+  at the packet level does not refuse the connect, it swallows it, so the `open` takes the OS TCP
+  timeout: 21.0 s on MySQL, 63 s on PostgreSQL, this crate's own measurement. `fetch_sessions` is
+  the method that most needed it, being the only one in the app that runs **on a timer, forever**:
+  a poll against a black-holed host blocked for 21 s showing the previous snapshot with no error,
+  beside a health check that had already said *Disconnected* at five seconds — and the polls
+  *stacked*, because regaining window focus re-runs the panel effect, which bumps the activity
+  generation and then refreshes, so the in-flight guard is keyed on a generation the refresh has
+  just moved and cannot suppress it. Three alt-tabs inside one connect left three connects hanging
+  at once. The deadline is the fix that does not depend on that guard. `kill_session` earns
+  `CANCEL_TIMEOUT` for the reason `Db::kill_query` already cites — the premise of reaching it is
+  that something on that server is misbehaving — and its timeout is reported as an error rather
+  than as a claim the kill failed: the statement may well have landed, and the next poll settles it.
+  Around the dispatch and not inside each arm, for `Db::fetch_databases`' reason: PostgreSQL's
+  `connect_maintenance` tries three candidate databases in turn, so a per-attempt bound is three
+  times the deadline it claims. `every_reachability_path_is_bounded_by_a_timeout` is a source gate
+  over all four of `ping`/`fetch_databases`/`fetch_sessions`/`kill_session`, because the failure is
+  a host that never answers and no unit test can stage one — a closed port is *refused*, instantly,
+  and only a packet filter reproduces the hang.
   **`Db::fetch_principals`/`Db::fetch_grants`** are the Users and privileges browser's backend, and
   they gate on `users::supports_users` before the engine `match` for the same reason those two do,
   with `NO_USERS_MSG` as the one sentence both raise. The MySQL half is `collect_my_users`: **five
@@ -8311,7 +8415,12 @@ existing prose was left alone.
     `section_title`/`centered_msg`/`toggle_icon` (whose `enabled` is **not optional**: every panel
     toggle in the footer needs it, so the ungated shims that passed `|| true` were only hiding the
     fact — see *The footer's panel toggles* below), `tip_when`, `measure_text_px`,
-    `jump_to_bottom_button`. Also `sparkle_action` — the sparkle-plus-label "AI fix" the editor's
+    `jump_to_bottom_button`. Also `dedup_key` — the one-line `create_memo` wrapper a
+    `dyn_container` key goes through so a write that doesn't change *this* node's answer doesn't
+    rebuild it. It is here rather than in either caller because two of them have the same shape, a
+    shared map keyed by node: the schema tree's `expanded` and the ER diagram's `collapsed`. It was
+    `schema_tree`'s until the second one needed it; the measurements and the two pins are under
+    *Floem 0.2 gotchas*. Also `sparkle_action` — the sparkle-plus-label "AI fix" the editor's
     error bar and the error modal both offer, in one definition because the two had already drifted
     to different colours by the time there were two of them; **neither half sets a colour**, so the
     row's own tints the SVG's `currentColor` and the words together and one `hover` covers the pair
@@ -10989,6 +11098,15 @@ existing prose was left alone.
     `app_state.focus` at `None` and the diagram answering no keys. So the handler hands the keyboard
     to the innermost focus root when the press landed **to the right of the field**, and still does
     nothing when it landed on the field itself, which is what its own comment was protecting.
+    **Both terms of that test are scaled**, and there the metric rule is behaviour rather than
+    pixels: the band is `[pad, pad + width)` against a bar whose padding is `theme::scaled(8.0)` and
+    a field styled `width(theme::scaled(190.0))`, while the test was written `8.0` and `190.0`. It
+    was right at 100% and wrong at every other interface scale — at 160% a press in the rightmost
+    4.8 px *inside* the box was judged a miss and handed the keyboard away, undoing the focus the
+    click had just set, and at 80% the mirror hole treated a press 1.6 px *past* the field as on it,
+    so the keyboard was never handed back and the diagram went keyboard-dead: the exact state this
+    handler exists to prevent. The width is read from the laid-out view and only falls back on the
+    constant, so a change to one cannot leave the other describing a field that moved.
     `Find::dismiss` does the same, covering Escape-in-field and the ✕ together: closing the bar
     removes the focused editor, and floem clears focus *silently* when a focused view is removed —
     after which Escape didn't close the diagram and Ctrl+F didn't reopen the bar until the user
@@ -11030,6 +11148,19 @@ existing prose was left alone.
     stub branch: `erd::search` matches a stub on its name deliberately, `sole_node` returns it and the
     canvas pans to it, and the early return used to skip both the recolour and the flash ring — a
     search that said "1 match" and marked nothing.
+    **Its title carries `min_width(0)` + `text_ellipsis()` like the real header's**, and without
+    them the name painted straight past the card's own border onto the canvas. `min_width(0)` is the
+    load-bearing half — taffy's automatic minimum for a flex item is its content size, so nothing
+    shrinks the text node without it — and a stub is the worst case by construction: `stub_width`
+    clamps the card at `NODE_MAX_W`, and a stub's id is the one label that is *always*
+    database-qualified (`analytics_warehouse.customer_order_line_items`), so it is the longest thing
+    any diagram holds and the clamp is routinely reached. It is a correctness fix rather than a
+    tidy: `export_scene` ellipsizes this same name against the same 320 px, so the saved picture
+    read `…customer_order_line_i…` where the screen showed the whole thing overflowing its box —
+    precisely the canvas/export drift that path exists to prevent. The truncation **tooltip** the
+    real header gets is deliberately not copied: that one hangs on the header *row inside* a
+    draggable card, while a stub has no inner row, so it would have to go on the whole card — making
+    a 340 px box swallow drags to reveal a name, which is a trade filed rather than taken.
     The pan is a `create_effect` on the matches memo: given a `sole_node` it calls `erd::center_pan`,
     which solves the cards' own `pan + logical·z` for `pan` — pure and tested beside `fit_bounds`,
     the whole-diagram case of the same arithmetic, because a sign slip or a `w` where an `h` belongs
@@ -11094,7 +11225,15 @@ existing prose was left alone.
     took the UI-thread stall between the click and the save dialog from 65 ms to 25.5 ms.
     `ErdDoc::into_text` is the exception and says why: the clipboard is synchronous, so *Copy as SVG*
     is the one caller with nowhere to hand the work and pays for the document here — and it answers
-    `None` for a PNG, which that channel cannot hold, which is why PNG is not in the copy menu. The
+    `None` for a PNG, which that channel cannot hold, which is why PNG is not in the copy menu.
+    **That copy's clipboard write is checked**, where it was `let _ = …` followed unconditionally by
+    the green confirmation — so a host whose clipboard provider never initialised
+    (`ClipboardError::NotAvailable`) or whose backend refused the write (`ProviderError`) was told
+    "Copied as Mermaid" with nothing on the clipboard. The file half of this same menu already
+    routed its failure through the notice bar; the channel was there and this caller declined to use
+    it. The two arms are spelled out rather than formatted, `ClipboardError` having no `Display` and
+    a `Debug` that is not a sentence: `NotAvailable` is about the host and says so, while
+    `ProviderError` carries the platform's own words and is worth repeating. The
     outcome lands in the diagram's own `notice_bar` at the canvas's bottom edge rather than the
     app's shared error modal, which is painted *under* this one. It arrives as the `ExportOutcome`
     the results export shares, of which a diagram uses two: one document has no row count and
@@ -11193,6 +11332,10 @@ existing prose was left alone.
     modal rather than to `monitor_export_err`, which nothing renders once it is shut, and the
     message is passed through as the pipeline wrote it — a second `Export failed —` in front of it
     read "Export failed — Export failed: Access is denied". `Tone` resolves to a `fn() -> Color`, per the themable-colour invariant.
+    `entry_row`'s per-kind label colour is the same rule, found the hard way: the rows are keyed on
+    `MonitorEntry::seq`, so nothing rebuilds them on a theme switch and one resolved `Color` in a
+    three-arm `match` left UPDATE in the old theme beside INSERT and DELETE in the new one — see the
+    invariant for the shape.
     It is pure and tested inline, which is what keeps the copy honest: the two caveats co-occurring
     is precisely the case a per-state `match` got wrong.
   - `blob_view.rs` — the **binary-cell panel** (`blob_overlay`), over `core::blob`: what a
@@ -11417,8 +11560,23 @@ existing prose was left alone.
     `Arc`: a comparison carries a `ChangeSet` per object, and both the tree and the pane read the
     signal per render. Two of the five are seeded by the **landing** rather than by the open —
     `default_expanded()` opens every kind that differs, and every difference that *can* be applied
-    arrives ticked, a comparison being opened to migrate the difference rather than to admire it. A
-    side is a **connection plus a database** (`CompareSide`/`CompareTarget`), because the two halves
+    arrives ticked, a comparison being opened to migrate the difference rather than to admire it.
+    **The landing seeds that tick set through
+    `SchemaComparison::selectable_keys(RowFilter::default())`, not through a filter written in
+    `main.rs`** — the default filter because none is on screen yet — and that is the same rule
+    `compare::is_planned` exists for: which differences a plan can carry has to have one spelling,
+    or the footer's count, the Apply button
+    and the statements actually built can disagree. The seed was a fourth one,
+    `differences().filter(|e| !e.needs_source())`, which drops `unplannable()` — so the tree could
+    open with objects ticked that the footer refuses to count. Nothing diverged only because
+    `unplannable` has no reachable producer today, and it sat in a *third* crate, outside every test
+    that could have noticed. `the_compare_seed_does_not_respell_the_plannable_predicate` is a source
+    gate rather than a unit test for exactly that reason — a fifth spelling compiles and passes
+    every assertion in the workspace — and it fails on `needs_source` or `unplannable` appearing
+    anywhere in `app/main.rs`'s production code. This module's own `needs_source` is not caught by
+    it and is not a violation: it draws the tick-box's *absence*, which is the reason the exclusion
+    exists.
+    A side is a **connection plus a database** (`CompareSide`/`CompareTarget`), because the two halves
     may live on different servers — which is why **the picker asks in two steps, connection then
     database**, and that is not decoration. The one-step version is every connection crossed with
     `schema.db_nodes`, and it is wrong in both directions: `db_nodes` only ever holds the *active*
@@ -11939,10 +12097,19 @@ existing prose was left alone.
   asked for and the wrong one for a reset nobody asked for, where "no snapshot yet" is the truth; the
   delete path reaches the same guard through `db_for`'s "connection no longer exists". For the same
   ordering reason `save_conn` calls `load_schema` **before** the reset, so the re-open has at least
-  been asked for. Both the effect and `reset_activity` take the "is the panel polling" gate from one
-  `activity_polling` closure — its reads are tracked, which is what the effect needs and what makes
-  them inert at the other caller — because that gate has grown a conjunct before and a second copy is
-  how the next one reaches one asker and not the other. A refresh over a
+  been asked for. All three arming sites — the effect, `reset_activity` and the **kill handler** —
+  take the "is the panel polling" gate from one `activity_polling` closure, which is
+  `activity::should_poll`'s three conjuncts; its reads are tracked, which is what the effect needs
+  and what makes them inert at the other callers. That gate has grown a conjunct before and a second
+  copy is how the next one reaches one asker and not the others, which is exactly what the kill
+  handler demonstrated: it passed a literal `true`, because the closure was defined eighty lines
+  *below* it, so a successful kill restarted auto-refresh on a panel switched away from or a window
+  that had lost focus — reinstating the load the `right_panel_visible` conjunct had been
+  added to remove, immediately after the one action on this panel that is reliably followed by
+  looking somewhere else. The closure moved above all three; the gate is
+  `every_poll_arming_asks_whether_anyone_is_watching`, a source gate rather than a unit test because
+  the defect was a literal at one call site out of three and nothing about the value was wrong. A
+  refresh over a
   live snapshot leaves it on screen rather than passing back through `Loading`, or a two-second
   interval would be a panel that flashes instead of one that updates. The interval is the only part
   persisted, and it is **per connection**: `UiState::activity_intervals` holds the rules and
@@ -13970,6 +14137,18 @@ Re-introducing the anti-patterns these guard against is a regression:
 - **Themable colors reach reactive styles as `fn() -> Color`, never a captured `Color`.** A `Color`
   read once at build freezes and won't follow a live theme switch; pass the fn and call it inside
   the `.style(move |s| …)` closure (see `FieldCfg::background`).
+  **A `match` that picks a colour alongside something else is the spelling this hides in**, and the
+  type annotation is the whole of the fix: `monitor_view::entry_row` bound
+  `let (label, color) = match entry.change.kind { … }` with `theme::chip_active()` *called* in one
+  arm and the two fixed literals in the others, so it read as three uniform arms and was one
+  resolved colour. The rows are keyed on `MonitorEntry::seq`, so a theme switch rebuilds none of
+  them — which is what turns a frozen colour into a permanent one: UPDATE labels stayed in the
+  previous theme's colour for as long as the modal stayed open, beside INSERT and DELETE labels that
+  had repainted, in the one place where colour is the only thing telling the three kinds apart. The
+  arms are all `fn`-shaped now (`fn() -> Color` on the binding), so the call happens inside the
+  style closure that re-runs. A never-rebuilt view is the amplifier to look for: a captured `Color`
+  in something floem tears down often is a flicker, and in something it never tears down is two
+  themes on screen at once.
 - **And so do sizes**: a design token that boxes, indents or spaces text is a `fn() -> f32`/`fn() ->
   f64` reading the interface scale (`theme::font_body()`, `consts::row_h()`, `theme::scaled(…)`),
   never a `const`. Same mechanism, same reason — the `.style` closure that *calls* the metric re-runs
@@ -15189,7 +15368,7 @@ Re-introducing the anti-patterns these guard against is a regression:
   the safe direction of wrong: two `Arc`s over identical bytes compare unequal and cost one needless
   rebuild of one cell — the behaviour before the memo — and nothing unequal can ever be called
   equal.
-  **The schema tree is the same fact at every level of one view, and `schema_tree::dedup_key` is the
+  **The schema tree is the same fact at every level of one view, and `widgets::dedup_key` is the
   remedy applied wholesale.** `expanded` is one app-wide `RwSignal<HashSet<String>>` and every
   children container and every chevron in the tree subscribes to it, so expanding one table in a
   500-table database re-ran `db_node`'s children key — which deep-copies every `TableInfo` in the
@@ -15198,7 +15377,23 @@ Re-introducing the anti-patterns these guard against is a regression:
   `dyn_container`s and two effects. Nor was it scoped to the database being touched: expanding a
   table in `analytics` rebuilt `shop`'s children too, and every chevron in both. `dedup_key` is a
   one-line `create_memo` wrapper round a key closure, the same device and the same framework fact as
-  `widgets::overlay_open_key`. **`SchemaKey` is what makes a `SchemaState` usable in such a key**: it
+  `widgets::overlay_open_key` — which is a memo over a *specific* key rather than the generic
+  wrapper, because its third term exists to keep the dedup honest.
+  **It lives in `widgets.rs`, not in `schema_tree.rs`, because two places pay for it and for one
+  reason: a shared map keyed by node.** The ER diagram's `collapsed` is a
+  `RwSignal<HashMap<String, bool>>` and each card's row stack is a `dyn_container` keyed on it, so
+  every card subscribes to every card's entry — clicking one card's "+N more" toggle rebuilt
+  **every** card's rows: ~3,000 rows, ~12,000 views and 3,000 memos at 500 nodes × 25 columns
+  (clone-only floor, measured, release: 0.313 ms at that size, 0.662 ms at 1000 × 30) for a change
+  concerning six of them. That file had already applied this remedy to the *other half of the same
+  key* — the find's matched columns came out of the tuple so a highlight stopped being a rebuild —
+  and left the collapse half a raw shared read, which is why the pin there is two tests:
+  `one_cards_collapse_does_not_notify_another_cards_rows` asserts the property over `dedup_key` with
+  the call site's own key expression **and over the undeduped shape beside it**, so the premise is
+  pinned too, and `every_container_keyed_on_the_collapse_map_dedups` reads the module's source for a
+  `dyn_container` keyed on `collapsed` that does not go through the wrapper. A test of the memo
+  alone would pass against a call site that never acquired one, which is the failure mode this
+  section has already paid for twice. **`SchemaKey` is what makes a `SchemaState` usable in such a key**: it
   compares `Loaded` by `Arc::ptr_eq`, because a derived `PartialEq` would compare a whole `DbSchema`
   by content on every notification — far worse than the rebuild being avoided — while what the
   container actually needs to know is "is this the same catalogue I built from", and a refresh
