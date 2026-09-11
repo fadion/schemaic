@@ -259,6 +259,14 @@ debug = true
 # tables that dominate the object files. `line-tables-only` is restated per crate
 # because `package."*"` also matches our crates when they're built as
 # dependencies of `schemaic-app`, the same reason `opt-level` is.
+#
+# Debug info is how *large* each artifact is; the other half of the problem is
+# how *many* accumulate, and no profile setting reaches it. Cargo reclaims
+# neither the incremental cache nor a superseded `lib<crate>-<hash>.rlib`, so a
+# `target/` measured again on 2026-09-11 had grown back to 105 GB — 53 GB of
+# `debug/incremental` and twelve live-looking copies of `libschemaic_ui` at
+# ~475 MB each. `scripts/prune-target.ps1` is what reclaims both; its header
+# carries the policy and the reason each rule is safe.
 [profile.dev]
 debug = "line-tables-only"
 
