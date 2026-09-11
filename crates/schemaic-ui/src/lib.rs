@@ -10764,20 +10764,32 @@ fn footer_text(s: String) -> AnyView {
 }
 
 /// A clickable status-bar segment that opens a `menu_panel` popup centred above
-/// it (the Tabs/Spaces, AI-model and AI-effort menus, which share the one popup
-/// channel). A second click on the *same* segment toggles it shut, while clicking
-/// a different one switches menus — which segment the open menu belongs to is
-/// [`widgets::menu_anchored_at`]'s question, answered from the anchor rather than
-/// a tag of its own. Its window rect is tracked (its x shifts as segments to its
-/// left change width) so the popup can centre on it, and that same rect is what
-/// identifies it.
+/// it. A second click on the *same* segment toggles it shut — which segment the
+/// open menu belongs to is [`widgets::menu_anchored_at`]'s question, answered
+/// from the anchor rather than a tag of its own, and that is still why the
+/// placement is spelled once as `anchor_here`. Its window rect is tracked (its x
+/// shifts as segments to its left change width) so the popup can centre on it,
+/// and that same rect is what identifies it.
+///
+/// **One caller**, the Tabs/Spaces segment. It served three — the AI model and
+/// effort chips shared the channel with it — and the block below the resource
+/// segments records why both were removed. The switching-between-segments
+/// behaviour the anchor supports is therefore unreachable today; it is kept
+/// because it is what makes `anchor_here`'s single spelling load-bearing rather
+/// than tidy, not because a second caller is expected.
+///
+/// `margin` is a `fn` for [`dividers::scaled_arg_gate`]'s reason: a length
+/// resolved at build freezes at the scale the view was built at. It was a raw
+/// `f64` and its one caller passed the literal `15.0`, so at Large every other
+/// gap in the footer was 24 and this one stayed 15, and at Small every other
+/// gap was 12 and this one was *wider* than its neighbours.
 fn status_menu_seg(
     label: impl Fn() -> String + 'static,
     build_entries: impl Fn() -> Vec<MenuEntry> + 'static,
     popup_menu: RwSignal<Option<Vec<MenuEntry>>>,
     popup_anchor: RwSignal<Option<PopupAnchor>>,
     popup_width: RwSignal<f64>,
-    margin: f64,
+    margin: fn() -> f64,
 ) -> impl IntoView {
     let origin: RwSignal<(f64, f64)> = RwSignal::new((0.0, 0.0));
     let size: RwSignal<(f64, f64)> = RwSignal::new((0.0, 0.0));
@@ -10823,7 +10835,7 @@ fn status_menu_seg(
         popup_menu.set(Some((build)()));
     })
     .style(move |s| {
-        s.margin_left(margin)
+        s.margin_left(margin())
             .items_center()
             .color(theme::status_text())
             .hover(|s| s.color(theme::chip_active()))
@@ -11127,7 +11139,7 @@ fn footer(ui: Ui) -> impl IntoView {
         popup_menu,
         popup_anchor,
         popup_width,
-        15.0,
+        || theme::scaled(15.0),
     );
     // Word wrap — click toggles it.
     let wrap_seg = dyn_container(
@@ -11386,13 +11398,22 @@ fn footer(ui: Ui) -> impl IntoView {
     // so every harness capability was answered twice with two chances to
     // disagree. The settings modal is where both are set now, and the 40px break
     // that opened the AI group belongs to the resource segments below.
+    // **Keyed on memos, like every sibling segment.** `resources` is rewritten
+    // on every poll tick; `create_updater` compares nothing, so keying on a
+    // direct read disposed and rebuilt both children once a second for the life
+    // of the session — even though the labels are rounded strings and most ticks
+    // render byte-identical text. The five segments above are keyed on the memos
+    // declared together further up for exactly this reason; these two were
+    // built later and did not get one.
+    let cpu_label = create_memo(move |_| resources.get().cpu_label());
+    let ram_label = create_memo(move |_| resources.get().ram_label());
     let cpu_seg = dyn_container(
-        move || resources.get().cpu_label(),
+        move || cpu_label.get(),
         move |c| footer_text(format!("CPU: {c}")),
     )
     .style(|s| s.margin_left(theme::scaled(40.0)));
     let ram_seg = dyn_container(
-        move || resources.get().ram_label(),
+        move || ram_label.get(),
         move |r| footer_text(format!("RAM: {r}")),
     )
     .style(|s| s.margin_left(theme::scaled(15.0)));

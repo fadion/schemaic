@@ -531,6 +531,136 @@ mod scaled_arg_gate {
         assert!(offenders.is_empty(), "{}", offenders.join("\n"));
     }
 
+    /// **The same question, asked of every view builder in the crate.**
+    ///
+    /// The handle gate above scans two functions in one file, and the class it
+    /// guards is not confined to either: `widgets::form_separator` took a
+    /// build-resolved `stack_gap: f64` and subtracted it from a
+    /// `theme::scaled(20.0)` read inside its own style closure, so the two
+    /// halves of one subtraction were resolved at different moments and fell
+    /// out of step whenever the interface scale changed under a mounted modal.
+    /// `lib::status_menu_seg` took its `margin` the same way and its one caller
+    /// passed an unscaled literal, leaving the footer's gaps disagreeing at
+    /// every scale but 100%.
+    ///
+    /// **A budget rather than a ban**, in `whole_ui_gate`'s shape and for its
+    /// reason: `toolbar_icon(mt, mr)` alone has 17 callers passing unscaled
+    /// literals, and a gate that fails today teaches nothing. Every entry below
+    /// is a knowing exception with its reason, and the only legal direction is
+    /// off the list.
+    const BUILDER_EXEMPT: &[(&str, &str, &str)] = &[
+        (
+            "lib.rs",
+            "color_dot",
+            "`ml`/`mr`/`mt` are optical nudges against a 8px dot's own centre, \
+             and every caller passes an unscaled literal — the same group as \
+             `widgets::toolbar_icon`'s. Scaling them is the inset census's \
+             sweep, held pending a look at 160%, and doing it one function at a \
+             time is how the two halves of a row drift apart.",
+        ),
+        (
+            "lib.rs",
+            "db_color_dot",
+            "`color_dot`'s wrapper, and its three margins are that function's.",
+        ),
+        (
+            "lib.rs",
+            "table_color_dot",
+            "`color_dot`'s wrapper, and its three margins are that function's.",
+        ),
+        (
+            "lib.rs",
+            "favorite_star",
+            "`ml`/`mr` sit beside `color_dot`'s in the same rows and move with \
+             them; `size` is already an unscaled base that `icons::icon` scales.",
+        ),
+        (
+            "widgets.rs",
+            "menu_panel",
+            "`width` is the panel's `min_width` *floor*, not a drawn length — \
+             the width it actually takes is `menu_panel_width`, computed inside \
+             the style closure from `theme::scaled` parts. And the panel is the \
+             child of a `dyn_container` that rebuilds whenever the menu opens, \
+             so the floor is re-read on every opening; a scale change with a \
+             menu already standing is the only exposure, and a standing menu \
+             closes on the next pointer-down.",
+        ),
+        (
+            "widgets.rs",
+            "menu_stack",
+            "`menu_panel`'s, passed straight through.",
+        ),
+        (
+            "widgets.rs",
+            "toolbar_icon",
+            "`mt`/`mr` are optical nudges like `color_dot`'s, and all 17 callers \
+             pass unscaled literals. B21.2-L2-03 named this one explicitly as a \
+             separate decision from the defect it filed, and it is: scaling it \
+             moves every toolbar glyph in the app.",
+        ),
+    ];
+
+    /// See [`BUILDER_EXEMPT`]. Red on `form_separator` and `status_menu_seg`
+    /// before the change that took both as `fn() -> f64`.
+    #[test]
+    fn no_view_builder_takes_a_length_it_cannot_re_read() {
+        let mut offenders: Vec<String> = Vec::new();
+        let mut checked = 0usize;
+        for (file, body) in crate::source_gate::crate_sources() {
+            if file.starts_with("schemaic-app/") || file == "dividers.rs" {
+                continue; // the handles have their own, stricter gate above
+            }
+            for (name, sig) in body
+                .split("pub(crate) fn ")
+                .skip(1)
+                .chain(body.split("\nfn ").skip(1))
+                .filter_map(|rest| {
+                    let name = rest.split('(').next()?.trim().to_string();
+                    let end = rest.find(") -> impl IntoView")?;
+                    // A signature runs to the first `)` that closes it; anything
+                    // further on is a later item in the same file.
+                    if rest[..end].contains("\n}") {
+                        return None;
+                    }
+                    Some((name, rest[..end].to_string()))
+                })
+            {
+                checked += 1;
+                for line in sig.lines() {
+                    let line = line.trim();
+                    if line.starts_with("//") {
+                        continue;
+                    }
+                    let Some(param) = line.strip_suffix(": f64,").or(line.strip_suffix(": f64"))
+                    else {
+                        continue;
+                    };
+                    // A one-line signature puts the whole head on this line, so
+                    // the name is what follows the last `(` or `,` — without
+                    // this the message reads `form_separator(stack_gap`.
+                    let param = param.rsplit(['(', ',']).next().unwrap_or(param).trim();
+                    if BUILDER_EXEMPT
+                        .iter()
+                        .any(|(f, n, _)| *f == file && *n == name)
+                    {
+                        continue;
+                    }
+                    offenders.push(format!(
+                        "{file}::{name}: `{param}: f64` is resolved at build \
+                         time, so it freezes at the interface scale the view was \
+                         built at. Take it as `fn() -> f64` and call it where it \
+                         is used, or add it to BUILDER_EXEMPT with the reason."
+                    ));
+                }
+            }
+        }
+        assert!(
+            checked > 200,
+            "only {checked} view builders scanned — the split stopped matching"
+        );
+        assert!(offenders.is_empty(), "{}", offenders.join("\n"));
+    }
+
     /// An exemption that no longer names a real parameter is a stale licence the
     /// next `f64` at that spelling would inherit.
     #[test]
@@ -548,6 +678,32 @@ mod scaled_arg_gate {
                 body.contains(&format!("{param}: f64")),
                 "EXEMPT licenses `{param}: f64` ({why}), but no handle takes it \
                  any more — drop the entry"
+            );
+        }
+    }
+
+    /// The same floor under [`BUILDER_EXEMPT`]: an entry naming a function that
+    /// has been renamed, deleted, or has since taken its length as a `fn`, is a
+    /// licence the next `f64` at that name would inherit silently.
+    #[test]
+    fn every_builder_exemption_still_names_a_builder_that_needs_it() {
+        let sources = crate::source_gate::crate_sources();
+        for (file, name, why) in BUILDER_EXEMPT {
+            let (_, body) = sources
+                .iter()
+                .find(|(f, _)| f == file)
+                .unwrap_or_else(|| panic!("BUILDER_EXEMPT names {file}, which is gone"));
+            let head = format!("fn {name}(");
+            let at = body.find(&head).unwrap_or_else(|| {
+                panic!("BUILDER_EXEMPT licenses {file}::{name} ({why}), which no longer exists")
+            });
+            let end = body[at..]
+                .find(") -> impl IntoView")
+                .expect("an exempted builder still returns a view");
+            assert!(
+                body[at..at + end].contains(": f64"),
+                "BUILDER_EXEMPT licenses {file}::{name} ({why}), but it takes no \
+                 `f64` any more — drop the entry"
             );
         }
     }

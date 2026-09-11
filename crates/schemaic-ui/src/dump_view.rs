@@ -582,9 +582,9 @@ fn dump_options(d: crate::DumpUi, dialect: SqlDialect, ring: FocusRing) -> impl 
     .style(|s| s.flex_col().width_full().gap(theme::scaled(10.0)));
 
     v_stack((
-        form_separator(theme::scaled(16.0)),
+        form_separator(|| theme::scaled(16.0)),
         what,
-        form_separator(theme::scaled(16.0)),
+        form_separator(|| theme::scaled(16.0)),
         replay,
     ))
     .style(|s| s.flex_col().width_full().gap(theme::scaled(16.0)))

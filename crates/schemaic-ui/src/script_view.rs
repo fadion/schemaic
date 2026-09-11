@@ -571,7 +571,7 @@ pub(crate) fn script_overlay(ui: Ui) -> impl IntoView {
                              Check the script to make sure it does what you expect."
                         .to_string(),
                 }),
-                form_separator(theme::scaled(16.0)),
+                form_separator(|| theme::scaled(16.0)),
                 dyn_container(
                     move || s.probe.get(),
                     |p| match p {

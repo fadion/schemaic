@@ -1037,7 +1037,7 @@ fn mapping_step(ui: Ui, ring: FocusRing) -> impl IntoView {
         missing,
         size_note,
         engine_note,
-        form_separator(GAP),
+        form_separator(|| GAP),
         form_section("Preview"),
         preview_table(ui.clone()),
         issue_list(ui).style(|s| s.margin_top(theme::scaled(16.0))),

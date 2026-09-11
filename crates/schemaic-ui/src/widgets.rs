@@ -1503,19 +1503,31 @@ pub(crate) fn fact_note(
 /// The margin is 20 *minus* the enclosing stack's gap, which also applies above
 /// and below — so the gap that lands on screen is exactly 20, not 28.
 ///
-/// **Both terms of that subtraction have to be at the same scale.** `stack_gap`
-/// comes from the caller, and every caller's gap is scaled — `import_view` hands
-/// it the app's own `form_gap()`, which is 29 at 160%. Against a literal 20 that
-/// is a **negative** margin: the rule would be pulled up over the section above
-/// it. The floor is belt-and-braces for a caller whose gap is wider than the
+/// **Both terms of that subtraction have to be at the same scale, and both have
+/// to be resolved at the same moment.** `stack_gap` is a `fn` for
+/// [`crate::dividers::scaled_arg_gate`]'s reason: a length resolved at *build*
+/// freezes at the scale the view was built at, while `theme::scaled(20.0)` here
+/// is read inside the style closure and re-runs. Three of the four callers
+/// passed `theme::scaled(16.0)` evaluated in the builder against the same
+/// stack's `.gap(theme::scaled(16.0))` read inside its closure, so changing the
+/// interface scale with one of those modals mounted left the halves out of
+/// step: 100% → 160% held the margin at 16 while the gap became 25.6, putting
+/// the rule in 41.6px of separation instead of the 32 promised.
+///
+/// The floor is belt-and-braces for a caller whose gap is wider than the
 /// separation it is asking for, which is a request that has no positive answer.
-pub(crate) fn form_separator(stack_gap: f64) -> impl IntoView {
+/// It has never fired: the doc here used to cite `import_view` handing it
+/// `form_gap()` at 29, and `import_view` hands it an unscaled `GAP` of 8 that
+/// also drives the enclosing stack's own `.gap`, so that subtraction is never
+/// negative. The floor stays because the *shape* invites it, not because a
+/// caller has asked for it.
+pub(crate) fn form_separator(stack_gap: fn() -> f64) -> impl IntoView {
     empty().style(move |s| {
         s.width_full()
             .height(1.0)
             .flex_shrink(0.0_f32)
             .background(theme::border())
-            .margin_vert((theme::scaled(20.0) - stack_gap).max(0.0))
+            .margin_vert((theme::scaled(20.0) - stack_gap()).max(0.0))
     })
 }
 
