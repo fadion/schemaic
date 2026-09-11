@@ -964,6 +964,103 @@ pub async fn a_switched_off_index_is_not_silently_brought_back(target: &'static 
     scratch.teardown().await;
 }
 
+/// A **functional** index does not stop the database being read at all.
+///
+/// The assertion that matters is the weakest-looking one: `fetch_schema`
+/// returns. MySQL 8 gives a functional key part a NULL `COLUMN_NAME` in
+/// `information_schema.STATISTICS`, that cell was bound as a non-`Option`
+/// `String`, and `mysql_async`'s `from_row` **panics** rather than erroring —
+/// inside the spawned fetch task, so the call site never got a `Result` to map
+/// to `SchemaState::Failed`. One `CREATE INDEX ix ON t ((a + b))` anywhere in a
+/// database and the tree spun on "loading" for ever, with no error row, no
+/// toast and nothing to retry against; Export, the dump, schema compare and
+/// every MCP `list_schema` took the same shape.
+///
+/// So it is written against `fetch_schema`, not against the fold: the fold is
+/// pure and was never what panicked, and a test on it alone is green on the
+/// unfixed tree — the thirteen-green-tests failure CLAUDE.md records.
+///
+/// The two reads behind it are asserted as well, because a bind widened to
+/// `Option` and then silently dropped would satisfy the no-panic half: the key
+/// part is marked `expression`, and the index is restatable — which the two
+/// engines answer differently and both legitimately. PostgreSQL keeps
+/// `pg_get_indexdef`'s whole text in `create_sql`, so it can recreate the index
+/// verbatim and is not lossy; MySQL publishes no per-index `CREATE` and
+/// reconstructs one from the key parts, which it cannot do for an expression,
+/// so it marks the index `lossy` and the edit is withheld instead. What must
+/// never hold is neither: an index modelled as an ordinary column key with no
+/// `CREATE` behind it is one a table edit drop-and-recreates as `KEY (<the
+/// expression as a column name>)`.
+///
+/// MariaDB 10.11 rejects the syntax outright, so its leg has no clause and
+/// returns early — which is exactly how two of three servers hid this.
+pub async fn a_functional_index_does_not_stop_the_schema_being_read(target: &'static Target) {
+    let Some(expr_sql) = target.expression_index_sql else {
+        return;
+    };
+    let scratch = Scratch::create(target, "ddl_expr_index").await;
+    let t = scratch.qualified("t");
+    scratch
+        .exec(&format!("CREATE TABLE {t} (a INTEGER, b INTEGER)"))
+        .await;
+    scratch
+        .exec(
+            &expr_sql
+                .replace("{table}", &t)
+                .replace("{index}", "ix_expr"),
+        )
+        .await;
+
+    // Not `table_of`: that unwraps, and the point here is that the whole
+    // schema read comes back at all rather than dying in its task.
+    let schema = scratch
+        .db
+        .fetch_schema(&scratch.database, CancellationToken::new())
+        .await
+        .unwrap_or_else(|e| {
+            panic!(
+                "{}: a functional index made the database unreadable — {e}",
+                target.name
+            )
+        });
+    let table = schema
+        .tables
+        .iter()
+        .find(|t| t.name == "t")
+        .unwrap_or_else(|| panic!("{}: no table t in {}", target.name, scratch.database));
+    let ix = table
+        .indexes
+        .iter()
+        .find(|i| i.name == "ix_expr")
+        .unwrap_or_else(|| {
+            panic!(
+                "{}: the functional index is not in the model at all — indexes are {:?}",
+                target.name,
+                table.indexes.iter().map(|i| &i.name).collect::<Vec<_>>()
+            )
+        });
+    assert!(
+        ix.columns.iter().any(|c| c.expression),
+        "{}: the functional key part is modelled as an ordinary column — {:?}",
+        target.name,
+        ix.columns
+    );
+    let restatable = ix
+        .create_sql
+        .as_deref()
+        .is_some_and(|s| s.contains('(') && s.contains('+'));
+    assert!(
+        ix.lossy || restatable,
+        "{}: a functional index is neither withheld nor restatable — a table \
+         edit would recreate it as a plain column key. lossy={}, create_sql={:?}",
+        target.name,
+        ix.lossy,
+        ix.create_sql
+    );
+
+    scratch.teardown().await;
+}
+
 async fn table_of(scratch: &Scratch, name: &str) -> TableInfo {
     let schema = scratch
         .db

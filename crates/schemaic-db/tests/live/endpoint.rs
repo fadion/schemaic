@@ -67,6 +67,21 @@ pub struct Target {
     /// equivalent, so its leg returns early rather than asserting a property
     /// the engine does not have.
     pub disable_index_sql: Option<&'static str>,
+    /// How this server declares a **functional** key part — an index over an
+    /// expression rather than over a column — or `None` where it has none.
+    /// `{table}` and `{index}` are substituted, and the expression is over the
+    /// `a`/`b` integer columns the index tests seed.
+    ///
+    /// MySQL 8.0.13+ and PostgreSQL both take `((a + b))`; MariaDB 10.11
+    /// rejects it outright (`ERROR 1064` at the inner paren). That asymmetry is
+    /// not trivia: a functional key part is the one row where MySQL's
+    /// `information_schema.STATISTICS` returns a **NULL** `COLUMN_NAME`, the
+    /// bind was a non-`Option` `String`, and `from_row` panicked *inside the
+    /// fetch task* — so one such index anywhere made the whole database
+    /// unbrowsable, with the tree spinning for ever and no error at all. Two of
+    /// the three legs could not reproduce it, which is exactly why the leg that
+    /// can has to be named here rather than assumed.
+    pub expression_index_sql: Option<&'static str>,
     /// Does a **DDL** plan roll back as a whole on this server?
     ///
     /// PostgreSQL's `run_ddl` wraps the plan in `BEGIN`/`ROLLBACK` and its DDL
@@ -185,6 +200,7 @@ pub static MARIADB: Target = Target {
     binary_type: "VARBINARY(4)",
     non_transactional: Some("ENGINE=MyISAM"),
     disable_index_sql: Some("ALTER TABLE {table} ALTER INDEX {index} IGNORED"),
+    expression_index_sql: None,
     transactional_ddl: false,
     grants_are_database_scoped: false,
     primary_key_include: None,
@@ -210,6 +226,7 @@ pub static MYSQL: Target = Target {
     binary_type: "VARBINARY(4)",
     non_transactional: Some("ENGINE=MyISAM"),
     disable_index_sql: Some("ALTER TABLE {table} ALTER INDEX {index} INVISIBLE"),
+    expression_index_sql: Some("CREATE INDEX {index} ON {table} ((a + b))"),
     transactional_ddl: false,
     grants_are_database_scoped: false,
     primary_key_include: None,
@@ -235,6 +252,7 @@ pub static POSTGRES: Target = Target {
     binary_type: "bytea",
     non_transactional: None,
     disable_index_sql: None,
+    expression_index_sql: Some("CREATE INDEX {index} ON {table} ((a + b))"),
     transactional_ddl: true,
     grants_are_database_scoped: true,
     primary_key_include: Some(" INCLUDE (payload)"),
