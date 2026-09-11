@@ -5434,3 +5434,226 @@ mod tests {
         assert!(v[1].is_null());
     }
 }
+
+#[cfg(test)]
+mod parity_census_tests {
+    use super::*;
+    use crate::intel::SqlDialect::MySql;
+    use crate::model::{Column, Value};
+
+    /// The binary formats that have a **hand-written** parity test instead of
+    /// byte equality, and the test that is it.
+    ///
+    /// A workbook's bytes are a ZIP — order, compression and a creation
+    /// timestamp — so `Xlsx` cannot join the byte-equality family and has
+    /// `a_chunked_xlsx_export_matches_the_same_rows_in_one_go`, which compares
+    /// `calamine`-parsed cells and the `ExportTally`, plus
+    /// `an_empty_result_writes_the_same_workbook_through_either_path`.
+    const BINARY_PARITY_TESTED: &[(ExportFormat, &str)] = &[(
+        ExportFormat::Xlsx,
+        "a_chunked_xlsx_export_matches_the_same_rows_in_one_go",
+    )];
+
+    /// **Every format is in a parity test, and the census is what says so.**
+    ///
+    /// The five byte-equality tests are self-extending — they all iterate
+    /// `text_formats()`, so a new *text* format is pulled into them
+    /// automatically. That is the good half. The other half is arithmetic
+    /// nobody was doing: `is_text()` sorts a format onto the tested or the
+    /// untested side by **capability**, and nothing asserted the untested side
+    /// was empty of formats with no substitute. Add a seventh that is not text
+    /// — Parquet, ODS, a binary dump — and it silently leaves every parity
+    /// assertion, free to let its `*_chunks` writer drift from its one-shot
+    /// path with the suite green. `docs/architecture.md` tells the next author
+    /// to "add a new format by writing the `*_chunks` and wrapping it" and does
+    /// not mention that a binary one also owes a hand-written parity test,
+    /// because for `Xlsx` someone happened to remember.
+    ///
+    /// This is CLAUDE.md's capability rule one layer up: the predicate is
+    /// right, and the *consequence* of falling on its far side was unguarded.
+    /// `lib.rs`'s `only_sql_writes_a_single_file` iterates `ExportFormat::ALL`
+    /// for exactly this reason — "so a seventh has to answer it".
+    #[test]
+    fn every_format_is_covered_by_a_parity_test() {
+        let text: Vec<ExportFormat> = ExportFormat::ALL
+            .into_iter()
+            .filter(|f| f.is_text())
+            .collect();
+        let binary: Vec<ExportFormat> = ExportFormat::ALL
+            .into_iter()
+            .filter(|f| !f.is_text())
+            .collect();
+        for f in &binary {
+            assert!(
+                BINARY_PARITY_TESTED.iter().any(|(g, _)| g == f),
+                "{} is not a text format, so it joins none of the byte-equality \
+                 parity tests. It needs a hand-written structural one, and an \
+                 entry here naming it.",
+                f.label()
+            );
+        }
+        // And the other direction: an entry naming a format that has become
+        // text, or has been removed, is a line claiming cover for nothing.
+        for (f, test) in BINARY_PARITY_TESTED {
+            assert!(
+                binary.contains(f),
+                "{} is no longer a binary format, so `{test}` is not what \
+                 covers it — it is in the byte-equality family now",
+                f.label()
+            );
+        }
+        assert_eq!(
+            text.len() + BINARY_PARITY_TESTED.len(),
+            ExportFormat::ALL.len(),
+            "every format is either in the byte-equality family or named above"
+        );
+    }
+
+    /// **A result with no columns at all**, which no fixture in this module had.
+    ///
+    /// The empty-*rows* edge is covered; the empty-*columns* one was not, in a
+    /// module whose whole business is header emission. A `SELECT` can return it
+    /// — and whatever each format writes for it, the streamed and the one-shot
+    /// paths have to write the same thing.
+    #[test]
+    fn a_result_with_no_columns_writes_the_same_bytes_through_either_path() {
+        let rs = ResultSet::from_rows(Vec::<Column>::new(), Vec::new());
+        let order: Vec<usize> = Vec::new();
+        for f in ExportFormat::ALL {
+            if !f.is_text() {
+                continue; // binary; see the census above
+            }
+            let mut whole = Vec::new();
+            f.render_to(&mut whole, &rs, &order, None, MySql)
+                .expect("the writer is a Vec");
+            let mut src = SliceChunks::new(&rs, &order, 4);
+            let mut chunked = Vec::new();
+            f.stream_to(&mut chunked, &mut src, None, MySql)
+                .expect("the writer is a Vec");
+            assert_eq!(
+                whole,
+                chunked,
+                "{} disagrees with itself on a result with no columns",
+                f.label()
+            );
+        }
+    }
+
+    /// And a **binary column** carried through the chunk-boundary gate, which
+    /// nothing composed before.
+    ///
+    /// `the_binary_note_finds_a_column_that_only_drops_later` asserts the
+    /// `-- NOTE:` line on the chunked path alone, and no byte-equality run
+    /// carried a binary column — so whether the note lands identically at every
+    /// chunk size was unasserted. That is the isolation-versus-composition seam
+    /// again, in a module that otherwise closes it well.
+    #[test]
+    fn a_binary_column_lands_the_same_at_every_chunk_size() {
+        let rs = binary_fixture();
+        let order: Vec<usize> = (0..rs.row_count()).collect();
+        for f in ExportFormat::ALL {
+            if !f.is_text() || f == ExportFormat::Sql {
+                continue; // binary → the census above; SQL → the test below
+            }
+            let mut whole = Vec::new();
+            f.render_to(&mut whole, &rs, &order, None, MySql)
+                .expect("the writer is a Vec");
+            for size in 1..=order.len() + 1 {
+                let mut src = SliceChunks::new(&rs, &order, size);
+                let mut chunked = Vec::new();
+                f.stream_to(&mut chunked, &mut src, None, MySql)
+                    .expect("the writer is a Vec");
+                assert_eq!(
+                    whole,
+                    chunked,
+                    "{} disagrees at chunk size {size} over a binary column",
+                    f.label()
+                );
+            }
+        }
+    }
+
+    /// **SQL is the exception, and it cannot be otherwise** — measured here
+    /// rather than assumed.
+    ///
+    /// Composing the binary note with the chunk-boundary gate turns up a real
+    /// divergence, and only in SQL: `render_to` has the whole result in hand and
+    /// writes `-- NOTE: binary column … exported as NULL` **above** the first
+    /// `INSERT`, while `stream_to` cannot know a column will drop until it reads
+    /// the row that drops it. At chunk sizes 1 and 2 the binary value arrives in
+    /// a later chunk than the first, so the note lands *after* an `INSERT` that
+    /// has already gone out — and the statement is split in two around it.
+    ///
+    /// No amount of care makes those byte-equal: knowing in advance means
+    /// buffering the whole result, which is the one thing a streamed export
+    /// exists not to do. So byte equality is the wrong assertion, and these are
+    /// the right ones — the note is said **exactly once** however the chunks
+    /// fall, and every row is present, in order, with the same cells.
+    #[test]
+    fn a_streamed_sql_export_says_the_binary_note_once_and_loses_no_row() {
+        let rs = binary_fixture();
+        let order: Vec<usize> = (0..rs.row_count()).collect();
+        let note = "-- NOTE:";
+        let values_of = |s: &str| -> Vec<String> {
+            s.lines()
+                .map(str::trim_end)
+                .filter(|l| l.starts_with('('))
+                .map(|l| l.trim_end_matches([',', ';']).to_string())
+                .collect()
+        };
+
+        let mut whole = Vec::new();
+        ExportFormat::Sql
+            .render_to(&mut whole, &rs, &order, None, MySql)
+            .expect("the writer is a Vec");
+        let whole = String::from_utf8(whole).expect("SQL is text");
+        assert_eq!(whole.matches(note).count(), 1, "{whole}");
+
+        for size in 1..=order.len() + 1 {
+            let mut src = SliceChunks::new(&rs, &order, size);
+            let mut buf = Vec::new();
+            ExportFormat::Sql
+                .stream_to(&mut buf, &mut src, None, MySql)
+                .expect("the writer is a Vec");
+            let out = String::from_utf8(buf).expect("SQL is text");
+            assert_eq!(
+                out.matches(note).count(),
+                1,
+                "the note must be said once at chunk size {size}: {out}"
+            );
+            assert_eq!(
+                values_of(&out),
+                values_of(&whole),
+                "chunk size {size} changed the rows, not just where the note                  sits"
+            );
+        }
+    }
+
+    /// The fixture both tests above read: a column whose binary-ness only
+    /// becomes visible on the third row, so where the chunk boundary falls
+    /// decides what the exporter knows when.
+    fn binary_fixture() -> ResultSet {
+        let cols = vec![
+            Column {
+                name: "id".to_string(),
+                type_name: "INT".to_string(),
+                origin: None,
+            },
+            Column {
+                name: "blob".to_string(),
+                type_name: "BLOB".to_string(),
+                origin: None,
+            },
+        ];
+        let rows = vec![
+            vec![Value::Int(1), Value::Str("real text".to_string())],
+            vec![Value::Int(2), Value::Null],
+            vec![
+                Value::Int(3),
+                Value::Str(crate::model::binary_display(4096)),
+            ],
+            vec![Value::Int(4), Value::Str(crate::model::binary_display(16))],
+        ];
+        ResultSet::from_rows(cols, rows)
+    }
+}
