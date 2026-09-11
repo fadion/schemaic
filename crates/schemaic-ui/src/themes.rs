@@ -946,6 +946,14 @@ struct ThemeState {
     // How large the app's own chrome is drawn (`UiScale`). Read by every scaled
     // design token, so a change re-runs each style closure that uses one.
     ui_scale: RwSignal<UiScale>,
+    // **Which kind each built theme came from**, so a setter can tell a swap
+    // from a re-pick of the value already in effect. The built `UiTheme` cannot
+    // answer that — it has no identity — and the callers were left to remember,
+    // which two of the three pickers did not. `None` until the first set, so
+    // `init`'s seeding always applies however it compares to the default the
+    // frame before it painted with.
+    ui_kind: RwSignal<Option<UiThemeKind>>,
+    editor_kind: RwSignal<Option<EditorThemeKind>>,
 }
 
 thread_local! {
@@ -971,6 +979,8 @@ fn with_state<R>(f: impl FnOnce(&ThemeState) -> R) -> R {
                 editor_soft_tabs: scope.create_rw_signal(true),
                 editor_word_wrap: scope.create_rw_signal(false),
                 ui_scale: scope.create_rw_signal(UiScale::Normal),
+                ui_kind: scope.create_rw_signal(None),
+                editor_kind: scope.create_rw_signal(None),
                 _scope: scope,
             };
             *cell.borrow_mut() = Some(state);
@@ -991,16 +1001,39 @@ pub fn init(ui: UiThemeKind, editor: EditorThemeKind, scale: UiScale) {
 }
 
 /// Swap the active UI theme (re-runs every reactive style closure).
+///
+/// **A re-pick of the theme already in effect does nothing**, and the guard is
+/// here rather than at each picker because the cost is entirely on this side and
+/// the callers were what proved unreliable: of the three controls that reach
+/// these setters, the two dropdowns guarded and the interface-scale segments did
+/// not. A `set` on `ui` re-runs every reactive style closure in the window, and
+/// the `ui_gen` bump beside it rebuilds every view keyed on the generation —
+/// which is the ones that *cannot* re-read a colour and have to be thrown away.
+/// The settings modal then persists `ui_state.json` synchronously off the same
+/// change. That is a whole-window rebuild and a disk write for clicking the row
+/// that is already highlighted.
 pub fn set_ui(kind: UiThemeKind) {
     with_state(|st| {
+        if st.ui_kind.get_untracked() == Some(kind) {
+            return;
+        }
+        st.ui_kind.set(Some(kind));
         st.ui.set(Rc::new(kind.build()));
         st.ui_gen.update(|g| *g += 1);
     });
 }
 
 /// Swap the active editor theme (bumps the generation so the editor re-highlights).
+///
+/// Guarded like [`set_ui`]: the generation bump is what makes the SQL editor
+/// invalidate its cached layout and re-highlight the whole document, which on a
+/// large file is not free and on a re-pick buys nothing.
 pub fn set_editor(kind: EditorThemeKind) {
     with_state(|st| {
+        if st.editor_kind.get_untracked() == Some(kind) {
+            return;
+        }
+        st.editor_kind.set(Some(kind));
         st.editor.set(Rc::new(kind.build()));
         st.editor_gen.update(|g| *g += 1);
     });
@@ -1019,8 +1052,16 @@ pub fn ui_scale() -> UiScale {
 /// those views are keyed on the generation, which is the only way to repaint
 /// them. The editor generation is deliberately *not* bumped: the scale doesn't
 /// touch the code font.
+///
+/// Guarded like [`set_ui`], and this is the one that needed it most: the four
+/// scale segments are always on screen in the settings modal, so the cheapest
+/// possible click — the one already selected — rebuilt every scaled token, bumped
+/// `ui_generation` and wrote `ui_state.json`.
 pub fn set_ui_scale(scale: UiScale) {
     with_state(|st| {
+        if st.ui_scale.get_untracked() == scale {
+            return;
+        }
         st.ui_scale.set(scale);
         st.ui_gen.update(|g| *g += 1);
     });
@@ -1285,6 +1326,84 @@ mod scale_tests {
             factors.windows(2).all(|w| w[0] < w[1]),
             "not ascending: {factors:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod setter_guard_tests {
+    use super::{
+        EditorThemeKind, UiScale, UiThemeKind, editor_generation, set_editor, set_ui, set_ui_scale,
+        ui_generation,
+    };
+
+    // `STATE` is a `thread_local` and cargo runs several tests per thread, so
+    // each of these establishes the value it is about to re-pick rather than
+    // assuming a starting one — the rule `widgets`' `keyboard_nav` tests follow.
+
+    /// **Re-picking the theme in effect must rebuild nothing.** A `set` re-runs
+    /// every reactive style closure in the window; the generation bump beside it
+    /// throws away and rebuilds every view that cannot re-read a colour; and the
+    /// settings modal persists `ui_state.json` off the same change. The two
+    /// dropdowns guard at the call site, which is why this was survivable — but
+    /// the guard belongs where the cost is.
+    #[test]
+    fn re_picking_the_ui_theme_in_effect_bumps_no_generation() {
+        set_ui(UiThemeKind::Dark);
+        let g = ui_generation();
+        set_ui(UiThemeKind::Dark);
+        assert_eq!(ui_generation(), g, "a no-op pick rebuilt the window");
+        set_ui(UiThemeKind::Light);
+        assert_eq!(ui_generation(), g + 1, "a real swap must still publish");
+        set_ui(UiThemeKind::Light);
+        assert_eq!(ui_generation(), g + 1);
+        set_ui(UiThemeKind::Dark);
+        assert_eq!(ui_generation(), g + 2, "and so must swapping back");
+    }
+
+    /// The editor's generation is what makes the SQL editor invalidate its
+    /// cached layout and re-highlight the whole document.
+    #[test]
+    fn re_picking_the_editor_theme_in_effect_bumps_no_generation() {
+        set_editor(EditorThemeKind::TokyoNight);
+        let g = editor_generation();
+        set_editor(EditorThemeKind::TokyoNight);
+        assert_eq!(editor_generation(), g, "a no-op pick re-highlighted");
+        set_editor(EditorThemeKind::OneDarkPro);
+        assert_eq!(editor_generation(), g + 1);
+    }
+
+    /// And the one that needed it most: the four scale segments are always on
+    /// screen, so the cheapest click in the modal is the one already selected.
+    #[test]
+    fn re_picking_the_interface_scale_in_effect_bumps_no_generation() {
+        set_ui_scale(UiScale::Normal);
+        let g = ui_generation();
+        set_ui_scale(UiScale::Normal);
+        assert_eq!(
+            ui_generation(),
+            g,
+            "clicking the selected segment rebuilt every scaled token"
+        );
+        set_ui_scale(UiScale::Large);
+        assert_eq!(ui_generation(), g + 1);
+        set_ui_scale(UiScale::Large);
+        assert_eq!(ui_generation(), g + 1);
+        // Put it back, so a neighbour on this thread finds the default.
+        set_ui_scale(UiScale::Normal);
+    }
+
+    /// A swap must still *change the palette*, not merely the counter — the
+    /// guard must key on the kind, and the built theme has no identity to key
+    /// on, which is why the kind is stored.
+    #[test]
+    fn a_real_swap_still_changes_the_colours() {
+        set_ui(UiThemeKind::Dark);
+        let dark = super::ui().bg_panel;
+        set_ui(UiThemeKind::Light);
+        let light = super::ui().bg_panel;
+        assert_ne!(dark, light, "the swap did not reach the palette");
+        set_ui(UiThemeKind::Dark);
+        assert_eq!(super::ui().bg_panel, dark, "and swapping back did not");
     }
 }
 

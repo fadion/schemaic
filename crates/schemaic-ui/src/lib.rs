@@ -9917,7 +9917,17 @@ pub(crate) fn edit_field(text_sig: RwSignal<String>, cfg: FieldCfg) -> impl Into
             }
             // Store the natural (unclamped) line count; the height clamps it to the
             // effective cap so a resizing cap (the viewer) re-clamps reactively.
-            rows.set(ed_upd.last_vline().get() + 1);
+            //
+            // Guarded, like the viewport twin below that computes the identical
+            // number: in a single-line field the count is a constant by
+            // construction, so every keystroke in every field in the app
+            // republished an unchanged row count and re-ran the box's style for
+            // it. The `text_sig.set` three lines up was already guarded; this
+            // one, on the same closure and the same keystroke, was not.
+            let n = ed_upd.last_vline().get() + 1;
+            if rows.get_untracked() != n {
+                rows.set(n);
+            }
         })
         .style(move |s| {
             // The box (below) owns the border/background; the editor is
@@ -10029,9 +10039,17 @@ pub(crate) fn edit_field(text_sig: RwSignal<String>, cfg: FieldCfg) -> impl Into
             if prev.is_some_and(|p| p != v) {
                 let ed2 = ed_ce.clone();
                 floem::action::exec_after(std::time::Duration::ZERO, move |_| {
-                    if let Some(Some(vid)) = ed2.editor_view_id.try_get_untracked() {
-                        vid.request_focus();
-                    }
+                    // **Everything inside the guard**, as the autofocus twin 45
+                    // lines above already has it. `try_get_untracked` is asked
+                    // because the field may have been disposed in the tick this
+                    // timer waited out — and `doc()` is `get_untracked().unwrap()`
+                    // on the same disposed scope, so detecting that and then
+                    // reading it one line later panicked on precisely the state
+                    // the guard had just identified.
+                    let Some(Some(vid)) = ed2.editor_view_id.try_get_untracked() else {
+                        return;
+                    };
+                    vid.request_focus();
                     let len = ed2.doc().text().to_string().len();
                     ed2.cursor.update(|c| c.set_offset(len, false, false));
                 });

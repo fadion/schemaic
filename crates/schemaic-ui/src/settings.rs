@@ -315,7 +315,18 @@ fn scale_picker(
     // equivalent of the design's `box-shadow: inset 0 0 0 1px`.
     let segments = theme::UiScale::ALL.map(|k| {
         text(k.label())
-            .on_click_stop(move |_| scale.set(k))
+            // Guarded, like `focusable_dropdown`'s `pick` — and this control
+            // needed it more, being the one a no-op click is *cheapest* to make:
+            // the four segments are always on screen, and clicking the one
+            // already selected re-fired `theme::set_ui_scale`, which rebuilds
+            // the whole scaled palette, bumps `ui_generation` — rebuilding every
+            // view in the window — and writes `ui_state.json` synchronously.
+            // `RwSignal::set` to the same value still notifies every dependent.
+            .on_click_stop(move |_| {
+                if scale.get_untracked() != k {
+                    scale.set(k);
+                }
+            })
             .style(move |s| {
                 let on = scale.get() == k;
                 let s = s

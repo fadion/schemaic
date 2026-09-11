@@ -24,6 +24,33 @@ use floem::style::CursorStyle;
 use crate::consts::{RESIZE_HOVER_DELAY, resize_bar, resize_hit};
 use crate::theme;
 
+/// Move `dim` by `d`, clamped to `[lo, hi]` — and publish **only if it moved**.
+///
+/// Both handles' `PointerMove` used to write straight through
+/// (`dim.update(|w| *w = (*w + d).clamp(lo, hi))`), and a drag is 60–120 of
+/// those a second. Past the clamp every one of them computes the same number,
+/// and floem notifies unconditionally — so a drag held against the floor
+/// restyled every rendered schema-tree row, and every view deriving a height
+/// from `editor_h`, sixty times a second for no visual change.
+///
+/// **At the source, not at each consumer.** `lib.rs` guards the two *width*
+/// republishes it owns (`schema_panel_w`, `right_panel_w`), which is what kept
+/// the tree still — but that is one consumer's protection, not the publisher's:
+/// `editor_h` has no such republished twin, its readers take it raw, and
+/// nothing below it held the line. One guard where the value is produced is the
+/// answer for all three.
+///
+/// `hi.max(lo)` is the caller's job and stays there — on a window too small to
+/// hold both panels' minimums the ceiling really is below the floor, and
+/// `clamp` panics on an inverted range.
+fn nudge(dim: floem::reactive::RwSignal<f64>, d: f64, lo: f64, hi: f64) {
+    let cur = dim.get_untracked();
+    let next = (cur + d).clamp(lo, hi);
+    if next != cur {
+        dim.set(next);
+    }
+}
+
 /// A divider's hover highlight, which arrives `RESIZE_HOVER_DELAY` after the
 /// pointer settles rather than the moment it arrives.
 ///
@@ -181,7 +208,7 @@ pub(crate) fn h_resize_handle(
                     // between build and drag moves the floor with everything else.
                     let lo = min_w();
                     let hi = max_w().max(lo);
-                    dim.update(|w| *w = (*w + d).clamp(lo, hi));
+                    nudge(dim, d, lo, hi);
                 }
                 EventPropagation::Stop
             } else {
@@ -304,7 +331,7 @@ pub(crate) fn v_resize_handle(
                     let d = pe.pos.y - resize_hit() / 2.0;
                     // Read here, inside the gesture — see `min_w`'s twin above.
                     let lo = min_h();
-                    dim.update(|h| *h = (*h + d).clamp(lo, max_h().max(lo)));
+                    nudge(dim, d, lo, max_h().max(lo));
                 }
                 EventPropagation::Stop
             } else {
@@ -528,14 +555,75 @@ mod scaled_arg_gate {
 
 #[cfg(test)]
 mod clamp_tests {
-    /// The premise the publishers' equality guard rests on (`lib.rs`'s
-    /// `schema_panel_w` / `right_panel_w` effects): once a drag pushes past the
-    /// floor, **every further frame produces the same width**.
+    use super::nudge;
+    use floem::prelude::SignalGet;
+    use floem::reactive::{RwSignal, create_effect};
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    /// How many times `dim` notified over a run of frames.
     ///
-    /// So without a guard those frames each republish an unchanged number, and
-    /// floem notifies unconditionally — restyling every rendered schema-tree row
-    /// for no visual change. This is the pure half of that; the rest is a
-    /// signal-notification count no `#[test]` can see.
+    /// **The half the note here used to say no `#[test]` could see.** It can:
+    /// `RwSignal`, `create_effect` and a counting `Cell` all run headless, with
+    /// no window and no app — which is what makes the guard's *effect*
+    /// assertable rather than only its premise.
+    fn publishes(start: f64, step: f64, frames: usize, lo: f64, hi: f64) -> usize {
+        let dim = RwSignal::new(start);
+        let runs = Rc::new(Cell::new(0usize));
+        let counted = runs.clone();
+        create_effect(move |_| {
+            dim.get();
+            counted.set(counted.get() + 1);
+        });
+        let before = runs.get();
+        for _ in 0..frames {
+            nudge(dim, step, lo, hi);
+        }
+        runs.get() - before
+    }
+
+    /// **A drag held past the clamp publishes once, not once a frame.**
+    ///
+    /// A drag is 60–120 `PointerMove`s a second, and past the floor every one of
+    /// them computes the same number. `RwSignal::set` notifies regardless, so an
+    /// unguarded write restyled every rendered schema-tree row, and every view
+    /// deriving a height from `editor_h`, for no visual change at all — sixty
+    /// times a second, for as long as the pointer kept going.
+    #[test]
+    fn a_drag_held_past_the_clamp_publishes_once() {
+        // Ten frames of a pointer still moving left from just above the floor:
+        // one real move onto the floor, then nine that change nothing.
+        assert_eq!(
+            publishes(250.0, -40.0, 10, 240.0, 800.0),
+            1,
+            "every frame past the floor republished the floor"
+        );
+        // And the same at the ceiling.
+        assert_eq!(publishes(790.0, 40.0, 10, 240.0, 800.0), 1);
+        // A drag that is actually moving still publishes every frame — the guard
+        // must not swallow the gesture it exists to carry.
+        assert_eq!(publishes(400.0, 10.0, 10, 240.0, 800.0), 10);
+    }
+
+    /// A zero-delta move — the pointer inside the handle's own hit area, which
+    /// is where a click that is not yet a drag lives — writes nothing either.
+    #[test]
+    fn a_pointer_that_has_not_moved_publishes_nothing() {
+        assert_eq!(publishes(400.0, 0.0, 5, 240.0, 800.0), 0);
+    }
+
+    /// An inverted range — `max_w()` below `min_w()` on a window too small to
+    /// hold both panels' minimums — must still land on the floor rather than
+    /// panicking in `clamp`, which is why both handles take `hi.max(lo)`.
+    #[test]
+    fn a_range_with_no_room_lands_on_the_floor() {
+        let dim = RwSignal::new(400.0);
+        nudge(dim, -1000.0, 240.0, 240.0_f64.max(100.0));
+        assert_eq!(dim.get_untracked(), 240.0);
+    }
+
+    /// The premise the guard rests on: once a drag pushes past the floor,
+    /// **every further frame produces the same width**.
     #[test]
     fn a_drag_past_the_floor_yields_the_same_width_every_frame() {
         let (lo, hi) = (240.0_f64, 800.0_f64);
