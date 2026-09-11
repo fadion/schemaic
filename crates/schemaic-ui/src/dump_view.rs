@@ -38,6 +38,7 @@ use floem::keyboard::{Key, NamedKey};
 use floem::prelude::*;
 use floem::reactive::{Memo, create_effect, create_memo};
 
+use schemaic_core::dump::PickerBody;
 use schemaic_core::intel::SqlDialect;
 
 use crate::theme;
@@ -95,7 +96,7 @@ pub(crate) fn open_dump(
     d.error.set(None);
     d.done.set(None);
     d.running.set(false);
-    d.listing.set(true);
+    d.listing.set(schemaic_core::dump::Listing::Reading);
     d.generation.update(|g| *g += 1);
     d.target.set(Some(DumpTarget {
         conn_id,
@@ -116,7 +117,13 @@ pub(crate) fn open_dump(
             if d.generation.get_untracked() != opened {
                 return;
             }
-            d.listing.set(false);
+            // Which of the two ways it came back, not just that it did: the
+            // picker's "no tables" sentence is a claim about a database that was
+            // successfully read, and this is the only place that knows.
+            d.listing.set(match &res {
+                Ok(_) => schemaic_core::dump::Listing::Done,
+                Err(_) => schemaic_core::dump::Listing::Failed,
+            });
             match res {
                 Ok(names) => {
                     // Both decisions are `core::dump`'s, with tests: which of the
@@ -663,22 +670,28 @@ fn table_picker(ui: Ui, ring: FocusRing) -> impl IntoView {
     ))
     .style(|s| s.items_center().width_full().gap(theme::scaled(10.0)));
 
+    // The four states are `dump::picker_body`'s, matched exhaustively: a second
+    // `if names.is_empty()` here is what printed "This database has no tables."
+    // over a listing that never finished, four lines above the error explaining
+    // why the list was empty.
     let list = dyn_container(
         move || (d.listing.get(), d.tables.get()),
         move |(listing, names)| {
-            if listing {
-                return text("Reading the table list…")
+            let note = |s: &'static str| {
+                text(s)
                     .style(|s| s.color(theme::text_muted()).font_size(theme::font_body()))
-                    .into_any();
+                    .into_any()
+            };
+            match schemaic_core::dump::picker_body(listing, names.len()) {
+                PickerBody::Reading => note("Reading the table list…"),
+                PickerBody::NoTables => note("This database has no tables."),
+                PickerBody::Unreadable => note("The table list could not be read."),
+                PickerBody::Tables => {
+                    v_stack_from_iter(names.into_iter().map(move |n| table_row(d, chosen_set, n)))
+                        .style(|s| s.flex_col().width_full())
+                        .into_any()
+                }
             }
-            if names.is_empty() {
-                return text("This database has no tables.")
-                    .style(|s| s.color(theme::text_muted()).font_size(theme::font_body()))
-                    .into_any();
-            }
-            v_stack_from_iter(names.into_iter().map(move |n| table_row(d, chosen_set, n)))
-                .style(|s| s.flex_col().width_full())
-                .into_any()
         },
     )
     .style(|s| s.flex_col().width_full());

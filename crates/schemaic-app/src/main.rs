@@ -11240,7 +11240,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             target: RwSignal::new(None),
             tables: RwSignal::new(Vec::new()),
             chosen: RwSignal::new(Vec::new()),
-            listing: RwSignal::new(false),
+            listing: RwSignal::new(schemaic_core::dump::Listing::Done),
             structure: RwSignal::new(true),
             data: RwSignal::new(true),
             other_objects: RwSignal::new(true),

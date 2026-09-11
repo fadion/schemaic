@@ -2701,8 +2701,11 @@ pub struct DumpUi {
     pub tables: RwSignal<Vec<String>>,
     /// The checked subset — what actually reaches the file.
     pub chosen: RwSignal<Vec<String>>,
-    /// True while the list is being read.
-    pub listing: RwSignal<bool>,
+    /// How far the read of that list has got.
+    ///
+    /// Three states, not a `bool`: a listing that *failed* leaves the list empty
+    /// for a reason the picker has to be able to tell from an empty database.
+    pub listing: RwSignal<schemaic_core::dump::Listing>,
     /// The options, one signal per control — the shape [`ImportUi`] uses, and for
     /// the same reason: a toggle binds to a `bool`, and a single struct signal
     /// would make every control a read-modify-write of the other five.

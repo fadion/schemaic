@@ -439,6 +439,63 @@ pub fn initial_selection(
     }
 }
 
+/// How far the Export modal's table listing has got.
+///
+/// A `bool` was enough while the only two states it could be in were "out" and
+/// "back"; it is not enough to tell "back, and the database really is empty"
+/// from "never came back". The picker branched on the `bool` and then on
+/// `names.is_empty()`, so a listing that *failed* landed in the reassuring arm.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Listing {
+    /// The read is out; nothing can be said about the database yet.
+    Reading,
+    /// The read came back, and what it found is in the list.
+    Done,
+    /// The read did not finish — unreachable server, or an account that cannot
+    /// see the catalog. The list is empty because nothing was read into it.
+    Failed,
+}
+
+/// What the Export modal's table picker should render.
+///
+/// **Same shape and same reason as [`crate::script::ProbeSummary`]**, which
+/// exists because the sibling modal's `== 0` branch made exactly this mistake:
+/// it described a file the probe had never finished reading as holding *"no
+/// statements Schemaic can run"*. Here the claim was *"This database has no
+/// tables."*, printed four lines above the connection error that explained why
+/// the list was empty — two contradictory statements about one database, with
+/// the reassuring one in the panel the user is reading.
+///
+/// An enum matched exhaustively rather than a second `if`, so that a fourth
+/// state cannot fall into the reassuring arm by default.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PickerBody {
+    /// Say the list is being read.
+    Reading,
+    /// The read succeeded and the database holds nothing to export.
+    NoTables,
+    /// The read failed. Say *that*, and let the error line say why.
+    Unreadable,
+    /// There are names to offer.
+    Tables,
+}
+
+/// Which of the four states the picker is in. See [`PickerBody`].
+///
+/// A failed listing that nevertheless has names is [`PickerBody::Tables`] — it
+/// cannot arise today (the error arm leaves the list untouched at empty), and
+/// showing the names would still be the right answer if it ever did. What must
+/// never happen is the reverse: an empty list from a read that failed being
+/// described as an empty database.
+pub fn picker_body(listing: Listing, tables: usize) -> PickerBody {
+    match (listing, tables) {
+        (Listing::Reading, _) => PickerBody::Reading,
+        (_, 1..) => PickerBody::Tables,
+        (Listing::Failed, 0) => PickerBody::Unreadable,
+        (Listing::Done, 0) => PickerBody::NoTables,
+    }
+}
+
 /// The statements that put a table's key counter back where the data left it.
 ///
 /// **PostgreSQL only, and it is the difference between a restore that works and
@@ -2540,6 +2597,41 @@ mod tests {
             error.as_deref().is_some_and(|e| e.contains("gone")),
             "{error:?}"
         );
+    }
+
+    /// **"This database has no tables." was printed about a database nobody had
+    /// managed to read.** The picker branched on `(listing, names.is_empty())`
+    /// and had no third state, so an unreachable server or an account that
+    /// cannot see the catalog produced the reassuring sentence — four lines
+    /// above the footer's connection error, and it is the panel the user is
+    /// reading. Exactly `ProbeSummary::CutOffBeforeFirst`'s bug, in the sibling
+    /// modal that never got the fix.
+    #[test]
+    fn a_listing_that_failed_is_not_an_empty_database() {
+        assert_eq!(picker_body(Listing::Failed, 0), PickerBody::Unreadable);
+        assert_eq!(picker_body(Listing::Done, 0), PickerBody::NoTables);
+    }
+
+    /// The other three states are unchanged, so the classifier cannot pass by
+    /// calling everything unreadable.
+    #[test]
+    fn the_picker_reads_then_offers_what_came_back() {
+        assert_eq!(picker_body(Listing::Reading, 0), PickerBody::Reading);
+        assert_eq!(
+            picker_body(Listing::Reading, 9),
+            PickerBody::Reading,
+            "a stale list from the previous open is not what this modal is showing"
+        );
+        assert_eq!(picker_body(Listing::Done, 1), PickerBody::Tables);
+        assert_eq!(picker_body(Listing::Done, 400), PickerBody::Tables);
+    }
+
+    /// Names beat the failure: it cannot arise today — the error arm leaves the
+    /// list at the empty `Vec` the open reset it to — and offering them would
+    /// still be the right answer if a partial read ever landed.
+    #[test]
+    fn a_failed_listing_that_still_has_names_offers_them() {
+        assert_eq!(picker_body(Listing::Failed, 3), PickerBody::Tables);
     }
 
     // ── the file has to address one database, and it has to be the target ────
