@@ -107,7 +107,6 @@ pub(crate) fn modal_layer(ui: Ui, modal_up: impl Fn() -> bool + Copy + 'static) 
             let dump_open = ui.dump.target;
             let script_open = ui.script.target;
             stack((
-                error_modal_overlay(ui.clone()),
                 crate::snippet_edit::snippet_edit_overlay(ui.clone()),
                 import_view::import_overlay(ui.clone()),
                 // Export and Import-a-script share one tuple element: this stack
@@ -296,6 +295,27 @@ pub(crate) fn modal_layer(ui: Ui, modal_up: impl Fn() -> bool + Copy + 'static) 
         // the three "comes first" comments above local facts about their own
         // group rather than rules the next modal has to rediscover.
         //
+        // **The shared error modal, hoisted out of the DDL group for the
+        // confirm's reason** — the third time this move has been made, after the
+        // confirm itself and the grid export's progress modal.
+        //
+        // It was child 0 of that group, under nine members that paint over it,
+        // and it is the only one of the ten that something other than a click on
+        // a live workspace can raise: a failed COMMIT, a Manual-mode session that
+        // failed to open after the user moved on, and `file_error` from a save
+        // dialog that is deliberately *not* window-modal. So the ordinary case
+        // was a round trip failing while the user had opened an editor — and the
+        // modal saying their transaction did not commit was full-window,
+        // correctly sized, and entirely behind the designer. It had the keyboard
+        // too, so the first Escape closed the modal nobody saw and cleared its
+        // text, and the second closed the designer: one Escape appeared to do
+        // nothing and a failed COMMIT was never reported.
+        //
+        // **Below the confirm, above everything else.** A confirm is a question
+        // waiting on an answer and an error is a report; putting the report over
+        // the question would block the answer, and the confirm's own resolve is
+        // one of the things that can raise this.
+        error_modal_overlay(ui.clone()),
         // Its own `absolute().inset(0)` needs a box to resolve against, hence the
         // wrapper — and the wrapper must be out of flow while nothing is asked,
         // or it would eat every click in the app.
@@ -332,7 +352,6 @@ pub(crate) fn modal_layer(ui: Ui, modal_up: impl Fn() -> bool + Copy + 'static) 
 /// at the end of the layer, above every group, and so has its own term in
 /// [`modal_backdrop_up`] exactly as `find`, `manage` and `plan` do.
 fn ddl_modals_up(ui: &Ui) -> impl Fn() -> bool + Copy + 'static {
-    let err_open = ui.overlay.error_modal_open;
     let tx_prompt = ui.overlay.tx_prompt;
     let import_open = ui.import.target;
     let dump_open = ui.dump.target;
@@ -340,8 +359,13 @@ fn ddl_modals_up(ui: &Ui) -> impl Fn() -> bool + Copy + 'static {
     let snippet_edit = ui.overlay.snippet_edit;
     let editors = ddl_editors_up(ui.ddl);
     move || {
-        err_open.get()
-            || tx_prompt.get().is_some()
+        // **The shared error modal is deliberately not here.** It is its own
+        // entry near the end of the layer now, above every group, and so has its
+        // own term in `modal_backdrop_up` exactly as the confirm and the export
+        // progress modal do. Leaving it would give this group a full-window box
+        // with nothing in it whenever an error is up — a transparent sheet over
+        // the app, eating clicks.
+        tx_prompt.get().is_some()
             || import_open.get().is_some()
             // Painted in this group, so it has to be in this list — the wrapper's
             // `inset(0)` resolves against a box this predicate keeps at zero by
@@ -482,6 +506,12 @@ pub(crate) fn modal_backdrop_up(ui: &Ui) -> impl Fn() -> bool + Copy + 'static {
     // predicate's doc names, and the one a modal leaving a group is most likely
     // to cause, since nothing about the move is visible from here.
     let export_open = ui.export.target;
+    // And the third to make that move: the shared error modal left the DDL group
+    // because it was child 0 of it, under nine members that painted over it, and
+    // it is the only one of the ten something other than a click can raise. Same
+    // consequence if this term were missing — the title bar live and undimmed
+    // over an error nobody can dismiss.
+    let error_modal_open = ui.overlay.error_modal_open;
     let ddl = ddl_modals_up(ui);
     let workspace = workspace_modals_up(ui);
     let settings = settings_modals_up(ui);
@@ -492,6 +522,7 @@ pub(crate) fn modal_backdrop_up(ui: &Ui) -> impl Fn() -> bool + Copy + 'static {
             || plan_open.get()
             || confirm.get().is_some()
             || export_open.get().is_some()
+            || error_modal_open.get()
             || ddl()
             || workspace()
             || settings()
@@ -709,6 +740,7 @@ mod modal_backdrop_gate {
             "plan_open.get()",
             "confirm.get()",
             "export_open.get()",
+            "error_modal_open.get()",
         ] {
             assert!(
                 closure.contains(term),
