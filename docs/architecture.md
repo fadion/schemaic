@@ -5367,6 +5367,41 @@ existing prose was left alone.
       than writing the field empty. The regression test that missed this asserted the opposite
       (`is_empty()`, which the bug satisfied), which is why the pinned one is named
       `no_connections_is_not_yet_rather_than_nothing_to_migrate`.
+    - `expanded.rs` — the `(conn_id, key)` set of open SCHEMA-tree nodes, modelled on `db_hidden.rs`
+      line for line because it is **the third instance of that same mistake**. Every key it holds is
+      name-only — `schema_tree::db_key` is `format!("db:{database}")`, and the same for
+      `tbl:`/`col:`/`sch:`/`objgrp:` — so a flat `Vec<String>` meant expanding `sys` on one
+      MySQL-family connection left it expanded on all of them, and since `information_schema`,
+      `mysql`, `sys` and `performance_schema` exist on every such server the collision was
+      guaranteed and landed on the largest databases on the box. The second connection's node
+      rendered already open, built its whole table list, and — with the size column on — fired a
+      `fetch_table_stats` against a database nobody had opened there; it survived restarts, because
+      the flat list was persisted. `db_hidden`'s flat names and `schema::tab_target`'s global "last
+      database" are the other two instances, both already written up as bugs in their own module
+      docs, and all three are fixed the same way. `keys_for` resolves one connection's keys back to
+      the `HashSet<String>` the tree reads, which is the question the tree is asking and what keeps
+      every `contains` in `schema_tree` a one-argument call. `set_keys` replaces one connection's
+      whole set and is the only mutator, because a toggle, *Collapse all* and collapse-this-database
+      all rewrite the tree's set wholesale, so "here is this connection's set now" is the operation
+      and a per-key insert/remove would be a second spelling of it; order within the connection
+      being written **must not be relied on** (the runtime side is a `HashSet`, so the on-disk order
+      is already whatever the set iterated), while every other connection's rules keep their
+      relative order, which is what keeps a `ui_state.json` diff readable. `clear_conn` is how a
+      deleted connection's expansions go out with it, which the flat set could not do at all: its
+      keys stayed in `ui_state.json` forever and auto-opened same-named databases on connections
+      created later. `migrate_flat` applies a legacy flat list to **every** connection and answers
+      `None` — not `Some(vec![])` — when there are no connection ids, `db_hidden::migrate_flat`'s
+      argument verbatim because it is the same migration: it runs at most once with the flat field
+      written empty from then on, so a launch whose `connections.json` failed to load would
+      otherwise collapse every tree permanently, with nothing said and no way to retry.
+      **App side, `expanded` is the *active* connection's set and `expanded_rules` is the persisted
+      truth.** A `create_effect` tracks `expanded` and writes it back through `set_keys`, reading
+      `active_conn` **untracked** — that is the load-bearing half: tracking it would fire the effect
+      on a connection *switch* and file the outgoing connection's set under the incoming one before
+      anything replaced it. `switch_conn` sets `active_conn` first and *then* `expanded` from
+      `keys_for`, which is what makes that untracked read land in the right place; the outgoing set
+      is already stored, because the effect ran on every change that made it. Deleting a connection
+      calls `expanded::clear_conn` beside the other per-connection stores.
     - `db_color.rs` — identity colours: a per-`(connection, database)` one and a
       per-`(connection, database, table)` one. Display-only — a dot in the tree, the active-DB
       selector and tabs for a database; a dot on the table row and a tint on that table's card
@@ -8420,7 +8455,13 @@ existing prose was left alone.
     rebuild it. It is here rather than in either caller because two of them have the same shape, a
     shared map keyed by node: the schema tree's `expanded` and the ER diagram's `collapsed`. It was
     `schema_tree`'s until the second one needed it; the measurements and the two pins are under
-    *Floem 0.2 gotchas*. Also `sparkle_action` — the sparkle-plus-label "AI fix" the editor's
+    *Floem 0.2 gotchas*. Also `Clearable`/`clear_if_any`/`retain_if_any`/`retain_pairs_if_any` —
+    the never-write-a-no-op guards, here because they were module-private to `grid.rs` and so
+    unreachable from `schemaic-app`, which held the only two live violations of the rule they
+    enforce. `Clearable`/`clear_if_any`/`retain_if_any` are re-exported from `lib.rs` for that
+    crate; `retain_pairs_if_any` is not, its only callers being `grid.rs`'s three `dirty` filters
+    (*Floem 0.2 gotchas*, `update` doesn't dedup).
+    Also `sparkle_action` — the sparkle-plus-label "AI fix" the editor's
     error bar and the error modal both offer, in one definition because the two had already drifted
     to different colours by the time there were two of them; **neither half sets a colour**, so the
     row's own tints the SVG's `currentColor` and the words together and one `hover` covers the pair
@@ -10393,6 +10434,11 @@ existing prose was left alone.
     `{prefix}{database}:` boundary rather than on `{prefix}{database}` alone, so collapsing `shop`
     leaves `shopify` alone (`collapsing_a_database_drops_every_key_under_it` asserts both halves).
     It replaced `table_key_prefix`, which was re-exported from `lib.rs` and is gone.
+    **The set those keys live in is the *active connection's*, not the app's.** `expanded` is still
+    a `RwSignal<HashSet<String>>` this file reads with one-argument `contains` calls, but every key
+    in it is name-only, so a flat app-wide set opened `db:sys` on every MySQL-family connection at
+    once; `core::expanded` holds the `(conn_id, key)` rules behind it and the bug that made them
+    necessary, and the app refills the signal from `expanded::keys_for` on each switch.
     **`chevron` takes the open state rather than deriving it**, and that is the same disagreement in
     the disclosure triangle. Its key was `expanded.contains(key)` and nothing else, while every
     consumer of that key ORs in a second term — `|| filtering` for a database or a namespace,
@@ -11369,9 +11415,21 @@ existing prose was left alone.
     `VirtualVector<usize>` shape (a capped fetch is still four million lines); the panel's width
     is the wider of a comfortable modal and what a `hex_line` actually measures, because a dump that
     wraps stops being a dump. The header names the kind and the whole value's size through
-    `format::human_bytes`, and adds *showing the first 64.0 MB* when the fetch was capped — the
+    `format::human_bytes`, and adds *showing the first N* when the fetch was capped — the
     same fact that disables **Save to file**, since a save of a truncated buffer writes a file that
-    is the front of a blob and looks like the blob. The Preview/Hex switch is a **dropdown**
+    is the front of a blob and looks like the blob. **Both sentences report the buffer's own length
+    rather than `FETCH_CAP`**, which is the cut point only on PostgreSQL and SQLite: MySQL's
+    `SELECT` asks for `SUBSTRING(col, 1, LEAST(?, PACKET_ROOM))`, the room being
+    `max_allowed_packet − 1 MiB` — measured 15,728,640 on stock MariaDB 10.11 and 66,060,288 on
+    MySQL 8.4, the second *below* `FETCH_CAP` on that engine's default, so it is not a
+    misconfiguration. Naming the constant made a 20 MiB `LONGBLOB` read *"Binary data · 20.0 MB ·
+    showing the first 64.0 MB"* — a 20 MB value cannot have a 64 MB front — and made `save_offer`
+    refuse it as "over 64.0 MB", false about the value and pointing at a limit the user cannot
+    change instead of the one they can. Nothing here can learn *why* it was cut, since `PACKET_ROOM`
+    is evaluated inside the statement and never crosses back, but it does not need to: how much
+    arrived is the fact the reader wants, and it is `bytes.len()`. `save_offer` still reads the
+    **server's** length for the yes/no, which is what keeps it right for a value that happens to be
+    exactly `FETCH_CAP` long. The Preview/Hex switch is a **dropdown**
     (`pane_picker` → `settings::focusable_dropdown`), not a pair of buttons: two mutually exclusive
     views of one value is what the app's `<select>` is for, and going through `in_ring_picker`
     inherits the edge-flipping, the arrow keys, the Enter/Escape peel and the tint-not-fill
@@ -11411,10 +11469,22 @@ existing prose was left alone.
     is **asserted rather than commented** —
     `the_area_cap_sits_behind_the_edge_cap_at_these_numbers` — so an edge cap raised to 5,657 or
     beyond, where its square first exceeds 32 megapixels, fails a test rather than quietly bringing
-    the second check back to life unread. Both of its refusals *say so*
+    the second check back to life unread. Every one of its refusals *says so*
     rather than leaving an empty box, and `Unmeasurable` is one of them: `sniff` matches magic bytes
-    and stops, so a truncated PNG still reads as a PNG, and floem would decode nothing and draw
-    nothing under a caption naming the format. The measurement is the UI's because it needs a
+    and stops, so bytes that are not the image it took them for still reach the preview, and floem
+    would decode nothing and draw nothing under a caption naming the format.
+    **`Truncated` is the third arm, and it is asked *before* the dimensions because the dimensions
+    are fine.** A PNG's IHDR is bytes 16..24 and a JPEG's SOF is near the top, so a 16 MiB scan cut
+    at 15 MiB by MySQL's packet room still measures 3000 × 2400 and still passes every cap:
+    `Unmeasurable` catches a corrupt *header* and cannot catch a missing *body*, which is the case
+    the app produces itself (`BlobValue::truncated`). floem's `img` is `load_from_memory(..).ok()`
+    with the width defaulting to `0`, so the decode error becomes a 0 × 0 image and an empty `Blob` —
+    a blank pane with no explanation, on the pane the panel chose for the user, which is exactly the
+    outcome `Unmeasurable` exists to prevent reached by the one route it did not cover. A decoder
+    that renders what it has, as some JPEG decoders do, is no better: a partial image with nothing
+    saying so is worse than a sentence. So `preview_verdict` takes `truncated` as a second parameter
+    and answers it first, and every other check in it is about an image these bytes do not contain.
+    The measurement is the UI's because it needs a
     decoder; the decision is core's, pure and tested, and the composition is pinned by a fixture
     that rewrites a real PNG's IHDR rather than encoding one at size — encoding it would be the
     very allocation the gate exists to prevent.
@@ -11428,7 +11498,7 @@ existing prose was left alone.
     would put one cell's identity in two places, which `BlobTarget` already refuses for the read
     half. `None` there is a cell nothing can write, and it is what leaves *Load from file*
     disabled; the button sits before *Save to file* and the three actions take `ACTION_TAB + 1/2/3`.
-    **It is a struct with two closures — `put` and `live` — and not a bare `Rc<dyn Fn(Vec<u8>) ->
+    **It is a struct with two closures — `put` and `live` — and not a bare `Rc<dyn Fn(Arc<[u8]>) ->
     bool>`**, because `put` asks `is_live` inside itself and so no caller can skip the check. The
     signal holding it is window-scoped while the sink closes over a `GridState`, so the two do not
     die together, and floem's `get_untracked` is `try_get_untracked().unwrap()`: a stale sink is a
@@ -11456,6 +11526,16 @@ existing prose was left alone.
     family whose late arrival would write to a *database* rather than to a label; a load arriving
     with no sink is refused in words rather than dropped, because doing nothing quietly looks
     exactly like a load that worked.
+    **`put` takes an `Arc<[u8]>`, not a `Vec<u8>`, because the seam forced a copy.** The panel read
+    the file into a `Vec`, cloned it to hand over, and `CellEdit::bytes` built its `Arc<[u8]>` by
+    copying *that* — three buffers live at once for one cell, which at the picker's 64 MiB cap is
+    three 64 MiB buffers on the path a `LONGBLOB` column exists for. `BlobState::Ready` had already
+    chosen the `Arc` for this reason ("the buffer is up to `FETCH_CAP` and every read of the signal
+    would otherwise copy it"); the clone one screen down reintroduced the copy before the `Arc` was
+    built. The panel now builds the `Arc` once and shares it, so the middle buffer goes and the peak
+    is two rather than three. The remaining pair is `BlobValue::bytes`, still a `Vec`, and the grid's
+    staged `Arc` — collapsing those wants `BlobValue` to hold an `Arc<[u8]>` too, which is a wider
+    change and has not been made.
     **And the sink itself can refuse**: `BlobStage::put` returns a `bool`, and the panel says which
     way it went. The file dialog stands open for as long as the user takes to choose and the grid is free
     to move underneath it — the pending row discarded, the row marked for deletion, the result re-run
@@ -11685,6 +11765,22 @@ existing prose was left alone.
     `themes.rs` holds the data and the three runtime axes, including `UiScale` and the pure
     `scale_at`/`scale_font_at` rounding; `icons.rs` sizes every glyph, scaling the **base** size its
     callers pass.
+    **The editor's font size and tab width are healed where they are *loaded*, not only where they
+    are stored**, which is what `clamped_editor_font`/`clamped_tab_width` and
+    `EDITOR_FONT_MIN`/`EDITOR_FONT_MAX`/`DEFAULT_EDITOR_FONT` are for (defined in `themes.rs`,
+    re-exported from `theme.rs` like the rest of the axis). `ui_state.json` carries both as raw
+    numbers under `#[serde(default)]`, which fills in an *absent* field and validates nothing, so a
+    hand-edited or newer-build config reached the editor unchecked: a `0` font size laid every SQL
+    editor out at zero, `-5` did the same (`as usize` saturates), and `1e40` deserialises to
+    `f32::INFINITY` and saturates the other way to `usize::MAX`. None of it is reachable through the
+    UI — Ctrl+scroll clamps — but a hand-written config is a real input class here, the reason
+    `parse_hex` carries a non-ASCII guard. The clamp used to live only inside `set_editor_tab_width`,
+    so the *stored* value was corrected and the source of it never was: the editor indented by 8
+    while the signal, the Settings picker and the file all went on saying 99, and `save_ui` writes
+    those signals back, so a clamp that does not reach them never sticks. `clamped_editor_font`
+    answers **NaN with the default** rather than passing it through, because `f32::clamp` returns
+    NaN for a NaN input (and panics on a NaN bound) and `serde_json` will hand over a NaN for a bare
+    `nan` token.
     `sql_highlight.rs` decides nothing about *where* a token is — both halves of that are
     `core::sql`'s, and both used to be re-derived here. `lex_line` asks `skip_noncode` for the span
     and `noncode_kind` for what the span **is**, instead of classifying it by its opening byte with
@@ -11721,10 +11817,26 @@ existing prose was left alone.
     `an_erd_header_tint_keeps_the_table_name_legible` asserts that pairing separately — `text` on
     every `CONN_COLOR_PRESETS` entry at `erd_view::HEADER_TINT_ALPHA` over that surface, every
     built-in UI theme, against the `Body` floor of 4.5:1, worst case 5.0:1 (Amber on Dark).
-    `env_badge_text` is excused from the same question because no theme can promise a ratio on an
-    arbitrary connection colour; here the colour set is closed and the wash strength is ours, so the
-    promise can be kept and is measured. A failure means the alpha is too high, not that a preset is
-    wrong. That test covers the **header only** — the same card's tinted border is deliberately not
+    The colour set is closed and the wash strength is ours, so the promise can be kept and is
+    measured. A failure means the alpha is too high, not that a preset is wrong.
+    **The environment badge used to be excused from exactly that question** — "no theme can promise
+    a ratio on an arbitrary connection colour" — which was the opposite of what the clause beside it
+    argued about the same eight presets, and with *more* to go on rather than less: the connection
+    form's colour control is a row of `CONN_COLOR_PRESETS` swatches with no free-hex entry, and the
+    badge's fill carries no wash over it at all, so it is the easier half of the two. Fixed white
+    measured 1.75:1 on Amber — under even the *Recessive* floor of 2.0 — and under Body on eight of
+    eight, on the label whose whole job is to say you are on production. `theme::env_badge_text_on(fill)`
+    replaces it and decides **by measuring** rather than by a luminance threshold: a threshold is a
+    guess at where the crossover is, while `contrast_ratio` is the function every other colour here
+    is already held to and cannot be off by a preset. On the eight shipped it answers a near-black
+    for all eight (white's best is 3.82:1 on Red, the near-black's worst 5.02:1), and a darker ninth
+    preset would correctly get white with nothing touched;
+    `the_env_badge_label_is_legible_on_every_connection_preset` asserts that through the accessor
+    rather than a copy of it. The header reads fill and label in the same style closure, so a colour
+    switch moves both and neither is frozen at build time. `caption_close_hover`'s fixed white is
+    **not** the same case and no longer cites this one: one saturated red measuring 5.66:1 in every
+    theme is a different question from a palette of eight, three of them pale, and the shared
+    comment is what made the badge's exclusion read as considered. That test covers the **header only** — the same card's tinted border is deliberately not
     asserted here, because a border carries no text and a legibility floor on it would mean nothing;
     `erd_view::tests::a_tinted_border_is_never_fainter_than_the_plain_one` holds it to the plain
     `border` it replaces instead.
@@ -12176,7 +12288,19 @@ existing prose was left alone.
   alone reached into whichever tab the map yielded first and, when that was the wrong one, closed a
   transaction still open on a server nobody had touched and re-pinned its connection underneath it —
   losing the uncommitted work of a tab the user never acted on, while the tab that actually lost its
-  socket stayed broken. **The kill asks `may_launch_destructive` before it raises the confirm** —
+  socket stayed broken. **That lookup is `owning_tab_of`, a free function rather than the
+  `Rc<dyn Fn>` bound inside `app_view` it used to be, because the composition is where the bug
+  was.** `Connection::targets_same_server` is exhaustively covered and was never wrong; what was
+  wrong was the lookup around it, which compared `conn_id` — and two Schemaic connections routinely
+  point at one server (`local (app)` and `local (root)`, or two entries differing only in default
+  database), so a true match was rejected and the tab was left holding the dead socket. That is the
+  seam CLAUDE.md names, a pure function's composition with its caller, and while the lookup had no
+  name outside `app_view` nothing could call it, so the same substitution could be made again with
+  the suite green. The `owning_tab` closure that remains only *gathers* the three registries —
+  pinned server ids, tab→connection, connections — and hands them over; nothing in it chooses
+  anything. Ties fall to the `HashMap`'s arbitrary order, as before the extraction, since two tabs
+  pinned to one session on one server is not a state the app can reach.
+  **The kill asks `may_launch_destructive` before it raises the confirm** —
   the shared guard every other destructive modal action asks, which this path asked nothing at all —
   and a read-only connection gets the refusal in words rather than a modal it cannot complete.
   The kill itself resolves its target `Db` **when the confirm is raised**, not
@@ -15278,9 +15402,34 @@ Re-introducing the anti-patterns these guard against is a regression:
   unconditionally, and the grid body's `dyn_container` key holds `new_rows.len()`: discarding one
   cell edit tore the body down, recomputed the sort order over every row and built a new one to
   arrive at the same `0` — and moved `focus_id` out from under the keyboard hand-back that the same
-  discard had already put in flight. `grid::clear_if_any` is the guard (`Clearable`, over `Option`
-  as well as the collections, so "the editor is already closed" is the same case), and
+  discard had already put in flight. `widgets::clear_if_any` is the guard (`Clearable`, over
+  `Option` as well as the collections, so "the editor is already closed" is the same case), and
   `grid::clear_tests` pins the floem fact itself by counting effect runs.
+  **It lives in `widgets.rs` and is `pub` on the crate root because it was neither, and that was
+  structural rather than untidy.** Module-private to `grid.rs` and re-exported from nowhere, the
+  guard was unreachable from `schemaic-app` — the one crate that had live violations of the rule it
+  enforces, and the crate the source gates were widened to cover on the grounds that it builds views
+  too. Both violations were the schema tree's collapses: `collapse_all`'s
+  `expanded.update(|set| set.clear())` notified every dependent of the expansion set *and wrote the
+  UI state to disk* on an already-collapsed tree, and `collapse_db` did the same through a `retain`
+  that removed nothing — `update` does not care whether the predicate kept everything, which is the
+  half easiest to miss, since a predicate reads as a condition already. `retain_if_any` and
+  `retain_pairs_if_any` are the partial-clear siblings written for those, the second over a map for
+  the grid's three `dirty` filters, whose common case is that the deleted rows had no staged edit.
+  They are **two functions rather than one trait**, unlike `Clearable`: a `HashSet` hands the
+  predicate a `&T` and a `HashMap` a `(&K, &V)`, so covering both wants a generic associated type
+  and more lifetime machinery than the two bodies it would save. The predicate runs twice, once to
+  ask and once to do — a membership test over a few hundred short strings against a rebuild of every
+  mounted subtree, so the trade is not close.
+  **The rule is about call sites rather than about the function, so the pin is a source gate**:
+  `no_view_code_clears_or_retains_a_signal_unguarded` scans both view crates for the two spellings
+  it names, floored on finding the guarded sites so a rename or a moved `src` cannot make it pass by
+  matching nothing. Its `EXEMPT` allowlist is `(file, line fragment, why)` — writes that always
+  change something, so the notification is the point: a `String` field on a query struct, a
+  dismissed error message, and the three `retain`s that delete a tab or a connection by an id that
+  came out of the list being filtered. `every_clear_exemption_still_names_a_real_write` is the floor
+  under *that*, `scaled_arg_gate`'s instrument applied a second time, because an exemption matching
+  nothing is a hole and not a permission.
   **That counting is available to any test, and is worth knowing before you decide something is only
   checkable with the app running:** `RwSignal::new` + `create_effect` + a `Cell` counter work in a
   plain `#[test]` with no window and no runtime, so *how many times* a write notifies is an ordinary
@@ -15369,7 +15518,9 @@ Re-introducing the anti-patterns these guard against is a regression:
   rebuild of one cell — the behaviour before the memo — and nothing unequal can ever be called
   equal.
   **The schema tree is the same fact at every level of one view, and `widgets::dedup_key` is the
-  remedy applied wholesale.** `expanded` is one app-wide `RwSignal<HashSet<String>>` and every
+  remedy applied wholesale.** `expanded` is one `RwSignal<HashSet<String>>` — the *active
+  connection's* keys since `core::expanded`, but still one signal, and one signal is all this
+  argument needs — and every
   children container and every chevron in the tree subscribes to it, so expanding one table in a
   500-table database re-ran `db_node`'s children key — which deep-copies every `TableInfo` in the
   database (measured, release: 2.77 ms at 500 tables × 25 columns, 6.78 ms at 1000 × 30, the clone
