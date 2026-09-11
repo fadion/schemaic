@@ -625,6 +625,55 @@ pub struct Issue {
     pub kind: IssueKind,
 }
 
+/// One preview cell, as the mapping step must draw it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PreviewCell<'a> {
+    Text(&'a str),
+    /// Drawn the way the grid draws a NULL — faint italic — so it cannot be
+    /// mistaken for the text that spells it.
+    Null,
+}
+
+/// Would this field land as NULL? The preview's question, answered the way the
+/// **load** answers it.
+///
+/// **The preview could not show a CSV NULL at all**, which made both NULL
+/// controls invisible in the one step whose stated job is verification by
+/// looking. The view decided nullness from the [`Field`] alone, and `Field` is
+/// `None` only for a *format-level* null — `read_csv_sample` builds every field
+/// as `Some(..)` and never reads `cfg.nulls`, because for CSV whether empty
+/// text means NULL is [`NullRule`]'s call and that call is made at coercion,
+/// which the preview does not run. So `people.csv` = `id,note\n1,NULL\n2,\n`
+/// with the defaults previewed row 1's `note` as the plain text `NULL` and row
+/// 2's as an empty cell, both in the ordinary colour and both indistinguishable
+/// from the string values `'NULL'` and `''` — while the import stored NULL in
+/// both. Toggling "Empty field is NULL" **off** left the preview byte-identical
+/// while row 2 now stored `''`: the control whose entire reason to exist is
+/// that distinction changed nothing on screen, at any setting, for any value.
+///
+/// The one arm that *did* render the faint italic was reachable only for a
+/// record shorter than the header — which for CSV is an
+/// [`IssueKind::FieldCount`], not a null, so the single case that drew it drew
+/// it for the wrong reason.
+///
+/// **`format` is asked, not assumed**, and through the same
+/// [`ImportFormat::has_own_nulls`] that `validate` and `row_iter` ask: JSON and
+/// Excel carry their own nulls, so applying the token rule to them would paint
+/// every empty JSON string and empty Excel cell as NULL — a preview that
+/// contradicts the file. Three places must not answer this differently, and now
+/// none of them re-derives it.
+pub fn preview_field<'a>(
+    field: &'a Field,
+    nulls: &NullRule,
+    format: ImportFormat,
+) -> PreviewCell<'a> {
+    match field {
+        None => PreviewCell::Null,
+        Some(text) if !format.has_own_nulls() && nulls.matches(text) => PreviewCell::Null,
+        Some(text) => PreviewCell::Text(text),
+    }
+}
+
 /// Turn one field's text into a [`Value`] for `kind`, or say why it can't be.
 ///
 /// `dialect` is needed only for booleans, and only because the engines genuinely
@@ -3039,6 +3088,127 @@ mod tests {
             trim: false,
             sheet: None,
         }
+    }
+
+    // ── The preview's nullness ──────────────────────────────────────────────
+    //
+    // **Asserted end to end, from `read_sample` rather than from a hand-built
+    // `Field`.** `NullRule::matches` passed its own tests from the day it was
+    // written; the defect was that the preview path never called it, and a
+    // sample built by hand with a `None` in it would have hidden exactly that.
+    // What makes these red on the unfixed tree is that `read_sample`'s output
+    // has no `None` to find.
+
+    /// The file from the report, previewed as it will land: with the modal's
+    /// defaults plus `NULL` in the tokens box, **both** `note` cells are NULL —
+    /// the spelled one and the empty one — and neither `id` is.
+    #[test]
+    fn a_csv_preview_shows_a_token_null_and_an_empty_field_as_null() {
+        let nulls = NullRule {
+            tokens: vec![String::new(), "NULL".to_string()],
+        };
+        let c = ReadConfig {
+            nulls: nulls.clone(),
+            ..cfg(true)
+        };
+        let s = read_sample(
+            b"id,note\n1,NULL\n2,\n".as_slice(),
+            ImportFormat::Csv,
+            &c,
+            10,
+        )
+        .unwrap();
+        let cell = |r: usize, f: usize| preview_field(&s.rows[r][f], &nulls, ImportFormat::Csv);
+        assert_eq!(cell(0, 0), PreviewCell::Text("1"));
+        assert_eq!(cell(0, 1), PreviewCell::Null, "the spelled NULL");
+        assert_eq!(cell(1, 0), PreviewCell::Text("2"));
+        assert_eq!(cell(1, 1), PreviewCell::Null, "the empty field");
+    }
+
+    /// And the control that decides it is visible on screen: turn "Empty field
+    /// is NULL" off — drop the empty token — and row 2's cell becomes the empty
+    /// *string* it will actually store. The preview used to be byte-identical
+    /// at both settings.
+    #[test]
+    fn turning_off_empty_is_null_changes_what_the_preview_shows() {
+        let nulls = NullRule {
+            tokens: vec!["NULL".to_string()],
+        };
+        let c = ReadConfig {
+            nulls: nulls.clone(),
+            ..cfg(true)
+        };
+        let s = read_sample(
+            b"id,note\n1,NULL\n2,\n".as_slice(),
+            ImportFormat::Csv,
+            &c,
+            10,
+        )
+        .unwrap();
+        let cell = |r: usize, f: usize| preview_field(&s.rows[r][f], &nulls, ImportFormat::Csv);
+        assert_eq!(cell(0, 1), PreviewCell::Null, "the token still matches");
+        assert_eq!(
+            cell(1, 1),
+            PreviewCell::Text(""),
+            "an empty field is now an empty string, and must look like one"
+        );
+    }
+
+    /// **A format that carries its own nulls is not swept up.** JSON says which
+    /// values are absent, so an empty string in the file is an empty string in
+    /// the preview whatever the token box holds — the same answer `validate`
+    /// and `row_iter` give through `has_own_nulls`.
+    #[test]
+    fn a_json_empty_string_is_not_previewed_as_null() {
+        let nulls = NullRule {
+            tokens: vec![String::new(), "NULL".to_string()],
+        };
+        let json = r#"[{"id":1,"note":""},{"id":2,"note":null}]"#;
+        let s = read_sample(json.as_bytes(), ImportFormat::Json, &cfg(true), 10).unwrap();
+        let at = |name: &str| s.columns.iter().position(|c| c == name).expect(name);
+        let (id, note) = (at("id"), at("note"));
+        assert_eq!(
+            preview_field(&s.rows[0][note], &nulls, ImportFormat::Json),
+            PreviewCell::Text(""),
+            "the token rule must not reach a format that carries its own nulls"
+        );
+        assert_eq!(
+            preview_field(&s.rows[1][note], &nulls, ImportFormat::Json),
+            PreviewCell::Null,
+            "a JSON null is a null whatever the tokens say"
+        );
+        assert_eq!(
+            preview_field(&s.rows[0][id], &nulls, ImportFormat::Json),
+            PreviewCell::Text("1")
+        );
+    }
+
+    /// A written token still matches a padded field, and the empty token still
+    /// does not match a quoted run of spaces — `matches`' two rules, asked
+    /// through the preview so the screen and the load agree about them.
+    #[test]
+    fn the_preview_reads_padding_the_way_the_load_does() {
+        let nulls = NullRule {
+            tokens: vec![String::new(), "NULL".to_string()],
+        };
+        let c = ReadConfig {
+            nulls: nulls.clone(),
+            ..cfg(true)
+        };
+        let s = read_sample(
+            b"a,b\n NULL ,\"   \"\n".as_slice(),
+            ImportFormat::Csv,
+            &c,
+            10,
+        )
+        .unwrap();
+        let cell = |f: usize| preview_field(&s.rows[0][f], &nulls, ImportFormat::Csv);
+        assert_eq!(cell(0), PreviewCell::Null, "a padded token is still NULL");
+        assert_eq!(
+            cell(1),
+            PreviewCell::Text("   "),
+            "three deliberate spaces are data, not an empty field"
+        );
     }
 
     // ── Excel ───────────────────────────────────────────────────────────────

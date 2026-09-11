@@ -75,30 +75,45 @@ fn read_config(ui: ImportUi) -> ReadConfig {
         "\\t" | "\t" => b'\t',
         s => s.as_bytes().first().copied().unwrap_or(b','),
     };
-    // The empty-string token comes from its own toggle: it can't be written in a
-    // comma-separated list, so an empty box would otherwise be read as "no
-    // tokens" and quietly turn every blank field into an empty string.
-    let mut tokens: Vec<String> = Vec::new();
-    if ui.empty_is_null.get_untracked() {
-        tokens.push(String::new());
-    }
-    tokens.extend(
-        ui.null_tokens
-            .get_untracked()
-            .split(',')
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty()),
-    );
     ReadConfig {
         dialect: CsvDialect {
             delimiter,
             quote: b'"',
             has_header: ui.has_header.get_untracked(),
         },
-        nulls: NullRule { tokens },
+        nulls: null_rule(
+            ui.empty_is_null.get_untracked(),
+            &ui.null_tokens.get_untracked(),
+        ),
         trim: ui.trim.get_untracked(),
         sheet: ui.sheet.get_untracked(),
     }
+}
+
+/// The two NULL controls as one [`NullRule`].
+///
+/// **Separate from [`read_config`] because the preview needs the same rule from
+/// *tracked* reads.** `read_config` reads every control untracked, which is
+/// right for launching a probe and wrong inside a `dyn_container` builder — a
+/// second spelling here is how the preview and the load would come to disagree
+/// about what a NULL is, which is exactly the class of defect the preview exists
+/// to catch.
+///
+/// The empty-string token comes from its own toggle: it can't be written in a
+/// comma-separated list, so an empty box would otherwise be read as "no tokens"
+/// and quietly turn every blank field into an empty string.
+fn null_rule(empty_is_null: bool, tokens: &str) -> NullRule {
+    let mut out: Vec<String> = Vec::new();
+    if empty_is_null {
+        out.push(String::new());
+    }
+    out.extend(
+        tokens
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty()),
+    );
+    NullRule { tokens: out }
 }
 
 fn delimiter_display(d: u8) -> String {
@@ -153,7 +168,10 @@ fn probe(ui: Ui, sniff: bool) {
     let format = i.format.get_untracked();
     let cfg = (!sniff).then(|| read_config(i));
     i.reading.set(true);
-    i.error.set(None);
+    // A probe is a new question, so the previous read's answers go — the error
+    // *and* the problem list, which this used to leave standing. See
+    // `ImportUi::begin_probe` for what it deliberately keeps.
+    i.begin_probe();
     let target = i.target.get_untracked();
     // Which question this answer belongs to: which *opening* of the modal, and
     // which *request* within it. Several probes of one file are routinely in
@@ -726,11 +744,29 @@ fn preview_cell(label: String, is_null: bool) -> impl IntoView {
 fn preview_table(ui: Ui) -> impl IntoView {
     let i = ui.import;
     dyn_container(
-        move || (i.sample.get(), i.mapping.get()),
-        move |(sample, mapping)| {
+        // **The NULL settings are part of the key**, and that is the whole fix
+        // for the preview not being able to show a CSV NULL. They cannot change
+        // what a *probe* returns — which is why the settings effect rightly does
+        // not re-read the file for them — so the rule has to be applied here, at
+        // render time, over the sample already in hand. That costs no file read,
+        // which is what makes the tokens box live-verifiable for the first time.
+        move || {
+            (
+                i.sample.get(),
+                i.mapping.get(),
+                i.empty_is_null.get(),
+                i.null_tokens.get(),
+                i.format.get(),
+            )
+        },
+        move |(sample, mapping, empty_is_null, null_tokens, format)| {
             let Some(sample) = sample else {
                 return empty().into_any();
             };
+            // Built here rather than through `read_config`, which reads the
+            // signals untracked — inside a `dyn_container` builder that would be
+            // a stale answer on the very rebuild this key exists to cause.
+            let nulls = null_rule(empty_is_null, &null_tokens);
             // Only mapped columns are previewed — the rest aren't going anywhere,
             // and showing them would imply otherwise.
             let shown: Vec<usize> = (0..sample.columns.len())
@@ -771,11 +807,26 @@ fn preview_table(ui: Ui) -> impl IntoView {
             // preview reads as the same surface.
             let body = v_stack_from_iter(sample.rows.iter().take(PREVIEW_ROWS).enumerate().map(
                 |(pos, row)| {
-                    h_stack_from_iter(shown.iter().map(|&fi| match row.get(fi) {
-                        Some(Some(v)) => preview_cell(v.clone(), false),
-                        // A format-level null, rendered the way the grid renders
-                        // one, so it can't be mistaken for an empty string.
-                        _ => preview_cell("NULL".to_string(), true),
+                    h_stack_from_iter(shown.iter().map(|&fi| {
+                        // Nullness is `import::preview_field`'s answer, not this
+                        // view's: it asks `NullRule` and `has_own_nulls` the way
+                        // the *load* does, so what is drawn faint is what will
+                        // land as NULL. Deciding it from the `Field` alone — the
+                        // only spelling this had — could never see a CSV null at
+                        // all, because `read_csv_sample` builds every field as
+                        // `Some(..)`.
+                        let cell = row
+                            .get(fi)
+                            .map(|f| import::preview_field(f, &nulls, format))
+                            // Short of the header: not a null, but there is
+                            // nothing to draw and the row is already an issue.
+                            .unwrap_or(import::PreviewCell::Null);
+                        match cell {
+                            import::PreviewCell::Text(v) => preview_cell(v.to_string(), false),
+                            // Rendered the way the grid renders one, so it can't
+                            // be mistaken for an empty string.
+                            import::PreviewCell::Null => preview_cell("NULL".to_string(), true),
+                        }
                     }))
                     .style(move |s| {
                         let s = s.flex_row().items_center().height(row_h());
@@ -1398,6 +1449,37 @@ pub(crate) fn import_overlay(ui: Ui) -> impl IntoView {
 
 #[cfg(test)]
 mod tests {
+    /// **The other half of `ImportUi::begin_probe`, and the only half that was
+    /// ever wrong.** Asserting that `begin_probe` empties `issues` proves
+    /// nothing — it did the moment it was written, and a `set(vec![])` in this
+    /// file would pass it too. The defect was that `probe` cleared `error` and
+    /// not the problem list, so what has to be pinned is that `probe` asks the
+    /// bundle rather than reaching for one signal it happens to remember.
+    #[test]
+    fn a_probe_invalidates_the_previous_read_through_the_bundle() {
+        let src =
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/import_view.rs"))
+                .expect("this file");
+        let body = crate::source_gate::production_code(&src);
+        let at = body
+            .find("fn probe(")
+            .expect("probe is gone — this gate is stale");
+        let end = body[at..].find("\n}\n").expect("the end of probe");
+        let probe = &body[at..at + end];
+        assert!(
+            probe.contains("begin_probe()"),
+            "`probe` no longer invalidates the previous read through the \
+             bundle, so a problem list from another file — or from before the \
+             setting that fixed it — stays on screen beside the new preview"
+        );
+        assert!(
+            !probe.contains("i.error.set(None)"),
+            "`probe` clears `error` by hand again. That is the spelling that \
+             left `issues` behind: the two are one answer about one read, and \
+             `begin_probe` is where they go together"
+        );
+    }
+
     /// **The gate.** The problem list's "there is more" line must come from
     /// `import::issue_tail`, not from this file's own reading of
     /// `more_issues`.

@@ -11109,33 +11109,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
         }),
         // Reset on every open (`import_view::open_import`), so one bundle serves
         // every table rather than a per-open scope that would need disposing.
-        import: schemaic_ui::ImportUi {
-            target: RwSignal::new(None),
-            step: RwSignal::new(schemaic_ui::ImportStep::Source),
-            path: RwSignal::new(None),
-            format: RwSignal::new(schemaic_core::import::ImportFormat::Csv),
-            delimiter: RwSignal::new(",".to_string()),
-            has_header: RwSignal::new(true),
-            sheets: RwSignal::new(Vec::new()),
-            sheet: RwSignal::new(None),
-            empty_is_null: RwSignal::new(true),
-            null_tokens: RwSignal::new(String::new()),
-            trim: RwSignal::new(false),
-            file_bytes: RwSignal::new(0),
-            sample: RwSignal::new(None),
-            mapping: RwSignal::new(schemaic_core::import::Mapping {
-                targets: Vec::new(),
-            }),
-            issues: RwSignal::new(Vec::new()),
-            more_issues: RwSignal::new(false),
-            error: RwSignal::new(None),
-            imported: RwSignal::new(0),
-            reading: RwSignal::new(false),
-            loading: RwSignal::new(false),
-            applying: RwSignal::new(false),
-            generation: RwSignal::new(0),
-            probe_seq: RwSignal::new(0),
-        },
+        import: schemaic_ui::ImportUi::new(),
         // Same rule as `import` above: one bundle, reset on open.
         dump: schemaic_ui::DumpUi {
             target: RwSignal::new(None),

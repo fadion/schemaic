@@ -2808,6 +2808,75 @@ pub struct ImportUi {
     pub probe_seq: RwSignal<u64>,
 }
 
+impl ImportUi {
+    /// The bundle in its opening state. One place the defaults live, so a test
+    /// can hold one — the app used to spell all twenty-four out at the call
+    /// site, which is why [`begin_probe`](Self::begin_probe)'s decision had no
+    /// subject.
+    pub fn new() -> ImportUi {
+        ImportUi {
+            target: RwSignal::new(None),
+            step: RwSignal::new(ImportStep::Source),
+            path: RwSignal::new(None),
+            format: RwSignal::new(schemaic_core::import::ImportFormat::Csv),
+            delimiter: RwSignal::new(",".to_string()),
+            has_header: RwSignal::new(true),
+            sheets: RwSignal::new(Vec::new()),
+            sheet: RwSignal::new(None),
+            empty_is_null: RwSignal::new(true),
+            null_tokens: RwSignal::new(String::new()),
+            trim: RwSignal::new(false),
+            file_bytes: RwSignal::new(0),
+            sample: RwSignal::new(None),
+            mapping: RwSignal::new(schemaic_core::import::Mapping {
+                targets: Vec::new(),
+            }),
+            issues: RwSignal::new(Vec::new()),
+            more_issues: RwSignal::new(false),
+            error: RwSignal::new(None),
+            imported: RwSignal::new(0),
+            reading: RwSignal::new(false),
+            loading: RwSignal::new(false),
+            applying: RwSignal::new(false),
+            generation: RwSignal::new(0),
+            probe_seq: RwSignal::new(0),
+        }
+    }
+
+    /// Drop everything that was an **answer about the previous read**, because a
+    /// probe is a new question.
+    ///
+    /// `error` was cleared here all along; `issues`/`more_issues` were not, and
+    /// they are the pair a reader believes. `issues` is written in one place —
+    /// the check refusing an import — and was cleared in two: a new modal *open*
+    /// and the next launch. Neither is a new file. So importing `bad.csv`,
+    /// pressing Back, picking `clean.csv` and pressing Next showed `clean.csv`'s
+    /// columns and `clean.csv`'s preview underneath `bad.csv`'s five problems
+    /// and `bad.csv`'s line numbers, attributed to "the file". The same list
+    /// stayed up after *fixing* the cause — typing `NA` into the NULL tokens, or
+    /// correcting the delimiter — because a settings change re-probes too, and
+    /// nothing short of pressing Import cleared it.
+    ///
+    /// Clearing where the **question** changes rather than where the answer does
+    /// is what makes one line cover both triggers: a file pick and every tracked
+    /// settings change both route through the probe.
+    ///
+    /// Deliberately *not* `path`, `format`, `sample` or `sheets` — those are the
+    /// previous read's answers the modal keeps on purpose, so the step does not
+    /// blank while the new read is in flight.
+    pub fn begin_probe(&self) {
+        self.error.set(None);
+        self.issues.set(Vec::new());
+        self.more_issues.set(false);
+    }
+}
+
+impl Default for ImportUi {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// A yes/no question asked before something destructive runs.
 ///
 /// Deliberately generic: this is *the* confirm modal, so the next action that
@@ -12246,6 +12315,67 @@ mod field_key_tests {
         ] {
             assert!(!is_modifier_key(&Key::Named(k)), "{k:?}");
         }
+    }
+}
+
+#[cfg(test)]
+mod import_probe_tests {
+    use super::ImportUi;
+    use floem::prelude::{SignalGet, SignalUpdate};
+    use schemaic_core::import::{Issue, IssueKind};
+
+    fn an_issue() -> Issue {
+        Issue {
+            line: 7,
+            column: "created_at".into(),
+            text: "not-a-date".into(),
+            kind: IssueKind::NotANumber,
+        }
+    }
+
+    /// **A probe is a new question, so the previous answer goes with it.** The
+    /// problem list is the one a reader believes — "5 problems in the file —
+    /// nothing was imported" — and it survived a file change, so `clean.csv`'s
+    /// preview rendered under `bad.csv`'s problems and `bad.csv`'s line numbers.
+    #[test]
+    fn beginning_a_probe_drops_the_previous_reads_problems() {
+        let i = ImportUi::new();
+        i.issues.set(vec![an_issue(), an_issue()]);
+        i.more_issues.set(true);
+        i.error.set(Some("could not read the file".into()));
+
+        i.begin_probe();
+
+        assert!(
+            i.issues.get_untracked().is_empty(),
+            "the previous file's problems are still on screen beside this one"
+        );
+        assert!(!i.more_issues.get_untracked(), "and its 'and more' line");
+        assert!(i.error.get_untracked().is_none());
+    }
+
+    /// And it drops **only** those. The step must not blank while the new read
+    /// is in flight, so the previous read's file, format and sample stay up —
+    /// which is the reason this is a named method and not a `reset`.
+    #[test]
+    fn beginning_a_probe_keeps_what_the_step_is_still_showing() {
+        let i = ImportUi::new();
+        i.path.set(Some(std::path::PathBuf::from("clean.csv")));
+        i.sheets.set(vec!["Sheet1".into()]);
+        i.sheet.set(Some("Sheet1".into()));
+        i.file_bytes.set(4096);
+        i.delimiter.set(";".into());
+
+        i.begin_probe();
+
+        assert_eq!(
+            i.path.get_untracked(),
+            Some(std::path::PathBuf::from("clean.csv"))
+        );
+        assert_eq!(i.sheets.get_untracked(), vec!["Sheet1".to_string()]);
+        assert_eq!(i.sheet.get_untracked(), Some("Sheet1".to_string()));
+        assert_eq!(i.file_bytes.get_untracked(), 4096);
+        assert_eq!(i.delimiter.get_untracked(), ";");
     }
 }
 
