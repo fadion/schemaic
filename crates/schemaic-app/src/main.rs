@@ -11923,7 +11923,7 @@ mod app_tests {
             .collect();
         assert!(
             hits.is_empty(),
-            "this crate must ask `SchemaComparison` which entries a plan can \
+            "this file must ask `SchemaComparison` which entries a plan can \
              carry, not re-derive it: {hits:?}"
         );
     }

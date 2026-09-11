@@ -178,6 +178,12 @@ pub fn applies(snippet: &Snippet, dialect: SqlDialect, conn_id: u64) -> bool {
 /// The body is matched **whitespace-collapsed**, the way [`crate::history`]
 /// matches a statement: the panel shows it collapsed to three lines, so a
 /// two-word filter has to read across the newlines the user can't see.
+///
+/// Through [`crate::text_ops::contains_collapsed_ignore_ascii_case`], which is
+/// the third of the three searches over collapsed SQL and the last to stop
+/// building the collapsed string to look at it. [`collapsed`] itself stays —
+/// unlike `history`'s search-only twin, it is what the panel *renders*, and
+/// [`collapsed_for_highlight`] is built on it.
 pub fn matches_query(snippet: &Snippet, query: &str) -> bool {
     let q = query.trim();
     if q.is_empty() {
@@ -188,7 +194,7 @@ pub fn matches_query(snippet: &Snippet, query: &str) -> bool {
             .abbrev
             .as_deref()
             .is_some_and(|a| contains_ignore_ascii_case(a, q))
-        || contains_ignore_ascii_case(&collapsed(&snippet.body), q)
+        || crate::text_ops::contains_collapsed_ignore_ascii_case(&snippet.body, q)
 }
 
 /// The body as the panel shows it: whitespace collapsed to single spaces.

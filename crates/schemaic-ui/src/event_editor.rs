@@ -1099,7 +1099,12 @@ mod tests {
     /// checking one against the other would only be checking whether the same
     /// hand wrote both. What this is compared against is the *layout*, which is
     /// the thing a tab order is supposed to follow.
-    const TAB_ORDER: [u32; 10] = [
+    /// **Membership is derived, ordering is not** — see
+    /// [`every_registered_tab_stop_is_in_the_walk`], which reads the `TAB_*`
+    /// registrations out of this file and requires this array to hold exactly
+    /// them. It listed ten while the form handed out eleven until that test was
+    /// written.
+    const TAB_ORDER: [u32; 11] = [
         TAB_NAME,
         TAB_SHAPE,
         TAB_SCHED,      // interval quantity, or the `AT` expression
@@ -1110,6 +1115,7 @@ mod tests {
         TAB_OPT,      // status
         TAB_OPT + 10, // preserve
         TAB_OPT + 20, // definer
+        TAB_OPT + 30, // comment
     ];
 
     /// **No two controls may share an index, and the walk must go down the
@@ -1138,5 +1144,98 @@ mod tests {
             assert!(TAB_OPT + 30 < crate::widgets::VALUE_TAB);
             assert!(crate::widgets::VALUE_TAB < crate::widgets::ACTION_TAB);
         }
+    }
+
+    /// Every stop the form actually hands out, read out of this file.
+    ///
+    /// Returns them in source order, first occurrence wins — `TAB_SCHED` is
+    /// registered twice, by the two mutually-exclusive schedule arms, and that
+    /// is one stop.
+    fn registered_stops() -> Vec<u32> {
+        let src =
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/event_editor.rs"))
+                .expect("this module's own source");
+        let body = crate::source_gate::production_code(&src);
+        let base = [
+            ("TAB_NAME", TAB_NAME),
+            ("TAB_SHAPE", TAB_SHAPE),
+            ("TAB_SCHED", TAB_SCHED),
+            ("TAB_BODY", TAB_BODY),
+            ("TAB_OPT", TAB_OPT),
+        ];
+        let mut out: Vec<u32> = Vec::new();
+        for line in body.lines() {
+            let l = line.trim();
+            // The declarations themselves are not registrations.
+            if l.starts_with("const TAB_") {
+                continue;
+            }
+            for (name, value) in base {
+                let mut rest = l;
+                while let Some(at) = rest.find(name) {
+                    let after = &rest[at + name.len()..];
+                    // `TAB_OPT` is a prefix of nothing here, but a longer name
+                    // starting with a shorter one would match twice otherwise.
+                    let boundary = !after.starts_with(|c: char| c.is_alphanumeric() || c == '_');
+                    // `+ 10`, `+ 20`, … or nothing.
+                    let offset = after
+                        .strip_prefix(" + ")
+                        .and_then(|t| {
+                            let digits: String =
+                                t.chars().take_while(char::is_ascii_digit).collect();
+                            digits.parse::<u32>().ok()
+                        })
+                        .unwrap_or(0);
+                    if boundary && !out.contains(&(value + offset)) {
+                        out.push(value + offset);
+                    }
+                    rest = after;
+                }
+            }
+        }
+        out
+    }
+
+    /// **The walk has to cover every control, and it did not.**
+    ///
+    /// `TAB_ORDER` is hand-written, and its doc argues — correctly — that the
+    /// thing to compare a tab order against is the *layout*, not another copy of
+    /// the constants. But nothing tied it to the form at all, so it could drift
+    /// in either direction, and it had: the form hands out **eleven** stops and
+    /// the array listed ten. The missing one was `TAB_OPT + 30`, the Comment
+    /// field — and the same test's trailing `const` block pins that very stop's
+    /// *ceiling* and names it, so its absence from the collision walk was an
+    /// omission rather than an oversight about the control.
+    ///
+    /// What that cost: give Comment the definer's `TAB_OPT + 20` and Tab orders
+    /// the two by construction order rather than layout, silently — the exact
+    /// defect `no_two_controls_claim_the_same_tab_stop` exists to catch, and it
+    /// stays green.
+    ///
+    /// **Set equality, not order.** Source order is not layout order here (the
+    /// schedule block is built before the name field and rendered after it), so
+    /// the ordering claim stays with the hand-written array where the finding
+    /// says it belongs. What is derived is the *membership*, which is the half
+    /// that can be checked mechanically.
+    #[test]
+    fn every_registered_tab_stop_is_in_the_walk() {
+        let found = registered_stops();
+        assert!(
+            found.len() >= 11,
+            "the scan stopped finding registrations — it saw {found:?}"
+        );
+        let mut a = found.clone();
+        a.sort_unstable();
+        let mut b = TAB_ORDER.to_vec();
+        b.sort_unstable();
+        assert_eq!(
+            a,
+            b,
+            "the form registers {} stops and the walk lists {}; a control the \
+             walk cannot see can collide with another and Tab will order the \
+             two by construction rather than layout",
+            found.len(),
+            TAB_ORDER.len()
+        );
     }
 }
