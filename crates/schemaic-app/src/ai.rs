@@ -2829,6 +2829,34 @@ pub(crate) fn needs_respawn(
         || (prev.cli_path != now.cli_path && cli_usable)
 }
 
+/// Which harness a turn is **actually** answered by, for the pending bubble.
+///
+/// **Not the selected one.** [`needs_respawn`]'s harness term is deliberately
+/// gated on reachability — "choosing a harness that is not installed keeps the
+/// working conversation instead of trading it for a binary that cannot be
+/// spawned" — so there is a live and supported state in which the *setting* says
+/// Codex and the process answering is Claude. Stamping the setting put CODEX
+/// over Claude's reply, in the transcript and then in `chats.json`, which
+/// `harness_label`'s own doc names as the worse of the two failures it exists to
+/// avoid: *"the transcript would then be wrong about history rather than merely
+/// wrong about now"*.
+///
+/// `live` is the session's own `settings.harness` — the value it was spawned
+/// with. It is preferred whenever there is a session, and the selected harness is
+/// the answer only when one is about to be spawned from it. The two agree on
+/// every path except the one the reachability gate creates, which is why this is
+/// a function with a test and not an expression.
+///
+/// There is always an answer — a harness is always selected — so this returns a
+/// key rather than `ChatMessage::pending`'s `Option`. The `None` that type allows
+/// is for a caller that genuinely does not know, which this one does.
+pub(crate) fn turn_harness(live: Option<Harness>, selected: Harness, need_new: bool) -> String {
+    match live {
+        Some(h) if !need_new => h.key().to_string(),
+        _ => selected.key().to_string(),
+    }
+}
+
 /// What to call the SQL block carrying the editor's contents.
 ///
 /// One function, because the system prompt and every later delta must agree:
@@ -4833,6 +4861,69 @@ mod tests {
             instructions: String::new(),
             schema_scope: SchemaScope::Active,
             hidden: HashSet::new(),
+        }
+    }
+
+    /// **The reachability gate's own consequence, asserted as the composition
+    /// rather than as the predicate.**
+    ///
+    /// `needs_respawn` deliberately keeps a live session when the newly chosen
+    /// harness is not installed. That is right, and it creates a state in which
+    /// the *setting* says Codex while the process answering is Claude — and the
+    /// pending bubble stamped the setting. The reply rendered under CODEX and
+    /// `persist_chat` wrote it to `chats.json` that way, permanently:
+    /// `harness_label`'s doc names this as the worse of the two failures it was
+    /// written to avoid — *"the transcript would then be wrong about history
+    /// rather than merely wrong about now"*.
+    ///
+    /// Driving `needs_respawn` and `turn_harness` together is the point. Each
+    /// was defensible alone; nothing looked at the pair, which is where the
+    /// defect lived.
+    #[test]
+    fn a_turn_is_stamped_with_the_harness_that_answers_it() {
+        let live = settings(); // spawned on Claude
+        let picked_but_missing = AiSettings {
+            harness: Harness::Codex,
+            ..settings()
+        };
+        // Step 2 of the failure: Codex chosen, Codex not installed.
+        let need_new = needs_respawn(Some((7, &live)), 7, &picked_but_missing, false);
+        assert!(!need_new, "the working Claude session is deliberately kept");
+        assert_eq!(
+            turn_harness(Some(live.harness), picked_but_missing.harness, need_new),
+            Harness::Claude.key(),
+            "the turn goes to the live Claude session, so Claude is who answered"
+        );
+    }
+
+    /// And when the harness really is replaced, the stamp follows it — otherwise
+    /// the fix would pass by always naming the old session.
+    #[test]
+    fn a_respawn_stamps_the_harness_it_respawned_onto() {
+        let live = settings();
+        let reachable = AiSettings {
+            harness: Harness::Codex,
+            ..settings()
+        };
+        let need_new = needs_respawn(Some((7, &live)), 7, &reachable, true);
+        assert!(need_new, "a reachable new harness replaces the session");
+        assert_eq!(
+            turn_harness(Some(live.harness), reachable.harness, need_new),
+            Harness::Codex.key()
+        );
+    }
+
+    /// The first question of all: no session yet, so the selection is the only
+    /// answer there is — and it is the right one, since the spawn about to
+    /// happen uses it.
+    #[test]
+    fn the_first_turn_is_stamped_with_what_it_is_about_to_spawn() {
+        for h in Harness::ALL {
+            assert_eq!(turn_harness(None, h, true), h.key());
+            // Even spelled `need_new = false`, which cannot happen with no
+            // session (`needs_respawn` returns true for `None`) — there is
+            // nothing else it could name.
+            assert_eq!(turn_harness(None, h, false), h.key());
         }
     }
 

@@ -10043,15 +10043,24 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                 .get_untracked()
                 .filter(|_| data_now.may_attach());
             ai_attachment.set(None);
+            // Read before the update borrows nothing of it, and *after* the
+            // `need_new` spawn above — so on the spawn path this is already the
+            // new session's own value and the two arms agree.
+            let live_harness = ai_session.borrow().as_ref().map(|s| s.settings.harness);
             ai_messages.update(|v| {
                 v.push(ChatMessage::user_with(msg.clone(), attachment.clone()));
                 // The harness *this* turn runs on, stamped now rather than read
                 // back at render time: the setting can change before the next
                 // draw, and the transcript has to keep saying who actually
-                // answered.
-                v.push(ChatMessage::pending(Some(
-                    ai_harness.get_untracked().key().to_string(),
-                )));
+                // answered. **The live session's harness, not the selected
+                // one** — `needs_respawn` keeps a working conversation when the
+                // newly chosen harness is unreachable, so the two disagree on
+                // exactly that path. See `ai::turn_harness`.
+                v.push(ChatMessage::pending(Some(ai::turn_harness(
+                    live_harness,
+                    ai_harness.get_untracked(),
+                    need_new,
+                ))));
             });
             ai_input.set(String::new());
             ai_busy.set(true);
