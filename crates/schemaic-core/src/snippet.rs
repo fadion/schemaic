@@ -630,6 +630,50 @@ mod tests {
         }
     }
 
+    /// **The precondition that made the snippet panel's key term load-bearing,
+    /// asserted so nobody has to rediscover it.**
+    ///
+    /// The panel's row list is a `dyn_container` keyed on
+    /// `(groups, search, dialect)` — `active_conn` is in none of the three — and
+    /// it read the connection id *inside* the child builder, which does not
+    /// track. That was survivable only if `groups` changed on a connection
+    /// switch, and with **no `Scope::Conn` snippet on either connection it does
+    /// not**: an empty bucket is dropped, so the `Bucket::Conn` band is absent
+    /// from both results and the two `Vec<Group>` compare equal. The memo
+    /// therefore did not notify, the child was not rebuilt, and the id stayed at
+    /// the connection the panel was opened on — so "Show in → This connection"
+    /// wrote `Scope::Conn(previous)` and the snippet vanished in front of the
+    /// user with no message.
+    ///
+    /// This is the *cause*, not the fix: the fix is that the menu reads the
+    /// connection when it is raised rather than when the row was drawn.
+    #[test]
+    fn two_connections_group_identically_when_neither_has_a_scoped_snippet() {
+        let all = vec![
+            snip(1, "a", Scope::Dialect(SqlDialect::MySql)),
+            snip(2, "b", Scope::Global),
+        ];
+        let on_a = grouped(&all, SqlDialect::MySql, 1, "");
+        let on_b = grouped(&all, SqlDialect::MySql, 2, "");
+        assert_eq!(
+            on_a, on_b,
+            "the grouping differs between connections, so the panel's memo would \
+             have notified and the stale-id defect could not have happened — if \
+             this ever fails, the reasoning behind reading the id at click time \
+             needs revisiting, not the fix"
+        );
+        // And the moment one connection *does* have a scoped snippet, they
+        // differ — which is what makes the equality above a statement about this
+        // library rather than about `grouped` ignoring its argument.
+        let mut with_conn = all.clone();
+        with_conn.push(snip(3, "c", Scope::Conn(1)));
+        assert_ne!(
+            grouped(&with_conn, SqlDialect::MySql, 1, ""),
+            grouped(&with_conn, SqlDialect::MySql, 2, ""),
+            "`grouped` is not reading `conn_id` at all"
+        );
+    }
+
     // ── edits ───────────────────────────────────────────────────────────────
 
     /// **A whitespace-only body edit is a real edit.** The dialog compared the

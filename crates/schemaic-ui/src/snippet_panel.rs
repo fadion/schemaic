@@ -74,7 +74,6 @@ pub(crate) fn snippet_panel(ui: Ui) -> impl IntoView {
     let list = dyn_container(move || (groups.get(), search.get(), dialect.get()), {
         let actions = actions.clone();
         move |(groups, _, _): (Vec<snippet::Group>, String, SqlDialect)| {
-            let conn = active_conn.get_untracked();
             if groups.is_empty() {
                 return empty_state().into_any();
             }
@@ -100,7 +99,7 @@ pub(crate) fn snippet_panel(ui: Ui) -> impl IntoView {
                                     actions.clone(),
                                     term.clone(),
                                     dialect.get_untracked(),
-                                    conn,
+                                    active_conn,
                                     renaming,
                                     rename_buf,
                                     overlay,
@@ -248,7 +247,12 @@ fn snippet_row(
     actions: Rc<crate::SnippetActions>,
     term: Option<String>,
     dialect: SqlDialect,
-    conn_id: u64,
+    // **The signal, not its value.** This row is built inside a `dyn_container`
+    // child builder, which does not track, and `active_conn` is in none of the
+    // three terms that container is keyed on — so a value read here freezes at
+    // whichever connection the panel was last rebuilt for. The menu below reads
+    // it when it is *raised*, which is when the answer is wanted.
+    active_conn: RwSignal<u64>,
     renaming: RwSignal<Option<u64>>,
     rename_buf: RwSignal<String>,
     overlay: OverlayUi,
@@ -462,7 +466,20 @@ fn snippet_row(
             // label grew past it. `menu_panel_width` is the same prediction the
             // edge flip decides against — the parts `menu_row` actually draws,
             // each scaled, with the labels measured in the render font.
-            let entries = row_menu(&menu_snip, &menu_actions, dialect, conn_id);
+            // **Read here, when the menu is raised.** Read at build time it was
+            // the connection the panel was last rebuilt for, and with no
+            // connection-scoped snippet on either side that rebuild never
+            // happened: `grouped` drops an empty bucket, so the two
+            // `Vec<Group>` compare equal and the memo does not notify (see
+            // `snippet::two_connections_group_identically_when_neither_has_a_scoped_snippet`).
+            // So "Show in → This connection" wrote `Scope::Conn(previous)` and
+            // the snippet vanished in front of the user with no message.
+            let entries = row_menu(
+                &menu_snip,
+                &menu_actions,
+                dialect,
+                active_conn.get_untracked(),
+            );
             overlay
                 .popup_width
                 .set(crate::widgets::menu_panel_width(&entries));
