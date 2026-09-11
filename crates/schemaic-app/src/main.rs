@@ -546,6 +546,13 @@ type ConnGateElse = Rc<dyn Fn(Action, Action)>;
 /// Reports a health check's outcome.
 type CheckDoneFn = Rc<dyn Fn(bool)>;
 
+/// Replaces the terminal session: spawn, install, badge, notify.
+///
+/// `(config, badge, what)` — `badge` is the engine the session is a client for
+/// (`None` for a plain shell or a message), and `what` names the caller in the
+/// log. `true` when the new session is running.
+type InstallTerminal = Rc<dyn Fn(&schemaic_term::ShellConfig, Option<String>, &str) -> bool>;
+
 /// Why a gated launch never happened.
 ///
 /// A [`ConnGate`] refusal answers the *error modal* and nothing else, which is
@@ -10732,15 +10739,53 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
         let _ = term_tx.send(());
     });
 
-    let terminal: Rc<RefCell<Option<schemaic_term::Terminal>>> = Rc::new(RefCell::new(
-        schemaic_term::Terminal::spawn(&init_shell, 80, 24, term_notify.clone())
-            .map_err(|e| tracing::error!("terminal spawn failed: {e}"))
-            .ok(),
-    ));
+    let terminal: Rc<RefCell<Option<schemaic_term::Terminal>>> = Rc::new(RefCell::new(None));
     // Which engine the terminal is a CLI for, or `None` for an ordinary shell —
-    // the panel title's badge. Every respawn sets it (this one starts a shell),
-    // since a session is only ever replaced, never layered.
+    // the panel title's badge. Every install sets it, since a session is only
+    // ever replaced, never layered.
     let term_db_label: RwSignal<Option<String>> = RwSignal::new(None);
+
+    // **Replacing the terminal session is one function, and this is it.**
+    //
+    // It was written out at five sites, and three of the five things each has to
+    // get right had already drifted between them: `term_apply_shell` was the one
+    // that did *not* notify after installing, so the panel went on drawing the
+    // previous session's last snapshot until the new shell wrote its first byte;
+    // the initial spawn was the one that did not set the badge, relying on the
+    // signal's initial `None` while the comment above it stated the rule as
+    // "every respawn sets it"; and the tunnel-message path swallowed a spawn
+    // failure with `if let Ok(t)` where the other three logged it.
+    //
+    // The old session drops as it is replaced, which kills its PTY and child.
+    // `what` names the caller in the log and nothing else. Returns whether the
+    // new session is running, for the caller that has more to do after
+    // (`term_apply_shell` records the profile only if it really started).
+    let install_terminal: InstallTerminal = {
+        let terminal = terminal.clone();
+        let term_dims = term_dims.clone();
+        let term_notify = term_notify.clone();
+        Rc::new(
+            move |cfg: &schemaic_term::ShellConfig, label: Option<String>, what: &str| {
+                let (cols, rows) = term_dims.get();
+                match schemaic_term::Terminal::spawn(cfg, cols, rows, term_notify.clone()) {
+                    Ok(t) => {
+                        *terminal.borrow_mut() = Some(t);
+                        term_db_label.set(label);
+                        // The panel redraws off a notify tick, so without this it
+                        // keeps the dead session's last frame on screen.
+                        (term_notify)();
+                        true
+                    }
+                    Err(e) => {
+                        tracing::error!("{what} failed: {e}");
+                        false
+                    }
+                }
+            },
+        )
+    };
+    // The session the window opens with. A plain shell, so no badge.
+    (install_terminal)(&init_shell, None, "terminal spawn");
 
     // Re-snapshot on a notify tick, focus change, cursor-style change, or blink
     // phase. The cursor shows only while focused (and, if blinking, on-phase); a
@@ -10884,9 +10929,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
     // Restart: respawn the current shell (fresh session). The old terminal drops,
     // killing its PTY/child.
     let term_restart: Rc<dyn Fn()> = {
-        let terminal = terminal.clone();
-        let term_dims = term_dims.clone();
-        let term_notify = term_notify.clone();
+        let install_terminal = install_terminal.clone();
         Rc::new(move || {
             // The shell that is running, not the picker's row: on a launch
             // that could not detect the saved profile the index is `0`, and
@@ -10899,15 +10942,8 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             )
             .map(|p| p.config())
             .unwrap_or_else(schemaic_term::shell::default_shell);
-            let (cols, rows) = term_dims.get();
-            match schemaic_term::Terminal::spawn(&cfg, cols, rows, term_notify.clone()) {
-                Ok(t) => {
-                    *terminal.borrow_mut() = Some(t);
-                    term_db_label.set(None); // back to a plain shell
-                    (term_notify)();
-                }
-                Err(e) => tracing::error!("terminal restart failed: {e}"),
-            }
+            // Back to a plain shell, so no badge.
+            (install_terminal)(&cfg, None, "terminal restart");
         })
     };
     // Open the DB CLI for the active connection in the terminal — `mysql`/
@@ -10915,9 +10951,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
     // database. Reveals the terminal panel and respawns it as a dedicated client
     // session.
     let open_db_cli: Rc<dyn Fn(Option<String>)> = {
-        let terminal = terminal.clone();
-        let term_dims = term_dims.clone();
-        let term_notify = term_notify.clone();
+        let install_terminal = install_terminal.clone();
         let tunnels = tunnels.clone();
         Rc::new(move |db: Option<String>| {
             // Guard the panel reveal: a redundant `set` rebuilds the panel
@@ -10947,15 +10981,10 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                         let cfg = message_shell(
                             "SSH tunnel is not established yet; try again in a moment.",
                         );
-                        let (cols, rows) = term_dims.get();
-                        if let Ok(t) =
-                            schemaic_term::Terminal::spawn(&cfg, cols, rows, term_notify.clone())
-                        {
-                            *terminal.borrow_mut() = Some(t);
-                            // A message, not a session — nothing to badge.
-                            term_db_label.set(None);
-                            (term_notify)();
-                        }
+                        // A message, not a session — nothing to badge. And a
+                        // failure to spawn even *that* is logged now; this was
+                        // the site that swallowed it.
+                        (install_terminal)(&cfg, None, "tunnel message shell");
                         return;
                     }
                 }
@@ -10997,41 +11026,26 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                 .is_ok()
                 .then(|| schemaic_core::connection::engine_label(&conn.db_type));
             let cfg = built.unwrap_or_else(message_shell);
-            let (cols, rows) = term_dims.get();
-            match schemaic_term::Terminal::spawn(&cfg, cols, rows, term_notify.clone()) {
-                Ok(t) => {
-                    *terminal.borrow_mut() = Some(t);
-                    term_db_label.set(label);
-                    (term_notify)();
-                }
-                Err(e) => tracing::error!("db cli spawn failed: {e}"),
-            }
+            (install_terminal)(&cfg, label, "db cli spawn");
         })
     };
     let term_apply_shell: Rc<dyn Fn(usize)> = {
-        let terminal = terminal.clone();
-        let term_dims = term_dims.clone();
-        let term_notify = term_notify.clone();
+        let install_terminal = install_terminal.clone();
         let save_term_prefs = save_term_prefs.clone();
         Rc::new(move |idx: usize| {
             let Some(profile) = term_shells.get_untracked().get(idx).cloned() else {
                 return;
             };
-            let (cols, rows) = term_dims.get();
-            match schemaic_term::Terminal::spawn(&profile.config(), cols, rows, term_notify.clone())
-            {
-                Ok(t) => {
-                    *terminal.borrow_mut() = Some(t);
-                    term_db_label.set(None); // a shell profile, not a client
-                    term_shell_selected.set(idx);
-                    // The picked profile is what runs now, so it is also what a
-                    // save and a Restart must name — this is the one writer.
-                    current_shell.set(Some(profile.clone()));
-                    // Persist the whole prefs file (shell + appearance).
-                    (save_term_prefs)();
-                }
-                Err(e) => tracing::error!("terminal respawn failed: {e}"),
+            // A shell profile, not a client, so no badge.
+            if !(install_terminal)(&profile.config(), None, "terminal respawn") {
+                return;
             }
+            term_shell_selected.set(idx);
+            // The picked profile is what runs now, so it is also what a save and
+            // a Restart must name — this is the one writer.
+            current_shell.set(Some(profile.clone()));
+            // Persist the whole prefs file (shell + appearance).
+            (save_term_prefs)();
         })
     };
     let term_sel_start: Rc<dyn Fn(usize, usize)> = {
@@ -12695,6 +12709,53 @@ mod app_tests {
         assert!(
             matches!(plan_state.get_untracked(), schemaic_ui::PlanState::Running),
             "nothing refused it, so the state machine is still `run_plan`'s"
+        );
+    }
+
+    /// **Replacing the terminal session is five things, and it was written out
+    /// five times.**
+    ///
+    /// Three of the five had already drifted: `term_apply_shell` was the one
+    /// that did not notify, so the panel kept drawing the dead session's last
+    /// frame until the new shell wrote a byte; the initial spawn was the one
+    /// that did not set the badge, relying on the signal's initial `None` while
+    /// the comment above it said "every respawn sets it"; and the tunnel-message
+    /// path swallowed a spawn failure the other three logged.
+    ///
+    /// Nothing runtime-testable is left — the sequence is four statements inside
+    /// a closure in `app_view` — so the subject is the source, and what it says
+    /// is that there is one `Terminal::spawn` in the file. That is the property:
+    /// a second one is a second copy of the sequence, which is where the drift
+    /// came from. B26-L5-01's fix (validating a target before it becomes a
+    /// `ShellConfig`) also needs a single choke point to be applied at.
+    #[test]
+    fn the_terminal_session_is_replaced_in_exactly_one_place() {
+        let src = include_str!("main.rs");
+        // Assembled rather than written, so this module's own mention of the
+        // call is not one of the hits — the trap every source gate in this
+        // workspace has to dodge.
+        let call = format!("schemaic_term::{}::spawn(", "Terminal");
+        let spawns = src.matches(&call).count();
+        assert_eq!(
+            spawns, 1,
+            "found {spawns} `Terminal::spawn` calls — the spawn/install/badge/\
+             notify sequence belongs in `install_terminal` alone, because the \
+             five hand-written copies it replaced had already disagreed about \
+             three of those four steps"
+        );
+        // And every caller goes through it, rather than one of them reaching
+        // past it to the terminal cell.
+        let installs = src.matches("(install_terminal)(").count();
+        assert!(
+            installs >= 5,
+            "only {installs} callers of `install_terminal` — did one go back to \
+             writing `*terminal.borrow_mut()` itself?"
+        );
+        let write = format!("*terminal.{}() = Some(", "borrow_mut");
+        assert_eq!(
+            src.matches(&write).count(),
+            1,
+            "the terminal cell is written in `install_terminal` and nowhere else"
         );
     }
 
