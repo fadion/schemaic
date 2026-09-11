@@ -10842,14 +10842,64 @@ fn status_menu_seg(
     })
 }
 
+/// The right edge a collapsing footer segment should be judged on.
+///
+/// While it is **shown** that is its own measured edge, live from `on_move` and
+/// `on_resize`.
+///
+/// While it is **hidden** it has no layout to measure — floem gives a
+/// `display:none` node no position, and reading one back is how a naive version
+/// of this oscillates: the hidden segment reports x = 0, decides it fits, comes
+/// back, measures its real x, and hides again. So the edge it *would* have is
+/// computed instead, from the left group's right edge plus this segment's own
+/// last measured width. That left edge is the right edge of the nearest
+/// **shown** segment to this one's left, because segments collapse
+/// right-to-left: anything to the right of a hidden segment has a larger edge
+/// and so crossed the threshold first, and contributes nothing to the group's
+/// width.
+///
+/// **Which is why this cannot oscillate.** The would-be edge depends only on
+/// segments to the left of this one, and those are unaffected by whether this
+/// one is drawn. Coming back moves the group's right edge to exactly the value
+/// this returned, so the live measurement that follows agrees with the
+/// prediction that caused it.
+fn footer_seg_edge(shown: bool, measured_edge: f64, left_edge: f64, width: f64) -> f64 {
+    if shown {
+        measured_edge
+    } else {
+        left_edge + width
+    }
+}
+
+/// Is there room for a footer segment whose right edge is `edge`?
+///
+/// `ai_x` under 1 means the right-hand icon group has not been measured yet, and
+/// nothing may collapse against a measurement that does not exist.
+fn footer_seg_fits(edge: f64, ai_x: f64, gap: f64) -> bool {
+    ai_x < 1.0 || edge + gap <= ai_x
+}
+
 /// Wrap a left status-bar segment so it auto-hides once its right edge comes
 /// within `footer_collapse_gap()` px of the right-hand icon group (`ai_x` = the AI
-/// icon's left edge, both in window coords). It tracks its own right edge, frozen
-/// while it's hidden (updates only while shown) so the show/hide test reads a
-/// stable full-layout position and can't oscillate. Segments hide right-to-left
-/// (the rightmost's edge is largest, so it crosses the threshold first) and
-/// reappear as the window widens.
-fn collapsing_seg(view: impl IntoView + 'static, ai_x: RwSignal<f64>) -> impl IntoView {
+/// icon's left edge, both in window coords). Segments hide right-to-left (the
+/// rightmost's edge is largest, so it crosses the threshold first) and reappear
+/// as the window widens — **or as the segments beside them get shorter**, which
+/// is what `left_edge` is for; see [`footer_seg_edge`].
+///
+/// It tracks its own right edge, frozen while it's hidden (the geometry handlers
+/// read `is_shown` untracked, so there is no reactive cycle) — but the frozen
+/// value is no longer the only input. Freezing alone meant a hidden segment
+/// could come back only when the *window* widened: commit a transaction and the
+/// pill, Commit and Rollback all vanish, freeing ~150px, while CPU and RAM stay
+/// hidden against an edge frozen at a layout that no longer exists. Switching to
+/// a SQLite connection (which hides `mode_seg` outright) and any left-hand
+/// segment that narrows — "Write mode" → "Read only", "Spaces: 4" → "Tabs: 4" —
+/// are the same way in.
+fn collapsing_seg(
+    view: impl IntoView + 'static,
+    ai_x: RwSignal<f64>,
+    left_edge: RwSignal<f64>,
+) -> impl IntoView {
     let x = RwSignal::new(0.0_f64);
     let w = RwSignal::new(0.0_f64);
     let edge = RwSignal::new(0.0_f64);
@@ -10857,8 +10907,23 @@ fn collapsing_seg(view: impl IntoView + 'static, ai_x: RwSignal<f64>) -> impl In
     // handlers so a hidden segment freezes its `edge` (no reactive cycle).
     let is_shown = move || {
         let ax = ai_x.get_untracked();
-        ax < 1.0 || edge.get_untracked() + footer_collapse_gap() <= ax
+        footer_seg_fits(edge.get_untracked(), ax, footer_collapse_gap())
     };
+    // **The one signal that says the row to my left got shorter.** Tracks
+    // `left_edge` and nothing else; `is_shown` and `w` are read untracked, so a
+    // hidden segment re-predicts its edge without this becoming a cycle through
+    // the style closure that reads it.
+    create_effect(move |_| {
+        let le = left_edge.get();
+        let width = w.get_untracked();
+        if width <= 0.0 || is_shown() {
+            return;
+        }
+        let would_be = footer_seg_edge(false, edge.get_untracked(), le, width);
+        if edge.get_untracked() != would_be {
+            edge.set(would_be);
+        }
+    });
     container(view)
         .on_move(move |p| {
             x.set(p.x);
@@ -10874,11 +10939,10 @@ fn collapsing_seg(view: impl IntoView + 'static, ai_x: RwSignal<f64>) -> impl In
             }
         })
         .style(move |s| {
-            let ax = ai_x.get();
-            if ax >= 1.0 && edge.get() + footer_collapse_gap() > ax {
-                s.hide()
-            } else {
+            if footer_seg_fits(edge.get(), ai_x.get(), footer_collapse_gap()) {
                 s
+            } else {
+                s.hide()
             }
         })
 }
@@ -11420,20 +11484,35 @@ fn footer(ui: Ui) -> impl IntoView {
 
     // The schema toggle always stays (it's a control, and leftmost); every status
     // segment after it collapses right-to-left as the AI icon nears it.
+    // The left cluster's own right edge in window coords — the input that says
+    // "the segments beside you got shorter" to every hidden segment. Because
+    // they collapse right-to-left, this is always the right edge of the
+    // rightmost *shown* one; see `footer_seg_edge`.
+    let left_edge = RwSignal::new(0.0_f64);
+    let left_x = RwSignal::new(0.0_f64);
+    let left_w = RwSignal::new(0.0_f64);
     let left_group = h_stack((
         schema_icon,
-        collapsing_seg(cursor_seg, ai_x),
-        collapsing_seg(tabs_seg, ai_x),
-        collapsing_seg(wrap_seg, ai_x),
-        collapsing_seg(warn_seg, ai_x),
-        collapsing_seg(ro_seg, ai_x),
-        collapsing_seg(mode_seg, ai_x),
-        collapsing_seg(tx_pill, ai_x),
-        collapsing_seg(commit_seg, ai_x),
-        collapsing_seg(rollback_seg, ai_x),
-        collapsing_seg(cpu_seg, ai_x),
-        collapsing_seg(ram_seg, ai_x),
+        collapsing_seg(cursor_seg, ai_x, left_edge),
+        collapsing_seg(tabs_seg, ai_x, left_edge),
+        collapsing_seg(wrap_seg, ai_x, left_edge),
+        collapsing_seg(warn_seg, ai_x, left_edge),
+        collapsing_seg(ro_seg, ai_x, left_edge),
+        collapsing_seg(mode_seg, ai_x, left_edge),
+        collapsing_seg(tx_pill, ai_x, left_edge),
+        collapsing_seg(commit_seg, ai_x, left_edge),
+        collapsing_seg(rollback_seg, ai_x, left_edge),
+        collapsing_seg(cpu_seg, ai_x, left_edge),
+        collapsing_seg(ram_seg, ai_x, left_edge),
     ))
+    .on_move(move |p| {
+        left_x.set(p.x);
+        left_edge.set(p.x + left_w.get_untracked());
+    })
+    .on_resize(move |r| {
+        left_w.set(r.width());
+        left_edge.set(left_x.get_untracked() + r.width());
+    })
     .style(|s| s.flex_row().items_center().min_width(0.0));
 
     let bar = h_stack((left_group, right_group)).style(|s| {
@@ -13454,6 +13533,81 @@ mod window_key_gate {
             "`workspace()` is the argument of `{prev}` — same failure as above, \
              written across two lines."
         );
+    }
+}
+
+#[cfg(test)]
+mod footer_collapse_tests {
+    use super::{footer_seg_edge, footer_seg_fits};
+
+    const GAP: f64 = 12.0;
+
+    /// A shown segment is judged on what it actually measures.
+    #[test]
+    fn a_shown_segment_is_judged_on_its_own_edge() {
+        assert_eq!(footer_seg_edge(true, 950.0, 950.0, 60.0), 950.0);
+    }
+
+    /// **The bug.** CPU is hidden with its edge frozen at 950. The transaction
+    /// is committed, so the pill, Commit and Rollback go and the left group's
+    /// right edge drops to 740. CPU's 60px would now end at 800, which clears
+    /// the AI icon at 900 — it must come back.
+    ///
+    /// Against a frozen edge the only remaining input was `ai_x`, so nothing
+    /// short of dragging the window wider than the stale 950 brought it back:
+    /// ~150px of empty bar between "Write mode" and the AI icon, permanently.
+    #[test]
+    fn freeing_space_beside_a_hidden_segment_brings_it_back() {
+        let edge = footer_seg_edge(false, 950.0, 740.0, 60.0);
+        assert_eq!(edge, 800.0, "the edge it would have in the new layout");
+        assert!(
+            footer_seg_fits(edge, 900.0, GAP),
+            "the segment stayed hidden against an edge frozen at a layout that \
+             no longer exists"
+        );
+    }
+
+    /// And it stays hidden while the space really is taken — the same
+    /// prediction, against a left group that has not moved.
+    #[test]
+    fn a_hidden_segment_stays_hidden_while_the_space_is_taken() {
+        let edge = footer_seg_edge(false, 950.0, 890.0, 60.0);
+        assert_eq!(edge, 950.0);
+        assert!(!footer_seg_fits(edge, 900.0, GAP));
+    }
+
+    /// **The anti-oscillation property, stated as a test.** Coming back moves
+    /// the left group's right edge to exactly the value the prediction used, so
+    /// the live measurement that follows agrees with the prediction that caused
+    /// it — and the segment does not immediately hide again.
+    #[test]
+    fn the_prediction_agrees_with_the_measurement_it_causes() {
+        let (left, width) = (740.0, 60.0);
+        let predicted = footer_seg_edge(false, 950.0, left, width);
+        // It comes back: the group now ends where this segment does.
+        let measured = footer_seg_edge(true, left + width, left + width, width);
+        assert_eq!(predicted, measured);
+        assert_eq!(
+            footer_seg_fits(predicted, 900.0, GAP),
+            footer_seg_fits(measured, 900.0, GAP),
+            "showing it changed the answer to the question that showed it"
+        );
+    }
+
+    /// Nothing collapses against a right-hand group that has not been measured
+    /// — the `ax < 1.0` arm, which is how the bar looks on the first frame.
+    #[test]
+    fn nothing_hides_before_the_right_group_is_measured() {
+        assert!(footer_seg_fits(5000.0, 0.0, GAP));
+        assert!(!footer_seg_fits(5000.0, 900.0, GAP));
+    }
+
+    /// The gap is a clearance, not a margin: an edge exactly `gap` short of the
+    /// icon still fits, one pixel nearer does not.
+    #[test]
+    fn the_collapse_gap_is_a_clearance() {
+        assert!(footer_seg_fits(888.0, 900.0, GAP));
+        assert!(!footer_seg_fits(889.0, 900.0, GAP));
     }
 }
 

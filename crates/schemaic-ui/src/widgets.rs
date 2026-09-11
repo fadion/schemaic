@@ -1270,10 +1270,28 @@ fn modal_title_impl(
     let title = title.into();
     let pressed = close.clone();
     h_stack((
+        // **`min_width(0)` and an ellipsis, because half the call sites pass a
+        // runtime string.** A flex item's `min-width` is `auto`, so a long title
+        // refuses to compress: the `flex_grow` spacer below collapses to zero
+        // and the ✕ — `flex_shrink(0)` from `in_ring_button`'s wrapper — is
+        // pushed past the panel's right edge, where `panel_style` sets no
+        // `.clip()` so it paints outside the modal. In the four footer-less
+        // modals the ✕ is the *only* button. This is the same failure
+        // `modal_footer_split` documents and fixes 780 lines below — "which is
+        // how the binary panel's 'Loaded …' line shipped its three buttons off
+        // the right-hand edge" — and no caller could supply the fix, because
+        // this takes a `String` and never hands the view back.
+        //
+        // The reachable case is `blob_view`'s `"{table}.{column}"`, which MySQL
+        // permits at 64 + 64 in a panel `modal_w(680.0)` wide; `Import into
+        // {table}`, `Import into {database}`, and the six object editors'
+        // `Edit <name>` are the same shape.
         text(title).style(|s| {
             s.font_size(theme::scaled_font(15.0))
                 .font_bold()
                 .color(theme::text())
+                .min_width(0.0)
+                .text_ellipsis()
         }),
         empty().style(|s| s.flex_grow(1.0_f32)),
         // Lucide X, 16px, vertically centred; `padding(6)` enlarges the click
@@ -1300,6 +1318,10 @@ fn modal_title_impl(
         s.width_full()
             .flex_row()
             .items_center()
+            // The wrapper takes the floor too — `modal_footer_split` sets it on
+            // both the item and its wrapper for the same reason, and one without
+            // the other leaves the row itself refusing to compress.
+            .min_width(0.0)
             .padding_horiz(modal_pad_h())
             .padding_vert(theme::scaled(10.0))
             .border_bottom(if border { 1.0 } else { 0.0 })
@@ -5340,21 +5362,57 @@ pub(crate) fn link_button(
 /// bottom-right (10px/10px) inside its parent stack. Shared by the AI panel and
 /// the terminal. Fades via alpha (Floem has no opacity prop); the icon owns its
 /// own colour + transition since an inherited colour won't animate a child svg.
+/// Does a hidden control still think the pointer is on it? — the one question
+/// [`jump_to_bottom_button`]'s hover latch turns on.
+///
+/// Its own name, rather than two terms inline, because the failure is that
+/// nobody thought to ask: the flag is written by a `PointerEnter`/`PointerLeave`
+/// pair that looks complete, and the leg that goes missing is the one floem
+/// declines to deliver.
+pub(crate) fn hover_should_clear(show: bool, hovered: bool) -> bool {
+    !show && hovered
+}
+
+/// The jump-to-bottom chevron's tint.
+///
+/// Transparent while hidden rather than absent, so the colour transition has
+/// something to run between — the button fades rather than blinking.
+pub(crate) fn jump_icon_tint(show: bool, hovered: bool) -> Color {
+    if !show {
+        theme::jump_icon().multiply_alpha(0.0)
+    } else if hovered {
+        theme::jump_icon_hover()
+    } else {
+        theme::jump_icon()
+    }
+}
+
 pub(crate) fn jump_to_bottom_button(
     show: impl Fn() -> bool + Copy + 'static,
     on_click: impl Fn() + 'static,
 ) -> impl IntoView {
     let hovered = RwSignal::new(false);
     let anim = || Transition::ease_in_out(std::time::Duration::from_millis(150));
+    // **The hover flag is cleared when the button goes away, because no
+    // `PointerLeave` will do it.** Clicking the button is what hides it, and it
+    // hides *under the pointer*: `.pointer_events(show)` then turns it inert, and
+    // floem's `should_send` refuses any positioned event to a view whose pointer
+    // events are off — so the `PointerLeave` that would clear this never
+    // arrives. Scroll up again and the button faded back in already wearing its
+    // hover tint with the pointer nowhere near it.
+    //
+    // This is the latch `with_scroll_gesture` documents 900 lines above — "the
+    // flag latched on for the life of the view" — and that one carries a
+    // root-level backstop as well, because `PointerLeave` alone can still be
+    // missed. Here the hide *is* the reliable signal, so it does the clearing.
+    create_effect(move |_| {
+        if hover_should_clear(show(), hovered.get_untracked()) {
+            hovered.set(false);
+        }
+    });
     let icon = icons::icon(icons::CHEVRON_DOWN, 16.0).style(move |s| {
-        let color = if !show() {
-            theme::jump_icon().multiply_alpha(0.0)
-        } else if hovered.get() {
-            theme::jump_icon_hover()
-        } else {
-            theme::jump_icon()
-        };
-        s.color(color).transition_color(anim())
+        s.color(jump_icon_tint(show(), hovered.get()))
+            .transition_color(anim())
     });
     container(icon)
         .on_click_stop(move |_| on_click())
@@ -5853,6 +5911,48 @@ mod destructive_launch_gate {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod jump_hover_tests {
+    use super::{hover_should_clear, jump_icon_tint};
+
+    /// **The latch.** The button is hidden by the very click that is on it, so
+    /// it goes away under the pointer and `.pointer_events(show)` makes it inert
+    /// before any `PointerLeave` can be delivered. The hide is what has to clear
+    /// the flag.
+    #[test]
+    fn a_control_that_hides_under_the_pointer_clears_its_hover() {
+        assert!(hover_should_clear(false, true));
+    }
+
+    /// And nothing else does: a visible control keeps whatever the pointer put
+    /// there, and a hidden one with the flag already down needs no write — the
+    /// same-value rule, since this runs in an effect.
+    #[test]
+    fn nothing_else_clears_it() {
+        assert!(!hover_should_clear(true, true));
+        assert!(!hover_should_clear(true, false));
+        assert!(!hover_should_clear(false, false));
+    }
+
+    /// The tint's three arms, including the one that makes the latch *visible*:
+    /// shown-and-hovered is a different colour from shown-and-not, which is why
+    /// a stale flag is something the user can see.
+    #[test]
+    fn the_tint_tells_the_three_states_apart() {
+        let plain = jump_icon_tint(true, false);
+        let hover = jump_icon_tint(true, true);
+        let gone = jump_icon_tint(false, false);
+        assert_ne!(plain, hover, "the hover tint is what a stale flag paints");
+        assert_eq!(gone.a, 0, "a hidden chevron is transparent");
+        assert_eq!(
+            jump_icon_tint(false, true),
+            gone,
+            "and transparent however the flag is left, so the latch is \
+             invisible until it comes back"
+        );
     }
 }
 

@@ -4551,6 +4551,20 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
         // block scrolled past the top of the pane would otherwise paint its bands
         // over the toolbar above it.
         .clip()
+        // **After the clip, not only before it.** `floem::views::clip` is a
+        // *constructor*, not a decorator: it mints a new `ViewId`, makes the
+        // styled child its only child, and gives itself no style at all. So an
+        // unstyled `size: auto` node was inserted between the absolute child and
+        // this flex **column** — where height is the main axis. Its only child
+        // is absolutely positioned and contributes no content size, `editor_box`
+        // has `flex_grow(1.0)` and takes the rest, so the `Clip` resolved to
+        // full width and **zero height**. `Clip::paint` then clips to its own
+        // layout rect, and a zero-height rect discards every child paint: no
+        // gutter band, no minus/plus marker, no strip in the wrapper's right
+        // padding — the entire job this overlay exists for. Styling after the
+        // constructor puts the geometry on the node that clips and positions,
+        // which is the remedy `docs/architecture.md` states for this same node.
+        .style(|s| s.absolute().inset(0.0))
         .pointer_events(|| false)
     };
 
