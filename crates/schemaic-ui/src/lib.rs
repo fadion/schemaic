@@ -4692,6 +4692,17 @@ pub struct SchemaActions {
     /// introspected and has no node for. Refusing to compare anything the tree
     /// hadn't already loaded would rule out the case the feature is for.
     pub compare_fetch: Rc<dyn Fn(CompareTarget)>,
+    /// Stop whatever [`SchemaActions::compare_fetch`] has in flight.
+    ///
+    /// **Closing the modal is the other end of the same token**, and it had no
+    /// way to reach it. `compare_fetch` cancels its own predecessor on the way
+    /// in, so the token had exactly one canceller and every one of them was a
+    /// *new* fetch — the close discharged eight signals and left two full
+    /// `fetch_schema` sweeps running for nobody, which on a wide schema over a
+    /// tunnel is a long time to keep reading a catalogue no one is going to see.
+    /// The cancellation is the app's to own (the token is), so the modal asks
+    /// for it rather than holding one of its own.
+    pub compare_cancel: Rc<dyn Fn()>,
     /// List one connection's databases, for the compare picker's second step —
     /// see [`OverlayUi::compare_dbs`] for why it is asked per connection.
     pub compare_list_dbs: Rc<dyn Fn(u64)>,
@@ -6554,21 +6565,28 @@ fn header(ui: Ui, chrome: window_chrome::WindowChrome) -> impl IntoView {
     // reaches a connect — but "which of these two is prod" is exactly the
     // question the header is there to answer. Empty when nothing was cut, so an
     // ordinary name raises no tooltip at all.
+    // `None` when nothing was cut — and through `tip_when`, which is the only
+    // thing that makes that mean "no tooltip". Floem has no "not now": once the
+    // hover delay fires it always adds the overlay, and `TooltipClass` paints
+    // the panel chrome onto whatever root it is handed, so an empty `text("")`
+    // is a small empty bordered box rather than nothing. On this control, which
+    // is the most-hovered in the app, it appeared for every name of fifteen
+    // characters or fewer.
     let conn_tip = move || {
         connections.with(|cs| {
             cs.iter()
                 .find(|c| c.id == active_conn.get())
                 .map(|c| c.name.clone())
                 .filter(|n| schemaic_core::connection::elide_name(n, consts::CONN_NAME_CHARS) != *n)
-                .unwrap_or_default()
         })
     };
     let switcher = move || {
         container(
             h_stack((
-                label(conn_label)
-                    .style(|s| s.color(theme::text()))
-                    .tooltip(move || text(conn_tip()).style(crate::widgets::tooltip_style)),
+                widgets::tip_when(
+                    label(conn_label).style(|s| s.color(theme::text())),
+                    conn_tip,
+                ),
                 icons::icon(icons::CHEVRON_DOWN, 16.0)
                     .style(move |s| s.color(active_conn_color(connections, active_conn))),
             ))
@@ -8385,10 +8403,11 @@ fn result_tab_chip(panel: ResultPanel, tab: Tab, gctx: GridCtx) -> impl IntoView
     // result it is holding — the thing the size is about — arrives after the chip
     // is built.
     let tip = move || {
-        let Some(panel) = result_tabs.with_untracked(|v| v.iter().find(|p| p.id == id).cloned())
-        else {
-            return String::new();
-        };
+        // `None`, not an empty string: floem always adds the overlay once the
+        // hover delay fires and `TooltipClass` paints the chrome onto it, so an
+        // empty tip is an empty bordered box. Only `tip_when`'s hidden root is
+        // actually nothing. (Reachable while a closing panel is still on screen.)
+        let panel = result_tabs.with_untracked(|v| v.iter().find(|p| p.id == id).cloned())?;
         let mut lines = vec![if panel.sql.trim().is_empty() {
             "Nothing has run in this tab yet.".to_string()
         } else {
@@ -8412,7 +8431,7 @@ fn result_tab_chip(panel: ResultPanel, tab: Tab, gctx: GridCtx) -> impl IntoView
         if !foot.is_empty() {
             lines.push(foot.join(" · "));
         }
-        lines.join("\n")
+        Some(lines.join("\n"))
     };
 
     // Trailing icon, on the query strip's rule and with its footprint: a
@@ -8447,23 +8466,23 @@ fn result_tab_chip(panel: ResultPanel, tab: Tab, gctx: GridCtx) -> impl IntoView
     // out at its natural width, runs under the × and out over the next chip.
     // Capping the *text* is what makes `text_ellipsis` fire — the query strip's
     // rule (`tab_title_avail`), and this is its arithmetic.
-    let label = text(panel.label.clone())
-        .style(|s| {
+    // **The tooltip goes on the label, not on the chip** — and this is the whole
+    // of a bug that survived two attempts at it. `tooltip()` does not decorate a
+    // view, it *wraps* it: `h_stack(…).on_click_stop(…).tooltip(…).style(…)` puts
+    // the background, the border, the height and the padding on the wrapper and
+    // leaves the click listeners on the stack inside it. The chip you see is the
+    // wrapper; the chip that listens is a content-sized box within it, so
+    // clicking anywhere but the text hit the wrapper and nothing happened. The
+    // query strip tooltips its label too, which is why editor tabs never had it.
+    let label = widgets::tip_when(
+        text(panel.label.clone()).style(|s| {
             s.margin_right(theme::scaled(6.0))
                 .max_width(result_title_avail())
                 .font_size(theme::font_body())
                 .text_ellipsis()
-        })
-        // **The tooltip goes on the label, not on the chip** — and this is the
-        // whole of a bug that survived two attempts at it. `tooltip()` does not
-        // decorate a view, it *wraps* it: `h_stack(…).on_click_stop(…).tooltip(…)
-        // .style(…)` puts the background, the border, the height and the padding
-        // on the wrapper and leaves the click listeners on the stack inside it.
-        // The chip you see is the wrapper; the chip that listens is a
-        // content-sized box within it, so clicking anywhere but the text hit the
-        // wrapper and nothing happened. The query strip tooltips its label too,
-        // which is why editor tabs never had it.
-        .tooltip(move || text(tip()).style(crate::widgets::tooltip_style));
+        }),
+        tip,
+    );
 
     // Colour is set on the tab container and cascades to the label.
     let chip = h_stack((label, pin_glyph, close_glyph))

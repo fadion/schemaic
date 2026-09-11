@@ -958,7 +958,18 @@ fn footer(
     let refresh = {
         let fetch = ui.schema_actions.principals.clone();
         let t = target.clone();
+        let selected = ui.overlay.users_selected;
         move || {
+            // **The selection goes back to nothing**, because the account it
+            // names may be the very one this refresh exists to notice is gone.
+            // Left standing, the detail pane went on describing a dropped
+            // account — with a live **Drop** button over it — while the list
+            // beside it no longer had the row. The DDL-apply path in the app
+            // does exactly this and says the same thing; Refresh, whose stated
+            // job is a `DROP USER` applied from another client, was the one that
+            // did not.
+            selected.set(None);
+            grants.set(GrantsState::Idle);
             state.set(UsersState::Loading);
             (fetch)(t.clone());
         }

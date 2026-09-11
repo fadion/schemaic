@@ -710,6 +710,31 @@ fn withheld_block(withheld: Vec<String>) -> impl IntoView {
     })
 }
 
+/// Is this plan refused — the connection read-only **now**, or the preview
+/// stamped read-only when it was built?
+///
+/// **One expression for three readers**, because they were not reading the same
+/// thing. `apply` asks the live flag (and must: flipping the connection
+/// read-only from the status bar while a `DROP DATABASE` plan is on screen is
+/// exactly where a stale answer costs most), while the footer's *enable* term
+/// and its "This connection is read-only" note both read only the stamp. So the
+/// flag could be flipped with the plan open and Apply stayed lit, said nothing,
+/// and silently did nothing when pressed — a disabled-looking action would at
+/// least have been honest, and the note that exists to explain it stayed hidden.
+///
+/// The stamp is still a term: a preview built while read-only says so for its
+/// whole life, which is what the note beside the footer is about.
+pub(crate) fn plan_read_only(
+    conns: &[schemaic_core::connection::Connection],
+    p: &DdlPreview,
+) -> bool {
+    p.read_only
+        || conns
+            .iter()
+            .find(|c| c.id == p.conn_id)
+            .is_some_and(|c| c.read_only)
+}
+
 /// Hand the plan to the app, and fold the outcome back into the modal.
 fn apply(ui: Ui) {
     let d = ui.ddl;
@@ -724,11 +749,10 @@ fn apply(ui: Ui) {
     // the moment Run is pressed, and two destructive modals must not answer the
     // same question two different ways. The stamp stays, because the note
     // beside the footer is about the preview as opened; the *guard* is this.
-    let read_only = ui.conn.connections.with_untracked(|cs| {
-        cs.iter()
-            .find(|c| c.id == p.conn_id)
-            .is_some_and(|c| c.read_only)
-    }) || p.read_only;
+    let read_only = ui
+        .conn
+        .connections
+        .with_untracked(|cs| plan_read_only(cs, &p));
     if !crate::widgets::accept_launch(d.applying.get_untracked(), read_only) {
         return;
     }
@@ -832,6 +856,9 @@ fn exit_cancellable(dialect: Option<SqlDialect>) -> bool {
 
 pub(crate) fn ddl_preview_overlay(ui: Ui) -> impl IntoView {
     let d = ui.ddl;
+    // The connection list, for the footer's two live read-only reads — see
+    // [`plan_read_only`].
+    let conns = ui.conn.connections;
     // Closing returns to the designer when it's still open behind — the draft is
     // untouched, so Cancel here means "not yet", not "throw it away".
     //
@@ -1054,8 +1081,22 @@ pub(crate) fn ddl_preview_overlay(ui: Ui) -> impl IntoView {
             let ring_actions = ring.clone();
             let footer_exit = exit.clone();
             let actions = dyn_container(
-                move || (d.applying.get(), d.applied.get()),
-                move |(busy, applied)| {
+                // **Read-only is in the key, not read in the builder.** A
+                // `dyn_container` builder is not a tracking scope (floem 0.2), so
+                // a flag read inside it is frozen at the rebuild that happened to
+                // last run — which is how the enable term came to answer about
+                // the connection as it was when the plan was stamped. It is the
+                // *live* answer, through the same `plan_read_only` `apply` asks.
+                move || {
+                    (
+                        d.applying.get(),
+                        d.applied.get(),
+                        d.preview
+                            .get()
+                            .is_some_and(|p| conns.with(|cs| plan_read_only(cs, &p))),
+                    )
+                },
+                move |(busy, applied, read_only)| {
                     let ui = ui.clone();
                     let ring = ring_actions.clone();
                     let exit = footer_exit.clone();
@@ -1128,7 +1169,7 @@ pub(crate) fn ddl_preview_overlay(ui: Ui) -> impl IntoView {
                                 ActionKind::Danger
                             },
                             !busy
-                                && !p.read_only
+                                && !read_only
                                 && !p.statements.is_empty()
                                 && p.withheld.is_empty(),
                             ring,
@@ -1148,7 +1189,15 @@ pub(crate) fn ddl_preview_overlay(ui: Ui) -> impl IntoView {
                     .color(theme::plan_warn())
                     .font_size(theme::font_label())
                     .margin_right(theme::scaled(12.0));
-                if d.preview.get().is_some_and(|p| p.read_only) && !d.applied.get() {
+                // The live answer too — a style closure *is* a tracking scope, so
+                // this one only ever needed the right expression. Flipping the
+                // flag with the plan open now says so instead of leaving a dead
+                // Apply unexplained.
+                let blocked = d
+                    .preview
+                    .get()
+                    .is_some_and(|p| conns.with(|cs| plan_read_only(cs, &p)));
+                if blocked && !d.applied.get() {
                     s
                 } else {
                     s.hide()
@@ -1262,6 +1311,85 @@ mod tests {
     use schemaic_core::intel::SqlDialect;
 
     use super::test_ddl_ui as ddl_ui;
+
+    /// A plan on connection `id`, stamped with `stamped_read_only`.
+    fn plan(id: u64, stamped_read_only: bool) -> DdlPreview {
+        let cs = schemaic_core::ddl::ChangeSet {
+            dialect: SqlDialect::MySql,
+            flavour: Default::default(),
+            schema: None,
+            table: String::new(),
+            changes: Vec::new(),
+        };
+        preview_of(id, "db", "orders", &cs, stamped_read_only)
+    }
+
+    fn conn(id: u64, read_only: bool) -> schemaic_core::connection::Connection {
+        schemaic_core::connection::Connection {
+            id,
+            name: format!("conn {id}"),
+            db_type: "MySQL".to_string(),
+            host: "localhost".to_string(),
+            port: 3306,
+            user: "root".to_string(),
+            password: String::new(),
+            file: String::new(),
+            database: String::new(),
+            ssh: Default::default(),
+            tls: Default::default(),
+            color: None,
+            prominent_color: false,
+            read_only,
+            environment: Default::default(),
+            ai_data: None,
+        }
+    }
+
+    /// **The connection as it is now, not as it was when the plan was stamped.**
+    ///
+    /// `apply` already asked the live flag — flipping a connection read-only
+    /// from the status bar with a `DROP DATABASE` plan on screen is exactly
+    /// where a stale answer costs most — but the footer's *enable* term and the
+    /// "This connection is read-only" note beside it both read the stamp. So the
+    /// flag could be flipped with the plan open and Apply stayed lit, said
+    /// nothing, and did nothing when pressed, while the note that exists to
+    /// explain a dead Apply stayed hidden.
+    #[test]
+    fn a_connection_flipped_read_only_refuses_a_plan_stamped_writable() {
+        let p = plan(7, false);
+        assert!(!super::plan_read_only(&[conn(7, false)], &p), "the premise");
+        assert!(
+            super::plan_read_only(&[conn(7, true)], &p),
+            "the flag was flipped after the plan was stamped and nothing saw it"
+        );
+    }
+
+    /// And the stamp is still a term in its own right: a plan built while the
+    /// connection was read-only says so for its whole life, which is what the
+    /// note beside the footer is about.
+    #[test]
+    fn a_plan_stamped_read_only_stays_refused() {
+        let p = plan(7, true);
+        assert!(super::plan_read_only(&[conn(7, false)], &p));
+        assert!(super::plan_read_only(&[conn(7, true)], &p));
+    }
+
+    /// **The id is half the question.** A tab keeps the connection it was opened
+    /// on, so the plan's own connection is the one to ask about — another
+    /// connection going read-only must not refuse it, and the plan's connection
+    /// having been deleted must not silently make it writable either.
+    #[test]
+    fn only_the_plans_own_connection_is_asked() {
+        let p = plan(7, false);
+        assert!(
+            !super::plan_read_only(&[conn(9, true), conn(7, false)], &p),
+            "another connection's flag refused this plan"
+        );
+        // Gone from the list: nothing says read-only, and the stamp is what is
+        // left to answer with.
+        assert!(!super::plan_read_only(&[conn(9, true)], &p));
+        assert!(super::plan_read_only(&[], &plan(7, true)));
+    }
 
     /// **With no preview there is no engine to ask**, and the exit guard must
     /// say so itself rather than borrowing an invented one's answer.

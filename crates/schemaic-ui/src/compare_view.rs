@@ -124,7 +124,16 @@ pub(crate) fn compare_overlay(ui: Ui) -> impl IntoView {
             };
             let ui = ui.clone();
             let o = ui.overlay;
+            // **And stop the fetch**, which `reset` cannot: the token lives in
+            // the app beside the `Db` handles, and until this existed its only
+            // canceller was the *next* fetch. Escape mid-comparison therefore
+            // left two full `fetch_schema` sweeps running for a modal that was
+            // gone — verbatim the waste `compare_fetch`'s own "whatever was in
+            // flight is for a pair nobody is looking at" comment describes, on
+            // the one path that never reaches it.
+            let cancel = ui.schema_actions.compare_cancel.clone();
             let close: Rc<dyn Fn()> = Rc::new(move || {
+                (cancel)();
                 reset(o);
                 target.set(None);
             });

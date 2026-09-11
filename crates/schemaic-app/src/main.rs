@@ -8045,6 +8045,14 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
     // records as a fixed bug.
     let compare_token: Rc<RefCell<CancellationToken>> =
         Rc::new(RefCell::new(CancellationToken::new()));
+    // **The token's other canceller.** `compare_fetch` below cancels its own
+    // predecessor on the way in, which made every canceller a *new* fetch — so
+    // closing the modal, the one path that starts nothing, left two full
+    // `fetch_schema` sweeps running for nobody. Wired to the modal's close.
+    let compare_cancel: Rc<dyn Fn()> = {
+        let compare_token = compare_token.clone();
+        Rc::new(move || compare_token.borrow().cancel())
+    };
     let compare_fetch: Rc<dyn Fn(schemaic_ui::CompareTarget)> = {
         let handle = handle.clone();
         let db_for = db_for.clone();
@@ -11099,6 +11107,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             event_source,
             table_stats,
             compare_fetch,
+            compare_cancel,
             compare_list_dbs,
             count_rows,
             count_cancel,

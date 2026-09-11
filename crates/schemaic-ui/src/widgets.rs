@@ -2250,12 +2250,22 @@ pub(crate) fn tooltip_style(s: floem::style::Style) -> floem::style::Style {
 /// fresh `Style` and merges the results per property by push order, and
 /// [`tooltip_style`] sets no `display`. So the overlay is still created and is
 /// simply never laid out or painted.
-pub(crate) fn tip_when(
+/// **Generic over the text**, so a tip computed from data can use it too. The
+/// header's connection switcher could not — its tip is the connection's *name*,
+/// an owned `String` — and so it went round this helper with a bare
+/// `.tooltip(|| text(conn_tip()))` returning `""` for any name short enough not
+/// to be elided. Which is every ordinary name: floem still added the overlay,
+/// `TooltipClass` still painted background, border, padding and shadow onto it,
+/// and the app's most-hovered header control grew a small empty chip. The site's
+/// own comment claimed the opposite ("so an ordinary name raises no tooltip at
+/// all"), which is this function's rule stated at a call site that wasn't
+/// applying it.
+pub(crate) fn tip_when<S: Into<String>>(
     view: impl IntoView + 'static,
-    tip: impl Fn() -> Option<&'static str> + 'static,
+    tip: impl Fn() -> Option<S> + 'static,
 ) -> impl IntoView {
     view.tooltip(move || match tip() {
-        Some(t) => text(t).into_any(),
+        Some(t) => text(t.into()).into_any(),
         None => empty().style(|s| s.hide()).into_any(),
     })
 }
