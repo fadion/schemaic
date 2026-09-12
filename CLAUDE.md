@@ -178,12 +178,30 @@ start with a failing test, then the code that makes it pass.
 - `cargo build` / `cargo run -p schemaic-app`.
 - **Windows:** if the app is running, the linker can't overwrite `target/debug/schemaic.exe`
   ("Access is denied"). Stop it first (`Get-Process schemaic | Stop-Process -Force`).
-- Visual and interaction changes: **build only, and let the user verify.** There is no screenshot
-  harness in this repository, and launching the app from a session is worse than useless — it
-  writes the user's real `%APPDATA%\Roaming\schemaic` (tabs, expansion set, active connection) and
-  the `.bak` sibling is rewritten in the same save, so there is no pre-agent restore point. Write
-  the hand checks down instead, in the shape `review/user-verify-fix.md` uses: setup, the exact
-  action, what should happen, and what would mean the fix is wrong.
+- Visual and interaction changes: **build only, and write the hand checks down** — in the shape
+  `review/user-verify-fix.md` uses: setup, the exact action, what should happen, and what would
+  mean the fix is wrong. There is no screenshot harness in this repository.
+
+- **The app may be launched from a session, but only sandboxed, and only when the desk is free.**
+  A naive launch writes the user's real `%APPDATA%\Roaming\schemaic` — tabs, expansion set, active
+  connection — and rewrites the `.bak` sibling in the same save, so there is no pre-agent restore
+  point. That is a reason to redirect the profile, not a reason never to launch:
+  `core::persist::config_dir` resolves it from the **`APPDATA` environment variable**, so
+  `$env:APPDATA = "<scratch>\profile"` before `Start-Process` gives a wholly throwaway one.
+  Copy `connections.json` in and the real connections come with it — the keyring is keyed on the
+  constant service `schemaic` with per-connection accounts, so secrets resolve while every piece of
+  throwaway state stays throwaway. Verify the isolation by mtime afterwards rather than assuming it.
+
+  `PrintWindow(hwnd, hdc, PW_RENDERFULLCONTENT)` captures the Floem/wgpu window at full fidelity,
+  needs no foreground, and catches in-window overlays (menus, the completion ring). `SendKeys`
+  plus `SetCursorPos`/`mouse_event` drives it. **Two standing limits:** driving it takes the
+  foreground, so ask before running while the user may be working; and the redirected `APPDATA`
+  breaks AI-harness auto-detect and the DBeaver/HeidiSQL import, so anything behind Ctrl+K cannot
+  be reached this way. Never type SQL through `SendKeys` — it eats `(`, `)`, `{`, `}`, `^`, `%`,
+  `+` and `~` as metacharacters; put it on the clipboard and paste.
+
+  **Prefer a test to a screenshot wherever one can fail.** This is for the tier where none can —
+  floem focus, layout, placement — and for settling a finding whose fix sketch is a guess.
 
 ## Writing the UI's words
 
