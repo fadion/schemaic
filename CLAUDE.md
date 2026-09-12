@@ -178,9 +178,12 @@ start with a failing test, then the code that makes it pass.
 - `cargo build` / `cargo run -p schemaic-app`.
 - **Windows:** if the app is running, the linker can't overwrite `target/debug/schemaic.exe`
   ("Access is denied"). Stop it first (`Get-Process schemaic | Stop-Process -Force`).
-- Visual and interaction changes: **build only, and write the hand checks down** — in the shape
-  `review/user-verify-fix.md` uses: setup, the exact action, what should happen, and what would
-  mean the fix is wrong. There is no screenshot harness in this repository.
+- Visual and interaction changes: **build only, and write the hand checks down where they will
+  outlive the round.** A check names four things: the setup, the exact action, what should happen,
+  and what would mean the fix is wrong. Put it **in the commit message** — that is the only place
+  guaranteed to still exist when someone runs it. A review in progress may collect them in
+  `review/` as well, but that directory is gitignored and goes away with the round, so it is a
+  worklist, never the record. There is no screenshot harness in this repository.
 
 - **The app may be launched from a session, but only sandboxed, and only when the desk is free.**
   A naive launch writes the user's real `%APPDATA%\Roaming\schemaic` — tabs, expansion set, active
