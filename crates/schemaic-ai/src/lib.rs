@@ -399,6 +399,102 @@ pub fn oversize_reason(
     ))
 }
 
+/// **Why this spawn cannot happen, or `None`** — the one pre-spawn verdict, and
+/// what every call site asks.
+///
+/// Two reasons, and they are asked together because they are one question with
+/// one answer: the command line is too long for the platform
+/// ([`oversize_reason`]), or the program cannot take this argv at all
+/// ([`batch_shim_reason`]). Both exist because the failure is unrecognisable
+/// after the spawn — one surfaces as `os error 206`, the other as "batch file
+/// arguments are invalid", and the app's handler blames the installation for
+/// both.
+///
+/// Size is asked first because it is the one a user can act on by changing what
+/// they sent; a shim is a property of the install and no amount of narrowing
+/// helps.
+pub fn spawn_refusal(
+    harness: crate::harness::Harness,
+    bin: &str,
+    args: &[String],
+    limit: usize,
+) -> Option<String> {
+    oversize_reason(harness, args, limit)
+        .or_else(|| batch_shim_reason(cfg!(windows), harness, bin, args))
+}
+
+/// **Would the OS refuse this argv for this program?** — the mechanism, without
+/// the message, and `windows` is a parameter so both answers are testable
+/// everywhere.
+///
+/// Rust runs a `.bat`/`.cmd` through `cmd.exe` and refuses any argument it
+/// cannot escape for it. Measured: `Command::new("x.cmd").arg("line one\nline
+/// two").output()` is `Err(kind = InvalidInput, "batch file arguments are
+/// invalid")` — before the child exists, so nothing downstream sees a cause.
+/// A single-line argument to the same shim runs fine, which is why this is about
+/// the *argument*, not about batch files.
+///
+/// Carriage return counts too: `cmd.exe`'s parser ends a line on either, and
+/// Rust refuses both.
+pub fn batch_argv_refused(windows: bool, program: &str, args: &[String]) -> bool {
+    if !windows {
+        // A Unix file named `x.cmd` is just a file; there is no `cmd.exe` in
+        // between and nothing to refuse.
+        return false;
+    }
+    let is_batch = [".bat", ".cmd"].iter().any(|e| {
+        program.len() > e.len() && program[program.len() - e.len()..].eq_ignore_ascii_case(e)
+    });
+    is_batch && args.iter().any(|a| a.contains('\n') || a.contains('\r'))
+}
+
+/// Why this command line can't be spawned **for this program**, or `None`.
+///
+/// [`oversize_reason`]'s sibling, and it exists for that function's reason
+/// rather than a new one: the failure is unrecognisable after the spawn. The OS
+/// says *"batch file arguments are invalid"*, which sends the reader to look at
+/// a batch file — and the batch file is fine. The prompt is what cannot travel.
+///
+/// **Every prompt this app builds is multi-line by construction.**
+/// `harness::prefixed_prompt` joins the system text and the user's with `\n\n`,
+/// so a harness whose binary resolves to a shim refuses *every* generation:
+/// Ctrl+K, Optimize, Fix with AI and each chat turn.
+/// `a_prefixed_prompt_always_carries_the_newline_that_a_shim_refuses` pins that
+/// coupling, so the day the prompt stops being multi-line this refusal is known
+/// to be dead rather than quietly kept.
+///
+/// **A capability check, not a `core::launch` one.** The invariant that sends
+/// validation to `core::launch` is about a string that stops being data at a
+/// launcher — a URL, a `psql` target. This asks whether a program can accept an
+/// argv at all, which is `oversize_reason`'s question with a different limit,
+/// and it belongs beside it.
+///
+/// `agent_cli::pick_executable` already prefers a non-batch `PATHEXT` entry, so
+/// this is reached only when the shim is the **only** candidate — which is
+/// npm's layout, and the one this cannot fix by choosing differently.
+///
+/// `windows` is a parameter for [`batch_argv_refused`]'s reason: the message is
+/// worth asserting on a Linux CI runner too, and a test that reaches it through
+/// `cfg!` can only assert the platform it happens to be built for.
+pub fn batch_shim_reason(
+    windows: bool,
+    harness: crate::harness::Harness,
+    bin: &str,
+    args: &[String],
+) -> Option<String> {
+    if !batch_argv_refused(windows, bin, args) {
+        return None;
+    }
+    let name = harness.label();
+    Some(format!(
+        "{name} resolved to a batch shim ({bin}), which cannot be given a \
+         multi-line prompt — Windows runs a .cmd through cmd.exe, and it \
+         refuses the argument before {name} is started. Set Settings → AI → \
+         CLI path to the real executable (an npm install usually has one under \
+         node_modules, beside the shim)."
+    ))
+}
+
 /// What [`arg_units`] counts, for the message that reports it.
 fn arg_unit_name() -> &'static str {
     match cfg!(windows) {
@@ -1613,5 +1709,83 @@ mod tests {
         let ascii = vec!["y".repeat(1_000)];
         assert!(oversize_reason(crate::harness::Harness::Claude, &ascii, 1_100).is_none());
         assert!(oversize_reason(crate::harness::Harness::Claude, &ascii, 900).is_some());
+    }
+
+    // ── A harness resolved to a batch shim (B15.3-L1-02) ──────────────────
+
+    fn args(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// **The measured refusal**, as a predicate: a `.cmd` plus a multi-line
+    /// argument is what Rust turns into `InvalidInput: batch file arguments are
+    /// invalid`, before the child exists.
+    #[test]
+    fn a_batch_shim_refuses_a_multi_line_argument() {
+        assert!(batch_argv_refused(
+            true,
+            r"C:\Users\x\AppData\Roaming\npm\opencode.cmd",
+            &args(&["run", "system\n\nSELECT 1"])
+        ));
+        // `.bat` and the case of the extension are the same question.
+        assert!(batch_argv_refused(true, "x.BAT", &args(&["a\nb"])));
+        // A carriage return alone is refused too — `cmd.exe` ends a line on it.
+        assert!(batch_argv_refused(true, "x.cmd", &args(&["a\rb"])));
+    }
+
+    /// And the three ways it is *not* refused, which is what keeps this from
+    /// becoming a refusal of every npm install.
+    #[test]
+    fn nothing_else_is_refused() {
+        // A single-line argument to the same shim runs fine — measured.
+        assert!(!batch_argv_refused(true, "x.cmd", &args(&["--help"])));
+        // A real executable takes anything.
+        assert!(!batch_argv_refused(true, "opencode.exe", &args(&["a\nb"])));
+        // And off Windows there is no `cmd.exe` in between, so a file that
+        // happens to end `.cmd` is just a file.
+        assert!(!batch_argv_refused(false, "x.cmd", &args(&["a\nb"])));
+        // A program whose whole name *is* the extension is not a shim.
+        assert!(!batch_argv_refused(true, ".cmd", &args(&["a\nb"])));
+    }
+
+    /// The message names the real cause and the lever, because the OS error
+    /// names neither — "batch file arguments are invalid" sends the reader to
+    /// look at a batch file that is fine.
+    #[test]
+    fn the_refusal_names_the_shim_and_the_setting() {
+        let why = batch_shim_reason(
+            true,
+            crate::harness::Harness::OpenCode,
+            "opencode.cmd",
+            &args(&["run", "a\n\nb"]),
+        )
+        .expect("a shim with a multi-line prompt is refused");
+        assert!(why.contains("opencode.cmd"), "{why}");
+        assert!(why.contains("CLI path"), "{why}");
+        assert!(
+            why.contains(crate::harness::Harness::OpenCode.label()),
+            "{why}"
+        );
+    }
+
+    /// A spawnable command line gets no reason — and neither does the same
+    /// shim off Windows, where nothing sits between us and the file.
+    #[test]
+    fn an_ordinary_binary_has_no_reason() {
+        let h = crate::harness::Harness::OpenCode;
+        let a = args(&["run", "a\n\nb"]);
+        assert!(batch_shim_reason(true, h, "opencode.exe", &a).is_none());
+        assert!(batch_shim_reason(false, h, "opencode.cmd", &a).is_none());
+    }
+
+    /// **The coupling, recorded.** The refusal above is only worth having
+    /// because every prompt this app builds is multi-line by construction. If
+    /// `prefixed_prompt` ever stops joining with a blank line, this fails and
+    /// the refusal can be reconsidered instead of being kept out of habit.
+    #[test]
+    fn a_prefixed_prompt_always_carries_the_newline_that_a_shim_refuses() {
+        let p = crate::harness::prefixed_prompt_for_test("system text", "SELECT 1");
+        assert!(p.contains('\n'), "{p:?}");
+        assert!(batch_argv_refused(true, "x.cmd", &[p]));
     }
 }

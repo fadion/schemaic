@@ -942,8 +942,10 @@ pub(crate) fn inline_plan(
     let stdin_prompt = harness.inline_stdin_prompt(&spec);
     // The same pre-spawn check the chat panel makes: it is the same argv entry
     // and the same platform limit, and an oversize prompt otherwise surfaces as
-    // `os error 206`, which names the one cause that isn't the problem.
-    if let Some(why) = schemaic_ai::oversize_reason(harness, &args, schemaic_ai::arg_limit()) {
+    // `os error 206`, which names the one cause that isn't the problem. The
+    // batch-shim half is the same shape — "batch file arguments are invalid",
+    // about a batch file that is fine.
+    if let Some(why) = schemaic_ai::spawn_refusal(harness, &bin, &args, schemaic_ai::arg_limit()) {
         // The reply file was created above, before this check could run — the
         // path has to exist to go into the argv this check measures — so a
         // refusal orphaned one every time. Cleaned up here rather than left for
@@ -1599,7 +1601,7 @@ pub(crate) fn start_ai_session(
                 // longer counts against the command-line limit.
                 let turn_stdin = harness.turn_stdin_prompt(&spec);
                 if let Some(why) =
-                    schemaic_ai::oversize_reason(harness, &args, schemaic_ai::arg_limit())
+                    schemaic_ai::spawn_refusal(harness, &bin, &args, schemaic_ai::arg_limit())
                 {
                     pump.fail(why);
                     continue;
@@ -1858,7 +1860,7 @@ pub(crate) fn start_ai_session(
 
     // Before the spawn, because afterwards it is unrecognisable: the OS returns
     // a generic failure and the arm below blames the installation.
-    if let Some(why) = schemaic_ai::oversize_reason(harness, &args, schemaic_ai::arg_limit()) {
+    if let Some(why) = schemaic_ai::spawn_refusal(harness, &bin, &args, schemaic_ai::arg_limit()) {
         let _ = ai_tx.send(AiStreamMsg {
             segs: vec![schemaic_core::transcript::Seg::Text(why.clone())],
             done: true,
@@ -3611,6 +3613,27 @@ mod tests {
             body.matches("Command::new(").count(),
             body.matches("current_dir(").count(),
             "a `Command` in this file does not set a working directory"
+        );
+        // **And every spawn asks the pre-spawn verdict.** Same counting, same
+        // reason: both failures it catches are unrecognisable afterwards — an
+        // oversize command line surfaces as `os error 206` and a batch shim as
+        // "batch file arguments are invalid", and this file's own error arm
+        // blames the installation for either. A fourth spawn added without the
+        // check shows up as an imbalance here rather than as a user report.
+        let asks = format!("schemaic_ai::spawn_{}(", "refusal");
+        assert_eq!(
+            body.matches("Command::new(").count(),
+            body.matches(&asks).count(),
+            "a `Command` in this file spawns without asking `spawn_refusal` \
+             first — see `schemaic_ai::batch_shim_reason` for what that costs"
+        );
+        // The half that replaced a bare size check: nothing here may go back to
+        // asking only about length, which would spawn a shim and blame npm.
+        let bare = format!("schemaic_ai::oversize_{}(", "reason");
+        assert!(
+            !body.contains(&bare),
+            "a spawn site asks `oversize_reason` directly — it must go through \
+             `spawn_refusal`, which also refuses a batch shim"
         );
     }
 

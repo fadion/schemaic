@@ -1494,6 +1494,15 @@ fn prefixed_prompt(system: &str, prompt: &str) -> String {
     format!("{system}\n\n{prompt}")
 }
 
+/// [`prefixed_prompt`] for the one test outside this module that needs it —
+/// `a_prefixed_prompt_always_carries_the_newline_that_a_shim_refuses`, which
+/// records why `batch_shim_reason` exists. Kept next to the function it exposes
+/// so the two cannot drift.
+#[cfg(test)]
+pub(crate) fn prefixed_prompt_for_test(system: &str, prompt: &str) -> String {
+    prefixed_prompt(system, prompt)
+}
+
 /// The system context this turn should carry, given whether it resumes a thread.
 ///
 /// **Once per thread, not once per turn.** With no `--append-system-prompt`,

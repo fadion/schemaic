@@ -221,7 +221,12 @@ pub(crate) fn pathext() -> Vec<String> {
 /// generation — Ctrl+K, Optimize, Fix with AI and each chat turn, reported as a
 /// batch-file problem rather than a prompt one. A default `PATHEXT` lists `.EXE`
 /// before `.CMD` and hid this; the variable is editable and installers edit it.
-/// The shim is still taken when it is the only candidate, which is npm's layout.
+/// The shim is still taken when it is the only candidate, which is npm's layout
+/// — and that case is not silent: `schemaic_ai::batch_shim_reason` refuses the
+/// spawn with the cause and the lever, rather than letting the OS report a
+/// batch-file problem about a batch file that is fine. Preferring here and
+/// refusing there are the two halves of one answer, and neither is sufficient
+/// alone: this cannot conjure an executable npm did not install.
 ///
 /// Off Windows `exts` is empty and the bare name is the only candidate, which
 /// is correct there: the executable bit is the test, not the name.
