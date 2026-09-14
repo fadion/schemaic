@@ -1442,7 +1442,7 @@ fn as_read_from<'a>(
     Cow::Owned(out)
 }
 
-/// Clear every view's `DEFINER`, on both sides, before the two are compared.
+/// Clear every `DEFINER`, on both sides, before the two are compared.
 ///
 /// It is a **server** account, so it does not compare across two servers at all
 /// — the same reading [`CompareEntry::uncertain`] takes of an index the model
@@ -1456,20 +1456,50 @@ fn as_read_from<'a>(
 /// migrated, and a view replaced for some other reason takes the running account
 /// — is a feature not offered rather than an object destroyed.
 ///
+/// **All four of them**, not the view's alone. A trigger, a stored routine and
+/// an event each carry a definer, each restated by its emitter, and each
+/// compared by a whole-struct equality — so a two-server comparison reported
+/// every one of them Differing although the bodies were byte-identical, and the
+/// plan (ticked by default, built for the **left** database) carried the right
+/// server's account into it. Both outcomes are bad and one destroys: without
+/// `SUPER`/`SET_USER_ID` the `CREATE` is refused `ERROR 1227` and, MySQL DDL not
+/// being transactional, the `DROP TRIGGER` above it has already run; with it,
+/// every `INSERT` into the table then fails `ERROR 1449 … does not exist`.
+/// `ReplaceTrigger`'s own risk line states the first half and nothing asked.
+///
 /// `definer` is `None` on every engine but MySQL's, so this is a no-op elsewhere
-/// and needs no predicate of its own; it borrows when no view carries one.
+/// and needs no predicate of its own; it borrows when nothing carries one.
 fn without_definer(side: &DbSchema) -> Cow<'_, DbSchema> {
-    if !side
+    let any_view = side
         .tables
         .iter()
-        .any(|t| t.view_options.as_ref().is_some_and(|o| o.definer.is_some()))
-    {
+        .any(|t| t.view_options.as_ref().is_some_and(|o| o.definer.is_some()));
+    let any_trigger = side
+        .tables
+        .iter()
+        .any(|t| t.triggers.iter().any(|g| g.definer.is_some()));
+    let any_routine = side.routines.iter().any(|r| r.definer.is_some());
+    let any_event = side.events.iter().any(|e| e.definer.is_some());
+    if !(any_view || any_trigger || any_routine || any_event) {
         return Cow::Borrowed(side);
     }
     let mut out = side.clone();
     for t in &mut out.tables {
         if let Some(o) = t.view_options.as_mut() {
             o.definer = None;
+        }
+        for g in &mut t.triggers {
+            g.definer = None;
+        }
+    }
+    for r in &mut out.routines {
+        if r.definer.is_some() {
+            std::sync::Arc::make_mut(r).definer = None;
+        }
+    }
+    for e in &mut out.events {
+        if e.definer.is_some() {
+            std::sync::Arc::make_mut(e).definer = None;
         }
     }
     Cow::Owned(out)
@@ -4447,6 +4477,85 @@ mod tests {
         let sql = d.plan(|_| true).emit().join("\n");
         assert!(sql.contains("`n`"), "{sql}");
         assert!(!sql.contains("DEFINER"), "{sql}");
+    }
+
+    /// **The other three definers, which the same rule is about.**
+    ///
+    /// `TriggerInfo`, `RoutineInfo` and `EventInfo` each carry one, each
+    /// restated by its emitter, and each compared by a whole-struct equality —
+    /// so a two-server comparison reported every trigger, routine and event
+    /// Differing although the bodies are byte-identical, and the plan (ticked by
+    /// default, built for the **left** database) carried the right server's
+    /// account into it.
+    ///
+    /// Both outcomes are bad and one destroys: without `SUPER`/`SET_USER_ID`
+    /// the `CREATE` is refused with `ERROR 1227` — and MySQL DDL is not
+    /// transactional, so the `DROP TRIGGER` above it has already run and the
+    /// trigger is simply gone. With it, the `CREATE` succeeds and every `INSERT`
+    /// into the table then fails `ERROR 1449 … does not exist`: the table is
+    /// unwritable. The routine arm gives the same 1449 on every `CALL`; the
+    /// event arm gives an event that never fires again — and an event has no
+    /// caller, so the definer's rights are the *only* rights its body runs with.
+    #[test]
+    fn a_trigger_routine_or_event_definer_neither_differs_nor_rides_into_the_statement() {
+        let side = |definer: &str| {
+            let mut t = TableInfo {
+                name: "city".to_string(),
+                columns: vec![col("id", "int")],
+                ..Default::default()
+            };
+            let mut tr = trigger("t_ins", "city", "BEGIN END");
+            tr.definer = Some(definer.to_string());
+            t.triggers = vec![tr];
+            let mut s = from_db("shop", vec![t]);
+            s.routines = vec![std::sync::Arc::new(RoutineInfo {
+                name: "f".to_string(),
+                definer: Some(definer.to_string()),
+                body: "BEGIN RETURN 1; END".to_string(),
+                ..Default::default()
+            })];
+            s.events = vec![std::sync::Arc::new(EventInfo {
+                name: "e".to_string(),
+                definer: Some(definer.to_string()),
+                body: "BEGIN END".to_string(),
+                ..Default::default()
+            })];
+            s
+        };
+        let c = mysql(side("schemaic@localhost"), side("deploy@10.0.0.7"));
+        for key in ["trigger:city.t_ins", "function:f()", "event:e"] {
+            assert_eq!(find(&c, key).status, ObjectStatus::Same, "{key}");
+        }
+
+        // And when something else *does* differ, the replacement takes the
+        // running account rather than the other server's.
+        let mut right = side("deploy@10.0.0.7");
+        right.tables[0].triggers[0].action =
+            crate::schema::TriggerAction::Body("BEGIN SET @x = 1; END".to_string());
+        let d = mysql(side("schemaic@localhost"), right);
+        assert_eq!(
+            find(&d, "trigger:city.t_ins").status,
+            ObjectStatus::Differing
+        );
+        assert_eq!(
+            d.differences().count(),
+            1,
+            "only the body, and only the trigger"
+        );
+
+        // And the subtraction really reaches all four carriers, not only the
+        // three the comparison happened to route through here.
+        let carrying = side("deploy@10.0.0.7");
+        let cleared = without_definer(&carrying);
+        assert!(cleared.tables[0].triggers[0].definer.is_none());
+        assert!(cleared.routines[0].definer.is_none());
+        assert!(cleared.events[0].definer.is_none());
+        // Nothing to clear borrows rather than clones.
+        let plain = from_db("shop", vec![table("city", &[("id", "int")])]);
+        assert!(matches!(
+            without_definer(&plain),
+            std::borrow::Cow::Borrowed(_)
+        ));
     }
 
     /// A column named after the database is not a qualifier: the qualifier is
