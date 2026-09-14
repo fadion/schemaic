@@ -269,12 +269,26 @@ asset_url() {
 }
 
 detect_family() {
-    # dnf/zypper before apt: a machine with both is an rpm machine that has
-    # picked up apt somehow, not the reverse.
-    if has dnf || has zypper || has rpm; then
+    # **`dnf` and `zypper` are diagnostic; the bare `rpm` binary is not.** A
+    # machine with dnf and apt is an rpm machine that has picked up apt somehow,
+    # not the reverse — but `rpm` on its own is an ordinary Debian/Ubuntu
+    # package, and this repository's own CI runners install it on
+    # `ubuntu-latest` (release.yml, pages.yml). Answering `rpm` for those steered
+    # them off the *signed apt repository* and onto `rpm -i --nosignature`, the
+    # one branch that installs an unsigned package with the check explicitly
+    # waived — a trust posture chosen by a predicate that was wrong about the
+    # machine. It did not even complete: the spec's nine soname `Requires:`
+    # cannot be met by an empty rpm database, so `rpm -i` failed, `set -e` ended
+    # the script, and an Ubuntu user got an rpm error with no hint that
+    # `SCHEMAIC_PKG_FAMILY=debian` existed.
+    if has dnf || has zypper; then
         echo rpm
     elif has apt-get || has dpkg; then
         echo debian
+    # An rpm machine with neither front-end — and only once dpkg has been ruled
+    # out, which is the whole correction.
+    elif has rpm; then
+        echo rpm
     else
         echo unknown
     fi
