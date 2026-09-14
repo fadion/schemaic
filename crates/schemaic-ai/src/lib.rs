@@ -442,9 +442,12 @@ pub fn batch_argv_refused(windows: bool, program: &str, args: &[String]) -> bool
         // between and nothing to refuse.
         return false;
     }
-    let is_batch = [".bat", ".cmd"].iter().any(|e| {
-        program.len() > e.len() && program[program.len() - e.len()..].eq_ignore_ascii_case(e)
-    });
+    // Through the shared predicate — see `launch::ends_with_ignore_ascii_case`
+    // for why slicing at a byte count is not the same question. `harness_bin`
+    // returns the user's override verbatim, so `C:	ools\克劳德` reached here.
+    let is_batch = [".bat", ".cmd"]
+        .iter()
+        .any(|e| schemaic_core::launch::ends_with_ignore_ascii_case(program, e));
     is_batch && args.iter().any(|a| a.contains('\n') || a.contains('\r'))
 }
 
@@ -1746,6 +1749,15 @@ mod tests {
         assert!(!batch_argv_refused(false, "x.cmd", &args(&["a\nb"])));
         // A program whose whole name *is* the extension is not a shim.
         assert!(!batch_argv_refused(true, ".cmd", &args(&["a\nb"])));
+        // And a non-ASCII program name is answered, not panicked on: the
+        // extension test used to slice at a fixed byte count. `harness_bin`
+        // hands the user's CLI-path override back verbatim, so this is
+        // reachable from the setting.
+        assert!(!batch_argv_refused(
+            true,
+            "C:\\tools\\\u{514b}\u{52b3}\u{5fb7}",
+            &args(&["a\nb"])
+        ));
     }
 
     /// The message names the real cause and the lever, because the OS error

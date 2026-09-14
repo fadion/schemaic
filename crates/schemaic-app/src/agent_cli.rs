@@ -239,9 +239,14 @@ pub(crate) fn pick_executable<'a>(
     if exts.is_empty() {
         return has(name);
     }
+    // Through the shared predicate, because the spelling this replaced —
+    // `name[name.len() - e.len()..]` behind a length guard — indexes a `&str` at
+    // a byte count that may be inside a character, and `PATHEXT`'s entries are
+    // 3 and 4 bytes. Typing `naïve` into Settings → AI → CLI path panicked the
+    // UI thread on the keystroke, since the field is validated per value.
     let already_extended = exts
         .iter()
-        .any(|e| name.len() > e.len() && name[name.len() - e.len()..].eq_ignore_ascii_case(e));
+        .any(|e| schemaic_core::launch::ends_with_ignore_ascii_case(name, e));
     if already_extended && let Some(hit) = has(name) {
         return Some(hit);
     }
@@ -638,6 +643,30 @@ mod pick_executable_tests {
     /// npm-installed harness to the `sh` script, which `spawn` answers with os
     /// error 193 — and `harness_reachable` reported it connected while every
     /// generation was refused for a reason the user could not act on.
+    /// **A non-ASCII CLI path is a question, not a crash.** The extension test
+    /// sliced the name at a fixed byte count behind a length guard, so a name
+    /// whose last 3 or 4 bytes straddle a character panicked — on the floem UI
+    /// thread, per keystroke, because Settings → AI validates the field on every
+    /// value rather than on commit. Eight ASCII tests and a hand check with
+    /// `café` (which is safe: its multi-byte character is not in the last four
+    /// bytes) did not see it.
+    #[test]
+    fn a_non_ascii_name_is_resolved_rather_than_panicked_on() {
+        for name in [
+            "na\u{ef}ve",
+            "\u{65e5}\u{672c}",
+            "\u{514b}\u{52b3}\u{5fb7}",
+            "\u{e9}\u{e9}",
+        ] {
+            assert_eq!(pick_executable(name, &[], &win()), None);
+        }
+        // And one that is really there still resolves, extension and all.
+        assert_eq!(
+            pick_executable("na\u{ef}ve", &["na\u{ef}ve.EXE"], &win()),
+            Some("na\u{ef}ve.EXE")
+        );
+    }
+
     #[test]
     fn an_npm_shim_directory_resolves_to_the_cmd_not_the_sh_script() {
         let present = ["opencode", "opencode.cmd", "opencode.ps1"];

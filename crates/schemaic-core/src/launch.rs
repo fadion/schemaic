@@ -36,6 +36,27 @@ fn is_url_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b"-._~:/?#[]@!$&'()*+,;=%".contains(&b)
 }
 
+/// Does `s` end with `suffix`, comparing ASCII case-insensitively?
+///
+/// **The one spelling of "is this the file extension", and it exists because
+/// the obvious spelling panics.** Both call sites wrote
+/// `s.len() > e.len() && s[s.len() - e.len()..].eq_ignore_ascii_case(e)`, which
+/// guards the index against being *out of range* and not against being inside a
+/// character — and indexing a `&str` requires a char boundary. `PATHEXT`'s
+/// entries are 3 and 4 bytes, so any name whose last 3 or 4 bytes straddle a
+/// multi-byte character panicked: `naïve` typed into Settings → AI → CLI path
+/// took the app down per keystroke, because the field is validated on every
+/// value rather than on commit. `克劳德` and `日本` do it too; `café` does not,
+/// which is why eight ASCII tests and a hand check never saw it.
+///
+/// Lives here rather than beside either caller because the two are in different
+/// crates and this is the same question in both — which extension a program name
+/// carries, at the boundary where a string becomes a process.
+pub fn ends_with_ignore_ascii_case(s: &str, suffix: &str) -> bool {
+    s.len() > suffix.len()
+        && s.as_bytes()[s.len() - suffix.len()..].eq_ignore_ascii_case(suffix.as_bytes())
+}
+
 /// A URL the app may hand to the OS default browser, or `None`.
 ///
 /// Requires an `http`/`https` scheme (ASCII-case-insensitively — the scheme is
@@ -73,7 +94,14 @@ pub fn openable_url(raw: &str) -> Option<&str> {
 /// The part of `raw` after an `http://`/`https://` scheme, or `None`.
 fn strip_scheme(raw: &str) -> Option<&str> {
     for scheme in ["https://", "http://"] {
-        if raw.len() >= scheme.len() && raw[..scheme.len()].eq_ignore_ascii_case(scheme) {
+        // `get`, not `[..n]`: a length guard proves the slice is in range and
+        // says nothing about `n` being a char boundary, which indexing a `&str`
+        // requires. `https:/é` is 9 bytes, so the guard passed and byte 8 was
+        // inside the `é` — a panic, on the thread that draws the window.
+        if raw
+            .get(..scheme.len())
+            .is_some_and(|p| p.eq_ignore_ascii_case(scheme))
+        {
             return Some(&raw[scheme.len()..]);
         }
     }
@@ -126,9 +154,13 @@ pub fn psql_target(db: &str) -> Result<&str, &'static str> {
     if db.contains('=') {
         return Err(EQUALS);
     }
+    // `get`, not `[..n]` — see `strip_scheme`. The name is read verbatim out of
+    // `pg_database.datname`, is not the user's to vouch for, and this runs on
+    // the UI thread from a click handler, where a panic takes the app rather
+    // than reaching the panel the way every other refusal here does.
     if URI_PREFIXES
         .iter()
-        .any(|p| db.len() >= p.len() && db[..p.len()].eq_ignore_ascii_case(p))
+        .any(|p| db.get(..p.len()).is_some_and(|s| s.eq_ignore_ascii_case(p)))
     {
         return Err(URI);
     }
@@ -346,6 +378,49 @@ mod tests {
         for db in ["postgres", "my_app", "Orders-2026", "a b", "--pager", "x'y"] {
             assert_eq!(psql_target(db), Ok(db), "{db} was refused");
         }
+    }
+
+    /// **A length guard is not a char-boundary guard.** Both prefix tests here
+    /// proved the slice was in *range* and then indexed a `&str` at a fixed byte
+    /// count — which panics when that byte is inside a character. The name comes
+    /// off `pg_database.datname` and is arbitrary UTF-8, and this runs on the
+    /// Floem UI thread from a click handler, so the panic took the app rather
+    /// than reaching the panel as every other refusal on this path does.
+    ///
+    /// `postgres:/é` is 12 bytes and `postgres://` is 11, so the length guard
+    /// passed and byte 11 is `é`'s continuation byte. `https:/é` is the same
+    /// arithmetic one function up.
+    #[test]
+    fn a_name_whose_character_straddles_the_prefix_is_answered_not_panicked_on() {
+        assert_eq!(psql_target("postgres:/\u{e9}"), Ok("postgres:/\u{e9}"));
+        assert_eq!(
+            psql_target("postgresql:/\u{e9}x"),
+            Ok("postgresql:/\u{e9}x")
+        );
+        assert_eq!(strip_scheme("https:/\u{e9}"), None);
+        assert_eq!(strip_scheme("http:/\u{e9}"), None);
+        // And the composition, since a boundary-safe predicate and a hostile
+        // caller are two different subjects: the launcher answers a `Result`.
+        assert!(openable_url("https:/\u{e9}").is_none());
+    }
+
+    /// The same arithmetic at the other end of the string — the extension test
+    /// `pick_executable` and `batch_argv_refused` both asked by slicing.
+    #[test]
+    fn the_extension_test_answers_a_non_ascii_name() {
+        // Red against the slicing spelling: the last 3 bytes of each of these
+        // land inside a character.
+        assert!(!ends_with_ignore_ascii_case("na\u{ef}ve", ".EXE"));
+        assert!(!ends_with_ignore_ascii_case("\u{65e5}\u{672c}", ".cmd"));
+        assert!(!ends_with_ignore_ascii_case(
+            "\u{514b}\u{52b3}\u{5fb7}",
+            ".bat"
+        ));
+        // And it still answers the question it was written for.
+        assert!(ends_with_ignore_ascii_case("opencode.CMD", ".cmd"));
+        assert!(ends_with_ignore_ascii_case("caf\u{e9}.exe", ".EXE"));
+        assert!(!ends_with_ignore_ascii_case(".cmd", ".cmd"), "not a shim");
+        assert!(!ends_with_ignore_ascii_case("x.exe", ".cmd"));
     }
 
     /// `--pager` is only dangerous as an *option*, and it is only an option
