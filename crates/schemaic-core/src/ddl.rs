@@ -9685,6 +9685,13 @@ fn apply_positions(
     if sim == target {
         return;
     }
+    // The order the positions are assigned in, which is the order the
+    // simulation above advances in — and therefore the order the clauses have
+    // to be applied in. Recorded here because nothing downstream can re-derive
+    // it: `emit_mysql` walks `self.changes`, and `ordered_column_clauses` only
+    // reorders on the `provides`/`needs` pair, which a plain `MODIFY` (whose
+    // `provides` is `None`) never trips.
+    let mut moved: Vec<String> = Vec::new();
     for (i, name) in target.iter().enumerate() {
         if sim.get(i) == Some(name) {
             continue;
@@ -9699,6 +9706,7 @@ fn apply_positions(
             let moved = sim.remove(at);
             sim.insert(i.min(sim.len()), moved);
         }
+        moved.push(name.clone());
         // Attach the position to the change that already touches this column,
         // or raise a definition-preserving `MODIFY` if nothing else does.
         if let Some(&ci) = add_at.get(name) {
@@ -9725,6 +9733,56 @@ fn apply_positions(
                 inline_check: None,
             });
         }
+    }
+    reorder_moves(changes, &moved);
+}
+
+/// Put the positioned `AlterColumn`s back into the order
+/// [`apply_positions`] simulated them in.
+///
+/// **MySQL applies the clauses of one `ALTER TABLE` left to right**, and
+/// `emit_mysql` walks `changes` in order — so the clause order *is* the apply
+/// order, and it has to be the one the positions were computed against.
+/// `apply_positions` attaches a position to a change that already touches the
+/// column and appends a new `MODIFY` when none does, so a column both moved and
+/// edited sat early in `changes` while a position-only move sat at the end,
+/// which is the reverse of the simulation. On `t(a,b,c)`, retyping `b` and
+/// reordering to `[c,b,a]`, the server then applied `MODIFY b AFTER c` and
+/// `MODIFY c FIRST` in that order and left `[c,a,b]` — no error, nothing
+/// withheld, "applied" reported, and the next open of the designer showing the
+/// wrong order as if the user had drawn it.
+///
+/// Only the positioned alters move, and only among themselves: every other
+/// change keeps its index, so a set with no reorder in it emits exactly what it
+/// emitted before. `ordered_column_clauses`' dependency pass runs after this and
+/// is stable, so the two compose rather than fight — that pass answers "is the
+/// anchor there yet", this one answers "in what order were these moves drawn".
+fn reorder_moves(changes: &mut [Change], moved: &[String]) {
+    let rank = |name: &str| moved.iter().position(|m| m == name);
+    let mut slots: Vec<usize> = Vec::new();
+    let mut ranks: Vec<usize> = Vec::new();
+    for (i, c) in changes.iter().enumerate() {
+        if let Change::AlterColumn {
+            to,
+            position: Some(_),
+            ..
+        } = c
+            && let Some(r) = rank(&to.name)
+        {
+            slots.push(i);
+            ranks.push(r);
+        }
+    }
+    let mut order: Vec<usize> = (0..slots.len()).collect();
+    order.sort_by_key(|&k| ranks[k]);
+    if order.iter().enumerate().all(|(k, &j)| k == j) {
+        return;
+    }
+    // Lift the clauses out, then drop them back into the same slots in the
+    // simulation's order — so nothing else in `changes` shifts.
+    let lifted: Vec<Change> = order.iter().map(|&k| changes[slots[k]].clone()).collect();
+    for (slot, c) in slots.iter().zip(lifted) {
+        changes[*slot] = c;
     }
 }
 
@@ -12773,6 +12831,114 @@ mod tests {
             add < mv,
             "the anchor is evaluated before `c` exists:\n{sql}"
         );
+    }
+
+    /// **The whole statement replayed against the table, which is the only
+    /// assertion that can see this class.**
+    ///
+    /// `apply_positions` computes each position against a simulation it advances
+    /// in **target** order, and *attaches* the position to a change that already
+    /// touches the column while *appending* a new `MODIFY` when none does. So a
+    /// column that is both moved and edited sits at a low index in `changes`
+    /// while a position-only move sits at the end — the reverse of the order the
+    /// simulation assumed. `ordered_column_clauses` cannot see it either: a
+    /// plain `MODIFY` has `provides: None`, so nothing is waiting on it and it
+    /// keeps its input position.
+    ///
+    /// `t(a,b,c)`, retype `b`, reorder to `[c,b,a]`, and MySQL applies
+    /// `MODIFY b AFTER c` then `MODIFY c FIRST` left to right: `[a,b,c]` →
+    /// `[a,c,b]` → `[c,a,b]`. The designer drew `[c,b,a]`. No error, nothing
+    /// withheld, the report says applied, and the next open shows the wrong
+    /// order as if the user had asked for it.
+    ///
+    /// The three ordering tests beside this one each assert the *relative* order
+    /// of two clauses; none replays the statement, which is the composition.
+    #[test]
+    fn the_emitted_clauses_leave_the_table_in_the_order_the_designer_drew() {
+        /// MySQL's own rule: apply each clause to the column list, left to
+        /// right, and hand back what the table ends up as.
+        fn replay(before: &[&str], sql: &str) -> Vec<String> {
+            let mut cols: Vec<String> = before.iter().map(|s| (*s).to_string()).collect();
+            for clause in sql.lines() {
+                let clause = clause.trim().trim_end_matches([',', ';']);
+                let name = |kw: &str| {
+                    clause.strip_prefix(kw).map(|rest| {
+                        rest.trim_start()
+                            .trim_start_matches('`')
+                            .split('`')
+                            .next()
+                            .unwrap_or_default()
+                            .to_string()
+                    })
+                };
+                let Some(col) = name("MODIFY COLUMN")
+                    .or_else(|| name("ADD COLUMN"))
+                    .or_else(|| {
+                        // `CHANGE COLUMN <old> <new> …` — the *new* name is the
+                        // one the table answers to afterwards.
+                        clause.strip_prefix("CHANGE COLUMN ").and_then(|rest| {
+                            rest.split('`')
+                                .nth(3)
+                                .map(str::to_string)
+                                .or_else(|| rest.split_whitespace().nth(1).map(str::to_string))
+                        })
+                    })
+                else {
+                    continue;
+                };
+                let old = clause
+                    .strip_prefix("CHANGE COLUMN ")
+                    .and_then(|r| r.split('`').nth(1).map(str::to_string));
+                if let Some(old) = old
+                    && let Some(at) = cols.iter().position(|c| *c == old)
+                {
+                    cols[at] = col.clone();
+                }
+                cols.retain(|c| *c != col || clause.starts_with("ADD COLUMN"));
+                let at = match clause.rfind("AFTER `") {
+                    Some(i) => {
+                        let anchor = clause[i + 7..].split('`').next().unwrap_or_default();
+                        cols.iter()
+                            .position(|c| c == anchor)
+                            .map(|p| p + 1)
+                            .unwrap_or(cols.len())
+                    }
+                    None if clause.contains(" FIRST") => 0,
+                    // No position clause: the column keeps where it was, which
+                    // the `retain` above has just undone — put it back.
+                    None => cols.len(),
+                };
+                if clause.contains("AFTER `") || clause.contains(" FIRST") {
+                    cols.insert(at.min(cols.len()), col);
+                }
+            }
+            cols
+        }
+
+        let t = TableInfo {
+            name: "t".into(),
+            columns: vec![col("a", "int"), col("b", "int"), col("c", "int")],
+            ..Default::default()
+        };
+        let mut d = TableDraft::from_table(&t);
+        // Edited *and* moved — the shape that puts the two clauses the wrong
+        // way round.
+        d.columns[1].info.type_name = "bigint".into();
+        d.columns.swap(0, 2); // [c, b, a]
+        assert_eq!(d.column_names(), vec!["c", "b", "a"]);
+
+        let sql = diff(&t, &d, MySql).emit().join("\n");
+        assert_eq!(
+            replay(&["a", "b", "c"], &sql),
+            d.column_names(),
+            "the table lands in an order nobody drew:\n{sql}"
+        );
+
+        // And the simpler reorder, with nothing edited, still works.
+        let mut d2 = TableDraft::from_table(&t);
+        d2.columns.swap(0, 2);
+        let sql2 = diff(&t, &d2, MySql).emit().join("\n");
+        assert_eq!(replay(&["a", "b", "c"], &sql2), d2.column_names(), "{sql2}");
     }
 
     /// The other direction, which is why the fix is a dependency order and not
