@@ -7824,15 +7824,53 @@ fn body(
 /// `RwSignal<Vec<Connection>>` and reaching into it is always going to compile.
 #[cfg(test)]
 mod read_only_gate {
+    /// **Over the whole workspace, not the two view crates.**
+    ///
+    /// The corpus was `crate_sources()` — `schemaic-ui` and `schemaic-app` — and
+    /// the respelling it exists to refuse was sitting in `schemaic-core`, in the
+    /// **write guard's own policy constructor**: `sql::GuardPolicy::of` wrote
+    /// `conn.is_some_and(|c| c.read_only)` because it holds a resolved
+    /// `Option<&Connection>` and could not call the id form. Its doc asserted
+    /// the coupling ("matching `connection::read_only_of`'s documented
+    /// fail-open") while not calling it, so the two agreed by inspection and
+    /// nothing held them together — a change to the fail-open default would have
+    /// moved the six delegating UI sites and left the write guard on the old
+    /// answer. `connection::read_only_ref` is the resolved form, and
+    /// `read_only_of` delegates to it, so there is still one answer.
+    ///
+    /// The definitions themselves are exempt by name: something has to hold the
+    /// expression, and `connection.rs` is where it is documented and tested.
     #[test]
     fn nothing_answers_the_read_only_question_for_itself() {
         // Assembled so this module's own prose is not a hit.
-        let respelling = format!("{}(|c| c.read_only)", "is_some_and");
+        //
+        // **The field, not one closure shape.** The needle was the single
+        // literal `is_some_and(|c| c.read_only)`, and the eighth spelling —
+        // `users_view`'s `cs.iter().any(|c| c.id == conn_id && c.read_only)`,
+        // behind the Users browser's write gate — was in the scanned set and
+        // passed it. Any line that *reads* `.read_only` off a connection is
+        // answering this question for itself; the accessors are the exemption,
+        // by file, and they are where the fail-open default is documented and
+        // tested.
+        let field = format!(".{}", "read_only");
         let mut offenders: Vec<String> = Vec::new();
-        for (file, code) in crate::source_gate::crate_sources() {
+        for (file, code) in crate::source_gate::workspace_sources() {
+            if file == "schemaic-core/connection.rs" {
+                continue; // the one definition, and its `read_only_of` caller
+            }
             for (n, line) in code.lines().enumerate() {
                 let dense: String = line.chars().filter(|c| !c.is_whitespace()).collect();
-                if dense.contains(&respelling.replace(' ', "")) {
+                // **Off a collection**, which is what makes it *this* question
+                // rather than a read of some other struct's identically named
+                // flag — `GuardPolicy`, `EditCtx` and every editor carry one, and
+                // each of those got its value from the accessor already. Both
+                // historical spellings ask the registry through a combinator:
+                // `is_some_and(|c| c.read_only)` and
+                // `any(|c| c.id == conn_id && c.read_only)`.
+                let asks = ["any(", "is_some_and(", "find(", "position(", "filter("]
+                    .iter()
+                    .any(|combinator| dense.contains(combinator));
+                if dense.contains(&field) && asks {
                     offenders.push(format!("{file}:{}", n + 1));
                 }
             }
@@ -7840,8 +7878,9 @@ mod read_only_gate {
         assert!(
             offenders.is_empty(),
             "these decide `read_only` for themselves instead of asking \
-             `schemaic_core::connection::read_only_of`, which is where the \
-             fail-open default for an unknown id is documented and tested: {}",
+             `schemaic_core::connection::read_only_of` (or `read_only_ref`, for \
+             a connection already resolved), which is where the fail-open \
+             default for an unknown id is documented and tested: {}",
             offenders.join(", ")
         );
     }

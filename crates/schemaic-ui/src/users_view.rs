@@ -715,9 +715,17 @@ fn write_gate(ui: &Ui, target: &UsersTarget) -> WriteGate {
 /// and `edit_ctx` stays the untracked one.
 fn live_read_only(ui: &Ui) -> bool {
     let conn_id = ui.conn.active_conn.get();
+    // **Through the one answer**, not an eighth spelling of it. This said
+    // `cs.iter().any(|c| c.id == conn_id && c.read_only)` — semantically
+    // identical to `read_only_of`, fail-open default included, and written a
+    // different way, so `read_only_gate`'s single-literal needle passed it even
+    // though this file is in its corpus. It feeds `write_gate`, which decides
+    // whether the Users browser offers **+ New account**, **Privileges** and the
+    // red **Drop** — a write gate, which is the category that consolidation's
+    // own doc singles out.
     ui.conn
         .connections
-        .with(|cs| cs.iter().any(|c| c.id == conn_id && c.read_only))
+        .with(|cs| schemaic_core::connection::read_only_of(cs, conn_id))
 }
 
 /// **`+ New account`, at the foot of the list column** — the shape Manage

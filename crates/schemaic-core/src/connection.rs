@@ -1343,7 +1343,23 @@ pub fn by_id(list: &[Connection], id: u64) -> Option<&Connection> {
 /// change with it, which is what `an_unknown_connection_is_writable_deliberately`
 /// is for.
 pub fn read_only_of(list: &[Connection], id: u64) -> bool {
-    by_id(list, id).is_some_and(|c| c.read_only)
+    read_only_ref(by_id(list, id))
+}
+
+/// [`read_only_of`] for a connection that is **already resolved**.
+///
+/// The same one answer, reached by callers that hold the row rather than an id:
+/// `sql::GuardPolicy::of` takes an `Option<&Connection>` and so could not call
+/// the id form, and it wrote `conn.is_some_and(|c| c.read_only)` out instead —
+/// byte-for-byte the spelling `read_only_gate` exists to refuse, in the **write
+/// guard's own policy constructor**, where a change to the fail-open default
+/// would move the six delegating UI sites and leave this one on the old answer.
+///
+/// The fail-open decision and its reasoning live on [`read_only_of`]; this is
+/// the same decision, not a second one, which is what delegating makes true
+/// rather than asserted.
+pub fn read_only_ref(conn: Option<&Connection>) -> bool {
+    conn.is_some_and(|c| c.read_only)
 }
 
 /// What to call this connection in a sentence about it.

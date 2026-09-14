@@ -1438,7 +1438,7 @@ impl GuardPolicy {
         confirm_writes: bool,
     ) -> GuardPolicy {
         GuardPolicy {
-            read_only: conn.is_some_and(|c| c.read_only),
+            read_only: crate::connection::read_only_ref(conn),
             confirm_writes,
             dialect: conn.map_or_else(SqlDialect::default, |c| {
                 SqlDialect::from_db_type(&c.db_type)
