@@ -200,6 +200,27 @@ fn looks_numeric(s: &str) -> bool {
 /// evidence to the contrary. That's the common case, and the preview makes a
 /// wrong guess obvious immediately (the header row shows up as data, or the
 /// first data row goes missing).
+/// Is `t` a plain decimal numeral — an optional sign, digits, and at most one
+/// decimal point?
+///
+/// **The shape an exact column takes**, as distinct from the range an `f64`
+/// covers. `NUMERIC` holds 131,072 digits before the point, so "no `f64` can
+/// hold it" says nothing about whether the server can; what it *does* separate
+/// is a numeral from `NaN`, `inf`, `Infinity` and `1e400`, none of which is one.
+fn is_decimal_numeral(t: &str) -> bool {
+    let body = t.strip_prefix(['+', '-']).unwrap_or(t);
+    let mut digits = 0usize;
+    let mut points = 0usize;
+    for b in body.bytes() {
+        match b {
+            b'0'..=b'9' => digits += 1,
+            b'.' => points += 1,
+            _ => return false,
+        }
+    }
+    digits > 0 && points <= 1
+}
+
 fn guess_header(lines: &[&str], d: u8) -> bool {
     !split_unquoted(lines[0], d).iter().any(|f| looks_numeric(f))
 }
@@ -726,8 +747,17 @@ pub fn coerce(
         // The parse is still only a *shape* check — the text is what is
         // inserted, so a value no `f64` can hold precisely still goes through
         // unrounded, which is the whole reason this arm is not `Float`.
+        // **`is_finite` alone was a *range* test where a *shape* one was
+        // wanted.** An unconstrained PostgreSQL `NUMERIC` holds 131,072 digits
+        // before the point, so a 401-digit integer is an ordinary value the
+        // server stores exactly — and `parse::<f64>` answers `inf` for it. The
+        // arm then reported "not a number" and `RowCtx::row` turned the first
+        // such issue into an `Err` that aborts the whole import, on a file
+        // `v0.24.0` imported correctly. A plain decimal numeral is admitted
+        // however long it is; `NaN`, `inf`, `Infinity` and `1e400` are not
+        // numerals and stay refused.
         ColKind::Exact => match t.parse::<f64>() {
-            Ok(f) if f.is_finite() => Ok(Value::Str(t.to_string())),
+            Ok(f) if f.is_finite() || is_decimal_numeral(t) => Ok(Value::Str(t.to_string())),
             _ => Err(IssueKind::NotANumber),
         },
         ColKind::Bool => {
@@ -1038,6 +1068,9 @@ struct ArrayUnwrap<R> {
     depth: u32,
     in_string: bool,
     escaped: bool,
+    /// How many bytes of a leading UTF-8 BOM have been blanked, capped at 3 —
+    /// which also means "stop looking". See [`ArrayUnwrap::rewrite`].
+    bom: usize,
 }
 
 impl<R: std::io::Read> ArrayUnwrap<R> {
@@ -1048,6 +1081,7 @@ impl<R: std::io::Read> ArrayUnwrap<R> {
             depth: 0,
             in_string: false,
             escaped: false,
+            bom: 0,
         }
     }
 
@@ -1056,6 +1090,30 @@ impl<R: std::io::Read> ArrayUnwrap<R> {
             // Decide what kind of file this is on the first byte that isn't
             // whitespace, then never revisit it.
             if self.array.is_none() {
+                // **A leading UTF-8 BOM first**, blanked to a space. Windows
+                // PowerShell's UTF-8 encoders emit one, so this is what
+                // `Set-Content -Encoding utf8` writes — and `serde_json` skips
+                // only space/tab/CR/LF, so it stopped on `0xEF` and the user was
+                // told *"expected value at line 1 column 1"* about a file that
+                // is perfectly well formed. It also defeated the array
+                // detection below, so a BOM'd `[{…}]` was not even unwrapped.
+                //
+                // `strip_bom` is the rule for a string; this is the same rule
+                // for a byte stream that must not change length. Blanking
+                // rather than removing keeps every later offset — and the caps
+                // that count bytes — exactly where they were.
+                if self.bom < 3 {
+                    const BOM: [u8; 3] = [0xEF, 0xBB, 0xBF];
+                    if *b == BOM[self.bom] {
+                        self.bom += 1;
+                        *b = b' ';
+                        continue;
+                    }
+                    // Not a BOM after all. A `0xEF` that opens a JSON document
+                    // is not a value on any reading, so nothing legible was
+                    // blanked; stop looking either way.
+                    self.bom = 3;
+                }
                 if b.is_ascii_whitespace() {
                     continue;
                 }
@@ -2895,6 +2953,48 @@ mod tests {
         }
     }
 
+    /// **A `NUMERIC` is not an `f64`, and the shape check was measuring range.**
+    ///
+    /// An unconstrained PostgreSQL `NUMERIC` holds 131,072 digits before the
+    /// point, so a 401-digit integer is an ordinary value the server stores
+    /// exactly — and `parse::<f64>` answers `inf` for it, so the `is_finite`
+    /// arm reported *"not a number"* and `RowCtx::row` turned the first such
+    /// issue into an `Err` that aborts the whole import. `v0.24.0` imported the
+    /// same file correctly, because the *text* is what is inserted.
+    ///
+    /// The arm's own doc already draws the distinction it was not making —
+    /// "a value no `f64` can hold precisely still goes through unrounded, which
+    /// is the whole reason this arm is not `Float`" — and the same sentence
+    /// applies to one it cannot hold at all.
+    #[test]
+    fn an_exact_column_takes_a_numeral_no_f64_can_hold() {
+        let n = NullRule::default();
+        let huge = format!("1{}", "0".repeat(400));
+        assert_eq!(
+            huge.parse::<f64>().map(f64::is_finite),
+            Ok(false),
+            "the premise: no `f64` holds it"
+        );
+        let negative = format!("-{huge}");
+        let fractional = format!("{huge}.5");
+        for good in [huge.as_str(), negative.as_str(), fractional.as_str(), "0.1"] {
+            assert_eq!(
+                coerce(good, ColKind::Exact, true, &n, MySql),
+                Ok(Value::Str(good.to_string())),
+                "{good:?}"
+            );
+        }
+        // And the shapes the `is_finite` term was added for are still refused:
+        // none of them is a decimal numeral, which is the real question.
+        for bad in ["NaN", "inf", "Infinity", "-inf", "1e400", "1.2.3"] {
+            assert_eq!(
+                coerce(bad, ColKind::Exact, true, &n, MySql),
+                Err(IssueKind::NotANumber),
+                "{bad:?}"
+            );
+        }
+    }
+
     #[test]
     fn coerce_rejects_non_finite_floats() {
         let n = NullRule::default();
@@ -4528,6 +4628,35 @@ mod tests {
         let s = read_sample(json.as_bytes(), ImportFormat::Json, &cfg(true), 10).unwrap();
         assert_eq!(s.columns, vec!["id", "name"]);
         assert_eq!(s.rows, vec![f(&["1", "Smith"]), f(&["2", "Jones"])]);
+    }
+
+    /// **A BOM'd JSON file is the ordinary output of this project's own shell.**
+    ///
+    /// Windows PowerShell 5.1's UTF-8 encoders (`Set-Content -Encoding utf8`,
+    /// `Out-File`) emit `EF BB BF`, and `serde_json` skips only space, tab, CR
+    /// and LF as whitespace — so it stopped on `0xEF` and the user was told
+    /// *"Couldn't read the file: expected value at line 1 column 1"* about a
+    /// perfectly well-formed file, at preview time, with nothing on screen to
+    /// say what was wrong. The BOM also defeated `ArrayUnwrap`'s array
+    /// detection, so a BOM'd `[{…}]` was not even unwrapped.
+    ///
+    /// `strip_bom` is the rule and it reached the CSV and Excel readers only —
+    /// JSON was the third reader and took no cure. Both shapes here, because
+    /// the array one needs the *unwrap* to see past it as well as the parser.
+    #[test]
+    fn a_bom_does_not_make_a_json_file_unreadable() {
+        const BOM: &[u8] = &[0xEF, 0xBB, 0xBF];
+        for body in [
+            br#"[{"id": 1, "name": "Smith"}]"#.as_slice(),
+            br#"{"id": 1, "name": "Smith"}"#.as_slice(),
+        ] {
+            let mut bytes = BOM.to_vec();
+            bytes.extend_from_slice(body);
+            let s = read_sample(&bytes[..], ImportFormat::Json, &cfg(true), 10)
+                .unwrap_or_else(|e| panic!("{e:?} over {:?}", String::from_utf8_lossy(body)));
+            assert_eq!(s.columns, vec!["id", "name"]);
+            assert_eq!(s.rows, vec![f(&["1", "Smith"])]);
+        }
     }
 
     /// Newline-delimited JSON is what most tools emit for anything large, and it

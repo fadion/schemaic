@@ -1559,7 +1559,23 @@ fn sheet_name(source: Option<(&str, Option<&str>, &str)>) -> String {
         })
         .take(31)
         .collect();
-    let trimmed = cleaned.trim_matches('\'').trim();
+    // **Alternated until it stops shrinking**, because one pass of each in a
+    // fixed order cannot deliver what this function's own doc promises. A table
+    // named `" 'orders' "` has a leading *space*, so `trim_matches('\'')`
+    // stripped nothing and `.trim()` then handed back `'orders'` — apostrophes
+    // intact, which `set_name` refuses, failing the whole Excel export of that
+    // table with a library message naming neither the table nor the rule. Every
+    // other format exported it fine. `" ' orders ' "` needs the loop even with
+    // the two reversed, which is why this is the shape `suggested_filename`
+    // already uses for a name derived from the same identifier.
+    let mut trimmed = cleaned.as_str();
+    loop {
+        let next = trimmed.trim().trim_matches('\'');
+        if next.len() == trimmed.len() {
+            break;
+        }
+        trimmed = next;
+    }
     if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("history") {
         "Result".to_string()
     } else {
@@ -4716,6 +4732,15 @@ mod tests {
         assert_eq!(sheet_name(Some(("db", None, "///"))), "___");
         assert_eq!(sheet_name(Some(("db", None, "  "))), "Result");
         assert_eq!(sheet_name(Some(("db", None, "'quoted'"))), "quoted");
+        // **Whitespace outside the apostrophes**, which the fixed order of the
+        // two trims could not reach: `trim_matches(''')` saw the leading space
+        // and stripped nothing, `.trim()` then handed back `'orders'`, and
+        // `set_name` refuses that — failing the whole Excel export of the table
+        // with a library message naming neither the table nor the rule.
+        assert_eq!(sheet_name(Some(("db", None, " 'orders' "))), "orders");
+        // And alternating, which is why it is a loop rather than a swap.
+        assert_eq!(sheet_name(Some(("db", None, " ' orders ' "))), "orders");
+        assert_eq!(sheet_name(Some(("db", None, "'''"))), "Result");
         // Excel's fifth rule, and the only one `rust_xlsxwriter` does not
         // enforce for us: `History` is reserved for a shared workbook's change
         // log, case-insensitively, and a workbook using it as an ordinary sheet
