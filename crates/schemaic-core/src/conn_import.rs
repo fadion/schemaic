@@ -365,11 +365,53 @@ impl ImportScan {
 ///
 /// The last `@`, not the first: an email address is a perfectly ordinary
 /// username.
+///
+/// **And the last `@` in the *authority*, not in the whole string.** Searching
+/// the whole string swapped one unqualified answer for another: it is right for
+/// a delimiter inside the userinfo and wrong for every `@` outside the
+/// authority, and `postgresql://db.example.com:5432/app?user=alice@corp.com` —
+/// Azure's ordinary spelling, whose login *is* `user@servername` — then
+/// imported silently with `host = corp.com`, `user = db.example.com` and a
+/// fabricated password, which is what reaches the OS keyring. So the RFC answer
+/// (the authority ends at the first `/`, `?` or `#`) is asked first, and the
+/// whole-string search survives only as the fallback for the case it was added
+/// for, behind [`looks_like_userinfo`].
 fn split_userinfo(after: &str) -> (Option<&str>, &str) {
-    match after.rfind('@') {
-        Some(i) => (Some(&after[..i]), &after[i + 1..]),
-        None => (None, after),
+    let boundary = after.find(['/', '?', '#']).unwrap_or(after.len());
+    if let Some(i) = after[..boundary].rfind('@') {
+        return (Some(&after[..i]), &after[i + 1..]);
     }
+    match after.rfind('@') {
+        Some(i) if looks_like_userinfo(&after[..i]) => (Some(&after[..i]), &after[i + 1..]),
+        _ => (None, after),
+    }
+}
+
+/// Does everything before a candidate `@` that lies **past** the authority's
+/// RFC end still read as `user:password` rather than as `host[:port]/path?query`?
+///
+/// Only reached when the authority holds no `@` at all, which means the string
+/// is either a URL with no userinfo or one whose password carries an unencoded
+/// `/`, `?` or `#`. Two things separate them:
+///
+/// - a userinfo has a `:`, and the **user** half of it carries no delimiter. A
+///   password with a slash in it is ordinary; a *username* with one is not, and
+///   that alone rules out `host/my@db` and `host/app#note@1`;
+/// - what follows that `:` is not a **port**. `db.example.com:5432/app?user=alice`
+///   passes the first test and fails this one, which is the whole finding.
+///
+/// The case it gets wrong is a numeric password that also holds a delimiter
+/// (`admin:1234/x@host`), which is indistinguishable from `host:port/path` by
+/// any rule that does not know which server exists.
+fn looks_like_userinfo(head: &str) -> bool {
+    let Some((user, secret)) = head.split_once(':') else {
+        return false;
+    };
+    if user.contains(['/', '?', '#']) {
+        return false;
+    }
+    let port_like = &secret[..secret.find(['/', '?', '#']).unwrap_or(secret.len())];
+    port_like.is_empty() || !port_like.bytes().all(|b| b.is_ascii_digit())
 }
 
 /// `name` with anything that could be a password replaced by `…`.
@@ -1807,6 +1849,12 @@ pub fn same_endpoint(a: &Connection, b: &Connection) -> bool {
         && a.port == b.port
         && a.database.eq_ignore_ascii_case(&b.database)
         && a.user == b.user
+        // **The tunnel is part of the target.** `host:port` names a machine only
+        // once you know how it is reached: a direct row and a bastion row for
+        // one `db.internal:5432` are two different servers, and collapsing them
+        // let [`absorb`] hand the survivor an SSH session it never declared.
+        && a.ssh.host.eq_ignore_ascii_case(&b.ssh.host)
+        && a.ssh.port == b.ssh.port
 }
 
 /// Path comparison for the one engine whose target is a file. Separators are
@@ -1866,14 +1914,28 @@ fn absorb(kept: &mut Imported, dropped: Imported) {
     if a.password.is_empty() {
         a.password = b.password;
     }
-    if a.ssh.host.is_empty() {
-        a.ssh = b.ssh;
+    // **No `ssh` arm.** A tunnel is not a field a source can merely be missing:
+    // it decides *which* machine `db.internal:5432` is, so two rows that differ
+    // in it are two connections and `same_endpoint` says so. Moving one across
+    // gave the survivor an SSH session to a jump host the user never configured
+    // for it, on every connect, with no SSH column in the review list to show it.
+    //
+    // **`stronger_of`, never an equality sentinel.** This branch was guarded by
+    // `a.tls == Tls::default()` while the same commit floored `blank()` at
+    // `Prefer`, and every row this module produces comes from `blank()` — so it
+    // was false for all of them and the merge never ran: a `verify-full` plus a
+    // CA path, collapsed into a row that said nothing about SSL, imported as
+    // `Prefer` with no CA file. `SslMode::stronger_of` is the rule for merging
+    // two sources that disagree, and it cannot be killed by moving the floor.
+    a.tls.mode = a.tls.mode.stronger_of(b.tls.mode);
+    if a.tls.ca_path.is_empty() {
+        a.tls.ca_path = b.tls.ca_path;
     }
-    // A TLS mode the survivor never stated: `Tls::default()` is what a source
-    // that said nothing leaves behind, so a source that *did* say is the better
-    // answer. See `sslmode_from_str` for why the default is not "no opinion".
-    if a.tls == Tls::default() {
-        a.tls = b.tls;
+    if a.tls.client_cert_path.is_empty() {
+        a.tls.client_cert_path = b.tls.client_cert_path;
+    }
+    if a.tls.client_key_path.is_empty() {
+        a.tls.client_key_path = b.tls.client_key_path;
     }
     // The dropped row's notes are about a row that is gone; only
     // `UnexpandedPath` is a property of the endpoint both describe, and the
@@ -2444,6 +2506,37 @@ mod tests {
         // And the query really is still a query when the password has no `?`.
         let c = url("postgres://admin:plain@h/d?sslmode=require");
         assert_eq!(c.tls.mode, crate::connection::SslMode::Require);
+    }
+
+    /// **The other door of the same rule**, and the one the fix above opened:
+    /// an `@` *outside* the authority. `rfind('@')` over the whole string takes
+    /// the one inside `?user=alice@corp.com` — Azure's ordinary spelling, since
+    /// its login is `user@servername` and libpq documents `?user=` as a URI
+    /// parameter — and the row imports with **no error** under a host, a user
+    /// and a password all read out of the wrong places. The fabricated password
+    /// is then what reaches the OS keyring.
+    ///
+    /// Both doors in one test, so neither fix can undo the other.
+    #[test]
+    fn an_at_sign_outside_the_authority_is_not_a_userinfo_delimiter() {
+        let c = url("postgresql://db.example.com:5432/app?user=alice@corp.com");
+        assert_eq!(c.host, "db.example.com");
+        assert_eq!(c.port, 5432);
+        assert_eq!(c.database, "app");
+        assert_eq!(c.user, "alice@corp.com", "from the query parameter");
+        assert_eq!(c.password, "");
+        // A path or a fragment holding one, by the same door.
+        let c = url("postgres://db.example.com/my@db");
+        assert_eq!(c.host, "db.example.com");
+        assert_eq!(c.database, "my@db");
+        let c = url("postgres://db.example.com/app#note@1");
+        assert_eq!(c.host, "db.example.com");
+        assert_eq!(c.database, "app");
+        // And a real userinfo whose `@` sits before the path is untouched.
+        let c = url("postgres://alice@corp.com:pw@db.example.com/app");
+        assert_eq!(c.user, "alice@corp.com");
+        assert_eq!(c.password, "pw");
+        assert_eq!(c.host, "db.example.com");
     }
 
     /// The same string on the **display** side, which is the half that put the
@@ -3438,6 +3531,88 @@ mod tests {
         assert_eq!(out[0].connection.password, "hunter2");
         // And it is no longer a row with nothing behind it.
         assert!(!out[0].has(ImportNote::NoPassword));
+    }
+
+    /// **The TLS half of the same merge, which was dead the moment it landed.**
+    ///
+    /// `absorb` guarded it with `a.tls == Tls::default()` while the same commit
+    /// floored `blank()` at `SslMode::Prefer` — and every row this module can
+    /// produce is built by `blank()`, so the equality was false for all of them
+    /// and the branch never ran. A `pg_service.conf` section saying
+    /// `sslmode=verify-full` with a CA path, collapsed into a DBeaver row that
+    /// said nothing about SSL, imported as `Prefer` with no CA file: it does not
+    /// verify the certificate, and a network attacker who refuses the handshake
+    /// gets the session in plaintext.
+    ///
+    /// `stronger_of` rather than a sentinel — its own doc calls itself "the rule
+    /// for merging two sources that disagree, which is what an import is" — so
+    /// the branch cannot be killed again by moving the floor.
+    #[test]
+    fn dedupe_takes_the_tls_the_row_it_drops_stated() {
+        let first = imported(at("h", 3306, "d", "u"), ImportSource::DBeaver);
+        assert_eq!(
+            first.connection.tls.mode,
+            SslMode::Prefer,
+            "the floor every imported row starts at"
+        );
+        let mut second = imported(at("h", 3306, "d", "u"), ImportSource::PgService);
+        second.connection.tls.mode = SslMode::VerifyFull;
+        second.connection.tls.ca_path = "/etc/ssl/ca.pem".into();
+        second.connection.tls.client_cert_path = "/etc/ssl/c.pem".into();
+        second.connection.tls.client_key_path = "/etc/ssl/k.pem".into();
+
+        let out = dedupe(vec![first, second]);
+        assert_eq!(out.len(), 1);
+        let tls = &out[0].connection.tls;
+        assert_eq!(tls.mode, SslMode::VerifyFull);
+        assert_eq!(tls.ca_path, "/etc/ssl/ca.pem");
+        assert_eq!(tls.client_cert_path, "/etc/ssl/c.pem");
+        assert_eq!(tls.client_key_path, "/etc/ssl/k.pem");
+
+        // And the survivor's own answer still wins when it is the stronger one.
+        let mut first = imported(at("h", 3306, "d", "u"), ImportSource::DBeaver);
+        first.connection.tls.mode = SslMode::VerifyFull;
+        first.connection.tls.ca_path = "/right.pem".into();
+        let mut second = imported(at("h", 3306, "d", "u"), ImportSource::PgService);
+        second.connection.tls.mode = SslMode::Disable;
+        second.connection.tls.ca_path = "/stale.pem".into();
+        let out = dedupe(vec![first, second]);
+        assert_eq!(out[0].connection.tls.mode, SslMode::VerifyFull);
+        assert_eq!(out[0].connection.tls.ca_path, "/right.pem");
+    }
+
+    /// **Two rows that differ in how they are *reached* are two connections.**
+    ///
+    /// `same_endpoint` compared engine, host, port, database and user and never
+    /// the tunnel, so a direct row and a bastion row for one `db.internal:5432`
+    /// collapsed — and `absorb` then moved the whole `SshTunnel` onto the
+    /// survivor. The imported connection opened an SSH session to a jump host
+    /// the user never configured for it, on every connect, with no SSH column in
+    /// the review list to show it. A tunnel is not a field a source can merely
+    /// be missing: it decides which machine `db.internal` is.
+    #[test]
+    fn a_tunnelled_endpoint_is_not_the_same_endpoint_as_a_direct_one() {
+        let direct = at("db.internal", 5432, "app", "svc");
+        let mut tunnelled = direct.clone();
+        tunnelled.ssh.host = "bastion.example".into();
+        tunnelled.ssh.port = 22;
+        tunnelled.ssh.user = "jump".into();
+        assert!(!same_endpoint(&direct, &tunnelled));
+
+        let out = dedupe(vec![
+            imported(direct, ImportSource::Url),
+            imported(tunnelled, ImportSource::DBeaver),
+        ]);
+        assert_eq!(out.len(), 2, "the tunnel is part of the target");
+        assert!(out[0].connection.ssh.host.is_empty());
+        assert_eq!(out[1].connection.ssh.host, "bastion.example");
+
+        // Two rows through the *same* bastion are still one endpoint.
+        let mut a = at("db.internal", 5432, "app", "svc");
+        a.ssh.host = "bastion.example".into();
+        a.ssh.port = 22;
+        let b = a.clone();
+        assert!(same_endpoint(&a, &b));
     }
 
     /// The survivor's own values are never overwritten: only what it *lacks*
