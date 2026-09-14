@@ -33,7 +33,7 @@ use std::rc::Rc;
 
 use floem::keyboard::Modifiers;
 use floem::peniko::Color;
-use floem::reactive::{RwSignal, SignalGet, SignalUpdate, SignalWith};
+use floem::reactive::{RwSignal, SignalUpdate, SignalWith};
 use floem::views::editor::Editor;
 use floem::views::editor::EditorStyle;
 use floem::views::editor::command::{Command, CommandExecuted};
@@ -361,11 +361,18 @@ impl DocumentPhantom for InlineDiffDoc {
     /// The wrapped `TextDocument` says `false` for any non-empty buffer, so
     /// delegating restores exactly the behaviour the editor had before it was
     /// wrapped, and the `true` is spent only when it buys something.
+    /// **`with_untracked`, not `get_untracked`** — the third method of this impl
+    /// block to need it, and the one `1ef2b9a` ("stop the inline diff rebuilding
+    /// the whole suggestion per row") stopped short of. `get_untracked` is
+    /// `with_untracked(Clone::clone)`: a deep clone of the whole `InlinePlan`,
+    /// every hunk and every added line's `String`, to answer a `bool`. A
+    /// whole-buffer Ctrl+K rewrite is *one* hunk with every added line hanging
+    /// off it — 3,000 of them measured on this tree — and floem asks this
+    /// through `Lines::is_linear`, which is the first line of nine separate
+    /// entry points that a single frame crosses several of.
     fn has_multiline_phantom(&self, edid: EditorId, styling: &EditorStyle) -> bool {
         self.preview
-            .get_untracked()
-            .as_ref()
-            .is_some_and(|v| v.plan().is_some())
+            .with_untracked(|v| v.as_ref().is_some_and(|v| v.plan().is_some()))
             || self.inner.has_multiline_phantom(edid, styling)
     }
 

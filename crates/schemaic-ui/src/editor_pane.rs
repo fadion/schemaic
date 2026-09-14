@@ -4748,7 +4748,6 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
         let segs = create_memo(move |_| {
             let mut diags = syntax.get();
             diags.extend(db_diag.get());
-            let sql = query.get();
             let vp = ed.viewport.get();
             let points = editor_points(&ed);
             // **Once for the whole list.** `content_x_of` counts every newline
@@ -4757,7 +4756,16 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
             // O(document × diagnostics): 7.7 ms at 1 MiB with 30 squiggles,
             // 125 ms at 16 MiB, on the UI thread, on a memo that re-runs on
             // every scroll tick and every keystroke.
-            let content_x = content_x_of(&sql);
+            //
+            // **`with`, not `get`**, for the reason the find scan ~300 lines
+            // below writes down: "the scan borrows the document, and cloning a
+            // 16 MiB buffer to hand it to a function that takes `&str` was 2.4 ms
+            // of a 20.3 ms keystroke". `content_x_of` is the only use of the
+            // document in this whole memo, and it takes `&str` — so `get` was a
+            // full-document allocation and memcpy per **scroll frame** as well
+            // as per keystroke, on a document with zero diagnostics as much as
+            // on one covered in them.
+            let content_x = query.with(|sql| content_x_of(sql));
             diags
                 .iter()
                 .filter_map(|d| {
