@@ -738,6 +738,86 @@ fn order_by_mention(items: Vec<Emitted>, dialect: SqlDialect) -> Vec<Emitted> {
     order.into_iter().filter_map(|p| items[p].take()).collect()
 }
 
+/// The types and sequences the chosen tables **name** that this file will not
+/// create, as display names, in the order they would have been emitted.
+///
+/// **The accounting the namespace filter never had.** `plan` emits only objects
+/// belonging to the namespaces the chosen tables live in — a dump of `sales` has
+/// no business recreating `archive`'s types — and that is a choice about what to
+/// emit, not a licence to say nothing. A `public` enum used by a `sales` column
+/// is simply absent from the file, and the `CREATE TABLE` declares the column
+/// with it: on a fresh server the restore stops before any data lands.
+///
+/// The same trade the dropped foreign keys already make, whose doc calls the
+/// header sentence "the honest half of the trade: silently emitting a statement
+/// that cannot succeed is not the alternative".
+///
+/// A column names an object in one of two places, and both are read as text
+/// because that is what the catalogue hands back: the declared type
+/// (`order_status`, or `public.order_status` when the search path does not cover
+/// it) and the default expression (`nextval('public.order_seq'::regclass)`).
+/// Matched as a whole identifier so `order_status_v2` is not a hit — and *not*
+/// through `intel::code_word_hits_in`, because a sequence's name lives inside a
+/// string literal in that default, which is exactly what a code mask hides.
+fn outside_dependencies(
+    schema: &DbSchema,
+    order: &[usize],
+    namespaces: &[Option<String>],
+) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for kind in [ObjectKind::Enum, ObjectKind::Domain, ObjectKind::Sequence] {
+        for o in schema.objects_all(kind) {
+            // An internal sequence is the column's own counter — it comes back
+            // with the column, so it is not missing.
+            if o.is_internal() || namespaces.iter().any(|ns| ns.as_deref() == o.schema()) {
+                continue;
+            }
+            let named = order.iter().any(|&i| {
+                schema.tables[i].columns.iter().any(|c| {
+                    names_identifier(&c.type_name, o.name())
+                        || c.default
+                            .as_deref()
+                            .is_some_and(|d| names_identifier(d, o.name()))
+                })
+            });
+            if named {
+                // Qualified unconditionally, unlike `display_name`: the whole
+                // point of the sentence is *where* the missing object lives, and
+                // `public` is exactly the namespace this case is usually about —
+                // the one `display_name` drops as the default.
+                let name = match o.schema() {
+                    Some(ns) => format!("{ns}.{}", o.name()),
+                    None => o.name().to_string(),
+                };
+                if !out.contains(&name) {
+                    out.push(name);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Does `text` name `word` as a whole identifier?
+///
+/// Byte-wise on [`crate::sql::is_word_byte`], the one definition of where an
+/// identifier runs — so `order_status` does not match inside `order_status_v2`,
+/// and a multi-byte name is not cut at a character.
+fn names_identifier(text: &str, word: &str) -> bool {
+    if word.is_empty() {
+        return false;
+    }
+    let (t, w) = (text.as_bytes(), word.as_bytes());
+    t.windows(w.len()).enumerate().any(|(i, win)| {
+        win == w
+            && !(i > 0 && crate::sql::is_word_byte(t[i - 1]))
+            && !t
+                .get(i + w.len())
+                .copied()
+                .is_some_and(crate::sql::is_word_byte)
+    })
+}
+
 /// One standalone object on its way into the file: what it is called, the text
 /// that decides what it waits for, and the statement that creates it.
 struct Emitted {
@@ -826,6 +906,9 @@ pub fn plan(
     // answers is *"restate it separately?"*, not *"is it carried?"*, and only the
     // first belongs in front of the emit.
     let mut dangling_fks = 0usize;
+    // Decided here, beside the other cross-selection census, for the same reason
+    // it gives: the header is written before the objects are.
+    let outside_deps = outside_dependencies(schema, &order, &namespaces);
     if opts.structure {
         for &i in &order {
             let t = &schema.tables[i];
@@ -968,6 +1051,34 @@ pub fn plan(
             crate::text::plural(dropped_fks, "key is", "keys are"),
             crate::text::plural(dropped_fks, "it does", "they do"),
             crate::text::plural(dropped_fks, "it", "them"),
+        ));
+    }
+    // **The other cross-selection dependency, which had no accounting at all.**
+    // The namespace filter below keeps `archive`'s types out of a dump of
+    // `sales` — a defensible choice about what to *emit*, and it said nothing
+    // about what to *report*. A `public` enum used by a `sales` column is then
+    // simply absent, and the `CREATE TABLE` that follows declares the column
+    // with it: on a fresh server the restore stops at `ERROR: type
+    // "order_status" does not exist`, before any data lands. Strictly louder
+    // than the dropped key above — that is a constraint the restore survives
+    // without, this is a `CREATE TABLE` that cannot run — and it was the half
+    // with no sentence.
+    if !outside_deps.is_empty() {
+        header.push_str(&format!(
+            "\n--\n-- {} {} used by the tables above {} outside this export and {} not in\n\
+             -- this file; the CREATE TABLE statements name {}: {}.\n\
+             -- Restore onto a server that already has {}, or export those namespaces too.",
+            outside_deps.len(),
+            crate::text::plural(
+                outside_deps.len(),
+                "type or sequence",
+                "types and sequences"
+            ),
+            crate::text::plural(outside_deps.len(), "lives", "live"),
+            crate::text::plural(outside_deps.len(), "is", "are"),
+            crate::text::plural(outside_deps.len(), "it", "them"),
+            crate::export::comment_text(&outside_deps.join(", ")),
+            crate::text::plural(outside_deps.len(), "it", "them"),
         ));
     }
     // The verbatim-DDL half, and deliberately a different sentence: nothing was
@@ -3337,6 +3448,58 @@ mod tests {
         let callee = file.find("b_base").expect("the callee's CREATE");
         let caller = file.find("a_total").expect("the caller's CREATE");
         assert!(callee < caller, "the caller was emitted first:\n{file}");
+    }
+
+    /// **A type the file does not create is named in the header, the way a
+    /// dropped foreign key is.**
+    ///
+    /// `plan` emits only objects in the chosen tables' namespaces, so a `public`
+    /// enum used by a `sales` column is absent — and the `CREATE TABLE` that
+    /// follows declares the column with it, so a restore onto a fresh server
+    /// stops at `ERROR: type "order_status" does not exist` before any data
+    /// lands. Strictly louder than the dropped-key case that *did* have a
+    /// sentence: that is a constraint the restore survives without.
+    #[test]
+    fn a_type_left_outside_the_export_is_named_in_the_header() {
+        let mut t = table("orders");
+        t.schema = Some("sales".to_string());
+        t.columns[0].type_name = "order_status".to_string();
+        let mut s = schema_of(vec![t]);
+        s.enums.push(crate::schema::EnumInfo {
+            name: "order_status".to_string(),
+            schema: Some("public".to_string()),
+            values: vec!["new".to_string(), "paid".to_string()],
+            ..Default::default()
+        });
+        let file = file_of(&plan(
+            &s,
+            "shop",
+            &all(&s),
+            DumpOptions::default(),
+            SqlDialect::Postgres,
+        ));
+        assert!(
+            file.contains("public.order_status"),
+            "the header says nothing about the type it left behind:\n{file}"
+        );
+        // The file really does not create it — the sentence is about a gap, not
+        // a change of what is emitted.
+        assert!(!file.contains("CREATE TYPE"), "{file}");
+    }
+
+    /// And it is a *whole identifier* match, on the two places a column names
+    /// one: the declared type and the default expression.
+    #[test]
+    fn the_outside_dependency_census_matches_whole_identifiers_only() {
+        assert!(names_identifier("order_status", "order_status"));
+        assert!(names_identifier("public.order_status", "order_status"));
+        assert!(names_identifier(
+            "nextval('public.order_seq'::regclass)",
+            "order_seq"
+        ));
+        assert!(!names_identifier("order_status_v2", "order_status"));
+        assert!(!names_identifier("my_order_status", "order_status"));
+        assert!(!names_identifier("anything", ""));
     }
 
     /// And a name only *mentioned* is not an edge — the same rule the view walk
