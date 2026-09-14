@@ -493,9 +493,18 @@ fn resume_cursor(
 // rest keep their natural order. Stable, so within each group the original order
 // is preserved. Shared by the tree render and keyboard-nav row list so the two
 // agree.
-fn sort_favorites_first(nodes: &mut [ConnNode], favorites: &[FavoriteRule], conn_id: u64) {
+/// Generic over the row so the keyboard walk can sort its own lighter type
+/// rather than a `Vec<ConnNode>` it had to clone first — see
+/// [`visible_nav_rows`]. The render passes `ConnNode`; both name the database
+/// the same way, which is the whole of what the rank reads.
+fn sort_favorites_first<T>(
+    nodes: &mut [T],
+    database_of: impl Fn(&T) -> &str,
+    favorites: &[FavoriteRule],
+    conn_id: u64,
+) {
     nodes.sort_by_key(|c| {
-        schemaic_core::favorite::rank(favorites, conn_id, &c.database)
+        schemaic_core::favorite::rank(favorites, conn_id, database_of(c))
             .map(|r| (0usize, r))
             .unwrap_or((1, 0))
     });
@@ -549,6 +558,22 @@ struct NavDb {
 
 // Build the visible-row list in display order. Reads the signals the walk depends
 // on, then hands plain data to `nav_rows`.
+//
+// **`with_untracked`, not `get_untracked`, for every one of them** — `get` is
+// documented as "try to *clone* and return", and this runs per arrow-key press
+// at key-repeat rate, plus on every `FocusGained` (so on every context-menu
+// close). It used to clone the whole expansion `HashSet` — "one key per open
+// database, table and folder, **thousands in a working session**", as the same
+// two signals' fix in `main.rs` puts it — the hidden set, the filter string, the
+// favourites list, and the whole `Vec<ConnNode>` with two `String`s per node.
+//
+// This is the third instance of a defect this range already fixed twice, for
+// these same signals: the stats effect in `main.rs` and `find_matches` in
+// `overlays.rs`, whose comment reads "so the two reads here allocated and freed
+// a whole `HashSet<String>` and a whole `Vec<ConnNode>`, two `String`s per node,
+// per character typed". What is left is what `nav_rows` genuinely needs to own:
+// the two names per database, which become `NavDb` directly rather than by way
+// of a cloned node.
 fn visible_nav_rows(
     db_nodes: RwSignal<Vec<ConnNode>>,
     expanded: RwSignal<HashSet<String>>,
@@ -557,29 +582,27 @@ fn visible_nav_rows(
     db_favorites: RwSignal<Vec<FavoriteRule>>,
     active_conn: RwSignal<u64>,
 ) -> Vec<NavRow> {
-    let mut nodes = db_nodes.get_untracked();
-    sort_favorites_first(
-        &mut nodes,
-        &db_favorites.get_untracked(),
-        active_conn.get_untracked(),
-    );
-    let dbs: Vec<NavDb> = nodes
-        .into_iter()
-        .map(|n| NavDb {
-            database: n.database,
-            name: n.name,
-            schema: match n.schema.get_untracked() {
-                SchemaState::Loaded(s) => Some(s),
-                _ => None,
-            },
+    let mut dbs: Vec<NavDb> = db_nodes.with_untracked(|nodes| {
+        nodes
+            .iter()
+            .map(|n| NavDb {
+                database: n.database.clone(),
+                name: n.name.clone(),
+                schema: match n.schema.get_untracked() {
+                    SchemaState::Loaded(s) => Some(s),
+                    _ => None,
+                },
+            })
+            .collect()
+    });
+    db_favorites.with_untracked(|favs| {
+        sort_favorites_first(&mut dbs, |d| &d.database, favs, active_conn.get_untracked());
+    });
+    expanded.with_untracked(|exp| {
+        hidden_dbs.with_untracked(|hidden| {
+            filter.with_untracked(|filter| nav_rows(&dbs, exp, hidden, filter))
         })
-        .collect();
-    nav_rows(
-        &dbs,
-        &expanded.get_untracked(),
-        &hidden_dbs.get_untracked(),
-        &filter.get_untracked(),
-    )
+    })
 }
 
 /// The nav walk. Mirrors the tree's own render rules: hidden DBs dropped; a
@@ -1114,7 +1137,12 @@ pub(crate) fn schema_panel(ui: Ui) -> impl IntoView {
                 .collect::<Vec<_>>();
             // Favorited databases sort to the top (oldest favorite first); re-runs
             // when a favorite is toggled (`db_favorites`) or the connection changes.
-            sort_favorites_first(&mut list, &db_favorites.get(), active_conn.get());
+            sort_favorites_first(
+                &mut list,
+                |c: &ConnNode| c.database.as_str(),
+                &db_favorites.get(),
+                active_conn.get(),
+            );
             list
         },
         |c: &ConnNode| c.id,
@@ -3957,6 +3985,57 @@ mod tests {
              remove:\n{}",
             offenders.join("\n")
         );
+    }
+
+    /// **The keyboard walk does not clone the sets it only reads.**
+    ///
+    /// `get` is documented as "try to *clone* and return", and
+    /// `visible_nav_rows` runs per arrow-key press at key-repeat rate and again
+    /// on every `FocusGained` — so on every context-menu close. It cloned the
+    /// whole expansion `HashSet` ("one key per open database, table and folder,
+    /// **thousands in a working session**", as the same two signals' fix in
+    /// `main.rs` puts it), the hidden set, the filter, the favourites and the
+    /// whole `Vec<ConnNode>`. That was the *third* instance of one defect this
+    /// range had already fixed twice, for these same signals.
+    ///
+    /// The function is not callable from a test — it takes six live signals —
+    /// so the subject is its source, in `source_gate`'s idiom. The needle is the
+    /// cloning read on the four sets, inside this function's body only: a
+    /// `get_untracked` elsewhere in the file may be perfectly reasonable.
+    #[test]
+    fn the_keyboard_walk_reads_its_signals_without_cloning_them() {
+        let src = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("src")
+                .join("schema_tree.rs"),
+        )
+        .expect("this file's own source");
+        let body = crate::source_gate::production_code(&src);
+        let start = body
+            .find("fn visible_nav_rows(")
+            .expect("the keyboard walk's entry point");
+        let end = start
+            + body[start..]
+                .find("\nfn ")
+                .or_else(|| body[start..].find("\n/// The nav walk"))
+                .expect("the next item");
+        let walk = &body[start..end];
+        for sig in [
+            "db_nodes",
+            "expanded",
+            "hidden_dbs",
+            "filter",
+            "db_favorites",
+        ] {
+            let needle = format!("{sig}.{}()", "get_untracked");
+            assert!(
+                !walk.contains(&needle),
+                "`visible_nav_rows` clones `{sig}` to read it — the expansion set \
+                 alone holds thousands of keys in a working session, and this \
+                 runs per arrow key. Use `with_untracked`, as the two sibling \
+                 fixes in `main.rs` and `overlays.rs` did for these same signals."
+            );
+        }
     }
 
     /// **The tree's focus handlers do not write a value that is already
