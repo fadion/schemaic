@@ -221,6 +221,44 @@ fn tokenize(sql: &str, dialect: SqlDialect) -> Vec<(Kind, &str)> {
             i = j;
             continue;
         }
+        // **A number is one token, exponent and all.** Ahead of the word arm
+        // because two of a numeric literal's three parts are spelled in bytes
+        // that arm calls punctuation: `1.5e-3` lexed as
+        // `["1", ".", "5e", "-", "3"]`, and while `need_space` suppresses the
+        // space around `.`, nothing said anything about a `-` after a word — the
+        // `"-" | "+"` arm asked `is_keyword("5e")`, got `false`, called the sign
+        // binary and spaced it. Format Code wrote `1.5e - 3` back over the
+        // user's buffer, and `1.5e` is not a number on any of the three: SQLite
+        // lexes it `TK_ILLEGAL`, PostgreSQL answers *trailing junk after numeric
+        // literal*, MySQL reads `1.5` and an identifier `e`.
+        //
+        // The shape all three lexers share, and no more of it: a `.` is taken
+        // only ahead of a digit, and a sign only ahead of a digit and behind the
+        // `e` the word scan already swallowed. So `select a-1` keeps its binary
+        // minus and `select 1 e` keeps its two tokens.
+        if c.is_ascii_digit() {
+            let s = i;
+            while i < n && is_word_byte(b[i]) {
+                i += 1;
+            }
+            if i < n && b[i] == b'.' && b.get(i + 1).is_some_and(u8::is_ascii_digit) {
+                i += 1;
+                while i < n && is_word_byte(b[i]) {
+                    i += 1;
+                }
+            }
+            if matches!(b[i - 1], b'e' | b'E')
+                && matches!(b.get(i), Some(b'+' | b'-'))
+                && b.get(i + 1).is_some_and(u8::is_ascii_digit)
+            {
+                i += 1;
+                while i < n && b[i].is_ascii_digit() {
+                    i += 1;
+                }
+            }
+            toks.push((Kind::Word, &sql[s..i]));
+            continue;
+        }
         if is_word_byte(c) {
             let s = i;
             i += 1;
@@ -1104,6 +1142,31 @@ mod tests {
             "select a from t where b<>1 and c||d = 'x'",
         ] {
             assert_preserves(sql, SqlDialect::Sqlite);
+        }
+    }
+
+    /// A number is one token, exponent and all.
+    ///
+    /// **Character-level on purpose.** `assert_preserves` tokenizes both sides
+    /// with the tokenizer under test, so while `1.5e-3` lexed as
+    /// `["1", ".", "5e", "-", "3"]` the round-trip agreed with itself and
+    /// passed — the token census cannot fail on a defect *in* the census's own
+    /// splitting. `1.5e` is not a number on any of the three engines, so the
+    /// spaced output is a statement the server rejects.
+    #[test]
+    fn a_scientific_notation_number_is_not_split_at_its_sign() {
+        for d in [SqlDialect::MySql, SqlDialect::Postgres, SqlDialect::Sqlite] {
+            for lit in ["1.5e-3", "1e-3", "2E-10", "1.5e+3", "1.5", "1e5", "0.5"] {
+                let sql = format!("select {lit} from t");
+                let out = super::format_sql(&sql, IND, d);
+                assert!(out.contains(lit), "{d:?} split {lit}:\n{out}");
+            }
+            // The sign is still binary where it really is binary.
+            let out = super::format_sql("select a-1 from t", IND, d);
+            assert!(out.contains("a - 1"), "{d:?}:\n{out}");
+            // …and a bare `e` is still its own word.
+            let out = super::format_sql("select 1 e from t", IND, d);
+            assert!(out.contains("1 e"), "{d:?}:\n{out}");
         }
     }
 
