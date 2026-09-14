@@ -215,6 +215,15 @@ pub struct SessionInfo {
     /// The statement the server reports, if it reports one. `None` for an idle
     /// session, and for a server that withholds it (a non-superuser sees only
     /// their own queries in `pg_stat_activity`).
+    ///
+    /// **A bounded prefix on both engines, and not by coincidence.**
+    /// PostgreSQL truncates `pg_stat_activity.query` itself at
+    /// `track_activity_query_size` (1 KB by default); MySQL's
+    /// `PROCESSLIST.INFO` is the *whole* statement, so `schemaic-db` reads it
+    /// through a `LEFT(INFO, …)` — see that module's `MY_INFO_MAX`. Without it
+    /// the field was unbounded on one engine only, in a type this module's doc
+    /// calls engine-neutral by construction, and every scan of it
+    /// ([`matches_query`], once per keystroke) inherited that.
     pub sql: Option<String>,
     /// How long the session has been in this state, in seconds, as the server
     /// measured it — `None` when the server would not say.

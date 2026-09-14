@@ -2177,10 +2177,43 @@ const NO_SESSIONS_MSG: &str = "this connection's engine has no server sessions";
 /// under them. The account is what both engines have in common for them, and it
 /// is what `SHOW PROCESSLIST` readers filter on. `Binlog Dump` still stays: that
 /// is the primary side, and it really is a client.
-const MY_PROCESSLIST_SQL: &str = "SELECT ID, USER, HOST, DB, COMMAND, TIME, INFO \
+///
+/// **`LEFT(INFO, …)`, because `INFO` is the *untruncated* statement** — this
+/// module says so twice, contrasting it with `SHOW PROCESSLIST`'s 100
+/// characters. `activity::MAX_SESSIONS` bounds the number of rows at 500 and
+/// nothing bounded the bytes: 40 sessions each running a generated 2 MB
+/// multi-row `INSERT` — the ordinary shape of a bulk loader, and exactly the
+/// load someone opens this panel to watch — put ~80 MB of statement text in the
+/// panel, allocated fresh on every poll and scanned end to end by
+/// `activity::matches_query` on every keystroke in the search box, on the UI
+/// thread.
+///
+/// The row never draws more than `history::PREVIEW_MAX` (2,000 bytes), and
+/// PostgreSQL's `pg_stat_activity.query` is truncated by the server at
+/// `track_activity_query_size` — 1 KB by default — so this was a MySQL-only cost
+/// inside a type whose doc calls itself engine-neutral by construction.
+/// [`MY_INFO_MAX`] is the cap and says why that size.
+///
+/// `ccfdea2` set out to remove this and removed the *allocation* only:
+/// `contains_collapsed_ignore_ascii_case` justifies its `O(n·m)` scan as "short
+/// needles over a **bounded list**" — the list was bounded, the haystack was
+/// not.
+const MY_PROCESSLIST_SQL: &str = "SELECT ID, USER, HOST, DB, COMMAND, TIME, LEFT(INFO, 65536) \
      FROM information_schema.PROCESSLIST \
      WHERE ID <> CONNECTION_ID() AND COMMAND <> 'Daemon' AND USER <> 'system user' \
      ORDER BY (COMMAND <> 'Sleep') DESC, TIME DESC LIMIT ";
+
+/// How many bytes of a MySQL session's statement the panel reads.
+///
+/// **32× what the row draws**, which is the balance: `history::preview` shows
+/// 2,000 bytes, and *Copy statement* wants more than that for anything a person
+/// would actually read back. 64 KiB × `activity::MAX_SESSIONS` caps the panel at
+/// 32 MB in the worst case it can now reach, against unbounded before.
+///
+/// Spelled into [`MY_PROCESSLIST_SQL`] rather than interpolated, because a
+/// `const` cannot be `format!`ed into another `const`; a test asserts the two
+/// agree.
+pub const MY_INFO_MAX: usize = 64 * 1024;
 
 /// Open InnoDB transactions, keyed by the thread holding them. This is what
 /// separates an idle pool connection from a client that went away mid-transaction
@@ -6050,6 +6083,30 @@ pub(crate) fn parse_typed(s: String, type_name: &str) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **The session list reads a bounded prefix of the statement.**
+    ///
+    /// `information_schema.PROCESSLIST.INFO` is the *untruncated* statement, and
+    /// `MAX_SESSIONS` bounds only the number of rows — so the panel used to hold
+    /// however many bytes the server's busiest sessions happened to be running,
+    /// re-allocated every poll and re-scanned by `matches_query` on every
+    /// keystroke. The truncation is in the SQL, so the source is the subject:
+    /// the cap in the statement has to be the constant that documents it.
+    #[test]
+    fn the_mysql_session_list_caps_the_statement_text() {
+        assert!(
+            MY_PROCESSLIST_SQL.contains(&format!("LEFT(INFO, {MY_INFO_MAX})")),
+            "the statement text is unbounded, or the cap has drifted from \
+             MY_INFO_MAX:\n{MY_PROCESSLIST_SQL}"
+        );
+        // Generous against what the row draws, and bounded against what the
+        // panel can hold: both halves of the balance the constant argues.
+        // `const` blocks, so a cap edited past either bound is a compile error
+        // rather than a test run — and so clippy does not read them as
+        // assertions about nothing.
+        const { assert!(MY_INFO_MAX > schemaic_core::history::PREVIEW_MAX * 8) };
+        const { assert!(MY_INFO_MAX * schemaic_core::activity::MAX_SESSIONS <= 64 * 1024 * 1024) };
+    }
 
     /// **A fourth engine variant is a compiler error; a fourth engine module is
     /// not.** [`ENGINE_ENTRY_POINTS`] is the interface the dispatcher expects by
