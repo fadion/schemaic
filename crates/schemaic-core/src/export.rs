@@ -85,9 +85,23 @@ impl ExportFormat {
     /// already solved once.
     ///
     /// Computed from the variant rather than stored, so a seventh format has to
-    /// answer it.
+    /// answer it — and an **exhaustive `match`**, because a `!matches!` is not
+    /// that. A new variant compiled against the old spelling and silently
+    /// answered `true`: `clipboard_formats()` offered it, `render`'s
+    /// `String::from_utf8(buf).unwrap_or_default()` turned its bytes into the
+    /// empty string, and Copy cleared the clipboard — the exact failure this
+    /// predicate exists to prevent. The census one layer up partitions
+    /// **by this predicate**, so it passed too: the gate's needle was the
+    /// predicate the defect was in.
     pub fn is_text(self) -> bool {
-        !matches!(self, ExportFormat::Xlsx)
+        match self {
+            ExportFormat::Json
+            | ExportFormat::Csv
+            | ExportFormat::Sql
+            | ExportFormat::Markdown
+            | ExportFormat::Html => true,
+            ExportFormat::Xlsx => false,
+        }
     }
 
     /// Does this format reach the sink **as it goes**, or only at the end?
@@ -104,9 +118,18 @@ impl ExportFormat {
     /// looks like a workbook and will not open.
     ///
     /// Computed from the variant rather than stored, so a seventh format has to
-    /// answer it.
+    /// answer it — exhaustively, for [`Self::is_text`]'s reason: a `!matches!`
+    /// lets a new binary format answer `true` and sends the user to a `.part`
+    /// sibling that is a truncated archive.
     pub fn writes_incrementally(self) -> bool {
-        !matches!(self, ExportFormat::Xlsx)
+        match self {
+            ExportFormat::Json
+            | ExportFormat::Csv
+            | ExportFormat::Sql
+            | ExportFormat::Markdown
+            | ExportFormat::Html => true,
+            ExportFormat::Xlsx => false,
+        }
     }
 
     /// The formats a **Copy** menu may offer, in menu order — [`Self::ALL`]
@@ -5568,6 +5591,52 @@ mod parity_census_tests {
             text.len() + BINARY_PARITY_TESTED.len(),
             ExportFormat::ALL.len(),
             "every format is either in the byte-equality family or named above"
+        );
+    }
+
+    /// **And `ALL` really is all of them.**
+    ///
+    /// Every assertion above iterates `ExportFormat::ALL`, which is a
+    /// hand-written `[_; 6]` — so a variant left out of it is invisible to the
+    /// census, to the parity family, and to `only_sql_writes_a_single_file`, all
+    /// of which then pass by not looking. The one thing the compiler *will*
+    /// enforce is an exhaustive `match`, so the count comes from one.
+    ///
+    /// The sibling half — that a new variant must answer `is_text` and
+    /// `writes_incrementally` rather than defaulting to `true` — is enforced by
+    /// those two being exhaustive `match`es, which is a compile error rather
+    /// than a test. There is no way to write the red run for that here without
+    /// adding a seventh variant; this is the part that *can* be asserted.
+    #[test]
+    fn every_variant_is_in_all() {
+        fn counted(f: ExportFormat) -> usize {
+            // One arm per variant, so adding one fails to compile until its
+            // author has also put it in `ALL` — the count below then moves.
+            match f {
+                ExportFormat::Json => 1,
+                ExportFormat::Csv => 1,
+                ExportFormat::Sql => 1,
+                ExportFormat::Markdown => 1,
+                ExportFormat::Html => 1,
+                ExportFormat::Xlsx => 1,
+            }
+        }
+        let n: usize = ExportFormat::ALL.into_iter().map(counted).sum();
+        assert_eq!(
+            n, 6,
+            "a variant was added: put it in `ExportFormat::ALL`, answer \
+             `is_text`/`writes_incrementally`, and move this count"
+        );
+        assert_eq!(ExportFormat::ALL.len(), n);
+        // …and no duplicates, which would make the sum agree for the wrong
+        // reason.
+        let mut seen = ExportFormat::ALL.to_vec();
+        seen.sort_by_key(|f| f.label());
+        seen.dedup_by_key(|f| f.label());
+        assert_eq!(
+            seen.len(),
+            ExportFormat::ALL.len(),
+            "`ALL` repeats a format"
         );
     }
 

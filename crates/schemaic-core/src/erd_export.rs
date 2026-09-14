@@ -91,16 +91,34 @@ impl ErdExportFormat {
 
     /// Whether the export is text the clipboard can hold — everything but PNG,
     /// which is why "Copy as…" lists five of the six.
+    ///
+    /// An exhaustive `match`, for the reason
+    /// [`crate::export::ExportFormat::is_text`] gives: `self != Png` is not a
+    /// question a new variant has to answer, and a binary one that silently
+    /// answers `true` here is offered on "Copy as…" and copies nothing.
     pub fn is_text(self) -> bool {
-        self != ErdExportFormat::Png
+        match self {
+            ErdExportFormat::Svg
+            | ErdExportFormat::Mermaid
+            | ErdExportFormat::Dbml
+            | ErdExportFormat::PlantUml
+            | ErdExportFormat::Dot => true,
+            ErdExportFormat::Png => false,
+        }
     }
 
     /// Whether the export renders the *arrangement* (positions, collapse state)
     /// rather than the graph. Asked rather than spelled `== Png || == Svg` at each
     /// site, so a seventh format lands on the right side of the menu by declaring
-    /// itself here.
+    /// itself here — exhaustively, so "declaring itself" is what it has to do.
     pub fn is_picture(self) -> bool {
-        matches!(self, ErdExportFormat::Png | ErdExportFormat::Svg)
+        match self {
+            ErdExportFormat::Png | ErdExportFormat::Svg => true,
+            ErdExportFormat::Mermaid
+            | ErdExportFormat::Dbml
+            | ErdExportFormat::PlantUml
+            | ErdExportFormat::Dot => false,
+        }
     }
 }
 

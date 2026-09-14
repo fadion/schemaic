@@ -55,8 +55,17 @@ impl ImportFormat {
     /// empty *string* they hold into a NULL. `validate` and `row_iter` each ask
     /// this, and they must not answer it differently — the preview would then
     /// show one thing and the import do another.
+    ///
+    /// An exhaustive `match`, for the reason
+    /// [`crate::export::ExportFormat::is_text`] gives: a `!matches!` lets a
+    /// fourth format default to "carries its own nulls" without its author ever
+    /// being asked, and the two readers would then agree on the wrong answer
+    /// rather than disagreeing loudly.
     pub fn has_own_nulls(self) -> bool {
-        !matches!(self, ImportFormat::Csv)
+        match self {
+            ImportFormat::Json | ImportFormat::Xlsx => true,
+            ImportFormat::Csv => false,
+        }
     }
 
     /// Every format, for the override dropdown.
