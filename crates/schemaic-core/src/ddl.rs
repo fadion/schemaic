@@ -8571,6 +8571,20 @@ fn unrestatable_sqlite_clauses(create_sql: &str) -> Vec<&'static str> {
     let mut first_in_group = true;
     while i < b.len() && depth > 0 {
         if let Some(j) = skip_noncode(b, i, d) {
+            // **A quoted identifier is a token of the group like any other.**
+            // This arm used to `continue` without clearing `first_in_group`, and
+            // it is the arm that consumes `"order"`, `[order]` and `` `order` ``
+            // — so the first *word* the scanner saw inside
+            // `PRIMARY KEY ("order" DESC)` was `DESC`, with the flag still set,
+            // and the test below read it as a column named `desc`. The quoted
+            // spelling is the one this app's own emitter writes.
+            //
+            // A **comment** leaves the flag alone: it is not a token, and
+            // `/* c */ desc` really is a group whose first word is `desc`.
+            if crate::sql::noncode_kind(b, i, d) != Some(crate::sql::NonCode::Comment) {
+                first_in_group = false;
+                prev_word.clear();
+            }
             i = j.max(i + 1);
             continue;
         }
@@ -18572,6 +18586,27 @@ mod sqlite_rebuild_tests {
             (
                 "CREATE TABLE \"t\" (a INTEGER REFERENCES p(id) DEFERRABLE INITIALLY DEFERRED)",
                 "DEFERRABLE",
+            ),
+            // **Quoted, which is how this app's own emitter writes it.** The
+            // scanner cleared `first_in_group` only on the *word* path, and a
+            // quoted identifier goes through `skip_noncode` — so the first word
+            // it saw inside `PRIMARY KEY ("desc" DESC)` was `DESC` itself, with
+            // the flag still set, and the narrowing that stops a *column* named
+            // `desc` being refused swallowed the real clause with it. The
+            // rebuild then wrote `PRIMARY KEY ("desc")`, reported success, and
+            // the next `diff` saw nothing because both sides read the same
+            // incomplete model.
+            (
+                "CREATE TABLE \"t\" (a INTEGER, \"desc\" TEXT, PRIMARY KEY (\"desc\" DESC))",
+                "DESC",
+            ),
+            (
+                "CREATE TABLE \"t\" (a INTEGER, [order] TEXT, PRIMARY KEY ([order] DESC))",
+                "DESC",
+            ),
+            (
+                "CREATE TABLE \"t\" (a INTEGER, `o` TEXT, PRIMARY KEY (`o` DESC))",
+                "DESC",
             ),
         ] {
             let w = withheld(&table_declaring(sql));
