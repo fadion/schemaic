@@ -6259,6 +6259,93 @@ mod tests {
         assert_eq!(got[0].1[2].display(), "written");
     }
 
+    /// **A confirmed re-fetch that misses is not "the row is gone".**
+    ///
+    /// The `WHERE` is the key *plus* every confirming column, valued from what
+    /// the grid read **before** the statement ran. An `AFTER UPDATE` trigger
+    /// that stamps a `touched` column — or a `STORED` generated column, or
+    /// another session writing any untouched column of the row — rewrites one of
+    /// those values as a side effect of the very write being confirmed, so the
+    /// read matches nothing while the row sits there holding exactly what the
+    /// user asked for.
+    ///
+    /// Splicing an empty vector and clearing the staging anyway painted the
+    /// pre-edit value back over the cell under a green "1 row updated"; the next
+    /// edit to that row then keyed off the same stale `ResultSet`, matched 0
+    /// rows, and the 1-row net rolled the whole batch back. `covered_by` is what
+    /// turns the short answer into a full re-run instead.
+    ///
+    /// Asserted over the composition — commit, then re-fetch, then the decision
+    /// — because the re-fetch returning empty is the *premise*, not the defect.
+    #[tokio::test]
+    async fn a_trigger_that_rewrites_a_confirming_column_re_runs_rather_than_splicing_nothing() {
+        let (keeper, db) = shared_memory("refetch_trigger");
+        keeper
+            .execute_batch(
+                "CREATE TABLE notes (body TEXT, tag TEXT, touched TEXT);
+                 INSERT INTO notes VALUES ('n1', 'old', 'never');
+                 CREATE TRIGGER notes_touch AFTER UPDATE ON notes
+                   BEGIN UPDATE notes SET touched = 'now' WHERE rowid = NEW.rowid; END;",
+            )
+            .unwrap();
+        let rs = run_query(
+            &keeper,
+            "SELECT rowid, * FROM notes",
+            &mut crate::RowDest::Capped(100),
+        )
+        .unwrap();
+        let m = schemaic_core::edit::analyze_edit(
+            &rs,
+            schemaic_core::intel::SqlDialect::Sqlite,
+            |_, _, name| Some(table_info_of(&keeper, name)),
+        );
+        let template =
+            schemaic_core::edit::refetch_template(&rs, &m).expect("a keyless table is spliceable");
+
+        // The commit itself, through the real path: one row, one `UPDATE`, and
+        // the trigger's own change is not counted by `sqlite3_changes`, so the
+        // 1-row net passes and the transaction commits.
+        let write = GridWrite {
+            updates: vec![edit(
+                "notes",
+                &[("tag", Some("new"))],
+                &[("rowid", Value::Int(1))],
+            )],
+            ..Default::default()
+        };
+        commit_writes(&db, &write, CancellationToken::new())
+            .await
+            .expect("the write lands");
+
+        let edited: std::collections::HashMap<usize, schemaic_core::model::CellEdit> =
+            [(2, schemaic_core::model::CellEdit::Text("new".to_string()))]
+                .into_iter()
+                .collect();
+        let key = schemaic_core::edit::refetch_key(&template, &rs, 0, &edited);
+        let req = schemaic_core::model::RefetchRequest {
+            template,
+            rows: vec![RefetchRow { data_row: 0, key }],
+        };
+        let got = refetch_rows(&db, &req.template, &req.rows, CancellationToken::new())
+            .await
+            .expect("refetch");
+        assert!(
+            got.is_empty(),
+            "the premise: `touched` no longer holds what the grid read"
+        );
+        assert!(
+            !req.covered_by(&got),
+            "so the commit must re-run the query, not splice nothing and clear the staging"
+        );
+
+        // And the row really does hold the user's edit — which is what makes
+        // painting the pre-edit value back a lie rather than a recovery.
+        let tag: String = keeper
+            .query_row("SELECT tag FROM notes WHERE rowid = 1", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(tag, "new");
+    }
+
     /// `block_in_place` needs the multi-threaded runtime, which the app uses.
     #[tokio::test(flavor = "multi_thread")]
     async fn an_import_loads_every_batch_in_one_transaction() {

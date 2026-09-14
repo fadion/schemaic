@@ -1581,6 +1581,27 @@ pub struct RefetchRequest {
     pub rows: Vec<RefetchRow>,
 }
 
+impl RefetchRequest {
+    /// Did the re-fetch bring back every row the commit had just written?
+    ///
+    /// **A miss is not "that row is gone".** The `WHERE` this builds is the key
+    /// *plus* the table's confirming columns — every non-key, non-binary column,
+    /// valued from what the grid read **before** the statement ran. So a trigger,
+    /// a `STORED` generated column or a concurrent write to any untouched column
+    /// of the row makes the confirmed read match nothing, although the row is
+    /// there and holds exactly what the user asked for.
+    ///
+    /// Splicing an empty vector and clearing the staging anyway painted the
+    /// **pre-edit** value back over the cell under a green "1 row updated", and
+    /// the next edit to that row then built its `WHERE` from the same stale
+    /// `ResultSet`, matched 0 rows and rolled the whole batch back — the row
+    /// uneditable until the query was re-run. A short miss is a re-fetch that
+    /// could not answer, so the answer is to re-run the query.
+    pub fn covered_by(&self, returned: &[(usize, Vec<Value>)]) -> bool {
+        returned.len() >= self.rows.len()
+    }
+}
+
 /// Outcome of a commit, delivered back to the grid on the UI thread.
 #[derive(Clone, Debug)]
 pub enum CommitDone {

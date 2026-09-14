@@ -4823,7 +4823,21 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                                 None => db.refetch_rows(&req.template, &req.rows, token).await,
                             };
                             match rows {
-                                Ok(rows) => finish(CommitDone::Spliced(rows)),
+                                // **A short answer is a re-fetch that could not
+                                // answer, not a row that is gone.** The `WHERE`
+                                // carries the confirming columns valued from
+                                // what the grid read *before* the statement ran,
+                                // so a trigger or a `STORED` column touching one
+                                // of them makes the confirmed read miss a row
+                                // that is there and holds exactly what the user
+                                // asked for. Splicing the empty vector and
+                                // clearing the staging anyway painted the
+                                // pre-edit value back under a green "1 row
+                                // updated". See `RefetchRequest::covered_by`.
+                                Ok(rows) if req.covered_by(&rows) => {
+                                    finish(CommitDone::Spliced(rows))
+                                }
+                                Ok(_) => finish(CommitDone::FullReran),
                                 Err(e) => {
                                     tracing::warn!("re-fetch after commit failed: {e}");
                                     finish(CommitDone::FullReran);
