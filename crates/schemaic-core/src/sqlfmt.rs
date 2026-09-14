@@ -252,13 +252,41 @@ fn tokenize(sql: &str, dialect: SqlDialect) -> Vec<(Kind, &str)> {
             toks.push((Kind::Word, &sql[s..i]));
             continue;
         }
+        // **A `:name` placeholder is one token.** `params`' doc owns the
+        // spelling — "a placeholder is `:` followed by an identifier" — and
+        // this modelled `:` only as part of `::` or `:=`, so a bare one fell
+        // through as a one-byte `Punct` and `need_space` put a space after it.
+        // One Ctrl+Alt+L emptied the parameters bar, lost every value bound to a
+        // name, and left a buffer that is a syntax error on all three engines.
+        // The module's contract is "without changing any token's text", and a
+        // placeholder is a token of the language this editor speaks.
+        //
+        // Ahead of the table, and unambiguously so: no operator spelling puts an
+        // identifier byte after the `:` — `::` and `:=` both do not.
+        if b[i] == b':' && b.get(i + 1).copied().is_some_and(crate::sql::is_word_start) {
+            let mut end = i + 1;
+            while end < b.len() && crate::sql::is_word_byte(b[end]) {
+                end += 1;
+            }
+            toks.push((Kind::Word, &sql[i..end]));
+            i = end;
+            continue;
+        }
         // Punctuation / operators. The table first, since its entries are the
         // spellings the composition rule cannot reach; then the run, for the
         // engine that composes.
+        //
+        // `get`, not `[..n]`: the guard below used to be `rest.len() >=
+        // op.len()`, which proves the slice is in *range* and says nothing about
+        // it being a char boundary — and the slice is taken for every candidate
+        // before any comparison, so **Format Code panicked** on any punctuation
+        // byte with a multi-byte character within `op.len() - 1` bytes of it
+        // (`create table t (имя text)`), on the floem UI thread, on all three
+        // dialects.
         let rest = &sql[i..];
         let len = ops(dialect)
             .iter()
-            .find(|op| rest.len() >= op.len() && &rest[..op.len()] == **op)
+            .find(|op| rest.get(..op.len()) == Some(**op))
             .map(|op| op.len())
             .or_else(|| {
                 operators_are_composable(dialect)
@@ -961,6 +989,66 @@ mod tests {
             token_texts(sql, dialect),
             "{dialect:?} mangled a token: {sql}\n{out}"
         );
+    }
+
+    /// **Format Code panicked on ordinary SQL**, on all three dialects, on the
+    /// floem UI thread.
+    ///
+    /// The operator table was tried with `&rest[..op.len()]` — a `&str` sliced
+    /// at a byte count behind a *length* guard, which says nothing about a char
+    /// boundary. The slice is taken for **every** candidate spelling before any
+    /// comparison, so the panic needs no operator to match: only a punctuation
+    /// byte with a multi-byte character starting within `op.len() - 1` bytes of
+    /// it. MySQL and SQLite lead with `"->>"` and PostgreSQL with `"::"`, so a
+    /// 2-byte character one byte after a punct byte reaches it everywhere.
+    #[test]
+    fn a_multi_byte_character_beside_punctuation_is_formatted_not_panicked_on() {
+        for sql in [
+            "create table t (\u{438}\u{43c}\u{44f} text)",
+            "select a-\u{e9} from t",
+            "select a.\u{e9} from t",
+            "select * from t where b=\u{e9}",
+            "select 1+\u{e9}",
+            "select a;\u{e9}",
+            "select (\u{4e2d}\u{6587}) from t",
+            "select a, \u{e9} from t",
+        ] {
+            for d in [SqlDialect::MySql, SqlDialect::Postgres, SqlDialect::Sqlite] {
+                assert_preserves(sql, d);
+            }
+        }
+    }
+
+    /// **A `:name` placeholder is a token of the language this editor speaks**,
+    /// and the formatter split every one into `: name`.
+    ///
+    /// `params`' own doc owns the spelling — "a placeholder is `:` followed by
+    /// an identifier" — but `tokenize` modelled `:` only as part of `::` or
+    /// `:=`, so a bare one fell through as a one-byte `Punct` and `need_space`
+    /// put a space after it. One Ctrl+Alt+L then emptied the parameters bar, lost
+    /// every value bound to a name, and left a buffer that is a syntax error on
+    /// all three engines.
+    ///
+    /// Asserted through `params::names` as well as through the tokens, since the
+    /// bar is what the user loses — the module's `assert_preserves` compares two
+    /// runs of the *same* tokenizer and is structurally blind to a token it does
+    /// not model.
+    #[test]
+    fn a_named_parameter_survives_formatting() {
+        let sql = "select * from t where id = :id and n > :n";
+        for d in [SqlDialect::MySql, SqlDialect::Postgres, SqlDialect::Sqlite] {
+            let out = super::format_sql(sql, IND, d);
+            assert_eq!(
+                crate::params::names(&out, d),
+                crate::params::names(sql, d),
+                "{d:?} lost the parameters bar:\n{out}"
+            );
+            assert!(!out.contains(": "), "{d:?} split the placeholder:\n{out}");
+            assert_preserves(sql, d);
+        }
+        // The operators that really do start with `:` are untouched.
+        assert_preserves("select a::text from t", SqlDialect::Postgres);
+        assert_preserves("select @x := 1", SqlDialect::MySql);
     }
 
     #[test]
