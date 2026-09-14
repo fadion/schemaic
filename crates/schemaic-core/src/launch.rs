@@ -398,10 +398,94 @@ fn is_windows_path(p: &str) -> bool {
     b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && (b[2] == b'/' || b[2] == b'\\')
 }
 
+/// `msg` reduced to bytes that are inert inside **both** shells' `echo`.
+///
+/// **The one place in the app where a string really is handed to a shell.** The
+/// two rules at the top of this module say the argv here is executed directly
+/// and nothing parses it — true of every other function, and not of the
+/// message terminal: it spawns `/bin/sh -c "echo '<msg>'; exec /bin/sh"` on Unix
+/// and `cmd.exe /k echo <msg>` on Windows, so the message is **shell source**.
+/// A `'` in it closes the quote on Unix; `&`, `|`, `^`, `>` and `%` are syntax
+/// to `cmd`. That was harmless while every caller passed a fixed sentence, and
+/// stops being harmless the moment one reports a program name out of
+/// `terminal.json` or an OS error string back to the user.
+///
+/// An **allowlist**, for the reason [`is_url_byte`]'s doc gives: filtering every
+/// metacharacter of every shell is how one of them comes to be missed. Letters,
+/// digits, space and a short punctuation set that neither shell treats as
+/// syntax; everything else — including every non-ASCII byte and every control
+/// character, newline among them — becomes a space, and runs of spaces collapse
+/// so a stripped run does not leave a gap. The result can be pasted into either
+/// command with no quoting beyond what is already there.
+pub fn shell_message_text(msg: &str) -> String {
+    let mut out = String::with_capacity(msg.len());
+    for ch in msg.chars() {
+        let keep = ch.is_ascii_alphanumeric() || " .,:;!?-_/()[]+=@#".contains(ch);
+        let ch = if keep { ch } else { ' ' };
+        if ch == ' ' && out.ends_with(' ') {
+            continue;
+        }
+        out.push(ch);
+    }
+    out.trim().to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::connection::{SslMode, Tls};
+
+    /// **The message terminal is the one place a string reaches a shell**, and
+    /// its callers stopped being fixed sentences the moment one reported a
+    /// program name out of `terminal.json`.
+    #[test]
+    fn a_shell_message_carries_no_syntax_of_either_shell() {
+        // Unix: the message sits inside single quotes in `sh -c`, so the one
+        // byte that matters is `'`. With it gone the `;` cannot start a
+        // command — it is inside the app's quotes, and nothing in the message
+        // can close them.
+        assert_eq!(
+            shell_message_text("Couldn't start '; rm -rf ~; echo '"),
+            "Couldn t start ; rm -rf ; echo"
+        );
+        assert!(!shell_message_text("a'b").contains('\''));
+        // Windows: `cmd /k echo` reads these.
+        for m in ["a & b", "a | b", "a ^ b", "a > b", "a %PATH% b", "a < b"] {
+            let out = shell_message_text(m);
+            assert!(
+                !out.contains(['&', '|', '^', '>', '<', '%', '\'', '"', '`', '$']),
+                "{m} -> {out}"
+            );
+        }
+        // A newline would end the command and start another.
+        assert_eq!(
+            shell_message_text(
+                "one
+two"
+            ),
+            "one two"
+        );
+        assert_eq!(
+            shell_message_text(
+                "one
+two"
+            ),
+            "one two"
+        );
+        // Ordinary text survives, including the punctuation a real sentence
+        // needs, and a stripped run leaves one space rather than a gap.
+        assert_eq!(
+            shell_message_text(
+                "Couldn't start /usr/bin/zsh (No such file or directory). Pick another shell in terminal settings."
+            ),
+            "Couldn t start /usr/bin/zsh (No such file or directory). Pick another shell in terminal settings."
+        );
+        // Non-ASCII goes, deliberately: a console codepage is not something this
+        // can answer for.
+        assert_eq!(shell_message_text("naïve 東京"), "na ve");
+        assert_eq!(shell_message_text("   "), "");
+        assert_eq!(shell_message_text(""), "");
+    }
 
     /// The programs that would make any amount of filtering above pointless.
     const SHELLS: &[&str] = &[

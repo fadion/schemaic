@@ -62,6 +62,9 @@ impl ShellProfile {
 ///
 /// Once the user picks a shell, `selected` names a row of `detected` and that
 /// row wins; `loaded` only answers for a profile the list does not contain.
+///
+/// `loaded` is *what the session is running*, not what was on disk — see
+/// [`initial_shell_state`], which is where the two stopped being the same.
 pub fn shell_to_persist(
     loaded: Option<&ShellProfile>,
     detected: &[ShellProfile],
@@ -75,6 +78,71 @@ pub fn shell_to_persist(
         return Some(saved.clone());
     }
     detected.get(selected).cloned()
+}
+
+/// Which picker row to start on, and which profile the session is **actually
+/// running**, for a launch with `saved` on disk and `running` spawned.
+///
+/// **The third input `shell_to_persist` needed and never had.** On a first run
+/// there is no saved profile, so the session spawns [`default_shell`] — `$SHELL`
+/// on Unix — while the picker index fell through to `0`. `detect_shells()` on
+/// Unix is `/etc/shells` in file order, whose first line on Debian and Ubuntu is
+/// `/bin/sh`. The appearance-saving effect, which floem runs **immediately on
+/// creation**, then wrote `/bin/sh` into `terminal.json` before the window was
+/// drawn and with no user action. The running session was still zsh, so there
+/// was no symptom until the *next* launch opened `/bin/sh`: no history, no
+/// prompt, no completion, and nothing saying why. The picker had agreed with the
+/// file and not with what was running since the first run.
+///
+/// This is the same mechanism [`shell_to_persist`]'s doc describes, on the
+/// branch that guard does not cover (`loaded == None`). Windows escaped it by
+/// coincidence: `default_shell()` and `detect_shells()[0]` are the same profile
+/// there, which is why the platform this shipped on never showed it.
+///
+/// Returns `(row, running)`. `running` is `Some` whenever a profile can be named
+/// for what is spawned, so the `loaded` branch above answers even when the
+/// running shell is absent from `detected` — a `$SHELL` outside `/etc/shells`.
+pub fn initial_shell_state(
+    saved: Option<&ShellProfile>,
+    running: &ShellConfig,
+    detected: &[ShellProfile],
+) -> (usize, Option<ShellProfile>) {
+    let same =
+        |d: &ShellProfile, program: &str, args: &[String]| d.program == program && d.args == args;
+    // A saved profile the list holds keeps its row; a saved profile it does not
+    // hold keeps row 0 and is protected by `shell_to_persist`'s `loaded` branch,
+    // exactly as before.
+    if let Some(s) = saved {
+        let row = detected
+            .iter()
+            .position(|d| same(d, &s.program, &s.args))
+            .unwrap_or(0);
+        return (row, Some(s.clone()));
+    }
+    let row = detected
+        .iter()
+        .position(|d| same(d, &running.program, &running.args));
+    let profile = match row.and_then(|i| detected.get(i)) {
+        // Named after the detected row, so the picker's label and the file agree.
+        Some(d) => d.clone(),
+        None => ShellProfile {
+            name: program_label(&running.program),
+            program: running.program.clone(),
+            args: running.args.clone(),
+        },
+    };
+    (row.unwrap_or(0), Some(profile))
+}
+
+/// A display name for a program with no detected row: its file stem, or the
+/// whole string when there isn't one.
+fn program_label(program: &str) -> String {
+    std::path::Path::new(program)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or(program)
+        .to_string()
 }
 
 fn default_font_size() -> u16 {
@@ -285,7 +353,8 @@ fn parse_wsl_list(stdout: &[u8]) -> Vec<String> {
 
 #[cfg(test)]
 mod persist_tests {
-    use super::{ShellProfile, shell_to_persist};
+    use super::{ShellProfile, initial_shell_state, shell_to_persist};
+    use crate::ShellConfig;
 
     fn p(name: &str, program: &str) -> ShellProfile {
         ShellProfile {
@@ -342,6 +411,81 @@ mod persist_tests {
         // A row that is not there answers nothing rather than panicking.
         assert_eq!(shell_to_persist(None, &detected, 9), None);
         assert_eq!(shell_to_persist(None, &[], 0), None);
+    }
+
+    /// **A first run persists the shell it is actually running.**
+    ///
+    /// The composition, not the pure function: `shell_to_persist(None, …, 0)`
+    /// was doing exactly what it was told, and what it was told was wrong.
+    /// `init_selected` fell through to `0` when nothing was saved, and on
+    /// Debian/Ubuntu `/etc/shells[0]` is `/bin/sh` while the session spawns
+    /// `$SHELL`. The save effect runs immediately on creation, so `/bin/sh` was
+    /// in `terminal.json` before the window was drawn — with the zsh session
+    /// still running, so nothing looked wrong until the next launch.
+    #[test]
+    fn a_first_run_persists_the_shell_it_is_running() {
+        let sh = p("sh", "/bin/sh");
+        let bash = p("bash", "/bin/bash");
+        let zsh = p("zsh", "/usr/bin/zsh");
+        let detected = [sh.clone(), bash.clone(), zsh.clone()];
+        let running = ShellConfig {
+            program: "/usr/bin/zsh".into(),
+            args: vec![],
+            cwd: None,
+            env: Vec::new(),
+        };
+
+        // What the old wiring handed the save — `current_shell` seeded from
+        // `term_prefs.shell` (None) and the row fallen through to 0. Still true
+        // of the pure function, which is the point: it was doing what it was
+        // told.
+        assert_eq!(shell_to_persist(None, &detected, 0), Some(sh.clone()));
+
+        let (row, current) = initial_shell_state(None, &running, &detected);
+        assert_eq!(row, 2, "the picker must start on what is running");
+        assert_eq!(current.as_ref(), Some(&zsh));
+        // …and the save that follows writes it, which is the whole point.
+        assert_eq!(
+            shell_to_persist(current.as_ref(), &detected, row),
+            Some(zsh.clone())
+        );
+
+        // A `$SHELL` that is not in `/etc/shells` at all: the row cannot name
+        // it, so the `loaded` branch has to — which is why `current` is `Some`
+        // on a first run at all.
+        let exotic = ShellConfig {
+            program: "/opt/fish/bin/fish".into(),
+            args: vec![],
+            cwd: None,
+            env: Vec::new(),
+        };
+        let (row, current) = initial_shell_state(None, &exotic, &detected);
+        assert_eq!(row, 0);
+        let got = shell_to_persist(current.as_ref(), &detected, row).expect("a profile");
+        assert_eq!(got.program, "/opt/fish/bin/fish");
+        assert_eq!(got.name, "fish", "named from the program for the picker");
+
+        // A saved profile is untouched in both directions — detected or not.
+        let (row, current) = initial_shell_state(Some(&bash), &running, &detected);
+        assert_eq!((row, current.as_ref()), (1, Some(&bash)));
+        let gone = p("Ubuntu", "wsl.exe");
+        let (row, current) = initial_shell_state(Some(&gone), &running, &detected);
+        assert_eq!((row, current.as_ref()), (0, Some(&gone)));
+        assert_eq!(
+            shell_to_persist(current.as_ref(), &detected, row),
+            Some(gone),
+            "a saved profile this launch could not detect still survives"
+        );
+
+        // Nothing detected at all: no row to start on, and the running shell is
+        // still what gets written.
+        let (row, current) = initial_shell_state(None, &running, &[]);
+        assert_eq!(row, 0);
+        assert_eq!(
+            shell_to_persist(current.as_ref(), &[], row),
+            Some(zsh),
+            "an empty list must not erase the running shell"
+        );
     }
 
     /// **The args are half the identity.** Two WSL distros differ only by

@@ -960,7 +960,16 @@ fn dialect_for(engine: schemaic_db::Engine) -> SqlDialect {
 
 /// A throwaway shell that just prints `msg` and stays open — used to surface "no
 /// client found" in the terminal rather than spawning a broken session.
+///
+/// **The message is shell source, so it goes through `launch::shell_message_text`
+/// first.** This is the one place in the app that hands a string to a shell:
+/// `sh -c "echo '<msg>'; exec /bin/sh"` and `cmd /k echo <msg>` are both parsed
+/// before they are run. That was harmless while every caller passed a fixed
+/// sentence and stopped being harmless when one began reporting a program name
+/// out of `terminal.json` and an OS error. Validated at the boundary rather than
+/// at each caller, which is `core::launch`'s own rule.
 fn message_shell(msg: &str) -> schemaic_term::ShellConfig {
+    let msg = schemaic_core::launch::shell_message_text(msg);
     #[cfg(windows)]
     {
         schemaic_term::ShellConfig {
@@ -10828,22 +10837,25 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
         .as_ref()
         .map(|p| p.config())
         .unwrap_or_else(schemaic_term::shell::default_shell);
-    let init_selected = term_prefs
-        .shell
-        .as_ref()
-        .and_then(|p| {
-            detected_shells
-                .iter()
-                .position(|d| d.program == p.program && d.args == p.args)
-        })
-        .unwrap_or(0);
     // **The shell this session is actually running**, which is not the same as
     // the picker's row: `term_shell_selected` is an index into
     // `detect_shells()`, and a saved profile this launch could not detect is
     // not in that list at all. Both the save and the Restart read this, so
     // neither can silently swap the user's shell for `detected[0]` — see
-    // `shell::shell_to_persist`. `term_apply_shell` is the only writer.
-    let current_shell = RwSignal::new(term_prefs.shell.clone());
+    // `shell::shell_to_persist`. `term_apply_shell` is the only other writer.
+    //
+    // **Seeded from what is spawned, not from the file**, which is the whole of
+    // the first-run fix: with no `terminal.json` the session runs `$SHELL` while
+    // the row fell through to 0, and `/etc/shells[0]` on Debian is `/bin/sh` —
+    // so the save effect, which floem runs immediately on creation, wrote
+    // `/bin/sh` before the window was drawn. `shell::initial_shell_state` is
+    // where that decision now lives, with its tests.
+    let (init_selected, init_profile) = schemaic_term::shell::initial_shell_state(
+        term_prefs.shell.as_ref(),
+        &init_shell,
+        &detected_shells,
+    );
+    let current_shell = RwSignal::new(init_profile);
     let term_shell_selected = RwSignal::new(init_selected);
     // Terminal appearance/behaviour, restored from `terminal.json`.
     let term_font_size = RwSignal::new(term_prefs.font_size);
@@ -10898,6 +10910,42 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                     }
                     Err(e) => {
                         tracing::error!("{what} failed: {e}");
+                        // **A failed spawn used to be a log line and nothing
+                        // else**, and `00e9b53` is what made that permanent. The
+                        // appearance-saving effect used to overwrite the unusable
+                        // profile with `detected[0]` on the next launch, so the
+                        // panel healed itself; removing that write was right (it
+                        // was data loss), and it uncovered a startup path with no
+                        // failure arm at all. A saved shell this launch cannot
+                        // spawn — an unregistered WSL distro, an uninstalled
+                        // login shell — left the panel a black pane with no
+                        // cursor, no text and no badge, where typing did nothing
+                        // and Restart re-read the same profile and failed the
+                        // same way. The only route out was Settings, and nothing
+                        // on screen pointed there.
+                        //
+                        // `message_shell` is the idiom this codebase already has
+                        // for a session that cannot be built honestly — the "no
+                        // client found" and "tunnel not established" arms. One
+                        // level only: a `message_shell` that itself fails is a
+                        // genuine nothing-to-show, and recursing would spawn a
+                        // message about failing to spawn a message.
+                        let cfg = message_shell(&format!(
+                            "Couldn't start {}: {e}. Pick another shell in Settings, Terminal.",
+                            cfg.program
+                        ));
+                        if let Ok(t) =
+                            schemaic_term::Terminal::spawn(&cfg, cols, rows, term_notify.clone())
+                        {
+                            *terminal.borrow_mut() = Some(t);
+                            term_db_label.set(None);
+                            (term_notify)();
+                        } else {
+                            tracing::error!("{what}: the message shell would not start either");
+                        }
+                        // Still `false`: the caller asked for *that* shell and
+                        // did not get it — `term_apply_shell` must not record a
+                        // profile whose session is a sentence about itself.
                         false
                     }
                 }
@@ -12855,10 +12903,15 @@ mod app_tests {
     ///
     /// Nothing runtime-testable is left — the sequence is four statements inside
     /// a closure in `app_view` — so the subject is the source, and what it says
-    /// is that there is one `Terminal::spawn` in the file. That is the property:
-    /// a second one is a second copy of the sequence, which is where the drift
-    /// came from. B26-L5-01's fix (validating a target before it becomes a
-    /// `ShellConfig`) also needs a single choke point to be applied at.
+    /// is that every `Terminal::spawn` is **inside `install_terminal`**. That is
+    /// the property: one outside it is a second copy of the sequence, which is
+    /// where the drift came from. B26-L5-01's fix (validating a target before it
+    /// becomes a `ShellConfig`) also needs a single choke point to be applied at.
+    ///
+    /// The count used to be pinned at one, which was the same property while
+    /// there was one arm. `install_terminal` now has two — the shell it was
+    /// asked for, and the `message_shell` that says why it could not be started
+    /// — so a count is no longer the property and the *region* is.
     #[test]
     fn the_terminal_session_is_replaced_in_exactly_one_place() {
         let src = include_str!("main.rs");
@@ -12866,14 +12919,33 @@ mod app_tests {
         // call is not one of the hits — the trap every source gate in this
         // workspace has to dodge.
         let call = format!("schemaic_term::{}::spawn(", "Terminal");
-        let spawns = src.matches(&call).count();
-        assert_eq!(
-            spawns, 1,
-            "found {spawns} `Terminal::spawn` calls — the spawn/install/badge/\
-             notify sequence belongs in `install_terminal` alone, because the \
-             five hand-written copies it replaced had already disagreed about \
-             three of those four steps"
+        let write = format!("*terminal.{}() = Some(", "borrow_mut");
+
+        let body_start = src
+            .find("let install_terminal: InstallTerminal = {")
+            .expect("the one installer");
+        let body_end = body_start
+            + src[body_start..]
+                .find("// The session the window opens with.")
+                .expect("the marker that follows the installer");
+        let body = &src[body_start..body_end];
+        let rest = format!("{}{}", &src[..body_start], &src[body_end..]);
+
+        assert!(
+            body.matches(&call).count() >= 1 && body.matches(&write).count() >= 1,
+            "the installer no longer spawns or installs — has this test lost its \
+             region rather than the code losing the call?"
         );
+        for (needle, what) in [(&call, "Terminal::spawn"), (&write, "the terminal cell")] {
+            let strays = rest.matches(needle.as_str()).count();
+            assert_eq!(
+                strays, 0,
+                "{what} appears {strays} time(s) outside `install_terminal` — the \
+                 spawn/install/badge/notify sequence belongs there alone, because \
+                 the five hand-written copies it replaced had already disagreed \
+                 about three of those four steps"
+            );
+        }
         // And every caller goes through it, rather than one of them reaching
         // past it to the terminal cell.
         let installs = src.matches("(install_terminal)(").count();
@@ -12881,12 +12953,6 @@ mod app_tests {
             installs >= 5,
             "only {installs} callers of `install_terminal` — did one go back to \
              writing `*terminal.borrow_mut()` itself?"
-        );
-        let write = format!("*terminal.{}() = Some(", "borrow_mut");
-        assert_eq!(
-            src.matches(&write).count(),
-            1,
-            "the terminal cell is written in `install_terminal` and nowhere else"
         );
     }
 
