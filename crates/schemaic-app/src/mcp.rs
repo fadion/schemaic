@@ -512,10 +512,41 @@ where
             token.cancel();
             // Kept alive across the cancel so the driver's KILL branch runs —
             // abandoning the future leaves the statement running on the server.
+            //
+            // **Only correct while `token` reaches a driver.** Over a read that
+            // takes no token this line is the bug: the cancel reaches nothing
+            // and the await then blocks for the server's own time, so the
+            // "deadline" returns after the query rather than after
+            // `QUERY_TIMEOUT`. [`with_deadline_abandoning`] is that case, and it
+            // is a separate function so the choice has to be made rather than
+            // inherited.
             let _ = fut.await;
             None
         }
     }
+}
+
+/// [`with_deadline`] for a read with **nothing to cancel**: the future is
+/// dropped at the deadline rather than awaited.
+///
+/// `Db::fetch_table_list` takes no `CancellationToken` on any of the three
+/// engines, so `with_deadline`'s `token.cancel()` reaches no driver and its
+/// `fut.await` waits out the server. `list_schema`'s per-database loop was the
+/// one caller, and the wedge it exists to prevent was therefore still open: a
+/// catalogue read stuck behind an `ALTER TABLE`'s metadata lock held the
+/// sequential serve loop for as long as the lock lasted, answering nothing —
+/// not even `ping`.
+///
+/// Dropping the future does leave the statement running on the server until the
+/// connection goes, which is the trade the call site already documented and
+/// believed it was making. It is the smaller half: the wedge being closed is
+/// *ours*. Giving the read a real token is a `schemaic-db` change and would let
+/// it use [`with_deadline`] instead.
+async fn with_deadline_abandoning<F>(fut: F) -> Option<F::Output>
+where
+    F: std::future::Future,
+{
+    tokio::time::timeout(QUERY_TIMEOUT, fut).await.ok()
 }
 
 async fn run_query(db: &Db, database: Option<&str>, sql: &str) -> (String, bool) {
@@ -645,14 +676,19 @@ async fn list_schema(
         // sequential and answers nothing while this runs.
         //
         // **Bounded in time, but not cancelled at the server**, and that is the
-        // one of the four reads where those differ: `fetch_table_list` takes no
+        // one of the six reads where those differ: `fetch_table_list` takes no
         // `CancellationToken` — it is a name listing, not the full
-        // introspection — so the token handed in here reaches no driver and the
-        // statement runs to completion on the server after we stop waiting. The
-        // wedge this is about is *ours*, so bounding the wait is the whole of
-        // the fix here; giving it a real token is a `schemaic-db` change.
-        let schema = match with_deadline(db.fetch_table_list(&name), CancellationToken::new()).await
-        {
+        // introspection — so the statement runs to completion on the server
+        // after we stop waiting. The wedge this is about is *ours*, so bounding
+        // the wait is the whole of the fix here; giving it a real token is a
+        // `schemaic-db` change.
+        //
+        // Through `with_deadline_abandoning`, not `with_deadline`, and the
+        // difference is the whole of it: the latter keeps the future alive
+        // across the cancel so a driver's KILL branch runs, which over a read
+        // that has no token means waiting out the server — so this read was not
+        // bounded at all, and this comment was describing an intention.
+        let schema = match with_deadline_abandoning(db.fetch_table_list(&name)).await {
             Some(r) => r.map_err(|e| e.to_string()),
             None => Err("timed out (30s)".to_string()),
         };
@@ -1074,6 +1110,50 @@ mod tests {
         );
     }
 
+    /// **And the sixth read, whose token reaches nothing, is bounded by giving
+    /// up on it.**
+    ///
+    /// Keeping the future alive across the cancel is right for the five reads
+    /// whose token reaches a driver — that is what makes the KILL run. It is
+    /// exactly wrong for `fetch_table_list`, which takes **no**
+    /// `CancellationToken` on any of the three engines: `token.cancel()` reaches
+    /// nothing, and `fut.await` then blocks for the server's own time. So the
+    /// deadline returned after the query, not after 30 s, and the sequential
+    /// serve loop answered nothing — not even `ping` — for the whole of it. The
+    /// call site's own comment said the opposite: "bounding the wait is the
+    /// whole of the fix here."
+    ///
+    /// A `MetadataLock` waiting on an `ALTER TABLE` is the ordinary shape of
+    /// this, and the same commit measured the sibling at >100 s on PG 16.15.
+    #[tokio::test(start_paused = true)]
+    async fn a_deadline_over_an_uncancellable_read_gives_up_on_it() {
+        let finished = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let saw = finished.clone();
+        let started = std::time::Instant::now();
+        let got = super::with_deadline_abandoning(async move {
+            // What `fetch_table_list` is: a read with nothing to cancel it.
+            tokio::time::sleep(std::time::Duration::from_secs(600)).await;
+            saw.store(true, std::sync::atomic::Ordering::SeqCst);
+            "rows"
+        })
+        .await;
+        assert_eq!(got, None, "the caller must see the timeout");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(60),
+            "the deadline waited for the read instead of giving up on it: {:?}",
+            started.elapsed()
+        );
+        assert!(
+            !finished.load(std::sync::atomic::Ordering::SeqCst),
+            "the read was awaited to completion"
+        );
+        // …and one that beats the deadline still comes back whole.
+        assert_eq!(
+            super::with_deadline_abandoning(async { "rows" }).await,
+            Some("rows")
+        );
+    }
+
     /// **The deadline is a property of the server, not of one tool** — and it
     /// was a property of one tool. Three of the four database reads built a
     /// fresh `CancellationToken` that nothing ever cancelled and awaited it
@@ -1120,6 +1200,22 @@ mod tests {
              sequential, so one slow read answers nothing and wedges every \
              request queued behind it"
         );
+
+        // And the other direction, which is the defect the token gate could not
+        // see: a read with **no** token must not go through the `with_deadline`
+        // that keeps the future alive across the cancel, because over a
+        // tokenless read that is a wait for the server rather than a deadline.
+        for line in body
+            .split('\n')
+            .filter(|l| !l.trim_start().starts_with("//"))
+        {
+            assert!(
+                !(line.contains("with_deadline(") && line.contains("fetch_table_list")),
+                "`fetch_table_list` takes no CancellationToken, so `with_deadline` \
+                 waits it out rather than bounding it — use \
+                 `with_deadline_abandoning`:\n{line}"
+            );
+        }
     }
 
     /// Tool names the server advertises, in order.
