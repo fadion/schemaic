@@ -2040,7 +2040,12 @@ pub(crate) async fn fetch_schema(db: &Db, cancel: CancellationToken) -> Result<D
             // lexer, so a mention in a comment or a string literal is not one.
             let referring_ddl: Vec<String> = all_triggers
                 .iter()
-                .filter(|(owner, _)| *owner != name)
+                // Case-insensitively — the exact negation of `trigger_sql`'s own
+                // match. With a byte comparison a table's *own* trigger written
+                // `ON foo` landed here instead, and `rebuild_strands_a_trigger`
+                // then refused a rename with a message about the table being
+                // edited.
+                .filter(|(owner, _)| !owner.eq_ignore_ascii_case(&name))
                 .filter(|(_, sql)| {
                     schemaic_core::intel::code_names(
                         sql,
@@ -2314,8 +2319,12 @@ fn table_declares_autoincrement(conn: &SqliteConn, db: &str, table: &str) -> boo
 fn index_sql(conn: &SqliteConn, db: &str, table: &str) -> Result<Vec<(String, String)>, DbError> {
     let mut stmt = conn
         .prepare(&format!(
+            // `COLLATE NOCASE` for the same reason as `trigger_sql`: an index
+            // declared against another spelling of the table's name is the same
+            // index. Missing one costs a withholding here (`IndexReplay::Refuse`)
+            // rather than a loss, but it is the same question and has one answer.
             "SELECT name, sql FROM {}.sqlite_master \
-             WHERE type = 'index' AND tbl_name = ?1 AND sql IS NOT NULL \
+             WHERE type = 'index' AND tbl_name = ?1 COLLATE NOCASE AND sql IS NOT NULL \
              ORDER BY name",
             ident_sqlite(db)
         ))
@@ -2376,8 +2385,16 @@ fn trigger_statements(raw: &[String]) -> Vec<String> {
 fn trigger_sql(conn: &SqliteConn, table: &str) -> Result<Vec<String>, DbError> {
     let mut stmt = conn
         .prepare(
+            // **`COLLATE NOCASE`, because SQLite folds identifiers and
+            // `sqlite_master.tbl_name` keeps the spelling the `CREATE TRIGGER`
+            // used.** A table declared `Foo` with a trigger written `ON foo` is
+            // ordinary and legal, and a BINARY `=` matched neither — so the
+            // trigger was missing from the editor's list *and* from
+            // `dependent_ddl`, which is the only thing the twelve-step rebuild
+            // replays. A retype then dropped it with the table and put nothing
+            // back, with no undo and no other copy of its `CREATE` text.
             "SELECT sql FROM sqlite_master \
-             WHERE type = 'trigger' AND tbl_name = ?1 AND sql IS NOT NULL \
+             WHERE type = 'trigger' AND tbl_name = ?1 COLLATE NOCASE AND sql IS NOT NULL \
              ORDER BY name",
         )
         .map_err(query_err)?;
@@ -2622,36 +2639,50 @@ fn generated_expr(conn: &SqliteConn, db: &str, table: &str, column: &str) -> Opt
 /// inside a literal.
 fn generated_expr_of(create_sql: &str, column: &str) -> Option<String> {
     use schemaic_core::intel::SqlDialect;
-    use schemaic_core::sql::{balanced_paren_span, is_word_byte, is_word_start, skip_noncode};
+    use schemaic_core::sql::{NonCode, ident_at, noncode_kind, skip_noncode};
 
     let b = create_sql.as_bytes();
     let mut i = 0usize;
-    // Walk code positions, looking for the column's name as a whole word.
+    // Walk code positions, looking for the column's name.
+    //
+    // **Through `ident_at`, the one quoted-identifier reader**, rather than the
+    // bare-word scan this used to be. `skip_noncode` reports a quoted name as a
+    // span to skip — `"x"`, `` `x` `` and `[x]` are all identifiers on SQLite —
+    // so every byte of one was consumed before the word test was reached and the
+    // name never matched. That is not an exotic input: `ColumnInfo::
+    // definition_sql` goes through `ident_sql`, which always quotes, so the
+    // first Schemaic rebuild of a table with a generated column writes the name
+    // quoted and the next read of it loses the expression. The column is then
+    // declared **plain** by the following rebuild and stops recomputing, with
+    // the stale values copied across and nothing reporting it — `diff` reads
+    // `None` on both sides. The sibling `collations_of_text` in this file has
+    // always asked `ident_at`; this was the one reader of the same text that
+    // did not.
     while i < b.len() {
-        if let Some(j) = skip_noncode(b, i, SqlDialect::Sqlite) {
-            i = j.max(i + 1);
+        // A comment or a string literal is not a name — skip it whole. An
+        // *identifier* span is exactly what `ident_at` is for, so it is not
+        // skipped here.
+        if noncode_kind(b, i, SqlDialect::Sqlite).is_some_and(|k| k != NonCode::Identifier) {
+            i = skip_noncode(b, i, SqlDialect::Sqlite)
+                .unwrap_or(i + 1)
+                .max(i + 1);
             continue;
         }
-        if !is_word_start(b[i]) {
-            i += 1;
+        let (name, end) = ident_at(create_sql, i, SqlDialect::Sqlite);
+        let Some(name) = name else {
+            i = end.max(i + 1);
             continue;
-        }
-        let start = i;
-        let mut end = i + 1;
-        while end < b.len() && is_word_byte(b[end]) {
-            end += 1;
-        }
-        if create_sql[start..end].eq_ignore_ascii_case(column) {
+        };
+        if name.eq_ignore_ascii_case(column) {
             // From here to the next comma at this paren depth is the column's
             // declaration; an `AS (` inside it opens the expression.
             if let Some(expr) = as_expression(create_sql, end) {
                 return Some(expr);
             }
         }
-        i = end;
+        i = end.max(i + 1);
     }
     // Not found, or the name matched something that wasn't a column declaration.
-    let _ = balanced_paren_span;
     None
 }
 
@@ -7918,6 +7949,68 @@ mod rebuild_fidelity_tests {
         d.columns[i].info.type_name = "TEXT".into();
     }
 
+    /// **SQLite folds identifiers; `sqlite_master.tbl_name` keeps the spelling
+    /// the `CREATE TRIGGER` used.**
+    ///
+    /// A table declared `Foo` with a trigger written `ON foo` is ordinary — an
+    /// ORM makes the table, a person writes the trigger — and legal. But the
+    /// per-table lookup was `tbl_name = ?1`, and SQLite's `=` on TEXT is BINARY,
+    /// so it matched nothing: the trigger was missing from `triggers` (the
+    /// editor showed an empty list) **and** from `dependent_ddl`, which is the
+    /// only thing the twelve-step rebuild replays. Retype a column — no rename,
+    /// nothing withheld, a plan that reports success — and `DROP TABLE` takes
+    /// the trigger with it and puts nothing back. Its `CREATE` text existed
+    /// nowhere else; there is no undo.
+    ///
+    /// Measured on SQLite 3.50.4 through rusqlite: `CREATE TABLE Foo` gives
+    /// `('table','Foo','Foo')` and `CREATE TRIGGER tr … ON foo` gives
+    /// `('trigger','tr','foo')`.
+    ///
+    /// Asserted over the composition — the model, then the rebuild — because the
+    /// model being empty is what makes the rebuild silent.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_trigger_that_spells_its_table_in_another_case_survives_a_rebuild() {
+        let (keeper, db) = shared_memory("fid_trigger_case");
+        keeper
+            .execute_batch(
+                "CREATE TABLE Foo (a INTEGER PRIMARY KEY, b TEXT);
+                 CREATE TABLE log (v TEXT);
+                 CREATE TRIGGER audit AFTER UPDATE ON foo
+                   BEGIN INSERT INTO log VALUES (old.b); END;",
+            )
+            .unwrap();
+
+        let before = table_of(&db, "Foo").await;
+        assert_eq!(
+            before.dependent_ddl.len(),
+            1,
+            "the rebuild's only source for the trigger"
+        );
+        assert_eq!(before.triggers.len(), 1, "and the editor's list");
+        assert!(
+            before.referring_ddl.is_empty(),
+            "its own trigger is not a *referring* one — that mis-wording is the \
+             same byte comparison from the other side"
+        );
+
+        let mut draft = TableDraft::from_table(&before);
+        retype_last(&mut draft);
+        let cs = diff(&before, &draft, SqlDialect::Sqlite);
+        assert!(cs.unsupported().is_empty(), "{:?}", cs.unsupported());
+        db.run_ddl(MAIN, &cs.emit(), CancellationToken::new())
+            .await
+            .unwrap_or_else(|e| panic!("{e} — plan {:#?}", cs.emit()));
+
+        let left: i64 = keeper
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type = 'trigger'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(left, 1, "the rebuild destroyed the trigger");
+    }
+
     /// **Create table, on SQLite, end to end.** `ddl::create` is the designer's
     /// whole New-table path (`table_designer.rs`), and its change set has to
     /// reach the engine as a statement: a plan holding one `CreateTable` is not
@@ -8078,6 +8171,72 @@ mod rebuild_fidelity_tests {
         )
         .await;
         assert!(sql.to_uppercase().contains("STORED"), "{sql}");
+    }
+
+    /// **And it survives a table whose identifiers are quoted — which is every
+    /// table Schemaic has ever rebuilt.**
+    ///
+    /// `generated_expr_of` looked for the column as a **bare word**, and
+    /// `skip_noncode` skips every byte of a quoted name before the word test is
+    /// reached, so `"total"` never matched and the column came back
+    /// `generated: None` with `generated_stored: true` — verbatim the state
+    /// `c040311` was written to eliminate. The next rebuild then declares it
+    /// **plain**, and the copy list (which filters on `generated.is_none()`)
+    /// puts it in the `INSERT … SELECT`, so the values it happened to hold come
+    /// across with no error and it never recomputes again.
+    ///
+    /// The reachability is not "someone quoted their DDL":
+    /// `ColumnInfo::definition_sql` goes through `ident_sql`, which **always**
+    /// quotes — so the first Schemaic rebuild rewrites `sqlite_master.sql` with
+    /// the name quoted, the next read loses the expression, and the second
+    /// rebuild de-materialises it. Two ordinary edits, with the app's own
+    /// emitter as the cause. Nothing reports it: `diff` reads `None` on both
+    /// sides, so the round-trip gate stays green.
+    ///
+    /// The loop now asks `sql::ident_at` — the one quoted-identifier reader,
+    /// which the sibling `collations_of_text` in this same file already used.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_generated_column_survives_a_quoted_declaration() {
+        for decl in [
+            r#"CREATE TABLE "inv" ("price" INTEGER, "qty" INTEGER, "total" INTEGER GENERATED ALWAYS AS ("price" * "qty") STORED);"#,
+            "CREATE TABLE [inv] ([price] INTEGER, [qty] INTEGER, [total] INTEGER GENERATED ALWAYS AS (price * qty) STORED);",
+            "CREATE TABLE `inv` (`price` INTEGER, `qty` INTEGER, `total` INTEGER GENERATED ALWAYS AS (price * qty) STORED);",
+        ] {
+            let (keeper, db) = shared_memory("fid_gen_quoted");
+            keeper.execute_batch("DROP TABLE IF EXISTS inv;").unwrap();
+            keeper.execute_batch(decl).unwrap();
+            let before = table_of(&db, "inv").await;
+            let total = before
+                .columns
+                .iter()
+                .find(|c| c.name.eq_ignore_ascii_case("total"))
+                .expect("the column");
+            assert!(
+                total.generated.is_some(),
+                "the expression is lost, and the next rebuild writes it back \
+                 plain: {decl}"
+            );
+            assert!(total.generated_stored, "{decl}");
+
+            // And the rebuild really does put it back generated.
+            let mut draft = TableDraft::from_table(&before);
+            draft.columns[0].info.type_name = "NUMERIC".into();
+            let cs = diff(&before, &draft, SqlDialect::Sqlite);
+            db.run_ddl(MAIN, &cs.emit(), CancellationToken::new())
+                .await
+                .unwrap_or_else(|e| panic!("{e} — {:#?}", cs.emit()));
+            let sql: String = keeper
+                .query_row(
+                    "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'inv'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert!(
+                sql.to_uppercase().contains("GENERATED ALWAYS AS"),
+                "de-materialised by the rebuild: {sql}"
+            );
+        }
     }
 
     /// **And a `STORED` generated column can be *added* to a table that has
