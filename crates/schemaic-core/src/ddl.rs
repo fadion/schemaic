@@ -497,14 +497,28 @@ impl TableDraft {
         }
         // By `key_name`, for the same reason [`TableDraft::rename_column`] moves
         // references by it: mid-rename `info.name` can be another column's.
-        let name = self.columns.remove(idx).key_name;
+        let gone = self.columns.remove(idx);
+        let name = gone.key_name;
         self.primary_key.retain(|c| *c != name);
         self.indexes
             .retain(|ix| !ix.info.columns.iter().any(|c| c.name == name));
         self.foreign_keys
             .retain(|fk| !fk.info.columns.contains(&name));
+        // **The check predicate is the one collection not in `key_name` space**,
+        // and it has to be probed with the name the *server* knows. Nothing
+        // repoints a check in the draft — deliberately; it is left for the
+        // engine-specific repair at emit time — so it still holds the server's
+        // own text while `key_name` has already advanced to whatever the user
+        // renamed the column to. Probing with the new name found nothing: a
+        // column renamed *then* removed kept its check, `diff` compared it equal
+        // to the identical current one and emitted no `DropCheck`, and the plan
+        // was the bare `DROP COLUMN` this arm exists to stop. Both names are
+        // tried, since a column the user *added* has no server-side one.
+        let server_name = gone.original.as_deref().unwrap_or(name.as_str());
         self.check_constraints.retain(|ck| {
             repoint_check_column(&ck.info.expression, &name, &name, dialect).is_none()
+                && repoint_check_column(&ck.info.expression, server_name, server_name, dialect)
+                    .is_none()
         });
         // Removing a column frees its name for anyone mid-rename onto it.
         self.settle_key_names();
@@ -3962,6 +3976,7 @@ impl ChangeSet {
                     IndexReplay::Emit | IndexReplay::Verbatim(_) | IndexReplay::Skip => None,
                 })
                 .chain(rebuild_strands_a_trigger(&r.current, &r.draft))
+                .chain(rebuild_strands_a_generated_column(&r.current, &r.draft))
                 .chain(rebuild_cannot_restate(&r.current))
                 .chain(rebuild_refuses_a_virtual_table(&r.current))
                 .collect();
@@ -8685,6 +8700,54 @@ struct MovedColumn {
 /// All of them rather than the first, because a caller asking *"does this other
 /// statement name one"* has to ask about each: the first moved column is not
 /// necessarily the one a given trigger spells.
+/// A generated column whose expression names a column this plan moves, or
+/// `None`.
+///
+/// **The fifth reference kind, and the one nothing accounted for.**
+/// `remove_column` takes the key membership, the indexes, the foreign keys and
+/// the checks; `move_references` repoints the first three; `sqlite_rebuild_sql`
+/// repoints the checks. A *generated* column's expression is repointed by none
+/// of them and compared by nobody — `columns_equal(total, total)` is true, so
+/// `diff` raises nothing for it.
+///
+/// On SQLite that is a dead end rather than a refusal: the rebuild's step-2
+/// `CREATE TABLE "t__schemaic_rebuild" (… "total" INTEGER GENERATED ALWAYS AS
+/// (qty * 2))` is `no such column: qty`, the whole plan rolls back, and there is
+/// **no route to removing the column through the app at all** — word for word
+/// the failure `remove_column`'s own doc describes for the check case. So it is
+/// said here, with the generated column named, rather than met as a rollback
+/// nothing warned about.
+///
+/// Through [`repoint_check_column`] like the check arm, so the engine's own
+/// quoting and case rules decide what "names it" means rather than a
+/// substring test.
+fn rebuild_strands_a_generated_column(current: &TableInfo, draft: &TableDraft) -> Option<String> {
+    let moved = moved_columns(current, draft);
+    if moved.is_empty() {
+        return None;
+    }
+    for c in &draft.columns {
+        let Some(expr) = c.info.generated.as_deref() else {
+            continue;
+        };
+        // Not its own name: a generated column that names itself is not a thing
+        // SQLite accepts in the first place, and moving it is the user's own
+        // edit rather than a reference left dangling.
+        let own = c.original.as_deref().unwrap_or(&c.info.name);
+        let Some(m) = moved.iter().find(|m| {
+            m.name != own
+                && repoint_check_column(expr, &m.name, &m.name, SqlDialect::Sqlite).is_some()
+        }) else {
+            continue;
+        };
+        return Some(format!(
+            "Generated column {} computes from {}. A rebuild writes the table from              the model, and nothing rewrites that expression — SQLite refuses the              new table with \"no such column\" and the whole plan rolls back. Edit or              remove {} first.",
+            c.info.name, m.phrase, c.info.name,
+        ));
+    }
+    None
+}
+
 fn moved_columns(current: &TableInfo, draft: &TableDraft) -> Vec<MovedColumn> {
     let mut out: Vec<MovedColumn> = Vec::new();
     for c in &draft.columns {
@@ -13366,6 +13429,125 @@ mod tests {
                 .unwrap_or_else(|| panic!("{sql}"));
             let drop_col = sql.find("DROP COLUMN").unwrap_or_else(|| panic!("{sql}"));
             assert!(drop_ck < drop_col, "{sql}");
+        }
+
+        /// **The fifth reference kind: a generated column's expression.**
+        ///
+        /// `remove_column` takes the key membership, the indexes, the foreign
+        /// keys and the checks, and `move_references` repoints the first three —
+        /// a generated expression is repointed by none of them and compared by
+        /// nobody, since `columns_equal(total, total)` is true.
+        ///
+        /// **Scoped to the rebuild**, which is where it is a dead end rather
+        /// than a refusal. A bare drop or rename goes through SQLite's own
+        /// `ALTER TABLE` (`supports_change` takes both), and the engine answers
+        /// for itself — a rename rewrites the expression, a drop is refused with
+        /// `no such column`. A plan that forces the twelve steps, though —
+        /// anything alongside a retype — writes the table from the model, and
+        /// nothing rewrites that expression: step 2's `CREATE TABLE` is
+        /// `no such column: qty`, the whole plan rolls back, and there is no
+        /// route to the edit through the app at all. That is the dead end
+        /// `3a6ce83` fixed for checks, one reference kind over.
+        ///
+        /// Said with the generated column named, since editing it is the only
+        /// thing that makes the table editable again.
+        #[test]
+        fn a_generated_column_standing_on_a_moved_column_is_refused_by_name() {
+            let t = TableInfo {
+                name: "t".into(),
+                columns: vec![
+                    col("a", "INTEGER"),
+                    col("qty", "INTEGER"),
+                    ColumnInfo {
+                        name: "total".into(),
+                        type_name: "INTEGER".into(),
+                        generated: Some("qty * 2".into()),
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            };
+            // A retype forces the rebuild; the drop rides with it.
+            let mut d = TableDraft::from_table(&t);
+            d.columns[0].info.type_name = "TEXT".into();
+            d.remove_column(1, Sqlite);
+            let why = diff(&t, &d, Sqlite).unsupported();
+            assert_eq!(why.len(), 1, "{why:?}");
+            assert!(why[0].contains("total"), "{why:?}");
+            assert!(why[0].contains("qty"), "{why:?}");
+
+            // A rename in the same plan is the same reference, left spelling the
+            // old name.
+            let mut d = TableDraft::from_table(&t);
+            d.columns[0].info.type_name = "TEXT".into();
+            d.rename_column(1, "quantity");
+            let why = diff(&t, &d, Sqlite).unsupported();
+            assert_eq!(why.len(), 1, "{why:?}");
+            assert!(why[0].contains("renames"), "{why:?}");
+
+            // A rebuild that moves nothing the expression names is untouched —
+            // otherwise "refuse" is just a way of never editing the table.
+            let mut d = TableDraft::from_table(&t);
+            d.columns[0].info.type_name = "TEXT".into();
+            assert!(diff(&t, &d, Sqlite).unsupported().is_empty());
+            // Including renaming the generated column itself.
+            let mut d = TableDraft::from_table(&t);
+            d.columns[0].info.type_name = "TEXT".into();
+            d.rename_column(2, "sum");
+            assert!(
+                diff(&t, &d, Sqlite).unsupported().is_empty(),
+                "{:?}",
+                diff(&t, &d, Sqlite).unsupported()
+            );
+            // And the engine's own `ALTER TABLE` still answers for a bare edit,
+            // which is why this is the rebuild's question and not the draft's.
+            let mut d = TableDraft::from_table(&t);
+            d.remove_column(1, Sqlite);
+            assert!(diff(&t, &d, Sqlite).unsupported().is_empty());
+        }
+
+        /// **And a column renamed *then* removed is the same removal.**
+        ///
+        /// The probe took the removed `ColumnDraft`'s `key_name`, which
+        /// `rename_column` has advanced to the new name — while
+        /// `check_constraints` still hold the *server's* own text. So
+        /// `repoint_check_column("qty > 0", "quantity", …)` found nothing, the
+        /// check was retained, `diff` compared it equal to the identical current
+        /// one and emitted no `DropCheck`, and the plan was a bare `DROP COLUMN`
+        /// again — with the same three measured outcomes.
+        ///
+        /// The three arms above the check arm are right to use `key_name`: they
+        /// compare against draft-side collections, which `move_references` keeps
+        /// in that space. The check predicate is the one collection that is not,
+        /// deliberately — nothing repoints it in the draft, because a check is
+        /// left for the engine-specific repair at emit time.
+        ///
+        /// Both of the tests beside this one remove a column that was never
+        /// renamed.
+        #[test]
+        fn removing_a_renamed_column_still_drops_its_check() {
+            let t = TableInfo {
+                name: "t".into(),
+                columns: vec![col("a", "int"), col("qty", "int")],
+                check_constraints: vec![ck("qty_pos", "qty > 0")],
+                ..Default::default()
+            };
+            let mut d = TableDraft::from_table(&t);
+            d.rename_column(1, "quantity");
+            d.remove_column(1, MySql);
+            assert!(
+                d.check_constraints.is_empty(),
+                "the draft still holds it: {:?}",
+                d.check_constraints
+            );
+            let cs = diff(&t, &d, MySql);
+            assert!(
+                cs.changes
+                    .iter()
+                    .any(|c| matches!(c, Change::DropCheck { name } if name == "qty_pos")),
+                "{:#?}",
+                cs.changes
+            );
         }
 
         /// It is a column **reference** test, not a name match: a check is on
