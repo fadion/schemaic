@@ -968,7 +968,7 @@ fn for_each_record<R: std::io::Read>(
         }
         ImportFormat::Json => {
             let mut keys: Vec<String> = Vec::new();
-            json_records(r, &mut keys, usize::MAX, false, |fields, line| {
+            json_records(r, &mut keys, usize::MAX, None, |fields, line| {
                 on_record(Record::plain(fields), line)
             })?;
         }
@@ -1158,6 +1158,27 @@ impl<R: std::io::Read> std::io::Read for ArrayUnwrap<R> {
     }
 }
 
+/// Counts the bytes handed out, through a shared cell the caller keeps.
+///
+/// **So [`json_records`] can tell two things apart that look identical from
+/// inside the deserializer**: the byte cap arriving, and a file that really is
+/// truncated. Both are `Error::is_eof`. `read_sample` builds the
+/// `Read::take(SAMPLE_MAX_BYTES)` and discards the handle, and
+/// `StreamDeserializer` never gives its reader back, so the count is taken on
+/// the way past instead.
+struct Counting<R> {
+    inner: R,
+    seen: std::rc::Rc<std::cell::Cell<u64>>,
+}
+
+impl<R: std::io::Read> std::io::Read for Counting<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        self.seen.set(self.seen.get() + n as u64);
+        Ok(n)
+    }
+}
+
 /// Walk a JSON source's records.
 ///
 /// Both shapes stream a record at a time — an array via [`ArrayUnwrap`], JSON
@@ -1191,14 +1212,21 @@ impl<R: std::io::Read> std::io::Read for ArrayUnwrap<R> {
 /// tickets is inside it. `read_sample`'s own doc says "a truncated read can
 /// only make the preview *shorter*", and it could not.
 ///
-/// A whole-file walk passes `false`, so a genuinely truncated file still fails
+/// A whole-file walk passes `None`, so a genuinely truncated file still fails
 /// there rather than importing a prefix in silence — which is why this is a
 /// parameter and not an unconditional `is_eof` arm.
+///
+/// **It carries the cap rather than a flag because "did anything parse" was the
+/// wrong question.** With a first record over the cap — one object with a large
+/// text or base64 column — `objects` is still empty when EOF arrives, so the arm
+/// did not fire and the corruption message came back on a valid file. The reader
+/// knows the right fact and the deserializer does not, so [`Counting`] carries it
+/// out: the cap arriving and a short file are then two different answers.
 fn json_records<R: std::io::Read>(
     r: R,
     keys: &mut Vec<String>,
     limit: usize,
-    bounded: bool,
+    bounded: Option<u64>,
     mut on_record: impl FnMut(Vec<Field>, u64) -> bool,
 ) -> Result<bool, ImportError> {
     // Collected first so every record can be emitted against the *final* key set
@@ -1207,8 +1235,12 @@ fn json_records<R: std::io::Read>(
     let mut objects: Vec<serde_json::Map<String, serde_json::Value>> = Vec::new();
     let mut more = false;
 
-    let stream =
-        serde_json::Deserializer::from_reader(ArrayUnwrap::new(r)).into_iter::<serde_json::Value>();
+    let seen = std::rc::Rc::new(std::cell::Cell::new(0u64));
+    let stream = serde_json::Deserializer::from_reader(ArrayUnwrap::new(Counting {
+        inner: r,
+        seen: seen.clone(),
+    }))
+    .into_iter::<serde_json::Value>();
     for v in stream {
         // Past the limit nothing more needs reading — and for a large file that's
         // the whole point, so stop before deserializing another record.
@@ -1218,14 +1250,31 @@ fn json_records<R: std::io::Read>(
         }
         let v = match v {
             Ok(v) => v,
-            // The cap, not a broken file — and only when something parsed, so a
-            // file that is empty or truncated before its first record still
-            // reports rather than previewing nothing with `more = true`.
-            Err(e) if bounded && e.is_eof() && !objects.is_empty() => {
-                more = true;
-                break;
+            Err(e) => {
+                if let Some(cap) = bounded
+                    && e.is_eof()
+                {
+                    // The cap, not a broken file — and something parsed, so the
+                    // preview is simply shorter.
+                    if !objects.is_empty() {
+                        more = true;
+                        break;
+                    }
+                    // Nothing parsed, and the reader delivered every byte the
+                    // cap allows: the first record alone is bigger than the
+                    // preview reads. Say that, rather than repeating serde's
+                    // `EOF while parsing` — the file is fine and the whole-file
+                    // walk reads it.
+                    if seen.get() >= cap {
+                        return Err(ImportError::Read(format!(
+                            "its first JSON record is larger than the {} MiB the preview reads, \
+                             so there is nothing to show",
+                            cap / (1024 * 1024)
+                        )));
+                    }
+                }
+                return Err(ImportError::Read(e.to_string()));
             }
-            Err(e) => return Err(ImportError::Read(e.to_string())),
         };
         let serde_json::Value::Object(map) = v else {
             return Err(ImportError::Read(
@@ -1582,16 +1631,39 @@ fn xlsx_rows(
         } else {
             text
         };
-        // A cell outside the declared range is dropped rather than widening or
-        // shifting the row: every record has to carry the same field count, or
-        // the mismatch report becomes noise on every row after the widest one.
-        if let Some(i) = col.checked_sub(left).map(|i| i as usize)
-            && let Some(slot) = row.get_mut(i)
-        {
-            *slot = Some(text);
-            if broken {
-                errs.push(i);
+        // A cell *left* of the settled origin is still dropped: the slots are
+        // indexed relative to `left`, and moving it after the first row would
+        // shift every value already placed onto the wrong column.
+        let Some(i) = col.checked_sub(left).map(|i| i as usize) else {
+            continue;
+        };
+        // **A cell right of the settled width widens this row, and only this
+        // row.** It used to be dropped here, and the drop had no reporter:
+        // `trim_to_mapping`'s doc promised that "a worksheet's columns are fixed
+        // by its used range, so every row is already the same width and a count
+        // mismatch is a real one worth reporting" — true of the arrival, and
+        // that was the defect. Padding every row to `width` made
+        // `coerce_record`'s mismatch branch unreachable *by construction* for
+        // Excel, so a two-column header over three-column data (a streaming
+        // writer with no `<dimension>`, or a stale one) previewed two columns,
+        // said nothing in `missing_required` when the lost column was nullable,
+        // and reported the right number of rows having written two-thirds of the
+        // data. CSV refuses the identical file with `IssueKind::FieldCount`.
+        //
+        // Widening per row is what makes the count differ, which is what
+        // `coerce_record` already reports — the same path, and the same message,
+        // a ragged CSV row takes. `XLSX_MAX_COLS` still bounds it: the cells
+        // could not raise the ceiling while the geometry was open and cannot
+        // raise it now.
+        if i >= row.len() {
+            if i as u64 >= XLSX_MAX_COLS {
+                continue;
             }
+            row.resize(i + 1, None);
+        }
+        row[i] = Some(text);
+        if broken {
+            errs.push(i);
         }
     }
     // A sheet with no cells at all: no header to take, and no rows to emit.
@@ -1742,10 +1814,16 @@ fn read_xlsx_sample<R: std::io::Read>(
 fn read_json_sample<R: std::io::Read>(r: R, limit: usize) -> Result<Sample, ImportError> {
     let mut columns: Vec<String> = Vec::new();
     let mut rows: Vec<Vec<Field>> = Vec::new();
-    let more = json_records(r, &mut columns, limit, true, |fields, _| {
-        rows.push(fields);
-        true
-    })?;
+    let more = json_records(
+        r,
+        &mut columns,
+        limit,
+        Some(SAMPLE_MAX_BYTES),
+        |fields, _| {
+            rows.push(fields);
+            true
+        },
+    )?;
     Ok(Sample {
         columns,
         rows,
@@ -2136,10 +2214,13 @@ pub fn validate<R: std::io::Read>(
 fn trim_to_mapping(fields: &[Field], format: ImportFormat, mapping: &Mapping) -> usize {
     match format {
         ImportFormat::Json => fields.len().min(mapping.targets.len()),
-        // Excel sides with CSV, not JSON: a worksheet's columns are fixed by its
-        // used range, so every row is already the same width and a count
-        // mismatch is a real one worth reporting — there is no key union here
-        // that could widen a later row.
+        // Excel sides with CSV, not JSON: a worksheet's columns are settled by
+        // its header row, so a count mismatch is a real one worth reporting —
+        // there is no key union here that could widen a later row. The reader
+        // has to let a wider row *arrive* wider for that to mean anything: it
+        // used to pad and truncate every row to the settled width, which made
+        // this branch unreachable by construction and the loss it reports
+        // invisible. See the placement site in `xlsx_rows`.
         ImportFormat::Csv | ImportFormat::Xlsx => fields.len(),
     }
 }
@@ -2269,7 +2350,7 @@ pub fn row_iter<R: std::io::Read>(
         ImportFormat::Json => {
             let mut keys = Vec::new();
             let mut rows = Vec::new();
-            json_records(r, &mut keys, usize::MAX, false, |fields, n| {
+            json_records(r, &mut keys, usize::MAX, None, |fields, n| {
                 rows.push((Record::plain(fields), n));
                 true
             })?;
@@ -4498,6 +4579,95 @@ mod tests {
         }
     }
 
+    /// **A row wider than the settled width is reported, not silently shortened
+    /// — the same answer CSV gives the same file.**
+    ///
+    /// `trim_to_mapping`'s doc claims the guarantee this tests: *"Excel sides
+    /// with CSV, not JSON: a worksheet's columns are fixed by its used range, so
+    /// every row is already the same width and a count mismatch is a real one
+    /// worth reporting"*. It was right that every row arrived the same width,
+    /// and that was the defect — the reader padded and truncated every row to
+    /// `width` before `coerce_record` saw it, so the branch the doc points at
+    /// was unreachable by construction and the loss it was meant to report had
+    /// no other reporter: the preview showed two columns, `missing_required`
+    /// was silent (the lost column is nullable) and the import reported the
+    /// right number of rows having written two-thirds of the data.
+    ///
+    /// The fixture needs a *narrow* declaration, because `rust_xlsxwriter`
+    /// always writes a correct `<dimension>` and the first row would then settle
+    /// the full width.
+    #[test]
+    fn an_excel_row_wider_than_the_header_is_reported_like_a_ragged_csv_row() {
+        let wide = workbook(&[(
+            "Sheet1",
+            &[
+                &[Cell::Text("id"), Cell::Text("name")],
+                &[Cell::Num(1.0), Cell::Text("ann"), Cell::Text("a@x")],
+            ],
+        )]);
+        let bytes = restate_dimension(&wide, "A1:B2");
+        let cfg = xlsx_cfg(true, None);
+
+        let s = read_sample(&bytes[..], ImportFormat::Xlsx, &cfg, 10).expect("preview");
+        assert_eq!(s.columns, vec!["id".to_string(), "name".to_string()]);
+        assert_eq!(
+            s.rows[0].len(),
+            3,
+            "the third cell has to reach the preview to be reportable: {:?}",
+            s.rows[0]
+        );
+
+        // …and the same file through the same CSV shape, for the comparison the
+        // doc makes.
+        let t = tbl(&[("id", "int", true), ("name", "varchar", true)]);
+        let m = auto_map(&["id".into(), "name".into()], &t, true);
+        let v = validate(&bytes[..], ImportFormat::Xlsx, &cfg, &t, &m, MySql, 100)
+            .expect("validation runs");
+        assert!(
+            v.issues.iter().any(|i| matches!(
+                i.kind,
+                IssueKind::FieldCount {
+                    expected: 2,
+                    found: 3
+                }
+            )),
+            "the widened row was dropped in silence: {:?}",
+            v.issues
+        );
+    }
+
+    /// And the arrangement the drop site exists for stays silent: a title block
+    /// puts the used range's origin partway across, and those rows are *not*
+    /// ragged.
+    #[test]
+    fn a_title_block_offset_sheet_reports_no_field_count_mismatch() {
+        let bytes = workbook_at(
+            4,
+            2,
+            &[(
+                "Sheet1",
+                &[
+                    &[Cell::Text("id"), Cell::Text("name")],
+                    &[Cell::Num(1.0), Cell::Text("ann")],
+                    &[Cell::Num(2.0), Cell::Text("bob")],
+                ],
+            )],
+        );
+        let cfg = xlsx_cfg(true, None);
+        let t = tbl(&[("id", "int", true), ("name", "varchar", true)]);
+        let m = auto_map(&["id".into(), "name".into()], &t, true);
+        let v = validate(&bytes[..], ImportFormat::Xlsx, &cfg, &t, &m, MySql, 100)
+            .expect("validation runs");
+        assert!(
+            !v.issues
+                .iter()
+                .any(|i| matches!(i.kind, IssueKind::FieldCount { .. })),
+            "{:?}",
+            v.issues
+        );
+        assert_eq!(v.rows, 2);
+    }
+
     /// The one thing a sheet's declared extent can still make unbounded: the row
     /// buffer. Excel's own ceiling is 16,384 columns, so a workbook claiming
     /// more is refused rather than believed.
@@ -4849,6 +5019,56 @@ mod tests {
         assert!(s.rows.len() < 5, "the cap did not bite: {}", s.rows.len());
         assert!(s.more, "a cut-short preview has to say there is more");
         assert_eq!(s.columns, vec!["body".to_string(), "id".to_string()]);
+    }
+
+    /// **And when the cap lands inside the *first* record, the reason is the
+    /// cap — not corruption.**
+    ///
+    /// `531c756`'s arm asked "did anything parse", which conflates two facts
+    /// the code can tell apart: *did the cap arrive* and *did anything parse*.
+    /// One JSON object with a large text or base64 column left `objects` empty,
+    /// so the arm did not fire and the user got `Couldn't read the file: EOF
+    /// while parsing a string at line 1 column 8388608` — the exact message, on
+    /// the exact cause, that commit was written to remove, on a file the
+    /// unbounded walk reads end to end without complaint.
+    #[test]
+    fn a_json_first_record_over_the_cap_blames_the_cap_not_the_file() {
+        let big = "x".repeat(SAMPLE_MAX_BYTES as usize + 1024);
+        let json = format!(r#"[{{"id": 1, "body": "{big}"}}]"#);
+
+        let err = read_sample(json.as_bytes(), ImportFormat::Json, &cfg(true), 200)
+            .expect_err("there is genuinely nothing to preview");
+        let msg = err.to_string();
+        assert!(msg.contains("preview"), "{msg}");
+        assert!(!msg.contains("EOF while parsing"), "{msg}");
+
+        // The file itself is fine, which is the whole point: the unbounded walk
+        // reads it.
+        let mut n = 0;
+        for_each_record(json.as_bytes(), ImportFormat::Json, &cfg(true), |_, _| {
+            n += 1;
+            true
+        })
+        .expect("the file is not corrupt");
+        assert_eq!(n, 1);
+    }
+
+    /// The other half of the same question: a file that really is truncated
+    /// before its first record is still reported as the broken file it is.
+    #[test]
+    fn a_json_file_truncated_before_its_first_record_is_still_an_error() {
+        let err = read_sample(
+            br#"[{"a": "unterminated"#.as_slice(),
+            ImportFormat::Json,
+            &cfg(true),
+            200,
+        )
+        .expect_err("a truncated file is an error");
+        let msg = err.to_string();
+        assert!(
+            !msg.contains("preview"),
+            "blamed the cap for a short file: {msg}"
+        );
     }
 
     /// And a file that really is broken still says so — the reason the bound is
