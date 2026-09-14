@@ -57,6 +57,42 @@ pub fn ends_with_ignore_ascii_case(s: &str, suffix: &str) -> bool {
         && s.as_bytes()[s.len() - suffix.len()..].eq_ignore_ascii_case(suffix.as_bytes())
 }
 
+/// May this **resolved** program be spawned directly, or is there a shell in
+/// between? `Err` carries the line the panel shows instead of a session.
+///
+/// **The one precondition this module's rule 1 does not survive.** On Windows,
+/// `CreateProcess` on a `.cmd`/`.bat` image runs it through `cmd.exe` — the
+/// CVE-2024-24576 class — and the library this path spawns through
+/// (`portable-pty`) quotes an argument only when it holds a space, tab,
+/// newline, VT or `"`. So `&`, `|`, `^`, `%VAR%` and `<`/`>` pass through raw
+/// into a command line `cmd` then parses. Measured on Windows 11 with a two-line
+/// `shim.cmd`: a database named `db&echo PWNED` ran the second command.
+///
+/// That defeats the `--` terminator the DB-CLI argv puts in front of a
+/// server-supplied database name: `--` is *my_getopt*'s option terminator and
+/// means nothing to `cmd`. And `--` is the whole reason `mysql_shell_config` may
+/// pass such a name through at all — a name written by anyone who may
+/// `CREATE DATABASE` on a shared server.
+///
+/// A `.cmd` client on `PATH` is a supported configuration rather than a
+/// misconfiguration: `shell::which`'s own `PATHEXT` default spells out
+/// `.EXE;.CMD;.BAT;.COM`, and wrapper shims are how npm- and pipx-style
+/// launchers ship. So this refuses rather than pretending, the way
+/// [`psql_target`] does for a conninfo-shaped name.
+///
+/// Only the DB-CLI launchers ask. The user's own terminal shell is a shell by
+/// definition and is not this question.
+pub fn direct_spawn_verdict(resolved: &std::path::Path) -> Result<(), &'static str> {
+    const SHIM: &str = "The client found on your PATH is a .cmd/.bat shim, which Windows runs \
+        through cmd.exe — where a database name carrying '&' or '|' would be a second command. \
+        Point Settings at the real executable, or open a query tab instead.";
+    let is_shim = resolved
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("cmd") || e.eq_ignore_ascii_case("bat"));
+    if is_shim { Err(SHIM) } else { Ok(()) }
+}
+
 /// A URL the app may hand to the OS default browser, or `None`.
 ///
 /// Requires an `http`/`https` scheme (ASCII-case-insensitively — the scheme is
@@ -402,6 +438,40 @@ mod tests {
         // And the composition, since a boundary-safe predicate and a hostile
         // caller are two different subjects: the launcher answers a `Result`.
         assert!(openable_url("https:/\u{e9}").is_none());
+    }
+
+    /// **A `.cmd`/`.bat` client puts `cmd.exe` between the argv and the
+    /// process**, and `cmd` does not know what `--` means.
+    ///
+    /// The whole DB-CLI path rests on this module's rule 1 — "no shell is ever
+    /// in between" — which is what licenses `mysql_shell_config` to pass a
+    /// server-supplied database name through behind a `--` terminator at all.
+    /// On Windows that premise is false for a batch image, and a `.cmd` shim on
+    /// `PATH` is a supported configuration: `shell::which`'s own `PATHEXT`
+    /// default names `.CMD` and `.BAT`.
+    #[test]
+    fn a_batch_shim_is_refused_rather_than_spawned() {
+        use std::path::Path;
+        for shim in [
+            r"C:	ools\mysql.cmd",
+            r"C:	ools\mariadb.BAT",
+            "/opt/bin/psql.Cmd",
+        ] {
+            assert!(
+                direct_spawn_verdict(Path::new(shim)).is_err(),
+                "{shim} runs through cmd.exe"
+            );
+        }
+        // A real image is spawned directly, extension or none.
+        for real in [
+            r"C:\Program Files\MySQLin\mysql.exe",
+            "/usr/bin/psql",
+            r"C:	ools\sqlite3.com",
+        ] {
+            assert!(direct_spawn_verdict(Path::new(real)).is_ok(), "{real}");
+        }
+        // And a directory named `.cmd` is not the program's extension.
+        assert!(direct_spawn_verdict(Path::new("/opt/x.cmd/psql")).is_ok());
     }
 
     /// The same arithmetic at the other end of the string — the extension test

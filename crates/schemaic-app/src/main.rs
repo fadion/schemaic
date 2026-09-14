@@ -302,24 +302,42 @@ enum CliLauncher<'a> {
 /// Find a client: the first of `progs` on `PATH`, else the first one inside WSL.
 /// `None` when neither exists, which is the caller's cue to say so in the
 /// terminal rather than spawn something that dies immediately.
-fn resolve_cli<'a>(progs: &[&'a str]) -> Option<CliLauncher<'a>> {
+fn resolve_cli<'a>(progs: &[&'a str]) -> Result<CliLauncher<'a>, &'static str> {
     use schemaic_term::shell::which;
     for prog in progs {
-        if which(prog).is_some() {
-            return Some(CliLauncher::Native(prog));
+        // **Asked of what `which` resolved, not of the name.** A `.cmd`/`.bat`
+        // image is run by `cmd.exe`, which does not know what the `--`
+        // terminator in front of a server-supplied database name means — see
+        // `launch::direct_spawn_verdict`. The refusal is a `Result` the caller
+        // cannot skip, which is the same shape every other refusal on this path
+        // has.
+        if let Some(path) = which(prog) {
+            launch::direct_spawn_verdict(&path)?;
+            return Ok(CliLauncher::Native(prog));
         }
     }
-    which("wsl.exe")
-        .is_some()
-        .then(|| CliLauncher::Wsl(progs[0]))
+    match which("wsl.exe") {
+        // The WSL launcher is `wsl.exe` itself; the client name rides in its
+        // argv and is never a Windows image.
+        Some(_) => Ok(CliLauncher::Wsl(progs[0])),
+        None => Err(NO_CLIENT),
+    }
 }
+
+/// The line the panel shows when no client was found at all — as opposed to one
+/// found and refused, which says why.
+const NO_CLIENT: &str = "No client found (PATH or WSL).";
 
 /// Find a client on `PATH` only, with **no WSL fallback** — see [`sqlite_shell`]
 /// for the one client that must not have one.
-fn resolve_native_cli(prog: &str) -> Option<CliLauncher<'_>> {
-    schemaic_term::shell::which(prog)
-        .is_some()
-        .then_some(CliLauncher::Native(prog))
+fn resolve_native_cli(prog: &str) -> Result<CliLauncher<'_>, &'static str> {
+    match schemaic_term::shell::which(prog) {
+        Some(path) => {
+            launch::direct_spawn_verdict(&path)?;
+            Ok(CliLauncher::Native(prog))
+        }
+        None => Err(NO_CLIENT),
+    }
 }
 
 /// Build the terminal shell that launches the MySQL/MariaDB CLI for `conn`,
@@ -334,8 +352,13 @@ fn mysql_shell(
     conn: &schemaic_core::connection::Connection,
     db: Option<&str>,
 ) -> Result<schemaic_term::ShellConfig, &'static str> {
-    let launcher =
-        resolve_cli(&["mysql", "mariadb"]).ok_or("No mysql/mariadb client found (PATH or WSL).")?;
+    let launcher = resolve_cli(&["mysql", "mariadb"]).map_err(|e| {
+        if e == NO_CLIENT {
+            "No mysql/mariadb client found (PATH or WSL)."
+        } else {
+            e
+        }
+    })?;
     mysql_shell_config(launcher, conn, db)
 }
 
@@ -345,7 +368,13 @@ fn psql_shell(
     conn: &schemaic_core::connection::Connection,
     db: &str,
 ) -> Result<schemaic_term::ShellConfig, &'static str> {
-    let launcher = resolve_cli(&["psql"]).ok_or("No psql client found (PATH or WSL).")?;
+    let launcher = resolve_cli(&["psql"]).map_err(|e| {
+        if e == NO_CLIENT {
+            "No psql client found (PATH or WSL)."
+        } else {
+            e
+        }
+    })?;
     psql_shell_config(launcher, conn, db)
 }
 
@@ -359,8 +388,15 @@ fn psql_shell(
 /// the path to `/mnt/c/…`, which nothing here does yet.
 fn sqlite_shell(
     conn: &schemaic_core::connection::Connection,
-) -> Option<schemaic_term::ShellConfig> {
-    resolve_native_cli("sqlite3").map(|l| sqlite_shell_config(l, conn))
+) -> Result<schemaic_term::ShellConfig, &'static str> {
+    let launcher = resolve_native_cli("sqlite3").map_err(|e| {
+        if e == NO_CLIENT {
+            "No sqlite3 client found on PATH."
+        } else {
+            e
+        }
+    })?;
+    Ok(sqlite_shell_config(launcher, conn))
 }
 
 /// Which database `psql` should open.
@@ -11094,9 +11130,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                 }
                 // `db` is ignored: a SQLite connection's one database is the file
                 // itself, which the config already names.
-                schemaic_db::Engine::Sqlite => {
-                    sqlite_shell(&conn).ok_or("No sqlite3 client found on PATH.")
-                }
+                schemaic_db::Engine::Sqlite => sqlite_shell(&conn),
                 schemaic_db::Engine::MySql => mysql_shell(&conn, db.as_deref()),
             };
             // Badge the panel only for a session that really is a client. The
@@ -13981,7 +14015,7 @@ mod app_tests {
     fn sqlite_client_is_resolved_natively_only() {
         assert!(matches!(
             resolve_native_cli("sqlite3"),
-            None | Some(CliLauncher::Native("sqlite3"))
+            Err(_) | Ok(CliLauncher::Native("sqlite3"))
         ));
     }
 
