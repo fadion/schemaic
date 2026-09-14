@@ -849,6 +849,39 @@ impl GridState {
         self.current_statement().is_some()
     }
 
+    /// May the gutter offer **Delete row** and **Duplicate row**?
+    ///
+    /// `EditModel::insert_target` answers this from the result's provenance and
+    /// structurally cannot see a join that projects only one table's columns —
+    /// `SELECT o.* FROM orders o JOIN order_lines l ON …` gives every column an
+    /// `orders` origin, so a 1:many join draws N display rows for one parent and
+    /// Delete row destroyed that parent while the other N-1 rows stayed on
+    /// screen. One row affected, so the write-back's 1-row net passes and the
+    /// report says one row deleted.
+    ///
+    /// Only the **statement** knows, and the grid is the surface that has it.
+    /// `edit::reads_one_relation` answering `None` — a shape provenance will not
+    /// be trusted on — is read as "no", the same direction every other refusal
+    /// on this path takes; the *cell*-level edits are untouched either way.
+    ///
+    /// **It over-blocks, deliberately.** A second relation reached only through
+    /// a subquery (`… WHERE id IN (SELECT order_id FROM flagged)`) multiplies no
+    /// rows and would be safe, and it is refused here too, because the question
+    /// the count answers is "could a row of this result stand for more than one
+    /// row of that table" and a `FROM`-list walk cannot tell the two apart. The
+    /// cost is a gesture the user can still perform in SQL; the cost of the
+    /// other direction is a parent row destroyed with a success report.
+    fn row_gestures_are_safe(&self) -> bool {
+        match self.current_statement() {
+            Some(sql) => {
+                schemaic_core::edit::reads_one_relation(&sql, self.dialect).unwrap_or(false)
+            }
+            // No statement to ask about — a table opened from the tree, or a
+            // pinned result. `insert_target`'s own answer stands.
+            None => true,
+        }
+    }
+
     /// Append a cell-derived condition (`col = 'val'` / `IS NULL` / negated) to the
     /// filter with ` AND `, then apply. Used by the cell "Filter by / Exclude" menu.
     fn add_filter_condition(&self, ci: usize, value: Option<&str>, negate: bool) {
@@ -8771,7 +8804,7 @@ fn gutter_menu(gs: GridState, pos: usize, pending: Option<usize>) -> Vec<MenuEnt
     // Row actions, on the same terms the cell menu offers them: real (already
     // committed) rows of a single writable table.
     let model = gs.edit_model.get_untracked();
-    if pending.is_none() && model.insert_target().is_some() {
+    if pending.is_none() && model.insert_target().is_some() && gs.row_gestures_are_safe() {
         // **Every selected row, not just the one clicked.** The gesture that
         // opened this menu selected rows, and the attach entry below already
         // counts them — narrowing to one here would have the same menu describe

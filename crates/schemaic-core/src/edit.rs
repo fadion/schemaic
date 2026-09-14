@@ -281,6 +281,34 @@ impl EditModel {
     }
 }
 
+/// Does `sql` read exactly one relation? `None` when the statement's shape is
+/// one provenance cannot be trusted on, which is the same refusal
+/// [`crate::intel::provenance_sources`] makes.
+///
+/// **The half `insert_target` structurally cannot see.** That method asks over
+/// the result's *origin* tables — the provenance of the projected columns — and
+/// a join contributing no column to the select list leaves exactly one group:
+///
+/// ```sql
+/// SELECT o.* FROM orders o JOIN order_lines l ON l.order_id = o.id
+/// ```
+///
+/// Order 7 with three line items draws **three** display rows, every column of
+/// every one of them originating in `orders`, so `origin_tables == 1` and the
+/// gutter offers **Delete row**. It issues `DELETE FROM orders WHERE id = 7`,
+/// which affects exactly one row — so the write-back's 1-row net passes, the
+/// report says one row deleted, the parent the other two rows also stand for is
+/// gone, and those two rows are still on screen. Duplicate row is the same gate.
+/// All three engines report provenance per *column*, so the shape is identical
+/// on every one.
+///
+/// The statement is the only thing that knows, and the model is built from the
+/// result. So the caller that has the SQL asks this and gates the row gestures
+/// with it.
+pub fn reads_one_relation(sql: &str, dialect: SqlDialect) -> Option<bool> {
+    crate::intel::provenance_sources(sql, dialect).map(|s| s.len() == 1)
+}
+
 /// If every result column has a real origin from a *single* base table (so the
 /// whole row can be re-`SELECT`ed by real column name), return the template for
 /// re-fetching edited rows after a commit. `None` — an expression/aggregate
@@ -3413,6 +3441,52 @@ mod tests {
         // for either table, so `tables` is empty and there is nothing to aim at.
         let m = analyze_edit(&joined, |_: &str, _: Option<&str>, _: &str| None);
         assert!(m.insert_target().is_none());
+    }
+
+    /// **The half `insert_target` structurally cannot see: a join that projects
+    /// only one table's columns.**
+    ///
+    /// `SELECT o.* FROM orders o JOIN order_lines l ON l.order_id = o.id` gives
+    /// every column an `orders` origin, so `origin_tables == 1`, so the gutter
+    /// offered **Delete row** — and on a 1:many join one display row destroys
+    /// the parent the other N stand for. It affects exactly one row, so the
+    /// 1-row net passes and the report says one row deleted.
+    ///
+    /// The model is built from the *result*; only the statement knows. The two
+    /// tests beside this one both project a column from **both** tables, which
+    /// is the shape neither of them reaches.
+    #[test]
+    fn a_join_that_projects_only_one_tables_columns_is_not_a_row_target() {
+        for d in [SqlDialect::MySql, SqlDialect::Postgres, SqlDialect::Sqlite] {
+            assert_eq!(
+                reads_one_relation(
+                    "SELECT o.* FROM orders o JOIN order_lines l ON l.order_id = o.id",
+                    d
+                ),
+                Some(false),
+                "{d:?}"
+            );
+            // The negative twin, so the gate cannot decay into "never".
+            assert_eq!(
+                reads_one_relation("SELECT * FROM orders", d),
+                Some(true),
+                "{d:?}"
+            );
+            assert_eq!(
+                reads_one_relation("SELECT id, upper(name) FROM orders WHERE id = 1", d),
+                Some(true),
+                "a subquery-free computed column is not a second relation: {d:?}"
+            );
+            // A shape provenance refuses outright is `None` — "cannot tell",
+            // which the caller reads as its own conservative answer rather than
+            // as a yes.
+            assert_eq!(
+                reads_one_relation("SELECT id FROM a UNION SELECT id FROM b", d),
+                None,
+                "{d:?}"
+            );
+            assert_eq!(reads_one_relation("this is not sql", d), None, "{d:?}");
+        }
     }
 
     /// The looseness that `tables.len() == 1` was standing in for, and that the
