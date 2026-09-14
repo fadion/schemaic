@@ -413,6 +413,15 @@ impl Stamp {
     pub fn has_offset(&self) -> bool {
         !self.tail.is_empty()
     }
+    /// The timezone tail as the source wrote it (`"+02"`, `"Z"`), or `""`.
+    ///
+    /// Beside [`Stamp::has_offset`] because the pair is one question: *did
+    /// whoever produced this value state an instant, and which one*. `set_date`
+    /// keeps a stated offset rather than replacing it, and could not while the
+    /// value's own was unreadable.
+    pub fn offset(&self) -> &str {
+        &self.tail
+    }
     /// Replace the timezone tail. **Replace, not keep**: an offset qualifies a
     /// particular instant, so writing a *new* time under the old value's offset
     /// states an instant that is hours away from the one intended — which is what

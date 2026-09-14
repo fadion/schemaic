@@ -453,21 +453,37 @@ pub fn toggle_set_member(value: &str, member: &str, members: &[String]) -> Strin
 /// had moved. Every test asked one of the two functions at a time; nothing
 /// composed them.
 ///
-/// **What this costs, stated rather than hidden.** An offset qualifies a
-/// particular instant, and the client's is *today's*: pick a July day in January
-/// from Berlin and the value is stated `+01`, an hour from the July wall clock
-/// the field shows. Recomputing it needs the zone's DST rules, which `core` has
-/// no business carrying, and the string alone cannot tell a server-rendered
-/// offset from a client-asserted one. So this is a choice between two wrong
-/// answers, and it takes the one that is wrong only across a DST boundary over
-/// the one that was wrong whenever the client and the server sit in different
-/// zones.
+/// **Whose offset, and what it costs.** An offset qualifies a particular
+/// instant, so replacing one moves the instant. The value's own offset is kept
+/// when it has one, and `offset` is used only when it has none.
+///
+/// That reading was available all along and the doc here denied it — "the string
+/// alone cannot tell a server-rendered offset from a client-asserted one" — while
+/// [`crate::date::Stamp::has_offset`] tells apart the two cases that actually
+/// differ. A PostgreSQL `timestamptz` always renders *with* a tail, so stating
+/// the client's over it was wrong for every cell the grid had loaded whenever
+/// client and server sit in different zones: Berlin server, UTC client,
+/// `2024-01-15 11:30:00+01` picked onto the 16th became `11:30:00+00:00` and
+/// re-read as 12:30. A MySQL `TIMESTAMP` renders *without* one and still resolves
+/// one, so a bare wall clock there is read in the server's session zone and
+/// stores an instant the field never showed — which is why `offset` exists, and
+/// it is exactly the no-tail case.
+///
+/// What is left is the DST case *within* one zone: pick a July day onto a January
+/// value from Berlin and the value keeps `+01`, an hour from the July wall clock.
+/// Recomputing that needs the zone's DST rules, which `core` has no business
+/// carrying. It is the smaller of the errors the old doc weighed, and now the
+/// only one.
 pub fn set_date(editor: &CellEditor, current: &str, date: Date, offset: &str) -> String {
     // A column that cannot resolve an offset is given none: a tail the
     // destination discards would suggest the instant was pinned when it was not
     // — `set_now`'s own reasoning, and the half of it that has not changed.
+    let carried = Stamp::parse(current).filter(Stamp::has_offset);
     let tail = match editor {
-        CellEditor::DateTime(Zoned::Offset) => offset,
+        CellEditor::DateTime(Zoned::Offset) => match &carried {
+            Some(s) => s.offset(),
+            None => offset,
+        },
         _ => "",
     };
     match editor {
@@ -1084,18 +1100,26 @@ mod tests {
         );
     }
 
-    /// **The old value's offset is not carried, and the client's is stated.**
+    /// **An offset the value carries is kept; a value with none is given the
+    /// client's.**
     ///
-    /// Carrying the old one restates the wall clock an hour out across a DST
-    /// boundary — `2024-01-15 11:30:00+01` picked onto 15 July would come back
-    /// `11:30:00+01`, which a Berlin server stores as `10:30Z` and renders back
-    /// as `12:30:00+02`. But *dropping* it was wrong the other way: on a column
-    /// that resolves an offset, a bare wall clock is handed to the server to
-    /// read in **its** session zone, so a client and server in different zones
-    /// stored an instant the field had never shown. See `set_date`'s doc for
-    /// why there is no third answer without the zone's DST rules.
+    /// The third answer the doc said did not exist. Stating the client's offset
+    /// over a value that already had one is wrong whenever client and server sit
+    /// in different zones — for *every* cell the grid loaded, since a
+    /// `timestamptz` always renders with a tail: server in Berlin, client on
+    /// UTC, `2024-01-15 11:30:00+01` picked onto the 16th came back
+    /// `11:30:00+00:00`, and the re-read showed 12:30. Dropping it was wrong the
+    /// other way on a column that renders *without* a tail and still resolves one
+    /// (MySQL's `TIMESTAMP`): a bare wall clock is read in the server's session
+    /// zone, so two zones stored an instant the field never showed.
+    ///
+    /// `has_offset` separates exactly those two, so each gets the right answer
+    /// rather than one of them getting the wrong one. What is left is the DST
+    /// case *within* one zone — picking a July day onto a January value keeps
+    /// `+01` — which is the smaller error the doc already argued for, and the
+    /// only one the zone's rules could fix.
     #[test]
-    fn picking_a_day_states_the_clients_offset_not_the_values() {
+    fn picking_a_day_keeps_an_offset_the_value_stated() {
         assert_eq!(
             set_date(
                 &zoned(),
@@ -1103,11 +1127,18 @@ mod tests {
                 day(2024, 7, 15),
                 "+02:00"
             ),
-            "2024-07-15 11:30:00+02:00"
+            "2024-07-15 11:30:00+01"
         );
-        // A `Z` is an offset too, and it is replaced like any other.
+        // A `Z` is an offset too, and it is kept like any other.
         assert_eq!(
             set_date(&zoned(), "2024-01-15 11:30:00Z", day(2024, 7, 15), "+02:00"),
+            "2024-07-15 11:30:00Z"
+        );
+        // A column that resolves an offset over a value that states none —
+        // MySQL's `TIMESTAMP`, rendered in the session zone — still gets the
+        // client's, which is the half `6c00963` was right about.
+        assert_eq!(
+            set_date(&zoned(), "2024-01-15 11:30:00", day(2024, 7, 15), "+02:00"),
             "2024-07-15 11:30:00+02:00"
         );
         // A column that cannot resolve one is given none — the half of the old
@@ -1122,8 +1153,10 @@ mod tests {
             ),
             "2024-01-15 23:59:59.250"
         );
-        // A value with no time of day gains midnight, and the tail follows the
-        // column rather than the value.
+        // A value with no time of day gains midnight.
+        // A value with no *time of day* stated no instant, so there is no offset
+        // to keep — `Stamp::parse` does not read a tail off a bare date — and the
+        // client's is what the new midnight is in.
         assert_eq!(
             set_date(&zoned(), "2024-01-15+01", day(2024, 7, 15), "+02:00"),
             "2024-07-15 00:00:00+02:00"

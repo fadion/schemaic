@@ -5751,8 +5751,12 @@ existing prose was left alone.
       by text, first/lowest tier wins, and a candidate equal to the typed prefix is dropped), scores
       each by `fuzzy_score` plus `recency_bonus`, and sorts by tier, then score, then length,
       capped at `MAX_ROWS`. `SchemaIndex`/`ColMeta`/`Suggestion`/`SuggestKind`/`KeyKind` are the
-      vocabulary; `worth_offering`, `statement_identifiers`, `database_suggestion_visible` and
-      `snippet_abbrev_rows` are the leaf rules it composes. **It is here because it could not be
+      vocabulary; `worth_offering` and `database_suggestion_visible` are the leaf rules `rank`
+      itself composes. **`statement_identifiers` and `snippet_abbrev_rows` are not** — they are the
+      *caller*'s leaf rules, called directly by `completion::recompute_completions` and handed back
+      in as `RankInput::used` and `RankInput::snippets`. They live in this module for the same
+      reason the ranking does and not because `rank` reaches them: they are decisions, and in
+      `completion.rs` nothing could test them. **It is here because it could not be
       tested where it was** — all of it was the middle of `completion::recompute_completions`, a
       519-line function taking `&Editor`, so the tier rules, the FK demotion, the last-table-in-scope
       bias, qualifier resolution and the comparator were unreachable from any test, and two
@@ -7225,7 +7229,9 @@ existing prose was left alone.
   itself a symptom. Separately, Windows populates its root program lazily, so a certificate every
   browser accepts can still fail `verify-ca` with `UnknownIssuer`, and one installed during a
   session needs a restart to be seen.
-  `import_rows` is the bulk-load path (both engines): one transaction of batched multi-row
+  `import_rows` is the bulk-load path, and it has an arm for **all three** engines — `Engine::Postgres`
+  and `Engine::Sqlite` hand off to `pg::import_rows`/`sqlite::import_rows` and `Engine::MySql` falls
+  through to the body below, which is why the paragraphs that follow are about MySQL's: one transaction of batched multi-row
   `INSERT`s pulled from a `RowSource` iterator, each batch required to affect exactly as many rows
   as it carried — the `commit_writes` 1-row safety net scaled to a file, without its
   statement-per-row round-trips.
@@ -9180,9 +9186,20 @@ existing prose was left alone.
     `.keyboard_navigable().request_focus(|| {})` again; that pair is what left every modal
     unclosable from the keyboard while a field was focused.
     Also the **shared modal form chrome** every modal wears — `form_setting`/`form_section`/
-    `form_separator`/`form_gap()`/`control_button`/`footer_button`/`modal_footer`. Manage
+    `form_separator`/`form_gap()`/`control_button`/`modal_footer`. Manage
     Connections set that shape and Import followed it; a new modal builds on these rather
     than copying them a third time.
+    **There is no `footer_button` any more.** Every modal with a footer bar wears the filled
+    `action_button`, and the text-only button that sat beside it at a smaller padding left with the
+    last of those footers. What remains of that family is `dialog_button`, the **only** text-button
+    family in the app, and its callers are the two question dialogs — the transaction prompt and the
+    confirm modal, which each carried a private copy of it before (same colour-fn signature, same
+    hover, same radius, differing only in the padding that was the reason they were not already
+    sharing one). Its `ring` is required, like `modal_title`'s: these were the last ring-less buttons
+    in the app, and one of the two dialogs they build is the transaction prompt, where Escape is
+    deliberately dead — so with no ring published no key did anything at all and the user had to
+    reach for the mouse to answer a question about their own uncommitted writes. A new footer takes
+    `action_button`; it does not revive the smaller one.
     **`modal_footer_split` shrinks the status and never the actions.** A flex item's `min-width` is
     `auto`, so a long sentence in the left slot refuses to compress and pushes what follows it out
     of the panel — which is how the binary panel's load line shipped its three buttons off the
@@ -14698,9 +14715,14 @@ existing prose was left alone.
     self-rescheduling ticks: the signal is disposed at shutdown and a surviving timer would read
     freed memory. The feed is a `GithubSource` on `https://github.com/fadion/schemaic`, read
     anonymously — 60 requests/hour per IP, and a round costs two requests (a releases listing and a
-    ~760-byte manifest), so three-hourly polling stays three orders of magnitude clear of the limit.
-    It is not shorter because nothing would be gained: the thing being waited for is a human tagging
-    a release.
+    ~760-byte manifest), so three-hourly polling spends 16 requests a day against the 1,440 the
+    limit allows: the two numbers, rather than an order-of-magnitude claim a reviewer has to
+    recompute. (It read *three* orders of magnitude for a while; the ratio is ~90×.) It is not shorter
+    because nothing would be gained: the thing being waited for is a human tagging a release.
+    **The pin is looser than the prose**: `the_recheck_interval_stays_clear_of_the_anonymous_rate_limit`
+    asserts only `per_hour < 6.0` — a tenth of the limit — so an interval shortened to 20 minutes
+    would keep the test green while the margin named here stopped being true. It is worth knowing
+    which of the two is the guard.
     `UpdateManager::new` *failing* is how "not a Velopack install" is detected, and is what feeds
     `check_gate`; a downgrade (`UpdateInfo::IsDowngrade` — a yanked release, or a dev build ahead of
     the tag) is skipped rather than walking the user backwards silently. The apply action builds its
