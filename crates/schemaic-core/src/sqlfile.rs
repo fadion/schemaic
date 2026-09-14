@@ -152,12 +152,18 @@ pub fn decode(bytes: &[u8]) -> SqlText {
 /// **and any file `decode` read without loss** — a lossy read has no inverse,
 /// which is what [`SqlFormat::lossy`] is for.
 pub fn encode(text: &str, format: SqlFormat) -> String {
+    // A stray `\r\n` already in the buffer — pasted from another Windows
+    // application, which floem inserts verbatim — is normalised out **on both
+    // branches**. On the CRLF branch that stops it doubling into `\r\r\n`; on
+    // the LF branch it stops an LF file silently becoming a mixed-ending one,
+    // which is what made the file unsavable: the bytes written held a `\r\n`,
+    // `decode` strips it on the way back, and the guard then differed from the
+    // tab's own text for the life of the tab.
+    let text = text.replace("\r\n", "\n");
     let body = if format.crlf {
-        // Guard against a stray `\r\n` already in the buffer (pasted from
-        // somewhere) doubling into `\r\r\n`.
-        text.replace("\r\n", "\n").replace('\n', "\r\n")
+        text.replace('\n', "\r\n")
     } else {
-        text.to_string()
+        text
     };
     if format.bom {
         format!("\u{FEFF}{body}")
@@ -320,8 +326,15 @@ pub fn expected_disk_text(
 ///
 /// The bytes as they are now against the text the tab holds — see
 /// [`expected_disk_text`] for why it is the text.
+///
+/// **Both sides read the same way.** `decode` normalises `\r\n` out of the
+/// file; the expectation is a *buffer*, and a buffer can hold one — floem
+/// inserts a Windows paste verbatim. Comparing the two raw meant the guard
+/// fired on the bytes the tab itself had just written, permanently, with a
+/// message about changes nobody had made. See
+/// `a_pasted_crlf_does_not_make_the_file_unsavable`.
 pub fn changed_on_disk(now: &[u8], expected: &str) -> bool {
-    decode(now).text != expected
+    decode(now).text != expected.replace("\r\n", "\n")
 }
 
 /// [`same_file`]'s rule with the platform's answer passed in, so both sides of it
@@ -796,6 +809,53 @@ mod tests {
                 String::from_utf8_lossy(bytes)
             );
         }
+    }
+
+    /// **The composition the case above cannot reach: a buffer the *editor*
+    /// produced, not one `decode` did.**
+    ///
+    /// The test above feeds `changed_on_disk` an expectation it built with
+    /// `decode`, so a `\r\n` has already been normalised out before the
+    /// assertion is made. A tab's text does not come from `decode` alone — a
+    /// paste from any other Windows application arrives with CRLF and floem
+    /// inserts it verbatim. The guard then compared that buffer against a decode
+    /// of the very bytes the previous Save had written from it, and the two
+    /// differ by construction: **every later Save of an LF file was refused, for
+    /// the life of the tab**, with a message about changes nobody had made, and
+    /// the recovery it offered (reload) discards the edit. Save As to the same
+    /// path is refused too.
+    ///
+    /// Two properties, both over the round trip rather than over either half:
+    /// an LF file stays LF whatever the buffer holds, and the guard reads its
+    /// own output as unchanged.
+    #[test]
+    fn a_pasted_crlf_does_not_make_the_file_unsavable() {
+        let pasted = "SELECT 1;\nSELECT 2;\r\nSELECT 3;\n";
+        for format in [
+            SqlFormat::default(),
+            SqlFormat {
+                crlf: false,
+                bom: true,
+                lossy: false,
+            },
+        ] {
+            let bytes = encode(pasted, format);
+            assert!(!bytes.contains("\r\n"), "an LF file stays LF: {:?}", bytes);
+            assert!(
+                !changed_on_disk(bytes.as_bytes(), pasted),
+                "the guard fired on the tab's own bytes: {format:?}"
+            );
+        }
+        // And a CRLF file is unaffected — the branch that already guarded
+        // against a stray `\r\n` doubling into `\r\r\n`.
+        let crlf = SqlFormat {
+            crlf: true,
+            bom: false,
+            lossy: false,
+        };
+        let bytes = encode(pasted, crlf);
+        assert!(!bytes.contains("\r\r\n"));
+        assert!(!changed_on_disk(bytes.as_bytes(), pasted));
     }
 
     /// **A Save As names somebody else's file**, and the user has already
