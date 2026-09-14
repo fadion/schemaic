@@ -1763,8 +1763,11 @@ fn db_node(conn: ConnNode, ctx: SchemaTreeCtx) -> impl IntoView {
     // force-expands the node and narrows its tables to name matches.
     let key_children = key.clone();
     let database = conn.database.clone();
-    // Lower-cased display name, for the "the DB itself matched" check below.
-    let db_name_lc = conn.name.to_lowercase();
+    // The display name, for the "the DB itself matched" check below. Kept as
+    // it is written rather than lower-cased here: the comparison is
+    // `object_name_matches`', and hoisting half of it out was how this row came
+    // to spell the predicate itself.
+    let db_name = conn.name.clone();
     let ot_tables = open_table;
     let otc_tables = open_table_col;
     let toggle_tables = on_toggle;
@@ -1790,7 +1793,16 @@ fn db_node(conn: ConnNode, ctx: SchemaTreeCtx) -> impl IntoView {
             let filt = filt.trim().to_lowercase();
             let filtering = !filt.is_empty();
             // The DB itself matched → show all its tables (not just matching ones).
-            let db_hit = filtering && db_name_lc.contains(&filt);
+            //
+            // **Through the one predicate**, like every other row. This was the
+            // tenth hand-spelled filter and it survived `76df9d0`'s fold of the
+            // other nine — hoisting the `to_lowercase()` into its own binding
+            // (the allocation-free shape that campaign recommended) put the two
+            // halves on separate lines, where the gate's single literal needle
+            // could not see them. `nav_rows` asks the same question with
+            // `object_name_matches`, and this file's own rule is that the two
+            // stay bug-for-bug identical.
+            let db_hit = filtering && object_name_matches(&db_name, &filt);
             if !open && !filtering {
                 return empty().into_any();
             }
@@ -3906,6 +3918,44 @@ mod tests {
              schema-search surface matches through `schema::object_name_matches` \
              (or `name_survives`, which owns the empty-filter case), or the tree \
              drifts from the palette"
+        );
+
+        // **And the same question asked in two lines.** The needle above is a
+        // single literal, so the spelling that survived the fold was the one
+        // that bound the lower-cased name first — the allocation-free shape the
+        // same campaign recommended — and the two halves were never adjacent.
+        // Anything reaching for `to_ascii_lowercase`, `eq_ignore_ascii_case` or
+        // `starts_with` was equally invisible. So the subject is now every line
+        // that *compares something to the filter*: it has to name one of the
+        // shared predicates.
+        const SANCTIONED: [&str; 6] = [
+            "object_name_matches",
+            "name_survives",
+            "db_survives",
+            "namespace_survives",
+            "matches_search",
+            "any_column_matches",
+        ];
+        const COMPARING: [&str; 5] = [
+            ".contains(",
+            ".starts_with(",
+            ".ends_with(",
+            "eq_ignore_ascii_case(",
+            ".find(",
+        ];
+        let offenders: Vec<&str> = body
+            .lines()
+            .filter(|l| l.contains("&filt") || l.contains("&filter"))
+            .filter(|l| COMPARING.iter().any(|v| l.contains(v)))
+            .filter(|l| !SANCTIONED.iter().any(|p| l.contains(p)))
+            .collect();
+        assert!(
+            offenders.is_empty(),
+            "a schema-tree row compares a name to the filter without going \
+             through the shared predicate — the tree and `nav_rows` then spell \
+             one question two ways, which is the divergence `76df9d0` set out to \
+             remove:\n{}",
+            offenders.join("\n")
         );
     }
 
