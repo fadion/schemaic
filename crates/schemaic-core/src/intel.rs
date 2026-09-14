@@ -3647,6 +3647,13 @@ mod colres {
         out.append(&mut c.gb);
     }
 
+    /// CTE name (lower) → its output columns and the byte range of its body,
+    /// which is `Src::defines`.
+    ///
+    /// **`None` for a `RECURSIVE` list**, where a body naming itself is the
+    /// construct rather than an error — see `pre_visit_query`.
+    type Ctes = HashMap<String, (Cols, Option<(usize, usize)>)>;
+
     struct Collector<'a> {
         stmt: &'a str,
         lo: usize,
@@ -3655,9 +3662,8 @@ mod colres {
         /// added to every **base table** source — not to a derived table or a CTE,
         /// which expose only what their projection selects.
         implicit: &'static [&'static str],
-        /// CTE name (lower) → its output columns and the byte range of its
-        /// body. Populated as queries are visited; the range is `Src::defines`.
-        ctes: HashMap<String, (Cols, (usize, usize))>,
+        /// Populated as queries are visited. See [`Ctes`].
+        ctes: Ctes,
         scopes: Vec<Scope>,
         refs: Vec<Ref>,
         /// `only_full_group_by` warnings collected per SELECT scope as it's pushed.
@@ -3674,7 +3680,17 @@ mod colres {
                     let cols = cte_cols(cte);
                     // The body's range, so a reference inside it cannot resolve
                     // against the CTE the body defines — see `Src::defines`.
-                    let range = to_range(self.stmt, self.lo, cte.query.span());
+                    //
+                    // **Except when the list is `RECURSIVE`, where naming
+                    // yourself is the entire construct.** `SELECT n + 1 FROM
+                    // nums` inside `nums` is correct SQL on all three engines,
+                    // and the rule that is right for a derived table — where a
+                    // self-reference is impossible — put two red Error
+                    // squiggles on it. `RECURSIVE` marks the whole `WITH` list
+                    // in the standard, not one CTE, so that is the granularity
+                    // the exception is taken at.
+                    let range =
+                        (!with.recursive).then(|| to_range(self.stmt, self.lo, cte.query.span()));
                     self.ctes
                         .insert(cte.alias.name.value.to_ascii_lowercase(), (cols, range));
                 }
@@ -3933,7 +3949,7 @@ mod colres {
         sel: &Select,
         catalog: &Catalog,
         implicit: &'static [&'static str],
-        ctes: &HashMap<String, (Cols, (usize, usize))>,
+        ctes: &Ctes,
         stmt: &str,
         lo: usize,
     ) -> (Vec<Src>, HashSet<String>) {
@@ -4144,7 +4160,7 @@ mod colres {
         sources: &mut Vec<Src>,
         catalog: &Catalog,
         implicit: &'static [&'static str],
-        ctes: &HashMap<String, (Cols, (usize, usize))>,
+        ctes: &Ctes,
         stmt: &str,
         lo: usize,
     ) {
@@ -4185,7 +4201,7 @@ mod colres {
                         cols: cols.clone(),
                         table: None,
                         shadowed: shadowed.clone(),
-                        defines: Some(*body),
+                        defines: *body,
                     });
                     return;
                 }
@@ -7741,6 +7757,38 @@ mod tests {
         ] {
             assert!(diag(sql).is_empty(), "{sql} -> {:?}", diag(sql));
         }
+    }
+
+    /// **And the one query that is supposed to see itself, does.**
+    ///
+    /// `Src::defines` says a reference inside a subquery must not resolve
+    /// against the source that subquery defines — right for a derived table,
+    /// where a self-reference is impossible, and exactly backwards for a
+    /// recursive CTE, whose body naming itself is the entire construct. The
+    /// filter hid `nums` from `SELECT n + 1 FROM nums`, the chain ran out, and
+    /// two red Error squiggles appeared on correct SQL that MySQL 8,
+    /// MariaDB 10.2+, PostgreSQL and SQLite all accept. The `RECURSIVE` keyword
+    /// was consulted nowhere in this module.
+    ///
+    /// `RECURSIVE` marks the whole `WITH` list in the standard, not one CTE, so
+    /// that is the granularity the exception is taken at.
+    #[test]
+    fn a_recursive_ctes_body_may_name_itself() {
+        for sql in [
+            "WITH RECURSIVE nums(n) AS (SELECT 1 AS n UNION ALL SELECT n + 1 FROM nums WHERE n < 10) SELECT n FROM nums",
+            // Qualified, which walks the other resolution arm.
+            "WITH RECURSIVE nums(n) AS (SELECT 1 AS n UNION ALL SELECT nums.n + 1 FROM nums WHERE nums.n < 10) SELECT n FROM nums",
+        ] {
+            assert!(diag(sql).is_empty(), "{sql} -> {:?}", diag(sql));
+        }
+        // The counterweight: a **non**-recursive CTE still cannot see itself,
+        // and a misspelling inside a recursive one is still a misspelling.
+        let d = col_errors("WITH c AS (SELECT nope FROM departments) SELECT * FROM c");
+        assert_eq!(d.len(), 1, "{d:?}");
+        let d = col_errors(
+            "WITH RECURSIVE nums(n) AS (SELECT 1 AS n UNION ALL SELECT nope FROM departments) SELECT n FROM nums",
+        );
+        assert_eq!(d.len(), 1, "{d:?}");
     }
 
     /// **An alias replaces the table name for the whole query.** Registering
