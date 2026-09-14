@@ -3885,6 +3885,63 @@ mod tests {
         assert!(o.iter().all(|x| x.is_none()));
     }
 
+    /// **The seam `c83f920`'s four tests stop one call short of.**
+    ///
+    /// That commit's own message states the failure as a composition: a nested
+    /// `WITH` stripped the real relation from `provenance_sources`, "the caller
+    /// never learns `v` is a view, and `column_table_name` reports one branch's
+    /// provenance for a whole compound view, so `v.x` is attributed to `main.a`
+    /// and offered as editable and the rows that came from `b` are edited
+    /// against `a`". The decision is not in `intel` — it is `attach_origins`'
+    /// loop here, which refuses the whole result when any returned relation is a
+    /// view. A *missing* entry in that list is invisible to every test that only
+    /// inspects the list, and all four of them do.
+    ///
+    /// So this asserts the refusal, over a statement whose real relation is a
+    /// view and whose nested `WITH` re-uses that view's name a scope down.
+    #[test]
+    fn a_nested_cte_does_not_hide_a_view_from_the_editability_refusal() {
+        let conn = seeded();
+        conn.execute_batch(
+            "CREATE VIEW v AS SELECT id, name AS x FROM artist \
+             UNION ALL SELECT id, title AS x FROM album;",
+        )
+        .expect("view");
+        // **The nested `WITH` is visited *before* the real `v`**, which is what
+        // makes this discriminating: with a flat name list the CTE's binding is
+        // still in scope when the view is reached, so the view is stripped and
+        // `artist` is left as the only source — a plain `main` table, so the
+        // refusal never fires and `artist.id` is attributed beside a `v.x` whose
+        // rows came from whichever branch SQLite happened to report. Put the
+        // nesting *after* the view and the outer `v` is recorded before anything
+        // shadows it, which is why the obvious spelling of this test cannot
+        // fail.
+        let o = origins_for(
+            &conn,
+            "SELECT artist.id, v.x \
+             FROM (WITH v AS (SELECT 1 AS z) SELECT z FROM v) q \
+             JOIN artist ON artist.id = q.z \
+             JOIN v ON v.id = artist.id",
+        );
+        assert!(
+            o.iter().all(|x| x.is_none()),
+            "a nested CTE stripped the real view, so its rows are offered as \
+             editable against whichever branch SQLite happened to report: {o:?}"
+        );
+        // The control: the same view, with no nested `WITH` anywhere near it, is
+        // refused for the ordinary reason — so the assertion above is about the
+        // nesting and not about the fixture being unattributable anyway.
+        let o = origins_for(&conn, "SELECT id, x FROM v");
+        assert!(o.iter().all(|x| x.is_none()));
+        // And a plain table beside it still *is* attributed, so the harness can
+        // tell the two apart at all.
+        let o = origins_for(&conn, "SELECT id, name FROM artist");
+        assert!(
+            o.iter().any(Option::is_some),
+            "nothing is attributed: {o:?}"
+        );
+    }
+
     /// **The seam the three tests above stop one call short of**, written as the
     /// composition rather than as two halves: every origin `attach_origins`
     /// hands out must name a database the bare statement `statement_for` builds
