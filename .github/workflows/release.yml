@@ -485,4 +485,10 @@ jobs:
       pages: write
       id-token: write
     uses: ./.github/workflows/pages.yml
+    # The tag, so the site build refuses to publish a repository that does not
+    # actually carry this release — a download that fails transiently used to
+    # read as "this tag had no packages" and the five before it still filled the
+    # site.
+    with:
+      expect_version: ${{ github.ref_name }}
     secrets: inherit

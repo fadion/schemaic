@@ -29,6 +29,10 @@ fi
 
 PACKAGES_DIR="$(cd "$1" && pwd)"
 OUTPUT_DIR="$2"
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${HERE}/../.." && pwd -P)"
+# shellcheck source=lib.sh
+. "${HERE}/lib.sh"
 
 : "${GPG_KEY_ID:?set GPG_KEY_ID to the signing key fingerprint or uid}"
 
@@ -52,7 +56,8 @@ if [ "${#debs[@]}" -eq 0 ]; then
     exit 1
 fi
 
-rm -rf "$OUTPUT_DIR"
+# Refuses a path that is not demonstrably this builder's — see `reset_dir`.
+reset_dir "$OUTPUT_DIR" "$REPO_ROOT"
 POOL="${OUTPUT_DIR}/pool/${COMPONENT}/s/schemaic"
 DIST="${OUTPUT_DIR}/dists/${SUITE}"
 BINDIR="${DIST}/${COMPONENT}/binary-${ARCH}"

@@ -156,10 +156,12 @@ type Recheck = Rc<RefCell<Option<Rc<dyn Fn()>>>>;
 /// How long to wait before asking the feed again.
 ///
 /// The cost of a round is two requests — a releases listing and a ~760-byte
-/// manifest — against GitHub's anonymous limit of 60 per hour per IP, so this is
-/// three orders of magnitude clear of it and could be far shorter without
-/// trouble. It is not shorter because nothing is gained: the thing being waited
-/// for is a human tagging a release.
+/// manifest — so eight rounds a day is **16 requests a day** against GitHub's
+/// anonymous limit of 60 an hour, i.e. 1,440: about 90× clear of it, and it
+/// could be far shorter without trouble. (This said "three orders of magnitude"
+/// on both sides of the crate boundary until someone did the division; it is
+/// two.) It is not shorter because nothing is gained: the thing being waited for
+/// is a human tagging a release.
 const RECHECK_INTERVAL: Duration = Duration::from_secs(3 * 60 * 60);
 
 /// Run one check + download on a worker thread, reporting into `state`, and

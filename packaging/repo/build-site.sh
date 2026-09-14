@@ -11,6 +11,11 @@
 #   SCHEMAIC_REPO_URL     base URL the site will be served from
 #   SCHEMAIC_RETAIN       how many releases to keep (default 5)
 #   SCHEMAIC_GH_REPO      owner/name to pull release assets from
+#   SCHEMAIC_EXPECT_VERSION
+#                         optional - the release this build is for. The build
+#                         fails unless the site's newest release is that one,
+#                         so a transient download failure cannot publish a
+#                         repository that silently omits the tag being released.
 #
 # **The GitHub Release assets are the source of truth and this output is
 # derived.** Nothing here is incremental: every run downloads the packages
@@ -28,7 +33,9 @@ fi
 
 OUT="$1"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "${HERE}/../.." && pwd)"
+REPO_ROOT="$(cd "${HERE}/../.." && pwd -P)"
+# shellcheck source=lib.sh
+. "${HERE}/lib.sh"
 
 : "${GPG_KEY_ID:?set GPG_KEY_ID to the signing key fingerprint or uid}"
 BASE_URL="${SCHEMAIC_REPO_URL:-https://fadion.github.io/schemaic}"
@@ -59,13 +66,32 @@ for tag in "${tags[@]}"; do
     got=0
     tmp="${STAGE}/dl"
     rm -rf "$tmp"; mkdir -p "$tmp"
-    if gh release download "$tag" --repo "$GH_REPO" --dir "$tmp" \
-        --pattern '*.deb' --pattern '*.rpm' --clobber 2>/dev/null; then
-        shopt -s nullglob
-        for f in "$tmp"/*.deb; do cp "$f" "${STAGE}/deb/"; got=1; done
-        for f in "$tmp"/*.rpm; do cp "$f" "${STAGE}/rpm/"; got=1; done
-        shopt -u nullglob
+    # **"It failed" and "there was nothing there" are two different facts, and
+    # this used to collapse them into one branch whose message asserts the
+    # second.** A rate limit, a network blip or a half-propagated release left
+    # `got` at 0, printed "no distribution packages, skipped", walked on to the
+    # previous tag, and still reached RETAIN from the releases before it — so a
+    # tag's own build published a signed, self-consistent repository that omits
+    # that tag, verified green by everything downstream, while every installed
+    # machine went on being offered nothing.
+    #
+    # `gh` also exits non-zero when it matched no asset, which is the only reason
+    # the old spelling worked at all; that case is recognised by its message and
+    # left to the glob below, which is the fact that actually decides it.
+    err="${tmp}.err"
+    if ! gh release download "$tag" --repo "$GH_REPO" --dir "$tmp" \
+        --pattern '*.deb' --pattern '*.rpm' --clobber 2>"$err"; then
+        if ! grep -qiE 'no assets|no artifact|asset.*not found|release not found' "$err"; then
+            echo "::error::downloading ${tag}'s packages failed" >&2
+            cat "$err" >&2
+            echo "refusing to publish a repository that would silently omit ${tag}" >&2
+            exit 1
+        fi
     fi
+    shopt -s nullglob
+    for f in "$tmp"/*.deb; do cp "$f" "${STAGE}/deb/"; got=1; done
+    for f in "$tmp"/*.rpm; do cp "$f" "${STAGE}/rpm/"; got=1; done
+    shopt -u nullglob
     if [ "$got" -eq 1 ]; then
         kept=$((kept + 1))
         [ -n "$latest_version" ] || latest_version="${tag#v}"
@@ -80,8 +106,24 @@ if [ "$kept" -eq 0 ]; then
     exit 1
 fi
 
-rm -rf "$OUT"
-mkdir -p "$OUT"
+# **The build had no idea which release it was for.** Nothing in the pipeline
+# carried a version the built site could be checked against — `pages.yml` passes
+# the URL, the retention count and the repository, and no tag — so a site missing
+# its own newest release is self-consistent and every verifier passes it. The
+# caller names the tag it is publishing for when it has one; `workflow_dispatch`,
+# which has none, passes nothing and this is a no-op.
+EXPECT="${SCHEMAIC_EXPECT_VERSION:-}"
+EXPECT="${EXPECT#v}"
+if [ -n "$EXPECT" ] && [ "$EXPECT" != "$latest_version" ]; then
+    echo "::error::built a repository whose newest release is ${latest_version}, but this build is for ${EXPECT}" >&2
+    echo "The tag's packages did not reach the site. Refusing to publish." >&2
+    exit 1
+fi
+
+# `packaging/repo/README.md` tells a developer to run this by hand with an
+# output path of their choosing, so `$OUT` really is arbitrary input and this
+# `rm -rf` runs before a single package has been downloaded. See `reset_dir`.
+reset_dir "$OUT" "$REPO_ROOT"
 
 bash "${HERE}/build-apt-repo.sh" "${STAGE}/deb" "${OUT}/deb"
 bash "${HERE}/build-rpm-repo.sh" "${STAGE}/rpm" "${OUT}/rpm"
