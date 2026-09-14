@@ -5542,30 +5542,121 @@ fn find_matches(
 /// precisely." The same sentence describes the per-database case, and the share
 /// mechanism it introduced was applied only *within* one database.
 ///
-/// So every database is asked — the early return is gone — each for at most
-/// `limit` hits, and the buckets are merged by the same share. The extra work is
-/// bounded: [`schema_hits`] stops each of its passes at the room it was given,
-/// so a database contributes at most `limit` hits however large it is.
+/// So every database is asked — the early return is gone — and the buckets are
+/// merged by a share.
+///
+/// **Each is asked for its share, not for the whole list**, which is what bounds
+/// the work the removed early return used to bound. Asking every database for
+/// `limit` meant a flooded one collected and dropped 80 hits so the merge could
+/// take 8 of them; the budget it is actually allowed is known before the walk,
+/// so it is what it gets. A second sweep re-asks the databases that filled their
+/// share, and only while the merged list still has room — so "one database can
+/// still fill the list on its own" survives, and in the case where every
+/// database is capped the first sweep already reaches `limit` and the second
+/// does not run.
+///
+/// **What this does not bound, honestly:** a database in which the needle
+/// matches *nothing* is still walked end to end, because [`schema_hits`]' passes
+/// break on hits collected and there are none. That is inherent to "every
+/// database gets a fair chance" — the property `7bc6e69` added and this keeps —
+/// and the only ways past it are an item budget (which brings back absent
+/// results, the defect that commit fixed) or debouncing, which this palette
+/// deliberately does not do. The share removes the flooded half of the cost;
+/// the empty half is the price of the answer being complete.
 fn matches_across<'a>(
     dbs: impl IntoIterator<Item = (&'a str, &'a schemaic_core::schema::DbSchema)>,
     q: &str,
     limit: usize,
 ) -> Vec<FindHit> {
-    let mut buckets: Vec<Vec<FindHit>> = Vec::new();
-    for (database, schema) in dbs {
+    let dbs: Vec<_> = dbs.into_iter().collect();
+    let share = scan_share(limit, dbs.len());
+    let mut buckets: Vec<Vec<FindHit>> = Vec::with_capacity(dbs.len());
+    for (database, schema) in &dbs {
         let mut bucket = Vec::new();
-        schema_hits(database, schema, q, limit, &mut bucket);
-        if !bucket.is_empty() {
-            buckets.push(bucket);
+        schema_hits(database, schema, q, share, &mut bucket);
+        buckets.push(bucket);
+    }
+    // The leftovers, for the databases that used all of their share. Re-asking
+    // re-walks, so it is done only where there is room to fill and only for a
+    // database that proved it has more.
+    let mut room = limit.saturating_sub(buckets.iter().map(Vec::len).sum::<usize>());
+    if room > 0 {
+        for (i, (database, schema)) in dbs.iter().enumerate() {
+            if room == 0 {
+                break;
+            }
+            if buckets[i].len() < share {
+                continue;
+            }
+            let mut more = Vec::new();
+            schema_hits(database, schema, q, share + room, &mut more);
+            room = room.saturating_sub(more.len().saturating_sub(buckets[i].len()));
+            buckets[i] = more;
         }
     }
+    buckets.retain(|b| !b.is_empty());
     let want: Vec<usize> = buckets.iter().map(Vec::len).collect();
-    let take = pass_shares(limit, &want);
+    let take = db_shares(limit, &want);
     let mut out = Vec::with_capacity(take.iter().sum());
     for (bucket, n) in buckets.into_iter().zip(take) {
         out.extend(bucket.into_iter().take(n));
     }
     out
+}
+
+/// How many hits to ask **one** database for on the first sweep.
+///
+/// `limit` split evenly, floored at one so a connection with more databases than
+/// the list has room still asks each of them a real question. Known before the
+/// walk, which is the point: it is the budget the merge would have given that
+/// database anyway, so collecting more is work whose only consumer is `take(n)`.
+fn scan_share(limit: usize, dbs: usize) -> usize {
+    if dbs == 0 {
+        return limit;
+    }
+    limit.div_ceil(dbs).max(1)
+}
+
+/// How many hits each **database** contributes, given the room in the list.
+///
+/// **Round-robin for the remainder, not pass order** — the one way this differs
+/// from [`pass_shares`], and it differs because the orders mean different
+/// things. That function's spare goes in pass order on purpose: names before
+/// objects before columns is precision order, so a narrow search fills the list
+/// with the most precise matches first. Database order is *catalogue* order and
+/// means nothing, so first-come there is not a policy, it is an accident.
+///
+/// It mattered at the scale this app is sized for. `pass_shares` computes
+/// `base = room / want.len()`, which is **zero** the moment there are more
+/// buckets than room — every bucket then took nothing in the guaranteed pass and
+/// the whole spare went to the earliest buckets. With 80 rows and the 200
+/// databases `INTROSPECT_PERMITS` is sized against, that is exactly the
+/// crowd-out `7bc6e69` set out to end, returned one level up.
+fn db_shares(room: usize, want: &[usize]) -> Vec<usize> {
+    let n = want.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    let base = room / n;
+    let mut take: Vec<usize> = want.iter().map(|&w| w.min(base)).collect();
+    let mut left = room - take.iter().sum::<usize>();
+    while left > 0 {
+        let mut gave = false;
+        for (i, &w) in want.iter().enumerate() {
+            if left == 0 {
+                break;
+            }
+            if take[i] < w {
+                take[i] += 1;
+                left -= 1;
+                gave = true;
+            }
+        }
+        if !gave {
+            break;
+        }
+    }
+    take
 }
 
 /// One database's hits, appended to `out`. Returns whether `limit` was reached.
@@ -6399,6 +6490,74 @@ mod find_tests {
         // Degenerate rooms don't over-allocate.
         assert_eq!(pass_shares(0, &[5, 5, 5]), [0, 0, 0]);
         assert_eq!(pass_shares(2, &[5, 5, 5]), [2, 0, 0]);
+    }
+
+    /// **The database split is fair where the pass split is ordered**, and the
+    /// difference shows up exactly where it matters.
+    ///
+    /// `pass_shares` computes `base = room / want.len()`, which is zero the
+    /// moment there are more buckets than room — every bucket then takes nothing
+    /// in the guaranteed pass and the whole spare goes to the earliest ones. For
+    /// the three passes that is a policy (names before objects before columns is
+    /// precision order, and the doc says so). For databases it is catalogue
+    /// order, which means nothing, and at the 200-database scale this app is
+    /// sized for it is the crowd-out `7bc6e69` set out to end, one level up.
+    #[test]
+    fn a_databases_share_does_not_collapse_to_first_come() {
+        use super::{db_shares, pass_shares};
+
+        // The shape of the defect, at the scale it bites: 200 databases with
+        // plenty to offer each, and a list of 80.
+        let want = vec![40usize; 200];
+        assert_eq!(
+            pass_shares(80, &want)
+                .iter()
+                .take(3)
+                .copied()
+                .collect::<Vec<_>>(),
+            [40, 40, 0],
+            "the pass split hands the list to the first two buckets"
+        );
+        let take = db_shares(80, &want);
+        assert_eq!(take.iter().sum::<usize>(), 80);
+        assert!(
+            take.iter().take(80).all(|&n| n == 1) && take[80..].iter().all(|&n| n == 0),
+            "one each, as far as the list goes: {:?}",
+            &take[..5]
+        );
+
+        // Fewer buckets than room: the base is real and the remainder goes
+        // round, so a bucket that cannot use its base does not hand the whole
+        // spare to bucket 0.
+        assert_eq!(db_shares(9, &[40, 40, 40]), [3, 3, 3]);
+        assert_eq!(db_shares(9, &[1, 40, 40]), [1, 4, 4]);
+        assert_eq!(db_shares(80, &[2, 3, 4]), [2, 3, 4]);
+        // Degenerate inputs answer rather than panicking.
+        assert_eq!(db_shares(10, &[]), Vec::<usize>::new());
+        assert_eq!(db_shares(0, &[5, 5]), [0, 0]);
+        assert_eq!(db_shares(10, &[0, 0]), [0, 0]);
+    }
+
+    /// **A database is asked for the share it will actually be allowed**, not
+    /// for the whole list.
+    ///
+    /// The early return `7bc6e69` removed was what bounded the work; asking
+    /// every database for `limit` meant a flooded one collected and dropped 80
+    /// hits so the merge could take 8. The budget is known before the walk.
+    #[test]
+    fn a_database_is_asked_for_its_share_not_the_whole_list() {
+        use super::scan_share;
+        assert_eq!(scan_share(80, 10), 8);
+        assert_eq!(
+            scan_share(80, 3),
+            27,
+            "rounded up, so the sweep can fill 80"
+        );
+        // More databases than room: still a real question each.
+        assert_eq!(scan_share(80, 200), 1);
+        // One database, and none at all.
+        assert_eq!(scan_share(80, 1), 80);
+        assert_eq!(scan_share(80, 0), 80);
     }
 
     /// The same arithmetic at other widths, since the buckets are now however
