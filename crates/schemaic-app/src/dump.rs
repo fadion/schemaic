@@ -26,6 +26,32 @@ use schemaic_db::{Db, DbError, ExportChunk};
 use schemaic_ui::{DumpOutcome, DumpProgress, DumpRequest, FilesOutcome, FilesRequest};
 use tokio_util::sync::CancellationToken;
 
+/// A writer failure, and whether the `.part` file exists to name in the note.
+///
+/// **`opened` is the fact `DumpVerdict::Failed::partial` is about**, and nothing
+/// carried it: `File::create` is each writer's first statement, so a read-only
+/// folder or a full volume fails before any fragment exists — and the note told
+/// the user "the rows that were written are in shop.sql.part" about a file that
+/// had never been opened.
+///
+/// `From<String>` is what makes this cheap: every later `?` in a writer is a
+/// failure *after* the create, so it converts with `opened: true` and no site
+/// changes.
+#[derive(Clone, Debug)]
+pub(crate) struct WriteFail {
+    pub message: String,
+    pub opened: bool,
+}
+
+impl From<String> for WriteFail {
+    fn from(message: String) -> Self {
+        WriteFail {
+            message,
+            opened: true,
+        }
+    }
+}
+
 /// What the writer task is fed, in file order.
 enum Msg {
     /// SQL or a comment, written as-is.
@@ -190,7 +216,10 @@ pub(crate) async fn run(
     };
     let write = match written {
         Ok(Ok(_)) => WriteEnd::Wrote,
-        Ok(Err(e)) => WriteEnd::Failed(e),
+        Ok(Err(e)) => WriteEnd::Failed {
+            message: e.message,
+            opened: e.opened,
+        },
         Err(e) => WriteEnd::Died(e.to_string()),
     };
     match dump_verdict(read, write) {
@@ -399,7 +428,13 @@ pub(crate) async fn run_files(
         };
         let (write_end, tally_of) = match written {
             Ok(Ok(t)) => (WriteEnd::Wrote, Some(t)),
-            Ok(Err(e)) => (WriteEnd::Failed(e), None),
+            Ok(Err(e)) => (
+                WriteEnd::Failed {
+                    message: e.message,
+                    opened: e.opened,
+                },
+                None,
+            ),
             Err(e) => (WriteEnd::Died(e.to_string()), None),
         };
         match schemaic_core::dump::dump_verdict(read_end, write_end) {
@@ -457,12 +492,19 @@ fn write_one(
     dialect: schemaic_core::intel::SqlDialect,
     source: (String, Option<String>, String),
     token: CancellationToken,
-) -> Result<ExportTally, String> {
+) -> Result<ExportTally, WriteFail> {
     use std::io::Write as _;
 
-    let mut w = std::fs::File::create(part)
-        .map(std::io::BufWriter::new)
-        .map_err(|e| format!("Export failed: {e}"))?;
+    // The create is the one failure that leaves nothing behind — see `WriteFail`.
+    let mut w = match std::fs::File::create(part) {
+        Ok(f) => std::io::BufWriter::new(f),
+        Err(e) => {
+            return Err(WriteFail {
+                message: format!("Export failed: {e}"),
+                opened: false,
+            });
+        }
+    };
     let src_token = token.clone();
     let mut src = PullChunks::new(move || match rows.blocking_recv() {
         // **A cancelled read is an error, not an end of stream** — the streamed
@@ -490,7 +532,7 @@ fn write_one(
     // of stream, so publishing first and declaring the cancel afterwards would
     // leave a truncated table looking exactly like a finished one.
     if token.is_cancelled() {
-        return Err("Export cancelled.".to_string());
+        return Err("Export cancelled.".to_string().into());
     }
     std::fs::rename(part, path).map_err(|e| {
         // **It must not point at the `.part`.** This message used to say "the
@@ -513,12 +555,19 @@ fn write(
     mut rx: tokio::sync::mpsc::Receiver<Msg>,
     dialect: schemaic_core::intel::SqlDialect,
     token: CancellationToken,
-) -> Result<ExportTally, String> {
+) -> Result<ExportTally, WriteFail> {
     use std::io::Write as _;
 
-    let mut w = std::fs::File::create(part)
-        .map(std::io::BufWriter::new)
-        .map_err(|e| format!("Export failed: {e}"))?;
+    // The create is the one failure that leaves nothing behind — see `WriteFail`.
+    let mut w = match std::fs::File::create(part) {
+        Ok(f) => std::io::BufWriter::new(f),
+        Err(e) => {
+            return Err(WriteFail {
+                message: format!("Export failed: {e}"),
+                opened: false,
+            });
+        }
+    };
     // **The tally, folded across every table, not a row count.** What the file
     // could not carry — a binary column written as `NULL`, a value past the arena
     // ceiling left blank — is the difference between a backup and something that
@@ -565,7 +614,7 @@ fn write(
     // would rename a truncated file over the user's, which is the whole reason
     // the sibling exists.
     if token.is_cancelled() {
-        return Err("Export cancelled.".to_string());
+        return Err("Export cancelled.".to_string().into());
     }
     std::fs::rename(part, path).map_err(|e| {
         format!(

@@ -176,7 +176,15 @@ pub enum WriteEnd {
     /// The file was published.
     Wrote,
     /// A disk or permission failure, in the writer's own words.
-    Failed(String),
+    ///
+    /// `opened` says whether the `.part` file was ever created — which is the
+    /// whole of what [`DumpVerdict::Failed::partial`] means, and what nothing
+    /// used to carry. `File::create` is the writer's first statement, so a
+    /// read-only folder, a full volume or a share that has just dropped fails
+    /// *before* any fragment exists — and the note told the user "the rows that
+    /// were written are in shop.sql.part" about a file that had never been
+    /// opened, on the one arm where they are least likely to look twice.
+    Failed { message: String, opened: bool },
     /// The worker task itself did not come back.
     Died(String),
 }
@@ -207,15 +215,19 @@ pub enum DumpVerdict {
 /// two of them turns "The disk is full" into "connection reset" with the suite
 /// still green.
 pub fn dump_verdict(read: ReadEnd, write: WriteEnd) -> DumpVerdict {
-    let failed = |message: String| DumpVerdict::Failed {
-        message,
-        partial: true,
-    };
+    // **`partial` is the writer's answer, not a constant.** It was hardcoded
+    // `true` for every failure while its own doc says it "means a `.part`
+    // fragment is on disk and worth naming" — a claim the code never made. The
+    // writer is the only thing that knows, so it says.
+    let failed = |message: String, partial: bool| DumpVerdict::Failed { message, partial };
     match (read, write) {
         (ReadEnd::Cancelled, _) => DumpVerdict::Cancelled,
-        (_, WriteEnd::Failed(e)) => failed(e),
-        (_, WriteEnd::Died(e)) => failed(format!("Export failed: worker died: {e}")),
-        (ReadEnd::Failed(e), _) => failed(format!("Export failed: {e}")),
+        (_, WriteEnd::Failed { message, opened }) => failed(message, opened),
+        // The worker died mid-run, so whatever it had opened is still there.
+        (_, WriteEnd::Died(e)) => failed(format!("Export failed: worker died: {e}"), true),
+        // The *reader* failed, which means the writer was running and had its
+        // file.
+        (ReadEnd::Failed(e), _) => failed(format!("Export failed: {e}"), true),
         (ReadEnd::Clean, WriteEnd::Wrote) => DumpVerdict::Done,
     }
 }
@@ -2693,7 +2705,10 @@ mod tests {
     fn a_cancel_is_the_readers_to_declare_whatever_the_writer_saw() {
         for write in [
             WriteEnd::Wrote,
-            WriteEnd::Failed("disk full".to_string()),
+            WriteEnd::Failed {
+                message: "disk full".to_string(),
+                opened: true,
+            },
             WriteEnd::Died("panic".to_string()),
         ] {
             assert_eq!(
@@ -2702,6 +2717,47 @@ mod tests {
                 "{write:?}"
             );
         }
+    }
+
+    /// **`partial` is a fact about the disk, not a constant.**
+    ///
+    /// It was hardcoded `true` for every failure while its own doc says it
+    /// "means a `.part` fragment is on disk and worth naming". `File::create` is
+    /// the writer's first statement, so a read-only folder, a full volume or a
+    /// share that has just dropped fails before any fragment exists — and the
+    /// note then read *"shop.sql was not changed; the rows that were written are
+    /// in shop.sql.part"* about a file that had never been opened, sending the
+    /// user to look for something that is not there.
+    #[test]
+    fn a_failure_before_the_part_was_opened_does_not_name_it() {
+        assert_eq!(
+            dump_verdict(
+                ReadEnd::Clean,
+                WriteEnd::Failed {
+                    message: "Export failed: Access is denied. (os error 5)".to_string(),
+                    opened: false,
+                }
+            ),
+            DumpVerdict::Failed {
+                message: "Export failed: Access is denied. (os error 5)".to_string(),
+                partial: false,
+            }
+        );
+        // And a failure *after* it still names it — otherwise "don't name the
+        // fragment" is just a way of never naming one.
+        assert_eq!(
+            dump_verdict(
+                ReadEnd::Clean,
+                WriteEnd::Failed {
+                    message: "Export failed: disk full".to_string(),
+                    opened: true,
+                }
+            ),
+            DumpVerdict::Failed {
+                message: "Export failed: disk full".to_string(),
+                partial: true,
+            }
+        );
     }
 
     /// And the other direction: anything that is *not* a cancel failed the writer
@@ -2713,7 +2769,10 @@ mod tests {
         assert_eq!(
             dump_verdict(
                 ReadEnd::Failed("connection reset".to_string()),
-                WriteEnd::Failed("Export failed: disk full".to_string())
+                WriteEnd::Failed {
+                    message: "Export failed: disk full".to_string(),
+                    opened: true,
+                }
             ),
             DumpVerdict::Failed {
                 message: "Export failed: disk full".to_string(),
