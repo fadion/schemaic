@@ -2153,6 +2153,26 @@ enum RowSourceIter<R: std::io::Read> {
     /// prefix at all. Either way the rows exist before the first one is handed
     /// out, so one variant carries both.
     Buffered(std::vec::IntoIter<(Record, u64)>),
+    /// Buffered like the above, but **without the padding**.
+    ///
+    /// `xlsx_records` hands every row out already widened to the sheet's used
+    /// width, and `sheet_width` admits `XLSX_MAX_COLS` = 16,384 — so a buffered
+    /// row costs 16,384 slots whether or not it holds a cell. Keeping N of them
+    /// re-materialised the dense rectangle `sheet_width`'s own doc says it
+    /// replaced: a ~40 KB workbook declaring `A1:XFD10000` and holding one cell
+    /// per row allocated ~3.9 GB before the first row was handed out, and the
+    /// worst legal sheet ~412 GB, with no warning in front of it because
+    /// `xlsx_memory_warning` estimates from the file's size **on disk**.
+    ///
+    /// So the trailing `None`s — which carry no information; a `Field` is an
+    /// `Option` and an absent cell *is* `None` — are dropped on the way in and
+    /// restored on the way out. The row the consumer sees is byte-identical,
+    /// which matters: `trim_to_mapping` reads `fields.len()` for Excel and a
+    /// short row would report a count mismatch that is not there.
+    Xlsx {
+        rows: std::vec::IntoIter<(Record, u64)>,
+        width: usize,
+    },
 }
 
 /// Build the row stream for an import. `mapping` must have at least one target,
@@ -2200,11 +2220,23 @@ pub fn row_iter<R: std::io::Read>(
         ImportFormat::Xlsx => {
             let mut names = Vec::new();
             let mut rows = Vec::new();
-            xlsx_records(r, cfg, &mut names, usize::MAX, |rec, n| {
+            let mut width = 0usize;
+            xlsx_records(r, cfg, &mut names, usize::MAX, |mut rec, n| {
+                // The sheet's used width, taken from the row as it arrives and
+                // not from a second reading of the dimension — every row
+                // `xlsx_records` emits is already padded to it.
+                width = width.max(rec.fields.len());
+                while rec.fields.last().is_some_and(Option::is_none) {
+                    rec.fields.pop();
+                }
+                rec.fields.shrink_to_fit();
                 rows.push((rec, n));
                 true
             })?;
-            RowSourceIter::Buffered(rows.into_iter())
+            RowSourceIter::Xlsx {
+                rows: rows.into_iter(),
+                width,
+            }
         }
     };
     Ok(RowIter { ctx, source })
@@ -2228,6 +2260,13 @@ impl<R: std::io::Read> Iterator for RowIter<R> {
             }
             RowSourceIter::Buffered(rows) => {
                 let (rec, line) = rows.next()?;
+                Some(self.ctx.row(&rec.fields, &rec.sheet_errors, line))
+            }
+            RowSourceIter::Xlsx { rows, width } => {
+                let (mut rec, line) = rows.next()?;
+                // Re-padded to the sheet's width, so the consumer sees exactly
+                // the row `xlsx_records` produced — see the variant's doc.
+                rec.fields.resize(*width, None);
                 Some(self.ctx.row(&rec.fields, &rec.sheet_errors, line))
             }
         }
@@ -3663,6 +3702,88 @@ mod tests {
         let s = read_sample(&bytes[..], ImportFormat::Xlsx, &xlsx_cfg(true, None), 2).unwrap();
         assert_eq!(s.rows.len(), 2);
         assert!(s.more);
+    }
+
+    /// **The load path buffers cells, not the dense rectangle.**
+    ///
+    /// `xlsx_records` pads every row to the sheet's used width, and
+    /// `sheet_width` admits `XLSX_MAX_COLS` = 16,384 — so buffering N of those
+    /// rows re-materialised exactly what `sheet_width`'s own doc says it
+    /// replaced. A workbook declaring a wide used range and holding one cell per
+    /// row costs 16,384 × 24 bytes a row: ~3.9 GB at 10,000 rows, ~412 GB at the
+    /// worst legal sheet, and no warning in front of either, because
+    /// `xlsx_memory_warning` estimates from the file's size **on disk** and such
+    /// a workbook is tens of kilobytes. Preview and `validate` were never
+    /// affected — both stream through `for_each_record`.
+    ///
+    /// Two assertions, and the second is the one that keeps the first honest:
+    /// the buffer is proportional to the cells present, **and** the rows handed
+    /// out are still the full-width rows the consumer expects (`trim_to_mapping`
+    /// reads `fields.len()` for Excel, so a short row would report a count
+    /// mismatch that is not there).
+    #[test]
+    fn a_wide_sparse_sheet_does_not_buffer_its_empty_cells() {
+        // A header as wide as the sheet, then rows holding only the first and
+        // the last cell — the shape that makes the padding the whole cost.
+        const W: usize = 60;
+        let mut header: Vec<Cell> = (0..W).map(|_| Cell::Blank).collect();
+        header[0] = Cell::Text("id");
+        header[1] = Cell::Text("tail");
+        // The far cell is what makes the sheet's used width `W`; the body never
+        // reaches it, which is the shape that made the padding the whole cost.
+        header[W - 1] = Cell::Text("far");
+        let mut body: Vec<Vec<Cell>> = Vec::new();
+        for i in 0..40u32 {
+            let mut r: Vec<Cell> = (0..2).map(|_| Cell::Blank).collect();
+            r[0] = Cell::Num(f64::from(i) + 1.0);
+            r[1] = Cell::Text("x");
+            body.push(r);
+        }
+        let mut rows: Vec<&[Cell]> = vec![&header];
+        rows.extend(body.iter().map(|r| r.as_slice()));
+        let bytes = workbook(&[("S", &rows)]);
+
+        let table = tbl(&[("id", "int", false), ("tail", "varchar", true)]);
+        let cfg = xlsx_cfg(true, None);
+        // Only the two real columns are mapped; the empties in between are not.
+        let names: Vec<String> = (0..W)
+            .map(|i| match i {
+                0 => "id".to_string(),
+                1 => "tail".to_string(),
+                x => format!("c{x}"),
+            })
+            .collect();
+        let mapping = auto_map(&names, &table, true);
+
+        let it = row_iter(
+            &bytes[..],
+            ImportFormat::Xlsx,
+            &cfg,
+            &table,
+            &mapping,
+            MySql,
+        )
+        .expect("a workbook we just wrote");
+        let RowSourceIter::Xlsx { rows, width } = &it.source else {
+            panic!("the Excel arm must buffer without padding");
+        };
+        assert_eq!(*width, W, "the sheet's used width is still known");
+        let buffered = rows.as_slice();
+        let slots: usize = buffered.iter().map(|(r, _)| r.fields.len()).sum();
+        assert_eq!(buffered.len(), 40);
+        assert!(
+            slots <= buffered.len() * W / 2,
+            "the buffer is the dense rectangle again: {slots} slots for \
+             {} rows of width {W}",
+            buffered.len()
+        );
+
+        // And the rows still come out whole — the mapped columns are read, and
+        // the Excel count check sees the width it expects.
+        let out: Vec<_> = it.collect::<Result<Vec<_>, _>>().expect("every row");
+        assert_eq!(out.len(), 40);
+        assert_eq!(out[0], vec![Value::Int(1), Value::Str("x".into())]);
+        assert_eq!(out[39], vec![Value::Int(40), Value::Str("x".into())]);
     }
 
     /// **The seam the two-pass import turns on.** `validate` and `row_iter` are
