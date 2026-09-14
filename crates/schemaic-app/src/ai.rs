@@ -1919,9 +1919,15 @@ pub(crate) fn start_ai_session(
                         "could not register the Schemaic MCP server with Antigravity; \
                          this session has no database tools"
                     );
-                    degraded = Some(no_tools_note(
+                    // **The ownership refusal names itself.** Antigravity keeps
+                    // one machine-wide MCP registration and it can point at only
+                    // one connection, so a second window gets no tools rather
+                    // than repointing the first one's — and "could not register"
+                    // would send the user looking for a broken install.
+                    let why = reg.as_ref().and_then(|r| r.blocked_reason()).unwrap_or(
                         "Schemaic could not register its database tools with Antigravity",
-                    ));
+                    );
+                    degraded = Some(no_tools_note(why));
                 }
                 reg
             }

@@ -354,9 +354,25 @@ fn claim() -> Claimed {
 enum Claimed {
     /// This session owns the marker, and its teardown must clean up.
     Mine(Claim),
-    /// Another **live** process owns it. Register and grant anyway — both are
-    /// idempotent upserts of the same state, and this session needs the tools
-    /// — but withdraw nothing on the way out: the owner is still the owner.
+    /// Another **live** process owns it.
+    ///
+    /// **This session gets no tools, and that is the honest answer.** The arm
+    /// used to register and grant anyway, on the premise that "both are
+    /// idempotent upserts of the same state" — and that premise is false for
+    /// the registration: `agy mcp add` is an upsert of the **one machine-global**
+    /// entry, and the two windows' entries differ in `--endpoint-file`, a
+    /// per-session path naming *that window's connection*. So the second window
+    /// repointed the shared registration at its own endpoint, the first
+    /// window's next `agy` respawn read the registry and began answering
+    /// questions about connection A by querying connection **B** with B's
+    /// credentials — and when B's session ended, `AiSession::drop` removed B's
+    /// endpoint file, leaving the global registration naming a file that is
+    /// gone and every tool call in A denied, which a denied Antigravity turn
+    /// reports as `"status":"SUCCESS"` with an empty response.
+    ///
+    /// A registration that names one endpoint file cannot serve two
+    /// connections, so the second window says it has no database tools rather
+    /// than quietly taking the first one's. See [`may_register`].
     Shared,
     /// No claim could be made at all, and without one there is nothing to stop
     /// another instance's sweep withdrawing this grant mid-session and nothing
@@ -440,6 +456,33 @@ pub(crate) struct AgyRegistration {
     /// added, and a session whose rules were declined has no database tools
     /// however well `agy mcp add` went.
     installed: bool,
+    /// Why this session has no database tools, when the reason is an *ownership*
+    /// one rather than a failed command — so the panel can say which.
+    blocked: Option<&'static str>,
+}
+
+/// May a session in this claim state write the **machine-global** MCP
+/// registration?
+///
+/// Only an owner. `agy mcp add` is an upsert of one entry whose
+/// `--endpoint-file` names a single connection, so a second window running it
+/// repoints the first window's assistant at *its* database — and a third state,
+/// `Refused`, has no claim to protect the grant from another instance's sweep.
+///
+/// A free function because [`AgyRegistration::install`] shells out and cannot be
+/// unit-tested, while this decision is the whole of what went wrong.
+fn may_register(claimed: &Claimed) -> bool {
+    matches!(claimed, Claimed::Mine(_))
+}
+
+/// The line the panel shows for a session [`may_register`] refused.
+fn blocked_reason(claimed: &Claimed) -> &'static str {
+    match claimed {
+        Claimed::Shared => {
+            "Another Schemaic window is already using Antigravity.              Antigravity keeps one machine-wide MCP registration, which can point at              only one connection, so this window's assistant has no database tools"
+        }
+        _ => "Schemaic could not claim Antigravity's configuration for this session",
+    }
 }
 
 impl AgyRegistration {
@@ -468,7 +511,17 @@ impl AgyRegistration {
             rules,
             mine,
             installed: false,
+            blocked: None,
         };
+        if !may_register(&claimed) {
+            reg.blocked = Some(blocked_reason(&claimed));
+        }
+        if claimed == Claimed::Shared {
+            tracing::warn!(
+                "another Schemaic window is already using Antigravity; this session                  runs without database tools rather than repointing the shared                  registration at its own connection"
+            );
+            return reg;
+        }
         if claimed == Claimed::Refused {
             // Without a claim *or* a live owner there is nothing to stop
             // another instance's sweep withdrawing this grant mid-session, and
@@ -522,6 +575,13 @@ impl AgyRegistration {
     /// database tools, which is worth saying rather than discovering.
     pub(crate) fn is_installed(&self) -> bool {
         self.installed
+    }
+
+    /// Why this session has no database tools, when [`may_register`] refused it
+    /// — `None` when it installed, or when the failure was a command that did
+    /// not take.
+    pub(crate) fn blocked_reason(&self) -> Option<&'static str> {
+        self.blocked
     }
 }
 
@@ -702,6 +762,53 @@ mod tests {
         assert!(!may_release(None, None, true));
         // The successful case, so the guard is not vacuously "never".
         assert!(may_release(Some(mine), Some(mine), true));
+    }
+
+    /// **A shared claim may not write the registration either**, and the arm
+    /// that did is the mirror of the teardown asymmetry `may_release` closed.
+    ///
+    /// `agy mcp add` is an upsert of the **one machine-global** entry, and the
+    /// two windows' entries differ in `--endpoint-file`, a per-session path
+    /// naming that window's connection — so the premise the `Shared` arm rested
+    /// on ("both are idempotent upserts of the same state") is false for the
+    /// registration, though it is true for the rules. A second window repointed
+    /// the shared registration at its own endpoint; the first window's next
+    /// `agy` respawn read the registry and began answering questions about
+    /// connection A by querying connection **B**, with B's credentials. When B's
+    /// session ended, `AiSession::drop` removed B's endpoint file, leaving the
+    /// registration naming a file that is gone and every tool call in A denied —
+    /// which a denied Antigravity turn reports as `"status":"SUCCESS"` with an
+    /// empty response.
+    ///
+    /// So the second window says it has no database tools instead, and says
+    /// *why*: "could not register" would send the user looking for a broken
+    /// install. `install` shells out and cannot be unit-tested; the decision it
+    /// got wrong can be, which is why it is a free function.
+    #[test]
+    fn only_an_owner_writes_the_machine_global_registration() {
+        let mine = Claim {
+            owner: Owner {
+                pid: 1234,
+                started: 900,
+            },
+            nonce: 7,
+        };
+        assert!(may_register(&Claimed::Mine(mine)));
+        assert!(
+            !may_register(&Claimed::Shared),
+            "one registration cannot point at two connections"
+        );
+        assert!(!may_register(&Claimed::Refused));
+        // And the refusal names the ownership case rather than a failed command.
+        assert!(
+            blocked_reason(&Claimed::Shared).contains("Another Schemaic window"),
+            "{}",
+            blocked_reason(&Claimed::Shared)
+        );
+        assert_ne!(
+            blocked_reason(&Claimed::Shared),
+            blocked_reason(&Claimed::Refused)
+        );
     }
 
     /// **A respawn is two sessions in one process**, so the pid and the start
