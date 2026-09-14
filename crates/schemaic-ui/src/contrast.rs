@@ -377,7 +377,7 @@ pub const UI_PAIRINGS: &[Pairing<UiTheme>] = &[
     // unwatched.
     pair!(accent on erd_canvas, Body, "cell editors: the value a control holds"),
     // [B16-L2-01] read these two as a fill under white text and set them aside
-    // as "therefore fine". They aren't a fill: `footer_button` takes a colour
+    // as "therefore fine". They aren't a fill: `dialog_button` takes a colour
     // fn, so this is red *text* on the modal panel.
     pair!(confirm_yes on bg_panel, Body, "confirm modal: Yes; DDL preview: a destructive Apply"),
     pair!(confirm_yes_hover on bg_panel, Body, "confirm modal: hovering Yes"),

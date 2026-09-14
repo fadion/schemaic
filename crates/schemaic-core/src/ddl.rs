@@ -9177,7 +9177,9 @@ pub fn supports_change(dialect: SqlDialect, change: &Change) -> bool {
             // The rebuild, which performs a whole set of table changes that have
             // no statement of their own. `diff` is what puts one in a set; a
             // context-menu shortcut has no draft to build from, which is why the
-            // changes it can raise on their own are still the four above.
+            // changes it can raise on their own are still the ones listed above.
+            // (It said "the four above" while the list stood at six — a count in
+            // a comment beside a list is a second copy of the list.)
             | Change::RebuildTable(_)
             // Views. SQLite creates and drops them like anyone else; what it has
             // no form of is replacing one in place or renaming it, and

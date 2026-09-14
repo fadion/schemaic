@@ -660,7 +660,7 @@ pub fn tx_rollback_hover() -> Color {
 /// Apply in the DDL preview. Starts at the same red as the transaction reds, but
 /// kept separate on purpose: this one answers "yes, do the destructive thing"
 /// for *any* action, so it should be retunable without dragging Rollback along
-/// with it. It is **text**, not a fill — `footer_button` takes it as a colour.
+/// with it. It is **text**, not a fill — `dialog_button` takes it as a colour fn.
 pub fn confirm_yes() -> Color {
     ui().confirm_yes
 }

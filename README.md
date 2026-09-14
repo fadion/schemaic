@@ -228,7 +228,11 @@ install updates itself. Override the choice with
 `SCHEMAIC_PKG_FAMILY=debian|rpm|appimage`, or set `SCHEMAIC_NO_REPO=1` to take a
 single downloaded package and add nothing to your source lists. Read it first if
 you would rather not pipe a script into a shell; it is [install.sh](install.sh)
-in this repository, and it uses `sudo` only for the package-manager step.
+in this repository. It asks for `sudo` three times and says so each time: to
+write the signing key and the source list under `/usr/share/keyrings` and
+`/etc/apt/sources.list.d` (or `/etc/yum.repos.d`), to `rpm --import` the key on
+an RPM system, and for the package-manager step itself. The uninstall lines it
+prints at the end name every file it put there.
 
 **Everything on this list updates itself now**, by one of two mechanisms: the
 AppImage checks GitHub in the background and offers a restart, and a packaged

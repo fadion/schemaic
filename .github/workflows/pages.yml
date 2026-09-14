@@ -119,6 +119,31 @@ jobs:
             || { echo "::error::packaging/repo/build-site.sh does not default to ${expected}"; fail=1; }
           grep -q "^ *SCHEMAIC_REPO_URL: ${expected}$" .github/workflows/pages.yml \
             || { echo "::error::this workflow does not build for ${expected}"; fail=1; }
+
+          # The **keyring path** is the same kind of value and had the same
+          # number of copies: it is written into every user's source list as
+          # `Signed-By`, and a machine whose list points at a path nothing
+          # installs stops verifying — or stops updating. Five copies, of which
+          # this step used to compare none.
+          keyring="/usr/share/keyrings/schemaic-archive-keyring.gpg"
+          for f in install.sh packaging/repo/build-site.sh packaging/repo/index.html.in \
+                   packaging/repo/verify-site.py; do
+            grep -q "${keyring}" "$f" \
+              || { echo "::error::${f} does not name ${keyring}"; fail=1; }
+          done
+          grep -c "${keyring}" packaging/repo/build-site.sh | grep -qx 2 \
+            || { echo "::error::build-site.sh writes the keyring path in both the deb822 and the one-line source, or the pair has drifted"; fail=1; }
+
+          # `Origin`/`Suite` are what an unattended-upgrades user writes in
+          # `Allowed-Origins` as "Schemaic:stable", so they are published
+          # interface in exactly the way the base URL is — and the invariant in
+          # CLAUDE.md claimed a guard for them that did not exist.
+          grep -q '^ORIGIN="Schemaic"$' packaging/repo/build-apt-repo.sh \
+            || { echo "::error::the apt repository's Origin is no longer Schemaic; every Allowed-Origins line in the wild names the old one"; fail=1; }
+          grep -q '^SUITE="stable"$' packaging/repo/build-apt-repo.sh \
+            || { echo "::error::the apt repository's Suite is no longer stable"; fail=1; }
+          grep -q 'Origin: Schemaic`, `Suite: stable' packaging/repo/README.md \
+            || { echo "::error::packaging/repo/README.md documents a different Origin/Suite"; fail=1; }
           [ "$fail" -eq 0 ]
 
       - name: Build the site
@@ -128,6 +153,25 @@ jobs:
           SCHEMAIC_RETAIN: "5"
           SCHEMAIC_GH_REPO: ${{ github.repository }}
         run: bash packaging/repo/build-site.sh site
+
+      # **The published fingerprint is the fifth identity value**, and the one
+      # the packaging README designates *the* independent channel: "a
+      # fingerprint you can only check against the same server the key came
+      # from is not a check at all, and this repository's history is a channel
+      # that server does not control." It was the one nobody compared. The
+      # site's copy is derived from the key that actually signed this build, so
+      # a rotation moves it and leaves README.md asserting the old one — which
+      # is worse than no fingerprint, because someone will check against it.
+      #
+      # After the build rather than beside the step above, because the built
+      # value is what there is to compare against.
+      - name: Check the published key fingerprint agrees with the README
+        run: |
+          set -euo pipefail
+          built="$(sed -n 's|.*<pre><code>\([0-9A-F]\{40\}\)</code></pre>.*|\1|p' site/index.html | head -n1)"
+          [ -n "$built" ] || { echo "::error::no 40-hex fingerprint in the built site/index.html"; exit 1; }
+          grep -qx "$built" README.md \
+            || { echo "::error::README.md does not carry the fingerprint this build published (${built}). The signing key rotated: update README.md, and say so in the release notes — people check against it."; exit 1; }
 
       # A repository whose metadata does not match its packages installs
       # nothing, and finds that out on a user's machine. This reads the site

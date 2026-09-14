@@ -117,9 +117,11 @@ substitute for the statement, and none of these is a style preference.
 - **A Velopack channel name is app identity, like `--packId`** — add a name, never rename one;
   the names live only in `release.yml`, so the guard is a CI step there, not a `cargo test`. **The
   published package-repository identity is the same rule, second instance**: the Pages base URL,
-  `Origin`/`Suite` and the `Signed-By` keyring path are written into users' source lists and
-  moving one orphans every install just as silently. Its guards are CI steps in `pages.yml`, for
-  the same reason.
+  `Origin`/`Suite`, the `Signed-By` keyring path and the **published key fingerprint** are written
+  into users' source lists — or checked against by hand — and moving one orphans every install just
+  as silently. Its guards are CI steps in `pages.yml`, for the same reason. They were added one
+  value at a time and the list above ran ahead of them: for a while only the base URL was actually
+  compared, while this sentence claimed all of it.
 - **Splitting `lib.rs`/`main.rs`** has its own procedure; read it before starting one.
 
 Two further sections are load-bearing and easy to regress by not knowing they exist: **Floem 0.2
@@ -165,10 +167,13 @@ start with a failing test, then the code that makes it pass.
   is sanctioned to break it** — `export::export_xlsx_chunks`, with the user's say-so; why, and what
   it costs, is in `docs/architecture.md`. Read it as *the* one case, not as licence for a second:
   anything else wanting a real file still models it at the boundary. Don't commit with failing
-  or `#[ignore]`d tests unless the user asks. The single exception is
-  `core/tests/doc_coverage.rs`, which asserts every `src/*.rs` module is named somewhere in
-  `docs/architecture.md` — the thing under test *is* a file. A new module fails it until it's on the
-  map there.
+  or `#[ignore]`d tests unless the user asks. **Reading the repository's own source is the one
+  exempt kind of filesystem access**, because there the thing under test *is* a file:
+  `core/tests/doc_coverage.rs` asserts every `src/*.rs` module is named somewhere in
+  `docs/architecture.md` (a new module fails it until it's on the map there), and the
+  `ui::source_gate` family scans `.rs` files for a pattern an invariant forbids. That is a whole
+  family, not one test — this line said "the single exception is `doc_coverage.rs`" while a
+  couple of dozen source files were already doing it.
 - **Architecture invariants are test-enforced where possible** — e.g. the single SQL boundary lexer,
   the 1-row write-back safety net, and edit-model key selection all have regression tests; extend
   them rather than working around them.
