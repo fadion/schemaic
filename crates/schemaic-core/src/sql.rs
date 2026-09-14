@@ -285,10 +285,22 @@ fn scan_quoted(b: &[u8], i: usize, q: u8, backslash: bool) -> usize {
 /// runs to the matching closing `$tag$`. Returns `None` when this isn't actually
 /// a dollar-quote (e.g. a `$1` positional parameter), so the caller scans it as
 /// ordinary code.
+///
+/// The tag obeys PostgreSQL's own rule — *"the same rules as an unquoted
+/// identifier, except that it cannot contain a dollar sign"* — so it is scanned
+/// with [`is_word_start`]/[`is_word_byte`], **this module's third word scanner**
+/// and the one the sweep that consolidated the other two did not reach. Written
+/// ASCII-only it ended the tag at the `0xC3` of `$prüfung$`, answered `None`, and
+/// the statement splitter then cut a PL/pgSQL body at its internal semicolons.
+/// Asking [`is_word_start`] for the first byte also closes the over-read on the
+/// other side: `$1$` is two positional parameters, not the tag `1`.
 fn scan_dollar(b: &[u8], i: usize) -> Option<usize> {
     let n = b.len();
     let mut j = i + 1;
-    while j < n && (b[j].is_ascii_alphanumeric() || b[j] == b'_') {
+    if j < n && b[j] != b'$' && !is_word_start(b[j]) {
+        return None; // `$1` / `$+` — no identifier can begin here
+    }
+    while j < n && is_word_byte(b[j]) {
         j += 1;
     }
     if j >= n || b[j] != b'$' {
@@ -341,9 +353,7 @@ pub fn is_word_start(b: u8) -> bool {
 /// Is the `'` at `i` preceded by a standalone `E`/`e` prefix (not the tail of a
 /// longer word), i.e. PostgreSQL's escape-string syntax?
 fn e_prefixed(b: &[u8], i: usize) -> bool {
-    i >= 1
-        && matches!(b[i - 1], b'e' | b'E')
-        && (i < 2 || !(b[i - 2].is_ascii_alphanumeric() || b[i - 2] == b'_'))
+    i >= 1 && matches!(b[i - 1], b'e' | b'E') && (i < 2 || !is_word_byte(b[i - 2]))
 }
 
 /// Scan a SQLite `[…]` bracketed identifier to just past its `]`. There is no
@@ -3185,6 +3195,39 @@ mod tests {
         assert_eq!(&t[..end], "$tag$x;y$tag$");
         // `$1` is a positional param, not a dollar-quote → scanned as code.
         assert_eq!(super::skip_noncode(b"$1 = x", 0, PG), None);
+    }
+
+    #[test]
+    fn pg_dollar_tag_may_carry_a_non_ascii_letter() {
+        // PostgreSQL's rule for the tag is "the same rules as an unquoted
+        // identifier, except that it cannot contain a dollar sign", and an
+        // unquoted identifier may carry diacritics and non-Latin letters —
+        // architecture invariant 11. The tag scan was the third word scanner in
+        // this module and was not swept with the other two.
+        let s = "$café$ a;b $café$ rest";
+        let body_end = s.rfind("$café$").unwrap() + "$café$".len();
+        let end = super::skip_noncode(s.as_bytes(), 0, PG).unwrap();
+        assert_eq!(end, body_end);
+        assert_eq!(&s[..end], "$café$ a;b $café$");
+
+        // The composition that is the actual damage: the splitter must not see
+        // the body's own semicolons.
+        assert_eq!(super::statement_ranges("SELECT $ü$ a; b $ü$", PG).len(), 1);
+        assert_eq!(
+            super::statement_ranges("SELECT $ü$ a; b $ü$; SELECT 2", PG).len(),
+            2
+        );
+    }
+
+    #[test]
+    fn pg_dollar_tag_cannot_begin_with_a_digit() {
+        // `$1$` is two positional params with nothing between them, not a tag:
+        // a PostgreSQL identifier cannot begin with a digit.
+        assert_eq!(super::skip_noncode(b"$1$ a;b $1$", 0, PG), None);
+        // …and a digit still *continues* one.
+        let s = "$t1$a;b$t1$";
+        let end = super::skip_noncode(s.as_bytes(), 0, PG).unwrap();
+        assert_eq!(&s[..end], s);
     }
 
     #[test]
