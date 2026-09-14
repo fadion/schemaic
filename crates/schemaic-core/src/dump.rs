@@ -781,7 +781,32 @@ pub fn plan(
                 flavour: ServerFlavour::Unknown,
                 changes: here
                     .into_iter()
-                    .map(|fk| Change::AddForeignKey(Box::new(fk)))
+                    .map(|mut fk| {
+                        // **A key whose target is in this dump names it the way
+                        // the file names its own tables — bare.**
+                        //
+                        // On MySQL and MariaDB `ref_schema` is the *database*
+                        // (`ddl::ref_schema_is_database`), and `information_
+                        // schema` reports it even for an ordinary same-database
+                        // key. `fk_clause` then hard-qualified the `REFERENCES`
+                        // while the `ALTER TABLE` above it stayed bare, so
+                        // editing the `USE` line — the retarget gesture this
+                        // module documents — moved every table, row and trigger
+                        // and left every foreign key pointing at the source. On
+                        // the same server that succeeds *silently* and
+                        // constrains the copy against production.
+                        //
+                        // This is `DumpStep::Rows::insert_database`'s rule, one
+                        // section further down the file; it exists because the
+                        // identical bug was found and fixed on the `INSERT`
+                        // half. PostgreSQL's `ref_schema` is a namespace — part
+                        // of the object rather than its address — so the
+                        // capability decides, not the engine.
+                        if crate::ddl::ref_schema_is_database(dialect) {
+                            fk.ref_schema = None;
+                        }
+                        Change::AddForeignKey(Box::new(fk))
+                    })
                     .collect(),
             };
             fks.extend(set.emit());
@@ -2121,6 +2146,64 @@ mod tests {
         ));
         assert!(pos(&file, "<<rows orders") < pos(&file, "ADD CONSTRAINT"));
         assert!(pos(&file, "<<rows customers") < pos(&file, "ADD CONSTRAINT"));
+    }
+
+    /// **And they name their target the way the file names its own tables.**
+    ///
+    /// On MySQL and MariaDB `KEY_COLUMN_USAGE.REFERENCED_TABLE_SCHEMA` is the
+    /// *database*, so `ForeignKeyInfo::ref_schema` is `Some("shop")` for an
+    /// ordinary same-database key — and `fk_clause` hard-qualified the
+    /// `REFERENCES` from it while the `ALTER TABLE` above it stayed bare. Edit
+    /// the `USE` line, which `target_database_sql`'s own doc calls "the one line
+    /// to edit to restore the dump somewhere else", and every table, row and
+    /// trigger lands in `shop_copy` while every foreign key points at `shop`.
+    /// On a fresh server that is `ERROR 1215` at the very end, after all the
+    /// data. On the **same** server — restoring a copy beside the original, the
+    /// commonest reason to retarget — it succeeds silently and constrains the
+    /// copy against production: an insert into the copy is validated against
+    /// live rows, and a production `ON DELETE CASCADE` deletes out of the copy.
+    ///
+    /// `DumpStep::Rows::insert_database` exists because this exact bug was found
+    /// and fixed on the `INSERT` half; the same reasoning never reached here.
+    ///
+    /// Every foreign-key fixture in this module is built by `refs()` with
+    /// `ref_schema: None` — the one shape that cannot show it — so this one
+    /// states the database explicitly.
+    #[test]
+    fn a_foreign_key_inside_the_dump_is_not_pinned_to_the_source_database() {
+        let mut orders = refs(table("orders"), "customers");
+        orders.foreign_keys[0].ref_schema = Some("shop".to_string());
+        let s = schema_of(vec![orders, table("customers")]);
+        let text = text_of(&plan(
+            &s,
+            "shop",
+            &all(&s),
+            DumpOptions::default(),
+            SqlDialect::MySql,
+        ));
+        assert!(text.contains("ADD CONSTRAINT"), "{text}");
+        assert!(
+            !text.contains("`shop`.`customers`"),
+            "the restored copy is wired back to the source:\n{text}"
+        );
+        assert!(text.contains("REFERENCES `customers`"), "{text}");
+
+        // PostgreSQL's `ref_schema` is a **namespace** — part of the object,
+        // not its address — so it stays.
+        let mut o = refs(table("orders"), "customers");
+        o.schema = Some("app".to_string());
+        o.foreign_keys[0].ref_schema = Some("app".to_string());
+        let mut c = table("customers");
+        c.schema = Some("app".to_string());
+        let s = schema_of(vec![o, c]);
+        let text = text_of(&plan(
+            &s,
+            "shop",
+            &all(&s),
+            DumpOptions::default(),
+            SqlDialect::Postgres,
+        ));
+        assert!(text.contains("\"app\".\"customers\""), "{text}");
     }
 
     #[test]
