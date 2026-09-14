@@ -93,6 +93,17 @@ impl SqlDialect {
         matches!(self, SqlDialect::Sqlite)
     }
 
+    /// Does the server expand `/*! … */` (and MariaDB's `/*M! … */`) as **code**
+    /// rather than skipping it as a comment?
+    ///
+    /// MySQL and MariaDB only. The marker may carry a minimum server version —
+    /// `/*!50000`, `/*M!010000` — and a bare `/*!` fires unconditionally; this
+    /// module treats every one of them as code, because a lexer that guessed the
+    /// server's version would guess in the unsafe direction half the time.
+    fn executable_comment(self) -> bool {
+        matches!(self, SqlDialect::MySql)
+    }
+
     /// Are `$tag$ … $tag$` strings accepted? PostgreSQL only.
     fn dollar_quoted(self) -> bool {
         matches!(self, SqlDialect::Postgres)
@@ -133,6 +144,25 @@ fn skip_comment(b: &[u8], i: usize, dialect: SqlDialect) -> Option<usize> {
         return Some(j);
     }
     if b[i] == b'/' && i + 1 < n && b[i + 1] == b'*' {
+        // **An executable comment is not a comment.** MySQL and MariaDB expand
+        // `/*! … */` — and MariaDB `/*M! … */` — as *code*, optionally gated on
+        // a version number that `/*!` alone omits and that `/*M!010000` clears
+        // on every MariaDB this app supports. Returning the end of the whole run
+        // hid the body from the one lexer, and with it from both security gates
+        // built on it: `SELECT /*!LOAD_FILE('/etc/passwd')*/` tokenised as
+        // `["SELECT"]` and passed the AI read-only gate, and
+        // `SELECT * FROM t /*!INTO OUTFILE '/tmp/x'*/` was a plain read to
+        // `contains_write`, so a connection marked read-only ran it with no
+        // refusal and no confirmation.
+        //
+        // So the span ends **just past the marker**: the body is lexed as code
+        // and the trailing `*/` falls out as punctuation. Over-blocking when the
+        // server's version is below the marker's is the right direction for a
+        // refusal gate, and it is one function, so every caller of
+        // `skip_noncode` gets it at once.
+        if let Some(after) = executable_marker(b, i, dialect) {
+            return Some(after);
+        }
         let mut j = i + 2;
         while j + 1 < n && !(b[j] == b'*' && b[j + 1] == b'/') {
             j += 1;
@@ -140,6 +170,30 @@ fn skip_comment(b: &[u8], i: usize, dialect: SqlDialect) -> Option<usize> {
         return Some((j + 2).min(n));
     }
     None
+}
+
+/// The index just past a MySQL-family executable-comment marker opening at
+/// `b[i]`, or `None` when this `/*` opens an ordinary comment.
+///
+/// The three spellings are `/*!`, `/*!nnnnn` and MariaDB's `/*M!` / `/*M!nnnnnn`;
+/// the digits are a minimum server version and are consumed with the marker
+/// because they are not part of the statement either. See [`skip_comment`].
+fn executable_marker(b: &[u8], i: usize, dialect: SqlDialect) -> Option<usize> {
+    if !dialect.executable_comment() {
+        return None;
+    }
+    let mut j = i + 2;
+    if b.get(j) == Some(&b'M') {
+        j += 1;
+    }
+    if b.get(j) != Some(&b'!') {
+        return None;
+    }
+    j += 1;
+    while b.get(j).is_some_and(u8::is_ascii_digit) {
+        j += 1;
+    }
+    Some(j)
 }
 
 /// Does a comment open at `b[i]`?
@@ -1743,6 +1797,24 @@ fn word_tokens(sql: &str, dialect: SqlDialect) -> (Vec<String>, bool) {
     while i < n {
         if let Some(j) = skip_noncode(b, i, dialect) {
             flush!();
+            // **A quoted name followed by `(` is a function call, and the deny
+            // scan has to see it.** PostgreSQL resolves a double-quoted
+            // identifier against the stored lower-case `pg_proc.proname`, so
+            // `SELECT "pg_read_file"('/etc/passwd')` is the same call as the
+            // unquoted one — but the whole run was skipped as non-code, the
+            // name never became a token, and `is_denied` was never asked about
+            // it. Every PostgreSQL entry was one character from reachable,
+            // including `lo_export`, which writes a server-side file.
+            //
+            // Only before a `(`. A quoted *column* of the same spelling is a
+            // read, and `SELECT "delete" FROM t` staying `Ok` is the case this
+            // gate was deliberately tuned for.
+            if noncode_kind(b, i, dialect) == Some(NonCode::Identifier)
+                && b[j..].iter().find(|c| !c.is_ascii_whitespace()) == Some(&b'(')
+                && let (Some(name), _) = ident_at(sql, i, dialect)
+            {
+                words.push(name.to_ascii_uppercase());
+            }
             i = j;
             continue;
         }
@@ -3483,6 +3555,120 @@ mod tests {
             let err = super::read_only_reason(bracketed, d).expect_err("`[` is not a quote here");
             assert!(err.contains("single statement"), "{d:?}: {err}");
         }
+    }
+
+    /// **A MySQL/MariaDB executable comment is code, and the one lexer read it
+    /// as a comment.**
+    ///
+    /// `/*! … */` and MariaDB's `/*M! … */` are expanded by the server whenever
+    /// its version is at least the number in the marker — `/*M!010000` fires on
+    /// every MariaDB this app supports, and a bare `/*!` fires always. This
+    /// repository already states that as live-measured fact in
+    /// `intel::is_single_expression`'s doc, and `propose.rs` carries fixtures
+    /// for it; the class was closed at the proposal surface and the two
+    /// **security** gates built on the same lexer were never swept with it.
+    ///
+    /// So `SELECT /*!LOAD_FILE('/etc/passwd')*/` tokenised as `["SELECT"]`: the
+    /// head is on the read allowlist, no deny keyword is ever a token, the AI
+    /// gate returns `Ok`, and the server ships the file back as a cell. And
+    /// `SELECT * FROM t /*!INTO OUTFILE '/tmp/x'*/` is a plain read to
+    /// `contains_write`, so on a connection the user marked **read-only** it is
+    /// `Allow` — no refusal and no confirmation — while the server writes the
+    /// table to a file on the DB host.
+    ///
+    /// The lexer now stops at the marker rather than at `*/`, so the body is
+    /// lexed as code. That over-blocks when the server's version is below the
+    /// marker's, which is the right direction for both consumers.
+    #[test]
+    fn an_executable_comment_is_lexed_as_the_code_the_server_runs() {
+        for sql in [
+            "SELECT /*!LOAD_FILE('/etc/passwd')*/",
+            "SELECT /*!50000 LOAD_FILE('/etc/passwd')*/",
+            "SELECT /*M!100000 SLEEP(60)*/",
+            "SELECT /*M!GET_LOCK('x',600)*/",
+        ] {
+            assert!(
+                super::read_only_reason(sql, SqlDialect::MySql).is_err(),
+                "{sql}"
+            );
+        }
+        // The write guard, asserted through the composition it protects — the
+        // invariant is about `run_verdict`, not about the predicate.
+        let outfile = "SELECT * FROM orders /*!INTO OUTFILE '/tmp/orders.csv'*/";
+        assert!(
+            super::contains_write(outfile, SqlDialect::MySql),
+            "{outfile}"
+        );
+        assert!(matches!(
+            run_verdict(
+                &[outfile.to_string()],
+                GuardPolicy {
+                    read_only: true,
+                    confirm_writes: false,
+                    dialect: SqlDialect::MySql,
+                    no_database: false,
+                },
+            ),
+            RunVerdict::Block(_)
+        ));
+
+        // An ordinary comment is still inert, on every engine…
+        assert!(super::read_only_reason("SELECT /* delete from t */ 1", SqlDialect::MySql).is_ok());
+        assert!(!super::contains_write(
+            "SELECT 1 /* INTO OUTFILE 'x' */",
+            SqlDialect::MySql
+        ));
+        // …and neither marker is special where the server does not expand it.
+        for d in [SqlDialect::Postgres, SqlDialect::Sqlite] {
+            assert!(
+                super::read_only_reason("SELECT /*!LOAD_FILE('/etc/passwd')*/ 1", d).is_ok(),
+                "{d:?}"
+            );
+        }
+    }
+
+    /// **A quoted function name takes the token out of the deny scan's reach.**
+    ///
+    /// PostgreSQL resolves a double-quoted identifier against the stored
+    /// lower-case `pg_proc.proname`, so `SELECT "pg_read_file"('/etc/passwd')`
+    /// is the same call as the unquoted one — but the lexer skipped the quoted
+    /// run whole, `PG_READ_FILE` never became a token, and `is_denied` was never
+    /// asked. Every entry in the PostgreSQL list is reachable that way,
+    /// including the two that act: `lo_export` writes a server-side file and
+    /// `pg_terminate_backend` kills other sessions.
+    ///
+    /// The rule has to separate a quoted **call** from a quoted **column**, or
+    /// it breaks the case the gate was deliberately tuned for — which is why the
+    /// token is emitted only when the next non-space byte is `(`.
+    #[test]
+    fn a_quoted_function_name_is_still_the_function() {
+        for sql in [
+            "SELECT \"pg_read_file\"('/etc/passwd')",
+            "SELECT \"pg_read_file\" ('/etc/passwd')",
+            "SELECT \"lo_export\"(1,'/tmp/x')",
+            "SELECT \"pg_terminate_backend\"(123)",
+        ] {
+            assert!(
+                super::read_only_reason(sql, SqlDialect::Postgres).is_err(),
+                "{sql}"
+            );
+        }
+        // And a quoted *column* of the same spelling stays a read — the case
+        // `the_gate_reads_this_engines_identifier_quoting` exists for.
+        assert!(super::read_only_reason("SELECT \"delete\" FROM t", SqlDialect::Postgres).is_ok());
+        assert!(super::read_only_reason("SELECT \"update\" FROM t", SqlDialect::Sqlite).is_ok());
+        assert!(super::read_only_reason("SELECT `update` FROM t", SqlDialect::MySql).is_ok());
+        // The same door on the write guard, which is a narrower list — it names
+        // the tokens that change data, so a quoted `DELETE(` is a write and a
+        // quoted `delete` column is still a read.
+        assert!(super::contains_write(
+            "SELECT \"delete\"(1)",
+            SqlDialect::Postgres
+        ));
+        assert!(!super::contains_write(
+            "SELECT \"delete\" FROM t",
+            SqlDialect::Postgres
+        ));
     }
 
     /// The rejection names what *this* engine allows, so the model can retry with

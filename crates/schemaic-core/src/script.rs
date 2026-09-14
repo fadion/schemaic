@@ -1133,6 +1133,41 @@ mod tests {
         probe(sql.as_bytes(), SqlDialect::MySql).expect("a slice never fails to read")
     }
 
+    /// **The third consumer of the executable-comment hole, and the one that is
+    /// not a gate.**
+    ///
+    /// `script_verdict` deliberately treats a whole `.sql` file as a write
+    /// *without reading it*, so the question "what will this file do" is
+    /// answered only by this panel. With the marker lexed as a comment,
+    /// `/*!50000 DROP DATABASE production */;` left `leading_words` empty, the
+    /// statement landed in `Other`, `is_destructive` matched none of its
+    /// prefixes, and `destruction_notice` returned `None` — **no red panel at
+    /// all** — over a file MySQL then executes in full.
+    ///
+    /// Not only the hostile case: `mysqldump --routines --triggers` writes
+    /// `/*!50003 DROP FUNCTION IF EXISTS f */;` as a matter of course, and this
+    /// module's own `UNCLASSIFIED` doc already cites `mysqldump` preambles as
+    /// the corpus that lands in `Other`. What nothing connected is that
+    /// `is_destructive` is asked of that same bucket.
+    #[test]
+    fn an_executable_comment_still_counts_as_the_statement_it_holds() {
+        let p = probed(
+            "/*!50000 DROP DATABASE production */;\
+             /*!50003 DROP TABLE customers */;",
+        );
+        assert_eq!(p.statements, 2);
+        assert_eq!(p.destructive, 2, "the red panel's own number");
+        assert!(
+            destruction_notice(&p).is_some(),
+            "and the panel renders: {:?}",
+            p.kinds
+        );
+        // An ordinary comment around the same words is still inert.
+        let inert = probed("/* DROP DATABASE production */ SELECT 1;");
+        assert_eq!(inert.destructive, 0);
+        assert!(destruction_notice(&inert).is_none());
+    }
+
     /// The histogram the modal reads out: commonest first, ties by name so two
     /// probes of one file print the same order.
     #[test]

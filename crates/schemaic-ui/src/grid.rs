@@ -1970,7 +1970,7 @@ pub(crate) fn drop_committed_staging(
         });
     }
     if !staged_del.is_empty() {
-        del_rows.update(|d| d.retain(|r| !staged_del.contains(r)));
+        crate::widgets::retain_if_any(del_rows, |r| !staged_del.contains(r));
     }
     if !committed.is_empty() {
         dirty.update(|d| drop_committed(d, committed));
