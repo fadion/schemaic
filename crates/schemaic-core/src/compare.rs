@@ -317,8 +317,22 @@ impl CompareEntry {
     /// Kept out of a plan and disclosed by it, exactly as
     /// [`CompareEntry::needs_source`] is — the two are the same shape of
     /// problem, an object the tree can show and the migration cannot carry.
+    ///
+    /// **It asks what the set `emit()`s, not whether the set is empty.** Those
+    /// are different questions, and the second one admitted the first input that
+    /// defeats it: `columns_equal` raises a change for a PostgreSQL identity
+    /// kind (`GENERATED ALWAYS` vs `BY DEFAULT`) that `pg_column_clauses` has no
+    /// arm for, so the set is non-empty and emits nothing. The entry was counted
+    /// as a planned object, the preview listed one change over an empty SQL box,
+    /// Apply was enabled, and the success line read *"Applied 0 statements to 1
+    /// object"* — the exact sentence above. Nothing else could catch it:
+    /// `ChangeSet::unsupported` filters on `supports_change`, which is `true`
+    /// for a PostgreSQL `AlterColumn` whatever the clause builder can express.
+    ///
+    /// An empty set emits nothing, so the case this was written for is still
+    /// covered.
     pub fn unplannable(&self) -> bool {
-        self.status.is_difference() && self.changes.is_empty()
+        self.status.is_difference() && self.changes.emit().is_empty()
     }
 
     /// The one-line disclosure for an entry a plan cannot carry — see
@@ -326,8 +340,14 @@ impl CompareEntry {
     fn omission_note(&self) -> String {
         let why = if self.needs_source() {
             "its body must be re-read from the server before it can be applied"
-        } else {
+        } else if self.changes.is_empty() {
             "this comparison has no statement for it — its definition could not be read"
+        } else {
+            // The third case, and it is not about reading: the difference was
+            // seen and this engine's emitter has no clause for it. Saying "its
+            // definition could not be read" there sends the reader to check a
+            // privilege that is fine.
+            "this comparison has no statement for the difference it found"
         };
         format!("{} {} — {why}", self.kind.label(), self.label())
     }
@@ -2027,6 +2047,120 @@ mod tests {
             })
             .is_empty()
         );
+    }
+
+    /// **A change set that is not empty and emits nothing is the same problem,
+    /// and the predicate could not see it.**
+    ///
+    /// `unplannable` asked `changes.is_empty()` while its own doc states the
+    /// rule as "a difference this comparison **has no statement for**" and names
+    /// *"Applied 0 statements to 1 object"* as the outcome it prevents. Those
+    /// are two different questions, and the second one admitted the first input
+    /// that defeats it: `columns_equal` raises a change for a PostgreSQL
+    /// identity kind that `pg_column_clauses` had no arm for — so the entry was
+    /// `Differing`, the plan counted it, the preview listed one change over an
+    /// empty SQL box, Apply was enabled, and the success line read that exact
+    /// sentence. The next compare found the same difference: a sync that never
+    /// converges.
+    ///
+    /// Nothing else could catch it. `ChangeSet::unsupported` filters on
+    /// `supports_change`, which is `true` for a PostgreSQL `AlterColumn`
+    /// whatever the clause builder can express.
+    ///
+    /// That particular input now emits (see
+    /// `a_postgres_identity_kind_is_a_statement_rather_than_a_silence`), so the
+    /// property is stated over a set that emits nothing for any reason — which
+    /// is what the predicate is actually about, and what keeps the *next* such
+    /// change from arriving silently.
+    #[test]
+    fn a_difference_the_emitter_cannot_express_is_disclosed_rather_than_counted() {
+        // A change set that is not empty and has nothing to say: an
+        // `AlterColumn` from a column to itself. `pg_column_clauses` finds no
+        // difference to spell, so `emit()` is empty.
+        let c = col("id", "integer");
+        let set = ChangeSet {
+            table: "city".to_string(),
+            schema: None,
+            dialect: SqlDialect::Postgres,
+            flavour: crate::schema::ServerFlavour::Unknown,
+            changes: vec![crate::ddl::Change::AlterColumn {
+                from: Box::new(c.clone()),
+                to: Box::new(c),
+                position: None,
+                inline_check: None,
+            }],
+        };
+        assert!(!set.is_empty(), "the premise: the set is not empty");
+        assert!(set.emit().is_empty(), "and it says nothing");
+
+        let entry = CompareEntry {
+            kind: CompareKind::Table,
+            schema: None,
+            name: "city".to_string(),
+            table: None,
+            signature: None,
+            status: ObjectStatus::Differing,
+            changes: set,
+            uncertain: false,
+            left_ddl: String::new(),
+            right_ddl: String::new(),
+        };
+        assert!(
+            entry.unplannable(),
+            "a difference this comparison has no statement for"
+        );
+        let c = SchemaComparison {
+            entries: vec![entry],
+            dialect: SqlDialect::Postgres,
+            cycles_create: false,
+            cycles_drop: false,
+            new_namespaces: Vec::new(),
+        };
+        let plan = c.plan(|_| true);
+        assert_eq!(plan.len(), 0, "not an object the plan applies");
+        assert_eq!(plan.omitted.len(), 1, "{:?}", plan.omitted);
+        assert!(plan.omitted[0].contains("city"), "{:?}", plan.omitted);
+        assert!(
+            plan.omitted[0].contains("no statement for the difference"),
+            "and it says which of the two reasons: {:?}",
+            plan.omitted
+        );
+    }
+
+    /// **And the input that found it is a statement now**, rather than a
+    /// disclosure: PostgreSQL spells the identity *kind* with
+    /// `ALTER COLUMN … SET GENERATED`, and `pg_column_clauses` had arms for the
+    /// expression, the type, the collation, nullability, the default and
+    /// `auto_increment` — and none for this.
+    #[test]
+    fn a_postgres_identity_kind_is_a_statement_rather_than_a_silence() {
+        let side = |always: bool| {
+            let mut c = col("id", "integer");
+            c.auto_increment = true;
+            c.identity_always = always;
+            from_db(
+                "app",
+                vec![TableInfo {
+                    name: "city".to_string(),
+                    columns: vec![c],
+                    ..Default::default()
+                }],
+            )
+        };
+        let c = SchemaComparison::of(&side(true), &side(false), SqlDialect::Postgres);
+        assert_eq!(find(&c, "table:city").status, ObjectStatus::Differing);
+        let sql = c.plan(|_| true).emit().join(
+            "
+",
+        );
+        assert!(sql.contains("SET GENERATED BY DEFAULT"), "{sql}");
+        // And the other direction.
+        let c = SchemaComparison::of(&side(false), &side(true), SqlDialect::Postgres);
+        let sql = c.plan(|_| true).emit().join(
+            "
+",
+        );
+        assert!(sql.contains("SET GENERATED ALWAYS"), "{sql}");
     }
 
     // ── an enum's dependents come off the side the DDL runs on ───────────────
