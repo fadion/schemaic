@@ -10307,8 +10307,45 @@ const CELL_PREVIEW_CHARS: usize = 200;
 ///
 /// Idempotent, which is what lets the builder call it over a value the memo
 /// has already cut.
+///
+/// **Cuts before it flattens, because the cap has to bound the *walk*.** The
+/// spelling was `truncate(&s.replace(['\r', '\n', '\t'], " "), CELL_PREVIEW_CHARS)`,
+/// and `str::replace` allocates and fills a `String` the length of the **whole**
+/// value before `truncate` takes 200 characters of it. On a `JSON`/`LONGTEXT`
+/// column at 1 MiB that is ~25 MiB of allocate-scan-copy per notification of a
+/// grid-wide signal, recomputing a byte-identical 200-character answer for every
+/// mounted cell but the one that changed. `9423587` fixed this exact shape one
+/// function away in the same range and wrote the rule down: "**`take`, not
+/// `min` — the cap has to bound the *walk*.**"
+///
+/// The substitution is 1:1 per character, so it commutes with the cut and the
+/// answer is unchanged — which is what [`preview_chars`] is asserted against.
 fn cell_preview(s: &str) -> String {
-    truncate(&s.replace(['\r', '\n', '\t'], " "), CELL_PREVIEW_CHARS)
+    preview_chars(s.chars())
+}
+
+/// [`cell_preview`] over a character stream, so a test can count what it pulls.
+///
+/// At most `CELL_PREVIEW_CHARS + 1` characters are read: the 201st only decides
+/// the ellipsis, and is never appended itself. That bound is the point of the
+/// function, and it is not observable through `&str`.
+fn preview_chars(chars: impl Iterator<Item = char>) -> String {
+    let mut it = chars;
+    let mut out: String = it
+        .by_ref()
+        .take(CELL_PREVIEW_CHARS)
+        .map(|c| {
+            if matches!(c, '\r' | '\n' | '\t') {
+                ' '
+            } else {
+                c
+            }
+        })
+        .collect();
+    if it.next().is_some() {
+        out.push('…');
+    }
+    out
 }
 
 fn truncate(s: &str, max: usize) -> String {
@@ -10318,6 +10355,60 @@ fn truncate(s: &str, max: usize) -> String {
         out
     } else {
         s.to_string()
+    }
+}
+
+#[cfg(test)]
+mod preview_walk_tests {
+    use super::*;
+
+    /// The spelling this replaced, kept as the oracle: the answer must not
+    /// change, only the work.
+    fn reference(s: &str) -> String {
+        truncate(&s.replace(['\r', '\n', '\t'], " "), CELL_PREVIEW_CHARS)
+    }
+
+    /// **The cap has to bound the walk, not just the answer.**
+    ///
+    /// `str::replace` filled a `String` the length of the whole value before
+    /// `truncate` took 200 characters of it — ~25 MiB of allocate-scan-copy for
+    /// a 1 MiB cell, per notification of a grid-wide signal, per mounted cell,
+    /// to recompute a byte-identical answer. The substitution is 1:1 per
+    /// character, so cutting first commutes with it.
+    ///
+    /// Counted through the character stream, because the bound is not
+    /// observable through `&str` — the old spelling produces the same string.
+    #[test]
+    fn cell_preview_cuts_before_it_flattens() {
+        let n = std::cell::Cell::new(0usize);
+        let big = "x".repeat(1_000_000);
+        let got = preview_chars(big.chars().inspect(|_| n.set(n.get() + 1)));
+        assert_eq!(
+            n.get(),
+            CELL_PREVIEW_CHARS + 1,
+            "the whole cell was walked to produce {} characters",
+            got.chars().count()
+        );
+        assert_eq!(got, reference(&big));
+
+        // The answer, over everything that makes this awkward.
+        for s in [
+            "",
+            "short",
+            "a\r\nb\tc",
+            "\r\n\t",
+            &"é".repeat(400),
+            &format!("{}\n{}", "a".repeat(199), "b".repeat(400)),
+            &"x".repeat(CELL_PREVIEW_CHARS),
+            &"x".repeat(CELL_PREVIEW_CHARS + 1),
+            &"日本語".repeat(300),
+        ] {
+            assert_eq!(cell_preview(s), reference(s), "{:?}", &s[..s.len().min(40)]);
+        }
+
+        // Idempotent — the builder calls it over a value the memo already cut.
+        let once = cell_preview(&"x".repeat(5_000));
+        assert_eq!(cell_preview(&once), once);
     }
 }
 
