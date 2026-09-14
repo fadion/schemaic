@@ -5413,7 +5413,20 @@ async fn import_on(
     if cancel.is_cancelled() {
         return Err(cancelled_import(rollback(conn, "ROLLBACK").await));
     }
-    conn.query_drop("COMMIT").await.map_err(qerr)?;
+    // **The fifth exit, and the one that had no `Rollback::note`.** Every other
+    // failure here says what the rollback achieved; this one returned the
+    // driver's bare sentence. On a MySQL `MyISAM`/`MEMORY`/`ARCHIVE`/`CSV`
+    // target — the tables this whole apparatus exists for — a connection that
+    // dies during the `COMMIT` left every row of the file durable in the table
+    // while the modal showed "Server has gone away" and nothing else. Asking
+    // for the rollback is what produces the answer: on a dead socket it fails
+    // too, and `Rollback::note` is what turns that into a sentence about the
+    // data rather than about the socket.
+    if let Err(e) = conn.query_drop("COMMIT").await {
+        let msg = qerr(e).to_string();
+        let undone = rollback(conn, "ROLLBACK").await;
+        return Err(DbError::Query(format!("{msg}{}", undone.note())));
+    }
     Ok(total)
 }
 
@@ -7361,6 +7374,92 @@ mod tests {
                 "`{name}` opens a connection for someone who is waiting and must \
                  bound it with {deadline} — a dark host otherwise costs the OS \
                  connect timeout, and this one repeats"
+            );
+        }
+    }
+
+    /// **Every exit out of `import_on` says what the rollback achieved.**
+    ///
+    /// `Rollback::note`'s reason for existing is written at `Db::import_rows`:
+    /// on a MySQL `MyISAM`/`MEMORY`/`ARCHIVE`/`CSV` target the batches already
+    /// sent really are durable, so the error must say so rather than report an
+    /// undo that did not happen. Four of the five exits carried it. The fifth —
+    /// the final `COMMIT` — was `map_err(qerr)?`, so a connection that died
+    /// there put the driver's bare *"Server has gone away"* in the modal over a
+    /// table holding every row of the file.
+    ///
+    /// A source gate because the failure is a socket that dies between two
+    /// statements, which no unit test can stage: every arm of `import_on` needs
+    /// a live MySQL connection to reach at all. What is checkable is that no
+    /// error leaves the function without the note, and that is what this reads.
+    #[test]
+    fn every_import_exit_says_what_the_rollback_achieved() {
+        let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/lib.rs"))
+            .expect("this module's own source");
+        let at = src
+            .find("async fn import_on(")
+            .expect("`import_on` is gone or was renamed");
+        let rest = &src[at..];
+        let end = rest[1..]
+            .find(
+                "
+/// ",
+            )
+            .map_or(rest.len(), |i| i + 1);
+        let body = &rest[..end];
+
+        let lines: Vec<&str> = body.lines().collect();
+        let mut offenders = Vec::new();
+        for (n, line) in lines.iter().enumerate() {
+            let code = line.trim_start();
+            if code.starts_with("//") || !code.contains("return Err(") {
+                continue;
+            }
+            // The whole `return` statement, which may be several lines: either
+            // spelling of the note counts — the explicit one, or
+            // `cancelled_import`, which is a wrapper over it.
+            let stmt: String = lines[n..]
+                .iter()
+                .take(8)
+                .copied()
+                .collect::<Vec<_>>()
+                .join(" ");
+            let says = stmt.contains("undone.note()")
+                || stmt.contains("cancelled_import(")
+                || stmt.contains(".note()");
+            if !says {
+                offenders.push(format!("import_on +{n}: {code}"));
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "an import failure that does not say what the rollback achieved              reports an undo that may not have happened, over a MySQL table that              may hold the whole file:
+{}",
+            offenders.join("
+")
+        );
+        // The floor: a negative assertion over a body it could not find passes.
+        assert!(
+            body.matches("undone.note()").count() >= 3,
+            "only {} notes in `import_on` — did they get renamed? Rewrite this              gate rather than letting it pass by finding nothing.",
+            body.matches("undone.note()").count()
+        );
+        // And nothing propagates a failure out with `?` instead, which is what
+        // the `COMMIT` exit did.
+        for (n, line) in body.lines().enumerate() {
+            let code = line.trim_start();
+            if code.starts_with("//") {
+                continue;
+            }
+            // The opening `BEGIN` is the one exception and it is not an
+            // exemption: nothing has been sent yet, so there is no rollback to
+            // describe and no durable batch to warn about.
+            if code.contains(r#"query_drop("BEGIN")"#) {
+                continue;
+            }
+            assert!(
+                !code.contains("map_err(qerr)?"),
+                "import_on +{n}: {code} — a `?` leaves without the note"
             );
         }
     }
