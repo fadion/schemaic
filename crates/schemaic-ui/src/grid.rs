@@ -1935,6 +1935,48 @@ fn hand_back_on_close(flag: RwSignal<bool>, back: Rc<dyn Fn()>) {
     });
 }
 
+/// Drop the staging a commit has just written, on the path where nothing else
+/// will.
+///
+/// **The landing has to clear what it wrote whether or not it re-ran.** The
+/// staged trio is owned by the `PanelView`, which outlives the grid, and the
+/// only other thing that clears it is `Tab::bump_panel_load`. On the happy path
+/// a `FullReran` commit reaches `begin_run`, which builds fresh panels — but
+/// `begin_run` is skipped when the committed tab is no longer active, and the
+/// grid's own arm did nothing on the assumption that it would not be. So a
+/// commit that landed while the user was on another tab left its pending row
+/// still staged and still green over the pre-commit rows: pressing Ctrl+Enter
+/// again **inserted it a second time** (auto-increment key, both rows persist,
+/// nothing reports it), and a re-issued `DELETE` matched 0 rows and rolled the
+/// whole batch back.
+///
+/// Only what *this* commit wrote: nothing stops the user staging another row
+/// while it is in flight, and that one has not been written. The new rows this
+/// commit took are the first `staged_new` of the vector, since staging appends.
+/// Over the signals rather than over the `GridState` that holds them, because
+/// those signals belong to the `PanelView` and a `GridState` cannot be built in
+/// a test — which is exactly how this path came to have none.
+pub(crate) fn drop_committed_staging(
+    dirty: RwSignal<DirtyCells>,
+    new_rows: RwSignal<Vec<HashMap<usize, CellEdit>>>,
+    del_rows: RwSignal<HashSet<usize>>,
+    committed: &HashSet<(usize, usize)>,
+    staged_new: usize,
+    staged_del: &HashSet<usize>,
+) {
+    if staged_new > 0 {
+        new_rows.update(|rows| {
+            rows.drain(..staged_new.min(rows.len()));
+        });
+    }
+    if !staged_del.is_empty() {
+        del_rows.update(|d| d.retain(|r| !staged_del.contains(r)));
+    }
+    if !committed.is_empty() {
+        dirty.update(|d| drop_committed(d, committed));
+    }
+}
+
 /// The grid body's rebuild key: sort state, frozen column, and **how many**
 /// pending new rows there are.
 ///
@@ -4949,6 +4991,10 @@ fn commit_grid(gs: GridState) {
     // The staged keys this write is assembled from. Nothing stops the user staging
     // another edit while the commit is in flight, and that one hasn't been written.
     let committed: HashSet<(usize, usize)> = gs.dirty.get_untracked().keys().copied().collect();
+    // The same question for the other two staged kinds, and for the same
+    // reason — see `drop_committed_staging`.
+    let staged_new = gs.new_rows.with_untracked(Vec::len);
+    let staged_del = gs.del_rows.get_untracked();
     let write = GridWrite {
         updates: gs.build_edits(),
         inserts: gs.build_inserts(),
@@ -4977,8 +5023,17 @@ fn commit_grid(gs: GridState) {
         match outcome {
             // Fresh DB values for the edited rows — splice in place, keep scroll.
             CommitDone::Spliced(rows) => gs.apply_splice(rows, &committed),
-            // The app re-ran the query; the grid is rebuilt fresh, nothing to do.
-            CommitDone::FullReran => {}
+            // The app *may* have re-run the query — it skips the re-run when the
+            // committed tab is no longer active, and then nothing else clears
+            // what this commit wrote. See `drop_committed_staging`.
+            CommitDone::FullReran => drop_committed_staging(
+                gs.dirty,
+                gs.new_rows,
+                gs.del_rows,
+                &committed,
+                staged_new,
+                &staged_del,
+            ),
             CommitDone::Failed(msg) => gs.commit_err.set(Some(msg)),
         }
     });

@@ -12681,6 +12681,85 @@ mod result_panel_tab_tests {
         assert!(view.del_rows.with_untracked(HashSet::is_empty));
     }
 
+    /// **And a commit that lands while the user is on another tab clears them
+    /// too** — the one path where neither `begin_run` nor `bump_panel_load`
+    /// runs.
+    ///
+    /// `CommitDone::FullReran` skips the re-run when the committed tab is no
+    /// longer active, and the grid's arm did nothing, on the assumption that the
+    /// grid would be rebuilt fresh. It is not. Coming back to the tab re-adopted
+    /// the panel's trio, so the pending row was still there and still green over
+    /// the pre-commit rows — and pressing Ctrl+Enter again inserted it a second
+    /// time, while a re-issued `DELETE` matched 0 rows and rolled the whole
+    /// batch back with every other staged edit in it.
+    ///
+    /// The composition: the panel's own signals, and the landing's decision over
+    /// them. A test of either alone passes today.
+    #[test]
+    fn a_commit_that_lands_on_another_tab_still_clears_what_it_wrote() {
+        use std::collections::{HashMap, HashSet};
+        let t = tab();
+        let id = t.begin_run(&["SELECT * FROM customers".to_string()])[0];
+        let view = t
+            .result_tabs
+            .with_untracked(|v| v.iter().find(|p| p.id == id).map(|p| p.view))
+            .expect("the panel");
+
+        view.dirty.update(|d| {
+            d.insert((0, 1), schemaic_core::model::CellEdit::Text("Ada".into()));
+        });
+        view.new_rows.update(|r| {
+            r.push(HashMap::from([(
+                1,
+                schemaic_core::model::CellEdit::Text("committed".into()),
+            )]))
+        });
+        view.del_rows.update(|d| {
+            d.insert(7);
+        });
+
+        // What the commit captured when it was assembled.
+        let committed: HashSet<(usize, usize)> =
+            view.dirty.with_untracked(|d| d.keys().copied().collect());
+        let staged_new = view.new_rows.with_untracked(Vec::len);
+        let staged_del = view.del_rows.get_untracked();
+
+        // …and a second pending row staged while it was in flight, which this
+        // commit did **not** write and must survive.
+        view.new_rows.update(|r| {
+            r.push(HashMap::from([(
+                1,
+                schemaic_core::model::CellEdit::Text("still mine".into()),
+            )]))
+        });
+
+        crate::grid::drop_committed_staging(
+            view.dirty,
+            view.new_rows,
+            view.del_rows,
+            &committed,
+            staged_new,
+            &staged_del,
+        );
+
+        assert!(view.dirty.with_untracked(HashMap::is_empty));
+        assert!(view.del_rows.with_untracked(HashSet::is_empty));
+        assert_eq!(
+            view.new_rows.with_untracked(Vec::len),
+            1,
+            "the row staged mid-flight is not this commit's to drop"
+        );
+        assert_eq!(
+            view.new_rows
+                .with_untracked(|r| r[0].get(&1).map(|v| format!("{v:?}"))),
+            Some(format!(
+                "{:?}",
+                schemaic_core::model::CellEdit::Text("still mine".into())
+            )),
+            "and it is the *later* one that survived"
+        );
+    }
+
     #[test]
     fn a_reset_tab_drops_its_pins_too() {
         let t = tab();
