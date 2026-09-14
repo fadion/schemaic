@@ -5086,13 +5086,22 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
             if n == 0 {
                 return;
             }
-            edit_untyped(
+            // Refused while the editor is frozen, exactly as `replace_one`
+            // above — and then the hit list must not be rewritten either. It
+            // was set from `new_text`, which is text that was never written: for
+            // the ordinary replacement that does not contain the needle that
+            // list is **empty**, so the bar reported no matches, `n/total`
+            // collapsed and Enter did nothing, over a document that still held
+            // every occurrence. The screen read as "the replace happened".
+            if !edit_untyped(
                 &ed,
                 comp,
                 Selection::region(0, text.len()),
                 &new_text,
                 EditType::Other,
-            );
+            ) {
+                return;
+            }
             find_hits.set(find_matches(&new_text, &q));
             find_idx.set(0);
         })
