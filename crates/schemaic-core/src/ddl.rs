@@ -2696,13 +2696,29 @@ fn unreplayable_rename(c: &Change) -> Option<String> {
 /// only reason the view was writable, are dropped with no error at all.
 /// Measured on PostgreSQL 16.15. The non-SQLite arm names them too, and the two
 /// arms now differ only in what the engine actually has.
-fn view_drop_cost(dialect: SqlDialect) -> &'static str {
-    match dialect {
-        SqlDialect::Sqlite => {
+///
+/// **`restored` is a parameter because the answer is the caller's.** The
+/// sentence is shared by `Change::DropView`, where nothing comes back, and by
+/// the `ReplaceView { recreate: true }` arm, which replays what the drop took —
+/// and the non-SQLite wording ended "and aren't restored" for both. The
+/// re-create arm then appended its own reassurance two lines later, so one risk
+/// block said the triggers are not restored *and* that they are put back, on the
+/// last surface before an irreversible Apply.
+fn view_drop_cost(dialect: SqlDialect, restored: bool) -> &'static str {
+    match (dialect, restored) {
+        (SqlDialect::Sqlite, false) => {
+            "Views that select from it stop resolving until it is back, and its \
+             INSTEAD OF triggers are dropped with it and aren't restored."
+        }
+        (SqlDialect::Sqlite, true) => {
             "Views that select from it stop resolving until it is back, and its \
              INSTEAD OF triggers are dropped with it."
         }
-        _ => {
+        (_, true) => {
+            "Dependent views, rules and grants are dropped with it and aren't \
+             restored; its INSTEAD OF triggers are dropped too."
+        }
+        (_, false) => {
             "Dependent views, rules, grants and its INSTEAD OF triggers are dropped \
              with it and aren't restored."
         }
@@ -3125,7 +3141,6 @@ impl Change {
     /// and a SQLite user their `INSTEAD OF` triggers, and stating one list to
     /// both told half the users the warning wasn't about them.
     pub fn risks(&self, dialect: SqlDialect) -> Vec<String> {
-        let view_drop_cost = view_drop_cost(dialect);
         match self {
             // The table really is dropped in the middle of this, so it belongs
             // in the destructive block even though the plan puts it back. What
@@ -3178,8 +3193,9 @@ impl Change {
                  on, and the grid may lose the key it was editing rows by."
             )],
             Change::DropView { materialized } => vec![format!(
-                "Drops the {}view. {view_drop_cost}",
-                if *materialized { "materialized " } else { "" }
+                "Drops the {}view. {}",
+                if *materialized { "materialized " } else { "" },
+                view_drop_cost(dialect, false)
             )],
             // The one place a *redefinition* is destructive: neither SQLite nor
             // PostgreSQL can always replace a view in place, so the edit costs a
@@ -3202,8 +3218,11 @@ impl Change {
                     }
                 };
                 let mut out = vec![format!(
-                    "Re-creating {} drops it first. {view_drop_cost} {why}",
-                    draft.name
+                    "Re-creating {} drops it first. {} {why}",
+                    draft.name,
+                    // The replay is what makes the triggers half of that
+                    // sentence untrue — see `view_drop_cost`.
+                    view_drop_cost(dialect, !replay.is_empty())
                 )];
                 // The reassurance is worth as much as the warning: the triggers
                 // are named as coming back, so the sentence above doesn't read
@@ -19966,6 +19985,47 @@ mod sqlite_view_tests {
         assert_eq!(withheld.len(), 1, "{withheld:?}");
         assert!(withheld[0].contains('v'), "{withheld:?}");
         assert!(withheld[0].contains("trigger"), "{withheld:?}");
+    }
+
+    /// **One risk block may not say a thing and its opposite.**
+    ///
+    /// The non-SQLite `view_drop_cost` sentence ended "and aren't restored" —
+    /// true for `Change::DropView`, and false since the replay landed for the
+    /// `ReplaceView { recreate: true }` arm that shares it, whose own
+    /// reassurance line is appended two lines later whenever `replay` is
+    /// non-empty. So the last surface before an irreversible Apply read: *"its
+    /// INSTEAD OF triggers are dropped with it and aren't restored … 1
+    /// statement dropped with it is put back afterwards."*
+    #[test]
+    fn a_recreate_that_replays_does_not_also_say_nothing_is_restored() {
+        let trg = r#"CREATE TRIGGER "vi" INSTEAD OF INSERT ON "v" BEGIN SELECT 1; END;"#;
+        let mut cur = view();
+        cur.dependent_ddl = vec![trg.to_string()];
+        let mut d = ViewDraft::from_table(&cur).unwrap();
+        d.select = "SELECT a FROM t".into();
+        for dialect in [SqlDialect::Postgres, SqlDialect::Sqlite] {
+            let risks = diff_view(&cur, &d, dialect).destructive().join(" ");
+            assert!(
+                risks.contains("put back afterwards"),
+                "{dialect:?}: {risks}"
+            );
+            assert!(
+                !risks.contains("triggers are dropped with it and aren't restored"),
+                "{dialect:?} says both: {risks}"
+            );
+            // The triggers are still named as dropped — the reassurance is not
+            // allowed to swallow the warning either.
+            assert!(risks.contains("INSTEAD OF"), "{dialect:?}: {risks}");
+        }
+        // And a plain drop, which really does restore nothing, keeps the word.
+        for dialect in [SqlDialect::Postgres, SqlDialect::Sqlite] {
+            let risks = Change::DropView {
+                materialized: false,
+            }
+            .risks(dialect)
+            .join(" ");
+            assert!(risks.contains("aren't restored"), "{dialect:?}: {risks}");
+        }
     }
 
     /// Nothing hanging off it, nothing to strand — the rename is unaffected.

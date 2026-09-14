@@ -2250,7 +2250,29 @@ async fn collect_schema(client: &Client) -> Result<DbSchema, DbError> {
             t.dependent_ddl = trigger_all
                 .iter()
                 .filter(|r| cell(r, 0) == ns && cell(r, 1) == t.name)
-                .map(|r| schemaic_core::sql::terminated(&cell(r, 7), SqlDialect::Postgres))
+                .map(|r| {
+                    let create = schemaic_core::sql::terminated(&cell(r, 7), SqlDialect::Postgres);
+                    // **And the state the DBA left it in.**
+                    // `pg_get_triggerdef` renders a `CREATE TRIGGER` and carries
+                    // no enabled state, so a replay put a *disabled* trigger
+                    // back at the default `O`: an `INSERT` through the view the
+                    // server had been refusing silently ran the trigger
+                    // function, and a replica-only trigger fired on the origin —
+                    // under a plan reporting success and a preview saying the
+                    // statement was "put back afterwards". The model three lines
+                    // up already reads `tgenabled` and names this hazard; the
+                    // replay added in the same file did not ask it.
+                    match TriggerEnabled::parse(&cell(r, 4)).alter_clause() {
+                        None => create,
+                        Some(clause) => format!(
+                            "{create}
+ALTER TABLE {}.{} {clause} {};",
+                            pg_ident(&ns),
+                            pg_ident(&t.name),
+                            pg_ident(&cell(r, 2)),
+                        ),
+                    }
+                })
                 .collect();
         }
         for ix in &mut t.indexes {

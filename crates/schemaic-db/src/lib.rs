@@ -4006,11 +4006,22 @@ pub(crate) fn mysql_column(r: MyColRow, mariadb: bool) -> ColRow {
     //
     // The classifier is the one place that knows a type keyword from its
     // spelling, and it is already exhaustive over both engines' vocabularies.
+    //
+    // **`YEAR` is the one the classifier cannot answer for**, and it is named
+    // rather than inherited. It sits with `date`/`datetime`/`time` there, which
+    // is right for the *icon* the classifier was written for and wrong here: a
+    // `YEAR` default is a bare number on both servers while a `DATE` default is
+    // a quoted string. Quoting it made a MySQL-to-MariaDB compare report the
+    // column Differing, emit a `SET DEFAULT '2024'` the server normalises back,
+    // and report the same difference on the next run — for ever.
     let numeric_or_bool = matches!(
         schemaic_core::schema::classify_column_type(&type_name),
         schemaic_core::schema::ColumnTypeClass::Numeric
             | schemaic_core::schema::ColumnTypeClass::Boolean
-    );
+    ) || type_name
+        .split(['(', ' '])
+        .next()
+        .is_some_and(|k| k.eq_ignore_ascii_case("year"));
     let default = default.and_then(|d| {
         if mariadb {
             // Already SQL text. MariaDB writes a *missing* default as SQL NULL
@@ -7495,6 +7506,17 @@ mod tests {
             ("double", "0.5"),
             ("float", "1"),
             ("bit(1)", "b'1'"),
+            // **`YEAR` is a bare number on both servers**, and the classifier
+            // puts it with `date`/`datetime`/`time` — correct for the *icon* it
+            // was written for, and wrong for the quoting question, which is why
+            // it has to be named here rather than inherited. MariaDB returns
+            // `2024`; MySQL quoted it `'2024'`, so a MySQL-to-MariaDB compare
+            // reported the column Differing, emitted a `SET DEFAULT '2024'` the
+            // server normalises, and reported the same difference next time —
+            // for ever. Verbatim the failure `58e0bd8` fixed for five sibling
+            // types, with this one left on the wrong side of the list.
+            ("year", "2024"),
+            ("year(4)", "0"),
         ] {
             let c = mysql_column(my_row(ty, Some(d), ""), false).column;
             assert_eq!(
