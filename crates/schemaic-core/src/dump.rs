@@ -1459,11 +1459,36 @@ pub fn destroyed(colliding: &[String], published: &[String]) -> Vec<String> {
 /// Separate from [`colliding_files`] because the caller needs the list for its
 /// *report* whichever way the verdict goes, and computing it twice is how the
 /// two answers come to disagree.
-pub fn folder_verdict(approved: bool, colliding: &[String]) -> FolderVerdict {
-    if approved || colliding.is_empty() {
-        FolderVerdict::Write
-    } else {
-        FolderVerdict::Ask(colliding.to_vec())
+///
+/// **`consented` is the list the user said yes to, not a `bool`.** It was a
+/// bool, and the approved re-launch then returned `Write` without looking at the
+/// new census at all — while the caller had just recomputed it, calling that
+/// "the more correct answer anyway, since the folder may have changed while the
+/// question stood". A re-read whose result is discarded is strictly worse than
+/// no re-read: it is the one place that *knows* the consented set and the actual
+/// set differ. A file that appeared in the folder while the modal stood — an
+/// editor autosaving, another export — was destroyed with no prompt naming it,
+/// and its only disclosure was the past-tense line in the finished report.
+///
+/// It needs no outside writer either: `file_plan` re-resolves the chosen tables
+/// against a freshly fetched schema, and the collision counter is spent over the
+/// *resolved* names, so a table that disappears between the question and the
+/// answer can shift a sibling from `orders_2.csv` onto `orders.csv` — a name the
+/// prompt never contained.
+///
+/// So consent covers exactly what it named: anything else is a new question,
+/// which is what the invariant this path was written for asks of it — "a
+/// destructive modal action guards its own launch, in the same step that
+/// launches it".
+pub fn folder_verdict(consented: Option<&[String]>, colliding: &[String]) -> FolderVerdict {
+    if colliding.is_empty() {
+        return FolderVerdict::Write;
+    }
+    match consented {
+        Some(said_yes) if colliding.iter().all(|f| said_yes.iter().any(|y| y == f)) => {
+            FolderVerdict::Write
+        }
+        _ => FolderVerdict::Ask(colliding.to_vec()),
     }
 }
 
@@ -1696,12 +1721,12 @@ mod tests {
         // An empty folder is nothing to ask about.
         assert!(census(|_| false).is_empty());
         assert_eq!(
-            folder_verdict(false, &census(|_| false)),
+            folder_verdict(None, &census(|_| false)),
             FolderVerdict::Write
         );
         // One collision is.
         assert_eq!(
-            folder_verdict(false, &census(|f| f == "orders.csv")),
+            folder_verdict(None, &census(|f| f == "orders.csv")),
             FolderVerdict::Ask(vec!["orders.csv".to_string()])
         );
         // In the plan's order — the order they would be replaced in.
@@ -1710,15 +1735,28 @@ mod tests {
             ["orders.csv".to_string(), "customers.csv".to_string()]
         );
         assert_eq!(
-            folder_verdict(false, &census(|_| true)),
+            folder_verdict(None, &census(|_| true)),
             FolderVerdict::Ask(vec!["orders.csv".to_string(), "customers.csv".to_string()])
         );
         // And once the user has said yes, it writes without asking again —
         // otherwise the confirm's Yes cannot get past its own guard.
+        let both = census(|_| true);
+        assert_eq!(folder_verdict(Some(&both), &both), FolderVerdict::Write);
+
+        // **But only for what they said yes to.** A file that appeared while the
+        // modal stood — an editor autosaving, another export, or a sibling
+        // shifted onto a free name by a table that went missing — is a new
+        // question, not a covered one.
+        let said_yes = vec!["orders.csv".to_string()];
         assert_eq!(
-            folder_verdict(true, &census(|_| true)),
-            FolderVerdict::Write
+            folder_verdict(Some(&said_yes), &both),
+            FolderVerdict::Ask(both.clone()),
+            "a file the prompt never named was replaced under an old consent"
         );
+        // Consent to more than turns up is still consent.
+        assert_eq!(folder_verdict(Some(&both), &said_yes), FolderVerdict::Write);
+        // And an empty folder needs no consent at all.
+        assert_eq!(folder_verdict(None, &[]), FolderVerdict::Write);
     }
 
     /// **The census is what is at risk; the report is what happened.** Handing

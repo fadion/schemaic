@@ -398,7 +398,7 @@ fn run_files(ui: Ui, target: DumpTarget) {
                 // **Never true here.** The collision list is only knowable off
                 // the UI thread, so the first run reports `WouldReplace` and the
                 // confirm re-launches — see `FilesRequest::approved`.
-                approved: false,
+                approved: None,
             },
             name,
         );
@@ -492,7 +492,13 @@ fn launch_files(ui: Ui, req: FilesRequest, name: String) {
                                 ) {
                                     return;
                                 }
-                                launch_files(ui.clone(), req.clone().approved(), name.clone());
+                                launch_files(
+                                    ui.clone(),
+                                    // The list the prompt named, which is what
+                                    // the re-run's census is compared against.
+                                    req.clone().approved(replaced.clone()),
+                                    name.clone(),
+                                );
                             }),
                         }));
                     }

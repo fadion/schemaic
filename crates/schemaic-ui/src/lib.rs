@@ -301,8 +301,8 @@ pub struct FilesRequest {
     /// file format.
     pub format: schemaic_core::export::ExportFormat,
     pub dialect: SqlDialect,
-    /// The user has been shown the files this export would replace and said
-    /// yes.
+    /// The files the user has been shown and said yes to — **the list, not a
+    /// flag**.
     ///
     /// **False on the launch the picker starts**, always: the file names are
     /// [`schemaic_core::dump::file_plan`]'s to choose and the folder's contents
@@ -311,15 +311,23 @@ pub struct FilesRequest {
     /// [`FilesOutcome::WouldReplace`] having written nothing, the view raises
     /// the shared confirm, and Yes re-launches with this set — which re-reads
     /// the folder, and is the more correct answer anyway, since the folder may
-    /// have changed while the question stood.
-    pub approved: bool,
+    /// have changed while the question stood — and `folder_verdict` compares
+    /// that re-read against this list rather than waving it through, so a file
+    /// that appeared while the modal stood raises the question again instead of
+    /// being destroyed under a consent that never named it.
+    pub approved: Option<Vec<String>>,
 }
 
 impl FilesRequest {
-    /// The same request, approved — what the confirm's Yes re-launches.
-    pub fn approved(self) -> Self {
+    /// The same request, approved for **these** files — what the confirm's Yes
+    /// re-launches.
+    ///
+    /// It takes the list the prompt named rather than setting a flag, so the
+    /// re-run's own census can be compared against it. See
+    /// `schemaic_core::dump::folder_verdict`.
+    pub fn approved(self, consented: Vec<String>) -> Self {
         FilesRequest {
-            approved: true,
+            approved: Some(consented),
             ..self
         }
     }

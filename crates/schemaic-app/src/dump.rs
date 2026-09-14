@@ -314,7 +314,7 @@ pub(crate) async fn run_files(
     // that touches a filesystem is the closure.
     let replaced = schemaic_core::dump::colliding_files(&plan, |f| req.folder.join(f).is_file());
     if let schemaic_core::dump::FolderVerdict::Ask(replaced) =
-        schemaic_core::dump::folder_verdict(req.approved, &replaced)
+        schemaic_core::dump::folder_verdict(req.approved.as_deref(), &replaced)
     {
         // Before the first `rename`, so the folder is untouched.
         return FilesOutcome::WouldReplace { replaced };
