@@ -458,6 +458,16 @@ existing prose was left alone.
     source's columns *were* the misspelling. `SELECT nope FROM departments` was flagged and
     `SELECT * FROM (SELECT nope FROM departments) d` was silent, which is the most common place for a
     wrong column name to be.
+    **A recursive CTE is the one exception, and it is why the CTE map carries an `Option`.** `Ctes`
+    is `HashMap<String, (Cols, Option<(usize, usize)>)>`: the range is `None` for a `WITH RECURSIVE`
+    list, because a body naming itself is the whole construct there rather than an error. The rule
+    that is right for a derived table — where a self-reference is impossible — put two red Error
+    squiggles on `WITH RECURSIVE nums(n) AS (SELECT 1 … UNION ALL SELECT n + 1 FROM nums …)`, which
+    MariaDB 10.2+, PostgreSQL and SQLite all accept. **The exception is taken at the list, not at the
+    CTE**, because `RECURSIVE` marks the whole `WITH` list in the standard and not one member of it —
+    so a sibling in a recursive list also loses the check. `a_recursive_ctes_body_may_name_itself`
+    carries the counterweight in the same test: a **non**-recursive CTE still cannot see itself, and
+    a misspelling inside a recursive one is still a misspelling.
     **`dedup_diagnostics` is the last gate every offline diagnostic passes, and it had no test.** It
     promises to drop what an earlier, *higher-or-equal severity* diagnostic already covers; the
     severity half was only in the sort, and only at an equal start offset, so the coverage test read
@@ -1316,7 +1326,18 @@ existing prose was left alone.
     the clipboard and report success. That menu filters on the capability while the Download menu
     still offers every format (*Data grid*) — the split `erd_export::ErdExportFormat::is_text`
     already makes for PNG — and the capability is computed from the variant rather than stored, so a
-    seventh format has to answer it. **The filter is `clipboard_formats()`, not `.filter(|f|
+    seventh format has to answer it. **It is an exhaustive `match`, not `!matches!(self, Xlsx)`**,
+    and so are `writes_incrementally`, `erd_export::ErdExportFormat::{is_text, is_picture}` and
+    `import::ImportFormat::has_own_nulls`: a negated `matches!` compiles against a new variant and
+    silently answers `true` for it, which for `is_text` is an entry that clears the clipboard and
+    for `writes_incrementally` is a user sent to a `.part` sibling that is a truncated archive. The
+    census that was supposed to catch exactly that could not, because
+    `every_format_is_covered_by_a_parity_test` partitions **by `is_text()`** — a seventh binary
+    format defaulting to `true` lands in the text half and the census passes. The gate's needle was
+    the predicate the defect was in. `every_variant_is_in_all` is the one that does not have that
+    shape: it derives the count from a `match` with one arm per variant, so a new variant fails to
+    compile until its author has put it in `ExportFormat::ALL` and moved the count, and it checks
+    `ALL` for duplicates as well — two of one format would make the sum agree for the wrong reason. **The filter is `clipboard_formats()`, not `.filter(|f|
     f.is_text())` written at the call site**: the predicate had a test and its application did not,
     so deleting the filter left the whole suite green and shipped an Excel entry that clears the
     clipboard. The composition is the part that can regress, so the composition is what has a name
@@ -1571,18 +1592,26 @@ existing prose was left alone.
     remainder of a file a single unterminated field and a sample "of 200 records" reads to EOF —
     from a file the user only meant to look at.
     **The JSON reader had to learn the difference between that cap arriving and a broken file.**
-    `json_records` takes a `bounded` flag: under `read_sample`'s `Read::take`, a `serde_json` EOF
-    *inside* a value is the byte cap, so the walk stops with `more = true`, while a whole-file walk
-    passes `false` and a genuinely truncated file still fails there rather than importing a prefix
-    in silence. CSV degrades gracefully under truncation — the reader simply yields fewer records —
+    `json_records` takes `bounded: Option<u64>` — the cap itself: under `read_sample`'s `Read::take`,
+    a `serde_json` EOF *inside* a value is the byte cap, so the walk stops with `more = true`, while
+    a whole-file walk passes `None` and a genuinely truncated file still fails there rather than
+    importing a prefix in silence. CSV degrades gracefully under truncation — the reader simply yields fewer records —
     and JSON does not: the preview reached the user as `Couldn't read the file: EOF while parsing a
     string at line 1 column 8388608`, which reads as file corruption, on a file `validate` then
     walks end to end without complaint. The trigger is the first `limit` records exceeding the cap,
     i.e. an average record over ~42 KiB, which one text column reaches easily — a JSON export of a
     hundred support tickets is inside it — and `read_sample`'s own doc had been promising that a
-    truncated read "can only make the preview *shorter*". The arm also requires that something
-    already parsed, so a file empty or truncated before its first record still reports instead of
-    previewing nothing with `more = true`.
+    truncated read "can only make the preview *shorter*".
+    **It carries the cap rather than a flag because "did anything parse" was the wrong question.**
+    With a *first* record over the cap — one object holding a large text or base64 column —
+    `objects` is still empty when EOF arrives, so an arm that only asked whether something had
+    parsed did not fire and the corruption message came back on a perfectly valid file. The reader
+    knows the fact the deserializer does not, so a `Counting` wrapper carries the byte count out
+    (`read_sample` builds the `Read::take` and discards the handle, and `StreamDeserializer` never
+    gives its reader back): with nothing parsed and `seen >= cap`, the file is blamed on the cap in
+    its own sentence — *its first JSON record is larger than the N MiB the preview reads* — rather
+    than on corruption. Below the cap with nothing parsed it is still a short or broken file, and
+    still reported as one.
     **Excel is the third format, and a workbook is a file with several tables in it.**
     `infer_format` takes `xlsx`/`xlsm` and deliberately **not** `.xls`/`.xlsb` — different formats
     this reader cannot open, where guessing would trade a clear "unsupported file" for a parse error
@@ -1612,15 +1641,48 @@ existing prose was left alone.
     *declared* extent** (`sheet_width` over `Dimensions`), capped at `XLSX_MAX_COLS` (16,384) and
     refused above it: the rows are streamed, so a sheet's height costs nothing to skip past, and the
     row buffer is the one allocation whose size the file controls. A cell is placed relative to the
-    used range's **left edge** — the same correction `range.start()` used to make — and one outside
-    the declared range is dropped rather than widening or shifting the row, since every record has
-    to carry the same field count or the mismatch report becomes noise on every row after the widest.
+    used range's **left edge** — the same correction `range.start()` used to make — and one *left* of
+    that settled origin is dropped, since the slots are indexed relative to it and moving it after
+    the first row would shift every value already placed onto the wrong column.
+    **A cell to the *right* of the settled width widens that row, and only that row.** It used to be
+    dropped there too, and the drop had no reporter: `trim_to_mapping`'s doc promised that "a
+    worksheet's columns are fixed by its used range, so every row is already the same width and a
+    count mismatch is a real one worth reporting" — true of what arrives, and that was the defect,
+    because padding and truncating every row to the settled width made `coerce_record`'s
+    `IssueKind::FieldCount` branch unreachable **by construction** for Excel. A two-column header
+    over three-column data — a streaming writer with no `<dimension>`, or a stale one — previewed
+    two columns, said nothing in `missing_required` when the lost column was nullable, and reported
+    the right number of rows having written two-thirds of the data. CSV refuses the identical file.
+    Widening per row is what makes the count differ, which is the path and the message a ragged CSV
+    row already takes; `XLSX_MAX_COLS` still bounds it, the cells being unable to raise the ceiling
+    after the geometry closed just as they could not raise it while it was open.
     `xlsx_size_refusal` is still asked of the file's *stat* before any of it
     is read, because it can say so before the file is touched and it names the size — but the
     ceiling is now **enforced in `open_xlsx`**, which reads through a `std::io::Read::take` at
     `XLSX_MAX_BYTES` (512 MiB) so all three readers inherit it. A guard the *launcher* has to
     remember is a guard the two load-path opens did not have; they went straight to `read_to_end`.
     `oversize_workbook` is the one sentence both raise, naming the size where the caller knows it.
+    **`XLSX_MAX_BYTES` bounds the wrong quantity, though, which is why there is a second ceiling.**
+    Both of its enforcement points measure *compressed* bytes — the size on disk and the bytes read
+    through the `take` — and `xlsx_memory_warning` is derived from the same figure, while what is
+    actually held is the **inflated** archive: calamine materialises the shared-strings table and
+    the sheet XML with no ceiling of its own. A 4 MiB workbook whose `xl/sharedStrings.xml` is a few
+    hundred megabytes of one repeated byte passed every compressed-size check, was given a "this is
+    a small workbook" disclosure, and took the process out — at *preview* time, on a probe the
+    import modal re-fires on every settings change, on a file the user only meant to glance at. So
+    `open_xlsx` now asks `inflated_refusal` between the read and the inflate, against
+    `XLSX_MAX_INFLATED_BYTES` (2 GiB), summing the entry sizes from the ZIP **central directory**
+    (`by_index_raw` decompresses nothing) — which cost `schemaic-core` a promotion of `zip` from a
+    dev-dependency to a dependency. It is the same shape as the declared sheet width: a figure the
+    workbook supplies, trusted to describe what the workbook costs. Two limits are deliberate and
+    written into the constant's own doc. An archive that *understates* its entries is not caught —
+    the `zip` reader does not stop a decompressor at the declared size, so closing that would mean
+    inflating the whole archive once ourselves and throwing it away, doubling the cost of every
+    preview of every legitimate workbook — and anything that is not a readable archive answers
+    `None`, because calamine is about to open the same bytes and a size complaint would replace its
+    real diagnosis. The ceiling is a parameter of `open_xlsx_within`/`inflated_refusal` so the
+    decision is testable without a two-gigabyte fixture; what the test pins is that opening a
+    workbook consults the bound at all, which is the seam rather than the predicate.
     `cell_text` is one cell → `Field`, and its conversions are chosen
     so a value that came *out* of a database survives the trip back in: an empty cell → null; a
     number in `f64`'s shortest round-trip form, so `7.0` is `7` (an `INT` column rejects the latter,
@@ -1681,8 +1743,9 @@ existing prose was left alone.
     bug was the composition. `RowSourceIter::Json` is now
     `RowSourceIter::Buffered` and carries both: the same buffering for two different causes, JSON not
     knowing its columns before EOF and an `.xlsx` not being readable as a prefix at all.
-    `trim_to_mapping` puts Excel on **CSV's** side rather than JSON's, the used range fixing the
-    width. **`read_sample` bypasses `SAMPLE_MAX_BYTES` for a workbook** for that same prefix reason:
+    `trim_to_mapping` puts Excel on **CSV's** side rather than JSON's — the header fixes the
+    columns, so a row that does not match that count is a mismatch to report rather than keys to
+    drop, which is now true of the reader as well as of this rule (see `xlsx_rows` above). **`read_sample` bypasses `SAMPLE_MAX_BYTES` for a workbook** for that same prefix reason:
     a ZIP's central directory is at the end of the file, so a truncated read does not open at all and
     the bound would turn "preview a 9 MB workbook" into "this file is corrupt". What is left to
     disclose is the memory that costs: `xlsx_load_estimate` is `XLSX_MEMORY_FACTOR` × the file size,
@@ -1919,7 +1982,21 @@ existing prose was left alone.
     that "the first ready one" *is* the tie-break and two dumps stay byte-identical. The mask is
     built **once per definition** (`intel::code_mask`, split out of `code_word_hits` for this
     caller): the question is every picked view's name against every other's definition, V² questions
-    over V definitions, and folding the lex back into the search re-lexes each definition V times. The standalone-objects section
+    over V definitions, and folding the lex back into the search re-lexes each definition V times.
+    **`order_by_mention` is the third instance of that same edge — "waits for what it names".**
+    Base tables are ordered by their foreign keys and views by the views their bodies name; a
+    routine calling another routine, and a domain built on another domain, had nothing, because
+    `objects_where` is a `filter().cloned()` over the catalogue vector with no sort and no walk. With
+    `check_function_bodies` on — PostgreSQL's default — a `LANGUAGE sql` `CREATE FUNCTION a_total()
+    … SELECT b_base()` ahead of `b_base` stops the restore, and by then the file's `DROP TABLE`s have
+    run against the target. Routines are now ordered against each other and so is the `objects` list,
+    through the same `topo_order`, with input order (already kind-then-catalogue) as the tie-break so
+    two dumps stay byte-identical, and a cycle broken rather than dropped because mutually recursive
+    routines are legal and the file must still hold both. **The text it searches is the body, not the
+    `CREATE` that carries it**, and that is the part a tidy would get wrong: a PostgreSQL function's
+    `CREATE` wraps its body in `$$ … $$`, which is exactly what `intel::code_mask` marks as *not*
+    code — so asking the emitted statement finds nothing, every time, and the walk would be a no-op
+    that looked like a fix. The standalone-objects section
     covers only the namespaces the chosen tables live in — a dump of `sales` has no business
     recreating `archive`'s types — and skips `ObjectItem::is_internal`, since a `serial`'s own
     sequence is created by the column's definition and restating it fails the load on a name that
@@ -1933,7 +2010,25 @@ existing prose was left alone.
     nothing behind it (`a_sequence_owned_by_a_same_named_table_in_another_namespace_is_kept`). A
     sequence carries its own namespace and its owner is in that namespace, which is what makes the
     pair available to compare. It is on by default because a file without it fails on the first
-    column typed as one of the database's enums. Pure + unit-tested; extend the tests that assert on the whole file
+    column typed as one of the database's enums.
+    **What that namespace filter leaves out is now accounted for in the header** (`outside_dependencies`):
+    the types and sequences the chosen tables' columns name that this file will not create, as
+    display names, in the order they would have been emitted. Emitting only the chosen namespaces'
+    objects is a choice about what the file holds, not a licence to say nothing about the rest — a
+    `public` enum used by a `sales` column is simply absent, the `CREATE TABLE` still declares the
+    column with it, and on a fresh server the restore stops before any data lands. It is the same
+    accounting `dropped_fks` already had and strictly louder, since a missing type is a
+    `CREATE TABLE` that cannot run at all. A column names such an object in one of two places and
+    both are read as text, because that is what the catalogue hands back: the declared type
+    (`order_status`, or `public.order_status` where the search path does not cover it) and the
+    default expression (`nextval('public.order_seq'::regclass)`). Matched as a whole identifier so
+    `order_status_v2` is not a hit — and deliberately **not** through `intel::code_word_hits_in`,
+    because a sequence's name lives inside a string literal in that default, which is precisely what
+    a code mask hides. An internal sequence is skipped: it comes back with its column, so it is not
+    missing. The names are qualified unconditionally, unlike `display_name`, since *where* the
+    missing object lives is the whole point of the sentence and `public` — the namespace
+    `display_name` drops as the default — is the case this is usually about.
+    Pure + unit-tested; extend the tests that assert on the whole file
     (`file_of`) rather than on one string, since ordering across the two step kinds is where this
     module's real bugs live.
   - `ddl.rs` — **schema editing**, and every engine now reshapes a table, edits a view and edits a
@@ -2323,13 +2418,21 @@ existing prose was left alone.
     behind it to build a table from — where the designer's plan can answer anything by rebuilding.
     On SQLite it is true for `DropTable`, `DropView { materialized: false }`, `DropColumn`,
     `DropIndex { constraint: None }` and `DropTrigger` — the drops the engine genuinely has
-    statements for — for the whole-statement objects it creates like anyone else (`CreateView`,
-    `ReplaceView`, `CreateTrigger`, `ReplaceTrigger`, the replaces being a drop-and-create on every
-    engine), and for `RebuildTable`, which only `diff` raises. `RenameView` is deliberately **not**
+    statements for — for the whole-statement objects it creates like anyone else (`CreateTable`,
+    `CreateView`, `ReplaceView`, `CreateTrigger`, `ReplaceTrigger`, the replaces being a
+    drop-and-create on every engine), for `TruncateTable`, which SQLite spells `DELETE FROM t` with
+    no `WHERE` and optimises into the same operation, and for `RebuildTable`, which only `diff`
+    raises. `CreateTable` and `TruncateTable` were both missing from this list for a while and each
+    absence is in `ddl.rs`'s comments: without the first the designer's New-table path built a
+    non-empty change set, opened a preview, offered Run and emitted nothing; without the second
+    Truncate was offered red and enabled, asked *"Delete all ~4.2m rows in orders?"*, and then
+    opened an empty script behind an inert Apply. `RenameView` is deliberately **not**
     on the list: `diff_view` resolves a SQLite rename into the re-create before it can reach here.
-    **It is no longer purely a question of the change's kind**: `AddColumn` is answered by asking
-    `sqlite_native_add` above, the one arm that depends on what the change *contains*, and it falls
-    through to that list only after. It is false for everything else, where each false is
+    **It is no longer purely a question of the change's kind**: two arms are answered from what the
+    change *contains* and never reach that list. `AddColumn` asks `sqlite_native_add` above, and
+    `AlterColumn` is true exactly when it is a bare rename — `position.is_none()`,
+    `inline_check.is_none()` and `is_rename_only` — which is the `ALTER TABLE … RENAME COLUMN` route
+    the rebuild's refusal points at. It is false for everything else, where each false is
     the twelve-step rebuild in disguise: a foreign key or a constraint-backed index comes off only
     by recreating the table around it. Every non-SQLite dialect answers true. It exists because the
     per-row menus were built with **no** gate at all — not this one, not even `read_only` — so a
@@ -5328,6 +5431,16 @@ existing prose was left alone.
     the document, because silently reformatting every line the user did not select is the worse of
     the two surprises. Both ends are asked through `pairs::region_at`, so the two halves of "is this
     code" stay one answer.
+    **`tokenize` takes a numeric literal in one arm, ahead of the word arm, because two of a
+    number's three parts are spelled in bytes that arm calls punctuation.** `1.5e-3` lexed as
+    `["1", ".", "5e", "-", "3"]`; `need_space` suppresses the space around a `.`, but nothing said
+    anything about a `-` after a word, so the `"-" | "+"` arm asked `is_keyword("5e")`, got `false`,
+    called the sign binary and spaced it — and Format Code wrote `1.5e - 3` back over the user's own
+    buffer. `1.5e` is not a number on any of the three engines: SQLite lexes it `TK_ILLEGAL`,
+    PostgreSQL answers *trailing junk after numeric literal*, MySQL reads `1.5` and an identifier
+    `e`. The arm takes only the shape all three lexers share and no more of it — a `.` only ahead of
+    a digit, and a sign only ahead of a digit *and* behind the `e` the word scan already swallowed —
+    so `select a-1` keeps its binary minus and `select 1 e` keeps its two tokens.
   - `pairs.rs` — caret-driven, boundary-aware editor highlights + auto-close pairs (via
     `skip_noncode`): `auto_pair` (auto-close `()`/`''`/`""`/`` `` `` [MySQL] at code positions, wrap a
     selection, type-over a closer/quote already at the caret — respects string/comment regions and
@@ -7229,9 +7342,9 @@ existing prose was left alone.
   itself a symptom. Separately, Windows populates its root program lazily, so a certificate every
   browser accepts can still fail `verify-ca` with `UnknownIssuer`, and one installed during a
   session needs a restart to be seen.
-  `import_rows` is the bulk-load path, and it has an arm for **all three** engines — `Engine::Postgres`
-  and `Engine::Sqlite` hand off to `pg::import_rows`/`sqlite::import_rows` and `Engine::MySql` falls
-  through to the body below, which is why the paragraphs that follow are about MySQL's: one transaction of batched multi-row
+  `import_rows` is the bulk-load path, and it has an arm for **all three** engines: `Engine::Postgres`
+  and `Engine::Sqlite` hand off to `pg::import_rows`/`sqlite::import_rows`, `Engine::MySql` falls
+  through to the body here, and the shape is the same in each — one transaction of batched multi-row
   `INSERT`s pulled from a `RowSource` iterator, each batch required to affect exactly as many rows
   as it carried — the `commit_writes` 1-row safety net scaled to a file, without its
   statement-per-row round-trips.
@@ -9365,6 +9478,13 @@ existing prose was left alone.
     flickering "couldn't read this" on every chunk — until then it is an ordinary code block. A
     block that doesn't parse is neither dropped nor hidden: the user is told it couldn't be read
     *and* still sees what the model wrote, which is what they need to tell it what went wrong.
+    **`flush_item` runs at the *start* of `Tag::Heading` and `Tag::BlockQuote`, beside the one
+    `Tag::Table` already had.** A tight list item's own sentence sits in `runs` when the next block
+    opens, and without the flush it was swept into that block: a bullet reading *Back up the table
+    first* immediately ahead of a `### Why this matters` rendered as the single heading line
+    `Back up the table firstWhy this matters`, bullet gone, and ahead of a blockquote it took the
+    quote's stripe. At the start rather than at `TagEnd` because by the end the two texts are one
+    vector and no longer separable.
     **Which blocks get a Run button is `code_is_sql`, and it is the only place a model's output
     becomes one click from the user's database** — so the tag is authoritative (a ```bash block
     holding `DROP TABLE` is not SQL, however it reads) and only an *untagged* block falls back to
@@ -11987,6 +12107,12 @@ existing prose was left alone.
     the user never searched for"), so a list that lags a tick cannot become an edit. The empty-query
     arm still calls `query.track()`, or typing a needle after clearing one would read a document the
     effect had stopped following.
+    **Replace All honours `edit_untyped`'s refusal before it touches `find_hits`**, which is the
+    guard `replace_one` beside it already had. `replace_all_cb` wrote the new hit list unconditionally
+    and it was computed from `new_text` — text that, when the editor is frozen, was never written. For
+    an ordinary replacement whose replacement does not contain the needle that list is **empty**, so
+    the bar reported no matches, `n/total` collapsed and Enter did nothing, over a document that still
+    held every occurrence: the screen read as though the replace had happened.
   - `inline_diff.rs` — the Ctrl+K suggestion rendered **in the editor's own line flow**: the lines
     it replaces stay where they are, faded, and the lines it proposes appear directly below them,
     pushing the rest of the document down. They are Floem *phantom text* (the facility inlay hints
@@ -16110,6 +16236,17 @@ Re-introducing the anti-patterns these guard against is a regression:
   `unsafe_reason` over all three dialects (and asserts a real `WHERE` after a non-ASCII name is
   still found, so the fix cannot trade a missed guard for a spurious one), and
   `a_non_ascii_byte_does_not_end_a_word_for_the_other_two_scanners` covers the rest.
+  **That sweep did not reach every scanner in the module it started in.** `sql::scan_dollar` scans a
+  PostgreSQL dollar-quote tag, which PostgreSQL defines as *"the same rules as an unquoted
+  identifier, except that it cannot contain a dollar sign"* — so it is a word scanner, and it was
+  written ASCII-only. `$prüfung$` ended the tag at the `0xC3`, `scan_dollar` answered `None`, and the
+  statement splitter then cut a PL/pgSQL body at its internal semicolons. It asks
+  `is_word_byte`/`is_word_start` now, and the `is_word_start` half closes an over-read on the other
+  side that the ASCII loop had too: `$1$` is two positional parameters, not a tag `1`. `e_prefixed`
+  — the *"is this `'` PostgreSQL's `E'…'`"* test — moved to `is_word_byte` in the same commit. The
+  lesson for the next sweep is that a violation does not have to look like a tokenizer: both of
+  these are three lines inside a scan of something else, which is why grepping for the loops did not
+  find them.
 - **A Velopack channel name is app identity, like `--packId`: add a name, never rename one.** The
   three `release.yml` packs with — `win-x64`, `linux-x64`, `osx-arm64` — are explicit because a
   *default* channel (`win`, `linux`) reaches only the manifest name, so both platforms emit one
@@ -16138,7 +16275,7 @@ Re-introducing the anti-patterns these guard against is a regression:
   keeps asking for them for as long as Schemaic is installed — so moving one stops updates for
   every existing install, silently, with no route back to those users, exactly as a channel rename
   does. `Origin`+`Suite` is additionally the string an unattended-upgrades user pins as
-  `"Schemaic:stable"`. Two guards divide the work, both in `pages.yml` and both blocking the
+  `"Schemaic:stable"`. Three guards divide the work, all in `pages.yml` and all blocking the
   deploy. `verify-site.py`'s `check_client_config` pins the keyring path, `Suites: stable` and the
   `/deb` and `/rpm` segments against each *built site* — the artefact, after it exists. The host is
   parameterised through `SCHEMAIC_REPO_URL` precisely so a site can be built and installed from at
@@ -16146,9 +16283,25 @@ Re-introducing the anti-patterns these guard against is a regression:
   the `Check the repository URL agrees everywhere` step, which compares `install.sh`'s `SITE`,
   `build-site.sh`'s default and the workflow's own `SCHEMAIC_REPO_URL` against one literal and
   fails if any drifts. That is the same shape as the channel guard and has the same limit: it
-  catches one of the three moving, not a deliberate edit of all four. **`Origin` is checked
-  nowhere** — it is held only by `build-apt-repo.sh` and the prose that tells users to pin
-  `"Schemaic:stable"` agreeing by hand.
+  catches one of the three moving, not a deliberate edit of all four. **That step now carries the
+  other source-side identity values too**, the invariant having claimed guards for them that did not
+  exist. The keyring path `Signed-By` names has **five** copies — `install.sh`, `build-site.sh`
+  twice (the deb822 source and the one-line one), `index.html.in` and `verify-site.py` — of which it
+  compared none; the pair inside `build-site.sh` is checked by *count* rather than by presence,
+  since one of the two writing a different path is exactly the drift that matters and a presence
+  test would pass on it. `Origin` and `Suite` are read out of `build-apt-repo.sh`
+  (`ORIGIN="Schemaic"`, `SUITE="stable"`) and out of `packaging/repo/README.md`, which is the prose
+  telling users to pin `"Schemaic:stable"`.
+  **The published key fingerprint is the last of these values, and the one the packaging README
+  designates *the* independent channel** — "a fingerprint you can only check against the same server
+  the key came from is not a check at all, and this repository's history is a channel that server
+  does not control." It was the one nobody compared. `Check the published key fingerprint agrees
+  with the README` runs **after** the build rather than beside the step above, because the built
+  value is what there is to compare against: it lifts the 40-hex string out of the generated
+  `site/index.html` — derived from the key that actually signed this build — and requires
+  `README.md` to carry it verbatim. A rotation moves the site's copy and leaves `README.md`
+  asserting the old one, which is worse than publishing no fingerprint at all, because someone will
+  check against it.
 - **Splitting `lib.rs` / `main.rs`:** grep the line range for interleaved unrelated `fn`s first; a
   helper still used by code that stays goes to `widgets.rs` (glob-imported), not the new leaf
   module; mark cross-called items `pub(crate)`; build + `cargo fmt` + smoke-launch each step.
