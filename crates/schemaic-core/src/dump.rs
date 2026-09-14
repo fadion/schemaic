@@ -690,6 +690,65 @@ fn topo_order(waits_for: &[Vec<usize>]) -> (Vec<usize>, bool) {
     (out, cycles)
 }
 
+/// Re-order `(name, sql)` so a statement that **names** another comes after it.
+///
+/// **The third instance of one edge.** Base tables are ordered by their foreign
+/// keys and views by the views their bodies name; a routine that calls another
+/// routine, and a domain built on another domain, had nothing — `objects_where`
+/// is a `filter().cloned()` over the catalogue vector, no sort and no walk. With
+/// `check_function_bodies` on, PostgreSQL's default, `CREATE FUNCTION a_total()
+/// … SELECT b_base()` ahead of `b_base` stops the restore, and by then the
+/// file's `DROP TABLE`s have run against the target.
+///
+/// The same rule as the view walk, and deliberately so: each item's text is
+/// lexed **once** with [`crate::intel::code_mask`], then asked about every other
+/// name as a whole word in code, so a name inside a comment, a string literal or
+/// a longer identifier is not an edge. Input order is the tie-break — it is
+/// already the caller's kind-then-catalogue order — so two dumps of one schema
+/// stay byte-identical.
+///
+/// **The text searched is the body, not the `CREATE` that carries it.** A
+/// PostgreSQL function's `CREATE` wraps its body in `$$ … $$`, and a dollar-quote
+/// is exactly what [`crate::intel::code_mask`] marks as *not* code — so asking
+/// the emitted statement finds nothing, every time, and the walk would be a
+/// no-op that looked like a fix.
+///
+/// A cycle is broken by [`topo_order`] rather than dropped: mutually recursive
+/// routines are legal and the file must still hold both.
+fn order_by_mention(items: Vec<Emitted>, dialect: SqlDialect) -> Vec<Emitted> {
+    let edges: Vec<Vec<usize>> = items
+        .iter()
+        .enumerate()
+        .map(|(i, it)| {
+            let code = crate::intel::code_mask(&it.body, dialect);
+            items
+                .iter()
+                .enumerate()
+                // A statement always names itself, and that is not an edge.
+                .filter(|&(j, other)| {
+                    j != i
+                        && !crate::intel::code_word_hits_in(&it.body, &code, &other.name).is_empty()
+                })
+                .map(|(j, _)| j)
+                .collect()
+        })
+        .collect();
+    let (order, _) = topo_order(&edges);
+    let mut items: Vec<Option<Emitted>> = items.into_iter().map(Some).collect();
+    order.into_iter().filter_map(|p| items[p].take()).collect()
+}
+
+/// One standalone object on its way into the file: what it is called, the text
+/// that decides what it waits for, and the statement that creates it.
+struct Emitted {
+    name: String,
+    /// The routine or event body — see [`order_by_mention`] for why this is not
+    /// the `CREATE`. For an object with no body it *is* the `CREATE`, which is
+    /// where a domain names the type it is built on.
+    body: String,
+    sql: String,
+}
+
 /// The whole file, as steps.
 ///
 /// The order is the feature: guard *outside* the transaction (SQLite's pragma is
@@ -973,7 +1032,9 @@ pub fn plan(
     // on — PostgreSQL's default — a `LANGUAGE sql` function naming a table that
     // is not there yet fails at `CREATE`, and the whole array used to be emitted
     // ahead of the table loop.
-    let mut routines: Vec<String> = Vec::new();
+    // Carried with their names so the dependency walk below can edge one to
+    // another; the strings alone said nothing about what they call.
+    let mut routines: Vec<Emitted> = Vec::new();
     // **`other_objects` alone, not `structure && other_objects`.** The modal
     // draws it as a peer of Structure and Data, so ticking it by itself asks for
     // a file of the database's types, sequences and routines — a coherent thing
@@ -1009,7 +1070,7 @@ pub fn plan(
                 )
             })
             .collect();
-        let mut objects: Vec<String> = Vec::new();
+        let mut objects: Vec<Emitted> = Vec::new();
         for kind in kinds {
             for o in schema.objects_all(kind) {
                 // `is_internal` is what keeps a `serial`'s own sequence out.
@@ -1028,18 +1089,31 @@ pub fn plan(
                         kind,
                         ObjectKind::Function | ObjectKind::Procedure | ObjectKind::Event
                     );
+                    let sql = o.create_sql(dialect);
+                    let item = Emitted {
+                        name: o.name().to_string(),
+                        body: match (o.routine(), o.event()) {
+                            (Some(r), _) => r.body.clone(),
+                            (_, Some(e)) => e.body.clone(),
+                            _ => sql.clone(),
+                        },
+                        sql,
+                    };
                     if after_tables {
-                        routines.push(o.create_sql(dialect));
+                        routines.push(item);
                     } else {
-                        objects.push(o.create_sql(dialect));
+                        objects.push(item);
                     }
                 }
             }
         }
         if !objects.is_empty() {
             text!("-- Types and sequences".to_string());
-            for o in objects {
-                text!(o);
+            // A domain over a domain is the same edge as a routine over a
+            // routine — `kinds` above orders Enum before Domain, and nothing
+            // ordered two Domains against each other.
+            for o in order_by_mention(objects, dialect) {
+                text!(o.sql);
             }
         }
     }
@@ -1135,11 +1209,19 @@ pub fn plan(
     // ── Routines and events, once the tables they read exist ─────────────────
     if !routines.is_empty() {
         steps.push(DumpStep::Text("-- Routines and events".to_string()));
+        // **Ordered against each other, not just against the tables.** The
+        // table→routine edge was the split above; the routine→routine edge had
+        // nothing at all, so two `LANGUAGE sql` functions came out in catalogue
+        // order and `CREATE FUNCTION a_total() … SELECT b_base()` ahead of
+        // `b_base` fails at `CREATE` under `check_function_bodies` — the very
+        // fact the split rests on — after the file's `DROP TABLE`s have run.
+        let ordered: Vec<String> = order_by_mention(routines, dialect)
+            .into_iter()
+            .map(|r| r.sql)
+            .collect();
         // Through the client wrapper, so a MySQL compound body gets its
         // `DELIMITER` — the same rule the triggers above follow.
-        steps.push(DumpStep::Text(crate::ddl::client_script(
-            &routines, dialect,
-        )));
+        steps.push(DumpStep::Text(crate::ddl::client_script(&ordered, dialect)));
     }
 
     // ── Foreign keys, once every table is filled ─────────────────────────────
@@ -3215,6 +3297,88 @@ mod tests {
             .expect("a routine section");
         let table_ddl = file.find("CREATE TABLE").expect("the table");
         assert!(table_ddl < routines, "{file}");
+    }
+
+    /// **And after the routines they call.**
+    ///
+    /// The table→routine edge was ordered; the routine→routine edge was not.
+    /// `objects_where` is a `filter().cloned()` over the catalogue vector — no
+    /// sort, no walk — so two `LANGUAGE sql` functions came out in whatever
+    /// order the catalogue held them, and with the caller first the restore
+    /// stops at `ERROR: function b_base() does not exist` *after* the file's
+    /// `DROP TABLE`s have run against the target. The same
+    /// `check_function_bodies` fact the table ordering already rests on.
+    ///
+    /// The names are chosen so catalogue order and name order both put the
+    /// caller first: only a dependency walk can produce the right file.
+    #[test]
+    fn a_routine_comes_after_the_routine_it_calls() {
+        let mut t = table("orders");
+        t.schema = Some("public".to_string());
+        let mut s = schema_of(vec![t]);
+        for (name, body) in [("a_total", "SELECT b_base()"), ("b_base", "SELECT 1")] {
+            s.routines
+                .push(std::sync::Arc::new(crate::schema::RoutineInfo {
+                    name: name.to_string(),
+                    schema: Some("public".to_string()),
+                    kind: crate::schema::RoutineKind::Function,
+                    language: "sql".to_string(),
+                    body: body.to_string(),
+                    ..Default::default()
+                }));
+        }
+        let file = file_of(&plan(
+            &s,
+            "shop",
+            &all(&s),
+            DumpOptions::default(),
+            SqlDialect::Postgres,
+        ));
+        let callee = file.find("b_base").expect("the callee's CREATE");
+        let caller = file.find("a_total").expect("the caller's CREATE");
+        assert!(callee < caller, "the caller was emitted first:\n{file}");
+    }
+
+    /// And a name only *mentioned* is not an edge — the same rule the view walk
+    /// keeps, asked of the routine bodies.
+    #[test]
+    fn a_routine_name_that_is_only_mentioned_is_not_a_dependency() {
+        let mut t = table("orders");
+        t.schema = Some("public".to_string());
+        let mut s = schema_of(vec![t]);
+        for (name, body) in [
+            (
+                "a_first",
+                "-- unrelated to z_other\nSELECT 'z_other', z_other_backup FROM orders",
+            ),
+            ("z_other", "SELECT 1"),
+        ] {
+            s.routines
+                .push(std::sync::Arc::new(crate::schema::RoutineInfo {
+                    name: name.to_string(),
+                    schema: Some("public".to_string()),
+                    kind: crate::schema::RoutineKind::Function,
+                    language: "sql".to_string(),
+                    body: body.to_string(),
+                    ..Default::default()
+                }));
+        }
+        let file = file_of(&plan(
+            &s,
+            "shop",
+            &all(&s),
+            DumpOptions::default(),
+            SqlDialect::Postgres,
+        ));
+        // No edge, so the catalogue order stands.
+        let first = file.find("a_first").expect("the first routine");
+        let other = file
+            .find("FUNCTION z_other")
+            .or_else(|| file.find("z_other()"));
+        assert!(
+            other.is_none_or(|at| first < at),
+            "a mention reordered the file:\n{file}"
+        );
     }
 
     /// The rows come back with their keys, but an explicit insert does not move
