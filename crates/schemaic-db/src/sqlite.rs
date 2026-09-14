@@ -106,6 +106,10 @@ use crate::{Db, DbError, ident_sqlite};
 /// level shows this single entry.
 pub const MAIN: &str = "main";
 
+/// SQLite's own name for the per-connection temporary database — the one an
+/// unqualified name resolves in *before* `main`.
+const TEMP: &str = "temp";
+
 /// Map a rusqlite error onto the app's error type.
 ///
 /// Everything that isn't a connection failure is a query failure, matching how
@@ -424,8 +428,10 @@ fn columns_of(stmt: &rusqlite::Statement<'_>) -> Vec<Column> {
 /// - every relation is resolved to the **database** it is really in
 ///   ([`resolve_relation`]), and every column attributed only to a
 ///   `(database, table)` pair the statement was seen to read — so nothing is
-///   attributed to a relation that was never checked for being a view, and two
-///   `ATTACH`ed files holding a table of one name cannot stand in for each other.
+///   attributed to a relation that was never checked for being a view, and a
+///   `temp` table shadowing a `main` one of the same name cannot stand in for it;
+/// - and that database must be `main`, because the write connection has nothing
+///   else. An `ATTACH`ed or `temp` relation reads fine and comes back read-only.
 ///
 /// Flags come from the table's own pragmas, **asked of that database**, so
 /// `analyze_edit` gets the same material it gets from the other two engines and
@@ -468,7 +474,22 @@ fn attach_origins(
     let mut read: Vec<(String, String)> = Vec::new();
     for s in &sources {
         match resolve_relation(conn, s.qualifier.as_deref(), &s.name) {
-            Some((db, false)) => read.push((db, s.name.clone())),
+            // **Only `main`.** Attribution is an offer to write, and the write
+            // runs on a *different* connection: `commit_writes` opens a fresh
+            // one, on which no `ATTACH` has run and no `temp` table exists, and
+            // `statement_for` names the table bare. So an origin naming any
+            // other database offers an edit whose `UPDATE` lands on `main`'s
+            // table of that name where there is one — one row affected, the
+            // 1-row safety net satisfied, success reported, and a table the
+            // user never opened overwritten.
+            //
+            // This was unreachable while every SQLite operation had its own
+            // connection: no `ATTACH` a user typed survived into the statement
+            // that would read from it. `run_batch` now holds one connection for
+            // a whole *Run all*, so statement *i*'s `ATTACH` (or
+            // `CREATE TEMP TABLE`) is live for statement *j*, and the premise
+            // expired. Reading is unaffected — the result comes back, read-only.
+            Some((db, false)) if db.eq_ignore_ascii_case(MAIN) => read.push((db, s.name.clone())),
             _ => return,
         }
     }
@@ -736,10 +757,18 @@ fn implicit_row_key(columns: &[ColumnInfo], has_rowid: bool) -> Option<String> {
 ///
 /// **Asked of SQLite rather than assumed**, because an unqualified name is not
 /// necessarily in `main`: it resolves against `temp`, then `main`, then each
-/// attached database in `ATTACH` order, and `pragma_table_list` lists the
-/// schemas holding a name in that same order. So the first row is the one the
-/// statement actually read, and defaulting an unqualified name to `main` would
-/// describe a different table whenever the name lives only in an attached file.
+/// attached database in `ATTACH` order. Defaulting an unqualified name to `main`
+/// would describe a different table whenever the name lives only in an attached
+/// file.
+///
+/// **`pragma_table_list`'s row order is not that order**, and this used to be
+/// written as though it were. Measured: with a `note` in all three, the pragma
+/// answers `["main", "temp", "side"]` — `main` first, then `temp`, then the
+/// attached databases — while SQLite resolves the bare name `note` in `temp`.
+/// So the rows are re-ordered here rather than read first-wins, and the test
+/// `an_unqualified_name_resolves_the_way_sqlite_resolves_it` pins it. Taking
+/// the pragma's first row meant an unqualified name shadowed by a `temp` table
+/// was attributed to `main` — the table the user did *not* read.
 ///
 /// **Matched case-insensitively**, because SQLite resolves an object name that
 /// way and every other lookup on this path already does. A case-sensitive `=`
@@ -756,17 +785,24 @@ fn resolve_relation(
     let mut stmt = conn
         .prepare("SELECT schema, type FROM pragma_table_list(?1) WHERE type IN ('table','view')")
         .ok()?;
-    let rows = stmt
+    let rows: Vec<(String, String)> = stmt
         .query_map([name], |r| {
             Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
         })
-        .ok()?;
-    for (schema, kind) in rows.flatten() {
-        if qualifier.is_none_or(|q| q.eq_ignore_ascii_case(&schema)) {
-            return Some((schema, kind == "view"));
-        }
-    }
-    None
+        .ok()?
+        .flatten()
+        .filter(|(schema, _)| qualifier.is_none_or(|q| q.eq_ignore_ascii_case(schema)))
+        .collect();
+    // Resolution order, not listing order: `temp` first, then `main`, then the
+    // attached databases in the order the pragma gave them, which is `ATTACH`
+    // order. A qualified name has at most one candidate, so this costs nothing
+    // there.
+    let pick = rows
+        .iter()
+        .find(|(s, _)| s.eq_ignore_ascii_case(TEMP))
+        .or_else(|| rows.iter().find(|(s, _)| s.eq_ignore_ascii_case(MAIN)))
+        .or_else(|| rows.first())?;
+    Some((pick.0.clone(), pick.1 == "view"))
 }
 
 /// Columns covered by a single-column UNIQUE index — what the editing system can
@@ -1177,9 +1213,14 @@ fn cell_param(v: &CellEdit) -> rusqlite::types::Value {
 
 /// The SQL and bound parameters for one step of a [`GridWrite`].
 ///
-/// The table is named **bare**, not `main.t`: a connection is one file, so there
-/// is nothing to disambiguate, and `main` would be wrong if this statement were
-/// ever run somewhere the file is attached under another name.
+/// The table is named **bare**, not `main.t`: `main` would be wrong if this
+/// statement were ever run somewhere the file is attached under another name.
+///
+/// That is only safe because [`attach_origins`] attributes nothing outside
+/// `main`, and it is the reason it does: this connection is a fresh one with no
+/// `ATTACH` and no `temp` table, so a bare name here means `main`'s table
+/// whatever the result was read from. The two are one decision — see the
+/// refusal's note, and `every_attributed_column_is_one_the_bare_write_statement_reaches`.
 fn statement_for(step: WriteStep<'_>) -> (String, Vec<rusqlite::types::Value>) {
     let mut params = Vec::new();
     let sql = match step {
@@ -3722,37 +3763,81 @@ mod tests {
         assert_eq!(o[1].as_ref().expect("name").column, "name");
     }
 
-    /// An `ATTACH`ed database is a database like `main`, and every schema read
-    /// behind attribution now says which one it means. SQLite named the database
-    /// per column all along; what could not answer was this crate, whose lookups
-    /// all addressed `main`.
+    /// **Nothing outside `main` is attributed, because nothing outside `main`
+    /// can be written.** The write connection is a fresh one
+    /// ([`commit_writes`]) on which no `ATTACH` has ever run and no `temp`
+    /// table exists, and [`statement_for`] names its table bare — so an origin
+    /// carrying any other database is an offer to write to a table the write
+    /// lands nowhere near. Where `main` happens to hold a table of that name
+    /// the `UPDATE` hits **it**, affects one row, satisfies the 1-row net and
+    /// reports success.
+    ///
+    /// Reading is unaffected: the result still comes back, with its values and
+    /// its column names. It comes back read-only.
     #[test]
-    fn an_attached_databases_columns_carry_its_own_name() {
-        let conn = attached();
-        let o = origins_for(&conn, "SELECT id, body FROM side.note");
-        let id = o[0].as_ref().expect("attached column is attributed");
-        assert_eq!(id.database, "side");
-        assert_eq!(id.table, "note");
-        assert!(id.flags.primary_key, "read from side's own pragma");
-        assert_eq!(o[1].as_ref().expect("body").column, "body");
-    }
-
-    /// The reason the reads had to be qualified rather than merely allowed: the
-    /// two databases hold a table of the *same name* with different columns, and
-    /// a lookup that forgot which database it was in would describe `main.note`
-    /// while attributing `side.note`. Every flag here comes from a pragma that
-    /// had to be told the database.
-    #[test]
-    fn two_databases_holding_the_same_table_name_do_not_borrow_each_others_schema() {
+    fn nothing_outside_main_is_attributed() {
         let conn = attached();
         let side = origins_for(&conn, "SELECT id, body FROM side.note");
+        assert!(
+            side.iter().all(|x| x.is_none()),
+            "an ATTACHed table's write would land on main.note: {side:?}"
+        );
+        // `main`'s own table of the same name is unaffected — the refusal is
+        // about the database, not about the name being ambiguous.
         let main = origins_for(&conn, "SELECT id, body FROM main.note");
-        assert_eq!(side[0].as_ref().unwrap().database, "side");
-        assert_eq!(main[0].as_ref().unwrap().database, "main");
-        // `main.note.body` is NOT NULL and `side.note.body` is not; the flag has
-        // to follow the database, not the name.
+        assert_eq!(main[0].as_ref().expect("main is writable").database, "main");
         assert!(main[1].as_ref().unwrap().flags.not_null);
-        assert!(!side[1].as_ref().unwrap().flags.not_null);
+    }
+
+    /// The same reach with no second file: a `CREATE TEMP TABLE` in an earlier
+    /// statement of the same *Run all* is live for the later one, since
+    /// `run_batch` holds one connection for the whole list.
+    #[test]
+    fn a_temp_table_is_not_attributed_even_when_main_has_no_such_name() {
+        let conn = seeded();
+        conn.execute_batch(
+            "CREATE TEMP TABLE scratch (id INTEGER PRIMARY KEY, body TEXT);
+             INSERT INTO scratch VALUES (1, 'x');",
+        )
+        .expect("temp");
+        for sql in [
+            "SELECT id, body FROM scratch",
+            "SELECT id, body FROM temp.scratch",
+        ] {
+            let o = origins_for(&conn, sql);
+            assert!(
+                o.iter().all(|x| x.is_none()),
+                "{sql} would be written bare against a connection with no temp.scratch: {o:?}"
+            );
+        }
+    }
+
+    /// `resolve_relation` has to answer the database **SQLite** read, and
+    /// `pragma_table_list`'s row order is not it: measured, the pragma lists
+    /// `main`, then `temp`, then each attached database, while name resolution
+    /// goes `temp`, then `main`, then attached. So an unqualified name held by
+    /// both `temp` and `main` resolved to `main` — and that is the whole
+    /// attribution, one `db != main` check away from a write aimed at a table
+    /// the user never read.
+    #[test]
+    fn an_unqualified_name_resolves_the_way_sqlite_resolves_it() {
+        let conn = attached();
+        conn.execute_batch("CREATE TEMP TABLE note (id INTEGER PRIMARY KEY, body TEXT);")
+            .expect("temp");
+        assert_eq!(
+            resolve_relation(&conn, None, "note"),
+            Some(("temp".to_string(), false)),
+            "temp shadows main for an unqualified name"
+        );
+        assert_eq!(
+            resolve_relation(&conn, Some("main"), "note"),
+            Some(("main".to_string(), false)),
+            "an explicit qualifier still wins"
+        );
+        assert_eq!(
+            resolve_relation(&conn, Some("side"), "note"),
+            Some(("side".to_string(), false))
+        );
     }
 
     /// A view in an attached database is refused exactly as one in `main` is —
@@ -3769,23 +3854,32 @@ mod tests {
         assert!(o.iter().all(|x| x.is_none()));
     }
 
-    /// End to end: an attached table is editable on its own key, and a join
-    /// across the two databases keys each side in its own.
+    /// **The seam the three tests above stop one call short of**, written as the
+    /// composition rather than as two halves: every origin `attach_origins`
+    /// hands out must name a database the bare statement `statement_for` builds
+    /// would actually reach. `main` is the only one, so the check is an
+    /// equality — and it is asserted over a statement that reads `main`, `temp`
+    /// and an attached file at once.
     #[test]
-    fn an_attached_table_is_editable_and_joins_across_databases() {
+    fn every_attributed_column_is_one_the_bare_write_statement_reaches() {
         let conn = attached();
-        const SQL: &str = "SELECT side.note.id, side.note.body, artist.id, artist.name \
-                           FROM side.note JOIN artist ON artist.id = side.note.id";
-        let rs = run_query(&conn, SQL, &mut crate::RowDest::Capped(100)).unwrap();
-        let m = schemaic_core::edit::analyze_edit(
-            &rs,
-            schemaic_core::intel::SqlDialect::Sqlite,
-            |db, _, t| Some(table_info_in(&conn, db, t)),
-        );
-        assert_eq!(m.table(0).map(|t| t.key_cols.clone()), Some(vec![0]));
-        assert_eq!(m.table(1).map(|t| t.key_cols.clone()), Some(vec![2]));
-        assert!(m.editable(1), "side.note.body edits through side's key");
-        assert!(m.editable(3), "artist.name edits through main's key");
+        conn.execute_batch("CREATE TEMP TABLE scratch (id INTEGER PRIMARY KEY, body TEXT);")
+            .expect("temp");
+        for sql in [
+            "SELECT id, name FROM artist",
+            "SELECT id, body FROM note",
+            "SELECT id, body FROM side.note",
+            "SELECT id, body FROM scratch",
+            "SELECT artist.id, side.note.body FROM artist JOIN side.note ON side.note.id = artist.id",
+        ] {
+            for o in origins_for(&conn, sql).into_iter().flatten() {
+                assert_eq!(
+                    o.database, MAIN,
+                    "{sql} attributed {}.{} — the write names it bare",
+                    o.database, o.table
+                );
+            }
+        }
     }
 
     /// **The hazard driver provenance introduces, and the reason for the shape

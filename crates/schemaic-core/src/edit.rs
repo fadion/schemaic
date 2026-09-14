@@ -738,7 +738,21 @@ fn resolve_key(info: Option<&TableInfo>, cis: &[usize], rs: &ResultSet) -> Optio
             .filter(|c| c.primary_key)
             .map(|c| c.name.clone())
             .collect();
-        if !pk.is_empty() && all_present(&pk).is_some() {
+        // **And every part of it identifies a row**, which the unique-index
+        // branch below has always required and this one did not. SQLite is the
+        // one engine where a `PRIMARY KEY` may hold NULLs — only an `INTEGER
+        // PRIMARY KEY`, the rowid, cannot, and `auto_increment` is the field
+        // that says which this is. A nullable key column reaches the engine's
+        // `where_clause` as `IS NULL`, so an unmatched outer-join row (every
+        // column NULL) updated whichever row of the joined table genuinely has
+        // a NULL key — one row affected, the 1-row net satisfied, success
+        // reported. See `a_nullable_primary_key_is_not_a_row_key_unless_it_is_the_rowid`.
+        let pk_identifies = t
+            .columns
+            .iter()
+            .filter(|c| c.primary_key)
+            .all(|c| !c.nullable || c.auto_increment);
+        if pk_identifies && !pk.is_empty() && all_present(&pk).is_some() {
             all_present(&pk)
         } else {
             // Else a unique, non-foreign index whose columns are all present and
@@ -3623,6 +3637,67 @@ mod tests {
         let m2 = analyze_edit(&r, schema_nullable);
         assert!(!m2.editable(0));
         assert!(!m2.editable(1));
+    }
+
+    /// **The same rule, on the branch above it.** The unique-index branch has
+    /// always required every key column `NOT NULL`; the primary-key branch read
+    /// `primary_key` alone — and SQLite is the one engine where a `PRIMARY KEY`
+    /// that is not the rowid may hold NULLs, a documented compatibility quirk.
+    ///
+    /// So `u (k TEXT PRIMARY KEY, v TEXT)` holding a row `(NULL, 'victim')` was
+    /// offered `k` as the write key. Read through a `LEFT JOIN`, an **unmatched**
+    /// display row has every `u` column NULL, the staged key is `("k", Null)`,
+    /// and every engine's `where_clause` renders that as `IS NULL` — so
+    /// `UPDATE u SET v = ? WHERE k IS NULL` hit the one genuine NULL-keyed row,
+    /// affected exactly one, satisfied the 1-row net and reported success, while
+    /// the row the user pointed at is not in `u` at all.
+    ///
+    /// An `INTEGER PRIMARY KEY` is the exception the rule has to keep: the
+    /// pragma reports it nullable and it is the rowid, which SQLite assigns and
+    /// which can never be NULL. `auto_increment` is the field that says so.
+    #[test]
+    fn a_nullable_primary_key_is_not_a_row_key_unless_it_is_the_rowid() {
+        let r = rs(vec![
+            col("k", "TEXT", "u", true, false),
+            col("v", "TEXT", "u", false, false),
+        ]);
+        let table = |nullable: bool, auto: bool| {
+            move |_db: &str, _s: Option<&str>, t: &str| {
+                (t == "u").then(|| TableInfo {
+                    schema: None,
+                    name: "u".to_string(),
+                    columns: vec![
+                        ColumnInfo {
+                            name: "k".to_string(),
+                            type_name: "text".to_string(),
+                            nullable,
+                            primary_key: true,
+                            auto_increment: auto,
+                            ..Default::default()
+                        },
+                        ColumnInfo {
+                            name: "v".to_string(),
+                            type_name: "text".to_string(),
+                            nullable: true,
+                            ..Default::default()
+                        },
+                    ],
+                    ..Default::default()
+                })
+            }
+        };
+        assert!(
+            !analyze_edit(&r, table(true, false)).editable(1),
+            "a nullable PRIMARY KEY does not identify a row"
+        );
+        assert!(
+            analyze_edit(&r, table(false, false)).editable(1),
+            "PRIMARY KEY NOT NULL is unaffected — every other engine's PK"
+        );
+        assert!(
+            analyze_edit(&r, table(true, true)).editable(1),
+            "an INTEGER PRIMARY KEY reads nullable and is the rowid"
+        );
     }
 
     /// **A sorted grid's display index is not its data index**, and the gutter's
