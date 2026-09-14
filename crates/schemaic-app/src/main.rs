@@ -9030,9 +9030,36 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
         })
     };
 
+    // **The one place `active_conn` moves, because it never moves alone.**
+    //
+    // `expanded` is per-connection and is a plain `RwSignal` (the tree writes
+    // it), so unlike `hidden_dbs` — a memo over `active_conn` — it does not
+    // re-derive itself. Pairing the two was a caller obligation, and two of the
+    // three sites that moved the id did not honour it: **deleting** the active
+    // connection left the survivor's tree rendered against the *deleted*
+    // connection's key set, so its `sys` node opened by itself, built its whole
+    // table list and — with the size column on — issued a `fetch_table_stats`
+    // against a database nobody had opened there, which is verbatim the failure
+    // `8a75103` was written to remove. Worse, the first expand or collapse then
+    // filed that whole set under the survivor's id, writing the deleted
+    // connection's `db:`/`tbl:`/`col:` keys back into `ui_state.json` *after*
+    // the delete had erased them — against the promise, eight lines above the
+    // erase, that a deleted connection is not reconstructable from what is left
+    // on disk.
+    //
+    // **Order matters and is the whole of it.** The write-through effect reads
+    // the active connection *untracked*, so it files whatever `expanded`
+    // becomes under whoever is active now. The outgoing connection's set is
+    // already stored: the effect ran on every change that made it.
+    let use_conn: Rc<dyn Fn(u64)> = Rc::new(move |id: u64| {
+        active_conn.set(id);
+        expanded.set(expanded_rules.with_untracked(|r| schemaic_core::expanded::keys_for(r, id)));
+    });
+
     let switch_conn: Rc<dyn Fn(u64)> = {
         let load_schema = load_schema.clone();
         let reset_ai_panel = reset_ai_panel.clone();
+        let use_conn = use_conn.clone();
         let check_conn = check_conn.clone();
         let last_tab = last_tab.clone();
         let open_tab_on = open_tab_on.clone();
@@ -9042,17 +9069,10 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             last_tab
                 .borrow_mut()
                 .insert(active_conn.get_untracked(), active.get_untracked());
-            active_conn.set(id);
-            // **After `active_conn`, and this order is the whole of it.** The
-            // write-through effect reads the active connection *untracked*, so
-            // it files whatever `expanded` becomes under whoever is active now —
-            // which, one line up, is the connection being switched to. The
-            // outgoing connection's set is already stored: the effect ran on
-            // every change that made it. Without this the tree opened the new
-            // connection with the old one's nodes expanded, built their table
-            // lists, and with the size column on queried them.
-            expanded
-                .set(expanded_rules.with_untracked(|r| schemaic_core::expanded::keys_for(r, id)));
+            // Both halves, in order — see `use_conn`. Without the second the
+            // tree opened the new connection with the old one's nodes expanded,
+            // built their table lists, and with the size column on queried them.
+            (use_conn)(id);
             persist_conns(Some(id));
             // The strip shows only this connection's tabs, so the active tab has
             // to become one of them. A connection with none gets a fresh tab —
@@ -9711,7 +9731,9 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                 health_failures.set(0);
                 match connections.with_untracked(|cs| cs.first().cloned()) {
                     Some(conn) => {
-                        active_conn.set(conn.id);
+                        // Both halves — see `use_conn`. The survivor's tree must
+                        // not be rendered against the deleted connection's keys.
+                        (use_conn)(conn.id);
                         // **And the AI panel, which this used to leave alone.**
                         // Deleting the active connection is a connection switch
                         // by another name; without it the deleted transcript
@@ -9743,7 +9765,13 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                         // connected. This is `startup_active_id`'s answer for
                         // the same state, which is where the coupling is
                         // documented and tested.
-                        active_conn.set(Connection::startup_active_id(None, &[]));
+                        // Through `use_conn`, which also empties `expanded`:
+                        // this id is `next_id(&[])` = 1, the id the *next*
+                        // connection created will take, so leaving the deleted
+                        // connection's keys in place opened that new connection
+                        // with the dead one's tree expanded and persisted it
+                        // under the new id.
+                        (use_conn)(Connection::startup_active_id(None, &[]));
                     }
                 }
                 // **The id does not always move here either**, which is the same
@@ -12807,6 +12835,48 @@ mod app_tests {
             src.matches(&write).count(),
             1,
             "the terminal cell is written in `install_terminal` and nowhere else"
+        );
+    }
+
+    /// **The active connection never moves alone**, and the pairing was a caller
+    /// obligation two of its three sites did not honour.
+    ///
+    /// `expanded` is per-connection and is a plain `RwSignal` — the tree writes
+    /// it — so unlike `hidden_dbs`, a memo over `active_conn`, it does not
+    /// re-derive itself. `switch_conn` reloaded it; the two arms that move the
+    /// id when the **active connection is deleted** did not. The survivor's tree
+    /// then rendered against the deleted connection's key set, opening databases
+    /// nobody had opened there and firing the `fetch_table_stats` `8a75103`
+    /// exists to stop — and the first expand or collapse filed that whole set
+    /// under the survivor's id, writing the deleted connection's keys back into
+    /// `ui_state.json` after the delete had erased them.
+    ///
+    /// The sequence is two statements inside a closure in `app_view`, so the
+    /// subject is the source: there is exactly one such write in the file, and
+    /// it is `use_conn`'s. A second one is a site that can forget the reload —
+    /// which is what this was. The needle is assembled rather than written, so
+    /// this module's own prose is not one of the hits.
+    #[test]
+    fn the_active_connection_is_moved_in_exactly_one_place() {
+        let src = include_str!("main.rs");
+        // Assembled so this module's own mention is not a hit.
+        let call = format!("active_conn.{}(", "set");
+        let sets = src.matches(&call).count();
+        assert_eq!(
+            sets, 1,
+            "found {sets} direct writes to the active-connection signal — \
+             moving it also has to reload `expanded` for it, and that pairing \
+             belongs in `use_conn` alone"
+        );
+        // And the one that is there really does both halves.
+        let keys = format!("expanded::{}(r, id)", "keys_for");
+        assert!(src.contains(&keys), "`use_conn` reloads the expansion set");
+        // Every site that moves it goes through the pair.
+        let uses = src.matches("(use_conn)(").count();
+        assert!(
+            uses >= 3,
+            "only {uses} callers of `use_conn` — did a site go back to setting \
+             `active_conn` directly?"
         );
     }
 
