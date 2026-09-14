@@ -6098,6 +6098,87 @@ mod destructive_launch_gate {
             }
         }
     }
+
+    /// **A constant in the `read_only` slot passes both gates above**, and that
+    /// is how Import came to be the one database write with no read-only check
+    /// anywhere on its path: `accept_launch(i.loading.get_untracked(), false)`.
+    /// It calls a guard, so the first gate is satisfied; it decides nothing with
+    /// an `if`, so the second is too. The only refusal left was
+    /// `.disabled(read_only || …)` on a context-menu entry, whose value is fixed
+    /// when the *menu* is built — the disabled control the invariant names as
+    /// insufficient, twice over.
+    ///
+    /// The **second** argument only, which is the read-only half in all three
+    /// guards. A literal in the first is sometimes the honest answer — the
+    /// lock-wait Kill in `activity_panel` is fire-and-forget and has no
+    /// in-flight signal to read, and says so — but a connection's read-only flag
+    /// always has somewhere to come from.
+    ///
+    /// One exemption, and it is about what is being written rather than about
+    /// convenience — listed with its reason, the way `OWN_IN_FLIGHT_TERM` is.
+    #[test]
+    fn no_launch_hands_the_guard_a_constant() {
+        /// (file, the call as written, why the read-only half is answered
+        /// somewhere else). Two entries, each about what is being written or
+        /// what refuses it — never about convenience.
+        const READ_ONLY_ANSWERED_ELSEWHERE: &[(&str, &str, &str)] = &[
+            (
+                "grid.rs",
+                "accept_launch(writing,false)",
+                "`export_may_launch`: an export writes a *file*, not a server,                  so no connection's read-only flag is the question. Its own doc                  says so.",
+            ),
+            (
+                "script_view.rs",
+                "accept_launch(s.running.get_untracked(),false)",
+                "`run_script` mints a `ScriptRequest::approved(policy(..))` two                  lines down, and `sql::script_verdict` answers `Block(\"Read-only                  connection.\")` — a refusal strictly stronger than this one, and                  the invariant's own named exception.",
+            ),
+        ];
+        for (file, code) in crate::source_gate::crate_sources() {
+            // This file *is* the guards; their own signatures and docs are not
+            // call sites.
+            if file == "widgets.rs" {
+                continue;
+            }
+            for (n, line) in code.lines().enumerate() {
+                let dense: String = line.chars().filter(|c| !c.is_whitespace()).collect();
+                let Some(args) = GUARDS.iter().find_map(|g| {
+                    let needle: String = g.chars().filter(|c| !c.is_whitespace()).collect();
+                    dense.split_once(&needle).map(|(_, rest)| rest)
+                }) else {
+                    continue;
+                };
+                // The second argument, taken at the call's own paren depth so a
+                // `,` inside `get_untracked()` or a closure is not a separator.
+                let mut depth = 1usize;
+                let mut arg = 0usize;
+                let mut second = String::new();
+                for c in args.chars() {
+                    match c {
+                        '(' | '[' => depth += 1,
+                        ')' | ']' if depth == 1 => break,
+                        ')' | ']' => depth -= 1,
+                        ',' if depth == 1 => arg += 1,
+                        _ if arg == 1 => second.push(c),
+                        _ => {}
+                    }
+                }
+                if READ_ONLY_ANSWERED_ELSEWHERE
+                    .iter()
+                    .any(|(f, call, _)| *f == file && dense.contains(call))
+                {
+                    continue;
+                }
+                assert!(
+                    !matches!(second.as_str(), "true" | "false"),
+                    "{file}:{}: `{}` — a constant in the guard's read-only slot \
+                     disables the half it stands for. Read the connection's flag \
+                     live, the way `ddl_preview::apply` does.",
+                    n + 1,
+                    line.trim()
+                );
+            }
+        }
+    }
 }
 
 /// **The wiring the three tests beside `menu_return` cannot reach.**

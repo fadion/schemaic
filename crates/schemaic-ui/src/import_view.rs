@@ -1064,7 +1064,23 @@ fn run_import(ui: Ui) {
     // second one, because it only takes effect on a later update pass. Two
     // launches within one key dispatch each opened their own transaction and
     // each committed — see `widgets::accept_launch`.
-    if !crate::widgets::accept_launch(i.loading.get_untracked(), false) {
+    //
+    // **And the read-only half was the literal `false`**, which disabled exactly
+    // half of it: Import was the one database write with no read-only check
+    // anywhere on its path. The only refusal was `.disabled(read_only || …)` on
+    // the context-menu entry — the disabled control the invariant names as
+    // insufficient, and one whose value is fixed when the *menu* is built. So a
+    // connection flipped read-only from the status bar while the modal stood,
+    // or a menu opened before the flag was set, wrote the file anyway.
+    //
+    // Asked **live**, for the reason `ddl_preview::apply` gives in full: two
+    // destructive modals must not answer the same question two different ways,
+    // and the flag can move while the modal is on screen.
+    let read_only = ui
+        .conn
+        .connections
+        .with_untracked(|cs| schemaic_core::connection::read_only_of(cs, target.conn_id));
+    if !crate::widgets::accept_launch(i.loading.get_untracked(), read_only) {
         return;
     }
     i.loading.set(true);
