@@ -546,9 +546,25 @@ fn pg_message(message: &str, detail: Option<&str>, hint: Option<&str>) -> String
 /// the chain for the same reason [`error_chain`] does — a failed TLS handshake
 /// keeps its cause in `source()`.
 fn db_err(e: &tokio_postgres::Error) -> DbError {
+    DbError::Query(db_text(e))
+}
+
+/// [`db_err`]'s text, for the paths that carry a bare `String` rather than a
+/// [`DbError`] — the DDL apply, the server-DDL apply and the `.sql` runner.
+///
+/// **The same rule, and they did not have it.** The commit that established
+/// `Display` is the category `"db error"` converted eight sites and said in as
+/// many words that every one of them was a *read*; these three write paths spell
+/// the failure `e.to_string()` straight into `DdlError::message` and
+/// `ScriptStep::Failed`, so an `ALTER COLUMN … TYPE` the server refused reported
+/// `db error` and nothing else — while `DETAIL` and `HINT`, which is where
+/// PostgreSQL puts the offending value and the fix, were on the floor. MySQL is
+/// unaffected (its driver's `Display` carries the server text), so this was a
+/// silent per-engine divergence on the app's most consequential message.
+fn db_text(e: &tokio_postgres::Error) -> String {
     match e.as_db_error() {
-        Some(d) => DbError::Query(pg_message(d.message(), d.detail(), d.hint())),
-        None => DbError::Query(error_chain(e)),
+        Some(d) => pg_message(d.message(), d.detail(), d.hint()),
+        None => error_chain(e),
     }
 }
 
@@ -691,7 +707,7 @@ pub(crate) async fn run_ddl(
     client
         .batch_execute("BEGIN")
         .await
-        .map_err(|e| fail(0, e.to_string()))?;
+        .map_err(|e| fail(0, db_text(&e)))?;
     // Inside the transaction, so it reverts with it — and the connection is
     // this plan's alone either way. Best-effort, as on MySQL.
     let _ = client
@@ -699,7 +715,7 @@ pub(crate) async fn run_ddl(
         .await;
     for (i, sql) in stmts.iter().enumerate() {
         let step = tokio::select! {
-            r = client.batch_execute(sql) => r.map_err(|e| e.to_string()),
+            r = client.batch_execute(sql) => r.map_err(|e| db_text(&e)),
             _ = cancel.cancelled() => Err("cancelled".to_string()),
         };
         if let Err(e) = step {
@@ -709,7 +725,7 @@ pub(crate) async fn run_ddl(
     }
     if let Err(e) = client.batch_execute("COMMIT").await {
         let _ = client.batch_execute("ROLLBACK").await;
-        return Err(fail(stmts.len().saturating_sub(1), e.to_string()));
+        return Err(fail(stmts.len().saturating_sub(1), db_text(&e)));
     }
     Ok(())
 }
@@ -749,7 +765,7 @@ pub(crate) async fn run_server_ddl(
         })?;
     for (i, sql) in stmts.iter().enumerate() {
         let step = tokio::select! {
-            r = client.batch_execute(sql) => r.map_err(|e| e.to_string()),
+            r = client.batch_execute(sql) => r.map_err(|e| db_text(&e)),
             _ = cancel.cancelled() => Err("cancelled".to_string()),
         };
         if let Err(e) = step {
@@ -842,7 +858,7 @@ pub(crate) async fn run_script(
             };
             match raced {
                 Some(Ok(())) => ScriptStep::Ran,
-                Some(Err(e)) => ScriptStep::Failed(e.to_string()),
+                Some(Err(e)) => ScriptStep::Failed(db_text(&e)),
                 None => {
                     cancel_query(db, &pg_cancel).await;
                     ScriptStep::Cancelled {
@@ -4244,27 +4260,63 @@ mod tests {
     /// of two spellings each site used and both compile: `db_err` was already
     /// here, already used at eight *write* sites, and its doc already said
     /// why.
+    ///
+    /// **Its first needle was narrower than the rule it states**, which is the
+    /// defect this whole review round found five times over. It searched for the
+    /// single assembled literal `DbError::Query(e.to_string())` — and the three
+    /// PostgreSQL *write* paths do not build a `DbError` at all: they put
+    /// `e.to_string()` straight into `DdlError::message` and
+    /// `ScriptStep::Failed`, so every failing DDL statement and every failing
+    /// statement of a user's `.sql` file reported `db error` and nothing else,
+    /// under a gate named for exactly that. The needle is now any `to_string()`
+    /// on an `e` binding produced by a `batch_execute` future, which is what
+    /// those three sites are.
+    ///
+    /// **And it has a floor.** It was a pure negative assertion, so deleting
+    /// every `db_err` call in the module would have left it green.
     #[test]
     fn no_error_in_this_module_is_built_from_the_drivers_own_display() {
         let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/pg.rs"))
             .expect("this module's own source");
         let mut offenders = Vec::new();
-        for (i, line) in src.lines().enumerate() {
+        // Assembled, so these lines are not their own first offenders.
+        let to_string = format!("e.{}()", "to_string");
+        let built = format!("DbError::Query({to_string})");
+        let lines: Vec<&str> = src.lines().collect();
+        for (i, line) in lines.iter().enumerate() {
             let code = line.trim_start();
             if code.starts_with("//") {
                 continue;
             }
-            // Assembled, so this line is not its own first offender.
-            let needle = format!("DbError::Query(e.{}())", "to_string");
-            if code.contains(&needle) {
+            // Either spelling: the `DbError` the read paths build, or the bare
+            // `String` the three write paths carry. The bare one is recognised
+            // by what produced the binding — a `batch_execute` future, on this
+            // line or the one that opened the `if let Err(e)` above it — so a
+            // `DbError` from `connect_to`, whose `Display` is the app's own
+            // sentence, is not a hit.
+            let from_execute = code.contains("batch_execute(")
+                || lines
+                    .get(i.wrapping_sub(1))
+                    .is_some_and(|p| p.contains("batch_execute("));
+            let bare =
+                code.contains(&to_string) && (from_execute || code.contains("ScriptStep::Failed("));
+            if code.contains(&built) || bare {
                 offenders.push(format!("pg.rs:{}: {code}", i + 1));
             }
         }
         assert!(
             offenders.is_empty(),
-            "call `db_err(&e)` — the driver's Display for a server error is the \
-             literal \"db error\":\n{}",
+            "call `db_err(&e)` (or `db_text(&e)` where a `String` is wanted) — \
+             the driver's Display for a server error is the literal \"db \
+             error\":\n{}",
             offenders.join("\n")
+        );
+        // The floor: a negative assertion with nothing left to find passes.
+        let uses = src.matches("db_err(&e)").count() + src.matches("db_text(&e)").count();
+        assert!(
+            uses >= 10,
+            "only {uses} calls to the message readers — did they get renamed? \
+             Rewrite this gate rather than letting it pass by finding nothing."
         );
     }
 
