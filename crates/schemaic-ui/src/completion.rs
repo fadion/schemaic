@@ -1040,11 +1040,36 @@ pub(crate) fn completion_popup(
                     // press does not also travel to the editor and move the
                     // caret out from under the insertion; `accept_completion`
                     // closes the list itself.
+                    //
+                    // **And hands the keyboard back**, which the key route never
+                    // had to. floem takes focus on *every* `PointerDown`, before
+                    // dispatch, and returns it only to a view under the pointer
+                    // that is `keyboard_navigable`. These rows are a plain
+                    // `h_stack`, and the editor is a **sibling** of the popup in
+                    // `editor_area` rather than an ancestor of the click target,
+                    // so nothing claimed it back: the word spliced, the list
+                    // closed, and the next character typed went nowhere until
+                    // the user clicked into the editor again. `accept_completion`
+                    // never needed this because until the rows grew a click
+                    // handler the only way to reach it was a key handler, which
+                    // by definition runs on the focused view.
+                    //
+                    // Deferred a frame, like the five sibling hand-backs in
+                    // `editor_pane` (the run menu, Ctrl+K twice, find close, goto
+                    // close/submit) — the focus floem takes is cleared during
+                    // this frame's dispatch, so requesting it back inside the
+                    // handler is undone by the same frame that stole it.
                     .on_click_stop({
                         let editor = editor.clone();
                         move |_| {
                             comp.sel.set(i);
                             accept_completion(&editor, comp);
+                            let ed = editor.clone();
+                            floem::action::exec_after(std::time::Duration::ZERO, move |_| {
+                                if let Some(Some(vid)) = ed.editor_view_id.try_get_untracked() {
+                                    vid.request_focus();
+                                }
+                            });
                         }
                     })
                     .style(move |s| {
