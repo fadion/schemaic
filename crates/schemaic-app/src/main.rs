@@ -585,7 +585,33 @@ type ConnGate = Rc<dyn Fn(Action)>;
 /// refusal, which is why there is one gate and not two.
 type ConnGateElse = Rc<dyn Fn(Action, Action)>;
 /// Reports a health check's outcome.
-type CheckDoneFn = Rc<dyn Fn(bool)>;
+type CheckDoneFn = Rc<dyn Fn(CheckAnswer)>;
+
+/// What a landed health check tells the continuation waiting on it.
+///
+/// **Three answers, because two were not enough.** It was a `bool`, and a
+/// connection switch inside the ping's five seconds was spelled by *not calling*
+/// the continuation at all — so neither the action nor the refusal ran, and a
+/// `with_conn`-gated control did nothing whatever: Run opened no panel and
+/// logged nothing, and the query-plan modal, whose caller sets
+/// `PlanState::Running` *before* the gate sees it, rendered
+/// `loading_dots("Explaining")` for ever over a query that was never sent.
+///
+/// `false` could not stand in for it. `with_conn_else` re-reads `conn_status`
+/// before refusing — deliberately, so a newer check that landed `Connected`
+/// wins — and after a switch that status belongs to the **new** connection, so a
+/// `false` would have run the action against a server the user had just left.
+/// That is the thing `check_continues` exists to refuse, and it is why this is a
+/// third answer rather than a value of the second.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CheckAnswer {
+    /// The ping landed for the connection that started it. `true` = reachable.
+    Reachable(bool),
+    /// The user moved to another connection while the check was in flight. The
+    /// action must not run, and the caller must still be told so it can put its
+    /// own state machine back.
+    ConnectionChanged,
+}
 
 /// Replaces the terminal session: spawn, install, badge, notify.
 ///
@@ -1160,10 +1186,14 @@ struct CheckOutcome {
     write_status: bool,
     /// Answer the `with_conn` continuation waiting on this check, and with what.
     ///
-    /// `None` means there is nobody to answer *about this server* — the user has
-    /// switched connections. It never means "the answer wasn't good enough":
-    /// dropping the reply is what makes a clicked button do nothing at all.
-    answer: Option<bool>,
+    /// **Always an answer.** It was an `Option`, and `None` — the user switched
+    /// connections — reached the call site as "never call `done`", which is
+    /// exactly what the doc one line down said it must never mean: dropping the
+    /// reply is what makes a clicked button do nothing at all. The switch is
+    /// [`CheckAnswer::ConnectionChanged`] now, which the gate refuses *and*
+    /// reports, so a caller that has already moved a state machine into "in
+    /// flight" gets it back.
+    answer: CheckAnswer,
 }
 
 /// Decide what a health check that has just landed may do.
@@ -1183,7 +1213,11 @@ struct CheckOutcome {
 fn check_outcome(started: (u64, u64), current: (u64, u64), ok: bool) -> CheckOutcome {
     CheckOutcome {
         write_status: check_landing(started, current),
-        answer: check_continues(started, current).then_some(ok),
+        answer: if check_continues(started, current) {
+            CheckAnswer::Reachable(ok)
+        } else {
+            CheckAnswer::ConnectionChanged
+        },
     }
 }
 
@@ -7320,7 +7354,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             let answer_none = |done: &Option<CheckDoneFn>| {
                 conn_status.set(ConnStatus::Unknown);
                 if let Some(f) = done {
-                    f(false);
+                    f(CheckAnswer::Reachable(false));
                 }
             };
             let Some(conn) =
@@ -7366,10 +7400,8 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                     // reset the timer's patience either.
                     health_failures.set(health::record(health_failures.get_untracked(), ok));
                 }
-                if let Some(answer) = outcome.answer
-                    && let Some(f) = &done
-                {
-                    f(answer);
+                if let Some(f) = &done {
+                    f(outcome.answer);
                 }
             });
             handle.spawn(async move {
@@ -7412,14 +7444,32 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                         .map(|c| c.name.clone())
                 })
                 .unwrap_or_else(|| "this connection".to_string());
-            (check_conn_then)(Some(Rc::new(move |ok: bool| {
+            (check_conn_then)(Some(Rc::new(move |answer: CheckAnswer| {
+                // **The connection moved out from under the action.** Refusing
+                // is right — running it would send it to a server the user has
+                // just left — but *answering* is the part that was missing: this
+                // arm used to be spelled by never calling the continuation, so
+                // Run did nothing at all and the query-plan modal, which sets
+                // `PlanState::Running` before the gate sees it, span for ever.
+                // `refused()` is what puts that state machine back.
+                if answer == CheckAnswer::ConnectionChanged {
+                    error_modal_text.set(Some(format!(
+                        "Didn't run against {name} — you switched connection while \
+                         Schemaic was checking that it was reachable. Switch back \
+                         and try again."
+                    )));
+                    error_modal_open.set(true);
+                    refused();
+                    return;
+                }
                 // A *superseded* failure still lands here — dropping it upstream
                 // is what makes Run do nothing at all. What it must not do is
                 // raise "Not connected" over a header a newer check has since
                 // set to Connected, so the refusal re-reads the status: if
                 // something more recent than our own ping says the server is up,
                 // that is the better answer and the action proceeds.
-                if ok || !conn_status.get_untracked().is_down() {
+                if answer == CheckAnswer::Reachable(true) || !conn_status.get_untracked().is_down()
+                {
                     action();
                 } else {
                     // Still unreachable — say so, rather than letting the action
@@ -13522,7 +13572,7 @@ mod app_tests {
     /// subject has to be the composition.
     #[test]
     fn a_superseded_check_still_answers_the_action_that_asked() {
-        use super::check_outcome;
+        use super::{CheckAnswer, check_outcome};
         // The failing ping the user is waiting on, landing after a poll has
         // bumped the generation. It may not repaint the header — but it is the
         // only reply the Run button is ever going to get.
@@ -13533,30 +13583,58 @@ mod app_tests {
         );
         assert_eq!(
             superseded_failure.answer,
-            Some(false),
+            CheckAnswer::Reachable(false),
             "but it still answers the action about connection 7"
         );
         // The same interleaving with a server that answered.
-        assert_eq!(check_outcome((7, 3), (7, 4), true).answer, Some(true));
+        assert_eq!(
+            check_outcome((7, 3), (7, 4), true).answer,
+            CheckAnswer::Reachable(true)
+        );
         // The ordinary case: nothing superseded it, so it does both.
         let ordinary = check_outcome((7, 3), (7, 3), false);
         assert!(ordinary.write_status);
-        assert_eq!(ordinary.answer, Some(false));
+        assert_eq!(ordinary.answer, CheckAnswer::Reachable(false));
     }
 
+    /// **A connection the user left is refused — and *said*.**
+    ///
+    /// The line the looser rule still holds is that the action must not run:
+    /// not against a server the user has walked away from, and not reported
+    /// unreachable in a modal sitting over the new one. What it must not do is
+    /// answer with *nothing*, which is how this was spelled — the continuation
+    /// was simply never called, so neither the action nor the refusal ran. Run
+    /// opened no panel and logged nothing; the query-plan modal, whose caller
+    /// sets `PlanState::Running` before the gate sees it, rendered
+    /// `loading_dots("Explaining")` for ever over a query that was never sent.
+    /// That is verbatim the defect `3c6d3f4` closed, in the one arm its
+    /// `Refusal` plumbing did not reach.
+    ///
+    /// `Reachable(false)` could not stand in for it: the gate re-reads
+    /// `conn_status` before refusing, deliberately, and after a switch that
+    /// status is the **new** connection's — so a `false` would have run the
+    /// action against the server the user had just moved to.
     #[test]
-    fn a_check_of_a_connection_the_user_left_answers_nothing() {
-        use super::check_outcome;
-        // The line the looser rule still holds: running an action gated on a
-        // server the user has walked away from, or reporting the old connection
-        // unreachable in a modal sitting over the new one.
+    fn a_check_of_a_connection_the_user_left_is_refused_and_says_so() {
+        use super::{CheckAnswer, check_outcome};
         for ok in [true, false] {
             for now in [(8, 4), (8, 3)] {
                 let outcome = check_outcome((7, 3), now, ok);
-                assert_eq!(outcome.answer, None, "{now:?} is a different connection");
+                assert_eq!(
+                    outcome.answer,
+                    CheckAnswer::ConnectionChanged,
+                    "{now:?} is a different connection"
+                );
                 assert!(!outcome.write_status);
             }
         }
+        // And it is a *different* answer from an unreachable server, which is
+        // the whole reason it is a third variant: the gate acts on them
+        // differently.
+        assert_ne!(
+            check_outcome((7, 3), (8, 3), false).answer,
+            check_outcome((7, 3), (7, 4), false).answer
+        );
     }
 
     /// The whole of the run-id allocator's correctness argument, which was
