@@ -1331,6 +1331,34 @@ fn json_records<R: std::io::Read>(
 /// itself is unhappy well below this.
 pub const XLSX_MAX_BYTES: u64 = 512 * 1024 * 1024;
 
+/// The largest an `.xlsx` may **unpack** to.
+///
+/// **[`XLSX_MAX_BYTES`] bounds the wrong quantity.** Both of its enforcement
+/// points measure compressed bytes — the file's size on disk, and the bytes read
+/// through [`open_xlsx`]'s `take` — and [`xlsx_memory_warning`] is derived from
+/// the same figure. What is actually held in memory is the *inflated* archive:
+/// calamine materialises the shared-strings table and the sheet XML, with no
+/// ceiling of its own. A 4 MiB workbook whose `xl/sharedStrings.xml` is a few
+/// hundred megabytes of one repeated byte passes every compressed-size check,
+/// gets a "this is a small workbook" disclosure, and takes the process out — at
+/// *preview* time, on a probe the import modal re-fires on every settings
+/// change, on a file the user only meant to glance at.
+///
+/// Same shape as the declared sheet width: a figure the workbook supplies,
+/// trusted to describe what the workbook costs. `sheet_width`'s refusal and the
+/// JSON preview cap both bound the inflated quantity; this is the third.
+///
+/// **What this closes and what it does not.** The sum is read from the central
+/// directory before a byte is inflated, so it costs nothing on an ordinary file
+/// and refuses the way a bomb is actually built — an archive whose declared
+/// sizes are honest, because a bomb has to stay a valid archive that ordinary
+/// tools will unpack. An archive that *understates* its entries in the directory
+/// is not caught here: the `zip` reader does not stop a decompressor at the
+/// declared size, so closing that would mean inflating the whole archive once
+/// ourselves and throwing it away, doubling the cost of every preview of every
+/// legitimate workbook.
+pub const XLSX_MAX_INFLATED_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
 /// Why this file cannot be opened at all, or `None` — asked from the file's
 /// *size on disk*, before a byte of it is read.
 pub fn xlsx_size_refusal(format: ImportFormat, file_bytes: u64) -> Option<String> {
@@ -1392,6 +1420,19 @@ pub fn read_workbook_sample<R: std::io::Read>(
 fn open_xlsx<R: std::io::Read>(
     r: R,
 ) -> Result<calamine::Xlsx<std::io::Cursor<Vec<u8>>>, ImportError> {
+    open_xlsx_within(r, XLSX_MAX_INFLATED_BYTES)
+}
+
+/// [`open_xlsx`] with the inflated ceiling named.
+///
+/// The ceiling is a parameter for one reason: a test that builds a
+/// two-gigabyte fixture is not a test anyone runs, and the decision worth
+/// pinning is that opening a workbook consults the bound at all — the seam,
+/// not the predicate.
+fn open_xlsx_within<R: std::io::Read>(
+    r: R,
+    inflated_ceiling: u64,
+) -> Result<calamine::Xlsx<std::io::Cursor<Vec<u8>>>, ImportError> {
     use calamine::Reader;
     let mut bytes = Vec::new();
     // One byte past the ceiling, so "exactly at it" and "over it" are
@@ -1401,7 +1442,46 @@ fn open_xlsx<R: std::io::Read>(
     if bytes.len() as u64 > XLSX_MAX_BYTES {
         return Err(ImportError::Read(oversize_workbook(None)));
     }
+    // The archive's own size said nothing about what opening it costs — see
+    // [`XLSX_MAX_INFLATED_BYTES`]. Asked here, between the read and the inflate,
+    // because this is the one place both are in scope.
+    if let Some(msg) = inflated_refusal(&bytes, inflated_ceiling) {
+        return Err(ImportError::Read(msg));
+    }
     calamine::Xlsx::new(std::io::Cursor::new(bytes)).map_err(|e| ImportError::Read(e.to_string()))
+}
+
+/// Why this archive unpacks to more than `ceiling`, or `None`.
+///
+/// Reads the central directory only — `by_index_raw` decompresses nothing — so
+/// an ordinary workbook pays one pass over its entry list.
+///
+/// **Anything that isn't a readable archive answers `None`**, deliberately:
+/// calamine is about to open the same bytes and its own message says what is
+/// wrong with them. A refusal here would replace a real diagnosis with a size
+/// complaint about a file that has no size problem.
+///
+/// The ceiling is a parameter so the decision is testable without building a
+/// two-gigabyte fixture; the one caller passes [`XLSX_MAX_INFLATED_BYTES`].
+fn inflated_refusal(bytes: &[u8], ceiling: u64) -> Option<String> {
+    let mut zin = zip::ZipArchive::new(std::io::Cursor::new(bytes)).ok()?;
+    let mut total: u64 = 0;
+    for i in 0..zin.len() {
+        let entry = zin.by_index_raw(i).ok()?;
+        total = total.saturating_add(entry.size());
+        if total > ceiling {
+            return Some(format!(
+                "This workbook is {} on disk but unpacks to at least {}, and an Excel file has \
+                 to be read whole before any of it can be shown — {} is the most this can hold \
+                 in memory. Export the sheet as CSV and import that instead; a CSV loads in \
+                 constant memory.",
+                crate::format::human_bytes(bytes.len() as i64),
+                crate::format::human_bytes(total as i64),
+                crate::format::human_bytes(ceiling as i64),
+            ));
+        }
+    }
+    None
 }
 
 /// The refusal for a workbook past [`XLSX_MAX_BYTES`], with the size named when
@@ -4373,6 +4453,84 @@ mod tests {
         assert_eq!(s.columns[0], "id");
         assert_eq!(s.rows.len(), 1);
         assert_eq!(s.rows[0][16_383].as_deref(), Some("x"));
+    }
+
+    /// **The archive's own size says nothing about what opening it costs.**
+    ///
+    /// `XLSX_MAX_BYTES` bounds *compressed* bytes at both enforcement points —
+    /// `xlsx_size_refusal` from the file's size on disk, `open_xlsx` from the
+    /// bytes read through its `take` — and `xlsx_memory_warning` is derived from
+    /// the same figure. None of them measures what is inflated, so a small
+    /// workbook holding one hugely compressible part passed every check and
+    /// handed calamine an archive that unpacks with no ceiling of its own, at
+    /// *preview* time, on a probe that re-fires on every settings change in the
+    /// import modal.
+    ///
+    /// Same shape as `b0374bc` ("take an Excel sheet's width from its cells, not
+    /// from a declaration it may not have"): a figure the workbook supplies,
+    /// trusted to describe what the workbook costs.
+    ///
+    /// The ceiling is a parameter here so the test can be fast; `open_xlsx`
+    /// passes [`XLSX_MAX_INFLATED_BYTES`].
+    #[test]
+    fn a_workbook_that_unpacks_far_larger_than_it_looks_is_refused() {
+        let good = workbook(&[("Sheet1", &[&[Cell::Text("id")], &[Cell::Num(1.0)]])]);
+        let bomb = with_entry(&good, "xl/bomb.bin", &vec![b'0'; 4 * 1024 * 1024]);
+        assert!(
+            (bomb.len() as u64) < 64 * 1024,
+            "the fixture must look small on disk: {} bytes",
+            bomb.len()
+        );
+        // Every bound that reads the compressed size is happy with it.
+        assert!(xlsx_size_refusal(ImportFormat::Xlsx, bomb.len() as u64).is_none());
+        assert!(memory_warning(ImportFormat::Xlsx, bomb.len() as u64).is_none());
+
+        let msg = inflated_refusal(&bomb, 1024 * 1024).expect("4 MiB is over a 1 MiB ceiling");
+        assert!(msg.contains("unpacks"), "{msg}");
+        // An ordinary workbook under the same ceiling is not refused, and the
+        // bomb is not refused under a ceiling that fits it — the bound is the
+        // inflated size, not the shape of the archive.
+        assert!(inflated_refusal(&good, 1024 * 1024).is_none());
+        assert!(inflated_refusal(&bomb, 64 * 1024 * 1024).is_none());
+        // Something that is not an archive at all is left to calamine to
+        // report, rather than being refused with the wrong reason.
+        assert!(inflated_refusal(b"not a zip", 1).is_none());
+
+        // The seam, not just the predicate: opening a workbook consults the
+        // bound, and answers with the bound's own reason rather than whatever
+        // calamine makes of the archive.
+        let err = match open_xlsx_within(&bomb[..], 1024 * 1024) {
+            Err(e) => e,
+            Ok(_) => panic!("a workbook over the ceiling was opened"),
+        };
+        assert!(err.to_string().contains("unpacks"), "{err}");
+
+        // And with the shipping ceiling both still open: the bound is generous.
+        assert!(open_xlsx(&bomb[..]).is_ok());
+        assert!(open_xlsx(&good[..]).is_ok());
+    }
+
+    /// A copy of `xlsx` with one extra entry, for the fixture above — the same
+    /// re-zip `restate_dimension` does, without touching what is there.
+    fn with_entry(xlsx: &[u8], name: &str, payload: &[u8]) -> Vec<u8> {
+        use std::io::{Cursor, Read, Write};
+        let mut zin = zip::ZipArchive::new(Cursor::new(xlsx)).expect("a workbook is a zip");
+        let mut out = Vec::new();
+        let mut zout = zip::ZipWriter::new(Cursor::new(&mut out));
+        let opts: zip::write::FileOptions<'_, ()> =
+            zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+        for i in 0..zin.len() {
+            let mut f = zin.by_index(i).expect("an entry");
+            let entry = f.name().to_string();
+            let mut bytes = Vec::new();
+            f.read_to_end(&mut bytes).expect("entry bytes");
+            zout.start_file(entry, opts).expect("start");
+            zout.write_all(&bytes).expect("write");
+        }
+        zout.start_file(name, opts).expect("start");
+        zout.write_all(payload).expect("write");
+        zout.finish().expect("finish");
+        out
     }
 
     /// A real workbook with its `<dimension ref>` restated — the one thing

@@ -14,10 +14,10 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 sqlparser = { workspace = true }
 tracing = { workspace = true }
-
-[dev-dependencies]
-# One fixture: a real workbook re-zipped with its `<dimension ref>` restated —
-# see the workspace entry. Nothing in `src` uses it.
+# An `.xlsx` is a ZIP, and `XLSX_MAX_BYTES` bounds the *compressed* archive — so
+# the size that decides whether opening it fits in memory is read from the
+# central directory here, before calamine inflates anything. Already in the graph
+# under calamine; this is the same crate, asked one question earlier.
 zip = { workspace = true }
 
 [lints]
