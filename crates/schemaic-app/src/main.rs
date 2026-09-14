@@ -446,7 +446,12 @@ fn mysql_shell_config(
         "-u".into(),
         conn.user.clone(),
     ];
-    cli_args.extend(launch::mysql_cli_tls_args(&conn.tls));
+    // **Which client**, because the two spell TLS differently and each
+    // spelling is fatal to the other — see `launch::MysqlClient`.
+    let client = match launcher {
+        CliLauncher::Native(prog) | CliLauncher::Wsl(prog) => launch::MysqlClient::of(prog),
+    };
+    cli_args.extend(launch::mysql_cli_tls_args(&conn.tls, client));
     if let Some(d) = db {
         cli_args.push("--".into());
         cli_args.push(d.to_string());
@@ -11086,6 +11091,19 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             // (127.0.0.1:<port>), not the firewalled remote host (review H11). If
             // the tunnel isn't up yet, say so rather than silently failing.
             let conn = if conn.uses_tunnel() {
+                // **And the rewrite is what the TLS rung cannot survive.** The
+                // app's own connect path moves the endpoint and carries a
+                // `hostname_override` in the same step; the CLI builders take
+                // the rewritten `Connection` with its `tls` block untouched and
+                // neither client has an equivalent option, so a verifying rung
+                // would tell the client to dial the loopback and check the
+                // certificate against it. Said here, where the rewrite happens,
+                // rather than met as the client's own handshake failure.
+                if let Some(why) = launch::tunnelled_verify_blocker(&conn.tls) {
+                    let cfg = message_shell(why);
+                    (install_terminal)(&cfg, None, "tunnel TLS message shell");
+                    return;
+                }
                 match tunnels.borrow().get(&conn.id).map(|h| h.port()) {
                     Some(port) => Connection {
                         host: "127.0.0.1".to_string(),
@@ -13845,18 +13863,20 @@ mod app_tests {
 
     #[test]
     fn native_shell_omits_db_when_none() {
+        // **`mariadb`, and its own spelling of the TLS rung.** `--ssl-mode` is
+        // MySQL's option; MariaDB's client exits with `unknown option` on it.
+        // See `launch::MysqlClient`.
         let cfg = mysql_shell_config(CliLauncher::Native("mariadb"), &conn(), None).unwrap();
         assert_eq!(
             cfg.args,
-            vec![
-                "-h",
-                "10.0.0.5",
-                "-P",
-                "3307",
-                "-u",
-                "root",
-                "--ssl-mode=DISABLED"
-            ]
+            vec!["-h", "10.0.0.5", "-P", "3307", "-u", "root", "--skip-ssl"]
+        );
+        // And Oracle's client still gets Oracle's.
+        let mysql = mysql_shell_config(CliLauncher::Native("mysql"), &conn(), None).unwrap();
+        assert!(
+            mysql.args.contains(&"--ssl-mode=DISABLED".to_string()),
+            "{:?}",
+            mysql.args
         );
         assert!(
             !cfg.args.contains(&"--".to_string()),

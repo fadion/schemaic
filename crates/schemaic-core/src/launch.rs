@@ -212,8 +212,85 @@ pub fn psql_target(db: &str) -> Result<&str, &'static str> {
 /// certificate either way — so an omitted flag downgrades a `verify-full`
 /// connection while the app's own header, whose socket really is encrypted,
 /// goes on reporting TLS.
-pub fn mysql_cli_tls_args(tls: &crate::connection::Tls) -> Vec<String> {
+/// Which of the two MySQL-family clients an argv is being built for.
+///
+/// **They do not share the option.** `--ssl-mode` is MySQL's; MariaDB's client
+/// uses `my_getopt` and has no such variable, so the flag is not merely
+/// unidiomatic there — the client exits immediately with
+/// `unknown option '--ssl-mode=DISABLED'` and the terminal panel shows that
+/// instead of a session. At *every* rung, the default included, because the flag
+/// was emitted unconditionally. MariaDB is this project's own primary engine
+/// and its own live tier, so this was the feature broken outright for the
+/// commonest install.
+///
+/// Resolved from the program name rather than guessed: `resolve_cli` accepts
+/// either binary, and the WSL fallback always spells it `mysql`, which on a
+/// modern MariaDB install is a symlink to the MariaDB client — so a name of
+/// `mysql` cannot mean "MySQL's client" and the only honest reading is the one
+/// the user's own `PATH` gave.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MysqlClient {
+    /// Oracle MySQL's `mysql`.
+    Mysql,
+    /// MariaDB's `mariadb` (and the `mysql` symlink that points at it).
+    MariaDb,
+}
+
+impl MysqlClient {
+    /// Which client the program named `prog` is.
+    ///
+    /// **`mysql` stays Oracle's, and that is a known residual.** On a modern
+    /// MariaDB install `mysql` is a symlink to the MariaDB client, and no
+    /// inspection of the *name* can tell the two apart — while the two spellings
+    /// are mutually fatal (`--ssl-mode` is unknown to MariaDB's client, and
+    /// MySQL removed `--ssl` in 8.0.26). So this closes the case the review
+    /// measured — a box whose only client is `mariadb`, which `resolve_cli`
+    /// falls through to — and leaves the symlink case as it was rather than
+    /// trading it for a new one. Asking the client its version is the real
+    /// answer and is not a thing this pure function can do.
+    pub fn of(prog: &str) -> Self {
+        let stem = prog
+            .rsplit(['/', '\\'])
+            .next()
+            .unwrap_or(prog)
+            .split('.')
+            .next()
+            .unwrap_or(prog);
+        if stem.eq_ignore_ascii_case("mariadb") {
+            MysqlClient::MariaDb
+        } else {
+            MysqlClient::Mysql
+        }
+    }
+}
+
+pub fn mysql_cli_tls_args(tls: &crate::connection::Tls, client: MysqlClient) -> Vec<String> {
     use crate::connection::SslMode;
+    if client == MysqlClient::MariaDb {
+        // MariaDB's spelling of the same five rungs. `--ssl` enables TLS,
+        // `--skip-ssl` refuses it, and `--ssl-verify-server-cert` is the one
+        // that checks the certificate names the host — the three long-standing
+        // `my_getopt` variables its client does have.
+        let mut args = match tls.mode {
+            SslMode::Disable => vec!["--skip-ssl".to_string()],
+            // The client's own default already tries TLS and verifies nothing,
+            // which is what this rung means — so there is nothing to say, and
+            // saying `--ssl` would turn a preference into a requirement.
+            SslMode::Prefer => Vec::new(),
+            SslMode::Require | SslMode::VerifyCa => vec!["--ssl".to_string()],
+            SslMode::VerifyFull => {
+                vec!["--ssl".to_string(), "--ssl-verify-server-cert".to_string()]
+            }
+        };
+        if let Some(ca) = tls.ca_file() {
+            args.push(format!("--ssl-ca={ca}"));
+        }
+        if tls.uses_client_cert() {
+            args.push(format!("--ssl-cert={}", tls.client_cert_path));
+            args.push(format!("--ssl-key={}", tls.client_key_path));
+        }
+        return args;
+    }
     let mode = match tls.mode {
         SslMode::Disable => "DISABLED",
         SslMode::Prefer => "PREFERRED",
@@ -276,6 +353,32 @@ pub fn wsl_tls_blocker(tls: &crate::connection::Tls) -> Option<&'static str> {
         client cannot open. Install a native client, or move the certificates inside WSL.";
     let paths = [&tls.ca_path, &tls.client_cert_path, &tls.client_key_path];
     paths.iter().any(|p| is_windows_path(p)).then_some(WHY)
+}
+
+/// Why a **tunnelled** connection cannot open a CLI session at this TLS rung,
+/// or `None`.
+///
+/// The app's own connect path rewrites the endpoint to `127.0.0.1:<local>` and
+/// carries `hostname_override: Some(conn.host)` **in the same step**, with a
+/// test that says why: *"Rewriting the endpoint to `127.0.0.1` would have
+/// `verify-full` compare a perfectly good certificate against the loopback
+/// address and reject it."* The CLI builders were handed the rewritten
+/// `Connection` with its `tls` block untouched and no way to say the same
+/// thing — `mysql` has no hostname-override option, and `psql` would need the
+/// `PGHOST`/`PGHOSTADDR` split — so the client was told to dial the loopback
+/// and verify the certificate against it, and refused its own server's
+/// certificate. Before the TLS arguments existed at all the client fell back to
+/// a non-verifying default and the session opened.
+///
+/// A refusal rather than a silent downgrade: dropping to `require` would open a
+/// session that says TLS and checks nothing, on a connection whose whole point
+/// is that it checks. Only the two verifying rungs ask — `require` and below
+/// name no certificate, so the loopback address is the address and nothing is
+/// compared.
+pub fn tunnelled_verify_blocker(tls: &crate::connection::Tls) -> Option<&'static str> {
+    use crate::connection::SslMode;
+    const WHY: &str = "This connection verifies the server's certificate and reaches it through         an SSH tunnel, so the client would be told to dial 127.0.0.1 and check the certificate         against that — which the server's own certificate cannot satisfy. Open a query tab         instead, or lower the TLS mode for the CLI session.";
+    matches!(tls.mode, SslMode::VerifyCa | SslMode::VerifyFull).then_some(WHY)
 }
 
 /// Is `p` a path only the Windows side can open?
@@ -499,10 +602,13 @@ mod tests {
     #[test]
     fn the_mysql_client_gets_a_mode_flag_for_every_rung() {
         let args = |mode| {
-            mysql_cli_tls_args(&Tls {
-                mode,
-                ..Tls::default()
-            })
+            mysql_cli_tls_args(
+                &Tls {
+                    mode,
+                    ..Tls::default()
+                },
+                MysqlClient::Mysql,
+            )
         };
         assert_eq!(args(SslMode::Disable), ["--ssl-mode=DISABLED"]);
         assert_eq!(args(SslMode::Prefer), ["--ssl-mode=PREFERRED"]);
@@ -517,6 +623,62 @@ mod tests {
         }
     }
 
+    /// **MariaDB's client has no `--ssl-mode`**, and the flag was emitted for
+    /// it unconditionally — at every rung, the default included. Its
+    /// `my_getopt` exits immediately with `unknown option
+    /// '--ssl-mode=DISABLED'`, so the terminal panel showed that instead of a
+    /// session: the feature broken outright for this project's own primary
+    /// engine and its own live tier.
+    ///
+    /// `resolve_cli` accepts either binary, so the argv has to ask which one it
+    /// is building for. A `mysql` that is really a MariaDB symlink stays
+    /// ambiguous — see `MysqlClient::of`.
+    #[test]
+    fn the_mariadb_client_gets_its_own_spelling() {
+        let args = |mode| {
+            mysql_cli_tls_args(
+                &Tls {
+                    mode,
+                    ..Tls::default()
+                },
+                MysqlClient::MariaDb,
+            )
+        };
+        for mode in SslMode::ALL {
+            assert!(
+                !args(mode).iter().any(|a| a.starts_with("--ssl-mode")),
+                "{mode:?} sends an option this client does not have"
+            );
+        }
+        assert_eq!(args(SslMode::Disable), ["--skip-ssl"]);
+        assert!(args(SslMode::Prefer).is_empty(), "the client's own default");
+        assert_eq!(args(SslMode::Require), ["--ssl"]);
+        assert_eq!(args(SslMode::VerifyCa), ["--ssl"]);
+        assert_eq!(
+            args(SslMode::VerifyFull),
+            ["--ssl", "--ssl-verify-server-cert"]
+        );
+        // The CA and client identity are spelled the same on both clients.
+        assert_eq!(
+            mysql_cli_tls_args(
+                &Tls {
+                    mode: SslMode::VerifyFull,
+                    ca_path: "/etc/ca.crt".into(),
+                    ..Tls::default()
+                },
+                MysqlClient::MariaDb,
+            ),
+            ["--ssl", "--ssl-verify-server-cert", "--ssl-ca=/etc/ca.crt"]
+        );
+        assert_eq!(MysqlClient::of("mariadb"), MysqlClient::MariaDb);
+        assert_eq!(MysqlClient::of("/usr/bin/mariadb"), MysqlClient::MariaDb);
+        assert_eq!(
+            MysqlClient::of(r"C:\Program Files\MariaDBin\mariadb.exe"),
+            MysqlClient::MariaDb
+        );
+        assert_eq!(MysqlClient::of("mysql"), MysqlClient::Mysql);
+    }
+
     #[test]
     fn the_mysql_client_gets_the_ca_and_client_identity() {
         let tls = Tls {
@@ -526,7 +688,7 @@ mod tests {
             client_key_path: "/etc/c.key".into(),
         };
         assert_eq!(
-            mysql_cli_tls_args(&tls),
+            mysql_cli_tls_args(&tls, MysqlClient::Mysql),
             [
                 "--ssl-mode=VERIFY_IDENTITY",
                 "--ssl-ca=/etc/ca.crt",
@@ -541,16 +703,45 @@ mod tests {
             mode: SslMode::Prefer,
             ..tls.clone()
         };
-        assert!(!mysql_cli_tls_args(&prefer).iter().any(|a| a.contains("ca")));
+        assert!(
+            !mysql_cli_tls_args(&prefer, MysqlClient::Mysql)
+                .iter()
+                .any(|a| a.contains("ca"))
+        );
         // Half a client pair is a failed handshake, not a weaker one.
         let half = Tls {
             client_key_path: String::new(),
             ..tls
         };
         assert_eq!(
-            mysql_cli_tls_args(&half),
+            mysql_cli_tls_args(&half, MysqlClient::Mysql),
             ["--ssl-mode=VERIFY_IDENTITY", "--ssl-ca=/etc/ca.crt"]
         );
+    }
+
+    /// **A tunnelled endpoint and a verifying rung cannot both be honoured by a
+    /// CLI**, and the builders were handed the rewritten `Connection` with its
+    /// `tls` block untouched. `Db::connect` moves the address and carries a
+    /// `hostname_override` in the same step, with a test saying why; neither
+    /// `mysql` nor `psql` has that option, so the client was told to dial
+    /// `127.0.0.1` and check the server's certificate against it — and refused
+    /// its own server's certificate. Before the TLS arguments existed the client
+    /// fell back to a non-verifying default and the session opened.
+    #[test]
+    fn a_tunnelled_connection_is_refused_only_at_a_verifying_rung() {
+        let at = |mode| {
+            tunnelled_verify_blocker(&Tls {
+                mode,
+                ..Tls::default()
+            })
+        };
+        assert!(at(SslMode::VerifyFull).is_some());
+        assert!(at(SslMode::VerifyCa).is_some());
+        // Nothing below names a certificate, so the loopback address is the
+        // address and there is nothing to compare it against.
+        assert!(at(SslMode::Require).is_none());
+        assert!(at(SslMode::Prefer).is_none());
+        assert!(at(SslMode::Disable).is_none());
     }
 
     #[test]
