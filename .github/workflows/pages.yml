@@ -17,6 +17,15 @@ name: Pages
 # repository that has gone wrong is fixed by running this again.
 on:
   workflow_call:
+    inputs:
+      # The tag this build is publishing for, so the built site can be checked
+      # against it. Without it a site that lost its newest release to a
+      # transient download failure is perfectly self-consistent and every
+      # verifier passes it — see `build-site.sh`'s SCHEMAIC_EXPECT_VERSION.
+      expect_version:
+        description: "Fail unless the built site's newest release is this version"
+        type: string
+        required: false
   workflow_dispatch:
     inputs:
       publish:
@@ -152,9 +161,13 @@ jobs:
           SCHEMAIC_REPO_URL: https://fadion.github.io/schemaic
           SCHEMAIC_RETAIN: "5"
           SCHEMAIC_GH_REPO: ${{ github.repository }}
+          # Empty on `workflow_dispatch`, which has no tag — the repair path
+          # rebuilds whatever the releases currently hold, which is the point of
+          # it.
+          SCHEMAIC_EXPECT_VERSION: ${{ inputs.expect_version }}
         run: bash packaging/repo/build-site.sh site
 
-      # **The published fingerprint is the fifth identity value**, and the one
+      # **The published fingerprint is an identity value too**, and the one
       # the packaging README designates *the* independent channel: "a
       # fingerprint you can only check against the same server the key came
       # from is not a check at all, and this repository's history is a channel
@@ -170,8 +183,15 @@ jobs:
           set -euo pipefail
           built="$(sed -n 's|.*<pre><code>\([0-9A-F]\{40\}\)</code></pre>.*|\1|p' site/index.html | head -n1)"
           [ -n "$built" ] || { echo "::error::no 40-hex fingerprint in the built site/index.html"; exit 1; }
+          fail=0
           grep -qx "$built" README.md \
-            || { echo "::error::README.md does not carry the fingerprint this build published (${built}). The signing key rotated: update README.md, and say so in the release notes — people check against it."; exit 1; }
+            || { echo "::error::README.md does not carry the fingerprint this build published (${built}). The signing key rotated: update README.md, and say so in the release notes — people check against it."; fail=1; }
+          # install.sh now *refuses* a key that is not this one, so a rotation
+          # that misses that constant bricks every new install rather than
+          # merely misinforming a careful reader.
+          grep -qx "KEY_FINGERPRINT=\"${built}\"" install.sh \
+            || { echo "::error::install.sh's KEY_FINGERPRINT is not the fingerprint this build published (${built}). It refuses any other key, so every new install would fail."; fail=1; }
+          [ "$fail" -eq 0 ]
 
       # A repository whose metadata does not match its packages installs
       # nothing, and finds that out on a user's machine. This reads the site

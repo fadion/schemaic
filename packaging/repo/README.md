@@ -88,12 +88,24 @@ private key on every run, so there is exactly one copy and nothing that can
 quietly disagree with what is actually signing the packages.
 
 **The fingerprint is a deliberate exception, and rotating the key means editing
-the top-level README.** It is printed there because the by-hand `dnf` route asks
-the user to approve a fingerprint, and one they can only compare against the
-same server the key arrived from is not a comparison — this repository's history
-is a channel that server does not control. That only works while the two agree,
-so a rotation updates the README in the same commit, or the independent channel
-becomes an independently wrong answer.
+two files in the same commit: the top-level README *and* `install.sh`.** It is
+printed in the README because the by-hand `dnf` route asks the user to approve a
+fingerprint, and one they can only compare against the same server the key
+arrived from is not a comparison — this repository's history is a channel that
+server does not control. `install.sh` carries the same constant as
+`KEY_FINGERPRINT` and **refuses** a key that does not match it, which is that
+same independent channel applied to the route the README leads with
+(`curl … | bash`): the script is served from `raw.githubusercontent.com` and the
+key from `fadion.github.io`, so the constant is a check the key's own origin
+cannot forge.
+
+Those two make a rotation sharper than it was. The README merely becoming wrong
+is a misinformed reader; `install.sh` becoming wrong is **every new install
+failing**, and every machine already installed continuing to trust the old key
+until someone re-runs it. So a rotation is: new key → `install.sh` and README
+updated → published → said in the release notes. `pages.yml` compares both
+against the key that actually signed the build and fails the publish if either
+has drifted, which is the backstop, not the procedure.
 
 ### 2. Pages
 

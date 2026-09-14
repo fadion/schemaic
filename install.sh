@@ -39,6 +39,29 @@ APP_ID="io.github.fadion.Schemaic"
 SITE="https://fadion.github.io/schemaic"
 KEYRING="/usr/share/keyrings/schemaic-archive-keyring.gpg"
 
+# The repository signing key's fingerprint, as an **independent** channel.
+#
+# This script is served from raw.githubusercontent.com and the key from
+# fadion.github.io — two origins — so a constant here is a check on the key that
+# does not come from the same server the key does. That is the whole argument
+# README.md makes for publishing the fingerprint at all: "a fingerprint you can
+# only check against the same server the key came from is not a check at all,
+# and this repository's history is a channel that server does not control." The
+# landing page prints the fingerprint beside the key, which is not that channel.
+#
+# Without this the only check was a *shape* test — the first byte is 0x98/0x99/
+# 0xc6, or the file says BEGIN PGP PUBLIC KEY BLOCK — which any attacker-made
+# key passes. On Debian the substituted key then signs every future
+# `apt-get upgrade` of schemaic, root-run, for the life of the install; on RPM
+# `rpm --import` puts it in the **global** rpm keyring, where it validates
+# packages from any repository on the machine, permanently, and no line in the
+# uninstall instructions removes it.
+#
+# **Rotating the key means editing this constant and README.md's copy together**,
+# and saying so in the release notes: an installed machine keeps the old key
+# until someone re-runs this. `packaging/repo/README.md` carries that procedure.
+KEY_FINGERPRINT="ABDBDC3958F3FAFC734273796566ECED7795DC1A"
+
 if [ -t 1 ]; then
     RED=$'\033[0;31m'
     GREEN=$'\033[0;32m'
@@ -124,6 +147,115 @@ download_to() {
     fi
 }
 
+# The fingerprint of the primary key in `$1`, upper-case hex, or empty.
+#
+# **Two implementations because the binary keyring exists for machines with no
+# `gpg`.** A slim container often has none — which is precisely why the
+# dearmored keyring is published beside the armoured one — and "we could not
+# check, so we installed it anyway" is not a check. So where `gpg` is missing
+# the fingerprint is computed directly, which needs only `sha1sum`, `od` and
+# `dd`.
+#
+# An OpenPGP v4 fingerprint is `SHA-1(0x99 || uint16(len) || packet body)` over
+# the **primary public-key packet**, which is the first packet of an exported
+# keyring. It depends on nothing that changes over the key's life — not the
+# user IDs, not an extended expiry, not a new subkey — which is why this is the
+# constant to pin rather than a hash of the exported file.
+key_fingerprint() {
+    local f="$1" out
+    if has gpg; then
+        out="$(gpg --batch --with-colons --show-keys --fingerprint "$f" 2>/dev/null \
+            | awk -F: '/^fpr:/ { print $10; exit }')"
+        if [ -n "$out" ]; then
+            printf '%s\n' "$out"
+            return 0
+        fi
+        # An armoured file `gpg` refused is a broken file, not a reason to fall
+        # through to a parser that only understands the binary form.
+        if grep -q 'BEGIN PGP PUBLIC KEY BLOCK' "$f" 2>/dev/null; then
+            return 1
+        fi
+    fi
+    has sha1sum && has od && has dd || return 1
+
+    # **The RPM branch downloads the armoured key**, so without `gpg` the parser
+    # below would refuse every RPM install rather than only the ones it cannot
+    # check. Strip the armour first: the payload is base64 between the blank line
+    # after the header and the `=CRC` line, and `base64` is coreutils like the
+    # rest of this.
+    if grep -q 'BEGIN PGP PUBLIC KEY BLOCK' "$f" 2>/dev/null; then
+        has base64 || return 1
+        local bin="${f}.dearmored"
+        sed -n '/-----BEGIN PGP PUBLIC KEY BLOCK-----/,/-----END PGP PUBLIC KEY BLOCK-----/p' "$f" \
+            | sed '1d' \
+            | sed -n '/^$/,$p' \
+            | sed '1d' \
+            | sed '/^=/,$d' \
+            | base64 -d > "$bin" 2>/dev/null || { rm -f "$bin"; return 1; }
+        [ -s "$bin" ] || { rm -f "$bin"; return 1; }
+        out="$(key_fingerprint "$bin")" || { rm -f "$bin"; return 1; }
+        rm -f "$bin"
+        printf '%s\n' "$out"
+        return 0
+    fi
+
+    local b0 b1 len off
+    b0="$(od -An -tx1 -N1 "$f" | tr -d ' \n')"
+    case "$b0" in
+        # Old format, tag 6 (public key), with a 1- or 2-byte length.
+        98) len=$((0x$(od -An -tx1 -j1 -N1 "$f" | tr -d ' \n'))); off=2 ;;
+        99) len=$((0x$(od -An -tx1 -j1 -N2 "$f" | tr -d ' \n'))); off=3 ;;
+        # New format, tag 6, with a 1-, 2- or 5-byte length.
+        c6)
+            b1=$((0x$(od -An -tx1 -j1 -N1 "$f" | tr -d ' \n')))
+            if [ "$b1" -lt 192 ]; then
+                len=$b1; off=2
+            elif [ "$b1" -lt 224 ]; then
+                len=$(( ((b1 - 192) << 8) + $((0x$(od -An -tx1 -j2 -N1 "$f" | tr -d ' \n'))) + 192 ))
+                off=3
+            elif [ "$b1" -eq 255 ]; then
+                len=$((0x$(od -An -tx1 -j2 -N4 "$f" | tr -d ' \n'))); off=6
+            else
+                return 1
+            fi
+            ;;
+        *) return 1 ;;
+    esac
+    [ "$len" -gt 0 ] || return 1
+
+    {
+        printf '\231'
+        printf "$(printf '\\%03o\\%03o' $((len / 256)) $((len % 256)))"
+        dd if="$f" bs=1 skip="$off" count="$len" 2>/dev/null
+    } | sha1sum | cut -d' ' -f1 | tr 'a-f' 'A-F'
+}
+
+# Refuse a signing key that is not the published one.
+#
+# Fails closed in every direction: a mismatch, an unreadable key, or a machine
+# with neither `gpg` nor `sha1sum`. The last is the case that costs an install,
+# and it is the right trade — the alternative is trusting a key nobody checked,
+# on the one file whose whole job is to decide what this machine will run as
+# root from now on. The message says exactly which tool would let it proceed.
+require_published_key() {
+    local f="$1" got
+    if ! got="$(key_fingerprint "$f")" || [ -z "$got" ]; then
+        err "could not read the downloaded signing key's fingerprint."
+        err "Install 'gnupg' (or coreutils, for sha1sum) and re-run; the key is not"
+        err "installed unchecked."
+        return 1
+    fi
+    if [ "$got" != "$KEY_FINGERPRINT" ]; then
+        err "the downloaded signing key is NOT the published Schemaic key."
+        err "  expected ${KEY_FINGERPRINT}"
+        err "  got      ${got}"
+        err "Nothing has been installed. Either the key was rotated and this script is"
+        err "out of date, or something between you and ${SITE} replaced it."
+        return 1
+    fi
+    ok "Signing key verified: ${KEY_FINGERPRINT}"
+}
+
 # Match a release asset by file-name pattern. Anonymous GitHub API calls are
 # limited to 60/hour per address, and this is the script's only one.
 asset_url() {
@@ -179,6 +311,12 @@ install_deb() {
             exit 1
             ;;
     esac
+    # …and a shape test is not an identity test. Any attacker-made key passes the
+    # one above; this one is the check — see `KEY_FINGERPRINT`.
+    if ! require_published_key "${tmp}/keyring.gpg"; then
+        rm -rf "$tmp"
+        exit 1
+    fi
 
     download_to "${SITE}/schemaic.sources" "${tmp}/schemaic.sources"
     if ! grep -q '^Types: deb' "${tmp}/schemaic.sources"; then
@@ -249,6 +387,14 @@ install_rpm() {
     download_to "${SITE}/schemaic.asc" "${tmp}/schemaic.asc"
     if ! grep -q 'BEGIN PGP PUBLIC KEY BLOCK' "${tmp}/schemaic.asc"; then
         err "the downloaded signing key is not an armoured GPG key"
+        rm -rf "$tmp"
+        exit 1
+    fi
+    # Checked *before* `rpm --import`, which is the larger of the two
+    # escalations: the rpm database's keyring is not scoped to this repository,
+    # so a substituted key would validate packages from any repository on this
+    # machine, permanently, and no line of the uninstall instructions removes it.
+    if ! require_published_key "${tmp}/schemaic.asc"; then
         rm -rf "$tmp"
         exit 1
     fi
