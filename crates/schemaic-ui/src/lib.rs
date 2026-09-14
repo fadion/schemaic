@@ -54,9 +54,16 @@ mod settings;
 mod shortcuts;
 mod snippet_edit;
 mod snippet_panel;
-/// The shared machinery behind this crate's source gates. Test-only.
-#[cfg(test)]
-mod source_gate;
+/// The shared machinery behind this crate's source gates.
+///
+/// **The module is compiled always, its corpus walkers only under `cfg(test)`.**
+/// The *cut* — `production_code` and the byte scanners under it — is what a gate
+/// in another crate needs, and `#[cfg(test)] mod` made it unreachable from one:
+/// `schemaic-app`'s AI gates carried a private copy instead, with both defects
+/// this one exists to remove. The walkers stay test-only because they read the
+/// source tree at paths derived from `CARGO_MANIFEST_DIR`, which means nothing
+/// at runtime.
+pub mod source_gate;
 pub mod sql_highlight;
 mod table_designer;
 mod tabs;

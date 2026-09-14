@@ -45,7 +45,13 @@
 /// exempted site, or licensing a different one. Every gate scans with
 /// `contains`/`find`, so the blank lines cost nothing and the numbers are right
 /// by construction.
-pub(crate) fn production_code(src: &str) -> String {
+/// **`pub`, so the one walk is reachable from `schemaic-app`.** It was
+/// `pub(crate)`, and the consequence was a twelfth private copy in `app/ai.rs`
+/// carrying both defects this one exists to remove — a cut at the *first*
+/// literal `#[cfg(test)]`, found by a bare `str::find` over the raw text. Nothing
+/// here is compiled into the app; it is test-only by construction, and the
+/// alternative to exporting it is another copy.
+pub fn production_code(src: &str) -> String {
     let b = src.as_bytes();
     let mut out = String::with_capacity(src.len());
     let mut i = 0usize;
@@ -292,6 +298,7 @@ fn find_bytes(hay: &[u8], needle: &[u8]) -> Option<usize> {
 /// scan walked `env!("CARGO_MANIFEST_DIR")/src`, which is `schemaic-ui` alone.
 /// `schemaic-app` builds views too (`app_view`), so a violation added there
 /// passed the whole suite.
+#[cfg(test)]
 pub(crate) fn crate_sources() -> Vec<(String, String)> {
     sources_of(&["", "schemaic-app/"])
 }
@@ -312,6 +319,7 @@ pub(crate) fn crate_sources() -> Vec<(String, String)> {
 /// the view the app's view function returned" — really are about the two crates
 /// that build views, and widening their corpus would only add noise they have no
 /// judgement for.
+#[cfg(test)]
 pub(crate) fn workspace_sources() -> Vec<(String, String)> {
     sources_of(&["", "schemaic-app/", "schemaic-core/", "schemaic-db/"])
 }
@@ -319,6 +327,7 @@ pub(crate) fn workspace_sources() -> Vec<(String, String)> {
 /// The `.rs` files of the named crates, as `(display name, production code)`.
 /// `""` is this crate; every other label is a sibling directory name with its
 /// trailing slash, which is also the prefix each file is reported under.
+#[cfg(test)]
 fn sources_of(labels: &[&str]) -> Vec<(String, String)> {
     let ui = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
     let crates = ui

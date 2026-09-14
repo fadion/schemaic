@@ -3643,18 +3643,53 @@ mod tests {
         );
     }
 
-    /// This file's production half: comment lines dropped, so prose naming a
-    /// call is not itself one, and everything from the first `#[cfg(test)]`
-    /// onward cut, so a test's own fixtures are not production either.
+    /// **A doc comment that merely names the attribute must not blind the
+    /// gates below.**
+    ///
+    /// The copy this file carried cut at the *first* literal `#[cfg(test)]`,
+    /// found by a bare `str::find` over the raw text — so one `///` line
+    /// mentioning the attribute, anywhere above the test modules, would have
+    /// left all four gates scanning only the prefix above it. Three of them are
+    /// `!body.contains(…)` with no floor, so they would have passed by scanning
+    /// nothing, silently. The same pair of defects once cost `widgets.rs` 87% of
+    /// its file, which is why the shared walk exists.
+    #[test]
+    fn a_comment_naming_the_attribute_does_not_cut_the_file() {
+        let src = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("src")
+                .join("ai.rs"),
+        )
+        .expect("this module's own source");
+        // The marker the gates below depend on being in the corpus at all.
+        let marker = format!("fn spawn_{}(", "refusal");
+        assert!(
+            production_code(&src).contains(&marker),
+            "the gates' corpus no longer holds `{marker}` — this test is stale"
+        );
+
+        let prefixed = format!("/// a line that names #[cfg(test)]\n{src}");
+        assert!(
+            production_code(&prefixed).contains(&marker),
+            "a comment naming the attribute cut the file: every gate below is \
+             now scanning the prefix above it, and three of them pass on an \
+             empty corpus"
+        );
+    }
+
+    /// This file's production half — **the shared walk**, not a private copy.
+    ///
+    /// The copy this replaced carried both defects
+    /// `schemaic_ui::source_gate::production_code` exists to remove: it cut at
+    /// the *first* literal `#[cfg(test)]`, and found it with a bare `str::find`
+    /// over the raw text. A `///` line anywhere above this file's test modules
+    /// that merely *mentioned* the attribute — documenting `spawn_refusal`, say
+    /// — would have left all four gates below scanning only the prefix above it,
+    /// and three of them are `!body.contains(…)` with no floor, so they would
+    /// have passed by scanning nothing. The same pair of defects once cost
+    /// `widgets.rs` 87% of its file.
     fn production_code(src: &str) -> String {
-        let head = match src.find("#[cfg(test)]") {
-            Some(at) => &src[..at],
-            None => src,
-        };
-        head.lines()
-            .filter(|l| !l.trim_start().starts_with("//"))
-            .collect::<Vec<_>>()
-            .join("\n")
+        schemaic_ui::source_gate::production_code(src)
     }
 
     /// **Both axes, and the second one was hard-coded to `true`.** The rule is
