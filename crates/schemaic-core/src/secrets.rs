@@ -237,6 +237,21 @@ impl Hydration {
         });
     }
 
+    /// Take on what a save just wrote to the store.
+    ///
+    /// The other half of [`Hydration::stored`]: a load records what it *read*,
+    /// and this records what a [`sanitize_file`] **wrote**. Both make the entry
+    /// one the store is known to hold, which is the question `was_stored` is
+    /// asked — and without this half a secret typed and cleared inside one
+    /// session had its refused delete pass in silence.
+    pub fn absorb_stored(&mut self, saved: &Sanitized) {
+        for &pair in &saved.stored {
+            if !self.stored.contains(&pair) {
+                self.stored.push(pair);
+            }
+        }
+    }
+
     /// Drop every entry for a deleted connection, so a reused id can't inherit
     /// its protection (the delete-on-empty branch exists for exactly that case)
     /// or be reported against a stored secret that was its predecessor's.
@@ -360,6 +375,9 @@ pub fn sanitize_file(
                     out.undeleted.push((conn.id, kind));
                 }
             } else if store.set(&acct, &value) {
+                // The store now holds it, whoever read it first — see
+                // `Sanitized::stored`.
+                out.stored.push((conn.id, kind));
                 set_field(conn, kind, String::new());
             } else {
                 // Store unavailable — keep the plaintext in the disk copy, which
@@ -391,6 +409,13 @@ pub struct Sanitized {
     /// Secrets the user cleared that the store would not delete, so the stored
     /// entry outlives the blanked disk field.
     pub undeleted: Vec<(u64, SecretKind)>,
+    /// Secrets this save **wrote** to the store, which it therefore now holds.
+    ///
+    /// Folded into [`Hydration::stored`] by the caller. Without it `was_stored`
+    /// answered only for what a *load* read, so a password typed and saved in
+    /// one session and cleared in the same one had its refused delete go
+    /// unreported — and came back on the next launch.
+    pub stored: Vec<(u64, SecretKind)>,
 }
 
 impl Sanitized {
@@ -794,6 +819,53 @@ mod tests {
         assert!(out.undeleted.is_empty());
         assert_eq!(out.notice(), None);
         assert_eq!(store.stored("conn.7.password"), None, "gone for good");
+    }
+
+    /// **The same refusal, for a secret this session *wrote* rather than read.**
+    ///
+    /// `Hydration::stored` was pushed to by a **load** and by nothing else, so a
+    /// password typed into a connection that had none, saved successfully, and
+    /// then cleared in the same session had `was_stored` answer `false` — and
+    /// the refused delete went unreported. Disk says blank, the keyring still
+    /// holds the value, and the next launch hydrates it straight back in: the
+    /// connection goes on authenticating with the credential the user
+    /// deliberately removed, which is the failure the whole mechanism exists to
+    /// end.
+    ///
+    /// The narrowing the guard was written for — a machine with no keyring, where
+    /// every empty field asks for a delete and every refusal is meaningless — is
+    /// an argument about entries that were **never written**. This one was
+    /// written, and the store said so.
+    ///
+    /// Asserted over the composition (`sanitize_file` → `Hydration` →
+    /// `sanitize_file`), because either half alone is green.
+    #[test]
+    fn a_secret_typed_and_saved_this_session_is_a_stored_one() {
+        let store = MemStore::new();
+        // The load found nothing, so nothing is `stored` and nothing unreadable.
+        let mut file = ConnectionsFile {
+            connections: vec![conn(7)],
+            active: Some(7),
+        };
+        let mut hydration = hydrate_file(&mut file, &store);
+        assert!(!hydration.was_stored(7, SecretKind::DbPassword));
+
+        // The user types a password and saves. The store takes it.
+        file.connections[0].password = "s3cret".to_string();
+        let out = sanitize_file(&file, &store, &hydration);
+        assert_eq!(out.stored, vec![(7, SecretKind::DbPassword)]);
+        assert_eq!(store.stored("conn.7.password").as_deref(), Some("s3cret"));
+        // What the app does with it at the save site.
+        hydration.absorb_stored(&out);
+        hydration.resolve_against(&file);
+        assert!(hydration.was_stored(7, SecretKind::DbPassword));
+
+        // They clear it again; the keyring has meanwhile relocked.
+        store.set_available(false);
+        let cleared = out.file.clone();
+        let out = sanitize_file(&cleared, &store, &hydration);
+        assert_eq!(out.undeleted, vec![(7, SecretKind::DbPassword)]);
+        assert!(out.notice().is_some(), "and the user is told");
     }
 
     /// A connection's id is reused, so a `forget` the keyring refused is worth a

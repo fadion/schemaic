@@ -149,6 +149,12 @@ pub fn save_connections(file: &ConnectionsFile) -> Option<String> {
     // A secret the user has since typed in is no longer unread; leaving it
     // marked would suppress the delete when they later clear it on purpose.
     hydration.resolve_against(file);
+    // And a secret this save just *wrote* is one the store is now known to
+    // hold, exactly as if a load had read it. `Hydration::stored` used to be
+    // pushed to by a load and by nothing else, so a password typed into a
+    // connection that had none and cleared again in the same session had its
+    // refused delete go unreported — and came back on the next launch.
+    hydration.absorb_stored(&sanitized);
     if let Ok(mut slot) = last_hydration().lock() {
         *slot = hydration;
     }
@@ -171,6 +177,7 @@ fn told_once(notice: &str) -> bool {
 /// Forget a deleted connection's stored secrets. Returns whether they are all
 /// definitely gone; `false` means the keyring would not answer and an entry may
 /// outlive the connection — which matters, because ids are reused.
+#[must_use = "a `false` is what the user is told; dropping it left the deleted               connection's secrets in the keyring for the next id to inherit"]
 pub fn forget_connection(id: u64) -> bool {
     let gone = secrets::forget(id, &KeyringStore);
     if !gone {

@@ -9623,7 +9623,28 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             // Drop any tunnel for the deleted connection (frees its listener/port).
             tunnels.borrow_mut().remove(&id);
             // Forget its keyring secrets so nothing is left behind.
-            secrets::forget_connection(id);
+            //
+            // **And say so when they are not.** The return value used to be
+            // dropped on the floor and the only report was a `tracing::warn!`,
+            // which a released GUI build discards — while the modal the user
+            // just confirmed told them the keyring entries were unrecoverable.
+            // They are not: `next_id` is `max + 1`, so deleting the
+            // highest-numbered connection frees its id, and the next connection
+            // created takes it and hydrates the dead one's password, SSH
+            // password and key passphrase on the launch after that. The form
+            // shows a filled mask and the connection sends server A's
+            // credential to server B.
+            if !secrets::forget_connection(id) {
+                persist::queue_notice(
+                    "Schemaic could not reach the OS keyring, so the deleted connection's \
+                     stored password and SSH secrets are **still in it**.\n\
+                     They will be removed the next time a connection is deleted or saved \
+                     while the keyring is reachable. Until then, avoid creating a new \
+                     connection: ids are reused, and a new one taking this id would be \
+                     given those secrets."
+                        .to_string(),
+                );
+            }
             // …and its saved AI conversation, which would otherwise linger and
             // resurface under whatever connection reuses the id.
             saved_chats.update(|chats| schemaic_core::chat::clear_conn(chats, id));
