@@ -336,8 +336,25 @@ fn md_blocks(src: &str, settled: bool) -> Vec<MdBlock> {
                 Tag::Emphasis => italic += 1,
                 Tag::Strikethrough => strike += 1,
                 Tag::Link { .. } => link += 1,
-                Tag::Heading { level, .. } => heading = Some(level),
-                Tag::BlockQuote(_) => quote += 1,
+                // Both flush first, for `Tag::Table`'s stated reason and at the
+                // same point in the event stream: a tight item's lead text
+                // arrives with **no** `Paragraph` event, so `runs` is still
+                // holding the item's sentence when the heading's or the quote's
+                // own text lands on top of it. A heading merged the two into one
+                // block with no separator (`Back up the table firstWhy this
+                // matters`, the bullet gone); a blockquote merged them and put
+                // the quote stripe on the item's own row.
+                //
+                // At the **start**, not at `TagEnd`: by the end the two texts are
+                // one vector and no longer separable.
+                Tag::Heading { level, .. } => {
+                    flush_item(&mut out, &mut runs, &mut item_stack, quote);
+                    heading = Some(level);
+                }
+                Tag::BlockQuote(_) => {
+                    flush_item(&mut out, &mut runs, &mut item_stack, quote);
+                    quote += 1;
+                }
                 Tag::CodeBlock(kind) => {
                     in_code = true;
                     code_buf.clear();
@@ -1150,6 +1167,50 @@ mod md_block_tests {
                 "CODE<sql>[DELETE FROM t WHERE id = 1;]",
             ]
         );
+    }
+
+    /// **And a heading inside an item used to swallow it.**
+    ///
+    /// The arm the same sweep did not reach. A tight item's lead text arrives
+    /// with no `Paragraph` event, so `runs` was still holding it when the
+    /// heading's own text landed on top: `md_blocks` produced **one** block,
+    /// `Heading { runs: ["Back up the table first", "Why this matters"] }` —
+    /// the bullet gone, the sentence gone as a sentence, and the two texts
+    /// concatenated with no separator into `Back up the table firstWhy this
+    /// matters`.
+    ///
+    /// The flush belongs at the heading's **start**, beside `Tag::Table`'s and
+    /// for the same stated reason ("before the first cell clears `runs`"): by
+    /// `TagEnd::Heading` the item's sentence and the heading's own text are one
+    /// vector and no longer separable.
+    #[test]
+    fn a_heading_in_a_list_item_keeps_the_item_it_belongs_to() {
+        let md = "- Back up the table first\n  ### Why this matters\n";
+        assert_eq!(
+            sketch(md),
+            vec!["ITEM(•@0)[Back up the table first]", "H[Why this matters]",]
+        );
+        // The blockquote sibling merges the same way, and the item's own
+        // sentence used to come out *inside* the quote — asserted on the blocks
+        // rather than the sketch, since the stripe is the point and `sketch`
+        // does not show it.
+        let blocks = md_blocks("- Note this\n  > quoted\n", true);
+        let quotes: Vec<(String, usize)> = blocks
+            .iter()
+            .map(|b| match b {
+                MdBlock::Item { runs, quote, .. } => (flat(runs), *quote),
+                MdBlock::Para { runs, quote, .. } => (flat(runs), *quote),
+                other => (format!("{other:?}"), 0),
+            })
+            .collect();
+        assert_eq!(quotes.len(), 2, "{quotes:?}");
+        assert_eq!(quotes[0].0, "Note this");
+        assert_eq!(quotes[0].1, 0, "the item's own sentence is not quoted");
+        assert_eq!(quotes[1].0, "quoted");
+        assert_eq!(quotes[1].1, 1, "and the quoted text is");
+        // A heading outside a list is untouched — the flush is a no-op with an
+        // empty item stack.
+        assert_eq!(sketch("Intro\n\n### Why\n"), vec!["PARA[Intro]", "H[Why]"]);
     }
 
     /// **A table inside an item used to delete the item's sentence.**
