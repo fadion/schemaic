@@ -231,7 +231,28 @@ impl TxState {
         }
         match self {
             TxState::Lost => TxState::Lost,
-            // Postgres rejects everything until ROLLBACK, so nothing counts.
+            // **PostgreSQL rejects everything until `ROLLBACK` — and that is the
+            // statement the pill tells the user to run.** This arm used to
+            // absorb it too, so a typed rollback left the tab reading
+            // "Tx aborted" for the rest of its life while `ensure_tx` opened a
+            // real, healthy transaction underneath: Commit hidden in the footer
+            // and in the close prompt, and the only offered actions destroying
+            // work that was never in trouble. `TxState::closed()`'s doc already
+            // called itself the way out of `Poisoned`; the typed rollback had no
+            // route to it.
+            //
+            // Gated on `Ok`: a rollback the server refused changes nothing, and
+            // a statement it rejected inside an aborted transaction is exactly
+            // what the absorbing behaviour is for.
+            TxState::Poisoned { .. }
+                if outcome == StmtOutcome::Ok
+                    && matches!(tx_after(engine, sql), TxAfter::Closed | TxAfter::Open) =>
+            {
+                match tx_after(engine, sql) {
+                    TxAfter::Open => TxState::Open { stmts: 0 },
+                    _ => TxState::Idle,
+                }
+            }
             TxState::Poisoned { stmts } => TxState::Poisoned { stmts },
             TxState::Idle | TxState::Open { .. } => {
                 let stmts = self.stmts();
@@ -326,6 +347,20 @@ pub fn implicit_commit(engine: TxEngine, sql: &str) -> bool {
     };
     if kw == "SET" {
         return set_commits(sql, dialect);
+    }
+    // **MySQL's own documented exception**: *"CREATE TABLE and DROP TABLE
+    // statements do not commit a transaction if the TEMPORARY keyword is
+    // used."* Without it the pill went blank over a live transaction holding
+    // the user's uncommitted work — the false positive the doc above calls the
+    // mirror image, and the one MySQL habit that produces it. Read through the
+    // same lexer, so a comment between the two words cannot hide it.
+    if matches!(kw.as_str(), "CREATE" | "DROP")
+        && crate::sql::leading_words(sql, 2, dialect)
+            .get(1)
+            .map(String::as_str)
+            == Some("TEMPORARY")
+    {
+        return false;
     }
     matches!(
         kw.as_str(),
@@ -461,23 +496,29 @@ pub fn tx_after(engine: TxEngine, sql: &str) -> TxAfter {
     let Some(kw) = crate::sql::leading_keyword(sql, dialect) else {
         return TxAfter::Unchanged;
     };
-    let rest = crate::sql::leading_keyword_end(sql, dialect).map_or("", |e| &sql[e..]);
-    let word = |n: usize| {
-        rest.split(|c: char| c.is_whitespace() || matches!(c, ';' | ',' | '=' | '(' | ')'))
-            .filter(|w| !w.is_empty())
-            .nth(n)
-            .map(|w| w.to_ascii_uppercase())
-    };
+    // **Through the shared lexer, not a split on the raw tail.** The leading
+    // keyword is read comment-aware and the words after it were not, so
+    // `ROLLBACK/* x */TO SAVEPOINT s` produced the token `/*`. `leading_words`
+    // is bounded, which is what keeps this cheap on a sixteen-megabyte `INSERT`.
+    let words = crate::sql::leading_words(sql, 4, dialect);
+    let word = |n: usize| words.get(n + 1).map(String::as_str);
     match kw.as_str() {
         // `AND CHAIN` starts the next transaction immediately; `TO [SAVEPOINT]`
         // is not a close at all.
         "COMMIT" | "ROLLBACK" | "END" | "ABORT" => {
-            let next = word(0);
-            match next.as_deref() {
+            // **`WORK`/`TRANSACTION` are noise words, and they sit between the
+            // keyword and the word that decides.** Reading only the first word
+            // after the keyword found `WORK`, missed both guards below, and
+            // answered `Closed` for `ROLLBACK WORK TO SAVEPOINT s` — legal on
+            // both engines. `Session::in_tx` then went false over a transaction
+            // the server still held, and the next statement's `ensure_tx`
+            // issued a `BEGIN`, which on MySQL commits the work the rollback
+            // was meant to keep.
+            let i = usize::from(matches!(word(0), Some("WORK" | "TRANSACTION")));
+            match word(i) {
                 Some("TO") => TxAfter::Unchanged,
-                Some("AND") if word(1).as_deref() == Some("CHAIN") => TxAfter::Open,
-                // `WORK`/`TRANSACTION` are noise words; `AND NO CHAIN` is the
-                // default.
+                Some("AND") if word(i + 1) == Some("CHAIN") => TxAfter::Open,
+                // `AND NO CHAIN` is the default.
                 _ => TxAfter::Closed,
             }
         }
@@ -882,6 +923,40 @@ mod tests {
             s.on_statement(PG, "SELECT 1", StmtOutcome::Failed),
             TxState::Poisoned { stmts: 2 }
         );
+    }
+
+    /// **The one statement PostgreSQL does not reject in an aborted
+    /// transaction is the one the pill tells the user to run.**
+    ///
+    /// The pill reads *"Tx aborted — rollback to continue"*, the user types
+    /// `ROLLBACK;`, the server accepts it and `Session::in_tx` goes false — but
+    /// the fold matched `Poisoned` above the outcome and returned unchanged. So
+    /// the tab stayed `Poisoned` for the rest of its life: Commit hidden in the
+    /// footer *and* in the close prompt, while `ensure_tx` opened a real,
+    /// healthy transaction for everything typed afterwards. The user then builds
+    /// work in a live transaction whose only offered actions destroy it.
+    ///
+    /// Gated on `Ok`, because a *failed* rollback changes nothing — that is the
+    /// case the absorbing arm was written for.
+    #[test]
+    fn a_typed_rollback_is_the_way_out_of_poisoned() {
+        let s = TxState::Poisoned { stmts: 2 };
+        assert_eq!(ok(s, PG, "ROLLBACK"), TxState::Idle);
+        // PostgreSQL turns a `COMMIT` in an aborted transaction into a
+        // rollback and answers `Ok`, so it lands in the same place.
+        assert_eq!(ok(s, PG, "COMMIT"), TxState::Idle);
+        // `AND CHAIN` closes one and opens another, here too.
+        assert_eq!(ok(s, PG, "ROLLBACK AND CHAIN"), TxState::Open { stmts: 0 });
+        // A rollback the server refused leaves the tab exactly as it was.
+        assert_eq!(
+            s.on_statement(PG, "ROLLBACK", StmtOutcome::Failed),
+            TxState::Poisoned { stmts: 2 }
+        );
+        // And the composition: the next statement counts, and Commit is
+        // offered again for the transaction it belongs to.
+        let after = ok(ok(s, PG, "ROLLBACK"), PG, "UPDATE t SET a = 1");
+        assert_eq!(after, TxState::Open { stmts: 1 });
+        assert!(after.can_commit());
     }
 
     /// A grid write runs under `SAVEPOINT schemaic_w`, and `pg::write_on` rolls
@@ -1664,6 +1739,95 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// **The noise word is optional, and it sits between the keyword and the
+    /// word that decides.** MySQL's grammar is
+    /// `ROLLBACK [WORK] TO [SAVEPOINT] identifier` and PostgreSQL's is
+    /// `ROLLBACK [ WORK | TRANSACTION ] TO [ SAVEPOINT ] name`; `COMMIT`, `END`
+    /// and `ABORT` take the same noise word before `AND [NO] CHAIN`. Reading
+    /// only the first word after the keyword found `WORK`, missed both guards,
+    /// and fell through to `Closed`.
+    ///
+    /// The cost is not a wrong label. `Session::in_tx` goes false over a
+    /// transaction the server still holds, so the next statement's `ensure_tx`
+    /// issues a `BEGIN` — which on MySQL **implicitly commits the work the
+    /// rollback was meant to keep**. In between, `TxState::Idle` hides Commit
+    /// and Rollback, blanks the pill and lets `guard_tx` close the tab unasked.
+    ///
+    /// The two halves of the existing case never met: it lists the noise-word
+    /// forms only on the closing side and the savepoint forms only without one.
+    #[test]
+    fn a_noise_word_does_not_turn_a_savepoint_rollback_into_a_close() {
+        for engine in [TxEngine::MySql, TxEngine::Postgres] {
+            for sql in [
+                "ROLLBACK WORK TO SAVEPOINT s1",
+                "ROLLBACK TRANSACTION TO SAVEPOINT s1",
+                "ROLLBACK WORK TO s1",
+                // The `rest` this reads used to be raw text rather than lexed,
+                // so a comment between the two words was itself the token.
+                "ROLLBACK/* x */TO SAVEPOINT s1",
+            ] {
+                assert_eq!(
+                    tx_after(engine, sql),
+                    TxAfter::Unchanged,
+                    "{engine:?} {sql}"
+                );
+            }
+            for sql in [
+                "COMMIT WORK AND CHAIN",
+                "END TRANSACTION AND CHAIN",
+                "ROLLBACK WORK AND CHAIN",
+            ] {
+                assert_eq!(tx_after(engine, sql), TxAfter::Open, "{engine:?} {sql}");
+            }
+            // The composition, not the predicate alone: the pill keeps the
+            // transaction it is counting.
+            assert!(
+                TxState::Open { stmts: 3 }
+                    .on_statement(engine, "ROLLBACK WORK TO SAVEPOINT s", StmtOutcome::Ok)
+                    .is_open(),
+                "{engine:?}"
+            );
+        }
+    }
+
+    /// **MySQL's one documented exception to its own implicit-commit list.**
+    ///
+    /// *"CREATE TABLE and DROP TABLE statements do not commit a transaction if
+    /// the TEMPORARY keyword is used."* Reading the leading keyword alone said
+    /// they do, so a `CREATE TEMPORARY TABLE` — a routine working habit —
+    /// blanked the pill over a live transaction holding the user's uncommitted
+    /// `UPDATE`. From there Commit and Rollback are both hidden, closing the tab
+    /// asks nothing and rolls back, and one more statement's `BEGIN` commits the
+    /// work instead. `implicit_commit`'s own doc forbids exactly this: it says
+    /// the list matches MySQL's documented set "and no wider".
+    #[test]
+    fn a_temporary_table_does_not_commit_the_transaction() {
+        for sql in [
+            "CREATE TEMPORARY TABLE tmp (a INT)",
+            "create temporary table tmp as select 1",
+            "DROP TEMPORARY TABLE tmp",
+            "DROP TEMPORARY TABLE IF EXISTS tmp",
+            "/* x */ CREATE TEMPORARY TABLE tmp (a INT)",
+        ] {
+            assert!(!implicit_commit(TxEngine::MySql, sql), "{sql}");
+            assert_eq!(tx_after(TxEngine::MySql, sql), TxAfter::Unchanged, "{sql}");
+            assert_eq!(
+                TxState::Open { stmts: 1 }.on_statement(TxEngine::MySql, sql, StmtOutcome::Ok),
+                TxState::Open { stmts: 2 },
+                "{sql}"
+            );
+        }
+        // The permanent forms still commit — the carve-out is `TEMPORARY` only.
+        for sql in ["CREATE TABLE t (a INT)", "DROP TABLE t"] {
+            assert!(implicit_commit(TxEngine::MySql, sql), "{sql}");
+        }
+        // And a column or an index named `temporary` is not the keyword.
+        assert!(implicit_commit(
+            TxEngine::MySql,
+            "CREATE TABLE temporary (a INT)"
+        ));
     }
 
     /// The seam, not the predicate: the pill folds on the same answer, so it

@@ -3277,6 +3277,23 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                                 states[i] = QueryState::Cancelled;
                                 continue;
                             }
+                            // **Per statement, not once above the loop.** It is
+                            // a no-op while the session's flag says a
+                            // transaction is open, so the ordinary script pays
+                            // nothing — but a `COMMIT` in the middle of the
+                            // script, or a MySQL implicit-commit DDL, clears
+                            // that flag, and every statement after it then ran
+                            // **auto-committed** while the pill still counted
+                            // and Rollback was a successful no-op over data
+                            // already permanent. `6d95b86` fixed the predicate
+                            // half of this (`tx_after`) and left the caller
+                            // half here.
+                            if let Err(e) = s.ensure_tx().await {
+                                states[i] = QueryState::Failed(e.to_string());
+                                took[i] = clock.elapsed().as_millis() as u64;
+                                stopped = true;
+                                continue;
+                            }
                             // Per statement, so a long script isn't bounded as
                             // one long statement. Dropped before the next arms.
                             let watchdog = RunTimeout::arm(&token, timeout_secs);
