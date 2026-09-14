@@ -208,8 +208,22 @@ pub(crate) fn item_end(src: &str, from: usize) -> Option<usize> {
 /// Past a `"…"` (or `r"…"`/`r#"…"#`) literal starting at `i`.
 fn skip_quoted(b: &[u8], i: usize, q: u8) -> usize {
     // Raw strings: count the `#`s that opened it and look for the same close.
+    //
+    // **`r"…"` counts, and the `hashes > 0` test used to say it did not.** A raw
+    // string with no hashes fell through to the escaping path below, where the
+    // `\` of `r"a\"` consumed the closing quote — and the scan then ran on to
+    // the next `"` anywhere in the file, swallowing every brace between. In
+    // `item_end` that means the item never balances, `production_code` takes its
+    // "refuse to guess" branch, and a whole test module comes back as production
+    // code. Three files were in that state (`db/lib.rs`, `core/ddl.rs`,
+    // `core/schema.rs`), silently, because the fallback is by design quiet; it
+    // is `no_test_module_survives_the_cut` that says so now.
+    //
+    // A `"` directly after an `r` is a raw string and nothing else — Rust has no
+    // identifier that may abut a literal — so the `r` is the test, and the hash
+    // count only picks the terminator.
     let hashes = b[..i].iter().rev().take_while(|c| **c == b'#').count();
-    if hashes > 0 && b[..i - hashes].last() == Some(&b'r') {
+    if i > hashes && b[..i - hashes].last() == Some(&b'r') {
         let close = format!("\"{}", "#".repeat(hashes));
         let rest = &b[i + 1..];
         return match find_bytes(rest, close.as_bytes()) {
@@ -279,18 +293,56 @@ fn find_bytes(hay: &[u8], needle: &[u8]) -> Option<usize> {
 /// `schemaic-app` builds views too (`app_view`), so a violation added there
 /// passed the whole suite.
 pub(crate) fn crate_sources() -> Vec<(String, String)> {
+    sources_of(&["", "schemaic-app/"])
+}
+
+/// [`crate_sources`] plus `schemaic-core` and `schemaic-db`.
+///
+/// **For a gate whose rule is not about views.** "Ask a capability, never an
+/// engine" is stated in CLAUDE.md about the whole workspace, and it names
+/// `ddl::supports_change`, `supports_column_reorder`, `stats::supports_table_stats`
+/// and `ref_schema_is_database` — every one of them in `schemaic-core`. A gate
+/// over the two view crates therefore claimed a rule it could not reach: a
+/// `dialect == SqlDialect::MySql` planted in `core/ddl.rs` passed the whole
+/// suite, and a live instance was already in a review ledger
+/// (`core/schema.rs`'s `is_bare_default`, since removed).
+///
+/// Separate from [`crate_sources`] rather than replacing it, because the
+/// view-shaped gates — "every `<select>` in the app", "the KeyDown listener is on
+/// the view the app's view function returned" — really are about the two crates
+/// that build views, and widening their corpus would only add noise they have no
+/// judgement for.
+pub(crate) fn workspace_sources() -> Vec<(String, String)> {
+    sources_of(&["", "schemaic-app/", "schemaic-core/", "schemaic-db/"])
+}
+
+/// The `.rs` files of the named crates, as `(display name, production code)`.
+/// `""` is this crate; every other label is a sibling directory name with its
+/// trailing slash, which is also the prefix each file is reported under.
+fn sources_of(labels: &[&str]) -> Vec<(String, String)> {
     let ui = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
-    let app = ui
+    let crates = ui
         .parent()
         .and_then(|p| p.parent())
         .expect("the workspace's crates dir")
-        .join("schemaic-app")
-        .join("src");
+        .to_path_buf();
+    let dirs: Vec<(&str, std::path::PathBuf)> = labels
+        .iter()
+        .map(|label| {
+            let dir = if label.is_empty() {
+                ui.clone()
+            } else {
+                crates.join(label.trim_end_matches('/')).join("src")
+            };
+            (*label, dir)
+        })
+        .collect();
     let mut out = Vec::new();
-    for (label, dir) in [("", ui), ("schemaic-app/", app)] {
+    for (label, dir) in dirs {
         let Ok(entries) = std::fs::read_dir(&dir) else {
             panic!("a gate's source directory is missing: {}", dir.display());
         };
+        let before = out.len();
         for entry in entries {
             let path = entry.expect("a dir entry").path();
             if path.extension().and_then(|e| e.to_str()) != Some("rs") {
@@ -300,6 +352,16 @@ pub(crate) fn crate_sources() -> Vec<(String, String)> {
             let src = std::fs::read_to_string(&path).expect("a source file");
             out.push((format!("{label}{name}"), production_code(&src)));
         }
+        // **Per directory, not only in total.** A total floor is satisfied by
+        // the largest crate alone, so a `src` that moved under any of the others
+        // would leave every gate over it green by finding nothing. The smallest
+        // crate here has six files.
+        assert!(
+            out.len() - before >= 5,
+            "only {} source files scanned in {}",
+            out.len() - before,
+            dir.display()
+        );
     }
     // The scan has to still be reading something: a moved `src` would pass every
     // gate by finding no files at all.
@@ -568,6 +630,70 @@ mod tests {
         assert!(!code.contains("dropdown"), "{code}");
         assert!(!code.contains("helper"), "{code}");
         assert!(code.contains("fn after()"), "{code}");
+    }
+
+    /// **Every gate's corpus is only as good as this cut**, so the cut is
+    /// checked against the real files rather than only against hand-written
+    /// fixtures.
+    ///
+    /// If `item_end` mis-reads one item, the rest of that file arrives as
+    /// "production code" and every gate over it then scans its test modules —
+    /// which does not fail loudly, it fails as noise: assertions about the app
+    /// answered from its tests. The tell is a surviving `#[cfg(test)]`, and
+    /// checking for one costs a scan of text already in memory.
+    #[test]
+    fn no_test_module_survives_the_cut() {
+        let mut leaks: Vec<String> = Vec::new();
+        for (name, code) in crate::source_gate::workspace_sources() {
+            // Not `contains`: the string appears in this module's own fixtures
+            // and prose, which the cut is not meant to remove.
+            let n = code.matches("#[cfg(test)]").count() + code.matches("#[test]").count();
+            if n > 0 && name != "source_gate.rs" {
+                leaks.push(format!("{name}: {n}"));
+            }
+        }
+        assert!(
+            leaks.is_empty(),
+            "`production_code` left a test module in place, so every gate over \
+             these files is scanning their tests:\n{}",
+            leaks.join("\n")
+        );
+    }
+
+    /// **A raw string with no hashes, ending in a backslash.**
+    ///
+    /// `r"a\\"` is `a\\`: in a raw string the backslash escapes nothing. The
+    /// scanner took it for one, consumed the closing quote, and ran on to the
+    /// next `"` anywhere in the file — every brace in between counted, so the
+    /// enclosing item never balanced and `production_code` handed a whole test
+    /// module back as production code. It found three files in that state.
+    #[test]
+    fn a_raw_string_ending_in_a_backslash_ends_where_it_ends() {
+        let src = concat!(
+            "#[cfg(test)]\nmod t {\n",
+            "    fn a() { assert_eq!(f(r\"a\\\"), 1); }\n",
+            "}\n",
+            "fn after() { views::dropdown(); }\n",
+        );
+        let code = production_code(src);
+        assert!(!code.contains("assert_eq"), "the module survived:\n{code}");
+        assert!(
+            code.contains("fn after()"),
+            "the cut ran past the module:\n{code}"
+        );
+        // …and the hashed forms still work, in both directions.
+        for lit in [
+            "r\"plain\"",
+            "r#\"has \"quotes\"\"#",
+            "\"ordinary \\\" escaped\"",
+        ] {
+            let src = format!(
+                "#[cfg(test)]\nmod t {{\n    fn a() {{ g({lit}); }}\n}}\nfn after() {{}}\n"
+            );
+            let code = production_code(&src);
+            assert!(code.contains("fn after()"), "{lit}:\n{code}");
+            assert!(!code.contains("fn a()"), "{lit}:\n{code}");
+        }
     }
 
     #[test]

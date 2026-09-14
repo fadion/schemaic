@@ -3983,6 +3983,90 @@ mod engine_comparison_gate {
              and the other two do not, so the host field and the \
              Database/Schema label are shape, not capability.",
         ),
+        // ── schemaic-core ───────────────────────────────────────────────────
+        //
+        // **Where the capabilities themselves live**, so a `match` on the
+        // dialect is the sanctioned shape here rather than the violation — the
+        // rule is that a *caller* asks a capability, and something has to
+        // answer. What these entries are for is the other half: an emitter that
+        // makes a grammar decision inline, where a named capability would let
+        // the two crates that already ask this question stop re-deriving it.
+        (
+            "schemaic-core/activity.rs",
+            1,
+            "`supports_activity` — a capability definition. SQLite has no \
+             server and so no session list; CLAUDE.md names this family as the \
+             shape a caller is supposed to ask instead of comparing.",
+        ),
+        (
+            "schemaic-core/celledit.rs",
+            5,
+            "**Not clean.** The cell editors pick a control from a column type, \
+             and four of the five are grammar (MySQL's `enum`/`set`, its \
+             backslash escape, PostgreSQL's array literal). They read as \
+             capabilities waiting to be named — `has_enum_columns`, \
+             `backslash_escapes_strings` — and the last is already asked, \
+             differently, by `core::sql`'s `e_string_backslash`. Admitted \
+             because naming them is a change to the editors, not to this gate.",
+        ),
+        (
+            "schemaic-core/ddl.rs",
+            24,
+            "Seven of the twenty-four *are* the capability definitions the rest \
+             of the app asks — `supports_or_replace_view`, \
+             `supports_view_rename`, `alter_column_disturbs_checks`, \
+             `requires_named_checks`, `requires_rowid_key`, \
+             `strict_type_allowed`, `supports_change` — and a `match` is how \
+             they answer. The other seventeen are DDL grammar inside the \
+             emitters (`create_view_sql`, `create_table_sql`, `client_script`'s \
+             `DELIMITER`, `is_begin_end_block`, `repoint_check_column`), where \
+             the three engines write genuinely different statements rather than \
+             one statement with a switch in it.",
+        ),
+        (
+            "schemaic-core/filter.rs",
+            1,
+            "MySQL reads `\"x\"` as a string literal where PostgreSQL reads a \
+             quoted identifier, so the filter normalises double quotes to \
+             single ones on one engine and must not on the other. Lexical, and \
+             the same fact `sql::double_quote_is_ident` states — which is the \
+             capability this could ask, and a reason to keep it on the list.",
+        ),
+        (
+            "schemaic-core/import.rs",
+            1,
+            "`bool_literal_is_integer` — a capability definition, named as one.",
+        ),
+        (
+            "schemaic-core/schema.rs",
+            6,
+            "DDL grammar in the four `*_sql` emitters — a column definition, an              index clause, a sequence and a whole `CREATE TABLE`. The three              engines write different statements there rather than one statement              with a switch in it, and `is_bare_default` — the one site here that              really was a capability in disguise — now asks `default_grammar`,              and `follow_target` asks `ddl::ref_schema_is_database`.",
+        ),
+        (
+            "schemaic-core/sql.rs",
+            14,
+            "Ten are the [`SqlDialect`] capability table itself — \
+             `backtick_ident`, `double_quote_is_ident`, `dollar_quoted`, \
+             `e_string_backslash` and the rest — which is the one place in the \
+             workspace where naming an engine is the whole job. The four others \
+             are the boundary lexer's own per-engine rules (SQLite's `''` \
+             doubling, its trigger bodies, MySQL's `USE`, PostgreSQL's \
+             dollar-quote), a lexical table for the same reason.",
+        ),
+        (
+            "schemaic-core/stats.rs",
+            1,
+            "`supports_table_stats` — a capability definition, and one CLAUDE.md \
+             names by hand.",
+        ),
+        (
+            "schemaic-core/users.rs",
+            1,
+            "`supports_users` — a capability definition. `supports_user_admin` \
+             is what `ddl::supports_change` asks of it rather than comparing \
+             engines a second time.",
+        ),
+        // ── schemaic-ui / schemaic-app ──────────────────────────────────────
         (
             "lib.rs",
             1,
@@ -4080,14 +4164,69 @@ mod engine_comparison_gate {
     /// thirty sites this gate is about under twenty that are simply correct.
     const DERIVATION: &str = "SqlDialect::from_db_type(";
 
+    /// Does this line **compare** something to an engine, rather than merely
+    /// name one?
+    ///
+    /// **The distinction the first needle did not make, and the reason this gate
+    /// could not be pointed at `core` and `db`.** The rule is "ask a capability,
+    /// never an engine" — about a branch that *asks which engine this is*, and
+    /// silently sorts a fourth onto whichever side it falls. Naming a dialect is
+    /// a different act: `db/pg.rs` passing `SqlDialect::Postgres` to a quoter is
+    /// not asking anything, it is stating which grammar the string it is about to
+    /// build is in, answered by the module's own identity. Counting those buried
+    /// the real sites under a hundred that are simply correct — which is exactly
+    /// what [`DERIVATION`] already says about the connection-derived form.
+    ///
+    /// So: an `==`/`!=` against a dialect path, or a `matches!` over one. An
+    /// exhaustive `match` is [`is_match_arm`]'s question and is sanctioned there.
+    fn is_comparison(line: &str) -> bool {
+        if line.contains("matches!(") && line.contains("SqlDialect::") {
+            return true;
+        }
+        // Path-tolerant, like `is_match_arm`: `d == crate::intel::SqlDialect::MySql`
+        // is the same comparison spelled through the module, and a needle of the
+        // literal `"== SqlDialect::"` could not see it — which is how a planted
+        // violation walked straight past the first version of this.
+        let b = line.as_bytes();
+        line.match_indices("SqlDialect::").any(|(at, _)| {
+            let mut i = at;
+            while i > 0
+                && (b[i - 1].is_ascii_alphanumeric() || b[i - 1] == b'_' || b[i - 1] == b':')
+            {
+                i -= 1;
+            }
+            let before = line[..i].trim_end();
+            before.ends_with("==") || before.ends_with("!=")
+        })
+    }
+
     #[test]
     fn a_view_asks_a_capability_and_not_an_engine() {
         let mut found: Vec<(String, Vec<String>)> = Vec::new();
-        for (name, code) in crate::source_gate::crate_sources() {
+        for (name, code) in crate::source_gate::workspace_sources() {
+            // **A view may not name a dialect at all; `core` and `db` may.**
+            // A view is never the thing that *has* an engine — it is handed one
+            // — so a bare `unwrap_or(SqlDialect::MySql)` standing in for a
+            // capability is a violation there, and it is the one that shipped.
+            // In `core` and `db` naming a dialect is the ordinary act: `pg.rs`
+            // passing `SqlDialect::Postgres` to a quoter is stating which
+            // grammar the string it is building is in, answered by the module's
+            // own identity, not asking which engine this is. Counting those
+            // buried the real sites under a hundred that are simply correct —
+            // the same reason `DERIVATION` exempts the connection-derived form.
+            let engine_owning =
+                name.starts_with("schemaic-core/") || name.starts_with("schemaic-db/");
             let sites: Vec<String> = code
                 .lines()
                 .map(|l| l.replace(DERIVATION, "«derived»("))
-                .filter(|l| l.contains("SqlDialect::") && !is_match_arm(l))
+                .filter(|l| {
+                    let named = if engine_owning {
+                        is_comparison(l)
+                    } else {
+                        l.contains("SqlDialect::")
+                    };
+                    named && !is_match_arm(l)
+                })
                 .map(|l| l.trim().to_string())
                 .collect();
             if !sites.is_empty() {
@@ -4106,6 +4245,13 @@ mod engine_comparison_gate {
                 .iter()
                 .map(|l| l.matches("SqlDialect::").count())
                 .sum();
+            // One comparison may name two variants (`matches!(d, A | B)`); it is
+            // still one decision, and the budget counts decisions there.
+            let n = if name.starts_with("schemaic-core/") || name.starts_with("schemaic-db/") {
+                sites.len()
+            } else {
+                n
+            };
             if budget != Some(n) {
                 report.push_str(&format!("{name}: {n}, admitted {budget:?}\n"));
                 for l in sites {

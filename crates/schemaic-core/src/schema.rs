@@ -608,13 +608,48 @@ fn when_group(guard: &str) -> String {
 /// question for `ADD COLUMN` — the two used to answer it separately, and the one
 /// that guessed sent statements the engine refuses down a path with no
 /// transaction around it.
-pub(crate) fn is_bare_default(d: &str, dialect: crate::intel::SqlDialect) -> bool {
+/// Which `DEFAULT` grammar an engine accepts **unparenthesised** — the
+/// capability [`is_bare_default`] asks, instead of asking which engine it is.
+///
+/// **A fourth engine has to answer.** The three rule blocks below used to be
+/// gated on `dialect == Postgres` and `dialect == MySql`, with everything else
+/// falling through to SQLite's — the *narrowest* of the three — so a new variant
+/// would inherit it with no comparison to grep for, and in the wrong direction:
+/// SQLite wraps the most, and `ColumnInfo::definition_sql` turns a wrong `false`
+/// into `DEFAULT (7)`, which MySQL reads as a different column. Over-wrapping is
+/// not free.
+///
+/// The shape is `d4ff6bd`'s, one commit earlier in the same range, which removed
+/// four instances of exactly this and whose subject is the rule's own words.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum DefaultGrammar {
+    /// Any expression may stand bare — PostgreSQL parses the whole clause as one.
+    AnyExpression,
+    /// A fixed keyword set, plus `CURRENT_TIMESTAMP(n)` and a character-set
+    /// introducer before a literal. MySQL and MariaDB.
+    MysqlKeywords,
+    /// The narrowest: a literal, or one of a short keyword list. SQLite.
+    LiteralsOnly,
+}
+
+/// The grammar `dialect` accepts, exhaustively, so a fourth engine is a compile
+/// error rather than a silent fall-through. See [`DefaultGrammar`].
+pub(crate) fn default_grammar(dialect: crate::intel::SqlDialect) -> DefaultGrammar {
     use crate::intel::SqlDialect;
+    match dialect {
+        SqlDialect::Postgres => DefaultGrammar::AnyExpression,
+        SqlDialect::MySql => DefaultGrammar::MysqlKeywords,
+        SqlDialect::Sqlite => DefaultGrammar::LiteralsOnly,
+    }
+}
+
+pub(crate) fn is_bare_default(d: &str, dialect: crate::intel::SqlDialect) -> bool {
     let t = d.trim();
     if t.is_empty() {
         return true;
     }
-    if dialect == SqlDialect::Postgres {
+    let grammar = default_grammar(dialect);
+    if grammar == DefaultGrammar::AnyExpression {
         return true;
     }
     // **One group, closed by the final `)`** — not merely a `(` at each end.
@@ -640,7 +675,7 @@ pub(crate) fn is_bare_default(d: &str, dialect: crate::intel::SqlDialect) -> boo
     }
     // MySQL's `DEFAULT CURRENT_TIMESTAMP(6)` and its two synonyms, which take a
     // fractional-seconds precision the three bare keywords above do not.
-    if dialect == SqlDialect::MySql
+    if grammar == DefaultGrammar::MysqlKeywords
         && let Some(rest) = ["CURRENT_TIMESTAMP", "LOCALTIMESTAMP", "LOCALTIME"]
             .iter()
             .find_map(|k| upper.strip_prefix(k))
@@ -661,7 +696,7 @@ pub(crate) fn is_bare_default(d: &str, dialect: crate::intel::SqlDialect) -> boo
     // literal, and a character-set introducer, which is what MySQL 8 puts in
     // front of a string it recorded as an expression default
     // (`_utf8mb3'draft'`). The literal itself is then the same question.
-    let intro = if dialect == SqlDialect::MySql {
+    let intro = if grammar == DefaultGrammar::MysqlKeywords {
         mysql_literal_introducer(t)
     } else {
         0
@@ -3969,9 +4004,16 @@ pub fn follow_target(
     if fk.ref_columns.is_empty() || values.len() != fk.ref_columns.len() {
         return None;
     }
-    let postgres = dialect == crate::intel::SqlDialect::Postgres;
-    // Postgres: the reference is same-database; open the current DB, not the schema.
-    let database = if postgres {
+    // **A capability, not a comparison.** The question is whether
+    // `fk.ref_schema` names the *database* the reference points into or a
+    // namespace within the current one — which is exactly
+    // `ddl::ref_schema_is_database`, the predicate CLAUDE.md names for it and
+    // which the schema comparison already asks. Spelled `== Postgres` here, it
+    // sorted SQLite onto the same side by accident, and a fourth engine would
+    // have joined it with no comparison to grep for.
+    let same_database = !crate::ddl::ref_schema_is_database(dialect);
+    // Same-database: open the current DB, not the schema.
+    let database = if same_database {
         default_schema.to_string()
     } else {
         fk.ref_schema
@@ -3980,7 +4022,7 @@ pub fn follow_target(
     };
     // On Postgres the FK's `ref_schema` *is* the namespace, so it becomes the
     // target's schema. On MySQL it was already consumed as the database above.
-    let schema = postgres.then(|| fk.ref_schema.clone()).flatten();
+    let schema = same_database.then(|| fk.ref_schema.clone()).flatten();
     let table = fk.ref_table.clone();
     // One dialect-aware quoter/literal for both engines, rather than a second
     // hand-rolled copy here — that's how the two drift (the copy this replaced
@@ -4001,7 +4043,7 @@ pub fn follow_target(
         })
         .collect::<Vec<_>>()
         .join(" AND ");
-    let sql = if postgres {
+    let sql = if same_database {
         // Connected to `database` directly → the name only needs the namespace,
         // and only when that isn't the search-path default.
         let name = match sql_qualifier(schema.as_deref()) {
