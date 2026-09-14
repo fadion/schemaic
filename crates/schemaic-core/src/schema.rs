@@ -1849,7 +1849,10 @@ impl TriggerInfo {
                 TriggerAction::Body(b) => b.trim().to_string(),
                 // Symmetric to the other two branches: say so rather than emit a
                 // statement that looks fine and isn't.
+                // Comment-safed: the name is server-supplied and this is a `--`
+                // line in a file that gets run. See `TableInfo::create_ddl`.
                 TriggerAction::Function { name, .. } => {
+                    let name = crate::export::comment_text(name);
                     format!("-- Schemaic can't call the function {name} from a SQLite trigger.")
                 }
             };
@@ -1882,7 +1885,9 @@ impl TriggerInfo {
                 TriggerAction::Body(b) => b.trim().to_string(),
                 // A PG-shaped action on MySQL can't be spelled; say so rather
                 // than emit a statement that looks fine and isn't.
+                // Comment-safed, for the same reason as the SQLite arm above.
                 TriggerAction::Function { name, .. } => {
+                    let name = crate::export::comment_text(name);
                     format!("-- Schemaic can't call the function {name} from a MySQL trigger.")
                 }
             };
@@ -3775,11 +3780,21 @@ impl TableInfo {
         // worse. So the script names the object and says what it could not
         // restate, the way the unreadable-view arm below does — the one thing
         // that leaves the reader able to fix it.
+        // **Comment-safed, not merely quoted.** Every arm below that puts this
+        // name on a `--` line emits `cname`, never `qname`: a `--` comment ends
+        // at the first newline and a quoted identifier may hold one, so a
+        // sequence named `sq\nDROP DATABASE prod; --` otherwise turned the line
+        // the reader takes for an explanation into a top-level statement in a
+        // file they take for a backup — and `Db::run_script`'s guard
+        // deliberately never reads the file. `ident_sql`/`ddl_ident_in` are not
+        // the fix: they double a quote character and say nothing about `\n`.
+        // **Invariant:** quoting is not comment-safety.
+        let cname = crate::export::comment_text(&qname);
         if self.is_sequence {
             return format!(
-                "-- {qname} is a sequence. Schemaic reads its definition from the row, not the
+                "-- {cname} is a sequence. Schemaic reads its definition from the row, not the
                  -- catalogue, so this script cannot restate it. Copy it from
-                 -- `SHOW CREATE SEQUENCE {qname}` on the source server."
+                 -- `SHOW CREATE SEQUENCE {cname}` on the source server."
             );
         }
         if self.is_view {
@@ -3794,7 +3809,7 @@ impl TableInfo {
             }) {
                 Some(sql) => sql,
                 None => format!(
-                    "-- View definition for {qname} was not available.\nCREATE VIEW {qname} AS\nSELECT ...;"
+                    "-- View definition for {cname} was not available.\nCREATE VIEW {qname} AS\nSELECT ...;"
                 ),
             };
         }

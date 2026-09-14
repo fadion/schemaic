@@ -40,7 +40,7 @@
 use crate::ddl::{Change, ChangeSet, ObjectKind};
 use crate::export::{ExportFormat, export_file_names, ident_sql, qualified_table};
 use crate::intel::SqlDialect;
-use crate::schema::{DbSchema, ServerFlavour, TableInfo, display_name};
+use crate::schema::{DbSchema, ServerFlavour, TableInfo, TableShape, display_name};
 
 /// What the file carries. [`Default`] is the mysqldump-shaped answer — the one
 /// that replays onto a database that already holds these tables.
@@ -1017,7 +1017,16 @@ pub fn plan(
             crate::export::comment_text(&display_name(t.schema.as_deref(), &t.name))
         ));
         if opts.structure {
-            if opts.drop_if_exists {
+            // **A file must not name an object it does not create.** A sequence's
+            // structure step is a comment — `create_ddl` reads the definition
+            // from the row, not the catalogue, so it cannot restate one — and
+            // this `DROP` asked the two-answer `is_view`, so the file destroyed
+            // the sequence (MariaDB accepts `DROP TABLE` on one) and left
+            // nothing behind it. Withheld rather than spelled `DROP SEQUENCE`:
+            // dropping what the file cannot put back is destruction, not a dump,
+            // which is the same reason `data_only_plans_no_create_and_no_drop`
+            // gives one file down.
+            if opts.drop_if_exists && t.shape() != TableShape::Sequence {
                 let kw = if t.is_view { "VIEW" } else { "TABLE" };
                 text!(format!(
                     "DROP {kw} IF EXISTS {}{};",
@@ -1047,7 +1056,12 @@ pub fn plan(
         // fills entirely has nothing insertable and gets no data step at all;
         // `SELECT  FROM` would not even parse.
         let cols = exported_columns(t);
-        if opts.data && !t.is_view && !cols.is_empty() {
+        // `shape()`, not `!is_view`: a sequence's eight `bigint` counter columns
+        // are server-assigned by nothing, so `exported_columns` keeps them all
+        // and the file grew an `INSERT INTO sq1` under a structure step that
+        // creates no `sq1` — the restore then stops there, and every later
+        // table's structure and rows are never applied.
+        if opts.data && t.shape() == TableShape::Table && !cols.is_empty() {
             steps.push(DumpStep::Rows {
                 database: database.to_string(),
                 // Whatever `target_database_sql` wrote is what the `INSERT`s
@@ -1835,6 +1849,136 @@ mod tests {
         // And the names are still legible in the file, not merely absent.
         let text = text_of(&p);
         assert!(text.contains("orders DROP TABLE customers;"), "{text}");
+    }
+
+    /// The same property one producer further in: the **structure step**.
+    ///
+    /// The header line above a table goes through `comment_text`; the
+    /// `create_ddl` line below it did not, and three of its arms are comments
+    /// carrying a server-supplied name — a sequence, a view whose definition
+    /// the connection could not read, and a PostgreSQL-shaped trigger emitted
+    /// in another dialect. Asserted over the emitted script for the reason the
+    /// header's own test states: a test of `comment_text` passes against a tree
+    /// that never calls it.
+    #[test]
+    fn a_comment_only_structure_step_cannot_open_a_line_of_its_own() {
+        let mut seq = table("sq\nDROP TABLE customers;");
+        seq.is_sequence = true;
+        let s = schema_of(vec![seq]);
+        let p = plan(
+            &s,
+            "shop",
+            &all(&s),
+            DumpOptions::default(),
+            SqlDialect::MySql,
+        );
+
+        for step in &p.steps {
+            let DumpStep::Text(txt) = step else { continue };
+            if !txt.starts_with("--") {
+                continue;
+            }
+            for line in txt.lines() {
+                assert!(
+                    line.trim_start().starts_with("--") || line.trim().is_empty(),
+                    "a comment block grew a statement line: {line:?}\nin step: {txt:?}"
+                );
+            }
+        }
+        assert!(
+            text_of(&p).contains("sq DROP TABLE customers;"),
+            "and the name is still legible, not merely absent"
+        );
+    }
+
+    /// The unreadable-view arm's step is a comment line **and then** a
+    /// `CREATE VIEW` skeleton, so the whole-step check above cannot be used: the
+    /// name inside that `CREATE` may hold a newline and is still one quoted
+    /// identifier. The comment line above it may not.
+    #[test]
+    fn an_unreadable_views_comment_line_stays_one_line() {
+        let mut unreadable = table("v\nDROP TABLE orders;");
+        unreadable.is_view = true;
+        unreadable.view_definition = None;
+        let ddl = unreadable.create_ddl(SqlDialect::MySql);
+        let first = ddl.lines().next().unwrap_or_default();
+        assert!(
+            first.ends_with("was not available."),
+            "the comment line was cut short by the name: {first:?}"
+        );
+        assert!(
+            first.contains("v DROP TABLE orders;"),
+            "and the name is still legible: {first:?}"
+        );
+    }
+
+    /// A PostgreSQL-shaped trigger emitted in another dialect says so on a `--`
+    /// line carrying the **unquoted** function name, and that line is followed
+    /// by a `;` — so a newline in the name made the rest of it the statement.
+    #[test]
+    fn a_cross_dialect_trigger_note_stays_one_line() {
+        let t = TriggerInfo {
+            name: "t1".to_string(),
+            table: "orders".to_string(),
+            timing: TriggerTiming::Before,
+            events: vec![TriggerEvent::Insert],
+            action: TriggerAction::Function {
+                name: "f\nDROP TABLE customers;".to_string(),
+                args: Vec::new(),
+            },
+            ..Default::default()
+        };
+        for dialect in [SqlDialect::MySql, SqlDialect::Sqlite] {
+            let sql = t.create_sql(dialect);
+            for line in sql.lines() {
+                assert!(
+                    !line.trim_start().starts_with("DROP"),
+                    "{dialect:?} note grew a statement line: {line:?}\n{sql}"
+                );
+            }
+            assert!(
+                sql.contains("f DROP TABLE customers;"),
+                "and the name is still legible: {sql}"
+            );
+        }
+    }
+
+    /// A dump must never name an object it does not create.
+    ///
+    /// A MariaDB sequence's structure step is a comment — Schemaic reads the
+    /// definition from the row, not the catalogue, so it cannot restate one.
+    /// The `DROP` above it and the `INSERT` below it were still asking the
+    /// two-answer `is_view`, so the file destroyed the sequence and then died
+    /// at an `INSERT` into a table nothing had created — taking every later
+    /// table's structure and rows with it, since a restore stops at the first
+    /// error.
+    #[test]
+    fn a_sequence_gets_neither_a_drop_nor_a_row_step() {
+        let mut seq = table("sq1");
+        seq.is_sequence = true;
+        seq.columns = vec![ColumnInfo {
+            name: "next_not_cached_value".to_string(),
+            type_name: "bigint".to_string(),
+            ..Default::default()
+        }];
+        let s = schema_of(vec![seq]);
+        let opts = DumpOptions {
+            data: true,
+            structure: true,
+            drop_if_exists: true,
+            ..Default::default()
+        };
+        let p = plan(&s, "shop", &all(&s), opts, SqlDialect::MySql);
+
+        assert!(
+            !p.steps.iter().any(|s| matches!(s, DumpStep::Rows { .. })),
+            "a sequence's counter row is not data this file can restore"
+        );
+        let text = text_of(&p);
+        assert!(
+            !text.contains("DROP TABLE"),
+            "the file drops an object it never recreates:\n{text}"
+        );
     }
 
     // ── plan: what each option puts in the file ──────────────────────────────
