@@ -266,7 +266,7 @@ impl IndexInfo {
     /// **Does this index identify a row?** — the one question three different
     /// parts of the app ask of an index, and used to answer three ways.
     ///
-    /// Not "is it unique". A unique index identifies a row only when all five
+    /// Not "is it unique". A unique index identifies a row only when all six
     /// hold:
     ///
     /// - **`unique`**, and **not `foreign`** — a foreign key constrains where a

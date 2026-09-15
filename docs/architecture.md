@@ -468,6 +468,18 @@ existing prose was left alone.
     so a sibling in a recursive list also loses the check. `a_recursive_ctes_body_may_name_itself`
     carries the counterweight in the same test: a **non**-recursive CTE still cannot see itself, and
     a misspelling inside a recursive one is still a misspelling.
+    **The CTE map is scoped by a frame stack, the same shape `provenance_sources` got in `c83f920`**
+    — and this visitor had the identical bug with no `post_visit_query` at all. It was inserted into
+    and never removed from, and subqueries are visited in source order, so
+    `SELECT a.z, b.name FROM (WITH departments AS (SELECT 1 AS z) SELECT z FROM departments) a,
+    (SELECT name FROM departments) b` still had the first derived table's `departments` in the map
+    when the second was visited: `add_source`'s CTE arm takes a map hit **before** it asks the
+    catalogue, so the real table resolved against the CTE's one column and a valid statement was
+    squiggled ``Column `name` not found``. Each query pushes a frame recording what its own CTEs
+    displaced and `post_visit_query` puts the map back, so an outer CTE stays visible to an inner
+    query that does not rebind the name — restoring, not clearing.
+    `a_nested_ctes_name_does_not_leak_into_a_later_sibling_subquery` carries both counterweights,
+    since the fix must not simply stop shadowing.
     **`dedup_diagnostics` is the last gate every offline diagnostic passes, and it had no test.** It
     promises to drop what an earlier, *higher-or-equal severity* diagnostic already covers; the
     severity half was only in the sort, and only at an equal start offset, so the coverage test read
@@ -1956,11 +1968,23 @@ existing prose was left alone.
     field on three arms that could only report. `colliding_files(plan, exists)` is the census —
     `exists` is an `exists` **predicate** rather than a filesystem, so it is unit-tested without
     one, and the order follows the plan because that is the order the files would be replaced in;
+    **each planned file's `.part` sibling is censused with it**, because the export destroys that too
+    and this is the only guard in front of it: `write_one` opens the fragment with `File::create`,
+    which truncates, and the failure path removes it — so a fragment left by an earlier failed export,
+    the one file in that directory this app teaches the user to care about (`export_failure_note`
+    having just said *"the rows that were written are in `orders.csv.part`"*), was replaced by a retry
+    and swept by its cancel with no prompt naming it. The suffix comes from `export::part_path`, the
+    one function that decides it.
     `folder_verdict(approved, colliding)` is the guard, separate from the census because the caller
     needs the same list for its *report* whichever way the verdict goes and computing it twice is
     how the two come to disagree; and `folder_replace_prompt` writes the question, beside the three
     report sentences and for the same reason — a message with arms (one file, a few, more than fit)
     is a decision, and not one to make inside a callback the suite cannot reach.
+    `destroyed(colliding, published)` is the fourth and belongs to the *report* rather than the ask —
+    of the files the export was going to replace, the ones it actually has — and it counts a `.part`
+    as destroyed **with its published sibling**, since the rename that publishes `orders.csv` is what
+    consumes `orders.csv.part`; a fragment whose table the run never reached is still sitting there
+    and is not named. See `app/dump.rs` for the two contradictory sentences that made it necessary.
     **`Listing`/`PickerBody`/`picker_body` are here for that same reason** — what the table picker
     says when it has no rows is a decision, and it was a `bool` plus an `if` in the view that told a
     failed read from an empty database wrongly. `dump_view.rs`'s entry has the bug in full.
@@ -3655,7 +3679,15 @@ existing prose was left alone.
     no highlight, nothing on screen saying why they matched — with the one session actually running
     the phrase lost among them. MariaDB was immune (`PROCESSLIST.INFO` is NULL on a `Sleep` thread),
     so the panel behaved one way per engine, which is the failure `SessionInfo` being "engine-neutral
-    by construction" exists to prevent. *Copy statement* still reads `sql`: it is the one consumer
+    by construction" exists to prevent. **`IdleInTx` is the same case, and stopping at `Idle` was an
+    omission**: `pg_stat_activity.query` is kept indefinitely for an `idle in transaction` backend
+    too, while MariaDB's equivalent — a `Sleep` thread with an open `INNODB_TRX` row — reports `INFO`
+    NULL and drew nothing, so one server state was two panels again, and through `matches_query` the
+    divergence reached the search box as well: typing `select` listed every idle-in-transaction
+    PostgreSQL backend and no MariaDB one. Those are the rows this panel is most about — an
+    idle-in-transaction holder is what the lock-wait banner points at — so it is the band where
+    drawing a statement that is *not running* misleads most.
+    *Copy statement* still reads `sql`: it is the one consumer
     that genuinely wants the last statement, and it is a menu entry rather than a match. The
     statement is compared **whitespace-collapsed and without allocating**, through
     `text_ops::contains_collapsed_ignore_ascii_case` — `INFO` is the *untruncated* statement where
@@ -4654,6 +4686,34 @@ existing prose was left alone.
     partition below. `is_view` and `is_sequence` stay public because the three backends fill them
     directly and privatising them needs a constructor first; what they are not is the question a
     decision asks.
+    **`IndexInfo::identifies_a_row` is the one answer to "does this index name a row", and it is not
+    "is it unique"** — the question three parts of the app ask and used to answer three ways. Unique,
+    not a foreign key, not partial (a `WHERE deleted_at IS NULL` promises uniqueness only over the
+    rows it admits), at least one key and every key a plain column (an expression key is no result
+    column, so `(a, lower(b))` reduces to `[a]`, which is not unique — measured on PostgreSQL 16.15),
+    not `lossy` (what was read back is not the whole index, so none of the checks above was made
+    against the whole of it), and — the sixth — **no key carrying its own `collation`**. The
+    collation is what the uniqueness is *measured in*, and a `WHERE col = ?` built from the key is
+    measured in the **column's**: given `email TEXT COLLATE NOCASE` and `CREATE UNIQUE INDEX ux ON t
+    (email COLLATE BINARY)` the index accepts `'A@x'` beside `'a@x'` while the `UPDATE` matches both,
+    so the 1-row net rolls the batch back and tells the user the edit failed for a reason that is not
+    the reason — the outcome this predicate exists to end. It refuses the safe direction (column
+    `BINARY`, index `NOCASE`) with it, which is the same conservatism the rest of the conjunction
+    takes. SQLite-only in effect: MySQL reports no per-key collation and PostgreSQL reports a
+    non-default operator class as `lossy` already. It says nothing about NULL — that is a fact about
+    the *table's* columns, which an index cannot see, and the two key resolvers add it.
+    **`classify_column_type` reads all three engines' spellings now**, the type name being what the
+    icon in the schema tree, the ER diagram's cards and tooltips, the completion popup and Find
+    Anywhere are chosen from. The MySQL and PostgreSQL gaps were closed one engine at a time and
+    SQLite's survived both, which is where it matters most: SQLite stores the declared type text
+    verbatim, so an unusual spelling there is ordinary rather than exotic. Every name added is an
+    example in SQLite's *own* type-affinity documentation — `VARYING CHARACTER`, `NATIVE CHARACTER`,
+    `NVARCHAR`, `NCHAR`, `CLOB`, `UNSIGNED BIG INT`, `INT2`/`INT4`/`INT8` — and `FLOAT4`/`FLOAT8` come
+    with the same edit as PostgreSQL's internal aliases for `real`/`double precision`, which
+    `format_type` does not emit but a hand-written draft does. All of them drew the "unrecognised
+    type" glyph before (`classify_column_type_reads_sqlites_own_documented_spellings`, which also
+    asserts the affinity rule's other examples already worked, so the set is the whole of what was
+    missing rather than a sample of it).
     **`index_disabled_sql(version)` is how the MySQL family is asked whether an index is switched
     off**, and it is pure and here because the column that answers differs in three ways at once. A DBA
     hides an index to test a plan change — MySQL 8's `ALTER TABLE … ALTER INDEX … INVISIBLE`,
@@ -5410,6 +5470,18 @@ existing prose was left alone.
       and column names through `prompt::inline_datum`: a column `COMMENT` carrying a newline and an
       imperative sentence used to land in the prompt's own instruction stream, between *"Fill ONLY
       these columns"* and *"Return ONLY a JSON array"*.
+      **`SEED_CELL_CHARS` is the per-cell cap this builder was the only one without**, and it is the
+      fourth of them beside `summary::SAMPLE_CHARS` (120), `prompt::CELL_CHARS` (200, for an
+      attachment) and `mcp::MCP_CELL_CHARS` (60). It matches the attachment's 200 because a seed
+      sample is the same kind of thing — rows the model is asked to imitate — and a sample exists to
+      show a column's *shape*, which 200 characters of a `LONGTEXT` does as well as 2 MB. Without it
+      `rows_to_json` spliced every cell of twenty whole rows in untruncated, so one 200 KB
+      `LONGTEXT`/`JSON`/`MEDIUMBLOB` cell blew `arg_limit()` on the harnesses that take the prompt on
+      argv and the spawn was refused — correctly, but with the chat path's wording, naming the schema
+      scope and "the query in the editor", neither of which is a lever a grid context menu has. Seed
+      and Fill were simply dead on such a table. `clip_cell` keeps newlines where `summary::clip`
+      flattens them, these values going into a JSON string where a newline escapes to one token
+      rather than breaking a line-oriented list.
     - `propose.rs` — the AI's proposed table change, as a **patch**: `Proposal`/`ProposedOp`
       deserialize the model's JSON (`{"add_column": {…}}`, externally tagged, `deny_unknown_fields`
       so an invented key fails loudly instead of being dropped), and `apply` lays the ops over
@@ -5873,13 +5945,20 @@ existing prose was left alone.
     themselves are tested here.
   - `launch.rs` — **what may be handed to an OS launcher**: the boundary where a string the app
     merely *displayed* becomes a string the operating system *executes*. Two rules hold for
-    everything in it, both stated in the module doc. **No shell** — the argv these functions emit is
-    executed directly, nothing they emit is parsed by `cmd`, `sh` or PowerShell, so a byte that is
-    syntax to a shell is inert; the alternative, filtering every metacharacter of every shell, is how
-    `&` would come to be refused inside a query string while `%` still expanded. And **the string is
-    validated where it stops being data**, not at the site that produced it: a producer may have its
-    own good reasons to be permissive — the terminal's link tagger admits `&` because a query string
-    needs one — and the launcher does not inherit them.
+    everything in it, both stated in the module doc. **No shell, with one named exception** — the
+    argv these functions emit is executed directly, nothing they emit is parsed by `cmd`, `sh` or
+    PowerShell *by this app*, so a byte that is syntax to a shell is inert; the alternative, filtering
+    every metacharacter of every shell, is how `&` would come to be refused inside a query string
+    while `%` still expanded. The exception is `xdg-open`, the Linux arm of `url_open_argv`, which
+    `xdg-utils` ships as a `#!/bin/sh` script — so the admitted sub-delims do reach an interpreter
+    there, and the argument that they are inert in it is an argument about third-party code that
+    nothing here re-checks. It was not verified against a real `xdg-open` (none on the machine), which
+    is recorded rather than glossed; the guarantee that remains is one argv element carrying only RFC
+    3986's allowlist. `explorer` and `open` are genuine executables and the rule holds on those two
+    exactly as stated, which is what the `LAUNCHERS` table's second column records. And **the
+    string is validated where it stops being data**, not at the site that produced it: a producer may
+    have its own good reasons to be permissive — the terminal's link tagger admits `&` because a query
+    string needs one — and the launcher does not inherit them.
     `openable_url` and `url_open_argv` are the browser half, and they exist because a clicked
     terminal link ran arbitrary commands. `open_url` guarded the *scheme* only and then built
     `cmd /C start "" <url>` itself; Rust's Windows argument encoder quotes an argument only when it
@@ -6167,6 +6246,18 @@ existing prose was left alone.
       spelled out inline, expression for expression and untested, because `schemaic-ui` cannot
       depend on `schemaic-app` — which made it a misplaced function rather than an unavoidable
       duplicate.
+      **`scoped_database` is a reading of `tab_scope` now, because one caller has to tell its two
+      `None`s apart and could not.** `TabScope::{Bound, NoDatabase, OtherConnection}` keeps "the
+      focused tab is on another connection (or there is no focused tab)" separate from "it is on this
+      one and has no database bound", which `scoped_database` is right to fold together — both mean
+      *do not use the focused tab's database* — and wrong to fold for a caller whose next act is to
+      explain the refusal. The chat code block's Insert/Run raised *"This chat is about a tab on a
+      different connection… switch to that tab"* for the second case, which happens when every
+      database is hidden or the schema had not finished loading when the tab was opened: the first
+      sentence false, and the remedy naming the tab the user was already on. It is the one caller that
+      matches on the enum; the other three keep asking `scoped_database`, and
+      `scoped_database_still_answers_exactly_what_the_scope_says` walks every state so the two cannot
+      drift.
     - `palette.rs` — parses the command palette's `>` command mode into
       `Parsed::{Search,Filter,Command{name,arg}}`. The hard part is when typing stops filtering the
       command list and becomes an argument: longest-word-prefix match against the caller's
@@ -6303,6 +6394,13 @@ existing prose was left alone.
         had happened. `to_markdown` diverged identically, so **Copy** put it in a ticket. The fix is
         in the predicate rather than in either surface, which is what keeps the two moving together;
         the timestamps are still shown by `options_section`, which has its own emptiness guard.
+        **That last sentence was false of exactly the object the predicate is about, and both
+        renderers had to be repaired for it to be true.** The panel's `!has_any()` arm did not call
+        `options_section` at all and `to_markdown` early-returned after "The server reported no
+        statistics for this table", so the MySQL view whose `CREATE_TIME` motivated the change lost
+        the one fact the server *had* published about it — from the panel and from **Copy**. Both
+        arms render `Created`/`Updated` now, `options_section`'s own emptiness guard meaning an engine
+        that publishes nothing still adds nothing.
         `any_single_figure_counts_as_something` — the test that should have caught it — walks
         `rows`/`data_bytes`/`engine`/`indexes` and never `created`, which is why it shipped;
         `a_view_whose_only_figure_is_a_creation_timestamp_reports_nothing` is the one that fails
@@ -7182,7 +7280,16 @@ existing prose was left alone.
   writes into its own plan inert and cost two Criticals; see the connection invariant for what they
   were, and `the_script_guards_itself_when_run_outside_run_ddl` (which was itself green against the
   cascade it guards, having opened one connection where the real path opened many) and
-  `a_rebuild_survives_a_view_over_the_table_it_rebuilds` for the tests that pin it now.
+  `a_rebuild_survives_a_view_over_the_table_it_rebuilds` for the tests that pin it now. **The arm's
+  own failure paths have a test module of their own** — `sqlite::run_batch_tests`, over in-memory
+  SQLite, the one backend this workspace may ask directly. Four tests: a failed statement stops the
+  batch and the rest report `Cancelled`, with the middle entry carrying the *server's* own text at
+  its own index (the UI keys result tabs on that index) and the table proving statement 3 never ran;
+  an already-cancelled token reports every index as `Cancelled` and writes no rows; a connection that
+  cannot be opened is **statement 0's error** with the rest cancelled by the drain, which is the shape
+  the MySQL arm has and the one arm here that never runs a statement at all; and a succeeding batch
+  delivers each statement once, in order, so the other three are about the failure arms rather than
+  about the loop.
   **`run_ddl` wears that shape too now, and it was the leg left out of it.** The DDL preview offers
   Stop on SQLite — `ddl_rolls_back_as_a_whole(Sqlite)` is true, so the footer's only enabled button
   is a red *Stop* and Escape maps to it — while the runner consulted the token only *between*
@@ -7774,6 +7881,16 @@ existing prose was left alone.
   defect — the retirement undone, `SELECT *` returning the column again — and a conditional check
   could not see it. Five more of the apply tests were given `assert_matches_draft` as well, since a
   helper only half the file calls is a helper that half the file's emitters are unguarded by.
+  **Its three set comparisons — indexes, foreign keys, checks — go both ways now.** They iterated the
+  draft alone and looked for a match on the server, so an object the draft *removed* and the emitter
+  failed to remove was invisible here, and invisible to `assert_round_trips` too, since a leftover
+  index round-trips perfectly well through its own re-read draft: a `DropIndex` arm emitting nothing
+  at all passed both, and this module's own doc already named dropping an index as untested. The
+  column check has always been an `assert_eq!` over two full vectors; these are the same strength
+  now. The one thing the reverse direction has to tolerate is an object the *server* invented — MySQL
+  backs a foreign key with an index of the constraint's name unless one already covers it, and
+  PostgreSQL backs a unique constraint the same way — and both are excused **by name**, against the
+  draft's own foreign-key and index names, rather than by dropping the direction.
   `a_renamed_column_keeps_its_indexs_kind` is what that bought:
   `FULLTEXT` is an index *kind* rather than a flag, any edit to a MySQL index is a drop-and-add, and
   an edit that restates the key without it leaves a plain `KEY` behind so every `MATCH … AGAINST`
@@ -7884,14 +8001,32 @@ existing prose was left alone.
   `SLEEP_SECS`: it was `"SELECT SLEEP(5)"` in three places beside a constant documented as linked to
   them and held together by nothing, so changing the constant left three servers sleeping for the
   old duration and the assertion measuring against the new one.
-  **That marker is shared, which is why the *script* cancel arms on something else.** Its token used
-  to fire when `running_sleeps` saw a sleep, and that count matches on a marker every leg's sleep
-  carries — so with the read-cancellation test running beside it the probe answered about somebody
+  **The marker is a parameter, and there is one per cancellation test rather than one shared.**
+  `running_sleeps` reads a server-wide view — `PROCESSLIST` / `pg_stat_activity`, filtered by neither
+  connection nor database — and libtest runs a leg's two cancellation tests concurrently, so on a
+  shared marker each test's "the server stopped" assertion counted the *other's* statement while it
+  was still being killed and failed saying the server was still running the statement about somebody
+  else's. `READ_CANCEL_MARKER` and `SCRIPT_CANCEL_MARKER` are the two; splitting the marker in half
+  for the pattern happens inside `running_sleeps` rather than at the call site, with a `debug_assert`
+  on four ASCII bytes as the floor, so "the probe does not count itself" stays a fact about the
+  function instead of a rule every caller has to remember. `74387d2` named this coupling and removed
+  it from the script test's *arming* probe; these two constants are the same removal at the two
+  assertions it left.
+  **That is also why the *script* cancel arms on something else.** Its token used
+  to fire when `running_sleeps` saw a sleep, and that count matched on a marker every leg's sleep
+  carried — so with the read-cancellation test running beside it the probe answered about somebody
   else's statement and the token fired before this script had started. It waits for the script's own
   inserted row instead: statement 2 is committed by the time a second connection can see it, so a
   visible row means both statements before the sleep have run. A fixed delay is the other thing it
   cannot be — under the whole tier's load PostgreSQL lost that race, the token fired with `ran == 0`,
-  and the test read as the accounting bug it exists to catch.
+  and the test read as the accounting bug it exists to catch. **`ARM_FALLBACK` is the blind-arming
+  budget, and it is strictly inside the elapsed limit the test asserts.** It was the same 3 s
+  (`SLEEP_SECS - CANCEL_MARGIN`), so a leg slow enough to miss the row — a cold CI container, or the
+  tier's threaded leg-tests contending on one server — fired the token at the instant the assertion
+  expired and failed with *"the cancel took 3.0s, so the sleep ran to completion"* about a sleep that
+  had never started. It is that subtraction minus one more second, written from the same two
+  constants so shortening either keeps the ordering, and a `saw_row` flag fails the blind arming as
+  itself, above the assertions that would otherwise describe it as something else.
   **`views.rs` and `triggers.rs`** carry the same round trip for the two objects the engines model
   differently. A view's body is never the text that went in — MySQL fully qualifies and back-quotes
   it, PostgreSQL re-prints it from the parse tree — so the identity diff is doing real work there;
@@ -8441,6 +8576,15 @@ existing prose was left alone.
   answers `"characters"` on Windows and `"bytes"` elsewhere — the count and the word that labels it
   reading the same `cfg!(windows)` four lines apart, so a platform added to one has to be added to
   the other in the same edit.
+  **And the lever the refusal names is the caller's, because it is not the same everywhere.**
+  `oversize_reason` and `spawn_refusal` take `levers: &str`, of which there are two constants:
+  `SCHEMA_AND_QUERY_LEVERS` (narrow the AI schema scope, or shorten the query in the editor) for a
+  chat turn or a Ctrl+K generation, and `SAMPLE_LEVERS` (lower this connection's AI data access below
+  Full, which stops the row sample being sent) for AI Fill and Seed. Those two are grid context
+  menus: there is no editor and no query, so the chat wording gave the user nothing to act on while
+  the one thing that would have worked went unnamed. `ai::inline_plan` threads the argument through
+  to the one-shot paths, and `an_oversize_refusal_names_the_levers_its_caller_has` asserts both
+  messages still carry the measurement and still blame no installation.
   - `harness.rs` — which agent CLI is being driven, what it can do, and how it is constrained.
     `Harness` (`Claude`/`Codex`/`Antigravity`/`OpenCode`) is **a dialect rather than a vendor**: the
     variant names the wire format a binary speaks, which is the only thing decoding needs to know,
@@ -8761,9 +8905,9 @@ existing prose was left alone.
     connection allow-list, through the same `bare_tool_name` — it interpolated the literal
     `schemaic` until the rules and the registration were found to be two independent spellings of
     one name, which is the `SERVER` story under `app/antigravity.rs`;
-    `antigravity_settings_with_rules` and
-    `_without_rules` are the `settings.json` surgery, pure so that the part that can destroy a
-    user's file is the part that is unit-tested. **Merged, never rewritten**: it is the user's file,
+    `antigravity_settings_with_rules`,
+    `_without_rules` and `_with_only_rules` are the `settings.json` surgery, pure so that the part
+    that can destroy a user's file is the part that is unit-tested. **Merged, never rewritten**: it is the user's file,
     it holds their `trustedWorkspaces`, and that CLI rewrites it itself, so the document is parsed,
     the rules are unioned in, and every other key is handed back untouched. Adding is idempotent, so
     a crashed session's leftovers do not accumulate; removing prunes empty `permissions`/`allow`
@@ -8779,8 +8923,23 @@ existing prose was left alone.
     removal matches by value, so a rule the *user* added by hand for the same tool is
     indistinguishable from ours and goes with it — the alternative is a standing grant nobody
     remembers making.
+    **A grant has to describe the level, not the session, which is why `install` calls
+    `_with_only_rules`.** Adding alone is not enough on a respawn that *lowers* the connection's
+    access: the previous session's wider rules are withdrawn by its own `Drop`, which runs on the
+    session task while the new `install` runs on a blocking thread, and if the new claim lands first
+    the old `Drop`'s `may_release` sees a claim that is not its own and withdraws nothing. Lowering a
+    connection from Full to schema-only therefore left `mcp(schemaic/run_query)` standing or not
+    depending on which thread won, while `antigravity_allow_rules`' own doc says a schema-only
+    connection never grants it. `_with_only_rules` clears the rules Schemaic could have granted and
+    is not granting now, then adds this level's — a statement about the *file* rather than about a
+    sequence of edits, so it holds whichever ordering wins. `ours` is the full set of our rules, so a
+    hand-written rule for one of our tools goes with it: the same documented limit as `_without_rules`
+    and the same trade. It stays idempotent — asking for the set already there answers `Unchanged`, so
+    a relaunch still rewrites nothing
+    (`granting_a_narrower_set_withdraws_the_wider_one_it_replaces`,
+    `granting_a_narrower_set_leaves_another_vendors_rules_alone`).
     **"Nothing changed" is this layer's answer to give, because nothing outside it can compute
-    one.** Both functions return `Option<SettingsEdit>` — `None` is still the decline, and otherwise
+    one.** All three return `Option<SettingsEdit>` — `None` is still the decline, and otherwise
     `Unchanged` or `Write(text)` — and `app/antigravity.rs` writes only on the second. The caller
     used to decide by comparing the returned text against the bytes it had read, a comparison that
     never succeeds against a real file: `to_string_pretty` emits no trailing newline, and with no
@@ -10114,7 +10273,19 @@ existing prose was left alone.
     — `PaletteItem::keys` is a `Cow<'static, str>` for exactly that. The tables stay Ctrl-spelled: a
     second Cmd-spelled table would drift, and `every_command_key_is_a_real_shortcut` works by
     comparing the two byte for byte, so respelling at the source would have dissolved that
-    guarantee. What the handlers **accept** goes through `primary_held`, which is *additive* — Ctrl
+    guarantee. **A key label is respelled, never spelled, and that is a source gate** —
+    `no_view_code_spells_the_primary_modifier_in_a_label`, over both view crates, because the three
+    sites that broke it were `&'static str`s in view code that no runtime test reaches. What they
+    produced: on macOS the Shortcuts modal, the palette and the ER diagram all said `Cmd+Enter` while
+    the new tab's own prompt — the first thing on screen, and the only place the app says how to run
+    something — said `Ctrl+Enter`, as did the commit button's tooltip. The handlers were right either
+    way (`primary_held` is additive); what was wrong is that the app advertised two keys for one
+    action. The needle is `Ctrl+` **inside a string literal**, so `Ctrl` alone in prose or code is not
+    it, and two shapes are recognised as not-labels rather than exempted by file: an argument to
+    `keys_label` itself, which is a Ctrl-spelled table entry on its way *through* the respeller, and
+    the trailing description of a `pair!`/`faded!` row in the contrast audit, which names a colour
+    pair for a report and never reaches a view. What the handlers **accept** goes through
+    `primary_held`, which is *additive* — Ctrl
     everywhere, Cmd as well on macOS, so the Ctrl bindings a macOS user already learned keep
     working. Off macOS it ignores Meta deliberately, because there it is the Windows/Super key and
     answering to it would take over shortcuts that belong to the desktop
@@ -10431,9 +10602,16 @@ existing prose was left alone.
     `out.len() > 20` against **65** files, so two thirds of the corpus could vanish and every gate
     over it would still report green — the same shape as the floors those gates carry, one level up.
     It is `>= 60` now, with `the_scan_reaches_both_crates_that_build_views` (which `.expect`s
-    `lib.rs` and `schemaic-app/main.rs` by name) doing the precise half. `read_dir` is deliberately
-    non-recursive and both crates are flat today, so a future `src/<subdir>/*.rs` would fall outside
-    every gate silently and this floor is what would notice.
+    `lib.rs` and `schemaic-app/main.rs` by name) doing the precise half. **And the walk is recursive,
+    which is a fix rather than a refinement.** It was one non-recursive `read_dir` per crate, under a
+    comment saying a future `src/<subdir>/*.rs` "would fall outside every gate silently — this floor
+    is what would notice". It would not: the floor is a *lower* bound on the whole corpus, so moving
+    six files out of a flat directory into a subdirectory leaves the count at 65 minus 6 and every
+    gate over those six blind, with nothing red. `collect_rs` does the walk — sorted, so a gate that
+    reports the first offender names the same file on every machine where `read_dir` order is the
+    filesystem's, and joining the relative path with `/` on every platform so a name a gate reports or
+    matches on reads the same on Windows and Linux. Both view crates are flat today; the point is that
+    they no longer have to be.
     **Four gates spelled the walk themselves and have been pointed at `crate_sources` too** —
     `consts::float_inset_gate`, `modals::modal_backdrop_gate`, `widgets::popup_anchor_gate` and
     `widgets::menu_trigger_gate`'s `crate_source`, the last of which also put text `crate_sources`
@@ -10646,7 +10824,12 @@ existing prose was left alone.
     - **A MySQL view reached the full `Loaded` arm on a creation timestamp alone**, printing two
       em-dashes under a staleness caveat about figures the server never publishes. The fix is in
       `stats::TableStats::has_any`, so the panel and the Markdown copy move together — see
-      `core/stats.rs` for the measurement and for why it could not be fixed in this file.
+      `core/stats.rs` for the measurement and for why it could not be fixed in this file. **The
+      `!has_any()` arm calls `options_section` too**, which it did not when that predicate stopped
+      counting the timestamps: the arm written for the object with no statistics then dropped the
+      `Created`/`Updated` rows, which on that view were the only thing the server had said about it.
+      `options_section` is reached from two arms, not only the full `Loaded` one, and its own
+      emptiness guard is what keeps it silent on an engine that publishes nothing.
     - Both requests outlive a close, so each checks `overlay.properties` still holds the target it
       was asked about before writing.
   - `users_view.rs` — the **Users and privileges** browser (`users_overlay`), over `core::users`.
@@ -10774,8 +10957,19 @@ existing prose was left alone.
     to begin with, which is two places for one answer to drift — one of them leaving `+ New account`
     live while `Privileges`/`Drop` were dimmed, with nothing on screen to say which was right — and
     it re-walked the connection list for an answer that cannot differ between them. Its capability
-    half reads `target.dialect` and its read-only half the *live* connection, deliberately: what the
-    browser is about cannot change while it is open, and a read-only setting can. It gives
+    half reads `target.dialect` and its read-only half reads the **browser's own** connection's flag
+    live, tracked: what the browser is about cannot change while it is open, and a read-only setting
+    can. Both halves being the *target's* is the repair — the read-only one asked the **active**
+    connection, and nothing in `switch_conn` closes this overlay, so opening Users on a read-only A
+    and then moving the tree to a writable B left the browser listing A's accounts while **Drop** and
+    **Privileges** lit up and the "This connection is read-only" note disappeared. No write escaped
+    (`ddl_preview::apply` re-asks `plan_read_only` by the *plan's* `conn_id`, which is A's), so the
+    cost was an enabled destructive button and a red confirm on a connection the app would then
+    refuse. `target.dialect`, `target.database` and `target.conn_id` were already the captured ones by
+    `UsersTarget`'s own rule; `read_only` was the one term that was not, and it goes through
+    `connection::read_only_of` like every other reading of that flag. Its helpers take the
+    `RwSignal<Vec<Connection>>` rather than `&Ui`, which is `whole_ui_gate`'s own prescription and why
+    this file's budget went 9 → 8. It gives
     **three refusals with three remedies**, because they have three different answers: no
     engine support is *absent* (there is nothing about this connection the user could change),
     while read-only and no-database-selected are both dimmed and each say under the buttons which
@@ -13916,9 +14110,13 @@ existing prose was left alone.
   pinned server ids, tab→connection, connections — and hands them over; nothing in it chooses
   anything. Ties fall to the `HashMap`'s arbitrary order, as before the extraction, since two tabs
   pinned to one session on one server is not a state the app can reach.
-  **The kill asks `may_launch_destructive` before it raises the confirm** —
-  the shared guard every other destructive modal action asks, which this path asked nothing at all —
-  and a read-only connection gets the refusal in words rather than a modal it cannot complete.
+  **The kill asks `may_launch_destructive` before it raises the confirm, and again inside the
+  resolve** — the shared guard every other destructive modal action asks, which this path asked
+  nothing at all — and a read-only connection gets the refusal in words rather than a modal it cannot
+  complete. The second ask is the one the rule is about: the early one only spares the user a
+  question that would be refused anyway, while the confirm stands for an unbounded stretch of time
+  and the flag can flip under it. It reads the `conn_id` captured for the handle, so both asks are
+  about the same connection by construction.
   The kill itself resolves its target `Db` **when the confirm is raised**, not
   when the button is clicked, for the same reason a session id means nothing without its server: a
   modal is open across an unbounded stretch of time, and reading `active_conn` inside `resolve` sent
@@ -15149,7 +15347,14 @@ existing prose was left alone.
     `rename`**, so the folder is untouched, and the modal asks. The list still reaches all three
     reporting arms as well — `export::files_note`/`files_cancel_note`/`files_failure_note` take it
     and `replaced_clause` renders it — because an approved run has still destroyed something worth
-    naming.
+    naming. **What they take is `core::dump::destroyed(&replaced, &published)`, not the census.** The
+    census has to be read before the first rename or this export's own output contaminates it, but
+    only the *finished* arm is reached with the loop complete, and the whole-plan list went verbatim
+    to all three — so pressing Stop while the first table was still streaming reported *"Export
+    cancelled — no file was finished, so nothing was written to out. 3 existing files were replaced:
+    orders.csv, items.csv, users.csv."* Two flatly contradictory sentences, of which the false one is
+    also the **only** disclosure that a folder export destroys anything, wrong in the direction that
+    sends a user looking for a backup they do not need.
     **The per-file resolution is `core::dump::dump_verdict` too, not a second copy of it.** Those
     five arms were written out again here and the copy diverged in the one arm the extraction exists
     to protect: `WriteEnd::Failed` carries the writer's own words, which already begin
@@ -16348,11 +16553,26 @@ Re-introducing the anti-patterns these guard against is a regression:
   future mid-statement desynchronised `mysql_async`'s result stream, so that `ROLLBACK` and its
   `SHOW WARNINGS` read replies that were not their own and `Complete` was claimed off garbage — the
   shape a cancel has to take is under `schemaic-db`, and `cancelled_import` is where the verdict
-  becomes an error. **And a cancelled write leaves through an explicit `ROLLBACK` on both engines
-  now**: `pg::commit_writes`' cancel arm was the one exit resting on the client's drop, which does
+  becomes an error — with `cancelled_write` its twin for a cancelled **Commit**: the same rule
+  (`DbError::Cancelled` only for `Rollback::Complete`, anything else carrying `Rollback::note`) in a
+  sentence that names the right act, since "Import cancelled" over a write-back describes something
+  the user did not do. **And a cancelled write leaves through an explicit `ROLLBACK` on both engines
+  that have a connection to lose — MySQL and PostgreSQL — now**: SQLite's is a rusqlite
+  `Transaction` whose drop aborts locally, holding no network lock and racing nothing, and its cancel
+  is refused up front by `refuse_if_cancelled` rather than mid-flight, so there is no in-flight
+  statement to leave behind. `pg::commit_writes`' cancel arm was the one exit resting on the client's drop, which does
   abort the transaction but not until the connection actually goes away — holding every row lock the
   completed statements took meanwhile. `pg::import_rows` and every error exit in `pg::write_on`
-  already issued one.
+  already issued one. **MySQL's arm was `cancelled_import`'s contract read backwards**: it killed the
+  query, disconnected and answered `Cancelled` — which the modal renders as "nothing was written" —
+  on the strength of the drop undoing the transaction. True on InnoDB, false on
+  `MyISAM`/`MEMORY`/`ARCHIVE`/`CSV`, where a cancelled commit of three staged `INSERT`s that got two
+  in reported nothing written, left all three staged, and a second Commit landed the two again. It
+  goes through `cancelled_write(rollback(&mut conn, "ROLLBACK").await)` now. A unit test of
+  `cancelled_write` alone is green against that defect — the seam is between the predicate and its
+  caller, and every arm of `commit_writes` needs a live MySQL server to reach — so the pin is a
+  source gate, `the_grid_commits_cancel_arm_goes_through_a_rollback`, which reads this crate's own
+  source and fails if the cancel arm stops asking what the rollback achieved.
   `one_row_verdict` states only what the guard saw — it runs *before* the rollback and can't
   know what it achieved, so **every** executor appends the clause once it does: SQLite's was the one
   that didn't, and a user reading *"UPDATE main.t affected 2 rows (expected exactly 1)"* with nothing
@@ -16385,6 +16605,18 @@ Re-introducing the anti-patterns these guard against is a regression:
   **two** bulk loads of the same file, both committing, with the second launch overwriting the
   cancellation token so the first could no longer be stopped. A new destructive action asks the same function; a guard re-derived per site
   is one that will be derived differently.
+  **A guard that opens a confirm asks *again* in the resolve, and that is now checked rather than
+  habitual.** A `Confirm` splits "the same step that launches it" in two — the press, and a closure
+  the user reaches an unbounded stretch of time later — and the flag can flip while the modal stands.
+  `kill_session` asked once, before `confirm.set`, immediately beside a comment that captures the
+  *connection handle* early for exactly that reason, so it gave the read-only flag the opposite
+  treatment for the same argument; its two siblings already asked twice (the Users **Drop**) or at
+  the press (`ddl_preview::apply`), which is what made it a residue rather than a rule. It re-reads
+  `connection::read_only_of` for the captured `conn_id` inside the `yes` arm now. The early ask is
+  not the defect and is deliberately kept: it is what produces the per-kind refusal *before* the user
+  is asked a question that would be refused anyway. `destructive_launch_gate`'s third test,
+  `a_guarded_launch_behind_a_confirm_asks_again_in_the_resolve`, scans both view crates for a guard
+  call followed by a `confirm.set(Some(` and fails unless something asks again after it.
   **The half the rule asks of the *other* side is that the disabled button be honest about it**, and
   two surfaces were failing that half rather than the launch half. The DDL preview's Apply asked the
   live flag inside `apply` while the footer's enable term and the "This connection is read-only."
@@ -16424,9 +16656,9 @@ Re-introducing the anti-patterns these guard against is a regression:
   flag is the protection with no "Run anyway", and terminating a live client session — rolling its
   transaction back under it — is the most destructive thing the app can do to a server it has been
   told not to write to. So the session row menu's two kill entries and the lock-wait banner's
-  one-click terminate all ask at the click, through the app-side `may_launch_destructive` re-export
-  of the same function, and a refusal says why in the panel's `kill_error` line rather than doing
-  nothing.
+  one-click terminate all ask at the click — and again in the confirm's resolve, per the paragraph
+  above — through the app-side `may_launch_destructive` re-export of the same function, and a refusal
+  says why in the panel's `kill_error` line rather than doing nothing.
   **The rule reaches the schema editors' *doors* as well, and there it has a gate.** Fifteen doors
   across eight files stamp `EditCtx::read_only` into the target they open; **three already refused**
   (`account_editor`'s two and `database_editor`'s one, which is where the rule was stated in the
@@ -16559,12 +16791,24 @@ Re-introducing the anti-patterns these guard against is a regression:
   whole conninfo string and dialled the attacker's host with `PGPASSWORD` in hand. Both are written
   up with their measurements under `core::launch`. The rule has two halves. The validation lives at
   the **launcher**, not at the producer — a producer may have its own good reasons to be permissive,
-  and the terminal's link tagger admitting `&` for a query string is one — and **no shell is ever in
-  between**, which is why the URI sub-delims that happen to be shell syntax are kept rather than
-  filtered. `launch::tests::no_shell_ever_reads_a_url` enforces that second half by asserting the
-  *composition* rather than the predicate: a hostile URL is either refused or reaches a program that
-  is not a shell as exactly one argv element, so it stays red for any future launcher that
-  reintroduces a shell however well the gate filters. **A refusal is a `Result`, not a caller's
+  and the terminal's link tagger admitting `&` for a query string is one — and **no shell of this
+  app's making is ever in between**, which is why the URI sub-delims that happen to be shell syntax
+  are kept rather than filtered. `launch::tests::no_shell_ever_reads_a_url` enforces that second half
+  by asserting the *composition* rather than the predicate: a hostile URL is either refused or
+  reaches a program that is not a shell as exactly one argv element, so it stays red for any future
+  launcher that reintroduces a shell however well the gate filters. **That half has one named
+  exception, and it is named rather than assumed away**: `url_open_argv`'s Linux arm is `xdg-open`,
+  which `xdg-utils` ships as a `#!/bin/sh` script, so on Linux the one program this module names is
+  itself an interpreter. What it costs is stated in `launch.rs`'s rule 1 — the sub-delims
+  `is_url_byte` admits reach that script's own parsing, and the argument that they are inert there is
+  an argument about somebody else's code that nothing in this repository re-checks when `xdg-utils`
+  changes; it was **not** verified against a real `xdg-open`, there being none on the machine, and
+  the note says so. What still holds is what this module can guarantee alone: one argv element, RFC
+  3986's allowlist, no byte outside it. The denylist of nine shell *names* could say nothing about a
+  program that is not one of them, which is exactly how this passed for as long as it did, so the
+  gate now also asserts the launcher is in a `LAUNCHERS` allowlist declaring `(program,
+  is_an_interpreter)` for each of the three, and `a_launcher_that_is_an_interpreter_is_declared`
+  fails if a second interpreter is added without amending that paragraph. **A refusal is a `Result`, not a caller's
   `if`** — `mysql_shell`/`psql_shell` and their `_config` halves return
   `Result<ShellConfig, &'static str>` where they returned an `Option` or a bare config, so every
   refusal lands on the one arm `open_db_cli` already had for "no client found" (a message spawned in
@@ -16743,6 +16987,15 @@ Re-introducing the anti-patterns these guard against is a regression:
   shipped on GitHub. The friction is the value — a rename has to be deliberate in two places, one of
   which is a comment explaining why it must not happen. Adding a platform is expected and safe: add
   the name in both places. See `app::update` for the packed file names this was measured against.
+  **The tag and `[workspace.package] version` are a third identity pair, reconciled in the same
+  file.** The version has two sources — the packages are *named* from the tag, and the binary inside
+  them reports `Cargo.toml` — so tagging without the bump publishes `schemaic_$v_amd64.deb` and a
+  Velopack manifest at `$v` around a binary whose `--version` says something else, and whose
+  `apt-get install schemaic=$v` rollback target therefore names a version the app disagrees with.
+  `vpk pack` already refuses a version *lower* than the channel's latest, so only this direction was
+  silent. `release.yml`'s *Resolve the package version* step fails the job when `${GITHUB_REF_NAME#v}`
+  and the `Cargo.toml` value disagree, and it sits beside the channel guard for the channel guard's
+  stated reason: a bad identity value should cost seconds, not a compile.
   **The published package-repository identity is the same rule with a second instance**, and a more
   thinly guarded one. `https://fadion.github.io/schemaic/deb` and `/rpm`, `Origin: Schemaic`,
   `Suite: stable`, and the keyring path `/usr/share/keyrings/schemaic-archive-keyring.gpg` that
