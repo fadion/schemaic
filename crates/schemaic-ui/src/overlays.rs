@@ -2516,7 +2516,7 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                                     confirm.set(Some(crate::Confirm {
                                         title: title.to_string(),
                                         message: schemaic_core::stats::drop_prompt(
-                                            &label, rows, is_view,
+                                            &label, rows, shape,
                                         ),
                                         resolve: Rc::new(move |yes| {
                                             if yes {

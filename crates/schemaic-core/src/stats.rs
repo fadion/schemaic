@@ -24,6 +24,7 @@
 use std::collections::HashMap;
 
 use crate::intel::SqlDialect;
+use crate::schema::TableShape;
 use crate::text::human_count;
 
 /// Does `dialect` publish per-table statistics at all?
@@ -942,9 +943,19 @@ pub fn truncate_prompt(label: &str, rows: Option<RowCount>) -> String {
 /// A view is dropped by `DROP VIEW` and owns no rows, so it is never given a row
 /// figure — asking about "every row in it" would be asking about rows that
 /// belong to the tables under it.
-pub fn drop_prompt(label: &str, rows: Option<RowCount>, is_view: bool) -> String {
-    if is_view {
-        return format!("Drop {label}? Anything built on it goes too. This can't be undone.");
+///
+/// **A [`TableShape`], not an `is_view` bool.** The boolean has two answers and
+/// the object has three: a MariaDB sequence is not a view, so it took the table
+/// sentence and the user was asked to confirm dropping "all N rows in it" about
+/// a counter. `TableShape` exists to make that a case somebody has to answer.
+pub fn drop_prompt(label: &str, rows: Option<RowCount>, shape: TableShape) -> String {
+    match shape {
+        TableShape::View => {
+            return format!("Drop {label}? Anything built on it goes too. This can't be undone.");
+        }
+        // No rows to name, and nothing is built on it — a sequence is a counter.
+        TableShape::Sequence => return format!("Drop {label}? This can't be undone."),
+        TableShape::Table => {}
     }
     match rows.filter(|&r| worth_naming(r)) {
         Some(r) => format!(
@@ -2067,7 +2078,11 @@ mod tests {
             "Delete all ~4.2m rows in orders? This can't be undone."
         );
         assert_eq!(
-            drop_prompt("orders", Some(RowCount::Estimate(4_200_000)), false),
+            drop_prompt(
+                "orders",
+                Some(RowCount::Estimate(4_200_000)),
+                TableShape::Table
+            ),
             "Drop orders and all ~4.2m rows in it? This can't be undone."
         );
         // An engine that counted is believed at any size above empty.
@@ -2103,10 +2118,36 @@ mod tests {
         // It owns none: the rows belong to the tables under it, and `DROP VIEW`
         // deletes no data at all.
         let expected = "Drop v? Anything built on it goes too. This can't be undone.";
-        assert_eq!(drop_prompt("v", None, true), expected);
+        assert_eq!(drop_prompt("v", None, TableShape::View), expected);
         assert_eq!(
-            drop_prompt("v", Some(RowCount::Estimate(4_200_000)), true),
+            drop_prompt("v", Some(RowCount::Estimate(4_200_000)), TableShape::View),
             expected
+        );
+    }
+
+    /// **Nor is a sequence**, which the `is_view` boolean could not say. It is
+    /// not a view, so it took the *table* sentence — the user was asked to
+    /// confirm dropping "all N rows in it" about a counter, with a figure that
+    /// came from whatever the row-count probe made of it.
+    #[test]
+    fn a_sequence_is_not_asked_about_as_a_table() {
+        let expected = "Drop sq1? This can't be undone.";
+        assert_eq!(drop_prompt("sq1", None, TableShape::Sequence), expected);
+        // Even handed a row figure: a sequence owns no rows whatever the probe
+        // reported, and repeating the number would be the bug with a sentence.
+        assert_eq!(
+            drop_prompt(
+                "sq1",
+                Some(RowCount::Estimate(4_200_000)),
+                TableShape::Sequence
+            ),
+            expected
+        );
+        // And it is not given the view's sentence either — nothing is built on
+        // a sequence the way a view is built on its tables.
+        assert_ne!(
+            drop_prompt("sq1", None, TableShape::Sequence),
+            drop_prompt("sq1", None, TableShape::View)
         );
     }
 }

@@ -336,7 +336,16 @@ pub fn resolve_target<'a>(
             .or_else(|| schema.find_table(None, &proposal.table)),
     };
     match found {
-        Some(t) if t.is_view => Err(ProposeError::NotATable(display_target(proposal))),
+        // **`shape()`, not `is_view`.** This is the one gate whose whole job is
+        // refusing a non-table, and it asked a question with two answers about
+        // an object that has three: a MariaDB sequence is not a view, so it fell
+        // on the "therefore an ordinary table" side, a `TableDraft` was built
+        // from its eight counter columns, and the plan was `ALTER TABLE sq1 …`
+        // on a sequence. `TableShape` exists for exactly that, and says so in
+        // its own doc.
+        Some(t) if t.shape() != crate::schema::TableShape::Table => {
+            Err(ProposeError::NotATable(display_target(proposal)))
+        }
         Some(t) => Ok(t),
         None => Err(ProposeError::NoSuchTable(display_target(proposal))),
     }
@@ -865,6 +874,38 @@ mod tests {
                 &schema,
                 &Proposal {
                     table: "v".into(),
+                    ..Default::default()
+                }
+            ),
+            Err(ProposeError::NotATable(_))
+        ));
+    }
+
+    /// **And a sequence is refused too**, which the `is_view` boolean could not
+    /// say. MariaDB's catalogue lists a `CREATE SEQUENCE` as a table, so it is
+    /// not a view — and this gate, whose one job is refusing a non-table, put it
+    /// on the "therefore an ordinary table" side. A `TableDraft` was then built
+    /// from its eight counter columns and the plan was `ALTER TABLE sq1 …` on a
+    /// sequence.
+    ///
+    /// `a_tables_shape_is_one_of_three` already tests `shape()` — in isolation,
+    /// where it passes either way. This is the composition with the caller, which
+    /// is where it sat.
+    #[test]
+    fn a_sequence_is_refused_before_any_op_is_applied() {
+        let schema = crate::schema::DbSchema {
+            tables: vec![TableInfo {
+                name: "sq1".into(),
+                is_sequence: true,
+                ..orders()
+            }],
+            ..Default::default()
+        };
+        assert!(matches!(
+            resolve_target(
+                &schema,
+                &Proposal {
+                    table: "sq1".into(),
                     ..Default::default()
                 }
             ),

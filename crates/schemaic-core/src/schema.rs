@@ -4620,8 +4620,15 @@ impl DbSchema {
         dialect: crate::intel::SqlDialect,
     ) -> String {
         use crate::ddl::ObjectKind;
-        let (views, tables): (Vec<&TableInfo>, Vec<&TableInfo>) =
-            self.tables_in(schema).partition(|t| t.is_view);
+        // **Three ways, through `shape()`.** A two-way `partition(|t| t.is_view)`
+        // put a MariaDB sequence in the base-table half — harmless only because
+        // `create_ddl` then withholds it, which is a second function's accident
+        // rather than this one's decision. A sequence in this script is the
+        // `objects_in(Sequence)` list's business, below.
+        let (views, tables): (Vec<&TableInfo>, Vec<&TableInfo>) = self
+            .tables_in(schema)
+            .filter(|t| t.shape() != TableShape::Sequence)
+            .partition(|t| t.shape() == TableShape::View);
         let types: Vec<String> = [ObjectKind::Enum, ObjectKind::Domain]
             .into_iter()
             .flat_map(|k| self.objects_in(schema, k))

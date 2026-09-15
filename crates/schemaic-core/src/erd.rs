@@ -12,7 +12,7 @@
 //! the current DB) can't be enumerated here, so it becomes a **stub node** carrying
 //! just the qualified name, never expanded.
 
-use crate::schema::{DbSchema, ForeignKeyInfo, TableInfo};
+use crate::schema::{DbSchema, ForeignKeyInfo, TableInfo, TableShape};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
@@ -193,12 +193,24 @@ fn target_id(child: &TableInfo, fk: &ForeignKeyInfo, current_db: &str) -> (Strin
 pub fn build_graph(schema: &DbSchema, current_db: &str, seed: &DiagramSeed) -> DiagramGraph {
     // Keyed by *id*, not bare name: two namespaces may hold same-named tables,
     // and collapsing them loses a node and misroutes its FK edges.
-    let by_id: HashMap<String, &TableInfo> =
-        schema.tables.iter().map(|t| (node_id(t), t)).collect();
+    // **Sequences are not nodes.** MariaDB's catalogue lists a `CREATE SEQUENCE`
+    // as a table, so `schema.tables` holds it — and a diagram drew it as a card
+    // with its eight counter columns (`next_not_cached_value`, `minimum_value`,
+    // …) and offered relationships on it. It has no foreign key either way, so
+    // dropping it costs the diagram nothing and it cannot be the target of an
+    // edge. Asked through `shape()`, which is the question with all three
+    // answers; `is_view` has two and put this on the table side.
+    let drawable = |t: &&TableInfo| t.shape() != TableShape::Sequence;
+    let by_id: HashMap<String, &TableInfo> = schema
+        .tables
+        .iter()
+        .filter(drawable)
+        .map(|t| (node_id(t), t))
+        .collect();
 
     // 1. Decide which real tables are in the node set.
     let included: Vec<&TableInfo> = match seed {
-        DiagramSeed::Database => schema.tables.iter().collect(),
+        DiagramSeed::Database => schema.tables.iter().filter(drawable).collect(),
         DiagramSeed::Table(seed_id) => {
             let Some(seed_t) = by_id.get(seed_id.as_str()) else {
                 return DiagramGraph::default();
@@ -213,7 +225,7 @@ pub fn build_graph(schema: &DbSchema, current_db: &str, seed: &DiagramSeed) -> D
                 }
             }
             // Tables that reference the seed.
-            for t in &schema.tables {
+            for t in schema.tables.iter().filter(drawable) {
                 if t.foreign_keys.iter().any(|fk| {
                     let (to, cross) = target_id(t, fk, current_db);
                     !cross && to == *seed_id
@@ -224,6 +236,7 @@ pub fn build_graph(schema: &DbSchema, current_db: &str, seed: &DiagramSeed) -> D
             schema
                 .tables
                 .iter()
+                .filter(drawable)
                 .filter(|t| set.contains(&node_id(t)))
                 .collect()
         }
@@ -360,10 +373,18 @@ fn table_node(t: &TableInfo) -> DiagramNode {
         .collect();
     DiagramNode {
         id: node_id(t),
-        kind: if t.is_view {
-            NodeKind::View
-        } else {
-            NodeKind::Table
+        // Through `shape()`, the question with all three answers. `is_view`
+        // has two, and a MariaDB sequence fell on the "therefore an ordinary
+        // table" side — drawn as a card with its eight counter columns, with
+        // relationships offered on it.
+        kind: match t.shape() {
+            TableShape::View => NodeKind::View,
+            // A sequence never reaches here: `build_graph` leaves it out of the
+            // node set, because it has no foreign key to draw an edge from and
+            // its counter columns are not a schema anyone opened the diagram to
+            // read. Named rather than left to a `_`, so a fourth shape is a
+            // compile error here too.
+            TableShape::Table | TableShape::Sequence => NodeKind::Table,
         },
         columns,
     }
@@ -1588,6 +1609,38 @@ mod tests {
             ],
             ..Default::default()
         }
+    }
+
+    /// **A sequence is not a node.** MariaDB's catalogue lists a
+    /// `CREATE SEQUENCE` as a table, so it arrives in `schema.tables` — and the
+    /// diagram asked `is_view`, which has two answers, so it drew a card with the
+    /// sequence's eight counter columns and offered relationships on it. It was
+    /// also counted as an *island*, so the "N hidden" note the diagram shows was
+    /// about an object the diagram has nothing to say about.
+    #[test]
+    fn a_sequence_is_left_out_of_the_diagram_entirely() {
+        let mut s = shop();
+        s.tables.push(TableInfo {
+            is_sequence: true,
+            ..table(
+                "sq1",
+                vec![
+                    col("next_not_cached_value", "bigint", false),
+                    col("minimum_value", "bigint", false),
+                ],
+                vec![],
+            )
+        });
+        let g = build_graph(&s, "shop", &DiagramSeed::Database);
+        assert!(g.nodes.iter().all(|n| n.id != "sq1"), "{:?}", g.nodes);
+        assert!(
+            !g.hidden_islands.contains(&"sq1".to_string()),
+            "{:?}",
+            g.hidden_islands
+        );
+        // And a table-seeded diagram cannot reach it either.
+        let g = build_graph(&s, "shop", &DiagramSeed::Table("sq1".to_string()));
+        assert!(g.nodes.is_empty(), "{:?}", g.nodes);
     }
 
     #[test]
