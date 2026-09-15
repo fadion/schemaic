@@ -4039,13 +4039,24 @@ impl ChangeSet {
     }
 }
 
-/// [`ChangeSet::script`]'s "INCOMPLETE" preamble, over any list of withheld
-/// items — empty when nothing was withheld.
+/// [`ChangeSet::editor_script`]'s "INCOMPLETE" preamble, over any list of
+/// withheld items — empty when nothing was withheld.
 ///
 /// A free function because a multi-object plan
 /// ([`crate::compare::SchemaPlan::editor_script`]) has to say the same thing over the
 /// union of its sets' omissions, and a second copy of this sentence is a second
 /// thing to keep true.
+///
+/// **Every item goes through [`crate::export::comment_text`].** The items are
+/// [`Change::summary`] strings, which embed introspected names verbatim, and
+/// these lines are the one place in this module that emits a `--` comment. The
+/// `lines()` split closes a `\n` incidentally — each line is re-prefixed — and
+/// closes a lone `\r` not at all: `str::lines` splits on `\n` only, and `trim`
+/// reaches a `\r` at the ends and not one in the middle. So a table named
+/// `orders\rDROP TABLE customers;` — legal in a quoted identifier on all three
+/// engines — rode out on a comment line that most editors turn back into two
+/// lines on paste, the second of them a statement. Quoting is not
+/// comment-safety, and this function had neither.
 pub fn withheld_header(withheld: &[String]) -> String {
     if withheld.is_empty() {
         return String::new();
@@ -4058,7 +4069,7 @@ pub fn withheld_header(withheld: &[String]) -> String {
     for w in withheld {
         for (i, line) in w.lines().enumerate() {
             out.push_str(if i == 0 { "--   - " } else { "--     " });
-            out.push_str(line.trim());
+            out.push_str(&crate::export::comment_text(line.trim()));
             out.push('\n');
         }
     }
@@ -19380,7 +19391,7 @@ mod sqlite_rebuild_tests {
         let cs = diff(&t, &d, SqlDialect::Sqlite);
         assert!(!cs.unsupported().is_empty(), "the premise");
 
-        for script in [cs.editor_script(), cs.editor_script()] {
+        for script in [cs.editor_script(), cs.export_script()] {
             assert!(script.contains("ix_mail"), "{script}");
             assert!(script.contains("INCOMPLETE"), "{script}");
             // The header is comment-only, so the script still runs as far as it
@@ -19389,6 +19400,58 @@ mod sqlite_rebuild_tests {
                 script.lines().take_while(|l| l.starts_with("--")).count() >= 4,
                 "{script}"
             );
+        }
+    }
+
+    /// **A name on a `--` line is a second question from quoting it.** The
+    /// withheld items are `Change::summary` strings, which embed introspected
+    /// names verbatim, and this header is the one place in this module that
+    /// writes a comment. The `lines()` split closed a `\n` incidentally; a lone
+    /// `\r` it never saw — `str::lines` splits on `\n` alone, and `trim` reaches
+    /// the ends of a line and not its middle. Most editors turn a lone CR back
+    /// into a line break on paste, at which point the tail of the name is a
+    /// top-level statement in the script the user was handed to run elsewhere.
+    ///
+    /// Asserted over the emitted script and split the way a pasting editor
+    /// splits it, not over `comment_text` — which was already correct, and is
+    /// why nothing caught this.
+    #[test]
+    fn a_carriage_return_in_a_withheld_name_cannot_open_a_line_of_its_own() {
+        use crate::schema::{IndexColumn, IndexInfo};
+        let mut t = table();
+        t.name = "orders\rDROP TABLE customers;".into();
+        t.indexes.push(IndexInfo {
+            name: "ix\rDROP TABLE ix_victim;".into(),
+            columns: vec![IndexColumn::plain("b")],
+            unique: true,
+            lossy: true,
+            create_sql: Some("CREATE UNIQUE INDEX \"ix\" ON \"t\" (lower(\"b\"))".into()),
+            ..Default::default()
+        });
+        let mut d = TableDraft::from_table(&t);
+        d.rename_column(0, "z");
+        d.columns[1].info.type_name = "BLOB".into();
+        let cs = diff(&t, &d, SqlDialect::Sqlite);
+        assert!(!cs.unsupported().is_empty(), "the premise");
+
+        for script in [cs.editor_script(), cs.export_script()] {
+            let header: String = script
+                .split("\n\n")
+                .next()
+                .expect("the header block")
+                .to_string();
+            assert!(header.starts_with("--"), "{script}");
+            // Both terminators, because the point is that the receiving editor
+            // treats them alike and this code did not.
+            for line in header.split(['\n', '\r']) {
+                assert!(
+                    line.trim_start().starts_with("--") || line.trim().is_empty(),
+                    "a comment block grew a statement line: {line:?}\nin: {header:?}"
+                );
+            }
+            // Legible, not merely absent — a redaction that dropped the name
+            // would pass the check above and tell the user nothing.
+            assert!(header.contains("DROP TABLE ix_victim;"), "{header}");
         }
     }
 
