@@ -130,18 +130,19 @@ impl WindowChrome {
     /// never arrives as a `DoubleClick`.
     fn draggable(self, view: impl IntoView + 'static) -> impl IntoView {
         let this = self;
-        view.on_event_stop(EventListener::PointerDown, move |e| {
-            let Event::PointerDown(p) = e else { return };
-            if !p.button.is_primary() {
-                return;
-            }
-            if p.count >= 2 {
-                this.toggle_maximized();
-            } else {
-                drag_window();
-            }
-            give_the_keyboard_back();
-        })
+        view.on_event_stop(
+            EventListener::PointerDown,
+            chrome_press(move |p| {
+                if !p.button.is_primary() {
+                    return;
+                }
+                if p.count >= 2 {
+                    this.toggle_maximized();
+                } else {
+                    drag_window();
+                }
+            }),
+        )
     }
 
     /// How wide the caption buttons are in total — what a band laid over the
@@ -391,6 +392,12 @@ fn control_button(
     on_press: impl Fn() + 'static,
 ) -> impl IntoView {
     container(glyph)
+        // `Click` is primary-only, so a right-press on a caption button reached
+        // nothing at all while still clearing focus. `Continue`, so the press
+        // carries on to become the `Click` a primary one does; and unconditional
+        // — `keeps_the_window` is about the moment *after* `on_press()` has torn
+        // the window down, and this runs before the press is even a click.
+        .on_event_cont(EventListener::PointerDown, chrome_press(|_| {}))
         .on_click_stop(move |_| {
             on_press();
             if keeps_the_window {
@@ -438,6 +445,36 @@ fn give_the_keyboard_back() {
     floem::action::exec_after(std::time::Duration::ZERO, |_| {
         crate::widgets::hand_keyboard_back(None);
     });
+}
+
+/// Wrap a chrome `PointerDown` handler so the keyboard is handed back for
+/// **every** press, whatever the handler then decides to do with it.
+///
+/// **The call used to be a step each handler had to remember, and two of the
+/// three put it in the wrong place.** `draggable` and `zone` both opened with
+/// `if p.button.is_primary()` and called [`give_the_keyboard_back`] inside it —
+/// but `on_event_stop` consumes the press whichever button sent it, and an
+/// early `return` does not change that (floem's `on_event_stop` returns `Stop`
+/// unconditionally). So the standard Windows caption gesture — right-click the
+/// title bar — took the keyboard and returned nothing, and over an open modal
+/// that meant Escape stopped closing it until the panel itself was clicked. The
+/// same hole sat on all six resize edges and both 14×14 corners.
+///
+/// Making it a wrapper rather than a first line is the point: there is no
+/// longer a branch for it to end up inside, and the gate below can ask for
+/// `chrome_press(` — a needle a call in a branch cannot satisfy — instead of
+/// asking whether the call appears *somewhere* in the handler, which is what it
+/// asked while both handlers were wrong.
+fn chrome_press(
+    f: impl Fn(&floem::pointer::PointerInputEvent) + 'static,
+) -> impl Fn(&Event) + 'static {
+    move |e| {
+        let Event::PointerDown(p) = e else { return };
+        // Idempotent and deferred, so paying it on a press the handler does
+        // nothing else with costs nothing.
+        give_the_keyboard_back();
+        f(p);
+    }
 }
 
 /// Which part of the frame a grab zone covers.
@@ -550,20 +587,21 @@ impl Edge {
 /// on every route into maximization, rather than a second answer to the question.
 fn zone(edge: Edge, maximized: RwSignal<bool>) -> impl IntoView {
     empty()
-        .on_event_stop(EventListener::PointerDown, move |e| {
-            let Event::PointerDown(p) = e else { return };
-            if p.button.is_primary() {
-                drag_resize_window(edge.direction());
-                // **A press on window chrome is not a focus change.** Floem
-                // clears `app_state.focus` on every pointer-down and only a
-                // `keyboard_navigable` view re-takes it during the walk — this
-                // is neither, and it stops the walk. Both siblings in this file
-                // hand it back for the same reason; without it, resizing the
-                // window with a modal open left Escape unable to close it, and
-                // with no modal dropped the next keystroke typed at the editor.
-                give_the_keyboard_back();
-            }
-        })
+        // **A press on window chrome is not a focus change.** Floem clears
+        // `app_state.focus` on every pointer-down and only a
+        // `keyboard_navigable` view re-takes it during the walk — this is
+        // neither, and it stops the walk. `chrome_press` is what hands it back,
+        // for every button; without it, resizing the window with a modal open
+        // left Escape unable to close it, and with no modal dropped the next
+        // keystroke typed at the editor.
+        .on_event_stop(
+            EventListener::PointerDown,
+            chrome_press(move |p| {
+                if p.button.is_primary() {
+                    drag_resize_window(edge.direction());
+                }
+            }),
+        )
         .style(move |s| {
             if maximized.get() {
                 return s.hide();
@@ -650,7 +688,7 @@ mod tests {
         // resize zones take `PointerDown` (they must — `on_click_stop` stops
         // *Click*, not the press a drag begins with), the caption buttons take
         // the click. All three are presses on chrome.
-        let marks: Vec<usize> = ["on_event_stop(EventListener::PointerDown", "on_click_stop("]
+        let marks: Vec<usize> = ["EventListener::PointerDown", "on_click_stop("]
             .iter()
             .flat_map(|m| code.match_indices(m).map(|(i, _)| i).collect::<Vec<_>>())
             .collect();
@@ -666,7 +704,22 @@ mod tests {
                 .unwrap_or(code.len())
                 .min(at + 1200)
                 .min(code.len());
-            if !code[at..end].contains("give_the_keyboard_back()") {
+            let span = &code[at..end];
+            // A `PointerDown` handler answers through `chrome_press`, which
+            // *is* the hand-back; a `Click` handler calls it itself. **The two
+            // needles are not interchangeable**: this gate used to accept the
+            // call anywhere in the span, and both `PointerDown` handlers in this
+            // file satisfied it with a call sitting inside
+            // `if p.button.is_primary()` — so every secondary press on the drag
+            // band and on all eight resize zones took the keyboard and returned
+            // nothing, with the gate green. Asking for the wrapper is a
+            // question a call in a branch cannot answer.
+            let answered = if code[at..].starts_with("EventListener::PointerDown") {
+                span.contains("chrome_press(")
+            } else {
+                span.contains("give_the_keyboard_back()")
+            };
+            if !answered {
                 offenders.push(code[..at].matches('\n').count() as u32 + 1);
             }
         }
@@ -674,7 +727,9 @@ mod tests {
             offenders.is_empty(),
             "window chrome presses at {offenders:?} take the keyboard and never \
              hand it back — floem clears focus on every pointer-down, so after \
-             one of these Escape stops reaching an open modal"
+             one of these Escape stops reaching an open modal. A `PointerDown` \
+             handler answers by going through `chrome_press`, not by calling \
+             `give_the_keyboard_back()` somewhere inside itself"
         );
         assert!(
             sorted.len() >= 3,
