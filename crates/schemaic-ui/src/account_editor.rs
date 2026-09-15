@@ -595,7 +595,11 @@ pub(crate) fn account_editor_overlay(ui: Ui) -> impl IntoView {
             .style(|s| s.width_full().flex_grow(1.0_f32).min_height(0.0));
 
             let status = dyn_container(
-                move || d.account_draft.get().name.trim().is_empty(),
+                // `with`, not `get`: this re-runs on every edit of the draft and
+                // asks one question about one field, so cloning the whole
+                // `AccountDraft` to reach it is the defect `consts`'
+                // `get_clone_gate` is named for.
+                move || d.account_draft.with(|a| a.name.trim().is_empty()),
                 move |empty_name| {
                     if empty_name {
                         text("A name is required.")

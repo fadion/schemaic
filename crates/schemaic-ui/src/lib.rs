@@ -14105,7 +14105,11 @@ mod whole_ui_gate {
         ("activity_panel.rs", 1),
         ("ai_panel.rs", 1),
         ("blob_view.rs", 1),
-        ("compare_view.rs", 6),
+        // 8, not 6: `body_for` and `ready_body` take `ui` *second*, which the
+        // counter could not see until it counted parameters rather than line
+        // shapes. The number is what the file declares now — the ratchet's rule
+        // — not a widening.
+        ("compare_view.rs", 8),
         ("connection_form.rs", 1),
         ("connection_import.rs", 6),
         ("database_editor.rs", 7),
@@ -14129,31 +14133,80 @@ mod whole_ui_gate {
         ("snippet_edit.rs", 1),
         ("snippet_panel.rs", 1),
         ("table_designer.rs", 33),
-        ("tabs.rs", 1),
+        // 2, for `compare_view.rs`'s reason: `tab_chip(tab: Tab, ui: Ui)`.
+        ("tabs.rs", 2),
         ("trigger_editor.rs", 11),
         ("users_view.rs", 9),
         ("view_editor.rs", 10),
+        // `MenuFlags::of`, which gathers a flag out of six child bundles and so
+        // genuinely needs the root one — the case the doc above calls taking
+        // "the child bundle … which is what those bundles are for", six times
+        // over. It was invisible until the counter learned `&crate::Ui`.
+        ("widgets.rs", 1),
     ];
 
     /// How many `ui: Ui` / `ui: &Ui` parameters a file declares.
     ///
-    /// Both spellings the crate uses: a multi-line signature puts the parameter
-    /// on its own line, a short one puts it first inside the parens.
+    /// **A parameter, not a line shape.** This matched four literal spellings —
+    /// three own-line forms with a trailing comma, and four inline forms
+    /// anchored on the opening paren — so `fn thing(x: Foo, ui: &Ui)` was
+    /// invisible: `ui` had to be *first*, and a single-line signature has no
+    /// trailing comma on its last parameter. Three sites did exactly that
+    /// (`compare_view.rs`'s `body_for` and `ready_body`, `tabs.rs`'s
+    /// `tab_chip`), so two of the budget entries below were 2 and 1 too low on
+    /// the day the gate shipped — and the sibling test asserts `found ==
+    /// allowed` using this same counter, so neither could see it. The ratchet's
+    /// own doc says "a file not on the list may not take one at all", and a new
+    /// one-line signature in any file passed both tests.
+    ///
+    /// Scanned per line rather than per signature because a parameter list is
+    /// one line or rustfmt has already broken it one-per-line; either way the
+    /// parameter is `[_]ui: [&]Ui` followed by `,` or `)`, and preceded by
+    /// something that is not an identifier byte — which is what keeps `my_ui:
+    /// Ui` and `sub_ui: &Ui` out.
     fn whole_ui_params(code: &str) -> usize {
-        code.lines()
-            .filter(|l| {
-                let t = l.trim();
-                if t.starts_with("//") {
-                    return false;
+        let mut n = 0usize;
+        for line in code.lines() {
+            let t = line.trim();
+            if t.starts_with("//") {
+                continue;
+            }
+            let b = t.as_bytes();
+            for name in ["_ui", "ui"] {
+                let mut from = 0usize;
+                while let Some(rel) = t[from..].find(name) {
+                    let at = from + rel;
+                    from = at + name.len();
+                    // `my_ui` / `sub_ui` are somebody else's parameter, and
+                    // `_ui` must not also be counted as the `ui` inside it.
+                    let before_ok =
+                        at == 0 || !(b[at - 1].is_ascii_alphanumeric() || b[at - 1] == b'_');
+                    if !before_ok {
+                        continue;
+                    }
+                    let rest = t[from..].trim_start();
+                    let Some(rest) = rest.strip_prefix(':') else {
+                        continue;
+                    };
+                    let rest = rest.trim_start();
+                    let rest = rest.strip_prefix('&').unwrap_or(rest).trim_start();
+                    // `crate::Ui` and `super::Ui` are the same parameter under a
+                    // path, and a ratchet that a respelling walks past is not
+                    // one. Cheap to allow, and there is nothing else named `Ui`.
+                    let rest = rest
+                        .strip_prefix("crate::")
+                        .or_else(|| rest.strip_prefix("super::"))
+                        .unwrap_or(rest);
+                    let Some(rest) = rest.strip_prefix("Ui") else {
+                        continue;
+                    };
+                    if matches!(rest.trim_start().as_bytes().first(), Some(b',' | b')')) {
+                        n += 1;
+                    }
                 }
-                let own_line = t == "ui: Ui," || t == "ui: &Ui," || t == "_ui: Ui,";
-                let inline = t.contains("(ui: Ui,")
-                    || t.contains("(ui: &Ui,")
-                    || t.contains("(ui: Ui)")
-                    || t.contains("(ui: &Ui)");
-                own_line || inline
-            })
-            .count()
+            }
+        }
+        n
     }
 
     #[test]

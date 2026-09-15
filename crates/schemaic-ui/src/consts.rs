@@ -1481,11 +1481,58 @@ mod get_clone_gate {
             for (i, line) in body.lines().enumerate() {
                 let l = line.trim();
                 for ask in ASKS {
-                    // `.get()` immediately followed by the question. Assembled
-                    // rather than written out, so this line is not its own first
-                    // offender.
-                    let needle = format!("{}(){ask}", ".get");
-                    if l.contains(&needle) {
+                    // **Not only *immediately* followed.** This required the
+                    // question to sit right against the `.get()`, so the four
+                    // live sites of the very defect the gate is named for —
+                    // `filter.get().trim().is_empty()` in a per-row reactive
+                    // closure, `d.account_draft.get().name.trim().is_empty()`
+                    // (a clone of the whole draft to test one field) — walked
+                    // past it, and the doc could say "the population is now
+                    // zero" while it was four. A borrowing adaptor or a field
+                    // access between the two changes nothing about the clone.
+                    //
+                    // Assembled rather than written out, so these lines are not
+                    // their own first offenders.
+                    let get = format!("{}()", ".get");
+                    let Some(at) = l.find(&get) else { continue };
+                    let after = &l[at + get.len()..];
+                    // Up to the end of the chain: a `,` or `)` at depth zero
+                    // ends the expression, and anything past it is a different
+                    // read that answers for itself.
+                    let mut depth = 0i32;
+                    let mut end = after.len();
+                    for (k, c) in after.char_indices() {
+                        match c {
+                            '(' | '[' => depth += 1,
+                            ')' | ']' if depth == 0 => {
+                                end = k;
+                                break;
+                            }
+                            ')' | ']' => depth -= 1,
+                            // A space at depth zero ends it too: a method chain
+                            // has none, so the next thing is a different
+                            // expression — `!a.get().trim().is_empty() && !b…`
+                            // put the *second* read inside the first's chain
+                            // and made the whole line look owned.
+                            ',' | ';' | ' ' if depth == 0 => {
+                                end = k;
+                                break;
+                            }
+                            _ => {}
+                        }
+                    }
+                    let chain = &after[..end];
+                    // Only a chain made of borrowing adaptors and field
+                    // accesses: `.get().unwrap_or_default().len()` really does
+                    // need the owned value, and `.get().0.is_empty()` does not.
+                    let borrows_only = chain.split('.').filter(|seg| !seg.is_empty()).all(|seg| {
+                        let seg = seg.trim();
+                        ASKS.iter()
+                            .any(|a| seg.starts_with(a.trim_start_matches('.')))
+                            || matches!(seg, "trim()" | "as_str()" | "as_ref()" | "as_deref()")
+                            || seg.chars().all(|c| c.is_alphanumeric() || c == '_')
+                    });
+                    if borrows_only && chain.contains(ask.trim_start_matches('.')) {
                         offenders.push(format!("{file}:{}: {l}", i + 1));
                     }
                 }

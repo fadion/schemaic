@@ -175,7 +175,10 @@ pub(crate) fn snippet_edit_overlay(ui: Ui) -> impl IntoView {
             let ring_actions = ring.clone();
             let save = Rc::new(save);
             let footer = modal_footer(dyn_container(
-                move || !name.get().trim().is_empty() && !body.get().trim().is_empty(),
+                // Two clones per keystroke, to ask whether two strings are
+                // blank — and a snippet body is the largest string in this
+                // modal. See `consts`' `get_clone_gate`.
+                move || name.with(|n| !n.trim().is_empty()) && body.with(|b| !b.trim().is_empty()),
                 move |ready: bool| {
                     let save = save.clone();
                     h_stack((

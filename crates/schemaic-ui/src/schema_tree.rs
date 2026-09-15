@@ -1728,7 +1728,14 @@ fn db_node(conn: ConnNode, ctx: SchemaTreeCtx) -> impl IntoView {
                 // The same term `children` opens on: a filter force-expands
                 // every database.
                 let key_chev = key.clone();
-                move || expanded.with(|e| e.contains(&key_chev)) || !filter.get().trim().is_empty()
+                // Both halves through `with`: this closure re-runs **per tree
+                // row**, and `filter.get()` cloned the whole query string to
+                // ask whether it was blank — the defect beside it already
+                // avoids, one operator away. See `consts`' `get_clone_gate`.
+                move || {
+                    expanded.with(|e| e.contains(&key_chev))
+                        || filter.with(|f| !f.trim().is_empty())
+                }
             },
             key.clone(),
             on_toggle.clone(),
@@ -2007,7 +2014,14 @@ fn schema_node(
             {
                 // The same term `children` opens on.
                 let key_chev = key.clone();
-                move || expanded.with(|e| e.contains(&key_chev)) || !filter.get().trim().is_empty()
+                // Both halves through `with`: this closure re-runs **per tree
+                // row**, and `filter.get()` cloned the whole query string to
+                // ask whether it was blank — the defect beside it already
+                // avoids, one operator away. See `consts`' `get_clone_gate`.
+                move || {
+                    expanded.with(|e| e.contains(&key_chev))
+                        || filter.with(|f| !f.trim().is_empty())
+                }
             },
             key.clone(),
             on_toggle,
