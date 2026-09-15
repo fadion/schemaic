@@ -3340,6 +3340,16 @@ existing prose was left alone.
     `DiagramSeed::Database` (whole database, hiding FK-less "island" tables) or `::Table` (one
     table's one-hop neighbourhood). A cross-database FK target can't be enumerated from one
     `DbSchema`, so it becomes an unexpandable `NodeKind::Stub` rather than a missing edge.
+    **A sequence is not a node at all**, and the filter is the `drawable` closure —
+    `shape() != TableShape::Sequence` — applied at every point the node set is built rather than at
+    one of them. MariaDB lists a `CREATE SEQUENCE` in `information_schema.TABLES`, so it arrives in
+    `schema.tables`, and this asked `is_view`: the diagram drew a card carrying the sequence's eight
+    internal counter columns (`next_not_cached_value`, `minimum_value`, …) and offered relationships
+    on it, and — having no foreign key in either direction — it was *also* counted as an FK-less
+    island, so the "N unrelated tables hidden" note was partly about an object the diagram has
+    nothing to say about. Leaving it out costs the diagram nothing, since it can be neither end of
+    an edge. `a_sequence_is_left_out_of_the_diagram_entirely` pins the node set, the island list and
+    the table-seeded case, where naming a sequence as the seed now yields an empty graph.
     `fit_toolbar` is the diagram **toolbar's responsive rule**, and it is here rather than in the
     view because it is arithmetic over widths: given the room available and what each optional
     group costs, it drops them in a fixed priority order — the count pills, then the zoom stepper,
@@ -3360,8 +3370,17 @@ existing prose was left alone.
     by longest FK-dependency chain, ordered by neighbour barycentre), so the same schema always
     arranges the same way; `edge_anchors`/`cubic_controls`/`sample_cubic`/`nearest_polyline` are the
     pure bezier geometry + hover hit-test the custom paint canvas uses. `DiagramLayoutsFile`
-    persists manual drags per `(conn_id, database)` to `diagrams.json`, falling back to auto-layout
-    for an unknown or stale id. That file is read **lazily**, from inside `erd_view`'s drag handlers
+    persists manual drags to `diagrams.json`, falling back to auto-layout
+    for an unknown or stale id, and **the seed is part of the key**: `layout_key(conn_id, database,
+    seed)` gives a table diagram a record of its own, because positions are not comparable across
+    seeds — a table diagram's come from `place()` over *its* four nodes on *its* canvas, a database
+    diagram's from `place()` over sixteen. With one key per database the two shared a slot, so
+    pressing **Reset layout** inside a table diagram wrote four origin-adjacent coordinates into the
+    database diagram's record, and reopening that put those cards on top of whatever the user had
+    arranged there. `DiagramSeed::Database` keeps the old spelling byte for byte, so every layout
+    already in `diagrams.json` is still the database diagram's and no migration is needed; only the
+    table diagrams gain a record, and they had none worth keeping. `clear_conn_layouts`' `{conn_id}:`
+    prefix still bounds the file either way. That file is read **lazily**, from inside `erd_view`'s drag handlers
     rather than at startup, which is why both of its loads and `delete_conn_now`'s layout prune call
     `schemaic_ui::report_recoveries` themselves — see `core/persist.rs` for the contract they were
     breaking.
@@ -3491,6 +3510,24 @@ existing prose was left alone.
     were individually correct and the defect was that there were two. This matters more than a display nicety because the log is
     exportable, and `discard_needs_asking` exists precisely because it is treated as a record
     somebody keeps.
+    **`baseline_is_stale(old_cols, new_cols)` is the other thing a snapshot cannot survive, and it
+    is the *shape* of the table rather than its rows.** Everything here is positional:
+    `Snapshot::from_result` builds each row's `cells` by column index, `diff_snapshots` compares two
+    `cells` vectors by index, `field_changes` walks them by index, and the modal names each
+    `FieldChange { col }` off the column list captured on the **baseline** poll. So an
+    `ALTER TABLE orders ADD COLUMN note TEXT AFTER id` run in another session while the monitor is
+    open shifts every cell from index 1 on by one place: every row in the window is logged as an
+    UPDATE, each field named from the pre-`ALTER` order, so the log claims `name: 'Ada' →
+    '2024-01-03'` for a column that never changed — in a record the modal exports and treats as the
+    only copy. The mirror case is quieter and worse: a `DROP COLUMN` before a key column leaves the
+    resolved key indices pointing past the new width, `from_result`'s fallback gives *every* row the
+    empty key, the map collapses to one entry, and the diff reports the whole window deleted. The
+    comparison is by **name and position**, not as a set — two columns swapped is the same shift, a
+    rename at the same position is a different column to a positional diff — and case-sensitively,
+    since a server that changes a column's case has changed the text the log will print. The answer
+    is to restart the baseline rather than diff across it, because nothing here can say what happened
+    to a row while the table's shape was changing; `main.rs`'s `monitor_apply` does that and **says
+    so in the modal**, a silent restart being indistinguishable from a poll that found nothing.
     The **log** lives here too, not just the diff. `MonitorEntry { at, change }` — a change plus the
     `M:SS` at which a poll *observed* it — moved down from `ui/lib.rs`, which re-exports it so every
     use site still reads as a UI type, because the log's export is a pure projection of these
@@ -3744,7 +3781,13 @@ existing prose was left alone.
     server's) sorts **last**, is still printed, and blocks the collapse. `PgObjectKind` covers databases, schemas, tables and sequences only:
     functions and procedures are absent on purpose, since `GRANT EXECUTE ON FUNCTION` must name the
     argument types and an overloaded name alone is ambiguous, so the `Grants::note` saying so beats a
-    statement naming the wrong overload. The grantee is taken **unquoted** and quoted here with
+    statement naming the wrong overload — **and the note had to be made to actually say it**, which
+    was the half of that reasoning nobody had checked. `pg::fetch_grants` reads four ACL columns and
+    `pg_proc.proacl` and `pg_attribute.attacl` are two of the ones it does not, so a role holding
+    nothing but an `EXECUTE` grant and a column grant was shown an empty privilege list under a note
+    that named only the *database* scope as the thing it could not answer for. Both
+    `pg_scope_note` and `pg_no_database_note` now name EXECUTE on functions and procedures, and
+    privileges granted on a single column, as not listed. The grantee is taken **unquoted** and quoted here with
     `export::ident_if_needed` (`pg_ident`) — SQL the user only reads — which is exactly what keeps it
     from being confused with `account_sql`'s unconditional quoting for SQL that runs.
     `Grants { statements, note }` is the honesty half, and `pg_scope_note` writes the note:
@@ -4537,8 +4580,45 @@ existing prose was left alone.
     `MODIFY` so they can't drift. `identity_always` separates PostgreSQL's `GENERATED ALWAYS AS
     IDENTITY` from `BY DEFAULT`/`serial`/MySQL `AUTO_INCREMENT`, because only the first **rejects**
     an explicit value — `is_server_assigned()` is that question (`generated.is_some() ||
-    identity_always`) and is what a write path must ask before naming a column. `IndexColumn` keeps prefix lengths + `DESC`; `ForeignKeyInfo`
-    keeps its name (both engines drop by name) + referential actions. `ViewOptions` is the same
+    identity_always`) and is what a write path must ask before naming a column.
+    **`ColumnInfo::invisible` is `index_disabled_sql`'s argument one object down**: MySQL 8.0.23+
+    and MariaDB 10.3+ mark a column `INVISIBLE`, which leaves it selectable by name and out of
+    `SELECT *`, and that is the standard way to retire a column without breaking an application —
+    a decision a DBA *stages*. With no field for it every emitter restated the column visible, so a
+    dump-and-restore or a Copy DDL brought the retirement back undone: `SELECT *` starts returning
+    the column again and every query written against the visible column set gets an extra one, with
+    nothing said. It is read from `EXTRA` in `db/lib.rs`'s `mysql_column` — the **fourth** question
+    that column answers, beside `auto_increment`, `on update current_timestamp` and
+    `stored generated`, and the one that was not being asked — and `definition_sql` writes
+    ` INVISIBLE` **last** and on the MySQL family only, since both servers print it at the end of
+    the definition and neither PostgreSQL nor SQLite has the concept (`false` on both). The
+    difference from a *switched-off index*, which is answered by marking it `IndexInfo::lossy`, is
+    that the model cannot restate the index and can restate the column — so this is a real field and
+    the emitter writes the keyword. `IndexColumn` keeps prefix lengths + `DESC`; `ForeignKeyInfo`
+    keeps its name (both engines drop by name), its referential actions, and **two PostgreSQL
+    attributes that were being dropped in silence**. `match_type` is `MATCH FULL` / `MATCH PARTIAL`,
+    `None` meaning the unwritten `MATCH SIMPLE` so an untouched key round-trips exactly, and it is
+    the difference between refusing and accepting a **partially NULL** composite key: under `SIMPLE`
+    a row with any NULL in the key passes the constraint, under `FULL` only an all-NULL one does, so
+    recreating a `FULL` key as `SIMPLE` widens what the table accepts and says nothing. `deferrable`
+    is `DEFERRABLE INITIALLY DEFERRED` / `… INITIALLY IMMEDIATE` held whole, `None` being
+    `NOT DEFERRABLE`, and it changes what an application can *do*: `INITIALLY DEFERRED` is what lets
+    a transaction insert children before parents and have the key checked at commit, so a copy
+    restored without it refuses those inserts at statement time and the application fails against a
+    database that "restored fine". That this matters was already settled here —
+    `ddl::unrestatable_sqlite_clauses` names *"a foreign key's DEFERRABLE clause"* and **withholds**
+    the SQLite rebuild rather than drop it — so until now the same attribute was a refusal on one
+    engine and a silent drop on another, because the model had no field for either side to read.
+    `pg.rs` reads both off `con.confmatchtype` / `con.condeferrable` + `con.condeferred` through
+    `fk_match` and `fk_deferrable` (`condeferred` without `condeferrable` cannot happen and is read
+    as the default rather than invented into a clause), and `ddl::fk_clause` emits them in the
+    **grammar's** order — `MATCH`, then the actions, then `DEFERRABLE` — which is the language's and
+    not a layout preference. Both stay `None` on the other two engines and nothing about them
+    changes: MySQL parses `MATCH` and ignores it, and SQLite honours no `MATCH` while
+    `pragma foreign_key_list` reports no deferrability at all — so the model says nothing rather than
+    guessing, and a SQLite key declared `DEFERRABLE` goes on being refused a rebuild by
+    `unrestatable_sqlite_clauses`, which reads the declaration *text* and is the one place that can
+    see it. `ViewOptions` is the same
     idea for a view (check option, MySQL definer/security/algorithm, PG storage params +
     `materialized`) — `CREATE OR REPLACE VIEW` replaces the whole view, so what isn't restated
     resets, and `SQL SECURITY DEFINER → INVOKER` is a privilege change. `definer_sql` quotes the
@@ -4557,6 +4637,23 @@ existing prose was left alone.
     (SQLite's `rowid`), or `None` — which is every MySQL and PostgreSQL table, every view, and every
     SQLite `WITHOUT ROWID` table. `filter::table_query` reads it to decide whether to project it, so
     no caller has to test which engine it is holding.
+    **`TableInfo::shape()` is the question with three answers, and `is_view` is the one with two.**
+    `information_schema.TABLE_TYPE` gives three, and MariaDB stores a `CREATE SEQUENCE` as a one-row
+    table listed beside the real ones — so `is_view` put it on the *not a view, therefore an
+    ordinary table* side and it was offered every table action there is: it arrived with eight
+    internal counter columns (`next_not_cached_value`, `minimum_value`, …), sat in the Tables
+    folder, opened in the designer offering `ALTER TABLE`, and dumped as `CREATE TABLE` **without**
+    the `SEQUENCE=1` option that is what makes it one — so restoring the dump gave a plain table and
+    every `NEXTVAL(sq1)` in the restored schema failed (measured on MariaDB 10.11.14). Passing
+    `is_view = true` for one would be no better: it is not a view either, and the view-only entries
+    (triggers, refresh, *Edit view*) would light up instead. `TableShape::{Table, View, Sequence}`
+    makes it a case somebody has to answer, and the consumers are the places that decide what an
+    object *is*: `dump.rs`'s `DROP`-and-data arms and `ui/overlays.rs`'s menus, then
+    `propose::resolve_target` (the one gate whose whole job is refusing a non-table),
+    `erd::build_graph`'s `drawable` filter, `stats::drop_prompt`, and `create_ddl_script`'s
+    partition below. `is_view` and `is_sequence` stay public because the three backends fill them
+    directly and privatising them needs a constructor first; what they are not is the question a
+    decision asks.
     **`index_disabled_sql(version)` is how the MySQL family is asked whether an index is switched
     off**, and it is pure and here because the column that answers differs in three ways at once. A DBA
     hides an index to test a plan change — MySQL 8's `ALTER TABLE … ALTER INDEX … INVISIBLE`,
@@ -4637,7 +4734,11 @@ existing prose was left alone.
     standalone types, then base tables, then views, then the sequences that stand on their own —
     because an omitted foreign key leaves a script that still runs while an omitted type fails on
     the first `CREATE TABLE`; a sequence a `serial` or an identity column already creates is
-    skipped, since restating it fails on a name that exists. `create_ddl_script_all(dialect)` is
+    skipped, since restating it fails on a name that exists. **The split is three ways and goes
+    through `shape()`**: a two-way `partition(|t| t.is_view)` put a MariaDB sequence in the
+    base-table half, harmless only because `create_ddl` then withheld it — which is a second
+    function's accident rather than this one's decision — so sequences are filtered out before the
+    partition and a sequence in this script is the `objects_in(Sequence)` list's business. `create_ddl_script_all(dialect)` is
     the database node's analogue: it walks `schemas()` in **display** order (`public` first, then
     alphabetical), so the script reads down the tree it was raised from, and joins only the
     namespaces that produced something rather than leaving a blank run where an empty one was.
@@ -4811,7 +4912,22 @@ existing prose was left alone.
     follow.** `main.rs`'s `fetch_landing` stamps each per-database fetch so an older one can't
     overwrite a newer (`try_update` guards a *disposed* scope, not a superseded fetch — press the
     connection-wide Refresh, apply an `ALTER`, and the pre-`ALTER` snapshot landed last and stayed,
-    with nothing to detect it and no further refresh scheduled). And `ConnNode::refreshing` makes
+    with nothing to detect it and no further refresh scheduled). **That stamp is read after the
+    fetch, though, and there is a second question to ask before it.** The introspection semaphore
+    (`main.rs`'s `introspect_permits`) is process-wide and `tokio::sync::Semaphore` is FIFO, so
+    opening a 200-database connection and then switching to a three-database one left the incoming
+    connection's three tasks queued behind the outgoing one's remaining ~196 — each of which still
+    opened a connection to the **abandoned** server and read a whole database's catalogue before
+    `fetch_landing`, consulted only once `fetch_schema` returns, threw the result away. Every
+    database on the new connection sat at "loading" until the old load drained: ~15 s at 300 ms a
+    database, ~100 s at 2 s. So a queued fetch asks `fetch_still_wanted(spawned_at, now)` **after
+    acquiring its permit and before the read**, against `schema_epoch()` — an `AtomicU64` bumped by
+    `clear_schema_tree`, which is every connection switch. Atomic and process-wide because that is
+    what the queued task can reach: the per-node `fetch_seq` stamps live in an `Rc<RefCell<…>>` on
+    the UI thread while the fetch runs on the tokio runtime. A superseded task releases its permit
+    immediately and the queue drains at once; `schema::introspection_order`'s whole purpose — put
+    what is on screen first — only orders within one enqueue, and could not survive the queue
+    outliving the connection it was enqueued for. And `ConnNode::refreshing` makes
     "a re-introspection is in flight" askable, which `table_designer::loaded_table` — the one
     funnel all four schema editors go through — answers `None` for: seeding a draft from a
     pre-apply `TableInfo` is what makes MySQL's `MODIFY COLUMN` silently restate the old column
@@ -5319,10 +5435,15 @@ existing prose was left alone.
       dead-ended at the card. The order is the one a caller means: an explicit `schema` field, then a
       qualifier written into `table`, then the bare name — which `DbSchema::find_table` already
       resolves preferring `public`, so the ordinary PostgreSQL case needs no separate default. **It
-      refuses a view**, which is the other half of being one function: `DbSchema::tables` holds views
-      too, every earlier caller of these lookups came from a tree row whose kind the user had already
-      seen, and a view laid under `TableDraft::from_table` emits `ALTER TABLE` — which PostgreSQL
-      *accepts* for a rename, under a modal that says "Rename the table".
+      refuses anything that is not a base table**, which is the other half of being one function:
+      `DbSchema::tables` holds views too, every earlier caller of these lookups came from a tree row
+      whose kind the user had already seen, and a view laid under `TableDraft::from_table` emits
+      `ALTER TABLE` — which PostgreSQL *accepts* for a rename, under a modal that says "Rename the
+      table". The test is `shape() != TableShape::Table` and **not** `is_view`: this is the one gate
+      whose whole job is refusing a non-table, and it was asking a two-answer question about an
+      object with three, so a MariaDB sequence fell on the "therefore an ordinary table" side, a
+      `TableDraft` was built from its eight counter columns, and the plan was `ALTER TABLE sq1 …` on
+      a sequence.
       **`apply`'s own guard has to decompose the name the way `resolve_target` does**, which is
       `names_the_same_table`. It compared the raw `proposal.table` to the bare `current.name`, so a
       qualified `sales.orders` resolved through the paragraph above and then dead-ended one line
@@ -5659,6 +5780,27 @@ existing prose was left alone.
     **Every arm carries `ran`**: a script is not transactional unless the file said so, so "it
     stopped" always leaves "how much of it happened?", and that count is the only answer — which is
     why an exhaustive test asserts no arm drops it.
+    **The panel *is* the confirmation, so the file it described has to be the file that runs** —
+    which is what `FileStamp` and `probe_still_describes` hold together. The probe reads a bounded
+    prefix and keeps only counts; the run re-opens the path and sends whatever is there at that
+    moment, and nothing else on the path ever looks at the content, `sql::script_verdict` treating a
+    whole `.sql` file as a write *without reading it* by design. So between the two opens the bytes
+    were free to change under a consent that named the old ones — benignly, when the user edits the
+    script in their editor while the modal stands (it is not window-modal and nothing re-probes),
+    and not benignly when the file is replaced outright. The failure and cancel reports compound it:
+    they read the probe *after* the run, so they would say "opened no transaction, so every
+    statement that ran is still applied" about a file that did open one. `FileStamp::of` takes the
+    length and the modification time in milliseconds off the file the probe opened, the stamp rides
+    on `ScriptRequest` beside the `Probe`, and `app/script.rs`'s reader refuses — *"This file changed
+    on disk after it was read, so the summary above is not what would run. Choose it again."* —
+    rather than running a file the panel never described. This is `sqlfile::changed_on_disk`'s
+    question for the **other** `.sql` path; that one compares *text*, because a tab holds the text it
+    last saved, and nothing here holds the file's bytes at all, so the comparison is the stamp.
+    **A missing timestamp is not a mismatch**: some filesystems report none, refusing on that would
+    make the feature unusable there for no gain, and the length still answers the replacement case,
+    which is the one with teeth. Two files of the same length modified within the same millisecond
+    are indistinguishable to this — stated rather than papered over, the alternative being to hash a
+    file the panel deliberately does not read whole.
     **The write guard for this path is `sql::script_verdict`**, not `run_verdict` — see the
     invariant.
   - `sqlfile.rs` — the pure half of opening and saving a tab's SQL as a `.sql` file on disk: what a
@@ -5939,6 +6081,24 @@ existing prose was left alone.
       reads a signal. **A `Suggestion` carries a `SuggestGlyph` rather than an icon**: the *reason*
       for its leading glyph (a column's type family, an FK target, an in-scope alias), which
       `completion::glyph_icon` turns into an SVG, so no `&'static str` icon body reaches core.
+      **The comparator is asserted by *calling* `rank`, which is what being callable was for.**
+      `completion.rs` held a test named `the_callers_comparator_preselects_the_prefix_match` whose
+      own doc claimed it covered the composition — and it built its rows from `fuzzy_score` and
+      sorted them with a **copy** of the comparator written inline, a copy missing the tier and the
+      `recency_bonus` term. `recompute_completions` sets `sel = 0` and `accept_completion` splices
+      `items[sel]`, so this sort *is* what Enter inserts; flipping the real one to score-*ascending*,
+      so the popup preselects the worst match, left the whole workspace green, because the replica
+      sorted its own vector. It is deleted, and the two that replace it are here:
+      `the_comparator_preselects_the_prefix_match_and_buries_the_interior_one` — prefix match first,
+      a non-match absent from the list entirely, and the interior match last of the three, compared
+      against its siblings rather than against the whole list, which also holds keywords and
+      functions — and `a_recently_used_name_is_lifted_past_a_better_scoring_one`, which is the term
+      the replica dropped. Both fail against that flip. **And the star-expansion arm had never been
+      called at all**: every one of the six construction sites in the workspace passed `star: None`,
+      so the row that replaces the `*` was asserted nowhere — not its wording, not its `replace`
+      range, not its `insert` — and restoring a hard-coded `"{ncols} columns"` over the singular
+      `1 column` passed the suite.
+      `the_star_expansion_row_says_its_column_count_and_replaces_the_star` is that caller.
     - `resultsel.rs` — the same rules one strip lower: which **result** panel is shown, and which
       ones a run is allowed to replace. `after_run` is the feature in one function — the pinned
       panels, in their order, then the run's fresh ones — and `active_after_run` answers the other
@@ -6107,7 +6267,13 @@ existing prose was left alone.
         least reliable exactly below that — it reports 0 for a table holding a handful of rows, so
         *"Delete all ~0 rows in orders?"* would answer a question the user didn't ask, wrongly. A
         figure the engine actually counted is named at any size above empty; a **view** is never
-        given one, since the rows belong to the tables under it.
+        given one, since the rows belong to the tables under it. **`drop_prompt` takes a
+        `TableShape` rather than an `is_view` bool**, and so has three sentences: the view one
+        (*"Anything built on it goes too"*), the table one that may name rows, and a third for a
+        sequence — *"Drop sq1? This can't be undone."*, with no rows to name and nothing built on
+        it, a sequence being a counter. The boolean has two answers and the object has three, so a
+        MariaDB sequence took the *table* sentence and the user was asked to confirm dropping "all N
+        rows in it" about a counter.
       - **`SchemaStats` carries a lookup index and its `tables` are private**, because the badge
         lookup is per *row* of the schema tree and one landing invalidates every badge in the
         database at once: `iter().find` cost 4.2 ms at 2,000 tables, 24.8 ms at 5,000 and 95.9 ms at
@@ -6204,7 +6370,7 @@ existing prose was left alone.
   `PING_TIMEOUT`, `kill_session` by `CANCEL_TIMEOUT` — and neither was. A host that stops answering
   at the packet level does not refuse the connect, it swallows it, so the `open` takes the OS TCP
   timeout: 21.0 s on MySQL, 63 s on PostgreSQL, this crate's own measurement. `fetch_sessions` is
-  the method that most needed it, being the only one in the app that runs **on a timer, forever**:
+  the method that most needed it, running **on a timer, forever**:
   a poll against a black-holed host blocked for 21 s showing the previous snapshot with no error,
   beside a health check that had already said *Disconnected* at five seconds — and the polls
   *stacked*, because regaining window focus re-runs the panel effect, which bumps the activity
@@ -6217,9 +6383,20 @@ existing prose was left alone.
   Around the dispatch and not inside each arm, for `Db::fetch_databases`' reason: PostgreSQL's
   `connect_maintenance` tries three candidate databases in turn, so a per-attempt bound is three
   times the deadline it claims. `every_reachability_path_is_bounded_by_a_timeout` is a source gate
-  over all four of `ping`/`fetch_databases`/`fetch_sessions`/`kill_session`, because the failure is
-  a host that never answers and no unit test can stage one — a closed port is *refused*, instantly,
-  and only a packet filter reproduces the hang.
+  over `ping`/`fetch_databases`/`fetch_sessions`/`kill_session` **and `fetch_table`**, because the
+  failure is a host that never answers and no unit test can stage one — a closed port is *refused*,
+  instantly, and only a packet filter reproduces the hang.
+  **`fetch_table` is the app's second forever-timer, and this gate's own doc used to say in so many
+  words that `fetch_sessions` was the only one.** The Live
+  Monitor re-arms `fetch_table` every two seconds for as long as its modal is open, and the premise
+  that admitted it to the already-bounded set — *the unbounded reads all take a
+  `CancellationToken`* — was true of the signature and false of the caller, which built a token
+  inline, stored it nowhere and cancelled it never. A dark host therefore cost the OS connect
+  timeout on every tick, under a modal still showing the last snapshot with no error, beside a
+  health check that had said *Disconnected* at five seconds. Its deadline is `PING_TIMEOUT`, and the
+  trade is worth naming: a poll that cannot finish inside it is one the monitor's two-second cadence
+  could not have kept up with anyway, and saying so beats a silent stale snapshot. The list the gate
+  reads is *the set of methods a timer calls*, so a method joining that set belongs in it.
   **`Db::fetch_principals`/`Db::fetch_grants`** are the Users and privileges browser's backend, and
   they gate on `users::supports_users` before the engine `match` for the same reason those two do,
   with `NO_USERS_MSG` as the one sentence both raise. The MySQL half is `collect_my_users`: **five
@@ -7006,6 +7183,20 @@ existing prose was left alone.
   were, and `the_script_guards_itself_when_run_outside_run_ddl` (which was itself green against the
   cascade it guards, having opened one connection where the real path opened many) and
   `a_rebuild_survives_a_view_over_the_table_it_rebuilds` for the tests that pin it now.
+  **`run_ddl` wears that shape too now, and it was the leg left out of it.** The DDL preview offers
+  Stop on SQLite — `ddl_rolls_back_as_a_whole(Sqlite)` is true, so the footer's only enabled button
+  is a red *Stop* and Escape maps to it — while the runner consulted the token only *between*
+  statements. A rebuild's copy step is one `INSERT INTO t_schemaic_rebuild (…) SELECT … FROM t` over
+  the whole table, so on a multi-million-row table the modal could not be dismissed and its backdrop
+  covered the workspace for the length of the copy with the button still reading Stop. On a
+  **single-statement** plan it was worse than a hang: the token is checked *before* each statement,
+  so a Stop arriving during the only statement was never seen and the plan ran on to its `COMMIT`.
+  It now takes `get_interrupt_handle` off the connection before entering the blocking section —
+  simpler than `run_script`'s, which has to hand the handle back *out* because it opens its
+  connection inside — with an async watcher that fires it when the token trips. An interrupt
+  surfaces as an ordinary `rusqlite` error, so the token is what tells the two apart: reporting
+  `SQLITE_INTERRUPT` as a failure would name the user's own Stop as a fault in their plan. The pin
+  is `a_stopped_plan_interrupts_the_statement_rather_than_waiting_for_it`.
   **A long read blocks a write here, and on neither other engine** — SQLite takes one
   write lock over the whole file, so a whole-table export or import holds a write off until it
   finishes. Measured against a real 53 MB file in rollback-journal mode (`journal_mode = delete`,
@@ -7495,6 +7686,16 @@ existing prose was left alone.
   length — resolves the key through `analyze_edit`, writes through `GridWrite` and reads the row
   back. It asserts every writable case was reached **and** how many really went through a resolved
   key — `Target::expected_keyed_cases`, declared per leg (19 / 19 / 24) the way `expected_cases` is.
+  **The first of those two was a tautology and is the declared number now.** `keyed` and `plain` are
+  incremented exactly once per iteration of `type_cases().filter(writable)` — the `keyed -= 1;
+  plain += 1` re-classification preserves the sum — so asking that same iterator for its length made
+  both sides one pure function of one input and the equality could not fail: delete two cases from
+  `cases::MYSQL_FAMILY` and both numbers fall together while the test reports green having written
+  nothing through them. That is verbatim the failure `suite.rs::report` was rewritten to end, and
+  the accessor built for it, `Target::expected_writable_cases()`, was already here and called from
+  `suite.rs` alone. `every_leg_declares_the_number_of_cases_it_has` now bounds the *keyed* number
+  too — `> 0`, and `<= expected_writable_cases` — because a hand-maintained count with no relation
+  to anything is exactly what it exists to keep honest.
   **That was `assert!(keyed > 0)` and it guarded nothing**, which is `suite.rs`'s `TYPE_CASE_FLOOR`
   failure one file over: the test rebuilds the fixture on an `INTEGER` key whenever the model
   refuses the case's own type — correctly, that being C2/C4 — so a change to `edit.rs`'s refusal
@@ -7566,7 +7767,14 @@ existing prose was left alone.
   generated expression or an index method while doing what it was asked went green. The type name
   goes through `ddl::types_equal`, a server rewriting `INT` as `int(11)` being no loss, and a column
   the draft *added* is compared only on what the draft **stated** — `auto_increment` and an implicit
-  key's type are the engine's to fill. `a_renamed_column_keeps_its_indexs_kind` is what that bought:
+  key's type are the engine's to fill. **`invisible` is the exception to that, and is asked
+  unconditionally**, unlike the collation, comment and `ON UPDATE` beside it: those are fields a
+  server fills in or does not read back, so asking about one the draft left empty is a false
+  failure, while a column coming back *visible* against a draft that said invisible is the whole
+  defect — the retirement undone, `SELECT *` returning the column again — and a conditional check
+  could not see it. Five more of the apply tests were given `assert_matches_draft` as well, since a
+  helper only half the file calls is a helper that half the file's emitters are unguarded by.
+  `a_renamed_column_keeps_its_indexs_kind` is what that bought:
   `FULLTEXT` is an index *kind* rather than a flag, any edit to a MySQL index is a drop-and-add, and
   an edit that restates the key without it leaves a plain `KEY` behind so every `MATCH … AGAINST`
   answers `ERROR 1191` — which `assert_round_trips` passes over, and which the test closes by making
@@ -7857,6 +8065,21 @@ existing prose was left alone.
   against the raw name would pass only for a name with no wildcard character in it, which is the one
   case the escaping does not matter for — so this is also the live guard on
   `export::ident_pattern_sql`, which nothing before it reached.
+  **Both revoke assertions hold a sibling grant the revoke must not touch**, and until they did,
+  every one of them got *easier* the broader the revoke was. With one grant on the account, a
+  `REVOKE` naming the whole server satisfies "the privilege is gone" perfectly — so collapsing
+  `object_sql`'s revoke path one level had nothing to fail it, on the one feature whose entire
+  safety property is which object a statement names. PostgreSQL makes that sharper still: revoking a
+  privilege a role does not hold is a silent no-op there rather than an error, so an over-broad
+  revoke leaves no trace at all, where the MySQL family answers `ERROR 1141` — which is why the gap
+  is PostgreSQL-shaped. Each test now holds a second grant on a **different object at the same
+  level** — a second scratch database, a second table, a second sequence — revokes the named one and
+  asserts the sibling is still there; collapsing `object_sql`'s revoke path one level (Table →
+  Schema) takes the sibling with it and is what fails. The sibling's *name* is load-bearing and
+  says so at both sites: these are substring tests over the server's own grant text, so a sibling
+  called `gt2` beside `gt`, or `grantrt2` beside `grantrt`, cannot be told from the original by
+  `contains` — hence `gx` and `sibdb`. The sibling is also revoked before teardown, PostgreSQL
+  refusing to drop a role anything still grants to.
   **The role test reads its role back out of the catalogue before touching it, and that is what makes
   it a test.** It created and dropped one through the principal it had *drafted* —
   `AccountDraft::principal` gives a role no host — so the catalogue's own representation, the one
@@ -7893,9 +8116,22 @@ existing prose was left alone.
   tier to `mariadb` reported green under all three legs' names with nothing on screen separating
   the leg that ran from the two-thirds that returned immediately. `endpoint::note_skipped` writes
   to the locked stderr handle instead, which is past the macro's capture-aware path, and
-  `no_skip_notice_goes_through_the_captured_macro` scans `main.rs` and `endpoint.rs` for the macro
+  `no_skip_notice_goes_through_the_captured_macro` scans for the macro
   spelling — a source assertion because it has to be one: a `#[test]` cannot observe libtest's
-  capture of its own run. Endpoints come from one environment variable per field (no URL to
+  capture of its own run. **Its corpus is the whole `tests/live/` directory, and was the literal
+  list `["main.rs", "endpoint.rs"]`** — the two files that already answered correctly — while
+  `routines.rs` held two live violations on the day the gate landed. A gate whose corpus is
+  narrower than the rule it states is the shape this tier keeps producing, so it reads the directory
+  rather than a list somebody has to remember to extend, with a floor (`seen >= 10`) that notices a
+  `read_dir` matching nothing, and two exemptions named in it: `scratch.rs` and `users.rs` report a
+  *leak* on a path that is about to fail the test anyway, so libtest will print it. **And a leg that
+  runs and asserts nothing is the other silent green, which now has a channel of its own.**
+  `endpoint::note_no_op(target, reason)` is `note_skipped`'s sibling for a test whose subject is one
+  engine's feature and which returns early on the other two — the more common case, and the one
+  `routines.rs`'s two `eprintln!`s were: four of six leg-tests reported green with nothing on
+  screen, on every run including CI's, under a doc claiming the opposite. It is deliberately *not*
+  deduped the way `note_skipped` is, that one being about a target and this one about a leg with a
+  different reason each time. Endpoints come from one environment variable per field (no URL to
   parse, no password to encode), defaulting to this project's own test bed.
   **Nothing here touches a database it did not create.** `scratch.rs` generates every name with the
   `schemaic_it_` prefix, the process id and the leg, and both the create and the drop path assert
@@ -8605,7 +8841,18 @@ existing prose was left alone.
     exists to protect went to the same place. The other three keep argv and each reason is written at
     the capability: OpenCode's `run` documents a `message..` positional and no stdin, Antigravity
     reads stdin only under its *session* shape, and Claude's stdin form passes context *alongside* a
-    positional rather than replacing one. `turn_stdin_prompt` and `inline_stdin_prompt` build what
+    positional rather than replacing one. **OpenCode's leg carries a date now — re-measured
+    2026-09-15**, `opencode run --help` still listing `message..` as a positional with none of its
+    twenty-odd options taking the prompt on stdin. Recorded with the date because this is the second
+    review to raise the question and both times the answer cost one `--help`; Claude's and
+    Antigravity's legs stay unverified *here*, neither binary being on the machine that measured the
+    others, and that is said rather than assumed. **What the three still on argv cost is stated at
+    the capability too**, since that is why it keeps being raised: `/proc/<pid>/cmdline` is
+    world-readable on Linux, so a one-shot turn's whole prompt — attached grid rows and Fill/Seed's
+    sample included — is visible to every local account for the life of the process. Everything is
+    ready for a flip: `stdin_prompt` is threaded through `InlinePlan`, `run_inline` pipes it whenever
+    the capability is true, and `turn_stdin_prompt` covers the persistent shape, so moving one leg is
+    this `match` arm and a measurement against the installed binary. `turn_stdin_prompt` and `inline_stdin_prompt` build what
     goes there from the same `prefixed_prompt` call the argv arm would have pushed — one
     construction, two destinations — and both Codex arms omit the positional under the same
     predicate, which is what `the_prompt_travels_exactly_once` and
@@ -11794,7 +12041,7 @@ existing prose was left alone.
     abbrev and inserts the **body**, through the same `Suggestion::insert` override an FK-JOIN row
     uses.
     **The `SchemaIndex` is memoised per UI thread beside the catalogue, and it was the half that
-    never got it.** `SchemaIndex::build` walks every loaded database, every table and every column,
+    never got it.** `index::build` walks every loaded database, every table and every column,
     allocating a fresh `ColMeta` per column plus three `HashMap`s, and `recompute_completions`
     called it directly — a function that is deliberately undebounced (`editor_pane` schedules it at
     `Duration::ZERO`, one tick, only so the caret has settled), so it ran on effectively every
@@ -11806,6 +12053,19 @@ existing prose was left alone.
     re-introspection changes and so nothing has to be invalidated by hand. `LoadedNode` exists so
     the snapshot is taken out of the signals **once**: reading `node.schema` twice could key an
     index on a schema it was not built from.
+    **`index::build` had no test of its own**, which is the other thing to know about it: it is a
+    pure function over a slice — no signal, no `Editor`, nothing that needs a mounted view — while
+    the hidden-database rule it enforces was pinned only for the *catalogue* half (`catalog_tests`),
+    a different function over a different structure. `index_tests` covers what it decides: a hidden
+    database contributes nothing at all, not its name, not its tables, not its columns; the **active**
+    database contributes even when it is hidden, which is what keeps a tab usable after its own
+    database is hidden; only the active database reaches the unqualified pool while the qualified
+    maps hold every database, which is what an explicit `otherdb.table` completes from; a foreign-key
+    column is marked and its siblings are not, that flag being the FK tint's source; two databases
+    sharing a table name merge their columns once each, exercised on both halves because the
+    `entry.is_empty()` fast path exists to keep the ordinary case out of the quadratic merge and only
+    the *second* table takes it; and the database list dedupes case-insensitively, so two connections
+    onto one server spelling a database differently are one row in the popup.
   - `tabs.rs` — query-tab strip, and where a **`.sql`-backed tab** shows itself. The state behind
     that is four signals on `Tab`: `path`, `disk_sql` (the file's text as of the last open / save /
     reload — `None` means *unknown*, which reads as modified, the safe direction), `file_format`
@@ -13158,6 +13418,42 @@ existing prose was left alone.
     the same floor `dividers::scaled_arg_gate` and `theme::color_arg_gate` keep on their exemptions.
     App-crate sources come through `source_gate::crate_sources` too and are skipped by path here: the
     bundle is this crate's, and `app_view` builds it rather than taking it.
+    **The counter counts *parameters*; it used to count line shapes.** It matched a fixed set of
+    literal spellings — own-line forms with a trailing comma, inline forms anchored on the opening
+    paren — so `fn thing(x: Foo, ui: &Ui)` was invisible: `ui` had to be **first**, and a single-line
+    signature has no trailing comma on its last parameter. Three sites were exactly that
+    (`compare_view.rs`'s `body_for` and `ready_body`, `tabs.rs`'s `tab_chip`), and the floor test
+    asserts `found == allowed` through this same counter, so neither test could see them while the
+    ratchet's own rule — *a file not on the list may not take one at all* — was walked past by any
+    new one-line signature in any file. `compare_view.rs` goes 6 → 8 and `tabs.rs` 1 → 2, which is
+    what those files declare *now* rather than a widening, and `widgets.rs` joins the list at 1:
+    `MenuFlags::of`, which gathers a flag out of six child bundles and so genuinely needs the root
+    one — the case the rule's own advice about taking the child bundle covers, six times over, and
+    invisible until the counter learned to read `&crate::Ui`.
+    **The footer's left segments collapse right-to-left, and coming *back* is a different question
+    from going away.** `collapsing_seg` hides a status segment once its right edge comes within
+    `footer_collapse_gap()` of the right-hand icon group, and a hidden one freezes its measured edge,
+    so all it can do is *predict* whether it would fit again. Freezing alone meant it could only
+    return when the **window** widened, which is why `footer_seg_edge` also reads a shared `left_edge`
+    — a neighbour getting shorter is the ordinary way room appears: commit a transaction and the Tx
+    pill, Commit and Rollback all go at once, freeing ~150px; switch to a SQLite connection and
+    `mode_seg` disappears outright; "Write mode" becomes "Read only". **That prediction had no
+    ordering term, and the order is the premise everything else rests on.** Segments hide
+    right-to-left, so the hidden set is a *suffix* — which is what `footer_seg_edge` means by "the
+    right edge of the nearest **shown** segment to this one's left" — yet every hidden segment read
+    the same `left_edge`, so they came back in order of **width** instead of position. Narrow the
+    window until the Tx pill, Commit, Rollback, CPU and RAM have all gone, then shorten anything to
+    their left and `left_edge` drops ~60px: Commit predicts `L+57` and fits, the Tx pill predicts
+    `L+130` and does not, and the footer settles at `… Read only Commit` — a lone commit action with
+    no pill saying a transaction is open and no Rollback beside it. It is *stable* rather than a
+    flicker, because once Commit is drawn the pill re-predicts `L+187` and still does not fit.
+    `footer_seg_may_return(width, shown, left_shown)` is the missing term: `collapsing_seg` takes its
+    left neighbour's shown-flag and publishes its own, so a segment may return only while everything
+    to its left already has, and the hidden set stays a suffix.
+    `the_prediction_agrees_with_the_measurement_it_causes` pins the anti-oscillation property for
+    **one** segment in isolation, which is the limit worth knowing about it: with two or more hidden
+    segments sharing a `left_edge`, the prediction agrees with the measurement only for whichever
+    returns leftmost.
     **The terminal's geometry is three pure functions, and two of them take the padding as a
     parameter because it is `theme::scaled(6.0)` and not 6.** `term_cell_wh(font)` is the IBM Plex
     Mono cell metrics; `term_fit(w, h, pad, cw, ch)` is how many columns and rows a surface holds;
@@ -13921,6 +14217,23 @@ existing prose was left alone.
   the *save*, which fails open because `ai_session` is `None` by then: nothing is written at that
   moment and the corruption stays in the signal. So the per-turn branch kills and sets `abandoned`,
   and the close is `if !ended && !abandoned` — a Stop still reports, a drop says nothing at all.
+  **That flag covered the turn's *terminal* snapshot and left the streaming ones, so every
+  `AiStreamMsg` carries the session that produced it now.** The consumer applies a snapshot to
+  `v.last_mut()`, and after a switch the session task is parked in a `tokio::select!` with **both**
+  arms ready — `rx.recv()` yielding `None`, and the reader yielding whatever the child wrote in the
+  meantime — which `select!` without `biased;` picks between at random. When the reader arm wins,
+  connection B's last answer is replaced by A's partial text and marked pending, so the bubble spins
+  for the rest of the session (`ai_busy` is already false and no further snapshot is coming) and the
+  corrupted message rides B's next `persist_chat` into `chats.json`. `AiSession::session_id` comes
+  from `next_session_id` — process-wide and monotonic, so an id is never reused, which a `conn_id`
+  could not promise here: switching away and back gives the same connection a *different* session
+  and the first one's stale snapshots would still match. The panel's consumer asks
+  `snapshot_is_current(live, msg)` and discards anything from a session it is not showing, `live`
+  being `None` once the switch has taken the session, so a snapshot arriving after that belongs to
+  nobody. An id closes the **class** where `biased;` would only narrow the window — a line already
+  decoded before the drop is still in flight — and it is its own function because the race has no
+  unit seam of its own, being an unbiased `select!` between a closed channel and a child's stdout,
+  which is also why the guard beside it is a source check.
   The MCP subprocess gets its DB endpoint as JSON in `$SCHEMAIC_MCP_ENDPOINT` via a
   per-session `--mcp-config` file (removed on drop) — never argv, so credentials don't leak
   to other same-user processes. **That file, and every other per-session file carrying the endpoint,
@@ -14725,6 +15038,12 @@ existing prose was left alone.
     disk error — closes the channel and lets the executor finish; and `ReadEnd::Stopped` is returned
     with no message on purpose when the send fails, because that means the executor went away and it
     is the one holding the reason.
+    **The reader's first act is to check that this is still the file the probe described.** It is the
+    *second* open of the path: `ScriptProbeDoneFn` hands the probe back as `(Probe, FileStamp)`, the
+    stamp rides on `ScriptRequest` beside the counts the panel printed, and `probe_still_describes`
+    compares it against the file just opened. A mismatch is a `ReadEnd::Failed` telling the user to
+    choose the file again, not a run under a summary that describes different bytes — see
+    `core::script` for why those counts *are* the confirmation.
     **The bounded channel is the progress design.** The reader cannot get more than `SCRIPT_QUEUE`
     statements ahead of the server, so `Splitter::consumed` tracks what has actually been applied
     closely enough to report from — which is why there is no progress channel out of the executor,
@@ -15344,6 +15663,27 @@ Re-introducing the anti-patterns these guard against is a regression:
   write?" gate says yes to an empty base — and
   `an_unfiltered_read_reruns_as_itself_even_when_it_cannot_be_rewritten`, the join-and-CTE property
   the read-more link exists for).
+  **The terminal is where this model stops, and the position is stated here rather than left to be
+  inferred.** The sentence above is *every path that executes user SQL*, with two named refusals
+  beside it — and a terminal running `mysql`, `psql` or `sqlite3` executes user SQL that never
+  passes through this app. No per-statement guard is possible there: the statements are typed into
+  another process, Schemaic sees bytes on a PTY, there is no `&[String]` for `run_verdict` to judge
+  and no moment at which to raise a bar. So the boundary of the model is the **launch** — and the
+  choice made was to gate that launch rather than only write it down. Both doors onto a database
+  CLI, the terminal panel's database icon and the schema tree's *Open in CLI*, are dimmed on a
+  read-only connection with the reason in the tip: the client they open is a full write session
+  carrying that connection's password in its environment, on a connection where the app refuses a
+  grid commit, refuses Apply in the DDL preview and refuses *Kill session* — which is the less
+  destructive of that pair and sits two clicks away in the same window. Neither door asked before;
+  the toolbar icon's enabled predicate was the literal `|| true` and the tree entry carried no
+  `.disabled(…)`. `read_only_gate::both_database_cli_doors_are_gated_on_read_only` holds it, a
+  source gate because both sites are closures inside view builders that need a mounted Floem tree.
+  What it reads is the **launch expression**, bounded to end where that expression does: with a
+  window measured in bytes, a tip that merely *says* "read-only" beside a button that is still live
+  satisfied the check, which is the disclosure without the gate. Its needles are assembled from
+  fragments for the reason every source gate here assembles them — the test names both launch sites
+  in its own prose, so a literal anchor matches there first, and that caught this one on its first
+  run.
 - **A row reaches the model only where `AiData` says it may, and the level is the connection's.**
   Every path that can put a cell value in a prompt — `run_query`, `describe_table`'s samples, the
   grid's attach-to-chat, AI Summary, AI Fill, AI Seed — is gated on
@@ -17017,6 +17357,17 @@ Re-introducing the anti-patterns these guard against is a regression:
   before the fix. `.with(|v| …)` borrows and tracks identically, so it is a drop-in. This was the
   review's most-repeated mechanical defect: reach for `with` on any collection, and keep `get` for
   small `Copy` values (`bool`, `f64`, `Option<usize>`).
+  **`consts::get_clone_gate` is the source gate over it, and its needle required the question to sit
+  *immediately* against the `.get()`.** A borrowing adaptor or a field access in between changes
+  nothing at all about the clone, so `filter.get().trim().is_empty()` — in a per-row reactive
+  closure — and `d.account_draft.get().name.trim().is_empty()`, which clones a whole draft to test
+  one field, both walked past it, and the gate could be described as having no population left while
+  it had four. `no_reactive_read_clones_a_collection_to_ask_about_it` now walks the whole `.get()`
+  chain to where the expression ends and fails only when every segment is a borrowing adaptor
+  (`trim`, `as_str`, `as_ref`, `as_deref`), a field access, or one of the questions itself — so
+  `.get().unwrap_or_default().len()`, which genuinely needs the owned value, still passes. The
+  widening found four live sites: two in `schema_tree.rs`, one each in `account_editor.rs` and
+  `snippet_edit.rs`, all now `with`.
 - **`RwSignal::set` never dedups** — setting a signal to its current value still notifies, re-running
   dependent `dyn_container`s (which dispose + rebuild their child scope + owned signals). Guard panel
   reveals: `if !matches!(right_panel.get_untracked(), Ai) { set(Ai) }` — a redundant `set(Ai)` while
@@ -18279,7 +18630,20 @@ renders the themed panel; the caller positions it absolutely. Used by the schema
   it had never taken focus. Up/Down step `menu_stops` and **wrap** (the swatches' rule, not the item
   list's: a menu is short and its ends read as adjacent), Home/End jump, Enter/Space runs the row and
   closes, Right/Enter opens a submenu and lands on its first child, Left comes back out, and Escape
-  closes an open submenu **before** the menu so "back" never skips a level. Two things the cursor
+  closes an open submenu **before** the menu so "back" never skips a level.
+  **Tab steps it too, and above all it is *claimed*.** The catch-all at the bottom of `menu_key`'s
+  match returned `Continue` for Tab, and an unprocessed Tab reaches floem's last resort:
+  `view_tab_navigation` over the **whole window tree**. A menu raised over the bare workspace has no
+  ring beneath it — a `menu_panel` registers as a ring-less `focus_root`, which
+  `widgets::innermost_ring_root` skips — so the workspace root's Tab backstop declined as well and
+  focus landed on an unrelated control behind the panel. The menu then stood there keyboard-dead:
+  ↑/↓/Home/End/Enter/Escape are all listeners on the panel, and floem delivers a key only to the
+  focused view and then to `main_view`, so none of them reached it, the menu could be dismissed with
+  the mouse alone, and Enter activated whatever the walk had found. It *steps* rather than merely
+  swallowing, because a key that does nothing is its own small defect and a `<select>`-shaped popup
+  steps on Tab anyway — and it asks `widgets::steps_ring`, which is the one predicate, so the
+  `primary_held` term comes with it and `Ctrl+Tab` stays the app's next-query-tab rather than being
+  eaten by whichever menu happens to be open. Two things the cursor
   must not do are why `menu_stops` exists rather than a range: resting on a **separator** makes Down
   look dead, and resting on a **disabled** row offers an Enter that silently does nothing. The
   pointer moves the same cursor (each row's `PointerEnter` sets it), so there is never a second
@@ -19685,7 +20049,20 @@ this bundle's.
   `FIND_COUNT_CELL_BUDGET`, with a comment saying the scan is "a String per cell" and must stay
   "well under a frame's worth of jank"; the jump, which is the expensive half, had neither. Running
   out means the jump does not move, which is what "no match" already looks like, and the readout
-  says `N+` off the same budget so the two surfaces agree about where they stopped looking. It is
+  says `N+` off the same budget so the two surfaces agree about where they stopped looking.
+  **They shared the budget's *value* and not its *window*, which is how a counted match came to be
+  unreachable.** `find_hits` walks row-major from display row 0 and stops after `budget` cells;
+  `next_match` walked `budget` cells from the **caret**, wrapping. Past the budget the two only
+  overlap: a 12-column result at the 200,000-row cap is 2,400,000 cells, so the count covers rows
+  0..166,666 while a caret at row 100,000 covered 100,000..199,999 and then 0..66,666 — and a single
+  match at row 80,000 was counted and could not be reached, Enter, next and prev all doing nothing
+  while the bar said there was a match. The mirror case reads `0/N+` with the caret sitting on the
+  matched cell. The walk is over `0..budget` **itself** now — the count's window, exactly — starting
+  at the caret within it and wrapping inside it, so a cell past the budget is neither counted nor
+  jumped to, which is the agreement the paragraph above claims. `find_hits_within(cells, q, budget)`
+  is the sibling that makes that seam testable: with the budget a constant, the only grid a test can
+  write is one small enough for the two windows to coincide — which is the one configuration in
+  which their disagreement is invisible, and is what all three of the existing budget tests used. It is
   split out of `grid_find` for the reason `find_hits` already is: the decision is testable without
   a live grid, and a budget nothing asserts is a constant nobody would miss. The cells themselves
   are read through `edit::GridCells::with_text`, which is what took two heap allocations per cell
