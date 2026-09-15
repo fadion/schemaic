@@ -514,6 +514,16 @@ pub struct SchemaComparison {
     /// neither has a level between the database and the table, so every
     /// object's namespace there is `None`.
     pub new_namespaces: Vec<String>,
+    /// Constraint and index names a table this comparison drops still holds and
+    /// a table it creates needs — see [`occupied_names`], which is what a table
+    /// **rename** produces on every engine.
+    ///
+    /// The resolvable ones are already settled: their drop was pulled ahead of
+    /// the creates, and they are kept only so a reader can see the plan is
+    /// deliberately not in phase order. The rest are disclosed through
+    /// [`SchemaPlan::destructive`], for [`SchemaPlan::cycles`]' reason — the
+    /// statements are all there and one of them will be refused.
+    pub name_clashes: Vec<NameClash>,
 }
 
 /// Why a comparison's tree is empty — see [`SchemaComparison::empty_reason`].
@@ -702,6 +712,39 @@ impl SchemaComparison {
             (ph, kind_rank(e.kind, e.status), rank, e.key())
         });
 
+        // ── name clashes between a table being dropped and one being created ─
+        //
+        // See [`occupied_names`]. A renamed table is a drop plus a create that
+        // both still carry the same constraint and index names, and the phases
+        // put every create ahead of every drop — so the create is refused for a
+        // name the table two statements below still holds.
+        let clashes = clashes_between(&entries, left, right, dialect);
+        // Pull each resolvable drop to the front of the table phase. `retain` +
+        // `splice` rather than a re-sort: the order everything else is in was
+        // just computed and is not up for revision.
+        let pulled: BTreeSet<String> = clashes
+            .iter()
+            .filter(|c| c.resolved)
+            .map(|c| c.freed_by.clone())
+            .collect();
+        if !pulled.is_empty() {
+            let moved: Vec<CompareEntry> = entries
+                .iter()
+                .filter(|e| pulled.contains(&e.key()))
+                .cloned()
+                .collect();
+            entries.retain(|e| !pulled.contains(&e.key()));
+            // Ahead of the whole table phase, not merely of the create it
+            // collides with: an earlier create in the same phase may hold the
+            // other half of a two-way rename, and a drop with nothing pointing
+            // at it is safe anywhere after the dependents come off.
+            let at = entries
+                .iter()
+                .position(|e| phase(e.kind, e.status) >= 2)
+                .unwrap_or(entries.len());
+            entries.splice(at..at, moved);
+        }
+
         // ── namespaces ──────────────────────────────────────────────────────
         //
         // Read off the entries rather than off `DbSchema`, which holds no list
@@ -738,6 +781,7 @@ impl SchemaComparison {
             cycles_create: c1,
             cycles_drop: c2,
             new_namespaces,
+            name_clashes: clashes,
         }
     }
 
@@ -971,11 +1015,28 @@ impl SchemaComparison {
         let has = |f: fn(&Change) -> bool| sets.iter().flat_map(|s| s.changes.iter()).any(f);
         let creates_a_table = has(|c| matches!(c, Change::CreateTable(_)));
         let drops_a_table = has(|c| matches!(c, Change::DropTable));
+        // **Only the clashes this plan's own ticks produce.** A comparison-level
+        // clash between two objects the user left out is not this plan's
+        // problem, and saying so above Apply would be a warning about
+        // statements that are not in the script.
+        let chosen_keys: BTreeSet<String> = self
+            .differences()
+            .filter(|e| include(e) && !e.needs_source() && !e.unplannable())
+            .map(CompareEntry::key)
+            .collect();
+        let clashes: Vec<String> = self
+            .name_clashes
+            .iter()
+            .filter(|c| !c.resolved)
+            .filter(|c| chosen_keys.contains(&c.freed_by) && chosen_keys.contains(&c.claimed_by))
+            .map(NameClash::note)
+            .collect();
         SchemaPlan {
             sets,
             dialect: self.dialect,
             cycles: (self.cycles_create && creates_a_table) || (self.cycles_drop && drops_a_table),
             omitted,
+            clashes,
         }
     }
 }
@@ -1061,6 +1122,10 @@ pub struct SchemaPlan {
     /// the plan at all: what is here is complete, and there is no tick to clear
     /// — the objects have no tick-box. So it discloses and does not refuse.
     pub omitted: Vec<String>,
+    /// One line per name a table this plan drops still holds and a table it
+    /// creates needs, where no order resolves it — see [`NameClash`]. Reported
+    /// through [`SchemaPlan::destructive`] for [`SchemaPlan::cycles`]' reason.
+    pub clashes: Vec<String>,
 }
 
 impl SchemaPlan {
@@ -1247,6 +1312,7 @@ impl SchemaPlan {
                     .to_string(),
             );
         }
+        out.extend(self.clashes.iter().cloned());
         out
     }
 
@@ -1337,6 +1403,161 @@ fn phase(kind: CompareKind, status: ObjectStatus) -> u8 {
         ObjectStatus::OnlyRight | ObjectStatus::Differing => 4,
         ObjectStatus::OnlyLeft => 5,
     }
+}
+
+/// The identifiers a table **occupies beyond itself** — the ones another table
+/// in the same scope cannot also use while this one exists.
+///
+/// A rename is the single most ordinary difference a schema-compare tool is
+/// opened for, and the pair it produces is always a drop plus a create: rename
+/// `orders` to `orders_old` on the left and the comparison yields `OnlyLeft
+/// table:orders_old` and `OnlyRight table:orders`. Neither `RENAME TABLE` nor
+/// `ALTER TABLE … RENAME TO` rewrites the names *inside* a table, so both sides
+/// still carry `fk_orders_customer` (or `orders_ibfk_1`, or `orders_pkey`) — and
+/// the plan emitted the `CREATE` before the `DROP`. MySQL and MariaDB scope a
+/// foreign-key constraint name to the **database**, so the create is refused
+/// with `ERROR 1826`; PostgreSQL scopes an index name to the **namespace**, so
+/// `orders_pkey` already exists and takes the transaction with it. Neither
+/// MySQL nor MariaDB rolls DDL back, so the user is left half-migrated under a
+/// message naming a constraint they never asked about.
+///
+/// **Per engine, because the scope is per engine** — a capability, not a
+/// dialect test dressed up as one:
+/// - MySQL/MariaDB key foreign-key constraint names to the database and index
+///   names to the table, so only the foreign keys are here.
+/// - PostgreSQL puts indexes and table-level constraints in the **same**
+///   namespace as tables, so both are.
+/// - SQLite keys index names to the database and names no foreign key at all.
+fn occupied_names(t: &TableInfo, dialect: SqlDialect) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    let qualify = |n: &str| display_name(t.schema.as_deref(), n);
+    match dialect {
+        SqlDialect::MySql => {
+            out.extend(t.foreign_keys.iter().map(|fk| qualify(&fk.name)));
+        }
+        SqlDialect::Postgres => {
+            out.extend(t.foreign_keys.iter().map(|fk| qualify(&fk.name)));
+            out.extend(t.indexes.iter().map(|ix| qualify(&ix.name)));
+            out.extend(
+                t.check_constraints
+                    .iter()
+                    .filter(|c| !c.column_level)
+                    .map(|c| qualify(&c.name)),
+            );
+        }
+        SqlDialect::Sqlite => {
+            out.extend(t.indexes.iter().map(|ix| qualify(&ix.name)));
+        }
+    }
+    out.remove(&String::new());
+    out
+}
+
+/// A name a table being dropped still holds and a table being created needs.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NameClash {
+    /// [`CompareEntry::key`] of the `OnlyLeft` table that still holds the name.
+    pub freed_by: String,
+    /// [`CompareEntry::key`] of the `OnlyRight` table that needs it.
+    pub claimed_by: String,
+    /// The identifier itself, qualified the way the engine scopes it.
+    pub name: String,
+    /// True when the drop was pulled ahead of the create, which settles it.
+    /// False when something on the left still references the dropped table, so
+    /// no order works and the clash is disclosed instead.
+    pub resolved: bool,
+}
+
+impl NameClash {
+    /// The sentence above Apply: which name, which two objects, and why no
+    /// order fixes it. Named for the objects rather than for the statement,
+    /// like every other line in [`SchemaPlan::destructive`].
+    pub fn note(&self) -> String {
+        let strip = |k: &str| k.split_once(':').map_or(k, |(_, n)| n).to_string();
+        format!(
+            "{} still holds {}, which creating {} needs — and {} cannot be dropped first \
+             because another table references it. One statement will be refused, and \
+             neither MySQL nor MariaDB rolls DDL back.",
+            strip(&self.freed_by),
+            self.name,
+            strip(&self.claimed_by),
+            strip(&self.freed_by),
+        )
+    }
+}
+
+/// Every clash between a table this comparison would drop and one it would
+/// create, in create order.
+///
+/// Only `OnlyLeft` against `OnlyRight`: a `Differing` table keeps its identity,
+/// so its constraint names are the *same table's* and the `ALTER` path already
+/// drops and re-adds each one in the right order.
+fn clashes_between(
+    entries: &[CompareEntry],
+    left: &DbSchema,
+    right: &DbSchema,
+    dialect: SqlDialect,
+) -> Vec<NameClash> {
+    let table_of = |src: &[TableInfo], e: &CompareEntry| -> Option<TableInfo> {
+        src.iter()
+            .find(|t| !t.is_view && t.name == e.name && t.schema.as_deref() == e.schema.as_deref())
+            .cloned()
+    };
+    let is_table = |e: &&CompareEntry| e.kind == CompareKind::Table;
+    let drops: Vec<(&CompareEntry, TableInfo)> = entries
+        .iter()
+        .filter(is_table)
+        .filter(|e| e.status == ObjectStatus::OnlyLeft)
+        .filter_map(|e| table_of(&left.tables, e).map(|t| (e, t)))
+        .collect();
+    if drops.is_empty() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for create in entries
+        .iter()
+        .filter(is_table)
+        .filter(|e| e.status == ObjectStatus::OnlyRight)
+    {
+        let Some(made) = table_of(&right.tables, create) else {
+            continue;
+        };
+        let claimed = occupied_names(&made, dialect);
+        for (drop, held) in &drops {
+            let Some(name) = occupied_names(held, dialect)
+                .intersection(&claimed)
+                .next()
+                .cloned()
+            else {
+                continue;
+            };
+            out.push(NameClash {
+                freed_by: drop.key(),
+                claimed_by: create.key(),
+                name,
+                resolved: nothing_else_references(&held.name, held.schema.as_deref(), &left.tables),
+            });
+        }
+    }
+    out
+}
+
+/// Is a table safe to drop **early** — before the creates that need its names?
+///
+/// Only when nothing else on the left side points at it. A referencing table
+/// has to be dropped (or have its foreign key altered away) first, and both of
+/// those sit at or after the phase the pull would move this in front of; moving
+/// the drop past them trades one refused statement for another. Where the
+/// answer is no, the clash is disclosed rather than reordered — the posture
+/// [`SchemaPlan::cycles`] already takes for a statement the server will refuse.
+fn nothing_else_references(table: &str, schema: Option<&str>, left: &[TableInfo]) -> bool {
+    let me = display_name(schema, table);
+    !left.iter().any(|t| {
+        display_name(t.schema.as_deref(), &t.name) != me
+            && t.foreign_keys
+                .iter()
+                .any(|fk| display_name(fk.ref_schema.as_deref(), &fk.ref_table) == me)
+    })
 }
 
 /// Where a kind sits **within** its phase, which is what settles the order
@@ -1947,6 +2168,150 @@ mod tests {
         assert!(e.text_differs_though_same());
     }
 
+    /// A table with one named foreign key, for the rename cases below.
+    fn child(name: &str, fk: &str, parent: &str) -> TableInfo {
+        TableInfo {
+            foreign_keys: vec![ForeignKeyInfo {
+                name: fk.to_string(),
+                columns: vec!["customer_id".to_string()],
+                ref_table: parent.to_string(),
+                ref_columns: vec!["id".to_string()],
+                ..Default::default()
+            }],
+            ..table(name, &[("id", "int"), ("customer_id", "int")])
+        }
+    }
+
+    fn at(sql: &str, needle: &str) -> usize {
+        sql.find(needle)
+            .unwrap_or_else(|| panic!("no {needle} in:\n{sql}"))
+    }
+
+    /// **A rename is a drop plus a create, and they share their inside names.**
+    /// `RENAME TABLE orders TO orders_old` leaves `fk_orders_customer` on
+    /// `orders_old`; the right side still has it on `orders`. The phases put
+    /// every `CREATE TABLE` ahead of every `DROP TABLE`, so the create was
+    /// emitted while the dropped table still held the name — `ERROR 1826` on
+    /// MySQL, `relation … already exists` on PostgreSQL, and no DDL rollback to
+    /// undo the statements before it.
+    ///
+    /// Asserted over the **emitted script**, which is the composition `phase` →
+    /// `plan` → `emit`; the existing ordering tests all stop at `phase`, which
+    /// is why the order they pin is the one that fails here.
+    #[test]
+    fn a_renamed_tables_drop_runs_before_the_create_that_needs_its_name() {
+        let c = mysql(
+            schema_of(vec![
+                table("customers", &[("id", "int")]),
+                child("orders_old", "fk_orders_customer", "customers"),
+            ]),
+            schema_of(vec![
+                table("customers", &[("id", "int")]),
+                child("orders", "fk_orders_customer", "customers"),
+            ]),
+        );
+        let sql = c.plan(|_| true).emit().join("\n");
+        assert!(
+            at(&sql, "DROP TABLE") < at(&sql, "CREATE TABLE"),
+            "the create is still first:\n{sql}"
+        );
+        // Settled by the order, so nothing is disclosed above Apply.
+        assert!(c.plan(|_| true).clashes.is_empty());
+    }
+
+    /// The same shape on PostgreSQL, where it needs no foreign key at all: an
+    /// index name is unique per namespace and a rename does not touch
+    /// `orders_pkey`.
+    #[test]
+    fn a_postgres_rename_clashes_on_the_index_name_too() {
+        let indexed = |name: &str| TableInfo {
+            indexes: vec![crate::schema::IndexInfo {
+                name: "orders_pkey".to_string(),
+                unique: true,
+                ..Default::default()
+            }],
+            ..table(name, &[("id", "int")])
+        };
+        let c = SchemaComparison::of(
+            &schema_of(vec![indexed("orders_old")]),
+            &schema_of(vec![indexed("orders")]),
+            SqlDialect::Postgres,
+        );
+        let sql = c.plan(|_| true).emit().join("\n");
+        assert!(
+            at(&sql, "DROP TABLE") < at(&sql, "CREATE TABLE"),
+            "the create is still first:\n{sql}"
+        );
+    }
+
+    /// **And the pull is refused where it would trade one refusal for another.**
+    /// If something on the left still references the table being dropped, that
+    /// referencing table has to come off first — which is at or after the phase
+    /// the pull moves in front of. So the order is left alone and the clash is
+    /// said out loud, which is the call `cycles` already makes.
+    #[test]
+    fn a_referenced_table_is_not_pulled_ahead_but_is_disclosed() {
+        let plan = referenced_rename().plan(|_| true);
+        let sql = plan.emit().join("\n");
+        assert!(
+            at(&sql, "CREATE TABLE") < at(&sql, "DROP TABLE `orders_old`"),
+            "the drop was pulled ahead of a table that still points at it:\n{sql}"
+        );
+        let said = plan.destructive().join(" ");
+        assert!(said.contains("fk_orders_customer"), "{said}");
+        assert!(said.contains("orders_old"), "{said}");
+    }
+
+    /// Left renames `orders` to `orders_old` and `shipments` still points at
+    /// the renamed table, so the drop cannot be pulled ahead of the create that
+    /// needs its constraint name.
+    fn referenced_rename() -> SchemaComparison {
+        mysql(
+            schema_of(vec![
+                table("customers", &[("id", "int")]),
+                child("orders_old", "fk_orders_customer", "customers"),
+                child("shipments", "fk_ship_orders", "orders_old"),
+            ]),
+            schema_of(vec![
+                table("customers", &[("id", "int")]),
+                child("orders", "fk_orders_customer", "customers"),
+            ]),
+        )
+    }
+
+    /// A clash between two objects the user did not tick is not this plan's
+    /// problem, and a warning about statements that are not in the script is
+    /// noise the reader cannot act on.
+    #[test]
+    fn a_clash_outside_the_ticked_set_is_not_reported() {
+        let c = referenced_rename();
+        assert!(!c.plan(|_| true).clashes.is_empty(), "the fixture clashes");
+        assert!(c.plan(|e| e.key() != "table:orders").clashes.is_empty());
+        assert!(c.plan(|e| e.key() != "table:orders_old").clashes.is_empty());
+    }
+
+    /// The per-engine scope, which is what decides whether two tables can hold
+    /// one name at all: MySQL keys an index name to its table and a foreign key
+    /// to the database, PostgreSQL puts both in the namespace, SQLite names no
+    /// foreign key.
+    #[test]
+    fn the_names_a_table_occupies_are_the_ones_its_engine_scopes_outside_it() {
+        let t = TableInfo {
+            indexes: vec![crate::schema::IndexInfo {
+                name: "ix_orders_customer".to_string(),
+                ..Default::default()
+            }],
+            ..child("orders", "fk_orders_customer", "customers")
+        };
+        let names = |d| occupied_names(&t, d).into_iter().collect::<Vec<_>>();
+        assert_eq!(names(SqlDialect::MySql), vec!["fk_orders_customer"]);
+        assert_eq!(
+            names(SqlDialect::Postgres),
+            vec!["fk_orders_customer", "ix_orders_customer"]
+        );
+        assert_eq!(names(SqlDialect::Sqlite), vec!["ix_orders_customer"]);
+    }
+
     /// It is only ever about a `Same` row — a differing one's pane is a diff and
     /// needs no excuse — and it stays quiet when the two texts really are equal.
     #[test]
@@ -2033,6 +2398,7 @@ mod tests {
             cycles_create: false,
             cycles_drop: false,
             new_namespaces: Vec::new(),
+            name_clashes: Vec::new(),
         };
         let plan = c.plan(|_| true);
         assert_eq!(plan.len(), 0, "nothing to apply");
@@ -2115,6 +2481,7 @@ mod tests {
             cycles_create: false,
             cycles_drop: false,
             new_namespaces: Vec::new(),
+            name_clashes: Vec::new(),
         };
         let plan = c.plan(|_| true);
         assert_eq!(plan.len(), 0, "not an object the plan applies");
@@ -3878,6 +4245,7 @@ mod tests {
             dialect: SqlDialect::MySql,
             cycles: false,
             omitted: Vec::new(),
+            clashes: Vec::new(),
         };
         assert!(
             plan.editor_script().contains("hunter2-in-the-clear"),
