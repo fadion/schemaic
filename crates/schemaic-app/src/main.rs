@@ -396,7 +396,7 @@ fn sqlite_shell(
             e
         }
     })?;
-    Ok(sqlite_shell_config(launcher, conn))
+    sqlite_shell_config(launcher, conn)
 }
 
 /// Which database `psql` should open.
@@ -476,17 +476,25 @@ fn mysql_shell_config(
 /// from — on a desktop launch, not a directory the user can name — would write
 /// files nobody can find. `None` when the path has no directory part, since
 /// spawning into `""` fails outright.
+///
+/// Returns an error for the one case a session cannot be built honestly, and it
+/// is the family's rule rather than this function's: the file goes through
+/// [`launch::sqlite_target`], as the MySQL builder's database goes behind a
+/// `--` and the PostgreSQL one's through [`launch::psql_target`]. The caller
+/// already renders an `Err` in the panel — the same arm the "no client found"
+/// message takes.
 fn sqlite_shell_config(
     launcher: CliLauncher,
     conn: &schemaic_core::connection::Connection,
-) -> schemaic_term::ShellConfig {
-    let mut cfg = wrap_launcher(launcher, vec![conn.file.clone()], Vec::new());
-    cfg.cwd = std::path::Path::new(&conn.file)
+) -> Result<schemaic_term::ShellConfig, &'static str> {
+    let file = launch::sqlite_target(&conn.file)?;
+    let mut cfg = wrap_launcher(launcher, vec![file.to_string()], Vec::new());
+    cfg.cwd = std::path::Path::new(file)
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
         .and_then(|p| p.to_str())
         .map(str::to_string);
-    cfg
+    Ok(cfg)
 }
 
 /// [`mysql_shell_config`]'s PostgreSQL twin. Every parameter takes a different
@@ -14150,7 +14158,8 @@ mod app_tests {
 
     #[test]
     fn sqlite_shell_opens_the_file_and_carries_no_secret() {
-        let cfg = sqlite_shell_config(CliLauncher::Native("sqlite3"), &file_conn());
+        let cfg = sqlite_shell_config(CliLauncher::Native("sqlite3"), &file_conn())
+            .expect("an ordinary path");
         assert_eq!(cfg.program, "sqlite3");
         assert_eq!(cfg.args, vec!["/data/chinook.db"]);
         // Nothing to pass: the server side of a file connection is inert, and the
@@ -14165,8 +14174,31 @@ mod app_tests {
     /// started from — which on a desktop launch is not a place the user can find.
     #[test]
     fn sqlite_shell_starts_in_the_databases_directory() {
-        let cfg = sqlite_shell_config(CliLauncher::Native("sqlite3"), &file_conn());
+        let cfg = sqlite_shell_config(CliLauncher::Native("sqlite3"), &file_conn())
+            .expect("an ordinary path");
         assert_eq!(cfg.cwd.as_deref(), Some("/data"));
+    }
+
+    /// **The third member of a family of three, and the one with no guard.**
+    /// The MySQL builder puts `--` before the database name and the PostgreSQL
+    /// one goes through `launch::psql_target`; this one handed `conn.file`
+    /// straight to argv. `sqlite3` reads a leading `-` as an option, so a file
+    /// called `-tmp.db` opened a session on something other than the file the
+    /// schema tree was showing — the outcome `sqlite_shell`'s own doc gives as
+    /// the reason WSL is refused here.
+    #[test]
+    fn sqlite_shell_refuses_a_file_the_client_would_read_as_an_option() {
+        let c = Connection {
+            file: "-tmp.db".to_string(),
+            ..file_conn()
+        };
+        assert!(sqlite_shell_config(CliLauncher::Native("sqlite3"), &c).is_err());
+        // And the ordinary way to hold such a file still works.
+        let ok = Connection {
+            file: "./-tmp.db".to_string(),
+            ..file_conn()
+        };
+        assert!(sqlite_shell_config(CliLauncher::Native("sqlite3"), &ok).is_ok());
     }
 
     /// The form a Windows connection actually holds, which is where these files
@@ -14178,7 +14210,8 @@ mod app_tests {
             file: r"C:\Users\me\dbs\chinook.db".to_string(),
             ..file_conn()
         };
-        let cfg = sqlite_shell_config(CliLauncher::Native("sqlite3"), &c);
+        let cfg =
+            sqlite_shell_config(CliLauncher::Native("sqlite3"), &c).expect("an ordinary path");
         assert_eq!(cfg.args, vec![r"C:\Users\me\dbs\chinook.db"]);
         assert_eq!(cfg.cwd.as_deref(), Some(r"C:\Users\me\dbs"));
     }
@@ -14191,7 +14224,8 @@ mod app_tests {
             file: "scratch.db".to_string(),
             ..file_conn()
         };
-        let cfg = sqlite_shell_config(CliLauncher::Native("sqlite3"), &c);
+        let cfg =
+            sqlite_shell_config(CliLauncher::Native("sqlite3"), &c).expect("an ordinary path");
         assert_eq!(cfg.args, vec!["scratch.db"]);
         assert_eq!(cfg.cwd, None);
     }

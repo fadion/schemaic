@@ -203,6 +203,32 @@ pub fn psql_target(db: &str) -> Result<&str, &'static str> {
     Ok(db)
 }
 
+/// Which file `sqlite3` should open.
+///
+/// [`psql_target`]'s sibling, and the third member of the family: the MySQL
+/// builder pushes `--` before the database name, the PostgreSQL one comes
+/// through `psql_target`, and the SQLite one handed `conn.file` to argv with
+/// neither. `sqlite3` reads a leading `-` as an option, so a file named
+/// `-tmp.db` — typed, or carried in from a DBeaver/HeidiSQL import — either
+/// errors incomprehensibly or opens a session against something other than the
+/// file the schema tree is showing. The second outcome is the one
+/// `sqlite_shell`'s own doc gives as the reason its WSL path is refused:
+/// "hands the user a session on something that looks like theirs".
+///
+/// A leading `-` is the whole of the question for this client — there is no
+/// connection-string syntax to be re-read into, which is what makes
+/// [`psql_target`] the longer of the two. The refusal is a `Result` rather than
+/// a caller's `if`, so it lands on the one arm `open_db_cli` already had.
+pub fn sqlite_target(file: &str) -> Result<&str, &'static str> {
+    const DASH: &str = "This database file's name begins with '-', which the sqlite3 client \
+        would read as an option rather than as the file. Rename it, or give it a path \
+        (./name.db), and open it again.";
+    if file.starts_with('-') {
+        return Err(DASH);
+    }
+    Ok(file)
+}
+
 /// The `--ssl-*` argv a MySQL/MariaDB client needs to honour `tls`.
 ///
 /// **Always non-empty, including for [`SslMode::Disable`][crate::connection::SslMode::Disable].**
@@ -594,6 +620,35 @@ two"
         assert!(psql_target("a=b").is_err());
         assert!(psql_target("postgresql://evil.example.com/x").is_err());
         assert!(psql_target("POSTGRES://evil.example.com/x").is_err());
+    }
+
+    /// The SQLite arm of the same family, which had no guard at all while both
+    /// its siblings got one. `sqlite3` reads a leading `-` as an option, so a
+    /// file the user could plausibly hold — or one carried in from a DBeaver /
+    /// HeidiSQL import — opened a session on something other than the file the
+    /// schema tree was showing.
+    #[test]
+    fn a_dash_leading_database_file_is_refused_for_sqlite() {
+        assert!(sqlite_target("-tmp.db").is_err());
+        assert!(sqlite_target("--help").is_err());
+        assert!(sqlite_target("-").is_err());
+    }
+
+    /// And everything else still reaches the client, including the shapes a
+    /// shell would care about and this does not — there is no shell here.
+    #[test]
+    fn an_ordinary_database_file_still_reaches_sqlite() {
+        for f in [
+            "shop.db",
+            "C:/Users/a b/My Documents/shop.db",
+            "/home/u/it's mine.db",
+            "./-tmp.db",
+            "data/-tmp.db",
+            "a;rm -rf x.db",
+            "",
+        ] {
+            assert_eq!(sqlite_target(f), Ok(f), "{f} was refused");
+        }
     }
 
     #[test]
