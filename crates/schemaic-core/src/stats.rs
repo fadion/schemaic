@@ -363,9 +363,14 @@ impl TableStats {
     /// about numbers the server never reports and never will. One code path,
     /// two engines, two different answers.
     ///
-    /// The timestamps are still shown, by `options_section`, which has its own
-    /// emptiness guard; this predicate is only about whether the engine said
-    /// anything worth a statistics panel.
+    /// The timestamps are still shown, by `options_section` and by
+    /// [`TableStats::to_markdown`]'s own tail, both of which are reached on the
+    /// "no statistics" path too; this predicate is only about whether the
+    /// engine said anything worth a statistics panel. **That sentence used to
+    /// be false of exactly the object this predicate is about**: the panel's
+    /// `!has_any()` arm never called `options_section` and `to_markdown`
+    /// early-returned, so the MySQL view whose `CREATE_TIME` motivated the
+    /// change lost the one thing the server *had* published about it.
     pub fn has_any(&self) -> bool {
         self.rows.is_some()
             || self.exact_rows.is_some()
@@ -454,6 +459,20 @@ impl TableStats {
         let mut out = format!("**{display_name}**\n");
         if !self.has_any() {
             out.push_str("\nThe server reported no statistics for this table.\n");
+            // **But a timestamp is not a statistic, and it is still a fact.**
+            // This used to return here, so the MySQL view whose `CREATE_TIME`
+            // is the reason `has_any` stopped counting the timestamps lost the
+            // one thing the server does publish about it — from Copy, and from
+            // the panel, which has the same shape.
+            if self.created.is_some() || self.updated.is_some() {
+                out.push('\n');
+                if let Some(c) = &self.created {
+                    out.push_str(&format!("- Created: {c}\n"));
+                }
+                if let Some(u) = &self.updated {
+                    out.push_str(&format!("- Updated: {u}\n"));
+                }
+            }
             return out;
         }
         out.push('\n');
@@ -1309,6 +1328,18 @@ mod tests {
             view.to_markdown("app.v_orders")
                 .contains("no statistics for this table"),
             "Copy carries the staleness caveat into a ticket: {}",
+            view.to_markdown("app.v_orders")
+        );
+        // **And the timestamp itself survives**, which is the composition the
+        // predicate test above cannot see on its own. `has_any` deciding the
+        // view has no *figures* must not take away the one fact the server did
+        // publish: the early return here dropped `Created` from Copy, and the
+        // panel's matching arm dropped it from the screen, while `has_any`'s
+        // own doc said both still showed it.
+        assert!(
+            view.to_markdown("app.v_orders")
+                .contains("Created: 2026-08-12 19:40:24"),
+            "the view's one published fact is gone from Copy: {}",
             view.to_markdown("app.v_orders")
         );
 

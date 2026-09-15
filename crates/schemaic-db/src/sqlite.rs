@@ -5956,6 +5956,78 @@ mod tests {
         );
     }
 
+    /// **And a unique index collated differently from its column is not a key
+    /// either** — the same failure through a different door, and the one
+    /// SQLite is alone in being able to reach.
+    ///
+    /// The index is unique in `BINARY` and the column is `NOCASE`, so two rows
+    /// differing only in case fit under the index. The `WHERE email = ?` a
+    /// write builds from that key is compared in the **column's** collation
+    /// (SQLite takes the left operand's, absent an explicit `COLLATE`), so it
+    /// matches both — the 1-row net rolls the batch back and reports a failure
+    /// whose stated reason is not the reason. The rows below prove the premise
+    /// rather than assuming it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_unique_index_collated_differently_is_not_offered_as_a_write_key() {
+        let (keeper, _db) = shared_memory("collated_unique_key");
+        keeper
+            .execute_batch(
+                "CREATE TABLE t (email TEXT NOT NULL COLLATE NOCASE, note TEXT);
+                 CREATE UNIQUE INDEX ux ON t (email COLLATE BINARY);
+                 INSERT INTO t VALUES ('A@x', 'one'), ('a@x', 'two');",
+            )
+            .unwrap();
+        // The premise, both halves: the engine accepted two rows the index
+        // considers distinct, and the comparison a write would make considers
+        // them the same.
+        let under_key: i64 = keeper
+            .query_row("SELECT count(*) FROM t WHERE email = 'A@x'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            under_key, 2,
+            "the column's collation is not NOCASE, so this fixture proves nothing"
+        );
+
+        let info = table_info_of(&keeper, "t");
+        let ux = info
+            .indexes
+            .iter()
+            .find(|ix| ix.name == "ux")
+            .expect("the index was introspected");
+        assert!(ux.unique, "not read as unique, so this proves nothing");
+        assert_eq!(
+            ux.columns[0].collation.as_deref(),
+            Some("BINARY"),
+            "the per-key collation was not introspected: {ux:?}"
+        );
+
+        let rs = run_query(
+            &keeper,
+            "SELECT email, note FROM t",
+            &mut crate::RowDest::Capped(100),
+        )
+        .unwrap();
+        let m = schemaic_core::edit::analyze_edit(
+            &rs,
+            schemaic_core::intel::SqlDialect::Sqlite,
+            |_, _, name| Some(table_info_of(&keeper, name)),
+        );
+        assert!(
+            m.insert_target().is_none(),
+            "an index collated differently from its column was accepted as a write key"
+        );
+        let editable: Vec<&str> = (0..rs.col_count())
+            .filter(|&ci| m.editable(ci))
+            .map(|ci| rs.columns[ci].name.as_str())
+            .collect();
+        assert!(
+            editable.is_empty(),
+            "the result is offered as editable on a key that matches two rows: {editable:?}"
+        );
+    }
+
     /// **The re-fetch is a second statement on a second connection**, and it was
     /// keyed on the rowid alone.
     ///

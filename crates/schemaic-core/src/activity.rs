@@ -270,11 +270,25 @@ impl SessionInfo {
     /// the grey state word underneath as the only thing saying otherwise — on
     /// the panel whose one decision is *what to kill*.
     ///
+    /// **`IdleInTx` is the same case and stopping at `Idle` was an omission.**
+    /// Every word above holds verbatim for `idle in transaction`:
+    /// `pg_stat_activity.query` keeps that backend's last statement
+    /// indefinitely too, while MariaDB's equivalent — a `Sleep` thread with an
+    /// open `INNODB_TRX` row — reports `INFO` NULL and drew nothing. Same
+    /// server state, two panels; and since `matches_query` was moved onto this
+    /// predicate the divergence reached the search box as well, so typing
+    /// `select` listed every idle-in-transaction PostgreSQL backend and no
+    /// MariaDB one. These are the rows the panel is most about — an
+    /// idle-in-transaction holder is what the lock-wait banner points at — so
+    /// it is the band where a statement that is *not running* is most
+    /// misleading.
+    ///
     /// Decided here rather than per surface, and rather than by dropping the
     /// column at the reader: `sql` is still wanted for *Copy statement*, and a
     /// second surface that draws a statement should not have to rediscover this.
     pub fn running_sql(&self) -> Option<&str> {
-        (self.state != SessionState::Idle).then_some(self.sql.as_deref())?
+        (!matches!(self.state, SessionState::Idle | SessionState::IdleInTx))
+            .then_some(self.sql.as_deref())?
     }
 
     /// The one-line explanation under the row's state, or `None` when the
@@ -1605,17 +1619,19 @@ mod tests {
 
     #[test]
     fn search_reaches_every_field_the_row_shows() {
-        let s = sess(1148, SessionState::IdleInTx, 0.0);
-        for q in [
-            "1148",
-            "app@10",
-            "10.0.0.1",
-            "employees",
-            "idle in txn",
-            "select",
-        ] {
+        // A **running** session, because the statement clause is part of what
+        // this asserts and the row has to be drawing one. The fixture used to
+        // be `IdleInTx`, from before `running_sql` covered that state — see
+        // `an_idle_in_transaction_session_draws_no_statement_either`.
+        let s = sess(1148, SessionState::Running, 0.0);
+        for q in ["1148", "app@10", "10.0.0.1", "employees", "select"] {
             assert!(matches_query(&s, q), "{q:?} should match");
         }
+        // And the state word, on a row whose state is the one being searched.
+        assert!(matches_query(
+            &sess(1148, SessionState::IdleInTx, 0.0),
+            "idle in txn"
+        ));
         assert!(
             matches_query(&s, "   "),
             "an empty filter matches everything"
@@ -1700,6 +1716,36 @@ mod tests {
         // row the user was looking for among them.
         let running = sess(1149, SessionState::Running, 0.0);
         assert!(matches_query(&running, "select"));
+    }
+
+    /// **`idle in transaction` is the same case**, and the predicate stopped at
+    /// `Idle`.
+    ///
+    /// `pg_stat_activity.query` keeps that backend's last statement
+    /// indefinitely too, so every leaked idle-in-transaction connection drew a
+    /// plausible statement in the running-statement block and matched the
+    /// search; MariaDB's equivalent — a `Sleep` thread with an open
+    /// `INNODB_TRX` row — reports `INFO` NULL and drew nothing. Same server
+    /// state, two panels, on the band the panel is most about: an
+    /// idle-in-transaction holder is what the lock-wait banner points at.
+    #[test]
+    fn an_idle_in_transaction_session_draws_no_statement_either() {
+        let held = sess(1150, SessionState::IdleInTx, 42.0);
+        assert!(
+            held.sql.is_some(),
+            "the fixture is a PG idle-in-transaction backend: the last \
+             statement is still there"
+        );
+        assert_eq!(held.running_sql(), None, "and the row draws none of it");
+        assert!(
+            !matches_query(&held, "select"),
+            "so the filter must not list it either"
+        );
+        // The row is still findable by everything it does draw — including its
+        // state, which is the word a user hunting these types.
+        for q in ["1150", "app@10", "employees", "idle in txn"] {
+            assert!(matches_query(&held, q), "{q:?} is drawn and must match");
+        }
     }
 
     #[test]
@@ -1805,15 +1851,21 @@ mod tests {
         // Still available for *Copy statement*, which is why the field stays.
         assert!(idle.sql.is_some());
 
-        for state in [
-            SessionState::Running,
-            SessionState::Blocked,
-            SessionState::IdleInTx,
-        ] {
+        // **`IdleInTx` is on the other side of this now**, and it moved here
+        // rather than in the predicate quietly: `pg_stat_activity.query` keeps
+        // an idle-in-transaction backend's last statement exactly as it keeps
+        // an idle one's, while MariaDB's equivalent reports `INFO` NULL — so
+        // leaving it in this list was the same engine divergence one state
+        // over. See `an_idle_in_transaction_session_draws_no_statement_either`.
+        for state in [SessionState::Running, SessionState::Blocked] {
             let mut s = sess(2, state, 1.0);
             s.sql = Some("UPDATE orders SET total = 1".to_string());
             assert!(s.running_sql().is_some(), "{state:?}");
         }
+        let mut held = sess(3, SessionState::IdleInTx, 1.0);
+        held.sql = Some("UPDATE orders SET total = 1".to_string());
+        assert_eq!(held.running_sql(), None);
+        assert!(held.sql.is_some(), "still there for *Copy statement*");
     }
 
     /// The poll is a full connect + authenticate + three `information_schema`

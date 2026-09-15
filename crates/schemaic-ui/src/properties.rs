@@ -267,6 +267,15 @@ fn stats_body(
                 },
             )),
             structure_section(target, info),
+            // **A timestamp is not a statistic, and it is still a fact.**
+            // `has_any` stopped counting `created`/`updated` so a MySQL view —
+            // whose `CREATE_TIME` is the one column `information_schema.TABLES`
+            // fills for a view — would stop claiming published figures; this
+            // arm then rendered without `options_section` and dropped the
+            // timestamp itself, which was the only thing the server had said
+            // about the object. `options_section` has its own emptiness guard,
+            // so on an engine that publishes nothing at all it adds nothing.
+            options_section(&stats, info),
             count_row(target, None, counting, count_err, ui, ring),
         ]
         .into_iter()

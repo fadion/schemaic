@@ -283,6 +283,19 @@ impl IndexInfo {
     /// - **not [`lossy`](IndexInfo::lossy)** — an index whose keys could not all
     ///   be read back, so what is in `columns` is not the whole index and none
     ///   of the checks above was made against the whole of it.
+    /// - **no key carrying its own [`collation`](IndexColumn::collation)** —
+    ///   the collation is what the uniqueness is *measured in*, and a
+    ///   `WHERE col = ?` built from the key is measured in the **column's**
+    ///   instead. SQLite is where the two can differ: given
+    ///   `email TEXT COLLATE NOCASE` and `CREATE UNIQUE INDEX ux ON t (email
+    ///   COLLATE BINARY)`, the index accepts `'A@x'` beside `'a@x'` and the
+    ///   `UPDATE` then matches both, so the 1-row net rolls the batch back and
+    ///   tells the user the edit failed for a reason that is not the reason —
+    ///   the outcome this predicate exists to end. The safe direction (column
+    ///   `BINARY`, index `NOCASE`) is refused with it, which is the
+    ///   conservatism the paragraph below argues for. MySQL reports no
+    ///   per-key collation and PostgreSQL reports a non-default operator class
+    ///   as `lossy`, so this conjunct only ever narrows SQLite.
     ///
     /// **It says nothing about NULL.** A unique index over a nullable column
     /// identifies nothing (SQL lets any number of rows share a NULL), but that
@@ -304,6 +317,7 @@ impl IndexInfo {
             && !self.lossy
             && !self.columns.is_empty()
             && self.columns.iter().all(|c| !c.expression)
+            && self.columns.iter().all(|c| c.collation.is_none())
     }
 
     /// An index over whole columns, ascending — the shape most call sites mean.
@@ -4861,6 +4875,15 @@ fn type_keyword_class(name: &str) -> Option<ColumnTypeClass> {
         // draft uses for an integer with a sequence behind it.
         "double precision" | "money" | "oid" | "smallserial" | "serial" | "bigserial"
         | "bit varying" => ColumnTypeClass::Numeric,
+        // **SQLite's own documented spellings**, and the engine where they
+        // matter most: SQLite stores the declared type text verbatim, so an
+        // unusual spelling is normal there rather than exotic, and every one of
+        // these is an example in its type-affinity documentation. `int2`/`int8`
+        // and `float4`/`float8` are also PostgreSQL's internal aliases for
+        // `smallint`/`bigint` and `real`/`double precision`.
+        "unsigned big int" | "unsigned" | "int2" | "int4" | "int8" | "float4" | "float8" => {
+            ColumnTypeClass::Numeric
+        }
         "char" | "varchar" | "tinytext" | "text" | "mediumtext" | "longtext" | "enum" | "set" => {
             ColumnTypeClass::Text
         }
@@ -4873,6 +4896,12 @@ fn type_keyword_class(name: &str) -> Option<ColumnTypeClass> {
         // you can read", which is true of all of them.
         "character varying" | "character" | "bpchar" | "name" | "uuid" | "xml" | "inet"
         | "cidr" | "macaddr" | "macaddr8" => ColumnTypeClass::Text,
+        // SQLite's, from the same documentation as the numerics above.
+        // `varying character` and `native character` are listed as whole
+        // phrases as well as by their leading word, because the second pass
+        // tries `varying`/`native` alone and neither means anything else here.
+        "varying character" | "varying" | "native character" | "native" | "nvarchar" | "nchar"
+        | "clob" => ColumnTypeClass::Text,
         "date" | "datetime" | "time" | "timestamp" | "year" => ColumnTypeClass::DateTime,
         // PostgreSQL's, and the reason `interval` is here rather than under
         // numerics: it is a span of time, and it renders as one.
@@ -5393,6 +5422,46 @@ mod browse_key_tests {
             "{:?}",
             browse_key_columns(&t)
         );
+    }
+
+    /// **And one collated differently from its column is not**, which is the
+    /// SQLite case:
+    ///
+    /// ```sql
+    /// CREATE TABLE t (email TEXT NOT NULL COLLATE NOCASE, note TEXT);
+    /// CREATE UNIQUE INDEX ux ON t (email COLLATE BINARY);
+    /// INSERT INTO t VALUES ('A@x','one'), ('a@x','two');   -- both accepted
+    /// ```
+    ///
+    /// The index is unique in `BINARY`, so both rows fit under it; the `WHERE
+    /// email = 'A@x'` the write builds from that key is measured in the
+    /// *column's* `NOCASE` and matches both. Offering it as a key sends the
+    /// edit into the 1-row net and reports a failure whose stated reason is not
+    /// the reason — the outcome `identifies_a_row` exists to end.
+    #[test]
+    fn a_unique_index_collated_differently_from_its_column_is_not_a_key() {
+        let mut ix = IndexInfo::plain("ux", vec!["email"], true);
+        ix.columns[0].collation = Some("BINARY".into());
+        let t = table(
+            vec![col("email", false, false), col("note", true, false)],
+            vec![ix.clone()],
+        );
+        assert!(!ix.identifies_a_row());
+        assert!(
+            browse_key_columns(&t).is_empty(),
+            "{:?}",
+            browse_key_columns(&t)
+        );
+        // The counterweight: with no per-key collation — which is what MySQL
+        // always reports and what SQLite reports when the index agrees with the
+        // column — the same index is still a key.
+        let plain = IndexInfo::plain("ux", vec!["email"], true);
+        assert!(plain.identifies_a_row());
+        let t = table(
+            vec![col("email", false, false), col("note", true, false)],
+            vec![plain],
+        );
+        assert_eq!(browse_key_columns(&t), ["email"]);
     }
 
     /// **And a *mixed* one is not**, which the all-expression case already
@@ -6259,6 +6328,37 @@ mod tests {
         assert_eq!(classify_column_type("numeric(10,2)"), Numeric);
         assert_eq!(classify_column_type("money"), Numeric);
         assert_eq!(classify_column_type("inet"), Text);
+    }
+
+    /// **And the third engine's.** The two tests above are MySQL's spellings
+    /// and PostgreSQL's, which is how the same gap the PostgreSQL one closed
+    /// survived for SQLite: every name below is an example in SQLite's *own*
+    /// type-affinity documentation, and SQLite is the engine where they matter
+    /// most, because it stores the declared type text verbatim — an unusual
+    /// spelling there is normal rather than exotic. All eight drew the
+    /// "unrecognised type" glyph in the schema tree, the ER diagram's cards and
+    /// tooltips, the completion popup and Find Anywhere.
+    #[test]
+    fn classify_column_type_reads_sqlites_own_documented_spellings() {
+        use ColumnTypeClass::*;
+        assert_eq!(classify_column_type("VARYING CHARACTER(255)"), Text);
+        assert_eq!(classify_column_type("NATIVE CHARACTER(70)"), Text);
+        assert_eq!(classify_column_type("NVARCHAR(100)"), Text);
+        assert_eq!(classify_column_type("NCHAR(55)"), Text);
+        assert_eq!(classify_column_type("CLOB"), Text);
+        assert_eq!(classify_column_type("UNSIGNED BIG INT"), Numeric);
+        assert_eq!(classify_column_type("INT2"), Numeric);
+        assert_eq!(classify_column_type("INT8"), Numeric);
+        // The affinity rule's other examples, which already worked, so the set
+        // above is the whole of what was missing rather than a sample of it.
+        for already in ["INTEGER", "TEXT", "BLOB", "REAL", "DOUBLE", "DECIMAL(10,5)"] {
+            assert_ne!(classify_column_type(already), Other, "{already}");
+        }
+        // `float4`/`float8` come with the same edit: PostgreSQL's internal
+        // aliases for `real` and `double precision`, which `format_type` does
+        // not emit but a hand-written draft does.
+        assert_eq!(classify_column_type("float8"), Numeric);
+        assert_eq!(classify_column_type("int4"), Numeric);
     }
 
     /// An array column is its element type — the icon is about what a cell

@@ -3673,6 +3673,7 @@ mod colres {
             // keeps the engine question at this boundary.
             implicit: dialect.implicit_columns(),
             ctes: HashMap::new(),
+            cte_frames: Vec::new(),
             scopes: Vec::new(),
             refs: Vec::new(),
             gb: Vec::new(),
@@ -3693,6 +3694,11 @@ mod colres {
     /// construct rather than an error — see `pre_visit_query`.
     type Ctes = HashMap<String, (Cols, Option<(usize, usize)>)>;
 
+    /// One query's worth of [`Ctes`] edits: the key each CTE claimed, and what
+    /// it displaced, so leaving the query can put the map back. See
+    /// [`Collector::cte_frames`].
+    type CteFrame = Vec<(String, Option<(Cols, Option<(usize, usize)>)>)>;
+
     struct Collector<'a> {
         stmt: &'a str,
         lo: usize,
@@ -3703,6 +3709,21 @@ mod colres {
         implicit: &'static [&'static str],
         /// Populated as queries are visited. See [`Ctes`].
         ctes: Ctes,
+        /// What each enclosing query put into [`Collector::ctes`], and what it
+        /// displaced, so leaving the query can put the map back.
+        ///
+        /// **A nested `WITH` binds inside its own query and nowhere else**, and
+        /// this map used to be inserted into and never removed from. Subqueries
+        /// are visited in source order, so
+        /// `FROM (WITH t AS (SELECT 1 AS z) SELECT z FROM t) a, (SELECT id FROM
+        /// t) b` left `t` in the map when the *second* derived table was
+        /// visited: `add_source`'s CTE arm takes a map hit before it asks the
+        /// catalogue, so the real table `t(id, note)` resolved against
+        /// `Known({"z"})` and a valid statement reported ``Column `id` not
+        /// found``. `c83f920` fixed this class in `provenance_sources`, twenty
+        /// lines below, with a frame stack; this visitor had the same bug and
+        /// no `post_visit_query` at all.
+        cte_frames: Vec<CteFrame>,
         scopes: Vec<Scope>,
         refs: Vec<Ref>,
         /// `only_full_group_by` warnings collected per SELECT scope as it's pushed.
@@ -3713,7 +3734,10 @@ mod colres {
         type Break = ();
 
         fn pre_visit_query(&mut self, q: &Query) -> ControlFlow<()> {
-            // Register this query's CTEs first (visible to its own FROM + siblings).
+            // Register this query's CTEs first (visible to its own FROM + siblings),
+            // remembering what each one displaced so `post_visit_query` can put
+            // the map back — see `Collector::cte_frames`.
+            let mut frame: CteFrame = Vec::new();
             if let Some(with) = &q.with {
                 for cte in &with.cte_tables {
                     let cols = cte_cols(cte);
@@ -3730,10 +3754,12 @@ mod colres {
                     // the exception is taken at.
                     let range =
                         (!with.recursive).then(|| to_range(self.stmt, self.lo, cte.query.span()));
-                    self.ctes
-                        .insert(cte.alias.name.value.to_ascii_lowercase(), (cols, range));
+                    let key = cte.alias.name.value.to_ascii_lowercase();
+                    let displaced = self.ctes.insert(key.clone(), (cols, range));
+                    frame.push((key, displaced));
                 }
             }
+            self.cte_frames.push(frame);
             match q.body.as_ref() {
                 // A single SELECT body: the scope spans the whole *query*, so its
                 // ORDER BY / LIMIT (which hang off the Query, not the Select) are
@@ -3783,6 +3809,25 @@ mod colres {
                 // A parenthesized inner query self-handles via its own
                 // pre_visit_query; VALUES/… have no columns to resolve.
                 _ => {}
+            }
+            ControlFlow::Continue(())
+        }
+
+        /// Undo this query's CTE registrations, innermost first, restoring
+        /// anything they shadowed — see [`Collector::cte_frames`].
+        ///
+        /// The scopes are *not* popped here: they are keyed by byte range and
+        /// `resolve` walks them after the visit, which is what lets an inner
+        /// reference find its enclosing SELECT. Only the CTE map is scoped by
+        /// nesting rather than by position.
+        fn post_visit_query(&mut self, _q: &Query) -> ControlFlow<()> {
+            if let Some(frame) = self.cte_frames.pop() {
+                for (key, displaced) in frame.into_iter().rev() {
+                    match displaced {
+                        Some(prev) => self.ctes.insert(key, prev),
+                        None => self.ctes.remove(&key),
+                    };
+                }
             }
             ControlFlow::Continue(())
         }
@@ -7861,6 +7906,41 @@ mod tests {
             "WITH RECURSIVE nums(n) AS (SELECT 1 AS n UNION ALL SELECT nope FROM departments) SELECT n FROM nums",
         );
         assert_eq!(d.len(), 1, "{d:?}");
+    }
+
+    /// **A nested `WITH` binds inside its own query and nowhere else** — the
+    /// class `c83f920` closed in `provenance_sources` and left open in the
+    /// visitor twenty lines above it.
+    ///
+    /// `colres::Collector`'s CTE map was inserted into and never removed from,
+    /// and subqueries are visited in source order, so the first derived table's
+    /// `WITH departments` was still in the map when the *second* one was
+    /// visited. `add_source`'s CTE arm takes a map hit before it asks the
+    /// catalogue, so the real `departments(id, name)` resolved against the
+    /// CTE's one column and a valid statement reported ``Column `name` not
+    /// found``.
+    #[test]
+    fn a_nested_ctes_name_does_not_leak_into_a_later_sibling_subquery() {
+        let sql = "SELECT a.z, b.name \
+                   FROM (WITH departments AS (SELECT 1 AS z) SELECT z FROM departments) a, \
+                        (SELECT name FROM departments) b";
+        assert!(diag(sql).is_empty(), "{:?}", diag(sql));
+
+        // The counterweight `c83f920` wrote for its own visitor: inside its own
+        // query the CTE still shadows the real table, so `z` resolves against
+        // the CTE and a real column of `departments` does not.
+        let sql = "SELECT * FROM (WITH departments AS (SELECT 1 AS z) SELECT z FROM departments) q";
+        assert!(diag(sql).is_empty(), "{:?}", diag(sql));
+        let d = col_errors(
+            "SELECT * FROM (WITH departments AS (SELECT 1 AS z) SELECT name FROM departments) q",
+        );
+        assert_eq!(d.len(), 1, "the CTE no longer shadows its own name: {d:?}");
+
+        // And an outer CTE is still visible to an inner query that does not
+        // rebind the name — the frame restores what it displaced rather than
+        // clearing the map.
+        let sql = "WITH d AS (SELECT 1 AS z) SELECT * FROM (SELECT z FROM d) q";
+        assert!(diag(sql).is_empty(), "{:?}", diag(sql));
     }
 
     /// **An alias replaces the table name for the whole query.** Registering
