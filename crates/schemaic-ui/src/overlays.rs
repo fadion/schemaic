@@ -1473,9 +1473,16 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                     // ── Open ──────────────────────────────────────────────────
                     let ocli = open_db_cli.clone();
                     let dbn = menu.name.clone();
-                    entries.push(MenuEntry::action("Open in CLI", move || {
-                        (ocli)(Some(dbn.clone()))
-                    }));
+                    // **Read-only gates the launch**, the same as the terminal
+                    // panel's own icon and for the same reason: the client this
+                    // opens is a full write session carrying the connection's
+                    // password, on a connection where the app refuses a grid
+                    // commit and refuses *Kill session*. See the terminal
+                    // panel's `db_cli_btn`.
+                    entries.push(
+                        MenuEntry::action("Open in CLI", move || (ocli)(Some(dbn.clone())))
+                            .disabled(conn_read_only(&connections, active_conn)),
+                    );
                     entries.push(MenuEntry::Separator);
                     // ── Read: clipboard, then what the node can show you, then
                     // the two that only rearrange the tree under it ───────────

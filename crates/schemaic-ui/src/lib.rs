@@ -7839,6 +7839,61 @@ fn body(
 /// `RwSignal<Vec<Connection>>` and reaching into it is always going to compile.
 #[cfg(test)]
 mod read_only_gate {
+    /// **Both doors onto a database CLI ask the flag.**
+    ///
+    /// The client this launches is a full write session with the connection's
+    /// password in the environment, on a connection where the app refuses a grid
+    /// commit, refuses Apply in the DDL preview, and refuses *Kill session* —
+    /// which is the less destructive of the pair, and sits two clicks away in
+    /// the same window. Neither door asked: the toolbar icon's enabled predicate
+    /// was the literal `|| true` and the schema tree's entry carried no
+    /// `.disabled(…)`.
+    ///
+    /// A source gate because both are closures inside view builders that need a
+    /// mounted Floem tree. What is checkable is that the question is asked at
+    /// each site, and that is what this reads.
+    #[test]
+    fn both_database_cli_doors_are_gated_on_read_only() {
+        // **Assembled, every one of them.** This test names both launch sites,
+        // so a literal anchor matches inside this function first — `find`
+        // returns the earlier offset and the region scanned is this prose. That
+        // is the trap every source gate in this workspace has to dodge, and it
+        // caught this one on its first run.
+        let flag = format!("{}_only", "read");
+        let icon = format!("let db_cli_btn = {}(", "toolbar_icon");
+        let entry = format!("MenuEntry::action(\"Open in {}\"", "CLI");
+        // **The launch, not the tooltip.** The region has to stop where the
+        // launch expression does: with a window measured in bytes, a tip that
+        // merely *says* "read-only" beside a button that is still live satisfied
+        // the check — which is the disclosure without the gate.
+        let tip = format!(".{}(", "tooltip");
+        for (file, src, anchor, ends) in [
+            ("lib.rs", include_str!("lib.rs"), icon, tip.clone()),
+            (
+                "overlays.rs",
+                include_str!("overlays.rs"),
+                entry,
+                ",\n                    );".to_string(),
+            ),
+        ] {
+            let at = src
+                .find(&anchor)
+                .unwrap_or_else(|| panic!("{file}: the CLI launch site is gone or was renamed"));
+            let span = &src[at..];
+            let end = span
+                .find(&ends)
+                .unwrap_or_else(|| panic!("{file}: the CLI launch expression has no end"));
+            let region = &span[..end];
+            assert!(
+                region.contains(&flag),
+                "{file} opens a database CLI without asking whether the \
+                 connection is marked read-only — the app refuses a grid commit \
+                 and a Kill session on that connection and would hand this one a \
+                 writable client session with the stored password"
+            );
+        }
+    }
+
     /// **Over the whole workspace, not the two view crates.**
     ///
     /// The corpus was `crate_sources()` — `schemaic-ui` and `schemaic-app` — and
@@ -9266,8 +9321,36 @@ fn terminal_panel(ui: Ui) -> impl IntoView {
 
     // Title row: "TERMINAL" left; open-DB-CLI + restart + settings gear right,
     // each 10px apart (gear 12px from the edge), matching the AI panel's spacing.
-    let db_cli_btn = toolbar_icon(icons::DATABASE, 5.0, 2.0, || true, move || (open_cli)(None))
-        .tooltip(|| text("Open the database CLI").style(widgets::tooltip_style));
+    // **Read-only gates the launch.** The client this opens is a full write
+    // session with the connection's password in `MYSQL_PWD`, and `DROP TABLE
+    // orders;` typed into it runs — on a connection where the app refuses a grid
+    // commit, refuses Apply in the DDL preview, and refuses *Kill session*, which
+    // is the less destructive of the pair. `accept_launch`'s own doc states the
+    // rule this was outside: "the flag is the protection with no 'Run anyway'".
+    //
+    // Dimmed rather than absent, and with the reason in the tip, for the same
+    // reason `activity_panel`'s two kills are: a control that vanishes reads as
+    // a missing feature, and the user cannot tell they are one toggle away.
+    // Reads must still be run — in a query tab, which read-only allows.
+    let cli_tabs = ui.tabs_ui.tabs;
+    let cli_active = ui.tabs_ui.active;
+    let cli_conns = ui.conn.connections;
+    let cli_read_only = create_memo(move |_| active_tab_read_only(cli_tabs, cli_active, cli_conns));
+    let db_cli_btn = toolbar_icon(
+        icons::DATABASE,
+        5.0,
+        2.0,
+        move || !cli_read_only.get(),
+        move || (open_cli)(None),
+    )
+    .tooltip(move || {
+        let t = if cli_read_only.get() {
+            "Open the database CLI — this connection is marked read-only"
+        } else {
+            "Open the database CLI"
+        };
+        text(t).style(widgets::tooltip_style)
+    });
     let restart_btn = toolbar_icon(icons::REFRESH_CW, 5.0, 2.0, || true, move || (restart)())
         .tooltip(|| text("Restart the terminal").style(widgets::tooltip_style));
     let gear = toolbar_icon(
