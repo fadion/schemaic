@@ -1318,6 +1318,38 @@ fn fetch_landing(started: u64, current: u64) -> bool {
     started == current
 }
 
+/// The schema tree's **epoch**: bumped every time the tree is cleared, which is
+/// every connection switch.
+///
+/// A queued introspection reads it after acquiring its permit — see
+/// [`fetch_still_wanted`]. Process-wide and atomic because that is what the
+/// queued task can reach: the per-node stamps (`fetch_seq`) live in an
+/// `Rc<RefCell<…>>` on the UI thread, and the fetch runs on the tokio runtime.
+fn schema_epoch() -> &'static std::sync::atomic::AtomicU64 {
+    static EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    &EPOCH
+}
+
+/// Should a fetch that has been waiting for a permit still run?
+///
+/// **The queue had no notion of which load is still wanted.** The introspection
+/// semaphore is process-wide and `tokio::sync::Semaphore` is FIFO, so opening a
+/// 200-database connection and then switching to a three-database one left the
+/// new connection's three tasks queued behind the old connection's remaining
+/// ~196 — each of which still opened a connection to the *abandoned* server and
+/// read a whole database before its result was discarded by
+/// [`fetch_landing`], which is consulted only after `fetch_schema` returns.
+/// Every database on the new connection sat at "loading" until the old load
+/// drained: ~15 s at 300 ms a database, ~100 s at 2 s.
+///
+/// So the check is *before* the read, not after it: a superseded task releases
+/// its permit immediately and the queue drains at once. `introspection_order`'s
+/// whole purpose — put what is on screen first — only orders within one
+/// enqueue, and could not survive the queue outliving its connection.
+fn fetch_still_wanted(spawned_at: u64, now: u64) -> bool {
+    spawned_at == now
+}
+
 /// Where the session's run-id counter starts: past **every** id on disk, across
 /// all connections. Each `record_history` then hands out `seed + 1`, `+ 2`, …
 ///
@@ -1815,6 +1847,12 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
         let nodes_scope = nodes_scope.clone();
         let nodes_conn = nodes_conn.clone();
         Rc::new(move || {
+            // **The queued introspections belong to the tree that is going.**
+            // Bumping the epoch is what lets them drop their permits the moment
+            // they get one, instead of each opening a connection to the server
+            // the user has just left and reading a whole database for a result
+            // `fetch_landing` then discards. See `fetch_still_wanted`.
+            schema_epoch().fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             db_nodes.set(Vec::new());
             *nodes_conn.borrow_mut() = None;
             if let Some(old) = nodes_scope.borrow_mut().take() {
@@ -7790,6 +7828,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                 let _ = refreshing.try_update(|v| *v = false);
             });
             let permits = introspect_permits();
+            let epoch = schema_epoch().load(std::sync::atomic::Ordering::Relaxed);
             handle.spawn(async move {
                 // **At most `INTROSPECT_PERMITS` catalogue reads at once.**
                 // `fetch_schema` opens a connection of its own and reads every
@@ -7806,6 +7845,19 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                 // Acquired inside the task, so the fan-out loop still returns
                 // at once and the tree shows every database as loading.
                 let _permit = permits.acquire_owned().await;
+                // **After the permit and before the read.** A task that waited
+                // out a connection switch has nothing to fetch for: its tree is
+                // gone and `fetch_landing` would discard the result anyway — but
+                // only after a connection to the abandoned server and a whole
+                // database's catalogue had been read, while the *incoming*
+                // connection's own fetches waited behind it in a FIFO queue.
+                // See `fetch_still_wanted`.
+                if !fetch_still_wanted(
+                    epoch,
+                    schema_epoch().load(std::sync::atomic::Ordering::Relaxed),
+                ) {
+                    return;
+                }
                 // A fresh token: the tree's own refresh has no Stop to offer, so
                 // there is nothing to cancel it with. `fetch_schema` takes one
                 // for the Export modal, which does.
@@ -13801,6 +13853,61 @@ mod app_tests {
         );
         // The newer one still writes when it lands, whichever order they arrive.
         assert!(fetch_landing(4, 4));
+    }
+
+    /// **`fetch_landing` is asked too late to help the user waiting.** It runs
+    /// after `fetch_schema` returns, so a superseded task still opened a
+    /// connection to the abandoned server and read a whole database first —
+    /// while the *incoming* connection's fetches waited behind it in a
+    /// process-wide FIFO queue. Open a 200-database connection, switch a second
+    /// later to a three-database one, and those three sat behind ~196 reads of
+    /// a server nobody was looking at: ~15 s at 300 ms a database, ~100 s at 2 s.
+    #[test]
+    fn a_fetch_queued_before_a_connection_switch_does_not_read_anything() {
+        use super::fetch_still_wanted;
+        assert!(
+            fetch_still_wanted(3, 3),
+            "the tree it belongs to is still up"
+        );
+        assert!(
+            !fetch_still_wanted(3, 4),
+            "the tree was cleared while this waited for a permit"
+        );
+        // Several switches while one task queued is still one answer.
+        assert!(!fetch_still_wanted(3, 9));
+    }
+
+    /// **And the caller asks it after the permit and before the read**, which is
+    /// the whole of the fix — asking before the permit would answer about a
+    /// queue the task had not yet joined, and asking after the read would be
+    /// `fetch_landing` again. A source assertion because `start_fetch` is a
+    /// closure over app signals and the permit lives inside a spawned task.
+    #[test]
+    fn the_queued_fetch_asks_before_it_opens_a_connection() {
+        let src = include_str!("main.rs");
+        let at = src
+            .find("let start_fetch: FetchSchemaFn = {")
+            .expect("`start_fetch` is gone or was renamed");
+        let rest = &src[at..];
+        let end = rest[1..].find("\n    let ").map_or(rest.len(), |i| i + 1);
+        let body = &rest[..end];
+        // Assembled, so this test's own source is not the hit.
+        let ask = format!("{}_still_wanted(", "fetch");
+        let permit = format!("permits.{}().await", "acquire_owned");
+        let read = format!("db.{}(&database", "fetch_schema");
+        let (a, p, r) = (
+            body.find(&ask).expect("the supersede check is gone"),
+            body.find(&permit).expect("the permit is gone"),
+            body.find(&read).expect("the schema read is gone"),
+        );
+        assert!(
+            p < a,
+            "the check runs before the permit, so it answers about a queue this task has not joined"
+        );
+        assert!(
+            a < r,
+            "the check runs after the read — that is `fetch_landing`, and the cost is already paid"
+        );
     }
 
     fn dbs(names: &[&str]) -> Vec<String> {
