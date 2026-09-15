@@ -1591,13 +1591,24 @@ fn scan_clauses(
     // had been projected. One boundary lexer is the invariant, `code_mask` is
     // this module's own primitive for it, and it is dialect-aware, which a
     // `contains` cannot be.
+    //
+    // **Over the span, not over the buffer.** The mask was built over the whole
+    // `sql` — `vec![true; sql.len()]` plus a full
+    // `skip_noncode` walk of the whole document, inside a closure that runs on
+    // every call, in a function whose own doc reads "microsecond-cheap — it runs
+    // every keystroke". `sqlfile::open_verdict` admits a 64 MiB script, so that
+    // was a 64 MB allocation and a 37.9 ms walk (`c000d3e`'s own measurement at
+    // 16 MiB) per character typed, to answer one bit about a fragment of one
+    // statement. Starting the lexer at `select_kw_end` is sound because that
+    // offset is the end of a token the tokenizer produced: it is code by
+    // construction, which is the state `skip_noncode` begins in.
     let select_has_star = matches!(cur, Clause::Select)
-        && sql.get(select_kw_end..scan_end).is_some_and(|_| {
-            let code = code_mask(sql, dialect);
-            sql.as_bytes()[select_kw_end..scan_end]
+        && sql.get(select_kw_end..scan_end).is_some_and(|span| {
+            let code = code_mask(span, dialect);
+            span.as_bytes()
                 .iter()
                 .enumerate()
-                .any(|(k, &c)| c == b'*' && code[select_kw_end + k])
+                .any(|(k, &c)| c == b'*' && code[k])
         });
     (
         kind,
@@ -2098,11 +2109,28 @@ pub struct Catalog {
 /// them. Comparison is exact (not case-folded) on the database names and the active
 /// database, so a case-only change misses and rebuilds — conservative in the safe
 /// direction.
+/// **Two slots, because there are two views and they alternate.** One was a
+/// cache only while every caller asked the same question. Since the completion
+/// *offer* catalog started passing a `loaded` list with the hidden databases
+/// filtered out — while diagnostics go on passing the unfiltered one — the two
+/// keys took turns, and a one-slot cache serves an alternation at a 0% hit
+/// rate: every keystroke paid a full `Catalog::build`, then the debounced
+/// diagnostics paid a second and replaced it, and the next keystroke missed
+/// again. Invisible until a database is hidden, because with an empty hidden
+/// set the two lists are byte-identical.
+///
+/// Two is enough and is not a guess: there are exactly two views and neither
+/// alternates within itself. The slots are most-recently-used first, so a third
+/// key — if one is ever added — costs the older of the two rather than
+/// thrashing the newer.
 #[derive(Default)]
 pub struct CatalogCache {
-    /// `None` until the first build.
-    entry: Option<CachedCatalog>,
+    /// Most-recently-used first. Empty until the first build.
+    entries: Vec<CachedCatalog>,
 }
+
+/// How many distinct catalog views the cache keeps — see [`CatalogCache`].
+const CATALOG_SLOTS: usize = 2;
 
 /// One built catalog and the inputs it was built from.
 struct CachedCatalog {
@@ -2120,24 +2148,35 @@ impl CatalogCache {
         loaded: &[(String, Arc<DbSchema>)],
         active_db: Option<&str>,
     ) -> Arc<Catalog> {
-        if let Some(hit) = &self.entry
-            && hit.active_db.as_deref() == active_db
-            && hit.loaded.len() == loaded.len()
-            && hit
-                .loaded
-                .iter()
-                .zip(loaded)
-                .all(|((kd, ks), (ld, ls))| kd == ld && Arc::ptr_eq(ks, ls))
-        {
-            return Arc::clone(&hit.catalog);
+        let matches = |hit: &CachedCatalog| {
+            hit.active_db.as_deref() == active_db
+                && hit.loaded.len() == loaded.len()
+                && hit
+                    .loaded
+                    .iter()
+                    .zip(loaded)
+                    .all(|((kd, ks), (ld, ls))| kd == ld && Arc::ptr_eq(ks, ls))
+        };
+        if let Some(i) = self.entries.iter().position(matches) {
+            // Move to front, so the slot that ages out is the one nobody has
+            // asked for since — with two callers alternating, that is never
+            // either of them.
+            let hit = self.entries.remove(i);
+            let catalog = Arc::clone(&hit.catalog);
+            self.entries.insert(0, hit);
+            return catalog;
         }
         let refs: Vec<(&str, &DbSchema)> = loaded.iter().map(|(d, s)| (d.as_str(), &**s)).collect();
         let catalog = Arc::new(Catalog::build(&refs, active_db));
-        self.entry = Some(CachedCatalog {
-            loaded: loaded.to_vec(),
-            active_db: active_db.map(str::to_string),
-            catalog: Arc::clone(&catalog),
-        });
+        self.entries.insert(
+            0,
+            CachedCatalog {
+                loaded: loaded.to_vec(),
+                active_db: active_db.map(str::to_string),
+                catalog: Arc::clone(&catalog),
+            },
+        );
+        self.entries.truncate(CATALOG_SLOTS);
         catalog
     }
 }
@@ -7225,6 +7264,39 @@ mod tests {
         assert_eq!(kws("SELECT count(*) "), vec!["FROM"]);
     }
 
+    /// **The scan's cost is the statement's, not the document's.** The mask was
+    /// built over the whole buffer inside a closure that runs on every call, in
+    /// a function whose doc reads "microsecond-cheap — it runs every keystroke"
+    /// — so a 64 MiB script (which `sqlfile::open_verdict` admits) paid a 64 MB
+    /// allocation and a full `skip_noncode` walk per character typed, to answer
+    /// one bit about a fragment of one statement.
+    ///
+    /// Asserted as a **bound** rather than as a duration, which is the only
+    /// honest shape for it in a unit suite: the needle is assembled so this
+    /// assertion's own source is not the hit, and it is red against
+    /// `code_mask(sql, dialect)`.
+    #[test]
+    fn the_projection_star_scan_reads_its_own_span_and_not_the_buffer() {
+        let src = include_str!("intel.rs");
+        let at = src.find("fn scan_clauses").expect("scan_clauses is gone");
+        let body = &src[at..];
+        let end = body.find("\n}\n").expect("the end of scan_clauses");
+        let needle = format!("{}(sql, dialect)", "code_mask");
+        assert!(
+            !body[..end].contains(&needle),
+            "`scan_clauses` masks the whole buffer again; at 64 MiB that is a \
+             64 MB allocation and a full boundary walk per keystroke"
+        );
+        // And the answer is the same however much of the document follows —
+        // the behaviour half, which the narrowing must not have moved.
+        let pad = "-- pad *\n".repeat(400);
+        assert_eq!(
+            kws(&format!("SELECT * FROM t;\n{pad}SELECT ")),
+            vec!["DISTINCT"]
+        );
+        assert_eq!(kws(&format!("{pad}SELECT * ")), vec!["FROM"]);
+    }
+
     #[test]
     fn continuation_from_ranks_after_projection() {
         // `select * f` → FROM is the expected continuation (the projection is
@@ -10366,6 +10438,80 @@ mod tests {
         assert!(
             Arc::ptr_eq(&a, &b),
             "an unchanged schema set must not rebuild the catalog"
+        );
+    }
+
+    /// **Two views, alternating, and one slot served neither.** The completion
+    /// *offer* catalog passes a `loaded` list with the hidden databases filtered
+    /// out; the debounced diagnostics pass the unfiltered one. With a
+    /// single-entry cache each replaced the other, so every keystroke paid a
+    /// full `Catalog::build` and the doc claiming "the filtered `loaded` list is
+    /// a different key, so the two views coexist" described the opposite of what
+    /// a one-slot cache does with a different key.
+    ///
+    /// Invisible until a database is hidden: with an empty hidden set the two
+    /// lists are byte-identical, which is why this shipped.
+    #[test]
+    fn catalog_cache_serves_two_alternating_views_without_rebuilding() {
+        let company = Arc::new(DbSchema {
+            tables: vec![tbl("employees", &["id"])],
+            ..Default::default()
+        });
+        let archive = Arc::new(DbSchema {
+            tables: vec![tbl("old_employees", &["id"])],
+            ..Default::default()
+        });
+        // What diagnostics ask for, and what the offer path asks for with
+        // `archive` hidden behind the SCHEMA eye.
+        let all = loaded(&[("company", &company), ("archive", &archive)]);
+        let visible = loaded(&[("company", &company)]);
+        let mut cache = CatalogCache::default();
+        let a1 = cache.get(&visible, Some("company"));
+        let b1 = cache.get(&all, Some("company"));
+        let a2 = cache.get(&visible, Some("company"));
+        let b2 = cache.get(&all, Some("company"));
+        assert!(Arc::ptr_eq(&a1, &a2), "the offer view rebuilt");
+        assert!(Arc::ptr_eq(&b1, &b2), "the diagnostics view rebuilt");
+        // And they are still two different catalogs, not one shared by mistake:
+        // the hidden database is absent from the offer view and present in the
+        // other. Asked qualified, since an unqualified lookup answers out of the
+        // active database alone.
+        assert!(!Arc::ptr_eq(&a1, &b1));
+        let in_archive = |cat: &Catalog| {
+            cat.columns_of(&TableRef {
+                name: "old_employees".to_string(),
+                alias: None,
+                db: Some("archive".to_string()),
+            })
+            .is_some()
+        };
+        assert!(
+            !in_archive(&a1),
+            "the hidden database reached the offer view"
+        );
+        assert!(in_archive(&b1), "diagnostics lost the hidden database");
+    }
+
+    /// The bound is two, not "as many as anyone asks for": a third key evicts
+    /// the *older* of the pair, which with two alternating callers is never
+    /// either of them.
+    #[test]
+    fn catalog_cache_keeps_two_views_and_ages_out_the_third() {
+        let s = |t: &str| {
+            Arc::new(DbSchema {
+                tables: vec![tbl(t, &["id"])],
+                ..Default::default()
+            })
+        };
+        let (x, y, z) = (s("a"), s("b"), s("c"));
+        let mut cache = CatalogCache::default();
+        let first = cache.get(&loaded(&[("d", &x)]), None);
+        let _second = cache.get(&loaded(&[("d", &y)]), None);
+        let _third = cache.get(&loaded(&[("d", &z)]), None);
+        let again = cache.get(&loaded(&[("d", &x)]), None);
+        assert!(
+            !Arc::ptr_eq(&first, &again),
+            "the oldest view is still held"
         );
     }
 
