@@ -7151,6 +7151,21 @@ struct MatchFrom {
 /// looks like — and the readout says `N+` off the same budget, so the two
 /// surfaces agree about where they stopped looking.
 ///
+/// **They share the budget's *value*, and they did not share its *window*.**
+/// [`find_hits`] walks row-major from display row 0 and stops after `budget`
+/// cells; this walked `budget` cells from the *caret*, wrapping. On a grid past
+/// the budget the two windows only overlap. A 12-column result at the 200,000-row
+/// cap is 2,400,000 cells: the count covers rows 0..166,666 and a caret at row
+/// 100,000 covers rows 100,000..199,999 then 0..66,666 — so a single match at row
+/// 80,000 is counted and unreachable. Enter, next and prev all do nothing while
+/// the bar says there is a match. The mirror case reads `0/N+` with the caret
+/// sitting on the matched cell.
+///
+/// So the walk is now over `0..budget` *itself* — the count's window, exactly —
+/// starting at the caret within it and wrapping inside it. Cells past the budget
+/// are neither counted nor jumped to, which is the agreement the paragraph above
+/// claims.
+///
 /// Split out from `grid_find` for the reason `find_hits` already is: the
 /// decision is testable without a live grid, and a budget nothing asserts is
 /// a constant nobody would miss.
@@ -7166,12 +7181,16 @@ fn next_match(
     if total == 0 || q.is_empty() {
         return None;
     }
-    let start = from.start.min(total - 1);
-    for off in 0..total.min(budget) {
+    // The window, not just the count of cells walked: every arithmetic below is
+    // modulo `scan`, so the walk visits exactly the region `find_hits` scanned
+    // and visits all of it.
+    let scan = total.min(budget);
+    let start = from.start.min(scan - 1);
+    for off in 0..scan {
         let lin = if from.forward {
-            (start + if from.from_current { off } else { off + 1 }) % total
+            (start + if from.from_current { off } else { off + 1 }) % scan
         } else {
-            (start + total * 2 - off - 1) % total
+            (start + scan * 2 - off - 1) % scan
         };
         let (dr, ci) = (lin / ncols, lin % ncols);
         // `with_text`, not `text`: borrowed wherever the value already is a
@@ -7223,6 +7242,21 @@ fn grid_find_hits(gs: GridState) -> (Vec<usize>, bool) {
 /// `more` is true when either budget cut the scan short, so the bar can say
 /// "500+" rather than reporting a floor as a total.
 fn find_hits(cells: &schemaic_core::edit::GridCells<'_>, q: &str) -> (Vec<usize>, bool) {
+    find_hits_within(cells, q, FIND_COUNT_CELL_BUDGET)
+}
+
+/// [`find_hits`] over a given window.
+///
+/// The budget is a parameter for the reason it already is one on [`next_match`]:
+/// the two have to scan the **same window**, and a test that cannot shrink the
+/// budget can only be written over a grid small enough that they coincide —
+/// which is the one configuration in which their disagreement is invisible, and
+/// is what all three of the existing budget tests use.
+fn find_hits_within(
+    cells: &schemaic_core::edit::GridCells<'_>,
+    q: &str,
+    budget: usize,
+) -> (Vec<usize>, bool) {
     if q.is_empty() {
         return (Vec::new(), false);
     }
@@ -7233,7 +7267,7 @@ fn find_hits(cells: &schemaic_core::edit::GridCells<'_>, q: &str) -> (Vec<usize>
     let mut scanned = 0usize;
     'outer: for dr in 0..nrows {
         for ci in 0..ncols {
-            if scanned >= FIND_COUNT_CELL_BUDGET {
+            if scanned >= budget {
                 more = true;
                 break 'outer;
             }
@@ -12821,6 +12855,88 @@ mod find_hits_tests {
             )
             .0,
             vec![0, 1]
+        );
+    }
+
+    /// **The count and the jump have to scan the same window, not the same
+    /// number of cells.** `find_hits` walks row-major from display row 0;
+    /// `next_match` walked `budget` cells *from the caret*, wrapping. Past the
+    /// budget the two only overlap: a 12-column result at the 200,000-row cap is
+    /// 2,400,000 cells, the count covers rows 0..166,666, and a caret at row
+    /// 100,000 covered 100,000..199,999 then 0..66,666 — so a single match at
+    /// row 80,000 was counted and unreachable, with Enter, next and prev all
+    /// doing nothing while the bar said there was a match.
+    ///
+    /// Scaled down here to a 20×2 grid and a 12-cell budget, which is the same
+    /// arithmetic: the count sees rows 0..5, the caret at row 8 is past them.
+    /// The three existing budget tests all use a grid small enough that the two
+    /// windows coincide, which is why none of them could see this.
+    #[test]
+    fn a_match_the_count_found_is_one_the_jump_can_reach() {
+        let mut rows: Vec<[&str; 2]> = vec![["x", "y"]; 20];
+        rows[4] = ["needle", "y"];
+        let rs = grid(&rows);
+        let order: Vec<usize> = (0..rows.len()).collect();
+        let (formats, dirty) = (fmts(), DirtyCells::new());
+        let cells = stored(&rs, &order, &formats, &dirty, &[]);
+        let budget = 12; // six rows of two columns
+
+        // The count finds it: display row 4, column 0 → linear 8.
+        let (hits, more) = find_hits_within(&cells, "needle", budget);
+        assert_eq!(hits, vec![8], "the fixture's premise");
+        assert!(more, "the scan stopped short, so the bar reads N+");
+
+        // And the jump reaches it from a caret *past* the counted window — the
+        // case that did nothing. Both directions, since prev walked the same
+        // wrapped window backwards.
+        for forward in [true, false] {
+            let from = MatchFrom {
+                start: 8 * 2, // display row 8, column 0 — outside 0..12
+                forward,
+                from_current: false,
+            };
+            assert_eq!(
+                next_match(&cells, rows.len(), 2, "needle", from, budget),
+                Some((4, 0)),
+                "forward={forward}: the bar counts a match the jump cannot reach"
+            );
+        }
+        // …and from inside the window it still works, in both directions.
+        for forward in [true, false] {
+            let from = MatchFrom {
+                start: 0,
+                forward,
+                from_current: false,
+            };
+            assert_eq!(
+                next_match(&cells, rows.len(), 2, "needle", from, budget),
+                Some((4, 0)),
+                "forward={forward}"
+            );
+        }
+    }
+
+    /// And a needle that is genuinely outside the counted window is reported by
+    /// neither — the agreement is two-sided, or the jump would move to a cell the
+    /// bar says does not exist.
+    #[test]
+    fn a_match_past_the_budget_is_found_by_neither() {
+        let mut rows: Vec<[&str; 2]> = vec![["x", "y"]; 20];
+        rows[9] = ["needle", "y"];
+        let rs = grid(&rows);
+        let order: Vec<usize> = (0..rows.len()).collect();
+        let (formats, dirty) = (fmts(), DirtyCells::new());
+        let cells = stored(&rs, &order, &formats, &dirty, &[]);
+        let budget = 12;
+        assert!(find_hits_within(&cells, "needle", budget).0.is_empty());
+        let from = MatchFrom {
+            start: 0,
+            forward: true,
+            from_current: false,
+        };
+        assert_eq!(
+            next_match(&cells, rows.len(), 2, "needle", from, budget),
+            None
         );
     }
 
