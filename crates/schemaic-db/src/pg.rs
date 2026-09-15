@@ -1924,6 +1924,8 @@ async fn collect_schema(client: &Client) -> Result<DbSchema, DbError> {
             // column, which `auto_increment`/`identity_always` above carry.
             generated_stored: true,
             sqlite_autoincrement: false,
+            // PostgreSQL has no invisible columns either.
+            invisible: false,
         };
         (ns, ColRow { table: t, column })
     })

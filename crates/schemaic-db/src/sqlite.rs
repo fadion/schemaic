@@ -2284,6 +2284,8 @@ fn table_columns(conn: &SqliteConn, db: &str, table: &str) -> Result<Vec<ColumnI
             on_update: None,
             comment: None,
             collation: collations.get(&name.to_ascii_lowercase()).cloned(),
+            // SQLite has no invisible columns.
+            invisible: false,
         });
     }
     Ok(out)

@@ -76,6 +76,24 @@ pub struct ColumnInfo {
     pub comment: Option<String>,
     /// Explicit collation, when the server reports one for this column.
     pub collation: Option<String>,
+    /// MySQL 8.0.23+ / MariaDB 10.3+ `INVISIBLE`: the column exists and is
+    /// selectable by name, but `SELECT *` leaves it out.
+    ///
+    /// **Modelled because restating it wrong is a silent behaviour change.**
+    /// Marking a column invisible is the standard way to retire one without
+    /// breaking an application, and it is a decision a DBA *stages*. With no
+    /// field here, every emitter restated the column visible: dump the database
+    /// and restore it, or copy the DDL, and `SELECT *` starts returning the
+    /// retired column again — every query written against the visible column set
+    /// gets an extra one, and the retirement is undone with nothing said.
+    ///
+    /// [`index_disabled_sql`]'s sibling, one object down: the same catalogue,
+    /// the same gesture, the same silent re-enable on a recreate. A *switched-off
+    /// index* is answered by marking it [`IndexInfo::lossy`], because the model
+    /// cannot restate it; a column can be restated, so this is a real field and
+    /// the emitter writes the keyword. `false` on the two engines that have no
+    /// such concept.
+    pub invisible: bool,
 }
 
 /// One key column of an index, with the parts of it that aren't just a name.
@@ -511,6 +529,14 @@ impl ColumnInfo {
             && !c.is_empty()
         {
             out.push_str(&format!(" COMMENT {}", ddl_string(c, dialect)));
+        }
+        // **Last, and MySQL-family only.** Both servers print `INVISIBLE` at the
+        // end of the column definition, and neither PostgreSQL nor SQLite has
+        // the concept — so a column the DBA had staged for retirement came back
+        // visible from every recreate path, and `SELECT *` silently started
+        // returning it again.
+        if self.invisible && !pg && !sqlite {
+            out.push_str(" INVISIBLE");
         }
         out
     }
@@ -5911,6 +5937,55 @@ mod tests {
         // column is an error there ("Invalid default value").
         let my = c.definition_sql(crate::intel::SqlDialect::MySql);
         assert_eq!(my, "`id` integer NOT NULL AUTO_INCREMENT");
+    }
+
+    /// **A column the DBA retired must come back retired.** `INVISIBLE` is how
+    /// a column is taken out of `SELECT *` without breaking anything that names
+    /// it — the staged first half of dropping it. The model carried no such
+    /// field, so a dump-and-restore, a Copy DDL and `create_ddl_script` all
+    /// restated the column visible, and every query written against the visible
+    /// column set silently got an extra one back.
+    #[test]
+    fn an_invisible_column_is_restated_invisible() {
+        let c = ColumnInfo {
+            name: "secret".into(),
+            type_name: "varchar(64)".into(),
+            nullable: true,
+            invisible: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            c.definition_sql(crate::intel::SqlDialect::MySql),
+            "`secret` varchar(64) INVISIBLE"
+        );
+        // It goes last, after everything else the column carries — which is
+        // where both servers print it.
+        let full = ColumnInfo {
+            default: Some("'x'".into()),
+            comment: Some("retiring".into()),
+            nullable: false,
+            ..c.clone()
+        };
+        let sql = full.definition_sql(crate::intel::SqlDialect::MySql);
+        assert!(sql.ends_with(" INVISIBLE"), "{sql}");
+        assert!(sql.contains("COMMENT"), "{sql}");
+        // Neither other engine has the concept, and emitting the word is a
+        // syntax error on both.
+        for d in [
+            crate::intel::SqlDialect::Postgres,
+            crate::intel::SqlDialect::Sqlite,
+        ] {
+            assert!(!c.definition_sql(d).contains("INVISIBLE"), "{d:?}");
+        }
+        // And an ordinary column is untouched.
+        let plain = ColumnInfo {
+            invisible: false,
+            ..c
+        };
+        assert_eq!(
+            plain.definition_sql(crate::intel::SqlDialect::MySql),
+            "`secret` varchar(64)"
+        );
     }
 
     /// A `CREATE TABLE` that drops the table's checks recreates something that

@@ -4114,6 +4114,13 @@ pub(crate) fn mysql_column(r: MyColRow, mariadb: bool) -> ColRow {
             // No such keyword on MySQL: `AUTO_INCREMENT` above is the whole
             // answer, and it already promises not to reuse a value.
             sqlite_autoincrement: false,
+            // The fourth question `EXTRA` answers, and the one that was not
+            // asked. MySQL 8.0.23+ and MariaDB 10.3+ publish `INVISIBLE` here
+            // beside `auto_increment`, `on update current_timestamp` and
+            // `stored generated`; with nothing to read it into, a column the
+            // DBA had retired from `SELECT *` was restated visible by the dump,
+            // by Copy DDL and by `create_ddl_script`.
+            invisible: extra_lc.contains("invisible"),
         },
     }
 }
@@ -7796,6 +7803,40 @@ mod tests {
         )
         .column;
         assert_eq!(c.on_update.as_deref(), Some("CURRENT_TIMESTAMP"));
+    }
+
+    /// **`EXTRA` answers a fourth question, and it was not asked.** MySQL
+    /// 8.0.23+ and MariaDB 10.3+ publish `INVISIBLE` in the same column as
+    /// `auto_increment` and `stored generated`. Marking a column invisible is
+    /// how a DBA retires one without breaking an application; with nothing
+    /// reading it, every recreate path restated the column *visible* and
+    /// `SELECT *` silently started returning it again.
+    ///
+    /// The test that names this column's contents is the one above, and its own
+    /// title enumerates two of the four.
+    #[test]
+    fn extra_carries_an_invisible_column_too() {
+        let c = mysql_column(my_row("varchar(64)", None, "INVISIBLE"), false).column;
+        assert!(c.invisible, "the retirement was read as an ordinary column");
+        // And an ordinary column is not marked, on either server.
+        assert!(
+            !mysql_column(my_row("int", None, ""), false)
+                .column
+                .invisible
+        );
+        assert!(
+            !mysql_column(my_row("int", None, "auto_increment"), true)
+                .column
+                .invisible
+        );
+        // It travels with the rest: MySQL writes `INVISIBLE` after the default,
+        // so a column can be both.
+        let c = mysql_column(
+            my_row("varchar(64)", Some("x"), "DEFAULT_GENERATED INVISIBLE"),
+            true,
+        )
+        .column;
+        assert!(c.invisible);
     }
 
     /// One key column of an index, as the MySQL fetch produces it (`non_unique`

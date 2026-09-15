@@ -827,6 +827,17 @@ async fn assert_matches_draft(
                 format!("{:?}", w.on_update),
             );
         }
+        // **Unconditionally**, unlike the three above. Those are fields a server
+        // fills in or does not read back, so asking about one the draft left
+        // empty is a false failure. `INVISIBLE` is the opposite: a column coming
+        // back *visible* when the draft said invisible is the whole defect — the
+        // retirement undone, `SELECT *` returning the column again — and a
+        // conditional check could not see it.
+        note(
+            "invisible",
+            got.invisible.to_string(),
+            w.invisible.to_string(),
+        );
     }
 
     // The sets the tests never looked at. Names and the attributes the model
