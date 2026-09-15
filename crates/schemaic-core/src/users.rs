@@ -481,6 +481,13 @@ pub fn from_pg_rows(rows: &[PgRoleRow]) -> Vec<Principal> {
 /// FUNCTION` has to name the argument types, an overloaded name alone is
 /// ambiguous, and a statement that names the wrong overload is worse than a
 /// [`Grants::note`] saying it is not covered.
+///
+/// **And the note has to actually say it** — it did not, which is the half of
+/// that reasoning that was missing. `pg::fetch_grants` reads four ACL kinds and
+/// `pg_proc.proacl` and `pg_attribute.attacl` are two of the ones it does not,
+/// so a role holding nothing but an `EXECUTE` grant and a column grant was shown
+/// "This account holds no privileges." under a note enumerating five caveats
+/// that covered neither. [`pg_scope_note`] names both now.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum PgObjectKind {
     Database,
@@ -794,8 +801,10 @@ pub fn pg_scope_note(database: &str, extra: Option<&str>) -> String {
     let base = format!(
         "Schema, table and sequence privileges are those in {database} — PostgreSQL keeps them in \
          each database's own catalogue, so privileges in other databases are not listed. \
-         Privileges held through role membership or granted to PUBLIC are not expanded, and \
-         neither are the privileges a role holds by owning an object or by being a superuser."
+         EXECUTE on functions and procedures, and privileges granted on a single column, are not \
+         listed either. Privileges held through role membership or granted to PUBLIC are not \
+         expanded, and neither are the privileges a role holds by owning an object or by being a \
+         superuser."
     );
     match extra {
         Some(e) => format!("{e} {base}"),
@@ -875,9 +884,10 @@ pub fn is_pg_predefined(role: &str) -> bool {
 pub fn pg_no_database_note(extra: Option<&str>) -> String {
     let base = "Schema, table and sequence privileges are not listed: PostgreSQL keeps them in \
          each database's own catalogue, and this connection has no database selected. Open a \
-         query tab on a database to see them. Privileges held through role membership or granted \
-         to PUBLIC are not expanded, and neither are the privileges a role holds by owning an \
-         object or by being a superuser.";
+         query tab on a database to see them. EXECUTE on functions and procedures, and privileges \
+         granted on a single column, are not listed either. Privileges held through role \
+         membership or granted to PUBLIC are not expanded, and neither are the privileges a role \
+         holds by owning an object or by being a superuser.";
     match extra {
         Some(e) => format!("{e} {base}"),
         None => base.to_string(),
@@ -2124,6 +2134,32 @@ mod tests {
             assert!(n.contains("owning an object"), "{n}");
             assert!(n.contains("superuser"), "{n}");
             assert!(n.contains("role membership"), "{n}");
+        }
+    }
+
+    /// **And the ACL kinds the read does not issue a query for.**
+    /// `pg::fetch_grants` reads four — `datacl`, `nspacl`, `relacl` and
+    /// `pg_auth_members` — so a role holding nothing but
+    /// `GRANT EXECUTE ON FUNCTION admin.reset_all() TO app` and
+    /// `GRANT SELECT (email) ON customers TO app` was shown the pane's literal
+    /// **"This account holds no privileges."**, under a note that enumerated
+    /// five other caveats and neither of those. An administrator auditing what
+    /// `app` can do was told it could do nothing, on a screen whose own module
+    /// doc says "a privilege screen that is quietly partial is the one way this
+    /// feature can mislead".
+    ///
+    /// The sentence rather than the two queries, and that is
+    /// [`PgObjectKind`]'s own decision restated where the user can read it:
+    /// `GRANT EXECUTE ON FUNCTION` has to name the argument types, an
+    /// overloaded name alone is ambiguous, and "a statement that names the
+    /// wrong overload is worse than a note saying it is not covered". The note
+    /// it promised did not exist.
+    #[test]
+    fn the_postgres_note_admits_the_acl_kinds_it_never_reads() {
+        for n in [pg_scope_note("warehouse", None), pg_no_database_note(None)] {
+            assert!(n.contains("EXECUTE"), "{n}");
+            assert!(n.contains("function"), "{n}");
+            assert!(n.contains("single column"), "{n}");
         }
     }
 
