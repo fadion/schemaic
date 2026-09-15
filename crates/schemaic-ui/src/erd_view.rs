@@ -2029,9 +2029,12 @@ pub(crate) fn erd_overlay(ui: Ui) -> impl IntoView {
             // A truncated `diagrams.json` was renamed `.corrupt` here and
             // reported to nobody.
             crate::report_recoveries(ui.overlay.error_modal_text, ui.overlay.error_modal_open);
-            if let Some(s) =
-                schemaic_core::erd::get_layout(&saved, target.conn_id, &target.database)
-            {
+            if let Some(s) = schemaic_core::erd::get_layout(
+                &saved,
+                target.conn_id,
+                &target.database,
+                &target.seed,
+            ) {
                 for (id, xy) in s {
                     if pos_map.contains_key(id) {
                         pos_map.insert(id.clone(), *xy);
@@ -2063,6 +2066,12 @@ pub(crate) fn erd_overlay(ui: Ui) -> impl IntoView {
             let persist: Rc<dyn Fn()> = {
                 let db = target.database.clone();
                 let cid = target.conn_id;
+                // **The seed, so these coordinates land in their own record.**
+                // A table diagram's positions were computed by `place()` over
+                // four cells near the origin; writing them into the database
+                // diagram's record put those cards on top of whatever the user
+                // had arranged there. See `erd::layout_key`.
+                let seed = target.seed.clone();
                 let (err_text, err_open) =
                     (ui.overlay.error_modal_text, ui.overlay.error_modal_open);
                 Rc::new(move || {
@@ -2073,7 +2082,13 @@ pub(crate) fn erd_overlay(ui: Ui) -> impl IntoView {
                     // writes the defaulted empty file over the recovered
                     // nothing — so the notice has to reach the user either way.
                     crate::report_recoveries(err_text, err_open);
-                    schemaic_core::erd::upsert_layout(&mut f, cid, &db, positions.get_untracked());
+                    schemaic_core::erd::upsert_layout(
+                        &mut f,
+                        cid,
+                        &db,
+                        &seed,
+                        positions.get_untracked(),
+                    );
                     schemaic_core::persist::save_json("diagrams.json", &f);
                 })
             };

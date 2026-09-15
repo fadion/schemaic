@@ -986,8 +986,29 @@ pub struct DiagramLayoutsFile {
 }
 
 /// Storage key for a diagram's layout.
-pub fn layout_key(conn_id: u64, database: &str) -> String {
-    format!("{conn_id}:{database}")
+///
+/// **The seed is part of it, because the coordinates are not comparable across
+/// seeds.** A table diagram's positions come from `place()` over *its* node
+/// count on *its* canvas — four cells near the origin — and a database
+/// diagram's from `place()` over sixteen. With one key per database the two
+/// shared a record, so pressing **Reset layout** inside a table diagram wrote
+/// four origin-adjacent coordinates into the database diagram's record, and
+/// reopening it put those cards on top of whichever the user had arranged
+/// there. `e61e617` fixed the larger half of this (the other twelve entries
+/// used to be *deleted*) and reasoned the residual through as intended
+/// semantics — but "reset these four" is not idempotent with respect to a
+/// diagram whose canvas they were never laid out on.
+///
+/// **[`DiagramSeed::Database`] keeps the old spelling exactly**, so every
+/// layout already in `diagrams.json` is still the database diagram's and no
+/// migration is needed; only the table diagrams get a record of their own, and
+/// they had none worth keeping. [`clear_conn_layouts`]'s `{conn_id}:` prefix
+/// still bounds the file either way.
+pub fn layout_key(conn_id: u64, database: &str, seed: &DiagramSeed) -> String {
+    match seed {
+        DiagramSeed::Database => format!("{conn_id}:{database}"),
+        DiagramSeed::Table(id) => format!("{conn_id}:{database}:table:{id}"),
+    }
 }
 
 /// The saved positions for a diagram, if any.
@@ -995,8 +1016,9 @@ pub fn get_layout<'a>(
     file: &'a DiagramLayoutsFile,
     conn_id: u64,
     database: &str,
+    seed: &DiagramSeed,
 ) -> Option<&'a NodePositions> {
-    file.layouts.get(&layout_key(conn_id, database))
+    file.layouts.get(&layout_key(conn_id, database, seed))
 }
 
 /// Forget every diagram layout belonging to `conn_id` — the connection was
@@ -1031,14 +1053,19 @@ pub fn clear_conn_layouts(file: &mut DiagramLayoutsFile, conn_id: u64) {
 /// A *reset* is therefore a reset of the nodes the user is looking at, which
 /// is what the button in a table diagram means; from the database diagram it
 /// still names every node and so still resets the lot.
+///
+/// The merge still matters with the seed in the key: a database diagram hides
+/// its island tables, so even *it* holds a subset of what the record may carry
+/// from a wider window.
 pub fn upsert_layout(
     file: &mut DiagramLayoutsFile,
     conn_id: u64,
     database: &str,
+    seed: &DiagramSeed,
     positions: NodePositions,
 ) {
     file.layouts
-        .entry(layout_key(conn_id, database))
+        .entry(layout_key(conn_id, database, seed))
         .or_default()
         .extend(positions);
 }
@@ -1539,11 +1566,12 @@ mod layout_clear_tests {
     #[test]
     fn clear_conn_layouts_drops_only_that_connections_diagrams() {
         let mut file = DiagramLayoutsFile::default();
-        upsert_layout(&mut file, 1, "shop", NodePositions::new());
-        upsert_layout(&mut file, 1, "blog", NodePositions::new());
-        upsert_layout(&mut file, 2, "shop", NodePositions::new());
+        let db = DiagramSeed::Database;
+        upsert_layout(&mut file, 1, "shop", &db, NodePositions::new());
+        upsert_layout(&mut file, 1, "blog", &db, NodePositions::new());
+        upsert_layout(&mut file, 2, "shop", &db, NodePositions::new());
         // Connection 12 must not be swept up by connection 1's prefix.
-        upsert_layout(&mut file, 12, "shop", NodePositions::new());
+        upsert_layout(&mut file, 12, "shop", &db, NodePositions::new());
         clear_conn_layouts(&mut file, 1);
         let mut keys: Vec<&String> = file.layouts.keys().collect();
         keys.sort();
@@ -1880,22 +1908,100 @@ mod tests {
         let whole: NodePositions = (0..4)
             .map(|i| (format!("t{i}"), (i as f64 * 10.0, 0.0)))
             .collect();
-        upsert_layout(&mut f, 7, "sakila", whole);
-        assert_eq!(get_layout(&f, 7, "sakila").unwrap().len(), 4);
+        let db = DiagramSeed::Database;
+        upsert_layout(&mut f, 7, "sakila", &db, whole);
+        assert_eq!(get_layout(&f, 7, "sakila", &db).unwrap().len(), 4);
 
-        // A table-scoped diagram of the same database, holding two of them.
+        // The same *database* diagram, saved again with a subset — which it
+        // really can be, since it hides its island tables.
         let subset: NodePositions = [("t1".to_string(), (99.0, 99.0))].into_iter().collect();
-        upsert_layout(&mut f, 7, "sakila", subset);
-        let saved = get_layout(&f, 7, "sakila").unwrap();
+        upsert_layout(&mut f, 7, "sakila", &db, subset);
+        let saved = get_layout(&f, 7, "sakila", &db).unwrap();
         assert_eq!(saved.len(), 4, "the other three nodes were forgotten");
         assert_eq!(saved["t1"], (99.0, 99.0), "and the nudged one moved");
         assert_eq!(saved["t3"], (30.0, 0.0), "while an untouched one did not");
 
         // A different database is untouched either way, and so is a different
         // connection — the key still separates those.
-        upsert_layout(&mut f, 7, "other", NodePositions::new());
-        upsert_layout(&mut f, 8, "sakila", NodePositions::new());
-        assert_eq!(get_layout(&f, 7, "sakila").unwrap().len(), 4);
+        upsert_layout(&mut f, 7, "other", &db, NodePositions::new());
+        upsert_layout(&mut f, 8, "sakila", &db, NodePositions::new());
+        assert_eq!(get_layout(&f, 7, "sakila", &db).unwrap().len(), 4);
+    }
+
+    /// **A table diagram's coordinates are not the database diagram's.** They
+    /// come from `place()` over *its* node count on *its* canvas — four cells
+    /// near the origin against sixteen — so merging them into the database
+    /// diagram's record put those cards on top of whatever the user had
+    /// arranged there. Two routes reached it: **Reset layout** inside a table
+    /// diagram, and the first drag in a table diagram opened before the
+    /// database one. No warning, no undo, and `diagrams.json` is the only copy.
+    ///
+    /// `saving_a_table_diagrams_layout_keeps_the_databases_other_nodes` pins
+    /// the merge and says nothing about where the merged values came from,
+    /// which is why it stayed green through all of it.
+    #[test]
+    fn a_table_diagrams_layout_does_not_move_the_database_diagrams_cards() {
+        let mut f = DiagramLayoutsFile::default();
+        let db = DiagramSeed::Database;
+        let arranged: NodePositions = (0..16)
+            .map(|i| (format!("t{i}"), (i as f64 * 200.0, 400.0)))
+            .collect();
+        upsert_layout(&mut f, 7, "sakila", &db, arranged.clone());
+
+        // A four-node table diagram resets, writing origin-adjacent coordinates
+        // for the nodes it can see.
+        let table = DiagramSeed::Table("t3".to_string());
+        let reset: NodePositions = (2..6)
+            .map(|i| (format!("t{i}"), ((i - 2) as f64 * 40.0, 0.0)))
+            .collect();
+        upsert_layout(&mut f, 7, "sakila", &table, reset.clone());
+
+        assert_eq!(
+            get_layout(&f, 7, "sakila", &db).unwrap(),
+            &arranged,
+            "the table diagram's reset moved the database diagram's cards"
+        );
+        assert_eq!(
+            get_layout(&f, 7, "sakila", &table).unwrap(),
+            &reset,
+            "and the table diagram kept its own arrangement"
+        );
+        // Two table diagrams of one database do not share either.
+        let other = DiagramSeed::Table("t9".to_string());
+        assert!(get_layout(&f, 7, "sakila", &other).is_none());
+    }
+
+    /// **The database diagram's key is byte-for-byte what it was**, so every
+    /// layout already in a user's `diagrams.json` is still theirs — the seed
+    /// term only gives the table diagrams a record they never had. A migration
+    /// is what the alternative spelling would have needed, and orphaning a
+    /// hand-built arrangement is the thing this whole finding is about.
+    #[test]
+    fn the_database_diagrams_key_is_unchanged_so_saved_layouts_survive() {
+        assert_eq!(layout_key(7, "sakila", &DiagramSeed::Database), "7:sakila");
+        // And `clear_conn_layouts` still reaches both, since both start with
+        // the connection id.
+        let mut f = DiagramLayoutsFile::default();
+        upsert_layout(
+            &mut f,
+            7,
+            "sakila",
+            &DiagramSeed::Database,
+            NodePositions::new(),
+        );
+        upsert_layout(
+            &mut f,
+            7,
+            "sakila",
+            &DiagramSeed::Table("t1".to_string()),
+            NodePositions::new(),
+        );
+        assert_eq!(f.layouts.len(), 2);
+        clear_conn_layouts(&mut f, 7);
+        assert!(
+            f.layouts.is_empty(),
+            "a table diagram's record outlived its connection"
+        );
     }
 
     /// The seed's *own* cross-database FK is one hop, and must still be drawn.
@@ -2757,50 +2863,64 @@ mod tests {
 
     #[test]
     fn layout_key_is_conn_and_db() {
-        assert_eq!(layout_key(7, "shop"), "7:shop");
-        assert_ne!(layout_key(7, "shop"), layout_key(8, "shop"));
-        assert_ne!(layout_key(7, "shop"), layout_key(7, "warehouse"));
+        let db = DiagramSeed::Database;
+        assert_eq!(layout_key(7, "shop", &db), "7:shop");
+        assert_ne!(layout_key(7, "shop", &db), layout_key(8, "shop", &db));
+        assert_ne!(layout_key(7, "shop", &db), layout_key(7, "warehouse", &db));
+        // …and the seed, which is the term the two coordinate spaces need.
+        let t = DiagramSeed::Table("orders".to_string());
+        assert_ne!(layout_key(7, "shop", &db), layout_key(7, "shop", &t));
+        assert_ne!(
+            layout_key(7, "shop", &t),
+            layout_key(7, "shop", &DiagramSeed::Table("staff".to_string()))
+        );
     }
 
     #[test]
     fn upsert_then_get_roundtrips_and_is_isolated() {
         let mut f = DiagramLayoutsFile::default();
+        let db = DiagramSeed::Database;
         let mut a: NodePositions = HashMap::new();
         a.insert("orders".into(), (10.0, 20.0));
-        upsert_layout(&mut f, 1, "shop", a);
-        upsert_layout(&mut f, 2, "shop", HashMap::new());
+        upsert_layout(&mut f, 1, "shop", &db, a);
+        upsert_layout(&mut f, 2, "shop", &db, HashMap::new());
 
         assert_eq!(
-            get_layout(&f, 1, "shop").unwrap().get("orders"),
+            get_layout(&f, 1, "shop", &db).unwrap().get("orders"),
             Some(&(10.0, 20.0))
         );
         // A different connection with the same db name is a separate entry.
-        assert!(get_layout(&f, 2, "shop").unwrap().is_empty());
-        assert!(get_layout(&f, 9, "shop").is_none());
+        assert!(get_layout(&f, 2, "shop", &db).unwrap().is_empty());
+        assert!(get_layout(&f, 9, "shop", &db).is_none());
     }
 
     #[test]
     fn upsert_replaces_existing_layout() {
         let mut f = DiagramLayoutsFile::default();
+        let db = DiagramSeed::Database;
         let mut a: NodePositions = HashMap::new();
         a.insert("t".into(), (1.0, 1.0));
-        upsert_layout(&mut f, 1, "d", a);
+        upsert_layout(&mut f, 1, "d", &db, a);
         let mut b: NodePositions = HashMap::new();
         b.insert("t".into(), (2.0, 2.0));
-        upsert_layout(&mut f, 1, "d", b);
-        assert_eq!(get_layout(&f, 1, "d").unwrap().get("t"), Some(&(2.0, 2.0)));
+        upsert_layout(&mut f, 1, "d", &db, b);
+        assert_eq!(
+            get_layout(&f, 1, "d", &db).unwrap().get("t"),
+            Some(&(2.0, 2.0))
+        );
     }
 
     #[test]
     fn layouts_file_json_roundtrips() {
         let mut f = DiagramLayoutsFile::default();
+        let db = DiagramSeed::Database;
         let mut a: NodePositions = HashMap::new();
         a.insert("orders".into(), (10.5, 20.5));
-        upsert_layout(&mut f, 1, "shop", a);
+        upsert_layout(&mut f, 1, "shop", &db, a);
         let json = serde_json::to_string(&f).unwrap();
         let back: DiagramLayoutsFile = serde_json::from_str(&json).unwrap();
         assert_eq!(
-            get_layout(&back, 1, "shop").unwrap().get("orders"),
+            get_layout(&back, 1, "shop", &db).unwrap().get("orders"),
             Some(&(10.5, 20.5))
         );
     }
