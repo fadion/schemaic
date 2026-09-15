@@ -3942,6 +3942,69 @@ mod tests {
         assert!(tsv.contains("Alicia") && tsv.contains("Carol"), "{tsv}");
     }
 
+    /// **On a sorted grid, and that is the only shape where it can be wrong.**
+    ///
+    /// The two resolvers index differently on purpose: `exported` writes by
+    /// **data** row, because `dirty` is keyed `(data row, column)` and
+    /// `splice_cells` indexes data rows, while `tsv`/`with_text` read by
+    /// **display** row and map through `order`. The test above builds
+    /// `order = vec![0, 1]`, where the two indexings agree by construction — so
+    /// it passes against an `exported()` that hands `splice_cells` the display
+    /// index, and against one that ignores `order` entirely. `selected_data_rows`
+    /// states the hazard in its own doc: "on a sorted grid the display index
+    /// and the data index are different numbers".
+    ///
+    /// Here `order = vec![1, 0]`: data row 0 is the *second* line of the file
+    /// and the *first* row of the clipboard, so the edit staged on data row 0
+    /// has to appear in both of those places and nowhere else.
+    #[test]
+    fn a_sorted_grid_exports_the_staged_cell_on_the_row_it_was_typed_into() {
+        let rs = crate::model::ResultSet::from_rows(
+            vec![
+                col("id", "INT", "t", true, false),
+                col("name", "VARCHAR", "t", false, false),
+            ],
+            vec![
+                vec![Value::Int(1), Value::Str("Alice".into())],
+                vec![Value::Int(2), Value::Str("Bob".into())],
+            ],
+        );
+        // Descending by id: display row 0 is data row 1.
+        let order = vec![1, 0];
+        let formats = vec![crate::format::ColumnFormat::None; 2];
+        let mut dirty = HashMap::new();
+        dirty.insert((0, 1), CellEdit::Text("Alicia".into()));
+
+        let c = cells(&rs, &order, &formats, &dirty, &[]);
+        let (out, ord) = c.exported();
+        let csv = crate::export::ExportFormat::Csv.render(
+            &out,
+            &ord,
+            None,
+            crate::intel::SqlDialect::MySql,
+        );
+        let lines: Vec<&str> = csv.lines().collect();
+        // Header, then Bob (display 0 = data 1), then the edited Alice row.
+        assert_eq!(lines.len(), 3, "{csv}");
+        assert!(lines[1].contains("Bob"), "the sort order was lost:\n{csv}");
+        assert!(
+            lines[2].contains("Alicia"),
+            "the staged edit landed on the wrong row:\n{csv}"
+        );
+        assert!(
+            !csv.contains("Alice,"),
+            "the pre-edit value is in the file:\n{csv}"
+        );
+
+        // And the clipboard, which indexes the other way, puts it on its own
+        // first row — the two disagree about the *line number* and agree about
+        // the *row*, which is the property.
+        let tsv = c.tsv((0, 0, 2, 1), None);
+        let tsv_lines: Vec<&str> = tsv.lines().collect();
+        assert!(tsv_lines[0].contains("Bob"), "{tsv}");
+        assert!(tsv_lines[1].contains("Alicia"), "{tsv}");
+    }
+
     /// A clean grid exports exactly what it fetched — the resolution is not
     /// allowed to *change* anything on the way through, which a round trip
     /// through `Value` would: a `FLOAT` stored as the text `1.0` comes back

@@ -34,6 +34,7 @@ use floem::keyboard::{Key, NamedKey};
 use floem::prelude::*;
 use floem::reactive::create_effect;
 
+use schemaic_core::connection::Connection;
 use schemaic_core::text::plural;
 use schemaic_core::users::{Grants, Principal, PrincipalKind, WriteGate};
 
@@ -162,16 +163,24 @@ pub(crate) fn users_overlay(ui: Ui) -> impl IntoView {
     }
 
     // **The read-only flag is part of the key, because `write_gate` reads it.**
-    // The gate below is computed once per container build; its `read_only` term
-    // comes from the *live* connection, and `core/users.rs` states why that is
-    // the live one rather than the target's — *"one is a setting that can change
-    // while the browser is open"*. Nothing re-ran the gate when it changed, so
-    // flipping the connection to read-only from the status bar left **Drop**
-    // lit, the "This connection is read-only." note absent, and Apply enabled on
-    // a preview that then silently did nothing.
-    let key_ui = ui.clone();
+    // The gate below is computed once per container build, so its `read_only`
+    // term has to be in the key: nothing re-ran the gate when the flag changed,
+    // so flipping the connection to read-only from the status bar left **Drop**
+    // lit, the "This connection is read-only." note absent, and Apply enabled
+    // on a preview that then silently did nothing.
+    //
+    // **The flag of the browser's own connection**, tracked — see
+    // `target_read_only`. Reading the *active* one here made the browser's one
+    // remaining live-connection term disagree with its three captured ones the
+    // moment the tree moved, which is the divergence `UsersTarget` exists to
+    // prevent.
+    let key_conns = ui.conn.connections;
     dyn_container(
-        move || (target.get(), hidden(), live_read_only(&key_ui)),
+        move || {
+            let t = target.get();
+            let ro = t.as_ref().map(|t| target_read_only(key_conns, t));
+            (t, hidden(), ro)
+        },
         move |(open, hidden, _)| {
             let Some(t) = open.filter(|_| !hidden) else {
                 return empty().into_any();
@@ -700,12 +709,12 @@ fn statement_row(sql: &str, dialect: SqlDialect) -> AnyView {
 fn write_gate(ui: &Ui, target: &UsersTarget) -> WriteGate {
     WriteGate::of(
         target.dialect,
-        live_read_only(ui),
+        target_read_only(ui.conn.connections, target),
         target.database.is_some(),
     )
 }
 
-/// The live connection's read-only flag, read **tracked**.
+/// The **browser's own** connection's read-only flag, read **tracked**.
 ///
 /// [`crate::table_designer::edit_ctx`] answers the same question with
 /// `get_untracked`, which is right at a click and wrong as a container key: a
@@ -713,8 +722,36 @@ fn write_gate(ui: &Ui, target: &UsersTarget) -> WriteGate {
 /// gate it computed once is a stale answer to a question whose whole point is
 /// that it changes. Both readings are wanted here, so this is the tracked one
 /// and `edit_ctx` stays the untracked one.
-fn live_read_only(ui: &Ui) -> bool {
-    let conn_id = ui.conn.active_conn.get();
+///
+/// **The target's connection, not the active one.** Nothing in `switch_conn`
+/// closes this overlay, so opening Users on a read-only connection A and then
+/// switching the tree to a writable B left the browser on screen listing A's
+/// accounts while this answered about B: **Drop** and **Privileges** lit up and
+/// the "This connection is read-only" note disappeared. The write itself was
+/// still refused — `ddl_preview::apply` re-asks `plan_read_only` by the *plan's*
+/// `conn_id`, which is A's — so the cost was an enabled destructive button and a
+/// confirm dialog on a connection the app would then refuse. Its three sibling
+/// reads (`target.dialect`, `target.database`, `target.conn_id`) were all
+/// already the captured ones, by `UsersTarget`'s own rule that "the browser
+/// describes the server it was opened on, even if the switcher has since
+/// moved"; `read_only` was the one term that was not.
+///
+/// Takes the registry signal rather than `&Ui`, which is `whole_ui_gate`'s rule
+/// and is right here on its own terms: the decision is `read_only_of` over a
+/// list, and nothing else in the bundle is part of it.
+fn target_read_only(conns: RwSignal<Vec<Connection>>, target: &UsersTarget) -> bool {
+    read_only_tracked(conns, target.conn_id)
+}
+
+/// The same question at a **launch**, where the read is untracked because it is
+/// a click rather than a container key — and about the connection the plan is
+/// for, which is the one the account lives on.
+fn launch_read_only(conns: RwSignal<Vec<Connection>>, conn_id: u64) -> bool {
+    conns.with_untracked(|cs| schemaic_core::connection::read_only_of(cs, conn_id))
+}
+
+/// `read_only_of` over the connection registry, tracked.
+fn read_only_tracked(conns: RwSignal<Vec<Connection>>, conn_id: u64) -> bool {
     // **Through the one answer**, not an eighth spelling of it. This said
     // `cs.iter().any(|c| c.id == conn_id && c.read_only)` — semantically
     // identical to `read_only_of`, fail-open default included, and written a
@@ -723,9 +760,7 @@ fn live_read_only(ui: &Ui) -> bool {
     // whether the Users browser offers **+ New account**, **Privileges** and the
     // red **Drop** — a write gate, which is the category that consolidation's
     // own doc singles out.
-    ui.conn
-        .connections
-        .with(|cs| schemaic_core::connection::read_only_of(cs, conn_id))
+    conns.with(|cs| schemaic_core::connection::read_only_of(cs, conn_id))
 }
 
 /// **`+ New account`, at the foot of the list column** — the shape Manage
@@ -859,7 +894,16 @@ fn actions_row(
         // *was* the whole guard — verbatim what `widgets::accept_launch`'s
         // contract forbids, on the one destructive action of the three (its two
         // neighbours refuse read-only inside `open_for_new` / `open_for_grant`).
-        if !crate::widgets::accept_launch(false, crate::table_designer::edit_ctx(&ui).read_only) {
+        //
+        // **And of the plan's connection, not the active one.** `edit_ctx`
+        // answers about whichever connection the tree points at, while
+        // `plan_conn_id` below is the one the account lives on — so after a
+        // connection switch this asked about the wrong server, in both
+        // directions. `read_only_of` is the one answer to that question.
+        if !crate::widgets::accept_launch(
+            false,
+            launch_read_only(ui.conn.connections, plan_conn_id),
+        ) {
             return;
         }
         let database = drop_target.database.clone().unwrap_or_default();
@@ -881,7 +925,7 @@ fn actions_row(
                 // time after the button was pressed — the deferred half
                 // `accept_dialog_launch` exists for. The flag can flip while the
                 // red confirm stands.
-                let read_only = crate::table_designer::edit_ctx(&ui).read_only;
+                let read_only = launch_read_only(ui.conn.connections, plan_conn_id);
                 if yes && crate::widgets::accept_launch(false, read_only) {
                     crate::ddl_preview::preview_account(
                         &ui,

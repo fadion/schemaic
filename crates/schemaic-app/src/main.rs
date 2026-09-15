@@ -5517,6 +5517,27 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                     if !yes {
                         return;
                     }
+                    // **And again here, in the step that launches the kill.**
+                    // The check above happens before the modal opens; the modal
+                    // stands for an unbounded stretch of time, which is the
+                    // reason the *connection handle* three lines up is captured
+                    // early and the reason the flag must not be. A guard that
+                    // runs once, early, is the shape `accept_launch`'s contract
+                    // forbids — its sibling in `users_view` re-asks inside its
+                    // own resolve and `ddl_preview::apply` asks at the press.
+                    // The early one stays: it is what produces the per-kind
+                    // refusal message before the user is asked a question that
+                    // would be refused anyway.
+                    //
+                    // `conn_id` is the one captured above, so the second read is
+                    // about the same connection by construction.
+                    let read_only = connections
+                        .with_untracked(|cs| schemaic_core::connection::read_only_of(cs, conn_id));
+                    if !schemaic_ui::may_launch_destructive(false, read_only) {
+                        activity_kill_error
+                            .set(Some(schemaic_core::activity::read_only_refusal(kind)));
+                        return;
+                    }
                     let db = db.clone();
                     let refresh = refresh.clone();
                     let repair = repair_killed_session.clone();

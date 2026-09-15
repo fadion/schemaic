@@ -10,11 +10,31 @@
 //!
 //! Two rules hold for everything in this module:
 //!
-//! 1. **No shell.** The argv this module produces is executed directly. Nothing
-//!    it emits is parsed by `cmd`, `sh` or PowerShell, so a byte that is syntax
-//!    to a shell is inert. [`url_open_argv`]'s own test pins that, because the
-//!    alternative — filtering every metacharacter of every shell — is how `&`
-//!    would come to be refused inside a query string while `%` still expanded.
+//! 1. **No shell — with one named exception, and it is named here rather than
+//!    assumed away.** The argv this module produces is executed directly:
+//!    nothing it emits is handed to `cmd`, `sh` or PowerShell *by this app*, so
+//!    a byte that is syntax to a shell is inert on the way out.
+//!    [`url_open_argv`]'s own test pins that, because the alternative —
+//!    filtering every metacharacter of every shell — is how `&` would come to
+//!    be refused inside a query string while `%` still expanded.
+//!
+//!    The exception is **`xdg-open`**, the Linux arm of [`url_open_argv`]. It
+//!    is not a binary: `xdg-utils` ships it as a `#!/bin/sh` script, so on
+//!    Linux the one program this module names is itself an interpreter. The
+//!    Windows and macOS arms (`explorer`, `open`) are genuine executables and
+//!    the rule holds there exactly as stated.
+//!
+//!    What that costs, stated rather than left to be discovered: the bytes
+//!    [`is_url_byte`] admits — `& ; $ ' ( ) *` — reach that script's own
+//!    parsing, and the argument that they are inert there is an argument about
+//!    **somebody else's code**, which nothing in this repository re-checks when
+//!    `xdg-utils` changes. It was not verified in writing this note (no
+//!    `xdg-utils` on the machine at hand), and saying so is the point: the URL
+//!    still travels as *one* argv element, still passes RFC 3986's allowlist,
+//!    and still carries no byte outside it — which is everything this module
+//!    can guarantee on its own. Removing the dependence means preferring a
+//!    resolvable `$BROWSER`/`gio open` on the Linux arm; until then this
+//!    paragraph is the guarantee.
 //! 2. **The string is validated where it stops being data**, not at the site
 //!    that produced it. A caller upstream may have its own reasons to be
 //!    permissive (the terminal's link tagger admits `&` because a query string
@@ -28,7 +48,10 @@
 /// `sh` treat as syntax and RFC 3986 has no use for. The sub-delims it *does*
 /// admit — `&`, `;`, `$`, `'`, `(`, `)` — are syntax to one shell or another
 /// and are kept anyway, because a real query string needs them and
-/// [`url_open_argv`] hands them to no shell. Non-ASCII is excluded too, and
+/// [`url_open_argv`] hands them to no shell **of this app's making** — see
+/// rule 1 in the module header for the one interpreter that is nonetheless in
+/// the set on Linux, and for what is and is not guaranteed about it.
+/// Non-ASCII is excluded too, and
 /// deliberately: the terminal's link tagger builds its candidates from
 /// `is_ascii_alphanumeric`, so a non-ASCII byte cannot have come from the one
 /// caller this gate has.
@@ -526,6 +549,25 @@ two"
         "start",
     ];
 
+    /// **Every launcher this module may name, and whether it is itself an
+    /// interpreter** — `(program, is_a_script)`.
+    ///
+    /// A denylist of nine shell *names* cannot say anything about a program
+    /// that is not one of them, which is how `xdg-open` — a `#!/bin/sh` script
+    /// shipped by `xdg-utils`, and the one interpreter in this set — passed
+    /// `no_shell_ever_reads_a_url` while the module header claimed no shell was
+    /// ever in between. An allowlist makes a new launcher a thing that has to
+    /// be *classified* rather than merely absent from a list of shells, and
+    /// `a_launcher_that_is_an_interpreter_is_declared` is what holds the second
+    /// column to the header's own paragraph.
+    const LAUNCHERS: &[(&str, bool)] = &[
+        ("explorer", false),
+        ("open", false),
+        // See rule 1 in the module header for what this costs and what is
+        // still guaranteed.
+        ("xdg-open", true),
+    ];
+
     /// The composition, not the predicate: a hostile URL must either be refused
     /// outright **or** reach a program that is not a shell, as exactly one argv
     /// element. Red against `cmd /C start "" <url>`, and it stays red for any
@@ -550,7 +592,53 @@ two"
             );
             assert_eq!(argv.len(), 2, "{raw} did not travel as one argv element");
             assert_eq!(argv[1], raw);
+            // **And it is a launcher this module has declared**, which is the
+            // half the shell-name list could not do: a program that is not one
+            // of the nine names above says nothing about whether it parses its
+            // argument. See `LAUNCHERS`.
+            assert!(
+                LAUNCHERS.iter().any(|(p, _)| *p == argv[0]),
+                "{raw} is launched through `{}`, which is not in `LAUNCHERS` — \
+                 add it there with an honest answer to \"is this itself an \
+                 interpreter\", and amend rule 1 in the module header if it is",
+                argv[0]
+            );
         }
+    }
+
+    /// **The header's exception and the table agree.**
+    ///
+    /// Rule 1 names `xdg-open` as the one launcher that is itself a shell
+    /// script. If a future edit adds a second interpreter to `LAUNCHERS`
+    /// without amending that paragraph, the module's stated guarantee and its
+    /// actual behaviour part company again — which is the whole of this
+    /// finding, one launcher earlier.
+    #[test]
+    fn a_launcher_that_is_an_interpreter_is_declared() {
+        let src = include_str!("launch.rs");
+        let header: String = src
+            .lines()
+            .take_while(|l| l.starts_with("//!") || l.trim().is_empty())
+            .collect::<Vec<_>>()
+            .join("\n");
+        for (program, is_script) in LAUNCHERS {
+            if !*is_script {
+                continue;
+            }
+            assert!(
+                header.contains(program),
+                "`{program}` is an interpreter and the module header does not \
+                 say so — rule 1 claims no shell is ever in between"
+            );
+        }
+        // And the floor: the exception is still one, so this is not passing by
+        // finding no interpreters at all.
+        assert_eq!(
+            LAUNCHERS.iter().filter(|(_, s)| *s).count(),
+            1,
+            "the number of interpreters in the launcher set changed — rule 1 \
+             names exactly one, so amend it rather than this number alone"
+        );
     }
 
     #[test]

@@ -6123,6 +6123,65 @@ mod destructive_launch_gate {
         );
     }
 
+    /// **A guard that opens a modal asks again inside the modal's answer.**
+    ///
+    /// [`super::accept_launch`]'s contract is "in the same step that launches
+    /// it", and a confirm dialog splits that step in two: the press, and the
+    /// resolve the user reaches an unbounded stretch of time later. `kill_session`
+    /// asked once, before `confirm.set` — beside a comment that captures the
+    /// *connection handle* early precisely because "a modal is open across an
+    /// unbounded stretch of time", giving the read-only flag the opposite
+    /// treatment for the same reason. Its two siblings already asked twice
+    /// (`users_view`'s Drop) or at the press (`ddl_preview::apply`), which is
+    /// what made this a residue rather than a rule.
+    ///
+    /// The early ask is not the defect and is not what this refuses: it is what
+    /// produces the refusal message before the user is asked a question that
+    /// would be refused anyway. What it requires is the second one.
+    #[test]
+    fn a_guarded_launch_behind_a_confirm_asks_again_in_the_resolve() {
+        let mut checked = 0usize;
+        for (file, code) in crate::source_gate::crate_sources() {
+            if file == "widgets.rs" {
+                continue;
+            }
+            let lines: Vec<&str> = code.lines().collect();
+            for (n, line) in lines.iter().enumerate() {
+                // A guard *call*, not one of the definitions above.
+                if line.contains("fn ") || !GUARDS.iter().any(|g| line.contains(g)) {
+                    continue;
+                }
+                // …that opens a confirm shortly after. 40 lines is the whole of
+                // the message-building between the two in every site today.
+                let Some(opens) = (n..(n + 40).min(lines.len()))
+                    .find(|&j| lines[j].contains("confirm.set(Some("))
+                else {
+                    continue;
+                };
+                checked += 1;
+                let after = &lines[opens..(opens + 80).min(lines.len())];
+                assert!(
+                    after
+                        .iter()
+                        .any(|l| !l.contains("fn ") && GUARDS.iter().any(|g| l.contains(g))),
+                    "{file}:{}: this guards the press and then opens a confirm, \
+                     and nothing asks again in the resolve — the flag can flip \
+                     while the modal stands, which is the reason the connection \
+                     handle beside it is captured early. Ask again in the `yes` \
+                     arm.",
+                    n + 1
+                );
+            }
+        }
+        // A floor: the two sites that do this must still be found, or the scan
+        // is passing by matching nothing.
+        assert!(
+            checked >= 2,
+            "only {checked} guard-then-confirm sites found — the shape moved, so \
+             rewrite this gate rather than letting it pass on an empty scan"
+        );
+    }
+
     /// **A read-only connection is refused through the guard, not through an
     /// `if`.** `activity_panel`'s lock-wait Kill spelled it `if !read_only`,
     /// beside a comment quoting `accept_launch`'s contract for the

@@ -10247,6 +10247,174 @@ mod designer_path_tests {
 
 /// **The filter bar's *Exclude this value*, run against an engine.**
 ///
+/// **[`run_batch`]'s three failure decisions**, none of which had a test.
+///
+/// The two tests that call `Db::run_batch` at all go through a `run_all` helper
+/// that asserts `failures.is_empty()`, so they exercise the all-succeed path
+/// only: a wrong index, a swallowed error or a missing tail entry could not
+/// fail either of them. What is decided here and nowhere else is (a) the
+/// connect-failure arm, which reports the error as statement 0 and leaves the
+/// drain to cancel the rest, (b) the interrupt remap, whose stated purpose is
+/// that a user's Stop must not be reported as a fault in their SQL, and (c) the
+/// `delivered..n` tail, which is the "stop on error" contract the MySQL and
+/// PostgreSQL arms keep.
+///
+/// Every one is reachable with the shared-cache in-memory URI the rest of this
+/// file already uses — no server, no file, nothing to clean up.
+#[cfg(test)]
+mod run_batch_tests {
+    use super::tests::shared_memory;
+    use super::*;
+    use tokio_util::sync::CancellationToken;
+
+    /// Every outcome in index order, as `(index, Ok(rows) | Err(text))`.
+    async fn collect(
+        db: &Db,
+        stmts: &[String],
+        cancel: CancellationToken,
+    ) -> Vec<(usize, Result<usize, String>)> {
+        let mut out = Vec::new();
+        db.run_batch(None, stmts, 100, cancel, |i, r| {
+            out.push((i, r.map(|rs| rs.row_count()).map_err(|e| e.to_string())));
+        })
+        .await;
+        out
+    }
+
+    fn sql(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// **A failure stops the batch, and what is past it is `Cancelled` rather
+    /// than silent.** Three entries come back, in index order, and the middle
+    /// one carries the *server's* error rather than a placeholder — a shifted
+    /// index would put it on the wrong statement, which is what the UI keys its
+    /// result tabs on.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_failed_statement_stops_the_batch_and_the_rest_report_cancelled() {
+        let (keeper, db) = shared_memory("batch_failure");
+        keeper
+            .execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY);")
+            .unwrap();
+        let stmts = sql(&[
+            "INSERT INTO t VALUES (1)",
+            "INSERT INTO nope VALUES (2)",
+            "INSERT INTO t VALUES (3)",
+        ]);
+
+        let out = collect(&db, &stmts, CancellationToken::new()).await;
+
+        assert_eq!(out.len(), 3, "every statement is accounted for: {out:?}");
+        assert_eq!(out[0].0, 0);
+        assert!(out[0].1.is_ok(), "{out:?}");
+        assert_eq!(out[1].0, 1);
+        let why = out[1].1.as_ref().unwrap_err();
+        assert!(
+            why.contains("nope"),
+            "the failure must carry the server's own text, not a placeholder: {why}"
+        );
+        assert_eq!(out[2].0, 2);
+        assert_eq!(
+            out[2].1.as_ref().unwrap_err(),
+            "query cancelled",
+            "a statement after a failure was written against a state that never \
+             happened, so it reports cancelled: {out:?}"
+        );
+
+        // And it really stopped: statement 3 did not run.
+        let n: i64 = keeper
+            .query_row("SELECT count(*) FROM t", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 1, "the batch ran past its failure");
+    }
+
+    /// **A token cancelled before the batch starts reports every index**, and
+    /// reports them as `Cancelled` rather than as errors in the user's SQL.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_cancelled_batch_reports_cancelled_for_every_statement() {
+        let (keeper, db) = shared_memory("batch_cancelled");
+        keeper
+            .execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY);")
+            .unwrap();
+        let stmts = sql(&[
+            "INSERT INTO t VALUES (1)",
+            "INSERT INTO t VALUES (2)",
+            "INSERT INTO t VALUES (3)",
+        ]);
+
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let out = collect(&db, &stmts, cancel).await;
+
+        assert_eq!(out.len(), 3, "{out:?}");
+        for (i, (idx, r)) in out.iter().enumerate() {
+            assert_eq!(*idx, i, "indexes are in order: {out:?}");
+            assert_eq!(r.as_ref().unwrap_err(), "query cancelled", "{out:?}");
+        }
+        let n: i64 = keeper
+            .query_row("SELECT count(*) FROM t", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 0, "a cancelled batch wrote rows");
+    }
+
+    /// **A connection that cannot be opened is statement 0's error**, and the
+    /// rest are cancelled by the drain — the shape the MySQL arm has, and the
+    /// one arm here that never runs a statement at all.
+    ///
+    /// A directory is the portable "cannot be opened as a database" input:
+    /// SQLite refuses it on every platform, and `SQLITE_OPEN_CREATE` cannot
+    /// make a file where one already exists as a folder.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_connection_that_cannot_open_fails_statement_zero_and_cancels_the_rest() {
+        let dir = std::env::temp_dir();
+        let db = Db::from_parts(
+            crate::Engine::Sqlite,
+            String::new(),
+            0,
+            String::new(),
+            String::new(),
+            dir.to_string_lossy().into_owned(),
+        );
+        let stmts = sql(&["SELECT 1", "SELECT 2"]);
+
+        let out = collect(&db, &stmts, CancellationToken::new()).await;
+
+        assert_eq!(out.len(), 2, "{out:?}");
+        assert_eq!(out[0].0, 0);
+        let why = out[0].1.as_ref().unwrap_err();
+        assert!(
+            why.starts_with("connection failed"),
+            "statement 0 must carry the connect failure, not a cancellation: {why}"
+        );
+        assert_eq!(out[1].1.as_ref().unwrap_err(), "query cancelled", "{out:?}");
+    }
+
+    /// The counterweight: a batch that succeeds delivers every statement's own
+    /// result, in order, and nothing extra — so the three tests above are about
+    /// the failure arms rather than about the loop.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_batch_that_succeeds_delivers_each_statement_once_in_order() {
+        let (keeper, db) = shared_memory("batch_ok");
+        keeper
+            .execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY);")
+            .unwrap();
+        let stmts = sql(&[
+            "INSERT INTO t VALUES (1)",
+            "INSERT INTO t VALUES (2)",
+            "SELECT id FROM t ORDER BY id",
+        ]);
+
+        let out = collect(&db, &stmts, CancellationToken::new()).await;
+
+        assert_eq!(out.len(), 3, "{out:?}");
+        for (i, (idx, r)) in out.iter().enumerate() {
+            assert_eq!(*idx, i);
+            assert!(r.is_ok(), "{out:?}");
+        }
+        assert_eq!(out[2].1.as_ref().unwrap(), &2, "the SELECT's rows: {out:?}");
+    }
+}
+
 /// `core::filter` is pure and its own tests can only pin the *text* of the
 /// fragment it emits — which is exactly how the bug survived: the text was
 /// wrong, and the assertion agreed with it. Three-valued logic is the engine's

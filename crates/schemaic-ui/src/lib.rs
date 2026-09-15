@@ -14265,7 +14265,11 @@ mod whole_ui_gate {
         // 2, for `compare_view.rs`'s reason: `tab_chip(tab: Tab, ui: Ui)`.
         ("tabs.rs", 2),
         ("trigger_editor.rs", 11),
-        ("users_view.rs", 9),
+        // 9 → 8: the browser's read-only question takes the connection registry
+        // signal it actually reads rather than the root bundle, which is this
+        // rule's own prescription and was the right shape anyway — the decision
+        // is `connection::read_only_of` over a list.
+        ("users_view.rs", 8),
         ("view_editor.rs", 10),
         // `MenuFlags::of`, which gathers a flag out of six child bundles and so
         // genuinely needs the root one — the case the doc above calls taking

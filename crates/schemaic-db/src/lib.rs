@@ -5291,6 +5291,19 @@ fn cancelled_import(undone: Rollback) -> DbError {
     }
 }
 
+/// [`cancelled_import`]'s twin for a cancelled **grid write-back**, and the
+/// same rule for the same reason.
+///
+/// Separate only because the sentence names a different act: "Import cancelled"
+/// is wrong over a Commit, and the whole point of the non-`Complete` arm is
+/// that the user reads it and knows what may still be in the table.
+fn cancelled_write(undone: Rollback) -> DbError {
+    match undone {
+        Rollback::Complete => DbError::Cancelled,
+        undone => DbError::Query(format!("Commit cancelled{}", undone.note())),
+    }
+}
+
 /// ` ORDER BY a, b` for the Live Monitor's window, or `""` when there is no key
 /// to order by. `quote` is the engine's identifier quoter, so the two callers
 /// can't drift on quoting.
@@ -5498,8 +5511,19 @@ async fn import_on(
 /// UPDATE identity comes from each edit's `key` (typically the primary key);
 /// INSERT columns not listed take their server default (auto-increment /
 /// `DEFAULT` / `NULL`). All values are bound parameters, coerced by the server to
-/// the column type. Cancellation kills the in-flight statement server-side; the
-/// open transaction is then rolled back when the connection drops.
+/// the column type.
+///
+/// **A cancel is an exit like any other, and leaves through an explicit
+/// `ROLLBACK`.** The MySQL arm used to `kill_query`, disconnect, and return
+/// `DbError::Cancelled` — relying on the drop to undo the transaction, and
+/// reporting the one verdict the modal renders as "nothing was written" without
+/// ever asking whether that was true. On a `MyISAM`/`MEMORY`/`ARCHIVE`/`CSV`
+/// table every statement already executed is durable, so a cancelled commit of
+/// three staged `INSERT`s that got two in reported "nothing was written", left
+/// all three staged, and a second Commit landed the two again. That is
+/// [`cancelled_import`]'s documented contract read backwards, and `import_on`
+/// three hundred lines up and `pg::commit_writes` both already did it the other
+/// way.
 impl Db {
     pub async fn commit_writes(
         &self,
@@ -5522,7 +5546,10 @@ impl Db {
             r = write_on(&mut conn, write, TxScope::Own) => r,
             _ = cancel.cancelled() => {
                 self.kill_query(conn_id).await;
-                Err(DbError::Cancelled)
+                // The `ROLLBACK` is what lets the report be true — see this
+                // method's doc. `cancelled_write` answers `Cancelled` only when
+                // the engine really undid it.
+                Err(cancelled_write(rollback(&mut conn, "ROLLBACK").await))
             }
         };
 
@@ -7569,6 +7596,68 @@ mod tests {
                 "import_on +{n}: {code} — a `?` leaves without the note"
             );
         }
+    }
+
+    /// **A cancelled write reports `Cancelled` only when the rollback really
+    /// undid it**, which is the same rule `cancelled_import` states and the
+    /// grid's commit did not follow.
+    #[test]
+    fn a_cancelled_write_says_so_only_when_the_rollback_was_complete() {
+        assert!(matches!(
+            cancelled_write(Rollback::Complete),
+            DbError::Cancelled
+        ));
+        match cancelled_write(Rollback::Incomplete) {
+            DbError::Query(msg) => {
+                assert!(msg.starts_with("Commit cancelled"), "{msg}");
+                assert!(
+                    msg.contains("remain"),
+                    "the note that says the rows may still be there is missing: {msg}"
+                );
+            }
+            other => panic!("an incomplete undo reported as {other:?}"),
+        }
+        // And it names the right act: "Import cancelled" over a Commit is the
+        // sentence `cancelled_import` would have given.
+        assert!(
+            !format!("{:?}", cancelled_write(Rollback::Incomplete)).contains("Import"),
+            "a cancelled commit reported as a cancelled import"
+        );
+    }
+
+    /// **And the composition, which the test above cannot reach.**
+    ///
+    /// `DbError::Cancelled` is what the modal renders as "nothing was written",
+    /// so the whole question is whether the cancel arm *asks*. It did not: it
+    /// killed the query, disconnected, and returned `Cancelled` on the strength
+    /// of the connection drop undoing the transaction — true on InnoDB and
+    /// false on `MyISAM`/`MEMORY`/`ARCHIVE`/`CSV`, where a cancelled commit of
+    /// three staged `INSERT`s that got two in reported "nothing was written",
+    /// left all three staged, and a second Commit landed the two again.
+    ///
+    /// A source gate for `import_on`'s reason one function up: every arm of
+    /// `commit_writes` needs a live MySQL connection to reach, and a unit test
+    /// of `cancelled_write` alone is green against the defect — the seam is
+    /// between the predicate and its caller, which is the shape CLAUDE.md's
+    /// testing section names.
+    #[test]
+    fn the_grid_commits_cancel_arm_goes_through_a_rollback() {
+        let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/lib.rs"))
+            .expect("this module's own source");
+        let at = src
+            .find("    pub async fn commit_writes(")
+            .expect("`commit_writes` is gone or was renamed");
+        let body = &src[at..at + 1400];
+        let arm = body
+            .find("_ = cancel.cancelled() =>")
+            .map(|i| &body[i..i + 400])
+            .expect("the cancel arm is gone — this gate is stale");
+        assert!(
+            arm.contains("rollback(") && arm.contains("cancelled_write("),
+            "the cancel arm returns without asking what the rollback achieved, \
+             so it claims 'nothing was written' about a MySQL table that may \
+             hold half the batch:\n{arm}"
+        );
     }
 
     /// **The gate.** One place decides which MySQL-family server this is, and
