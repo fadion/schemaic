@@ -894,6 +894,152 @@ mod tests {
         .collect()
     }
 
+    /// One table whose columns are the three shapes a prefix can match —
+    /// exactly, at a word boundary, and buried inside a longer name.
+    fn similar() -> SchemaIndex {
+        let col = |n: &str| ColMeta {
+            name: n.to_string(),
+            type_name: "int".to_string(),
+            nullable: false,
+            primary_key: false,
+            foreign_key: false,
+        };
+        let cols = Rc::new(vec![
+            col("account_customs"),
+            col("customer_id"),
+            col("custom"),
+            col("total"),
+        ]);
+        let mut columns = HashMap::new();
+        columns.insert("ledger".to_string(), (*cols).clone());
+        let mut columns_by_db = HashMap::new();
+        columns_by_db.insert(("shop".to_string(), "ledger".to_string()), cols);
+        let mut tables_by_db = HashMap::new();
+        tables_by_db.insert("shop".to_string(), vec!["ledger".to_string()]);
+        SchemaIndex {
+            databases: vec!["shop".to_string()],
+            tables: vec![("ledger".to_string(), "shop".to_string())],
+            columns,
+            columns_by_db,
+            tables_by_db,
+        }
+    }
+
+    /// **What Enter splices, through the comparator that decides it.**
+    ///
+    /// `recompute_completions` sets `sel = 0` and `accept_completion` splices
+    /// `items[sel]`, so `rank`'s sort *is* the decision. The test that claimed
+    /// to cover it built its rows from `fuzzy_score` and then sorted them with a
+    /// **copy** of the comparator written inline — a copy that omitted the tier
+    /// and the `recency_bonus` term. Flip this file's `b.1.cmp(&a.1)` to score
+    /// *ascending*, so the popup preselects the worst match, and that replica
+    /// stayed green: it sorted its own vector. This one calls `rank`.
+    #[test]
+    fn the_comparator_preselects_the_prefix_match_and_buries_the_interior_one() {
+        let s = similar();
+        let out = ranked(&s, ClauseCtx::Column, &[tref("ledger", None)], "cus");
+        assert_eq!(out.first().map(String::as_str), Some("custom"), "{out:?}");
+        // A non-match never reaches the list at all.
+        assert!(!out.iter().any(|t| t == "total"), "{out:?}");
+        // And the interior match sorts last of the three that do — asserted
+        // against its siblings rather than against the whole list, which also
+        // holds keywords and functions.
+        let pos = |t: &str| out.iter().position(|x| x == t).unwrap_or(usize::MAX);
+        assert!(pos("custom") < pos("customer_id"), "{out:?}");
+        assert!(pos("customer_id") < pos("account_customs"), "{out:?}");
+    }
+
+    /// **And the recency term is part of that sort, not a decoration on it.**
+    /// The replica dropped it, so a change to `recency_bonus`' effect on order
+    /// was invisible. A name the user has already typed in this statement is
+    /// lifted past a better-scoring one.
+    #[test]
+    fn a_recently_used_name_is_lifted_past_a_better_scoring_one() {
+        let s = similar();
+        let cont = Continuation::default();
+        let plain = ranked(&s, ClauseCtx::Column, &[tref("ledger", None)], "cus");
+        assert_eq!(plain.first().map(String::as_str), Some("custom"));
+
+        let used: HashSet<String> = ["customer_id".to_string()].into_iter().collect();
+        let out: Vec<String> = rank(
+            &s,
+            &RankInput {
+                ctx: &ClauseCtx::Column,
+                cont: &cont,
+                scope: &[tref("ledger", None)],
+                prefix: "cus",
+                snippets: &[],
+                join_targets: &[],
+                star: None,
+                used: &used,
+                active_db: Some("shop"),
+            },
+        )
+        .into_iter()
+        .map(|s| s.text)
+        .collect();
+        assert_eq!(
+            out.first().map(String::as_str),
+            Some("customer_id"),
+            "the recency term did not move the row: {out:?}"
+        );
+    }
+
+    /// **The star-expansion arm, end to end.** Nothing in the workspace called
+    /// `rank` with `star: Some(_)` — all six construction sites passed `None` —
+    /// so the row that replaces the `*` itself was asserted nowhere: not its
+    /// wording, not its `replace` range, not its `insert`. `fda8449` is named
+    /// after making it say "1 column", and tested the *count* one crate over;
+    /// the half that turns the count into words had no test, so restoring a
+    /// hard-coded `"{ncols} columns"` passed the whole suite.
+    #[test]
+    fn the_star_expansion_row_says_its_column_count_and_replaces_the_star() {
+        let s = similar();
+        let cont = Continuation::default();
+        let used = HashSet::new();
+        let row = |exp: &crate::intel::StarExpansion| {
+            rank(
+                &s,
+                &RankInput {
+                    ctx: &ClauseCtx::Column,
+                    cont: &cont,
+                    scope: &[tref("ledger", None)],
+                    prefix: "",
+                    snippets: &[],
+                    join_targets: &[],
+                    star: Some(exp),
+                    used: &used,
+                    active_db: Some("shop"),
+                },
+            )
+            .into_iter()
+            .find(|r| r.text == "expand *")
+            .expect("the star row")
+        };
+        let one = row(&crate::intel::StarExpansion {
+            range: (7, 8),
+            replacement: "id".to_string(),
+            columns: 1,
+        });
+        assert_eq!(
+            one.detail, "1 column",
+            "the singular is the whole of fda8449"
+        );
+        assert_eq!(one.insert.as_deref(), Some("id"));
+        // The one suggestion that replaces a range other than the word at the
+        // caret. Without it, accepting the row inserts the column list over the
+        // empty word *after* the star: `SELECT *id, name`.
+        assert_eq!(one.replace, Some((7, 8)));
+
+        let three = row(&crate::intel::StarExpansion {
+            range: (7, 8),
+            replacement: "id, name, email".to_string(),
+            columns: 3,
+        });
+        assert_eq!(three.detail, "3 columns");
+        assert_eq!(three.insert.as_deref(), Some("id, name, email"));
+    }
+
     /// **The last table in the FROM list claims a shared column name.**
     ///
     /// The bias exists because the table you just typed is the one you are about

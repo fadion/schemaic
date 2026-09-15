@@ -1722,25 +1722,17 @@ mod tests {
         assert!(fuzzy_score("café", "CAF").is_some());
     }
 
-    /// **The composition, not the function.** The seam that matters is
-    /// `fuzzy_score` plus the caller's comparator, since it is the sort that
-    /// decides what Enter inserts: highest score first, ties broken by the
-    /// shorter text.
-    #[test]
-    fn the_callers_comparator_preselects_the_prefix_match() {
-        let mut rows: Vec<(i32, &str)> = ["account_customs", "customer_id", "custom", "orders"]
-            .into_iter()
-            .filter_map(|t| fuzzy_score(t, "cus").map(|s| (s, t)))
-            .collect();
-        // `recompute_completions`' comparator, minus the tier every row here
-        // shares: score descending, then the shorter text.
-        rows.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.len().cmp(&b.1.len())));
-        assert_eq!(rows.first().map(|r| r.1), Some("custom"));
-        // `orders` is not a match and never reaches the list.
-        assert!(!rows.iter().any(|r| r.1 == "orders"));
-        // And the interior match sorts last of the three that do.
-        assert_eq!(rows.last().map(|r| r.1), Some("account_customs"));
-    }
+    // **The composition lives in `rank.rs`, with the comparator.** A test here
+    // called `the_callers_comparator_preselects_the_prefix_match`, and its own
+    // doc said "the composition, not the function" — but it built its rows from
+    // `fuzzy_score` and sorted them with a *copy* of the comparator written
+    // inline, missing the tier and the `recency_bonus` term. Flipping `rank`'s
+    // sort to score-ascending, so the popup preselects the worst match and Enter
+    // splices it, left the whole workspace green. `rank` is callable now, so the
+    // seam is asserted by calling it:
+    // `the_comparator_preselects_the_prefix_match_and_buries_the_interior_one`
+    // and `a_recently_used_name_is_lifted_past_a_better_scoring_one`, both of
+    // which do fail against that flip.
 }
 
 #[cfg(test)]
@@ -1927,5 +1919,164 @@ mod schema_index_cache_tests {
         assert!(!Rc::ptr_eq(&e, &f));
 
         scope.dispose();
+    }
+}
+
+/// [`index::build`] is a pure function over a slice — no signal, no `Editor`,
+/// nothing that needs a mounted view — and had no test at all. The hidden-database
+/// rule it enforces was pinned only for the *catalog* half (`catalog_tests`),
+/// which is a different function over a different structure: the index is what
+/// produces the plain table list, the column rows and the database rows.
+#[cfg(test)]
+mod index_tests {
+    use super::*;
+    use schemaic_core::schema::{ColumnInfo, DbSchema, ForeignKeyInfo, TableInfo};
+    use std::sync::Arc;
+
+    fn tbl(name: &str, cols: &[&str], fk_col: Option<&str>) -> TableInfo {
+        TableInfo {
+            name: name.to_string(),
+            columns: cols
+                .iter()
+                .map(|c| ColumnInfo {
+                    name: c.to_string(),
+                    type_name: "int".into(),
+                    ..Default::default()
+                })
+                .collect(),
+            foreign_keys: fk_col
+                .map(|c| {
+                    vec![ForeignKeyInfo {
+                        name: "fk".into(),
+                        columns: vec![c.to_string()],
+                        ref_table: "other".into(),
+                        ref_columns: vec!["id".into()],
+                        ..Default::default()
+                    }]
+                })
+                .unwrap_or_default(),
+            ..Default::default()
+        }
+    }
+
+    fn node(db: &str, tables: Vec<TableInfo>) -> LoadedNode {
+        LoadedNode {
+            database: db.to_string(),
+            schema: Some(Arc::new(DbSchema {
+                tables,
+                ..Default::default()
+            })),
+        }
+    }
+
+    fn hidden(names: &[&str]) -> HashSet<String> {
+        names.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// **A hidden database contributes nothing at all** — not its name, not its
+    /// tables, not its columns. The function's own doc says so; nothing asserted
+    /// it for the index.
+    #[test]
+    fn a_hidden_database_contributes_no_name_no_table_and_no_column() {
+        let nodes = [
+            node("shop", vec![tbl("orders", &["id"], None)]),
+            node("archive", vec![tbl("old_orders", &["id"], None)]),
+        ];
+        let ix = index::build(&nodes, &hidden(&["archive"]), None);
+        assert_eq!(ix.databases, vec!["shop".to_string()]);
+        assert!(
+            !ix.tables.iter().any(|(t, _)| t == "old_orders"),
+            "{:?}",
+            ix.tables
+        );
+        assert!(!ix.columns_by_db.keys().any(|(d, _)| d == "archive"));
+        assert!(!ix.tables_by_db.contains_key("archive"));
+    }
+
+    /// …**unless it is the active one**, which is the exception that keeps a tab
+    /// usable after its own database is hidden.
+    #[test]
+    fn the_active_database_contributes_even_when_it_is_hidden() {
+        let nodes = [node("archive", vec![tbl("old_orders", &["id"], None)])];
+        let ix = index::build(&nodes, &hidden(&["archive"]), Some("archive"));
+        assert_eq!(ix.databases, vec!["archive".to_string()]);
+        assert!(ix.tables.iter().any(|(t, _)| t == "old_orders"));
+        assert!(ix.columns_by_db.keys().any(|(d, _)| d == "archive"));
+    }
+
+    /// **The unqualified pool is scoped to the active database; the qualified one
+    /// is not.** A tab with a database selected must not be polluted by every
+    /// other database's tables, while `otherdb.table` still completes.
+    #[test]
+    fn only_the_active_database_reaches_the_unqualified_pool() {
+        let nodes = [
+            node("shop", vec![tbl("orders", &["id"], None)]),
+            node("archive", vec![tbl("old_orders", &["id"], None)]),
+        ];
+        let ix = index::build(&nodes, &HashSet::new(), Some("shop"));
+        assert!(
+            !ix.tables.iter().any(|(t, _)| t == "old_orders"),
+            "{:?}",
+            ix.tables
+        );
+        assert!(!ix.columns.contains_key("old_orders"));
+        // But the qualified maps hold both, which is what `archive.old_orders`
+        // completes from.
+        assert!(
+            ix.columns_by_db
+                .contains_key(&("archive".to_string(), "old_orders".to_string()))
+        );
+        assert!(ix.tables_by_db.contains_key("archive"));
+    }
+
+    /// The FK tint's source: a column covered by a foreign key, and only that
+    /// column.
+    #[test]
+    fn a_foreign_key_column_is_marked_and_its_siblings_are_not() {
+        let nodes = [node(
+            "shop",
+            vec![tbl("orders", &["id", "customer_id"], Some("customer_id"))],
+        )];
+        let ix = index::build(&nodes, &HashSet::new(), Some("shop"));
+        let cols = ix.columns.get("orders").expect("orders");
+        let fk = |n: &str| cols.iter().find(|c| c.name == n).expect(n).foreign_key;
+        assert!(fk("customer_id"));
+        assert!(!fk("id"));
+    }
+
+    /// **A same-named table in two databases merges by column name.** The fast
+    /// path (`entry.is_empty()`) exists to keep the ordinary case out of the
+    /// quadratic merge, so both halves have to be exercised: the first table
+    /// takes the fast path, the second the merge.
+    #[test]
+    fn two_databases_sharing_a_table_name_merge_their_columns_once_each() {
+        let nodes = [
+            node("shop", vec![tbl("orders", &["id", "total"], None)]),
+            node("eu", vec![tbl("orders", &["id", "vat"], None)]),
+        ];
+        // No active database, so both are in the unqualified pool.
+        let ix = index::build(&nodes, &HashSet::new(), None);
+        let mut names: Vec<&str> = ix
+            .columns
+            .get("orders")
+            .expect("orders")
+            .iter()
+            .map(|c| c.name.as_str())
+            .collect();
+        names.sort_unstable();
+        assert_eq!(
+            names,
+            ["id", "total", "vat"],
+            "the shared `id` is not doubled"
+        );
+    }
+
+    /// The database list dedupes case-insensitively — two connections onto the
+    /// same server spelling one database differently are one row in the popup.
+    #[test]
+    fn the_database_list_dedupes_by_case() {
+        let nodes = [node("Shop", vec![]), node("shop", vec![])];
+        let ix = index::build(&nodes, &HashSet::new(), None);
+        assert_eq!(ix.databases, vec!["Shop".to_string()]);
     }
 }
