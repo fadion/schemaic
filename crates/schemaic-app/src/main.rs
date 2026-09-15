@@ -12050,6 +12050,29 @@ fn monitor_apply(ctx: MonitorCtx, my_gen: u64, out: Result<ResultSet, String>) {
     match out {
         Err(e) => ctx.error.set(Some(e)),
         Ok(rs) => {
+            // **Has the table's shape moved under us?** Everything below is
+            // positional — `from_result` builds cells by index, `diff_snapshots`
+            // compares them by index, and the modal names each field from the
+            // list captured on the baseline poll. An `ALTER TABLE … ADD COLUMN …
+            // AFTER id` in another session shifts every cell one place, so every
+            // row in the window was logged as an UPDATE under the pre-`ALTER`
+            // names, into a log the modal exports and treats as the only copy.
+            // See `monitor::baseline_is_stale`.
+            //
+            // The answer is to restart the baseline rather than diff across it:
+            // nothing here can say what happened to a row while the table was
+            // being altered, and claiming otherwise is what filled the log.
+            let fresh: Vec<String> = rs.columns.iter().map(|c| c.name.clone()).collect();
+            let mut restarted = false;
+            if ctx.prev.borrow().is_some()
+                && ctx
+                    .cols
+                    .with_untracked(|c| schemaic_core::monitor::baseline_is_stale(c, &fresh))
+            {
+                *ctx.prev.borrow_mut() = None;
+                ctx.key_cols.borrow_mut().clear();
+                restarted = true;
+            }
             if ctx.prev.borrow().is_none() {
                 // Baseline poll: capture columns + resolve the identity key once.
                 ctx.cols
@@ -12077,7 +12100,17 @@ fn monitor_apply(ctx: MonitorCtx, my_gen: u64, out: Result<ResultSet, String>) {
                     }
                 }
             }
-            ctx.error.set(None);
+            // Said, not merely done: a gap in a record someone keeps has to be
+            // visible in it. The next poll's diff is against the new baseline,
+            // so this clears itself.
+            if restarted {
+                ctx.error.set(Some(
+                    "The table's columns changed, so change tracking restarted from here."
+                        .to_string(),
+                ));
+            } else {
+                ctx.error.set(None);
+            }
             let key_cols = ctx.key_cols.borrow().clone();
             // **The two facts the snapshot needs, recorded separately.**
             // Whether the poll carried an `ORDER BY` over the row key is what
@@ -12999,6 +13032,44 @@ mod app_tests {
     /// there was one arm. `install_terminal` now has two — the shell it was
     /// asked for, and the `message_shell` that says why it could not be started
     /// — so a count is no longer the property and the *region* is.
+    /// **The caller has to ask.** `monitor::baseline_is_stale` is correct in
+    /// isolation, and the defect was that `monitor_apply` captured the watched
+    /// table's column list on the *baseline* poll and never looked at it again
+    /// — a pure function's composition with its caller, which is where this
+    /// whole class of bug sits. Everything under the poll is positional, so an
+    /// `ALTER TABLE … ADD COLUMN … AFTER id` in another session shifted every
+    /// cell one place and logged every row in the window as an UPDATE, named
+    /// from the pre-`ALTER` order, into a log the modal exports and treats as
+    /// the only copy.
+    ///
+    /// A source assertion because `monitor_apply` is floem-scheduled and takes a
+    /// `MonitorCtx` full of signals; the pure half is tested in `core::monitor`.
+    #[test]
+    fn the_monitor_restarts_its_baseline_when_the_tables_shape_moves() {
+        let src = include_str!("main.rs");
+        let at = src
+            .find("fn monitor_apply(")
+            .expect("`monitor_apply` is gone or was renamed");
+        let rest = &src[at..];
+        let end = rest[1..].find("\nfn ").map_or(rest.len(), |i| i + 1);
+        let body = &rest[..end];
+        // Assembled, so this module's own mention is not one of the hits.
+        let ask = format!("{}_is_stale(", "baseline");
+        assert!(
+            body.contains(&ask),
+            "`monitor_apply` no longer asks whether the table's shape moved; a \
+             mid-session ALTER then logs every row in the window as an UPDATE, \
+             named from the pre-ALTER column order"
+        );
+        let reset = format!("*ctx.prev.{}() = None", "borrow_mut");
+        assert!(
+            body.contains(&reset),
+            "`monitor_apply` asks the question and does not restart the \
+             baseline, so the stale snapshot is still what the next poll diffs \
+             against"
+        );
+    }
+
     #[test]
     fn the_terminal_session_is_replaced_in_exactly_one_place() {
         let src = include_str!("main.rs");

@@ -865,34 +865,52 @@ impl Db {
         limit: usize,
         cancel: CancellationToken,
     ) -> Result<ResultSet, DbError> {
-        match self.engine {
-            Engine::Postgres => {
-                return pg::fetch_table(self, database, schema, table, order_by, limit, cancel)
-                    .await;
+        // **Bounded, because the Live Monitor calls this on a timer, forever.**
+        // `fetch_sessions`' deadline was added under the claim that it was the
+        // app's only such caller; `monitor_tick` re-arms this one every two
+        // seconds for as long as its modal is open. The `CancellationToken` in
+        // the signature is what admitted it to the "already bounded" set, and it
+        // is bounded only if a caller *keeps* the token — the monitor built one
+        // inline, stored it nowhere and cancelled it never. A dark host does not
+        // refuse the connect, it swallows it, so every tick cost the OS TCP
+        // timeout (21.0 s on MySQL, 63 s on PostgreSQL — see [`PING_TIMEOUT`])
+        // under a modal still showing the last snapshot with no error.
+        //
+        // The deadline is over the whole dispatch, the shape the two activity
+        // methods took, so it covers the engine arms as well as the connect.
+        let fetch = async {
+            match self.engine {
+                Engine::Postgres => {
+                    return pg::fetch_table(self, database, schema, table, order_by, limit, cancel)
+                        .await;
+                }
+                Engine::Sqlite => {
+                    // One file, one namespace: the table stands alone, and the
+                    // `main.` qualifier would only be noise.
+                    let sql = format!(
+                        "SELECT * FROM {}{} LIMIT {}",
+                        ident_sqlite(table),
+                        order_by_clause(order_by, ident_sqlite),
+                        limit
+                    );
+                    return self.fetch_query(None, &sql, limit, cancel).await;
+                }
+                Engine::MySql => {}
             }
-            Engine::Sqlite => {
-                // One file, one namespace: the table stands alone, and the
-                // `main.` qualifier would only be noise.
-                let sql = format!(
-                    "SELECT * FROM {}{} LIMIT {}",
-                    ident_sqlite(table),
-                    order_by_clause(order_by, ident_sqlite),
-                    limit
-                );
-                return self.fetch_query(None, &sql, limit, cancel).await;
-            }
-            Engine::MySql => {}
-        }
-        // MySQL has no namespace level — the database already is one.
-        debug_assert!(schema.is_none(), "MySQL tables carry no namespace");
-        let sql = format!(
-            "SELECT * FROM {}.{}{} LIMIT {}",
-            ident(database),
-            ident(table),
-            order_by_clause(order_by, ident),
-            limit
-        );
-        self.fetch_query(Some(database), &sql, limit, cancel).await
+            // MySQL has no namespace level — the database already is one.
+            debug_assert!(schema.is_none(), "MySQL tables carry no namespace");
+            let sql = format!(
+                "SELECT * FROM {}.{}{} LIMIT {}",
+                ident(database),
+                ident(table),
+                order_by_clause(order_by, ident),
+                limit
+            );
+            self.fetch_query(Some(database), &sql, limit, cancel).await
+        };
+        tokio::time::timeout(PING_TIMEOUT, fetch)
+            .await
+            .map_err(|_| DbError::Connect("timed out".to_string()))?
     }
 }
 
@@ -7399,9 +7417,23 @@ mod tests {
     /// MySQL, 63 s on PostgreSQL, this file's own measurement (see
     /// `PING_TIMEOUT`). `ping` and `fetch_databases` were bounded for exactly
     /// that; `fetch_sessions` and `kill_session` were not, and `fetch_sessions`
-    /// is the only method in the app that runs **on a timer, forever**, with a
-    /// de-dup guard keyed on a generation that a window-focus regain bumps
-    /// before refreshing — so hung polls stacked one per alt-tab.
+    /// runs **on a timer, forever**, with a de-dup guard keyed on a generation
+    /// that a window-focus regain bumps before refreshing — so hung polls
+    /// stacked one per alt-tab.
+    ///
+    /// **It is not the only one, though this doc said so.** The Live Monitor
+    /// re-arms `fetch_table` every two seconds for as long as its modal is open,
+    /// and that method was left out of this list because it takes a
+    /// `CancellationToken` — which bounds nothing unless a caller *keeps* the
+    /// token, and the monitor built one inline and cancelled it never. The list
+    /// below is the set of methods a timer calls, and a method joining that set
+    /// belongs in it.
+    ///
+    /// `fetch_table`'s deadline is a trade worth naming: a poll that cannot
+    /// finish in [`PING_TIMEOUT`] is one the monitor's two-second cadence could
+    /// not keep up with anyway, and reporting that is better than a modal
+    /// showing the last snapshot with no error for the length of an OS connect
+    /// timeout.
     ///
     /// A source gate because the failure is a host that never answers, which no
     /// unit test can stage: a closed port is *refused*, instantly, and the only
@@ -7431,6 +7463,17 @@ mod tests {
             ("fetch_databases", "PING_TIMEOUT"),
             ("fetch_sessions", "PING_TIMEOUT"),
             ("kill_session", "CANCEL_TIMEOUT"),
+            // **The second forever-timer, which the doc above said did not
+            // exist.** The Live Monitor re-arms `fetch_table` every two seconds
+            // for as long as its modal is open, and the premise that admitted it
+            // to the "already bounded" set — *the unbounded reads all take a
+            // `CancellationToken`* — was true of the signature and false of the
+            // caller, which built a token inline, stored it nowhere and
+            // cancelled it never. A dark host cost the OS connect timeout on
+            // every tick, under a modal still showing the last snapshot with no
+            // error, beside a health check that said Disconnected at five
+            // seconds.
+            ("fetch_table", "PING_TIMEOUT"),
         ] {
             let body = body_of(name);
             assert!(

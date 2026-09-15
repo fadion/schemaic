@@ -59,6 +59,35 @@ pub fn discard_needs_asking(log_len: usize, exported: bool) -> bool {
     log_len > 0 && !exported
 }
 
+/// Has the watched table's shape moved out from under the baseline?
+///
+/// **A snapshot is positional, all the way down.** [`Snapshot::from_result`]
+/// builds each row's `cells` by column index, [`diff_snapshots`] compares two
+/// `cells` vectors, [`field_changes`] walks them by index, and the modal renders
+/// each `FieldChange { col }` against the column-name list captured on the
+/// *baseline* poll. So an `ALTER TABLE orders ADD COLUMN note TEXT AFTER id` in
+/// another session, while the monitor is open, shifts every cell from index 1 on
+/// by one place: every row in the window is logged as an UPDATE, and each field
+/// is named from the pre-`ALTER` order — the log claims `name: 'Ada' →
+/// '2024-01-03'` for a column that never changed, in a record the modal exports
+/// and treats as the only copy.
+///
+/// The mirror case is quieter and worse: a `DROP COLUMN` before a key column
+/// leaves the resolved key indices pointing past the new width,
+/// `from_result`'s fallback gives *every* row the empty key, the map collapses
+/// to one entry, and the diff reports the whole window deleted.
+///
+/// Compared by **name and position**, not as a set: two columns swapped is the
+/// same shift, and a rename at the same position is a different column as far as
+/// a positional diff is concerned. Case-sensitively, because a server that
+/// changes a column's case has changed the text the log will print.
+///
+/// The answer is to restart the baseline, not to diff across it — nothing here
+/// can say what happened to a row while the table's shape was changing.
+pub fn baseline_is_stale(old_cols: &[String], new_cols: &[String]) -> bool {
+    old_cols != new_cols
+}
+
 /// What one poll of the monitor's timer should do.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TickAction {
@@ -637,6 +666,37 @@ mod tests {
         // And pausing doesn't rescue it: the timer belongs to a target the user
         // has already left.
         assert_eq!(tick_action(true, true, true), TickAction::Stop);
+    }
+
+    /// **A shift, not a set difference.** The whole snapshot pipeline is
+    /// positional, so what matters is whether cell *i* still means the same
+    /// column — which an added, dropped, reordered or renamed column all break,
+    /// and which nothing about the set of names alone can answer.
+    #[test]
+    fn a_column_added_dropped_or_moved_makes_the_baseline_stale() {
+        let c = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let base = c(&["id", "name", "total"]);
+        assert!(!baseline_is_stale(&base, &base));
+        // Added mid-table — the case that logs every row as an UPDATE.
+        assert!(baseline_is_stale(
+            &base,
+            &c(&["id", "note", "name", "total"])
+        ));
+        // Added at the end still shifts nothing, but the next poll's rows are a
+        // different width and the diff would report every one of them.
+        assert!(baseline_is_stale(
+            &base,
+            &c(&["id", "name", "total", "note"])
+        ));
+        // Dropped before the key — the case that collapses every key to empty.
+        assert!(baseline_is_stale(&base, &c(&["name", "total"])));
+        // Reordered, same set: a set comparison would call this unchanged.
+        assert!(baseline_is_stale(&base, &c(&["id", "total", "name"])));
+        // Renamed in place: the values still line up, but the log would print
+        // the old name against them.
+        assert!(baseline_is_stale(&base, &c(&["id", "full_name", "total"])));
+        // And case is a change, because it is a change to what the log prints.
+        assert!(baseline_is_stale(&base, &c(&["id", "Name", "total"])));
     }
 
     fn row(key: &str, cells: &[Option<&str>]) -> SnapshotRow {
