@@ -660,6 +660,25 @@ impl Harness {
     /// written here as what was read rather than assumed, and moving one is a
     /// measurement against the installed binary — the rule every other
     /// behavioural claim in this module was established by.
+    ///
+    /// **OpenCode's leg was re-measured on 2026-09-15** and stands:
+    /// `opencode run --help` lists `message..` as a positional and, of its
+    /// twenty-odd options, none takes the prompt on stdin. Recorded with a date
+    /// because the next reader would otherwise re-derive it — this is the second
+    /// review to raise the question, and both times the answer cost a `--help`.
+    ///
+    /// Claude's and Antigravity's legs are unverified *here*: neither binary is
+    /// on this machine, and a claim about a CLI nobody measured is exactly what
+    /// this doc refuses to make. Everything else is ready for the flip —
+    /// `stdin_prompt` is threaded through `InlinePlan`, `run_inline` pipes it
+    /// whenever this returns `true`, and `turn_stdin_prompt` covers the
+    /// persistent shape — so moving one is this `match` arm and nothing else.
+    ///
+    /// What it costs while they stay on argv is worth stating plainly, since it
+    /// is why this keeps being raised: `/proc/<pid>/cmdline` is world-readable
+    /// on Linux, so a one-shot turn's whole prompt — including any grid rows the
+    /// user attached and Fill/Seed's sample — is visible to every local account
+    /// for the life of the process.
     pub fn prompt_on_stdin(self) -> bool {
         match self {
             Harness::Codex => true,
