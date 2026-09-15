@@ -13410,6 +13410,19 @@ mod clear_tests {
             "connections.update(|cs| cs.retain(|c| c.id != id))",
             "Deleting a connection by id, same shape: the id came from the list              being filtered.",
         ),
+        // The two the gate could not see until it read the closure's whole
+        // span rather than one line of it. Both are real writes; neither is a
+        // signal-level collection clear.
+        (
+            "trigger_editor.rs",
+            "dr.info.events.retain(|e| *e != ev)",
+            "Not a collection signal: `d` is the object-editor draft and              `events` is a `Vec` field several levels inside it. The `update`              is the toggle's effect, which only runs when the checkbox's value              actually changed (`prev.is_some_and(|p| p != v)`), and it always              writes — the retain removes the event or the `push` below adds it              back. Guarding the signal would ask the wrong question anyway: the              subscribers have to rebuild because the draft changed.",
+        ),
+        (
+            "schemaic-app/main.rs",
+            "r.notes .retain(|n| *n != conn_import::ImportNote::AlreadySaved)",
+            "Not a collection signal either: `notes` is a `Vec` field on each              row inside the signal, and `conn_import::mark_existing` on the next              line rewrites them from the connection list that has just grown.              The notification is the point — the rows have to redraw with              \"Already saved\" on the ones that now are.",
+        ),
     ];
 
     /// **An exemption that no longer matches anything is a hole, not a     /// permission.**
@@ -13420,7 +13433,15 @@ mod clear_tests {
     /// gate above reports success.
     #[test]
     fn every_clear_exemption_still_names_a_real_write() {
-        let sources = crate::source_gate::crate_sources();
+        // **Whitespace-collapsed, the way the gate above collapses a span.**
+        // Otherwise the two halves can disagree about the same site: a write
+        // rustfmt wraps is one line to this test and several to the file, so an
+        // exemption written the way the gate reports it matched nothing here
+        // while covering a real write there.
+        let sources: Vec<(String, String)> = crate::source_gate::crate_sources()
+            .into_iter()
+            .map(|(f, body)| (f, body.split_whitespace().collect::<Vec<_>>().join(" ")))
+            .collect();
         for (file, frag, why) in EXEMPT {
             assert!(!why.trim().is_empty(), "{file}: {frag} carries no reason");
             let found = sources
@@ -13433,32 +13454,105 @@ mod clear_tests {
         }
     }
 
+    /// The three guards' own bodies — the only writes in the tree that are
+    /// *supposed* to be unguarded, because they are what everything else calls.
+    ///
+    /// **Named, rather than the file they live in.** This was
+    /// `if file == "widgets.rs" { continue; }`, which skipped all ~9,700 lines
+    /// of the crate's largest widget module for the sake of three, so an
+    /// unguarded clear written anywhere in it was unscannable. The spans come
+    /// from `source_gate::item_end`, so a fourth guard has to be added here to
+    /// be exempt and moving one of these does not silently widen the hole.
+    const GUARD_FNS: &[&str] = &[
+        "pub fn clear_if_any",
+        "pub fn retain_if_any",
+        "pub fn retain_pairs_if_any",
+    ];
+
+    /// The byte ranges of [`GUARD_FNS`]' bodies in `body`, as `(start, end)`.
+    fn guard_spans(file: &str, body: &str) -> Vec<(usize, usize)> {
+        if file != "widgets.rs" {
+            return Vec::new();
+        }
+        GUARD_FNS
+            .iter()
+            .map(|sig| {
+                let at = body
+                    .find(sig)
+                    .unwrap_or_else(|| panic!("the guard `{sig}` is gone — this gate is stale"));
+                // From the `{` that opens the body, not from the signature:
+                // `item_end` ends an item at a depth-0 comma, and
+                // `retain_pairs_if_any<K: …, V: 'static>` has one in its
+                // generics — which ended the span before the body and left the
+                // guard's own write reported as an offender.
+                let brace = body[at..]
+                    .find('{')
+                    .map(|d| at + d)
+                    .unwrap_or_else(|| panic!("the guard `{sig}` has no body"));
+                let end = crate::source_gate::item_end(body, brace).unwrap_or(body.len());
+                (at, end)
+            })
+            .collect()
+    }
+
     #[test]
     fn no_view_code_clears_or_retains_a_signal_unguarded() {
         let mut offenders: Vec<String> = Vec::new();
         let mut guarded = 0usize;
         for (file, body) in crate::source_gate::crate_sources() {
-            for (i, line) in body.lines().enumerate() {
+            for line in body.lines() {
                 let l = line.trim();
                 if l.contains("clear_if_any(") || l.contains("retain_if_any(") {
                     guarded += 1;
+                }
+            }
+            let exempt_spans = guard_spans(&file, &body);
+            // **The `update` closure's whole span, not one line of it.** The
+            // needle was `.update(|` and `.clear()` on the same trimmed line, so
+            // the rustfmt-ordinary three-line form —
+            // `sig.update(|v| {` / `v.clear();` / `});` — walked straight past a
+            // gate whose own doc says "the rule is about *call sites*". That is
+            // the second half of the shape `13517c9` set out to remove: its grep
+            // could not see a `retain`, and what replaced it could not see a
+            // line break.
+            //
+            // `item_end` from just past `.update(` returns the `)` that closes
+            // the call, balancing braces, brackets, strings and comments on the
+            // way — so a nested closure inside the body is inside the span, as
+            // it should be.
+            let mut from = 0usize;
+            while let Some(rel) = body[from..].find(".update(|") {
+                let at = from + rel;
+                let open = at + ".update(".len();
+                from = open;
+                if exempt_spans.iter().any(|(s, e)| at >= *s && at < *e) {
                     continue;
                 }
-                // `.update(|x| x.clear())` / `.update(|x| x.retain(…))`, the two
-                // spellings the rule names. The guards' own bodies are exempt:
-                // they are what everything else is supposed to call.
-                if file == "widgets.rs" {
+                let Some(end) = crate::source_gate::item_end(&body, open) else {
+                    continue;
+                };
+                let line_start = body[..at].rfind('\n').map_or(0, |n| n + 1);
+                // `item_end` returns the index *of* the closing `)`, and the
+                // `EXEMPT` fragments are written as the whole call, closer
+                // included.
+                let span = &body[line_start..(end + 1).min(body.len())];
+                let is_clear = span.contains(".clear()");
+                let is_retain = span.contains(".retain(");
+                if !is_clear && !is_retain {
                     continue;
                 }
-                let is_clear = l.contains(".update(|") && l.contains(".clear()");
-                let is_retain = l.contains(".update(|") && l.contains(".retain(");
-                if (is_clear || is_retain)
-                    && !EXEMPT
-                        .iter()
-                        .any(|(f, frag, _)| *f == file && l.contains(frag))
+                // Collapsed to one line so a multi-line write reports as one
+                // offender, and so an `EXEMPT` fragment — which is written the
+                // way the single-line form reads — still matches it.
+                let flat = span.split_whitespace().collect::<Vec<_>>().join(" ");
+                if EXEMPT
+                    .iter()
+                    .any(|(f, frag, _)| *f == file && flat.contains(frag))
                 {
-                    offenders.push(format!("{file}:{}: {l}", i + 1));
+                    continue;
                 }
+                let lineno = body[..at].matches('\n').count() + 1;
+                offenders.push(format!("{file}:{lineno}: {flat}"));
             }
         }
         assert!(

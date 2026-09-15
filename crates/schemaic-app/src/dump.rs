@@ -666,35 +666,62 @@ mod tests {
     ///
     /// Doc comments are dropped before the scan, so the prose above (and the
     /// several paragraphs in `main.rs` that discuss the sibling) is not a hit.
+    ///
+    /// **The needle is the suffix at the end of a literal, not the literal
+    /// `".part"`.** It used to be `code.contains("\".part\"")` — the suffix with
+    /// a *leading* quote — which matches the one violating spelling it was
+    /// written for (`p.push(".part")`) and misses the two commoner ones:
+    /// `format!("{name}.part")` and `with_extension("sql.part")` carry no quote
+    /// before the dot. `.part"` catches all three, and the rule the gate states
+    /// is "nothing spells it", not "nothing spells it that way".
+    ///
+    /// **And the walk is recursive**, because a rule phrased as "nothing in
+    /// this crate" was enforced over one non-recursive `read_dir` of `src`: a
+    /// submodule directory added later would have been outside it silently.
+    ///
+    /// The comment skip is still `starts_with("//")` on the trimmed line, so a
+    /// violating expression inside a `/* … */` block is not seen. That is a
+    /// known and deliberate limit — this crate has no block comments, and the
+    /// alternative is a second copy of `source_gate::production_code` in a
+    /// crate that cannot reach it.
     #[test]
     fn nothing_in_this_crate_spells_the_fragment_suffix_itself() {
-        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
-        let mut offenders = Vec::new();
-        for entry in std::fs::read_dir(&dir).expect("the crate's src") {
-            let path = entry.expect("a dir entry").path();
-            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
-                continue;
-            }
-            let src = std::fs::read_to_string(&path).expect("a source file");
-            for (i, line) in src.lines().enumerate() {
-                let code = line.trim_start();
-                if code.starts_with("//") {
+        fn walk(dir: &std::path::Path, rel: &str, offenders: &mut Vec<String>, files: &mut usize) {
+            for entry in std::fs::read_dir(dir).expect("the crate's src") {
+                let path = entry.expect("a dir entry").path();
+                let name = path.file_name().unwrap().to_string_lossy().to_string();
+                if path.is_dir() {
+                    walk(&path, &format!("{rel}{name}/"), offenders, files);
                     continue;
                 }
-                if code.contains("\".part\"") {
-                    offenders.push(format!(
-                        "{}:{}: {}",
-                        path.file_name().unwrap().to_string_lossy(),
-                        i + 1,
-                        code.trim()
-                    ));
+                if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                    continue;
+                }
+                *files += 1;
+                let src = std::fs::read_to_string(&path).expect("a source file");
+                for (i, line) in src.lines().enumerate() {
+                    let code = line.trim_start();
+                    if code.starts_with("//") {
+                        continue;
+                    }
+                    if code.contains(".part\"") {
+                        offenders.push(format!("{rel}{name}:{}: {}", i + 1, code.trim()));
+                    }
                 }
             }
         }
+
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut offenders = Vec::new();
+        let mut files = 0usize;
+        walk(&dir, "", &mut offenders, &mut files);
         assert!(
             offenders.is_empty(),
             "call `dump::part_of` (which asks `export::part_path`) instead:\n{}",
             offenders.join("\n")
         );
+        // The scan has to still be reading the crate: a moved `src` would pass
+        // this gate by finding nothing at all.
+        assert!(files >= 12, "only {files} source files scanned");
     }
 }

@@ -9438,14 +9438,30 @@ mod popup_anchor_gate {
         false
     }
 
-    /// Does this line write the anchor? Both spellings: the shared
-    /// `popup_anchor`, and `table_designer`'s local, which is simply `anchor`
-    /// because its popup is local too.
-    fn sets_anchor(line: &str) -> bool {
+    /// Does this line write the **popup** anchor?
+    ///
+    /// **The receivers are named, not matched as a suffix.** This was
+    /// `["popup_anchor.set(", "anchor.set("].any(|p| t.contains(p))` — an
+    /// unanchored substring test — and `grid.rs` writes an entirely unrelated
+    /// *selection* anchor (`gs.anchor`, a cell coordinate) fifteen times. Every
+    /// one of them set this gate's `anchored` flag, and three sit between two
+    /// consecutive popup openers with two more between another pair, so a new
+    /// opener added in either span would have shipped with no
+    /// `popup_anchor.set` and the gate green. `grid.rs` holds six of the
+    /// nineteen openers in the tree, more than any other file.
+    ///
+    /// The tree has exactly three legal receivers, and spelling them out is
+    /// both simpler than a boundary rule and checkable by a reader:
+    /// the shared `…popup_anchor`, [`menu_channel`]'s own `ch.anchor`
+    /// (`widgets.rs:4292`), and `table_designer`'s bare local, whose popup is
+    /// local too (`table_designer.rs:771`). The bare form is accepted only in
+    /// that file, which is what keeps `gs.anchor.set(` out.
+    fn sets_anchor(line: &str, file: &str) -> bool {
         let t = line.trim_start();
-        ["popup_anchor.set(", "anchor.set("]
-            .iter()
-            .any(|p| t.contains(p))
+        if t.contains("popup_anchor.set(") || t.contains("ch.anchor.set(") {
+            return true;
+        }
+        file == "table_designer.rs" && t.starts_with("anchor.set(")
     }
 
     #[test]
@@ -9462,7 +9478,7 @@ mod popup_anchor_gate {
         for (name, code) in crate::source_gate::crate_sources() {
             let mut anchored = false;
             for (lineno, line) in logical_lines(&code) {
-                if sets_anchor(&line) {
+                if sets_anchor(&line, &name) {
                     anchored = true;
                 }
                 if fills_channel(&line) {
@@ -9515,7 +9531,7 @@ mod menu_trigger_gate {
     /// not here: they are opened on `SecondaryClick`, where the root's dismissal
     /// runs on the secondary *press* and the opener on the release — one
     /// gesture, and the documented behaviour.
-    const CLICK_OPENED: &[&str] = &[
+    pub(super) const CLICK_OPENED: &[&str] = &[
         "SchemaEye",
         "SchemaGear",
         "Connection",
@@ -9596,33 +9612,46 @@ mod menu_trigger_gate {
 /// registration sits in front of the root's handler.
 #[cfg(test)]
 mod menu_panel_gate {
-    use std::path::Path;
+    use super::menu_trigger_gate::CLICK_OPENED;
 
-    /// The overlay that builds each click-opened menu's panel — the same five
-    /// menus [`super::menu_trigger_gate`] names from the trigger side, in the
-    /// same order. `popup_menu_overlay` and `context_menu_overlay` are absent
-    /// for the reason they are absent there, and because their panel is
-    /// [`menu_panel`], which carries the absorb once for both.
-    const PANEL_OVERLAYS: &[&str] = &[
-        "db_visibility_overlay",
-        "schema_settings_overlay",
-        "conn_menu_overlay",
-        "active_db_menu_overlay",
-        "activity_menu_overlay",
+    /// Where each click-opened menu's absorb lives, as
+    /// `(MenuId, the fn whose body carries it, that fn's file)`.
+    ///
+    /// **Keyed by [`CLICK_OPENED`], and checked against it**, because the two
+    /// lists are one fact read from two ends and restating the second is how
+    /// they drifted. This was five overlay names and a doc calling them "the
+    /// same five menus [`super::menu_trigger_gate`] names from the trigger
+    /// side" — while that list held **six**. The sixth is `DatePick`, whose
+    /// panel was outside the gate that exists to catch a click-opened panel
+    /// that does not absorb its own `PointerDown`, the failure this gate's own
+    /// doc records as having shipped twice. It is correct today: delete
+    /// `cell_editors.rs`'s one `on_event_stop(PointerDown, …)` and picking a
+    /// date becomes impossible while the whole suite stays green.
+    ///
+    /// The file is part of the entry rather than assumed, which is the other
+    /// half: `DatePick`'s overlay is in `overlays.rs` like the rest, but the
+    /// panel it delegates to — and therefore the absorb — is in
+    /// `cell_editors.rs`, outside the single file this gate used to read.
+    ///
+    /// `Popup` and `Context` are absent for the reason they are absent from
+    /// [`CLICK_OPENED`], and because their panel is [`super::menu_panel`],
+    /// which carries the absorb once for both.
+    const PANELS: &[(&str, &str, &str)] = &[
+        ("SchemaEye", "db_visibility_overlay", "overlays.rs"),
+        ("SchemaGear", "schema_settings_overlay", "overlays.rs"),
+        ("Connection", "conn_menu_overlay", "overlays.rs"),
+        ("ActiveDb", "active_db_menu_overlay", "overlays.rs"),
+        ("ActivityClock", "activity_menu_overlay", "overlays.rs"),
+        ("DatePick", "calendar_panel", "cell_editors.rs"),
     ];
 
-    fn overlays_src() -> String {
-        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/overlays.rs");
-        std::fs::read_to_string(path).expect("the crate's own overlays.rs")
-    }
-
     /// The body of a top-level `fn name(` — up to the next header at column 0,
-    /// which is the one shape every function in `overlays.rs` has.
-    fn body_of<'a>(src: &'a str, name: &str) -> &'a str {
+    /// which is the one shape every function in these files has.
+    fn body_of<'a>(src: &'a str, name: &str, file: &str) -> &'a str {
         let head = format!("fn {name}(");
         let start = src
             .find(&head)
-            .unwrap_or_else(|| panic!("`{name}` is gone from overlays.rs — renamed?"));
+            .unwrap_or_else(|| panic!("`{name}` is gone from {file} — renamed?"));
         let rest = &src[start + head.len()..];
         let end = ["\nfn ", "\npub(crate) fn ", "\npub fn "]
             .iter()
@@ -9632,14 +9661,38 @@ mod menu_panel_gate {
         &rest[..end]
     }
 
+    /// A seventh click-opened menu has to name its panel here, or this fails.
+    #[test]
+    fn every_click_opened_menu_has_a_panel_on_the_list() {
+        let named: Vec<&str> = PANELS.iter().map(|(id, _, _)| *id).collect();
+        let missing: Vec<&&str> = CLICK_OPENED.iter().filter(|m| !named.contains(m)).collect();
+        assert!(
+            missing.is_empty(),
+            "these menus are opened by click and no panel is listed for them, so \
+             nothing checks that their panel absorbs its own pointer-down: \
+             {missing:?}"
+        );
+        let stale: Vec<&&str> = named.iter().filter(|m| !CLICK_OPENED.contains(m)).collect();
+        assert!(
+            stale.is_empty(),
+            "these panels are listed for menus no longer opened by click: {stale:?}"
+        );
+    }
+
     #[test]
     fn every_click_opened_menu_panel_absorbs_its_own_pointer_down() {
-        let src = overlays_src();
-        let missing: Vec<&str> = PANEL_OVERLAYS
-            .iter()
-            .copied()
-            .filter(|name| !body_of(&src, name).contains("EventListener::PointerDown"))
-            .collect();
+        let sources = crate::source_gate::crate_sources();
+        let mut missing: Vec<&str> = Vec::new();
+        for (_, panel, file) in PANELS {
+            let src = sources
+                .iter()
+                .find(|(f, _)| f == file)
+                .map(|(_, code)| code.as_str())
+                .unwrap_or_else(|| panic!("{file} is not in the scan — moved?"));
+            if !body_of(src, panel, file).contains("EventListener::PointerDown") {
+                missing.push(panel);
+            }
+        }
         assert!(
             missing.is_empty(),
             "these panels never absorb their own pointer-down, so the root's \

@@ -756,8 +756,29 @@ mod modal_backdrop_gate {
         // So the count is derived from the layer instead of written down. One
         // direct child of `modal_layer`'s `stack` is one thing that can raise a
         // backdrop, and one term answers for it.
+        //
+        // **Both halves used to be one too high, and the two cancelled.**
+        // `closure` starts *at* the `move ||` this gate searched for, so the
+        // closure's own sigil was counted as an OR — 9 operators over 10 terms
+        // came out as 11 — and `layer_child_count` added one to a comma count
+        // that already included rustfmt's trailing comma, so 10 children also
+        // came out as 11. The equality was still equivalent to the property, so
+        // the gate did catch a child added without a term; what it could not do
+        // is tell the truth at the one moment anyone reads it, which is the
+        // failure. And the two errors are independent — the `move ||` is
+        // structural, the trailing comma is a rustfmt artefact that disappears
+        // the day the tuple fits on one line — so the cancellation was a
+        // coincidence, not a design.
+        //
+        // The concrete numbers are asserted too, so the arithmetic is pinned
+        // rather than only its difference.
         let children = super::modal_group_gate::layer_child_count(&src);
-        let terms = closure.matches("||").count() + 1;
+        let terms = closure["move ||".len()..].matches("||").count() + 1;
+        assert_eq!(
+            children, 10,
+            "`modal_layer` has {children} direct children, not 10 — if that is \
+             right, update this number and the term list above with it"
+        );
         assert_eq!(
             terms, children,
             "`modal_layer` has {children} direct children and \
@@ -849,24 +870,57 @@ mod modal_group_gate {
         let at = body.find("stack((").expect("the layer's own stack is gone");
         let bytes = body.as_bytes();
         // One past the `stack(`, i.e. sitting on the tuple's `(`.
+        //
+        // **Starts at 0, not 1.** `items` counts separators, and rustfmt emits
+        // a *trailing* comma after the last child of a multi-line tuple — so
+        // ten children already produce ten commas and the `+ 1` made it eleven.
+        // It went unnoticed because the one caller compared this against a term
+        // count that was over by one for its own unrelated reason; see
+        // `the_predicate_names_every_group_the_layer_raises`. A tuple short
+        // enough to fit on one line has no trailing comma, which is what the
+        // `!after_comma` test below covers.
         let mut depth = 0usize;
-        let mut items = 1usize;
+        let mut items = 0usize;
+        // Whether the last thing seen at tuple depth was a comma, so a trailing
+        // one is not counted as opening an eleventh child; `trailing` is its
+        // value at the moment the tuple closes.
+        let mut after_comma = false;
+        let mut trailing = false;
         for &b in bytes.iter().skip(at + "stack".len()) {
             match b {
-                b'(' | b'[' | b'{' => depth += 1,
+                b'(' | b'[' | b'{' => {
+                    depth += 1;
+                    after_comma = false;
+                }
                 b')' | b']' | b'}' => {
+                    // This one closes the tuple itself, so whether a comma was
+                    // the last thing in it is the answer — and it has to be
+                    // taken here, because the `)` that follows resets it.
+                    if depth == 2 {
+                        trailing = after_comma;
+                    }
                     depth -= 1;
                     // Depth 0 closes the `stack(` itself; the tuple closed just
                     // before it.
                     if depth == 0 {
                         break;
                     }
+                    after_comma = false;
                 }
                 // Depth 2 is inside the tuple but outside anything nested in it:
                 // 1 is `stack(`, 2 is the tuple's own `(`.
-                b',' if depth == 2 => items += 1,
-                _ => {}
+                b',' if depth == 2 => {
+                    items += 1;
+                    after_comma = true;
+                }
+                b' ' | b'\t' | b'\r' | b'\n' => {}
+                _ => after_comma = false,
             }
+        }
+        // `items` is the separator count. With rustfmt's trailing comma that is
+        // already the number of children; on a one-line tuple it is one short.
+        if !trailing {
+            items += 1;
         }
         items
     }

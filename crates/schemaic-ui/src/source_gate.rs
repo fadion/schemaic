@@ -348,19 +348,8 @@ fn sources_of(labels: &[&str]) -> Vec<(String, String)> {
         .collect();
     let mut out = Vec::new();
     for (label, dir) in dirs {
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            panic!("a gate's source directory is missing: {}", dir.display());
-        };
         let before = out.len();
-        for entry in entries {
-            let path = entry.expect("a dir entry").path();
-            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
-                continue;
-            }
-            let name = path.file_name().unwrap().to_string_lossy().to_string();
-            let src = std::fs::read_to_string(&path).expect("a source file");
-            out.push((format!("{label}{name}"), production_code(&src)));
-        }
+        collect_rs(&dir, label, "", &mut out);
         // **Per directory, not only in total.** A total floor is satisfied by
         // the largest crate alone, so a `src` that moved under any of the others
         // would leave every gate over it green by finding nothing. The smallest
@@ -382,11 +371,47 @@ fn sources_of(labels: &[&str]) -> Vec<(String, String)> {
     // `the_scan_reaches_both_crates_that_build_views`, which `.expect`s
     // `lib.rs` and `schemaic-app/main.rs` by name; this is the blunt half.
     //
-    // `read_dir` is deliberately non-recursive and both crates are flat today.
-    // A future `src/<subdir>/*.rs` would fall outside every gate silently —
-    // this floor is what would notice.
+    // The floor counts the *view* crates only — 65 today — so that it stays the
+    // same number whichever entry point called in, and because
+    // [`workspace_sources`]' extra two crates carry their own per-directory
+    // floor above.
     assert!(out.len() >= 60, "only {} source files scanned", out.len());
     out
+}
+
+/// Every `.rs` file under `dir`, at any depth, appended as
+/// `(label + relative path, production code)`.
+///
+/// **Recursive, and that is the fix rather than a refinement.** This was one
+/// non-recursive `read_dir` per crate, with a comment saying a future
+/// `src/<subdir>/*.rs` "would fall outside every gate silently — this floor is
+/// what would notice". It would not: the floor is a *lower* bound on the whole
+/// corpus, so moving six files out of a flat directory into a subdirectory
+/// leaves the count at 65 minus 6 and every gate over those six blind, with
+/// nothing red. Both view crates are flat today; the point is that they no
+/// longer have to be.
+///
+/// The relative path is joined with `/` on every platform, so a name a gate
+/// reports or matches on reads the same on Windows and Linux.
+#[cfg(test)]
+fn collect_rs(dir: &std::path::Path, label: &str, rel: &str, out: &mut Vec<(String, String)>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        panic!("a gate's source directory is missing: {}", dir.display());
+    };
+    let mut paths: Vec<std::path::PathBuf> =
+        entries.map(|e| e.expect("a dir entry").path()).collect();
+    // Sorted, so a gate that reports the first offender names the same file on
+    // every machine — `read_dir` order is the filesystem's.
+    paths.sort();
+    for path in paths {
+        let name = path.file_name().unwrap().to_string_lossy().to_string();
+        if path.is_dir() {
+            collect_rs(&path, label, &format!("{rel}{name}/"), out);
+        } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
+            let src = std::fs::read_to_string(&path).expect("a source file");
+            out.push((format!("{label}{rel}{name}"), production_code(&src)));
+        }
+    }
 }
 
 /// **A `\` line continuation typed as `\n`.**
