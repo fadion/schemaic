@@ -502,7 +502,29 @@ install_appimage() {
     download_to "${RAW}/assets/icon.png" "${icon_dir}/${APP_ID}.png" || true
     tmp_desktop="$(mktemp)"
     fetch "${RAW}/packaging/linux/${APP_ID}.desktop" > "$tmp_desktop"
-    sed "s|^Exec=schemaic\$|Exec=${dest}|" "$tmp_desktop" > "${desktop_dir}/${APP_ID}.desktop"
+    # Drop whatever `Exec=` the upstream file carries and append ours, rather
+    # than substituting a restated copy of it. The old spelling was
+    # `sed "s|^Exec=schemaic$|Exec=${dest}|"`, a second copy of
+    # `packaging/linux/<APP_ID>.desktop`'s own line, and `sed` substitutes zero
+    # occurrences without an error: the ordinary next edit upstream
+    # (`Exec=schemaic %U`, which is what makes "open with" work) would have left
+    # the installed entry pointing at a `schemaic` that is not on PATH in an
+    # AppImage install, under a printed "Added a desktop entry". The file is
+    # fetched from `main` while the AppImage beside it comes from the latest
+    # release, so the two can differ by any number of commits and nothing pins
+    # them; an append cannot miss whatever that line says.
+    #
+    # `|| true` because `grep -v` exits 1 when it selects nothing and `set -e`
+    # is on; the assertion below is what actually catches a bad fetch.
+    if ! grep -q '^\[Desktop Entry\]' "$tmp_desktop"; then
+        rm -f "$tmp_desktop"
+        err "the downloaded desktop entry is not a desktop file"
+        exit 1
+    fi
+    {
+        grep -v '^Exec=' "$tmp_desktop" || true
+        printf 'Exec=%s\n' "$dest"
+    } > "${desktop_dir}/${APP_ID}.desktop"
     rm -f "$tmp_desktop"
     if has update-desktop-database; then
         update-desktop-database "$desktop_dir" >/dev/null 2>&1 || true
@@ -587,7 +609,19 @@ case "$family" in
         if [ "${SCHEMAIC_NO_REPO:-0}" = 1 ] || { ! has dnf && ! has zypper; }; then
             info "Updates:   none - this is a single package, with no repository behind it."
             info "           Re-run this script without SCHEMAIC_NO_REPO to get them."
-            info "Uninstall: sudo dnf remove schemaic"
+            # The removal command comes from the same test `install_rpm_direct`
+            # branched on, not from the family: the second disjunct above is
+            # reached *precisely when there is no dnf*, and printing
+            # `sudo dnf remove` there names a command that is not on the
+            # machine. The install went through `rpm -i --nosignature`, so the
+            # way back out is `rpm -e`.
+            if has dnf; then
+                info "Uninstall: sudo dnf remove schemaic"
+            elif has zypper; then
+                info "Uninstall: sudo zypper remove schemaic"
+            else
+                info "Uninstall: sudo rpm -e schemaic"
+            fi
         elif has dnf; then
             info "Updates:   with the rest of your system - sudo dnf upgrade."
             info "Uninstall: sudo dnf remove schemaic && sudo rm /etc/yum.repos.d/schemaic.repo"
@@ -599,8 +633,12 @@ case "$family" in
         ;;
     appimage)
         info "Updates:   checked automatically; the app offers a restart when one is staged."
+        # All three files `install_appimage` writes, including the icon it
+        # drops into the hicolor theme - following a line that omits one leaves
+        # it behind.
         info "Uninstall: rm ~/.local/bin/Schemaic.AppImage \\"
-        info "              ~/.local/share/applications/${APP_ID}.desktop"
+        info "              ~/.local/share/applications/${APP_ID}.desktop \\"
+        info "              ~/.local/share/icons/hicolor/512x512/apps/${APP_ID}.png"
         ;;
     macos)
         info "Updates:   checked automatically; the app offers a restart when one is staged."

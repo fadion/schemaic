@@ -33,11 +33,28 @@ command -v python3 >/dev/null || { echo "python3 not found" >&2; exit 1; }
 [ -s "$KEYRING" ] || { echo "no published keyring at ${KEYRING}" >&2; exit 1; }
 
 fail=0
+# The tool's own output *is* the diagnosis, so it survives the failure: `BADSIG`,
+# `NO_PUBKEY` and `EXPKEYSIG` are three different problems with three different
+# repairs, and a bare "FAILED: gpgv ..." tells an operator none of them. On a
+# runner the first line is repeated as a `::error::` so it reaches the job
+# summary without anyone opening the log. `verify-site.py` already reports every
+# problem with its cause; this is the shell half meeting that standard.
 check() {
-    if "$@" >/dev/null 2>&1; then
+    local out status=0
+    # `|| status=$?` rather than a bare assignment: `set -e` is on, and a
+    # command substitution that fails in an assignment would end the script
+    # before the diagnosis below could be printed.
+    out="$("$@" 2>&1)" || status=$?
+    if [ "$status" -eq 0 ]; then
         echo "  ok"
     else
         echo "  FAILED: $*"
+        if [ -n "$out" ]; then
+            printf '%s\n' "$out" | sed 's/^/      /'
+            if [ -n "${GITHUB_ACTIONS:-}" ]; then
+                printf '::error::%s: %s\n' "$*" "$(printf '%s' "$out" | head -n 1)"
+            fi
+        fi
         fail=1
     fi
 }

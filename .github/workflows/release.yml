@@ -100,10 +100,25 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          cargo_v="$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)"
           if [ "$GITHUB_REF_TYPE" = tag ]; then
             v="${GITHUB_REF_NAME#v}"
+            # **The number has two sources and this is where they meet.** The
+            # packages are named from the tag; the binary inside them reports
+            # `[workspace.package] version`. Tagging without the bump publishes
+            # `schemaic_$v_amd64.deb` and a Velopack manifest at $v around a
+            # binary whose `--version` says something else, and whose
+            # `apt-get install schemaic=$v` rollback target therefore names a
+            # version the app disagrees with. `vpk pack` already refuses a
+            # version *lower* than the channel's latest, so only this direction
+            # was silent. Placed beside the channel guard above, for its stated
+            # reason: a bad identity value should cost seconds, not a compile.
+            if [ "$v" != "$cargo_v" ]; then
+              echo "::error::Tag v$v does not match [workspace.package] version $cargo_v in Cargo.toml. Bump the workspace version and re-tag; the packages are named from the tag while the binary reports Cargo.toml."
+              exit 1
+            fi
           else
-            v="$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)"
+            v="$cargo_v"
             echo "::notice::No tag; packing the workspace version $v as a dry run"
           fi
           echo "VPK_VERSION=$v" >> "$GITHUB_ENV"
