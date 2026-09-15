@@ -11215,10 +11215,39 @@ fn footer_seg_fits(edge: f64, ai_x: f64, gap: f64) -> bool {
 /// a SQLite connection (which hides `mode_seg` outright) and any left-hand
 /// segment that narrows — "Write mode" → "Read only", "Spaces: 4" → "Tabs: 4" —
 /// are the same way in.
+/// May a hidden segment re-predict its edge and come back?
+///
+/// **The ordering term, which the prediction had none of.** Segments collapse
+/// right-to-left, so the hidden set is a *suffix* — that is the premise
+/// [`footer_seg_edge`]'s own doc rests on ("the right edge of the nearest
+/// **shown** segment to this one's left"). Every hidden segment reads the same
+/// `left_edge`, so without this they returned in order of **width**, not
+/// position: narrow the window until the Tx pill, Commit, Rollback, CPU and RAM
+/// have all gone, then make anything to their left shorter — flip Write mode to
+/// Read only, or let the caret segment go from `Ln 412, Col 38` to `Ln 1, Col 1`
+/// — and `left_edge` drops ~60px. Commit predicts `L+57` and fits; the Tx pill
+/// predicts `L+130` and does not. The footer settles at `… Read only Commit`: a
+/// lone commit action with no pill saying a transaction is open and no Rollback
+/// beside it, and it is *stable*, not a flicker — once Commit is drawn the pill
+/// re-predicts `L+187` and still does not fit.
+///
+/// `the_prediction_agrees_with_the_measurement_it_causes` pins the
+/// anti-oscillation property for **one** segment in isolation; with two or more
+/// hidden segments sharing one `left_edge` the prediction agrees with the
+/// measurement only for whichever returns leftmost.
+fn footer_seg_may_return(width: f64, shown: bool, left_shown: bool) -> bool {
+    width > 0.0 && !shown && left_shown
+}
+
 fn collapsing_seg(
     view: impl IntoView + 'static,
     ai_x: RwSignal<f64>,
     left_edge: RwSignal<f64>,
+    // The segment immediately to this one's left, or `None` for the first of
+    // them. See [`footer_seg_may_return`].
+    left_shown: Option<RwSignal<bool>>,
+    // This one's own flag, for the segment to its right.
+    shown: RwSignal<bool>,
 ) -> impl IntoView {
     let x = RwSignal::new(0.0_f64);
     let w = RwSignal::new(0.0_f64);
@@ -11233,10 +11262,24 @@ fn collapsing_seg(
     // `left_edge` and nothing else; `is_shown` and `w` are read untracked, so a
     // hidden segment re-predicts its edge without this becoming a cycle through
     // the style closure that reads it.
+    // This one's own answer, for the segment to its right. A memo-shaped effect
+    // rather than a write inside the style closure, which is the Floem hazard
+    // the module header names.
+    create_effect(move |_| {
+        let now = footer_seg_fits(edge.get(), ai_x.get(), footer_collapse_gap());
+        if shown.get_untracked() != now {
+            shown.set(now);
+        }
+    });
     create_effect(move |_| {
         let le = left_edge.get();
+        // **Tracked, not untracked.** The neighbour coming back is what may let
+        // this one come back, and reading it untracked would leave that to
+        // whether `left_edge` happened to move as well. The chain never loops:
+        // no segment writes anything its left neighbour reads.
+        let left_ok = left_shown.is_none_or(|s| s.get());
         let width = w.get_untracked();
-        if width <= 0.0 || is_shown() {
+        if !footer_seg_may_return(width, is_shown(), left_ok) {
             return;
         }
         let would_be = footer_seg_edge(false, edge.get_untracked(), le, width);
@@ -11811,19 +11854,39 @@ fn footer(ui: Ui) -> impl IntoView {
     let left_edge = RwSignal::new(0.0_f64);
     let left_x = RwSignal::new(0.0_f64);
     let left_w = RwSignal::new(0.0_f64);
+    // **The chain that makes the hidden set a suffix again.** Each segment reads
+    // the one to its left and publishes its own answer to the one on its right,
+    // so a hidden segment may only come back once everything left of it is
+    // back. Without it they returned in order of *width* — see
+    // `footer_seg_may_return`, which is where the failure is written down.
+    // Declared as an array so the chain below is the declaration order, which is
+    // also the on-screen order.
+    let seg_shown: [RwSignal<bool>; 11] = std::array::from_fn(|_| RwSignal::new(true));
     let left_group = h_stack((
         schema_icon,
-        collapsing_seg(cursor_seg, ai_x, left_edge),
-        collapsing_seg(tabs_seg, ai_x, left_edge),
-        collapsing_seg(wrap_seg, ai_x, left_edge),
-        collapsing_seg(warn_seg, ai_x, left_edge),
-        collapsing_seg(ro_seg, ai_x, left_edge),
-        collapsing_seg(mode_seg, ai_x, left_edge),
-        collapsing_seg(tx_pill, ai_x, left_edge),
-        collapsing_seg(commit_seg, ai_x, left_edge),
-        collapsing_seg(rollback_seg, ai_x, left_edge),
-        collapsing_seg(cpu_seg, ai_x, left_edge),
-        collapsing_seg(ram_seg, ai_x, left_edge),
+        collapsing_seg(cursor_seg, ai_x, left_edge, None, seg_shown[0]),
+        collapsing_seg(tabs_seg, ai_x, left_edge, Some(seg_shown[0]), seg_shown[1]),
+        collapsing_seg(wrap_seg, ai_x, left_edge, Some(seg_shown[1]), seg_shown[2]),
+        collapsing_seg(warn_seg, ai_x, left_edge, Some(seg_shown[2]), seg_shown[3]),
+        collapsing_seg(ro_seg, ai_x, left_edge, Some(seg_shown[3]), seg_shown[4]),
+        collapsing_seg(mode_seg, ai_x, left_edge, Some(seg_shown[4]), seg_shown[5]),
+        collapsing_seg(tx_pill, ai_x, left_edge, Some(seg_shown[5]), seg_shown[6]),
+        collapsing_seg(
+            commit_seg,
+            ai_x,
+            left_edge,
+            Some(seg_shown[6]),
+            seg_shown[7],
+        ),
+        collapsing_seg(
+            rollback_seg,
+            ai_x,
+            left_edge,
+            Some(seg_shown[7]),
+            seg_shown[8],
+        ),
+        collapsing_seg(cpu_seg, ai_x, left_edge, Some(seg_shown[8]), seg_shown[9]),
+        collapsing_seg(ram_seg, ai_x, left_edge, Some(seg_shown[9]), seg_shown[10]),
     ))
     .on_move(move |p| {
         left_x.set(p.x);
@@ -13938,7 +14001,7 @@ mod window_key_gate {
 
 #[cfg(test)]
 mod footer_collapse_tests {
-    use super::{footer_seg_edge, footer_seg_fits};
+    use super::{footer_seg_edge, footer_seg_fits, footer_seg_may_return};
 
     const GAP: f64 = 12.0;
 
@@ -14008,6 +14071,51 @@ mod footer_collapse_tests {
     fn the_collapse_gap_is_a_clearance() {
         assert!(footer_seg_fits(888.0, 900.0, GAP));
         assert!(!footer_seg_fits(889.0, 900.0, GAP));
+    }
+
+    /// **Two hidden segments sharing one `left_edge`, which is the case the
+    /// test above cannot see.** It pins the anti-oscillation property for *one*
+    /// segment in isolation; with two, the prediction agrees with the
+    /// measurement only for whichever returns leftmost — and nothing said which
+    /// that was, so they returned sorted by **width**.
+    ///
+    /// The numbers are the real ones: the Tx pill is ~130 wide ("Tx open · 12
+    /// stmts"), Commit ~57. Free ~100px to their left and Commit fits while the
+    /// pill does not, so the footer settled at `… Read only  Commit` — a lone
+    /// commit action with no pill saying a transaction is open and no Rollback
+    /// beside it. Stable, not a flicker: once Commit is drawn the pill
+    /// re-predicts `L+187` and still does not fit.
+    #[test]
+    fn a_narrow_segment_does_not_come_back_past_a_wider_one_still_hidden() {
+        // Both hidden, both to the right of the same left edge.
+        let (left, ax) = (700.0, 800.0);
+        let (pill_w, commit_w) = (130.0, 57.0);
+        let pill_would = footer_seg_edge(false, 2000.0, left, pill_w);
+        let commit_would = footer_seg_edge(false, 2000.0, left, commit_w);
+        // The premise: on width alone, Commit fits and the pill does not.
+        assert!(
+            !footer_seg_fits(pill_would, ax, GAP),
+            "the fixture's premise"
+        );
+        assert!(
+            footer_seg_fits(commit_would, ax, GAP),
+            "the fixture's premise"
+        );
+
+        // The pill is leftmost of the two, so it may try.
+        assert!(
+            footer_seg_may_return(pill_w, false, true),
+            "the leftmost hidden segment is the one that may come back"
+        );
+        // Commit may not, while the pill is still hidden — which is what stops
+        // the footer showing a commit action with no transaction pill.
+        assert!(!footer_seg_may_return(commit_w, false, false));
+        // …and may once the pill is back.
+        assert!(footer_seg_may_return(commit_w, false, true));
+        // A segment that is already shown never re-predicts (that is the
+        // oscillation guard), and neither does an unmeasured one.
+        assert!(!footer_seg_may_return(commit_w, true, true));
+        assert!(!footer_seg_may_return(0.0, false, true));
     }
 }
 
