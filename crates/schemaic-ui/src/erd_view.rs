@@ -42,7 +42,7 @@ use floem::context::PaintCx;
 use floem::event::{Event, EventListener, EventPropagation};
 use floem::file::{FileDialogOptions, FileSpec};
 use floem::keyboard::{Key, NamedKey};
-use floem::kurbo::{BezPath, Line, Point, Stroke};
+use floem::kurbo::{BezPath, Line, Point, Size, Stroke};
 use floem::prelude::*;
 use floem::reactive::{Memo, create_effect, create_memo};
 use floem::views::{container, empty, v_stack_from_iter};
@@ -274,6 +274,30 @@ impl Find {
 /// answers a different question — it lights up every match at once, and moves the
 /// canvas only when there is exactly one card to move to. A "next" button would
 /// have to invent a sequence over a 2-D canvas before it had anything to do.
+/// Did a press on the find bar land somewhere **other** than the search field?
+///
+/// `pos` is relative to the bar; `field` is the laid-out size of the field,
+/// which sits at `pad` inside it. The bar has padding on all four sides, so the
+/// region that is on the bar but not on the field is a frame, not a half-plane:
+/// `x < pad.0`, `x >= pad.0 + field.width`, `y < pad.1`, `y >= pad.1 +
+/// field.height`, and the count readout and ✕ to the right of all of it.
+///
+/// **It was written as one edge** — `pos.x > pad + width` — which is right for
+/// the readout and wrong for the other three sides. A press on the 6 px strip
+/// above the box is a miss the bar consumes, and the keyboard is then held by
+/// nothing: floem takes focus on every `PointerDown` before dispatch, and the
+/// `Stop` this handler returns comes from inside the children loop, so no
+/// ancestor reaches the block that would have re-focused the modal root. Escape
+/// and Ctrl+F both stop answering until the user happens to click the canvas.
+///
+/// Pure, and separate from the closure, because the closure cannot be tested and
+/// this is the whole of the decision in it.
+fn press_missed_the_field(pos: Point, field: Size, pad: (f64, f64)) -> bool {
+    let on_field = (pad.0..pad.0 + field.width).contains(&pos.x)
+        && (pad.1..pad.1 + field.height).contains(&pos.y);
+    !on_field
+}
+
 fn find_bar(find: Find, matches: Memo<erd::Matches>) -> impl IntoView {
     dyn_container(
         move || find.open.get(),
@@ -386,11 +410,11 @@ fn find_bar(find: Find, matches: Memo<erd::Matches>) -> impl IntoView {
                     // keyboard-dead — the exact state this handler exists to
                     // prevent.
                     if let Event::PointerDown(pe) = e {
-                        let w = input_id
-                            .get_size()
-                            .map(|s| s.width)
-                            .unwrap_or_else(|| theme::scaled(190.0));
-                        if pe.pos.x > theme::scaled(8.0) + w {
+                        let field = input_id.get_size().unwrap_or_else(|| {
+                            Size::new(theme::scaled(190.0), crate::field_input_h())
+                        });
+                        let pad = (theme::scaled(8.0), theme::scaled(6.0));
+                        if press_missed_the_field(pe.pos, field, pad) {
                             crate::widgets::hand_keyboard_back(None);
                         }
                     }
@@ -2946,6 +2970,57 @@ fn modal_frame(
 mod tests {
     use super::*;
     use schemaic_core::erd::{Cardinality, DiagramEdge, DiagramGraph, DiagramNode, NodeKind};
+
+    /// **The band is a frame, not an edge.** The bar pads 8 px horizontally and
+    /// 6 px vertically, so a press can miss the field on any of four sides; the
+    /// handler tested one. Above and to the left are the two a user reaches by
+    /// aiming at the box and being 3 px off, and both left the diagram
+    /// keyboard-dead — Escape and Ctrl+F dead until the canvas was clicked.
+    #[test]
+    fn a_press_misses_the_field_on_every_side_of_it_not_only_the_right() {
+        let field = Size::new(190.0, 26.0);
+        let pad = (8.0, 6.0);
+        // Inside: the click focuses the field itself and the handler must not
+        // touch focus, or it undoes what the click just did.
+        assert!(!press_missed_the_field(Point::new(100.0, 18.0), field, pad));
+        // Right — the count readout and ✕. The one case that already worked.
+        assert!(press_missed_the_field(Point::new(199.0, 18.0), field, pad));
+        // Left, above, below: the padding.
+        assert!(press_missed_the_field(Point::new(3.0, 18.0), field, pad));
+        assert!(press_missed_the_field(Point::new(100.0, 2.0), field, pad));
+        assert!(press_missed_the_field(Point::new(100.0, 34.0), field, pad));
+    }
+
+    /// The edges themselves, since a half-open range is the whole of this
+    /// function and an off-by-one at either end is a press that is judged the
+    /// opposite of what it is.
+    #[test]
+    fn the_field_owns_its_own_top_left_corner_and_not_the_pixel_past_it() {
+        let field = Size::new(190.0, 26.0);
+        let pad = (8.0, 6.0);
+        assert!(!press_missed_the_field(Point::new(8.0, 6.0), field, pad));
+        assert!(press_missed_the_field(Point::new(7.9, 6.0), field, pad));
+        assert!(press_missed_the_field(Point::new(8.0, 5.9), field, pad));
+        assert!(!press_missed_the_field(Point::new(197.9, 31.9), field, pad));
+        assert!(press_missed_the_field(Point::new(198.0, 31.9), field, pad));
+        assert!(press_missed_the_field(Point::new(197.9, 32.0), field, pad));
+    }
+
+    /// **Scaled, both terms and both axes.** The padding and the field size are
+    /// read at the interface scale in force, so the band moves with them. A
+    /// fixed 8.0/6.0 here was the bug `b64accc` fixed on one axis; the vertical
+    /// term arrived with this function and must not repeat it.
+    #[test]
+    fn the_band_follows_the_interface_scale() {
+        let (field, pad) = (Size::new(304.0, 41.6), (12.8, 9.6));
+        // A press 10 px in is outside the field at 160% and inside it at 100%.
+        assert!(press_missed_the_field(Point::new(10.0, 20.0), field, pad));
+        assert!(!press_missed_the_field(
+            Point::new(10.0, 20.0),
+            Size::new(190.0, 26.0),
+            (8.0, 6.0)
+        ));
+    }
 
     /// Substituting a card's identity colour for `theme::border` must never leave
     /// the card *less* defined than it was — the outline is what separates it from
