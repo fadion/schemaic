@@ -4449,7 +4449,7 @@ pub(crate) fn menu_panel(
             let Key::Named(k) = ke.key.logical_key else {
                 return EventPropagation::Continue;
             };
-            menu_key(k, level, &stops, &sub_stops, &act)
+            menu_key(k, ke.modifiers, level, &stops, &sub_stops, &act)
         })
 }
 
@@ -4458,6 +4458,7 @@ pub(crate) fn menu_panel(
 /// anything this doesn't claim.
 fn menu_key(
     k: NamedKey,
+    mods: floem::keyboard::Modifiers,
     level: MenuLevel,
     stops: &[(usize, MenuAct)],
     sub_stops: &std::collections::HashMap<usize, Vec<(usize, MenuAct)>>,
@@ -4482,6 +4483,30 @@ fn menu_key(
             cursor.set(Some(*entry));
         }
     };
+    // **Tab walks the menu, and above all it is *claimed*.** The catch-all at
+    // the bottom of the match returned `Continue` for it, and an unprocessed Tab
+    // reaches floem's last resort: `view_tab_navigation` over the **whole window
+    // tree**. A menu raised over the bare workspace has no ring beneath it — a
+    // `menu_panel` registers as a ring-less `focus_root`, which
+    // [`innermost_ring_root`] skips — so the workspace root's Tab backstop
+    // declined as well, and focus landed on an unrelated control behind the
+    // panel. The menu then stood there keyboard-dead: every one of
+    // ↑/↓/Home/End/Enter/Escape is a listener on the panel and floem delivers a
+    // key only to the focused view and then to `main_view`, so none of them
+    // reached it, the menu could be dismissed with the mouse alone, and Enter
+    // activated whatever the walk had found.
+    //
+    // Stepping rather than merely swallowing, because a key that does nothing is
+    // its own small defect and a `<select>`-shaped popup steps on Tab anyway.
+    //
+    // **Through [`steps_ring`], which is the one predicate**: it carries the
+    // `primary_held` term, so `Ctrl+Tab` stays the app's next-query-tab rather
+    // than being eaten by whichever menu happens to be up — the same rule, and
+    // the same reason, as the focus rings.
+    if steps_ring(&Key::Named(k), mods) {
+        step(mods.shift());
+        return EventPropagation::Stop;
+    }
     match k {
         NamedKey::ArrowDown => step(false),
         NamedKey::ArrowUp => step(true),
@@ -7096,6 +7121,7 @@ mod submenu_place_tests {
 #[cfg(test)]
 mod menu_key_tests {
     use super::*;
+    use floem::keyboard::Modifiers;
     use std::cell::Cell;
 
     /// `[Action, Separator, Action(disabled), Sub[Action, Action]]` — one of each
@@ -7154,8 +7180,13 @@ mod menu_key_tests {
         /// which is as much of the return value as any caller cares about —
         /// floem's enum is neither `PartialEq` nor `Debug`.
         fn press(&self, k: NamedKey) -> bool {
+            self.press_with(k, Modifiers::empty())
+        }
+        /// The same with modifiers held — Shift is `Tab`'s direction, and the
+        /// primary modifier is what keeps `Ctrl+Tab` the window's.
+        fn press_with(&self, k: NamedKey, mods: Modifiers) -> bool {
             matches!(
-                menu_key(k, self.level, &self.stops, &self.subs, &self.close),
+                menu_key(k, mods, self.level, &self.stops, &self.subs, &self.close),
                 EventPropagation::Stop
             )
         }
@@ -7205,6 +7236,50 @@ mod menu_key_tests {
         assert_eq!(m.cursor(), Some(3), "1 and 2 are not stops");
         m.press(NamedKey::ArrowDown);
         assert_eq!(m.cursor(), Some(0), "wrapped");
+    }
+
+    /// **Tab has to be claimed, or floem walks the whole window.** The catch-all
+    /// returned `Continue` for it, and an unprocessed Tab reaches
+    /// `view_tab_navigation` over the entire tree. A menu over the bare
+    /// workspace has no ring beneath it — a `menu_panel` is a *ring-less*
+    /// `focus_root`, which `innermost_ring_root` skips — so the workspace root's
+    /// Tab backstop declined as well, and focus landed on an unrelated control
+    /// behind the panel. The menu then stayed on screen keyboard-dead: every one
+    /// of ↑/↓/Home/End/Enter/Escape is a listener on the panel, so none of them
+    /// reached it, the menu could be dismissed only with the mouse, and Enter
+    /// activated whatever the walk had found.
+    ///
+    /// It steps rather than merely swallowing, because a key that does nothing
+    /// is its own small defect — and Shift is the direction, as it is for
+    /// `steps_ring`.
+    #[test]
+    fn tab_walks_the_menu_instead_of_leaving_it() {
+        let m = menu();
+        assert!(
+            m.press(NamedKey::Tab),
+            "Tab must not escape into the window"
+        );
+        assert_eq!(m.cursor(), Some(0), "and it moves, like Down");
+        assert!(m.press(NamedKey::Tab));
+        assert_eq!(m.cursor(), Some(3), "1 and 2 are not stops");
+        // Shift is the direction, so it walks back.
+        assert!(m.press_with(NamedKey::Tab, Modifiers::SHIFT));
+        assert_eq!(m.cursor(), Some(0));
+        // …and wraps at the end, like Up.
+        assert!(m.press_with(NamedKey::Tab, Modifiers::SHIFT));
+        assert_eq!(m.cursor(), Some(3), "wrapped");
+    }
+
+    /// **`Ctrl+Tab` is still the window's**, which is `steps_ring`'s whole
+    /// reason for carrying the `primary_held` term — the menu asks that one
+    /// predicate rather than matching Tab itself, so the app's next-query-tab is
+    /// not eaten by whichever menu happens to be up.
+    #[test]
+    fn a_primary_modified_tab_is_not_the_menus() {
+        let m = menu();
+        assert!(!m.press_with(NamedKey::Tab, Modifiers::CONTROL));
+        assert_eq!(m.cursor(), None, "and it moved nothing");
+        assert!(!m.press_with(NamedKey::Tab, Modifiers::CONTROL | Modifiers::SHIFT));
     }
 
     #[test]
@@ -7428,11 +7503,17 @@ mod menu_key_tests {
 
     /// Left at the root is not the menu's key — nothing is open to leave, so it
     /// passes through rather than being swallowed.
+    ///
+    /// **Tab used to be listed here, and that was the defect written as a
+    /// test.** An unclaimed Tab reaches floem's whole-tree
+    /// `view_tab_navigation`, which over the bare workspace handed focus to a
+    /// control behind the panel and left the menu keyboard-dead — see
+    /// `tab_walks_the_menu_instead_of_leaving_it`. `Ctrl+Tab` is the one that
+    /// still passes through, and it has a test of its own.
     #[test]
     fn a_key_the_menu_has_no_use_for_passes_through() {
         let m = menu();
         assert!(!m.press(NamedKey::ArrowLeft));
-        assert!(!m.press(NamedKey::Tab));
         // Enter with the cursor nowhere: there is no row to run.
         assert!(!m.press(NamedKey::Enter));
         assert_eq!(m.closed.get(), 0);
