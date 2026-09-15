@@ -330,7 +330,9 @@ impl Environment {
 }
 
 /// Optional SSH tunnel for reaching a server that isn't directly routable.
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+///
+/// [`Debug`] is hand-written and redacting — see the impl.
+#[derive(Clone, Serialize, Deserialize, PartialEq)]
 pub struct SshTunnel {
     pub enabled: bool,
     pub host: String,
@@ -347,6 +349,51 @@ pub struct SshTunnel {
     /// Passphrase decrypting `key_path`, if the key is encrypted (may be empty).
     #[serde(default)]
     pub key_passphrase: String,
+}
+
+/// **Two secrets, and the derive printed both.** `Db` was given a redacting
+/// `Debug` in this same range for the one password it carries; the structs
+/// `Db::connect` reads *from* carry three between them, and kept the derive. No
+/// site formats one today — which is the whole reason to fix it now, while the
+/// fix is free: a `tracing::warn!(?tunnel, …)` on a handshake failure is the
+/// obvious next line for anyone debugging one, and it would write the SSH
+/// password and the key passphrase to the log file the Settings modal invites
+/// the user to attach to a bug report.
+///
+/// Fields are named individually rather than through
+/// [`std::fmt::DebugStruct::finish_non_exhaustive`] on a filtered set, so a
+/// field added later is **omitted** until someone lists it. Omission is the safe
+/// direction; a new secret joining the output silently is not.
+impl std::fmt::Debug for SshTunnel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SshTunnel")
+            .field("enabled", &self.enabled)
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("user", &self.user)
+            .field("password", &Redacted(&self.password))
+            .field("auth", &self.auth)
+            .field("key_path", &self.key_path)
+            .field("key_passphrase", &Redacted(&self.key_passphrase))
+            .finish()
+    }
+}
+
+/// A secret, as a `Debug` field: whether it is set, never what it is.
+///
+/// "Set or not" is the half that helps — an empty password where one was
+/// expected is the commonest cause of the failures anyone would be printing
+/// this for — and it is not the half that leaks.
+struct Redacted<'a>(&'a str);
+
+impl std::fmt::Debug for Redacted<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(if self.0.is_empty() {
+            "<empty>"
+        } else {
+            "<redacted>"
+        })
+    }
 }
 
 impl Default for SshTunnel {
@@ -712,7 +759,10 @@ pub struct TlsPlan {
 }
 
 /// A saved connection to a database server.
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+///
+/// [`Debug`] is hand-written and redacting — see the impl below the struct, and
+/// [`SshTunnel`]'s for why.
+#[derive(Clone, Serialize, Deserialize, PartialEq)]
 pub struct Connection {
     pub id: u64,
     pub name: String,
@@ -785,6 +835,31 @@ pub struct Connection {
     /// assistant more access nor silently takes away what the user had.
     #[serde(default)]
     pub ai_data: Option<AiData>,
+}
+
+/// Redacting, for [`SshTunnel`]'s reasons — the DB password here, and the two
+/// the `ssh` field carries, which reach this output through its own impl.
+impl std::fmt::Debug for Connection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Connection")
+            .field("id", &self.id)
+            .field("name", &self.name)
+            .field("db_type", &self.db_type)
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("user", &self.user)
+            .field("password", &Redacted(&self.password))
+            .field("file", &self.file)
+            .field("database", &self.database)
+            .field("ssh", &self.ssh)
+            .field("tls", &self.tls)
+            .field("color", &self.color)
+            .field("prominent_color", &self.prominent_color)
+            .field("read_only", &self.read_only)
+            .field("environment", &self.environment)
+            .field("ai_data", &self.ai_data)
+            .finish()
+    }
 }
 
 fn default_db_type() -> String {
@@ -1705,6 +1780,41 @@ mod tests {
             },
             ..conn()
         }
+    }
+
+    /// **`{:?}` on a connection must not be a credential dump.** The derive put
+    /// the DB password, the SSH password and the SSH key passphrase in the
+    /// clear into whatever formatted it — a `tracing` field, a panic message,
+    /// an `unwrap` on a `Result<_, Connection>`. `Db` was given a redacting
+    /// `Debug` for exactly this; the struct `Db::connect` is built *from* kept
+    /// the derive.
+    #[test]
+    fn formatting_a_connection_prints_none_of_the_three_secrets_it_holds() {
+        let rendered = format!("{:?}", tunnelled());
+        assert!(
+            !rendered.contains("secret"),
+            "a secret survived the redaction: {rendered}"
+        );
+        // Redacted, not dropped: a log line that cannot say which server it is
+        // about is worth nothing, and none of these is a credential.
+        assert!(rendered.contains("db.example.com"), "{rendered}");
+        assert!(rendered.contains("bastion.example.com"), "{rendered}");
+        assert!(rendered.contains("root"), "{rendered}");
+    }
+
+    /// The tunnel block formats on its own too — it is a `pub` field of a `pub`
+    /// struct, so a caller can hold and print one without a `Connection`.
+    #[test]
+    fn formatting_a_tunnel_prints_neither_its_password_nor_its_passphrase() {
+        let rendered = format!("{:?}", tunnelled().ssh);
+        assert!(
+            !rendered.contains("secret"),
+            "a secret survived the redaction: {rendered}"
+        );
+        assert!(rendered.contains("bastion.example.com"), "{rendered}");
+        // The key *path* is not a secret, and it is the first thing a failing
+        // key-pair handshake needs named.
+        assert!(rendered.contains("id_ed25519"), "{rendered}");
     }
 
     /// The whole point: the credentials come across. They live in the keyring,
