@@ -125,17 +125,37 @@ pub(crate) fn ai_panel(ui: Ui) -> impl IntoView {
                         .find(|t| t.id == active.get_untracked())
                         .map(|t| (t.conn_id.get_untracked(), t.database.get_untracked()))
                 });
-                match schemaic_core::tabsel::scoped_database(tab, conn, None) {
-                    Some(db) => {
+                // **Two refusals, because there are two reasons.**
+                // `scoped_database` answers one `None` for both, which is right
+                // for its own question and leaves this caller — whose next act
+                // is to explain itself — unable to say which happened. It said
+                // "a tab on a different connection… switch to that tab" for a
+                // tab on *this* connection with no database bound (every
+                // database hidden, or the schema still loading when the tab was
+                // opened): the sentence false and the remedy naming the tab the
+                // user is already on.
+                match schemaic_core::tabsel::tab_scope(tab, conn) {
+                    schemaic_core::tabsel::TabScope::Bound(db) => {
                         (oq)(sql, Some(db));
                         true
                     }
-                    None => {
+                    schemaic_core::tabsel::TabScope::NoDatabase => {
+                        error_text.set(Some(
+                            "This tab has no database selected, so a statement run from \
+                             here would have nowhere to go. Pick one for this connection \
+                             first — if every database is hidden, the SCHEMA eye is where \
+                             to bring one back."
+                                .to_string(),
+                        ));
+                        error_open.set(true);
+                        false
+                    }
+                    schemaic_core::tabsel::TabScope::OtherConnection => {
                         error_text.set(Some(
                             "This chat is about a tab on a different connection. A new tab \
                              would open on the connection selected in the tree, so the \
                              statement would run somewhere else — switch to that tab, or \
-                             pick a database on this connection, first."
+                             select its connection in the tree, first."
                                 .to_string(),
                         ));
                         error_open.set(true);

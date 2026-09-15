@@ -80,7 +80,7 @@
 //! single [`SERVER`] constant so a future check has one place to hook.
 
 use schemaic_ai::harness::{
-    SettingsEdit, antigravity_allow_rules, antigravity_settings_with_rules,
+    SettingsEdit, antigravity_allow_rules, antigravity_settings_with_only_rules,
     antigravity_settings_without_rules,
 };
 use schemaic_core::persist;
@@ -557,7 +557,20 @@ impl AgyRegistration {
         // discarded, so an unparseable or unwritable `settings.json` produced a
         // registered server whose every call that CLI refuses, reported as a
         // working session.
-        let granted = edit_settings(true, move |cur| antigravity_settings_with_rules(cur, &r));
+        //
+        // **`with_only_rules`, not `with_rules`**: the file has to say what
+        // *this* level allows, not the union of every level that has run. A
+        // respawn that lowers the connection's access drops the old
+        // registration on the session task while this runs on a blocking
+        // thread, and if this claim lands first the old `Drop`'s `may_release`
+        // sees a claim that is not its own and withdraws nothing — leaving
+        // `run_query` granted for a connection now set to schema-only,
+        // depending on which thread won. See
+        // `antigravity_settings_with_only_rules`.
+        let ours = antigravity_allow_rules(&crate::ai::ai_allowed_tools(true, true));
+        let granted = edit_settings(true, move |cur| {
+            antigravity_settings_with_only_rules(cur, &ours, &r)
+        });
         if !granted {
             tracing::warn!(
                 "Antigravity's settings file could not be granted the Schemaic tool rules; \
@@ -701,7 +714,13 @@ mod tests {
         // Granting is the other half and still creates: a fresh install has no
         // file, and its tools are refused without the rules.
         let fresh = settings_to_edit(true, None).expect("a document to edit");
-        let Some(SettingsEdit::Write(granted)) = antigravity_settings_with_rules(&fresh, &rules)
+        // Through the surgery `install` actually calls — see
+        // `antigravity_settings_with_only_rules`, which is what makes the grant
+        // describe the connection's level rather than the union of every level
+        // that has run.
+        let ours = antigravity_allow_rules(&crate::ai::ai_allowed_tools(true, true));
+        let Some(SettingsEdit::Write(granted)) =
+            antigravity_settings_with_only_rules(&fresh, &ours, &rules)
         else {
             panic!("a fresh install must be granted its rules");
         };

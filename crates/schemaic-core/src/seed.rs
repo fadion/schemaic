@@ -121,8 +121,41 @@ pub fn parse_seed_response(stdout: &str) -> Result<Vec<Row>, SeedError> {
     Ok(rows)
 }
 
+/// Longest single sampled value kept, in characters.
+///
+/// **The bound every sibling prompt builder had and this one did not.** A
+/// sample exists to show the *shape* of a column, and 200 characters of a
+/// `LONGTEXT` shows that as well as 2 MB does. Without it, Seed and Fill copied
+/// every cell of twenty whole rows untruncated: on the harnesses that take the
+/// prompt on the command line, one 200 KB `LONGTEXT`/`JSON`/`MEDIUMBLOB` cell
+/// blows `arg_limit()` (30,000 UTF-16 units on Windows, 120 KiB elsewhere) and
+/// the spawn is refused — correctly, but with a message written for the chat
+/// path, naming the schema scope and "the query in the editor", neither of
+/// which is a lever a grid context menu has. Seed and Fill were simply dead on
+/// such a table.
+///
+/// The siblings, all with the same reason written beside them:
+/// `summary::SAMPLE_CHARS` = 120, `prompt::CELL_CHARS` = 200 for an attachment,
+/// `mcp::MCP_CELL_CHARS` = 60. This matches the attachment's, since a seed
+/// sample is the same kind of thing: rows the model is asked to imitate.
+pub const SEED_CELL_CHARS: usize = 200;
+
+/// Clip one sampled value to [`SEED_CELL_CHARS`].
+///
+/// Newlines are kept — unlike `summary::clip`, which flattens them, because
+/// these values go into a JSON string where a newline is escaped and stays one
+/// token rather than breaking the layout of a line-oriented list.
+fn clip_cell(v: &str) -> String {
+    if v.chars().count() > SEED_CELL_CHARS {
+        format!("{}…", v.chars().take(SEED_CELL_CHARS).collect::<String>())
+    } else {
+        v.to_string()
+    }
+}
+
 /// Render a list of rows as a compact JSON array for embedding in a prompt (the
-/// same shape the model is asked to emit back). `None` values render as `null`.
+/// same shape the model is asked to emit back). `None` values render as `null`;
+/// every value is clipped to [`SEED_CELL_CHARS`].
 fn rows_to_json(rows: &[Row]) -> String {
     let arr: Vec<serde_json::Value> = rows
         .iter()
@@ -131,7 +164,7 @@ fn rows_to_json(rows: &[Row]) -> String {
                 .iter()
                 .map(|(k, v)| {
                     let jv = match v {
-                        Some(s) => serde_json::Value::String(s.clone()),
+                        Some(s) => serde_json::Value::String(clip_cell(s)),
                         None => serde_json::Value::Null,
                     };
                     (k.clone(), jv)
@@ -532,6 +565,76 @@ mod tests {
             crate::intel::SqlDialect::MySql,
         );
         assert!(p.contains("No rows are being sampled"));
+    }
+
+    /// **One `LONGTEXT` cell used to be the whole prompt.**
+    ///
+    /// The app samples twenty whole rows and `rows_to_json` spliced every cell
+    /// in untruncated, so a `LONGTEXT`/`JSON`/`MEDIUMBLOB` column blew
+    /// `arg_limit()` on the harnesses that take the prompt on argv — and the
+    /// refusal the user then read named the schema scope and "the query in the
+    /// editor", neither of which is a lever a grid context menu has. Seed and
+    /// Fill were simply dead on such a table. Every sibling builder had a cap
+    /// for exactly this reason (`summary::SAMPLE_CHARS`, `prompt::CELL_CHARS`,
+    /// `mcp::MCP_CELL_CHARS`); this one did not.
+    ///
+    /// A sample exists to show *shape*, and the assertions below are what shape
+    /// means: the column names, the other values and the row count all survive.
+    #[test]
+    fn a_huge_sampled_cell_is_clipped_and_the_shape_around_it_survives() {
+        let huge = "x".repeat(10_000);
+        let sample = [row(&[
+            ("id", Some("7")),
+            ("body", Some(&huge)),
+            ("status", Some("draft")),
+        ])];
+        let p = build_seed_prompt(
+            "articles",
+            Some("CREATE TABLE articles (id INT, body LONGTEXT, status VARCHAR(16))"),
+            &["body".to_string(), "status".to_string()],
+            &sample,
+            3,
+            AiData::Full,
+            crate::intel::SqlDialect::MySql,
+        );
+        assert!(
+            !p.contains(&"x".repeat(SEED_CELL_CHARS + 1)),
+            "the cell was not clipped — the prompt is {} characters",
+            p.chars().count()
+        );
+        assert!(p.contains(&"x".repeat(SEED_CELL_CHARS)), "clipped too hard");
+        for want in ["body", "status", "draft", "\"id\":\"7\""] {
+            assert!(p.contains(want), "{want} is gone from the prompt");
+        }
+        // Bounded by the sample's shape now, not by one cell's size.
+        assert!(
+            p.chars().count() < 4_000,
+            "{} characters",
+            p.chars().count()
+        );
+    }
+
+    /// The fill prompt carries the row being filled through the same renderer,
+    /// so the cap has to reach it too — a `LONGTEXT` neighbour in the row is
+    /// the commonest way this path overflowed.
+    #[test]
+    fn a_huge_neighbouring_cell_is_clipped_in_the_fill_prompt() {
+        let huge = "y".repeat(10_000);
+        let context = vec![
+            ("id".to_string(), Some("7".to_string())),
+            ("body".to_string(), Some(huge)),
+        ];
+        let p = build_fill_prompt(
+            "articles",
+            "status",
+            Some("CREATE TABLE articles (id INT, body LONGTEXT, status VARCHAR(16))"),
+            &[],
+            &context,
+            AiData::Full,
+            crate::intel::SqlDialect::MySql,
+        );
+        assert!(!p.contains(&"y".repeat(SEED_CELL_CHARS + 1)), "not clipped");
+        assert!(p.contains("\"id\":\"7\""), "the rest of the row is gone");
     }
 
     // ── the three consent questions these prompts answer ─────────────────

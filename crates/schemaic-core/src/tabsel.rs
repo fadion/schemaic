@@ -200,9 +200,46 @@ pub fn scoped_database(
     active_conn: u64,
     fallback: Option<&str>,
 ) -> Option<String> {
-    tab.filter(|(conn_id, _)| *conn_id == active_conn)
-        .and_then(|(_, database)| database)
-        .or_else(|| fallback.map(str::to_string))
+    match tab_scope(tab, active_conn) {
+        TabScope::Bound(database) => Some(database),
+        TabScope::NoDatabase | TabScope::OtherConnection => fallback.map(str::to_string),
+    }
+}
+
+/// Why [`scoped_database`] answered as it did — the two different `None`s, kept
+/// apart.
+///
+/// **Because one caller has to tell them apart and cannot.** `scoped_database`
+/// collapses "the focused tab is on another connection" and "the focused tab is
+/// on this one and has no database" into a single `None`, which is right for
+/// its own question — both mean "do not use the focused tab's database" — and
+/// wrong for a caller whose next act is to *explain the refusal to the user*.
+/// The chat code block's Insert/Run raised "This chat is about a tab on a
+/// different connection… switch to that tab" for a tab on the same connection
+/// whose databases are all hidden, or whose schema had not finished loading
+/// when it was opened: the first sentence false, and the remedy naming the tab
+/// the user was already on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TabScope {
+    /// The focused tab is on the active connection and names a database.
+    Bound(String),
+    /// The focused tab is on the active connection and has no database bound —
+    /// `schema::tab_target` answered `None` when it was opened.
+    NoDatabase,
+    /// The focused tab belongs to another connection, or there is no focused
+    /// tab. A new tab would open on the connection selected in the tree, which
+    /// is not the one this question is about.
+    OtherConnection,
+}
+
+/// Which of [`TabScope`]'s three states the focused tab is in.
+pub fn tab_scope(tab: Option<(u64, Option<String>)>, active_conn: u64) -> TabScope {
+    match tab {
+        Some((conn_id, _)) if conn_id != active_conn => TabScope::OtherConnection,
+        Some((_, Some(database))) => TabScope::Bound(database),
+        Some((_, None)) => TabScope::NoDatabase,
+        None => TabScope::OtherConnection,
+    }
 }
 
 #[cfg(test)]
@@ -313,6 +350,56 @@ mod tests {
             Some("world".to_string())
         );
         assert_eq!(scoped_database(None, 7, None), None);
+    }
+
+    /// **The two `None`s `scoped_database` folds together, kept apart.**
+    ///
+    /// Its `None` means "do not use the focused tab's database", which has two
+    /// causes: the tab is on another connection, or it is on this one and has
+    /// no database bound. A caller whose next act is to *explain the refusal*
+    /// needs the difference, and the chat code block's Insert/Run raised "This
+    /// chat is about a tab on a different connection… switch to that tab" for
+    /// the second — false, and pointing at the tab the user was already on.
+    #[test]
+    fn tab_scope_tells_the_two_refusals_apart() {
+        assert_eq!(
+            tab_scope(Some((7, Some("classicmodels".into()))), 7),
+            TabScope::Bound("classicmodels".to_string())
+        );
+        // On this connection, no database: hidden databases, or a schema that
+        // had not loaded when the tab was opened.
+        assert_eq!(tab_scope(Some((7, None)), 7), TabScope::NoDatabase);
+        // Another connection — with or without a database of its own, and the
+        // no-tab case, which a new tab would also open on the tree's selection.
+        assert_eq!(
+            tab_scope(Some((9, Some("chinook".into()))), 7),
+            TabScope::OtherConnection
+        );
+        assert_eq!(tab_scope(Some((9, None)), 7), TabScope::OtherConnection);
+        assert_eq!(tab_scope(None, 7), TabScope::OtherConnection);
+    }
+
+    /// `scoped_database` is now a reading of [`tab_scope`], so the two cannot
+    /// drift: every state either answers with the tab's database or falls back.
+    #[test]
+    fn scoped_database_still_answers_exactly_what_the_scope_says() {
+        for tab in [
+            None,
+            Some((7, None)),
+            Some((7, Some("classicmodels".to_string()))),
+            Some((9, None)),
+            Some((9, Some("chinook".to_string()))),
+        ] {
+            let want = match tab_scope(tab.clone(), 7) {
+                TabScope::Bound(db) => Some(db),
+                _ => Some("world".to_string()),
+            };
+            assert_eq!(
+                scoped_database(tab.clone(), 7, Some("world")),
+                want,
+                "{tab:?}"
+            );
+        }
     }
 
     /// Tabs interleaved across two connections, as the flat list really is.

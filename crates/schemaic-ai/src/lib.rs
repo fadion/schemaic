@@ -374,10 +374,18 @@ pub const fn arg_limit() -> usize {
 ///
 /// The message names the lever the user actually has. The system prompt carries
 /// the schema outline, and the AI schema scope is a setting.
+///
+/// **`levers` comes from the caller**, because "shorten the query in the
+/// editor" is only a lever on the surface it was written for. Fill and Seed are
+/// grid context menus with no editor and no query: told that, the user has
+/// nothing to act on, and the one thing that would work — lowering the
+/// connection's AI data level, which drops the row sample entirely — was not
+/// named. Use [`SCHEMA_AND_QUERY_LEVERS`] where both apply.
 pub fn oversize_reason(
     harness: crate::harness::Harness,
     args: &[String],
     limit: usize,
+    levers: &str,
 ) -> Option<String> {
     // Roughly what the OS sees: the arguments plus a separator each.
     let total: usize = args.iter().map(|a| arg_units(a) + 1).sum();
@@ -393,11 +401,21 @@ pub fn oversize_reason(
     let unit = arg_unit_name();
     Some(format!(
         "The context sent to {name} is too large for one command line \
-         ({total} {unit}; this platform allows about {limit}). Narrow \
-         Settings → AI → schema scope to the active database (or None), or \
-         shorten the query in the editor."
+         ({total} {unit}; this platform allows about {limit}). {levers}"
     ))
 }
+
+/// The levers a chat turn or a Ctrl+K generation has: the schema outline in the
+/// system prompt, and the editor's own text.
+pub const SCHEMA_AND_QUERY_LEVERS: &str = "Narrow Settings → AI → schema scope to the active database (or None), or \
+     shorten the query in the editor.";
+
+/// The levers AI Fill and Seed rows have. Neither of the two above is one: the
+/// schema section is a `CREATE TABLE` skeleton and there is no editor in a grid
+/// context menu. What does work is the connection's data level, below which the
+/// row sample is not sent at all.
+pub const SAMPLE_LEVERS: &str = "Lower this connection's AI data access below Full, which stops the row \
+     sample being sent, or narrow Settings → AI → schema scope.";
 
 /// **Why this spawn cannot happen, or `None`** — the one pre-spawn verdict, and
 /// what every call site asks.
@@ -418,8 +436,9 @@ pub fn spawn_refusal(
     bin: &str,
     args: &[String],
     limit: usize,
+    levers: &str,
 ) -> Option<String> {
-    oversize_reason(harness, args, limit)
+    oversize_reason(harness, args, limit, levers)
         .or_else(|| batch_shim_reason(cfg!(windows), harness, bin, args))
 }
 
@@ -1641,7 +1660,12 @@ mod tests {
             CliSeal::ALL,
         );
         assert_eq!(
-            oversize_reason(crate::harness::Harness::Claude, &args, arg_limit()),
+            oversize_reason(
+                crate::harness::Harness::Claude,
+                &args,
+                arg_limit(),
+                SCHEMA_AND_QUERY_LEVERS
+            ),
             None
         );
     }
@@ -1653,10 +1677,46 @@ mod tests {
         // installation that is fine.
         let huge = "x".repeat(40_000);
         let args = build_session_args(&huge, None, None, None, &[], CliSeal::ALL);
-        let why =
-            oversize_reason(crate::harness::Harness::Claude, &args, 30_000).expect("must refuse");
+        let why = oversize_reason(
+            crate::harness::Harness::Claude,
+            &args,
+            30_000,
+            SCHEMA_AND_QUERY_LEVERS,
+        )
+        .expect("must refuse");
         assert!(why.contains("schema scope"), "{why}");
         assert!(!why.contains("installed"), "{why}");
+    }
+
+    /// **The levers are the caller's, because they are not the same
+    /// everywhere.** Fill and Seed are grid context menus: there is no editor
+    /// and no query, so "shorten the query in the editor" gave the user nothing
+    /// to act on, while the one thing that works — lowering the connection's AI
+    /// data level, which stops the row sample being sent at all — was not named.
+    #[test]
+    fn an_oversize_refusal_names_the_levers_its_caller_has() {
+        let args = vec!["-p".to_string(), "y".repeat(200)];
+        let chat = oversize_reason(
+            crate::harness::Harness::Claude,
+            &args,
+            150,
+            SCHEMA_AND_QUERY_LEVERS,
+        )
+        .expect("must refuse");
+        assert!(chat.contains("query in the editor"), "{chat}");
+
+        let sample =
+            oversize_reason(crate::harness::Harness::Claude, &args, 150, SAMPLE_LEVERS).expect("x");
+        assert!(sample.contains("AI data access"), "{sample}");
+        assert!(
+            !sample.contains("query in the editor"),
+            "Fill/Seed has no editor: {sample}"
+        );
+        // Both still carry the measurement and neither blames the install.
+        for why in [&chat, &sample] {
+            assert!(why.contains("too large for one command line"), "{why}");
+            assert!(!why.contains("installed"), "{why}");
+        }
     }
 
     /// The same wrong-cause failure [`cli_failure_message`] was fixed for, one
@@ -1667,7 +1727,7 @@ mod tests {
     fn an_oversize_refusal_names_the_harness_it_was_built_for() {
         let args = vec!["-p".to_string(), "y".repeat(200)];
         for h in crate::harness::Harness::ALL {
-            let why = oversize_reason(h, &args, 150).expect("must refuse");
+            let why = oversize_reason(h, &args, 150, SCHEMA_AND_QUERY_LEVERS).expect("must refuse");
             assert!(
                 why.contains(h.label()),
                 "{h:?} was named as something else: {why}"
@@ -1681,7 +1741,15 @@ mod tests {
         // at `MAX_ARG_STRLEN` — a total-only check would pass and the spawn
         // would still fail.
         let args = vec!["-p".to_string(), "y".repeat(200)];
-        assert!(oversize_reason(crate::harness::Harness::Claude, &args, 150).is_some());
+        assert!(
+            oversize_reason(
+                crate::harness::Harness::Claude,
+                &args,
+                150,
+                SCHEMA_AND_QUERY_LEVERS
+            )
+            .is_some()
+        );
     }
 
     /// **The limit's units are the platform's, not UTF-8's.** Windows'
@@ -1704,14 +1772,15 @@ mod tests {
         // A cap of 1,100 units fits it on Windows and does not on Unix, where
         // the byte count really is the constraint (`MAX_ARG_STRLEN`).
         let args = vec![cjk];
-        let refused = oversize_reason(crate::harness::Harness::Claude, &args, 1_100).is_some();
+        let lv = SCHEMA_AND_QUERY_LEVERS;
+        let refused = oversize_reason(crate::harness::Harness::Claude, &args, 1_100, lv).is_some();
         assert_eq!(refused, !cfg!(windows));
 
         // ASCII is one unit per byte everywhere, so nothing about the ordinary
         // case moved.
         let ascii = vec!["y".repeat(1_000)];
-        assert!(oversize_reason(crate::harness::Harness::Claude, &ascii, 1_100).is_none());
-        assert!(oversize_reason(crate::harness::Harness::Claude, &ascii, 900).is_some());
+        assert!(oversize_reason(crate::harness::Harness::Claude, &ascii, 1_100, lv).is_none());
+        assert!(oversize_reason(crate::harness::Harness::Claude, &ascii, 900, lv).is_some());
     }
 
     // ── A harness resolved to a batch shim (B15.3-L1-02) ──────────────────

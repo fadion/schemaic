@@ -1715,6 +1715,49 @@ pub fn antigravity_settings_with_rules(current: &str, rules: &[String]) -> Optio
     Some(SettingsEdit::Write(render_settings(doc)?))
 }
 
+/// Make an Antigravity `settings.json` say **exactly** `rules` of the ones
+/// Schemaic ever grants, leaving every other rule and key alone.
+///
+/// **Because a grant has to describe the level, not the session.** Adding is not
+/// enough on a respawn that *lowers* the connection's access: the previous
+/// session's wider rules are withdrawn by its own `Drop`, which runs on the
+/// session task while the new `install` runs on a blocking thread, and if the
+/// new claim lands first the old `Drop`'s `may_release` sees a claim that is not
+/// its own and withdraws nothing. The same gesture then left either two or four
+/// rules standing depending on thread scheduling, while
+/// [`antigravity_allow_rules`]' own doc says "a schema-only connection never
+/// grants `run_query`". Removing the rest here makes that true whichever
+/// ordering wins, because it is a statement about the file rather than about a
+/// sequence of edits.
+///
+/// `ours` is every rule Schemaic could grant — the full set, so a rule from a
+/// *wider* previous session is in it. A rule the user wrote by hand for one of
+/// our tools is indistinguishable from ours by value and is removed too, which
+/// is [`antigravity_settings_without_rules`]' documented limit and the same
+/// trade for the same reason.
+pub fn antigravity_settings_with_only_rules(
+    current: &str,
+    ours: &[String],
+    rules: &[String],
+) -> Option<SettingsEdit> {
+    let stale: Vec<String> = ours
+        .iter()
+        .filter(|o| !rules.contains(o))
+        .cloned()
+        .collect();
+    let cleared = match antigravity_settings_without_rules(current, &stale)? {
+        SettingsEdit::Write(text) => text,
+        SettingsEdit::Unchanged => current.to_string(),
+    };
+    match antigravity_settings_with_rules(&cleared, rules)? {
+        SettingsEdit::Write(text) => Some(SettingsEdit::Write(text)),
+        // Nothing to add — but the clear may still have removed something, and
+        // "unchanged" has to mean the *file* is unchanged, not this half of it.
+        SettingsEdit::Unchanged if cleared == current => Some(SettingsEdit::Unchanged),
+        SettingsEdit::Unchanged => Some(SettingsEdit::Write(cleared)),
+    }
+}
+
 /// Remove exactly `rules` from an Antigravity `settings.json`.
 ///
 /// **Only ours.** A rule the user added by hand — even for the same tool — is
@@ -2701,6 +2744,69 @@ mod tests {
         // The user's own key survives untouched — this is their file.
         assert_eq!(v["trustedWorkspaces"][0], "C:\\Users\\jonid");
         assert_eq!(v["permissions"]["allow"][0], "mcp(schemaic/list_schema)");
+    }
+
+    /// **A lower level's grant has to take the higher level's rules away.**
+    ///
+    /// The install used to only ever *add*, on the premise that the previous
+    /// session's `Drop` withdraws its own. It does — on the session task, while
+    /// the new install runs on a blocking thread, and if the new claim lands
+    /// first the old `Drop`'s `may_release` sees a claim that is not its own
+    /// and withdraws nothing. So lowering a connection from Full to
+    /// schema-only left `mcp(schemaic/run_query)` standing or not depending on
+    /// which thread won, while `antigravity_allow_rules`' own doc says a
+    /// schema-only connection never grants it.
+    #[test]
+    fn granting_a_narrower_set_withdraws_the_wider_one_it_replaces() {
+        let all = antigravity_allow_rules(&[
+            "mcp__schemaic__list_schema",
+            "mcp__schemaic__describe_table",
+            "mcp__schemaic__run_query",
+        ]);
+        let narrow = antigravity_allow_rules(&["mcp__schemaic__list_schema"]);
+
+        // The wide session grants three.
+        let wide_file = written(antigravity_settings_with_rules(AGY_SETTINGS, &all));
+        assert!(wide_file.contains("run_query"));
+
+        // The narrow one grants one — and the file then says exactly that.
+        let out = written(antigravity_settings_with_only_rules(
+            &wide_file, &all, &narrow,
+        ));
+        let v: serde_json::Value = serde_json::from_str(&out).expect("json");
+        let allow = v["permissions"]["allow"].as_array().expect("allow");
+        assert_eq!(
+            allow,
+            &vec![serde_json::Value::String(
+                "mcp(schemaic/list_schema)".to_string()
+            )],
+            "{out}"
+        );
+        // The user's own keys are still theirs.
+        assert_eq!(v["trustedWorkspaces"][0], "C:\\Users\\jonid");
+
+        // Idempotent: asking for the same set again writes nothing at all, so a
+        // relaunch does not rewrite another vendor's file for no change.
+        assert_eq!(
+            antigravity_settings_with_only_rules(&out, &all, &narrow),
+            Some(SettingsEdit::Unchanged)
+        );
+    }
+
+    /// A rule that is not one of ours is not ours to remove, even when we are
+    /// clearing the rest.
+    #[test]
+    fn granting_a_narrower_set_leaves_another_vendors_rules_alone() {
+        let all =
+            antigravity_allow_rules(&["mcp__schemaic__list_schema", "mcp__schemaic__run_query"]);
+        let narrow = antigravity_allow_rules(&["mcp__schemaic__list_schema"]);
+        let theirs = vec!["mcp(other/whatever)".to_string()];
+        let seeded = written(antigravity_settings_with_rules(AGY_SETTINGS, &theirs));
+        let wide = written(antigravity_settings_with_rules(&seeded, &all));
+
+        let out = written(antigravity_settings_with_only_rules(&wide, &all, &narrow));
+        assert!(out.contains("mcp(other/whatever)"), "{out}");
+        assert!(!out.contains("run_query"), "{out}");
     }
 
     #[test]

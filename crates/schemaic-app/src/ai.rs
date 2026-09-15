@@ -900,6 +900,11 @@ pub(crate) fn inline_plan(
     effort: &str,
     intent: &str,
     system: &str,
+    // `levers`: the sentence a size refusal ends on — see
+    // `schemaic_ai::oversize_reason`. Ctrl+K has an editor and a query; Fill
+    // and Seed are grid context menus and have neither, so the levers cannot be
+    // written here.
+    levers: &str,
 ) -> Result<InlinePlan, String> {
     let bin = harness_bin(harness, cli_path);
     let p = probe(harness, &bin);
@@ -948,7 +953,9 @@ pub(crate) fn inline_plan(
     // `os error 206`, which names the one cause that isn't the problem. The
     // batch-shim half is the same shape — "batch file arguments are invalid",
     // about a batch file that is fine.
-    if let Some(why) = schemaic_ai::spawn_refusal(harness, &bin, &args, schemaic_ai::arg_limit()) {
+    if let Some(why) =
+        schemaic_ai::spawn_refusal(harness, &bin, &args, schemaic_ai::arg_limit(), levers)
+    {
         // The reply file was created above, before this check could run — the
         // path has to exist to go into the argv this check measures — so a
         // refusal orphaned one every time. Cleaned up here rather than left for
@@ -1665,9 +1672,13 @@ pub(crate) fn start_ai_session(
                 // check below deliberately: what leaves argv is exactly what no
                 // longer counts against the command-line limit.
                 let turn_stdin = harness.turn_stdin_prompt(&spec);
-                if let Some(why) =
-                    schemaic_ai::spawn_refusal(harness, &bin, &args, schemaic_ai::arg_limit())
-                {
+                if let Some(why) = schemaic_ai::spawn_refusal(
+                    harness,
+                    &bin,
+                    &args,
+                    schemaic_ai::arg_limit(),
+                    schemaic_ai::SCHEMA_AND_QUERY_LEVERS,
+                ) {
                     pump.fail(why);
                     continue;
                 }
@@ -1925,7 +1936,13 @@ pub(crate) fn start_ai_session(
 
     // Before the spawn, because afterwards it is unrecognisable: the OS returns
     // a generic failure and the arm below blames the installation.
-    if let Some(why) = schemaic_ai::spawn_refusal(harness, &bin, &args, schemaic_ai::arg_limit()) {
+    if let Some(why) = schemaic_ai::spawn_refusal(
+        harness,
+        &bin,
+        &args,
+        schemaic_ai::arg_limit(),
+        schemaic_ai::SCHEMA_AND_QUERY_LEVERS,
+    ) {
         let _ = ai_tx.send(AiStreamMsg {
             segs: vec![schemaic_core::transcript::Seg::Text(why.clone())],
             done: true,
@@ -2509,18 +2526,26 @@ pub(crate) fn render_history(
     let start = messages.len().saturating_sub(max_turns);
     let withheld =
         |why: &str| format!("Earlier turns of this conversation are not being replayed: {why}\n");
-    if !data.may_attach() && messages[start..].iter().any(|m| !m.prose().is_empty()) {
-        return withheld(
-            "this connection's AI data access is set to send no rows, and an \
-             earlier answer may quote some. Ask the user for anything you need \
-             from them.",
-        );
-    }
     let mut lines = String::new();
     let mut dropped_vendor = false;
+    let mut dropped_data = false;
     for m in &messages[start..] {
         let prose = m.prose();
         if prose.is_empty() {
+            continue;
+        }
+        // **Per message, and the user's own turn is kept** — the same shape as
+        // the vendor gate below, and for the same reason its test gives: "the
+        // user's own turn is theirs and is still replayed, so a follow-up has
+        // something to hang on". This used to be one test above the loop that
+        // returned the note and *nothing else*, so at `SchemaOnly` a follow-up
+        // like "and the other one?" arrived with no antecedent at all. The rule
+        // this gate states is "there is no route by which prose *this
+        // connection produced* may re-enter a prompt"; the user's typed text is
+        // not that, and `prose()` already excludes the `attachment`, so rows
+        // the user attached are out by construction either way.
+        if m.role != Role::User && !data.may_attach() {
+            dropped_data = true;
             continue;
         }
         // A turn another CLI produced. `None` is a transcript written before the
@@ -2544,14 +2569,27 @@ pub(crate) fn render_history(
         };
         lines.push_str(&format!("{who}: {prose}\n"));
     }
-    let note = if dropped_vendor {
-        withheld(
+    // **Only when something was actually dropped.** The data note used to be
+    // emitted whenever the window held any prose at all, over every role — and
+    // `ChatMessage::prose()` returns the text of a `User` message too — so a
+    // window of the user's own questions and tool-only assistant turns (which
+    // is ordinary when the last answers were all `run_query` chips) was told
+    // "an earlier answer may quote some rows" about a window holding no earlier
+    // answer.
+    let mut note = String::new();
+    if dropped_data {
+        note.push_str(&withheld(
+            "this connection's AI data access is set to send no rows, and the \
+             answers in them may quote some. The user's own questions are still \
+             here; ask them for anything else you need.",
+        ));
+    }
+    if dropped_vendor {
+        note.push_str(&withheld(
             "the answers in them came from a different agent CLI, and were not \
              sent to this one.",
-        )
-    } else {
-        String::new()
-    };
+        ));
+    }
     if lines.is_empty() {
         return note;
     }
@@ -4501,12 +4539,48 @@ mod tests {
         // Said out loud, so a follow-up that stops resolving has a reason the
         // assistant can give.
         assert!(out.contains("not being replayed"), "{out}");
+        // **And the user's own question survives it**, which is the half that
+        // makes the follow-up answerable at all. The gate used to return the
+        // note and nothing else, so "and the other one?" arrived with no
+        // antecedent — while the vendor gate eight lines down kept the user's
+        // turn for exactly this reason, and says so in its own test.
+        assert!(out.contains("show me the first five customers"), "{out}");
 
         // The premise, and the level that is allowed to: `OnRequest` and `Full`
         // both still carry it, since the user is looking at those turns on
         // screen and asked the follow-up themselves.
         for data in [AiData::OnRequest, AiData::Full] {
             assert!(at(data).contains("ada@example.test"), "{data:?}");
+        }
+    }
+
+    /// **A window with nothing to withhold says nothing**, at every level.
+    ///
+    /// The data gate's condition was `messages.iter().any(|m|
+    /// !m.prose().is_empty())` over *every* role, and `ChatMessage::prose()`
+    /// returns the text of a `User` message — so a window holding only the
+    /// user's own questions (ordinary when the last answers were all
+    /// `run_query` chips, whose assistant turns carry no prose) was told "an
+    /// earlier answer may quote some rows" about a window holding no earlier
+    /// answer at all.
+    #[test]
+    fn a_window_of_only_the_users_own_turns_is_replayed_whole_with_no_note() {
+        let history = [
+            msg(Role::User, "show me the first five customers"),
+            msg(Role::User, "and the other one?"),
+        ];
+        for data in [AiData::SchemaOnly, AiData::OnRequest, AiData::Full] {
+            let out = render_history(&history, 10, data, "claude");
+            assert!(
+                out.contains("show me the first five customers")
+                    && out.contains("and the other one?"),
+                "{data:?}: {out}"
+            );
+            assert!(
+                !out.contains("not being replayed"),
+                "{data:?} withheld something from a window of the user's own \
+                 questions: {out}"
+            );
         }
     }
 
@@ -5670,7 +5744,12 @@ mod tests {
             schemaic_ai::CliSeal::ALL,
         );
         assert_eq!(
-            schemaic_ai::oversize_reason(Harness::Claude, &args, 30_000),
+            schemaic_ai::oversize_reason(
+                Harness::Claude,
+                &args,
+                30_000,
+                schemaic_ai::SCHEMA_AND_QUERY_LEVERS
+            ),
             None
         );
     }
