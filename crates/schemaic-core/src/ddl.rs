@@ -4023,12 +4023,6 @@ impl ChangeSet {
         }
     }
 
-    /// The statements as one script, blank-line separated — what "Copy" and
-    /// "Open in editor" hand over.
-    pub fn script(&self) -> String {
-        format!("{}{}", self.withheld_header(), self.emit().join("\n\n"))
-    }
-
     /// What [`unsupported`](Self::unsupported) refused, as a `--` comment block
     /// above the script — empty when nothing was refused.
     ///
@@ -10989,7 +10983,7 @@ mod tests {
         draft.columns[1].info.type_name = "varchar(320)".into();
         let cs = diff(&t, &draft, MySql);
         assert_eq!(cs.len(), 1);
-        let sql = cs.script();
+        let sql = cs.editor_script();
         assert!(sql.contains("MODIFY COLUMN `email` varchar(320)"), "{sql}");
         assert!(sql.contains("COLLATE utf8mb4_bin"), "{sql}");
         assert!(sql.contains("NOT NULL"), "{sql}");
@@ -11337,7 +11331,7 @@ mod tests {
             cs.changes[0].summary(),
             "Rename column email to login_email"
         );
-        let sql = cs.script();
+        let sql = cs.editor_script();
         assert!(
             sql.contains("CHANGE COLUMN `email` `login_email` varchar(255)"),
             "{sql}"
@@ -11356,7 +11350,7 @@ mod tests {
         t.collation = None;
         let mut draft = TableDraft::from_table(&t);
         draft.rename_column(1, "login_email");
-        let sql = diff(&t, &draft, Postgres).script();
+        let sql = diff(&t, &draft, Postgres).editor_script();
         assert_eq!(
             sql,
             "ALTER TABLE \"users\" RENAME COLUMN \"email\" TO \"login_email\";"
@@ -11372,7 +11366,7 @@ mod tests {
         draft.remove_column(2, MySql);
         assert!(draft.foreign_keys.is_empty());
         let cs = diff(&t, &draft, MySql);
-        let sql = cs.script();
+        let sql = cs.editor_script();
         // The foreign key standing on the column has to come off first.
         let fk_at = sql.find("DROP FOREIGN KEY").expect("fk dropped");
         let col_at = sql.find("DROP COLUMN").expect("column dropped");
@@ -11399,13 +11393,13 @@ mod tests {
                 ..Default::default()
             }),
         );
-        let sql = diff(&t, &draft, MySql).script();
+        let sql = diff(&t, &draft, MySql).editor_script();
         assert!(
             sql.contains("ADD COLUMN `nickname` varchar(40) AFTER `id`"),
             "{sql}"
         );
         // PostgreSQL can't place a column, and mustn't pretend to.
-        let pg = diff(&t, &draft, Postgres).script();
+        let pg = diff(&t, &draft, Postgres).editor_script();
         assert!(pg.contains("ADD COLUMN \"nickname\""), "{pg}");
         assert!(!pg.contains("AFTER"), "{pg}");
     }
@@ -11419,7 +11413,7 @@ mod tests {
         let cs = diff(&t, &draft, MySql);
         assert_eq!(cs.len(), 1, "{:?}", cs.changes);
         assert_eq!(cs.changes[0].summary(), "Move column updated first");
-        let sql = cs.script();
+        let sql = cs.editor_script();
         assert!(sql.contains("MODIFY COLUMN `updated` timestamp"), "{sql}");
         assert!(sql.contains(" FIRST"), "{sql}");
         // Reordering on PostgreSQL isn't expressible, so it isn't claimed.
@@ -11433,7 +11427,7 @@ mod tests {
         draft.primary_key = vec!["id".into(), "email".into()];
         let cs = diff(&t, &draft, MySql);
         assert_eq!(cs.len(), 1);
-        let sql = cs.script();
+        let sql = cs.editor_script();
         let drop_at = sql.find("DROP PRIMARY KEY").expect("dropped");
         let add_at = sql.find("ADD PRIMARY KEY (`id`, `email`)").expect("added");
         assert!(drop_at < add_at, "{sql}");
@@ -11448,7 +11442,7 @@ mod tests {
         let mut draft = TableDraft::from_table(&t);
         draft.primary_key.clear();
         let cs = diff(&t, &draft, Postgres);
-        let sql = cs.script();
+        let sql = cs.editor_script();
         assert!(sql.contains("DROP CONSTRAINT \"users_pkey\""), "{sql}");
         assert!(!sql.contains("DROP PRIMARY KEY"), "{sql}");
         // Losing the key costs the grid its ability to edit rows.
@@ -11462,7 +11456,7 @@ mod tests {
         draft.indexes[0].info.unique = false;
         let cs = diff(&t, &draft, MySql);
         assert_eq!(cs.len(), 2);
-        let sql = cs.script();
+        let sql = cs.editor_script();
         assert!(sql.contains("DROP INDEX `email_uq`"), "{sql}");
         assert!(sql.contains("ADD INDEX `email_uq` (`email`)"), "{sql}");
     }
@@ -11490,7 +11484,7 @@ mod tests {
         let t = users();
         let mut draft = TableDraft::from_table(&t);
         draft.foreign_keys[0].info.ref_columns = vec!["id".into()];
-        let sql = diff(&t, &draft, MySql).script();
+        let sql = diff(&t, &draft, MySql).editor_script();
         assert!(sql.contains("DROP FOREIGN KEY `fk_status`"), "{sql}");
         assert!(
             sql.contains(
@@ -11520,7 +11514,7 @@ mod tests {
         draft.comment = Some("staff".into());
         let cs = diff(&t, &draft, MySql);
         assert_eq!(cs.len(), 1, "the options are one change, not three");
-        let sql = cs.script();
+        let sql = cs.editor_script();
         assert!(sql.contains("COMMENT='staff'"), "{sql}");
         // The engine didn't change, so it isn't restated — a restated clause
         // reads as an edit the user didn't ask for.
@@ -11532,7 +11526,7 @@ mod tests {
         draft.engine = Some("MyISAM".into());
         let cs = diff(&t, &draft, MySql);
         assert_eq!(cs.len(), 1);
-        let sql = cs.script();
+        let sql = cs.editor_script();
         assert!(
             sql.contains("ENGINE=MyISAM") && sql.contains("COMMENT='staff'"),
             "{sql}"
@@ -11676,7 +11670,7 @@ mod tests {
         let mut draft = TableDraft::from_table(&t);
         draft.original = None;
         draft.name = "people".into();
-        let sql = create(&draft, MySql).script();
+        let sql = create(&draft, MySql).editor_script();
         assert!(sql.starts_with("CREATE TABLE `people` ("), "{sql}");
         assert!(
             sql.contains("`id` int(11) NOT NULL AUTO_INCREMENT"),
@@ -14986,10 +14980,40 @@ mod tests {
 
             // A statement with no internal `;` is handed over untouched.
             let plain = create_trigger(&TriggerDraft::from_info(&my_trigger()), MySql);
-            assert_eq!(plain.editor_script(), plain.script());
+            assert!(!plain.editor_script().contains("DELIMITER"));
+            assert_eq!(plain.editor_script().trim_end(), plain.emit().join("\n\n"));
             // …and PostgreSQL never wraps: its bodies are dollar-quoted.
             let pg = create_trigger(&TriggerDraft::from_info(&pg_trigger()), Postgres);
-            assert_eq!(pg.editor_script(), pg.script());
+            assert!(!pg.editor_script().contains("DELIMITER"));
+        }
+
+        /// **And no fourth builder joins statements behind `client_script`'s
+        /// back.** There were three. `9fe049d` deleted `SchemaPlan`'s and wrote
+        /// the rule down — "a third builder skipping that fix, kept alive by
+        /// tests, is the next caller's trap" — while `ChangeSet::script`, the
+        /// shorter and more obvious name, survived it with no production caller
+        /// at all. A single-object set is exactly where a MySQL trigger or
+        /// routine body *does* live, so what that name handed a user to paste
+        /// was a compound body the app's own splitter cuts at its internal `;`:
+        /// the ERROR 1064 fragment the wrapping exists to prevent.
+        ///
+        /// The needle is assembled rather than spelled, or this assertion's own
+        /// source is the hit and the gate passes on itself.
+        #[test]
+        fn nothing_joins_the_emitted_statements_outside_client_script() {
+            let needle = format!("{}().join(", "emit");
+            for (file, src) in [
+                ("ddl.rs", include_str!("ddl.rs")),
+                ("compare.rs", include_str!("compare.rs")),
+            ] {
+                let code = src.split("#[cfg(test)]").next().expect("production code");
+                assert!(
+                    !code.contains(&needle),
+                    "{file} joins emitted statements without going through \
+                     `client_script`, which is what terminates every statement \
+                     and wraps a compound MySQL body in `DELIMITER $$`"
+                );
+            }
         }
 
         /// The gate, for the whole set: a draft off a table says nothing.
@@ -16332,7 +16356,7 @@ mod tests {
                 edit(&mut draft);
                 let cs = diff(&t, &draft, MySql);
                 assert_eq!(cs.len(), 1, "{label}: {:#?}", cs.changes);
-                let sql = cs.script();
+                let sql = cs.editor_script();
                 assert!(sql.contains(expect), "{label}: {sql}");
             }
         }
@@ -16346,7 +16370,7 @@ mod tests {
             draft.remove_column(1, MySql); // `title`, which `idx_title` stands on
             let cs = diff(&t, &draft, MySql);
             assert_eq!(cs.len(), 2, "{:#?}", cs.changes);
-            let sql = cs.script();
+            let sql = cs.editor_script();
             let ix_at = sql.find("DROP INDEX `idx_title`").expect("index dropped");
             let col_at = sql.find("DROP COLUMN `title`").expect("column dropped");
             assert!(ix_at < col_at, "{sql}");
@@ -16535,7 +16559,7 @@ mod tests {
             ] {
                 let mut v = ViewDraft::blank("v", None);
                 v.select = format!("select id from t {comment}");
-                let script = create_view(&v, dialect).script();
+                let script = create_view(&v, dialect).editor_script();
                 let joined = format!("{script}\n\nSELECT 1");
                 let pos = joined.rfind("SELECT 1").unwrap();
                 let (lo, hi) = crate::sql::statement_range(&joined, pos, dialect);
@@ -16551,7 +16575,7 @@ mod tests {
         fn an_ordinary_body_keeps_its_semicolon_where_it_was() {
             let mut v = ViewDraft::blank("v", None);
             v.select = "select id from t".into();
-            assert!(create_view(&v, MySql).script().ends_with("from t;"));
+            assert!(create_view(&v, MySql).editor_script().ends_with("from t;"));
         }
 
         /// The anti-drift test: the display/copy emitter and the apply emitter
@@ -16560,7 +16584,7 @@ mod tests {
         fn copy_ddl_and_the_apply_path_emit_the_same_view() {
             for (dialect, t) in view_fixtures() {
                 let draft = ViewDraft::from_table(&t).expect("a view drafts");
-                let applied = create_view(&draft, dialect).script();
+                let applied = create_view(&draft, dialect).editor_script();
                 let copied = t.create_ddl(dialect);
                 assert_eq!(
                     copied.trim(),
@@ -16625,7 +16649,7 @@ mod tests {
             draft.select = "select 1 as staff_id, 'x' as name".into();
             let cs = diff_view(&v, &draft, MySql);
             assert_eq!(cs.len(), 1, "{:#?}", cs.changes);
-            let sql = cs.script();
+            let sql = cs.editor_script();
             assert!(sql.starts_with("CREATE OR REPLACE "), "{sql}");
             assert!(sql.contains("ALGORITHM = MERGE"), "{sql}");
             assert!(sql.contains("DEFINER = `root`@`localhost`"), "{sql}");
@@ -16653,7 +16677,7 @@ mod tests {
             });
             let mut draft = ViewDraft::from_table(&v).unwrap();
             draft.select = "SELECT city.id, city.name FROM city;".into();
-            let sql = diff_view(&v, &draft, Postgres).script();
+            let sql = diff_view(&v, &draft, Postgres).editor_script();
             assert!(!sql.contains(";\nWITH"), "{sql}");
             assert!(
                 sql.trim_end().ends_with("WITH LOCAL CHECK OPTION;"),
@@ -16669,7 +16693,7 @@ mod tests {
             let v = pg_view();
             let mut draft = ViewDraft::from_table(&v).unwrap();
             draft.select = "SELECT city.id, city.name, city.pop FROM city".into();
-            let sql = diff_view(&v, &draft, Postgres).script();
+            let sql = diff_view(&v, &draft, Postgres).editor_script();
             assert!(sql.contains("WITH (security_barrier=true)"), "{sql}");
         }
 
@@ -16681,7 +16705,7 @@ mod tests {
             draft.select = "SELECT city.id, city.name, city.pop FROM city".into();
             let cs = diff_view(&v, &draft, Postgres);
             assert_eq!(cs.len(), 1, "{:#?}", cs.changes);
-            let sql = cs.script();
+            let sql = cs.editor_script();
             assert!(sql.contains("CREATE OR REPLACE VIEW"), "{sql}");
             assert!(!sql.contains("DROP VIEW"), "{sql}");
             assert!(cs.destructive().is_empty(), "{:?}", cs.destructive());
@@ -16696,7 +16720,7 @@ mod tests {
             let mut draft = ViewDraft::from_table(&v).unwrap();
             draft.select = "SELECT city.id, city.name AS city_name FROM city".into();
             let cs = diff_view(&v, &draft, Postgres);
-            let sql = cs.script();
+            let sql = cs.editor_script();
             let drop_at = sql.find("DROP VIEW").expect("dropped first");
             let create_at = sql.find("CREATE VIEW").expect("then created");
             assert!(drop_at < create_at, "{sql}");
@@ -16715,7 +16739,7 @@ mod tests {
             draft.select = "SELECT city.id FROM city".into();
             assert!(
                 diff_view(&v, &draft, Postgres)
-                    .script()
+                    .editor_script()
                     .contains("DROP VIEW")
             );
         }
@@ -16729,7 +16753,11 @@ mod tests {
             let mut draft = ViewDraft::from_table(&v).unwrap();
             draft.select = "SELECT * FROM city".into();
             let cs = diff_view(&v, &draft, Postgres);
-            assert!(!cs.script().contains("DROP VIEW"), "{}", cs.script());
+            assert!(
+                !cs.editor_script().contains("DROP VIEW"),
+                "{}",
+                cs.editor_script()
+            );
             assert!(cs.destructive().is_empty());
         }
 
@@ -16742,7 +16770,11 @@ mod tests {
             draft.select = "SELECT city.id, city.name, city.pop FROM city".into();
             draft.force_recreate = true;
             let cs = diff_view(&v, &draft, Postgres);
-            assert!(cs.script().contains("DROP VIEW"), "{}", cs.script());
+            assert!(
+                cs.editor_script().contains("DROP VIEW"),
+                "{}",
+                cs.editor_script()
+            );
             assert!(!cs.destructive().is_empty());
         }
 
@@ -16754,7 +16786,7 @@ mod tests {
             let mut draft = ViewDraft::from_table(&v).unwrap();
             draft.select = "select 1 as x".into();
             draft.force_recreate = true;
-            let sql = diff_view(&v, &draft, MySql).script();
+            let sql = diff_view(&v, &draft, MySql).editor_script();
             assert!(!sql.contains("DROP VIEW"), "{sql}");
         }
 
@@ -16766,16 +16798,16 @@ mod tests {
             let cs = diff_view(&v, &draft, MySql);
             assert_eq!(cs.len(), 1, "{:#?}", cs.changes);
             assert!(
-                cs.script()
+                cs.editor_script()
                     .contains("RENAME TABLE `active_staff` TO `staff_on_duty`;"),
                 "{}",
-                cs.script()
+                cs.editor_script()
             );
 
             let v = pg_view();
             let mut draft = ViewDraft::from_table(&v).unwrap();
             draft.name = "large_city".into();
-            let sql = diff_view(&v, &draft, Postgres).script();
+            let sql = diff_view(&v, &draft, Postgres).editor_script();
             assert!(
                 sql.contains(r#"ALTER VIEW "big_city" RENAME TO "large_city";"#),
                 "{sql}"
@@ -16790,7 +16822,7 @@ mod tests {
             let mut draft = ViewDraft::from_table(&v).unwrap();
             draft.name = "large_city".into();
             draft.select = "SELECT city.id AS city_id FROM city".into();
-            let sql = diff_view(&v, &draft, Postgres).script();
+            let sql = diff_view(&v, &draft, Postgres).editor_script();
             assert!(sql.contains(r#"DROP VIEW "big_city";"#), "{sql}");
             assert!(sql.contains(r#"CREATE VIEW "large_city""#), "{sql}");
             assert!(!sql.contains("RENAME"), "{sql}");
@@ -16806,7 +16838,7 @@ mod tests {
                 ..ViewDraft::blank("one_row", None)
             };
             let cs = create_view(&draft, MySql);
-            let sql = cs.script();
+            let sql = cs.editor_script();
             assert_eq!(sql, "CREATE VIEW `one_row` AS\nSELECT 1 AS one;");
             assert!(cs.destructive().is_empty());
         }
@@ -16821,7 +16853,7 @@ mod tests {
                     materialized: false,
                 },
             );
-            assert_eq!(cs.script(), "DROP VIEW `active_staff`;");
+            assert_eq!(cs.editor_script(), "DROP VIEW `active_staff`;");
             assert!(
                 cs.destructive()[0].contains("Dependent"),
                 "{:?}",
@@ -16834,7 +16866,10 @@ mod tests {
                 Postgres,
                 Change::DropView { materialized: true },
             );
-            assert_eq!(cs.script(), r#"DROP MATERIALIZED VIEW "city_stats";"#);
+            assert_eq!(
+                cs.editor_script(),
+                r#"DROP MATERIALIZED VIEW "city_stats";"#
+            );
         }
 
         /// **Every engine that has `INSTEAD OF` triggers says they go.**
@@ -16883,10 +16918,10 @@ mod tests {
                 },
             );
             assert_eq!(
-                cs.script(),
+                cs.editor_script(),
                 r#"REFRESH MATERIALIZED VIEW "city_stats";"#,
                 "{}",
-                cs.script()
+                cs.editor_script()
             );
             assert!(cs.destructive().is_empty(), "{:?}", cs.destructive());
             // The lock is what the summary has to say, since the SQL doesn't.
@@ -16903,10 +16938,10 @@ mod tests {
                 Change::RefreshView { concurrently: true },
             );
             assert_eq!(
-                cs.script(),
+                cs.editor_script(),
                 r#"REFRESH MATERIALIZED VIEW CONCURRENTLY "sales"."city_stats";"#,
                 "{}",
-                cs.script()
+                cs.editor_script()
             );
             // The promise this form makes to the user, and the one thing the SQL
             // alone doesn't tell them. Asserted in its own right rather than
@@ -16983,7 +17018,7 @@ mod tests {
                 // incomplete rather than looking like it did nothing, which is
                 // `withheld_header`'s whole job.
                 assert!(cs.emit().is_empty(), "{d:?}: {:?}", cs.emit());
-                assert!(cs.script().starts_with("-- INCOMPLETE"), "{d:?}");
+                assert!(cs.editor_script().starts_with("-- INCOMPLETE"), "{d:?}");
             }
             assert!(supports_change(
                 Postgres,
@@ -19345,7 +19380,7 @@ mod sqlite_rebuild_tests {
         let cs = diff(&t, &d, SqlDialect::Sqlite);
         assert!(!cs.unsupported().is_empty(), "the premise");
 
-        for script in [cs.script(), cs.editor_script()] {
+        for script in [cs.editor_script(), cs.editor_script()] {
             assert!(script.contains("ix_mail"), "{script}");
             assert!(script.contains("INCOMPLETE"), "{script}");
             // The header is comment-only, so the script still runs as far as it
@@ -19365,8 +19400,12 @@ mod sqlite_rebuild_tests {
         d.columns[0].info.type_name = "TEXT".into();
         let cs = diff(&t, &d, SqlDialect::Sqlite);
         assert!(cs.unsupported().is_empty(), "{:?}", cs.unsupported());
-        assert!(!cs.script().starts_with("--"), "{}", cs.script());
-        assert_eq!(cs.script(), cs.editor_script());
+        assert!(
+            !cs.editor_script().starts_with("--"),
+            "{}",
+            cs.editor_script()
+        );
+        assert_eq!(cs.editor_script(), cs.editor_script());
     }
 
     /// The rebuild's body — everything between the foreign-key guard, which
@@ -19938,7 +19977,7 @@ mod sqlite_view_tests {
             "{:#?}",
             cs.changes
         );
-        let sql = cs.script();
+        let sql = cs.editor_script();
         assert!(
             !sql.to_ascii_uppercase().contains("OR REPLACE"),
             "SQLite has no CREATE OR REPLACE VIEW: {sql}"
@@ -20090,7 +20129,7 @@ mod sqlite_view_tests {
             "SQLite can't rename a view: {:#?}",
             cs.changes
         );
-        let sql = cs.script();
+        let sql = cs.editor_script();
         assert!(sql.contains("DROP VIEW \"v\""), "{sql}");
         assert!(sql.contains("CREATE VIEW \"v2\""), "{sql}");
         assert!(!sql.to_ascii_uppercase().contains("RENAME"), "{sql}");
@@ -20109,7 +20148,7 @@ mod sqlite_view_tests {
         });
         let mut d = ViewDraft::from_table(&cur).unwrap();
         d.select = "SELECT a, b FROM t WHERE a > 1".into();
-        let sql = diff_view(&cur, &d, Sqlite).script();
+        let sql = diff_view(&cur, &d, Sqlite).editor_script();
         assert!(sql.contains("CREATE VIEW \"v\" (x, y) AS"), "{sql}");
     }
 
@@ -20117,7 +20156,7 @@ mod sqlite_view_tests {
     fn no_column_list_emits_no_parentheses() {
         let cur = view();
         let d = ViewDraft::from_table(&cur).unwrap();
-        let sql = create_view(&d, Sqlite).script();
+        let sql = create_view(&d, Sqlite).editor_script();
         assert!(sql.contains("CREATE VIEW \"v\" AS"), "{sql}");
     }
 
@@ -20137,7 +20176,7 @@ mod sqlite_view_tests {
             ..Default::default()
         });
         let d = ViewDraft::from_table(&cur).unwrap();
-        let sql = create_view(&d, Sqlite).script().to_ascii_uppercase();
+        let sql = create_view(&d, Sqlite).editor_script().to_ascii_uppercase();
         for clause in [
             "ALGORITHM",
             "DEFINER",
@@ -20160,7 +20199,7 @@ mod sqlite_view_tests {
         });
         let d = ViewDraft::from_table(&cur).unwrap();
         assert!(!d.validate(Sqlite).is_empty());
-        let sql = create_view(&d, Sqlite).script().to_ascii_uppercase();
+        let sql = create_view(&d, Sqlite).editor_script().to_ascii_uppercase();
         assert!(!sql.contains("MATERIALIZED"), "{sql}");
     }
 }

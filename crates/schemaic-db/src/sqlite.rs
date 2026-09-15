@@ -8931,7 +8931,7 @@ mod rebuild_fidelity_tests {
             assert!(w[0].contains(clause), "{table}: {w:?}");
             // And the omission travels with the copied script, which is not
             // disabled the way Apply is.
-            assert!(cs.script().contains("INCOMPLETE"), "{table}");
+            assert!(cs.editor_script().contains("INCOMPLETE"), "{table}");
         }
         // The gate is narrow: an ordinary table beside them is still editable.
         let before = table_of(&db, "p").await;
