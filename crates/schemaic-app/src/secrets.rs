@@ -12,7 +12,7 @@
 use std::sync::{Mutex, OnceLock};
 
 use keyring::Entry;
-use schemaic_core::persist::{self, ConnectionsFile};
+use schemaic_core::persist::{self, ConnectionsFile, Saving};
 use schemaic_core::secrets::{self, Hydration, SecretStore, StoreError};
 
 /// Keyring service name under which all of Schemaic's secrets are grouped; the
@@ -97,9 +97,10 @@ pub fn load_connections() -> ConnectionsFile {
     let hydration = secrets::hydrate_file(&mut file, &store);
     if hydration.needs_resave {
         let sanitized = secrets::sanitize_file(&file, &store, &hydration);
-        persist::save_connections(&sanitized.file);
+        persist::save_connections(&sanitized.file, Saving::Replacing);
         // The pre-migration file (with plaintext secrets) was snapshotted to
-        // `.bak` by that save — scrub it so no plaintext credential lingers.
+        // `.bak` by that save — scrub it, and the `.corrupt` sibling with it, so
+        // no plaintext credential lingers.
         persist::clear_connections_backup();
         // The migration is the one save that can leave plaintext behind without
         // the user having done anything, so it reports on the same channel.
@@ -133,8 +134,11 @@ pub fn load_connections() -> ConnectionsFile {
 /// Once per session because the alternative is a modal on every read-only
 /// toggle and every connection switch for as long as the keyring is down, which
 /// is a notice nobody reads.
+///
+/// `saving` travels straight through to [`persist::save_connections`]; see it
+/// for why a save that *drops* a connection must not leave a `.bak`.
 #[must_use = "a `Some` is what the user is told; dropping it is how this went unsurfaced before"]
-pub fn save_connections(file: &ConnectionsFile) -> Option<String> {
+pub fn save_connections(file: &ConnectionsFile, saving: Saving) -> Option<String> {
     // **`into_inner`, not `unwrap_or_default`.** A poisoned mutex used to hand
     // the save a *default* `Hydration` — nothing marked unreadable — and the
     // save then read every empty field as a password the user had cleared and
@@ -145,7 +149,7 @@ pub fn save_connections(file: &ConnectionsFile) -> Option<String> {
         .unwrap_or_else(|e| e.into_inner())
         .clone();
     let sanitized = secrets::sanitize_file(file, &KeyringStore, &hydration);
-    persist::save_connections(&sanitized.file);
+    persist::save_connections(&sanitized.file, saving);
     // A secret the user has since typed in is no longer unread; leaving it
     // marked would suppress the delete when they later clear it on purpose.
     hydration.resolve_against(file);

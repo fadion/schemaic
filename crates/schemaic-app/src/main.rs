@@ -1472,7 +1472,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             // Before the window exists, so it goes to the same startup channel
             // the config-recovery modal drains rather than to a surface that is
             // not there yet.
-            if let Some(notice) = secrets::save_connections(&cf) {
+            if let Some(notice) = secrets::save_connections(&cf, persist::Saving::Replacing) {
                 persist::queue_notice(notice);
             }
         }
@@ -1505,7 +1505,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             // Before the window exists, so it goes to the same startup channel
             // the config-recovery modal drains rather than to a surface that is
             // not there yet.
-            if let Some(notice) = secrets::save_connections(&cf) {
+            if let Some(notice) = secrets::save_connections(&cf, persist::Saving::Replacing) {
                 persist::queue_notice(notice);
             }
         }
@@ -2463,13 +2463,20 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
     let snippets = RwSignal::new(
         persist::load_json::<schemaic_core::snippet::SnippetsFile>("snippets.json").snippets,
     );
-    let save_snippets: Rc<dyn Fn()> = Rc::new(move || {
-        persist::save_json(
-            "snippets.json",
-            &schemaic_core::snippet::SnippetsFile {
-                snippets: snippets.get_untracked(),
-            },
-        );
+    // `Erasing` from the two paths that *remove* a snippet, `Replacing` from the
+    // edits — the shape `clear_history`/`remove_history` already have, and for
+    // the same reason: a snippet is the user's own SQL, written against a named
+    // server, and the ordinary save would copy the pre-delete file (body and
+    // all) to `snippets.json.bak` at the moment the modal said "This can't be
+    // undone". On a library nobody edits again, that copy is forever.
+    let save_snippets: Rc<dyn Fn(persist::Saving)> = Rc::new(move |saving| {
+        let file = schemaic_core::snippet::SnippetsFile {
+            snippets: snippets.get_untracked(),
+        };
+        match saving {
+            persist::Saving::Erasing => persist::save_json_erasing("snippets.json", &file),
+            persist::Saving::Replacing => persist::save_json("snippets.json", &file),
+        }
     });
     // The active tab, for the actions that read or write one.
     let active_tab = move || {
@@ -2528,7 +2535,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                 return;
             }
             snippets.update(|v| schemaic_core::snippet::touch(v, id, snippet_now()));
-            (save_snippets)();
+            (save_snippets)(persist::Saving::Replacing);
         })
     };
     let insert_snippet: Rc<dyn Fn(schemaic_core::snippet::Snippet)> = {
@@ -2562,7 +2569,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                     snippet_now(),
                 ))
             });
-            (save_snippets)();
+            (save_snippets)(persist::Saving::Replacing);
             Some(id)
         })
     };
@@ -2599,7 +2606,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                     s.name = name.clone();
                 }
             });
-            (save_snippets)();
+            (save_snippets)(persist::Saving::Replacing);
         })
     };
     let set_snippet_abbrev: Rc<dyn Fn(u64, Option<String>)> = {
@@ -2610,7 +2617,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                     s.abbrev = abbrev.clone().filter(|a| !a.trim().is_empty());
                 }
             });
-            (save_snippets)();
+            (save_snippets)(persist::Saving::Replacing);
         })
     };
     let set_snippet_body: Rc<dyn Fn(u64, String)> = {
@@ -2621,7 +2628,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                     s.body = body.clone();
                 }
             });
-            (save_snippets)();
+            (save_snippets)(persist::Saving::Replacing);
         })
     };
     let set_snippet_scope: Rc<dyn Fn(u64, schemaic_core::snippet::Scope)> = {
@@ -2632,7 +2639,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                     s.scope = scope.clone();
                 }
             });
-            (save_snippets)();
+            (save_snippets)(persist::Saving::Replacing);
         })
     };
     let duplicate_snippet: Rc<dyn Fn(u64)> = {
@@ -2651,7 +2658,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             // `snippet::duplicate`'s, with the tests: they were a struct literal
             // here, where nothing could call them.
             snippets.update(|v| v.push(schemaic_core::snippet::duplicate(&src, new_id)));
-            (save_snippets)();
+            (save_snippets)(persist::Saving::Replacing);
         })
     };
     let remove_snippet: Rc<dyn Fn(u64)> = {
@@ -2668,7 +2675,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                 resolve: Rc::new(move |yes| {
                     if yes {
                         snippets.update(|v| schemaic_core::snippet::remove(v, id));
-                        (save_snippets)();
+                        (save_snippets)(persist::Saving::Erasing);
                     }
                 }),
             }));
@@ -9065,7 +9072,14 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
     };
 
     // Persist the current connections list with a given active id.
-    let persist_conns = move |active: Option<u64>| {
+    //
+    // `saving` is the caller's answer to "is anything gone from this list?".
+    // `Erasing` on the delete path only: an ordinary save keeps the previous
+    // generation as `connections.json.bak`, which for a delete is the deleted
+    // connection — its server coordinates, and its three plaintext secrets
+    // whenever the keyring fallback is in force — written to disk by the very
+    // save that answered "This can't be undone".
+    let persist_conns = move |active: Option<u64>, saving: persist::Saving| {
         let file = ConnectionsFile {
             connections: connections.get_untracked(),
             active,
@@ -9076,7 +9090,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
         // to say nothing at all. `save_connections` returns each distinct notice
         // once per session, so a keyring that stays down does not raise a modal
         // on every read-only toggle.
-        if let Some(notice) = secrets::save_connections(&file) {
+        if let Some(notice) = secrets::save_connections(&file, saving) {
             error_modal_text.set(Some(notice));
             error_modal_open.set(true);
         }
@@ -9090,7 +9104,10 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                 c.read_only = !c.read_only;
             }
         });
-        persist_conns(Some(active_conn.get_untracked()));
+        persist_conns(
+            Some(active_conn.get_untracked()),
+            persist::Saving::Replacing,
+        );
     });
 
     // Switch the active connection and reload its schema.
@@ -9173,7 +9190,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             // tree opened the new connection with the old one's nodes expanded,
             // built their table lists, and with the size column on queried them.
             (use_conn)(id);
-            persist_conns(Some(id));
+            persist_conns(Some(id), persist::Saving::Replacing);
             // The strip shows only this connection's tabs, so the active tab has
             // to become one of them. A connection with none gets a fresh tab —
             // with no database, since `db_nodes` still holds the previous
@@ -9257,7 +9274,10 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                 Some(pick_connection_color(&used_colors)),
             );
             connections.update(|cs| cs.push(copy));
-            persist_conns(Some(active_conn.get_untracked()));
+            persist_conns(
+                Some(active_conn.get_untracked()),
+                persist::Saving::Replacing,
+            );
             (select_conn)(next_id);
         })
     };
@@ -9542,7 +9562,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                     cs.push(conn.sanitized());
                 }
             });
-            persist_conns(Some(active));
+            persist_conns(Some(active), persist::Saving::Replacing);
             // The active id now names one of the connections just added, and nothing
             // has connected to it — see `was_dangling` above.
             if was_dangling
@@ -9614,7 +9634,10 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                 }
             });
             draft.id.set(Some(id));
-            persist_conns(Some(active_conn.get_untracked()));
+            persist_conns(
+                Some(active_conn.get_untracked()),
+                persist::Saving::Replacing,
+            );
             // **Did this edit move the connection to a different server?** Asked
             // through `targets_same_server`, the predicate that already answers it
             // for the schema tree, rather than a second reading of the same
@@ -9811,7 +9834,13 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             } else {
                 Some(active_conn.get_untracked())
             };
-            persist_conns(new_active);
+            // **Erasing**, for the reason the comment sixty lines above gives
+            // about the chat and history stores: the ordinary save would copy
+            // the pre-delete list — this connection's server, user, database
+            // and SSH coordinates, and its plaintext secrets wherever the
+            // keyring is unreachable — into `connections.json.bak`, where
+            // nothing removes it.
+            persist_conns(new_active, persist::Saving::Erasing);
             match connections.with_untracked(|cs| cs.first().cloned()) {
                 Some(c) => draft.load(&c),
                 None => {
@@ -9981,7 +10010,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             // force: the next connection to take this freed id would have found
             // them waiting under "THIS CONNECTION".
             snippets.update(|v| schemaic_core::snippet::clear_conn(v, id));
-            (save_snippets)();
+            (save_snippets)(persist::Saving::Erasing);
             // Diagram layouts live only on disk (no signal) — load, prune, save.
             // The third lazy load, and the third that owes the user the recovery
             // notice the startup drain cannot carry: the prune-and-save here is

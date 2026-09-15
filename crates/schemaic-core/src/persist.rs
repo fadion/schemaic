@@ -1127,8 +1127,24 @@ pub(crate) fn write_bytes(store: &dyn FileStore, path: &Path, json: &[u8], savin
         store.remove(&tmp);
     }
     if saving == Saving::Erasing && landed {
-        store.remove(&sibling(path, ".bak"));
+        remove_erased_siblings(store, path);
     }
+}
+
+/// Every sibling copy of `path` an erasure has to reach.
+///
+/// **Two, not one.** The `.bak` is the obvious one — [`Saving::Erasing`] was
+/// written about it. The `.corrupt` is the one nothing else in the workspace
+/// ever removes: [`read_bytes`] renames an unparseable primary aside *whole*
+/// (`{path}.corrupt`) and falls back to the backup, and from then on that file
+/// sits in the config directory for the life of the install. For
+/// `connections.json` under the no-keyring fallback it holds the DB password,
+/// the SSH password and the key passphrase in the clear; for `history.json` and
+/// `snippets.json` it holds the user's own SQL. A confirm reading "This can't
+/// be undone" is a claim about the directory, not about one file in it.
+fn remove_erased_siblings(store: &dyn FileStore, path: &Path) {
+    store.remove(&sibling(path, ".bak"));
+    store.remove(&sibling(path, ".corrupt"));
 }
 
 /// The file a save should actually replace: `path` with any symlink standing in
@@ -1382,20 +1398,33 @@ pub fn load_connections() -> ConnectionsFile {
 }
 
 /// Persist saved connections (best effort).
-pub fn save_connections(file: &ConnectionsFile) {
-    write_json(connections_path(), file, Saving::Replacing);
+///
+/// **The one store whose `.bak` is a credential file.** Pass
+/// [`Saving::Erasing`] from the path that *removes* a connection: an ordinary
+/// save copies the pre-delete generation aside, so the deleted row's host,
+/// port, user, database and SSH coordinates — and, with no working keyring, its
+/// three plaintext secrets — land in `connections.json.bak` at the moment the
+/// user confirms a modal telling them the opposite. Ordinary saves stay
+/// [`Saving::Replacing`]: this is the only config file with no second copy
+/// anywhere, and losing it loses every connection.
+pub fn save_connections(file: &ConnectionsFile, saving: Saving) {
+    write_json(connections_path(), file, saving);
 }
 
-/// Remove the `connections.json.bak` recovery copy (best effort).
+/// Remove the sibling copies of `connections.json` (best effort).
 ///
 /// [`write_json`] snapshots the *previous* file to `.bak` before each write, so
 /// the first save that migrates legacy plaintext secrets into the keyring leaves
 /// a `.bak` still holding those plaintext secrets. The secret layer calls this
 /// right after a migration save to make sure no plaintext credential lingers at
 /// rest; a fresh (already-sanitized) `.bak` is regenerated on the next save.
+///
+/// The `.corrupt` sibling goes with it, for the reason
+/// [`remove_erased_siblings`] gives: it is the same plaintext, in a file the
+/// migration cannot rewrite and nothing else ever deletes.
 pub fn clear_connections_backup() {
     if let Some(path) = connections_path() {
-        let _ = std::fs::remove_file(sibling(&path, ".bak"));
+        remove_erased_siblings(&Fs, &path);
     }
 }
 
@@ -1404,8 +1433,8 @@ mod tests {
     use super::{
         ConnectionsFile, FileStore, Load, RECOVERIES, Recovered, RightPanelState, Saving, UiState,
         ai_harness_to_persist, classify, legacy_ai_run_queries_in, missing_notice, private_dir_in,
-        read_bytes, recover, recovery_notice, sibling, statement_timeout, statement_timeout_label,
-        take_recoveries, usable_base, write_bytes,
+        read_bytes, recover, recovery_notice, remove_erased_siblings, sibling, statement_timeout,
+        statement_timeout_label, take_recoveries, usable_base, write_bytes,
     };
     use std::cell::RefCell;
     use std::collections::HashMap;
@@ -1721,6 +1750,97 @@ mod tests {
         write_bytes(&fs, Path::new(CFG), br#"[]"#, Saving::Erasing);
         assert_eq!(fs.get(CFG).as_deref(), Some(&br#"["a","b","c"]"#[..]));
         assert!(fs.get("/cfg/ui.json.bak").is_some(), "nothing was erased");
+    }
+
+    /// **The `.corrupt` sibling is the erasure's second copy, and nothing else
+    /// ever removes it.** A store that failed to parse once is renamed aside
+    /// whole; for `connections.json` that sibling holds the plaintext fallback
+    /// password, the SSH password and the key passphrase. The user then
+    /// confirms a delete that says "This can't be undone" and the erasing save
+    /// scrubs the `.bak` and walks past the `.corrupt`.
+    #[test]
+    fn an_erasing_save_removes_the_corrupt_sibling_too() {
+        let fs = FakeFs::default();
+        fs.put("/cfg/ui.json.corrupt", r#"["a","b"]"#);
+        write_bytes(&fs, Path::new(CFG), br#"["a","b"]"#, Saving::Replacing);
+        write_bytes(&fs, Path::new(CFG), br#"["a"]"#, Saving::Erasing);
+        assert!(
+            fs.get("/cfg/ui.json.corrupt").is_none(),
+            "the erased entry is still readable in the .corrupt sibling"
+        );
+    }
+
+    /// The same ordering the `.bak` removal has: a save that could not land
+    /// leaves **every** copy it found, because the primary is now the only
+    /// thing that did not get written.
+    #[test]
+    fn an_erasing_save_that_cannot_stage_keeps_the_corrupt_sibling() {
+        let fs = FakeFs::default();
+        fs.put("/cfg/ui.json.corrupt", r#"["a","b"]"#);
+        write_bytes(&fs, Path::new(CFG), br#"["a","b"]"#, Saving::Replacing);
+        fs.unwritable
+            .borrow_mut()
+            .push(PathBuf::from("/cfg/ui.json.tmp"));
+        write_bytes(&fs, Path::new(CFG), br#"[]"#, Saving::Erasing);
+        assert!(
+            fs.get("/cfg/ui.json.corrupt").is_some(),
+            "nothing was erased"
+        );
+    }
+
+    /// **The composition, not either half.** `read_bytes` is what creates a
+    /// `.corrupt`, and an erasing save is what has to answer for it — the two
+    /// are 500 lines apart and each is correct on its own. This runs the real
+    /// sequence: a primary goes bad, recovery renames it aside, the user
+    /// deletes a row, and the deleted row must not still be in the directory.
+    #[test]
+    fn a_recovery_then_an_erasure_leaves_nothing_of_the_erased_row() {
+        let _guard = recovery_lock();
+        let fs = FakeFs::default();
+        write_bytes(
+            &fs,
+            Path::new(CFG),
+            br#"["keep","secret"]"#,
+            Saving::Replacing,
+        );
+        write_bytes(
+            &fs,
+            Path::new(CFG),
+            br#"["keep","secret"]"#,
+            Saving::Replacing,
+        );
+        // Truncated, not replaced: the shape a power loss mid-write leaves, and
+        // the reason a `.corrupt` is worth keeping at all — every byte that was
+        // in the file is still readable in it.
+        fs.put(CFG, r#"["keep","secret""#);
+        let _: Vec<String> = read_bytes(&fs, Path::new(CFG));
+        let _ = take_recoveries();
+        assert!(
+            fs.get("/cfg/ui.json.corrupt").is_some(),
+            "the fixture needs the rename to have happened"
+        );
+        write_bytes(&fs, Path::new(CFG), br#"["keep"]"#, Saving::Erasing);
+        for sibling in ["/cfg/ui.json.bak", "/cfg/ui.json.corrupt"] {
+            let left = fs.get(sibling).unwrap_or_default();
+            assert!(
+                !String::from_utf8_lossy(&left).contains("secret"),
+                "{sibling} still holds the erased row"
+            );
+        }
+    }
+
+    /// `clear_connections_backup`'s one job, over the store rather than over
+    /// `std::fs`: the migration that rewrites `connections.json` blanked has to
+    /// leave no sibling still holding what it blanked — `.corrupt` included,
+    /// which is where a file that failed to parse *once* puts them forever.
+    #[test]
+    fn clearing_the_siblings_reaches_both_of_them() {
+        let fs = FakeFs::default();
+        fs.put("/cfg/ui.json.bak", r#"{"password":"hunter2"}"#);
+        fs.put("/cfg/ui.json.corrupt", r#"{"password":"hunter2"}"#);
+        remove_erased_siblings(&fs, Path::new(CFG));
+        assert!(fs.get("/cfg/ui.json.bak").is_none());
+        assert!(fs.get("/cfg/ui.json.corrupt").is_none());
     }
 
     #[test]
