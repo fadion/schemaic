@@ -13,6 +13,8 @@
 //! only a cancel if the server stops: a client that returns early while the
 //! statement runs on has told the user something untrue about their database.
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use schemaic_core::model::Value;
@@ -371,7 +373,12 @@ pub async fn a_cancelled_query_stops_at_the_server(target: &'static Target) {
     let started = Instant::now();
     let outcome = scratch
         .db
-        .fetch_query(Some(&scratch.database), &target.sleep_sql(), 10, cancel)
+        .fetch_query(
+            Some(&scratch.database),
+            &target.sleep_sql(READ_CANCEL_MARKER),
+            10,
+            cancel,
+        )
         .await;
     let elapsed = started.elapsed();
 
@@ -401,11 +408,18 @@ pub async fn a_cancelled_query_stops_at_the_server(target: &'static Target) {
     // asynchronous — the row leaves the view shortly after the client returns —
     // and the wait is bounded well inside the sleep so a statement that really
     // ran on cannot pass by outlasting it.
+    //
+    // **This test's own marker**, because the probe reads a server-wide view
+    // (`PROCESSLIST` / `pg_stat_activity`, filtered by neither connection nor
+    // database) and the script-cancel test runs beside this one on the same
+    // server. On a shared marker this assertion counted that test's sleep while
+    // it was still being killed, and failed saying "the server is still running
+    // the statement" about somebody else's.
     let deadline = Instant::now() + (Duration::from_secs(SLEEP_SECS) - CANCEL_MARGIN);
-    let mut still = target.running_sleeps(&scratch.db).await;
+    let mut still = target.running_sleeps(&scratch.db, READ_CANCEL_MARKER).await;
     while still > 0 && Instant::now() < deadline {
         tokio::time::sleep(Duration::from_millis(100)).await;
-        still = target.running_sleeps(&scratch.db).await;
+        still = target.running_sleeps(&scratch.db, READ_CANCEL_MARKER).await;
     }
     assert_eq!(
         still, 0,
@@ -439,7 +453,7 @@ pub async fn a_cancelled_script_stops_at_the_server_and_reports_what_ran(target:
     let stmts = vec![
         format!("CREATE TABLE {t} (id INTEGER NOT NULL PRIMARY KEY)"),
         format!("INSERT INTO {t} (id) VALUES (1)"),
-        target.sleep_sql(),
+        target.sleep_sql(SCRIPT_CANCEL_MARKER),
         format!("INSERT INTO {t} (id) VALUES (2)"),
     ];
 
@@ -454,13 +468,25 @@ pub async fn a_cancelled_script_stops_at_the_server_and_reports_what_ran(target:
     // statement and the token fires before this script has started. Statement 2
     // is committed by the time a second connection can see its row, so a row
     // that is visible means both statements before the sleep have run.
+    //
+    // **The fallback is a budget of its own, strictly inside the elapsed
+    // limit.** It used to be the same 3 s the assertion below measures against,
+    // so a leg slow enough to miss the row — a cold CI service container, or
+    // the tier's threaded leg-tests contending on one server, which is the load
+    // that made PostgreSQL lose the previous race — fired the token at t=3 s
+    // and then failed saying "the cancel took 3.0s, so the sleep ran to
+    // completion". The sleep had never started. `saw_row` is what separates the
+    // two: the blind arming now fails as itself, above the assertions that
+    // would otherwise describe it as something else.
     let cancel = CancellationToken::new();
     let armed = cancel.clone();
     let probe = scratch.db.clone();
     let database = scratch.database.clone();
     let probe_sql = format!("SELECT COUNT(*) FROM {t}");
+    let saw_row = Arc::new(AtomicBool::new(false));
+    let reached = Arc::clone(&saw_row);
     tokio::spawn(async move {
-        let deadline = Instant::now() + Duration::from_secs(SLEEP_SECS) - CANCEL_MARGIN;
+        let deadline = Instant::now() + ARM_FALLBACK;
         while Instant::now() < deadline {
             let seen = probe
                 .fetch_query(Some(&database), &probe_sql, 1, CancellationToken::new())
@@ -468,6 +494,7 @@ pub async fn a_cancelled_script_stops_at_the_server_and_reports_what_ran(target:
                 .ok()
                 .and_then(|rs| rs.cell(0, 0).map(|c| c.display().to_string()));
             if seen.as_deref() == Some("1") {
+                reached.store(true, Ordering::SeqCst);
                 break;
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
@@ -479,6 +506,13 @@ pub async fn a_cancelled_script_stops_at_the_server_and_reports_what_ran(target:
     let (end, ran) = run_script_with(&scratch, &stmts, cancel).await;
     let elapsed = started.elapsed();
 
+    assert!(
+        saw_row.load(Ordering::SeqCst),
+        "{}: the script had not run its first two statements after {ARM_FALLBACK:?}, so the \
+         cancel was armed blind — this is a slow server, not the accounting bug the assertions \
+         below are about",
+        target.name
+    );
     assert_eq!(
         end,
         ExecEnd::Cancelled,
@@ -498,12 +532,17 @@ pub async fn a_cancelled_script_stops_at_the_server_and_reports_what_ran(target:
     );
 
     // The half a client-side `select!` answers on its own is the half that is
-    // worth nothing — polled, as the read cancellation test polls it.
+    // worth nothing — polled, as the read cancellation test polls it, and on
+    // this test's own marker for the reason stated there.
     let deadline = Instant::now() + (Duration::from_secs(SLEEP_SECS) - CANCEL_MARGIN);
-    let mut still = target.running_sleeps(&scratch.db).await;
+    let mut still = target
+        .running_sleeps(&scratch.db, SCRIPT_CANCEL_MARKER)
+        .await;
     while still > 0 && Instant::now() < deadline {
         tokio::time::sleep(Duration::from_millis(100)).await;
-        still = target.running_sleeps(&scratch.db).await;
+        still = target
+            .running_sleeps(&scratch.db, SCRIPT_CANCEL_MARKER)
+            .await;
     }
     assert_eq!(
         still, 0,
@@ -660,6 +699,31 @@ const CANCEL_MARGIN: Duration = Duration::from_secs(2);
 /// it. Long enough that finishing it is unmistakable, short enough that a leg
 /// failing this does not stall the suite.
 pub const SLEEP_SECS: u64 = 5;
+
+/// How long [`a_cancelled_script_stops_at_the_server_and_reports_what_ran`]
+/// waits for the script's own progress before arming the token blind.
+///
+/// **Strictly shorter than the elapsed limit the test asserts**
+/// (`SLEEP_SECS - CANCEL_MARGIN`, 3 s), and that gap is the whole point: when
+/// the two were equal, a leg that missed the row fired the token at the exact
+/// instant the assertion expired and failed with a diagnosis naming the one
+/// thing that had not happened. Written as a subtraction from the same two
+/// constants so shortening either keeps the ordering.
+const ARM_FALLBACK: Duration = Duration::from_secs(SLEEP_SECS)
+    .saturating_sub(CANCEL_MARGIN)
+    .saturating_sub(Duration::from_secs(1));
+
+/// The marker each cancellation test tags its sleep with.
+///
+/// **One each, not one shared**, because [`Target::running_sleeps`] reads a
+/// server-wide view and libtest runs the two tests of a leg concurrently: on a
+/// shared marker each test's "the server stopped" assertion counted the other's
+/// statement while it was still being killed. `74387d2` named this coupling and
+/// removed it from the script test's *arming* probe; these two constants are
+/// the same removal at the two assertions it left.
+const READ_CANCEL_MARKER: &str = "schemaicItCancelRead";
+/// See [`READ_CANCEL_MARKER`].
+const SCRIPT_CANCEL_MARKER: &str = "schemaicItCancelScript";
 
 /// Feed `stmts` through the channel `run_script` reads, and report how it ended.
 ///

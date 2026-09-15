@@ -843,6 +843,22 @@ async fn assert_matches_draft(
     // The sets the tests never looked at. Names and the attributes the model
     // carries — an index that came back as a plain `KEY` where a `FULLTEXT` was
     // drafted is the shape B2.2 measured, and no assertion here could see it.
+    //
+    // **Both directions.** All three checks used to iterate the draft alone and
+    // look for a match on the server, so an index, foreign key or check the
+    // draft *removed* and the emitter failed to remove was invisible here — and
+    // invisible to `assert_round_trips` too, since a leftover index round-trips
+    // through its own re-read draft. A `DropIndex` arm that emitted nothing at
+    // all passed both, and the module doc above already names dropping an index
+    // as untested. The column check twenty lines up has always been an
+    // `assert_eq!` over two full vectors; these are now the same strength.
+    //
+    // The one thing the reverse direction has to tolerate is an object the
+    // *server* invented: MySQL backs a foreign key with an index of the
+    // constraint's name unless one already covers it, and PostgreSQL backs a
+    // unique constraint the same way. Neither was asked for by the draft, so
+    // both are excused by name — narrowly, against the draft's own foreign-key
+    // and index names, rather than by dropping the direction.
     let want_ix: Vec<(String, bool, Option<String>)> = draft
         .indexes
         .iter()
@@ -853,6 +869,11 @@ async fn assert_matches_draft(
         .iter()
         .filter(|ix| !ix.is_primary())
         .map(|ix| (ix.name.clone(), ix.unique, ix.method.clone()))
+        .collect();
+    let want_fk: Vec<String> = draft
+        .foreign_keys
+        .iter()
+        .map(|f| f.info.name.clone())
         .collect();
     for w in &want_ix {
         if !got_ix
@@ -865,14 +886,28 @@ async fn assert_matches_draft(
             ));
         }
     }
-    let want_fk: Vec<String> = draft
-        .foreign_keys
-        .iter()
-        .map(|f| f.info.name.clone())
-        .collect();
+    for g in &got_ix {
+        let drafted = want_ix.iter().any(|w| w.0 == g.0);
+        let backs_a_key = want_fk.iter().any(|f| *f == g.0);
+        if !drafted && !backs_a_key {
+            lost.push(format!(
+                "  index {:?}: the server has it and the draft does not — a drop the \
+                 emitter did not perform, or an index nobody asked for",
+                g.0
+            ));
+        }
+    }
     for w in &want_fk {
         if !after.foreign_keys.iter().any(|f| f.name == *w) {
             lost.push(format!("  foreign key {w:?} is gone"));
+        }
+    }
+    for g in &after.foreign_keys {
+        if !want_fk.iter().any(|w| *w == g.name) {
+            lost.push(format!(
+                "  foreign key {:?}: the server has it and the draft does not",
+                g.name
+            ));
         }
     }
     let want_ck: Vec<String> = draft
@@ -883,6 +918,17 @@ async fn assert_matches_draft(
     for w in &want_ck {
         if !w.is_empty() && !after.check_constraints.iter().any(|c| c.name == *w) {
             lost.push(format!("  check {w:?} is gone"));
+        }
+    }
+    // Unnamed checks are excluded on both sides: the draft carries `""` for one
+    // the user has not named and the server invents a name for it, so the two
+    // cannot be matched by name in either direction.
+    for g in &after.check_constraints {
+        if !g.name.is_empty() && !want_ck.iter().any(|w| *w == g.name) {
+            lost.push(format!(
+                "  check {:?}: the server has it and the draft does not",
+                g.name
+            ));
         }
     }
 

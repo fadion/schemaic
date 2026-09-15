@@ -163,8 +163,9 @@ pub struct Target {
     pub trigger_condition: Option<&'static str>,
     pub trigger_update_columns: &'static [&'static str],
     /// A statement that does nothing for a given number of seconds, in this
-    /// server's spelling, with `{}` where the count goes — what the cancellation
-    /// test interrupts. There is no portable way to ask a server to wait.
+    /// server's spelling, with `{}` where the count goes and `{marker}` where
+    /// the caller's marker goes — what the cancellation test interrupts. There
+    /// is no portable way to ask a server to wait.
     ///
     /// **A template, not the finished statement.** It used to be
     /// `"SELECT SLEEP(5)"` in three places beside a `SLEEP_SECS = 5` the test
@@ -172,9 +173,20 @@ pub struct Target {
     /// changing the constant left three servers sleeping for the old duration
     /// and the assertion measuring against the new one. [`Target::sleep_sql`]
     /// is the one place the two meet.
+    ///
+    /// **The marker is the caller's, not a constant**, because the two
+    /// cancellation tests of a leg run concurrently under libtest and
+    /// [`Target::running_sleeps`] reads a *server-wide* view. With one shared
+    /// marker each test's probe counted the other test's statement, and a
+    /// failure there reported "the server is still running the statement" about
+    /// a statement belonging to a different test. `74387d2` recognised this for
+    /// the script test's *arming* probe and routed around it; the two `still ==
+    /// 0` assertions kept the coupling.
     sleep_template: &'static str,
-    /// How to ask this server whether a [`Target::sleep_sql`] is **still
-    /// running** — one row, one column, the count.
+    /// How to ask this server whether a [`Target::sleep_sql`] carrying a given
+    /// marker is **still running** — one row, one column, the count. `{head}`
+    /// and `{tail}` are the marker's two halves; see
+    /// [`Target::running_sleeps`].
     ///
     /// The other half of the cancellation test, and the half it did not have: it
     /// measured how long the *client* took to return `Cancelled`, which
@@ -182,9 +194,8 @@ pub struct Target {
     /// `cancel_query` from both arms left all six legs passing in ~250 ms while
     /// three servers slept on.
     ///
-    /// The marker is split in the middle of this pattern (`'…Cancel'` +
-    /// `'Marker…'`) so the probe does not count *itself*: its own text is in the
-    /// same view it reads.
+    /// The marker is split in the middle of this pattern so the probe does not
+    /// count *itself*: its own text is in the same view it reads.
     running_sleeps_sql: &'static str,
     /// The types this server is asked to round-trip, and the ones only it has.
     /// Two slices rather than one so MySQL and MariaDB can share the twenty they
@@ -255,8 +266,8 @@ pub static MARIADB: Target = Target {
     trigger_function_name: None,
     trigger_condition: None,
     trigger_update_columns: &[],
-    sleep_template: "SELECT SLEEP({}) /* schemaicItCancelMarker */",
-    running_sleeps_sql: "SELECT COUNT(*) FROM information_schema.PROCESSLIST \n         WHERE INFO LIKE CONCAT('%schemaicItCancel', 'Marker%')",
+    sleep_template: "SELECT SLEEP({}) /* {marker} */",
+    running_sleeps_sql: "SELECT COUNT(*) FROM information_schema.PROCESSLIST \n         WHERE INFO LIKE CONCAT('%{head}', '{tail}%')",
     types: cases::MYSQL_FAMILY,
     extra_types: cases::MARIADB_ONLY,
     expected_cases: 24,
@@ -286,8 +297,8 @@ pub static MYSQL: Target = Target {
     trigger_function_name: None,
     trigger_condition: None,
     trigger_update_columns: &[],
-    sleep_template: "SELECT SLEEP({}) /* schemaicItCancelMarker */",
-    running_sleeps_sql: "SELECT COUNT(*) FROM information_schema.PROCESSLIST \n         WHERE INFO LIKE CONCAT('%schemaicItCancel', 'Marker%')",
+    sleep_template: "SELECT SLEEP({}) /* {marker} */",
+    running_sleeps_sql: "SELECT COUNT(*) FROM information_schema.PROCESSLIST \n         WHERE INFO LIKE CONCAT('%{head}', '{tail}%')",
     types: cases::MYSQL_FAMILY,
     extra_types: cases::MYSQL_ONLY,
     expected_cases: 24,
@@ -319,8 +330,8 @@ pub static POSTGRES: Target = Target {
     trigger_function_name: Some("upper_name"),
     trigger_condition: Some("NEW.name IS NOT NULL"),
     trigger_update_columns: &["name"],
-    sleep_template: "SELECT pg_sleep({}) /* schemaicItCancelMarker */",
-    running_sleeps_sql: "SELECT count(*) FROM pg_stat_activity \n         WHERE state = 'active' AND query LIKE '%schemaicItCancel' || 'Marker%'",
+    sleep_template: "SELECT pg_sleep({}) /* {marker} */",
+    running_sleeps_sql: "SELECT count(*) FROM pg_stat_activity \n         WHERE state = 'active' AND query LIKE '%{head}' || '{tail}%'",
     types: cases::POSTGRES,
     extra_types: &[],
     expected_cases: 28,
@@ -405,20 +416,41 @@ impl Target {
     }
 
     /// The statement that makes this server wait for
-    /// [`crate::runtime::SLEEP_SECS`] seconds.
+    /// [`crate::runtime::SLEEP_SECS`] seconds, tagged with `marker` so
+    /// [`Target::running_sleeps`] can count this caller's sleeps and nobody
+    /// else's.
     ///
     /// The one place the template and the constant meet — see
     /// [`Target::sleep_template`].
-    pub fn sleep_sql(&self) -> String {
+    pub fn sleep_sql(&self, marker: &str) -> String {
         self.sleep_template
             .replace("{}", &crate::runtime::SLEEP_SECS.to_string())
+            .replace("{marker}", marker)
     }
 
-    /// How many [`Target::sleep_sql`] statements this server is running right
-    /// now — the question the cancellation test asks the *server*.
-    pub async fn running_sleeps(&self, db: &Db) -> u64 {
+    /// How many [`Target::sleep_sql`] statements carrying `marker` this server
+    /// is running right now — the question the cancellation test asks the
+    /// *server*.
+    ///
+    /// **The marker goes into the pattern in two halves**, so the probe's own
+    /// text — which sits in the very view it reads — does not match. Splitting
+    /// here rather than at the call site keeps that property a fact about this
+    /// function instead of a rule every caller has to remember; `debug_assert`
+    /// is the floor, because a marker short enough to split badly would make
+    /// the probe count itself and every assertion downstream would be about the
+    /// wrong statement.
+    pub async fn running_sleeps(&self, db: &Db, marker: &str) -> u64 {
+        debug_assert!(
+            marker.len() >= 4 && marker.is_ascii(),
+            "a cancel marker must be at least four ASCII bytes so it can be split"
+        );
+        let (head, tail) = marker.split_at(marker.len() / 2);
+        let sql = self
+            .running_sleeps_sql
+            .replace("{head}", head)
+            .replace("{tail}", tail);
         let rs = db
-            .fetch_query(None, self.running_sleeps_sql, 10, Default::default())
+            .fetch_query(None, &sql, 10, Default::default())
             .await
             .unwrap_or_else(|e| panic!("{}: could not read the sleep probe: {e}", self.endpoint()));
         rs.cell(0, 0)

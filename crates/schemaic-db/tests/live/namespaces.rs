@@ -541,6 +541,27 @@ pub async fn a_join_across_namespaces_stays_two_tables(target: &'static Target) 
 /// **The untouched table is the assertion that matters**, which is why both
 /// namespaces get a table of the same shape: an `ALTER` aimed at the wrong one
 /// has to *succeed* for the failure to be silent.
+///
+/// **And it is load-bearing on one leg of three** — the same disclosure
+/// `same_named_tables_in_two_namespaces_stay_distinct` and
+/// `a_join_across_namespaces_stays_two_tables` make about themselves, and this
+/// test had no equivalent while carrying a `ddl`-shaped name a reader takes for
+/// three legs' worth. On PostgreSQL the qualifier is the only thing standing
+/// between `alt.orders` and `public.orders`, and the commit that added this
+/// watched it red by stubbing `sql_qualifier` to `None`: the PostgreSQL leg
+/// turned red and the other two did not. On both MySQL legs a namespace *is* a
+/// database and `Scratch::apply_plan_in` scopes the connection to it
+/// (`self.db.clone().with_database(Some(&ns.database))`), so an emitter that
+/// dropped the qualifier entirely resolves the bare name inside the alt
+/// database — the right table — and every assertion below still holds. Those
+/// two legs assert "the `ALTER` applied", no more.
+///
+/// There is a stronger shape available for them — run the plan through a
+/// connection scoped to the *primary* database and let the emitted qualifier be
+/// the only thing that routes it, which is what the production path does when
+/// the designer is open on one database and the tree on another — and
+/// `apply_plan_in`'s own doc argues against it. While that stands, this
+/// paragraph is not optional.
 pub async fn generated_ddl_lands_in_the_namespace_it_was_drafted_from(target: &'static Target) {
     use schemaic_core::ddl::{self, ColumnDraft, TableDraft};
     use schemaic_core::schema::ColumnInfo;
