@@ -744,6 +744,67 @@ mod tests {
         assert!(primary_from(true, true, false), "Ctrl+Super is still Ctrl");
     }
 
+    /// **A key label is respelled, never spelled** — the invariant
+    /// `docs/architecture.md` states in the imperative, and a source gate
+    /// because the three sites that broke it were `&'static str`s in view code
+    /// that no runtime test reaches.
+    ///
+    /// The divergence they produced: on macOS the Shortcuts modal, the command
+    /// palette and the ER diagram all say `Cmd+Enter` while the new tab's own
+    /// prompt — the first thing on screen, and the only place the app says how
+    /// to run something — said `Ctrl+Enter`, as did the commit button's
+    /// tooltip. The handlers were right either way (`primary_held` is
+    /// additive); what was wrong is that the app advertised two keys for one
+    /// action.
+    ///
+    /// The needle is a `Ctrl+` inside a string literal, in either view crate,
+    /// outside this module. It is deliberately blind to `Ctrl` alone
+    /// (`"control() || meta()"` prose, the terminal's `Ctrl+Shift+C` encoding
+    /// note) — those are comments and code, and comments are already cut by
+    /// `production_code`.
+    ///
+    /// Two forms are not labels and are recognised by their shape rather than
+    /// by their file, so the rule stays about the thing and not about where it
+    /// happens to live today:
+    ///
+    /// - an argument to `keys_label` itself, which is a Ctrl-spelled table
+    ///   entry on its way *through* the respeller. That is the fix, not the
+    ///   defect.
+    /// - the trailing description of a `pair!` / `faded!` row in the contrast
+    ///   audit, which names a colour pair for a report and never reaches a
+    ///   view.
+    #[test]
+    fn no_view_code_spells_the_primary_modifier_in_a_label() {
+        let mut offenders: Vec<String> = Vec::new();
+        for (file, code) in crate::source_gate::crate_sources() {
+            if file == "shortcuts.rs" {
+                continue;
+            }
+            for (i, line) in code.lines().enumerate() {
+                let l = line.trim();
+                if l.contains("keys_label(") || l.contains("pair!(") || l.contains("faded!(") {
+                    continue;
+                }
+                // Inside a string literal, which is what makes it a label
+                // rather than a mention: `"…Ctrl+…"`.
+                let quoted = l
+                    .split('"')
+                    .skip(1)
+                    .step_by(2)
+                    .any(|seg| seg.contains("Ctrl+"));
+                if quoted {
+                    offenders.push(format!("{file}:{}: {l}", i + 1));
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "a key label must go through `shortcuts::keys_label`, or macOS reads \
+             Ctrl where every other surface reads Cmd:\n{}",
+            offenders.join("\n")
+        );
+    }
+
     #[test]
     fn the_table_is_not_accidentally_empty() {
         assert!(SHORTCUTS.len() >= 3);

@@ -8798,7 +8798,18 @@ fn build_result_body(
         // The tab's own opening state, and the only prompt in the app that says
         // how to run something — it is the first thing on screen in a new tab.
         Some(QueryState::Idle) => {
-            centered_msg("Run a query  (Ctrl+Enter)", theme::text_muted).into_any()
+            // Respelled, not spelled: this is the first thing in a new tab and
+            // the only place the app says how to run something, and on macOS it
+            // was the one surface still saying Ctrl after `07de2d7` moved the
+            // modal, the palette and the ER diagram to Cmd.
+            centered_msg(
+                format!(
+                    "Run a query  ({})",
+                    crate::shortcuts::keys_label("Ctrl+Enter")
+                ),
+                theme::text_muted,
+            )
+            .into_any()
         }
         Some(QueryState::Running) => running_view(cancel).into_any(),
         // The message itself goes to the panel-level error bar (see
@@ -11330,11 +11341,21 @@ fn footer(ui: Ui) -> impl IntoView {
     // Caret Ln/Col of the active tab (1-based). Reads the tab's `query` +
     // `cursor_offset` (mirrored out of the editor); safe to read per-tab signals
     // here — the same pattern as the `read_only`/`active_db` memos.
+    //
+    // **`with`, not `get`.** Both track identically, so the memo still re-runs
+    // per keystroke and the footer still updates; what `get` added was a clone
+    // of the whole document — `get` is documented as "try to *clone* and
+    // return" — allocated and freed one expression before `line_col_of_offset`
+    // borrowed it. On a few hundred KB of migration SQL that is a few hundred
+    // KB of memcpy plus an allocator round trip per keypress, on a path already
+    // carrying three other per-keystroke budgets.
     let cursor_lc = create_memo(move |_| {
         let id = active.get();
         tabs.with(|v| {
             v.iter().find(|t| t.id == id).map(|t| {
-                schemaic_core::text_ops::line_col_of_offset(&t.query.get(), t.cursor_offset.get())
+                t.query.with(|sql| {
+                    schemaic_core::text_ops::line_col_of_offset(sql, t.cursor_offset.get())
+                })
             })
         })
         .unwrap_or((1, 1))

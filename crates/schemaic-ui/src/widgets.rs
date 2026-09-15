@@ -401,51 +401,6 @@ const _: () = {
     assert!(ROW_BUTTON_TAB + 2 < ROW_TAB_STRIDE);
 };
 
-/// A button in a modal's Tab order: focusable, reached by Tab, and pressed with
-/// **Space or Enter**.
-///
-/// Both keys, unlike [`crate::settings::focusable_toggle`], which has to leave
-/// Enter to floem's `ToggleButton`. Nothing here answers either key already, so
-/// there is no second handler to double up with.
-///
-/// A **disabled** button is not a stop at all — it isn't registered and isn't
-/// focusable, so Tab walks past it the way it walks past a label. It keeps its
-/// place on screen (see [`action_button`]), which is a layout decision; being
-/// skipped by the keyboard is the same answer the pointer already gives, since
-/// its click handler is inert too.
-///
-/// There is deliberately **no default-Enter**: Enter in a field does not fire a
-/// modal's affirmative action. The DDL preview's Apply is an irreversible
-/// `ALTER`, and a key that means "newline" in one control and "apply the plan"
-/// in another is the shape of defect this ring's own review was full of. Reach
-/// the button and press it.
-///
-/// **The ring member is a wrapper this function builds, never the caller's own
-/// view**, and that is a correctness rule rather than a layout preference. Two
-/// things resolve by exact `ViewId` with no descendant propagation, and they
-/// were resolving to *different* ids depending on the order each call site
-/// happened to chain its decorators:
-///
-/// - Floem fires [`EventListener::Click`] on the **focused view** for any
-///   physical Enter / NumpadEnter / Space (`context.rs`'s keyboard-trigger
-///   path) and discards the result, then folds every registered `KeyDown`
-///   listener without short-circuiting. So registering a view that already
-///   carries `on_click_stop` made the arm below the *second* activation: one
-///   Space added two columns, opened two file dialogs, started **two bulk
-///   imports** of the same file.
-/// - `.focus(…)` resolves by exact id too, so a caller that chained
-///   `.tooltip()` (which allocates a fresh `ViewId`) before this call registered
-///   an id that carries no [`button_focus_ring`] — every list-row ↑/↓/✕ was a
-///   Tab stop that painted nothing.
-///
-/// A wrapper answers both at once: it never carries the caller's click listener,
-/// so Space fires exactly once, and it carries the focus outline itself, so the
-/// id in the ring is the id that paints. Callers therefore do **not** apply
-/// `button_focus_ring` to the face they pass in — it would never fire there.
-///
-/// `radius` is the face's own corner radius, so the outline can follow it rather
-/// than boxing it — see [`button_focus_ring`]. `0.0` for the icon buttons, whose
-/// faces are square.
 /// Does this key event **press** a focusable button?
 ///
 /// **The modifier term is the whole of it, and it was missing.** The two arms
@@ -529,6 +484,51 @@ pub(crate) fn strip_defers(key: &Key, mods: floem::keyboard::Modifiers) -> bool 
         )
 }
 
+/// A button in a modal's Tab order: focusable, reached by Tab, and pressed with
+/// **Space or Enter**.
+///
+/// Both keys, unlike [`crate::settings::focusable_toggle`], which has to leave
+/// Enter to floem's `ToggleButton`. Nothing here answers either key already, so
+/// there is no second handler to double up with.
+///
+/// A **disabled** button is not a stop at all — it isn't registered and isn't
+/// focusable, so Tab walks past it the way it walks past a label. It keeps its
+/// place on screen (see [`action_button`]), which is a layout decision; being
+/// skipped by the keyboard is the same answer the pointer already gives, since
+/// its click handler is inert too.
+///
+/// There is deliberately **no default-Enter**: Enter in a field does not fire a
+/// modal's affirmative action. The DDL preview's Apply is an irreversible
+/// `ALTER`, and a key that means "newline" in one control and "apply the plan"
+/// in another is the shape of defect this ring's own review was full of. Reach
+/// the button and press it.
+///
+/// **The ring member is a wrapper this function builds, never the caller's own
+/// view**, and that is a correctness rule rather than a layout preference. Two
+/// things resolve by exact `ViewId` with no descendant propagation, and they
+/// were resolving to *different* ids depending on the order each call site
+/// happened to chain its decorators:
+///
+/// - Floem fires [`EventListener::Click`] on the **focused view** for any
+///   physical Enter / NumpadEnter / Space (`context.rs`'s keyboard-trigger
+///   path) and discards the result, then folds every registered `KeyDown`
+///   listener without short-circuiting. So registering a view that already
+///   carries `on_click_stop` made the arm below the *second* activation: one
+///   Space added two columns, opened two file dialogs, started **two bulk
+///   imports** of the same file.
+/// - `.focus(…)` resolves by exact id too, so a caller that chained
+///   `.tooltip()` (which allocates a fresh `ViewId`) before this call registered
+///   an id that carries no [`button_focus_ring`] — every list-row ↑/↓/✕ was a
+///   Tab stop that painted nothing.
+///
+/// A wrapper answers both at once: it never carries the caller's click listener,
+/// so Space fires exactly once, and it carries the focus outline itself, so the
+/// id in the ring is the id that paints. Callers therefore do **not** apply
+/// `button_focus_ring` to the face they pass in — it would never fire there.
+///
+/// `radius` is the face's own corner radius, so the outline can follow it rather
+/// than boxing it — see [`button_focus_ring`]. `0.0` for the icon buttons, whose
+/// faces are square.
 pub(crate) fn in_ring_button<V: IntoView + 'static>(
     view: V,
     ring: FocusRing,
@@ -3906,11 +3906,6 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
-/// The channel [`submenu_layer`] draws from.
-///
-/// A **detached scope**, deliberately: the signal has to outlive any individual
-/// menu, since what publishes into it is a row inside a panel that is disposed the
-/// moment the menu closes. The same arrangement [`window_size`] uses.
 /// Does the hoisted-submenu channel need clearing? — the decision
 /// [`menu_panel`]'s clearing effect asks, lifted out so the guard is a thing
 /// with a name rather than a line inside a view.
@@ -3933,6 +3928,11 @@ pub(crate) fn submenu_channel_needs_clearing(open_sub: Option<usize>, channel_op
     open_sub.is_none() && channel_open
 }
 
+/// The channel [`submenu_layer`] draws from.
+///
+/// A **detached scope**, deliberately: the signal has to outlive any individual
+/// menu, since what publishes into it is a row inside a panel that is disposed the
+/// moment the menu closes. The same arrangement [`window_size`] uses.
 pub(crate) fn hoisted_submenu() -> RwSignal<Option<OpenSubmenu>> {
     OPEN_SUBMENU.with(|cell| {
         if cell.borrow().is_none() {
@@ -4093,26 +4093,6 @@ pub(crate) fn set_menu_return(f: Rc<dyn Fn()>) {
     MENU_RETURN.with_borrow_mut(|s| *s = Some(f));
 }
 
-/// Build a [`set_menu_return`] closure that restores focus on the next tick and
-/// **claims the keyboard as it lands**.
-///
-/// Every return wants this exact shape and all three spelled it out themselves,
-/// none of them claiming — which left the restore racing the panel's own
-/// hand-back. Both are `exec_after(Duration::ZERO)` scheduled in the same pass:
-/// the return's, here, and `refocus_grid`'s, queued when `focus_root`'s cleanup
-/// calls [`hand_keyboard_back`]. floem keeps timers in a `HashMap<TimerToken,
-/// Timer>` and collects every due token by iterating that map, so they fire in
-/// an arbitrary order and the last `UpdateMessage::Focus` queued wins. Tab to
-/// the results toolbar's Copy icon, Enter, Escape, and focus landed either back
-/// on the icon or on the grid body, differently on different presses.
-///
-/// **The claim is inside the timer, not before it.** `refocus_grid` snapshots
-/// the generation when it *schedules*, so a claim taken synchronously at Escape
-/// time is already in that snapshot and changes nothing. Claiming when this
-/// lands settles both orders: run first and `refocus_grid` finds the generation
-/// moved and stands down; run second and it simply lands on top. That is the
-/// property `claim_keyboard`'s own doc describes — "the race is settled either
-/// way round" — applied at the sites that had not applied it.
 /// **Put the keyboard back on `tabindex` after a rebuild that disposed the
 /// control holding it.**
 ///
@@ -4148,6 +4128,26 @@ pub(crate) fn reclaim_focus_at(ring: &FocusRing, tabindex: u32) {
     });
 }
 
+/// Build a [`set_menu_return`] closure that restores focus on the next tick and
+/// **claims the keyboard as it lands**.
+///
+/// Every return wants this exact shape and all three spelled it out themselves,
+/// none of them claiming — which left the restore racing the panel's own
+/// hand-back. Both are `exec_after(Duration::ZERO)` scheduled in the same pass:
+/// the return's, here, and `refocus_grid`'s, queued when `focus_root`'s cleanup
+/// calls [`hand_keyboard_back`]. floem keeps timers in a `HashMap<TimerToken,
+/// Timer>` and collects every due token by iterating that map, so they fire in
+/// an arbitrary order and the last `UpdateMessage::Focus` queued wins. Tab to
+/// the results toolbar's Copy icon, Enter, Escape, and focus landed either back
+/// on the icon or on the grid body, differently on different presses.
+///
+/// **The claim is inside the timer, not before it.** `refocus_grid` snapshots
+/// the generation when it *schedules*, so a claim taken synchronously at Escape
+/// time is already in that snapshot and changes nothing. Claiming when this
+/// lands settles both orders: run first and `refocus_grid` finds the generation
+/// moved and stands down; run second and it simply lands on top. That is the
+/// property `claim_keyboard`'s own doc describes — "the race is settled either
+/// way round" — applied at the sites that had not applied it.
 pub(crate) fn menu_return(restore: impl Fn() + Clone + 'static) -> Rc<dyn Fn()> {
     Rc::new(move || {
         let restore = restore.clone();
@@ -5620,11 +5620,6 @@ pub(crate) fn link_button(
     )
 }
 
-/// A 22px jump-to-bottom circle (chevron-down) that fades in only while `show()`
-/// is true and is inert (no pointer events) otherwise. Absolutely positioned
-/// bottom-right (10px/10px) inside its parent stack. Shared by the AI panel and
-/// the terminal. Fades via alpha (Floem has no opacity prop); the icon owns its
-/// own colour + transition since an inherited colour won't animate a child svg.
 /// Does a hidden control still think the pointer is on it? — the one question
 /// [`jump_to_bottom_button`]'s hover latch turns on.
 ///
@@ -5650,6 +5645,11 @@ pub(crate) fn jump_icon_tint(show: bool, hovered: bool) -> Color {
     }
 }
 
+/// A 22px jump-to-bottom circle (chevron-down) that fades in only while `show()`
+/// is true and is inert (no pointer events) otherwise. Absolutely positioned
+/// bottom-right (10px/10px) inside its parent stack. Shared by the AI panel and
+/// the terminal. Fades via alpha (Floem has no opacity prop); the icon owns its
+/// own colour + transition since an inherited colour won't animate a child svg.
 pub(crate) fn jump_to_bottom_button(
     show: impl Fn() -> bool + Copy + 'static,
     on_click: impl Fn() + 'static,

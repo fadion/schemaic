@@ -2480,7 +2480,14 @@ fn export_menu(
     if !truncated || !gs.rerunnable() {
         return per_format(false);
     }
-    let fetched = gs.rs.with_untracked(|rs| rs.row_count());
+    // **Off the same order the file is written from.** This was
+    // `gs.rs.row_count()` — the fetched result alone — while the fetched export
+    // has rendered through `exported_rows` since `bf13fbe`, which appends one
+    // row per pending ＋ Row. So 200,000 fetched with 3 staged said
+    // "Fetched rows (200k)" over a file holding 200,003, while the export
+    // modal's own denominator (`order.len()`) said 200,003: two figures for one
+    // file, three lines apart. One derivation now, and it is the file's.
+    let fetched = exported_rows(gs).1.len();
     vec![
         MenuEntry::sub(
             format!(
@@ -7979,12 +7986,17 @@ fn grid_toolbar(
             // `dyn_container` above already keys on both, so the face and its tip
             // are replaced together.
             .tooltip(move || {
+                // Through `keys_label`, because the primary modifier is asked
+                // for and never spelled at the use site: on macOS the Shortcuts
+                // modal, the palette and the ER diagram all say Cmd, and these
+                // two said Ctrl.
+                let keys = crate::shortcuts::keys_label("Ctrl+Enter");
                 let t = if busy {
                     "Committing…".to_string()
                 } else if n == 1 {
-                    "Commit 1 change (Ctrl+Enter)".to_string()
+                    format!("Commit 1 change ({keys})")
                 } else {
-                    format!("Commit {n} changes (Ctrl+Enter)")
+                    format!("Commit {n} changes ({keys})")
                 };
                 text(t).style(crate::widgets::tooltip_style)
             });
@@ -10727,11 +10739,17 @@ mod cell_preview_tests {
         )
         .expect("grid.rs");
         let body = crate::source_gate::production_code(&src);
+        // `export_menu` writes no file — it *names* one, and the name has to
+        // count what the file will hold. Its `Fetched rows (N)` label read
+        // `gs.rs`'s row count while the file it opens carries the pending ＋
+        // Rows too, so the menu and the export modal's own denominator gave two
+        // figures for one file. Same rule, same needle: read the resolved pair.
         for name in [
             "fn render_export(",
             "fn export_column_json(",
             "fn export_column_csv(",
             "fn save_export(",
+            "fn export_menu(",
         ] {
             let at = body
                 .find(name)

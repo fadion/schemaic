@@ -1156,12 +1156,21 @@ mod tests {
         }
     }
 
-    /// Every stop the form actually hands out, read out of this file.
+    /// Every registration the form makes, **with multiplicity**, as
+    /// `(stop, line number)` in source order.
     ///
-    /// Returns them in source order, first occurrence wins — `TAB_SCHED` is
-    /// registered twice, by the two mutually-exclusive schedule arms, and that
-    /// is one stop.
-    fn registered_stops() -> Vec<u32> {
+    /// **Not deduped, which is the fix.** It used to drop a repeat — right for
+    /// `TAB_SCHED`, which the two mutually-exclusive schedule arms register
+    /// twice, and wrong as a general rule, because a *second* control at an
+    /// existing stop then looked exactly like the first. Add a twelfth control
+    /// at `TAB_OPT + 20` and leave it out of `TAB_ORDER`: the set is unchanged,
+    /// `every_registered_tab_stop_is_in_the_walk` compares eleven against
+    /// eleven and passes, `no_two_controls_claim_the_same_tab_stop` walks the
+    /// hand-written array whose entries are still distinct and passes too — and
+    /// Tab orders the two by construction rather than layout, which is the
+    /// failure the deriving commit set out to close. The subtractive half was
+    /// caught; the additive half is what this restores.
+    fn registrations() -> Vec<(u32, usize)> {
         let src =
             std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/event_editor.rs"))
                 .expect("this module's own source");
@@ -1173,8 +1182,8 @@ mod tests {
             ("TAB_BODY", TAB_BODY),
             ("TAB_OPT", TAB_OPT),
         ];
-        let mut out: Vec<u32> = Vec::new();
-        for line in body.lines() {
+        let mut out: Vec<(u32, usize)> = Vec::new();
+        for (i, line) in body.lines().enumerate() {
             let l = line.trim();
             // The declarations themselves are not registrations.
             if l.starts_with("const TAB_") {
@@ -1196,8 +1205,8 @@ mod tests {
                             digits.parse::<u32>().ok()
                         })
                         .unwrap_or(0);
-                    if boundary && !out.contains(&(value + offset)) {
-                        out.push(value + offset);
+                    if boundary {
+                        out.push((value + offset, i + 1));
                     }
                     rest = after;
                 }
@@ -1229,23 +1238,67 @@ mod tests {
     /// that can be checked mechanically.
     #[test]
     fn every_registered_tab_stop_is_in_the_walk() {
-        let found = registered_stops();
+        let regs = registrations();
+        let mut found: Vec<u32> = regs.iter().map(|(s, _)| *s).collect();
+        found.sort_unstable();
+        found.dedup();
         assert!(
             found.len() >= 11,
-            "the scan stopped finding registrations — it saw {found:?}"
+            "the scan stopped finding registrations — it saw {regs:?}"
         );
-        let mut a = found.clone();
-        a.sort_unstable();
         let mut b = TAB_ORDER.to_vec();
         b.sort_unstable();
         assert_eq!(
-            a,
+            found,
             b,
-            "the form registers {} stops and the walk lists {}; a control the \
-             walk cannot see can collide with another and Tab will order the \
-             two by construction rather than layout",
+            "the form registers {} distinct stops and the walk lists {}; a \
+             control the walk cannot see can collide with another and Tab will \
+             order the two by construction rather than layout",
             found.len(),
             TAB_ORDER.len()
+        );
+    }
+
+    /// **And no two *controls* share a stop**, which the set above cannot say.
+    ///
+    /// The one legitimate repeat is `TAB_SCHED`: the two schedule arms (`EVERY`
+    /// and `AT`) are mutually exclusive, so only one is ever on screen and the
+    /// stop is handed out once. Everything else registered twice is two
+    /// controls at one stop, which Tab then orders by construction rather than
+    /// by layout — invisible to both tests here while the walk deduped, because
+    /// a second registration looked exactly like the first.
+    #[test]
+    fn no_stop_is_registered_by_two_different_controls() {
+        let regs = registrations();
+        let mut dupes: Vec<String> = Vec::new();
+        for (stop, line) in &regs {
+            // Reported once per stop, from its first registration, so a pair
+            // does not read as two findings.
+            let lines: Vec<usize> = regs
+                .iter()
+                .filter(|(s, _)| s == stop)
+                .map(|(_, l)| *l)
+                .collect();
+            if lines.len() > 1 && lines[0] == *line && *stop != TAB_SCHED {
+                dupes.push(format!("stop {stop} is registered at lines {lines:?}"));
+            }
+        }
+        dupes.sort();
+        dupes.dedup();
+        assert!(
+            dupes.is_empty(),
+            "two controls at one tab stop: Tab orders them by construction \
+             rather than by layout, and `TAB_ORDER` cannot see the second one. \
+             The only sanctioned repeat is `TAB_SCHED`, whose two arms are \
+             mutually exclusive:\n{}",
+            dupes.join("\n")
+        );
+        // The floor: `TAB_SCHED`'s two arms are still both there, so the
+        // exemption above is covering something rather than nothing.
+        assert!(
+            regs.iter().filter(|(s, _)| *s == TAB_SCHED).count() >= 2,
+            "the two schedule arms no longer both register `TAB_SCHED` — the \
+             exemption in this test is now a hole"
         );
     }
 }
