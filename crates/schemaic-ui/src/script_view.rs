@@ -159,6 +159,9 @@ fn pick_file(ui: Ui) {
         }
         s.path.set(Some(path.clone()));
         s.probe.set(None);
+        // With no probe there is no claim about the file, so the stamp goes back
+        // to "nothing learned" rather than describing the *previous* pick.
+        s.stamp.set(schemaic_core::script::FileStamp::default());
         s.error.set(None);
         s.done.set(None);
         s.probing.set(true);
@@ -180,7 +183,10 @@ fn pick_file(ui: Ui) {
                 }
                 s.probing.set(false);
                 match res {
-                    Ok(p) => s.probe.set(Some(p)),
+                    Ok((p, stamp)) => {
+                        s.probe.set(Some(p));
+                        s.stamp.set(stamp);
+                    }
                     Err(e) => s.error.set(Some(e)),
                 }
             }),
@@ -215,6 +221,7 @@ fn run_script(ui: Ui) {
         target.conn_id,
         target.database.clone(),
         target.dialect,
+        s.stamp.get_untracked(),
     ) {
         Ok(r) => r,
         Err(why) => {

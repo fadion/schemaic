@@ -4446,10 +4446,14 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             move |path: std::path::PathBuf,
                   dialect: schemaic_core::intel::SqlDialect,
                   done: schemaic_ui::ScriptProbeDoneFn| {
-                let report = create_ext_action(
-                    cx,
-                    move |r: Result<schemaic_core::script::Probe, String>| (done)(r),
-                );
+                type ProbeResult = Result<
+                    (
+                        schemaic_core::script::Probe,
+                        schemaic_core::script::FileStamp,
+                    ),
+                    String,
+                >;
+                let report = create_ext_action(cx, move |r: ProbeResult| (done)(r));
                 // Off the UI thread and blocking: the probe reads up to
                 // `PROBE_MAX_BYTES` off a disk, which is exactly the pause the
                 // modal must not take on the thread drawing it.
@@ -4457,7 +4461,14 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                     let out = std::fs::File::open(&path)
                         .map_err(|e| e.to_string())
                         .and_then(|f| {
-                            schemaic_core::script::probe(f, dialect).map_err(|e| e.to_string())
+                            // **Stamped from the same handle the probe reads**,
+                            // so the claim is about the bytes the panel is about
+                            // to describe rather than about whatever is at the
+                            // path a moment later.
+                            let stamp = schemaic_core::script::FileStamp::of(&f);
+                            schemaic_core::script::probe(f, dialect)
+                                .map_err(|e| e.to_string())
+                                .map(|p| (p, stamp))
                         });
                     report(out);
                 });
@@ -11606,6 +11617,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             path: RwSignal::new(None),
             probing: RwSignal::new(false),
             probe: RwSignal::new(None),
+            stamp: RwSignal::new(schemaic_core::script::FileStamp::default()),
             running: RwSignal::new(false),
             progress: script_progress,
             error: RwSignal::new(None),

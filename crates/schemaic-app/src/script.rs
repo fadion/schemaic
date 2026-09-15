@@ -70,7 +70,8 @@ pub(crate) async fn run(
     let (tx, rx) = tokio::sync::mpsc::channel(SCRIPT_QUEUE);
     let reader = {
         let (path, dialect, token) = (req.path().to_path_buf(), req.dialect(), token.clone());
-        tokio::task::spawn_blocking(move || read(path, dialect, tx, token, progress))
+        let stamp = req.stamp();
+        tokio::task::spawn_blocking(move || read(path, dialect, stamp, tx, token, progress))
     };
 
     // Both halves run at once. The executor ends when the reader drops `tx` —
@@ -94,6 +95,7 @@ pub(crate) async fn run(
 fn read(
     path: std::path::PathBuf,
     dialect: schemaic_core::intel::SqlDialect,
+    stamp: schemaic_core::script::FileStamp,
     tx: tokio::sync::mpsc::Sender<schemaic_core::script::Statement>,
     token: CancellationToken,
     progress: crossbeam_channel::Sender<ScriptProgress>,
@@ -102,6 +104,23 @@ fn read(
         Ok(f) => f,
         Err(e) => return ReadEnd::Failed(e.to_string()),
     };
+    // **This is the second open of the path.** The panel's counts and its red
+    // destruction line describe what the *probe* read, and that is the whole of
+    // the confirmation — `sql::script_verdict` treats a `.sql` file as a write
+    // without reading it, by design, so nothing else on this path ever looks at
+    // the content. Between the two opens the bytes were free to change: benignly
+    // when the user edits the script while the modal stands, and not benignly
+    // when the file is replaced. See `script::probe_still_describes`.
+    if !schemaic_core::script::probe_still_describes(
+        stamp,
+        schemaic_core::script::FileStamp::of(&file),
+    ) {
+        return ReadEnd::Failed(
+            "This file changed on disk after it was read, so the summary above \
+             is not what would run. Choose it again."
+                .to_string(),
+        );
+    }
     // Best-effort: a file whose length cannot be read still loads, it just has
     // no denominator to report against.
     let total = file.metadata().map(|m| m.len()).unwrap_or(0);
@@ -237,6 +256,10 @@ mod tests {
                 read(
                     path,
                     schemaic_core::intel::SqlDialect::MySql,
+                    // The default stamp is "nothing was learned", which
+                    // `probe_still_describes` accepts — this test is about the
+                    // reader, not about the consent.
+                    schemaic_core::script::FileStamp::default(),
                     tx,
                     CancellationToken::new(),
                     ptx,
@@ -261,6 +284,65 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// **The panel's summary has to be about the bytes that run.** The probe
+    /// and the run are two opens of the same path, and the panel's counts and
+    /// its red destruction line — which its own doc calls the confirmation,
+    /// with "no second 'are you sure' step" — describe the first. Nothing else
+    /// on this path looks at the content: `sql::script_verdict` treats a `.sql`
+    /// file as a write *without reading it*, by design. So the file was free to
+    /// change in between, and the new content ran under the old consent.
+    ///
+    /// Over a real file for the reason the sibling test above states: the thing
+    /// under test *is* reading one.
+    #[test]
+    fn a_file_that_changed_since_the_probe_is_refused_rather_than_run() {
+        let dir = std::env::temp_dir().join("schemaic-script-restamp-test");
+        std::fs::create_dir_all(&dir).expect("a temp dir");
+        let path = dir.join("swapped.sql");
+        std::fs::write(&path, "SELECT 1;\n").expect("write the fixture");
+        let probed = schemaic_core::script::FileStamp::of(
+            &std::fs::File::open(&path).expect("the fixture opens"),
+        );
+        assert_ne!(
+            probed,
+            schemaic_core::script::FileStamp::default(),
+            "the fixture needs a real stamp, or this asserts nothing"
+        );
+        // What the user did not consent to, and a different length so the
+        // check does not rest on the timestamp's resolution.
+        std::fs::write(&path, "DROP DATABASE shop;\n").expect("swap the fixture");
+
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .build()
+            .expect("a runtime");
+        let (tx, mut rx) = tokio::sync::mpsc::channel(SCRIPT_QUEUE);
+        let (ptx, _prx) = crossbeam_channel::unbounded();
+        let p = path.clone();
+        let end = rt.block_on(async move {
+            tokio::task::spawn_blocking(move || {
+                read(
+                    p,
+                    schemaic_core::intel::SqlDialect::MySql,
+                    probed,
+                    tx,
+                    CancellationToken::new(),
+                    ptx,
+                )
+            })
+            .await
+            .expect("the reader finishes")
+        });
+        match &end {
+            ReadEnd::Failed(why) => assert!(why.contains("changed on disk"), "{why}"),
+            other => panic!("the swapped file was read: {other:?}"),
+        }
+        // And nothing reached the executor — a refusal that still queued the
+        // first statement would be the bug with a message on top.
+        assert!(rx.try_recv().is_err(), "a statement was handed over anyway");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A file that is not there fails the *reader*, which `run_outcome` then
     /// ranks above anything the executor saw — the executor only ever sees an
     /// empty stream, which is indistinguishable from an empty file.
@@ -279,6 +361,7 @@ mod tests {
                 read(
                     path,
                     schemaic_core::intel::SqlDialect::MySql,
+                    schemaic_core::script::FileStamp::default(),
                     tx,
                     CancellationToken::new(),
                     ptx,

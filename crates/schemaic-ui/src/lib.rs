@@ -432,6 +432,11 @@ pub struct ScriptRequest {
     conn_id: u64,
     database: String,
     dialect: SqlDialect,
+    /// The file as the probe found it. The run re-opens the path, so this is
+    /// what makes the panel's counts — which *are* the confirmation — a claim
+    /// about the bytes that actually execute. See
+    /// [`schemaic_core::script::probe_still_describes`].
+    stamp: schemaic_core::script::FileStamp,
 }
 
 /// A statement approved for a **re-run** — the second minted request on the
@@ -500,6 +505,7 @@ impl ScriptRequest {
         conn_id: u64,
         database: String,
         dialect: SqlDialect,
+        stamp: schemaic_core::script::FileStamp,
     ) -> Result<ScriptRequest, String> {
         match schemaic_core::sql::script_verdict(policy, file_name) {
             // Refused with no override, by design: the read-only block has
@@ -516,11 +522,18 @@ impl ScriptRequest {
             conn_id,
             database,
             dialect,
+            stamp,
         })
     }
 
     pub fn path(&self) -> &std::path::Path {
         &self.path
+    }
+
+    /// The file as the panel described it — what the run checks the reopened
+    /// file against.
+    pub fn stamp(&self) -> schemaic_core::script::FileStamp {
+        self.stamp
     }
 
     pub fn conn_id(&self) -> u64 {
@@ -2684,6 +2697,10 @@ pub struct ScriptUi {
     pub probing: RwSignal<bool>,
     /// What the probe found — the second step's whole content.
     pub probe: RwSignal<Option<schemaic_core::script::Probe>>,
+    /// The file as it was when [`ScriptUi::probe`] read it, so the run can
+    /// refuse a file that has changed since the panel described it. See
+    /// [`schemaic_core::script::FileStamp`].
+    pub stamp: RwSignal<schemaic_core::script::FileStamp>,
     /// True while the run itself is going. Guards a second launch and is what
     /// turns every exit into a cancel, exactly as [`DumpUi::running`] does.
     pub running: RwSignal<bool>,
@@ -2696,8 +2713,22 @@ pub struct ScriptUi {
     pub generation: RwSignal<u64>,
 }
 
-/// Delivers a [`schemaic_core::script::Probe`] back onto the UI thread.
-pub type ScriptProbeDoneFn = Rc<dyn Fn(Result<schemaic_core::script::Probe, String>)>;
+/// Delivers a [`schemaic_core::script::Probe`] back onto the UI thread, with the
+/// [`schemaic_core::script::FileStamp`] of the bytes it read.
+///
+/// The stamp travels with the probe because the panel's counts *are* the
+/// confirmation, and the run re-opens the path — see `FileStamp`.
+pub type ScriptProbeDoneFn = Rc<
+    dyn Fn(
+        Result<
+            (
+                schemaic_core::script::Probe,
+                schemaic_core::script::FileStamp,
+            ),
+            String,
+        >,
+    ),
+>;
 /// Read the opening statements of a `.sql` file, off the UI thread, so the modal
 /// can say what the file will do before it does it.
 pub type ScriptProbeFn = Rc<dyn Fn(std::path::PathBuf, SqlDialect, ScriptProbeDoneFn)>;
@@ -13520,6 +13551,7 @@ mod script_launch_gate {
             7,
             "shop".to_string(),
             SqlDialect::MySql,
+            schemaic_core::script::FileStamp::default(),
         )
     }
 

@@ -644,6 +644,77 @@ impl Probe {
     }
 }
 
+/// What a probe read, as a claim about the bytes that were on disk.
+///
+/// **The panel *is* the confirmation** — its own doc says "there is no second
+/// 'are you sure' step" — and it describes the file as it was when it was
+/// *picked*. The run re-opens the path and sends whatever is there when Run is
+/// pressed, and nothing else on that path ever looks at the content:
+/// `sql::script_verdict` treats a whole `.sql` file as a write *without reading
+/// it*, by design. So between the two opens the bytes were free to change under
+/// a consent that named the old ones — benignly, when the user edits the script
+/// in their editor while the modal stands (the modal is not window-modal and
+/// nothing re-probes), and not benignly when the file is replaced outright.
+///
+/// The failure and cancel reports compound it: they read the probe *after* the
+/// run, so they will say "opened no transaction, so every statement that ran is
+/// still applied" about a file that did open one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub struct FileStamp {
+    pub len: u64,
+    /// Modification time as milliseconds since the epoch, or `None` where the
+    /// platform or filesystem does not report one.
+    pub modified_ms: Option<u128>,
+}
+
+impl FileStamp {
+    /// The stamp of an open file, best effort.
+    ///
+    /// A file whose metadata cannot be read gets the default, which
+    /// [`probe_still_describes`] then treats as "cannot tell" — see there for
+    /// why that answer is *accept*.
+    pub fn of(file: &std::fs::File) -> FileStamp {
+        let Ok(m) = file.metadata() else {
+            return FileStamp::default();
+        };
+        FileStamp {
+            len: m.len(),
+            modified_ms: m.modified().ok().and_then(|t| {
+                t.duration_since(std::time::UNIX_EPOCH)
+                    .ok()
+                    .map(|d| d.as_millis())
+            }),
+        }
+    }
+}
+
+/// Does the file the run just opened still hold what the probe described?
+///
+/// [`crate::sqlfile::changed_on_disk`]'s question, for the *other* `.sql` path:
+/// that one compares text, because a tab holds the text it last saved. Nothing
+/// here holds the file's bytes — the probe reads a bounded prefix and keeps only
+/// counts — so the comparison is the stamp.
+///
+/// **A missing timestamp is not a mismatch.** Some filesystems report no
+/// modification time, and refusing a run on that would make the feature
+/// unusable there for no gain: the length still answers the replacement case,
+/// which is the one with teeth. Two files of the same length modified within the
+/// same millisecond are indistinguishable to this, and that is the residue —
+/// stated rather than papered over, because the alternative is hashing a file
+/// the panel deliberately does not read whole.
+pub fn probe_still_describes(expected: FileStamp, now: FileStamp) -> bool {
+    if expected == FileStamp::default() || now == FileStamp::default() {
+        return true; // nothing was learned either time; see the doc above
+    }
+    if expected.len != now.len {
+        return false;
+    }
+    match (expected.modified_ms, now.modified_ms) {
+        (Some(a), Some(b)) => a == b,
+        _ => true,
+    }
+}
+
 /// Read the start of a script and report what it holds.
 ///
 /// Bounded by [`PROBE_MAX_BYTES`] and [`PROBE_MAX_STATEMENTS`]; either bound sets
@@ -832,6 +903,65 @@ pub fn run_outcome(read: ReadEnd, exec: ExecEnd, ran: usize) -> RunOutcome {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn stamp(len: u64, modified_ms: Option<u128>) -> FileStamp {
+        FileStamp { len, modified_ms }
+    }
+
+    /// **A different length is a different file**, whatever the clock says.
+    #[test]
+    fn a_file_of_a_different_length_no_longer_matches_the_probe() {
+        let was = stamp(120, Some(1_700_000_000_000));
+        assert!(probe_still_describes(was, was));
+        assert!(!probe_still_describes(
+            was,
+            stamp(121, Some(1_700_000_000_000))
+        ));
+        assert!(!probe_still_describes(
+            was,
+            stamp(0, Some(1_700_000_000_000))
+        ));
+    }
+
+    /// And a same-length edit is caught by the timestamp — the commoner case,
+    /// since a script edited in place while the modal stands often keeps its
+    /// size.
+    #[test]
+    fn a_same_length_edit_is_caught_by_the_modification_time() {
+        let was = stamp(120, Some(1_700_000_000_000));
+        assert!(!probe_still_describes(
+            was,
+            stamp(120, Some(1_700_000_000_001))
+        ));
+    }
+
+    /// **A filesystem that reports no time is not a mismatch.** Refusing there
+    /// would make the feature unusable for no gain: the length still answers the
+    /// replacement case, which is the one with teeth. The residue — two files of
+    /// one length modified in the same millisecond — is what this cannot see,
+    /// and hashing a file the panel deliberately does not read whole is the only
+    /// alternative.
+    #[test]
+    fn a_missing_timestamp_is_answered_by_the_length_alone() {
+        assert!(probe_still_describes(stamp(120, None), stamp(120, Some(5))));
+        assert!(probe_still_describes(stamp(120, Some(5)), stamp(120, None)));
+        assert!(!probe_still_describes(stamp(120, None), stamp(121, None)));
+    }
+
+    /// The default stamp means "nothing was learned", which has to *accept* —
+    /// it is what a probe whose metadata could not be read produces, and a file
+    /// nobody could stat is not a file that changed.
+    #[test]
+    fn an_unknown_stamp_on_either_side_accepts() {
+        assert!(probe_still_describes(
+            FileStamp::default(),
+            stamp(120, Some(5))
+        ));
+        assert!(probe_still_describes(
+            stamp(120, Some(5)),
+            FileStamp::default()
+        ));
+    }
 
     /// Every construct that can hide a `;` from a naive split, plus a
     /// `DELIMITER` block in the shape our own dump writes.
