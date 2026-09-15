@@ -1627,7 +1627,31 @@ pub(crate) async fn run_ddl(
     }
     let conn = tokio::task::block_in_place(|| open(db)).map_err(|e| fail(0, format!("{e}")))?;
 
-    tokio::task::block_in_place(|| {
+    // **Stop reaches a statement already running.** The preview offers Stop for
+    // SQLite — `ddl_rolls_back_as_a_whole(Sqlite)` is true, so the footer's only
+    // enabled button is a red *Stop* and Escape maps to it — and this function
+    // consulted the token only *between* statements. A rebuild's copy step is
+    // `INSERT INTO t_schemaic_rebuild (…) SELECT … FROM t`, one statement over
+    // the whole table, so on a multi-million-row table the modal could not be
+    // closed and its backdrop covered the workspace for the length of the copy,
+    // with the button still reading "Stop". That is the shape `2ac97d5` set out
+    // to remove, and SQLite was the leg left in it: MySQL's arm wraps each
+    // statement in a `select!` with `kill_query`, PostgreSQL's with
+    // `cancel.cancelled()`.
+    //
+    // Same shape as [`run_script`] a hundred lines above, and simpler because
+    // the connection is already open here: the handle is taken before the
+    // blocking section rather than handed out of it. `get_interrupt_handle` is
+    // the direct analogue of `KILL QUERY` and needs no second connection.
+    let watcher = {
+        let (cancel, handle) = (cancel.clone(), conn.get_interrupt_handle());
+        tokio::spawn(async move {
+            cancel.cancelled().await;
+            handle.interrupt();
+        })
+    };
+
+    let out = tokio::task::block_in_place(|| {
         if cancel.is_cancelled() {
             return Err(fail(0, "the plan was cancelled".into()));
         }
@@ -1693,8 +1717,17 @@ pub(crate) async fn run_ddl(
                 if cancel.is_cancelled() {
                     return Err(fail(i, "the plan was cancelled".into()));
                 }
-                conn.execute_batch(sql)
-                    .map_err(|e| fail(i, format!("{e}")))?;
+                conn.execute_batch(sql).map_err(|e| {
+                    // An interrupt surfaces as an ordinary error, so the token
+                    // is what tells the two apart — reporting `SQLITE_INTERRUPT`
+                    // as a failure would name the user's own Stop as a fault in
+                    // the plan. `run_script`'s arm models the same thing.
+                    if cancel.is_cancelled() {
+                        fail(i, "the plan was cancelled".into())
+                    } else {
+                        fail(i, format!("{e}"))
+                    }
+                })?;
             }
             // The last statement's index, so a violation is reported against the
             // plan rather than against nothing.
@@ -1740,7 +1773,11 @@ pub(crate) async fn run_ddl(
                 }
             }
         }
-    })
+    });
+    // A plan that finished normally leaves the watcher parked on a token that
+    // will never trip — `run_script`'s reason, verbatim.
+    watcher.abort();
+    out
 }
 
 /// Every view in the database that does not currently resolve, by name.
@@ -9437,6 +9474,65 @@ mod rebuild_fk_tests {
             .query_row("SELECT count(*) FROM artist", [], |r| r.get(0))
             .unwrap();
         assert_eq!(artists, 1, "and it rolled back");
+    }
+
+    /// **Stop has to reach a statement that is already running.** The preview
+    /// offers it for SQLite — `ddl_rolls_back_as_a_whole(Sqlite)` is true, so the
+    /// footer's only enabled button is a red *Stop* and Escape maps to it — and
+    /// `run_ddl` consulted the token only *between* statements. A rebuild's copy
+    /// step is one `INSERT … SELECT` over the whole table, so on a large table
+    /// the modal could not be closed and its backdrop covered the workspace for
+    /// the length of the copy, with the button still reading "Stop".
+    ///
+    /// Driven by a recursive CTE rather than by a large table: it is the same
+    /// question — one statement that runs long — without minutes of fixture.
+    /// The bound is what is asserted, not the exact timing: without the
+    /// interrupt handle this does not return until the CTE finishes counting to
+    /// fifty million, which is far outside it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_stopped_plan_interrupts_the_statement_rather_than_waiting_for_it() {
+        let (keeper, db) = shared_memory("ddl_interrupt");
+        keeper.execute_batch("CREATE TABLE t (n INTEGER)").unwrap();
+        let cancel = CancellationToken::new();
+        let stopper = {
+            let cancel = cancel.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                cancel.cancel();
+            })
+        };
+        let started = std::time::Instant::now();
+        let err = db
+            .run_ddl(
+                MAIN,
+                &["INSERT INTO t (n) WITH RECURSIVE c(i) AS \
+                   (SELECT 1 UNION ALL SELECT i + 1 FROM c WHERE i < 50000000) \
+                   SELECT i FROM c"
+                    .to_string()],
+                cancel,
+            )
+            .await
+            .expect_err("a cancelled plan must not report success");
+        let took = started.elapsed();
+        let _ = stopper.await;
+
+        assert!(
+            took < std::time::Duration::from_secs(20),
+            "Stop did not reach the running statement — it took {took:?}"
+        );
+        // And the interrupt is reported as the user's own Stop, not as a fault
+        // in the plan: `SQLITE_INTERRUPT` arrives as an ordinary error, so the
+        // token is the only thing that tells the two apart.
+        assert!(
+            err.message.contains("cancelled"),
+            "the interrupt was reported as a failure: {}",
+            err.message
+        );
+        // Rolled back whole, which is what this engine's arm promises.
+        let rows: i64 = keeper
+            .query_row("SELECT count(*) FROM t", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rows, 0, "a cancelled plan left rows behind");
     }
 
     /// **The same cascade, on the path that has no `run_ddl` around it.** The
