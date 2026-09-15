@@ -3243,6 +3243,13 @@ fn table_foreign_keys(conn: &SqliteConn, table: &str) -> Result<Vec<ForeignKeyIn
                 ref_columns: Vec::new(),
                 on_delete: action_of(&on_delete),
                 on_update: action_of(&on_update),
+                // SQLite has no `MATCH` clause it honours and `pragma
+                // foreign_key_list` reports no deferrability, so the model says
+                // nothing rather than guessing. A key declared `DEFERRABLE` is
+                // still refused a rebuild by `ddl::unrestatable_sqlite_clauses`,
+                // which reads the declaration text — the one place that can see
+                // it.
+                ..Default::default()
             });
         }
         let fk = out.last_mut().expect("just pushed");

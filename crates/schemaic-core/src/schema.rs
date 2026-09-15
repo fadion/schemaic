@@ -375,6 +375,32 @@ pub struct ForeignKeyInfo {
     pub on_delete: Option<String>,
     /// `ON UPDATE` action, same rule as [`ForeignKeyInfo::on_delete`].
     pub on_update: Option<String>,
+    /// PostgreSQL's `MATCH FULL` / `MATCH PARTIAL`. `None` is `MATCH SIMPLE`,
+    /// the unwritten default, so an untouched key round-trips exactly.
+    ///
+    /// The difference between refusing and accepting a **partially NULL**
+    /// composite key: under `SIMPLE` a row with any NULL in the key passes the
+    /// constraint, under `FULL` only an all-NULL one does. Recreating a `FULL`
+    /// key as `SIMPLE` widens what the table accepts, and says nothing.
+    ///
+    /// MySQL parses `MATCH` and ignores it; SQLite has no such clause. `None` on
+    /// both.
+    pub match_type: Option<String>,
+    /// PostgreSQL's `DEFERRABLE INITIALLY DEFERRED` / `DEFERRABLE INITIALLY
+    /// IMMEDIATE`, written whole. `None` is `NOT DEFERRABLE`, the default.
+    ///
+    /// **This one changes what an application can do.** `DEFERRABLE INITIALLY
+    /// DEFERRED` is what lets a transaction insert children before parents and
+    /// have the key checked at commit; a copy restored without it refuses those
+    /// inserts at statement time, so the application fails against a database
+    /// that "restored fine".
+    ///
+    /// That it matters is already settled here: `ddl::unrestatable_sqlite_clauses`
+    /// names *"a foreign key's DEFERRABLE clause"* and withholds the SQLite
+    /// rebuild rather than drop it. The same attribute was a refusal on one
+    /// engine and a silent drop on another, because the model had no field for
+    /// either side to read.
+    pub deferrable: Option<String>,
 }
 
 /// Backtick-quote a SQL identifier, doubling any embedded backtick.

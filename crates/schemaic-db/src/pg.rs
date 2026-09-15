@@ -1939,7 +1939,8 @@ async fn collect_schema(client: &Client) -> Result<DbSchema, DbError> {
         &format!(
             "SELECT n.nspname, c.relname, con.conname, a.attname, \
                     rn.nspname, rc.relname, ra.attname, \
-                    con.confdeltype, con.confupdtype \
+                    con.confdeltype, con.confupdtype, \
+                    con.confmatchtype, con.condeferrable, con.condeferred \
              FROM pg_constraint con \
              JOIN pg_class c ON c.oid = con.conrelid \
              JOIN pg_namespace n ON n.oid = c.relnamespace \
@@ -1976,8 +1977,23 @@ async fn collect_schema(client: &Client) -> Result<DbSchema, DbError> {
     // Referential actions, per constraint. A key that isn't restated with its
     // `ON DELETE CASCADE` comes back as `NO ACTION`, so a schema editor that
     // drops and recreates one has to know it.
-    // `(namespace, table, constraint, on_delete, on_update)`.
-    type FkRule = (String, String, String, Option<String>, Option<String>);
+    // `(namespace, table, constraint, on_delete, on_update, match, deferrable)`.
+    //
+    // **`MATCH` and `DEFERRABLE` are here for the same reason the actions are.**
+    // A key not restated with its clause comes back `MATCH SIMPLE NOT
+    // DEFERRABLE`: the first widens what the table accepts for a partially-NULL
+    // composite key, and the second turns a constraint an application relies on
+    // deferring into one checked at statement time, so a restored copy refuses
+    // inserts the original accepted.
+    type FkRule = (
+        String,
+        String,
+        String,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    );
     let fk_rules: Vec<FkRule> = fk_all
         .iter()
         .map(|r| {
@@ -1987,6 +2003,8 @@ async fn collect_schema(client: &Client) -> Result<DbSchema, DbError> {
                 cell(r, 2),
                 fk_action(&cell(r, 7)),
                 fk_action(&cell(r, 8)),
+                fk_match(&cell(r, 9)),
+                fk_deferrable(&cell(r, 10), &cell(r, 11)),
             )
         })
         .collect();
@@ -2282,13 +2300,15 @@ ALTER TABLE {}.{} {clause} {};",
                 .get(&(ns.clone(), t.name.clone(), ix.name.clone()))
                 .cloned();
         }
-        for (rns, rtable, rname, on_delete, on_update) in &fk_rules {
+        for (rns, rtable, rname, on_delete, on_update, match_type, deferrable) in &fk_rules {
             if *rns == ns
                 && *rtable == t.name
                 && let Some(fk) = t.foreign_keys.iter_mut().find(|f| f.name == *rname)
             {
                 fk.on_delete = on_delete.clone();
                 fk.on_update = on_update.clone();
+                fk.match_type = match_type.clone();
+                fk.deferrable = deferrable.clone();
             }
         }
     }
@@ -3202,6 +3222,39 @@ fn fk_action(code: &str) -> Option<String> {
         "d" => Some("SET DEFAULT".to_string()),
         _ => None,
     }
+}
+
+/// `pg_constraint.confmatchtype` as the clause, or `None` for the default.
+///
+/// `s` is `MATCH SIMPLE`, which every server leaves unwritten — so `None` is
+/// what makes an untouched key round-trip exactly, the same rule
+/// [`fk_action`] follows for `NO ACTION`.
+fn fk_match(code: &str) -> Option<String> {
+    match code {
+        "f" => Some("FULL".to_string()),
+        "p" => Some("PARTIAL".to_string()),
+        _ => None,
+    }
+}
+
+/// `condeferrable`/`condeferred` as the whole clause, or `None` for
+/// `NOT DEFERRABLE`.
+///
+/// Two booleans, one clause: a constraint is deferrable or it is not, and a
+/// deferrable one is *initially* deferred or immediate. `condeferred` without
+/// `condeferrable` cannot happen — the server rejects it — and is read as the
+/// default rather than invented into a clause.
+///
+/// The text protocol spells a boolean `t`/`f`.
+fn fk_deferrable(deferrable: &str, deferred: &str) -> Option<String> {
+    if deferrable != "t" {
+        return None;
+    }
+    Some(if deferred == "t" {
+        "DEFERRABLE INITIALLY DEFERRED".to_string()
+    } else {
+        "DEFERRABLE INITIALLY IMMEDIATE".to_string()
+    })
 }
 
 /// Run a read-only SELECT and return every row as a `Vec<Option<String>>` (one

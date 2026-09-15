@@ -2791,6 +2791,32 @@ mod tests {
         assert!(text.contains("ADD CONSTRAINT"));
     }
 
+    /// **And it is restated whole.** The FK section is where a PostgreSQL dump
+    /// puts every key, so it is the path that decided whether a restored copy
+    /// behaves like the original. A key declared
+    /// `MATCH FULL DEFERRABLE INITIALLY DEFERRED` came back
+    /// `MATCH SIMPLE NOT DEFERRABLE`: the first widens what the table accepts
+    /// for a partially-NULL composite key, and the second turns a constraint the
+    /// application relies on deferring into one checked at statement time — so
+    /// inserts the original accepted are refused by a database that "restored
+    /// fine".
+    #[test]
+    fn a_restored_foreign_key_keeps_its_match_and_deferrable_clauses() {
+        let mut orders = refs(table("orders"), "customers");
+        orders.foreign_keys[0].match_type = Some("FULL".to_string());
+        orders.foreign_keys[0].deferrable = Some("DEFERRABLE INITIALLY DEFERRED".to_string());
+        let s = schema_of(vec![orders, table("customers")]);
+        let text = text_of(&plan(
+            &s,
+            "shop",
+            &all(&s),
+            DumpOptions::default(),
+            SqlDialect::Postgres,
+        ));
+        assert!(text.contains("MATCH FULL"), "{text}");
+        assert!(text.contains("DEFERRABLE INITIALLY DEFERRED"), "{text}");
+    }
+
     #[test]
     fn a_sequence_owned_by_a_same_named_table_in_another_namespace_is_kept() {
         // The owner check has to compare `(namespace, name)`: `sales.orders` owns

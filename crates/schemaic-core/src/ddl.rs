@@ -5773,6 +5773,12 @@ fn fk_clause(fk: &ForeignKeyInfo, dialect: SqlDialect) -> String {
         cols(&fk.columns),
         cols(&fk.ref_columns)
     );
+    // **`MATCH` comes before the actions**, which is the grammar's order on
+    // PostgreSQL and not a preference. `None` is `MATCH SIMPLE`, the unwritten
+    // default, so an untouched key round-trips exactly.
+    if let Some(m) = &fk.match_type {
+        out.push_str(&format!(" MATCH {m}"));
+    }
     // `NO ACTION` is the unwritten default on both engines, so `None` emits
     // nothing and an untouched key round-trips exactly.
     if let Some(a) = &fk.on_delete {
@@ -5780,6 +5786,14 @@ fn fk_clause(fk: &ForeignKeyInfo, dialect: SqlDialect) -> String {
     }
     if let Some(a) = &fk.on_update {
         out.push_str(&format!(" ON UPDATE {a}"));
+    }
+    // **And `DEFERRABLE` last**, also the grammar's order. Dropping it turned a
+    // key an application relies on deferring into one checked at statement time,
+    // so a restored copy refused inserts the original accepted — the failure
+    // `unrestatable_sqlite_clauses` already refuses to let a SQLite rebuild
+    // cause, while every PostgreSQL recreate path caused it silently.
+    if let Some(d) = &fk.deferrable {
+        out.push_str(&format!(" {d}"));
     }
     out
 }
@@ -11506,6 +11520,57 @@ mod tests {
         );
     }
 
+    /// **A PostgreSQL key keeps `MATCH` and `DEFERRABLE` too**, which the model
+    /// could not carry at all. Every recreate path goes through `fk_clause` —
+    /// `diff`'s drop-and-add pair, `move_references` on a column rename,
+    /// `dump::plan`'s FK section, `compare`'s migration — so a key declared
+    /// `MATCH FULL DEFERRABLE INITIALLY DEFERRED` came back
+    /// `MATCH SIMPLE NOT DEFERRABLE`, with nothing in the preview, the change
+    /// list or the restore saying so.
+    ///
+    /// The second clause is the one that changes what an application can do: it
+    /// is what lets a transaction insert children before parents and have the
+    /// key checked at commit. A restored copy without it refuses those inserts
+    /// at statement time — against a database that "restored fine".
+    ///
+    /// That this matters was already settled here:
+    /// `unrestatable_sqlite_clauses` names "a foreign key's DEFERRABLE clause"
+    /// and withholds the SQLite rebuild rather than drop it. The same attribute
+    /// was a refusal on one engine and a silent drop on another.
+    #[test]
+    fn a_postgres_foreign_key_keeps_its_match_and_deferrable_clauses() {
+        let mut t = users();
+        t.foreign_keys[0].match_type = Some("FULL".into());
+        t.foreign_keys[0].deferrable = Some("DEFERRABLE INITIALLY DEFERRED".into());
+        let mut draft = TableDraft::from_table(&t);
+        draft.foreign_keys[0].info.ref_columns = vec!["id".into()];
+        let sql = diff(&t, &draft, Postgres).editor_script();
+        // The grammar's order: MATCH, then the actions, then DEFERRABLE.
+        assert!(
+            sql.contains(
+                "FOREIGN KEY (\"status\") REFERENCES \"statuses\" (\"id\") \
+                 MATCH FULL ON DELETE CASCADE DEFERRABLE INITIALLY DEFERRED"
+            ),
+            "{sql}"
+        );
+    }
+
+    /// And a key that carries neither is emitted exactly as before — `None` is
+    /// `MATCH SIMPLE NOT DEFERRABLE`, which every server leaves unwritten, so an
+    /// untouched key still round-trips without gaining a clause the user never
+    /// typed.
+    #[test]
+    fn an_ordinary_foreign_key_gains_no_match_or_deferrable_clause() {
+        let t = users();
+        let mut draft = TableDraft::from_table(&t);
+        draft.foreign_keys[0].info.ref_columns = vec!["id".into()];
+        for d in [MySql, Postgres] {
+            let sql = diff(&t, &draft, d).editor_script();
+            assert!(!sql.contains("MATCH"), "{d:?}: {sql}");
+            assert!(!sql.contains("DEFERRABLE"), "{d:?}: {sql}");
+        }
+    }
+
     #[test]
     fn renaming_the_table_runs_last_and_under_the_old_name() {
         let t = users();
@@ -12796,6 +12861,7 @@ mod tests {
                 ref_columns: vec!["id".into()],
                 on_delete: None,
                 on_update: None,
+                ..Default::default()
             })
         };
         d.foreign_keys = vec![

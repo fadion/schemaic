@@ -564,6 +564,10 @@ fn apply_op(
                     ref_columns: fk.ref_columns.clone(),
                     on_delete: fk.on_delete.clone(),
                     on_update: fk.on_update.clone(),
+                    // The assistant's grammar has no `MATCH`/`DEFERRABLE`, so a
+                    // proposed key takes the server's defaults rather than
+                    // inventing a clause the user never asked for.
+                    ..Default::default()
                 }));
         }
         ProposedOp::DropForeignKey { name } => {
