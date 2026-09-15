@@ -251,10 +251,6 @@ pub fn rank(schema: &SchemaIndex, input: &RankInput<'_>) -> Vec<Suggestion> {
                    table: &str,
                    alias: Option<&str>,
                    tier: u8| {
-        let tl = c.name.to_ascii_lowercase();
-        if tl == pl || !seen.insert(tl) {
-            return;
-        }
         // **Ask the question that decides it before paying for the answer.**
         // Every `Cand` costs four fresh `String`s, and the ranking below drops any
         // candidate `fuzzy_score` refuses — so building one for a column that
@@ -262,10 +258,24 @@ pub fn rank(schema: &SchemaIndex, input: &RankInput<'_>) -> Vec<Suggestion> {
         // the database* on every keystroke. Same predicate, same argument
         // (`Cand::text` is `c.name`), so nothing that would have been offered stops
         // being offered; an empty prefix still matches everything, which is the
-        // case that keeps the no-FROM list complete. The dedup above stays where it
-        // is: skipping it here would let a same-named column from a later table
-        // take the slot.
+        // case that keeps the no-FROM list complete.
+        //
+        // **And it goes first, above the dedup.** It sat below, on the grounds
+        // that "skipping the dedup here would let a same-named column from a
+        // later table take the slot" — which cannot happen: `worth_offering` is
+        // `fuzzy_score(name, prefix).is_some()` and depends on nothing but the
+        // name, so two candidates sharing a lowercase name share a verdict. A
+        // column this refuses can only block candidates this would refuse too,
+        // and the `filter_map` below drops every one of them anyway. So the
+        // `seen` claim it was making was inert, while the lowercase `String` and
+        // the `HashSet` insert it exists to avoid were paid on every column —
+        // 12,500 of each per keystroke at the 500 × 25 scale this pre-filter was
+        // measured at, on a path that runs undebounced.
         if !worth_offering(&c.name, prefix) {
+            return;
+        }
+        let tl = c.name.to_ascii_lowercase();
+        if tl == pl || !seen.insert(tl) {
             return;
         }
         let key = if c.primary_key {
@@ -981,6 +991,53 @@ mod tests {
         let email = out.iter().find(|s| s.text == "email").expect("offered");
         assert_eq!(email.table, "customers", "annotated by its owner");
         assert_eq!(email.alias, "", "there is no alias without a FROM");
+    }
+
+    /// **The dedup's output does not depend on which side of it the pre-filter
+    /// sits.** `add_col` paid the lowercase `String` and the `HashSet` insert
+    /// *before* asking `worth_offering`, on the grounds that the dedup had to go
+    /// first or "a same-named column from a later table would take the slot".
+    /// The hoist rests on that being false: `worth_offering` depends on nothing
+    /// but the name, so two candidates sharing a lowercase name share a verdict,
+    /// and a refused column can only block columns that would also be refused.
+    ///
+    /// `shop` has an `id` in both tables, which is the case the old comment was
+    /// about. Green before and after the reorder by design — that is the point
+    /// of it, and it is said here rather than implied.
+    #[test]
+    fn a_column_two_tables_share_is_annotated_by_the_first_of_them_either_way() {
+        let s = shop();
+        let cont = Continuation::default();
+        let used = HashSet::new();
+        let ranked = |prefix: &str| {
+            rank(
+                &s,
+                &RankInput {
+                    ctx: &ClauseCtx::Column,
+                    cont: &cont,
+                    scope: &[],
+                    prefix,
+                    snippets: &[],
+                    join_targets: &[],
+                    star: None,
+                    used: &used,
+                    active_db: Some("shop"),
+                },
+            )
+        };
+        // Offered once, from the table the walk reaches first. Not the prefix
+        // `id` itself: a candidate equal to the prefix is dropped by the
+        // `tl == pl` arm, which the hoist leaves exactly where it was.
+        let out = ranked("i");
+        let ids: Vec<&str> = out
+            .iter()
+            .filter(|s| s.text == "id")
+            .map(|s| s.table.as_str())
+            .collect();
+        assert_eq!(ids, ["orders"], "{out:?}");
+        // And a prefix that matches neither copy offers neither, rather than one
+        // copy consuming the slot and the other being dropped later.
+        assert!(ranked("zqx").iter().all(|s| s.text != "id"));
     }
 
     /// **A predicted keyword demotes the table list.** With a complete table

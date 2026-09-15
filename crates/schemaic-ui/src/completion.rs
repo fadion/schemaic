@@ -241,8 +241,15 @@ pub(crate) fn build_catalog(
 /// which is the rule `SchemaIndex::build` has always followed and these three
 /// surfaces did not.
 ///
-/// Shares [`CATALOG`]'s cache: the filtered `loaded` list is a different key, so
-/// the two views coexist without a second cache or a second walk.
+/// Shares [`CATALOG`]'s cache, which keeps **two** slots for exactly this: the
+/// filtered `loaded` list is a different key from the unfiltered one
+/// diagnostics pass, and the two callers alternate. A different key is what
+/// makes two views *coexist* only in a cache with room for both — this line
+/// claimed it of a single-entry one, which serves an alternation at a 0% hit
+/// rate, so with any database hidden every keystroke paid a full
+/// `Catalog::build` and the debounced diagnostics paid a second. Invisible
+/// until a database is hidden, since an empty hidden set makes the two lists
+/// byte-identical. See [`intel::CatalogCache`].
 pub(crate) fn build_offer_catalog(
     db_nodes: RwSignal<Vec<ConnNode>>,
     hidden: &HashSet<String>,
