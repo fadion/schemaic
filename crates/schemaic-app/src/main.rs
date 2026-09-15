@@ -10144,6 +10144,29 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
         let persist_chat = persist_chat.clone();
         create_effect(move |_| {
             if let Some(msg) = ai_stream.get() {
+                // **Whose snapshot is this?** Every one was applied blindly to
+                // `v.last_mut()`. Switching connections mid-turn drops the
+                // session and restores the new connection's transcript, but the
+                // session task is then parked in a `tokio::select!` with both
+                // arms ready — `rx.recv()` yielding `None` and the reader
+                // yielding what the child wrote in between — and `select!`
+                // without `biased;` picks at random. When the reader won,
+                // connection B's last answer was replaced by A's partial text
+                // and marked `pending`, so the bubble spun for the rest of the
+                // session (`ai_busy` was already false and no further snapshot
+                // was coming) and the corrupted message rode B's next
+                // `persist_chat` into `chats.json`.
+                //
+                // `8431fb8`'s `abandoned` flag closed that turn's *terminal*
+                // snapshot and left the streaming ones. The id closes the class:
+                // no live session, or a different one, means nobody is waiting
+                // for this.
+                if !ai::snapshot_is_current(
+                    ai_session.borrow().as_ref().map(|s| s.session_id),
+                    msg.session,
+                ) {
+                    return;
+                }
                 ai_messages.update(|v| {
                     if let Some(last) = v.last_mut() {
                         last.segs = msg.segs;
@@ -10285,6 +10308,11 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                     // here is the ordering half, and the two together are the
                     // fix.
                     ai_session.borrow_mut().take();
+                    // Minted here because this is what holds it: the consumer
+                    // compares every snapshot against the live session's id, so
+                    // a snapshot from a session the user has left is discarded
+                    // rather than applied to whatever transcript replaced it.
+                    let session_id = ai::next_session_id();
                     let (stdin_tx, private) = start_ai_session(
                         &handle,
                         StartAiParams {
@@ -10303,10 +10331,12 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                             // the next one — the same as the schema outline.
                             hidden: hidden_dbs.get_untracked(),
                             schema_scope: scope_now,
+                            session: session_id,
                         },
                     );
                     *ai_session.borrow_mut() = Some(AiSession {
                         conn_id: active_id,
+                        session_id,
                         stdin_tx,
                         private,
                         settings: ai_settings_now(),

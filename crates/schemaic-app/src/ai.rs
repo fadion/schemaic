@@ -83,6 +83,9 @@ pub(crate) fn ai_allowed_tools(may_query: bool, schema: bool) -> Vec<&'static st
 /// kills the child; the temp MCP-config file (if any) is removed on drop too.
 pub(crate) struct AiSession {
     pub(crate) conn_id: u64,
+    /// This session's id — what every [`AiStreamMsg`] it produces is stamped
+    /// with, and what the panel's consumer compares against before applying one.
+    pub(crate) session_id: u64,
     pub(crate) stdin_tx: tokio::sync::mpsc::UnboundedSender<SessionMsg>,
     /// Everything this session put on disk — the endpoint file carrying the
     /// database password, the MCP config that holds it, the working directory
@@ -1095,6 +1098,48 @@ pub(crate) struct AiStreamMsg {
     pub(crate) is_error: bool,
     /// Cost/usage summary; only populated on the final (done) snapshot.
     pub(crate) stats: Option<schemaic_core::transcript::TurnStats>,
+    /// Which session produced this snapshot — see [`next_session_id`].
+    ///
+    /// **The consumer applied every snapshot blindly to `v.last_mut()`.**
+    /// Switching connections mid-turn drops the session (closing `rx`) and
+    /// replaces the transcript with the new connection's; the session task is
+    /// then parked in a `tokio::select!` with **both** arms ready — `rx.recv()`
+    /// yielding `None` and the reader yielding whatever the child wrote in the
+    /// meantime — and `select!` without `biased;` picks at random. When the
+    /// reader arm won, connection B's last answer was replaced by A's partial
+    /// text and marked `pending`, so the bubble spun for the rest of the session
+    /// (`ai_busy` was already false, and no further snapshot was coming) and the
+    /// corrupted message rode B's next `persist_chat` into `chats.json`.
+    ///
+    /// `8431fb8` closed the *terminal* snapshot of that turn with its
+    /// `abandoned` flag and left the streaming ones. An id closes the class
+    /// rather than the instance: `biased;` would only narrow the window, since a
+    /// line already decoded before the drop is still in flight.
+    pub(crate) session: u64,
+}
+
+/// Does this snapshot belong to the session the panel is showing?
+///
+/// `live` is the id of the session in `ai_session`, or `None` when there is
+/// none — a connection switch takes it before the transcript is replaced, and a
+/// snapshot arriving after that belongs to nobody.
+///
+/// Its own function so the decision is testable: the *race* has no unit seam
+/// (it is an unbiased `tokio::select!` between a closed channel and a child's
+/// stdout), which is why the sibling guard `8431fb8` added is a source check.
+pub(crate) fn snapshot_is_current(live: Option<u64>, msg: u64) -> bool {
+    live == Some(msg)
+}
+
+/// Mint an id for a new AI session.
+///
+/// Process-wide and monotonic, so an id is never reused — which is what a
+/// `conn_id` could not promise here, since switching away and back gives the
+/// same connection a *different* session and the stale snapshots of the first
+/// would still match.
+pub(crate) fn next_session_id() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Spawn a persistent streaming `claude` session for a connection. Returns the
@@ -1122,6 +1167,11 @@ pub(crate) struct StartAiParams {
     /// `None` the prompt describes no database, and the tools must not offer
     /// the model a way to fetch the whole catalogue anyway.
     pub schema_scope: SchemaScope,
+    /// This session's id, stamped onto every snapshot it sends — see
+    /// [`AiStreamMsg::session`]. Minted by the caller with
+    /// [`next_session_id`], because the caller is what holds it in
+    /// [`AiSession`] and has to compare against it.
+    pub session: u64,
 }
 
 /// Folds decoded events into a turn and pushes snapshots to the panel.
@@ -1136,13 +1186,18 @@ pub(crate) struct StartAiParams {
 struct TurnPump {
     turn: schemaic_ai::TurnState,
     ai_tx: crossbeam_channel::Sender<AiStreamMsg>,
+    /// Stamped onto every snapshot this pump sends, so the consumer can tell a
+    /// snapshot from the session it is showing from one belonging to a session
+    /// the user has left. See [`AiStreamMsg::session`].
+    session: u64,
 }
 
 impl TurnPump {
-    fn new(ai_tx: crossbeam_channel::Sender<AiStreamMsg>) -> Self {
+    fn new(ai_tx: crossbeam_channel::Sender<AiStreamMsg>, session: u64) -> Self {
         Self {
             turn: schemaic_ai::TurnState::default(),
             ai_tx,
+            session,
         }
     }
 
@@ -1173,6 +1228,7 @@ impl TurnPump {
                     done: true,
                     is_error,
                     stats: (!stats.is_empty()).then_some(stats),
+                    session: self.session,
                 });
                 self.turn = schemaic_ai::TurnState::default();
                 true
@@ -1184,6 +1240,7 @@ impl TurnPump {
                         done: false,
                         is_error: false,
                         stats: None,
+                        session: self.session,
                     });
                 }
                 false
@@ -1214,6 +1271,7 @@ impl TurnPump {
             done: false,
             is_error: false,
             stats: None,
+            session: self.session,
         });
     }
 
@@ -1255,6 +1313,7 @@ impl TurnPump {
             done: true,
             is_error: true,
             stats: None,
+            session: self.session,
         });
         self.turn = schemaic_ai::TurnState::default();
     }
@@ -1279,6 +1338,7 @@ fn refuse_every_turn(
     mut rx: tokio::sync::mpsc::UnboundedReceiver<SessionMsg>,
     ai_tx: crossbeam_channel::Sender<AiStreamMsg>,
     why: String,
+    session: u64,
 ) {
     handle.spawn(async move {
         while let Some(msg) = rx.recv().await {
@@ -1291,6 +1351,7 @@ fn refuse_every_turn(
                 done: true,
                 is_error: true,
                 stats: None,
+                session,
             });
         }
     });
@@ -1393,6 +1454,7 @@ pub(crate) fn start_ai_session(
         cli_path,
         hidden,
         schema_scope,
+        session,
     } = p;
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<SessionMsg>();
 
@@ -1410,12 +1472,13 @@ pub(crate) fn start_ai_session(
             done: true,
             is_error: true,
             stats: None,
+            session,
         });
         // **A task, not a bare sender.** Returning `tx` with nothing behind it
         // closes the channel, and `needs_respawn` will not rebuild a session
         // whose settings have not changed — so the *second* question was
         // swallowed in silence and the panel spun. See `refuse_every_turn`.
-        refuse_every_turn(handle, rx, ai_tx, why);
+        refuse_every_turn(handle, rx, ai_tx, why, session);
         return (tx, SessionPrivate::default());
     }
 
@@ -1433,8 +1496,9 @@ pub(crate) fn start_ai_session(
             done: true,
             is_error: true,
             stats: None,
+            session,
         });
-        refuse_every_turn(handle, rx, ai_tx, why);
+        refuse_every_turn(handle, rx, ai_tx, why, session);
         return (tx, SessionPrivate::default());
     };
 
@@ -1544,11 +1608,12 @@ pub(crate) fn start_ai_session(
                     done: true,
                     is_error: true,
                     stats: None,
+                    session,
                 });
                 // Same reason as the constraint refusal above: without a task
                 // holding `rx`, every question after this one is dropped in
                 // silence rather than told why.
-                refuse_every_turn(handle, rx, ai_tx, why);
+                refuse_every_turn(handle, rx, ai_tx, why, session);
                 return (tx, private);
             }
             _ => {}
@@ -1566,7 +1631,7 @@ pub(crate) fn start_ai_session(
             // flag — is spawned once per conversation now, so its
             // `AgyRegistration` lives with the persistent task instead. Codex
             // and OpenCode are configured entirely per invocation.
-            let mut pump = TurnPump::new(ai_tx);
+            let mut pump = TurnPump::new(ai_tx, session);
             if let Some(why) = degraded {
                 pump.note(why);
             }
@@ -1866,6 +1931,7 @@ pub(crate) fn start_ai_session(
             done: true,
             is_error: true,
             stats: None,
+            session,
         });
         // **The third non-spawning return, and the one that was left behind.**
         // The comment that used to stand here — "the next question re-enters
@@ -1874,7 +1940,7 @@ pub(crate) fn start_ai_session(
         // this return, `needs_respawn` does not rebuild a session whose settings
         // have not changed, so every later question was a discarded `Err` and
         // the bubble spun with nothing said.
-        refuse_every_turn(handle, rx, ai_tx, why);
+        refuse_every_turn(handle, rx, ai_tx, why, session);
         return (tx, private);
     }
 
@@ -1958,6 +2024,7 @@ pub(crate) fn start_ai_session(
                     done: true,
                     is_error: true,
                     stats: None,
+                    session,
                 });
                 return;
             }
@@ -1965,7 +2032,7 @@ pub(crate) fn start_ai_session(
         let mut stdin = child.stdin.take().expect("stdin piped");
         let mut reader = BufReader::new(child.stdout.take().expect("stdout piped")).lines();
         // The same accumulator the process-per-turn tasks use — see `TurnPump`.
-        let mut pump = TurnPump::new(ai_tx.clone());
+        let mut pump = TurnPump::new(ai_tx.clone(), session);
         if let Some(why) = degraded {
             pump.note(why);
         }
@@ -2069,6 +2136,7 @@ pub(crate) fn start_ai_session(
                                     rx,
                                     ai_tx.clone(),
                                     why,
+                                    session,
                                 );
                                 return;
                             }
@@ -2113,6 +2181,7 @@ pub(crate) fn start_ai_session(
                                 rx,
                                 ai_tx.clone(),
                                 why,
+                                session,
                             );
                             return;
                         }
@@ -2202,6 +2271,7 @@ pub(crate) fn start_ai_session(
                             rx,
                             ai_tx.clone(),
                             why,
+                            session,
                         );
                         return;
                     }
@@ -3222,7 +3292,7 @@ mod session_tests {
 
     fn pump() -> (TurnPump, crossbeam_channel::Receiver<AiStreamMsg>) {
         let (tx, rx) = crossbeam_channel::unbounded();
-        (TurnPump::new(tx), rx)
+        (TurnPump::new(tx, 1), rx)
     }
 
     fn text_of(m: &AiStreamMsg) -> String {
@@ -3375,7 +3445,7 @@ mod session_tests {
         let rt = rt();
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<SessionMsg>();
         let (ai_tx, ai_rx) = crossbeam_channel::unbounded();
-        refuse_every_turn(rt.handle(), rx, ai_tx, "the reason".to_string());
+        refuse_every_turn(rt.handle(), rx, ai_tx, "the reason".to_string(), 1);
 
         for n in 1..=3 {
             assert!(
@@ -3578,6 +3648,60 @@ mod tests {
             "the persistent branch's dropped-session arm has changed shape — \
              the two must stay in agreement"
         );
+    }
+
+    /// **The `abandoned` flag covers only the turn's *final* snapshot.**
+    /// Nothing gated the streaming ones: the session task parks in a
+    /// `tokio::select!` whose two arms — a closed `rx` and the child's stdout —
+    /// are both ready after a connection switch, and without `biased;` tokio
+    /// picks at random. When the reader arm won, `pump.push` sent a snapshot the
+    /// consumer applied blindly to `v.last_mut()`, so connection B's last answer
+    /// was replaced by A's partial text, marked `pending` forever, and written
+    /// into `chats.json` by B's next `persist_chat`.
+    ///
+    /// The test the sibling fix shipped with asserts the `None` arm's shape and
+    /// that `abandoned` is named — both true of the partial fix. This asserts
+    /// the property instead: the consumer checks the session before it touches
+    /// the transcript.
+    ///
+    /// **That every snapshot carries the id is the compiler's job, not this
+    /// test's.** `session` is a field of `AiStreamMsg`, so a send that omits it
+    /// does not build — which is a stronger guarantee than a source scan and is
+    /// why there is no scan here. What the compiler cannot check is *where* the
+    /// consumer asks, and asking after the write is the whole defect.
+    #[test]
+    fn the_consumer_checks_whose_snapshot_it_has_before_applying_it() {
+        let main = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("src")
+                .join("main.rs"),
+        )
+        .expect("the app's own source");
+        let at = main
+            .find("if let Some(msg) = ai_stream.get() {")
+            .expect("the stream consumer is gone or was renamed");
+        let ask = main[at..]
+            .find(&format!("{}_is_current(", "snapshot"))
+            .expect("the consumer no longer asks whose snapshot this is");
+        let write = main[at..]
+            .find("ai_messages.update(")
+            .expect("the consumer no longer writes the transcript");
+        assert!(
+            ask < write,
+            "the consumer writes the transcript before asking whose snapshot it is"
+        );
+    }
+
+    #[test]
+    fn a_snapshot_from_a_session_nobody_is_showing_is_discarded() {
+        use super::snapshot_is_current;
+        assert!(snapshot_is_current(Some(4), 4), "the live session's own");
+        // A connection switch takes the session before the transcript is
+        // replaced, so there is nothing for a late snapshot to belong to.
+        assert!(!snapshot_is_current(None, 4));
+        // …and switching away and back gives the same *connection* a new
+        // session, which is why the id is not the `conn_id`.
+        assert!(!snapshot_is_current(Some(5), 4));
     }
 
     /// **Every agent spawn sets a working directory, unconditionally.**
