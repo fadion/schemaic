@@ -535,6 +535,29 @@ fn every_leg_declares_the_number_of_cases_it_has() {
             t.expected_writable_cases,
             t.type_cases().filter(|c| c.writable).count(),
         );
+        // **The third number, which this gate was not asserting.**
+        // `expected_keyed_cases`' own doc says it exists "for the reason
+        // `expected_cases` is one" — and then the guard that makes forgetting to
+        // maintain such a number loud checked the other two and not it. There is
+        // no slice to compare it against without a server (whether a case keys
+        // on its own type is the *server's* answer, which is why the matrix
+        // asserts it), so the bounds are what can be checked here: a keyable
+        // case is a writable one, and a leg that declares none has stopped
+        // testing the thing this number exists for.
+        assert!(
+            t.expected_keyed_cases <= t.expected_writable_cases,
+            "{}: expected_keyed_cases says {} of {} writable cases key on their \
+             own type, which is more than there are",
+            t.name,
+            t.expected_keyed_cases,
+            t.expected_writable_cases,
+        );
+        assert!(
+            t.expected_keyed_cases > 0,
+            "{}: expected_keyed_cases is zero, so the matrix's `row_key` \
+             assertion has nothing left to be about",
+            t.name,
+        );
     }
 }
 
@@ -579,6 +602,29 @@ pub fn note_skipped(target: &'static Target) {
     let _ = writeln!(
         err,
         "live: {} is not in SCHEMAIC_IT_ENGINES — its tests asserted nothing",
+        target.name
+    );
+    let _ = err.flush();
+}
+
+/// [`note_skipped`]'s sibling, for a leg that **runs** and has nothing to assert
+/// on this engine.
+///
+/// The other silent green the tier admits, and the more common one: a test whose
+/// subject is one engine's feature returns early on the other two. Two such
+/// notices in `routines.rs` went through `eprintln!`, which libtest prints only
+/// for a *failing* test — so four of six leg-tests reported green with nothing
+/// on screen, on every run including CI's, under a doc claiming the opposite.
+///
+/// Not deduped the way `note_skipped` is: that one is about a target and would
+/// otherwise repeat once per test, while this is about a *leg* — a different
+/// reason each time, and repeating it is the point.
+pub fn note_no_op(target: &'static Target, reason: &str) {
+    use std::io::Write as _;
+    let mut err = std::io::stderr().lock();
+    let _ = writeln!(
+        err,
+        "live: {} {reason} — this test asserted nothing",
         target.name
     );
     let _ = err.flush();

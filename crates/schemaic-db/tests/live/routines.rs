@@ -39,10 +39,7 @@ use crate::scratch::Scratch;
 /// connection nor fails on an ordinary one.
 pub async fn a_pg_redefinition_keeps_a_functions_planner_attributes(target: &'static Target) {
     if target.engine.dialect() != SqlDialect::Postgres {
-        eprintln!(
-            "live: {} has no PARALLEL/COST/ROWS to lose — this test asserted nothing",
-            target.name
-        );
+        crate::endpoint::note_no_op(target, "has no PARALLEL/COST/ROWS to lose");
         return;
     }
     let scratch = Scratch::create(target, "routine_attrs").await;
@@ -172,10 +169,7 @@ async fn routine_of(scratch: &Scratch) -> RoutineInfo {
 /// legs return early.
 pub async fn a_mariadb_sequence_is_not_read_as_a_base_table(target: &'static Target) {
     if target.name != "mariadb" {
-        eprintln!(
-            "live: {} has no table-shaped sequence — this test asserted nothing",
-            target.name
-        );
+        crate::endpoint::note_no_op(target, "has no table-shaped sequence");
         return;
     }
     let scratch = Scratch::create(target, "sequence_shape").await;

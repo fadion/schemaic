@@ -260,9 +260,35 @@ mod skip_notice {
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("tests")
             .join("live");
-        for file in ["main.rs", "endpoint.rs"] {
-            let src = std::fs::read_to_string(dir.join(file))
-                .unwrap_or_else(|e| panic!("reading {file}: {e}"));
+        // **The whole tier, not two names.** The corpus was the literal list
+        // `["main.rs", "endpoint.rs"]` — the two files that already answered
+        // correctly — while `routines.rs` held two live violations the day the
+        // gate landed. A gate whose corpus is narrower than the rule it states
+        // is the shape this tier keeps producing; the fix is to read the
+        // directory rather than a list somebody has to remember to extend.
+        //
+        // **Two exemptions, both named.** `scratch.rs` and `users.rs` report a
+        // *leak* — scratch state the teardown could not remove — on a path that
+        // is about to fail the test anyway, so libtest will print it. Anything
+        // else is a notice on a passing test, which is the silent green.
+        let exempt = ["scratch.rs", "users.rs"];
+        let mut seen = 0usize;
+        for entry in std::fs::read_dir(&dir).expect("the live tier's directory") {
+            let path = entry.expect("a directory entry").path();
+            if path.extension().is_none_or(|e| e != "rs") {
+                continue;
+            }
+            let file = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .expect("a file name")
+                .to_string();
+            seen += 1;
+            if exempt.contains(&file.as_str()) {
+                continue;
+            }
+            let src =
+                std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("reading {file}: {e}"));
             let code: String = src
                 .lines()
                 .filter(|l| !l.trim_start().starts_with("//"))
@@ -273,10 +299,17 @@ mod skip_notice {
             assert!(
                 !code.contains(&macro_call),
                 "{file} reports through the macro libtest hides for passing \
-                 tests; the skip notice must go to the locked stderr handle \
-                 (`endpoint::note_skipped`), or the one exception this tier \
-                 allows becomes a silent green"
+                 tests; a notice about a leg that asserted nothing must go to \
+                 the locked stderr handle (`endpoint::note_skipped` or \
+                 `endpoint::note_no_op`), or it becomes a silent green"
             );
         }
+        // The floor that notices the corpus going empty — a `read_dir` that
+        // matched nothing is a gate that passes on everything.
+        assert!(
+            seen >= 10,
+            "only {seen} files in the live tier were scanned; this gate has \
+             stopped seeing the directory it is written about"
+        );
     }
 }

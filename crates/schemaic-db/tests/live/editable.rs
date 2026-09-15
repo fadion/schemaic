@@ -495,12 +495,24 @@ pub async fn a_write_built_from_the_resolved_key_lands_on_that_row(target: &'sta
     }
 
     scratch.teardown().await;
+    // **The declared count, not a re-derivation of the slices.** `keyed` and
+    // `plain` are incremented exactly once per iteration of
+    // `type_cases().filter(writable)` — the `keyed -= 1; plain += 1`
+    // re-classification above preserves the sum — so asking the same iterator
+    // for its length made both sides one pure function of one input, and the
+    // equality could not fail. Delete two cases from `cases::MYSQL_FAMILY` and
+    // both numbers fell together while the test reported green having written
+    // nothing through them. That is verbatim the failure `suite.rs::report` was
+    // rewritten to end, and the accessor built for it was already here, called
+    // from `suite.rs` and from nowhere else.
     assert_eq!(
         keyed + plain,
-        target.type_cases().filter(|c| c.writable).count(),
-        "{}: only {} writable types were written through a resolved key",
+        target.expected_writable_cases(),
+        "{}: only {} writable types were written through a resolved key; this \
+         leg declares {}",
         target.name,
-        keyed + plain
+        keyed + plain,
+        target.expected_writable_cases(),
     );
     assert_eq!(
         keyed,

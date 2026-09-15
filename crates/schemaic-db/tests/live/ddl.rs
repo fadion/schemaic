@@ -1233,6 +1233,14 @@ pub async fn clearing_a_generated_expression_keeps_the_column_values(target: &'s
 
     apply(&scratch, &current, &draft, target).await;
     assert_round_trips(&scratch, "t", target, "clearing a generated expression").await;
+    assert_matches_draft(
+        &scratch,
+        "t",
+        &draft,
+        target,
+        "clearing a generated expression",
+    )
+    .await;
 
     let after = table_of(&scratch, "t").await;
     let col = after
@@ -1445,6 +1453,7 @@ pub async fn a_dropped_foreign_key_goes_and_the_column_stays(target: &'static Ta
 
     apply(&scratch, &current, &draft, target).await;
     assert_round_trips(&scratch, "t", target, "dropping a foreign key").await;
+    assert_matches_draft(&scratch, "t", &draft, target, "dropping a foreign key").await;
 
     let after = table_of(&scratch, "t").await;
     assert!(
@@ -1497,6 +1506,7 @@ pub async fn an_added_check_is_enforced_by_the_server(target: &'static Target) {
 
     apply(&scratch, &current, &draft, target).await;
     assert_round_trips(&scratch, "t", target, "adding a check").await;
+    assert_matches_draft(&scratch, "t", &draft, target, "adding a check").await;
 
     let after = table_of(&scratch, "t").await;
     assert!(
@@ -1562,6 +1572,7 @@ pub async fn a_renamed_table_keeps_its_rows_and_its_keys(target: &'static Target
 
     apply(&scratch, &current, &draft, target).await;
     assert_round_trips(&scratch, "t_renamed", target, "renaming a table").await;
+    assert_matches_draft(&scratch, "t_renamed", &draft, target, "renaming a table").await;
 
     let after = table_of(&scratch, "t_renamed").await;
     assert!(
@@ -1610,6 +1621,7 @@ pub async fn a_table_comment_lands_and_reads_back(target: &'static Target) {
 
     apply(&scratch, &current, &draft, target).await;
     assert_round_trips(&scratch, "t", target, "setting a table comment").await;
+    assert_matches_draft(&scratch, "t", &draft, target, "setting a table comment").await;
 
     let after = table_of(&scratch, "t").await;
     assert_eq!(

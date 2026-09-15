@@ -737,6 +737,25 @@ pub async fn a_granted_privilege_comes_back_and_a_revoke_takes_it_off(target: &'
         target.endpoint()
     );
 
+    // **A sibling grant the revoke must not touch.** Every assertion below gets
+    // *easier* the broader the revoke is: with one grant on the account, a
+    // revoke that named the whole server would satisfy "the privilege is gone"
+    // perfectly. `8addff9` fixed the grant half of this test — "assert what a
+    // grant is ON, not just which word it carries" — and left the revoke half
+    // asserting the word alone, which is the shape it set out to remove. On
+    // PostgreSQL a `REVOKE` of a privilege the role does not hold is a silent
+    // no-op rather than an error, so an over-broad revoke has nothing to stop
+    // it; on the MySQL family it is `ERROR 1141`, which is why this gap is
+    // PostgreSQL-shaped.
+    // `sibdb`, not `grantrt2`: the assertions below are substring tests over the
+    // server's grant text, and a name the first database's name is a prefix of
+    // cannot be told from it by `contains`.
+    let other = Scratch::create(target, "sibdb").await;
+    let (sibling_draft, _) = one_privilege(&other);
+    let change = ddl::grant_change(&sibling_draft, &account.principal).expect("a complete draft");
+    account.run(change).await;
+    let sibling_object = as_read_back(other.dialect(), GrantLevelKind::Database, &other.database);
+
     let mut revoking = draft.clone();
     revoking.revoke = true;
     let change = ddl::grant_change(&revoking, &account.principal).expect("a complete draft");
@@ -744,12 +763,31 @@ pub async fn a_granted_privilege_comes_back_and_a_revoke_takes_it_off(target: &'
 
     let after_revoke = account.grants().await;
     assert!(
-        !after_revoke.iter().any(|s| s.contains(&privilege)),
-        "{}: revoked {privilege} is still in {after_revoke:?}",
+        !after_revoke
+            .iter()
+            .any(|s| s.contains(&privilege) && s.contains(&object)),
+        "{}: revoked {privilege} on {object} is still in {after_revoke:?}",
+        target.endpoint()
+    );
+    assert!(
+        after_revoke
+            .iter()
+            .any(|s| s.contains(&privilege) && s.contains(&sibling_object)),
+        "{}: revoking {privilege} on {object} also took it off {sibling_object}: \
+         {after_revoke:?}",
         target.endpoint()
     );
 
+    // And off again before the account goes: PostgreSQL refuses to drop a role
+    // anything still grants to, so a sibling left standing turns the teardown
+    // into the failure instead of the assertion.
+    let mut revoking = sibling_draft;
+    revoking.revoke = true;
+    let change = ddl::grant_change(&revoking, &account.principal).expect("a complete draft");
+    account.run(change).await;
+
     account.teardown().await;
+    other.teardown().await;
     scratch.teardown().await;
 }
 
@@ -777,9 +815,31 @@ pub async fn a_grant_at_every_level_reads_back_naming_that_object(target: &'stat
             scratch.qualified("gt")
         ))
         .await;
+    // **A sibling at each object level, which the revoke must leave alone.**
+    // Both revoke assertions here get easier the broader the revoke is, and the
+    // test held exactly one grant at a time — so there was nothing for an
+    // over-broad revoke to destroy that it could notice. Collapse `object_sql`'s
+    // revoke path one level (Table → Schema) and, on PostgreSQL, where revoking
+    // a privilege the role does not hold is a silent no-op, the named grant
+    // disappears, every assertion passes, and the sibling has gone with it.
+    //
+    // **`gx`, not `gt2`.** The read-back assertions are substring tests over the
+    // server's own grant text, and `gt` is a substring of `gt2` — so a sibling
+    // named that way makes the *existing* "the named grant is gone" assertion
+    // fail on the sibling's line. The names have to be distinguishable by
+    // `contains`, which is a real constraint of this test's instrument.
+    scratch
+        .exec(&format!(
+            "CREATE TABLE {} (id INTEGER)",
+            scratch.qualified("gx")
+        ))
+        .await;
     if dialect == SqlDialect::Postgres {
         scratch
             .exec(&format!("CREATE SEQUENCE {}", scratch.qualified("gs")))
+            .await;
+        scratch
+            .exec(&format!("CREATE SEQUENCE {}", scratch.qualified("sx")))
             .await;
     }
     let ns = scratch.namespace.unwrap_or(&scratch.database).to_string();
@@ -848,6 +908,23 @@ pub async fn a_grant_at_every_level_reads_back_naming_that_object(target: &'stat
             );
         }
 
+        // The same privilege on a sibling object at this level, where there is
+        // one — the thing an over-broad revoke destroys and the assertion below
+        // could not see. Only the object levels have a cheap sibling; `Global`
+        // has none by definition, and `Database`'s is covered by the
+        // second-scratch grant in the round-trip test above.
+        let sibling = match level {
+            GrantLevelKind::Table => Some(("gx", as_read_back(dialect, level, "gx"))),
+            GrantLevelKind::Sequence => Some(("sx", as_read_back(dialect, level, "sx"))),
+            _ => None,
+        };
+        if let Some((name, _)) = &sibling {
+            let mut d = draft.clone();
+            d.name = (*name).to_string();
+            let change = ddl::grant_change(&d, &account.principal).expect("a complete draft");
+            account.run(change).await;
+        }
+
         // And off again, so the next level's read-back is not confused by the
         // last one's leftovers — which is also the revoke naming the same object.
         let mut revoking = draft.clone();
@@ -863,6 +940,23 @@ pub async fn a_grant_at_every_level_reads_back_naming_that_object(target: &'stat
             target.endpoint(),
             level.label()
         );
+        if let Some((name, sib_object)) = &sibling {
+            assert!(
+                after
+                    .iter()
+                    .any(|s| s.contains(&privilege) && s.contains(sib_object)),
+                "{}: revoking {privilege} at {} on {object} also took it off \
+                 {sib_object}: {after:?}",
+                target.endpoint(),
+                level.label()
+            );
+            // …and clean it up, for the reason the revoke above gives.
+            let mut d = draft.clone();
+            d.name = (*name).to_string();
+            d.revoke = true;
+            let change = ddl::grant_change(&d, &account.principal).expect("a complete draft");
+            account.run(change).await;
+        }
     }
 
     account.teardown().await;
