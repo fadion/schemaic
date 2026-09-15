@@ -3074,14 +3074,14 @@ existing prose was left alone.
     the single-`ChangeSet` shape that would have to grow, and it fills `omitted` with an empty vec:
     a designer edit is about one object it either can or cannot change, so nothing can be left out
     of it.
-    **The answers that are more than a concatenation are each load-bearing.** `script`
+    **The answers that are more than a concatenation are each load-bearing.** `editor_script`
     puts `ddl::withheld_header` above the statements, over the **union** of its sets' omissions: a
-    `join("\n\n")` dropped the "INCOMPLETE" preamble a single set's `ChangeSet::script` carries, so
+    `join("\n\n")` dropped the "INCOMPLETE" preamble a single set's own script carries, so
     a copied plan read as complete while `emit` was silently leaving a lossy index's `UNIQUE` out of
     a SQLite rebuild (`a_plan_that_withholds_a_statement_says_so_above_its_script`,
     `a_plan_that_withholds_nothing_has_no_header`). That header is a `pub` free function in
     `ddl.rs` over any `&[String]` — `ChangeSet::withheld_header` delegates to it — because a second
-    copy of that sentence is a second thing to keep true. `editor_script` is the same header over
+    copy of that sentence is a second thing to keep true. The statements under it come from
     `ddl::client_script` — and **a compare plan carries no MySQL body at all**, which is the
     opposite of what this passage used to claim ("several such bodies in one plan is exactly this
     module's case"). `CompareEntry::needs_source` had already made that false: `plan` excludes every
@@ -3153,7 +3153,41 @@ existing prose was left alone.
     `view:` for the same reason (`a_new_domain_is_created_after_the_enum_it_names` and
     `a_new_view_is_created_before_the_trigger_that_names_it`, both failing before the ordinal went
     in; `a_dropped_enum_goes_after_the_domain_that_names_it` guards the negation, where alphabetical
-    happened to coincide with the right answer). A cycle is reported rather than resolved — no
+    happened to coincide with the right answer).
+    **The order is no longer purely by phase, and the exception is a renamed table.** A rename is the
+    single most ordinary difference a schema-compare tool is opened for, and it arrives as a drop
+    plus a create: rename `orders` to `orders_old` on the left and the comparison yields `OnlyLeft
+    table:orders_old` beside `OnlyRight table:orders`. Neither `RENAME TABLE` nor
+    `ALTER TABLE … RENAME TO` rewrites the names *inside* a table, so both sides still carry
+    `fk_orders_customer` (or `orders_ibfk_1`, or `orders_pkey`) — and phases 2 and 3 put the create
+    first. MySQL and MariaDB scope a foreign-key constraint name to the **database**, so the create
+    comes back `ERROR 1826`; PostgreSQL scopes an index name to the namespace, so `orders_pkey`
+    already exists and takes the whole transaction with it; and neither MySQL nor MariaDB rolls DDL
+    back, so the user is left half-migrated under a message naming a constraint they never asked
+    about. `occupied_names(table, dialect)` is what a table occupies **beyond its own name**, and it
+    is per engine because the scope is per engine: foreign keys on MySQL/MariaDB (index names there
+    are keyed to the table), foreign keys, indexes and table-level checks on PostgreSQL, indexes
+    alone on SQLite, which names no foreign key at all. `clashes_between` intersects each `OnlyLeft`
+    table's set with each `OnlyRight` table's; a `Differing` table is skipped because it keeps its
+    identity, so its names are the *same table's* and the `ALTER` path already drops and re-adds each
+    one in the right order.
+    **The resolvable ones are reordered and the rest disclosed**, which is the posture `cycles`
+    already takes. `nothing_else_references` is the test for resolvable: a drop can be pulled ahead
+    only when nothing else on the left points at that table, because a referencing table has to be
+    dropped (or have its foreign key altered away) first and both of those sit at or after the phase
+    the pull moves this in front of — moving it past them trades one refused statement for another.
+    A resolvable drop is lifted to the front of the **whole** table phase rather than merely ahead of
+    the create it collides with, since an earlier create in the same phase may hold the other half of
+    a two-way rename and a drop with nothing pointing at it is safe anywhere after the dependents
+    come off. It is a `retain` + `splice` and not a second sort, because the order everything else is
+    in was just computed and is not up for revision. `SchemaComparison::name_clashes` keeps the whole
+    list, `resolved` ones included, so a reader can see the plan is deliberately not in phase order;
+    `plan()` turns the unresolved ones into `SchemaPlan::clashes`, one `NameClash::note` line each,
+    and `destructive()` appends them. That filter is narrow on purpose — only clashes whose *both*
+    ends are keys this plan's own ticks selected, since a comparison-level clash between two objects
+    the user left out is not this plan's problem and a warning above Apply about statements that are
+    not in the script is a warning about nothing.
+    A cycle is reported rather than resolved — no
     creation order satisfies one — and it is **two facts about two schemas, not one**.
     `SchemaComparison::cycles_create` is a tangle among the **right** schema's tables and
     `cycles_drop` one among the **left**'s; the `cycles()` method is the comparison-level "either",
@@ -4432,7 +4466,9 @@ existing prose was left alone.
     default is deliberately the *safe* level, since an unknown one written by a newer build means
     more access than this one understands. There is deliberately no
     `mysql://user:pass@host` builder, and the password fields here aren't what's on disk — see
-    `secrets.rs`. `duplicate` is the copy the connection list's right-click menu makes — a
+    `secrets.rs`. **`Debug` is hand-written on both `Connection` and `SshTunnel`** and redacts the
+    three secrets they hold through the private `Redacted` wrapper; the reasoning, and why the impls
+    list their fields one at a time, is under *Connection identity* in the invariants. `duplicate` is the copy the connection list's right-click menu makes — a
     **struct update**, so a field added to `Connection` later is carried by construction; the
     failure mode is a credential silently not copied, which the field-by-field form would not
     fail to compile over. `targets_same_server` is the "is this still the same server" test the schema
@@ -4848,12 +4884,35 @@ existing prose was left alone.
     another query run; a clear followed by a quit left it there indefinitely. The user's own SQL is
     content this module already treats as sensitive (`open_private_append` narrows the log for
     exactly that reason) and the Settings modal's **Log file** row is an explicit invitation to open
-    that folder and share it. An erasing save takes no `.bak` and removes any earlier one **after**
-    the new file lands. It is a property of the save and not of a particular store, which is why it
+    that folder and share it. An erasing save takes no `.bak` and removes every earlier sibling
+    **after** the new file lands.
+    **Which siblings those are is `remove_erased_siblings`, and there are two.** The `.bak` is the
+    one `Saving::Erasing` was written about; the `.corrupt` is the one nothing in the workspace ever
+    removed, because `read_bytes` renames an unparseable primary aside *whole* and from then on that
+    file sits in the config directory for the life of the install — the user's own SQL for
+    `history.json` and `snippets.json`, and under the no-keyring fallback the DB password, the SSH
+    password and the key passphrase for `connections.json`. A confirm reading "This can't be undone"
+    is a claim about the directory and not about one file in it
+    (`an_erasing_save_removes_the_corrupt_sibling_too`, with
+    `an_erasing_save_that_cannot_stage_keeps_the_corrupt_sibling` holding the same
+    land-before-you-sweep ordering the `.bak` has). `clear_connections_backup` — the scrub the
+    secret layer runs right after a migration save, when the `.bak` still holds the plaintext that
+    migration just moved into the keyring — calls the same function, so it clears both siblings now
+    rather than only the `.bak`.
+    Erasing is a property of the save and not of a particular store, which is why it
     is a parameter rather than a `clear_*_backup` per file; `save_json_erasing` is the public entry,
-    and the callers are the history panel's trash, one history row removed from its menu, a deleted
-    connection's history and chats, and the AI panel's New chat — `persist_chat` takes a `Saving`,
-    so the caller says whether a turn finished or a transcript was replaced with nothing.
+    and the erasing callers are the history panel's trash, one history row removed from its menu, a
+    deleted connection's history, chats and snippets, the AI panel's New chat, one snippet deleted
+    from the snippet panel, and the connection delete itself. `persist_chat` takes a `Saving`, so the
+    caller says whether a turn finished or a transcript was replaced with nothing; `main.rs`'s
+    `save_snippets` closure is `Rc<dyn Fn(persist::Saving)>` for the same reason; and
+    `persist::save_connections` takes one, with `app::secrets::save_connections` and `persist_conns`
+    forwarding it. **Every connection save but the delete stays `Replacing`**, because
+    `connections.json` is the one config file with no second copy anywhere and losing it loses every
+    connection — but an ordinary save on the delete path copies the pre-delete generation aside, so
+    the removed row's host, port, user, database and SSH coordinates (and, with no working keyring,
+    its three plaintext secrets) land in `connections.json.bak` at the moment the user confirms a
+    modal telling them the opposite.
     **An absent primary is not a first run**, and treating it as one was silent data loss.
     `recover(primary, staged, backup)` returns the value *and* a `Recovered` — `Primary`,
     `FirstRun`, `Corrupt(err)` or `Restored(sibling)` — and an absent primary walks `.tmp` then
@@ -9372,7 +9431,8 @@ existing prose was left alone.
     block of stops starts), and the `PopupToken`-tagged `set_open_popup`/`clear_open_popup`/
     `dismiss_open_popup` slot. A field joins through `FieldCfg::focus` instead, since nothing
     outside floem's editor can see a key it has.
-    **Two free predicates decide what a key *is*, and each was missing its modifier term.**
+    **Three free predicates decide what a key *is*, and the first two were each missing their
+    modifier term.**
     `presses(key, mods)` is "does this press a button": a bare Space or Enter and nothing else,
     because the two arms that asked it used to match the logical key alone — so `Ctrl+Enter`, which
     is the grid's **Commit**, pressed a ringed button instead, and with focus on the results strip's
@@ -9390,6 +9450,25 @@ existing prose was left alone.
     `matches!`es that could gain the term separately, and
     `press_tests::every_tab_arm_asks_the_one_predicate` holds every Tab arm in the file to
     `steps_ring`.
+    **`strip_defers(key, mods)` is the third, and it is the one that makes `presses`' doc true.**
+    That doc said a modified Space/Enter is declined so the event "keeps travelling" to whatever
+    binding owns it — and floem does not travel: `WindowHandle::event` dispatches a `KeyDown` to the
+    **focused** view with `directed = true`, never up through ancestors, and then, if unprocessed,
+    only to the window root's own listeners. The grid's `Ctrl+Enter → commit` is a listener on the
+    grid *body*, a sibling of the toolbar strip, so it was on neither path: with the keyboard on the
+    ✓, under a tooltip reading "Commit N changes (Ctrl+Enter)", the press did nothing at all. So
+    `in_strip_button` takes a `keys: impl Fn(&Event) -> EventPropagation` and carries the panel's
+    bindings itself — **for the modified keys only**, which is exactly the class `presses` declines,
+    so the two answers cannot disagree. A bare key stays the strip's own (Space/Enter press it,
+    Left/Right step it, Escape leaves it), and those three are excluded modified as well.
+    `grid_toolbar`'s `panel_keys` — `grid_key(gs, nrows, ncols, e)` — is the app's only `keys`
+    closure, passed to every icon in the cluster.
+    **The verdict is returned as given, and that is load-bearing.** A combination the panel does not
+    own comes back `Continue` and still falls through to the window root, which is how `Ctrl+Tab`
+    goes on switching query tabs from inside the strip — `steps_ring`'s rule, one level out. It holds
+    *because* `grid_key` has no Tab arm rather than by accident, which is what
+    `the_panel_handler_behind_the_strip_claims_no_tab` pins by reading `grid_key`'s own span in
+    `grid.rs` and refusing a `NamedKey::Tab` in it.
   - `modals.rs` — **the modal layer** (`modal_layer`) and the four predicates that raise it
     (`ddl_modals_up`, `ddl_editors_up`, `workspace_modals_up`, `settings_modals_up`,
     `modal_backdrop_up`), plus the `modal_backdrop_gate` tests. It mounts no modal of its own and
@@ -11011,15 +11090,34 @@ existing prose was left alone.
     needs to know neither. Deferred because the clear happens *before* the listeners run, so a
     request inside the same dispatch would be undone by it. **Close is excluded** — it is the one
     press after which there is no window to hand a keyboard back to.
+    **The hand-back is a wrapper now, `chrome_press(f)`, and that shape is the fix rather than a
+    tidy-up.** It was a step each handler had to remember, and two of the three remembered it in the
+    wrong place: `draggable` and `zone` both opened with `if p.button.is_primary()` and called
+    `give_the_keyboard_back()` *inside* that branch — but `on_event_stop` consumes the press whatever
+    button sent it, and an early `return` does not change that (floem's `on_event_stop` returns
+    `Stop` unconditionally). So the standard Windows caption gesture, right-clicking the title bar,
+    took the keyboard and returned nothing, and over an open modal that meant Escape stopped closing
+    it until the panel itself was clicked; the same hole sat on all six resize edges and both 14×14
+    corners. Wrapping the handler leaves no branch for the call to end up inside, and it is
+    idempotent and deferred, so paying it on a press the handler does nothing else with costs
+    nothing. `control_button` gained a `PointerDown` leg of its own through the same wrapper,
+    `on_event_cont` so the press still becomes the `Click` a primary one does: `Click` is
+    primary-only, so a right-press on a caption button reached nothing at all while still clearing
+    focus. That leg is unconditional and separate from the `keeps_the_window` exclusion, which is
+    about the moment *after* `on_press()` has torn the window down.
     **The eight resize zones owe it too, and that is the instance it bit on.** A zone is a bare
     `empty()` with an `on_event_stop`, so it is neither navigable nor inside anything that is and it
     ends the walk — dragging a window edge therefore left focus `None`. With a modal open Escape
     stopped closing it, recoverable only with Tab through the workspace root's ring backstop, which
     is why it read as intermittent rather than as a dead modal; with no modal the next keystroke
     after a resize was dropped instead of landing at the caret.
-    `window_chrome::tests::every_chrome_press_hands_the_keyboard_back` covers both spellings (the
-    caption buttons take the *click* rather than the press, so there are two `PointerDown` handlers
-    and not the three the finding sketched) and floors at three handlers overall.
+    `window_chrome::tests::every_chrome_press_hands_the_keyboard_back` covers both spellings — a
+    `PointerDown` handler must go through `chrome_press(`, a `Click` handler must call
+    `give_the_keyboard_back()` itself — and floors at three handlers overall.
+    **The two needles are not interchangeable, and that is the load-bearing part of the gate.** It
+    used to accept the call anywhere in a handler's span, which both `PointerDown` handlers satisfied
+    with the call sitting inside `if p.button.is_primary()`: the gate was green for as long as the
+    bug existed. Asking for the wrapper is a question a call in a branch cannot answer.
     **And a maximized window's zones are hidden, because it has no frame to grab.** The `NorthEast`
     zone is a 14×14 square pinned to the extreme top-right pixel — the Fitts's-law gesture for
     closing a maximized window — and `North` is the top 5px of all three caption buttons; both
@@ -12287,16 +12385,27 @@ existing prose was left alone.
     reaches the default block that would have re-focused the modal root, and floem takes focus on
     every `PointerDown` before dispatch — a press on the bar's padding therefore left
     `app_state.focus` at `None` and the diagram answering no keys. So the handler hands the keyboard
-    to the innermost focus root when the press landed **to the right of the field**, and still does
-    nothing when it landed on the field itself, which is what its own comment was protecting.
-    **Both terms of that test are scaled**, and there the metric rule is behaviour rather than
-    pixels: the band is `[pad, pad + width)` against a bar whose padding is `theme::scaled(8.0)` and
-    a field styled `width(theme::scaled(190.0))`, while the test was written `8.0` and `190.0`. It
+    to the innermost focus root when the press **missed the field**, and still does nothing when it
+    landed on the field itself, which is what its own comment was protecting.
+    **That test is a frame, not a half-plane**, and it is the pure `press_missed_the_field(pos,
+    field, pad)` rather than an expression in the closure, because the closure cannot be tested and
+    this is the whole of the decision in it. The bar pads on all four sides, so the region that is on
+    the bar but not on the field surrounds it; the handler asked only `pos.x > pad + width`, which is
+    right for the count readout and the ✕ and wrong for the other three sides. A press on the 6 px
+    strip above the box, or the 8 px to its left — where a user aiming at the box and being 3 px off
+    lands — was a miss the bar consumed while handing the keyboard to nobody, and Escape and Ctrl+F
+    stayed dead until the canvas happened to be clicked.
+    `a_press_misses_the_field_on_every_side_of_it_not_only_the_right` walks all four,
+    `the_field_owns_its_own_top_left_corner_and_not_the_pixel_past_it` pins the half-open ends, and
+    `the_band_follows_the_interface_scale` holds the older half of this. **Both terms are scaled**,
+    and there the metric rule is behaviour rather than pixels: the band is `[pad, pad + size)` on
+    each axis against a bar whose padding is `theme::scaled(8.0)`/`theme::scaled(6.0)` and a field
+    styled `width(theme::scaled(190.0))`, while the test was once written `8.0` and `190.0`. It
     was right at 100% and wrong at every other interface scale — at 160% a press in the rightmost
     4.8 px *inside* the box was judged a miss and handed the keyboard away, undoing the focus the
     click had just set, and at 80% the mirror hole treated a press 1.6 px *past* the field as on it,
     so the keyboard was never handed back and the diagram went keyboard-dead: the exact state this
-    handler exists to prevent. The width is read from the laid-out view and only falls back on the
+    handler exists to prevent. The size is read from the laid-out view and only falls back on the
     constant, so a change to one cannot leave the other describing a field that moved.
     `Find::dismiss` does the same, covering Escape-in-field and the ✕ together: closing the bar
     removes the focused editor, and floem clears focus *silently* when a focused view is removed —
@@ -15551,15 +15660,29 @@ Re-introducing the anti-patterns these guard against is a regression:
   `schemaic.log` in cleartext, in the folder Settings offers an **Open folder** button for. A
   dependency that logs a secret gets a line in `CREDENTIAL_TARGETS`, appended last so the floor
   outranks an equal key; never a `debug!` we hope nobody enables.
-  **And it includes a `Debug` nobody has written a call site for yet.** `Db` has a hand-written one
-  printing `pass: "<redacted>"` and everything else, because the derived one printed the password:
-  no site formats a `Db` today — the whole workspace was checked, which is what made the derive
-  latent rather than live — but the type is threaded through nearly everything (`McpEndpoint`,
-  `StartAiParams`, the dump and script runners), and the moment a struct that owns one gains a
-  `#[derive(Debug)]` and is logged, or anyone writes `.expect(&format!("{db:?}"))`, the credential
-  lands in `%APPDATA%\Roaming\schemaic`'s log — the folder the Settings pane invites the user to
-  share for support. The struct's own doc already claimed the property; a derived `Debug` was an
-  unguarded second spelling of the same leak.
+  **And it includes a `Debug` nobody has written a call site for yet.** All three types that carry a
+  credential have a hand-written one now. `Db` prints `pass: "<redacted>"` and everything else,
+  because the derived one printed the password: no site formats a `Db` today — the whole workspace
+  was checked, which is what made the derive latent rather than live — but the type is threaded
+  through nearly everything (`McpEndpoint`, `StartAiParams`, the dump and script runners), and the
+  moment a struct that owns one gains a `#[derive(Debug)]` and is logged, or anyone writes
+  `.expect(&format!("{db:?}"))`, the credential lands in `%APPDATA%\Roaming\schemaic`'s log — the
+  folder the Settings pane invites the user to share for support. `core::connection`'s `Connection`
+  and `SshTunnel` are the structs `Db::connect` reads *from*, they carry three secrets between them
+  (the DB password, the SSH password, the SSH key passphrase), and they kept the derive until the
+  same treatment reached them: a `tracing::warn!(?tunnel, …)` on a failed handshake is the obvious
+  next line for anyone debugging one, and it would have written two of the three into the log file
+  Settings invites the user to attach to a bug report. A secret field goes through the private
+  `Redacted` wrapper, which prints `<empty>` or `<redacted>` — whether a secret is *set* is the half
+  that explains the failure anyone is printing this for, and it is not the half that leaks. Both
+  impls name their fields one at a time rather than filtering a `finish_non_exhaustive` set, so a
+  field added later is **omitted** until someone lists it; omission is the safe direction, a new
+  secret joining the output silently is not.
+  `formatting_a_connection_prints_none_of_the_three_secrets_it_holds` and
+  `formatting_a_tunnel_prints_neither_its_password_nor_its_passphrase` pin both directions — no
+  secret out, and the host, user and key *path* still in, because a log line that cannot say which
+  server it is about is worth nothing. Each struct's own doc already claimed the property; a derived
+  `Debug` was an unguarded second spelling of the same leak.
   **And it includes a script the user asked for a copy of.** The DDL preview's *Copy* and *Open in
   editor* both put their text somewhere durable — the OS clipboard, which on Windows persists in
   Clipboard History and cloud-syncs, and a query tab whose text the next session save writes into
@@ -15787,9 +15910,21 @@ Re-introducing the anti-patterns these guard against is a regression:
   the preview names each one and Apply refuses while it does — on the action, not only on the
   disabled button. The "INCOMPLETE" preamble that carries the same omission *out* through Copy and
   Open in editor is **`ddl::withheld_header`**, one `pub` free function over any list of withheld
-  items, which `ChangeSet::script` and `compare::SchemaPlan::script` both delegate to; a second copy
+  items, which `ChangeSet::editor_script` and `compare::SchemaPlan::editor_script` both delegate to;
+  a second copy
   of that sentence would be a second thing to keep true, and the aggregate that joined statements
-  without it produced a script that read as complete. **`supports_change` has to be as narrow as the change is**, or `unsupported()`
+  without it produced a script that read as complete.
+  **And every builder that joins emitted statements for a reader goes through
+  `ddl::client_script`.** There were three; `SchemaPlan::script` went first, and `ChangeSet::script`
+  — the shorter and more obvious name — survived that deletion with no production caller at all,
+  which is worse rather than safer: a single-object set is exactly where a MySQL trigger or routine
+  body *does* live, so what that name handed a user to paste was a compound body the app's own
+  splitter cuts at its internal `;` — the ERROR 1064 fragment the `DELIMITER $$` wrapping exists to
+  prevent. What is left is `editor_script` on the set and on the plan, plus their `export_script`
+  counterparts, all four of them behind `client_script`.
+  `nothing_joins_the_emitted_statements_outside_client_script` reads the production half of `ddl.rs`
+  and `compare.rs` and refuses a fourth; its needle is assembled rather than spelled, or the
+  assertion's own source is the hit and the gate passes on itself. **`supports_change` has to be as narrow as the change is**, or `unsupported()`
   is blind: its account arm answered for all six variants on "does this engine have accounts",
   which is true of `GRANT … ON *.*` on PostgreSQL and of `ON SCHEMA` on MySQL, neither of which has
   a grammar there — so there was no INCOMPLETE header and Apply was enabled over a statement the
@@ -17494,7 +17629,11 @@ Re-introducing the anti-patterns these guard against is a regression:
   `keyboard_nav` on the way); ←/→ walk it, Tab does too, Enter/Space activates. `widgets::in_strip_button`
   is `in_ring_button` plus those two keys, and its `leave` must **defer** its focus request —
   `in_focus_ring`'s own Escape arm runs too (floem folds every KeyDown listener) and queues a
-  `ClearFocus` in the same pass, so only a request landing in a later tick wins. Two smaller rules
+  `ClearFocus` in the same pass, so only a request landing in a later tick wins. **And it carries
+  the panel's own bindings**, through a `keys` closure it consults for modified keys only
+  (`widgets::strip_defers`): the panel is a *sibling* of the strip, floem carries an unconsumed
+  `KeyDown` to neither an ancestor nor a sibling, so `Ctrl+Enter` on the ✓ did nothing under a
+  tooltip advertising it. Two smaller rules
   ride along: a disabled control is not a ring member, so the block holding − and clone tracks the
   row selection as well as insertability or Tab would walk onto controls that had since gone live;
   and closing a menu raised from the strip has to hand focus **back to the icon**
