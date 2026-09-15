@@ -1418,10 +1418,24 @@ pub enum FolderVerdict {
 ///
 /// Order follows the plan, not the directory: that is the order the export would
 /// replace them in, and the order the prompt should read in.
+///
+/// **Each file's `.part` sibling is censused with it**, because the export
+/// destroys that too and this is the only guard in front of it.
+/// `write_one` opens the fragment with `File::create`, which truncates, and the
+/// failure path removes it — so a fragment left behind by an earlier failed
+/// export, which `export_failure_note` has just told the user holds their rows
+/// ("`orders.csv` was not changed; the rows that were written are in
+/// `orders.csv.part`"), was replaced by a retry and swept by its cancel with no
+/// prompt naming it. The one file in that directory this app teaches the user to
+/// care about was the one file the guard could not see.
+///
+/// The name comes from [`crate::export::part_path`], the one function that
+/// decides that suffix — see `dump::part_of`, and the source gate that keeps it
+/// the only spelling.
 pub fn colliding_files(plan: &FilePlan, exists: impl Fn(&str) -> bool) -> Vec<String> {
     plan.files
         .iter()
-        .map(|f| f.file.clone())
+        .flat_map(|f| [f.file.clone(), crate::export::part_path(&f.file)])
         .filter(|f| exists(f))
         .collect()
 }
@@ -1446,10 +1460,19 @@ pub fn colliding_files(plan: &FilePlan, exists: impl Fn(&str) -> bool) -> Vec<St
 ///
 /// Plan order, not `published` order: that is the order the prompt names them in
 /// and the order they would have been replaced in.
+///
+/// **A `.part` counts as destroyed once its published sibling is published**:
+/// the rename that publishes `orders.csv` is what consumes `orders.csv.part`,
+/// so the two go together. A fragment whose table the export never reached is
+/// still sitting there and is not named.
 pub fn destroyed(colliding: &[String], published: &[String]) -> Vec<String> {
     colliding
         .iter()
-        .filter(|f| published.iter().any(|p| p == *f))
+        .filter(|f| {
+            published
+                .iter()
+                .any(|p| p == *f || crate::export::part_path(p) == **f)
+        })
         .cloned()
         .collect()
 }
@@ -1729,14 +1752,19 @@ mod tests {
             folder_verdict(None, &census(|f| f == "orders.csv")),
             FolderVerdict::Ask(vec!["orders.csv".to_string()])
         );
-        // In the plan's order — the order they would be replaced in.
-        assert_eq!(
-            census(|_| true),
-            ["orders.csv".to_string(), "customers.csv".to_string()]
-        );
+        // In the plan's order — the order they would be replaced in — each
+        // published name followed by the `.part` sibling that is consumed with
+        // it.
+        let all_four = [
+            "orders.csv".to_string(),
+            "orders.csv.part".to_string(),
+            "customers.csv".to_string(),
+            "customers.csv.part".to_string(),
+        ];
+        assert_eq!(census(|_| true), all_four);
         assert_eq!(
             folder_verdict(None, &census(|_| true)),
-            FolderVerdict::Ask(vec!["orders.csv".to_string(), "customers.csv".to_string()])
+            FolderVerdict::Ask(all_four.to_vec())
         );
         // And once the user has said yes, it writes without asking again —
         // otherwise the confirm's Yes cannot get past its own guard.
@@ -1757,6 +1785,28 @@ mod tests {
         assert_eq!(folder_verdict(Some(&both), &said_yes), FolderVerdict::Write);
         // And an empty folder needs no consent at all.
         assert_eq!(folder_verdict(None, &[]), FolderVerdict::Write);
+
+        // **And the `.part` siblings, which this export destroys just as
+        // surely.** `write_one` opens the fragment with `File::create`, which
+        // truncates, and the failure path removes it — so a fragment left by an
+        // earlier failed export, which `export_failure_note` has just told the
+        // user holds their rows, was replaced by a retry with no prompt naming
+        // it. The one file in that directory this app teaches the user to care
+        // about was the one the guard could not see.
+        assert_eq!(
+            census(|f| f == "orders.csv.part"),
+            ["orders.csv.part".to_string()]
+        );
+        assert_eq!(
+            folder_verdict(None, &census(|f| f == "orders.csv.part")),
+            FolderVerdict::Ask(vec!["orders.csv.part".to_string()])
+        );
+        // Each published name is followed by its own fragment, so the prompt
+        // still reads in the order the export would replace them.
+        assert_eq!(
+            census(|f| f.starts_with("orders")),
+            ["orders.csv".to_string(), "orders.csv.part".to_string()]
+        );
     }
 
     /// **The census is what is at risk; the report is what happened.** Handing
@@ -1792,6 +1842,25 @@ mod tests {
                 &["items.csv".to_string(), "orders.csv".to_string()]
             ),
             ["orders.csv".to_string(), "items.csv".to_string()]
+        );
+
+        // **A `.part` goes with its published sibling**, because the rename that
+        // publishes `orders.csv` is what consumes `orders.csv.part` — and a
+        // fragment whose table the export never reached is still sitting there,
+        // so it is not named.
+        let with_parts = [
+            "orders.csv".to_string(),
+            "orders.csv.part".to_string(),
+            "items.csv.part".to_string(),
+        ];
+        assert_eq!(
+            destroyed(&with_parts, &["orders.csv".to_string()]),
+            ["orders.csv".to_string(), "orders.csv.part".to_string()],
+            "the fragment the rename consumed was not reported"
+        );
+        assert!(
+            destroyed(&with_parts, &[]).is_empty(),
+            "a run that published nothing destroyed nothing"
         );
     }
 
