@@ -7545,6 +7545,13 @@ fn grid_toolbar(
     // win over the `ClearFocus` that `in_focus_ring`'s own Escape arm queues in
     // the same pass — see `in_strip_button`.
     let leave = move || refocus_grid(gs);
+    // **The panel's own bindings, still reachable from the strip.** F6 is the
+    // documented way in here, and once the keyboard is on the ✓ the panel is a
+    // sibling of this strip rather than an ancestor of it — floem never carries
+    // an unconsumed KeyDown to either — so `Ctrl+Enter` did nothing under a
+    // tooltip that advertises it. `in_strip_button` hands this only the modified
+    // keys; the bare ones are the strip's.
+    let panel_keys = move |e: &Event| grid_key(gs, nrows, ncols, e);
     // **Closing a menu must give the keyboard back to the icon that opened it.**
     // The panel is a `focus_root` with no other root above it out here, so its
     // teardown drops focus altogether and F6 — a listener on the grid body — had
@@ -7973,10 +7980,18 @@ fn grid_toolbar(
             .tooltip(|| text("Discard all pending changes").style(crate::widgets::tooltip_style));
             let (r1, r2) = (strip_commit.clone(), strip_commit.clone());
             h_stack((
-                in_strip_button(commit, r1, TB_COMMIT, true, leave, move || commit_grid(gs)),
-                in_strip_button(discard, r2, TB_DISCARD, true, leave, move || {
-                    discard_edits(gs)
+                in_strip_button(commit, r1, TB_COMMIT, true, leave, panel_keys, move || {
+                    commit_grid(gs)
                 }),
+                in_strip_button(
+                    discard,
+                    r2,
+                    TB_DISCARD,
+                    true,
+                    leave,
+                    panel_keys,
+                    move || discard_edits(gs),
+                ),
                 toolbar_sep(),
             ))
             .style(|s| s.items_center().flex_row().gap(theme::scaled(3.0)))
@@ -8048,6 +8063,7 @@ fn grid_toolbar(
                     TB_ADD,
                     true,
                     leave,
+                    panel_keys,
                     move || add_pending_row(gs),
                 ),
                 in_strip_button(
@@ -8059,6 +8075,7 @@ fn grid_toolbar(
                     TB_DELETE,
                     live,
                     leave,
+                    panel_keys,
                     del,
                 ),
                 in_strip_button(
@@ -8069,6 +8086,7 @@ fn grid_toolbar(
                     TB_CLONE,
                     live,
                     leave,
+                    panel_keys,
                     clone,
                 ),
                 toolbar_sep(),
@@ -8391,9 +8409,15 @@ fn grid_toolbar(
             // in the ring rather than leaving and re-entering it on every
             // generation — a Tab stop that came and went with a background task
             // would move the strip under the user mid-walk.
-            in_strip_button(face, strip_ai.clone(), TB_AI, true, leave, move || {
-                (open_ai)()
-            })
+            in_strip_button(
+                face,
+                strip_ai.clone(),
+                TB_AI,
+                true,
+                leave,
+                panel_keys,
+                move || (open_ai)(),
+            )
             .into_any()
         },
     );
@@ -8409,12 +8433,24 @@ fn grid_toolbar(
         commit_ctrl,
         row_actions,
         ai_menu,
-        in_strip_button(copy_menu, strip.clone(), TB_COPY, true, leave, move || {
-            (open_copy)()
-        }),
-        in_strip_button(save_menu, strip.clone(), TB_SAVE, true, leave, move || {
-            (open_save)()
-        }),
+        in_strip_button(
+            copy_menu,
+            strip.clone(),
+            TB_COPY,
+            true,
+            leave,
+            panel_keys,
+            move || (open_copy)(),
+        ),
+        in_strip_button(
+            save_menu,
+            strip.clone(),
+            TB_SAVE,
+            true,
+            leave,
+            panel_keys,
+            move || (open_save)(),
+        ),
     ))
     // **The half of the strip that never gives way.** Everything to its left is
     // words and can be ellipsized; these are the only way to commit, export or

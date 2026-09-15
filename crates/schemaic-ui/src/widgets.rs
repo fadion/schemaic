@@ -498,6 +498,37 @@ pub(crate) fn steps_ring(key: &Key, mods: floem::keyboard::Modifiers) -> bool {
     *key == Key::Named(NamedKey::Tab) && !crate::shortcuts::primary_held(mods)
 }
 
+/// Does a key pressed on a [strip button](in_strip_button) belong to the **panel
+/// behind the strip** rather than to the strip itself?
+///
+/// [`presses`]' third sibling, and the one that makes its doc true. That
+/// function declines a modified Space/Enter because "a modified one belongs to
+/// whatever binding owns that combination, and this returning `false` is what
+/// lets the event keep travelling to it" — and floem does not travel: a
+/// `KeyDown` goes to the focused view and then, unconsumed, only to the window
+/// root's own listeners. Never to an ancestor, and never to a sibling. The
+/// grid's `Ctrl+Enter → commit` is a listener on the grid *body*, a sibling of
+/// the toolbar strip, so with the keyboard on the ✓ — where the tooltip reads
+/// "Commit N changes (Ctrl+Enter)" — the press reached nothing.
+///
+/// **Modified keys only, and never the strip's own three.** Space/Enter press
+/// the button, Left/Right step the ring and Escape leaves it; those are what
+/// being *in* the strip means. Everything modified is a binding the panel may
+/// own, and the caller returns the panel's verdict as given, so a combination it
+/// does not own — `Ctrl+Tab`, the global tab switcher — still falls through to
+/// the window root. That fall-through is the whole of the guarantee, and it is
+/// the `keys` closure's to keep: claiming a combination the window root owns
+/// breaks it, which is [`steps_ring`]'s rule one level out.
+pub(crate) fn strip_defers(key: &Key, mods: floem::keyboard::Modifiers) -> bool {
+    !mods.is_empty()
+        && !matches!(
+            key,
+            Key::Named(NamedKey::ArrowLeft)
+                | Key::Named(NamedKey::ArrowRight)
+                | Key::Named(NamedKey::Escape)
+        )
+}
+
 pub(crate) fn in_ring_button<V: IntoView + 'static>(
     view: V,
     ring: FocusRing,
@@ -614,12 +645,30 @@ pub(crate) fn key_pressable<V: IntoView + 'static>(
 /// A deferred request lands in a later tick and therefore wins, whichever order
 /// the two listeners happen to run in. The grid's `refocus_grid` already works
 /// this way, for the same reason.
+/// **`keys` is the third, and it is what makes [`presses`]' doc true.** That
+/// function declines a *modified* Space/Enter on the grounds that "a modified
+/// one belongs to whatever binding owns that combination, and this returning
+/// `false` is what lets the event keep travelling to it". floem does not travel:
+/// `WindowHandle::event` dispatches a `KeyDown` to the **focused** view with
+/// `directed = true` — never up through ancestors — and then, if unprocessed,
+/// only to the window root's own listeners. The panel's `Ctrl+Enter → commit`
+/// is a listener on the grid body, a *sibling* of this strip, so it is on
+/// neither path: with the keyboard on the ✓, under a tooltip reading "Commit N
+/// changes (Ctrl+Enter)", that press did nothing at all.
+///
+/// So the strip carries the panel's bindings itself, for the modified keys only
+/// — the same class `presses` declines, which is what keeps the two answers from
+/// disagreeing. A bare key is the strip's own (Space/Enter press it, the arrows
+/// step it, Escape leaves), and `keys`' verdict is returned as given, so a
+/// combination the panel does not own still falls through to the window root
+/// the way `Ctrl+Tab` must.
 pub(crate) fn in_strip_button<V: IntoView + 'static>(
     view: V,
     ring: FocusRing,
     tabindex: u32,
     enabled: bool,
     leave: impl Fn() + 'static,
+    keys: impl Fn(&Event) -> EventPropagation + 'static,
     on_press: impl Fn() + 'static,
 ) -> AnyView {
     let button = in_ring_button(view, ring.clone(), tabindex, enabled, 0.0, on_press);
@@ -632,6 +681,9 @@ pub(crate) fn in_strip_button<V: IntoView + 'static>(
             let Event::KeyDown(ke) = e else {
                 return EventPropagation::Continue;
             };
+            if strip_defers(&ke.key.logical_key, ke.modifiers) {
+                return keys(e);
+            }
             match ke.key.logical_key {
                 Key::Named(NamedKey::ArrowRight) => ring.step_from(id, false),
                 Key::Named(NamedKey::ArrowLeft) => ring.step_from(id, true),
@@ -6300,7 +6352,7 @@ mod jump_hover_tests {
 
 #[cfg(test)]
 mod press_tests {
-    use super::{presses, steps_ring};
+    use super::{presses, steps_ring, strip_defers};
     use floem::keyboard::{Key, Modifiers, NamedKey};
 
     /// **A modified Enter is somebody else's key.** Without the modifier term,
@@ -6340,6 +6392,81 @@ mod press_tests {
             assert!(!presses(&key, Modifiers::empty()), "{key:?}");
             assert!(!presses(&key, Modifiers::CONTROL), "{key:?}");
         }
+    }
+
+    /// **The seam, not either half.** `presses` declining `Ctrl+Enter` is only
+    /// correct if something else answers it, and on the results toolbar strip
+    /// nothing did: the tooltip on the ✓ reads "Commit N changes (Ctrl+Enter)"
+    /// and the press did nothing at all, because floem hands a `KeyDown` to the
+    /// focused view and then only to the window root — never to the grid body
+    /// beside it. So the two predicates are asserted **together**: over every
+    /// key/modifier pair the strip can see, at most one of them may claim it,
+    /// and `Ctrl+Enter` must be claimed by exactly one.
+    #[test]
+    fn a_key_the_strip_declines_is_claimed_by_exactly_one_of_the_two() {
+        let keys = [
+            Key::Named(NamedKey::Enter),
+            Key::Named(NamedKey::Space),
+            Key::Named(NamedKey::Tab),
+            Key::Named(NamedKey::Escape),
+            Key::Named(NamedKey::ArrowLeft),
+            Key::Named(NamedKey::ArrowRight),
+            Key::Named(NamedKey::Delete),
+            Key::Character("f".into()),
+        ];
+        let mods = [
+            Modifiers::empty(),
+            Modifiers::CONTROL,
+            Modifiers::SHIFT,
+            Modifiers::ALT,
+            Modifiers::META,
+            Modifiers::CONTROL | Modifiers::SHIFT,
+        ];
+        for key in &keys {
+            for held in mods {
+                assert!(
+                    !(presses(key, held) && strip_defers(key, held)),
+                    "{key:?}+{held:?} is claimed twice"
+                );
+            }
+        }
+        // The case the tooltip advertises: `presses` says no, so `strip_defers`
+        // has to say yes — this pair is the whole finding.
+        let enter = Key::Named(NamedKey::Enter);
+        assert!(!presses(&enter, Modifiers::CONTROL));
+        assert!(strip_defers(&enter, Modifiers::CONTROL));
+        // A bare Enter is still the button's own press, not the panel's.
+        assert!(presses(&enter, Modifiers::empty()));
+        assert!(!strip_defers(&enter, Modifiers::empty()));
+        // The strip's own navigation stays the strip's, modified or not.
+        for key in [
+            Key::Named(NamedKey::ArrowLeft),
+            Key::Named(NamedKey::ArrowRight),
+            Key::Named(NamedKey::Escape),
+        ] {
+            assert!(!strip_defers(&key, Modifiers::CONTROL), "{key:?}");
+            assert!(!strip_defers(&key, Modifiers::empty()), "{key:?}");
+        }
+    }
+
+    /// **The panel may not swallow what the window root owns.** `strip_defers`
+    /// hands `Ctrl+Tab` to the panel like any other modified key, and the strip
+    /// returns the panel's verdict as given — so the app's next-query-tab keeps
+    /// working *because* the panel's handler has no Tab arm, not by accident.
+    /// This pins that: the grid's key handler, which is the one `keys` closure
+    /// in the app, must not name Tab.
+    #[test]
+    fn the_panel_handler_behind_the_strip_claims_no_tab() {
+        let grid = crate::source_gate::production_code(include_str!("grid.rs"));
+        let at = grid.find("fn grid_key(").expect("grid_key is gone");
+        let body = &grid[at..];
+        let end = body.find("\n}\n").expect("the end of grid_key");
+        assert!(
+            !body[..end].contains("NamedKey::Tab"),
+            "`grid_key` has gained a Tab arm; the results strip now defers \
+             Ctrl+Tab to it, so the app's next-query-tab shortcut would be \
+             swallowed whenever the keyboard is on a toolbar icon"
+        );
     }
 
     /// **Shift steps; the primary modifier does not.** `Ctrl+Tab` /
