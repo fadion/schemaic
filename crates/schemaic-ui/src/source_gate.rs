@@ -759,4 +759,259 @@ mod tests {
             "schemaic-app builds views too, and the invariants are stated app-wide"
         );
     }
+
+    /// **Nothing joins `ChangeSet::emit()`'s statements into a script outside
+    /// `ddl::client_script`.**
+    ///
+    /// `client_script` terminates every statement and wraps a compound MySQL
+    /// body in `DELIMITER $$`. A builder that joins them itself hands the reader
+    /// a `CREATE TRIGGER … BEGIN SET NEW.a = 1; SET NEW.b = 2; END` that the
+    /// app's own splitter cuts at the internal semicolons — the ERROR 1064
+    /// fragment the wrapping exists to prevent. Only what the user is handed to
+    /// read is affected; the apply path sends each statement whole, which is
+    /// what makes it easy to reintroduce and hard to notice.
+    ///
+    /// **Third spelling of this guard, and the first that can see the whole
+    /// workspace.** `9fe049d` deleted the first extra builder and wrote the rule
+    /// down in prose; `d316d35` deleted the second and added a ratchet that read
+    /// the production half of `ddl.rs` and `compare.rs` only and matched the
+    /// single literal `emit().join(`. `schemaic-app/src/mcp.rs` was a live fifth
+    /// member the whole time, in a crate the corpus did not include, under a
+    /// commit message declaring the class closed at four.
+    ///
+    /// Here rather than in `schemaic-core/tests/` — where it first landed —
+    /// because a workspace-wide scan there needs a second copy of
+    /// [`production_code`] (`schemaic-ui` depends on `schemaic-core`, so the
+    /// dev-dependency back is a cycle), and a second copy of this walk is the
+    /// thing this module exists to prevent. The rule is about `schemaic-core`'s
+    /// API and the corpus is every crate, so it belongs with the walk.
+    #[test]
+    fn nothing_joins_the_emitted_statements_outside_client_script() {
+        // Assembled, or this test's own source is the hit.
+        let needle = format!(".{}()", "emit");
+        let mut seen = 0usize;
+        let mut offenders: Vec<String> = Vec::new();
+        for (name, code) in workspace_sources() {
+            let mut from = 0usize;
+            while let Some(rel) = code[from..].find(&needle) {
+                let at = from + rel + needle.len();
+                from = at;
+                seen += 1;
+                // The rest of this statement: a join into one script is inside
+                // the same expression, so it lands before the `;`.
+                let stmt = &code[at..];
+                let end = stmt.find(';').unwrap_or(stmt.len()).min(400);
+                if stmt[..end].contains(".join(") || stmt[..end].contains(".concat(") {
+                    let line = 1 + code[..at].bytes().filter(|c| *c == b'\n').count();
+                    offenders.push(format!("{name}:{line}"));
+                }
+            }
+        }
+        assert!(
+            seen >= 5,
+            "the needle stopped matching: {seen} `.emit()` calls across the \
+             workspace's production code — a gate that scans nothing reports \
+             success"
+        );
+        assert!(
+            offenders.is_empty(),
+            "these join emitted statements without going through \
+             `ddl::client_script`, which terminates every statement and wraps a \
+             compound MySQL body in `DELIMITER $$`:\n{}",
+            offenders.join("\n")
+        );
+    }
+
+    /// Apply Rust's line-continuation rule to a literal's raw source text: a
+    /// `\` at end of line removes the newline **and the whole of the next
+    /// line's leading whitespace**.
+    ///
+    /// This is the whole point of the gate below. A literal that *is* continued
+    /// properly still holds `\`, a newline and an indent in its source bytes, so
+    /// a scan of the raw text reports every correctly-written multi-line string
+    /// in the workspace. What is left after this is what the program will hold.
+    fn unescape_continuations(raw: &str) -> String {
+        let mut out = String::with_capacity(raw.len());
+        let mut chars = raw.chars().peekable();
+        while let Some(c) = chars.next() {
+            if c != '\\' {
+                out.push(c);
+                continue;
+            }
+            match chars.peek() {
+                Some('\n') => {
+                    chars.next();
+                    while chars.peek().is_some_and(|c| c.is_whitespace()) {
+                        chars.next();
+                    }
+                }
+                // Any other escape: keep both characters. `\"` must not be read
+                // as the end of anything, and `\\` must not eat the next one.
+                Some(_) => {
+                    out.push(c);
+                    out.push(chars.next().expect("peeked"));
+                }
+                None => out.push(c),
+            }
+        }
+        out
+    }
+
+    /// Every `"…"` literal in `src`, as `(line, contents)`, skipping raw
+    /// strings, char literals and both kinds of comment.
+    ///
+    /// A char literal is skipped **whole**: `'a` is one byte to step over, but
+    /// `'"'` is not — treating its `"` as the opening of a string
+    /// desynchronises the scan for the rest of the file, and the run of
+    /// "literals" that follows is source code.
+    fn string_literals(src: &str) -> Vec<(usize, String)> {
+        let b = src.as_bytes();
+        let mut out = Vec::new();
+        let mut i = 0usize;
+        let mut line = 1usize;
+        while i < b.len() {
+            match b[i] {
+                b'\n' => {
+                    line += 1;
+                    i += 1;
+                }
+                b'/' if b.get(i + 1) == Some(&b'/') => {
+                    while i < b.len() && b[i] != b'\n' {
+                        i += 1;
+                    }
+                }
+                b'/' if b.get(i + 1) == Some(&b'*') => {
+                    i += 2;
+                    while i < b.len() && !(b[i] == b'*' && b.get(i + 1) == Some(&b'/')) {
+                        if b[i] == b'\n' {
+                            line += 1;
+                        }
+                        i += 1;
+                    }
+                    i = (i + 2).min(b.len());
+                }
+                // A raw string keeps whatever it holds on purpose. Compared as
+                // bytes: `i` walks past every byte of the body, so slicing here
+                // lands inside a multi-byte character the moment one appears.
+                b'r' if matches!(b.get(i + 1), Some(b'"' | b'#')) => {
+                    i += 1;
+                    let mut hashes = 0usize;
+                    while b.get(i) == Some(&b'#') {
+                        hashes += 1;
+                        i += 1;
+                    }
+                    if b.get(i) != Some(&b'"') {
+                        continue;
+                    }
+                    i += 1;
+                    let close = format!("\"{}", "#".repeat(hashes));
+                    let close = close.as_bytes();
+                    while i < b.len() && !b[i..].starts_with(close) {
+                        if b[i] == b'\n' {
+                            line += 1;
+                        }
+                        i += 1;
+                    }
+                    i = (i + close.len()).min(b.len());
+                }
+                b'\'' => {
+                    let body = if b.get(i + 1) == Some(&b'\\') { 3 } else { 2 };
+                    i += if b.get(i + body) == Some(&b'\'') {
+                        body + 1
+                    } else {
+                        1
+                    };
+                }
+                b'"' => {
+                    let at = line;
+                    i += 1;
+                    let start = i;
+                    while i < b.len() {
+                        if b[i] == b'\\' {
+                            if b.get(i + 1) == Some(&b'\n') {
+                                line += 1;
+                            }
+                            i += 2;
+                            continue;
+                        }
+                        if b[i] == b'"' {
+                            break;
+                        }
+                        if b[i] == b'\n' {
+                            line += 1;
+                        }
+                        i += 1;
+                    }
+                    if start <= i && i <= src.len() {
+                        out.push((at, unescape_continuations(&src[start..i])));
+                    }
+                    i += 1;
+                }
+                _ => i += 1,
+            }
+        }
+        out
+    }
+
+    /// **A string literal wrapped across source lines carries a `\` at the
+    /// break**, or the indentation becomes content.
+    ///
+    /// Rust does not join adjacent lines inside a `"…"`: without the backslash,
+    /// the newline *and the whole of the next line's indent* are part of the
+    /// string. The result is a sentence with a fourteen- or eighteen-space run
+    /// in the middle of it, and it reaches wherever that string goes.
+    ///
+    /// The instances differed only in who saw them: `app/antigravity.rs`'s
+    /// `blocked_reason` reaches the AI panel's no-tools note verbatim, so a user
+    /// read "already using Antigravity.⎵×14 Antigravity keeps one
+    /// machine-wide…"; `core/ddl.rs`'s generated-column refusal shows in the DDL
+    /// preview; `ui/blob_view.rs`'s is a cell-preview message; `core/launch.rs`'s
+    /// is latent, because its one consumer collapses space runs — a copy of the
+    /// mistake rather than a live one, which is exactly how a class survives
+    /// being fixed at its noisy sites.
+    ///
+    /// One test over the workspace rather than one per site, because the failure
+    /// is a typing habit and not a bug in any of them. Production code only: a
+    /// test's expected output lines columns up on purpose, and so does a SQL
+    /// fixture — and a literal that spells its own `\n` or `\t` is left alone,
+    /// that being the mark of a block whose spacing is deliberate.
+    #[test]
+    fn no_string_literal_carries_a_wrapped_lines_indentation() {
+        let files = workspace_sources();
+        assert!(files.len() >= 40, "the corpus collapsed: {}", files.len());
+        let mut scanned = 0usize;
+        let mut offenders: Vec<String> = Vec::new();
+        for (name, code) in &files {
+            for (line, lit) in string_literals(code) {
+                scanned += 1;
+                if lit.contains("\\n") || lit.contains("\\t") {
+                    continue;
+                }
+                // Six is past any legitimate run inside a sentence and well
+                // under the shortest indent that produced one of the originals.
+                let Some(at) = lit.find("      ") else {
+                    continue;
+                };
+                // Leading indentation of a literal that *starts* on its own line
+                // is the author's, not a wrap.
+                if lit[..at].trim().is_empty() {
+                    continue;
+                }
+                let from = lit[..at].char_indices().rev().nth(30).map_or(0, |(i, _)| i);
+                offenders.push(format!("{name}:{line}: …{}…", &lit[from..]));
+            }
+        }
+        assert!(
+            scanned >= 500,
+            "the scanner stopped finding literals: {scanned} — a gate that scans \
+             nothing reports success"
+        );
+        assert!(
+            offenders.is_empty(),
+            "a string wrapped across source lines with no `\\` at the break \
+             carries the next line's indentation as content, and it reaches \
+             wherever the string goes:\n{}",
+            offenders.join("\n")
+        );
+    }
 }

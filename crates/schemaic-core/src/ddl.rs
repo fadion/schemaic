@@ -8817,7 +8817,10 @@ fn rebuild_strands_a_generated_column(current: &TableInfo, draft: &TableDraft) -
             continue;
         };
         return Some(format!(
-            "Generated column {} computes from {}. A rebuild writes the table from              the model, and nothing rewrites that expression — SQLite refuses the              new table with \"no such column\" and the whole plan rolls back. Edit or              remove {} first.",
+            "Generated column {} computes from {}. A rebuild writes the table \
+             from the model, and nothing rewrites that expression — SQLite \
+             refuses the new table with \"no such column\" and the whole plan \
+             rolls back. Edit or remove {} first.",
             c.info.name, m.phrase, c.info.name,
         ));
     }
@@ -15266,28 +15269,27 @@ mod tests {
         /// was a compound body the app's own splitter cuts at its internal `;`:
         /// the ERROR 1064 fragment the wrapping exists to prevent.
         ///
-        /// **Moved to `tests/script_builders.rs`, which can see the whole
-        /// workspace.** The version that lived here read the production half of
-        /// `ddl.rs` and `compare.rs` only and matched the single literal
+        /// **Moved to `schemaic_ui::source_gate`'s tests, which can see the
+        /// whole workspace.** The version that lived here read the production
+        /// half of `ddl.rs` and `compare.rs` only and matched the single literal
         /// `emit().join(` — while `schemaic-app/src/mcp.rs` was a live fifth
         /// member of the class the whole time, in a crate the corpus did not
         /// include, under a commit message declaring the class closed at four.
         /// The replacement asks about the expression rather than one spelling of
         /// it, over every crate's `src`, with a floor.
         ///
+        /// It lives *there* rather than in this crate's `tests/` because a
+        /// workspace-wide scan here would need a second copy of
+        /// `source_gate::production_code` — `schemaic-ui` depends on this crate,
+        /// so a dev-dependency back is a cycle — and a second copy of that walk
+        /// is the thing `source_gate` exists to prevent.
+        ///
         /// This stub is the pointer; a reader who greps for the rule lands
         /// somewhere that names where it now lives.
         #[test]
         fn nothing_joins_the_emitted_statements_outside_client_script() {
-            // The two files that gate covered are still covered, now alongside
-            // the rest. Asserting the replacement exists is the only thing this
-            // can usefully do from here.
-            assert!(
-                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                    .join("tests/script_builders.rs")
-                    .exists(),
-                "the workspace-wide ratchet this was replaced by is gone"
-            );
+            // Nothing to assert from here — the corpus is unreachable. Kept as a
+            // signpost, which is stated rather than dressed up as coverage.
         }
 
         /// The gate, for the whole set: a draft off a table says nothing.

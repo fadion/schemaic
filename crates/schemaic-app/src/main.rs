@@ -303,24 +303,52 @@ enum CliLauncher<'a> {
 /// `None` when neither exists, which is the caller's cue to say so in the
 /// terminal rather than spawn something that dies immediately.
 fn resolve_cli<'a>(progs: &[&'a str]) -> Result<CliLauncher<'a>, &'static str> {
-    use schemaic_term::shell::which;
+    resolve_cli_with(progs, |p| {
+        schemaic_term::shell::which(p).map(|path| path.display().to_string())
+    })
+}
+
+/// [`resolve_cli`] over an injected resolver, so the *search* is testable
+/// without a `PATH`.
+///
+/// **A refused candidate is skipped, not an exit.** The `?` on
+/// `direct_spawn_verdict` propagated straight out of the loop, so a Windows box
+/// with an npm/scoop-style `mysql.cmd` earlier on `PATH` than a real client —
+/// which `direct_spawn_verdict`'s own doc calls "a supported configuration
+/// rather than a misconfiguration" — never tried `mariadb`, never reached the
+/// WSL arm, and told the user to point Settings at the real executable. There is
+/// no such setting on this path; the only DB-CLI resolution is this probe, so
+/// the feature was simply gone on a machine that had a safe client installed.
+/// The loop's whole shape says the refusal is about *this candidate*: it exists
+/// to try the next name.
+///
+/// The refusal is still the answer of last resort, so a box whose *only* client
+/// is a shim gets that specific line rather than the generic one.
+fn resolve_cli_with<'a>(
+    progs: &[&'a str],
+    resolve: impl Fn(&str) -> Option<String>,
+) -> Result<CliLauncher<'a>, &'static str> {
+    let mut refused: Option<&'static str> = None;
     for prog in progs {
         // **Asked of what `which` resolved, not of the name.** A `.cmd`/`.bat`
         // image is run by `cmd.exe`, which does not know what the `--`
         // terminator in front of a server-supplied database name means — see
-        // `launch::direct_spawn_verdict`. The refusal is a `Result` the caller
-        // cannot skip, which is the same shape every other refusal on this path
-        // has.
-        if let Some(path) = which(prog) {
-            launch::direct_spawn_verdict(&path)?;
-            return Ok(CliLauncher::Native(prog));
+        // `launch::direct_spawn_verdict`.
+        if let Some(path) = resolve(prog) {
+            match launch::direct_spawn_verdict(std::path::Path::new(&path)) {
+                Ok(()) => return Ok(CliLauncher::Native(prog)),
+                Err(why) => {
+                    refused.get_or_insert(why);
+                    continue;
+                }
+            }
         }
     }
-    match which("wsl.exe") {
+    match resolve("wsl.exe") {
         // The WSL launcher is `wsl.exe` itself; the client name rides in its
         // argv and is never a Windows image.
         Some(_) => Ok(CliLauncher::Wsl(progs[0])),
-        None => Err(NO_CLIENT),
+        None => Err(refused.unwrap_or(NO_CLIENT)),
     }
 }
 
@@ -12644,8 +12672,9 @@ mod app_tests {
     use super::{
         Action, CliLauncher, ConnGate, ConnGateElse, Refusal, RunTimeout, gate1, gate1_on_tab,
         gate1_on_tab_answered, inline_outcome, mysql_shell_config, owning_tab_of,
-        plan_refusal_text, plan_refused, psql_database, psql_shell_config, resolve_native_cli,
-        sqlite_shell_config, test_outcome, timeout_message, tx_engine, unique_name,
+        plan_refusal_text, plan_refused, psql_database, psql_shell_config, resolve_cli_with,
+        resolve_native_cli, sqlite_shell_config, test_outcome, timeout_message, tx_engine,
+        unique_name,
     };
     use floem::prelude::{SignalGet, SignalUpdate};
     use floem::reactive::RwSignal;
@@ -13499,6 +13528,71 @@ mod app_tests {
         tokio::time::sleep(std::time::Duration::from_secs(61)).await;
         assert!(token.is_cancelled(), "the run was not cancelled");
         assert!(watchdog.fired(), "the reason was not recorded");
+    }
+
+    /// **A `.cmd` shim for the first candidate must not end the search.**
+    ///
+    /// `direct_spawn_verdict`'s `?` propagated out of the loop, so a Windows box
+    /// with an npm/scoop-style `mysql.cmd` earlier on `PATH` than a real client
+    /// — a configuration that predicate's own doc calls supported — never tried
+    /// `mariadb` and never reached the WSL arm. The user was told to point
+    /// Settings at the real executable, and there is no such setting on this
+    /// path: the probe *is* the resolution, so the feature was gone on a machine
+    /// that had a safe client installed.
+    ///
+    /// Over an injected resolver, because the defect is in the search and the
+    /// real one reads the machine's `PATH`.
+    #[test]
+    fn a_shim_for_one_candidate_does_not_hide_the_next_one() {
+        let found = |table: &'static [(&'static str, &'static str)]| {
+            move |p: &str| {
+                table
+                    .iter()
+                    .find(|(name, _)| *name == p)
+                    .map(|(_, path)| (*path).to_string())
+            }
+        };
+        // The first is a shim and the second is real: the real one wins.
+        let r = resolve_cli_with(
+            &["mysql", "mariadb"],
+            found(&[
+                ("mysql", "C:\\npm\\mysql.cmd"),
+                ("mariadb", "C:\\db\\mariadb.exe"),
+            ]),
+        );
+        assert!(
+            matches!(r, Ok(CliLauncher::Native("mariadb"))),
+            "the shim hid an installed client"
+        );
+        // Only a shim on PATH, but WSL is present: the WSL client is reached.
+        let r = resolve_cli_with(
+            &["mysql", "mariadb"],
+            found(&[
+                ("mysql", "C:\\npm\\mysql.cmd"),
+                ("wsl.exe", "C:\\w\\wsl.exe"),
+            ]),
+        );
+        assert!(
+            matches!(r, Ok(CliLauncher::Wsl("mysql"))),
+            "the shim hid the WSL fallback"
+        );
+        // A shim and nothing else: the specific refusal, not the generic line —
+        // this is the case the message was written for.
+        let r = resolve_cli_with(&["mysql"], found(&[("mysql", "C:\\npm\\mysql.cmd")]));
+        let why = r.err().expect("a shim with no alternative is refused");
+        assert!(why.contains("shim"), "{why}");
+        // Nothing at all is the generic line.
+        let r = resolve_cli_with(&["mysql"], found(&[]));
+        assert_eq!(r.err(), Some(super::NO_CLIENT));
+        // And an ordinary first candidate still short-circuits.
+        let r = resolve_cli_with(
+            &["mysql", "mariadb"],
+            found(&[
+                ("mysql", "C:\\db\\mysql.exe"),
+                ("mariadb", "C:\\db\\mariadb.exe"),
+            ]),
+        );
+        assert!(matches!(r, Ok(CliLauncher::Native("mysql"))));
     }
 
     /// A statement that finishes must not leave an hour-long `sleep` behind,

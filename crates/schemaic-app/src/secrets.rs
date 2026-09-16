@@ -181,7 +181,8 @@ fn told_once(notice: &str) -> bool {
 /// Forget a deleted connection's stored secrets. Returns whether they are all
 /// definitely gone; `false` means the keyring would not answer and an entry may
 /// outlive the connection — which matters, because ids are reused.
-#[must_use = "a `false` is what the user is told; dropping it left the deleted               connection's secrets in the keyring for the next id to inherit"]
+#[must_use = "a `false` is what the user is told; dropping it left the deleted \
+              connection's secrets in the keyring for the next id to inherit"]
 pub fn forget_connection(id: u64) -> bool {
     let gone = secrets::forget(id, &KeyringStore);
     if !gone {

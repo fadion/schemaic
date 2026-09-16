@@ -631,7 +631,8 @@ fn preview_view(value: Arc<BlobValue>, kind: BlobKind) -> impl IntoView {
         .into_any(),
         PreviewVerdict::Truncated => note_view(
             format!(
-                "Only the first {} of this {} was read, so it cannot be drawn.                  Read the bytes as Hex.",
+                "Only the first {} of this {} was read, so it cannot be drawn. \
+                 Read the bytes as Hex.",
                 human_bytes(value.bytes.len() as i64),
                 kind.label()
             ),

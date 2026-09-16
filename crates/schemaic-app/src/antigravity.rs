@@ -479,7 +479,10 @@ fn may_register(claimed: &Claimed) -> bool {
 fn blocked_reason(claimed: &Claimed) -> &'static str {
     match claimed {
         Claimed::Shared => {
-            "Another Schemaic window is already using Antigravity.              Antigravity keeps one machine-wide MCP registration, which can point at              only one connection, so this window's assistant has no database tools"
+            "Another Schemaic window is already using Antigravity. \
+             Antigravity keeps one machine-wide MCP registration, which can \
+             point at only one connection, so this window's assistant has no \
+             database tools"
         }
         _ => "Schemaic could not claim Antigravity's configuration for this session",
     }
@@ -518,7 +521,9 @@ impl AgyRegistration {
         }
         if claimed == Claimed::Shared {
             tracing::warn!(
-                "another Schemaic window is already using Antigravity; this session                  runs without database tools rather than repointing the shared                  registration at its own connection"
+                "another Schemaic window is already using Antigravity; this \
+                 session runs without database tools rather than repointing the \
+                 shared registration at its own connection"
             );
             return reg;
         }

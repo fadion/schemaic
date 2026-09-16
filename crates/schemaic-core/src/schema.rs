@@ -3911,8 +3911,8 @@ impl TableInfo {
         let cname = crate::export::comment_text(&qname);
         if self.is_sequence {
             return format!(
-                "-- {cname} is a sequence. Schemaic reads its definition from the row, not the
-                 -- catalogue, so this script cannot restate it. Copy it from
+                "-- {cname} is a sequence. Schemaic reads its definition from the row, not the\n\
+                 -- catalogue, so this script cannot restate it. Copy it from\n\
                  -- `SHOW CREATE SEQUENCE {cname}` on the source server."
             );
         }

@@ -252,15 +252,6 @@ pub fn sqlite_target(file: &str) -> Result<&str, &'static str> {
     Ok(file)
 }
 
-/// The `--ssl-*` argv a MySQL/MariaDB client needs to honour `tls`.
-///
-/// **Always non-empty, including for [`SslMode::Disable`][crate::connection::SslMode::Disable].**
-/// Saying nothing is
-/// not neutral: the client's own default is `--ssl-mode=PREFERRED`, which
-/// accepts an unencrypted socket if the server offers one and verifies no
-/// certificate either way — so an omitted flag downgrades a `verify-full`
-/// connection while the app's own header, whose socket really is encrypted,
-/// goes on reporting TLS.
 /// Which of the two MySQL-family clients an argv is being built for.
 ///
 /// **They do not share the option.** `--ssl-mode` is MySQL's; MariaDB's client
@@ -313,6 +304,25 @@ impl MysqlClient {
     }
 }
 
+/// The `--ssl-*` argv a MySQL/MariaDB client needs to honour `tls`.
+///
+/// **Restored to the function it is about.** `44ccfa4` inserted
+/// [`MysqlClient`]'s doc between this block and its signature, so this paragraph
+/// became the opening of the published rustdoc for *that enum* and this function
+/// carried no doc at all — `missing_docs` is off, so `cargo doc -D warnings` saw
+/// nothing. The contract below is the one thing a reader of this function has to
+/// know, and for a while it was attached to something else.
+///
+/// **Non-empty wherever saying nothing would change the meaning.** For MySQL's
+/// client that is every rung including
+/// [`SslMode::Disable`][crate::connection::SslMode::Disable]: its default is
+/// `--ssl-mode=PREFERRED`, which accepts an unencrypted socket if the server
+/// offers one and verifies no certificate either way — so an omitted flag
+/// downgrades a `verify-full` connection while the app's own header, whose
+/// socket really is encrypted, goes on reporting TLS.
+///
+/// MariaDB's client has one rung where the empty answer is the right one, and it
+/// is measured rather than assumed — see the `Prefer` arm.
 pub fn mysql_cli_tls_args(tls: &crate::connection::Tls, client: MysqlClient) -> Vec<String> {
     use crate::connection::SslMode;
     if client == MysqlClient::MariaDb {
@@ -325,6 +335,16 @@ pub fn mysql_cli_tls_args(tls: &crate::connection::Tls, client: MysqlClient) -> 
             // The client's own default already tries TLS and verifies nothing,
             // which is what this rung means — so there is nothing to say, and
             // saying `--ssl` would turn a preference into a requirement.
+            //
+            // **Measured, because the sentence above was originally written
+            // about *MySQL's* client and inherited here.** MariaDB 10.11.14's
+            // client, invoked with no `--ssl` flag at all against a server with
+            // `have_ssl = YES`, reports
+            // `Ssl_cipher = TLS_AES_256_GCM_SHA384` — it is opportunistic, so
+            // the empty answer really is this rung. Had it come back blank, the
+            // CLI session would have been plaintext while the app's own driver
+            // on the same `Connection` was encrypted and the terminal panel
+            // badged it as this connection's client.
             SslMode::Prefer => Vec::new(),
             SslMode::Require | SslMode::VerifyCa => vec!["--ssl".to_string()],
             SslMode::VerifyFull => {
@@ -426,7 +446,10 @@ pub fn wsl_tls_blocker(tls: &crate::connection::Tls) -> Option<&'static str> {
 /// compared.
 pub fn tunnelled_verify_blocker(tls: &crate::connection::Tls) -> Option<&'static str> {
     use crate::connection::SslMode;
-    const WHY: &str = "This connection verifies the server's certificate and reaches it through         an SSH tunnel, so the client would be told to dial 127.0.0.1 and check the certificate         against that — which the server's own certificate cannot satisfy. Open a query tab         instead, or lower the TLS mode for the CLI session.";
+    const WHY: &str = "This connection verifies the server's certificate and reaches it \
+        through an SSH tunnel, so the client would be told to dial 127.0.0.1 and check the \
+        certificate against that — which the server's own certificate cannot satisfy. Open a \
+        query tab instead, or lower the TLS mode for the CLI session.";
     matches!(tls.mode, SslMode::VerifyCa | SslMode::VerifyFull).then_some(WHY)
 }
 
@@ -878,7 +901,30 @@ two"
             );
         }
         assert_eq!(args(SslMode::Disable), ["--skip-ssl"]);
-        assert!(args(SslMode::Prefer).is_empty(), "the client's own default");
+        // **What `Prefer` means, not merely that this rung is empty.** Empty is
+        // the right answer here only because MariaDB's client is opportunistic —
+        // measured on 10.11.14: no `--ssl` flag against a server with
+        // `have_ssl = YES` gives `Ssl_cipher = TLS_AES_256_GCM_SHA384`. So the
+        // property is "tries TLS, requires nothing, verifies nothing": it must
+        // not *demand* TLS (`--ssl`), must not *refuse* it (`--skip-ssl`), and
+        // must not verify (`--ssl-verify-server-cert`). Asserting `is_empty()`
+        // alone said nothing about any of those, so an arm that started sending
+        // `--skip-ssl` here would have been caught by nothing.
+        let prefer = args(SslMode::Prefer);
+        assert!(
+            !prefer.iter().any(|a| a == "--skip-ssl"),
+            "Prefer must not refuse TLS: {prefer:?}"
+        );
+        assert!(
+            !prefer.iter().any(|a| a == "--ssl"),
+            "Prefer must not require TLS — that is what Require is: {prefer:?}"
+        );
+        assert!(
+            !prefer.iter().any(|a| a == "--ssl-verify-server-cert"),
+            "Prefer verifies nothing: {prefer:?}"
+        );
+        // And it is strictly weaker than the rung above it.
+        assert_ne!(prefer, args(SslMode::Require));
         assert_eq!(args(SslMode::Require), ["--ssl"]);
         assert_eq!(args(SslMode::VerifyCa), ["--ssl"]);
         assert_eq!(
