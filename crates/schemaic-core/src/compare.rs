@@ -731,7 +731,12 @@ impl SchemaComparison {
         // both still carry the same constraint and index names, and the phases
         // put every create ahead of every drop — so the create is refused for a
         // name the table two statements below still holds.
-        let clashes = clashes_between(&entries, left, right, dialect);
+        //
+        // `target.flavour()` — the *left* server's, the one that will read the
+        // statements — because MySQL and MariaDB do not scope a `CHECK`
+        // constraint name the same way, and this is the question that turns on
+        // it.
+        let clashes = clashes_between(&entries, left, right, dialect, left.flavour);
         // Pull each resolvable drop to the front of the table phase. `retain` +
         // `splice` rather than a re-sort: the order everything else is in was
         // just computed and is not up for revision.
@@ -1037,12 +1042,20 @@ impl SchemaComparison {
             .filter(|e| include(e) && !e.needs_source() && !e.unplannable())
             .map(CompareEntry::key)
             .collect();
+        // **`resolved` is resolved only if the drop is in this plan.** It is
+        // computed once, in `SchemaComparison::of`, from the whole schema —
+        // `include` is not known until here — so a clash the reordering settled
+        // stayed settled however the ticks fell. Untick the drop, which is an
+        // ordinary thing to do ("create the new table, I'll drop the old one
+        // later"), and the refused `CREATE` comes back with nothing above Apply:
+        // the constraint name is still held by a table this plan no longer
+        // touches.
         let clashes: Vec<String> = self
             .name_clashes
             .iter()
-            .filter(|c| !c.resolved)
-            .filter(|c| chosen_keys.contains(&c.freed_by) && chosen_keys.contains(&c.claimed_by))
-            .map(NameClash::note)
+            .filter(|c| !(c.resolved && chosen_keys.contains(&c.freed_by)))
+            .filter(|c| chosen_keys.contains(&c.claimed_by))
+            .map(|c| c.note(self.dialect))
             .collect();
         SchemaPlan {
             sets,
@@ -1435,28 +1448,53 @@ fn phase(kind: CompareKind, status: ObjectStatus) -> u8 {
 /// message naming a constraint they never asked about.
 ///
 /// **Per engine, because the scope is per engine** — a capability, not a
-/// dialect test dressed up as one:
-/// - MySQL/MariaDB key foreign-key constraint names to the database and index
-///   names to the table, so only the foreign keys are here.
-/// - PostgreSQL puts indexes and table-level constraints in the **same**
-///   namespace as tables, so both are.
-/// - SQLite keys index names to the database and names no foreign key at all.
-fn occupied_names(t: &TableInfo, dialect: SqlDialect) -> BTreeSet<String> {
+/// dialect test dressed up as one. Every line below was measured on the live
+/// tier (MySQL 8.4.11, MariaDB 10.11.14, PostgreSQL 16.15) by creating two
+/// tables in one database that share the name:
+/// - **MySQL and MariaDB** key foreign-key constraint names to the database
+///   (ERROR 1826 on MySQL, ERROR 1005 / errno 121 on MariaDB) and index names to
+///   the table.
+/// - **`CHECK` names split the family**, which is why this takes a flavour and
+///   not only a dialect: MySQL 8.0.16+ scopes them to the database (measured:
+///   *ERROR 3822 Duplicate check constraint name*) and MariaDB scopes them to
+///   the table (measured: accepted). `Unknown` — a hand-built schema, or a
+///   server not yet asked — takes the *narrow* answer, so an uncertain read
+///   raises no warning about a statement that may be fine.
+/// - **PostgreSQL scopes only what creates a relation.** `pg_constraint`'s
+///   unique index is on `(conrelid, contypid, conname)`, so a constraint name is
+///   per *table*; it is the index a `UNIQUE`/`PRIMARY KEY`/`EXCLUDE` builds that
+///   shares the namespace with tables. Measured: two tables with the same
+///   `CHECK` name and two with the same foreign-key name are both accepted, and
+///   two with the same `UNIQUE` name give *relation "uq_x" already exists*. So
+///   the arm is `t.indexes` alone — the index a unique or primary-key constraint
+///   creates is already an `IndexInfo`, so the real clash is still caught.
+/// - **SQLite** keys index names to the database and names no foreign key at
+///   all.
+fn occupied_names(
+    t: &TableInfo,
+    dialect: SqlDialect,
+    flavour: crate::schema::ServerFlavour,
+) -> BTreeSet<String> {
+    use crate::schema::ServerFlavour;
     let mut out = BTreeSet::new();
     let qualify = |n: &str| display_name(t.schema.as_deref(), n);
+    let table_checks = |out: &mut BTreeSet<String>| {
+        out.extend(
+            t.check_constraints
+                .iter()
+                .filter(|c| !c.column_level)
+                .map(|c| qualify(&c.name)),
+        );
+    };
     match dialect {
         SqlDialect::MySql => {
             out.extend(t.foreign_keys.iter().map(|fk| qualify(&fk.name)));
+            if flavour == ServerFlavour::MySql {
+                table_checks(&mut out);
+            }
         }
         SqlDialect::Postgres => {
-            out.extend(t.foreign_keys.iter().map(|fk| qualify(&fk.name)));
             out.extend(t.indexes.iter().map(|ix| qualify(&ix.name)));
-            out.extend(
-                t.check_constraints
-                    .iter()
-                    .filter(|c| !c.column_level)
-                    .map(|c| qualify(&c.name)),
-            );
         }
         SqlDialect::Sqlite => {
             out.extend(t.indexes.iter().map(|ix| qualify(&ix.name)));
@@ -1473,8 +1511,14 @@ pub struct NameClash {
     pub freed_by: String,
     /// [`CompareEntry::key`] of the `OnlyRight` table that needs it.
     pub claimed_by: String,
-    /// The identifier itself, qualified the way the engine scopes it.
-    pub name: String,
+    /// The identifiers themselves, qualified the way the engine scopes them.
+    ///
+    /// **Every shared name, not the first.** Two tables sharing three
+    /// constraint names produced one sentence naming one of them, so the user
+    /// renamed that one and met the next — and which one was named came out of a
+    /// `BTreeSet` intersection, i.e. alphabetically, while the server refuses on
+    /// whichever it meets first.
+    pub names: Vec<String>,
     /// True when the drop was pulled ahead of the create, which settles it.
     /// False when something on the left still references the dropped table, so
     /// no order works and the clash is disclosed instead.
@@ -1485,16 +1529,39 @@ impl NameClash {
     /// The sentence above Apply: which name, which two objects, and why no
     /// order fixes it. Named for the objects rather than for the statement,
     /// like every other line in [`SchemaPlan::destructive`].
-    pub fn note(&self) -> String {
+    /// **The closing clause is per engine.** It was the MySQL sentence for
+    /// every dialect, so a PostgreSQL comparison was told that "neither MySQL
+    /// nor MariaDB rolls DDL back" about a server whose DDL *is* transactional
+    /// — which is not a detail: on PostgreSQL the refused statement takes the
+    /// whole migration with it and nothing is half-applied, and that changes
+    /// what the reader should do about it.
+    ///
+    /// The reason the drop cannot be pulled ahead is also per clash: it is a
+    /// reference on the left when `resolved` is false, and "this plan does not
+    /// include the drop" when the user unticked it.
+    pub fn note(&self, dialect: SqlDialect) -> String {
         let strip = |k: &str| k.split_once(':').map_or(k, |(_, n)| n).to_string();
+        let names = self.names.join(", ");
+        let why = if self.resolved {
+            "and this plan does not drop it"
+        } else {
+            "and it cannot be dropped first because another table references it"
+        };
+        let cost = match dialect {
+            SqlDialect::MySql => {
+                "One statement will be refused, and neither MySQL nor MariaDB rolls DDL back."
+            }
+            // The whole migration is one transaction here, so nothing is left
+            // half-applied — but the migration does not happen.
+            SqlDialect::Postgres => {
+                "One statement will be refused, which rolls the whole migration back."
+            }
+            SqlDialect::Sqlite => "One statement will be refused.",
+        };
         format!(
-            "{} still holds {}, which creating {} needs — and {} cannot be dropped first \
-             because another table references it. One statement will be refused, and \
-             neither MySQL nor MariaDB rolls DDL back.",
+            "{} still holds {names}, which creating {} needs — {why}. {cost}",
             strip(&self.freed_by),
-            self.name,
             strip(&self.claimed_by),
-            strip(&self.freed_by),
         )
     }
 }
@@ -1502,14 +1569,21 @@ impl NameClash {
 /// Every clash between a table this comparison would drop and one it would
 /// create, in create order.
 ///
-/// Only `OnlyLeft` against `OnlyRight`: a `Differing` table keeps its identity,
-/// so its constraint names are the *same table's* and the `ALTER` path already
-/// drops and re-adds each one in the right order.
+/// The drop side is `OnlyLeft`. The claim side is `OnlyRight` **or
+/// `Differing`**, and the second half was missing under a rationale that does
+/// not cover it: *"a `Differing` table keeps its identity, so its constraint
+/// names are the same table's and the `ALTER` path already drops and re-adds
+/// each one in the right order"* — true of a name the table already had, and
+/// false of one it is **acquiring from somewhere else**. `ALTER TABLE orders ADD
+/// CONSTRAINT fk_cust` while `archive` still holds `fk_cust` is ERROR 1826, and
+/// the `ALTER` sits in the phase that runs *before* every drop. So a `Differing`
+/// table contributes only the names it does **not** already hold on the left.
 fn clashes_between(
     entries: &[CompareEntry],
     left: &DbSchema,
     right: &DbSchema,
     dialect: SqlDialect,
+    flavour: crate::schema::ServerFlavour,
 ) -> Vec<NameClash> {
     // The shape, not `!is_view` — a MariaDB sequence is not a view and is not a
     // table either, and pulling one into the clash census would make it a
@@ -1537,24 +1611,36 @@ fn clashes_between(
     for create in entries
         .iter()
         .filter(is_table)
-        .filter(|e| e.status == ObjectStatus::OnlyRight)
+        .filter(|e| matches!(e.status, ObjectStatus::OnlyRight | ObjectStatus::Differing))
     {
         let Some(made) = table_of(&right.tables, create) else {
             continue;
         };
-        let claimed = occupied_names(&made, dialect);
+        let mut claimed = occupied_names(&made, dialect, flavour);
+        // A `Differing` table keeps the names it already had; only what it is
+        // *acquiring* can clash with something else's.
+        if create.status == ObjectStatus::Differing
+            && let Some(was) = table_of(&left.tables, create)
+        {
+            for had in occupied_names(&was, dialect, flavour) {
+                claimed.remove(&had);
+            }
+        }
+        if claimed.is_empty() {
+            continue;
+        }
         for (drop, held) in &drops {
-            let Some(name) = occupied_names(held, dialect)
+            let names: Vec<String> = occupied_names(held, dialect, flavour)
                 .intersection(&claimed)
-                .next()
                 .cloned()
-            else {
+                .collect();
+            if names.is_empty() {
                 continue;
-            };
+            }
             out.push(NameClash {
                 freed_by: drop.key(),
                 claimed_by: create.key(),
-                name,
+                names,
                 resolved: nothing_else_references(&held.name, held.schema.as_deref(), &left.tables),
             });
         }
@@ -2387,34 +2473,310 @@ mod tests {
     /// A clash between two objects the user did not tick is not this plan's
     /// problem, and a warning about statements that are not in the script is
     /// noise the reader cannot act on.
+    ///
+    /// **The *create* is what the clash is about.** Unticking it removes the
+    /// statement that would be refused, so there is nothing left to say.
+    /// Unticking the **drop** does not: the name is still held by a table this
+    /// plan no longer touches, so the create is refused exactly as before — and
+    /// that direction used to be silent, because the filter required both keys.
     #[test]
     fn a_clash_outside_the_ticked_set_is_not_reported() {
         let c = referenced_rename();
         assert!(!c.plan(|_| true).clashes.is_empty(), "the fixture clashes");
         assert!(c.plan(|e| e.key() != "table:orders").clashes.is_empty());
-        assert!(c.plan(|e| e.key() != "table:orders_old").clashes.is_empty());
+        assert!(
+            !c.plan(|e| e.key() != "table:orders_old").clashes.is_empty(),
+            "the create is still in the plan and is still refused"
+        );
+    }
+
+    /// **A clash the reordering settled is settled only while the drop is in the
+    /// plan.**
+    ///
+    /// `resolved` is computed once in `SchemaComparison::of`, from the whole
+    /// schema — `include` is not known until `plan()` — so a clash the pull had
+    /// fixed stayed fixed however the ticks fell. Untick the drop, which is an
+    /// ordinary thing to do ("create the new table, I'll drop the old one
+    /// later"), and the `CREATE TABLE orders … CONSTRAINT fk_orders_customer`
+    /// goes out with `orders_old` still holding that name: ERROR 1826, one
+    /// statement among many, on an engine with no DDL rollback — the exact
+    /// failure the clash detector exists to end — with nothing above Apply.
+    #[test]
+    fn a_resolved_clash_is_disclosed_when_its_drop_is_not_ticked() {
+        let c = mysql(
+            schema_of(vec![
+                table("customers", &[("id", "int")]),
+                child("orders_old", "fk_orders_customer", "customers"),
+            ]),
+            schema_of(vec![
+                table("customers", &[("id", "int")]),
+                child("orders", "fk_orders_customer", "customers"),
+            ]),
+        );
+        // With both ticked the pull settles it and nothing is said.
+        assert!(c.plan(|_| true).clashes.is_empty());
+        // With the drop unticked it is not settled, and the plan says so.
+        let plan = c.plan(|e| e.key() != "table:orders_old");
+        assert!(
+            plan.clashes
+                .iter()
+                .any(|n| n.contains("fk_orders_customer")),
+            "the refused CREATE is back with nothing said: {:?}",
+            plan.clashes
+        );
+        assert!(
+            plan.clashes.iter().any(|n| n.contains("does not drop it")),
+            "the sentence gives the wrong reason: {:?}",
+            plan.clashes
+        );
+    }
+
+    /// **Every shared name, not the first.** Two tables sharing three
+    /// constraint names produced one sentence naming one of them — chosen
+    /// alphabetically by a `BTreeSet` intersection, while the server refuses on
+    /// whichever it meets first. The user renames that one and meets the next.
+    #[test]
+    fn a_clash_names_every_identifier_the_two_tables_share() {
+        let three = |name: &str| {
+            let mut t = child(name, "fk_a", "customers");
+            t.foreign_keys.push(crate::schema::ForeignKeyInfo {
+                name: "fk_b".to_string(),
+                columns: vec!["customer_id".to_string()],
+                ref_table: "customers".to_string(),
+                ref_columns: vec!["id".to_string()],
+                ..Default::default()
+            });
+            t.foreign_keys.push(crate::schema::ForeignKeyInfo {
+                name: "fk_c".to_string(),
+                columns: vec!["customer_id".to_string()],
+                ref_table: "customers".to_string(),
+                ref_columns: vec!["id".to_string()],
+                ..Default::default()
+            });
+            t
+        };
+        let c = mysql(
+            schema_of(vec![
+                table("customers", &[("id", "int")]),
+                three("orders_old"),
+                child("shipments", "fk_ship_orders", "orders_old"),
+            ]),
+            schema_of(vec![table("customers", &[("id", "int")]), three("orders")]),
+        );
+        let plan = c.plan(|_| true);
+        let note = plan.clashes.join(" ");
+        for n in ["fk_a", "fk_b", "fk_c"] {
+            assert!(note.contains(n), "{n} is not named: {note}");
+        }
+    }
+
+    /// **A `Differing` table can acquire a name from somewhere else**, and the
+    /// rationale for leaving it out did not cover that.
+    ///
+    /// *"A `Differing` table keeps its identity, so its constraint names are the
+    /// same table's and the `ALTER` path already drops and re-adds each one in
+    /// the right order"* — true of a name the table already had. Here `orders`
+    /// gains `fk_cust` while `archive` still holds it, and the `ALTER` sits in
+    /// the phase that runs **before** every drop: ERROR 1826, with whatever ran
+    /// before it left in place.
+    #[test]
+    fn an_alter_that_claims_a_dropped_tables_constraint_name_is_ordered_or_disclosed() {
+        let plain = |name: &str| table(name, &[("id", "int"), ("customer_id", "int")]);
+        let left = || {
+            schema_of(vec![
+                table("customers", &[("id", "int")]),
+                child("archive", "fk_cust", "customers"),
+                plain("orders"),
+            ])
+        };
+        let right = || {
+            schema_of(vec![
+                table("customers", &[("id", "int")]),
+                child("orders", "fk_cust", "customers"),
+            ])
+        };
+        // Nothing references `archive`, so the drop is pulled ahead of the
+        // `ALTER` that needs the name.
+        let c = mysql(left(), right());
+        let sql = c.plan(|_| true).emit().join("\n");
+        assert!(
+            at(&sql, "DROP TABLE `archive`") < at(&sql, "ADD CONSTRAINT `fk_cust`"),
+            "the ALTER still runs while `archive` holds the name:\n{sql}"
+        );
+
+        // …and when something does reference it, no order works and the plan
+        // says so instead.
+        let mut blocked = left();
+        blocked
+            .tables
+            .push(child("shipments", "fk_ship", "archive"));
+        let c = mysql(blocked, right());
+        let plan = c.plan(|_| true);
+        assert!(
+            plan.clashes.iter().any(|n| n.contains("fk_cust")),
+            "nothing disclosed: {:?}",
+            plan.clashes
+        );
+    }
+
+    /// **A `Differing` table keeping its *own* names raises nothing** — which is
+    /// the half the original rationale had right, and the widening must not
+    /// break it.
+    #[test]
+    fn a_differing_table_that_keeps_its_own_constraint_names_clashes_with_nothing() {
+        let left = schema_of(vec![
+            table("customers", &[("id", "int")]),
+            child("orders", "fk_cust", "customers"),
+            table("gone", &[("id", "int")]),
+        ]);
+        let mut right_orders = child("orders", "fk_cust", "customers");
+        right_orders.columns.push(crate::schema::ColumnInfo {
+            name: "added".to_string(),
+            type_name: "int".to_string(),
+            ..Default::default()
+        });
+        let right = schema_of(vec![table("customers", &[("id", "int")]), right_orders]);
+        let c = mysql(left, right);
+        assert_eq!(find(&c, "table:orders").status, ObjectStatus::Differing);
+        assert!(
+            c.plan(|_| true).clashes.is_empty(),
+            "{:?}",
+            c.plan(|_| true).clashes
+        );
+    }
+
+    /// **PostgreSQL scopes only what creates a relation**, so a shared `CHECK`
+    /// or foreign-key name is not a clash there — and the plan must not be
+    /// reordered on the strength of one.
+    ///
+    /// Measured on PostgreSQL 16.15: two tables in one schema with the same
+    /// `CHECK` name and two with the same foreign-key name are both accepted;
+    /// two with the same `UNIQUE` name give *relation "uq_x" already exists*.
+    #[test]
+    fn a_postgres_check_name_shared_between_two_tables_is_not_a_clash() {
+        let checked = |name: &str| TableInfo {
+            check_constraints: vec![crate::schema::CheckInfo {
+                name: "ck_total".to_string(),
+                expression: "total >= 0".to_string(),
+                ..Default::default()
+            }],
+            ..table(name, &[("id", "int"), ("total", "int")])
+        };
+        let c = SchemaComparison::of(
+            &schema_of(vec![checked("orders_old")]),
+            &schema_of(vec![checked("orders")]),
+            SqlDialect::Postgres,
+        );
+        assert!(
+            c.plan(|_| true).clashes.is_empty(),
+            "{:?}",
+            c.plan(|_| true).clashes
+        );
+        // And the plan is not reordered on the strength of it: a create that
+        // fails for an unrelated reason must not have taken the old table with
+        // it first.
+        let sql = c.plan(|_| true).emit().join("\n");
+        assert!(
+            at(&sql, "CREATE TABLE") < at(&sql, "DROP TABLE"),
+            "the drop was pulled ahead for a name PostgreSQL does not scope:\n{sql}"
+        );
+    }
+
+    /// **MySQL 8 scopes a `CHECK` name to the database and MariaDB does not**,
+    /// so the answer is the server's flavour rather than the dialect.
+    ///
+    /// Measured: MySQL 8.4.11 refuses the second table with *ERROR 3822
+    /// Duplicate check constraint name*; MariaDB 10.11.14 accepts it.
+    #[test]
+    fn a_mysql_check_name_clashes_where_mariadb_lets_it_stand() {
+        let checked = |name: &str| TableInfo {
+            check_constraints: vec![crate::schema::CheckInfo {
+                name: "ck_total".to_string(),
+                expression: "total >= 0".to_string(),
+                ..Default::default()
+            }],
+            ..table(name, &[("id", "int"), ("total", "int")])
+        };
+        let compare = |flavour| {
+            let mut left = schema_of(vec![checked("orders_old")]);
+            left.flavour = flavour;
+            SchemaComparison::of(
+                &left,
+                &schema_of(vec![checked("orders")]),
+                SqlDialect::MySql,
+            )
+        };
+        // MySQL: the drop is pulled ahead, because the create would be refused.
+        let my = compare(crate::schema::ServerFlavour::MySql);
+        let sql = my.plan(|_| true).emit().join("\n");
+        assert!(
+            at(&sql, "DROP TABLE") < at(&sql, "CREATE TABLE"),
+            "MySQL refuses a duplicate check name (3822) and the order ignores it:\n{sql}"
+        );
+        // MariaDB: nothing to reorder.
+        let maria = compare(crate::schema::ServerFlavour::MariaDb);
+        let sql = maria.plan(|_| true).emit().join("\n");
+        assert!(
+            at(&sql, "CREATE TABLE") < at(&sql, "DROP TABLE"),
+            "MariaDB scopes a check name per table; the plan was reordered anyway:\n{sql}"
+        );
     }
 
     /// The per-engine scope, which is what decides whether two tables can hold
-    /// one name at all: MySQL keys an index name to its table and a foreign key
-    /// to the database, PostgreSQL puts both in the namespace, SQLite names no
-    /// foreign key.
+    /// one name at all. **Every line measured on the live tier**, by creating
+    /// two tables in one database that share the name:
+    ///
+    /// | | FK name | `CHECK` name | index name |
+    /// | --- | --- | --- | --- |
+    /// | MySQL 8.4.11 | refused (1826) | **refused (3822)** | per table |
+    /// | MariaDB 10.11.14 | refused (1005/121) | **accepted** | per table |
+    /// | PostgreSQL 16.15 | accepted | accepted | refused |
+    ///
+    /// Two corrections to the first spelling are in that table. PostgreSQL's
+    /// arm claimed foreign keys and table-level checks as well as indexes; its
+    /// `pg_constraint` unique index is on `(conrelid, contypid, conname)`, so a
+    /// constraint name is per *table* and it is only the relation an index
+    /// creates that shares the namespace. And the `CHECK` answer splits the
+    /// MySQL family, which is why this takes a flavour.
     #[test]
     fn the_names_a_table_occupies_are_the_ones_its_engine_scopes_outside_it() {
+        use crate::schema::{CheckInfo, ServerFlavour};
         let t = TableInfo {
             indexes: vec![crate::schema::IndexInfo {
                 name: "ix_orders_customer".to_string(),
                 ..Default::default()
             }],
+            check_constraints: vec![CheckInfo {
+                name: "ck_orders_total".to_string(),
+                ..Default::default()
+            }],
             ..child("orders", "fk_orders_customer", "customers")
         };
-        let names = |d| occupied_names(&t, d).into_iter().collect::<Vec<_>>();
-        assert_eq!(names(SqlDialect::MySql), vec!["fk_orders_customer"]);
+        let names = |d, f| occupied_names(&t, d, f).into_iter().collect::<Vec<_>>();
+        // MySQL 8 scopes the check name too; MariaDB does not.
         assert_eq!(
-            names(SqlDialect::Postgres),
-            vec!["fk_orders_customer", "ix_orders_customer"]
+            names(SqlDialect::MySql, ServerFlavour::MySql),
+            vec!["ck_orders_total", "fk_orders_customer"]
         );
-        assert_eq!(names(SqlDialect::Sqlite), vec!["ix_orders_customer"]);
+        assert_eq!(
+            names(SqlDialect::MySql, ServerFlavour::MariaDb),
+            vec!["fk_orders_customer"]
+        );
+        // A server not yet asked takes the narrow answer: an uncertain read must
+        // not raise a warning about a statement that may be fine.
+        assert_eq!(
+            names(SqlDialect::MySql, ServerFlavour::Unknown),
+            vec!["fk_orders_customer"]
+        );
+        // PostgreSQL: the index alone.
+        assert_eq!(
+            names(SqlDialect::Postgres, ServerFlavour::Unknown),
+            vec!["ix_orders_customer"]
+        );
+        assert_eq!(
+            names(SqlDialect::Sqlite, ServerFlavour::Unknown),
+            vec!["ix_orders_customer"]
+        );
     }
 
     /// It is only ever about a `Same` row — a differing one's pane is a diff and
