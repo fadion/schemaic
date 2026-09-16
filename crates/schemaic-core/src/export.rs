@@ -5618,41 +5618,112 @@ mod parity_census_tests {
         );
     }
 
+    /// The variant names declared by `pub enum <name> {` in `src`.
+    ///
+    /// Unit variants only, which is what this enum has: a line is a variant if
+    /// what survives stripping its `//` comment is an identifier and a comma.
+    /// Attribute lines and doc comments fall out by that test rather than by
+    /// being enumerated.
+    fn declared_variants(src: &str, name: &str) -> Vec<String> {
+        let head = format!("pub enum {name} {{");
+        let at = src.find(&head).expect("the enum declaration") + head.len();
+        let end = at + src[at..].find("\n}").expect("the enum's closing brace");
+        src[at..end]
+            .lines()
+            .filter_map(|l| l.split("//").next())
+            .map(|l| l.trim().trim_end_matches(',').trim())
+            .filter(|l| !l.is_empty() && l.chars().all(|c| c.is_alphanumeric() || c == '_'))
+            .map(str::to_owned)
+            .collect()
+    }
+
+    /// The variant names listed inside `<name>::ALL`'s array literal.
+    fn listed_in_all(src: &str, name: &str) -> Vec<String> {
+        let head = format!("pub const ALL: [{name};");
+        let at = src.find(&head).expect("the `ALL` literal") + head.len();
+        let end = at + src[at..].find("];").expect("the `ALL` literal's end");
+        let path = format!("{name}::");
+        src[at..end]
+            .split(&path)
+            .skip(1)
+            .map(|s| {
+                s.chars()
+                    .take_while(|c| c.is_alphanumeric() || *c == '_')
+                    .collect()
+            })
+            .collect()
+    }
+
     /// **And `ALL` really is all of them.**
     ///
     /// Every assertion above iterates `ExportFormat::ALL`, which is a
     /// hand-written `[_; 6]` — so a variant left out of it is invisible to the
     /// census, to the parity family, and to `only_sql_writes_a_single_file`, all
-    /// of which then pass by not looking. The one thing the compiler *will*
-    /// enforce is an exhaustive `match`, so the count comes from one.
+    /// of which then pass by not looking.
+    ///
+    /// **This test used to be that state rather than the guard against it.** It
+    /// summed `1` over `ALL` and asserted the total was `6`, then asserted
+    /// `ALL.len() == n` — two spellings of `6 == 6`, because `ALL`'s own type is
+    /// `[ExportFormat; 6]` and both terms are read off the same array. A seventh
+    /// variant left out of `ALL` compiles as soon as the exhaustive `match`
+    /// has its arm, and the whole module goes on passing by not looking at it.
+    ///
+    /// Nothing in the type system relates the enum to the array, so the check is
+    /// **this file's own source**: the variant names the enum declares, against
+    /// the names the `ALL` literal lists. Reading the repository's own source is
+    /// the sanctioned exception to the no-filesystem rule, and it is the shape
+    /// `core/tests/doc_coverage.rs` already uses for the same kind of question.
+    ///
+    /// The floor matters as much as the comparison — a parser that stops
+    /// matching reports an empty set against an empty set and passes. Both sides
+    /// are held to the count the real `ALL` has, so a drifted parser fails
+    /// rather than falling silent.
     ///
     /// The sibling half — that a new variant must answer `is_text` and
     /// `writes_incrementally` rather than defaulting to `true` — is enforced by
     /// those two being exhaustive `match`es, which is a compile error rather
-    /// than a test. There is no way to write the red run for that here without
-    /// adding a seventh variant; this is the part that *can* be asserted.
+    /// than a test.
     #[test]
     fn every_variant_is_in_all() {
-        fn counted(f: ExportFormat) -> usize {
-            // One arm per variant, so adding one fails to compile until its
-            // author has also put it in `ALL` — the count below then moves.
-            match f {
-                ExportFormat::Json => 1,
-                ExportFormat::Csv => 1,
-                ExportFormat::Sql => 1,
-                ExportFormat::Markdown => 1,
-                ExportFormat::Html => 1,
-                ExportFormat::Xlsx => 1,
-            }
-        }
-        let n: usize = ExportFormat::ALL.into_iter().map(counted).sum();
+        let src = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/export.rs"),
+        )
+        .expect("this module's own source");
+
+        let declared = declared_variants(&src, "ExportFormat");
+        let listed = listed_in_all(&src, "ExportFormat");
+
+        // The floor: both parsers found what the real array holds, so neither
+        // side can be empty and agree with the other.
         assert_eq!(
-            n, 6,
-            "a variant was added: put it in `ExportFormat::ALL`, answer \
-             `is_text`/`writes_incrementally`, and move this count"
+            listed.len(),
+            ExportFormat::ALL.len(),
+            "the parsed `ALL` literal has drifted from the real one: {listed:?}"
         );
-        assert_eq!(ExportFormat::ALL.len(), n);
-        // …and no duplicates, which would make the sum agree for the wrong
+        assert!(
+            declared.len() >= ExportFormat::ALL.len(),
+            "the variant parser has drifted — it found {declared:?}"
+        );
+
+        for v in &declared {
+            assert!(
+                listed.contains(v),
+                "`ExportFormat::{v}` is declared but is not in `ExportFormat::ALL`. \
+                 Every export path iterates `ALL`, so the format is unreachable \
+                 from the menus and untested by the census, the parity family and \
+                 `only_sql_writes_a_single_file`. Put it in `ALL` and answer \
+                 `is_text`/`writes_incrementally`."
+            );
+        }
+        assert_eq!(
+            listed.len(),
+            declared.len(),
+            "`ALL` lists {} entries for {} declared variants",
+            listed.len(),
+            declared.len()
+        );
+
+        // …and no duplicates, which would make the counts agree for the wrong
         // reason.
         let mut seen = ExportFormat::ALL.to_vec();
         seen.sort_by_key(|f| f.label());
