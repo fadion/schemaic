@@ -1927,14 +1927,34 @@ fn absorb(kept: &mut Imported, dropped: Imported) {
     // CA path, collapsed into a row that said nothing about SSL, imported as
     // `Prefer` with no CA file. `SslMode::stronger_of` is the rule for merging
     // two sources that disagree, and it cannot be killed by moving the floor.
+    //
+    // **The three paths are not independent fields, and merging them one at a
+    // time builds a configuration neither source described.** The mode merges by
+    // strength; its material does not follow the same rule.
+    //
+    // *The CA.* A `VerifyFull` row with an empty `ca_path` is not *missing* a
+    // CA — in every client this module imports from, an absent CA path means the
+    // system trust store, which is the ordinary way to verify a public
+    // certificate. Filling it from a weaker row pins the trust anchor to a CA
+    // that did not issue the server's certificate, and then **every** connect
+    // fails with a verification error the user has no way to trace back to an
+    // import they ran once. So a CA crosses only when the survivor's own mode
+    // does not protect *more* than the row being absorbed: at that point the
+    // dropped row's verification is at least as demanding as the survivor's, and
+    // its trust anchor is the one that belongs with it.
+    //
+    // *The client certificate and its key.* A pair. Taken a field at a time, a
+    // survivor holding a certificate takes the other row's key and the handshake
+    // fails on a key that does not match the certificate — a config that existed
+    // in neither source. They cross together, onto a survivor holding neither,
+    // or not at all.
+    let ca_crosses = a.tls.ca_path.is_empty() && !a.tls.mode.protects_more_than(b.tls.mode);
     a.tls.mode = a.tls.mode.stronger_of(b.tls.mode);
-    if a.tls.ca_path.is_empty() {
+    if ca_crosses {
         a.tls.ca_path = b.tls.ca_path;
     }
-    if a.tls.client_cert_path.is_empty() {
+    if a.tls.client_cert_path.is_empty() && a.tls.client_key_path.is_empty() {
         a.tls.client_cert_path = b.tls.client_cert_path;
-    }
-    if a.tls.client_key_path.is_empty() {
         a.tls.client_key_path = b.tls.client_key_path;
     }
     // The dropped row's notes are about a row that is gone; only
@@ -3579,6 +3599,85 @@ mod tests {
         let out = dedupe(vec![first, second]);
         assert_eq!(out[0].connection.tls.mode, SslMode::VerifyFull);
         assert_eq!(out[0].connection.tls.ca_path, "/right.pem");
+    }
+
+    /// **An empty `ca_path` on a verifying row is an answer, not a gap.**
+    ///
+    /// The three TLS paths were merged by emptiness, each on its own, while the
+    /// mode merged by strength — so the survivor could end up with a
+    /// verification level from one row and a trust anchor from another. In every
+    /// client this module imports from, an absent CA path on a verifying row
+    /// means the **system trust store**, which is the ordinary way to verify a
+    /// public certificate. Taking a weaker row's CA pins the anchor to a CA that
+    /// did not issue the server's certificate, and then every connect fails with
+    /// a verification error, permanently, from an import run once.
+    ///
+    /// Driven through `dedupe`, not through `absorb`: the composition is the
+    /// defect. `stronger_of` is right on its own and so is "fill an empty field
+    /// from the other source"; it is running them over the same row that builds
+    /// the configuration neither source described.
+    #[test]
+    fn a_verifying_row_on_the_system_store_does_not_take_a_weaker_rows_ca() {
+        let mut strict = imported(at("h", 5432, "d", "u"), ImportSource::PgService);
+        strict.connection.tls.mode = SslMode::VerifyFull;
+        // No `ca_path`: verify against the system store.
+        let mut lax = imported(at("h", 5432, "d", "u"), ImportSource::DBeaver);
+        lax.connection.tls.mode = SslMode::Require;
+        lax.connection.tls.ca_path = "/corp/internal-ca.pem".into();
+
+        let out = dedupe(vec![strict, lax]);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].connection.tls.mode, SslMode::VerifyFull);
+        assert_eq!(
+            out[0].connection.tls.ca_path, "",
+            "a weaker row's CA was pinned onto a row that verifies against the \
+             system store — every connect now fails"
+        );
+
+        // …and the CA *does* cross when the dropped row's verification is at
+        // least as demanding, because then its anchor is the one that belongs
+        // with the mode the survivor is taking.
+        let strict = imported(at("h", 5432, "d", "u"), ImportSource::DBeaver);
+        let mut other = imported(at("h", 5432, "d", "u"), ImportSource::PgService);
+        other.connection.tls.mode = SslMode::VerifyCa;
+        other.connection.tls.ca_path = "/corp/internal-ca.pem".into();
+        let out = dedupe(vec![strict, other]);
+        assert_eq!(out[0].connection.tls.mode, SslMode::VerifyCa);
+        assert_eq!(out[0].connection.tls.ca_path, "/corp/internal-ca.pem");
+    }
+
+    /// **A client certificate and its key cross together or not at all.**
+    ///
+    /// Merged a field at a time, a survivor holding a certificate took the other
+    /// row's key — a certificate and a key that do not belong to each other, so
+    /// the handshake fails on a mismatch, and neither source described that
+    /// configuration.
+    #[test]
+    fn a_client_keypair_is_never_split_across_two_sources() {
+        let mut mine = imported(at("h", 3306, "d", "u"), ImportSource::DBeaver);
+        mine.connection.tls.client_cert_path = "/mine/client.pem".into();
+        // …and no key: this source did not record one.
+        let mut theirs = imported(at("h", 3306, "d", "u"), ImportSource::DataGrip);
+        theirs.connection.tls.client_cert_path = "/theirs/client.pem".into();
+        theirs.connection.tls.client_key_path = "/theirs/client.key".into();
+
+        let out = dedupe(vec![mine, theirs]);
+        assert_eq!(out.len(), 1);
+        let tls = &out[0].connection.tls;
+        assert_eq!(tls.client_cert_path, "/mine/client.pem");
+        assert_eq!(
+            tls.client_key_path, "",
+            "the survivor's certificate was paired with the other row's key"
+        );
+
+        // A survivor holding neither takes the pair whole.
+        let mine = imported(at("h", 3306, "d", "u"), ImportSource::DBeaver);
+        let mut theirs = imported(at("h", 3306, "d", "u"), ImportSource::DataGrip);
+        theirs.connection.tls.client_cert_path = "/theirs/client.pem".into();
+        theirs.connection.tls.client_key_path = "/theirs/client.key".into();
+        let out = dedupe(vec![mine, theirs]);
+        assert_eq!(out[0].connection.tls.client_cert_path, "/theirs/client.pem");
+        assert_eq!(out[0].connection.tls.client_key_path, "/theirs/client.key");
     }
 
     /// **Two rows that differ in how they are *reached* are two connections.**

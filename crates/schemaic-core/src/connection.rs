@@ -551,6 +551,23 @@ impl SslMode {
         }
     }
 
+    /// Does this mode protect **strictly** more than `other`?
+    ///
+    /// The question [`stronger_of`](Self::stronger_of) cannot be asked, because
+    /// it answers *which* mode wins and says nothing about whether there was a
+    /// contest. A merge needs both: the winning mode, and whether the losing
+    /// row's TLS *material* should come with it. An import that took a weaker
+    /// row's CA path onto a `VerifyFull` survivor pinned the trust anchor to a
+    /// CA that had not issued the server's certificate — see
+    /// [`crate::conn_import`]'s `absorb`.
+    ///
+    /// Here rather than at the call site for [`rung`](Self::rung)'s reason: the
+    /// ladder is this type's business, and a caller spelling it as a comparison
+    /// is the variant-matching this type exists to prevent.
+    pub fn protects_more_than(self, other: SslMode) -> bool {
+        self.rung() > other.rung()
+    }
+
     /// Human label for the picker.
     pub fn label(self) -> &'static str {
         match self {
@@ -2753,6 +2770,38 @@ mod tls_tests {
         for m in SslMode::ALL {
             assert_eq!(m.stronger_of(SslMode::STRICTEST), SslMode::STRICTEST);
             assert_eq!(m.stronger_of(SslMode::Disable), m);
+        }
+    }
+
+    /// The **strict** half of the same ladder — the question `stronger_of`
+    /// cannot be asked, because it answers which mode wins and not whether
+    /// there was a contest. Ties are the case that matters: a merge gated on
+    /// `protects_more_than` must let a tie through, and a merge that spelled the
+    /// question `stronger_of(b) == self` would not.
+    #[test]
+    fn protects_more_than_is_strict_and_agrees_with_the_ladder() {
+        use SslMode::*;
+        assert!(VerifyFull.protects_more_than(VerifyCa));
+        assert!(VerifyCa.protects_more_than(Require));
+        assert!(Require.protects_more_than(Prefer));
+        assert!(Prefer.protects_more_than(Disable));
+        for m in SslMode::ALL {
+            assert!(
+                !m.protects_more_than(m),
+                "{m:?} is not stronger than itself"
+            );
+        }
+        // Antisymmetric, and it agrees with `stronger_of` everywhere.
+        for a in SslMode::ALL {
+            for b in SslMode::ALL {
+                assert!(
+                    !(a.protects_more_than(b) && b.protects_more_than(a)),
+                    "{a:?} / {b:?}"
+                );
+                if a.protects_more_than(b) {
+                    assert_eq!(a.stronger_of(b), a, "{a:?} / {b:?}");
+                }
+            }
         }
     }
 
