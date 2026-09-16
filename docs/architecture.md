@@ -1136,6 +1136,14 @@ existing prose was left alone.
     `BlobTarget::new` for the same reason — a field anyone can write is a third producer waiting to
     forget — and `grid.rs`'s `blob_launch` sends both arms through the constructor, the keyed one
     included, so the two are one rule rather than two that agree today.
+    **Its last step is `export::device_safe_stem`, which this side had no answer of its own for.**
+    `CON`, `NUL`, `COM1`… name a device whatever extension follows them, in every directory, so a
+    keyless cell on a column called `NUL` offered `NUL.png` and the atomic save's `rename` came back
+    as an OS message about a name the user never chose. `export::suggested_filename` has carried
+    that list since it was written and `save_stem_from` carried none — two save-name sanitizers
+    answering one question differently — so the list, the comparison and the `_` prefix moved into
+    `device_safe_stem` and both call it, the way there is one identifier quoter. A prefix rather
+    than a suffix, because the escape has to survive an extension being appended.
     **`column_byte_cap(dialect, type_name)` is the write's one pure question: how much does this
     column actually hold?** It exists so an oversized file is refused where the user picked it. The other
     place it gets refused is MySQL's `ERROR 1406: Data too long`, which arrives at the *commit*,
@@ -6952,6 +6960,24 @@ existing prose was left alone.
   whose values all arrive as `Bytes` and can never reach the typed arm: one function, and a caller
   that *could* hit that arm must not be the one that forgot. `refetch_on` reads it before the
   collect, which consumes the result and empties `columns_ref`.
+  **`ZEROFILL` is the same disagreement again, and here the *text* protocol is the side that is
+  right.** MySQL renders such a column padded to its declared display width, so an
+  `INT(4) UNSIGNED ZEROFILL` holding 7 arrives as `0007` on a `SELECT` and as `Int(7)` on the
+  prepared re-fetch — measured on MariaDB 10.11.14 and MySQL 8.4, with `column_length` carrying the
+  display width. The padding is the value the user is looking at, and the type name is the only
+  thing `num_kind` is given to decide that by, so `resolve_type_name` takes the wire
+  `ZEROFILL_FLAG` as a fourth argument and appends ` ZEROFILL` to a numeric type name, and
+  `num_kind` answers `NumKind::Text` for any name holding it — which keeps the server's own
+  characters in the grid and in every export, the way `DECIMAL` already does. The binary arm then
+  has to re-pad rather than parse: `zerofill_widths` reads the width once per column, a sibling of
+  `fractional_scales` and hoisted for its reason, and `convert_row`'s Int/UInt arms go through
+  `zerofill_value`, which pads to that width and **never truncates**, a value wider than the
+  declared width being the server's to render. Both callers hand the slice over — the query row loop
+  and `refetch_on` — for the reason the `scale` slice is passed from every caller. Alignment is
+  untouched, `Column::is_numeric` reading the leading type token and ignoring the suffixes. Only a
+  server can send one cell two ways, so the live tier carries it twice: `cases::MYSQL_FAMILY`'s
+  `int_zerofill`, and a `pad INT(4) UNSIGNED ZEROFILL` column on the MySQL-family legs of
+  `a_spliced_row_is_the_row_a_fresh_select_would_show`.
   `fetch_table_stats` fills `core::stats::SchemaStats` for a whole database — one round trip
   either way, and having the set is what feeds the schema tree's size column. It is **lazy and
   deliberately not part of `fetch_schema`**: selecting `DATA_LENGTH` from
@@ -7450,6 +7476,15 @@ existing prose was left alone.
   `a_refetch_reads_a_keyless_row_back_by_its_rowid` — which asserts the template's `confirm_cols`
   as well as its key columns and builds the key it re-fetches with through `edit::refetch_key`, the
   app's own composition, rather than by hand).
+  **That second test's round trip is satisfied by `WHERE rowid = 2` alone**, which is to say it
+  passed with the engine's `.chain(confirm_cols)` deleted: the confirming columns are only visible
+  when they *disagree*. It has a second phase now — move one of them behind the key's back, the way
+  another session or an `AFTER UPDATE` trigger would, and the same re-fetch must match nothing,
+  while a truncated key would still return the row. The MySQL builder's copy of that chain has no
+  round trip at all to exercise it, `confirm_cols` being empty on every non-SQLite engine, so
+  `db/lib.rs`'s `build_refetch_sql_confirms_with_the_columns_after_the_key` asserts the `WHERE` it
+  emits from a template carrying both halves — key placeholders first, which is the order
+  `edit::refetch_key` binds in.
   **But a rowid is not a row identity, and the safety net alone cannot see that.** SQLite reassigns
   them: the twelve-step rebuild used to renumber a keyless table, an insert after a delete takes the
   freed number, `VACUUM` compacts them — and nothing re-runs an open result tab when any of that
@@ -7792,7 +7827,7 @@ existing prose was left alone.
   PostgreSQL has no btree operator class for `json` and MySQL refuses a `TEXT` key without a
   length — resolves the key through `analyze_edit`, writes through `GridWrite` and reads the row
   back. It asserts every writable case was reached **and** how many really went through a resolved
-  key — `Target::expected_keyed_cases`, declared per leg (19 / 19 / 24) the way `expected_cases` is.
+  key — `Target::expected_keyed_cases`, declared per leg (20 / 20 / 24) the way `expected_cases` is.
   **The first of those two was a tautology and is the declared number now.** `keyed` and `plain` are
   incremented exactly once per iteration of `type_cases().filter(writable)` — the `keyed -= 1;
   plain += 1` re-classification preserves the sum — so asking that same iterator for its length made
@@ -9837,6 +9872,12 @@ existing prose was left alone.
     block of stops starts), and the `PopupToken`-tagged `set_open_popup`/`clear_open_popup`/
     `dismiss_open_popup` slot. A field joins through `FieldCfg::focus` instead, since nothing
     outside floem's editor can see a key it has.
+    Also `takes_pointer_focus`/`note_pointer_focus` — the report a view makes when a press puts the
+    keyboard on it, which is the only way `begin_pointer_dismissal` can tell a click that placed
+    focus from one on chrome that placed none, floem answering neither question. Spell the decorator
+    beside every `.keyboard_navigable()`;
+    `menu_return_gate::every_navigable_view_reports_the_press_that_focuses_it` fails on a site that
+    doesn't, and the Tab gotchas below carry the bug that bought it.
     **Three free predicates decide what a key *is*, and the first two were each missing their
     modifier term.**
     `presses(key, mods)` is "does this press a button": a bare Space or Enter and nothing else,
@@ -10562,7 +10603,14 @@ existing prose was left alone.
     `focus_root_with_ring`, naming the offender by its enclosing `fn` — a modal root with no ring is
     a modal whose Tab does nothing at all, which is how the error modal shipped. Its `EXEMPT` list is
     `(file, enclosing fn, why)` and holds the seven roots that legitimately have no ring, every one
-    of them a popup driving its own arrows, Enter and Escape. `production_code` blanks every
+    of them a popup driving its own arrows, Enter and Escape.
+    **`widgets::menu_return_gate::every_navigable_view_reports_the_press_that_focuses_it` is the
+    third**, and it is the shape's limit case: it holds every `.keyboard_navigable()` in both view
+    crates to a `takes_pointer_focus` in the preceding 600 bytes, and it cannot see the views floem
+    focuses *without* one — the SQL editor, `edit_field`'s editor and the grid's inline `text_input`
+    carry no such call for a needle to match, so those three are a census kept by hand in
+    `takes_pointer_focus`'s doc and the test says so rather than reading as broader than it is.
+    `production_code` blanks every
     `#[cfg(test)]` **item** — brace-aware, skipping braces inside strings, chars and comments — and
     every `//` line; `crate_sources` enumerates the files to scan. Both halves exist because the
     idiom was written out eleven times across nine files and every copy had the same two holes. It cut each
@@ -18334,6 +18382,46 @@ Re-introducing the anti-patterns these guard against is a regression:
   This is the durable form of what
   `set_menu_return` does for one case: fixing the sites one at a time is what produced the tree's
   cursor regression below.
+  **And a press that dismissed a menu suppresses the hand-back — but only when that press placed
+  focus.** `widgets::begin_pointer_dismissal` is marked by the workspace root's `PointerDown` before
+  it closes the menus and read by every `focus_root` cleanup through `hand_back_wanted`, because
+  floem has already put focus where the click landed: right-click in the SQL editor, then left-click
+  back into it, and the panel's teardown handed the keyboard to `refocus_grid` while the caret sat
+  where the press put it, so typing inserted nothing and the arrows moved the cell selection. A flag
+  and not a `claim_keyboard`, because the cleanup is scheduled in `process_update` after this
+  handler has returned and a claim taken here would sit *inside* the snapshot `refocus_grid` took;
+  cleared on the next tick rather than at the end of the handler, so the teardown in between can
+  still read it.
+  **The premise had no source, and outside a modal it was simply false** (S19-L1-01). Inside one a
+  press always lands on something navigable — `focus_root_inner` makes the modal's own root
+  navigable and its view is `size_full()`, so an ancestor takes the keyboard on the unwind — but the
+  workspace has no such ancestor and most of what it shows takes no focus at all: the status bar's
+  text, a panel title row, the tab-strip background, the results header. Closing the results
+  toolbar's Copy menu by clicking the row-count segment left **nothing** holding the keyboard, and
+  the suppression made that permanent — no arrow, no `Del`, no `Ctrl+Enter`, no `Ctrl+F`, not even
+  the `F6` that would have got back into the strip, until a cell was clicked. Reproduced and fixed
+  in the running app: before, ↓ after the gesture did nothing; after, the selection moves. So a
+  second one-tick flag answers the question the first one assumed — `note_pointer_focus` /
+  `pointer_placed_focus`, mirroring the pair above — and `begin_pointer_dismissal` marks nothing
+  unless the press placed focus.
+  **The views that take the keyboard are what report it, because floem will not.** `app_state.focus`
+  is `pub(crate)` to floem, no `ViewId` accessor answers it, and the `FocusGained` that would is
+  dispatched *after* the root's handler returns (`window_handle.rs:361`). What makes a view's report
+  reliable is floem's own ordering: focus is cleared at the top of every `PointerDown`
+  (`window_handle.rs:227-231`), the deepest-first child walk gives it to the first
+  `keyboard_navigable` view under the point (`context.rs:176-181`, `AppState::update_focus` being
+  first-wins), and a view's own listeners run **last** (`context.rs:405-423`) — so every view under
+  the press has reported by the time the root asks. `widgets::takes_pointer_focus` is the decorator
+  to spell beside every `.keyboard_navigable()`, and it is `on_event_cont` and never
+  `on_event_stop`, or the press stops reaching the root that closes the menus. It wraps
+  `focus_root_inner`, `key_pressable` and `in_focus_ring_with` — which is most sites by inheritance
+  — plus the grid body and its inline `text_input`, `pick_field` and the set chip, the schema tree,
+  the terminal surface and `edit_field`'s editor; the SQL editor calls `note_pointer_focus()`
+  directly at the top of the `PointerDown` handler it already had.
+  `menu_return_gate::every_navigable_view_reports_the_press_that_focuses_it` fails on a navigable
+  view with no report above it; what it cannot see is floem's own focusable views, which carry no
+  `.keyboard_navigable()` for a needle to match and are a census kept by hand in
+  `takes_pointer_focus`'s doc.
 - **A `.hide()`n control is still in the Tab order** — `hide()` is `display: none`, so the view is
   still in the tree and still registered in the ring, and Tab moves focus onto something nobody can
   see. Every engine-conditional block that was built-and-hidden is therefore now **built
