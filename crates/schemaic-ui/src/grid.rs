@@ -3755,8 +3755,7 @@ pub(crate) fn grid_find_bar(
                     if is_empty {
                         return empty().into_any();
                     }
-                    let label = format!("{pos}/{total}{}", if more { "+" } else { "" });
-                    text(label)
+                    text(find_readout(pos, total, more))
                         .style(|s| {
                             s.font_size(theme::font_label())
                                 .color(theme::text_dim())
@@ -7444,6 +7443,32 @@ fn find_hits_within(
     (hits, more)
 }
 
+/// The find bar's `pos/total` readout.
+///
+/// **`pos == 0` means two different things, and only one of them is `0`.** It is
+/// the 1-based rank of the caret's cell among the collected matches, and
+/// `find_pos`' binary search answers `0` both when the caret is not on a match
+/// and when it is on one the *collection* never reached. Those are the same
+/// number and not the same fact.
+///
+/// `find_hits_within` stops on either of two budgets: the cell budget, and
+/// `FIND_MAX_HITS` matches. The jump's window is the cell budget alone, so past
+/// 100,000 matches the caret can land — correctly, on a highlighted cell — past
+/// where collection stopped, and the bar read `0/100000+` over a match the user
+/// can see. A readout contradicting the grid beneath it is worse than one that
+/// admits it does not know.
+///
+/// So a `0` under a truncated count renders as "unknown" rather than as "none".
+/// With `more` false the count is complete, `0` really does mean "not on a
+/// match", and the familiar `0/N` is right.
+fn find_readout(pos: usize, total: usize, more: bool) -> String {
+    let tail = if more { "+" } else { "" };
+    if pos == 0 && more {
+        return format!("–/{total}{tail}");
+    }
+    format!("{pos}/{total}{tail}")
+}
+
 fn grid_key(gs: GridState, nrows: usize, ncols: usize, e: &Event) -> EventPropagation {
     let Event::KeyDown(ke) = e else {
         return EventPropagation::Continue;
@@ -7517,7 +7542,14 @@ fn grid_key(gs: GridState, nrows: usize, ncols: usize, e: &Event) -> EventPropag
             }
         }
         Key::Named(NamedKey::Enter) if ctrl => commit_grid(gs),
-        Key::Named(NamedKey::Enter) => {
+        // **`m.is_empty()`, because this handler is not only the grid's.** The
+        // results strip hands `grid_key` *every* modified key it declines
+        // (`widgets::strip_defers` is `!mods.is_empty()` minus three), so with
+        // the keyboard on a toolbar button Shift+Enter and Alt+Enter fell into
+        // this arm and opened the in-cell editor — neither a binding the strip
+        // advertises, and before `586ebeb` neither reached the grid at all. The
+        // arm above claims Ctrl; everything else with a modifier is nobody's.
+        Key::Named(NamedKey::Enter) if m.is_empty() => {
             // Enter **opens** the active cell — the in-cell editor on one that
             // takes text, the binary panel on one that holds bytes, nothing on
             // anything else. It used to ask `text_editable` and stop, which was
@@ -7560,7 +7592,15 @@ fn grid_key(gs: GridState, nrows: usize, ncols: usize, e: &Event) -> EventPropag
             // and unmarks, which reads as the key doing nothing. Any unmarked row
             // in range means "mark them all"; only an already-fully-marked range
             // unmarks. A pending row has nothing to delete and is skipped.
-            if active_opt.is_some() && gs.edit_model.get_untracked().insert_target().is_some() => {
+            //
+            // **`m.is_empty()` for the same reason the `Enter` arm has it**, and
+            // this is the half that stages a write: the results strip forwards
+            // every modified key it declines, so with the keyboard on the Commit
+            // or Discard icon **Ctrl+Delete marked rows for deletion**. The grid
+            // advertises plain Delete and nothing else.
+            if m.is_empty()
+                && active_opt.is_some()
+                && gs.edit_model.get_untracked().insert_target().is_some() => {
                 let Some((r0, _, r1, _)) = gs.bounds_untracked() else {
                     return EventPropagation::Continue;
                 };
@@ -13213,6 +13253,82 @@ mod find_hits_tests {
         );
         assert_eq!(hits.len(), FIND_MAX_HITS);
         assert!(more, "capped, so the count is a floor not a total");
+    }
+
+    /// **The two `grid_key` arms that a modified key must not reach.**
+    ///
+    /// `grid_key` is not only the grid body's handler: the results strip hands
+    /// it *every* modified key it declines (`widgets::strip_defers` is
+    /// `!mods.is_empty()` minus `ArrowLeft`, `ArrowRight` and `Escape`). So with
+    /// the keyboard on a toolbar button, **Ctrl+Delete staged a row deletion**
+    /// and Shift+Enter opened the in-cell editor — neither a binding the strip
+    /// advertises, and before `586ebeb` neither reached the grid at all.
+    ///
+    /// A source read because `grid_key` needs a `GridState`, which cannot be
+    /// built in a test — the same reason `drop_committed_staging` takes signals
+    /// rather than one. The floor is that both arms were found.
+    #[test]
+    fn the_staging_key_arms_refuse_a_modified_press() {
+        let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/grid.rs"))
+            .expect("this file's own source");
+        let body = crate::source_gate::production_code(&src);
+        let at = body
+            .find("fn grid_key(")
+            .expect("grid_key — this gate is stale");
+        let end = at + body[at..].find("\n}\n").expect("the end of grid_key");
+        let f = &body[at..end];
+
+        assert!(
+            f.contains("Key::Named(NamedKey::Delete)"),
+            "the Delete arm is gone — this gate is stale"
+        );
+        assert!(
+            f.contains("Key::Named(NamedKey::Enter) if m.is_empty()"),
+            "the plain-Enter arm no longer refuses a modified press, so \
+             Shift+Enter from a results-strip button opens the in-cell editor"
+        );
+        // The Delete arm's guard spans several lines; take the text between the
+        // pattern and the `=>` that ends its `if`.
+        let d = f
+            .find("Key::Named(NamedKey::Delete)")
+            .expect("the Delete arm");
+        let guard_end = d + f[d..].find("=> {").expect("the Delete arm's body");
+        assert!(
+            f[d..guard_end].contains("m.is_empty()"),
+            "the Delete arm no longer refuses a modified press, so Ctrl+Delete \
+             from a results-strip button stages a row deletion"
+        );
+    }
+
+    /// **…and the *position* half of the same readout.**
+    ///
+    /// `find_pos` is a binary search of the collected hits, so it answers `0`
+    /// both when the caret is not on a match and when it is on one the
+    /// collection never reached. Those are one number and two facts. The
+    /// collection stops on *either* budget — the cell budget, or `FIND_MAX_HITS`
+    /// matches — while the jump's window is the cell budget alone, so past
+    /// 100,000 matches the caret lands, correctly, on a highlighted cell beyond
+    /// where collecting stopped and the bar read `0/100000+` over a match the
+    /// user can see.
+    ///
+    /// The two new two-sided find tests both fix `budget` and neither varies
+    /// `FIND_MAX_HITS`, which is the budget that is wrong here — so this is
+    /// asserted on the readout, which is the surface that was lying.
+    #[test]
+    fn the_readout_does_not_claim_a_position_the_count_stopped_short_of() {
+        // A complete count: `0` really does mean "not on a match", and the
+        // familiar spelling is right.
+        assert_eq!(find_readout(0, 12, false), "0/12");
+        assert_eq!(find_readout(3, 12, false), "3/12");
+        // A truncated count with the caret on a match it did reach: unchanged.
+        assert_eq!(find_readout(7, FIND_MAX_HITS, true), "7/100000+");
+        // …and with the caret on a match past where it stopped, which is what
+        // `0` means here. Not "none".
+        assert_eq!(find_readout(0, FIND_MAX_HITS, true), "–/100000+");
+        assert!(
+            !find_readout(0, FIND_MAX_HITS, true).starts_with('0'),
+            "the bar claims the caret is on no match while the grid highlights one"
+        );
     }
 
     #[test]
