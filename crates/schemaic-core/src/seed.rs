@@ -153,6 +153,62 @@ fn clip_cell(v: &str) -> String {
     }
 }
 
+/// The most the sampled rows may take in a prompt, all together.
+///
+/// **[`SEED_CELL_CHARS`] bounds one cell and the size is a product of three
+/// terms.** The other two are unbounded: the app samples twenty whole rows and
+/// every column of each goes in, so 20 × C × 201 crosses `arg_limit()` —
+/// 30,000 UTF-16 units on Windows — at roughly **eight** long-text columns. An
+/// ordinary `articles` or `audit_log` table reaches that, and Seed and Fill were
+/// then dead on it with a refusal written for the chat path, naming a schema
+/// scope and "the query in the editor" — neither of which is a lever a grid
+/// context menu has. Clipping the cell narrowed the class; it did not close it.
+pub const SEED_SAMPLE_CHARS: usize = 10_000;
+
+/// The most the table's DDL may take in a prompt.
+///
+/// The third unbounded term. `create_ddl` is spliced whole, and a wide table
+/// with comments on every column is thousands of characters before a single row
+/// is sampled.
+pub const SEED_DDL_CHARS: usize = 12_000;
+
+/// As many trailing rows as fit in [`SEED_SAMPLE_CHARS`], and how many were
+/// dropped.
+///
+/// **Trailing**, because the section they go into says "most recent last" and
+/// the recent ones are what the model is being asked to imitate. Whole rows, not
+/// a truncated string: the block is fenced JSON and half an object is not
+/// something to hand a model as an example of the shape it should emit.
+///
+/// A single row that does not fit on its own yields none at all — with the count
+/// saying so — for the same reason. At [`SEED_CELL_CHARS`] a row would need
+/// about fifty text columns to get there.
+fn fitting_rows(rows: &[Row]) -> (String, usize) {
+    for keep in (1..=rows.len()).rev() {
+        let json = rows_to_json(&rows[rows.len() - keep..]);
+        if json.chars().count() <= SEED_SAMPLE_CHARS {
+            return (json, rows.len() - keep);
+        }
+    }
+    (rows_to_json(&[]), rows.len())
+}
+
+/// Clip `ddl` to [`SEED_DDL_CHARS`], saying so when it bites.
+///
+/// Out loud, like [`schema_section`]'s withheld arm and for its reason: a model
+/// handed a truncated `CREATE TABLE` with no note reads it as the whole table
+/// and invents nothing for the columns it cannot see — it simply omits them.
+fn clip_ddl(ddl: &str) -> String {
+    if ddl.chars().count() <= SEED_DDL_CHARS {
+        return ddl.to_string();
+    }
+    format!(
+        "{}\n-- … truncated: this table's definition is longer than the prompt \
+         can carry. Columns below this point were not shown.",
+        ddl.chars().take(SEED_DDL_CHARS).collect::<String>()
+    )
+}
+
 /// Render a list of rows as a compact JSON array for embedding in a prompt (the
 /// same shape the model is asked to emit back). `None` values render as `null`;
 /// every value is clipped to [`SEED_CELL_CHARS`].
@@ -194,7 +250,8 @@ fn schema_section(ddl: Option<&str>) -> String {
         Some(ddl) => format!(
             "{}\n\nSchema:\n{}",
             crate::prompt::UNTRUSTED_NOTE,
-            crate::prompt::fenced_as("sql", ddl)
+            // Bounded, like the sample — see `SEED_DDL_CHARS`.
+            crate::prompt::fenced_as("sql", &clip_ddl(ddl))
         ),
         None => "Schema: withheld — the user's Schema context setting is None. \
                  Work from the column's name and the row below; do not guess at \
@@ -222,10 +279,26 @@ fn sample_section(sample: &[Row], data: AiData, empty_hint: &str) -> String {
     if rows.is_empty() {
         return empty_hint.to_string();
     }
+    // Bounded in aggregate, not only per cell — see `SEED_SAMPLE_CHARS`.
+    let (json, dropped) = fitting_rows(rows);
+    if dropped == rows.len() {
+        return empty_hint.to_string();
+    }
+    let note = if dropped == 0 {
+        String::new()
+    } else {
+        // Said, because a model shown three of twenty rows and told nothing
+        // reads them as the whole table's conventions.
+        format!(
+            " — {} older {} omitted to fit",
+            dropped,
+            crate::text::plural(dropped, "row", "rows")
+        )
+    };
     format!(
-        "{}\n\nRecent rows from the table (JSON, most recent last):\n{}",
+        "{}\n\nRecent rows from the table (JSON, most recent last{note}):\n{}",
         crate::prompt::UNTRUSTED_NOTE,
-        crate::prompt::fenced_as("json", &rows_to_json(rows))
+        crate::prompt::fenced_as("json", &json)
     )
 }
 
@@ -612,6 +685,80 @@ mod tests {
             "{} characters",
             p.chars().count()
         );
+    }
+
+    /// **…and the size is a product of three terms, of which the cell was one.**
+    ///
+    /// `SEED_CELL_CHARS` bounds one value. The app samples twenty whole rows and
+    /// splices every column of each, so 20 × C × 201 crosses `arg_limit()` —
+    /// 30,000 UTF-16 units on Windows — at about **eight** long-text columns; an
+    /// ordinary `articles` or `audit_log` table reaches that, and Seed and Fill
+    /// were dead on it with a refusal naming levers a grid context menu does not
+    /// have. The unclipped DDL is the third term.
+    ///
+    /// Asserted on the whole prompt, which is the thing with the limit — the
+    /// per-cell cap was correct in isolation the moment it was written, and a
+    /// test of it alone is green against this.
+    #[test]
+    fn twenty_wide_rows_and_a_long_ddl_still_fit_in_one_command_line() {
+        // Eight long-text columns, twenty rows: the shape from the finding.
+        let cell = "x".repeat(400);
+        let sample: Vec<Row> = (0..20)
+            .map(|i| {
+                let mut r: Row = vec![("id".to_string(), Some(i.to_string()))];
+                for c in 0..8 {
+                    r.push((format!("col{c}"), Some(cell.clone())));
+                }
+                r
+            })
+            .collect();
+        // …and a DDL far past its own cap.
+        let ddl = format!(
+            "CREATE TABLE wide (\n{}\n)",
+            (0..400)
+                .map(|c| format!("  col{c} LONGTEXT COMMENT 'a comment that is not short'"))
+                .collect::<Vec<_>>()
+                .join(",\n")
+        );
+        let p = build_seed_prompt(
+            "wide",
+            Some(&ddl),
+            &["col0".to_string()],
+            &sample,
+            5,
+            AiData::Full,
+            crate::intel::SqlDialect::MySql,
+        );
+        // The Windows limit, which is the one that bites first.
+        assert!(
+            p.chars().count() < 30_000,
+            "the prompt is {} characters and will be refused on Windows",
+            p.chars().count()
+        );
+        // And it is still a usable prompt: the shape survives, the omissions are
+        // stated, and the fenced JSON is whole rows rather than a cut string.
+        assert!(p.contains("older rows omitted to fit"), "{p}");
+        assert!(p.contains("truncated"), "the DDL was cut in silence");
+        assert!(p.contains("\"col0\""), "the sample lost its column names");
+        assert!(p.contains("Fill ONLY these columns"), "{p}");
+
+        // A sample that fits is untouched — no note, every row present.
+        let small: Vec<Row> = (0..20)
+            .map(|i| vec![("id".to_string(), Some(i.to_string()))])
+            .collect();
+        let q = build_seed_prompt(
+            "t",
+            Some("CREATE TABLE t (id INT)"),
+            &["id".to_string()],
+            &small,
+            5,
+            AiData::Full,
+            crate::intel::SqlDialect::MySql,
+        );
+        assert!(!q.contains("omitted to fit"), "{q}");
+        assert!(!q.contains("truncated"), "{q}");
+        assert!(q.contains("\"id\":\"19\""), "the newest row is gone: {q}");
+        assert!(q.contains("\"id\":\"0\""), "the oldest row is gone: {q}");
     }
 
     /// The fill prompt carries the row being filled through the same renderer,
