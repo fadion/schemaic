@@ -3738,6 +3738,15 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
         // guessing — and anchor the menu at the click point.
         .on_event(EventListener::PointerDown, move |e| {
             if let Event::PointerDown(pe) = e {
+                // **The editor takes the keyboard on this press**, and floem is
+                // what places it — a `text_editor_keys` view is focusable by
+                // construction, with no `.keyboard_navigable()` here to say so.
+                // The workspace root's dismissal asks after this handler has
+                // run, and this is the answer: without it, closing a menu by
+                // clicking back into the editor hands the keyboard to the
+                // results grid and typing inserts nothing. See
+                // `widgets::note_pointer_focus`.
+                crate::widgets::note_pointer_focus();
                 // Any click in the editor clears the picked-statement highlight
                 // and dismisses the unsafe-run notice (without executing).
                 highlight.set(None);

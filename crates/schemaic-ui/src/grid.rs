@@ -4370,42 +4370,46 @@ fn grid_view(rs: Arc<ResultSet>, gctx: GridCtx) -> impl IntoView {
                 let cur = gs.vp.get_untracked();
                 gs.vp.set(Rect::from_origin_size(cur.origin(), rect.size()));
             })
-            .scroll_style(move |s| thin_scroll(s).hide_bars(!grid_shown.get()))
-            .keyboard_navigable()
-            // Ends a drag-select. On the body rather than the cells because the
-            // release routinely lands outside the cell the drag began in — and
-            // past the last row, or outside the grid entirely.
-            .on_event_cont(EventListener::PointerUp, move |_| {
-                gs.selecting.set(false);
-                gs.row_selecting.set(false);
-            })
-            .on_event(EventListener::KeyDown, move |e| {
-                // **F6 steps out to the toolbar** — the OS-conventional "next
-                // pane" key, and free here where every other reflex is taken
-                // (Tab hops cells while editing, the arrows move the selection,
-                // Escape closes the find/goto bars). Handled at the view rather
-                // than in `grid_key` because it is about *focus*, not grid state.
-                //
-                // `step_from` with the body's own id, which is not a ring member:
-                // it enters at the first control, or resumes where the strip was
-                // last left. It also arms `keyboard_nav`, so the ring it lands on
-                // is visible.
-                if let Event::KeyDown(ke) = e
-                    && ke.key.logical_key == Key::Named(NamedKey::F6)
-                    && let Some(from) = gs.focus_id.get_untracked()
-                {
-                    strip_entry.step_from(from, false);
-                    return EventPropagation::Stop;
-                }
-                grid_key(gs, nrows, ncols, e)
-            })
-            .style(|s| {
-                s.flex_grow(1.0_f32)
-                    .min_height(0.0)
-                    .min_width(0.0)
-                    .border_top(1.0)
-                    .border_color(theme::border())
-            });
+            .scroll_style(move |s| thin_scroll(s).hide_bars(!grid_shown.get()));
+            // Clicking a cell puts the keyboard here, and the workspace root's
+            // dismissal has no other way to know — see
+            // `widgets::note_pointer_focus`.
+            let data_body = crate::widgets::takes_pointer_focus(data_body)
+                .keyboard_navigable()
+                // Ends a drag-select. On the body rather than the cells because the
+                // release routinely lands outside the cell the drag began in — and
+                // past the last row, or outside the grid entirely.
+                .on_event_cont(EventListener::PointerUp, move |_| {
+                    gs.selecting.set(false);
+                    gs.row_selecting.set(false);
+                })
+                .on_event(EventListener::KeyDown, move |e| {
+                    // **F6 steps out to the toolbar** — the OS-conventional "next
+                    // pane" key, and free here where every other reflex is taken
+                    // (Tab hops cells while editing, the arrows move the selection,
+                    // Escape closes the find/goto bars). Handled at the view rather
+                    // than in `grid_key` because it is about *focus*, not grid state.
+                    //
+                    // `step_from` with the body's own id, which is not a ring member:
+                    // it enters at the first control, or resumes where the strip was
+                    // last left. It also arms `keyboard_nav`, so the ring it lands on
+                    // is visible.
+                    if let Event::KeyDown(ke) = e
+                        && ke.key.logical_key == Key::Named(NamedKey::F6)
+                        && let Some(from) = gs.focus_id.get_untracked()
+                    {
+                        strip_entry.step_from(from, false);
+                        return EventPropagation::Stop;
+                    }
+                    grid_key(gs, nrows, ncols, e)
+                })
+                .style(|s| {
+                    s.flex_grow(1.0_f32)
+                        .min_height(0.0)
+                        .min_width(0.0)
+                        .border_top(1.0)
+                        .border_color(theme::border())
+                });
             gs.focus_id.set(Some(data_body.id()));
             // **And this is where the keyboard goes when a control disappears while
             // focused with no modal open** — the toolbar's ✓/✗ pressed from the
@@ -9672,144 +9676,153 @@ fn data_cell(
                 // the caret back to it. Filled once the view exists — the
                 // handler only ever reads it at event time.
                 let field_id: RwSignal<Option<floem::ViewId>> = RwSignal::new(None);
-                let field = floem::views::text_input(gs.edit_buf)
-                    .on_event(EventListener::KeyDown, move |e| {
-                        if let Event::KeyDown(ke) = e {
-                            match &ke.key.logical_key {
-                                Key::Named(NamedKey::Enter) => {
-                                    // Stage the current cell. In a pending new row
-                                    // Enter hops to the next editable cell (fast
-                                    // data entry); in a real row it just closes.
-                                    if pending.is_some() {
-                                        advance_edit(gs, i, ci, pending, true);
-                                    } else {
-                                        gs.stage(data_idx, ci, Some(gs.edit_buf.get_untracked()));
-                                        gs.edit_cell.set(None);
-                                        refocus_grid(gs);
+                // The inline editor is focusable by construction, like every
+                // floem text view, so it reports the press itself — see
+                // `widgets::note_pointer_focus`.
+                let field =
+                    crate::widgets::takes_pointer_focus(floem::views::text_input(gs.edit_buf))
+                        .on_event(EventListener::KeyDown, move |e| {
+                            if let Event::KeyDown(ke) = e {
+                                match &ke.key.logical_key {
+                                    Key::Named(NamedKey::Enter) => {
+                                        // Stage the current cell. In a pending new row
+                                        // Enter hops to the next editable cell (fast
+                                        // data entry); in a real row it just closes.
+                                        if pending.is_some() {
+                                            advance_edit(gs, i, ci, pending, true);
+                                        } else {
+                                            gs.stage(
+                                                data_idx,
+                                                ci,
+                                                Some(gs.edit_buf.get_untracked()),
+                                            );
+                                            gs.edit_cell.set(None);
+                                            refocus_grid(gs);
+                                        }
+                                        return EventPropagation::Stop;
                                     }
-                                    return EventPropagation::Stop;
+                                    Key::Named(NamedKey::Tab) => {
+                                        // Tab / Shift+Tab hop to the next / previous
+                                        // editable cell (staging the current one).
+                                        // Intercepted so it doesn't move window focus.
+                                        advance_edit(gs, i, ci, pending, !ke.modifiers.shift());
+                                        return EventPropagation::Stop;
+                                    }
+                                    // **Escape is not here**, and cannot be:
+                                    // floem's `text_input` handles it in
+                                    // `event_before_children` (clearing the
+                                    // window focus) and reports it processed, so
+                                    // no listener of ours runs. What that leaves
+                                    // behind is picked up by `FocusLost` below.
+                                    _ => {}
                                 }
-                                Key::Named(NamedKey::Tab) => {
-                                    // Tab / Shift+Tab hop to the next / previous
-                                    // editable cell (staging the current one).
-                                    // Intercepted so it doesn't move window focus.
-                                    advance_edit(gs, i, ci, pending, !ke.modifiers.shift());
-                                    return EventPropagation::Stop;
+                            }
+                            EventPropagation::Continue
+                        })
+                        // Losing focus (Esc, clicking elsewhere, etc.) discards —
+                        // only Enter keeps the value. Guard: close only if THIS cell
+                        // is still the open editor — a Tab/Enter hop has already
+                        // repointed `edit_cell` to the next cell, and this input's
+                        // focus-loss must not clobber that.
+                        .on_event(EventListener::FocusLost, move |_| {
+                            // **A press inside this cell's own calendar is not
+                            // the user leaving.** Floem takes the window focus on
+                            // *every* pointer-down and hands it back only to a
+                            // focusable view under the cursor — and a day, a month
+                            // arrow and the Now button are none of them. So the
+                            // first click in the panel arrived here as a focus
+                            // loss, closed the editor, and the pick it was about
+                            // to make landed on a cell that was no longer being
+                            // edited. What closes the editor in that case is the
+                            // panel itself (`cell_calendar_editor`).
+                            //
+                            // **The press, not the panel, is the question.**
+                            // Standing down whenever a panel was merely *open*
+                            // meant Escape — which reaches this handler and
+                            // nothing else, `text_input` having answered it by
+                            // dropping the window focus — closed neither the
+                            // editor nor the panel, and left the grid with no
+                            // keyboard and no way back but the mouse.
+                            if cell_calendar_up(gs) && cell_editors::take_calendar_press() {
+                                // **And hand the caret straight back**, or the
+                                // field survives the click without the keyboard:
+                                // paging a month would leave a `DATETIME`'s time
+                                // of day untypable and Enter/Tab going to the
+                                // window root, which is the one thing keeping the
+                                // field beside the panel was for. Floem gives the
+                                // focus back only to a focusable view under the
+                                // cursor, and a month arrow is not one — so it has
+                                // to be asked for here. (The caret lands at the end
+                                // of the value: `text_input` drops its selection
+                                // and moves the cursor there on regaining focus.)
+                                if let Some(id) = field_id.get_untracked() {
+                                    id.request_focus();
                                 }
-                                // **Escape is not here**, and cannot be:
-                                // floem's `text_input` handles it in
-                                // `event_before_children` (clearing the
-                                // window focus) and reports it processed, so
-                                // no listener of ours runs. What that leaves
-                                // behind is picked up by `FocusLost` below.
-                                _ => {}
+                                return EventPropagation::Continue;
                             }
-                        }
-                        EventPropagation::Continue
-                    })
-                    // Losing focus (Esc, clicking elsewhere, etc.) discards —
-                    // only Enter keeps the value. Guard: close only if THIS cell
-                    // is still the open editor — a Tab/Enter hop has already
-                    // repointed `edit_cell` to the next cell, and this input's
-                    // focus-loss must not clobber that.
-                    .on_event(EventListener::FocusLost, move |_| {
-                        // **A press inside this cell's own calendar is not
-                        // the user leaving.** Floem takes the window focus on
-                        // *every* pointer-down and hands it back only to a
-                        // focusable view under the cursor — and a day, a month
-                        // arrow and the Now button are none of them. So the
-                        // first click in the panel arrived here as a focus
-                        // loss, closed the editor, and the pick it was about
-                        // to make landed on a cell that was no longer being
-                        // edited. What closes the editor in that case is the
-                        // panel itself (`cell_calendar_editor`).
-                        //
-                        // **The press, not the panel, is the question.**
-                        // Standing down whenever a panel was merely *open*
-                        // meant Escape — which reaches this handler and
-                        // nothing else, `text_input` having answered it by
-                        // dropping the window focus — closed neither the
-                        // editor nor the panel, and left the grid with no
-                        // keyboard and no way back but the mouse.
-                        if cell_calendar_up(gs) && cell_editors::take_calendar_press() {
-                            // **And hand the caret straight back**, or the
-                            // field survives the click without the keyboard:
-                            // paging a month would leave a `DATETIME`'s time
-                            // of day untypable and Enter/Tab going to the
-                            // window root, which is the one thing keeping the
-                            // field beside the panel was for. Floem gives the
-                            // focus back only to a focusable view under the
-                            // cursor, and a month arrow is not one — so it has
-                            // to be asked for here. (The caret lands at the end
-                            // of the value: `text_input` drops its selection
-                            // and moves the cursor there on regaining focus.)
-                            if let Some(id) = field_id.get_untracked() {
-                                id.request_focus();
+                            if gs.edit_cell.get_untracked() == Some((i, ci)) {
+                                gs.edit_cell.set(None);
+                                // Escape came through here rather than through a
+                                // key handler, and took the keyboard with it —
+                                // see `reclaim_keyboard` for why the pointer is
+                                // what decides whether to take it back.
+                                let over = gs
+                                    .focus_id
+                                    .get_untracked()
+                                    .map(|f| f.layout_rect())
+                                    .is_some_and(|r| {
+                                        reclaim_keyboard(gs.last_mouse.get_untracked(), r)
+                                    });
+                                if over {
+                                    refocus_grid(gs);
+                                }
                             }
-                            return EventPropagation::Continue;
-                        }
-                        if gs.edit_cell.get_untracked() == Some((i, ci)) {
-                            gs.edit_cell.set(None);
-                            // Escape came through here rather than through a
-                            // key handler, and took the keyboard with it —
-                            // see `reclaim_keyboard` for why the pointer is
-                            // what decides whether to take it back.
-                            let over = gs
-                                .focus_id
-                                .get_untracked()
-                                .map(|f| f.layout_rect())
-                                .is_some_and(|r| {
-                                    reclaim_keyboard(gs.last_mouse.get_untracked(), r)
+                            EventPropagation::Continue
+                        })
+                        .request_focus(|| {})
+                        // Fill the whole cell (its own `dyn_container` is set to
+                        // fill while editing) with no field chrome, so it reads as
+                        // editing the cell in place rather than a nested input.
+                        // The global `TextInputClass` paints inputs `bg_deepest`
+                        // in every state (incl. `:focus`, which is always on while
+                        // editing), so we must clear the background per-state too.
+                        .style(move |s| {
+                            let clear = floem::peniko::Color::TRANSPARENT;
+                            let s = s
+                                .width_full()
+                                .height_full()
+                                .items_center()
+                                .font_size(theme::font_body())
+                                .color(theme::text())
+                                .background(clear)
+                                .border(0.0)
+                                .border_radius(0.0)
+                                .padding(0.0)
+                                .hover(|s| s.background(clear).border(0.0))
+                                .active(|s| s.background(clear).border(0.0))
+                                .focus(|s| {
+                                    s.background(clear)
+                                        .border(0.0)
+                                        .hover(|s| s.background(clear))
                                 });
-                            if over {
-                                refocus_grid(gs);
+                            if numeric {
+                                // Right-align the editor to match the right-aligned
+                                // numeric display, so entering edit mode doesn't jump
+                                // the value to the left. Floem's text_input has no
+                                // text-align, so pad the left by the free space — the
+                                // buffer's *measured* width (re-runs as the buffer
+                                // changes, keeping it right-anchored while typing). A
+                                // value wider than the column clamps to `pad_left = 0`
+                                // (full width, left-aligned + clip) like the display.
+                                let w =
+                                    gs.widths.with(|ws| ws.get(ci).copied().unwrap_or(cell_w()));
+                                let text_px = gs.edit_buf.with(|b| measure_text_px(b));
+                                s.padding_left(numeric_edit_pad_left(w, text_px))
+                            } else {
+                                s
                             }
-                        }
-                        EventPropagation::Continue
-                    })
-                    .request_focus(|| {})
-                    // Fill the whole cell (its own `dyn_container` is set to
-                    // fill while editing) with no field chrome, so it reads as
-                    // editing the cell in place rather than a nested input.
-                    // The global `TextInputClass` paints inputs `bg_deepest`
-                    // in every state (incl. `:focus`, which is always on while
-                    // editing), so we must clear the background per-state too.
-                    .style(move |s| {
-                        let clear = floem::peniko::Color::TRANSPARENT;
-                        let s = s
-                            .width_full()
-                            .height_full()
-                            .items_center()
-                            .font_size(theme::font_body())
-                            .color(theme::text())
-                            .background(clear)
-                            .border(0.0)
-                            .border_radius(0.0)
-                            .padding(0.0)
-                            .hover(|s| s.background(clear).border(0.0))
-                            .active(|s| s.background(clear).border(0.0))
-                            .focus(|s| {
-                                s.background(clear)
-                                    .border(0.0)
-                                    .hover(|s| s.background(clear))
-                            });
-                        if numeric {
-                            // Right-align the editor to match the right-aligned
-                            // numeric display, so entering edit mode doesn't jump
-                            // the value to the left. Floem's text_input has no
-                            // text-align, so pad the left by the free space — the
-                            // buffer's *measured* width (re-runs as the buffer
-                            // changes, keeping it right-anchored while typing). A
-                            // value wider than the column clamps to `pad_left = 0`
-                            // (full width, left-aligned + clip) like the display.
-                            let w = gs.widths.with(|ws| ws.get(ci).copied().unwrap_or(cell_w()));
-                            let text_px = gs.edit_buf.with(|b| measure_text_px(b));
-                            s.padding_left(numeric_edit_pad_left(w, text_px))
-                        } else {
-                            s
-                        }
-                    })
-                    .into_any();
+                        })
+                        .into_any();
                 field_id.set(Some(field.id()));
                 return match shape {
                     CellShape::Calendar(e) => {

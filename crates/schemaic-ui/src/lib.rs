@@ -9489,16 +9489,18 @@ fn terminal_panel(ui: Ui) -> impl IntoView {
     // The surface's own id, so a selection drag can capture the pointer (see the
     // `PointerDown` arm below) — the same idiom as the resize handles.
     let surface_id = surface.id();
-    let surface = surface
-        .style(|s| {
-            s.flex_grow(1.0_f32)
-                .width_full()
-                .min_height(0.0)
-                .min_width(0.0)
-                .padding(term_pad())
-                .background(term_color(schemaic_term::DEFAULT_BG))
-                .cursor(CursorStyle::Text)
-        })
+    let surface = surface.style(|s| {
+        s.flex_grow(1.0_f32)
+            .width_full()
+            .min_height(0.0)
+            .min_width(0.0)
+            .padding(term_pad())
+            .background(term_color(schemaic_term::DEFAULT_BG))
+            .cursor(CursorStyle::Text)
+    });
+    // A click in the terminal puts the keyboard here, and the workspace root's
+    // dismissal has no other way to know — see `widgets::note_pointer_focus`.
+    let surface = widgets::takes_pointer_focus(surface)
         .keyboard_navigable()
         .on_event(EventListener::FocusGained, move |_| {
             focused.set(true);
@@ -10593,6 +10595,14 @@ pub(crate) fn edit_field(text_sig: RwSignal<String>, cfg: FieldCfg) -> impl Into
                 s.width_full()
             }
         });
+    // **A click in a field places the keyboard, and floem is what places it** —
+    // this view has no `.keyboard_navigable()` of its own because
+    // `text_editor_keys` is focusable by construction. The workspace root's
+    // dismissal needs to hear about it all the same, or closing a menu by
+    // clicking into a field hands the keyboard to the grid behind it. See
+    // `widgets::note_pointer_focus`; `on_event_cont`, so the press still
+    // reaches the root that closes the menus.
+    let editor = widgets::takes_pointer_focus(editor);
     // Autofocus: focus the editor's own view id, deferred a frame so it exists
     // (a `request_focus` on the outer view doesn't reach the editor).
     // `try_get_untracked` — the field may be disposed before this timer fires

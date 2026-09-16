@@ -194,23 +194,26 @@ pub(crate) fn pick_field(
     )
     .on_event(floem::event::EventListener::KeyDown, move |e| {
         escape(e, &on_escape)
-    })
-    .keyboard_navigable()
-    // The app's own ring, gated on `keyboard_nav` — so it marks a control the
-    // keyboard reached and stays dark on a click, which is the only time it says
-    // anything. The radius is `field_box`'s, or floem strokes a square ring
-    // around a rounded box.
-    .style(|s| {
-        crate::widgets::button_focus_ring(field_box(s), 6.0)
-            .width(pick_field_w())
-            .gap(theme::scaled(6.0))
-    })
-    // The milder half of the same defect the in-cell picker has: this `pick`
-    // only writes `buf`, so a click after the panel is gone no-ops rather than
-    // panicking — but the list is still stranded over the app, and a stranded
-    // `menu_panel` keeps its `focus_root` registered, which is how a new query
-    // tab ends up declining the keyboard (see the module doc).
-    .on_cleanup(move || close_picker(ch, standing.get()));
+    });
+    // Floem focuses this box when it is clicked, and the workspace root's
+    // dismissal has no other way to know — see `widgets::note_pointer_focus`.
+    let boxed = crate::widgets::takes_pointer_focus(boxed)
+        .keyboard_navigable()
+        // The app's own ring, gated on `keyboard_nav` — so it marks a control the
+        // keyboard reached and stays dark on a click, which is the only time it says
+        // anything. The radius is `field_box`'s, or floem strokes a square ring
+        // around a rounded box.
+        .style(|s| {
+            crate::widgets::button_focus_ring(field_box(s), 6.0)
+                .width(pick_field_w())
+                .gap(theme::scaled(6.0))
+        })
+        // The milder half of the same defect the in-cell picker has: this `pick`
+        // only writes `buf`, so a click after the panel is gone no-ops rather than
+        // panicking — but the list is still stranded over the app, and a stranded
+        // `menu_panel` keeps its `focus_root` registered, which is how a new query
+        // tab ends up declining the keyboard (see the module doc).
+        .on_cleanup(move || close_picker(ch, standing.get()));
     anchor_id.set(Some(boxed.id()));
     focus_on_mount(autofocus, anchor_id);
     boxed.into_any()
@@ -383,32 +386,34 @@ pub(crate) fn set_control(
                     }
                 }
             };
-            let chip = text(name)
-                .on_click_stop(move |_| toggle())
-                .on_event(floem::event::EventListener::KeyDown, move |e| {
-                    escape(e, &on_escape)
-                })
-                .keyboard_navigable()
-                .style(move |s| {
-                    let s = crate::widgets::button_focus_ring(s, CHIP_RADIUS)
-                        .padding_horiz(theme::scaled(8.0))
-                        .padding_vert(theme::scaled(3.0))
-                        .border(1.0)
-                        .font_size(theme::font_body());
-                    if held() {
-                        s.background(theme::control_bg())
-                            .border_color(theme::accent())
-                            .color(theme::accent())
-                    } else {
-                        s.background(theme::bg_editor())
-                            .border_color(theme::field_border())
-                            .color(theme::text_dim())
-                            .hover(|s| {
-                                s.color(theme::text())
-                                    .border_color(theme::field_border_active())
-                            })
-                    }
-                });
+            let chip = crate::widgets::takes_pointer_focus(
+                text(name)
+                    .on_click_stop(move |_| toggle())
+                    .on_event(floem::event::EventListener::KeyDown, move |e| {
+                        escape(e, &on_escape)
+                    }),
+            )
+            .keyboard_navigable()
+            .style(move |s| {
+                let s = crate::widgets::button_focus_ring(s, CHIP_RADIUS)
+                    .padding_horiz(theme::scaled(8.0))
+                    .padding_vert(theme::scaled(3.0))
+                    .border(1.0)
+                    .font_size(theme::font_body());
+                if held() {
+                    s.background(theme::control_bg())
+                        .border_color(theme::accent())
+                        .color(theme::accent())
+                } else {
+                    s.background(theme::bg_editor())
+                        .border_color(theme::field_border())
+                        .color(theme::text_dim())
+                        .hover(|s| {
+                            s.color(theme::text())
+                                .border_color(theme::field_border_active())
+                        })
+                }
+            });
             if i == 0 {
                 first_id.set(Some(chip.id()));
             }

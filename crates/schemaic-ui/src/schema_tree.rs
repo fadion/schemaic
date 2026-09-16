@@ -1216,7 +1216,10 @@ pub(crate) fn schema_panel(ui: Ui) -> impl IntoView {
                 arm_menu_return(nav);
                 ui.overlay.popup_menu.set(Some(entries));
             }
-        })
+        });
+    // A click in the tree puts the keyboard here, and the workspace root's
+    // dismissal has no other way to know — see `widgets::note_pointer_focus`.
+    let tree = crate::widgets::takes_pointer_focus(tree)
         .keyboard_navigable()
         .on_event(EventListener::FocusGained, move |_| {
             // **Guarded, because this fires on a tree that is already

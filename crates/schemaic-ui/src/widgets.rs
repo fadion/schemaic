@@ -52,6 +52,62 @@ thread_local! {
     /// True from a pointer-driven menu dismissal until the tick after it — see
     /// [`begin_pointer_dismissal`].
     static POINTER_DISMISSAL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// True from a press that landed on a view which takes the keyboard until
+    /// the tick after it — see [`note_pointer_focus`].
+    static POINTER_PLACED_FOCUS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// **This press landed on me, and I take the keyboard.** Called by every view
+/// that floem focuses on a pointer press, from the view's own `PointerDown`
+/// listener.
+///
+/// It is the question [`begin_pointer_dismissal`] has to ask and floem will not
+/// answer: `AppState::focus` is `pub(crate)` to floem, there is no "what has
+/// focus" accessor on `ViewId`, and the `FocusGained` that would say so is
+/// dispatched *after* the root's handler has returned
+/// (`floem-0.2.0/src/window_handle.rs:361`). So the views that know say so.
+///
+/// **The ordering is what makes it work, and it is floem's, not ours.** On a
+/// `PointerDown` floem takes `app_state.focus` away first
+/// (`window_handle.rs:227-231`), walks the children deepest-first and lets the
+/// first `keyboard_navigable` view under the point take focus
+/// (`context.rs:176-181`, `AppState::update_focus` is first-wins), and runs a
+/// view's own listeners **last** (`context.rs:405-423`). A child's listener
+/// therefore always runs before its ancestors', and the workspace root's runs
+/// after every one of them — so by the time the root asks, every view under the
+/// press has already reported.
+///
+/// Cleared on the next tick like its sibling, so a press the root never sees —
+/// one a menu trigger or a panel absorbed with `on_event_stop` — cannot leave a
+/// stale `true` behind for the next press to read.
+pub(crate) fn note_pointer_focus() {
+    POINTER_PLACED_FOCUS.with(|d| d.set(true));
+    floem::action::exec_after(std::time::Duration::ZERO, |_| {
+        POINTER_PLACED_FOCUS.with(|d| d.set(false));
+    });
+}
+
+/// Whether the press being dispatched landed on a view that takes the keyboard
+/// — see [`note_pointer_focus`].
+pub(crate) fn pointer_placed_focus() -> bool {
+    POINTER_PLACED_FOCUS.with(|d| d.get())
+}
+
+/// Attach [`note_pointer_focus`] to a view that floem gives focus to when it is
+/// clicked: the pair to spell at every such site, so the report is one call
+/// rather than a listener each site writes out.
+///
+/// `on_event_cont`, never `on_event_stop`: the press must go on reaching the
+/// workspace root, which is what closes the menus.
+///
+/// **Use it beside every `.keyboard_navigable()`**, and on the floem views that
+/// are focusable without one — the text editor the SQL pane and `edit_field`
+/// are built on, and the grid's inline `text_input`. `keyboard_focus_report_gate`
+/// keeps the first half honest; the second half is a census this comment is the
+/// record of, because a floem built-in announces nothing a gate could match.
+pub(crate) fn takes_pointer_focus<V: IntoView + 'static>(view: V) -> V::V {
+    view.into_view()
+        .on_event_cont(EventListener::PointerDown, |_| note_pointer_focus())
 }
 
 /// **A press dismissed a menu, and the press has already placed focus.**
@@ -83,7 +139,22 @@ thread_local! {
 /// unmounting inside it for an unrelated reason would skip its hand-back too,
 /// which is the cost, and the gesture that opens the window is a press that
 /// closes menus.
+///
+/// **It marks nothing when the press placed no focus**, which is the other half
+/// of the same premise and was missing (S19-L1-01). Inside a modal a press
+/// always lands on *something* navigable — `focus_root_inner` makes the modal's
+/// own root navigable and its view is `size_full()`, so an ancestor takes the
+/// keyboard on the unwind — but the workspace has no such ancestor, and most of
+/// what it shows takes no focus at all: the status bar's text, a panel title
+/// row, the tab-strip background, the results header. Closing a menu by
+/// clicking one of those left **nothing** holding the keyboard, and skipping the
+/// hand-back made that permanent until the user clicked a cell. Only a press
+/// that actually placed focus has something for the teardown to defer to, and
+/// [`note_pointer_focus`] is how the views that took it say so.
 pub(crate) fn begin_pointer_dismissal() {
+    if !pointer_placed_focus() {
+        return;
+    }
     POINTER_DISMISSAL.with(|d| d.set(true));
     floem::action::exec_after(std::time::Duration::ZERO, |_| {
         POINTER_DISMISSAL.with(|d| d.set(false));
@@ -186,6 +257,7 @@ fn focus_root_inner<V: IntoView + 'static>(view: V, ring: Option<FocusRing>) -> 
     let view = view.into_view();
     let id = view.id();
     FOCUS_ROOTS.with_borrow_mut(|s| s.push((id, ring)));
+    let view = takes_pointer_focus(view);
     view.keyboard_navigable()
         .request_focus(|| {})
         .on_cleanup(move || {
@@ -608,7 +680,7 @@ pub(crate) fn key_pressable<V: IntoView + 'static>(
     // ring is an `outline`, which floem inflates outward, and adds no padding —
     // so every pixel the button occupies still answers a click.
     let pressable = container(view).on_click_stop(move |_| (clicked)());
-    container(pressable)
+    takes_pointer_focus(container(pressable))
         .style(move |s| button_focus_ring(s, radius).flex_shrink(0.0_f32))
         .keyboard_navigable()
         .on_event(EventListener::KeyDown, move |e| {
@@ -1295,7 +1367,8 @@ pub(crate) fn in_focus_ring_with<V: IntoView + 'static>(
     // already been cleared.
     let focused = Rc::new(std::cell::Cell::new(false));
     let (gained, lost, at_cleanup) = (focused.clone(), focused.clone(), focused);
-    view.keyboard_navigable()
+    takes_pointer_focus(view)
+        .keyboard_navigable()
         .on_event_cont(EventListener::FocusGained, move |_| gained.set(true))
         .on_event_cont(EventListener::FocusLost, move |_| lost.set(false))
         .on_event(EventListener::KeyDown, move |e| {
@@ -6371,6 +6444,57 @@ mod menu_return_gate {
         );
     }
 
+    /// **Every view this crate makes keyboard-navigable reports the press that
+    /// focuses it** (S19-L1-01).
+    ///
+    /// `begin_pointer_dismissal` suppresses a focus root's hand-back on the
+    /// premise that the press placed focus somewhere, and the only thing that
+    /// can tell it so is the view that took the focus — floem exposes no
+    /// accessor for it. A navigable view added without the report is invisible
+    /// to that question: the hand-back then runs and moves the keyboard off the
+    /// control the user just clicked, which is the bug
+    /// `begin_pointer_dismissal` was written for in the first place.
+    ///
+    /// **What this cannot see**, stated because a gate that reads as broader
+    /// than it is does more harm than none: floem's own focusable views carry
+    /// no `.keyboard_navigable()` for the needle to find — the editor behind
+    /// the SQL pane and `edit_field`, and the grid's inline `text_input` — so
+    /// those three are a census kept by hand (`takes_pointer_focus`'s doc lists
+    /// them). It also reads only this crate, which is where every navigable
+    /// view is today.
+    #[test]
+    fn every_navigable_view_reports_the_press_that_focuses_it() {
+        let needle = format!(".{}()", "keyboard_navigable");
+        let report = "takes_pointer_focus";
+        let mut seen = 0;
+        for (name, src) in crate::source_gate::crate_sources() {
+            let body = crate::source_gate::production_code(&src);
+            let mut from = 0;
+            while let Some(at) = body[from..].find(&needle) {
+                let at = from + at;
+                seen += 1;
+                // The pair is spelt within a few lines of each other — the
+                // helper wraps the view the call is chained onto, so it sits
+                // just above it, with at most a comment in between.
+                let window = body[at.saturating_sub(600)..at].to_string();
+                assert!(
+                    window.contains(report),
+                    "{name}: a `{needle}` view with no `{report}` above it — the \
+                     press that focuses it is invisible to \
+                     `begin_pointer_dismissal`, so a menu dismissal will take \
+                     the keyboard off it"
+                );
+                from = at + needle.len();
+            }
+        }
+        assert!(
+            seen >= 7,
+            "only {seen} navigable views found — the grid body, the schema tree, \
+             the terminal, both row-panel controls and the two `widgets` \
+             helpers each have one"
+        );
+    }
+
     /// And the workspace root marks the press *before* it closes the menus, so
     /// the flag is already set when the teardown runs in `process_update`.
     #[test]
@@ -7486,12 +7610,20 @@ mod menu_key_tests {
     /// Not a claim, and the test says why: the flag has to survive into the
     /// `process_update` pass that runs the panel's cleanup, which is after the
     /// handler that sets it has returned.
+    ///
+    /// The press has to have *placed* focus for that to be true, which is what
+    /// [`note_pointer_focus`] reports and what the sibling test below covers —
+    /// so this one opens by reporting it, the way a click in the SQL editor
+    /// does.
     #[test]
     fn a_pointer_dismissal_suppresses_the_hand_back() {
+        clear_press_flags();
         assert!(
             hand_back_wanted(),
             "a teardown with no press behind it still hands the keyboard back"
         );
+        // The press landed on something that takes the keyboard.
+        note_pointer_focus();
         begin_pointer_dismissal();
         assert!(
             !hand_back_wanted(),
@@ -7499,8 +7631,44 @@ mod menu_key_tests {
         );
         // Cleared on the next tick, not at the end of the handler — so this is
         // still set when the cleanup runs.
-        POINTER_DISMISSAL.with(|d| d.set(false));
+        clear_press_flags();
         assert!(hand_back_wanted());
+    }
+
+    /// **A press that placed focus on nothing must not suppress the hand-back**
+    /// (S19-L1-01).
+    ///
+    /// The suppression's whole premise is "the pointer has already placed
+    /// focus", and out in the workspace most of what a press can land on takes
+    /// no focus at all: the status bar's text, a panel title row, the tab-strip
+    /// background, the results header. Floem clears `app_state.focus` at the
+    /// top of every `PointerDown` and only a `keyboard_navigable` view under
+    /// the point puts it back, so after such a press **nothing holds the
+    /// keyboard** — and the teardown's hand-back is the only thing that will.
+    ///
+    /// Marked unconditionally, closing the results toolbar's Copy menu by
+    /// clicking the row-count segment left the grid answering no key — not the
+    /// arrows, not `Del`, not `Ctrl+Enter`, not `Ctrl+F`, not the `F6` that
+    /// would have got back into the strip — until the user clicked a cell.
+    #[test]
+    fn a_press_that_placed_no_focus_does_not_suppress_the_hand_back() {
+        clear_press_flags();
+        // No `note_pointer_focus()`: the press landed on chrome.
+        begin_pointer_dismissal();
+        assert!(
+            hand_back_wanted(),
+            "the press placed focus nowhere, so the teardown is what decides \
+             where the keyboard goes — suppressing it leaves the workspace \
+             keyboard-dead"
+        );
+        clear_press_flags();
+    }
+
+    /// Both flags are per-press and cleared on the next tick; the tests drive
+    /// that reset by hand, because `exec_after` has no loop to run on here.
+    fn clear_press_flags() {
+        POINTER_DISMISSAL.with(|d| d.set(false));
+        POINTER_PLACED_FOCUS.with(|d| d.set(false));
     }
 
     // The grid toolbar's Copy icon, and Save's a few px to its right.
