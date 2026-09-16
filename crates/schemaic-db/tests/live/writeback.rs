@@ -655,7 +655,14 @@ pub async fn a_spliced_row_is_the_row_a_fresh_select_would_show(target: &'static
         target.engine.dialect(),
         schemaic_core::intel::SqlDialect::Postgres
     );
-    let pad_col = if padded { ", pad" } else { "" };
+    // **Three padded columns, not one.** `zerofill_widths` answers `Some` for
+    // every numeric column carrying the flag, and only the integer arms of
+    // `zerofill_value` consumed it — so an `INT … ZEROFILL` was spliced back
+    // padded while a `DOUBLE … ZEROFILL` beside it was painted over with the
+    // bare number, in a cell nobody edited. One case cannot stand in for the
+    // other: the integer and the float take different arms of `convert_row`,
+    // and the `FLOAT` takes a third (it falls to `binary_as_text`).
+    let pad_col = if padded { ", pad, padd, padf" } else { "" };
     // Shapes whose *text* form the binary protocol does not reproduce on its
     // own: a datetime with a zero time, a time-of-day, and a 32-bit float.
     // Deliberately awkward, for the reason the DDL shapes are.
@@ -668,7 +675,8 @@ pub async fn a_spliced_row_is_the_row_a_fresh_select_would_show(target: &'static
         _ => format!(
             "CREATE TABLE {t} (id INT PRIMARY KEY, note VARCHAR(20), \
              due DATETIME, micros DATETIME(3), plain DATE, dur TIME, \
-             ratio FLOAT, exact DOUBLE, pad INT(4) UNSIGNED ZEROFILL)"
+             ratio FLOAT, exact DOUBLE, pad INT(4) UNSIGNED ZEROFILL, \
+             padd DOUBLE(10,2) UNSIGNED ZEROFILL, padf FLOAT(8,2) UNSIGNED ZEROFILL)"
         ),
     };
     scratch.exec(&ddl).await;
@@ -681,7 +689,7 @@ pub async fn a_spliced_row_is_the_row_a_fresh_select_would_show(target: &'static
             "INSERT INTO {t} (id, note, due, micros, plain, dur, ratio, exact{pad_col}) \
              VALUES (1, 'a', '2024-01-15 00:00:00', '2024-01-15 08:09:10.120', \
              '2024-01-15', '10:30:00', 3.14, 3.14{})",
-            if padded { ", 7" } else { "" }
+            if padded { ", 7, 123.45, 12.5" } else { "" }
         ))
         .await;
 

@@ -119,6 +119,25 @@ pub static MYSQL_FAMILY: &[TypeCase] = &[
     // write-back half runs `0007` back through the quoter and the key, where
     // the server coerces it to the same number.
     case("int_zerofill", "INT(4) UNSIGNED ZEROFILL", "7", "0007"),
+    // **And the float twin, which the integer case could not stand in for.**
+    // `zerofill_widths` answers `Some` for every numeric column carrying the
+    // flag, and only the integer arms of `zerofill_value` consumed it — so the
+    // binary-protocol re-fetch painted `123.45` over the `0000123.45` the text
+    // load had put in the grid, in a cell the user never edited. Both engines
+    // accept the `(M,D)` form (deprecated on MySQL 8.0.17+, still accepted on
+    // 8.4.11) and both pad the same way.
+    case(
+        "double_zerofill",
+        "DOUBLE(10,2) UNSIGNED ZEROFILL",
+        "123.45",
+        "0000123.45",
+    ),
+    case(
+        "float_zerofill",
+        "FLOAT(8,2) UNSIGNED ZEROFILL",
+        "12.5",
+        "00012.50",
+    ),
     case(
         "decimal_wide",
         "DECIMAL(30,10)",

@@ -270,8 +270,8 @@ pub static MARIADB: Target = Target {
     running_sleeps_sql: "SELECT COUNT(*) FROM information_schema.PROCESSLIST \n         WHERE INFO LIKE CONCAT('%{head}', '{tail}%')",
     types: cases::MYSQL_FAMILY,
     extra_types: cases::MARIADB_ONLY,
-    expected_cases: 25,
-    expected_writable_cases: 24,
+    expected_cases: 27,
+    expected_writable_cases: 26,
     expected_keyed_cases: 20,
 };
 
@@ -301,8 +301,8 @@ pub static MYSQL: Target = Target {
     running_sleeps_sql: "SELECT COUNT(*) FROM information_schema.PROCESSLIST \n         WHERE INFO LIKE CONCAT('%{head}', '{tail}%')",
     types: cases::MYSQL_FAMILY,
     extra_types: cases::MYSQL_ONLY,
-    expected_cases: 25,
-    expected_writable_cases: 24,
+    expected_cases: 27,
+    expected_writable_cases: 26,
     expected_keyed_cases: 20,
 };
 

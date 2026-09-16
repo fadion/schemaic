@@ -4698,13 +4698,35 @@ fn convert_row(
             // protocol sent it padded, so it is re-rendered to the column's
             // display width — see `zerofill_value`. Every other column has
             // `None` and passes straight through.
-            Some(MyValue::Int(n)) => {
-                zerofill_value(Value::Int(*n), zerofill.get(i).copied().flatten())
+            Some(MyValue::Int(n)) => zerofill_value(
+                Value::Int(*n),
+                zerofill.get(i).copied().flatten(),
+                scale.get(i).copied().unwrap_or(0),
+            ),
+            Some(MyValue::UInt(n)) => zerofill_value(
+                Value::UInt(*n),
+                zerofill.get(i).copied().flatten(),
+                scale.get(i).copied().unwrap_or(0),
+            ),
+            // A `ZEROFILL` double is padded here for the same reason an integer
+            // is — see `zerofill_value`. Without the width it is the bare float,
+            // exactly as before.
+            Some(MyValue::Double(f)) => zerofill_value(
+                Value::Float(*f),
+                zerofill.get(i).copied().flatten(),
+                scale.get(i).copied().unwrap_or(0),
+            ),
+            // A `ZEROFILL` `FLOAT`, for the same reason as the `DOUBLE` above.
+            // Without the width this falls through to `binary_as_text`, whose
+            // `f32` rendering is deliberate and unchanged — which is why the
+            // arm is guarded rather than unconditional.
+            Some(MyValue::Float(f)) if zerofill.get(i).copied().flatten().is_some() => {
+                zerofill_value(
+                    Value::Float(f64::from(*f)),
+                    zerofill.get(i).copied().flatten(),
+                    scale.get(i).copied().unwrap_or(0),
+                )
             }
-            Some(MyValue::UInt(n)) => {
-                zerofill_value(Value::UInt(*n), zerofill.get(i).copied().flatten())
-            }
-            Some(MyValue::Double(f)) => Value::Float(*f),
             // **The binary protocol's own shapes, rendered the way the text
             // protocol renders the same column.** See `binary_as_text`; the
             // catch-all below is `as_sql`, which is a *SQL literal* and not what
@@ -6235,9 +6257,10 @@ pub(crate) fn parse_as(kind: NumKind, s: String) -> Value {
     }
 }
 
-/// Re-render a **binary-protocol** integer the way the text protocol would have
+/// Re-render a **binary-protocol** number the way the text protocol would have
 /// sent it, for a `ZEROFILL` column — `width` is the column's display width, or
-/// `None` for every other column, which passes through untouched.
+/// `None` for every other column, which passes through untouched. `scale` is the
+/// column's declared decimals, which a float needs and an integer ignores.
 ///
 /// **The two protocols disagree about these cells and only one of them is the
 /// user's answer.** A prepared statement — which is what the post-commit
@@ -6246,15 +6269,38 @@ pub(crate) fn parse_as(kind: NumKind, s: String) -> Value {
 /// paint `7` over the padded value the load put in the grid, and the column
 /// would disagree with itself about a cell the user never edited.
 ///
+/// **Floats are `ZEROFILL` columns too**, and covering the integer arms alone
+/// left exactly that disagreement on them. MySQL's numeric-type syntax admits
+/// the attribute on `FLOAT[(M,D)]` and `DOUBLE[(M,D)]`, and `zerofill_widths`
+/// answers `Some` for every numeric column carrying the flag — so the width was
+/// computed, carried into `convert_row`, and consumed by two of the arms that
+/// could use it. Measured on MariaDB 10.11.14 **and** MySQL 8.4.11, where the
+/// form is deprecated but still accepted: `DOUBLE(10,2) UNSIGNED ZEROFILL`
+/// holding `123.45` reads back `0000123.45` over the text protocol, and
+/// `FLOAT(8,2) UNSIGNED ZEROFILL` holding `12.5` reads `00012.50`. The splice
+/// painted `123.45` over the first of those, in a cell the user never touched,
+/// and an export taken before the next full re-run wrote the unpadded text out.
+///
+/// The scale is part of it: the server pads to `width` *including* the decimal
+/// point and the fraction, so `{n:0w$.p$}` is the same rendering.
+///
 /// Padding only, never truncation: a value wider than the declared width is the
 /// server's to render, and `format!` leaves it alone.
-fn zerofill_value(v: Value, width: Option<usize>) -> Value {
+fn zerofill_value(v: Value, width: Option<usize>, scale: u32) -> Value {
     let Some(w) = width else {
         return v;
     };
+    let p = scale as usize;
     match v {
         Value::Int(n) => Value::Str(format!("{n:0w$}")),
         Value::UInt(n) => Value::Str(format!("{n:0w$}")),
+        // **`NOT_FIXED_DEC` is not a scale.** A `FLOAT`/`DOUBLE` declared
+        // without `(M,D)` reports `decimals = 31`, and formatting to
+        // thirty-one places would invent digits the server never sent. There
+        // the shortest round-tripping form is what the text protocol prints,
+        // padded — the same reading `binary_as_text` takes for an `f32`.
+        Value::Float(f) if p >= 31 => Value::Str(format!("{:0>w$}", f.to_string())),
+        Value::Float(f) => Value::Str(format!("{f:0w$.p$}")),
         other => other,
     }
 }
@@ -7115,25 +7161,70 @@ mod tests {
     #[test]
     fn a_zerofill_cell_from_the_binary_protocol_is_padded_back() {
         assert!(matches!(
-            zerofill_value(Value::Int(7), Some(4)),
+            zerofill_value(Value::Int(7), Some(4), 0),
             Value::Str(s) if s == "0007"
         ));
         assert!(matches!(
-            zerofill_value(Value::UInt(42), Some(8)),
+            zerofill_value(Value::UInt(42), Some(8), 0),
             Value::Str(s) if s == "00000042"
         ));
         // A value already at or over the width is untouched by the padding.
         assert!(matches!(
-            zerofill_value(Value::UInt(12345), Some(4)),
+            zerofill_value(Value::UInt(12345), Some(4), 0),
             Value::Str(s) if s == "12345"
         ));
         // No width means no ZEROFILL: every other column passes through whole.
-        assert!(matches!(zerofill_value(Value::Int(7), None), Value::Int(7)));
         assert!(matches!(
-            zerofill_value(Value::Str("0007".into()), Some(4)),
+            zerofill_value(Value::Int(7), None, 0),
+            Value::Int(7)
+        ));
+        assert!(matches!(
+            zerofill_value(Value::Str("0007".into()), Some(4), 0),
             Value::Str(s) if s == "0007"
         ));
-        assert!(matches!(zerofill_value(Value::Null, Some(4)), Value::Null));
+        assert!(matches!(
+            zerofill_value(Value::Null, Some(4), 0),
+            Value::Null
+        ));
+    }
+
+    /// **A float is a `ZEROFILL` column too**, and the first spelling of this
+    /// covered the integer arms alone — so `zerofill_widths`, which answers
+    /// `Some` for every numeric column carrying the flag, computed a width that
+    /// two of the three arms that could use it threw away. The splice then
+    /// painted `123.45` over the `0000123.45` the text load had put in the grid,
+    /// in a cell the user never touched, and an export taken before the next
+    /// full re-run wrote the unpadded text out.
+    ///
+    /// Measured on MariaDB 10.11.14 **and** MySQL 8.4.11, where the `(M,D)` form
+    /// is deprecated and still accepted: `DOUBLE(10,2) UNSIGNED ZEROFILL`
+    /// holding `123.45` reads back `0000123.45`, and `FLOAT(8,2) UNSIGNED
+    /// ZEROFILL` holding `12.5` reads `00012.50`.
+    #[test]
+    fn a_zerofill_float_is_padded_to_its_declared_scale() {
+        assert!(matches!(
+            zerofill_value(Value::Float(123.45), Some(10), 2),
+            Value::Str(s) if s == "0000123.45"
+        ));
+        // The scale is part of the rendering: a trailing zero the server prints
+        // is not noise, it is the column's declared precision.
+        assert!(matches!(
+            zerofill_value(Value::Float(12.5), Some(8), 2),
+            Value::Str(s) if s == "00012.50"
+        ));
+        // **`NOT_FIXED_DEC` is not a scale.** A float declared without `(M,D)`
+        // reports `decimals = 31`; formatting to thirty-one places would invent
+        // digits the server never sent, so the shortest round-tripping form is
+        // padded instead.
+        assert!(matches!(
+            zerofill_value(Value::Float(1.5), Some(6), 31),
+            Value::Str(s) if s == "0001.5"
+        ));
+        // And no width is still no ZEROFILL.
+        assert!(matches!(
+            zerofill_value(Value::Float(1.5), None, 2),
+            Value::Float(f) if f == 1.5
+        ));
     }
 
     #[test]
