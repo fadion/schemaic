@@ -253,6 +253,34 @@ impl TxState {
                     _ => TxState::Idle,
                 }
             }
+            // **PostgreSQL's own documented way out, which is not a close.**
+            // `ROLLBACK TO SAVEPOINT s` is accepted *inside* an aborted
+            // transaction and un-aborts it, leaving the transaction live and
+            // committable — measured on PostgreSQL 16.15:
+            // `SAVEPOINT s1; SELECT 1/0; ROLLBACK TO SAVEPOINT s1; SELECT 1;`
+            // and the `COMMIT` after it both succeed. `tx_after` answers
+            // `Unchanged` for it, correctly, because the question *that*
+            // predicate was written for is `Session::in_tx` — and the arm above
+            // enumerates `Closed | Open`, so the statement fell to this one and
+            // the tab stayed `Poisoned` for the rest of its life: `can_commit()`
+            // false, Commit hidden in the footer and in the close prompt, and
+            // the only offered action discarding a healthy transaction's work.
+            //
+            // **Only the typed statement, not `FailedIsolated`.** The review
+            // that found this proposed letting that outcome out of `Poisoned`
+            // too, on the grounds that `Session::classify_isolated` mints it
+            // only after a `ROLLBACK TO SAVEPOINT schemaic_w` the server
+            // accepted. The premise is right and the input cannot occur:
+            // reaching that rollback needs a `SAVEPOINT` first, and PostgreSQL
+            // refuses one inside an aborted transaction. So the combination is
+            // unreachable, `a_savepoint_isolated_failure_does_not_revive_a_poisoned_transaction`
+            // already decided it the conservative way, and this does not
+            // reverse that decision for a case nothing can produce.
+            TxState::Poisoned { stmts }
+                if outcome == StmtOutcome::Ok && clears_abort(engine, sql) =>
+            {
+                TxState::Open { stmts }
+            }
             TxState::Poisoned { stmts } => TxState::Poisoned { stmts },
             TxState::Idle | TxState::Open { .. } => {
                 let stmts = self.stmts();
@@ -567,6 +595,46 @@ pub fn tx_after(engine: TxEngine, sql: &str) -> TxAfter {
         _ if implicit_commit(engine, sql) => TxAfter::Closed,
         _ => TxAfter::Unchanged,
     }
+}
+
+/// Does `sql` take an **aborted** transaction back to a working one?
+///
+/// **The third question about a statement, and the one nothing was asking.**
+/// [`tx_after`] answers "is there a transaction afterwards" — the session's
+/// `in_tx` flag — and [`implicit_commit`] answers "did this end one". Neither is
+/// "is it still aborted", and PostgreSQL has exactly one statement where the
+/// three come apart: `ROLLBACK [WORK|TRANSACTION] TO [SAVEPOINT] s` is accepted
+/// *inside* an aborted transaction, clears the aborted state, and leaves the
+/// transaction open and committable. `tx_after` says `Unchanged` for it, which
+/// is right for the flag and left `TxState::Poisoned` with no exit: Commit was
+/// hidden for the rest of the tab's life while the user went on building work in
+/// a transaction that was fine.
+///
+/// Measured on PostgreSQL 16.15: `SAVEPOINT s1; SELECT 1/0;
+/// ROLLBACK TO SAVEPOINT s1; SELECT 1;` — the `SELECT` and the `COMMIT` after it
+/// both succeed.
+///
+/// **PostgreSQL only.** MySQL has no aborted-transaction state to clear: a
+/// failed statement there leaves the transaction usable, so the fold never
+/// reaches `Poisoned` on that engine at all.
+pub fn clears_abort(engine: TxEngine, sql: &str) -> bool {
+    if engine != TxEngine::Postgres {
+        return false;
+    }
+    let dialect = crate::intel::SqlDialect::MySql;
+    let Some(kw) = crate::sql::leading_keyword(sql, dialect) else {
+        return false;
+    };
+    if kw != "ROLLBACK" {
+        return false;
+    }
+    // The same noise-word walk `tx_after`'s closer arm does, and for the same
+    // reason: `WORK`/`TRANSACTION` sit between the keyword and the word that
+    // decides, and reading only the first word after `ROLLBACK` finds `WORK`.
+    let words = crate::sql::leading_words(sql, 4, dialect);
+    let word = |n: usize| words.get(n + 1).map(String::as_str);
+    let i = usize::from(matches!(word(0), Some("WORK" | "TRANSACTION")));
+    word(i) == Some("TO")
 }
 
 /// Did a statement that **did not apply** nonetheless end the transaction it was
@@ -1824,6 +1892,97 @@ mod tests {
                 "{engine:?}"
             );
         }
+    }
+
+    /// **PostgreSQL's documented way out of an aborted transaction had no route
+    /// out of `Poisoned`.**
+    ///
+    /// `ROLLBACK TO SAVEPOINT s` is accepted *inside* an aborted transaction and
+    /// un-aborts it, leaving the transaction live and committable — measured on
+    /// PostgreSQL 16.15. The exit arm enumerated `Closed | Open`, and `tx_after`
+    /// answers `Unchanged` for this statement (correctly: the question it
+    /// answers is `Session::in_tx`), so the fold dropped it into the absorbing
+    /// arm. From there `can_commit()` is false, so **Commit is hidden in the
+    /// footer and in the close prompt for the rest of the tab's life**, while
+    /// the session's flag is correctly still true and the user goes on building
+    /// work in a healthy transaction whose only offered action discards it.
+    ///
+    /// Stated over the composition, which is where it lives: the predicates were
+    /// each right about their own question.
+    #[test]
+    fn a_savepoint_rollback_takes_an_aborted_transaction_back() {
+        let poisoned = TxState::Poisoned { stmts: 2 };
+        for sql in [
+            "ROLLBACK TO SAVEPOINT s1",
+            "ROLLBACK TO s1",
+            "ROLLBACK WORK TO SAVEPOINT s1",
+            "ROLLBACK TRANSACTION TO s1",
+            // Through the shared lexer, so a comment between the words cannot
+            // hide it — the same property the closer arm carries.
+            "ROLLBACK/* x */TO SAVEPOINT s1",
+        ] {
+            let after = poisoned.on_statement(TxEngine::Postgres, sql, StmtOutcome::Ok);
+            assert!(
+                after.can_commit(),
+                "{sql}: Commit is still hidden over a healthy transaction — {after:?}"
+            );
+            assert!(after.is_open(), "{sql}: {after:?}");
+            // The count is kept: the work before the savepoint is still there.
+            assert_eq!(after.stmts(), 2, "{sql}");
+        }
+
+        // **A plain `ROLLBACK` still closes it**, and a statement the server
+        // refused inside the aborted transaction still absorbs — the two cases
+        // the arm above and the arm below exist for.
+        assert!(
+            !poisoned
+                .on_statement(TxEngine::Postgres, "ROLLBACK", StmtOutcome::Ok)
+                .is_open()
+        );
+        assert!(
+            !poisoned
+                .on_statement(TxEngine::Postgres, "SELECT 1", StmtOutcome::Failed)
+                .can_commit()
+        );
+        // A savepoint rollback the server *refused* changes nothing.
+        assert!(
+            !poisoned
+                .on_statement(
+                    TxEngine::Postgres,
+                    "ROLLBACK TO SAVEPOINT s1",
+                    StmtOutcome::Failed
+                )
+                .can_commit()
+        );
+        // And `RELEASE SAVEPOINT` is not a way out: it discards the savepoint,
+        // not the abort.
+        assert!(
+            !poisoned
+                .on_statement(TxEngine::Postgres, "RELEASE SAVEPOINT s1", StmtOutcome::Ok)
+                .can_commit()
+        );
+
+        // **`FailedIsolated` is deliberately left alone**, and
+        // `a_savepoint_isolated_failure_does_not_revive_a_poisoned_transaction`
+        // is the decision. Reaching it from here would need a `SAVEPOINT` inside
+        // an aborted transaction, which PostgreSQL refuses — so the combination
+        // cannot occur, and this widening does not reverse that answer for it.
+        assert!(
+            !poisoned
+                .on_statement(
+                    TxEngine::Postgres,
+                    "UPDATE t SET a = 1",
+                    StmtOutcome::FailedIsolated
+                )
+                .can_commit()
+        );
+
+        // MySQL has no aborted state to clear — a failed statement there leaves
+        // the transaction usable — so the predicate answers no for it.
+        assert!(!clears_abort(TxEngine::MySql, "ROLLBACK TO SAVEPOINT s1"));
+        assert!(clears_abort(TxEngine::Postgres, "ROLLBACK TO SAVEPOINT s1"));
+        assert!(!clears_abort(TxEngine::Postgres, "ROLLBACK"));
+        assert!(!clears_abort(TxEngine::Postgres, "COMMIT"));
     }
 
     /// **Three of MySQL's four `START` statements open no transaction.**
