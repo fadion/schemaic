@@ -344,8 +344,45 @@ fn claim() -> Claimed {
         let _ = std::fs::create_dir_all(dir);
     }
     match persist::write_file_atomic(&path, claim_text(c).as_bytes()) {
-        Ok(()) => Claimed::Mine(c),
+        // **Read back, because the write is atomic and the decision is not.**
+        //
+        // `may_claim` reads the marker, `write_file_atomic` replaces it, and
+        // nothing holds the file between the two. Two windows starting an AI
+        // turn at the same moment both read "no live claim", both wrote, and
+        // both returned `Mine` — so both ran `agy mcp add` against the
+        // machine-global registration, which is the cross-connection hijack this
+        // marker exists to prevent. The teardown was asymmetric too: `release`
+        // correctly refuses to remove a marker that is not its own, so the loser
+        // withdrew nothing and the winner's grant outlived both.
+        //
+        // The rename is atomic, so exactly one marker survives it, and the nonce
+        // says whose. A session that does not find its own nonce lost, and the
+        // honest answer for a loser is the one `Shared` already carries: no
+        // tools, because a live process owns the registration.
+        //
+        // **What this does not close**, stated rather than implied: two writes
+        // that both land before either read-back still both see themselves, and
+        // the second rename then orphans the first's marker. The window is the
+        // interval between one process's rename and its own next read rather
+        // than the whole of `agy mcp add`, and the loser's `release` still
+        // declines to remove a marker it does not own. Closing it outright needs
+        // an `O_EXCL` create, which the takeover path (a marker left by a dead
+        // process) cannot use.
+        Ok(()) => claim_outcome(c, claim_on_disk()),
         Err(_) => Claimed::Refused,
+    }
+}
+
+/// What a session got, given the claim it wrote and the claim that is on disk
+/// once the write has settled.
+///
+/// Split out from [`claim`] so the decision has a test: everything around it is
+/// a filesystem and two processes.
+fn claim_outcome(mine: Claim, settled: Option<Claim>) -> Claimed {
+    if settled == Some(mine) {
+        Claimed::Mine(mine)
+    } else {
+        Claimed::Shared
     }
 }
 
@@ -900,6 +937,59 @@ mod tests {
         );
         // A's own teardown still works: it is the owner and nobody displaced it.
         assert!(may_release(Some(held_by_a), Some(held_by_a), true));
+    }
+
+    /// **And when they ask at the same instant.**
+    ///
+    /// `may_claim` reads the marker and `write_file_atomic` replaces it, with
+    /// nothing holding the file between the two — so two windows starting an AI
+    /// turn together both read "no live claim", both wrote, and both returned
+    /// `Mine`. Both then ran `agy mcp add` against the machine-global
+    /// registration, which is the cross-connection hijack the marker exists to
+    /// prevent; and `release` correctly refuses to remove a marker that is not
+    /// its own, so the loser withdrew nothing and the winner's grant outlived
+    /// them both.
+    ///
+    /// The rename is atomic, so exactly one marker survives it, and the nonce
+    /// says whose. A session that reads back something other than its own claim
+    /// lost, and the honest answer for a loser is the one `Shared` already
+    /// carries: no tools, because a live process owns the registration.
+    ///
+    /// `may_claim` alone cannot see any of this — it is asked *before* either
+    /// write, and both processes get the same true answer from it.
+    #[test]
+    fn two_sessions_writing_at_once_do_not_both_own_the_registration() {
+        let a = Owner {
+            pid: 1000,
+            started: 500,
+        };
+        let b = Owner {
+            pid: 2000,
+            started: 600,
+        };
+        let mine = Claim { owner: a, nonce: 7 };
+        let theirs = Claim { owner: b, nonce: 8 };
+
+        // The premise: asked before either write, both are allowed to claim.
+        assert!(may_claim(None, None, a));
+        assert!(may_claim(None, None, b));
+
+        // The winner reads its own claim back.
+        assert_eq!(claim_outcome(mine, Some(mine)), Claimed::Mine(mine));
+        // The loser reads the winner's, and gets no tools rather than a second
+        // registration.
+        assert_eq!(claim_outcome(mine, Some(theirs)), Claimed::Shared);
+        // Same owner, different session: still not mine. The nonce is what makes
+        // two sessions of one process distinguishable at all.
+        let same_pid = Claim {
+            owner: a,
+            nonce: 99,
+        };
+        assert_eq!(claim_outcome(mine, Some(same_pid)), Claimed::Shared);
+        // A marker that vanished between the write and the read is not this
+        // session's either — something removed it, and installing against state
+        // no marker accounts for is what the claim goes first to prevent.
+        assert_eq!(claim_outcome(mine, None), Claimed::Shared);
     }
 
     /// The three cases that must still take the claim, so the refusal above is
