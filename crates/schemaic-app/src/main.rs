@@ -2302,6 +2302,15 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
     // True between pressing Stop and the interrupted turn's `result` landing.
     // The CLI reports that result as an error; this says it was us.
     let ai_stopping = RwSignal::new(false);
+    // Which Stop. **The flag above is one global bool, and the safety net that
+    // reads it is armed five seconds earlier**, so a first Stop's timer fired on
+    // a *second* Stop pressed inside its window and destroyed that turn's
+    // session — a process respawn and the whole multi-turn context, three
+    // seconds before its own grace period was up, which is exactly what the
+    // interrupt route exists to avoid. The session id cannot tell the two
+    // apart: the interrupt route deliberately *keeps* the session alive, so
+    // both Stops are about the same one. A counter can.
+    let ai_stop_seq = RwSignal::new(0u64);
     // Saved conversations (`chats.json`), keyed by connection like the panel
     // itself. Seeded into `ai_messages` for the active connection below, once
     // the restored connection id is known.
@@ -9809,6 +9818,19 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                     .is_some_and(|s| s.conn_id == id);
                 if ours {
                     ai_session.borrow_mut().take();
+                    // **Taking the session settles the panel.** Nothing else
+                    // will: the drop closes `stdin_tx`, the session task breaks
+                    // to `child.kill()`, and whether a further snapshot is
+                    // emitted at all is a race — so leaving `ai_busy` true here
+                    // left "Thinking…" spinning with its timer, the send box a
+                    // Stop button, and `ai_send` returning early for the rest of
+                    // the session. The stream consumer's `Settle` arm is the
+                    // other half of this, for the snapshot that does arrive.
+                    ai_stopping.set(false);
+                    if ai_busy.get_untracked() {
+                        mark_stopped(ai_messages);
+                        ai_busy.set(false);
+                    }
                 }
             }
             if active_conn.get_untracked() == id {
@@ -10182,10 +10204,31 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                 // snapshot and left the streaming ones. The id closes the class:
                 // no live session, or a different one, means nobody is waiting
                 // for this.
-                if !ai::snapshot_is_current(
+                //
+                // **Three answers, not two.** The guard used to sit above this
+                // whole body — `ai_busy.set(false)` included — so a session
+                // taken *mid-turn* left the panel spinning for ever: the AI
+                // settings modal's apply and an in-place edit of the active
+                // connection both drop the session and settle nothing
+                // themselves. `Settle` is the case that was collapsed into
+                // `Discard`.
+                let action = ai::snapshot_action(
                     ai_session.borrow().as_ref().map(|s| s.session_id),
                     msg.session,
-                ) {
+                    msg.done,
+                );
+                if action == ai::SnapshotAction::Discard {
+                    return;
+                }
+                if action == ai::SnapshotAction::Settle {
+                    // No transcript write — the text belongs to a session
+                    // nobody is showing. Only the panel, which nothing else
+                    // will now settle.
+                    if ai_stopping.get_untracked() {
+                        ai_stopping.set(false);
+                        mark_stopped(ai_messages);
+                    }
+                    ai_busy.set(false);
                     return;
                 }
                 ai_messages.update(|v| {
@@ -10511,12 +10554,22 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                 return;
             }
             ai_stopping.set(true);
+            let armed_for = ai_stop_seq.get_untracked() + 1;
+            ai_stop_seq.set(armed_for);
             // Safety net: if the interrupt is ignored, don't leave the panel
             // spinning — drop the session (killing the child) and settle the UI.
+            //
+            // **Armed for *this* Stop.** It used to fire on the global
+            // `ai_stopping` alone, so a first Stop's timer destroyed a *second*
+            // Stop's session: the interrupt route keeps the session alive by
+            // design, so both Stops are about the same one and the id cannot
+            // tell them apart — see `ai_stop_seq`.
             floem::action::exec_after(std::time::Duration::from_secs(5), {
                 let ai_session = ai_session.clone();
                 move |_| {
-                    if ai_stopping.try_get_untracked() == Some(true) {
+                    if ai_stopping.try_get_untracked() == Some(true)
+                        && ai_stop_seq.try_get_untracked() == Some(armed_for)
+                    {
                         ai_session.borrow_mut().take();
                         mark_stopped(ai_messages);
                         ai_stopping.set(false);
@@ -10623,6 +10676,16 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             });
             if changed {
                 ai_session.borrow_mut().take();
+                // The gear is enabled unconditionally, during a turn included,
+                // so this is reachable mid-stream — and taking the session is
+                // what strands the panel. Same pair as the connection-edit path
+                // above: settle here, and let the consumer's `Settle` arm catch
+                // the snapshot that may still arrive.
+                ai_stopping.set(false);
+                if ai_busy.get_untracked() {
+                    mark_stopped(ai_messages);
+                    ai_busy.set(false);
+                }
             }
             save_ui();
         })

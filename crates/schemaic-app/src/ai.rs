@@ -1138,6 +1138,44 @@ pub(crate) fn snapshot_is_current(live: Option<u64>, msg: u64) -> bool {
     live == Some(msg)
 }
 
+/// What the stream consumer should do with a snapshot — see [`snapshot_action`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum SnapshotAction {
+    /// Write it to the transcript and do the terminal bookkeeping if it is done.
+    Apply,
+    /// Not this session's text, but nothing else is going to settle the panel:
+    /// clear `ai_busy` and leave the transcript alone.
+    Settle,
+    /// Nobody is waiting for this and nobody is stranded by ignoring it.
+    Discard,
+}
+
+/// The three answers [`snapshot_is_current`] has only two of.
+///
+/// **"Not mine" and "throw the whole effect away" are not the same thing.** The
+/// consumer placed the `snapshot_is_current` guard above its entire body,
+/// `ai_busy.set(false)` included — so a session taken *mid-turn* left the panel
+/// spinning for ever: the AI settings modal's apply and an in-place edit of the
+/// active connection both drop the session and settle nothing themselves, and
+/// from that moment every remaining snapshot of the in-flight turn, the terminal
+/// one included, failed the guard and returned. The pending bubble kept its
+/// timer, the send box stayed a Stop button, `ai_send` returned early on
+/// `ai_busy`, and the answer the CLI produced was discarded before
+/// `persist_chat`. Recovery was Stop or New chat.
+///
+/// The middle answer exists only where **no** session is live. If a *different*
+/// one is, `ai_busy` belongs to that session's turn and clearing it would strand
+/// the new turn the way this stranded the old.
+pub(crate) fn snapshot_action(live: Option<u64>, msg: u64, done: bool) -> SnapshotAction {
+    if snapshot_is_current(live, msg) {
+        SnapshotAction::Apply
+    } else if live.is_none() && done {
+        SnapshotAction::Settle
+    } else {
+        SnapshotAction::Discard
+    }
+}
+
 /// Mint an id for a new AI session.
 ///
 /// Process-wide and monotonic, so an id is never reused — which is what a
@@ -3718,8 +3756,10 @@ mod tests {
         let at = main
             .find("if let Some(msg) = ai_stream.get() {")
             .expect("the stream consumer is gone or was renamed");
+        // `snapshot_action` since the guard grew its third answer; the question
+        // it asks is the same one, in the same place.
         let ask = main[at..]
-            .find(&format!("{}_is_current(", "snapshot"))
+            .find(&format!("{}_action(", "snapshot"))
             .expect("the consumer no longer asks whose snapshot this is");
         let write = main[at..]
             .find("ai_messages.update(")
@@ -3740,6 +3780,112 @@ mod tests {
         // …and switching away and back gives the same *connection* a new
         // session, which is why the id is not the `conn_id`.
         assert!(!snapshot_is_current(Some(5), 4));
+    }
+
+    /// **"Not mine" and "throw the whole effect away" are not the same
+    /// answer**, and collapsing them left the panel spinning for ever.
+    ///
+    /// The guard was placed above the entire effect body, including the
+    /// `ai_busy.set(false)` that settles the pending bubble. So a session taken
+    /// mid-turn — by the AI settings modal's `(apply)()`, or by editing the
+    /// active connection in place, neither of which settles anything itself —
+    /// made every remaining snapshot of that turn fail the guard, the terminal
+    /// one included. "Thinking…" ran on with its timer, the send box stayed a
+    /// Stop button, `ai_send` returned early on `ai_busy`, and the answer the
+    /// CLI did produce was discarded before `persist_chat`. Recovery was Stop or
+    /// New chat.
+    ///
+    /// Three answers, not two: the transcript write belongs to the live session
+    /// alone, but the *bookkeeping* on a terminal snapshot has to run when
+    /// nobody is live, because nothing else will.
+    #[test]
+    fn a_terminal_snapshot_with_no_live_session_still_settles_the_panel() {
+        use super::{SnapshotAction as A, snapshot_action};
+        // The ordinary case: this turn's own snapshots, streaming and terminal.
+        assert_eq!(snapshot_action(Some(4), 4, false), A::Apply);
+        assert_eq!(snapshot_action(Some(4), 4, true), A::Apply);
+        // Nobody live and the turn has ended: settle, or nothing ever will.
+        assert_eq!(snapshot_action(None, 4, true), A::Settle);
+        // Nobody live and the turn is still streaming: there is nothing to
+        // settle yet and nothing to write.
+        assert_eq!(snapshot_action(None, 4, false), A::Discard);
+        // **A *different* session is live**, which is the case that must not
+        // settle: `ai_busy` then belongs to that session's turn, and clearing it
+        // would strand the new one exactly the way this bug stranded the old.
+        assert_eq!(snapshot_action(Some(5), 4, true), A::Discard);
+        assert_eq!(snapshot_action(Some(5), 4, false), A::Discard);
+        // The two predicates agree about what "mine" means.
+        for (live, msg) in [(Some(4u64), 4u64), (None, 4), (Some(5), 4)] {
+            assert_eq!(
+                snapshot_is_current(live, msg),
+                snapshot_action(live, msg, false) == A::Apply
+            );
+        }
+    }
+
+    /// **Every taker of the AI session answers for `ai_busy`.**
+    ///
+    /// The predicate above is the consumer's half. This is the other: nothing
+    /// guarantees a snapshot arrives after the session is dropped — the drop
+    /// closes `stdin_tx`, the task breaks to `child.kill()`, and whether the
+    /// reader got one more line out first is a race. So the flag has to be
+    /// settled where the session is taken, and a new taker that forgets is
+    /// exactly how this bug arrived: two of the nine sites did not, and they
+    /// were the two reachable while a turn was in flight.
+    ///
+    /// Each exemption carries its reason, and the floor means a needle that
+    /// stops matching cannot read as a clean file.
+    #[test]
+    fn every_taker_of_the_ai_session_answers_for_ai_busy() {
+        let src = schemaic_ui::source_gate::production_code(include_str!("main.rs"));
+        let needle = format!("ai_session.borrow_mut().{}()", "take");
+        // A taker that runs *before* `ai_busy` is raised cannot strand it — two
+        // of `ai_send`'s do, and its own `set(true)` is the marker. `Regenerate`
+        // hands straight to `ai_send`; deleting a connection settles through
+        // `reset_ai_panel`. Markers rather than line numbers, because an
+        // exemption keyed on a number moves whenever a comment is added above it.
+        let settles = [
+            "ai_busy.set(false)",
+            "ai_busy.set(true)",
+            "reset_ai_panel",
+            "(ai_send)(",
+        ];
+        let mut seen = 0usize;
+        let mut offenders: Vec<usize> = Vec::new();
+        let mut from = 0usize;
+        while let Some(rel) = src[from..].find(&needle) {
+            let at = from + rel;
+            from = at + needle.len();
+            seen += 1;
+            // Forward over the rest of the handler. Generous on purpose: the
+            // two takers inside `ai_send` sit a hundred lines above the
+            // `set(true)` that is their answer, and a tighter window would need
+            // a line-keyed exemption list instead — the thing this is written to
+            // avoid, since such a list moves whenever a comment is added above
+            // it. What makes it still bite is that the two sites this bug lived
+            // at have no `ai_busy` anywhere in reach; verified by removing the
+            // fix and watching it name both.
+            let window: String = src[at..]
+                .split('\n')
+                .take(120)
+                .collect::<Vec<_>>()
+                .join("\n");
+            if !settles.iter().any(|s| window.contains(s)) {
+                offenders.push(1 + src[..at].bytes().filter(|c| *c == b'\n').count());
+            }
+        }
+        assert!(
+            seen >= 9,
+            "the needle stopped matching: {seen} takers found, and there are at \
+             least nine — a gate that scans nothing reports success"
+        );
+        assert!(
+            offenders.is_empty(),
+            "these take the AI session without settling `ai_busy`; nothing else \
+             will, so the pending bubble spins for ever, the send box stays a \
+             Stop button and `ai_send` returns early for the rest of the \
+             session — main.rs lines {offenders:?}"
+        );
     }
 
     /// **Every agent spawn sets a working directory, unconditionally.**

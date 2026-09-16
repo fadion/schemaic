@@ -101,7 +101,7 @@ pub(crate) fn ai_panel(ui: Ui) -> impl IntoView {
             let error_text = ui.overlay.error_modal_text;
             let error_open = ui.overlay.error_modal_open;
             Rc::new(move |sql: String| {
-                // **`tabsel::scoped_database`, the same rule `propose` applies
+                // **`tabsel::tab_scope`, the same rule `propose` applies
                 // twenty lines below, and for the same reason.** `open_query`
                 // builds the new tab from `default_tab_target()`, whose
                 // `conn_id` is the **active** connection, and took the database
@@ -183,9 +183,9 @@ pub(crate) fn ai_panel(ui: Ui) -> impl IntoView {
                 // into the plan `run_ddl` executes: an `ALTER` on prod against a
                 // proposal written about dev.
                 //
-                // `tabsel::scoped_database` is that rule, and the call is here
-                // rather than a second spelling of it because this is the one
-                // caller that can destroy something. It was written out inline —
+                // `tabsel::tab_scope` is that rule, and the call is here rather
+                // than a second spelling of it because this is the one caller
+                // that can destroy something. It was written out inline —
                 // expression for expression identical, with no test — because
                 // `schemaic-ui` cannot depend on `schemaic-app`, where it lived.
                 let conn = active_conn.get_untracked();
@@ -194,12 +194,34 @@ pub(crate) fn ai_panel(ui: Ui) -> impl IntoView {
                         .find(|t| t.id == active.get_untracked())
                         .map(|t| (t.conn_id.get_untracked(), t.database.get_untracked()))
                 });
-                let Some(db) = schemaic_core::tabsel::scoped_database(tab, conn, None) else {
-                    return Err(
-                        "This change is about a tab on a different connection — switch to it, or \
-                         pick a database on this one, before applying a schema change."
-                            .to_string(),
-                    );
+                // **Three states, and the two-state answer conflated them.**
+                // `scoped_database` returns `None` for both "another
+                // connection" and "this connection, no database bound", so the
+                // refusal told a user whose tab is on *this* connection to
+                // switch to it — which is the tab they are already on, with no
+                // hint that the SCHEMA eye is where a hidden database comes
+                // back. That sentence was replaced two arms above, on the code
+                // block; this is the caller its own comment calls "the one
+                // caller that can destroy something", and it kept the old one.
+                let db = match schemaic_core::tabsel::tab_scope(tab, conn) {
+                    schemaic_core::tabsel::TabScope::Bound(db) => db,
+                    schemaic_core::tabsel::TabScope::NoDatabase => {
+                        return Err(
+                            "This tab has no database selected, so a schema change applied \
+                             from here would have nowhere to go. Pick one for this \
+                             connection first — if every database is hidden, the SCHEMA eye \
+                             is where to bring one back."
+                                .to_string(),
+                        );
+                    }
+                    schemaic_core::tabsel::TabScope::OtherConnection => {
+                        return Err(
+                            "This change is about a tab on a different connection — switch \
+                             to it, or select its connection in the tree, before applying a \
+                             schema change."
+                                .to_string(),
+                        );
+                    }
                 };
                 crate::ddl_preview::preview_proposal(&ui, &db, &proposal)
             })
