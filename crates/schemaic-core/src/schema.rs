@@ -496,10 +496,28 @@ impl ColumnInfo {
         if let Some(expr) = &self.generated {
             out.push_str(&format!(" GENERATED ALWAYS AS ({expr})"));
             // PostgreSQL only has the stored form and requires the keyword.
-            // SQLite has both, defaults to VIRTUAL, and the difference is the
-            // storage/read trade the user chose — so a `STORED` column that came
-            // back without the word has been silently un-materialised.
-            if pg || (sqlite && self.generated_stored) {
+            // SQLite and MySQL both have both, both default to `VIRTUAL`, and
+            // the difference is the storage/read trade the user chose — so a
+            // `STORED` column that came back without the word has been silently
+            // un-materialised.
+            //
+            // **MySQL was missing from that sentence while its reader set the
+            // flag** (`extra_lc.contains("stored generated")`), so a dump, Copy
+            // DDL, Duplicate table or a designer `ADD COLUMN` wrote the
+            // keywordless form and the restored column came back `VIRTUAL` —
+            // computed on every read instead of materialised, with nothing said.
+            // Where the column is in the primary key it does not merely differ:
+            // the restore fails, after the file's earlier statements have run.
+            // Measured on MySQL 8.4.11 and MariaDB 10.11.14: the keywordless
+            // form reports `VIRTUAL GENERATED` on both, both accept an explicit
+            // `STORED` on `CREATE` and on `ADD COLUMN`, and a virtual generated
+            // column in the primary key is refused (*ERROR 3106* / *ERROR
+            // 1903*).
+            //
+            // The `false` case stays unwritten because `VIRTUAL` is every
+            // engine's default, so omitting it round-trips and adding it would
+            // rewrite the DDL of every existing virtual column.
+            if pg || self.generated_stored {
                 out.push_str(" STORED");
             }
         }
@@ -6004,6 +6022,63 @@ mod tests {
         let sql = c.definition_sql(crate::intel::SqlDialect::MySql);
         assert_eq!(sql, "`total` int GENERATED ALWAYS AS (qty * price)");
         assert!(!sql.contains("DEFAULT"));
+    }
+
+    /// **`STORED` is a choice the user made, and every engine's default is
+    /// `VIRTUAL`, so a column that comes back without the word has been
+    /// silently un-materialised.**
+    ///
+    /// The keyword was written for PostgreSQL and SQLite only, while MySQL's
+    /// reader has always set the flag — so a dump, Copy DDL, Duplicate table or
+    /// a designer `ADD COLUMN` on the busiest engine emitted the keywordless
+    /// form and the restored column was computed on every read instead of
+    /// materialised, with nothing said. Where the column is in the primary key
+    /// the restore does not differ, it **fails**, after the file's earlier
+    /// statements have run.
+    ///
+    /// Measured on MySQL 8.4.11 and MariaDB 10.11.14: the keywordless form
+    /// reports `VIRTUAL GENERATED` on both; both accept the explicit `STORED`
+    /// on `CREATE TABLE` and on `ADD COLUMN`; and a virtual generated column in
+    /// the primary key is refused (*ERROR 3106* / *ERROR 1903*).
+    #[test]
+    fn a_stored_generated_column_keeps_its_keyword_on_every_engine() {
+        let c = |stored: bool| ColumnInfo {
+            name: "total".into(),
+            type_name: "int".into(),
+            nullable: true,
+            generated: Some("qty * price".into()),
+            generated_stored: stored,
+            ..Default::default()
+        };
+        for d in [
+            crate::intel::SqlDialect::MySql,
+            crate::intel::SqlDialect::Sqlite,
+            crate::intel::SqlDialect::Postgres,
+        ] {
+            assert!(
+                c(true).definition_sql(d).contains(" STORED"),
+                "{d:?} dropped the keyword: {}",
+                c(true).definition_sql(d)
+            );
+        }
+        // `VIRTUAL` is every engine's default, so the false case stays
+        // unwritten — except on PostgreSQL, which has only the stored form and
+        // requires the word.
+        for d in [
+            crate::intel::SqlDialect::MySql,
+            crate::intel::SqlDialect::Sqlite,
+        ] {
+            assert!(
+                !c(false).definition_sql(d).contains("STORED"),
+                "{d:?} invented a keyword: {}",
+                c(false).definition_sql(d)
+            );
+        }
+        assert!(
+            c(false)
+                .definition_sql(crate::intel::SqlDialect::Postgres)
+                .contains(" STORED")
+        );
     }
 
     /// The same rule as a generated column, for the other server-assigned form:

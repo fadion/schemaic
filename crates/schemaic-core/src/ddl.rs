@@ -9161,15 +9161,21 @@ pub fn supports_change(dialect: SqlDialect, change: &Change) -> bool {
     }
     // **MySQL cannot move a generated column between `VIRTUAL` and `STORED`**,
     // and saying nothing about that is worse than refusing it. `columns_equal`
-    // compares `generated_stored`, so a flip raises an `AlterColumn` — and
-    // `ColumnInfo::definition_sql` writes the `VIRTUAL`/`STORED` keyword only
-    // for PostgreSQL and SQLite, so the emitted `MODIFY COLUMN g … GENERATED
-    // ALWAYS AS (…)` carries none. MySQL reads the keywordless form as
-    // `VIRTUAL`: the `STORED → VIRTUAL` direction silently **un-materialises**
-    // the column, and the reverse direction either does nothing or is refused by
-    // the server as *'Changing the STORED status' is not supported*. So it is
-    // withheld here, where `unsupported()` puts it in front of the user with the
-    // rest of the plan intact.
+    // compares `generated_stored`, so a flip raises an `AlterColumn` — and the
+    // engine refuses the statement outright: *ERROR 3106: 'Changing the STORED
+    // status' is not supported for generated columns* on MySQL 8.4.11, and a
+    // syntax error on MariaDB 10.11.14 (measured). So it is withheld here,
+    // where `unsupported()` puts it in front of the user with the rest of the
+    // plan intact — and `emit_mysql`'s column loop asks this same predicate, so
+    // the INCOMPLETE header and the script below it agree.
+    //
+    // The reason used to be spelled as "`definition_sql` writes the keyword
+    // only for PostgreSQL and SQLite, so MySQL reads the keywordless form as
+    // `VIRTUAL` and the column is silently un-materialised". That emitter gap
+    // was real and is now closed — every engine gets the ` STORED` it asked
+    // for — but it was never why *this* refusal is right. The refusal is the
+    // engine's own: there is no `ALTER` that moves an existing generated column
+    // between the two.
     if let Change::AlterColumn { from, to, .. } = change
         && dialect == SqlDialect::MySql
         && from.generated.is_some()
