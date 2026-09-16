@@ -1327,6 +1327,7 @@ pub(crate) fn import_overlay(ui: Ui) -> impl IntoView {
             // modal ends with. Back is the exception to the "actions on the right"
             // rule — it moves *backwards* through the modal, so it sits at the far
             // left rather than in the group deciding what happens next.
+            let conns_ro = ui.conn.connections;
             let ui_back = ui.clone();
             let ui_next = ui.clone();
             let ui_run = ui.clone();
@@ -1372,8 +1373,20 @@ pub(crate) fn import_overlay(ui: Ui) -> impl IntoView {
                 )
                 .into_any(),
                 ImportStep::Mapping => dyn_container(
-                    move || (i.loading.get(), i.mapping.get(), i.target.get()),
-                    move |(busy, mapping, target)| {
+                    // **`read_only` is in the key, not read in the builder.** A
+                    // `dyn_container` builder is not a tracking scope, so a flag
+                    // flipped from the status bar while the modal stands would
+                    // be frozen at whatever the last rebuild saw — and this is
+                    // the term that decides whether Import is offered.
+                    move || {
+                        let target = i.target.get();
+                        let read_only = target.as_ref().is_some_and(|t| {
+                            conns_ro
+                                .with(|cs| schemaic_core::connection::read_only_of(cs, t.conn_id))
+                        });
+                        (i.loading.get(), i.mapping.get(), target, read_only)
+                    },
+                    move |(busy, mapping, target, read_only)| {
                         let ui = ui_run.clone();
                         let back = ui_back.clone();
                         let ring = ring_map.clone();
@@ -1390,6 +1403,16 @@ pub(crate) fn import_overlay(ui: Ui) -> impl IntoView {
                                 move || back.import.step.set(ImportStep::Source),
                             ),
                             h_stack((
+                                // Said where the disabled button is, rather than
+                                // leaving it unexplained — the same sentence, in
+                                // the same place, as `ddl_preview`'s.
+                                text("This connection is read-only.").style(move |s| {
+                                    let s = s
+                                        .color(theme::plan_warn())
+                                        .font_size(theme::font_label())
+                                        .margin_right(theme::scaled(12.0));
+                                    if read_only { s } else { s.hide() }
+                                }),
                                 // While a load is running this stops it (rolling
                                 // the transaction back) instead of closing —
                                 // closing would hide a write that's still going,
@@ -1408,7 +1431,15 @@ pub(crate) fn import_overlay(ui: Ui) -> impl IntoView {
                                 action_button(
                                     if busy { "Importing…" } else { "Import" },
                                     ActionKind::Primary,
-                                    ready && !busy,
+                                    // **The enable term `run_import`'s guard was
+                                    // copied without.** The guard is real —
+                                    // `accept_launch` refuses the write — but it
+                                    // refuses *silently*, so Import stayed lit,
+                                    // said nothing and did nothing. That is the
+                                    // failure `ddl_preview::plan_read_only`'s own
+                                    // doc records, on the modal that copied its
+                                    // guard.
+                                    ready && !busy && !read_only,
                                     ring,
                                     ACTION_TAB + 20,
                                     move || run_import(ui.clone()),
@@ -1539,6 +1570,52 @@ mod tests {
         assert!(
             !body.contains("…and more."),
             "the old wording names neither cap and fires only on core's"
+        );
+    }
+
+    /// **A guard that refuses silently is not a disclosure.**
+    ///
+    /// `run_import` asks the live read-only flag and `accept_launch` refuses the
+    /// write, which is the dangerous half and it is right. What was copied from
+    /// `ddl_preview::apply` was the guard alone: Import stayed lit, said nothing
+    /// and did nothing — the exact failure `ddl_preview::plan_read_only`'s own
+    /// doc records, on the modal that copied its guard.
+    ///
+    /// Three things, because the defect is that they came apart. The flag has to
+    /// be in the `dyn_container`'s **key** — a builder is not a tracking scope,
+    /// so a flag flipped from the status bar while the modal stands would be
+    /// frozen at whatever the last rebuild saw. It has to reach the Import
+    /// button's enable term. And the sentence has to be in the footer, in the
+    /// same words as the modal this one is modelled on.
+    ///
+    /// Read off the source because all three live in view closures. The floor is
+    /// that the footer was located at all.
+    #[test]
+    fn the_import_button_says_a_read_only_connection_rather_than_going_quiet() {
+        let src =
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/import_view.rs"))
+                .expect("this file");
+        let body = crate::source_gate::production_code(&src);
+
+        assert!(
+            body.contains("if busy { \"Importing…\" } else { \"Import\" }"),
+            "the Import button was not found — this gate is stale"
+        );
+        assert!(
+            body.contains("ready && !busy && !read_only"),
+            "the Import button's enable term dropped its read-only half, so it \
+             stays lit on a connection whose write `run_import` will refuse"
+        );
+        assert!(
+            body.contains("This connection is read-only."),
+            "the footer no longer says why Import is disabled — the same \
+             sentence `ddl_preview` puts beside its own disabled Apply"
+        );
+        // The guard itself, which the enable term does not replace: a disabled
+        // button is not what stops the write.
+        assert!(
+            body.contains("crate::widgets::accept_launch(i.loading.get_untracked(), read_only)"),
+            "`run_import` no longer guards its own launch"
         );
     }
 }
