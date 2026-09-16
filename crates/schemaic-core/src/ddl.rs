@@ -6695,6 +6695,13 @@ fn columns_equal(a: &ColumnInfo, b: &ColumnInfo, d: SqlDialect) -> bool {
         && a.generated_stored == b.generated_stored
         && a.sqlite_autoincrement == b.sqlite_autoincrement
         && a.identity_always == b.identity_always
+        // The fourth member of that list, and the same failure: the reader and
+        // the emitter learned `invisible` and this did not, so a comparison
+        // between an `INVISIBLE` column and a visible one was `Same` — the tree
+        // showed nothing, the plan carried nothing, and the retirement the
+        // column was marked for was silently not migrated. Inert on the two
+        // engines that cannot report it, where the flag is always `false`.
+        && a.invisible == b.invisible
 }
 
 fn blank_as_none(s: Option<&str>) -> Option<&str> {
@@ -6724,6 +6731,16 @@ fn fks_equal(a: &ForeignKeyInfo, b: &ForeignKeyInfo) -> bool {
             (Some(x), Some(y)) => x == y,
             _ => true,
         }
+        // **Both of these change what the key enforces**, and the range added
+        // the reader and `fk_clause` without adding them here — so a
+        // `MATCH FULL DEFERRABLE INITIALLY DEFERRED` key compared equal to the
+        // bare form. Under `MATCH SIMPLE` a partly-NULL composite key is
+        // accepted where `FULL` refuses it, and without `INITIALLY DEFERRED` an
+        // application that inserts children before parents fails at statement
+        // time against a database that restored fine. Both are `None` on the
+        // engines that cannot report them, so this costs nothing there.
+        && a.match_type == b.match_type
+        && a.deferrable == b.deferrable
 }
 
 /// A trigger's `CREATE`, wrapped in the session state it was created under.
@@ -10933,6 +10950,17 @@ mod tests {
                     on_update: Some("CURRENT_TIMESTAMP".into()),
                     ..Default::default()
                 },
+                // This fixture's doc says every field the model carries is
+                // populated, "so the round-trip test can't pass by leaving
+                // something empty" — and for a while that was false about
+                // `invisible`, which is exactly how the differ came to have no
+                // term for it.
+                ColumnInfo {
+                    name: "legacy_note".into(),
+                    type_name: "varchar(64)".into(),
+                    invisible: true,
+                    ..Default::default()
+                },
             ],
             indexes: vec![
                 IndexInfo::plain("PRIMARY", vec!["id"], true),
@@ -10949,6 +10977,10 @@ mod tests {
                 ref_table: "statuses".into(),
                 ref_columns: vec!["code".into()],
                 on_delete: Some("CASCADE".into()),
+                // Same reason as `legacy_note` above — populated so the
+                // round-trip gate covers them.
+                match_type: Some("FULL".into()),
+                deferrable: Some("DEFERRABLE INITIALLY DEFERRED".into()),
                 ..Default::default()
             }],
             engine: Some("InnoDB".into()),
@@ -11338,6 +11370,57 @@ mod tests {
         }
     }
 
+    /// **A field the model carries and the differ does not ask about is a
+    /// difference that is silently not migrated.**
+    ///
+    /// `columns_equal`'s own comment enumerates this class three lines above
+    /// its `generated_stored` term; `invisible`, `match_type` and `deferrable`
+    /// were its fourth, fifth and sixth members. Compare two MySQL databases
+    /// whose `legacy_note` is `INVISIBLE` on one side only and the entry is
+    /// `Same`: the tree shows nothing, the plan carries nothing, and the
+    /// retirement the column was marked for is not migrated. On PostgreSQL a
+    /// `MATCH FULL DEFERRABLE INITIALLY DEFERRED` key compared equal to the
+    /// bare form — under `MATCH SIMPLE` a partly-NULL composite key is accepted
+    /// where `FULL` refuses it, and without `INITIALLY DEFERRED` an application
+    /// that inserts children before parents fails against a database that
+    /// restored fine.
+    ///
+    /// Both commits added the reader and the emitter and tested those; the bug
+    /// sat at the composition with the caller that decides whether a change
+    /// exists at all.
+    #[test]
+    fn a_draft_differing_only_in_one_model_field_still_raises_a_change() {
+        // Invisible, on the engine that has it.
+        let mut visible = users();
+        visible.columns[4].invisible = false;
+        let draft = TableDraft::from_table(&users());
+        let cs = diff(&visible, &draft, MySql);
+        assert!(
+            cs.changes
+                .iter()
+                .any(|c| matches!(c, Change::AlterColumn { to, .. } if to.name == "legacy_note")),
+            "an INVISIBLE flip raised nothing: {:?}",
+            cs.changes
+        );
+
+        // The two foreign-key fields, on the engine that has them.
+        for strip in [
+            (|f: &mut ForeignKeyInfo| f.match_type = None) as fn(&mut ForeignKeyInfo),
+            |f: &mut ForeignKeyInfo| f.deferrable = None,
+        ] {
+            let mut bare = users();
+            strip(&mut bare.foreign_keys[0]);
+            let cs = diff(&bare, &TableDraft::from_table(&users()), Postgres);
+            assert!(
+                cs.changes
+                    .iter()
+                    .any(|c| matches!(c, Change::AddForeignKey(_))),
+                "a foreign-key field flip raised nothing: {:?}",
+                cs.changes
+            );
+        }
+    }
+
     #[test]
     fn tightening_nullability_warns_before_it_fails() {
         let mut t = users();
@@ -11471,8 +11554,13 @@ mod tests {
     fn moving_a_column_emits_one_modify_and_nothing_else() {
         let t = users();
         let mut draft = TableDraft::from_table(&t);
-        let last = draft.columns.pop().expect("four columns");
-        draft.columns.insert(0, last);
+        let at = draft
+            .columns
+            .iter()
+            .position(|c| c.info.name == "updated")
+            .expect("fixture has `updated`");
+        let moved = draft.columns.remove(at);
+        draft.columns.insert(0, moved);
         let cs = diff(&t, &draft, MySql);
         assert_eq!(cs.len(), 1, "{:?}", cs.changes);
         assert_eq!(cs.changes[0].summary(), "Move column updated first");
@@ -11544,7 +11632,12 @@ mod tests {
 
     #[test]
     fn a_foreign_key_keeps_its_referential_actions_when_recreated() {
-        let t = users();
+        // MySQL has neither `MATCH` nor `DEFERRABLE`, so the fixture's two
+        // PostgreSQL-only fields are stripped here — this test is about the
+        // referential actions surviving a recreate.
+        let mut t = users();
+        t.foreign_keys[0].match_type = None;
+        t.foreign_keys[0].deferrable = None;
         let mut draft = TableDraft::from_table(&t);
         draft.foreign_keys[0].info.ref_columns = vec!["id".into()];
         let sql = diff(&t, &draft, MySql).editor_script();
@@ -11599,7 +11692,12 @@ mod tests {
     /// typed.
     #[test]
     fn an_ordinary_foreign_key_gains_no_match_or_deferrable_clause() {
-        let t = users();
+        // An *ordinary* key is one carrying neither, so the fixture's two are
+        // stripped — the fixture populates them so the round-trip gate covers
+        // the differ's terms for them.
+        let mut t = users();
+        t.foreign_keys[0].match_type = None;
+        t.foreign_keys[0].deferrable = None;
         let mut draft = TableDraft::from_table(&t);
         draft.foreign_keys[0].info.ref_columns = vec!["id".into()];
         for d in [MySql, Postgres] {
