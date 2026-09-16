@@ -253,7 +253,149 @@ require_published_key() {
         err "out of date, or something between you and ${SITE} replaced it."
         return 1
     fi
+    if ! only_one_key "$f"; then
+        err "the downloaded signing key file holds more than one key."
+        err "The published key is the only one that belongs in it. Nothing has been"
+        err "installed. Either the key was rotated and this script is out of date, or"
+        err "something between you and ${SITE} added a key to it."
+        return 1
+    fi
     ok "Signing key verified: ${KEY_FINGERPRINT}"
+}
+
+# Does `$1` hold exactly one public key?
+#
+# **A fingerprint is a claim about one key; the file is what gets installed.**
+# An OpenPGP keyring is a packet stream, so `cat real.gpg attacker.gpg` is a
+# valid keyring every tool unpacks — and `key_fingerprint` reads only the first
+# key in it (the `exit` in the awk; the hand parser hashes packet 0 and never
+# looks further). So the genuine key, with a second key concatenated after it,
+# passed the check and printed "Signing key verified" — and then the **whole
+# file** was installed: apt trusts every key in a `Signed-By` keyring, and
+# `rpm --import` imports every block in the file into the machine's *global*
+# keyring, where it validates packages from any repository, permanently, and no
+# line of the uninstall instructions removes it.
+#
+# Counting `^pub:` records is the narrow version of "install only the key you
+# verified": it refuses the composed file rather than re-exporting from it, so
+# the no-`gpg` path keeps working the way the rest of this script does — by
+# refusing what it cannot check rather than proceeding unchecked.
+only_one_key() {
+    local f="$1" n bin rc
+    if has gpg; then
+        n="$(gpg --batch --with-colons --show-keys "$f" 2>/dev/null | grep -c '^pub:' || true)"
+        [ "$n" = 1 ]
+        return $?
+    fi
+    # Without gpg, the same question is "is there anything after the first
+    # packet's declared length" — for the armoured form, after dearmouring it.
+    if grep -q 'BEGIN PGP PUBLIC KEY BLOCK' "$f" 2>/dev/null; then
+        has base64 || return 1
+        # More than one armour block in one file is the same attack, spelled
+        # differently, and needs no parsing to see.
+        [ "$(grep -c 'BEGIN PGP PUBLIC KEY BLOCK' "$f")" = 1 ] || return 1
+        bin="${f}.onekey"
+        sed -n '/-----BEGIN PGP PUBLIC KEY BLOCK-----/,/-----END PGP PUBLIC KEY BLOCK-----/p' "$f" \
+            | sed '1d' \
+            | sed -n '/^$/,$p' \
+            | sed '1d' \
+            | sed '/^=/,$d' \
+            | base64 -d > "$bin" 2>/dev/null || { rm -f "$bin"; return 1; }
+        only_one_key "$bin"
+        rc=$?
+        rm -f "$bin"
+        return $rc
+    fi
+    # A binary keyring, with no gpg: walk the packet stream. Subkeys, user IDs
+    # and signatures are tags 14, 13 and 2 and are all part of the one key; a
+    # second **tag 6** is a second key. The deb route publishes the dearmoured
+    # keyring precisely so a slim container needs no gpg, so this path has to
+    # answer rather than refuse — and it walks the same header shapes
+    # `key_fingerprint` already decodes one of.
+    n="$(count_public_key_packets "$f")" || return 1
+    [ "$n" = 1 ]
+}
+
+# How many OpenPGP public-key packets (tag 6) are in the binary file `$1`, or a
+# non-zero exit if the stream does not walk cleanly to its end.
+#
+# A malformed or truncated stream is a failure, not a count: the whole point is
+# that the bytes about to be installed are the bytes that were verified, and a
+# file this cannot account for is not that.
+count_public_key_packets() {
+    local f="$1" size off b0 tag ltype b1 len hdr n
+    has od && has wc || return 1
+    size="$(wc -c < "$f" | tr -d ' ')"
+    off=0
+    n=0
+    while [ "$off" -lt "$size" ]; do
+        b0=$((0x$(od -An -tx1 -j"$off" -N1 "$f" | tr -d ' \n')))
+        # Bit 7 is set on every packet header; anything else is not a stream.
+        [ $((b0 & 128)) -ne 0 ] || return 1
+        if [ $((b0 & 64)) -eq 0 ]; then
+            # Old format: tag in bits 5-2, length type in bits 1-0.
+            tag=$(((b0 >> 2) & 15))
+            ltype=$((b0 & 3))
+            case "$ltype" in
+                0) len=$((0x$(od -An -tx1 -j$((off + 1)) -N1 "$f" | tr -d ' \n'))); hdr=2 ;;
+                1) len=$((0x$(od -An -tx1 -j$((off + 1)) -N2 "$f" | tr -d ' \n'))); hdr=3 ;;
+                2) len=$((0x$(od -An -tx1 -j$((off + 1)) -N4 "$f" | tr -d ' \n'))); hdr=5 ;;
+                # Indeterminate length: runs to EOF, so nothing can follow it and
+                # nothing here can check that. Refuse.
+                *) return 1 ;;
+            esac
+        else
+            # New format: tag in bits 5-0, then a 1-, 2- or 5-byte length.
+            tag=$((b0 & 63))
+            b1=$((0x$(od -An -tx1 -j$((off + 1)) -N1 "$f" | tr -d ' \n')))
+            if [ "$b1" -lt 192 ]; then
+                len=$b1
+                hdr=2
+            elif [ "$b1" -lt 224 ]; then
+                len=$((((b1 - 192) << 8) + $((0x$(od -An -tx1 -j$((off + 2)) -N1 "$f" | tr -d ' \n'))) + 192))
+                hdr=3
+            elif [ "$b1" -eq 255 ]; then
+                len=$((0x$(od -An -tx1 -j$((off + 2)) -N4 "$f" | tr -d ' \n')))
+                hdr=6
+            else
+                # Partial body length — not used by an exported key.
+                return 1
+            fi
+        fi
+        if [ "$tag" -eq 6 ]; then
+            n=$((n + 1))
+        fi
+        off=$((off + hdr + len))
+        # Past the end means the declared length lied about the file.
+        [ "$off" -le "$size" ] || return 1
+    done
+    printf '%s\n' "$n"
+}
+
+# Refuse a downloaded repository configuration that does not name this site.
+#
+# **The fingerprint check guards the key; nothing guarded the file that decides
+# what the key is used for.** Both configs were fetched from the same origin as
+# the key and accepted on one shape grep each — so an adversary serving the
+# *genuine* key alongside a config naming their own `URIs:`/`baseurl=` got
+# "Repository added, signed by the published key" printed at them, and every
+# `apt-get upgrade`/`dnf upgrade` on that machine fetched root-installed
+# packages from their host for the life of the install. deb822 also accepts
+# `Trusted: yes`, which turns apt's signature verification off for the entry
+# entirely, and an *inline* armoured key in `Signed-By:` — so the attacker's key
+# can travel in the file that was never checked rather than the one that was.
+#
+# `SITE` and `KEYRING` are constants this script already holds; it just never
+# made the comparison. A rotation of `SITE` has to touch this file anyway (the
+# `pages.yml` guard enforces it), so these cannot drift silently.
+require_expected_line() {
+    local f="$1" want="$2"
+    grep -qx -- "$want" "$f" && return 0
+    err "the downloaded repository configuration does not match this installer."
+    err "  expected a line: ${want}"
+    err "Nothing has been installed. Either the repository moved and this script is"
+    err "out of date, or something between you and ${SITE} replaced it."
+    return 1
 }
 
 # Match a release asset by file-name pattern. Anonymous GitHub API calls are
@@ -338,6 +480,22 @@ install_deb() {
         rm -rf "$tmp"
         exit 1
     fi
+    # …and a shape test is not an identity test here either. The two lines that
+    # decide what this machine will install as root from now on are `URIs:` and
+    # `Signed-By:`; `Trusted: yes` turns apt's signature checking off for the
+    # entry entirely, and an inline armoured key in `Signed-By:` would carry a
+    # key past the fingerprint check that only ever looked at the other file.
+    if ! require_expected_line "${tmp}/schemaic.sources" "URIs: ${SITE}/deb" \
+        || ! require_expected_line "${tmp}/schemaic.sources" "Signed-By: ${KEYRING}"; then
+        rm -rf "$tmp"
+        exit 1
+    fi
+    if grep -qi '^Trusted:' "${tmp}/schemaic.sources"; then
+        err "the downloaded apt source asks apt to trust it without a signature."
+        err "Nothing has been installed."
+        rm -rf "$tmp"
+        exit 1
+    fi
 
     info "Installing the repository (this needs root)"
     run_privileged install -m 0644 -D "${tmp}/keyring.gpg" "$KEYRING"
@@ -415,6 +573,17 @@ install_rpm() {
     download_to "${SITE}/schemaic.repo" "${tmp}/schemaic.repo"
     if ! grep -q '^\[schemaic\]' "${tmp}/schemaic.repo"; then
         err "the downloaded repository definition is not a .repo file"
+        rm -rf "$tmp"
+        exit 1
+    fi
+    # The four lines that decide where root-installed packages come from and
+    # whether anything checks them. `dnf install -y` below imports whatever
+    # `gpgkey=` names with no prompt, so an unchecked `.repo` defeats the key
+    # check entirely rather than merely weakening it.
+    if ! require_expected_line "${tmp}/schemaic.repo" "baseurl=${SITE}/rpm" \
+        || ! require_expected_line "${tmp}/schemaic.repo" "gpgkey=${SITE}/schemaic.asc" \
+        || ! require_expected_line "${tmp}/schemaic.repo" "gpgcheck=1" \
+        || ! require_expected_line "${tmp}/schemaic.repo" "repo_gpgcheck=1"; then
         rm -rf "$tmp"
         exit 1
     fi
