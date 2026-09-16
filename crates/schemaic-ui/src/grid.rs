@@ -405,6 +405,8 @@ struct GridState {
     /// the pin was for. A `Memo` for [`GridCtx::panel_frozen`]'s reason — the
     /// grid is not rebuilt when a result is pinned.
     kept: Memo<bool>,
+    /// The statement this panel's rows came from — see [`GridCtx::panel_sql`].
+    panel_sql: Memo<Option<String>>,
     /// This tab's commit mode — see [`GridCtx::tx_mode`]. The export menu's, and
     /// held as the signal rather than resolved at build because the mode is
     /// toggled from the footer while the grid stays mounted.
@@ -712,6 +714,7 @@ impl GridState {
             connections: gctx.connections,
             dialect,
             kept: gctx.panel_frozen,
+            panel_sql: gctx.panel_sql,
             tx_mode: gctx.tx_mode,
             base_sql: gctx.base_sql,
             grid_query: gctx.grid_query,
@@ -849,7 +852,7 @@ impl GridState {
         self.current_statement().is_some()
     }
 
-    /// May the gutter offer **Delete row** and **Duplicate row**?
+    /// May **Delete row** and **Duplicate row** run at all?
     ///
     /// `EditModel::insert_target` answers this from the result's provenance and
     /// structurally cannot see a join that projects only one table's columns —
@@ -871,13 +874,35 @@ impl GridState {
     /// row of that table" and a `FROM`-list walk cannot tell the two apart. The
     /// cost is a gesture the user can still perform in SQL; the cost of the
     /// other direction is a parent row destroyed with a success report.
+    /// **Asked on the actions, not on one menu.** This started as a term in the
+    /// gutter menu's entry list, and three other routes reach the identical
+    /// write: the cell context menu's Delete row / Duplicate row, the results
+    /// strip's − and clone buttons, and the Delete key over a gutter selection.
+    /// All four stage the same `DELETE FROM orders WHERE id = ?`, which affects
+    /// exactly one row — so the write-back's 1-row net passes, the report says
+    /// one row deleted, and the other N−1 display rows of that parent sit on
+    /// screen with nothing saying the row behind them is gone. Putting it on
+    /// [`GridState::toggle_delete`] and [`clone_rows`] is the rule `clone_rows`
+    /// already states for its own size question, and the one CLAUDE.md states
+    /// for the run guard: a fifth caller written later cannot reach the staging
+    /// without passing it. The menu terms are presentation after that.
+    ///
+    /// **`panel_sql`, not `current_statement`.** The latter answers "what would
+    /// a re-run be", which is `None` for a pinned panel and for every panel of a
+    /// Run Everything batch — and a `None => true` arm falls open on both, which
+    /// is where the first spelling of this let the gutter entry back in. A panel
+    /// always knows the statement its own rows came from.
     fn row_gestures_are_safe(&self) -> bool {
-        match self.current_statement() {
+        match self
+            .panel_sql
+            .get_untracked()
+            .or_else(|| self.current_statement())
+        {
             Some(sql) => {
                 schemaic_core::edit::reads_one_relation(&sql, self.dialect).unwrap_or(false)
             }
-            // No statement to ask about — a table opened from the tree, or a
-            // pinned result. `insert_target`'s own answer stands.
+            // No statement to ask about at all — a table opened from the tree.
+            // `insert_target`'s own answer stands.
             None => true,
         }
     }
@@ -1206,6 +1231,16 @@ impl GridState {
     /// drops any staged cell edits on it (a delete supersedes an update, so the row
     /// can never be both `UPDATE`d and `DELETE`d in one commit).
     fn toggle_delete(&self, data_idx: usize) {
+        // **The join guard is here, not on the menu that offered this.** Four
+        // routes reach this one function — the gutter menu, the cell menu, the
+        // results strip's − button and the Delete key — and gating one of them
+        // left the other three destroying a parent row behind a success report.
+        // See `row_gestures_are_safe`. Un-marking is always allowed: a row
+        // already staged has to be reachable to unstage.
+        if !self.del_rows.with_untracked(|d| d.contains(&data_idx)) && !self.row_gestures_are_safe()
+        {
+            return;
+        }
         let now_marked = self.del_rows.try_update(|d| {
             if d.remove(&data_idx) {
                 false
@@ -3207,6 +3242,10 @@ pub(crate) struct GridCtx {
     /// (switching away and back). Tracked, the edit-model effect recomputes on
     /// the pin itself, exactly as it already does for `read_only`.
     pub(crate) panel_frozen: Memo<bool>,
+    /// The statement **this** panel's rows came from — see
+    /// [`crate::Tab::panel_sql_memo`]. The question `current_statement` does not
+    /// answer, and the one the row-gesture guard needs.
+    pub(crate) panel_sql: Memo<Option<String>>,
     /// The tab's connection is read-only → disable all inline editing (an empty
     /// `EditModel`, so no cell is editable / committable). Reactive.
     pub(crate) read_only: Memo<bool>,
@@ -5319,6 +5358,13 @@ fn clone_row(gs: GridState, data_idx: usize) {
 /// third one written later.
 fn clone_rows(gs: GridState, data_idxs: &[usize]) {
     if data_idxs.is_empty() {
+        return;
+    }
+    // The join guard, on the action for the same reason the size question below
+    // is — see [`GridState::row_gestures_are_safe`]. A duplicate off a 1:many
+    // join pre-fills from a display row that stands for one parent and N
+    // children, so the staged insert is a parent the user did not describe.
+    if !gs.row_gestures_are_safe() {
         return;
     }
     if schemaic_core::edit::duplicate_needs_confirm(data_idxs.len()) {
@@ -8067,7 +8113,11 @@ fn grid_toolbar(
     let row_actions = dyn_container(
         move || {
             (
-                gs.edit_model.get().insert_target().is_some(),
+                gs.edit_model.get().insert_target().is_some()
+                    // The join term, so the controls are absent rather than
+                    // present-and-refused — `toggle_delete` and `clone_rows`
+                    // hold the real guard, this is presentation.
+                    && gs.row_gestures_are_safe(),
                 row_selected(),
             )
         },
@@ -10046,7 +10096,14 @@ fn data_cell(
             let text_editable = model.text_editable(ci);
             // Real row + a single writable table → row-level actions (clone/delete)
             // are available. `deleted` = this real row is already marked for deletion.
-            let can_rows = pending.is_none() && model.insert_target().is_some();
+            //
+            // The join term too: `insert_target` structurally cannot see a join
+            // that projects one table's columns, and this menu is one of the
+            // four routes to the same staging. The actions hold the real guard
+            // (`row_gestures_are_safe`); this keeps the entries off a menu where
+            // they would only be refused.
+            let can_rows =
+                pending.is_none() && model.insert_target().is_some() && gs.row_gestures_are_safe();
             let deleted =
                 pending.is_none() && gs.del_rows.with_untracked(|d| d.contains(&data_idx));
             // Nullable = editable + the base column isn't NOT NULL.
@@ -10788,6 +10845,64 @@ mod cell_preview_tests {
             .expect("`exported_rows` is gone");
         let end = body[at..].find("\n}").expect("no end");
         assert!(body[at..at + end].contains("grid_cells("));
+    }
+
+    /// **The join guard is on the two actions, so no menu can route around it.**
+    ///
+    /// It was a term in the gutter menu's entry list, and three other routes
+    /// reach the identical staging: the cell context menu, the results strip's −
+    /// and clone buttons, and the Delete key over a gutter selection. All four
+    /// end at `toggle_delete` or `clone_rows`, and the write they stage affects
+    /// exactly one row — so the 1-row net passes, the report says one row
+    /// deleted, and the parent of a 1:many join is gone with its other display
+    /// rows still on screen. `a_join_that_projects_only_one_tables_columns_is_not_a_row_target`
+    /// is green against all four of those sites, which is the seam it could not
+    /// reach.
+    ///
+    /// Stated over the *actions*, which is the rule `clone_rows` already follows
+    /// for its size question and the run guard follows for writes: a fifth
+    /// caller inherits it instead of having to remember it.
+    #[test]
+    fn the_row_gestures_ask_the_join_guard_in_the_action() {
+        let src = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("src")
+                .join("grid.rs"),
+        )
+        .expect("grid.rs");
+        let body = crate::source_gate::production_code(&src);
+        let guard = format!("{}()", "row_gestures_are_safe");
+        for name in ["fn toggle_delete(", "fn clone_rows("] {
+            let at = body
+                .find(name)
+                .unwrap_or_else(|| panic!("`{name}` is gone — this gate is stale"));
+            // **The whole item, brace-matched.** `find("\n}")` is wrong for a
+            // method (indented) and `find("\n    }")` is wrong for a free
+            // function — and the second lands on the first early `return`'s
+            // closing brace, which reads a three-line window as the function.
+            let end = crate::source_gate::item_end(&body, at)
+                .unwrap_or_else(|| panic!("`{name}` has no end — this gate is stale"));
+            let f = &body[at..end];
+            assert!(
+                f.contains(&guard),
+                "`{name}` stages a row gesture without asking whether the result \
+                 is a join that projects one table's columns, so the cell menu, \
+                 the results strip and the Delete key each reach it unguarded:\n{f}"
+            );
+        }
+        // And the guard asks the panel's own statement, not "what would a re-run
+        // be" — which is `None` on a pinned panel and on every Run Everything
+        // panel, where a `None => true` arm falls open.
+        let at = body
+            .find("fn row_gestures_are_safe(")
+            .expect("the guard is gone — this gate is stale");
+        let end = crate::source_gate::item_end(&body, at).expect("no end");
+        assert!(
+            body[at..end].contains("panel_sql"),
+            "the guard reads only `current_statement`, which answers `None` for a \
+             pinned panel and for a Run Everything panel — and its `None` arm is \
+             permissive"
+        );
     }
 
     /// **And `clone_rows` asks the size question before it stages anything.**

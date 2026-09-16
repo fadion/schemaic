@@ -2104,6 +2104,31 @@ impl Tab {
         })
     }
 
+    /// **The statement this panel's rows actually came from**, which is not the
+    /// same question as "what would a re-run be".
+    ///
+    /// [`crate::grid::GridState::current_statement`] answers the second, from
+    /// `base_sql` + the grid's filter, and returns `None` for a **pinned** panel
+    /// (a snapshot has no re-run) and for every panel of a **Run Everything**
+    /// batch (`start_manual_run(None)` leaves the tab with no single base). Both
+    /// of those panels do have a statement — their own — and a guard that reads
+    /// "no statement, so nothing to object to" falls open on both. The join
+    /// row-gesture guard did exactly that.
+    ///
+    /// A memo per panel, for [`Tab::panel_frozen_memo`]'s reason: "the statement
+    /// of this panel" is a fact about *one* panel and the context outlives every
+    /// one of them.
+    pub fn panel_sql_memo(&self, id: u64) -> Memo<Option<String>> {
+        let panels = self.result_tabs;
+        create_memo(move |prev: Option<&Option<String>>| {
+            panels.with(|v| match v.iter().find(|p| p.id == id) {
+                Some(p) if !p.sql.trim().is_empty() => Some(p.sql.clone()),
+                Some(_) => None,
+                None => prev.cloned().unwrap_or_default(),
+            })
+        })
+    }
+
     /// The strip, reduced to what [`schemaic_core::resultsel`] answers about.
     ///
     /// Every caller takes it from here rather than spelling the `map` again: the
@@ -8399,6 +8424,8 @@ fn center(ui: Ui) -> impl IntoView {
                     // about *one* panel and this context outlives every one of
                     // them.
                     panel_frozen: create_memo(|_| false),
+                    // Same placeholder, same reason — replaced per panel below.
+                    panel_sql: create_memo(|_| None),
                     read_only,
                     tx_mode: tab.tx_mode,
                     conn_id: tab.conn_id,
@@ -8756,6 +8783,7 @@ fn results_multi(tab: Tab, cancel: Rc<dyn Fn()>, gctx: GridCtx) -> impl IntoView
             // shown". See `Tab::panel_frozen_memo` for why the difference is a
             // crash and not a nuance.
             gctx.panel_frozen = tab.panel_frozen_memo(id);
+            gctx.panel_sql = tab.panel_sql_memo(id);
             if phase == Phase::Loaded {
                 // The splice sink, pointed at *this* panel: an in-place commit
                 // replaces the result this grid is showing, and only that one.
