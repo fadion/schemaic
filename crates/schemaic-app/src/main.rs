@@ -4910,10 +4910,31 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                 // A grid is only editable when it came from a read, so refusing to
                 // replay anything else costs nothing real and closes the hole
                 // rather than narrowing it.
-                let refetch_sql = tab
+                //
+                // **It ends in a minted request, not in this `filter`.** That is
+                // the shape the write-guard invariant asks for, and the reason
+                // is this site's own history: a refusal written as a step the
+                // launcher had to remember is one `return` away from being
+                // forgotten, and the census that was supposed to notice could
+                // not see this call at all — it read `(run)(sql);`, which does
+                // not begin with `run(`. A `RerunRequest` cannot be forgotten,
+                // because without one there is no SQL to pass.
+                //
+                // **Both questions, because neither implies the other.**
+                // `read_only_reason` is the narrower one on three axes — a
+                // single statement, a read head this engine actually has, and
+                // no denied word, so a `SELECT SLEEP(600)` or a second
+                // statement appended to the base is refused where
+                // `contains_write` would pass them. It is not strictly stronger
+                // in every direction: `OUTFILE`/`DUMPFILE` are in
+                // `WRITE_KEYWORDS` and, outside MySQL, in no deny list. So the
+                // filter narrows and the mint guards, and the composition is
+                // stronger than either alone.
+                let refetch_req = tab
                     .base_sql
                     .get_untracked()
-                    .filter(|s| schemaic_core::sql::read_only_reason(s, dialect_of(&db)).is_ok());
+                    .filter(|s| schemaic_core::sql::read_only_reason(s, dialect_of(&db)).is_ok())
+                    .and_then(|s| schemaic_ui::RerunRequest::approved(s, dialect_of(&db)));
                 let run = run.clone();
                 let engine = tx_engine(&db);
                 let fold = create_ext_action(cx, move |stmt: StmtOutcome| {
@@ -4942,8 +4963,8 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                     let still_active = active.get_untracked() == id;
                     let outcome = match outcome {
                         CommitDone::FullReran => {
-                            if still_active && let Some(sql) = refetch_sql.clone() {
-                                (run)(sql);
+                            if still_active && let Some(req) = refetch_req.clone() {
+                                run(req.into_sql());
                             }
                             CommitDone::FullReran
                         }
@@ -12721,27 +12742,84 @@ mod app_tests {
         );
     }
 
+    /// The byte after the `(` at `open`'s match, or `None` if it never closes.
+    ///
+    /// Balanced rather than "the next `)`", because every call this census reads
+    /// has a call inside it — `run(req.into_sql())` closes twice.
+    fn call_end(b: &[u8], open: usize) -> Option<usize> {
+        let mut depth = 0usize;
+        for (i, c) in b.iter().enumerate().skip(open) {
+            match c {
+                b'(' => depth += 1,
+                b')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(i);
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
+    /// Every call to the bare `run` closure in `body`, whitespace-collapsed.
+    ///
+    /// **A token scan over whole calls, not a line prefix.** The census this
+    /// replaces took lines that `starts_with("run(")`, and the post-commit
+    /// re-fetch spells its call `(run)(sql);` — which begins with `(`. So the
+    /// one caller that was *not* taking its SQL from a `RerunRequest` was the
+    /// one caller the gate could not see, while the gate reported the class
+    /// closed at two. A line prefix also loses any call rustfmt has wrapped.
+    ///
+    /// `(run)(…)` is normalised to `run(…)` because they are the same call.
+    /// `guarded_run(`, `rerun(`, `dump::run(`, `script::run(` and `x.run(` all
+    /// carry a word byte, a `:` or a `.` in front of the token and are other
+    /// functions; a declaration is preceded by `fn`.
+    fn raw_run_calls(body: &str) -> Vec<String> {
+        let body = body.replace("(run)(", "run(");
+        let b = body.as_bytes();
+        let mut out = Vec::new();
+        let mut from = 0usize;
+        while let Some(rel) = body[from..].find("run(") {
+            let at = from + rel;
+            from = at + 4;
+            let before = b[..at].last().copied();
+            if before.is_some_and(|c| schemaic_core::sql::is_word_byte(c) || c == b'.' || c == b':')
+            {
+                continue;
+            }
+            if body[..at].trim_end().ends_with("fn") {
+                continue;
+            }
+            let Some(end) = call_end(b, at + 3) else {
+                continue;
+            };
+            out.push(
+                body[at..=end]
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" "),
+            );
+        }
+        out
+    }
+
     #[test]
-    fn the_unguarded_run_has_only_its_two_stated_callers() {
+    fn the_unguarded_run_has_only_its_three_stated_callers() {
         let src = std::fs::read_to_string(
             std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join("src")
                 .join("main.rs"),
         )
         .expect("this file's own source");
-        // Comment lines out, so the prose above (which names `run(sql)`) is not
-        // itself a call site. A call is `run(` at the head of a statement —
-        // `guarded_run(`, `run_query_core(` and the rest end in other characters
-        // before the paren and do not match.
-        let calls: Vec<&str> = src
-            .lines()
-            .map(str::trim)
-            .filter(|l| !l.starts_with("//"))
-            .filter(|l| l.starts_with("run(") && l.ends_with(");"))
-            .collect();
+        // Comments and `#[cfg(test)]` items out, so the prose above (which names
+        // `run(sql)`) and this test are not themselves call sites.
+        let body = schemaic_ui::source_gate::production_code(&src);
+        let calls = raw_run_calls(&body);
         assert_eq!(
             calls,
-            ["run(req.into_sql());", "run(sql);"],
+            ["run(req.into_sql())", "run(req.into_sql())", "run(sql)"],
             "the raw `run` gained or lost a caller: every one must take its SQL \
              from a `RerunRequest`, which only `sql::rerunnable_for_export` mints"
         );
