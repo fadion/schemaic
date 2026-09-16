@@ -11341,8 +11341,41 @@ fn footer_seg_fits(edge: f64, ai_x: f64, gap: f64) -> bool {
 /// anti-oscillation property for **one** segment in isolation; with two or more
 /// hidden segments sharing one `left_edge` the prediction agrees with the
 /// measurement only for whichever returns leftmost.
-fn footer_seg_may_return(width: f64, shown: bool, left_shown: bool) -> bool {
-    width > 0.0 && !shown && left_shown
+/// `measured`, not `width > 0.0`, and that is the second half of this finding.
+/// A zero width means two different things: a segment floem has never laid out
+/// (it returns before the resize and move listeners for a hidden view, so one
+/// hidden from the start never is), and one measured as **empty** — the Tx pill,
+/// Commit and Rollback after a commit lands, `mode_seg` on a SQLite connection.
+/// Only the first has no edge to predict.
+///
+/// Conflating them froze the second for ever. It kept the stale, non-fitting
+/// `edge` it held while it had width; `width > 0.0` then locked its `shown` flag
+/// false; and because the flags chain left-to-right, every segment to its right
+/// was blocked behind it. Commit a transaction, narrow the window until CPU and
+/// RAM go, then widen it again: they never came back.
+fn footer_seg_may_return(measured: bool, shown: bool, left_shown: bool) -> bool {
+    measured && !shown && left_shown
+}
+
+/// The `edge` a segment holds after a layout pass — the body of both geometry
+/// handlers, so the two cannot answer differently.
+///
+/// `prev` is kept in two cases and they are not the same case. A segment floem
+/// has **never laid out** has no edge to compute: it is hidden, and floem
+/// returns before the resize and move listeners for a hidden view, so `x` and
+/// `w` are both meaningless. A segment that is **currently hidden** has an edge
+/// and deliberately freezes it — that is the anti-oscillation guard, and
+/// `footer_seg_may_return` is the only thing allowed to move it.
+///
+/// **A measured width of zero is an edge, not the absence of one.** The handlers
+/// asked `w > 0.0`, which folded the first case together with a segment that had
+/// simply become empty — the Tx pill, Commit and Rollback the moment a
+/// transaction commits, `mode_seg` on a SQLite connection. Such a segment kept
+/// the stale, wide edge it held before emptying, never fitted again, and blocked
+/// every segment to its right for the rest of the session. An empty segment ends
+/// where it begins.
+fn footer_seg_settled_edge(measured: bool, shown: bool, x: f64, w: f64, prev: f64) -> f64 {
+    if measured && shown { x + w } else { prev }
 }
 
 fn collapsing_seg(
@@ -11358,6 +11391,11 @@ fn collapsing_seg(
     let x = RwSignal::new(0.0_f64);
     let w = RwSignal::new(0.0_f64);
     let edge = RwSignal::new(0.0_f64);
+    // Has floem ever laid this segment out? See [`footer_seg_may_return`] — a
+    // width of zero is an answer for a segment whose content emptied and no
+    // answer at all for one that has never been measured, and the two were the
+    // same test.
+    let measured = RwSignal::new(false);
     // Whether the segment is currently shown, read untracked in the geometry
     // handlers so a hidden segment freezes its `edge` (no reactive cycle).
     let is_shown = move || {
@@ -11385,7 +11423,7 @@ fn collapsing_seg(
         // no segment writes anything its left neighbour reads.
         let left_ok = left_shown.is_none_or(|s| s.get());
         let width = w.get_untracked();
-        if !footer_seg_may_return(width, is_shown(), left_ok) {
+        if !footer_seg_may_return(measured.get_untracked(), is_shown(), left_ok) {
             return;
         }
         let would_be = footer_seg_edge(false, edge.get_untracked(), le, width);
@@ -11396,16 +11434,25 @@ fn collapsing_seg(
     container(view)
         .on_move(move |p| {
             x.set(p.x);
-            if w.get_untracked() > 0.0 && is_shown() {
-                edge.set(p.x + w.get_untracked());
-            }
+            edge.set(footer_seg_settled_edge(
+                measured.get_untracked(),
+                is_shown(),
+                p.x,
+                w.get_untracked(),
+                edge.get_untracked(),
+            ));
         })
         .on_resize(move |r| {
             let cw = r.width();
             w.set(cw);
-            if cw > 0.0 && is_shown() {
-                edge.set(x.get_untracked() + cw);
-            }
+            measured.set(true);
+            edge.set(footer_seg_settled_edge(
+                true,
+                is_shown(),
+                x.get_untracked(),
+                cw,
+                edge.get_untracked(),
+            ));
         })
         .style(move |s| {
             if footer_seg_fits(edge.get(), ai_x.get(), footer_collapse_gap()) {
@@ -14223,7 +14270,7 @@ mod window_key_gate {
 
 #[cfg(test)]
 mod footer_collapse_tests {
-    use super::{footer_seg_edge, footer_seg_fits, footer_seg_may_return};
+    use super::{footer_seg_edge, footer_seg_fits, footer_seg_may_return, footer_seg_settled_edge};
 
     const GAP: f64 = 12.0;
 
@@ -14326,18 +14373,77 @@ mod footer_collapse_tests {
 
         // The pill is leftmost of the two, so it may try.
         assert!(
-            footer_seg_may_return(pill_w, false, true),
+            footer_seg_may_return(true, false, true),
             "the leftmost hidden segment is the one that may come back"
         );
         // Commit may not, while the pill is still hidden — which is what stops
         // the footer showing a commit action with no transaction pill.
-        assert!(!footer_seg_may_return(commit_w, false, false));
-        // …and may once the pill is back.
-        assert!(footer_seg_may_return(commit_w, false, true));
-        // A segment that is already shown never re-predicts (that is the
-        // oscillation guard), and neither does an unmeasured one.
-        assert!(!footer_seg_may_return(commit_w, true, true));
-        assert!(!footer_seg_may_return(0.0, false, true));
+        assert!(!footer_seg_may_return(true, false, false));
+        // A segment that is already shown never re-predicts — the oscillation
+        // guard — and neither does one floem has never laid out.
+        assert!(!footer_seg_may_return(true, true, true));
+        assert!(!footer_seg_may_return(false, false, true));
+        // Silence the width bindings, which are the fixture's premise above and
+        // no longer this predicate's inputs.
+        let _ = (pill_w, commit_w);
+    }
+
+    /// **A segment that empties *while visible* still comes back.**
+    ///
+    /// The term was `width > 0.0`, and a width of zero is two different facts: a
+    /// segment floem has never laid out — it returns before the resize and move
+    /// listeners for a hidden view, so one hidden from the start never is — and
+    /// one measured as **empty**. The Tx pill, Commit and Rollback all empty the
+    /// moment a transaction commits; `mode_seg` empties outright on switching to
+    /// a SQLite connection.
+    ///
+    /// Such a segment kept the stale, non-fitting `edge` it held while it had
+    /// width, so `width > 0.0` locked its `shown` flag false for the rest of the
+    /// session — and the flags chain strictly left to right, so every segment to
+    /// its right was blocked behind it. Commit a transaction, narrow the window
+    /// until CPU and RAM vanish, widen it again: they never returned. Before the
+    /// `left_shown` chain existed they did.
+    #[test]
+    fn a_segment_that_emptied_while_visible_is_not_frozen_out() {
+        // Measured, empty, hidden behind a stale edge, with room to its left.
+        assert!(
+            footer_seg_may_return(true, false, true),
+            "a segment whose content emptied is blocked from ever returning, and \
+             it blocks every segment to its right with it"
+        );
+        // And the layout pass gives it a real edge, which is the half that
+        // bites: measured, shown, and *empty* settles at its own left position,
+        // because a segment of no width ends where it begins. The handlers asked
+        // `w > 0.0` here and kept the stale, wide edge instead.
+        assert_eq!(
+            footer_seg_settled_edge(true, true, 700.0, 0.0, 2000.0),
+            700.0,
+            "a segment that emptied kept the edge it had while it had width"
+        );
+        assert!(
+            footer_seg_fits(
+                footer_seg_settled_edge(true, true, 700.0, 0.0, 2000.0),
+                800.0,
+                GAP
+            ),
+            "an empty segment takes no room and must fit"
+        );
+        // The two cases that legitimately keep the previous edge, and they are
+        // different cases: never laid out (no edge to compute at all), and
+        // hidden (an edge, deliberately frozen — the oscillation guard).
+        assert_eq!(
+            footer_seg_settled_edge(false, true, 700.0, 0.0, 2000.0),
+            2000.0
+        );
+        assert_eq!(
+            footer_seg_settled_edge(true, false, 700.0, 130.0, 2000.0),
+            2000.0
+        );
+        // An ordinary measured segment is unchanged.
+        assert_eq!(
+            footer_seg_settled_edge(true, true, 700.0, 130.0, 2000.0),
+            830.0
+        );
     }
 }
 
