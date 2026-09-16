@@ -470,6 +470,104 @@ pub async fn a_failed_batch_says_what_the_rollback_actually_undid(target: &'stat
     scratch.teardown().await;
 }
 
+/// **A cancelled commit reports "nothing was written" only when nothing was.**
+///
+/// The twin of `a_cancelled_import_on_a_non_transactional_table_says_the_rows_remain`,
+/// and it exists for the same reason one layer down: `DbError::Cancelled` is the
+/// variant the modal renders as *nothing was written*, and on a `MyISAM` table
+/// every statement already executed is durable.
+///
+/// What this can only be asked of a server is whether the `ROLLBACK` that
+/// licenses that claim is heard at all. It was not: the cancel was a
+/// `tokio::select!` around the whole write, whose arm runs after the branch
+/// future is **dropped** — mid-statement — which desynchronises `mysql_async`'s
+/// result stream, so the `ROLLBACK` and its `SHOW WARNINGS` read replies that
+/// were not their own and `Rollback::Complete` was classified off them. The same
+/// construct was removed from `import_rows` for the same measured reason.
+///
+/// The batch is long rather than slow: each staged edit is its own round trip,
+/// so a few thousand of them run for well over the cancel's delay and the token
+/// is guaranteed to fire with statements both behind and ahead of it. There is
+/// no client-side pacing lever here the way `slow_rows` gives the import — a
+/// `GridWrite` arrives fully built.
+pub async fn a_cancelled_commit_on_a_non_transactional_table_says_the_rows_remain(
+    target: &'static Target,
+) {
+    let Some(clause) = target.non_transactional else {
+        return;
+    };
+    const ROWS: i64 = 4000;
+    let scratch = Scratch::create(target, "commitcancel").await;
+    scratch
+        .exec(&format!(
+            "CREATE TABLE {} {WRITABLE} {clause}",
+            scratch.qualified("m")
+        ))
+        .await;
+    let seed: Vec<String> = (1..=ROWS).map(|i| format!("({i}, 'before')")).collect();
+    scratch
+        .exec(&format!(
+            "INSERT INTO {} (id, name) VALUES {}",
+            scratch.qualified("m"),
+            seed.join(", ")
+        ))
+        .await;
+
+    let cancel = CancellationToken::new();
+    let armed = cancel.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        armed.cancel();
+    });
+
+    let updates = (1..=ROWS)
+        .map(|i| {
+            edit(
+                &scratch,
+                "m",
+                &[("name", Some("after"))],
+                &[("id", Value::Int(i))],
+            )
+        })
+        .collect();
+    let outcome = scratch
+        .db
+        .commit_writes(
+            &GridWrite {
+                updates,
+                ..Default::default()
+            },
+            cancel,
+        )
+        .await;
+
+    let changed = one_cell(
+        &scratch,
+        "m",
+        "SELECT COUNT(*) FROM {} WHERE name = 'after'",
+    )
+    .await;
+    match outcome {
+        // The whole batch landed before the token fired — the timing missed, and
+        // there is nothing to assert about a cancel that did not happen.
+        Ok(_) => {}
+        Err(schemaic_db::DbError::Cancelled) => assert_eq!(
+            changed, "0",
+            "{}: the commit claimed nothing was written, and {changed} rows of a \
+             {clause} table were changed",
+            target.name
+        ),
+        Err(e) => assert!(
+            e.to_string().contains("did NOT undo") || changed == "0",
+            "{}: {changed} rows changed and the cancel neither undid them nor \
+             admitted it: {e}",
+            target.name
+        ),
+    }
+
+    scratch.teardown().await;
+}
+
 /// An empty batch writes nothing and says so, without opening a transaction.
 pub async fn an_empty_batch_writes_nothing(target: &'static Target) {
     let scratch = Scratch::create(target, "empty").await;

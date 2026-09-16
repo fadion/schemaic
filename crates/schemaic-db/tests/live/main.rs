@@ -191,6 +191,7 @@ live_suite!(
         a_key_that_matches_no_row_fails_the_batch_and_undoes_the_rest,
         a_key_that_matches_two_rows_fails_the_batch_and_undoes_the_rest,
         a_failed_batch_says_what_the_rollback_actually_undid,
+        a_cancelled_commit_on_a_non_transactional_table_says_the_rows_remain,
         a_refused_write_in_a_transaction_undoes_only_itself,
         an_empty_batch_writes_nothing,
     ],

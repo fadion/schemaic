@@ -5573,16 +5573,26 @@ impl Db {
         let mut conn = self.open(None, true).await?;
         let conn_id = conn.id();
 
-        let outcome = tokio::select! {
-            r = write_on(&mut conn, write, TxScope::Own) => r,
-            _ = cancel.cancelled() => {
-                self.kill_query(conn_id).await;
-                // The `ROLLBACK` is what lets the report be true — see this
-                // method's doc. `cancelled_write` answers `Cancelled` only when
-                // the engine really undid it.
-                Err(cancelled_write(rollback(&mut conn, "ROLLBACK").await))
-            }
-        };
+        // **The cancel is inside `write_on`, not a race around it** — the same
+        // rule `import_rows` states three hundred lines up, for the same
+        // measured reason. A `tokio::select!` over the whole write dropped that
+        // future *mid-statement* (the `&mut conn` re-borrow in the cancel arm
+        // only compiles because the branch futures are dropped first), which
+        // leaves a `mysql_async` connection's result stream desynchronised:
+        // measured there on MariaDB 10.11.14 and MySQL 8.4.11, after the drop
+        // the following `ROLLBACK` "succeeded" and `SHOW WARNINGS` was empty.
+        // So the `ROLLBACK` this method's doc is about classified `Complete`
+        // off a reply that was not its own, and a cancelled Commit of three
+        // staged `INSERT`s into a `MyISAM` table reported "nothing was written"
+        // over two rows that were permanently there — the exact failure the
+        // `ROLLBACK` was added to prevent, one exit further along.
+        let outcome = write_on(
+            &mut conn,
+            write,
+            TxScope::Own,
+            Some((self, conn_id, &cancel)),
+        )
+        .await;
 
         let _ = conn.disconnect().await;
         outcome
@@ -5640,10 +5650,26 @@ impl TxScope {
 /// Deletes run first so "delete a row, then insert one with the same unique key"
 /// works. The caller is responsible for `client_found_rows` being on — the guard
 /// counts *matched* rows, not *changed* ones.
+///
+/// **`cancel` is handled *here*, not raced around this future.** That is the
+/// rule [`Db::import_rows`] states with its measurement: a `tokio::select!`
+/// around the whole write drops it mid-statement, and a dropped `mysql_async`
+/// statement leaves the connection's result stream desynchronised — after which
+/// the `ROLLBACK` and the `SHOW WARNINGS` behind [`Rollback`] read replies that
+/// are not their own and `Complete` is claimed off garbage. Inside, the batch
+/// stops between statements, or after *awaiting* a statement it killed, so the
+/// rollback goes out on an intact protocol and [`cancelled_write`] can be
+/// believed.
+///
+/// `None` for a caller that does not cancel — or that owns the cancel itself,
+/// as [`crate::session::Session::commit_writes`] does, where the batch is a
+/// savepoint inside the user's transaction and `classify_isolated` is what
+/// answers for it.
 pub(crate) async fn write_on(
     conn: &mut Conn,
     write: &GridWrite,
     scope: TxScope,
+    cancel: Option<(&Db, u32, &CancellationToken)>,
 ) -> Result<u64, DbError> {
     let qerr = |e: mysql_async::Error| DbError::Query(e.to_string());
     conn.query_drop(scope.begin_sql()).await.map_err(qerr)?;
@@ -5658,8 +5684,33 @@ pub(crate) async fn write_on(
         sql: String,
         params: Params,
         step: WriteStep<'_>,
+        cancel: Option<(&Db, u32, &CancellationToken)>,
     ) -> Result<u64, DbError> {
-        if let Err(e) = conn.exec_drop(sql, params).await {
+        // **The killed statement is awaited, not dropped** — see this
+        // function's doc, and `import_on`, which states the rule and the
+        // measurement behind it. Scoped so the borrow ends before the rollback.
+        let sent = match cancel {
+            None => Some(conn.exec_drop(sql, params).await),
+            Some((db, conn_id, token)) => {
+                let mut fut = std::pin::pin!(conn.exec_drop(sql, params));
+                let raced = tokio::select! {
+                    r = fut.as_mut() => Some(r),
+                    _ = token.cancelled() => None,
+                };
+                match raced {
+                    Some(r) => Some(r),
+                    None => {
+                        db.kill_query(conn_id).await;
+                        let _ = fut.await;
+                        None
+                    }
+                }
+            }
+        };
+        let Some(sent) = sent else {
+            return Err(cancelled_write(rollback(conn, scope.rollback_sql()).await));
+        };
+        if let Err(e) = sent {
             let msg = e.to_string();
             let undone = rollback(conn, scope.rollback_sql()).await;
             return Err(DbError::Query(format!("{msg}{}", undone.note())));
@@ -5676,12 +5727,16 @@ pub(crate) async fn write_on(
     // Deletes → updates → inserts, ordered by `GridWrite::plan` rather than by
     // three loops each engine has to keep in step.
     for step in write.plan() {
+        // Between statements, where the protocol is whole.
+        if cancel.is_some_and(|(_, _, t)| t.is_cancelled()) {
+            return Err(cancelled_write(rollback(conn, scope.rollback_sql()).await));
+        }
         let (sql, params) = match step {
             WriteStep::Delete(del) => build_delete(del),
             WriteStep::Update(edit) => build_update(edit),
             WriteStep::Insert(ins) => build_insert(ins),
         };
-        total += one(conn, scope, sql, params, step).await?;
+        total += one(conn, scope, sql, params, step, cancel).await?;
     }
 
     if let Err(e) = conn.query_drop(scope.commit_sql()).await {
@@ -7833,6 +7888,17 @@ mod tests {
     /// of `cancelled_write` alone is green against the defect — the seam is
     /// between the predicate and its caller, which is the shape CLAUDE.md's
     /// testing section names.
+    ///
+    /// **And the half that gate could not see: *where* the cancel happens.**
+    /// Asking `rollback` is worth nothing if the connection cannot hear the
+    /// answer, and a `tokio::select!` around the whole write is exactly that —
+    /// the cancel arm runs only after the branch futures are dropped, which is
+    /// why its `&mut conn` re-borrow compiles at all, so the killed statement is
+    /// dropped rather than awaited and the stream is torn. `import_rows` removed
+    /// that construct three hundred lines up for this reason and recorded the
+    /// measurement; `commit_writes` kept it and then put a `ROLLBACK` on the
+    /// torn connection, which is how `Complete` came to be claimed off a reply
+    /// that was not its own.
     #[test]
     fn the_grid_commits_cancel_arm_goes_through_a_rollback() {
         let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/lib.rs"))
@@ -7840,16 +7906,33 @@ mod tests {
         let at = src
             .find("    pub async fn commit_writes(")
             .expect("`commit_writes` is gone or was renamed");
-        let body = &src[at..at + 1400];
-        let arm = body
-            .find("_ = cancel.cancelled() =>")
-            .map(|i| &body[i..i + 400])
-            .expect("the cancel arm is gone — this gate is stale");
+        let body = &src[at..at + 2400];
+        // The write itself is not raced. Assembled, so this paragraph is not the
+        // hit.
+        let raced = format!("{}! {{", "tokio::select");
         assert!(
-            arm.contains("rollback(") && arm.contains("cancelled_write("),
-            "the cancel arm returns without asking what the rollback achieved, \
+            !body.contains(&raced),
+            "`commit_writes` races the write future again: the cancel arm drops \
+             it mid-statement, which desynchronises the connection's result \
+             stream, and the `ROLLBACK` below then reads somebody else's reply. \
+             Hand the token into `write_on`, the way `import_rows` does."
+        );
+        // …and the cancel still leaves through a rollback whose outcome is asked
+        // for, which is now `write_on`'s job.
+        let wo = src
+            .find("pub(crate) async fn write_on(")
+            .expect("`write_on` is gone or was renamed");
+        let wob = &src[wo..wo + 3000];
+        assert!(
+            wob.contains("rollback(") && wob.contains("cancelled_write("),
+            "the cancel path returns without asking what the rollback achieved, \
              so it claims 'nothing was written' about a MySQL table that may \
-             hold half the batch:\n{arm}"
+             hold half the batch"
+        );
+        assert!(
+            wob.contains("db.kill_query(conn_id).await") && wob.contains("let _ = fut.await;"),
+            "the killed statement is not awaited, so the next statement reads \
+             its reply — see `import_on`, which states the rule"
         );
     }
 

@@ -635,8 +635,12 @@ impl Session {
         let result = match &mut *guard {
             Backend::MySql { conn, conn_id } => {
                 let conn_id = *conn_id;
+                // `None`: this path owns its own cancel, and the batch is a
+                // savepoint inside the user's transaction — `classify_isolated`
+                // below is what answers for what survived, not a `Rollback`
+                // verdict read off this connection. See `write_on`'s doc.
                 tokio::select! {
-                    r = write_on(conn, write, TxScope::Savepoint) => r,
+                    r = write_on(conn, write, TxScope::Savepoint, None) => r,
                     _ = cancel.cancelled() => {
                         self.db.kill_query(conn_id).await;
                         Err(DbError::Cancelled)
