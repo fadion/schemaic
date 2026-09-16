@@ -4304,6 +4304,13 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                         let ed = ed.clone();
                         floem::action::exec_after(std::time::Duration::ZERO, move |_| {
                             if let Some(Some(vid)) = ed.editor_view_id.try_get_untracked() {
+                                // Claimed, like the Ctrl+K hand-backs below:
+                                // this menu's own action can open the Ctrl+K
+                                // bar, whose prompt field queues its autofocus
+                                // in the same pass, and the one that lands last
+                                // wins. Two of the five siblings this is one of
+                                // claimed and three did not.
+                                crate::widgets::claim_keyboard();
                                 vid.request_focus();
                             }
                         });

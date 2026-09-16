@@ -1074,6 +1074,16 @@ pub(crate) fn completion_popup(
                             let ed = editor.clone();
                             floem::action::exec_after(std::time::Duration::ZERO, move |_| {
                                 if let Some(Some(vid)) = ed.editor_view_id.try_get_untracked() {
+                                    // **Claimed, like the five it is modelled
+                                    // on.** The comment above says this is one
+                                    // of the deferred hand-backs; the three
+                                    // movers the `claim_keyboard` gotcha names
+                                    // all claim, and this one did not. Without
+                                    // it a `refocus_grid` scheduled in the same
+                                    // pass has nothing to stand down for, and
+                                    // the focus this asks for is taken away by
+                                    // the deferred action queued behind it.
+                                    crate::widgets::claim_keyboard();
                                     vid.request_focus();
                                 }
                             });

@@ -1014,4 +1014,93 @@ mod tests {
             offenders.join("\n")
         );
     }
+
+    /// **A deferred hand-back to the SQL editor either claims the keyboard or
+    /// stands down.**
+    ///
+    /// Focus is handed back a frame late in several places — the run menu,
+    /// Ctrl+K twice, the find close, the goto close and submit, the completion
+    /// row's click — because the focus floem takes is cleared during the frame's
+    /// own dispatch, so asking for it back inside the handler is undone by the
+    /// frame that stole it. Deferring makes the request *land*; it does not make
+    /// it *win*. Two immediate timers queued in one pass, and the one that lands
+    /// last takes the keyboard.
+    ///
+    /// So each of these has to say which it is. A **mover** — the user did
+    /// something whose whole point is that the editor ends up focused — calls
+    /// `claim_keyboard`, and a hand-back scheduled behind it reads the
+    /// generation and stands down. A **hand-back** does the reading instead,
+    /// through `keyboard_claim_unchanged` or, for the tab-mount autofocus,
+    /// `innermost_focus_root` (an overlay owns the keyboard while it is up). A
+    /// block that does neither is the bug: it wins or loses by timing.
+    ///
+    /// One gate over the workspace rather than a note at each site, because the
+    /// failure is a hand-back written without looking at its five siblings —
+    /// two of the five claimed and three did not.
+    ///
+    /// Scoped to the **editor's** `editor_view_id`, deliberately. The grid's
+    /// keyboard home is the other side of the same protocol and reads the
+    /// generation rather than claiming it, and a picker's mount autofocus is a
+    /// different question again; a rule wide enough to cover all three would
+    /// have to be "or does something else", which is not a rule.
+    #[test]
+    fn a_deferred_editor_hand_back_claims_or_stands_down() {
+        /// The byte after the `(` opened at `open`, by paren balance.
+        fn call_end(b: &[u8], open: usize) -> Option<usize> {
+            let mut depth = 0usize;
+            for (i, c) in b.iter().enumerate().skip(open) {
+                match c {
+                    b'(' => depth += 1,
+                    b')' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            return Some(i);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            None
+        }
+
+        let files = workspace_sources();
+        assert!(files.len() >= 40, "the corpus collapsed: {}", files.len());
+        let mut deferred = 0usize;
+        let mut offenders: Vec<String> = Vec::new();
+        for (name, code) in &files {
+            let b = code.as_bytes();
+            let mut from = 0usize;
+            while let Some(rel) = code[from..].find("exec_after(") {
+                let at = from + rel;
+                from = at + "exec_after(".len();
+                let Some(end) = call_end(b, at + "exec_after".len()) else {
+                    continue;
+                };
+                let block = &code[at..=end];
+                if !block.contains("request_focus()") || !block.contains("editor_view_id") {
+                    continue;
+                }
+                deferred += 1;
+                let decided = block.contains("claim_keyboard()")
+                    || block.contains("keyboard_claim_unchanged")
+                    || block.contains("innermost_focus_root()");
+                if !decided {
+                    let line = code[..at].matches('\n').count() + 1;
+                    offenders.push(format!("{name}:{line}"));
+                }
+            }
+        }
+        assert!(
+            deferred >= 5,
+            "only {deferred} deferred editor hand-backs found; this gate has gone \
+             blind — it reports success by matching nothing"
+        );
+        assert!(
+            offenders.is_empty(),
+            "a deferred hand-back to the editor that neither claims the keyboard \
+             nor stands down: it wins or loses by which timer lands last, and the \
+             keyboard ends up somewhere the user did not put it:\n{}",
+            offenders.join("\n")
+        );
+    }
 }

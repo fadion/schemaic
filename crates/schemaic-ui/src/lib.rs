@@ -10749,6 +10749,12 @@ pub(crate) fn edit_field(text_sig: RwSignal<String>, cfg: FieldCfg) -> impl Into
                     let Some(Some(vid)) = ed2.editor_view_id.try_get_untracked() else {
                         return;
                     };
+                    // **And the claim, as the autofocus twin has it too.** This
+                    // is a mover — the pulse's whole point is that the field
+                    // ends up focused with the caret at the end — and a
+                    // hand-back queued in the same pass would otherwise take the
+                    // keyboard away by landing second.
+                    widgets::claim_keyboard();
                     vid.request_focus();
                     let len = ed2.doc().text().to_string().len();
                     ed2.cursor.update(|c| c.set_offset(len, false, false));
