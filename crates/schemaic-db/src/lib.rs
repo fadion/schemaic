@@ -4376,6 +4376,10 @@ pub(crate) async fn collect_rows(
     // its siblings because `convert_row` is one function and a caller that
     // *could* hit a typed arm must not be the one that forgot to supply it.
     let scale = fractional_scales(result.columns_ref());
+    // Likewise unread on this path — the padding is already in the bytes the
+    // server sent — and supplied for the same reason: one function, one set of
+    // per-column facts, whichever protocol the caller is on.
+    let zerofill = zerofill_widths(result.columns_ref());
     // Hoisted for the same reason, and asked of the type name only: a bit-field's
     // bytes are a number, and nothing but the column says so.
     let bit: Vec<bool> = columns
@@ -4394,7 +4398,15 @@ pub(crate) async fn collect_rows(
         while let Some(row) = stream.next().await {
             let row = row.map_err(qerr)?;
             if builder.row_count() < row_cap {
-                let cells = convert_row(&row, builder.columns(), &binary, &bit, &scale, &kinds);
+                let cells = convert_row(
+                    &row,
+                    builder.columns(),
+                    &binary,
+                    &bit,
+                    &scale,
+                    &kinds,
+                    &zerofill,
+                );
                 builder.push_row(&cells);
                 // A stream hands the block over here and keeps reading into an
                 // empty builder; a capped read never fills a chunk, so this is
@@ -4502,13 +4514,19 @@ fn type_name_of(c: &MyColumn) -> String {
         c.column_type(),
         c.flags().contains(ColumnFlags::UNSIGNED_FLAG),
         c.character_set() == BINARY_CHARSET,
+        c.flags().contains(ColumnFlags::ZEROFILL_FLAG),
     )
 }
 
 /// Pure core of [`type_name_of`]: map a wire column type + UNSIGNED flag + binary
 /// charset to a human SQL type name. Split out so the mapping (which drives
 /// `parse_typed` and editability) is unit-tested without a wire column object.
-fn resolve_type_name(ct: ColumnType, unsigned: bool, binary: bool) -> String {
+///
+/// **`ZEROFILL` is here because it changes what a value *is* over the wire**,
+/// not merely how it was declared: the server renders such a column padded to
+/// its display width (`0007`), and the type name is the only thing
+/// [`num_kind`] is given to decide whether the cell's text is the value.
+fn resolve_type_name(ct: ColumnType, unsigned: bool, binary: bool, zerofill: bool) -> String {
     let base = match ct {
         ColumnType::MYSQL_TYPE_TINY => "TINYINT",
         ColumnType::MYSQL_TYPE_SHORT => "SMALLINT",
@@ -4586,11 +4604,14 @@ fn resolve_type_name(ct: ColumnType, unsigned: bool, binary: bool) -> String {
             | ColumnType::MYSQL_TYPE_DECIMAL
             | ColumnType::MYSQL_TYPE_NEWDECIMAL
     );
+    let mut name = base.to_string();
     if numeric && unsigned {
-        format!("{base} UNSIGNED")
-    } else {
-        base.to_string()
+        name.push_str(" UNSIGNED");
     }
+    if numeric && zerofill {
+        name.push_str(" ZEROFILL");
+    }
+    name
 }
 
 /// Convert one wire row into our typed cells. Over the text protocol every
@@ -4617,6 +4638,7 @@ fn convert_row(
     bit: &[bool],
     scale: &[u32],
     kinds: &[NumKind],
+    zerofill: &[Option<usize>],
 ) -> Vec<Value> {
     (0..columns.len())
         .map(|i| match row.as_ref(i) {
@@ -4656,8 +4678,17 @@ fn convert_row(
                 kinds.get(i).copied().unwrap_or(NumKind::Text),
                 String::from_utf8_lossy(b).into_owned(),
             ),
-            Some(MyValue::Int(n)) => Value::Int(*n),
-            Some(MyValue::UInt(n)) => Value::UInt(*n),
+            // **The one integer the binary protocol renders differently.** A
+            // `ZEROFILL` column arrives here as a bare number while the text
+            // protocol sent it padded, so it is re-rendered to the column's
+            // display width — see `zerofill_value`. Every other column has
+            // `None` and passes straight through.
+            Some(MyValue::Int(n)) => {
+                zerofill_value(Value::Int(*n), zerofill.get(i).copied().flatten())
+            }
+            Some(MyValue::UInt(n)) => {
+                zerofill_value(Value::UInt(*n), zerofill.get(i).copied().flatten())
+            }
             Some(MyValue::Double(f)) => Value::Float(*f),
             // **The binary protocol's own shapes, rendered the way the text
             // protocol renders the same column.** See `binary_as_text`; the
@@ -5898,6 +5929,10 @@ pub(crate) async fn refetch_on(
         // **Before the collect**, which consumes the result and empties
         // `columns_ref`. The declared fractional precision is only on the wire.
         let scale = fractional_scales(result.columns_ref());
+        // **This is the path that needs it.** A prepared statement sends a
+        // `ZEROFILL` column as a bare integer, so the splice would otherwise
+        // paint `7` over the `0007` the load read — see `zerofill_value`.
+        let zerofill = zerofill_widths(result.columns_ref());
         let fetched: Vec<Row> = result.collect::<Row>().await.map_err(qerr)?;
         if let Some(r) = fetched.first() {
             let binary: Vec<bool> = columns.iter().map(Column::is_binary).collect();
@@ -5908,7 +5943,7 @@ pub(crate) async fn refetch_on(
             let kinds: Vec<NumKind> = columns.iter().map(|c| num_kind(&c.type_name)).collect();
             out.push((
                 row.data_row,
-                convert_row(r, &columns, &binary, &bit, &scale, &kinds),
+                convert_row(r, &columns, &binary, &bit, &scale, &kinds, &zerofill),
             ));
         }
     }
@@ -6093,6 +6128,16 @@ pub(crate) enum NumKind {
 /// [`NumKind`] for a column's declared type. Called once per column.
 pub(crate) fn num_kind(type_name: &str) -> NumKind {
     let t = type_name.to_ascii_uppercase();
+    // **A `ZEROFILL` column's text *is* its value.** The server pads it to the
+    // declared display width — `INT(4) UNSIGNED ZEROFILL` holding 7 arrives as
+    // `0007` — and parsing that as a number drops the padding in the grid and
+    // in every export. `Text` keeps the server's own rendering, the way
+    // `DECIMAL` already does; the column still right-aligns, because
+    // `Column::is_numeric` reads the leading type token and ignores the
+    // suffixes.
+    if t.contains("ZEROFILL") {
+        return NumKind::Text;
+    }
     let is_integer = ["TINYINT", "SMALLINT", "MEDIUMINT", "INT", "BIGINT", "YEAR"]
         .iter()
         .any(|k| t.starts_with(k));
@@ -6118,6 +6163,44 @@ pub(crate) fn parse_as(kind: NumKind, s: String) -> Value {
         NumKind::Float => s.parse::<f64>().map(Value::Float).unwrap_or(Value::Str(s)),
         NumKind::Text => Value::Str(s),
     }
+}
+
+/// Re-render a **binary-protocol** integer the way the text protocol would have
+/// sent it, for a `ZEROFILL` column — `width` is the column's display width, or
+/// `None` for every other column, which passes through untouched.
+///
+/// **The two protocols disagree about these cells and only one of them is the
+/// user's answer.** A prepared statement — which is what the post-commit
+/// re-fetch runs — sends `Int(7)` for the cell `SELECT` sent as `0007`
+/// (measured on MariaDB 10.11.14 and MySQL 8.4). Without this the splice would
+/// paint `7` over the padded value the load put in the grid, and the column
+/// would disagree with itself about a cell the user never edited.
+///
+/// Padding only, never truncation: a value wider than the declared width is the
+/// server's to render, and `format!` leaves it alone.
+fn zerofill_value(v: Value, width: Option<usize>) -> Value {
+    let Some(w) = width else {
+        return v;
+    };
+    match v {
+        Value::Int(n) => Value::Str(format!("{n:0w$}")),
+        Value::UInt(n) => Value::Str(format!("{n:0w$}")),
+        other => other,
+    }
+}
+
+/// Per-column display width for the `ZEROFILL` columns of a result, `None` for
+/// every other column — computed **once for the result**, like
+/// [`fractional_scales`] beside it, because it is a fact about the column.
+fn zerofill_widths(columns: &[MyColumn]) -> Vec<Option<usize>> {
+    columns
+        .iter()
+        .map(|c| {
+            c.flags()
+                .contains(ColumnFlags::ZEROFILL_FLAG)
+                .then(|| c.column_length() as usize)
+        })
+        .collect()
 }
 
 /// Parse a text-protocol cell into a typed [`Value`] using the column's SQL
@@ -6889,6 +6972,88 @@ mod tests {
         ));
     }
 
+    /// **A `ZEROFILL` column's padding is the server's own rendering, and it is
+    /// the value the user sees in `mysql` and in DataGrip.** `INT(4) UNSIGNED
+    /// ZEROFILL` holding 7 arrives over the text protocol as `0007`
+    /// (**measured** on MariaDB 10.11.14 and MySQL 8.4 — both send the padded
+    /// bytes and set `ZEROFILL_FLAG` with the display width in
+    /// `column_length`), and parsing it as a number threw the padding away in
+    /// the grid and in every export, on the path whose doc promises the cell
+    /// keeps its exact text.
+    ///
+    /// `Text` costs nothing here that matters: `Column::is_numeric` reads the
+    /// **leading** type token, so the column still right-aligns, and a
+    /// fixed-width zero-padded unsigned sorts identically as text.
+    #[test]
+    fn a_zerofill_column_keeps_the_padding_the_server_sent() {
+        assert_eq!(num_kind("INT(4) UNSIGNED ZEROFILL"), NumKind::Text);
+        assert_eq!(num_kind("BIGINT(8) UNSIGNED ZEROFILL"), NumKind::Text);
+        assert!(matches!(
+            parse_typed("0007".into(), "INT(4) UNSIGNED ZEROFILL"),
+            Value::Str(s) if s == "0007"
+        ));
+        // Without the attribute nothing changes: an ordinary unsigned integer is
+        // still a number, which is what the hoisted kind array is mostly for.
+        assert_eq!(num_kind("INT UNSIGNED"), NumKind::UInt);
+        assert_eq!(num_kind("INT"), NumKind::Int);
+    }
+
+    /// The wire flag has to reach the type name, or `num_kind` above cannot see
+    /// it — the type name is the only thing it is given.
+    #[test]
+    fn resolve_type_name_carries_the_zerofill_attribute() {
+        assert_eq!(
+            resolve_type_name(ColumnType::MYSQL_TYPE_LONG, true, false, true),
+            "INT UNSIGNED ZEROFILL"
+        );
+        // ZEROFILL implies UNSIGNED on the server, but the flags are
+        // independent on the wire; the name is built from what arrived.
+        assert_eq!(
+            resolve_type_name(ColumnType::MYSQL_TYPE_LONGLONG, false, false, true),
+            "BIGINT ZEROFILL"
+        );
+        assert_eq!(
+            resolve_type_name(ColumnType::MYSQL_TYPE_LONG, true, false, false),
+            "INT UNSIGNED"
+        );
+        // Non-numeric types never carry it, the way they never carry UNSIGNED.
+        assert_eq!(
+            resolve_type_name(ColumnType::MYSQL_TYPE_VAR_STRING, true, false, true),
+            "VARCHAR"
+        );
+    }
+
+    /// **The other protocol, which sends no padding at all.** The post-commit
+    /// re-fetch runs a *prepared* statement, and the binary protocol carries an
+    /// integer: `Int(7)` for the same cell the text protocol sent as `0007`
+    /// (measured on both engines). Left alone, the splice would paint `7` over
+    /// the `0007` the load put there and the grid would disagree with itself
+    /// about a cell nobody edited — so the re-fetch re-renders it the way the
+    /// server would have, from the display width the wire also carries.
+    #[test]
+    fn a_zerofill_cell_from_the_binary_protocol_is_padded_back() {
+        assert!(matches!(
+            zerofill_value(Value::Int(7), Some(4)),
+            Value::Str(s) if s == "0007"
+        ));
+        assert!(matches!(
+            zerofill_value(Value::UInt(42), Some(8)),
+            Value::Str(s) if s == "00000042"
+        ));
+        // A value already at or over the width is untouched by the padding.
+        assert!(matches!(
+            zerofill_value(Value::UInt(12345), Some(4)),
+            Value::Str(s) if s == "12345"
+        ));
+        // No width means no ZEROFILL: every other column passes through whole.
+        assert!(matches!(zerofill_value(Value::Int(7), None), Value::Int(7)));
+        assert!(matches!(
+            zerofill_value(Value::Str("0007".into()), Some(4)),
+            Value::Str(s) if s == "0007"
+        ));
+        assert!(matches!(zerofill_value(Value::Null, Some(4)), Value::Null));
+    }
+
     #[test]
     fn parse_typed_integers_unsigned_floats_and_fallback() {
         // Signed integer types.
@@ -7237,24 +7402,25 @@ mod tests {
     #[test]
     fn resolve_type_name_maps_common_types() {
         let non_binary = false;
+        let plain = false;
         assert_eq!(
-            resolve_type_name(ColumnType::MYSQL_TYPE_LONG, false, non_binary),
+            resolve_type_name(ColumnType::MYSQL_TYPE_LONG, false, non_binary, plain),
             "INT"
         );
         assert_eq!(
-            resolve_type_name(ColumnType::MYSQL_TYPE_LONGLONG, false, non_binary),
+            resolve_type_name(ColumnType::MYSQL_TYPE_LONGLONG, false, non_binary, plain),
             "BIGINT"
         );
         assert_eq!(
-            resolve_type_name(ColumnType::MYSQL_TYPE_NEWDECIMAL, false, non_binary),
+            resolve_type_name(ColumnType::MYSQL_TYPE_NEWDECIMAL, false, non_binary, plain),
             "DECIMAL"
         );
         assert_eq!(
-            resolve_type_name(ColumnType::MYSQL_TYPE_DATETIME, false, non_binary),
+            resolve_type_name(ColumnType::MYSQL_TYPE_DATETIME, false, non_binary, plain),
             "DATETIME"
         );
         assert_eq!(
-            resolve_type_name(ColumnType::MYSQL_TYPE_JSON, false, non_binary),
+            resolve_type_name(ColumnType::MYSQL_TYPE_JSON, false, non_binary, plain),
             "JSON"
         );
     }
@@ -7262,50 +7428,52 @@ mod tests {
     #[test]
     fn resolve_type_name_binary_charset_flips_string_and_blob_types() {
         // charset 63 (binary) turns text types into their binary counterparts.
+        let plain = false;
         assert_eq!(
-            resolve_type_name(ColumnType::MYSQL_TYPE_VAR_STRING, false, true),
+            resolve_type_name(ColumnType::MYSQL_TYPE_VAR_STRING, false, true, plain),
             "VARBINARY"
         );
         assert_eq!(
-            resolve_type_name(ColumnType::MYSQL_TYPE_VAR_STRING, false, false),
+            resolve_type_name(ColumnType::MYSQL_TYPE_VAR_STRING, false, false, plain),
             "VARCHAR"
         );
         assert_eq!(
-            resolve_type_name(ColumnType::MYSQL_TYPE_STRING, false, true),
+            resolve_type_name(ColumnType::MYSQL_TYPE_STRING, false, true, plain),
             "BINARY"
         );
         assert_eq!(
-            resolve_type_name(ColumnType::MYSQL_TYPE_STRING, false, false),
+            resolve_type_name(ColumnType::MYSQL_TYPE_STRING, false, false, plain),
             "CHAR"
         );
         assert_eq!(
-            resolve_type_name(ColumnType::MYSQL_TYPE_BLOB, false, true),
+            resolve_type_name(ColumnType::MYSQL_TYPE_BLOB, false, true, plain),
             "BLOB"
         );
         assert_eq!(
-            resolve_type_name(ColumnType::MYSQL_TYPE_BLOB, false, false),
+            resolve_type_name(ColumnType::MYSQL_TYPE_BLOB, false, false, plain),
             "TEXT"
         );
     }
 
     #[test]
     fn resolve_type_name_unsigned_only_on_numeric_types() {
+        let plain = false;
         // UNSIGNED suffix appended for numerics…
         assert_eq!(
-            resolve_type_name(ColumnType::MYSQL_TYPE_LONG, true, false),
+            resolve_type_name(ColumnType::MYSQL_TYPE_LONG, true, false, plain),
             "INT UNSIGNED"
         );
         assert_eq!(
-            resolve_type_name(ColumnType::MYSQL_TYPE_NEWDECIMAL, true, false),
+            resolve_type_name(ColumnType::MYSQL_TYPE_NEWDECIMAL, true, false, plain),
             "DECIMAL UNSIGNED"
         );
         // …but never for non-numeric types, even if the flag is set.
         assert_eq!(
-            resolve_type_name(ColumnType::MYSQL_TYPE_DATETIME, true, false),
+            resolve_type_name(ColumnType::MYSQL_TYPE_DATETIME, true, false, plain),
             "DATETIME"
         );
         assert_eq!(
-            resolve_type_name(ColumnType::MYSQL_TYPE_VAR_STRING, true, false),
+            resolve_type_name(ColumnType::MYSQL_TYPE_VAR_STRING, true, false, plain),
             "VARCHAR"
         );
     }
