@@ -362,6 +362,17 @@ pub fn implicit_commit(engine: TxEngine, sql: &str) -> bool {
     {
         return false;
     }
+    // **MySQL's second carve-out**: *"RESET (but not RESET PERSIST)"*. Without
+    // it the pill would go blank over a live transaction, which this function's
+    // doc prices as the mirror failure.
+    if kw == "RESET"
+        && crate::sql::leading_words(sql, 2, dialect)
+            .get(1)
+            .map(String::as_str)
+            == Some("PERSIST")
+    {
+        return false;
+    }
     matches!(
         kw.as_str(),
         "ALTER"
@@ -385,9 +396,21 @@ pub fn implicit_commit(engine: TxEngine, sql: &str) -> bool {
             | "TRUNCATE"
             | "UNINSTALL"
             | "UNLOCK"
-            // Opening a new transaction commits the current one.
+            // Opening a new transaction commits the current one. `START` is
+            // here for both readings: `START TRANSACTION` opens one, and
+            // `START REPLICA`/`SLAVE`/`GROUP_REPLICATION` open nothing but are
+            // in MySQL's replication-control group, which commits.
             | "BEGIN"
             | "START"
+            // The rest of that group, which matched nothing at all — so the
+            // pill kept counting a transaction the server had already
+            // committed. `STOP REPLICA`/`SLAVE`, `RESET REPLICA`/`SLAVE`/
+            // `MASTER` and `CHANGE REPLICATION SOURCE TO`/`CHANGE MASTER TO`;
+            // no other statement in the language leads with `CHANGE`, and
+            // `RESET PERSIST` is excluded above.
+            | "STOP"
+            | "RESET"
+            | "CHANGE"
     )
 }
 
@@ -529,7 +552,18 @@ pub fn tx_after(engine: TxEngine, sql: &str) -> TxAfter {
         // surely, and one issued inside an open transaction warns and leaves it
         // open. Either way there is a transaction afterwards, which is the whole
         // of what this answers.
-        "BEGIN" | "START" => TxAfter::Open,
+        "BEGIN" => TxAfter::Open,
+        // **`START` alone is not an opener.** `START TRANSACTION` is; MySQL's
+        // other three — `START REPLICA`, `START SLAVE`,
+        // `START GROUP_REPLICATION` — open nothing, and matching the bare
+        // keyword set the session's flag over no transaction. `ensure_tx` then
+        // issued no `BEGIN` for the next statement, so it ran auto-committed
+        // and permanent while the pill counted it and Rollback reported an undo
+        // that never happened — the failure group 1 of this doc exists for,
+        // reached from the other side. They fall through to `implicit_commit`,
+        // which is where they belong: MySQL lists the replication-control
+        // statements among those that commit.
+        "START" if word(0) == Some("TRANSACTION") => TxAfter::Open,
         _ if implicit_commit(engine, sql) => TxAfter::Closed,
         _ => TxAfter::Unchanged,
     }
@@ -1790,6 +1824,86 @@ mod tests {
                 "{engine:?}"
             );
         }
+    }
+
+    /// **Three of MySQL's four `START` statements open no transaction.**
+    ///
+    /// The arm matched the bare keyword, so `START REPLICA` / `START SLAVE` /
+    /// `START GROUP_REPLICATION` set `Session::in_tx` true over nothing:
+    /// `ensure_tx` then issued no `BEGIN` for the next statement, that statement
+    /// ran auto-committed and permanent, and the pill still offered Rollback —
+    /// which succeeded as a no-op while the app reported the work undone. The
+    /// same seam the first group of `tx_after`'s doc exists for, reached from
+    /// the other side.
+    ///
+    /// They are not `Unchanged` either: MySQL lists the replication-control
+    /// statements among those that cause an implicit commit, so the transaction
+    /// that *was* open is gone. **Measured on MySQL 8.4.11**: inside an open
+    /// transaction holding a `DELETE`, a `STOP REPLICA` and a `RESET REPLICA`
+    /// each made the delete permanent — the following `ROLLBACK` succeeded and
+    /// the row did not come back. MariaDB 10.11.14 refuses both there instead
+    /// (*ERROR 1192: Can't execute the given command because you have … an
+    /// active transaction*), which `failure_committed` already handles: it
+    /// asks the server whether the transaction survived.
+    #[test]
+    fn only_start_transaction_opens_one() {
+        for sql in [
+            "START REPLICA",
+            "START SLAVE",
+            "START GROUP_REPLICATION",
+            "START REPLICA UNTIL SOURCE_LOG_FILE = 'x'",
+        ] {
+            assert_ne!(
+                tx_after(TxEngine::MySql, sql),
+                TxAfter::Open,
+                "{sql} opens no transaction"
+            );
+            assert_ne!(tx_open_after(TxEngine::MySql, sql), Some(true), "{sql}");
+            // The composition, not the predicate alone: the pill must not start
+            // counting a transaction the server never opened.
+            assert!(
+                !TxState::Idle
+                    .on_statement(TxEngine::MySql, sql, StmtOutcome::Ok)
+                    .is_open(),
+                "{sql}"
+            );
+        }
+        // And the one that does still does, noise word or comment in between.
+        for sql in [
+            "START TRANSACTION",
+            "start transaction read only",
+            "START/* x */TRANSACTION",
+            "BEGIN",
+            "BEGIN WORK",
+        ] {
+            assert_eq!(tx_after(TxEngine::MySql, sql), TxAfter::Open, "{sql}");
+            assert_eq!(tx_after(TxEngine::Postgres, sql), TxAfter::Open, "{sql}");
+        }
+        // The mirror half: the replication statements that *end* a transaction
+        // and matched nothing at all, so the pill kept counting one the server
+        // had already committed.
+        for sql in [
+            "STOP REPLICA",
+            "STOP SLAVE",
+            "RESET REPLICA ALL",
+            "CHANGE REPLICATION SOURCE TO SOURCE_HOST = 'h'",
+            "CHANGE MASTER TO MASTER_HOST = 'h'",
+        ] {
+            assert_eq!(tx_after(TxEngine::MySql, sql), TxAfter::Closed, "{sql}");
+            assert!(implicit_commit(TxEngine::MySql, sql), "{sql}");
+            // PostgreSQL has transactional DDL and none of these statements.
+            assert_eq!(
+                tx_after(TxEngine::Postgres, sql),
+                TxAfter::Unchanged,
+                "{sql}"
+            );
+        }
+        // `RESET PERSIST` is MySQL's own carve-out from that list.
+        assert!(!implicit_commit(TxEngine::MySql, "RESET PERSIST"));
+        assert!(!implicit_commit(
+            TxEngine::MySql,
+            "RESET PERSIST IF EXISTS x"
+        ));
     }
 
     /// **MySQL's one documented exception to its own implicit-commit list.**
