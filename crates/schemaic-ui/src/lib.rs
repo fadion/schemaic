@@ -9444,10 +9444,19 @@ fn terminal_panel(ui: Ui) -> impl IntoView {
     // reason `activity_panel`'s two kills are: a control that vanishes reads as
     // a missing feature, and the user cannot tell they are one toggle away.
     // Reads must still be run — in a query tab, which read-only allows.
-    let cli_tabs = ui.tabs_ui.tabs;
-    let cli_active = ui.tabs_ui.active;
+    // **`active_conn`, because that is what the button launches.** It asked
+    // `active_tab_read_only` — the active *tab's* connection — about a call that
+    // opens a client on the active *connection*, and that predicate answers
+    // `false` when no tab matches at all. So with the terminal open and no tab
+    // on the active connection, the button was lit over a connection the app
+    // refuses a grid commit on. The schema tree's *Open in CLI* entry has always
+    // asked this question; the two doors now ask the same one, and
+    // `open_db_cli` guards its own launch regardless of either.
     let cli_conns = ui.conn.connections;
-    let cli_read_only = create_memo(move |_| active_tab_read_only(cli_tabs, cli_active, cli_conns));
+    let cli_active_conn = ui.conn.active_conn;
+    let cli_read_only = create_memo(move |_| {
+        cli_conns.with(|cs| schemaic_core::connection::read_only_of(cs, cli_active_conn.get()))
+    });
     let db_cli_btn = toolbar_icon(
         icons::DATABASE,
         5.0,

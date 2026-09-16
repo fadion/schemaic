@@ -466,6 +466,17 @@ fn mysql_shell_config(
     {
         return Err(why);
     }
+    // **Inside the builder, like its sibling one line up.** `open_db_cli` also
+    // asks this, earlier, so that a verifying tunnelled connection is told why
+    // before it is told the tunnel is down — but a refusal checked only in a
+    // caller's `if` is the shape `core::launch`'s invariant forbids, and
+    // `sqlite_target`'s own doc states the rule: a second launch path would
+    // compile with it absent. Here it is a `Result` no caller can skip.
+    if conn.uses_tunnel()
+        && let Some(why) = launch::tunnelled_verify_blocker(&conn.tls)
+    {
+        return Err(why);
+    }
     let mut cli_args: Vec<String> = vec![
         "-h".into(),
         conn.host.clone(),
@@ -543,6 +554,13 @@ fn psql_shell_config(
     let db = launch::psql_target(db)?;
     if matches!(launcher, CliLauncher::Wsl(_))
         && let Some(why) = launch::wsl_tls_blocker(&conn.tls)
+    {
+        return Err(why);
+    }
+    // See `mysql_shell_config`'s copy: the refusal belongs to the builder, not
+    // to a caller's `if`.
+    if conn.uses_tunnel()
+        && let Some(why) = launch::tunnelled_verify_blocker(&conn.tls)
     {
         return Err(why);
     }
@@ -11306,6 +11324,24 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                             (term_notify)();
                         } else {
                             tracing::error!("{what}: the message shell would not start either");
+                            // **And the previous session goes even so.**
+                            //
+                            // Both spawns failed, so nothing here replaced
+                            // anything — and what was left standing was the
+                            // *old* session, still live, still connected to
+                            // whatever it was connected to, under the *old*
+                            // badge. So *Open in CLI* on connection B, failing
+                            // twice, left connection A's client on screen and
+                            // the next line the user typed ran on A.
+                            //
+                            // An empty panel is the honest state: the caller
+                            // asked for this session to be replaced, and it was.
+                            // The `false` returned below says the replacement is
+                            // not what they asked for; it does not say the old
+                            // one survived, and it must not.
+                            *terminal.borrow_mut() = None;
+                            term_db_label.set(None);
+                            (term_notify)();
                         }
                         // Still `false`: the caller asked for *that* shell and
                         // did not get it — `term_apply_shell` must not record a
@@ -11499,6 +11535,30 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             let Some(conn) = conn else {
                 return;
             };
+            // **The guard, on the launch, about the connection being launched.**
+            //
+            // What this opens is a full write session carrying the connection's
+            // password, on a connection where the app refuses a grid commit and
+            // refuses *Kill session*. The whole protection used to be two
+            // disabled controls — the shape the write-guard invariant names as
+            // insufficient — and they did not even ask the same question: the
+            // schema tree's entry asks `active_conn`, which is what is launched,
+            // while the terminal's button asked the active *tab's* `conn_id` and
+            // answered "writable" when no tab matched it. Neither is what stops
+            // the spawn.
+            //
+            // Read live from `conn.id` rather than from anything captured when a
+            // menu was built, for `ddl_preview::apply`'s reason: the flag moves
+            // from the status bar while a menu stands open.
+            if connections.with_untracked(|cs| schemaic_core::connection::read_only_of(cs, conn.id))
+            {
+                let cfg = message_shell(
+                    "This connection is read-only in Schemaic. Its command-line client \
+                     would not be, so it is not opened here.",
+                );
+                (install_terminal)(&cfg, None, "read-only refusal message shell");
+                return;
+            }
             // For an SSH connection, point the client at the local tunnel
             // (127.0.0.1:<port>), not the firewalled remote host (review H11). If
             // the tunnel isn't up yet, say so rather than silently failing.
@@ -12835,6 +12895,112 @@ mod app_tests {
             erasing >= 9,
             "only {erasing} erasing saves in the delete closure; every store keyed \
              to the connection has to be one"
+        );
+    }
+
+    /// **The database CLI's read-only protection is a guard, not two disabled
+    /// controls.**
+    ///
+    /// What *Open in CLI* opens is a full write session carrying the
+    /// connection's password, on a connection where the app refuses a grid
+    /// commit and refuses *Kill session*. The whole protection was the schema
+    /// tree entry's `.disabled(…)` and the terminal button's enable term — the
+    /// shape the write-guard invariant names as insufficient — and the two did
+    /// not ask the same question: the entry asks `active_conn`, which is what is
+    /// launched, while the button asked the active *tab's* `conn_id` through
+    /// `active_tab_read_only`, which answers "writable" when no tab matches at
+    /// all.
+    ///
+    /// Both halves, because either alone is the bug: the launch has to refuse,
+    /// and the refusal has to be about the connection being launched.
+    #[test]
+    fn opening_the_database_cli_refuses_a_read_only_connection_at_the_launch() {
+        let src = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("src")
+                .join("main.rs"),
+        )
+        .expect("this file's own source");
+        let body = schemaic_ui::source_gate::production_code(&src);
+        let head = "let open_db_cli: Rc<dyn Fn(Option<String>)> = {";
+        let at = body.find(head).expect("`open_db_cli` — this gate is stale");
+        let end = at
+            + body[at..]
+                .find("\n    };")
+                .expect("the end of `open_db_cli`");
+        let region = &body[at..end];
+        assert!(
+            region.len() > 1_000,
+            "the launch was not located — this gate is reading {} bytes",
+            region.len()
+        );
+        assert!(
+            region.contains("read_only_of(cs, conn.id)"),
+            "`open_db_cli` no longer asks whether the connection it is about to \
+             open a write session on is read-only. A disabled control is not a \
+             guard, and the two controls did not even agree on the question."
+        );
+    }
+
+    /// **And the two builders own the tunnelled-TLS refusal**, rather than a
+    /// caller's `if`.
+    ///
+    /// `core::launch`'s invariant says a refusal is a `Result` the caller cannot
+    /// skip, and `sqlite_target`'s own doc states it at the site. This one was an
+    /// `Option` checked outside both builders, so a second launch path would
+    /// compile with it absent — the client told to dial `127.0.0.1` and verify
+    /// the server's certificate against the loopback. `open_db_cli` asks it
+    /// earlier as well, so that a verifying tunnelled connection hears why
+    /// before it hears that the tunnel is down; the authority is here.
+    #[test]
+    fn both_cli_builders_refuse_a_tunnelled_verifying_connection_themselves() {
+        let src = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("src")
+                .join("main.rs"),
+        )
+        .expect("this file's own source");
+        let body = schemaic_ui::source_gate::production_code(&src);
+        for builder in ["fn mysql_shell_config(", "fn psql_shell_config("] {
+            let at = body.find(builder).unwrap_or_else(|| {
+                panic!("{builder} is gone — this gate is stale");
+            });
+            let end = at + body[at..].find("\n}\n").expect("the end of the builder");
+            assert!(
+                body[at..end].contains("launch::tunnelled_verify_blocker(&conn.tls)"),
+                "{builder} no longer refuses a tunnelled verifying connection \
+                 itself, so the refusal is once again a caller's `if`"
+            );
+        }
+    }
+
+    /// **A double spawn failure leaves nothing, not the previous session.**
+    ///
+    /// `install_terminal`'s `Err` arm spawns a `message_shell` explaining the
+    /// failure. When *that* fails too it logged and returned — leaving the old
+    /// session installed, live, and under its old badge. So *Open in CLI* on
+    /// connection B could leave connection A's client on screen, and the next
+    /// line typed ran on A.
+    #[test]
+    fn a_terminal_that_could_not_be_replaced_holds_no_session_at_all() {
+        let src = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("src")
+                .join("main.rs"),
+        )
+        .expect("this file's own source");
+        let body = schemaic_ui::source_gate::production_code(&src);
+        let needle = "the message shell would not start either";
+        let at = body.find(needle).expect("the double-failure arm is gone");
+        let arm = &body[at..(at + 600).min(body.len())];
+        assert!(
+            arm.contains("*terminal.borrow_mut() = None;"),
+            "the double-failure arm leaves the previous session installed — a \
+             live client on a connection the user has asked to leave"
+        );
+        assert!(
+            arm.contains("term_db_label.set(None);"),
+            "…and still badged as whatever it was before"
         );
     }
 
