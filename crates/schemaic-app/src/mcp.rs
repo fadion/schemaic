@@ -1190,15 +1190,26 @@ mod tests {
     #[test]
     fn every_database_read_carries_the_deadline() {
         let src = include_str!("mcp.rs");
-        let body = src.split("#[cfg(test)]").next().expect("production code");
-        // Comments stripped before the window is measured: a paragraph
+        // The shared walk, not a cut at the first `#[cfg(test)]` — positional
+        // and not comment-aware. See `source_gate::production_code`, and the
+        // gate below, which reads this same file.
+        let body = schemaic_ui::source_gate::production_code(src);
+        let body = body.as_str();
+        // Comments dropped before the window is measured: a paragraph
         // explaining *why* a read has a deadline would otherwise push the
         // `with_deadline` that proves it out of view, which is exactly what it
         // did on the first run of this gate.
+        //
+        // **Blank lines too, now that the walk *blanks* a comment rather than
+        // removing it** — which it does so that a line number still means
+        // something. The old filter asked only whether a line starts with `//`,
+        // so every comment line came through as `""` and filled the window
+        // again, in the one function whose comments are longest.
         let code: Vec<(u32, &str)> = body
             .split('\n')
             .enumerate()
             .map(|(n, l)| (n as u32 + 1, l))
+            .filter(|(_, l)| !l.trim().is_empty())
             .filter(|(_, l)| !l.trim_start().starts_with("//"))
             .collect();
         let mut offenders: Vec<u32> = Vec::new();

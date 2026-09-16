@@ -3,7 +3,18 @@
 //! in production code (a floem `Dropdown`, a captured `Color`, a raw pixel inset,
 //! an unguarded `exec_after`).
 //!
-//! Test-only: nothing here is compiled into the app.
+//! **Compiled into the library, and it has to be.** A `#[cfg(test)] mod` is
+//! invisible to a *different* crate's tests, and `schemaic-app`'s gates need
+//! the cut — so `production_code` and the byte scanners under it are
+//! unconditional public API of `schemaic-ui`, rendered by `cargo doc` and held
+//! to `RUSTDOCFLAGS=-D warnings`. What is test-only is the corpus walkers
+//! (`crate_sources`, `workspace_sources`), which read the source tree at
+//! paths derived from `CARGO_MANIFEST_DIR` and mean nothing at runtime.
+//!
+//! Nothing here is *called* from the app: it is a handful of pure string
+//! functions that a linker with `--gc-sections` drops. That is a different
+//! claim from "not compiled", and this file said the second one for a while
+//! after it stopped being true.
 //!
 //! # Why this is one module and not eleven copies
 //!
@@ -48,9 +59,9 @@
 /// **`pub`, so the one walk is reachable from `schemaic-app`.** It was
 /// `pub(crate)`, and the consequence was a twelfth private copy in `app/ai.rs`
 /// carrying both defects this one exists to remove — a cut at the *first*
-/// literal `#[cfg(test)]`, found by a bare `str::find` over the raw text. Nothing
-/// here is compiled into the app; it is test-only by construction, and the
-/// alternative to exporting it is another copy.
+/// literal `#[cfg(test)]`, found by a bare `str::find` over the raw text. So
+/// this is unconditional public API rather than test-only, which the module doc
+/// states in full; the alternative to exporting it is another copy.
 pub fn production_code(src: &str) -> String {
     let b = src.as_bytes();
     let mut out = String::with_capacity(src.len());

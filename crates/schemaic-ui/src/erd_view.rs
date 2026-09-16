@@ -3802,7 +3802,10 @@ mod collapse_key_tests {
     fn every_container_keyed_on_the_collapse_map_dedups() {
         let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/erd_view.rs"))
             .expect("this module's own source");
-        let body = src.split("#[cfg(test)]").next().expect("production code");
+        // The shared walk, not a cut at the first `#[cfg(test)]` — which is
+        // positional and not comment-aware. See `source_gate::production_code`.
+        let body = crate::source_gate::production_code(&src);
+        let body = body.as_str();
         let lines: Vec<&str> = body.lines().collect();
         let mut checked = 0;
         for (i, l) in lines.iter().enumerate() {

@@ -2107,7 +2107,7 @@ impl Tab {
     /// **The statement this panel's rows actually came from**, which is not the
     /// same question as "what would a re-run be".
     ///
-    /// [`crate::grid::GridState::current_statement`] answers the second, from
+    /// `GridState::current_statement` answers the second, from
     /// `base_sql` + the grid's filter, and returns `None` for a **pinned** panel
     /// (a snapshot has no re-run) and for every panel of a **Run Everything**
     /// batch (`start_manual_run(None)` leaves the tab with no single base). Both

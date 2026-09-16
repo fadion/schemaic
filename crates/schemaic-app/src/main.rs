@@ -12680,11 +12680,7 @@ mod app_tests {
                 .join("main.rs"),
         )
         .expect("main.rs");
-        let body = src
-            .split("#[cfg(test)]")
-            .next()
-            .expect("production code")
-            .to_string();
+        let body = schemaic_ui::source_gate::production_code(&src);
         assert!(
             body.contains("tab.start_manual_run(Some(&sql));"),
             "the single-statement run no longer records its base"
@@ -12837,11 +12833,7 @@ mod app_tests {
                 .join("main.rs"),
         )
         .expect("this file's own source");
-        let body = src
-            .split("#[cfg(test)]")
-            .next()
-            .expect("production code")
-            .to_string();
+        let body = schemaic_ui::source_gate::production_code(&src);
         let calls: Vec<&str> = body
             .lines()
             .map(str::trim)
@@ -12881,11 +12873,7 @@ mod app_tests {
                 .join("main.rs"),
         )
         .expect("this file's own source");
-        let body = src
-            .split("#[cfg(test)]")
-            .next()
-            .expect("production code")
-            .to_string();
+        let body = schemaic_ui::source_gate::production_code(&src);
         // `rearm_activity(…)` spans several lines at two of the three sites and
         // its arguments carry parens of their own (`refresh.clone()`), so the
         // call is read by balancing rather than by matching a line or the first
@@ -12959,11 +12947,7 @@ mod app_tests {
                 .join("main.rs"),
         )
         .expect("this file's own source");
-        let body = src
-            .split("#[cfg(test)]")
-            .next()
-            .expect("production code")
-            .to_string();
+        let body = schemaic_ui::source_gate::production_code(&src);
         let hits: Vec<&str> = body
             .lines()
             .map(str::trim)
@@ -13587,7 +13571,7 @@ mod app_tests {
                 .expect("erd_view.rs"),
             ),
         ] {
-            let body = code.split("#[cfg(test)]").next().unwrap_or(&code);
+            let body = schemaic_ui::source_gate::production_code(&code);
             let code: String = body
                 .lines()
                 .filter(|l| !l.trim_start().starts_with("//"))
@@ -13618,6 +13602,16 @@ mod app_tests {
     }
 
     /// This file's production text — every source gate below reads it.
+    ///
+    /// **Through `source_gate::production_code`, not a cut at the first
+    /// `#[cfg(test)]`.** That cut carries both defects the shared walk exists to
+    /// remove: it is positional, so a file with an inline test-only `fn` above
+    /// its test module has everything after that `fn` silently dropped from
+    /// every gate reading it; and it is a plain `str::find`, so a `///` line
+    /// *mentioning* the attribute cuts there. `widgets.rs` lost 87% of itself to
+    /// the first of those. Latent here today — measured — but this file is the
+    /// corpus of a dozen gates, two of which this review found missing a live
+    /// site each, so it is not a risk worth carrying for a one-line saving.
     fn production_main() -> String {
         let src = std::fs::read_to_string(
             std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -13625,10 +13619,7 @@ mod app_tests {
                 .join("main.rs"),
         )
         .expect("this file's own source");
-        src.split("#[cfg(test)]")
-            .next()
-            .expect("production code")
-            .to_string()
+        schemaic_ui::source_gate::production_code(&src)
     }
 
     /// The closure binding a line sits in — `let <name>: Rc<dyn Fn…> = {` at

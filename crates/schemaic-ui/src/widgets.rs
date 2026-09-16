@@ -6324,70 +6324,137 @@ mod destructive_launch_gate {
     /// in-flight signal to read, and says so — but a connection's read-only flag
     /// always has somewhere to come from.
     ///
-    /// One exemption, and it is about what is being written rather than about
-    /// convenience — listed with its reason, the way `OWN_IN_FLIGHT_TERM` is.
+    /// Exemptions are about what is being written rather than about
+    /// convenience — each listed with its reason, the way `OWN_IN_FLIGHT_TERM`
+    /// is.
+    ///
+    /// **The whole call, not one line of it.** The first spelling read
+    /// `code.lines()` and split each line on the needle, so a call rustfmt had
+    /// broken across lines yielded an empty second argument and passed. Measured
+    /// against the fourteen live guard calls: six were invisible that way —
+    /// `dump_view.rs` ×3, `script_view.rs` ×2, `users_view.rs` — and five of
+    /// those six hand the guard the literal `false`, which is the precise defect
+    /// this gate is named for. Its entire live population was its own exemption
+    /// list: it was asserting over nothing. The floor is the other half, and the
+    /// half its two siblings already had: a needle that stops matching must not
+    /// be indistinguishable from a clean tree.
     #[test]
     fn no_launch_hands_the_guard_a_constant() {
-        /// (file, the call as written, why the read-only half is answered
-        /// somewhere else). Two entries, each about what is being written or
-        /// what refuses it — never about convenience.
+        /// (file, the call densed of whitespace, why the read-only half is
+        /// answered somewhere else). Each about what is being written or what
+        /// refuses it — never about convenience.
         const READ_ONLY_ANSWERED_ELSEWHERE: &[(&str, &str, &str)] = &[
             (
                 "grid.rs",
                 "accept_launch(writing,false)",
-                "`export_may_launch`: an export writes a *file*, not a server,                  so no connection's read-only flag is the question. Its own doc                  says so.",
+                "`export_may_launch`: an export writes a *file*, not a server, \
+                 so no connection's read-only flag is the question. Its own doc \
+                 says so.",
             ),
             (
                 "script_view.rs",
                 "accept_launch(s.running.get_untracked(),false)",
-                "`run_script` mints a `ScriptRequest::approved(policy(..))` two                  lines down, and `sql::script_verdict` answers `Block(\"Read-only                  connection.\")` — a refusal strictly stronger than this one, and                  the invariant's own named exception.",
+                "`run_script` mints a `ScriptRequest::approved(policy(..))` two \
+                 lines down, and `sql::script_verdict` answers `Block(\"Read-only \
+                 connection.\")` — a refusal strictly stronger than this one, and \
+                 the invariant's own named exception.",
+            ),
+            (
+                "dump_view.rs",
+                "accept_dialog_launch(d.running.get_untracked(),false,",
+                "A dump *reads* the server and writes a **file**. Same answer as \
+                 `grid.rs`'s export: no connection's read-only flag is the \
+                 question, because nothing is written to a connection. Two sites \
+                 — the save dialog's callback and the folder dialog's — and both \
+                 are the file-picking half, not a statement.",
+            ),
+            (
+                "dump_view.rs",
+                "accept_dialog_launch(ui.dump.running.get_untracked(),false,",
+                "The same dump, launched from the overwrite confirm. Writes a \
+                 file; see above.",
+            ),
+            (
+                "script_view.rs",
+                "accept_dialog_launch(s.running.get_untracked(),false,",
+                "Picking and probing a `.sql` file, which reads the file and \
+                 touches no server. The **run** is `accept_launch` at `:207`, \
+                 which is exempted above for its own, stronger reason.",
             ),
         ];
+        // Every guard call outside `widgets.rs`. Counted so a needle that stops
+        // matching fails loudly rather than reporting a clean tree — the floor
+        // the two gates beside this one already carry.
+        const LIVE_CALLS: usize = 12;
+        let mut checked = 0usize;
+        let mut offenders: Vec<String> = Vec::new();
         for (file, code) in crate::source_gate::crate_sources() {
             // This file *is* the guards; their own signatures and docs are not
             // call sites.
             if file == "widgets.rs" {
                 continue;
             }
-            for (n, line) in code.lines().enumerate() {
-                let dense: String = line.chars().filter(|c| !c.is_whitespace()).collect();
-                let Some(args) = GUARDS.iter().find_map(|g| {
-                    let needle: String = g.chars().filter(|c| !c.is_whitespace()).collect();
-                    dense.split_once(&needle).map(|(_, rest)| rest)
-                }) else {
-                    continue;
-                };
-                // The second argument, taken at the call's own paren depth so a
-                // `,` inside `get_untracked()` or a closure is not a separator.
-                let mut depth = 1usize;
-                let mut arg = 0usize;
-                let mut second = String::new();
-                for c in args.chars() {
-                    match c {
-                        '(' | '[' => depth += 1,
-                        ')' | ']' if depth == 1 => break,
-                        ')' | ']' => depth -= 1,
-                        ',' if depth == 1 => arg += 1,
-                        _ if arg == 1 => second.push(c),
-                        _ => {}
+            for g in GUARDS {
+                let mut from = 0usize;
+                while let Some(rel) = code[from..].find(g) {
+                    let open = from + rel + g.len();
+                    from = open;
+                    // The call's own arguments, to the `)` that closes it.
+                    let mut depth = 1usize;
+                    let mut arg = 0usize;
+                    let mut second = String::new();
+                    let mut span_end = open;
+                    for (i, c) in code[open..].char_indices() {
+                        span_end = open + i;
+                        match c {
+                            '(' | '[' => depth += 1,
+                            ')' | ']' if depth == 1 => break,
+                            ')' | ']' => depth -= 1,
+                            ',' if depth == 1 => arg += 1,
+                            _ if arg == 1 => second.push(c),
+                            _ => {}
+                        }
+                    }
+                    checked += 1;
+                    // Past the closing `)`, so an exemption may name the whole
+                    // call — `accept_launch(writing,false)` is how the two
+                    // original entries are written.
+                    let mut span_end = span_end + 1;
+                    while span_end < code.len() && !code.is_char_boundary(span_end) {
+                        span_end += 1;
+                    }
+                    let dense: String = code[open - g.len()..span_end.min(code.len())]
+                        .chars()
+                        .filter(|c| !c.is_whitespace())
+                        .collect();
+                    if READ_ONLY_ANSWERED_ELSEWHERE
+                        .iter()
+                        .any(|(f, call, _)| *f == file && dense.contains(call))
+                    {
+                        continue;
+                    }
+                    let second: String = second.chars().filter(|c| !c.is_whitespace()).collect();
+                    if matches!(second.as_str(), "true" | "false") {
+                        let line = 1 + code[..open].bytes().filter(|c| *c == b'\n').count();
+                        offenders.push(format!("{file}:{line}: `{dense}`"));
                     }
                 }
-                if READ_ONLY_ANSWERED_ELSEWHERE
-                    .iter()
-                    .any(|(f, call, _)| *f == file && dense.contains(call))
-                {
-                    continue;
-                }
-                assert!(
-                    !matches!(second.as_str(), "true" | "false"),
-                    "{file}:{}: `{}` — a constant in the guard's read-only slot \
-                     disables the half it stands for. Read the connection's flag \
-                     live, the way `ddl_preview::apply` does.",
-                    n + 1,
-                    line.trim()
-                );
             }
         }
+        assert!(
+            checked >= LIVE_CALLS,
+            "the needle stopped matching: {checked} guard calls found outside \
+             `widgets.rs`, and there are at least {LIVE_CALLS} — a gate that \
+             scans nothing reports success"
+        );
+        assert!(
+            offenders.is_empty(),
+            "a constant in the guard's read-only slot disables the half it \
+             stands for. Read the connection's flag live, the way \
+             `ddl_preview::apply` does — or give the site an entry in \
+             READ_ONLY_ANSWERED_ELSEWHERE with its reason:\n{}",
+            offenders.join("\n")
+        );
     }
 }
 
