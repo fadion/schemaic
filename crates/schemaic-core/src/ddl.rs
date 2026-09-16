@@ -4998,6 +4998,26 @@ impl ChangeSet {
         let d = self.dialect;
         let mut out = Vec::new();
         for c in &self.changes {
+            // **Deliberately *not* filtered on `supports_change`**, unlike
+            // `view_statements`, `routine_statements`, the container builders and
+            // (since the column loops were repaired) `emit_mysql`'s clause list.
+            // `a_misrouted_event_plan_is_rejected_by_the_server_not_swallowed`
+            // is the decision: an event change set reaching a non-MySQL emitter
+            // emits its statement so the server rejects it, rather than the plan
+            // reporting success having done nothing.
+            //
+            // **That leaves this family the one place `unsupported()` and
+            // `emit()` disagree**, which is why
+            // `a_refused_change_is_in_no_script_the_set_produces` carves it out
+            // by name rather than passing quietly: `supports_change` answers
+            // `false` for every event change on an engine with no scheduler, so
+            // the INCOMPLETE header would say "would leave out: Create event
+            // nightly" over a `CREATE EVENT` printed below it — the shape the
+            // column loops had. It is unreachable today (`supports_event_editing`
+            // gates the tree's folder, the Create entry and every way into the
+            // editor), and the column loops were unreachable too until one arm
+            // made them reachable. Whichever of the two decisions gives way, they
+            // cannot both stand.
             match c {
                 Change::CreateEvent(draft) => {
                     let e = &draft.info;
@@ -11375,6 +11395,176 @@ mod tests {
             assert!(
                 diff(&current, &draft, d).unsupported().is_empty(),
                 "{d:?} spells VIRTUAL/STORED and needs no refusal"
+            );
+        }
+    }
+
+    /// **A change this engine refuses contributes nothing to the script**, for
+    /// every change and every engine — not only the one arm a finding was filed
+    /// about.
+    ///
+    /// `unsupported()` and `emit()` are two halves of one decision, and the
+    /// INCOMPLETE header `withheld_header` prints says so in words: *"Running
+    /// the statements below anyway would leave out: …"*. Copy and Open in editor
+    /// are deliberately not disabled, so that sentence is the only thing telling
+    /// the user what is missing — and it was false, because `emit_mysql`'s
+    /// column loops were the one family of clause builders with no
+    /// `supports_change` filter.
+    ///
+    /// Stated as a property rather than per arm, which is the difference between
+    /// this and the test that missed it: *the script for a set is the script for
+    /// its supported changes*. A new refused arm inherits it; a new emitter that
+    /// forgets the filter fails it wherever `supports_change` says no.
+    ///
+    /// **One family is carved out, and it is a conflict rather than an
+    /// exemption.** `event_statements` deliberately does not filter:
+    /// `a_misrouted_event_plan_is_rejected_by_the_server_not_swallowed` decides
+    /// that an event change set reaching a non-MySQL emitter should emit its
+    /// statement so the *server* rejects it, rather than the plan reporting
+    /// success having done nothing. But `supports_change` answers `false` for
+    /// every event change on an engine with no scheduler, so on that path the
+    /// INCOMPLETE header says a change was left out and the script below it
+    /// holds that change — the same shape as the column loops this property was
+    /// written for. Both decisions are deliberate and they cannot both stand.
+    /// Unreachable today, because `supports_event_editing` gates every way into
+    /// the editor; the column loops were unreachable too, until `377dfb2` gave
+    /// `supports_change` its first `false` arm an `AlterColumn` could reach.
+    ///
+    /// **It is the PostgreSQL emitter alone.** `emit_sqlite` filters its whole
+    /// change list through `supported()`, so SQLite withholds the event and
+    /// agrees with its own header; the assertion below pins which engine the
+    /// conflict is on, so the carve-out cannot quietly widen.
+    ///
+    /// Carved out **by name** so it is greppable from both sides, rather than
+    /// left out of the fixture where it would read as untested.
+    #[test]
+    fn a_refused_change_is_in_no_script_the_set_produces() {
+        let col_of = |name: &str, stored: bool| ColumnInfo {
+            name: name.into(),
+            type_name: "int".into(),
+            generated: Some("a * 2".into()),
+            generated_stored: stored,
+            ..Default::default()
+        };
+        // Representative changes across the kinds `supports_change` narrows on:
+        // a MySQL stored flip, a materialized-view refresh, a schema create, a
+        // scheduled event, and an ordinary column change beside them so the set
+        // is mixed rather than wholly refused.
+        let changes = || {
+            vec![
+                Change::AlterColumn {
+                    from: Box::new(col_of("g", true)),
+                    to: Box::new(col_of("g", false)),
+                    position: None,
+                    inline_check: None,
+                },
+                Change::RefreshView {
+                    concurrently: false,
+                },
+                Change::CreateSchema {
+                    name: "app".into(),
+                    owner: None,
+                },
+                // MySQL's alone, so the other two refuse it. Held out of the
+                // comparison by `is_event` below, for the reason this test's doc
+                // gives — it is in the fixture so the carve-out is visible and
+                // checked, not so it is quietly absent.
+                Change::CreateEvent(Box::new(EventDraft::blank("nightly", None))),
+                // And the standalone PostgreSQL objects, which the other
+                // direction refuses — `object_statements` is `event_statements`'
+                // sibling and is reached from both emitters the same way.
+                Change::CreateSequence(Box::new(SequenceInfo {
+                    name: "s1".into(),
+                    ..Default::default()
+                })),
+                Change::CreateEnum(Box::new(EnumInfo {
+                    name: "mood".into(),
+                    values: vec!["ok".into()],
+                    ..Default::default()
+                })),
+                // A grant at MySQL's `*.*`, which PostgreSQL has no level for —
+                // so with the event carved out, every engine in the loop still
+                // refuses something and the premise below is real. It is also
+                // the narrowest arm `supports_change` has: `users::levels_for`,
+                // asked per level rather than per kind.
+                Change::GrantPrivileges(Box::new(crate::users::PrivilegeChange {
+                    account: crate::users::Principal {
+                        name: "app".into(),
+                        host: Some("%".into()),
+                        kind: crate::users::PrincipalKind::User,
+                        system: false,
+                        attributes: Vec::new(),
+                    },
+                    level: crate::users::GrantLevel::Global,
+                    privileges: vec!["SELECT".into()],
+                    with_grant_option: false,
+                })),
+                Change::AddColumn {
+                    column: Box::new(ColumnInfo {
+                        name: "plain".into(),
+                        type_name: "int".into(),
+                        ..Default::default()
+                    }),
+                    position: None,
+                },
+            ]
+        };
+        for d in [MySql, Postgres, Sqlite] {
+            let set = |changes: Vec<Change>| ChangeSet {
+                table: "t".into(),
+                schema: None,
+                dialect: d,
+                flavour: ServerFlavour::Unknown,
+                changes,
+            };
+            // The carve-out, by name: see this test's doc. An event change is
+            // *expected* in the script on an engine that refuses it, so it is
+            // held out of both sides rather than making the property false.
+            let is_event = |c: &Change| {
+                matches!(
+                    c,
+                    Change::CreateEvent(_) | Change::AlterEvent { .. } | Change::DropEvent(_)
+                )
+            };
+            let all = set(changes().into_iter().filter(|c| !is_event(c)).collect());
+            let supported = set(changes()
+                .into_iter()
+                .filter(|c| !is_event(c) && supports_change(d, c))
+                .collect());
+            // …and the carve-out really is one, on the one emitter it applies
+            // to. `emit_sqlite` filters the whole change list through
+            // `supported()` — the only `supports_change` any of the three
+            // emitters had before this campaign — so SQLite withholds the event
+            // and agrees with its own header. PostgreSQL is where the two
+            // decisions collide. If that stops being true, the carve-out above
+            // is dead weight and should go with it.
+            if d == Postgres {
+                let ev = set(vec![Change::CreateEvent(Box::new(EventDraft::blank(
+                    "nightly", None,
+                )))]);
+                assert!(!ev.unsupported().is_empty(), "{d:?}: not refused");
+                assert!(
+                    !ev.emit().is_empty(),
+                    "{d:?}: `event_statements` now filters, so the carve-out in \
+                     this test is stale — remove it and let the property cover \
+                     events too"
+                );
+            }
+            assert_eq!(
+                all.emit(),
+                supported.emit(),
+                "{d:?}: a refused change reached the script — {:?} was withheld",
+                all.unsupported()
+            );
+            assert_eq!(
+                all.editor_script().contains("INCOMPLETE"),
+                !all.unsupported().is_empty(),
+                "{d:?}: the header and the refusals disagree"
+            );
+            // The premise, so this cannot pass by nothing being refused.
+            assert!(
+                !all.unsupported().is_empty(),
+                "{d:?}: the fixture refuses nothing, so the property is untested"
             );
         }
     }
