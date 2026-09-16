@@ -4602,18 +4602,19 @@ mod tests {
             xlsx_memory_warning(ImportFormat::Xlsx, XLSX_WARN_BYTES + 1).is_some(),
             "nothing is said one byte past the threshold"
         );
-        // The factor is at least the load path's measured ratio. 13.27× at
-        // 100k × 50 and 13.53× at 20k × 50, both `--release` with a counting
-        // global allocator over this module.
-        assert!(
-            XLSX_MEMORY_FACTOR >= 14,
-            "the factor is below the measured load ratio"
-        );
-        // And the estimate is an over-estimate at the measured shape: a 23.3 MB
-        // workbook of 100k × 50 peaked at 309.5 MB.
+        // The estimate is an over-estimate at the two shapes the factor was
+        // measured on, `--release` with a counting global allocator over this
+        // module: 23.3 MB / 100k × 50 peaked at 309.5 MB on `row_iter`, and
+        // 4.7 MB / 20k × 50 at 13.53×. Stated over the estimate rather than over
+        // the constant, because `assert!(CONST >= n)` is an assertion with a
+        // constant value and cannot go red for the reason it is written for.
         assert!(
             xlsx_load_estimate(23_315_012) >= 309_468_534,
             "the estimate understates the shape it was measured on"
+        );
+        assert!(
+            xlsx_load_estimate(4_700_000) >= (4_700_000f64 * 13.53) as u64,
+            "the estimate understates the second measured shape"
         );
     }
 

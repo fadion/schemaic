@@ -985,6 +985,23 @@ pub fn drop_prompt(label: &str, rows: Option<RowCount>, shape: TableShape) -> St
     }
 }
 
+/// The title over [`drop_prompt`] — the same three answers, so the modal cannot
+/// say one thing in its heading and another in its body.
+///
+/// **Here rather than at the call site, because that is where it went wrong.**
+/// The body was routed through `drop_prompt` and the title three lines above it
+/// kept `if is_view { "Drop view" } else { "Drop table" }`, so a MariaDB
+/// sequence drew *"Drop table"* over *"Drop sq1? This can't be undone."* — the
+/// two halves of one modal disagreeing about what the object is. A view closure
+/// has no unit test to hold it; a pure pair does.
+pub fn drop_title(shape: TableShape) -> &'static str {
+    match shape {
+        TableShape::View => "Drop view",
+        TableShape::Sequence => "Drop sequence",
+        TableShape::Table => "Drop table",
+    }
+}
+
 /// A duration in seconds as the shortest sensible unit: `30s`, `5m`, `1h`,
 /// `24h`, `2d`. For naming a staleness window, not for precision.
 pub fn format_age(secs: u64) -> String {
@@ -2180,5 +2197,24 @@ mod tests {
             drop_prompt("sq1", None, TableShape::Sequence),
             drop_prompt("sq1", None, TableShape::View)
         );
+    }
+
+    /// **The title has to answer the same three, or the modal contradicts
+    /// itself.** The body was routed through `drop_prompt` and the title left on
+    /// `is_view`, so a sequence drew "Drop table" over "Drop sq1? This can't be
+    /// undone."
+    #[test]
+    fn the_drop_title_names_the_same_three_shapes_as_its_body() {
+        assert_eq!(drop_title(TableShape::Table), "Drop table");
+        assert_eq!(drop_title(TableShape::View), "Drop view");
+        assert_eq!(drop_title(TableShape::Sequence), "Drop sequence");
+        // The property, not the strings: three shapes, three titles.
+        let titles = [TableShape::Table, TableShape::View, TableShape::Sequence]
+            .map(drop_title)
+            .to_vec();
+        let mut uniq = titles.clone();
+        uniq.sort_unstable();
+        uniq.dedup();
+        assert_eq!(uniq.len(), titles.len(), "two shapes share a title");
     }
 }

@@ -2519,9 +2519,16 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                                     // about rows it doesn't own either — which is
                                     // also why `drop_prompt` never gives one a
                                     // row figure.
-                                    let title = if is_view { "Drop view" } else { "Drop table" };
+                                    //
+                                    // **The title asks the shape too.** It was
+                                    // `if is_view { … } else { … }` three lines
+                                    // above the `shape` the body was already
+                                    // using, so a MariaDB sequence read
+                                    // "Drop table" over "Drop sq1? This can't be
+                                    // undone." — the two halves of one modal
+                                    // disagreeing about what the object is.
                                     confirm.set(Some(crate::Confirm {
-                                        title: title.to_string(),
+                                        title: schemaic_core::stats::drop_title(shape).to_string(),
                                         message: schemaic_core::stats::drop_prompt(
                                             &label, rows, shape,
                                         ),
@@ -2532,12 +2539,36 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                                                     &db,
                                                     &tbl,
                                                     ns.as_deref(),
-                                                    if is_view {
-                                                        schemaic_core::ddl::Change::DropView {
-                                                            materialized,
+                                                    // **`DropTable` for a
+                                                    // sequence, deliberately.**
+                                                    // There is no
+                                                    // `Change::DropSequence`,
+                                                    // and MariaDB's own
+                                                    // `DROP TABLE sq1` drops a
+                                                    // sequence — measured on
+                                                    // 10.11.14: the object is
+                                                    // gone and the catalogue is
+                                                    // empty afterwards. So the
+                                                    // statement is right and it
+                                                    // was only ever the labels
+                                                    // that were wrong. Spelled
+                                                    // out per shape rather than
+                                                    // left on the boolean, so a
+                                                    // `DROP SEQUENCE` arm has a
+                                                    // place to land.
+                                                    {
+                                                        use schemaic_core::schema::TableShape;
+                                                        match shape {
+                                                            TableShape::View => {
+                                                                schemaic_core::ddl::Change::DropView {
+                                                                    materialized,
+                                                                }
+                                                            }
+                                                            TableShape::Sequence
+                                                            | TableShape::Table => {
+                                                                schemaic_core::ddl::Change::DropTable
+                                                            }
                                                         }
-                                                    } else {
-                                                        schemaic_core::ddl::Change::DropTable
                                                     },
                                                 );
                                             }

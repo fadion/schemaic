@@ -64,7 +64,7 @@ use crate::ddl::{
 use crate::intel::SqlDialect;
 use crate::schema::{
     DbSchema, DomainInfo, EnumInfo, EventInfo, RoutineInfo, RoutineKind, SequenceInfo, TableInfo,
-    TriggerInfo, display_name,
+    TableShape, TriggerInfo, display_name,
 };
 
 /// What kind of object a [`CompareEntry`] is about.
@@ -585,10 +585,23 @@ impl SchemaComparison {
         // `is_view` is part of the **key**, not something to diff: no `ALTER`
         // turns one into the other, so a name that swapped kinds is a drop and
         // a create rather than a migration nobody can express.
+        //
+        // **Three answers, not two.** `is_view` was the question, and it has
+        // only the two — so a MariaDB sequence, which the catalogue lists as a
+        // base table, fell on the "not a view, therefore an ordinary table"
+        // side. It was keyed `t:`, diffed as a table, and the plan offered
+        // `CREATE TABLE sq1 (next_not_cached_value bigint, …)` under a pane
+        // saying the object could not be restated. `TableShape` is the question
+        // with the third answer, and `TableInfo::create_ddl` — which builds
+        // those panes — was already asking it.
         let table_key = |t: &TableInfo| {
             format!(
                 "{}{}",
-                if t.is_view { "v:" } else { "t:" },
+                match t.shape() {
+                    TableShape::View => "v:",
+                    TableShape::Sequence => "q:",
+                    TableShape::Table => "t:",
+                },
                 display_name(t.schema.as_deref(), &t.name)
             )
         };
@@ -1498,9 +1511,16 @@ fn clashes_between(
     right: &DbSchema,
     dialect: SqlDialect,
 ) -> Vec<NameClash> {
+    // The shape, not `!is_view` — a MariaDB sequence is not a view and is not a
+    // table either, and pulling one into the clash census would make it a
+    // drop/create candidate for a name it has no `CREATE TABLE` for.
     let table_of = |src: &[TableInfo], e: &CompareEntry| -> Option<TableInfo> {
         src.iter()
-            .find(|t| !t.is_view && t.name == e.name && t.schema.as_deref() == e.schema.as_deref())
+            .find(|t| {
+                t.shape() == TableShape::Table
+                    && t.name == e.name
+                    && t.schema.as_deref() == e.schema.as_deref()
+            })
             .cloned()
     };
     let is_table = |e: &&CompareEntry| e.kind == CompareKind::Table;
@@ -1852,33 +1872,50 @@ fn table_entry(
     dialect: SqlDialect,
 ) -> CompareEntry {
     let any = l.or(r).expect("a pair holds at least one side");
-    let is_view = any.is_view;
-    let kind = if is_view {
-        CompareKind::View
-    } else {
-        CompareKind::Table
+    let shape = any.shape();
+    let is_view = shape == TableShape::View;
+    let kind = match shape {
+        TableShape::View => CompareKind::View,
+        TableShape::Sequence => CompareKind::Sequence,
+        TableShape::Table => CompareKind::Table,
     };
-    let changes = match (l, r) {
-        (Some(l), Some(r)) if is_view => match ViewDraft::from_table(r) {
-            Some(d) => ddl::diff_view(l, &d, dialect),
-            None => empty_set(&any.name, any.schema.as_deref(), dialect),
-        },
-        (Some(l), Some(r)) => ddl::diff(l, &TableDraft::from_table(r), target),
-        (None, Some(r)) if is_view => match ViewDraft::from_table(r) {
-            Some(d) => ddl::create_view(&d, dialect),
-            None => empty_set(&any.name, any.schema.as_deref(), dialect),
-        },
-        (None, Some(r)) => ddl::create(&TableDraft::from_table(r), dialect),
-        (Some(l), None) if is_view => ddl::single(
-            &l.name,
-            l.schema.as_deref(),
-            dialect,
-            Change::DropView {
-                materialized: l.view_options.as_ref().is_some_and(|o| o.materialized),
+    // **A sequence's columns are its counter, not its definition.** MariaDB
+    // reports `CREATE SEQUENCE sq1` as a base table whose columns are
+    // `next_not_cached_value`, `minimum_value` and the rest of the state row, so
+    // every arm below would have emitted a statement about a different object:
+    // `CREATE TABLE sq1 (…)` creates an ordinary table on the target, where
+    // `NEXTVAL(sq1)` then fails with *'db.sq1' is not a SEQUENCE* and a later
+    // real `CREATE SEQUENCE sq1` is refused for the name. An empty set is what
+    // `CompareEntry::unplannable` reads, so the object is disclosed through
+    // `omission_note` exactly as an unreadable view is — which is also what the
+    // right-hand DDL pane has been saying all along.
+    let changes = if shape == TableShape::Sequence {
+        empty_set(&any.name, any.schema.as_deref(), dialect)
+    } else {
+        match (l, r) {
+            (Some(l), Some(r)) if is_view => match ViewDraft::from_table(r) {
+                Some(d) => ddl::diff_view(l, &d, dialect),
+                None => empty_set(&any.name, any.schema.as_deref(), dialect),
             },
-        ),
-        (Some(l), None) => ddl::single(&l.name, l.schema.as_deref(), dialect, Change::DropTable),
-        (None, None) => unreachable!("a pair holds at least one side"),
+            (Some(l), Some(r)) => ddl::diff(l, &TableDraft::from_table(r), target),
+            (None, Some(r)) if is_view => match ViewDraft::from_table(r) {
+                Some(d) => ddl::create_view(&d, dialect),
+                None => empty_set(&any.name, any.schema.as_deref(), dialect),
+            },
+            (None, Some(r)) => ddl::create(&TableDraft::from_table(r), dialect),
+            (Some(l), None) if is_view => ddl::single(
+                &l.name,
+                l.schema.as_deref(),
+                dialect,
+                Change::DropView {
+                    materialized: l.view_options.as_ref().is_some_and(|o| o.materialized),
+                },
+            ),
+            (Some(l), None) => {
+                ddl::single(&l.name, l.schema.as_deref(), dialect, Change::DropTable)
+            }
+            (None, None) => unreachable!("a pair holds at least one side"),
+        }
     };
     // An index the model only partly read compares equal whatever the server
     // holds, so a match over one is a match this cannot vouch for.
@@ -2140,6 +2177,70 @@ mod tests {
 
     fn mysql(left: DbSchema, right: DbSchema) -> SchemaComparison {
         SchemaComparison::of(&left, &right, SqlDialect::MySql)
+    }
+
+    /// **A MariaDB sequence is not a table, and the plan must not offer one.**
+    ///
+    /// MariaDB's catalogue reports `CREATE SEQUENCE sq1` as a base table whose
+    /// columns are its counter state — `next_not_cached_value`, `minimum_value`
+    /// and the rest. `table_key` asked `is_view`, which has only two answers, so
+    /// the sequence fell on the "not a view, therefore an ordinary table" side:
+    /// keyed `t:`, diffed as a table, and the plan emitted
+    /// `CREATE TABLE sq1 (next_not_cached_value bigint, …)`. Applying that
+    /// creates an ordinary table on the target, where `NEXTVAL(sq1)` fails with
+    /// *'db.sq1' is not a SEQUENCE* and a later real `CREATE SEQUENCE sq1` is
+    /// refused for the name — and nothing was in `omitted`, so the user was told
+    /// the object had been migrated. The reverse direction emitted
+    /// `DROP TABLE sq1`.
+    ///
+    /// The contradiction was on screen the whole time: the right-hand DDL pane
+    /// is built from `TableInfo::create_ddl`, which *does* ask the shape, and
+    /// says the object cannot be restated.
+    #[test]
+    fn a_sequence_is_not_offered_as_a_table() {
+        let seq = |name: &str| TableInfo {
+            name: name.to_string(),
+            is_sequence: true,
+            columns: vec![
+                col("next_not_cached_value", "bigint"),
+                col("minimum_value", "bigint"),
+            ],
+            ..Default::default()
+        };
+        // Only on the right: a create.
+        let c = mysql(schema_of(vec![]), schema_of(vec![seq("sq1")]));
+        let plan = c.plan(|_| true);
+        let sql = plan.emit().join("\n");
+        assert!(
+            !sql.contains("CREATE TABLE"),
+            "a sequence was offered as a table:\n{sql}"
+        );
+        assert!(
+            plan.omitted.iter().any(|o| o.contains("sq1")),
+            "the object was dropped from the plan silently: {:?}",
+            plan.omitted
+        );
+        assert_eq!(find(&c, "sequence:sq1").kind, CompareKind::Sequence);
+
+        // Only on the left: no `DROP TABLE` either.
+        let c = mysql(schema_of(vec![seq("sq1")]), schema_of(vec![]));
+        let plan = c.plan(|_| true);
+        let sql = plan.emit().join("\n");
+        assert!(!sql.contains("DROP TABLE"), "{sql}");
+        assert!(plan.omitted.iter().any(|o| o.contains("sq1")));
+
+        // A sequence and a table of the same name are two objects, not one
+        // that changed kind — the reason the shape is part of the key.
+        let c = mysql(
+            schema_of(vec![seq("sq1")]),
+            schema_of(vec![table("sq1", &[("id", "int")])]),
+        );
+        assert!(
+            keys(&c).contains(&"sequence:sq1".to_string())
+                && keys(&c).contains(&"table:sq1".to_string()),
+            "{:?}",
+            keys(&c)
+        );
     }
 
     /// **A `Same` row can still have two different texts under it.** On SQLite
