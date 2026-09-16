@@ -102,7 +102,8 @@ pub(crate) fn pointer_placed_focus() -> bool {
 ///
 /// **Use it beside every `.keyboard_navigable()`**, and on the floem views that
 /// are focusable without one — the text editor the SQL pane and `edit_field`
-/// are built on, and the grid's inline `text_input`. `keyboard_focus_report_gate`
+/// are built on, and the grid's inline `text_input`.
+/// `menu_return_gate::every_navigable_view_reports_the_press_that_focuses_it`
 /// keeps the first half honest; the second half is a census this comment is the
 /// record of, because a floem built-in announces nothing a gate could match.
 pub(crate) fn takes_pointer_focus<V: IntoView + 'static>(view: V) -> V::V {
