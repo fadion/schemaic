@@ -5617,17 +5617,32 @@ fn matches_across<'a>(
     // The leftovers, for the databases that used all of their share. Re-asking
     // re-walks, so it is done only where there is room to fill and only for a
     // database that proved it has more.
+    //
+    // **A second per-database share, not the whole leftover to the first.** It
+    // asked each capped database for `share + room` in turn, so the first one in
+    // **catalogue order** took as much of the spare as it had — which is the
+    // crowd-out `7bc6e69` set out to end, returned one level up. Ten databases,
+    // `limit` 80, three of them holding 50 matches each gave **50 / 22 / 8**
+    // instead of 27/27/26; at 200 databases, **50 / 29 / 1**. `db_shares` below
+    // cannot compensate, because every `take[i]` is capped by `want[i]` — a
+    // bucket that was never allowed to collect more has nothing for the merge to
+    // hand back. Catalogue order is not a policy, it is an accident, which is
+    // the reason `db_shares` itself gives for its round-robin.
     let mut room = limit.saturating_sub(buckets.iter().map(Vec::len).sum::<usize>());
     if room > 0 {
-        for (i, (database, schema)) in dbs.iter().enumerate() {
+        let hungry: Vec<usize> = (0..dbs.len())
+            .filter(|&i| buckets[i].len() >= share)
+            .collect();
+        // The same split the first sweep made, over the databases that proved
+        // they have more and the room that is actually left.
+        let extra = scan_share(room, hungry.len());
+        for i in hungry {
             if room == 0 {
                 break;
             }
-            if buckets[i].len() < share {
-                continue;
-            }
+            let (database, schema) = dbs[i];
             let mut more = Vec::new();
-            schema_hits(database, schema, q, share + room, &mut more);
+            schema_hits(database, schema, q, share + extra.min(room), &mut more);
             room = room.saturating_sub(more.len().saturating_sub(buckets[i].len()));
             buckets[i] = more;
         }
@@ -6486,6 +6501,59 @@ mod find_tests {
         assert!(
             names.iter().filter(|n| n.starts_with("analytics.")).count() >= 40,
             "{names:?}"
+        );
+    }
+
+    /// **The *leftover* is shared too, and it was first-come in catalogue
+    /// order.**
+    ///
+    /// The second sweep asked each capped database for `share + room` in turn,
+    /// so the first one to fill its share took as much of the spare as it had.
+    /// Ten databases, `limit` 80, three of them holding 50 matches each gave
+    /// **50 / 22 / 8** instead of 27/27/26; at 200 databases, **50 / 29 / 1**.
+    /// `db_shares` cannot compensate — every `take[i]` is capped by `want[i]`,
+    /// and a bucket that was never allowed to collect more has nothing for the
+    /// merge to hand back.
+    ///
+    /// Driven through `matches_across` rather than `db_shares`, which is where
+    /// the defect is: nothing calls that function with a mixed bucket population
+    /// today, so
+    /// `a_databases_share_does_not_collapse_to_first_come` tests it against the
+    /// one bucket shape the second sweep could not produce.
+    #[test]
+    fn the_leftover_budget_is_shared_rather_than_taken_by_the_first_database() {
+        let fifty = |tag: &str| DbSchema {
+            tables: (0..50)
+                .map(|i| TableInfo {
+                    name: format!("orders_{tag}_{i}"),
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        };
+        let (a, b, c) = (fifty("a"), fifty("b"), fifty("c"));
+        let empty = DbSchema::default();
+        // Three flooded databases in catalogue order, then seven with nothing.
+        let mut dbs: Vec<(&str, &DbSchema)> = vec![("a_db", &a), ("b_db", &b), ("c_db", &c)];
+        for name in ["d", "e", "f", "g", "h", "i", "j"] {
+            dbs.push((name, &empty));
+        }
+        let hits = super::matches_across(dbs, "orders", 80);
+        assert_eq!(hits.len(), 80, "the list is still full");
+        let count = |tag: &str| {
+            hits.iter()
+                .filter(|h| match &h.target {
+                    FindTarget::Table { source, .. } => source.table.contains(&format!("_{tag}_")),
+                    FindTarget::Object { .. } => false,
+                })
+                .count()
+        };
+        let (na, nb, nc) = (count("a"), count("b"), count("c"));
+        assert_eq!(na + nb + nc, 80, "{na}/{nb}/{nc}");
+        // Even to within the remainder, rather than 50/22/8.
+        assert!(
+            [na, nb, nc].iter().all(|&n| (26..=27).contains(&n)),
+            "the first database in catalogue order took the leftover: {na}/{nb}/{nc}"
         );
     }
 
