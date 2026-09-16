@@ -780,6 +780,24 @@ fn preview_table(ui: Ui) -> impl IntoView {
                 .style(|s| s.padding(theme::scaled(12.0)))
                 .into_any();
             }
+            // **Columns without values.** A JSON file whose first record is
+            // larger than the prefix the preview reads yields its column names
+            // and nothing else (`import::read_json_columns`), which is enough to
+            // map and import. Said here because the alternative is a header over
+            // an empty body, which reads as an empty file — and `values_withheld`
+            // rather than `rows.is_empty()`, because a file with a header and no
+            // records has the same shape and a different explanation.
+            if sample.values_withheld {
+                return container(
+                    text(
+                        "This file's first record is too large to preview, so only the \
+                         column names were read. Mapping and import read the whole file.",
+                    )
+                    .style(|s| s.color(theme::text_dim()).font_size(theme::font_body())),
+                )
+                .style(|s| s.padding(theme::scaled(12.0)))
+                .into_any();
+            }
 
             // Header row: bold dim labels on the grid's own header height, with
             // the same bottom rule the results grid draws.

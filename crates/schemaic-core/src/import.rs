@@ -847,6 +847,21 @@ pub enum ImportError {
     /// Not one file column maps to a table column, so there's nothing to insert.
     /// Caught here rather than emitting `INSERT INTO t () VALUES ()`.
     NoColumnsMapped,
+    /// A JSON file whose **first record alone** is larger than the preview
+    /// reads, carrying the cap in bytes.
+    ///
+    /// **A variant rather than a `Read(String)`, because it is not a read
+    /// failure and the caller has to be able to tell.** The file is valid and
+    /// the whole-file walk reads it end to end; only the preview cannot be
+    /// built from a prefix. Spelled as a message, it reached the modal through
+    /// the same channel as "this file is corrupt", the sample stayed `None`, and
+    /// Next is gated on the sample — so a valid file could not be imported at
+    /// all. [`read_json_columns`] is the answer, and a caller can only reach for
+    /// it if it can recognise the case.
+    PreviewRecordTooLarge {
+        /// The preview's byte cap, as [`SAMPLE_MAX_BYTES`].
+        cap: u64,
+    },
 }
 
 impl std::fmt::Display for ImportError {
@@ -856,6 +871,12 @@ impl std::fmt::Display for ImportError {
             ImportError::NoColumnsMapped => {
                 write!(f, "No file columns are mapped to table columns")
             }
+            ImportError::PreviewRecordTooLarge { cap } => write!(
+                f,
+                "its first JSON record is larger than the {} MiB the preview \
+                 reads, so there is nothing to show",
+                cap / (1024 * 1024)
+            ),
         }
     }
 }
@@ -880,6 +901,15 @@ pub struct Sample {
     pub rows: Vec<Vec<Field>>,
     /// More records exist beyond the sample.
     pub more: bool,
+    /// The columns are real and the **values were not read** — see
+    /// [`read_json_columns`].
+    ///
+    /// A flag rather than letting the view infer it from `rows.is_empty()`: a
+    /// file with a header and no records has exactly that shape, and the note
+    /// the two deserve is not the same one. `more && rows.is_empty()` happens to
+    /// discriminate today, which is precisely the kind of accident that stops
+    /// being true without anyone noticing.
+    pub values_withheld: bool,
 }
 
 fn reader_for<R: std::io::Read>(r: R, cfg: &ReadConfig) -> csv::Reader<R> {
@@ -1015,6 +1045,7 @@ fn read_csv_sample<R: std::io::Read>(
                     columns,
                     rows,
                     more: false,
+                    values_withheld: false,
                 });
             }
         }
@@ -1050,6 +1081,7 @@ fn read_csv_sample<R: std::io::Read>(
         columns,
         rows,
         more,
+        values_withheld: false,
     })
 }
 
@@ -1271,15 +1303,13 @@ fn json_records<R: std::io::Read>(
                     }
                     // Nothing parsed, and the reader delivered every byte the
                     // cap allows: the first record alone is bigger than the
-                    // preview reads. Say that, rather than repeating serde's
-                    // `EOF while parsing` — the file is fine and the whole-file
-                    // walk reads it.
+                    // preview reads. Its own variant, rather than serde's
+                    // `EOF while parsing` or a sentence — the file is fine, the
+                    // whole-file walk reads it, and the caller has to be able to
+                    // tell this from corruption so it can fall back to
+                    // [`read_json_columns`].
                     if seen.get() >= cap {
-                        return Err(ImportError::Read(format!(
-                            "its first JSON record is larger than the {} MiB the preview reads, \
-                             so there is nothing to show",
-                            cap / (1024 * 1024)
-                        )));
+                        return Err(ImportError::PreviewRecordTooLarge { cap });
                     }
                 }
                 return Err(ImportError::Read(e.to_string()));
@@ -1406,6 +1436,7 @@ pub fn read_workbook_sample<R: std::io::Read>(
             columns,
             rows,
             more,
+            values_withheld: false,
         },
         sheets,
     ))
@@ -1943,7 +1974,89 @@ fn read_json_sample<R: std::io::Read>(r: R, limit: usize) -> Result<Sample, Impo
         columns,
         rows,
         more,
+        values_withheld: false,
     })
+}
+
+/// The columns of a JSON file whose first record the preview cannot hold —
+/// **keys only, values skipped**.
+///
+/// The answer to [`ImportError::PreviewRecordTooLarge`]. The mapping step needs
+/// a column list and nothing else to be usable; the preview's rows are a
+/// convenience. So when one record is larger than the prefix the preview reads —
+/// one long text or base64 column does it — this reads the *first record alone*,
+/// unbounded in bytes and bounded in memory, and hands back that record's keys
+/// with no rows. The user maps the columns and imports; the whole-file walk was
+/// always going to read every byte anyway.
+///
+/// **Unbounded bytes is not unbounded memory.** Every value is deserialized as
+/// `serde::de::IgnoredAny`, which parses and discards without allocating, so a
+/// two-gigabyte record costs its key names. That is the whole reason this can
+/// drop the cap the preview cannot.
+///
+/// A second reader, because the first was consumed: the caller reopens the file.
+/// `more` is `true` unconditionally — one record was read, and there is no
+/// claim here about whether it was the only one.
+pub fn read_json_columns<R: std::io::Read>(r: R) -> Result<Sample, ImportError> {
+    let mut columns: Vec<String> = Vec::new();
+    // `BTreeMap`, not `serde_json::Map`, which only deserializes with `Value` as
+    // its value type — and `Value` is the allocation this exists to avoid. The
+    // key order is the same either way: `serde_json::Map` *is* a `BTreeMap`
+    // without the `preserve_order` feature, which is what `json_records`' own
+    // doc says about the column order it produces.
+    let stream = serde_json::Deserializer::from_reader(ArrayUnwrap::new(r))
+        .into_iter::<std::collections::BTreeMap<String, serde::de::IgnoredAny>>();
+    // The first record only — its keys are the column list, and reading a second
+    // buys nothing this path can use.
+    let mut stream = stream;
+    if let Some(v) = stream.next() {
+        let map = v.map_err(|e| ImportError::Read(e.to_string()))?;
+        columns.extend(map.into_keys());
+    }
+    if columns.is_empty() {
+        return Err(ImportError::Read(
+            "expected JSON objects (an array of them, or one per line)".into(),
+        ));
+    }
+    Ok(Sample {
+        columns,
+        rows: Vec::new(),
+        more: true,
+        values_withheld: true,
+    })
+}
+
+/// The mapping step's sample for a file, **falling back to its column list when
+/// the preview cannot be built from a prefix**.
+///
+/// `open` returns a fresh reader on the file; it is called again only on the
+/// fallback, which needs to start over — the first reader is spent by then and
+/// the failure is not knowable until it has been.
+///
+/// **The decision lives here rather than in the probe's closure** because it is
+/// the composition that was wrong, not either half: `read_sample` correctly
+/// refuses to invent a preview, and the modal correctly gates Next on having a
+/// sample — and between them a valid JSON file whose first record is one long
+/// text or base64 column could not be imported at all, under a sentence saying
+/// the *preview* was the problem. A decision in a view closure is a decision no
+/// test can reach, which is how it stayed that way.
+///
+/// Only [`ImportError::PreviewRecordTooLarge`] falls back. A truncated or
+/// malformed file still fails, on the same bytes, through a different reader.
+pub fn probe_sample<R: std::io::Read>(
+    open: impl Fn() -> std::io::Result<R>,
+    format: ImportFormat,
+    cfg: &ReadConfig,
+    limit: usize,
+) -> Result<Sample, ImportError> {
+    let first = open().map_err(|e| ImportError::Read(e.to_string()))?;
+    match read_sample(first, format, cfg, limit) {
+        Err(ImportError::PreviewRecordTooLarge { .. }) => {
+            let again = open().map_err(|e| ImportError::Read(e.to_string()))?;
+            read_json_columns(again)
+        }
+        other => other,
+    }
 }
 
 /// How much memory a JSON load needs, as a multiple of the file's size.
@@ -5410,6 +5523,12 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("preview"), "{msg}");
         assert!(!msg.contains("EOF while parsing"), "{msg}");
+        // **A variant, not a sentence**, because the caller has to tell this
+        // from corruption to know it can fall back to `read_json_columns`.
+        assert!(
+            matches!(err, ImportError::PreviewRecordTooLarge { .. }),
+            "{err:?}"
+        );
 
         // The file itself is fine, which is the whole point: the unbounded walk
         // reads it.
@@ -5420,6 +5539,102 @@ mod tests {
         })
         .expect("the file is not corrupt");
         assert_eq!(n, 1);
+    }
+
+    /// **…and the file is still importable.**
+    ///
+    /// The half the message left out. `read_sample` returning `Err` sets the
+    /// modal's sample to `None`, and Next is gated on the sample being `Some` —
+    /// so a valid JSON file whose first record is one long text or base64 column
+    /// could not be imported at all, under a sentence explaining that the
+    /// *preview* was the problem.
+    ///
+    /// The mapping step needs a column list and nothing else. `read_json_columns`
+    /// reads the first record with every value as `IgnoredAny` — unbounded in
+    /// bytes, bounded in memory — and hands back its keys with no rows.
+    #[test]
+    fn a_json_record_too_big_to_preview_still_yields_its_columns() {
+        let big = "x".repeat(SAMPLE_MAX_BYTES as usize + 1024);
+        let json = format!(r#"[{{"id": 1, "body": "{big}", "note": null}}]"#);
+
+        let s = read_json_columns(json.as_bytes()).expect("the columns are readable");
+        assert_eq!(
+            s.columns,
+            vec!["body".to_string(), "id".to_string(), "note".to_string()],
+            "every key of the first record, including the null one"
+        );
+        assert!(s.rows.is_empty(), "there are deliberately no preview rows");
+        assert!(s.more);
+
+        // And the columns it names are the ones the whole-file walk emits, which
+        // is the property that makes the mapping built from them correct.
+        let mut walked: Vec<String> = Vec::new();
+        json_records(json.as_bytes(), &mut walked, 1, None, |_, _| true)
+            .expect("the file is not corrupt");
+        assert_eq!(
+            walked, s.columns,
+            "the fallback names different columns from the walk that will import them"
+        );
+    }
+
+    /// **The composition, which is where the defect was.**
+    ///
+    /// `read_sample` refusing to invent a preview is right, and the modal gating
+    /// Next on having a sample is right; between them a valid JSON file whose
+    /// first record is one long text or base64 column could not be imported at
+    /// all. The decision that joins them used to live in the probe's closure,
+    /// where no test could reach it.
+    #[test]
+    fn a_file_whose_first_record_cannot_be_previewed_is_still_probed() {
+        let big = "x".repeat(SAMPLE_MAX_BYTES as usize + 1024);
+        let json = format!(r#"[{{"id": 1, "body": "{big}"}}]"#);
+
+        // The half that refuses, unchanged.
+        assert!(matches!(
+            read_sample(json.as_bytes(), ImportFormat::Json, &cfg(true), 200),
+            Err(ImportError::PreviewRecordTooLarge { .. })
+        ));
+
+        // …and the probe over the same file hands back something the mapping
+        // step can use.
+        let s = probe_sample(|| Ok(json.as_bytes()), ImportFormat::Json, &cfg(true), 200)
+            .expect("a file the walk can read is a file the modal can offer");
+        assert_eq!(s.columns, vec!["body".to_string(), "id".to_string()]);
+        assert!(s.values_withheld, "the view has to be able to say why");
+        assert!(s.rows.is_empty());
+
+        // An ordinary file is untouched by any of this — same sample, one read.
+        let plain = r#"[{"a": 1, "b": 2}]"#;
+        let via_probe =
+            probe_sample(|| Ok(plain.as_bytes()), ImportFormat::Json, &cfg(true), 200).unwrap();
+        let direct = read_sample(plain.as_bytes(), ImportFormat::Json, &cfg(true), 200).unwrap();
+        assert_eq!(via_probe, direct);
+        assert!(!via_probe.values_withheld);
+    }
+
+    /// A genuinely broken file is still broken on the fallback path — it is a
+    /// different reader over the same bytes, not a way past the parser.
+    #[test]
+    fn the_column_only_read_still_refuses_a_broken_file() {
+        // …including through the probe, which must not turn a corrupt file into
+        // a column list.
+        assert!(
+            probe_sample(
+                || Ok(br#"[{"a": "unterminated"#.as_slice()),
+                ImportFormat::Json,
+                &cfg(true),
+                200,
+            )
+            .is_err(),
+            "the probe fell back on a file that is genuinely truncated"
+        );
+        assert!(read_json_columns(br#"[{"a": "unterminated"#.as_slice()).is_err());
+        assert!(read_json_columns(b"not json at all".as_slice()).is_err());
+        assert!(
+            read_json_columns(b"[1, 2, 3]".as_slice()).is_err(),
+            "an array of scalars has no columns"
+        );
+        assert!(read_json_columns(b"[]".as_slice()).is_err(), "no records");
     }
 
     /// The other half of the same question: a file that really is truncated

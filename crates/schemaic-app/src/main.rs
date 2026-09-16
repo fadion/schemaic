@@ -3636,8 +3636,15 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                                 )
                                 .map_err(|e| e.to_string())?
                             } else {
-                                let sample = schemaic_core::import::read_sample(
-                                    std::io::BufReader::new(f),
+                                // `probe_sample`, not `read_sample`: the
+                                // fallback to a column-only read, when the
+                                // preview cannot be built from a prefix, is a
+                                // decision with a test — see its doc for why it
+                                // is not written here. `f` is dropped; the
+                                // reopen is the fallback's own.
+                                drop(f);
+                                let sample = schemaic_core::import::probe_sample(
+                                    || std::fs::File::open(&req.path).map(std::io::BufReader::new),
                                     req.format,
                                     &cfg,
                                     SAMPLE_ROWS,
