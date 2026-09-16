@@ -331,6 +331,19 @@ impl CompareEntry {
     ///
     /// An empty set emits nothing, so the case this was written for is still
     /// covered.
+    ///
+    /// **It costs an `emit()`, and one caller pays it per keystroke.** The
+    /// compare footer's `planned` memo runs [`is_planned`] — which ends in this
+    /// — once per difference, on every tick-box toggle. Measured in `--release`
+    /// over 200 differing SQLite tables selected whole: 0.6–0.7 ms per tick for
+    /// plain tables, 2.3–2.5 ms when every entry is a twelve-step
+    /// `sqlite_rebuild_sql` (8 columns, 8 indexes each). Linear in objects.
+    /// That is under a frame at this size and is left alone on purpose — the
+    /// reasoning, and the point at which it stops being true, are written out at
+    /// the memo in `ui/compare_view.rs`. Anything moved here to make it cheaper
+    /// must give the same answer: a *non-empty* set that emits nothing is the
+    /// whole case, and `self.changes.is_empty()` was the spelling that got it
+    /// wrong.
     pub fn unplannable(&self) -> bool {
         self.status.is_difference() && self.changes.emit().is_empty()
     }

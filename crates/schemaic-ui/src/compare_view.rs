@@ -1089,6 +1089,28 @@ fn footer(ui: Ui, close: Rc<dyn Fn()>, ring: FocusRing) -> impl IntoView {
     // checkbox. The statement count went with it: the preview shows that, and
     // it cannot be had without emitting.
     //
+    // **One `emit()` came back, one level down, and this paragraph did not
+    // notice.** `377dfb2` made `CompareEntry::unplannable` ask what the change
+    // set *emits* rather than whether it is empty — which is correct, and is
+    // what keeps a difference the emitter has no arm for out of an irreversible
+    // `run_ddl` — and `is_planned` runs that predicate per difference, here, per
+    // tick. So the outer build was removed and an inner one took its place.
+    //
+    // **Measured before deciding what to do about it**, because the paragraph
+    // above asserts a magnitude nobody had taken: `--release`, 200 differing
+    // SQLite tables selected whole, the body below timed over 20 iterations.
+    // Plain tables: **0.6–0.7 ms** per tick. The expensive shape — 8 columns and
+    // 8 indexes each, so every entry is a twelve-step `sqlite_rebuild_sql`:
+    // **2.3–2.5 ms**. Real, and about 15% of a 16.7 ms frame rather than the
+    // whole of it; linear in objects, so it becomes a frame at roughly 1,500.
+    //
+    // Left as it is, deliberately and with the number written down rather than
+    // as an omission. The structural fix is to memoise the answer per
+    // `CompareEntry` — it cannot change while the comparison is alive — and that
+    // means a field on a struct with twenty literal constructions, for a cost
+    // this size. If a comparison of that scale ever becomes ordinary, the memo
+    // is the change to make, and `unplannable`'s answer must not move with it.
+    //
     // `with` rather than `get` on the selection, so the `HashSet` is read in
     // place instead of cloned.
     let planned = create_memo(move |_| {
