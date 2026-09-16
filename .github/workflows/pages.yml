@@ -153,6 +153,32 @@ jobs:
             || { echo "::error::the apt repository's Suite is no longer stable"; fail=1; }
           grep -q 'Origin: Schemaic`, `Suite: stable' packaging/repo/README.md \
             || { echo "::error::packaging/repo/README.md documents a different Origin/Suite"; fail=1; }
+
+          # `Components` and `Architectures` are the same class of value one
+          # field further down the deb822 stanza, and they had no guard at all.
+          # They are written into every user's source list, and the repository's
+          # index is laid out under `dists/stable/<component>/binary-<arch>/` —
+          # so a change on either side alone publishes an index at a path the
+          # source lists do not ask for, and `apt update` 404s on every machine
+          # that already has one. `Architectures` had no backstop anywhere:
+          # verify-site.py hard-codes `main/binary-amd64`, which means it would
+          # only ever notice the mismatch as a missing file, and only if the
+          # *other* side moved.
+          #
+          # Three places, deliberately: the stanza the user installs, the
+          # builder that lays the index out, and the checker that fetches it.
+          grep -q '^Components: main$' packaging/repo/build-site.sh \
+            || { echo "::error::the published source list no longer names the 'main' component; every schemaic.sources in the wild asks for it"; fail=1; }
+          grep -q '^Architectures: amd64$' packaging/repo/build-site.sh \
+            || { echo "::error::the published source list no longer names the amd64 architecture"; fail=1; }
+          grep -q '^COMPONENT="main"$' packaging/repo/build-apt-repo.sh \
+            || { echo "::error::the apt repository is built under a component the source list does not name"; fail=1; }
+          grep -q '^ARCH="amd64"$' packaging/repo/build-apt-repo.sh \
+            || { echo "::error::the apt repository is built for an architecture the source list does not name"; fail=1; }
+          grep -q '"main", "binary-amd64"' packaging/repo/verify-site.py \
+            || { echo "::error::verify-site.py checks an index path the source list does not point at"; fail=1; }
+          grep -q 'arch=amd64 ' packaging/repo/build-site.sh \
+            || { echo "::error::the one-line .list and the deb822 stanza disagree about the architecture"; fail=1; }
           [ "$fail" -eq 0 ]
 
       - name: Build the site

@@ -54,8 +54,9 @@ KEYRING="/usr/share/keyrings/schemaic-archive-keyring.gpg"
 # key passes. On Debian the substituted key then signs every future
 # `apt-get upgrade` of schemaic, root-run, for the life of the install; on RPM
 # `rpm --import` puts it in the **global** rpm keyring, where it validates
-# packages from any repository on the machine, permanently, and no line in the
-# uninstall instructions removes it.
+# packages from any repository on the machine, permanently — which is why the
+# rpm uninstall instructions now end in `rpm -e gpg-pubkey-<id>`, derived from
+# this constant so the two cannot drift.
 #
 # **Rotating the key means editing this constant and README.md's copy together**,
 # and saying so in the release notes: an installed machine keeps the old key
@@ -273,8 +274,9 @@ require_published_key() {
 # passed the check and printed "Signing key verified" — and then the **whole
 # file** was installed: apt trusts every key in a `Signed-By` keyring, and
 # `rpm --import` imports every block in the file into the machine's *global*
-# keyring, where it validates packages from any repository, permanently, and no
-# line of the uninstall instructions removes it.
+# keyring, where it validates packages from any repository, permanently — and
+# the uninstall line names only *our* key id, so a second key smuggled in beside
+# it would outlive the uninstall even now.
 #
 # Counting `^pub:` records is the narrow version of "install only the key you
 # verified": it refuses the composed file rather than re-exporting from it, so
@@ -775,6 +777,23 @@ case "$family" in
         fi
         ;;
     rpm)
+        # **The key `rpm --import` put in the machine-global keyring.**
+        #
+        # The debian route's uninstall line removes ${KEYRING}, which is a file
+        # this script installed and nothing else uses. The rpm route has no such
+        # file: `rpm --import` writes the key into the rpm *database*, where it
+        # validates packages from any repository on the machine, permanently —
+        # and not one of the three uninstall lines below removed it. Somebody
+        # following them to the letter was left trusting a signing key for
+        # software they had just removed.
+        #
+        # `gpg-pubkey-<keyid>` is how rpm names it: the low 8 hex digits of the
+        # long key id, lower-cased, which is the last 16 of the fingerprint's
+        # first 8. Derived from ${KEY_FINGERPRINT} rather than written out, so
+        # the two cannot drift — the fingerprint is already the value CI pins and
+        # the key check compares against.
+        rpm_key_id="$(printf '%s' "${KEY_FINGERPRINT}" | tail -c 8 | tr 'A-F' 'a-f')"
+        rpm_key_removal="&& sudo rpm -e --allmatches gpg-pubkey-${rpm_key_id}"
         if [ "${SCHEMAIC_NO_REPO:-0}" = 1 ] || { ! has dnf && ! has zypper; }; then
             info "Updates:   none - this is a single package, with no repository behind it."
             info "           Re-run this script without SCHEMAIC_NO_REPO to get them."
@@ -784,6 +803,12 @@ case "$family" in
             # `sudo dnf remove` there names a command that is not on the
             # machine. The install went through `rpm -i --nosignature`, so the
             # way back out is `rpm -e`.
+            #
+            # **And no key line on this branch**: this install went through
+            # `rpm -i --nosignature` and never ran `rpm --import`, so there is
+            # no `gpg-pubkey` of ours in the database to remove. Telling the
+            # user to remove one would be a line that fails, on the branch
+            # where they are least able to tell whether that mattered.
             if has dnf; then
                 info "Uninstall: sudo dnf remove schemaic"
             elif has zypper; then
@@ -793,11 +818,14 @@ case "$family" in
             fi
         elif has dnf; then
             info "Updates:   with the rest of your system - sudo dnf upgrade."
-            info "Uninstall: sudo dnf remove schemaic && sudo rm /etc/yum.repos.d/schemaic.repo"
+            info "Uninstall: sudo dnf remove schemaic \\"
+            info "           && sudo rm /etc/yum.repos.d/schemaic.repo \\"
+            info "           ${rpm_key_removal}"
         else
             info "Updates:   with the rest of your system - sudo zypper update."
             info "Uninstall: sudo zypper remove schemaic \\"
-            info "           && sudo rm /etc/zypp/repos.d/schemaic.repo"
+            info "           && sudo rm /etc/zypp/repos.d/schemaic.repo \\"
+            info "           ${rpm_key_removal}"
         fi
         ;;
     appimage)
