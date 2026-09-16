@@ -314,10 +314,14 @@ fn run_dump(ui: Ui, target: DumpTarget) {
                                 .unwrap_or_default(),
                         )))
                     }
-                    DumpOutcome::Cancelled => d.error.set(Some(format!(
-                        "Export cancelled — {name} was not changed; what had been written is in {}",
-                        schemaic_core::export::part_path(&name)
-                    ))),
+                    // Through `export_cancel_note`, which is the function that
+                    // already knows both sentences — and which takes `partial`
+                    // for exactly this reason. The unconditional sentence here
+                    // pointed at a `.part` that a cancel during the schema read
+                    // never created.
+                    DumpOutcome::Cancelled { partial } => d.error.set(Some(
+                        schemaic_core::export::export_cancel_note(&name, partial),
+                    )),
                     DumpOutcome::Failed { message, partial } => {
                         d.error.set(Some(schemaic_core::export::export_failure_note(
                             &message,

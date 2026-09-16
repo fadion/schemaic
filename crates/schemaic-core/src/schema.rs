@@ -2060,11 +2060,21 @@ impl TriggerInfo {
                 format!("{name}({args})")
             }
             // Symmetric to the MySQL branch: PostgreSQL has nowhere to put a body.
+            //
+            // **Comment-safed, not merely quoted** — the fifth site of the
+            // family, and the only one that interpolated a server-supplied name
+            // with no treatment at all. A trigger named `t1` + newline +
+            // `DROP DATABASE prod; --` turns the second line of this note into a
+            // top-level statement in whatever script carries it, and
+            // `Db::run_script`'s guard deliberately never reads the file. Same
+            // rule as the two arms above and `create_ddl`'s: nothing
+            // server-supplied reaches a `--` line without `export::comment_text`.
             TriggerAction::Body(_) => {
                 return format!(
                     "-- Schemaic can't emit a PostgreSQL trigger without a function to call.\n\
-                     -- Trigger {} on {qtable} has an inline body, which PostgreSQL has no place for.",
-                    self.name
+                     -- Trigger {} on {} has an inline body, which PostgreSQL has no place for.",
+                    crate::export::comment_text(&self.name),
+                    crate::export::comment_text(&qtable),
                 );
             }
         };

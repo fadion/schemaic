@@ -193,7 +193,19 @@ pub enum WriteEnd {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DumpVerdict {
     Done,
-    Cancelled,
+    /// `partial` means the same thing it does on [`DumpVerdict::Failed`], and it
+    /// is here for the same reason it was added there.
+    ///
+    /// **A cancel during the schema read never opened a file.** `fetch_schema`
+    /// takes the token precisely because it is the longest phase on a large
+    /// database, and it returns before `part_of` is computed and before the
+    /// writer is spawned — so no `shop.sql.part` exists anywhere, while the
+    /// modal said "what had been written is in shop.sql.part" and sent the user
+    /// to look for it. That is the identical false claim `c3c2127` removed from
+    /// the `Failed` arm one line over, which this enum did not follow.
+    Cancelled {
+        partial: bool,
+    },
     /// `partial` means a `.part` fragment is on disk and worth naming.
     Failed {
         message: String,
@@ -221,7 +233,14 @@ pub fn dump_verdict(read: ReadEnd, write: WriteEnd) -> DumpVerdict {
     // writer is the only thing that knows, so it says.
     let failed = |message: String, partial: bool| DumpVerdict::Failed { message, partial };
     match (read, write) {
-        (ReadEnd::Cancelled, _) => DumpVerdict::Cancelled,
+        // The writer is the only thing that knows whether a fragment exists —
+        // the same rule `partial` follows on the `Failed` arms. `Wrote` reaches
+        // here when the reader was cancelled after the writer had finished its
+        // own stream, and `Died` when it was holding the file.
+        (ReadEnd::Cancelled, WriteEnd::Failed { opened, .. }) => {
+            DumpVerdict::Cancelled { partial: opened }
+        }
+        (ReadEnd::Cancelled, _) => DumpVerdict::Cancelled { partial: true },
         (_, WriteEnd::Failed { message, opened }) => failed(message, opened),
         // The worker died mid-run, so whatever it had opened is still there.
         (_, WriteEnd::Died(e)) => failed(format!("Export failed: worker died: {e}"), true),
@@ -1097,7 +1116,15 @@ pub fn plan(
     // than the dropped key above — that is a constraint the restore survives
     // without, this is a `CREATE TABLE` that cannot run — and it was the half
     // with no sentence.
-    if !outside_deps.is_empty() {
+    // **Gated on `opts.structure`, because the sentence is about the structure
+    // section.** It says "the CREATE TABLE statements name it", and a data-only
+    // dump has none — the file is `INSERT`s, and a data-only restore into an
+    // existing database needs the type no more and no less than the target
+    // already has. So the user was sent to satisfy a dependency the file does
+    // not have. Its sibling one block up is gated by construction, because
+    // `dropped_fks` is only incremented inside the structure step; this one is
+    // computed above it and had no such arithmetic in front of it.
+    if opts.structure && !outside_deps.is_empty() {
         header.push_str(&format!(
             "\n--\n-- {} {} used by the tables above {} outside this export and {} not in\n\
              -- this file; the CREATE TABLE statements name {}: {}.\n\
@@ -2313,6 +2340,34 @@ mod tests {
                 "and the name is still legible: {sql}"
             );
         }
+
+        // **The fifth arm of the same family, and the one the sweep missed.**
+        // A MySQL/SQLite trigger carries a `Body` and a PostgreSQL one carries a
+        // `Function`, so this note needs a `TriggerInfo` rendered in a dialect
+        // other than the one it was read from — exactly the reachability the two
+        // arms above have. It interpolated the trigger's own name and its table
+        // with no treatment at all, so a name carrying a newline made the second
+        // line a top-level statement in whatever script carried it, and
+        // `Db::run_script`'s guard deliberately never reads the file.
+        let body = TriggerInfo {
+            name: "t1\nDROP DATABASE prod;".to_string(),
+            table: "orders\nDROP TABLE customers;".to_string(),
+            timing: TriggerTiming::Before,
+            events: vec![TriggerEvent::Insert],
+            action: TriggerAction::Body("SET NEW.a = 1".to_string()),
+            ..Default::default()
+        };
+        let sql = body.create_sql(SqlDialect::Postgres);
+        for line in sql.lines() {
+            assert!(
+                line.trim_start().starts_with("--"),
+                "the note grew a line that is not a comment: {line:?}\n{sql}"
+            );
+        }
+        assert!(
+            sql.contains("t1 DROP DATABASE prod;"),
+            "and the name is still legible: {sql}"
+        );
     }
 
     /// A dump must never name an object it does not create.
@@ -3126,12 +3181,44 @@ mod tests {
             },
             WriteEnd::Died("panic".to_string()),
         ] {
-            assert_eq!(
-                dump_verdict(ReadEnd::Cancelled, write.clone()),
-                DumpVerdict::Cancelled,
+            assert!(
+                matches!(
+                    dump_verdict(ReadEnd::Cancelled, write.clone()),
+                    DumpVerdict::Cancelled { .. }
+                ),
                 "{write:?}"
             );
         }
+
+        // **And `partial` is the writer's answer here too**, not a constant —
+        // the same correction `partial` got on the `Failed` arms, which this one
+        // did not follow. A cancel that arrives before `File::create` leaves no
+        // fragment, and the note pointed at one regardless.
+        assert_eq!(
+            dump_verdict(
+                ReadEnd::Cancelled,
+                WriteEnd::Failed {
+                    message: "permission denied".to_string(),
+                    opened: false,
+                }
+            ),
+            DumpVerdict::Cancelled { partial: false }
+        );
+        assert_eq!(
+            dump_verdict(
+                ReadEnd::Cancelled,
+                WriteEnd::Failed {
+                    message: "disk full".to_string(),
+                    opened: true,
+                }
+            ),
+            DumpVerdict::Cancelled { partial: true }
+        );
+        // A writer that finished its stream, or died holding the file, had one.
+        assert_eq!(
+            dump_verdict(ReadEnd::Cancelled, WriteEnd::Wrote),
+            DumpVerdict::Cancelled { partial: true }
+        );
     }
 
     /// **`partial` is a fact about the disk, not a constant.**
@@ -3707,6 +3794,35 @@ mod tests {
         // The file really does not create it — the sentence is about a gap, not
         // a change of what is emitted.
         assert!(!file.contains("CREATE TYPE"), "{file}");
+
+        // **And a data-only dump is not that gap.** The sentence says "the
+        // CREATE TABLE statements name it", and a data-only file has none: it
+        // is `INSERT`s, and a restore into an existing database needs the type
+        // no more and no less than the target already has. Telling the user to
+        // go and satisfy a dependency the file does not have is the same shape
+        // as the `.part` that was never written. Its sibling sentence one block
+        // up is gated by construction, because `dropped_fks` is only
+        // incremented inside the structure step; this one was computed above it.
+        let data_only = file_of(&plan(
+            &s,
+            "shop",
+            &all(&s),
+            DumpOptions {
+                structure: false,
+                data: true,
+                ..DumpOptions::default()
+            },
+            SqlDialect::Postgres,
+        ));
+        assert!(
+            !data_only.contains("outside this export"),
+            "a file with no CREATE TABLE claims its CREATE TABLE statements name \
+             a type:\n{data_only}"
+        );
+        // The premise, so this cannot pass by the dump being empty: the file has
+        // a row step for the table and no `CREATE TABLE` for it.
+        assert!(data_only.contains("rows orders"), "{data_only}");
+        assert!(!data_only.contains("CREATE TABLE"), "{data_only}");
     }
 
     /// And it is a *whole identifier* match, on the two places a column names

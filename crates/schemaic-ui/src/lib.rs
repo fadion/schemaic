@@ -695,7 +695,16 @@ pub enum DumpOutcome {
         /// that must not read as a clean success.
         missing: Vec<String>,
     },
-    Cancelled,
+    /// `partial` says whether a `.part` fragment is on disk and worth naming —
+    /// the same field `Failed` carries, and for the same reason.
+    ///
+    /// **A cancel during the schema read never opened a file.** `run` returns
+    /// here before `part_of` is computed and before the writer is spawned, so
+    /// nothing was ever created — and the modal's sentence was unconditional,
+    /// sending the user to look for a `shop.sql.part` that is not there.
+    Cancelled {
+        partial: bool,
+    },
     Failed {
         message: String,
         partial: bool,

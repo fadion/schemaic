@@ -105,7 +105,10 @@ pub(crate) async fn run(
     // done.
     let schema = match db.fetch_schema(&req.database, token.clone()).await {
         Ok(s) => s,
-        Err(DbError::Cancelled) => return DumpOutcome::Cancelled,
+        // `partial: false` — this is the whole point of the flag. The writer is
+        // spawned thirty lines below, so nothing has been created and the note
+        // must not point at a `.part` that does not exist.
+        Err(DbError::Cancelled) => return DumpOutcome::Cancelled { partial: false },
         Err(e) => return failed(format!("Export failed: {e}"), false),
     };
     let dump = plan(&schema, &req.database, &req.tables, req.opts, req.dialect);
@@ -197,7 +200,11 @@ pub(crate) async fn run(
     // says so as an *error*, which would be reported as a failed dump rather than
     // a stopped one. Ask the token instead: it is the only witness either way.
     if token.is_cancelled() {
-        return DumpOutcome::Cancelled;
+        // The writer ran, so ask *it* whether a fragment exists rather than
+        // assuming one — a structure-only dump cancelled before `File::create`
+        // is the case that has none.
+        let partial = !matches!(&written, Ok(Err(e)) if !e.opened);
+        return DumpOutcome::Cancelled { partial };
     }
 
     // The five-arm resolution is `core::dump::dump_verdict`'s, with tests: it is a
@@ -223,7 +230,7 @@ pub(crate) async fn run(
         Err(e) => WriteEnd::Died(e.to_string()),
     };
     match dump_verdict(read, write) {
-        DumpVerdict::Cancelled => DumpOutcome::Cancelled,
+        DumpVerdict::Cancelled { partial } => DumpOutcome::Cancelled { partial },
         DumpVerdict::Failed { message, partial } => failed(message, partial),
         DumpVerdict::Done => DumpOutcome::Done {
             // The file's own count: every table it covers, streamed or not.
@@ -438,7 +445,9 @@ pub(crate) async fn run_files(
             Err(e) => (WriteEnd::Died(e.to_string()), None),
         };
         match schemaic_core::dump::dump_verdict(read_end, write_end) {
-            DumpVerdict::Cancelled => {
+            // A folder export names the files it published rather than a single
+            // `.part`, so `partial` has nothing to say here.
+            DumpVerdict::Cancelled { .. } => {
                 sweep();
                 return FilesOutcome::Cancelled {
                     files: done,
