@@ -838,19 +838,46 @@ fn outside_dependencies(
 ) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     for kind in [ObjectKind::Enum, ObjectKind::Domain, ObjectKind::Sequence] {
-        for o in schema.objects_all(kind) {
+        let all = schema.objects_all(kind);
+        // **The names of this kind the file will itself create.** An unqualified
+        // mention resolves through the search path, and if this dump emits an
+        // object of that name the mention is satisfied by it. Without this, a
+        // `sales` table whose column is typed `status` reported `archive.status`
+        // as an outside dependency while the file emits `CREATE TYPE
+        // sales.status` — an object it does have a local twin of.
+        //
+        // Per kind, not across all three: a sequence named `status` must not
+        // suppress a real dependency on an enum of the same name, which is a
+        // separate catalogue in PostgreSQL.
+        let local: std::collections::HashSet<&str> = all
+            .iter()
+            .filter(|o| !o.is_internal() && namespaces.iter().any(|ns| ns.as_deref() == o.schema()))
+            .map(|o| o.name())
+            .collect();
+        for o in &all {
             // An internal sequence is the column's own counter — it comes back
             // with the column, so it is not missing.
             if o.is_internal() || namespaces.iter().any(|ns| ns.as_deref() == o.schema()) {
                 continue;
             }
+            // **Qualified first, and it is definitive.** `archive.status` in a
+            // type or a `nextval('archive.status_seq'::regclass)` names this
+            // object and no other, whatever else the file creates.
+            // `names_identifier` only checks the run's outer boundaries, so a
+            // dotted needle works unchanged.
+            let qualified = o.schema().map(|ns| format!("{ns}.{}", o.name()));
+            let bare = !local.contains(o.name());
+            let mentions = |text: &str| {
+                qualified
+                    .as_deref()
+                    .is_some_and(|q| names_identifier(text, q))
+                    || (bare && names_identifier(text, o.name()))
+            };
             let named = order.iter().any(|&i| {
-                schema.tables[i].columns.iter().any(|c| {
-                    names_identifier(&c.type_name, o.name())
-                        || c.default
-                            .as_deref()
-                            .is_some_and(|d| names_identifier(d, o.name()))
-                })
+                schema.tables[i]
+                    .columns
+                    .iter()
+                    .any(|c| mentions(&c.type_name) || c.default.as_deref().is_some_and(mentions))
             });
             if named {
                 // Qualified unconditionally, unlike `display_name`: the whole
@@ -1554,17 +1581,26 @@ pub fn colliding_files(plan: &FilePlan, exists: impl Fn(&str) -> bool) -> Vec<St
 /// Plan order, not `published` order: that is the order the prompt names them in
 /// and the order they would have been replaced in.
 ///
-/// **A `.part` counts as destroyed once its published sibling is published**:
-/// the rename that publishes `orders.csv` is what consumes `orders.csv.part`,
-/// so the two go together. A fragment whose table the export never reached is
-/// still sitting there and is not named.
-pub fn destroyed(colliding: &[String], published: &[String]) -> Vec<String> {
+/// **A `.part` counts as destroyed once its table was *attempted*, not once its
+/// sibling was published.** The rename that publishes `orders.csv` consumes
+/// `orders.csv.part`, so publishing is one way — but the writer truncates the
+/// `.part` with `File::create` at the *start* of every attempt, and both the
+/// cancel and the failure arms then sweep it. So a table whose retry was stopped
+/// or failed destroyed the fragment an earlier run had left, and nothing named
+/// it: `published` holds only the tables that finished, so the one file the user
+/// might still have wanted back was the one the report was silent about. A
+/// fragment whose table the export never reached is still sitting there and is
+/// not named, which is unchanged.
+///
+/// `published` is a subset of `attempted`, so the published-sibling rule is the
+/// same rule; it is kept as its own term because a published file is destroyed
+/// under its *own* name as well as its fragment's.
+pub fn destroyed(colliding: &[String], published: &[String], attempted: &[String]) -> Vec<String> {
     colliding
         .iter()
         .filter(|f| {
-            published
-                .iter()
-                .any(|p| p == *f || crate::export::part_path(p) == **f)
+            published.iter().any(|p| p == *f)
+                || attempted.iter().any(|a| crate::export::part_path(a) == **f)
         })
         .cloned()
         .collect()
@@ -1914,26 +1950,26 @@ mod tests {
             "customers.csv".to_string(),
             "items.csv".to_string(),
         ];
-        // Stopped before the first table finished.
-        assert!(destroyed(&census, &[]).is_empty());
+        // Stopped before the first table finished — and before it was opened.
+        assert!(destroyed(&census, &[], &[]).is_empty());
         // Stopped after the second.
-        assert_eq!(
-            destroyed(
-                &census,
-                &["orders.csv".to_string(), "customers.csv".to_string()]
-            ),
-            ["orders.csv".to_string(), "customers.csv".to_string()]
-        );
+        let two = ["orders.csv".to_string(), "customers.csv".to_string()];
+        assert_eq!(destroyed(&census, &two, &two), two);
         // A file the export wrote that was not there before is not a
         // replacement, however far the run got.
-        assert!(destroyed(&[], &["orders.csv".to_string()]).is_empty());
+        assert!(
+            destroyed(
+                &[],
+                &["orders.csv".to_string()],
+                &["orders.csv".to_string()]
+            )
+            .is_empty()
+        );
         // Plan order, not publication order — the order the prompt named them
         // in, and the order they would have gone in.
+        let out_of_order = ["items.csv".to_string(), "orders.csv".to_string()];
         assert_eq!(
-            destroyed(
-                &census,
-                &["items.csv".to_string(), "orders.csv".to_string()]
-            ),
+            destroyed(&census, &out_of_order, &out_of_order),
             ["orders.csv".to_string(), "items.csv".to_string()]
         );
 
@@ -1946,15 +1982,47 @@ mod tests {
             "orders.csv.part".to_string(),
             "items.csv.part".to_string(),
         ];
+        let orders = ["orders.csv".to_string()];
         assert_eq!(
-            destroyed(&with_parts, &["orders.csv".to_string()]),
+            destroyed(&with_parts, &orders, &orders),
             ["orders.csv".to_string(), "orders.csv.part".to_string()],
             "the fragment the rename consumed was not reported"
         );
         assert!(
-            destroyed(&with_parts, &[]).is_empty(),
-            "a run that published nothing destroyed nothing"
+            destroyed(&with_parts, &[], &[]).is_empty(),
+            "a run that opened nothing destroyed nothing"
         );
+    }
+
+    /// **The fragment a *stopped retry* destroyed, which nothing named.**
+    ///
+    /// `write_one` truncates the table's `.part` with `File::create` before it
+    /// writes a byte, and the cancel and failure arms then sweep it. So a table
+    /// that was begun and did not finish destroyed whatever fragment an earlier
+    /// run had left there — the file `export_failure_note` had just told the user
+    /// holds their rows — while `published`, which only finished tables reach,
+    /// said nothing about it. The report's `replaced` clause is the *only* place
+    /// a folder export ever says it destroyed anything.
+    #[test]
+    fn a_fragment_a_stopped_retry_truncated_is_named_even_though_nothing_published() {
+        let census = ["orders.csv.part".to_string()];
+        // The run reached `orders` and was stopped inside it: nothing published,
+        // and the pre-existing fragment is gone all the same.
+        assert_eq!(
+            destroyed(&census, &[], &["orders.csv".to_string()]),
+            ["orders.csv.part".to_string()],
+            "the fragment this run truncated and swept was not reported"
+        );
+        // A table the run never reached keeps its fragment, and is not named.
+        assert!(
+            destroyed(&census, &[], &["items.csv".to_string()]).is_empty(),
+            "a fragment the export never opened is still sitting there"
+        );
+        // And the published name is still reported under its own name as well as
+        // its fragment's.
+        let both = ["orders.csv".to_string(), "orders.csv.part".to_string()];
+        let orders = ["orders.csv".to_string()];
+        assert_eq!(destroyed(&both, &orders, &orders), both);
     }
 
     #[test]
@@ -3887,6 +3955,101 @@ mod tests {
         // a row step for the table and no `CREATE TABLE` for it.
         assert!(data_only.contains("rows orders"), "{data_only}");
         assert!(!data_only.contains("CREATE TABLE"), "{data_only}");
+    }
+
+    /// **…and it does not name an object the file emits a local twin of.**
+    ///
+    /// The census matched `o.name()` bare against the column's type and default,
+    /// with the namespace added afterwards for the sentence only — so with
+    /// `sales.status` and `archive.status` both in the catalogue, a `sales` table
+    /// whose column is typed `status` reported `archive.status` as an outside
+    /// dependency. An unqualified type resolves through the search path, and this
+    /// file creates `sales.status`, so the mention is satisfied.
+    ///
+    /// **The direction matters.** Over-reporting costs a false line in a header;
+    /// under-reporting lets a restore stop on a type the file never mentioned.
+    /// So the suppression is narrow: only a *bare* mention, and only when this
+    /// dump itself emits an object of that name and kind. A qualified mention
+    /// still names the object it qualifies, and a bare mention with no local twin
+    /// is still reported.
+    #[test]
+    fn an_outside_object_shadowed_by_a_local_one_is_not_a_dependency() {
+        let mut t = table("orders");
+        t.schema = Some("sales".to_string());
+        t.columns[0].type_name = "status".to_string();
+        let mut s = schema_of(vec![t]);
+        // The one the file will create…
+        s.enums.push(crate::schema::EnumInfo {
+            name: "status".to_string(),
+            schema: Some("sales".to_string()),
+            values: vec!["new".to_string()],
+            ..Default::default()
+        });
+        // …and a same-named one in a namespace this dump has no business in.
+        s.enums.push(crate::schema::EnumInfo {
+            name: "status".to_string(),
+            schema: Some("archive".to_string()),
+            values: vec!["old".to_string()],
+            ..Default::default()
+        });
+        let file = file_of(&plan(
+            &s,
+            "shop",
+            &all(&s),
+            DumpOptions::default(),
+            SqlDialect::Postgres,
+        ));
+        assert!(
+            file.contains("CREATE TYPE"),
+            "the premise: the file emits the local twin\n{file}"
+        );
+        assert!(
+            !file.contains("archive.status"),
+            "the header names an object the file emits a local twin of:\n{file}"
+        );
+
+        // And the narrowness, in both directions. A *qualified* mention of the
+        // out-of-namespace object is still a dependency…
+        let mut t2 = table("orders");
+        t2.schema = Some("sales".to_string());
+        t2.columns[0].type_name = "archive.status".to_string();
+        let mut s2 = schema_of(vec![t2]);
+        s2.enums = s.enums.clone();
+        let file2 = file_of(&plan(
+            &s2,
+            "shop",
+            &all(&s2),
+            DumpOptions::default(),
+            SqlDialect::Postgres,
+        ));
+        assert!(
+            file2.contains("archive.status"),
+            "a qualified mention names the object it qualifies:\n{file2}"
+        );
+
+        // …and a bare mention with no local twin is still reported, which is the
+        // case this must not have broken.
+        let mut t3 = table("orders");
+        t3.schema = Some("sales".to_string());
+        t3.columns[0].type_name = "status".to_string();
+        let mut s3 = schema_of(vec![t3]);
+        s3.enums.push(crate::schema::EnumInfo {
+            name: "status".to_string(),
+            schema: Some("archive".to_string()),
+            values: vec!["old".to_string()],
+            ..Default::default()
+        });
+        let file3 = file_of(&plan(
+            &s3,
+            "shop",
+            &all(&s3),
+            DumpOptions::default(),
+            SqlDialect::Postgres,
+        ));
+        assert!(
+            file3.contains("archive.status"),
+            "a bare mention with nothing local to satisfy it is still a gap:\n{file3}"
+        );
     }
 
     /// And it is a *whole identifier* match, on the two places a column names

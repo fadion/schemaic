@@ -344,6 +344,13 @@ pub(crate) async fn run_files(
     // a folder the same sentence had just said nothing was written to. See
     // `dump::destroyed`.
     let mut published: Vec<String> = Vec::new();
+    // **And what it has *opened*.** `write_one` truncates the table's `.part`
+    // with `File::create` before it writes a byte, and both the cancel and the
+    // failure arms then sweep it — so a table whose retry was stopped destroyed
+    // the fragment an earlier run had left, while `published` (which only the
+    // finished tables reach) said nothing about it. That fragment is the one
+    // file in the folder the user might still have wanted back.
+    let mut attempted: Vec<String> = Vec::new();
 
     for (i, step) in plan.files.iter().enumerate() {
         // **Asked before the table is begun**, so a Stop that landed between two
@@ -354,7 +361,7 @@ pub(crate) async fn run_files(
             return FilesOutcome::Cancelled {
                 files: done,
                 missing,
-                replaced: schemaic_core::dump::destroyed(&replaced, &published),
+                replaced: schemaic_core::dump::destroyed(&replaced, &published, &attempted),
             };
         }
         // Best-effort, exactly as the dump's: a full progress channel must never
@@ -367,6 +374,9 @@ pub(crate) async fn run_files(
         });
         let path = req.folder.join(&step.file);
         let part = part_of(&path);
+        // Recorded here, before the writer is spawned: from this point the
+        // `.part` is this run's, truncated whatever happens next.
+        attempted.push(step.file.clone());
         let (row_tx, row_rx) = tokio::sync::mpsc::channel::<ExportChunk>(2);
         let w_token = token.clone();
         let (format, dialect) = (req.format, req.dialect);
@@ -452,7 +462,7 @@ pub(crate) async fn run_files(
                 return FilesOutcome::Cancelled {
                     files: done,
                     missing,
-                    replaced: schemaic_core::dump::destroyed(&replaced, &published),
+                    replaced: schemaic_core::dump::destroyed(&replaced, &published, &attempted),
                 };
             }
             DumpVerdict::Failed { message, .. } => {
@@ -461,7 +471,7 @@ pub(crate) async fn run_files(
                     message,
                     files: done,
                     missing,
-                    replaced: schemaic_core::dump::destroyed(&replaced, &published),
+                    replaced: schemaic_core::dump::destroyed(&replaced, &published, &attempted),
                 };
             }
             DumpVerdict::Done => {
@@ -486,7 +496,7 @@ pub(crate) async fn run_files(
         missing,
         // Every step published, so this equals the census — computed the same
         // way regardless, so the three arms cannot drift apart again.
-        replaced: schemaic_core::dump::destroyed(&replaced, &published),
+        replaced: schemaic_core::dump::destroyed(&replaced, &published, &attempted),
     }
 }
 
@@ -732,5 +742,39 @@ mod tests {
         // The scan has to still be reading the crate: a moved `src` would pass
         // this gate by finding nothing at all.
         assert!(files >= 12, "only {files} source files scanned");
+    }
+
+    /// **Which list is the consent and which is the census.**
+    ///
+    /// `folder_verdict`'s whole point is that the consent is the list the user
+    /// was shown and said yes to, while the collisions are a *fresh* reading of
+    /// the folder — so a file that appeared while the modal stood is asked about
+    /// again instead of being destroyed silently. Both parameters are lists of
+    /// file names, so `folder_verdict(Some(&replaced), &replaced)` compiles,
+    /// always answers `Write`, and restores the exact defect the `Option<&[…]>`
+    /// signature replaced — with the whole suite green. `core::dump`'s eight
+    /// cases drive the pure function and none of them can see which list *this*
+    /// caller hands it.
+    ///
+    /// The other half is that the census is read before the first `rename`: once
+    /// this export has published a file, the folder's contents are partly its
+    /// own output and the answer is contaminated.
+    #[test]
+    fn the_folder_export_consents_to_the_list_the_user_was_shown() {
+        let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/dump.rs"))
+            .expect("this file's own source");
+        let body = schemaic_ui::source_gate::production_code(&src);
+        assert!(
+            body.contains("folder_verdict(req.approved.as_deref(), &replaced)"),
+            "the folder export's consent is no longer the list the user saw. \
+             Handing it the fresh census instead answers `Write` unconditionally, \
+             and every test of the pure function stays green."
+        );
+        // And the census the verdict judges is read from the folder, not
+        // reconstructed from the plan.
+        assert!(
+            body.contains("colliding_files(&plan, |f| req.folder.join(f).is_file())"),
+            "the collision census is no longer a reading of the folder"
+        );
     }
 }
