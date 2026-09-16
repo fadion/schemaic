@@ -1783,6 +1783,34 @@ fn is_denied(word: &str, dialect: SqlDialect) -> bool {
     DENY_ANY_ENGINE.contains(&word) || deny_keywords_for(dialect).contains(&word)
 }
 
+/// The first byte at or after `i` that is neither whitespace nor inside a
+/// comment — `None` if the input runs out first.
+///
+/// **The separator between a name and its `(` is not just whitespace.** Every
+/// dialect's parser treats a comment there as a gap, so a rule asking "is the
+/// next thing a `(`" has to ask this and not `is_ascii_whitespace`. Built on
+/// [`skip_noncode`] like everything else that reads SQL boundaries here, and on
+/// [`noncode_kind`] so that a *string* or a quoted *identifier* — which are
+/// code, not gaps — stop the scan rather than being stepped over.
+fn next_code_byte(b: &[u8], mut i: usize, dialect: SqlDialect) -> Option<u8> {
+    let n = b.len();
+    while i < n {
+        if b[i].is_ascii_whitespace() {
+            i += 1;
+            continue;
+        }
+        if noncode_kind(b, i, dialect) == Some(NonCode::Comment)
+            && let Some(j) = skip_noncode(b, i, dialect)
+            && j > i
+        {
+            i = j;
+            continue;
+        }
+        return Some(b[i]);
+    }
+    None
+}
+
 /// Split SQL into upper-cased word tokens, skipping string/identifier/comment
 /// content. The bool is set once a top-level `;` is followed by more real
 /// content (i.e. the input is multiple statements).
@@ -1819,8 +1847,16 @@ fn word_tokens(sql: &str, dialect: SqlDialect) -> (Vec<String>, bool) {
             // Only before a `(`. A quoted *column* of the same spelling is a
             // read, and `SELECT "delete" FROM t` staying `Ok` is the case this
             // gate was deliberately tuned for.
+            //
+            // **`next_code_byte`, not "the first non-whitespace byte".** The
+            // first spelling of this rule tested `!c.is_ascii_whitespace()`,
+            // and a comment is not whitespace — so `"pg_read_file"/*x*/('…')`
+            // put the name straight back out of reach, on a gate the MCP
+            // server's `run_query` is the sole consumer of. Every engine skips
+            // a comment between a name and its argument list exactly as it
+            // skips a space.
             if noncode_kind(b, i, dialect) == Some(NonCode::Identifier)
-                && b[j..].iter().find(|c| !c.is_ascii_whitespace()) == Some(&b'(')
+                && next_code_byte(b, j, dialect) == Some(b'(')
                 && let (Some(name), _) = ident_at(sql, i, dialect)
             {
                 words.push(name.to_ascii_uppercase());
@@ -3712,6 +3748,83 @@ mod tests {
             "SELECT \"delete\" FROM t",
             SqlDialect::Postgres
         ));
+    }
+
+    /// **A comment is a separator too, and the quoted-call rule only knew about
+    /// whitespace.**
+    ///
+    /// `0557365` tested the first *non-whitespace* byte after the closing quote
+    /// for `(`. A comment is not whitespace, so the first non-whitespace byte is
+    /// `/` or `#`, the token was never pushed, and
+    /// `SELECT "pg_read_file"/*x*/('/etc/passwd')` went back through the gate
+    /// that `a_quoted_function_name_is_still_the_function` closes — reaching the
+    /// MCP server's `run_query`, which is gated on this predicate alone.
+    /// Every engine's parser skips a comment between a function name and its
+    /// argument list exactly as it skips a space.
+    #[test]
+    fn a_comment_between_a_quoted_name_and_its_paren_is_a_separator() {
+        // Every comment spelling each dialect has, in the separator slot.
+        for sep in [
+            "/*x*/",
+            "/**/",
+            "/*!*/",
+            "-- c
+",
+            "/* multi
+line */",
+        ] {
+            let sql = format!("SELECT \"pg_read_file\"{sep}('/etc/passwd')");
+            assert!(
+                super::read_only_reason(&sql, SqlDialect::Postgres).is_err(),
+                "{sql:?}"
+            );
+            let sql = format!("SELECT \"lo_export\"{sep}(1,'/tmp/x')");
+            assert!(
+                super::read_only_reason(&sql, SqlDialect::Postgres).is_err(),
+                "{sql:?}"
+            );
+            // The write guard has the identical door.
+            let sql = format!("SELECT \"delete\"{sep}(1)");
+            assert!(super::contains_write(&sql, SqlDialect::Postgres), "{sql:?}");
+        }
+        // MySQL's `#` comment, on the engine that has it.
+        assert!(super::contains_write(
+            "SELECT `delete`# c
+(1)",
+            SqlDialect::MySql
+        ));
+        // Mixed whitespace and comments, in both orders.
+        for sep in [
+            " /*x*/ ",
+            "	--c
+	",
+            "/*a*/ /*b*/",
+        ] {
+            let sql = format!("SELECT \"pg_read_file\"{sep}('/etc/passwd')");
+            assert!(
+                super::read_only_reason(&sql, SqlDialect::Postgres).is_err(),
+                "{sql:?}"
+            );
+        }
+        // A quoted *column* followed by a comment is still a read — the case the
+        // rule is tuned for must survive the widening.
+        assert!(
+            super::read_only_reason("SELECT \"delete\"/*x*/ FROM t", SqlDialect::Postgres).is_ok()
+        );
+        assert!(
+            super::read_only_reason(
+                "SELECT \"delete\" -- c
+ FROM t",
+                SqlDialect::Postgres
+            )
+            .is_ok()
+        );
+        assert!(!super::contains_write(
+            "SELECT \"delete\"/*x*/ FROM t",
+            SqlDialect::Postgres
+        ));
+        // An unterminated comment runs to end of input and reaches no `(`.
+        assert!(super::read_only_reason("SELECT \"delete\"/* x", SqlDialect::Postgres).is_ok());
     }
 
     /// The rejection names what *this* engine allows, so the model can retry with
