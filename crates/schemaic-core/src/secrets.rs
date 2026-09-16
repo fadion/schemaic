@@ -600,6 +600,7 @@ mod tests {
         let file = ConnectionsFile {
             connections: vec![conn(4)],
             active: Some(4),
+            highest_id: 0,
         };
         sanitize(&file, &store);
         assert_eq!(
@@ -711,6 +712,7 @@ mod tests {
         let file = ConnectionsFile {
             connections: vec![c],
             active: Some(7),
+            highest_id: 0,
         };
         let saved = sanitize(&file, &store);
         assert_eq!(saved.connections[0].password, "");
@@ -752,6 +754,7 @@ mod tests {
         let file = ConnectionsFile {
             connections: vec![c],
             active: Some(7),
+            highest_id: 0,
         };
         let out = sanitize_file(&file, &store, &Hydration::default());
         assert_eq!(
@@ -783,6 +786,7 @@ mod tests {
         let file = ConnectionsFile {
             connections: vec![c],
             active: Some(7),
+            highest_id: 0,
         };
         let saved = sanitize(&file, &store);
         assert_eq!(store.stored("conn.7.password").as_deref(), Some("s3cret"));
@@ -846,6 +850,7 @@ mod tests {
         let mut file = ConnectionsFile {
             connections: vec![conn(7)],
             active: Some(7),
+            highest_id: 0,
         };
         let mut hydration = hydrate_file(&mut file, &store);
         assert!(!hydration.was_stored(7, SecretKind::DbPassword));
@@ -879,6 +884,7 @@ mod tests {
         let file = ConnectionsFile {
             connections: vec![c],
             active: Some(7),
+            highest_id: 0,
         };
         let _ = sanitize(&file, &store);
         store.set_available(false);
@@ -897,6 +903,7 @@ mod tests {
         let mut file = ConnectionsFile {
             connections: vec![conn(7)],
             active: Some(7),
+            highest_id: 0,
         };
 
         store.set_available(false); // keyring locked at startup
@@ -932,6 +939,7 @@ mod tests {
         let file = ConnectionsFile {
             connections: vec![c],
             active: Some(7),
+            highest_id: 0,
         };
 
         hydration.resolve_against(&file);
@@ -951,6 +959,7 @@ mod tests {
         let empty = ConnectionsFile {
             connections: vec![],
             active: None,
+            highest_id: 0,
         };
         hydration.resolve_against(&empty);
         assert!(!hydration.any_unreadable(), "gone with the connection");
@@ -975,6 +984,7 @@ mod tests {
         let mut file = ConnectionsFile {
             connections: vec![conn(7)],
             active: Some(7),
+            highest_id: 0,
         };
         // A *successful* hydrate of a connection whose entry the user removed.
         store.delete("conn.7.password");
@@ -994,6 +1004,7 @@ mod tests {
         let file = ConnectionsFile {
             connections: vec![c],
             active: Some(7),
+            highest_id: 0,
         };
         let disk = sanitize(&file, &store);
         assert_eq!(disk.connections[0].password, "", "disk copy blanked");
@@ -1012,6 +1023,7 @@ mod tests {
         let file = ConnectionsFile {
             connections: vec![c],
             active: Some(7),
+            highest_id: 0,
         };
         let disk = sanitize(&file, &store);
         assert_eq!(
@@ -1028,6 +1040,7 @@ mod tests {
         let file = ConnectionsFile {
             connections: vec![conn(7)], // password empty
             active: Some(7),
+            highest_id: 0,
         };
         let _ = sanitize(&file, &store);
         assert_eq!(store.stored("conn.7.password"), None);
@@ -1043,6 +1056,7 @@ mod tests {
         let file = ConnectionsFile {
             connections: vec![c],
             active: Some(7),
+            highest_id: 0,
         };
         // Save: secrets go to keyring, disk copy is blank.
         let disk = sanitize(&file, &store);
@@ -1068,6 +1082,7 @@ mod tests {
         let mut file = ConnectionsFile {
             connections: vec![clean, legacy_c],
             active: Some(1),
+            highest_id: 0,
         };
         assert!(hydrate_file(&mut file, &store).needs_resave);
     }
@@ -1123,6 +1138,7 @@ mod tests {
         let file = ConnectionsFile {
             connections: vec![c],
             active: Some(7),
+            highest_id: 0,
         };
         let disk = sanitize(&file, &store);
         assert_eq!(disk.connections[0].password, "", "db pw migrated");

@@ -1098,6 +1098,32 @@ impl Connection {
         existing.iter().map(|c| c.id).max().unwrap_or(0) + 1
     }
 
+    /// The id a new connection takes, past every id **this install has ever
+    /// used** — not merely past the ones still in use.
+    ///
+    /// [`next_id`](Self::next_id)'s own doc says an id freed by a delete stays
+    /// free "because whatever still refers to it would otherwise be adopted by
+    /// the next connection created". That is true of a gap in the middle and
+    /// false at the top: delete the highest-numbered connection and the maximum
+    /// itself drops, so the very next connection created takes the id that was
+    /// just released.
+    ///
+    /// Which matters because the id is the whole of the keyring account string
+    /// (`conn.{id}.password` and its three siblings). The delete path asks the
+    /// keyring to forget them and tells the user when it could not — but a
+    /// notice is a disclosure, not a barrier: create a connection anyway and it
+    /// hydrates the dead one's password, SSH password and key passphrase, the
+    /// form shows a filled mask, and the connection sends server A's credential
+    /// to server B. This is the barrier.
+    ///
+    /// `high_water` is [`crate::persist::ConnectionsFile::highest_id`], which
+    /// only ever rises. An older file has no such field and reads `0`, which
+    /// makes this exactly [`next_id`](Self::next_id) — so the guarantee begins
+    /// at the first save rather than being claimed retroactively.
+    pub fn next_id_after(existing: &[Connection], high_water: u64) -> u64 {
+        Self::next_id(existing).max(high_water + 1)
+    }
+
     /// Which connection is active at startup, given the id the last session
     /// saved and the connections that actually loaded.
     ///
@@ -1908,6 +1934,43 @@ mod tests {
         assert_eq!(Connection::next_id(&with(&[7])), 8);
         // Order-independent.
         assert_eq!(Connection::next_id(&with(&[9, 2, 5])), 10);
+    }
+
+    /// **…and past every one this install has ever used**, which is the half
+    /// `next_id` cannot answer.
+    ///
+    /// Its own doc says a freed id stays free "because whatever still refers to
+    /// it would otherwise be adopted by the next connection created". True of a
+    /// gap in the middle; false at the top. Delete the highest-numbered
+    /// connection and the maximum drops with it, so the very next connection
+    /// created takes the id just released — and the id is the whole of the
+    /// keyring account string, so it hydrates the dead connection's password,
+    /// SSH password and key passphrase, shows a filled mask in the form, and
+    /// sends server A's credential to server B. The delete path warns when the
+    /// keyring would not forget them; a warning is a disclosure, not a barrier.
+    #[test]
+    fn a_new_connection_does_not_take_back_an_id_a_delete_released() {
+        let with = |ids: &[u64]| -> Vec<Connection> {
+            ids.iter()
+                .map(|id| Connection { id: *id, ..conn() })
+                .collect()
+        };
+        // Three connections, 7 deleted: `next_id` hands 7 straight back.
+        assert_eq!(Connection::next_id(&with(&[5, 6])), 7, "the premise");
+        assert_eq!(
+            Connection::next_id_after(&with(&[5, 6]), 7),
+            8,
+            "an id this install has handed out was handed out a second time"
+        );
+        // Several deleted from the top in a row: still monotone.
+        assert_eq!(Connection::next_id_after(&with(&[1]), 9), 10);
+        // An empty list is still the first id when nothing has been used.
+        assert_eq!(Connection::next_id_after(&[], 0), 1, "never 0");
+        // A mark *below* the ids in use cannot lower the answer — which is what
+        // makes a `connections.json` written before the field existed safe: it
+        // reads `0`, and this is then exactly `next_id`.
+        assert_eq!(Connection::next_id_after(&with(&[9, 2, 5]), 0), 10);
+        assert_eq!(Connection::next_id_after(&with(&[9, 2, 5]), 3), 10);
     }
 
     #[test]

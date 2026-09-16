@@ -523,6 +523,20 @@ pub struct ConnectionsFile {
     pub connections: Vec<Connection>,
     #[serde(default)]
     pub active: Option<u64>,
+    /// The highest connection id this install has ever handed out — a
+    /// **high-water mark**, which only rises.
+    ///
+    /// Deleting the highest-numbered connection lowers the maximum id in use, so
+    /// `Connection::next_id` would hand that id straight back — and the id is the
+    /// whole of the keyring account string, so the next connection created
+    /// inherits whatever a failed `forget` left behind. See
+    /// [`Connection::next_id_after`], which is the only thing that reads this.
+    ///
+    /// `#[serde(default)]`, so a file written before this field reads `0` and the
+    /// answer is the old one: the guarantee starts at the first save rather than
+    /// being claimed for ids handed out before it existed.
+    #[serde(default)]
+    pub highest_id: u64,
 }
 
 /// Our config directory (`%APPDATA%/schemaic`, or XDG/`~/.config` elsewhere).
@@ -2148,6 +2162,7 @@ mod tests {
         let file = ConnectionsFile {
             connections: vec![c],
             active: Some(1),
+            highest_id: 0,
         };
 
         let json = serde_json::to_string(&file)
@@ -2185,6 +2200,38 @@ mod tests {
         assert_eq!(
             back.connections[0].tls.ca_path, "/etc/ca.crt",
             "the rest of the TLS block survives the unknown mode"
+        );
+    }
+
+    /// **The high-water mark survives a round trip, and an older file reads
+    /// `0`.**
+    ///
+    /// `highest_id` is what stops a deleted connection's id — and the keyring
+    /// entries a failed `forget` left under it — being handed to the next
+    /// connection created. It is worth nothing if it does not persist, and the
+    /// back-compatible default is the half that decides whether the barrier can
+    /// be rolled out at all: a `connections.json` written before the field
+    /// existed must load, not fail, and must fall back to `Connection::next_id`'s
+    /// answer rather than to a mark of `0` that blocks nothing *and* claims to.
+    #[test]
+    fn the_connection_high_water_mark_round_trips_and_defaults_to_nothing() {
+        let file = ConnectionsFile {
+            connections: Vec::new(),
+            active: None,
+            highest_id: 12,
+        };
+        let json = serde_json::to_string(&file).expect("serialize");
+        let back: ConnectionsFile = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back.highest_id, 12);
+
+        // A file from before the field: it loads, and the mark is nothing.
+        let old: ConnectionsFile =
+            serde_json::from_str(r#"{"connections": [], "active": null}"#).expect("an older file");
+        assert_eq!(old.highest_id, 0);
+        assert_eq!(
+            crate::connection::Connection::next_id_after(&old.connections, old.highest_id),
+            crate::connection::Connection::next_id(&old.connections),
+            "an older file must answer exactly as it did before the field existed"
         );
     }
 

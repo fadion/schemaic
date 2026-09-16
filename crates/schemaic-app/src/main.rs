@@ -1597,6 +1597,14 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
         }
     }
     let active_id = Connection::startup_active_id(cf.active, &cf.connections);
+    // The highest id this install has ever handed out — see
+    // `Connection::next_id_after`. Seeded to at least the maximum in the file, so
+    // a `connections.json` written before the field existed (where it reads `0`)
+    // still cannot hand back an id that is currently in use.
+    let highest_conn_id = RwSignal::new(
+        cf.highest_id
+            .max(cf.connections.iter().map(|c| c.id).max().unwrap_or(0)),
+    );
     let connections = RwSignal::new(cf.connections.clone());
     let active_conn = RwSignal::new(active_id);
 
@@ -9270,9 +9278,21 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
     // whenever the keyring fallback is in force — written to disk by the very
     // save that answered "This can't be undone".
     let persist_conns = move |active: Option<u64>, saving: persist::Saving| {
+        let cs = connections.get_untracked();
+        // **The high-water mark rises here and nowhere else.** Every mid-session
+        // save funnels through this closure, so recording it here is what makes
+        // "an id this install has handed out is never handed out again" true
+        // across a restart — see `Connection::next_id_after`. `max` in both
+        // directions, because a connection restored from an import can carry an
+        // id above anything this install has minted.
+        let high = highest_conn_id
+            .get_untracked()
+            .max(cs.iter().map(|c| c.id).max().unwrap_or(0));
+        highest_conn_id.set(high);
         let file = ConnectionsFile {
-            connections: connections.get_untracked(),
+            connections: cs,
             active,
+            highest_id: high,
         };
         // **Every mid-session save funnels through here**, which is why the
         // keyring's bad news is surfaced here: a save that had to leave a
@@ -9451,7 +9471,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                     cs.iter()
                         .filter_map(|c| c.color.clone())
                         .collect::<Vec<_>>(),
-                    Connection::next_id(cs),
+                    Connection::next_id_after(cs, highest_conn_id.get_untracked()),
                 )
             });
             // A fresh colour, not the original's: the dot is what tells two
@@ -9744,7 +9764,9 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                     let used_colors: Vec<String> =
                         cs.iter().filter_map(|c| c.color.clone()).collect();
                     let mut conn = conn;
-                    conn.id = Connection::next_id(cs);
+                    // `cs` grows as this loop pushes, so the maximum moves with
+                    // it; the high-water mark only bounds it from below.
+                    conn.id = Connection::next_id_after(cs, highest_conn_id.get_untracked());
                     conn.name = unique_name(&conn.name, &names);
                     conn.color = Some(pick_connection_color(&used_colors));
                     // The same sanitising a saved form goes through: a SQLite row
@@ -9807,10 +9829,11 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
         let drop_session = drop_session.clone();
         let ai_session = ai_session.clone();
         Rc::new(move || {
-            let id = draft
-                .id
-                .get_untracked()
-                .unwrap_or_else(|| connections.with_untracked(|cs| Connection::next_id(cs)));
+            let id = draft.id.get_untracked().unwrap_or_else(|| {
+                connections.with_untracked(|cs| {
+                    Connection::next_id_after(cs, highest_conn_id.get_untracked())
+                })
+            });
             // The entry as it stood *before* this save, so the edit can be asked
             // what it moved. `None` for a connection being created, where there is
             // nothing yet to invalidate.
@@ -13001,6 +13024,44 @@ mod app_tests {
         assert!(
             arm.contains("term_db_label.set(None);"),
             "…and still badged as whatever it was before"
+        );
+    }
+
+    /// **Every connection this app mints takes an id past the high-water mark.**
+    ///
+    /// `Connection::next_id` answers "past every id *in use*", which hands back
+    /// the id of the highest-numbered connection the moment it is deleted — and
+    /// the id is the whole of the keyring account string. `next_id_after` is the
+    /// barrier; a mint site that reaches for the plain one restores the defect
+    /// silently, because the two differ only when a delete has happened and the
+    /// pure function's own tests cannot see which one a caller chose.
+    ///
+    /// The floor is that mint sites were found at all.
+    #[test]
+    fn every_minted_connection_id_is_past_the_high_water_mark() {
+        let src = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("src")
+                .join("main.rs"),
+        )
+        .expect("this file's own source");
+        let body = schemaic_ui::source_gate::production_code(&src);
+        assert!(
+            !body.contains("Connection::next_id("),
+            "a connection id is minted with `next_id`, which hands back the id of \
+             a connection the user has just deleted — along with whatever the \
+             keyring still holds under it"
+        );
+        let mints = body.matches("Connection::next_id_after(").count();
+        assert!(
+            mints >= 3,
+            "only {mints} mint sites found; this gate has gone blind"
+        );
+        // …and the mark is recorded, or it is `0` for ever and the barrier is
+        // `next_id` wearing another name.
+        assert!(
+            body.contains("highest_id: high"),
+            "the high-water mark is no longer written to `connections.json`"
         );
     }
 
