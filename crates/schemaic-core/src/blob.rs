@@ -288,10 +288,12 @@ pub fn save_stem_from<S: AsRef<str>>(parts: &[S]) -> String {
     // not push the whole thing past what a filesystem will take.
     out.truncate(120);
     if out.trim_matches('_').is_empty() {
-        "blob".to_string()
-    } else {
-        out
+        out = "blob".to_string();
     }
+    // A column named `NUL` on a keyless cell is the whole stem, and a device is
+    // a device whatever extension follows it — one answer, shared with the
+    // other sanitizer.
+    crate::export::device_safe_stem(out)
 }
 
 /// One cell's bytes as fetched, with the length the server reported.
@@ -1070,6 +1072,33 @@ mod tests {
         assert_eq!(
             save_stem_from(&["t", "c"]),
             a_ref("t", "c", &[]).save_stem()
+        );
+    }
+
+    /// **A device is not a file, whatever extension follows it.** The same
+    /// no-key arm drops the empty parts, so a result whose binary column
+    /// carries no origin table leaves one part — and a PostgreSQL or SQLite
+    /// column named `NUL` (or `CON`, `AUX`, `COM1`…) is then the whole stem.
+    /// On Windows `NUL.png` names the device, so the atomic save's `rename`
+    /// onto it is refused with an OS message about a file the user never
+    /// chose. [`crate::export::suggested_filename`], this function's twin, has
+    /// dodged the 22 names since it was written; this one had no list at all.
+    #[test]
+    fn a_save_stem_is_never_a_windows_device_name() {
+        // The shape the panel's no-key arm passes: no origin table, one column.
+        assert_eq!(save_stem_from(&["", "NUL"]), "_NUL");
+        // The compare is case-insensitive, like the device itself.
+        assert_eq!(save_stem_from(&["com1"]), "_com1");
+        assert_eq!(save_stem_from(&["Aux"]), "_Aux");
+        // Only the whole stem is a device. A name that merely starts with one
+        // is an ordinary file, and must not be touched.
+        assert_eq!(save_stem_from(&["nullable"]), "nullable");
+        assert_eq!(save_stem_from(&["t", "NUL"]), "t_NUL");
+        // And the two sanitizers give the same answer to the same question.
+        assert_eq!(
+            save_stem_from(&["NUL"]),
+            crate::export::suggested_filename(Some("NUL"), crate::export::ExportFormat::Csv)
+                .trim_end_matches(".csv")
         );
     }
 

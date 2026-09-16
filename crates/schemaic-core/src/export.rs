@@ -604,10 +604,6 @@ where
 /// names, so the stem is trimmed and a reserved stem is prefixed. A base that
 /// sanitizes away to nothing falls back to `result`.
 pub fn suggested_filename(base: Option<&str>, format: ExportFormat) -> String {
-    const RESERVED: [&str; 22] = [
-        "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
-        "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
-    ];
     let mut stem: String = base
         .unwrap_or_default()
         .chars()
@@ -628,10 +624,38 @@ pub fn suggested_filename(base: Option<&str>, format: ExportFormat) -> String {
     if stem.is_empty() {
         stem = "result".to_string();
     }
+    format!("{}.{}", device_safe_stem(stem), format.extension())
+}
+
+/// **The one answer to "is this stem a device rather than a file?"** — the
+/// reserved Windows names, and what to do about one.
+///
+/// A stem equal to `CON`, `NUL`, `COM1`… names a device *whatever extension
+/// follows it*, in every directory, so `NUL.png` is not a file that can be
+/// written: an atomic save's `rename` onto it is refused, and the user is shown
+/// an OS message about a name they never chose. The stems that reach a save
+/// dialog here are server-supplied — a table, a column, a key value — so the
+/// check belongs on the sanitizer rather than on the operator.
+///
+/// **Shared because there are exactly two sanitizers and they were not
+/// agreeing.** [`suggested_filename`] has carried this list since it was
+/// written; [`crate::blob::save_stem_from`], its twin over the blob panel's
+/// save name, had no list at all, and a column named `NUL` on a `NULL` cell
+/// reached the dialog as `NUL.png`. One list, one compare, one escape — the
+/// way there is one identifier quoter.
+///
+/// The escape is a `_` prefix rather than a suffix: it survives an extension
+/// being appended, and it keeps the name the user recognises.
+pub fn device_safe_stem(stem: String) -> String {
+    const RESERVED: [&str; 22] = [
+        "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
+        "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+    ];
     if RESERVED.contains(&stem.to_ascii_uppercase().as_str()) {
-        stem = format!("_{stem}");
+        format!("_{stem}")
+    } else {
+        stem
     }
-    format!("{stem}.{}", format.extension())
 }
 
 /// One file name per table, for an export that writes a **folder** rather than a

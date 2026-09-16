@@ -1024,6 +1024,28 @@ mod tests {
         }
     }
 
+    /// **The constructor is where the sanitizer is applied, so this asks the
+    /// constructor.** `BlobTarget::new`'s own doc says the field is private
+    /// precisely because "a field anyone can write is a third producer waiting
+    /// to forget" — and the save button appends the extension to whatever is in
+    /// it (`format!("{stem}.{}", kind.extension())`), so a stem of `NUL` is
+    /// handed to the dialog as `NUL.png`, which on Windows is the device and not
+    /// a file. The pure half is pinned in
+    /// `schemaic_core::blob::a_save_stem_is_never_a_windows_device_name`; this
+    /// is the composition the panel actually runs.
+    #[test]
+    fn the_constructor_sanitizes_a_device_name_out_of_the_save_stem() {
+        // The keyless arm's parts: a binary column with no origin table.
+        let t = BlobTarget::new("NUL".into(), &["", "NUL"], None);
+        assert_eq!(t.stem(), "_NUL");
+        assert_eq!(format!("{}.png", t.stem()), "_NUL.png");
+        // An ordinary column keeps its name.
+        assert_eq!(
+            BlobTarget::new("t.c".into(), &["t", "c"], None).stem(),
+            "t_c"
+        );
+    }
+
     fn value(len: u64, bytes: usize) -> BlobValue {
         BlobValue {
             bytes: vec![0; bytes],
