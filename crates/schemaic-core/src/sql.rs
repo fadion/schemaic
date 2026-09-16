@@ -196,6 +196,32 @@ fn executable_marker(b: &[u8], i: usize, dialect: SqlDialect) -> Option<usize> {
     Some(j)
 }
 
+/// The index just past a **whole** `/*! … */` executable-comment run opening at
+/// `b[i]` — marker, body and closing `*/` — or `None` when this `/*` opens an
+/// ordinary comment (or the dialect has no executable comments).
+///
+/// **The other question about the same bytes, and both answers are needed.**
+/// [`skip_comment`] stops just past the marker because its callers are the
+/// security gates, which must see the body as the code the server will run. A
+/// *formatter* is asking something else — "what may I re-flow" — and the answer
+/// there is the whole run, verbatim: once the body is ordinary tokens the
+/// trailing `*/` falls out as two one-byte puncts, `ops(MySql)` has no `*/`
+/// entry, and Format Code wrote `* /` into the user's buffer, leaving the
+/// comment unterminated and swallowing everything after it.
+///
+/// Unterminated → end of input, matching [`skip_comment`]'s ordinary arm.
+pub(crate) fn executable_comment_end(b: &[u8], i: usize, dialect: SqlDialect) -> Option<usize> {
+    let n = b.len();
+    if i + 1 >= n || b[i] != b'/' || b[i + 1] != b'*' {
+        return None;
+    }
+    let mut j = executable_marker(b, i, dialect)?;
+    while j + 1 < n && !(b[j] == b'*' && b[j + 1] == b'/') {
+        j += 1;
+    }
+    Some((j + 2).min(n))
+}
+
 /// Does a comment open at `b[i]`?
 ///
 /// The classification half of [`skip_comment`], exposed because

@@ -208,6 +208,27 @@ fn tokenize(sql: &str, dialect: SqlDialect) -> Vec<(Kind, &str)> {
             i += 1;
             continue;
         }
+        // **An executable comment is one verbatim slice here, `*/` included.**
+        // Ahead of `skip_noncode`, which deliberately ends that span just past
+        // the *marker* so the security gates see the body as the code the
+        // server runs. This is the fourth caller of that function and the one
+        // asking a different question — what may I re-flow — and taking the
+        // gates' answer split the closing `*/` into two puncts with a space
+        // between them, leaving the statement an unterminated comment.
+        if let Some(j) = crate::sql::executable_comment_end(b, i, dialect) {
+            toks.push((Kind::BlockComment, &sql[i..j]));
+            i = j;
+            continue;
+        }
+        // A `*/` with no opener in this slice — what a selection ending past
+        // the close of an executable comment hands us — is still one token, for
+        // the same reason: `ops()` has no entry for it, so the two bytes would
+        // otherwise reach the punctuation path separately and be spaced apart.
+        if c == b'*' && b.get(i + 1) == Some(&b'/') {
+            toks.push((Kind::Punct, &sql[i..i + 2]));
+            i += 2;
+            continue;
+        }
         // Strings / identifiers / dollar-quotes / comments — one verbatim slice,
         // keyed by the opening byte (`skip_noncode` only returns `Some` for a
         // `--`/`/*`/`#` here when it really is a comment in this dialect).
@@ -301,7 +322,13 @@ fn tokenize(sql: &str, dialect: SqlDialect) -> Vec<(Kind, &str)> {
         //
         // Ahead of the table, and unambiguously so: no operator spelling puts an
         // identifier byte after the `:` — `::` and `:=` both do not.
-        if b[i] == b':' && b.get(i + 1).copied().is_some_and(crate::sql::is_word_start) {
+        //
+        // **`params`' own predicate, not half of it.** Asking only "identifier
+        // byte next" made `a[lo:hi]` one token; `need_space` wrote it back as
+        // `lo :hi`, which `params` *does* read as a placeholder — so the
+        // formatter created a parameter by moving a space, the exact inverse of
+        // the defect this arm exists to fix.
+        if crate::params::opens_placeholder(b, i) {
             let mut end = i + 1;
             while end < b.len() && crate::sql::is_word_byte(b[end]) {
                 end += 1;
@@ -881,6 +908,91 @@ mod tests {
     fn negative_numbers_stay_tight() {
         let got = format_sql("SELECT a FROM t WHERE a = -1", IND);
         assert_eq!(got, "SELECT\n  a\nFROM\n  t\nWHERE\n  a = -1");
+    }
+
+    /// **Format Code must not invent a query parameter, and it did — by moving
+    /// a space.**
+    ///
+    /// `e10abee` made `:name` one token so a reformat stopped emptying the
+    /// parameters bar. It copied half of `params`' rule: `params` also declines
+    /// a `:` that follows an identifier byte, a `]`, or sits in an open
+    /// subscript, so `a[lo:hi]` carries no placeholder. To `tokenize` it was one,
+    /// `need_space` put a space in front of it, and at `a [ lo :hi ]` `params`
+    /// agrees — the bar gains `hi`, and the run is held until a name the user
+    /// never wrote is bound. The commit's own test asserts `!out.contains(": ")`
+    /// and is blind to the ` :` spelling this produces.
+    ///
+    /// The property, not the spelling: reformatting changes no token's text, so
+    /// it changes no statement's parameter list.
+    #[test]
+    fn formatting_never_changes_the_parameter_list() {
+        for sql in [
+            "SELECT a[lo:hi] FROM t WHERE x = :p",
+            "SELECT a[1:n] FROM t",
+            "SELECT arr[i:j] FROM t",
+            "SELECT a[:hi] FROM t",
+            "SELECT m[1][2:3] FROM t",
+            "SELECT * FROM t WHERE id = :id",
+            "SELECT ARRAY[:a, :b]",
+            "my_loop:LOOP SELECT 1; END LOOP",
+        ] {
+            for dialect in [SqlDialect::MySql, SqlDialect::Postgres, SqlDialect::Sqlite] {
+                let before = crate::params::names(sql, dialect);
+                let after = crate::params::names(&super::format_sql(sql, IND, dialect), dialect);
+                assert_eq!(before, after, "{dialect:?} {sql:?}");
+            }
+        }
+    }
+
+    /// **An executable comment is one token to the formatter, `*/` included.**
+    ///
+    /// `skip_comment` ends a `/*! … */` span just past the *marker*, so the
+    /// security gates see the body as the code the server runs. `tokenize` is a
+    /// fourth caller of that function and took the same answer: the body became
+    /// ordinary tokens and the trailing `*/` fell out as two one-byte puncts,
+    /// which `need_space` then separated. Format Code turned
+    /// `/*!40101 SET NAMES utf8 */;` into an **unterminated comment**,
+    /// swallowing that statement and everything after it in the file — and
+    /// idempotently, so a second Format did not repair it.
+    #[test]
+    fn an_executable_comment_survives_formatting_whole() {
+        for sql in [
+            "/*!40101 SET NAMES utf8 */;",
+            "SELECT /*!40001 SQL_NO_CACHE */ * FROM t;",
+            "INSERT /*!IGNORE*/ INTO t VALUES (1);",
+            "/*!40000 ALTER TABLE `orders` DISABLE KEYS */;",
+            "/*M!100000 SET @x = 1 */;",
+        ] {
+            for dialect in [SqlDialect::MySql, SqlDialect::Postgres, SqlDialect::Sqlite] {
+                let got = super::format_sql(sql, IND, dialect);
+                assert!(!got.contains("* /"), "{dialect:?} {sql:?} -> {got:?}");
+                assert_eq!(
+                    got.matches("*/").count(),
+                    sql.matches("*/").count(),
+                    "{dialect:?} {sql:?} -> {got:?}"
+                );
+            }
+        }
+        // The run is reproduced verbatim on the engines that execute it — the
+        // formatter's contract is that a token's text is preserved.
+        let got = super::format_sql("/*!40101 SET NAMES utf8 */;", IND, SqlDialect::MySql);
+        assert!(got.contains("/*!40101 SET NAMES utf8 */"), "{got:?}");
+        // A statement count round trip over a dump preamble: reformatting must
+        // not change how many statements the boundary lexer sees.
+        let preamble = "/*!40101 SET @OLD_CHARSET=@@CHARACTER_SET_CLIENT */;\n\
+                        /*!40101 SET NAMES utf8mb4 */;\n\
+                        SELECT 1;\n";
+        let before = crate::sql::executable_statements(preamble, SqlDialect::MySql).len();
+        let after = crate::sql::executable_statements(
+            &super::format_sql(preamble, IND, SqlDialect::MySql),
+            SqlDialect::MySql,
+        )
+        .len();
+        assert_eq!(before, after, "statement count changed");
+        // A stray `*/` with no opener — what a selection ending past the close
+        // of an executable comment hands the formatter — stays one token too.
+        let got = super::format_sql("SET NAMES utf8 */", IND, SqlDialect::MySql);
+        assert!(got.contains("*/"), "{got:?}");
     }
 
     /// **A selection whose ends are not in code is not formattable.**

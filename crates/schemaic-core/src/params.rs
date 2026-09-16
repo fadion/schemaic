@@ -229,28 +229,7 @@ pub fn scan(sql: &str, dialect: SqlDialect) -> Vec<ParamRef> {
             i += 2;
             continue;
         }
-        // An array slice's `:` belongs to the subscript around it; a
-        // placeholder's `:` never does.
-        //
-        // Three shapes say "subscript":
-        //
-        // - a word byte immediately before — `arr[1:2]`, `arr[lo:hi]`
-        // - a `]` immediately before       — `m[1][2:3]`
-        // - an **open `[`**                — `arr[:hi]`, PostgreSQL's open-ended
-        //   lower bound. This one was missing, and it is not cosmetic: a legal
-        //   statement grew a parameter row named `hi`, `prepare_run` returned
-        //   `Err(Missing)`, and the run was held with no "Run anyway" to get past
-        //   it. The three existing slice tests all wrote a lower bound.
-        //
-        // The first two must look at the byte *immediately* before, not the last
-        // non-space one — `SELECT :a` has `T` a space away, and skipping the space
-        // would swallow every placeholder in the language. The `[` rule looks past
-        // whitespace, and has to ask what the `[` hangs off — see
-        // [`subscript_open_before`]. Where `[` quotes an identifier (SQLite)
-        // `skip_noncode` has already consumed it.
-        let attached =
-            i > 0 && (is_word_byte(b[i - 1]) || b[i - 1] == b']') || subscript_open_before(b, i);
-        if attached || !b.get(i + 1).copied().is_some_and(is_word_start) {
+        if !opens_placeholder(b, i) {
             i += 1;
             continue;
         }
@@ -266,6 +245,43 @@ pub fn scan(sql: &str, dialect: SqlDialect) -> Vec<ParamRef> {
         i = j;
     }
     out
+}
+
+/// Does a placeholder open at `b[i]` — is this `:` the start of `:name`?
+///
+/// **The one definition, because a second copy of half of it invented a
+/// parameter.** The formatter needs the same answer: it makes `:name` a single
+/// token so that re-flowing cannot put a space inside it, and its first
+/// spelling asked only "is the next byte an identifier start". That made
+/// `a[lo:hi]` one token, `need_space` wrote it back as `lo :hi`, and at that
+/// spelling *this* function agrees it is a placeholder — so Format Code created
+/// a parameter the user never wrote, by moving a space. `tokenize` calls this
+/// instead.
+///
+/// An array slice's `:` belongs to the subscript around it; a placeholder's `:`
+/// never does. Three shapes say "subscript":
+///
+/// - a word byte immediately before — `arr[1:2]`, `arr[lo:hi]`
+/// - a `]` immediately before       — `m[1][2:3]`
+/// - an **open `[`**                — `arr[:hi]`, PostgreSQL's open-ended lower
+///   bound. This one was missing, and it is not cosmetic: a legal statement grew
+///   a parameter row named `hi`, `prepare_run` returned `Err(Missing)`, and the
+///   run was held with no "Run anyway" to get past it.
+///
+/// The first two must look at the byte *immediately* before, not the last
+/// non-space one — `SELECT :a` has `T` a space away, and skipping the space
+/// would swallow every placeholder in the language. The `[` rule looks past
+/// whitespace, and has to ask what the `[` hangs off — see
+/// [`subscript_open_before`]. Where `[` quotes an identifier (SQLite)
+/// `skip_noncode` has already consumed it, and a `::` cast is consumed whole by
+/// the caller before it gets here.
+pub(crate) fn opens_placeholder(b: &[u8], i: usize) -> bool {
+    if b.get(i) != Some(&b':') {
+        return false;
+    }
+    let attached =
+        i > 0 && (is_word_byte(b[i - 1]) || b[i - 1] == b']') || subscript_open_before(b, i);
+    !attached && b.get(i + 1).copied().is_some_and(is_word_start)
 }
 
 /// Is the `:` at `i` opening a **subscript's** slice bound — `arr[:hi]`?
