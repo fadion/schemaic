@@ -5962,7 +5962,16 @@ pub struct Ui {
     /// read + upserted by the results grid's "Format as" menu.
     pub formats: RwSignal<Vec<ColumnFormatRule>>,
     /// Persist the formatter rules to disk (after the grid upserts one).
-    pub save_formats: Rc<dyn Fn()>,
+    ///
+    /// **Takes its [`schemaic_core::persist::Saving`]**, like the snippet store's
+    /// save, because one of its callers is a *deletion*. Deleting a connection
+    /// prunes this store of everything keyed to it and then saves — and an
+    /// ordinary save copies the pre-prune generation to `format.json.bak`, so
+    /// every column the deleted connection had was still on disk under a confirm
+    /// saying it could not be. `Saving`'s own doc names this store, along with
+    /// `db_colors.json`, `favorites.json` and `diagrams.json`, as having that
+    /// property; the argument is how a shared closure can honour it.
+    pub save_formats: Rc<dyn Fn(schemaic_core::persist::Saving)>,
     /// Per-database identity colours (persisted to `db_colors.json`), keyed by
     /// `(conn_id, database)`; set from the schema tree, shown as a dot on the DB
     /// node, the active-DB selector, and the database's query tabs.
@@ -5972,14 +5981,16 @@ pub struct Ui {
     /// a dot on the table row and as a tint on the table's ER-diagram card header.
     pub table_colors: RwSignal<Vec<TableColorRule>>,
     /// Persist both colour stores to disk (after a menu upsert). One closure for
-    /// the pair, because they share one file.
-    pub save_db_colors: Rc<dyn Fn()>,
+    /// the pair, because they share one file. Takes its
+    /// [`schemaic_core::persist::Saving`] for [`Ui::save_formats`]' reason.
+    pub save_db_colors: Rc<dyn Fn(schemaic_core::persist::Saving)>,
     /// Favorited (bookmarked) databases (persisted to `favorites.json`), keyed by
     /// `(conn_id, database)` in favorite order (oldest first); set from the schema
     /// tree's right-click menu, shown as a gold star and sorted to the top.
     pub db_favorites: RwSignal<Vec<FavoriteRule>>,
-    /// Persist the favorites to disk (after a menu toggle).
-    pub save_db_favorites: Rc<dyn Fn()>,
+    /// Persist the favorites to disk (after a menu toggle). Takes its
+    /// [`schemaic_core::persist::Saving`] for [`Ui::save_formats`]' reason.
+    pub save_db_favorites: Rc<dyn Fn(schemaic_core::persist::Saving)>,
     /// The app process's own CPU/RAM usage, sampled on a timer at the app
     /// boundary and shown in the status bar. Transient (never persisted).
     pub resources: RwSignal<ResourceSample>,

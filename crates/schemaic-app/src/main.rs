@@ -1618,12 +1618,15 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
     let formats = RwSignal::new(
         persist::load_json::<schemaic_core::format::FormatsFile>("format.json").rules,
     );
-    let save_formats: Rc<dyn Fn()> = Rc::new(move || {
-        persist::save_json(
+    // **Takes its `Saving`**, like the snippet store's save and for the same
+    // reason: one of its callers is a deletion. See `Ui::save_formats`.
+    let save_formats: Rc<dyn Fn(persist::Saving)> = Rc::new(move |saving| {
+        persist::write_json_store(
             "format.json",
             &schemaic_core::format::FormatsFile {
                 rules: formats.get_untracked(),
             },
+            saving,
         );
     });
 
@@ -1637,25 +1640,27 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
     let table_colors = RwSignal::new(colors.tables);
     // One save for the pair — they share `db_colors.json`, so writing either half
     // has to write both or the other is lost.
-    let save_db_colors: Rc<dyn Fn()> = Rc::new(move || {
-        persist::save_json(
+    let save_db_colors: Rc<dyn Fn(persist::Saving)> = Rc::new(move |saving| {
+        persist::write_json_store(
             "db_colors.json",
             &schemaic_core::db_color::DbColorsFile {
                 rules: db_colors.get_untracked(),
                 tables: table_colors.get_untracked(),
             },
+            saving,
         );
     });
     // Favorited (bookmarked) databases — same standalone-file pattern as colours.
     let db_favorites = RwSignal::new(
         persist::load_json::<schemaic_core::favorite::FavoritesFile>("favorites.json").rules,
     );
-    let save_db_favorites: Rc<dyn Fn()> = Rc::new(move || {
-        persist::save_json(
+    let save_db_favorites: Rc<dyn Fn(persist::Saving)> = Rc::new(move |saving| {
+        persist::write_json_store(
             "favorites.json",
             &schemaic_core::favorite::FavoritesFile {
                 rules: db_favorites.get_untracked(),
             },
+            saving,
         );
     });
 
@@ -7199,60 +7204,66 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
 
     // ── Persisted expand/collapse + database-visibility state ───────────────
     // Snapshot both sets to disk (best effort).
-    let save_ui: Rc<dyn Fn()> = Rc::new({
+    // **Takes its `Saving`**, because one of its callers is a deletion — this
+    // store's `expanded_rules`, `hidden_db_rules` and `activity_intervals` are
+    // all keyed by connection. See `persist::save_ui_state`.
+    let save_ui: Rc<dyn Fn(persist::Saving)> = Rc::new({
         let pending_legacy_hidden = pending_legacy_hidden.clone();
-        move || {
-            persist::save_ui_state(&UiState {
-                // Same bargain as `hidden_dbs` below: the legacy flat field is
-                // written empty only once the migration has read it, and carried
-                // back out unchanged until then, so a launch that could not
-                // migrate leaves the upgrade to a later one rather than
-                // collapsing every tree permanently.
-                expanded: (*pending_legacy_expanded).clone(),
-                expanded_rules: expanded_rules.get_untracked(),
-                // The legacy flat field is written empty **once the migration has
-                // actually read it** — `hidden_db_rules` is the truth after that.
-                // Until then it is carried back out unchanged, so a launch that
-                // could not migrate (no connections loaded) leaves the upgrade to a
-                // later one instead of erasing it.
-                hidden_dbs: (*pending_legacy_hidden).clone(),
-                hidden_db_rules: hidden_db_rules.get_untracked(),
-                schema_visible: schema_visible.get_untracked(),
-                right_panel: right_panel.get_untracked().into(),
-                activity_intervals: activity_intervals.get_untracked(),
-                schema_w: schema_w.get_untracked(),
-                right_w: right_w.get_untracked(),
-                editor_h: editor_h.get_untracked(),
-                // **The unknown key survives the save**, or the field's own promise
-                // — "an unrecognised value is *not* silently replaced with the
-                // default" — is false one save later. Cleared the moment the user
-                // picks a harness themselves, which is the point at which the file
-                // should start naming what is actually running.
-                ai_harness: persist::ai_harness_to_persist(
-                    ai_harness_unknown.get_untracked().as_deref(),
-                    ai_harness.get_untracked().key(),
-                ),
-                ai_cli_path: ai_cli_path.get_untracked(),
-                ai_model: ai_model.get_untracked(),
-                ai_effort: ai_effort.get_untracked().cli().to_string(),
-                ai_instructions: ai_instructions.get_untracked(),
-                ai_schema_scope: ai_schema_scope.get_untracked().key().to_string(),
-                ai_gutter: ai_gutter.get_untracked(),
-                ai_run_queries: legacy_ai_run_queries,
-                ui_theme: ui_theme.get_untracked().key().to_string(),
-                editor_theme: editor_theme.get_untracked().key().to_string(),
-                ui_scale: ui_scale.get_untracked().key().to_string(),
-                editor_font_size: editor_font.get_untracked(),
-                row_limit: row_limit.get_untracked(),
-                statement_timeout_secs: statement_timeout.get_untracked(),
-                confirm_writes: confirm_writes.get_untracked(),
-                tab_width: tab_width.get_untracked(),
-                soft_tabs: soft_tabs.get_untracked(),
-                word_wrap: word_wrap.get_untracked(),
-                restore_tabs: restore_tabs.get_untracked(),
-                live_validate: live_validate.get_untracked(),
-                show_table_sizes: table_sizes.get_untracked(),
-            });
+        move |saving| {
+            persist::save_ui_state(
+                &UiState {
+                    // Same bargain as `hidden_dbs` below: the legacy flat field is
+                    // written empty only once the migration has read it, and carried
+                    // back out unchanged until then, so a launch that could not
+                    // migrate leaves the upgrade to a later one rather than
+                    // collapsing every tree permanently.
+                    expanded: (*pending_legacy_expanded).clone(),
+                    expanded_rules: expanded_rules.get_untracked(),
+                    // The legacy flat field is written empty **once the migration has
+                    // actually read it** — `hidden_db_rules` is the truth after that.
+                    // Until then it is carried back out unchanged, so a launch that
+                    // could not migrate (no connections loaded) leaves the upgrade to a
+                    // later one instead of erasing it.
+                    hidden_dbs: (*pending_legacy_hidden).clone(),
+                    hidden_db_rules: hidden_db_rules.get_untracked(),
+                    schema_visible: schema_visible.get_untracked(),
+                    right_panel: right_panel.get_untracked().into(),
+                    activity_intervals: activity_intervals.get_untracked(),
+                    schema_w: schema_w.get_untracked(),
+                    right_w: right_w.get_untracked(),
+                    editor_h: editor_h.get_untracked(),
+                    // **The unknown key survives the save**, or the field's own promise
+                    // — "an unrecognised value is *not* silently replaced with the
+                    // default" — is false one save later. Cleared the moment the user
+                    // picks a harness themselves, which is the point at which the file
+                    // should start naming what is actually running.
+                    ai_harness: persist::ai_harness_to_persist(
+                        ai_harness_unknown.get_untracked().as_deref(),
+                        ai_harness.get_untracked().key(),
+                    ),
+                    ai_cli_path: ai_cli_path.get_untracked(),
+                    ai_model: ai_model.get_untracked(),
+                    ai_effort: ai_effort.get_untracked().cli().to_string(),
+                    ai_instructions: ai_instructions.get_untracked(),
+                    ai_schema_scope: ai_schema_scope.get_untracked().key().to_string(),
+                    ai_gutter: ai_gutter.get_untracked(),
+                    ai_run_queries: legacy_ai_run_queries,
+                    ui_theme: ui_theme.get_untracked().key().to_string(),
+                    editor_theme: editor_theme.get_untracked().key().to_string(),
+                    ui_scale: ui_scale.get_untracked().key().to_string(),
+                    editor_font_size: editor_font.get_untracked(),
+                    row_limit: row_limit.get_untracked(),
+                    statement_timeout_secs: statement_timeout.get_untracked(),
+                    confirm_writes: confirm_writes.get_untracked(),
+                    tab_width: tab_width.get_untracked(),
+                    soft_tabs: soft_tabs.get_untracked(),
+                    word_wrap: word_wrap.get_untracked(),
+                    restore_tabs: restore_tabs.get_untracked(),
+                    live_validate: live_validate.get_untracked(),
+                    show_table_sizes: table_sizes.get_untracked(),
+                },
+                saving,
+            );
         }
     });
 
@@ -7265,7 +7276,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             right_panel.get();
             table_sizes.get();
             activity_intervals.get();
-            save_ui();
+            save_ui(persist::Saving::Replacing);
         });
     }
 
@@ -7277,7 +7288,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             ui_theme.get();
             editor_theme.get();
             ui_scale.get();
-            save_ui();
+            save_ui(persist::Saving::Replacing);
         });
     }
 
@@ -7294,7 +7305,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             confirm_writes.get();
             restore_tabs.get();
             live_validate.get();
-            save_ui();
+            save_ui(persist::Saving::Replacing);
         });
     }
 
@@ -7422,7 +7433,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                     set.insert(key);
                 }
             });
-            save_ui();
+            save_ui(persist::Saving::Replacing);
         })
     };
 
@@ -7433,7 +7444,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             hidden_db_rules.update(move |rules| {
                 schemaic_core::db_hidden::toggle(rules, conn_id, &db);
             });
-            save_ui();
+            save_ui(persist::Saving::Replacing);
         })
     };
 
@@ -7449,7 +7460,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             let before = expanded.with_untracked(|set| set.is_empty());
             schemaic_ui::clear_if_any(expanded);
             if !before {
-                save_ui();
+                save_ui(persist::Saving::Replacing);
             }
         })
     };
@@ -7470,7 +7481,11 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                 expanded.with_untracked(|set| set.iter().any(|k| schemaic_ui::key_under(&db, k)));
             schemaic_ui::retain_if_any(expanded, move |k| !schemaic_ui::key_under(&db, k));
             if had_any {
-                save_ui();
+                // Collapsing a subtree, not deleting anything: an expansion key
+                // is not content, nothing confirmed its removal, and the next
+                // connection delete's erasing save takes the whole `.bak` with
+                // it anyway.
+                save_ui(persist::Saving::Replacing);
             }
         })
     };
@@ -10133,9 +10148,20 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             // Everything else keyed to this connection goes too. A deleted
             // connection shouldn't be reconstructable from what's left on disk —
             // its queries, the databases it had, the tables looked at. Which is
-            // also why these two saves are **erasing**: the ordinary one keeps
+            // also why **every save below is erasing**: the ordinary one keeps
             // the pre-deletion generation as `.bak`, and "not reconstructable
             // from what's left on disk" is exactly the claim that breaks.
+            //
+            // **It said "these two saves" and meant it.** Four of the twelve
+            // stores erased and the other five did not, so `ui_state.json.bak`
+            // kept the deleted connection's expanded tree and hidden databases,
+            // `db_colors.json.bak` and `favorites.json.bak` its databases and
+            // tables, `format.json.bak` its columns, and `diagrams.json.bak` its
+            // ER-diagram layout — every one of them named in `Saving`'s own doc
+            // as having this property. The four that were right were the four
+            // whose save takes a `Saving`; the five that were wrong were the
+            // five written by a shared `Fn()` closure with nowhere to say it.
+            // They take one now.
             history_entries.update(|v| schemaic_core::history::clear_conn(v, id));
             persist::save_json_erasing(
                 "history.json",
@@ -10148,9 +10174,9 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             db_colors.update(|v| schemaic_core::db_color::clear_conn(v, id));
             table_colors.update(|v| schemaic_core::db_color::table_clear_conn(v, id));
             // One save, both stores — see where `save_db_colors` is built.
-            (save_db_colors)();
+            (save_db_colors)(persist::Saving::Erasing);
             db_favorites.update(|v| schemaic_core::favorite::clear_conn(v, id));
-            (save_db_favorites)();
+            (save_db_favorites)(persist::Saving::Erasing);
             // Its poll interval too — connection ids are reused, and the next
             // connection to take this one would inherit a choice nobody made for
             // it. `save_ui` follows from the effect watching this store.
@@ -10164,9 +10190,9 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             // nodes went on auto-opening same-named databases on connections
             // created later.
             expanded_rules.update(|v| schemaic_core::expanded::clear_conn(v, id));
-            (save_ui)();
+            (save_ui)(persist::Saving::Erasing);
             formats.update(|v| schemaic_core::format::clear_conn(v, id));
-            (save_formats)();
+            (save_formats)(persist::Saving::Erasing);
             // The twelfth store, and it was the one missed. A connection-scoped
             // snippet is a query the user wrote against *this* connection — so
             // both reasons above apply to it, and the id-recycling one with
@@ -10183,7 +10209,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                 persist::load_json("diagrams.json");
             schemaic_ui::report_recoveries(error_modal_text, error_modal_open);
             schemaic_core::erd::clear_conn_layouts(&mut layouts, id);
-            persist::save_json("diagrams.json", &layouts);
+            persist::save_json_erasing("diagrams.json", &layouts);
         })
     };
 
@@ -10736,7 +10762,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                     ai_busy.set(false);
                 }
             }
-            save_ui();
+            save_ui(persist::Saving::Replacing);
         })
     };
 
@@ -12077,7 +12103,12 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             live_validate,
             window_focused,
         },
-        persist_layout: save_ui.clone(),
+        // A divider drag is never a deletion, so the UI's own handle is the
+        // replacing half of `save_ui` rather than the whole question.
+        persist_layout: {
+            let save_ui = save_ui.clone();
+            Rc::new(move || save_ui(persist::Saving::Replacing))
+        },
         formats,
         save_formats,
         db_colors,
@@ -12739,6 +12770,64 @@ mod app_tests {
             body.contains("tab.start_manual_run(None);"),
             "Run Everything no longer clears the previous run's base — a batch \
              panel's filter row will rebuild the last single statement"
+        );
+    }
+
+    /// **Deleting a connection erases every store it was keyed into.**
+    ///
+    /// The claim the confirm makes is about the disk — "a deleted connection
+    /// shouldn't be reconstructable from what's left on disk" — and
+    /// `Saving::Replacing` copies the pre-deletion generation to `<store>.bak`
+    /// on its way past. Four of the twelve stores got that right and five did
+    /// not, so `ui_state.json.bak` kept the connection's expanded tree and
+    /// hidden databases, `db_colors.json.bak` and `favorites.json.bak` its
+    /// databases and tables, `format.json.bak` its columns and
+    /// `diagrams.json.bak` its ER layout — all five named in `Saving`'s own doc
+    /// as having this property.
+    ///
+    /// It is a decision inside a view closure, so no unit test reaches it; this
+    /// reads the closure's own text. **Both directions, and a floor:** no
+    /// `Replacing` may appear in that region, at least nine saves must be
+    /// erasing, and the region must actually have been found — a needle that
+    /// stops matching otherwise reports an empty region with no `Replacing` in
+    /// it and passes, which is how the gate would become the bug.
+    #[test]
+    fn deleting_a_connection_erases_every_store_it_was_keyed_into() {
+        let src = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("src")
+                .join("main.rs"),
+        )
+        .expect("this file's own source");
+        let body = schemaic_ui::source_gate::production_code(&src);
+        let head = "let delete_conn_now: Rc<dyn Fn(u64)> = {";
+        let at = body.find(head).expect("the connection-delete closure");
+        // Anchored on code, not on prose: `production_code` blanks comment
+        // lines, so a landmark in a comment is not there to be found.
+        let end = at
+            + body[at..]
+                .find("let delete_conn: Rc<dyn Fn(u64)> = {")
+                .expect("the confirming wrapper that follows the closure");
+        let region = &body[at..end];
+
+        // The floor: the region is the closure, not an empty slice.
+        assert!(
+            region.len() > 2_000 && region.contains("save_json_erasing(\"diagrams.json\""),
+            "the delete closure was not located — this gate is reading {} bytes",
+            region.len()
+        );
+        assert!(
+            !region.contains("Saving::Replacing"),
+            "a store keyed to the deleted connection is saved `Replacing`, so its \
+             pre-deletion generation stays in `<store>.bak` under a confirm saying \
+             it cannot be recovered"
+        );
+        let erasing = region.matches("Saving::Erasing").count()
+            + region.matches("save_json_erasing(").count();
+        assert!(
+            erasing >= 9,
+            "only {erasing} erasing saves in the delete closure; every store keyed \
+             to the connection has to be one"
         );
     }
 

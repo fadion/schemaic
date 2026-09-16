@@ -248,6 +248,10 @@ type FollowFn = Rc<dyn Fn(TableSource, crate::RerunRequest)>;
 /// server-side filter/sort callback (`TabsActions::apply_view`).
 type ApplyViewFn = Rc<dyn Fn(crate::RerunRequest)>;
 
+/// Persist the app-wide formatter rules — see [`crate::Ui::save_formats`], whose
+/// doc says why the save takes its own [`schemaic_core::persist::Saving`].
+type SaveFormats = Rc<dyn Fn(schemaic_core::persist::Saving)>;
+
 /// Per-result interactive grid state. `Copy` (every field is an `RwSignal`, which
 /// is `Copy`) so it threads freely into the many cell/handler closures. Created
 /// once per result set and shared across sort rebuilds. Selection is tracked in
@@ -431,7 +435,7 @@ struct GridState {
     /// App-wide formatter-rule store (upserted + persisted on a menu choice).
     fmt_rules: RwSignal<Vec<ColumnFormatRule>>,
     /// Persist the formatter rules (wrapped so `GridState` stays `Copy`).
-    save_formats: RwSignal<Option<Rc<dyn Fn()>>>,
+    save_formats: RwSignal<Option<SaveFormats>>,
     /// In-grid find (Ctrl+F): the bar's open state and its query. Match counts
     /// live in `GridCtx` (written by `grid_view`, read by the panel-level bar).
     find_open: RwSignal<bool>,
@@ -3343,7 +3347,7 @@ pub(crate) struct GridCtx {
     /// to seed each column's format and upserts on a menu choice.
     pub(crate) formats: RwSignal<Vec<ColumnFormatRule>>,
     /// Persist the formatter rules to disk (called after an upsert).
-    pub(crate) save_formats: Rc<dyn Fn()>,
+    pub(crate) save_formats: SaveFormats,
     /// In-grid find (Ctrl+F). State lives here (at the RESULTS-panel level) so the
     /// find bar can render at the panel's top edge — above the grid — while the
     /// search runs in `grid_view` (which has the row data). `find_step` is a
@@ -9196,7 +9200,8 @@ fn set_format(gs: GridState, ci: usize, fmt: ColumnFormat) {
         gs.fmt_rules
             .update(|rules| format::upsert(rules, conn, &db, &table, &col, fmt));
         if let Some(save) = gs.save_formats.get_untracked() {
-            (save)();
+            // An upsert, not a deletion: the previous generation stays as `.bak`.
+            (save)(schemaic_core::persist::Saving::Replacing);
         }
     }
 }

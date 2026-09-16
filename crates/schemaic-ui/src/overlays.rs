@@ -1556,7 +1556,7 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                                 dbc.update(|r| {
                                     schemaic_core::db_color::upsert(r, cid, &db, Some(hex.clone()))
                                 });
-                                (save)();
+                                (save)(schemaic_core::persist::Saving::Replacing);
                             })
                         })
                         .collect();
@@ -1568,7 +1568,7 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                         swatches.push(MenuEntry::action("None", move || {
                             let cid = active_conn.get_untracked();
                             dbc.update(|r| schemaic_core::db_color::upsert(r, cid, &db, None));
-                            (save)();
+                            (save)(schemaic_core::persist::Saving::Replacing);
                         }));
                     }
                     // Favorite / unfavorite: a favorited database gets a gold star
@@ -1596,7 +1596,7 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                             dbf.update(|r| {
                                 schemaic_core::favorite::toggle(r, cid, &db);
                             });
-                            (save)();
+                            (save)(schemaic_core::persist::Saving::Replacing);
                         }));
                     }
                     entries.push(MenuEntry::sub("Colour", swatches));
@@ -2212,7 +2212,7 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                                             Some(hex.clone()),
                                         )
                                     });
-                                    (save)();
+                                    (save)(schemaic_core::persist::Saving::Replacing);
                                 })
                             })
                             .collect();
@@ -2227,7 +2227,7 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                                 tc.update(|r| {
                                     schemaic_core::db_color::table_upsert(r, cid, &db, &tbl, None)
                                 });
-                                (save)();
+                                (save)(schemaic_core::persist::Saving::Replacing);
                             }));
                         }
                         entries.push(MenuEntry::sub("Colour", swatches));

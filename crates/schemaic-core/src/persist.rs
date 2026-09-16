@@ -1299,8 +1299,14 @@ pub fn load_ui_state() -> UiState {
 }
 
 /// Persist UI state (best effort — errors are intentionally ignored).
-pub fn save_ui_state(state: &UiState) {
-    write_json(config_path(), state, Saving::Replacing);
+///
+/// **Takes its [`Saving`]**, because one of its callers is a deletion. This
+/// store holds the tree's expansion rules, the hidden-database rules and the
+/// per-connection Server Activity intervals, all keyed by connection — so
+/// deleting a connection prunes them and saves, and an ordinary save left every
+/// pruned rule in `ui_state.json.bak`.
+pub fn save_ui_state(state: &UiState, saving: Saving) {
+    write_json(config_path(), state, saving);
 }
 
 /// The legacy `ai_run_queries` flag **as a file actually recorded it**, or
@@ -1377,7 +1383,7 @@ pub fn load_json_strict<T: Default + for<'de> Deserialize<'de>>(file: &str) -> R
 
 /// Persist a JSON value to `<config>/<file>` (best effort).
 pub fn save_json<T: Serialize>(file: &str, value: &T) {
-    write_json(config_dir().map(|d| d.join(file)), value, Saving::Replacing);
+    write_json_store(file, value, Saving::Replacing);
 }
 
 /// [`save_json`] for a save whose point is that something is **gone** — the
@@ -1389,7 +1395,23 @@ pub fn save_json<T: Serialize>(file: &str, value: &T) {
 /// short version is that a confirm reading "This can't be undone" has to be
 /// true of the disk as well as of the panel.
 pub fn save_json_erasing<T: Serialize>(file: &str, value: &T) {
-    write_json(config_dir().map(|d| d.join(file)), value, Saving::Erasing);
+    write_json_store(file, value, Saving::Erasing);
+}
+
+/// [`save_json`] with the [`Saving`] chosen by the caller.
+///
+/// **For a store written by one shared closure with callers on both sides of
+/// the question.** The colour, favourite and formatter stores are each saved by
+/// a single `Rc<dyn Fn(Saving)>` that a menu upsert and a connection deletion
+/// both reach; neither of the two fixed-verb spellings above can serve that, and
+/// the alternative — the closure picking for itself — is how those three stores
+/// came to keep a deleted connection's databases, tables and columns in their
+/// `.bak` siblings under a confirm saying they could not be recovered.
+///
+/// Not a third policy: it is the same [`write_json`], with the argument passed
+/// through instead of written in.
+pub fn write_json_store<T: Serialize>(file: &str, value: &T, saving: Saving) {
+    write_json(config_dir().map(|d| d.join(file)), value, saving);
 }
 
 /// Load saved connections (best effort).
