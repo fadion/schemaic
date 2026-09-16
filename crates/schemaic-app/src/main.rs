@@ -635,9 +635,16 @@ type ConnGate = Rc<dyn Fn(Action)>;
 /// [`ConnGate`], with the refusal handed back to the caller.
 ///
 /// The second action runs *instead of* the first, and only when the gate has
-/// decided the connection is unreachable. [`ConnGate`] is this with a no-op
-/// refusal, which is why there is one gate and not two.
-type ConnGateElse = Rc<dyn Fn(Action, Action)>;
+/// decided not to proceed. [`ConnGate`] is this with a no-op refusal, which is
+/// why there is one gate and not two.
+///
+/// **It takes a [`Refusal`], because the gate has two of them.** It was an
+/// argument-less `Action`, so the one thing the gate knew — whether the
+/// connection was unreachable or the user had switched away from it — was
+/// dropped at the boundary, and `gate1_on_tab_answered` had to invent
+/// `Refusal::NotConnected` for both. The error modal said the right thing and
+/// the caller's own state machine said the wrong one.
+type ConnGateElse = Rc<dyn Fn(Action, Rc<dyn Fn(Refusal)>)>;
 /// Reports a health check's outcome.
 type CheckDoneFn = Rc<dyn Fn(CheckAnswer)>;
 
@@ -689,8 +696,39 @@ type InstallTerminal = Rc<dyn Fn(&schemaic_term::ShellConfig, Option<String>, &s
 enum Refusal {
     /// The connection is down, and the health re-check did not revive it.
     NotConnected,
+    /// The user switched connection while the health check was in flight.
+    ///
+    /// **Its own variant, because the sentence is different and the old one was
+    /// false.** Both of the gate's refusals arrived as `NotConnected` — the
+    /// gate's `refused` callback took no argument, so there was nothing for it
+    /// to say which it was — and the query-plan modal then read "the server
+    /// didn't answer the health check" about a server that had answered
+    /// perfectly well, for a connection the user had simply left. The error
+    /// modal already distinguished the two; the caller's own state machine did
+    /// not.
+    ConnectionChanged,
     /// The user left the tab the action was started on while the gate held it.
     TabMovedOn,
+}
+
+/// Does a refused health check still let the action through?
+///
+/// **A superseded failure is not the same as a stale one.** A check that lands
+/// after a newer one has already said the server is up is answering a question
+/// somebody else has since answered better, and refusing on it would raise "Not
+/// connected" over a header reading Connected. So the status is re-read.
+///
+/// **But `Connected`, not "not down".** It was `!conn_status.is_down()`, and
+/// `ConnStatus::Unknown` is not down — by design, since it covers "not checked
+/// yet" and "the tunnel is still coming up". `check_conn_then`'s two early exits
+/// set exactly that status and answer `Reachable(false)`: no such connection,
+/// and an SSH tunnel that is not up. So the override fired on the answers it was
+/// least entitled to, the action ran against a connection with no tunnel, and
+/// the user got the driver's raw connect error in place of the gate's sentence —
+/// against `answer_none`'s own doc, which says `false` is the honest answer and
+/// "`with_conn` then says so".
+fn health_check_lets_through(answer: CheckAnswer, now: ConnStatus) -> bool {
+    answer == CheckAnswer::Reachable(true) || now == ConnStatus::Connected
 }
 
 /// What a finished connection test leaves on the Test button.
@@ -743,6 +781,10 @@ fn plan_refusal_text(why: Refusal) -> &'static str {
         Refusal::NotConnected => {
             "Not connected — the plan was not run. The server didn't answer the \
              health check, so nothing was sent to it."
+        }
+        Refusal::ConnectionChanged => {
+            "You switched connection while Schemaic was checking that it was \
+             reachable, so the plan was not run. Switch back and ask again."
         }
         Refusal::TabMovedOn => {
             "You switched tabs while the connection was being re-checked, so the \
@@ -861,7 +903,13 @@ fn gate1_on_tab_answered<A: Clone + 'static>(
                 }
                 action(arg.clone())
             }),
-            Rc::new(move || (unreachable)(Refusal::NotConnected)),
+            // **The gate's own reason, not one invented here.** This used to be
+            // `Rc::new(move || (unreachable)(Refusal::NotConnected))`: the gate
+            // had two refusals and no way to say which, so a connection switched
+            // mid-check reached the query-plan modal as "the server didn't
+            // answer the health check" — about a server that answered fine, for
+            // a connection the user had left.
+            unreachable,
         );
     })
 }
@@ -7623,7 +7671,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
     // flight takes this instead — see [`Refusal`].
     let with_conn_else: ConnGateElse = {
         let check_conn_then = check_conn_then.clone();
-        Rc::new(move |action: Rc<dyn Fn()>, refused: Rc<dyn Fn()>| {
+        Rc::new(move |action: Rc<dyn Fn()>, refused: Rc<dyn Fn(Refusal)>| {
             if !conn_status.get_untracked().is_down() {
                 action();
                 return;
@@ -7650,7 +7698,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                          and try again."
                     )));
                     error_modal_open.set(true);
-                    refused();
+                    refused(Refusal::ConnectionChanged);
                     return;
                 }
                 // A *superseded* failure still lands here — dropping it upstream
@@ -7659,8 +7707,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                 // set to Connected, so the refusal re-reads the status: if
                 // something more recent than our own ping says the server is up,
                 // that is the better answer and the action proceeds.
-                if answer == CheckAnswer::Reachable(true) || !conn_status.get_untracked().is_down()
-                {
+                if health_check_lets_through(answer, conn_status.get_untracked()) {
                     action();
                 } else {
                     // Still unreachable — say so, rather than letting the action
@@ -7671,14 +7718,14 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                          right."
                     )));
                     error_modal_open.set(true);
-                    refused();
+                    refused(Refusal::NotConnected);
                 }
             })));
         })
     };
     let with_conn: ConnGate = {
         let g = with_conn_else.clone();
-        Rc::new(move |action: Rc<dyn Fn()>| (g)(action, Rc::new(|| {})))
+        Rc::new(move |action: Rc<dyn Fn()>| (g)(action, Rc::new(|_| {})))
     };
 
     // ── The write guard ─────────────────────────────────────────────────────
@@ -12812,11 +12859,11 @@ mod app_tests {
     use std::rc::Rc;
 
     use super::{
-        Action, CliLauncher, ConnGate, ConnGateElse, Refusal, RunTimeout, gate1, gate1_on_tab,
-        gate1_on_tab_answered, inline_outcome, mysql_shell_config, owning_tab_of,
-        plan_refusal_text, plan_refused, psql_database, psql_shell_config, resolve_cli_with,
-        resolve_native_cli, sqlite_shell_config, test_outcome, timeout_message, tx_engine,
-        unique_name,
+        Action, CheckAnswer, CliLauncher, ConnGate, ConnGateElse, Refusal, RunTimeout, gate1,
+        gate1_on_tab, gate1_on_tab_answered, health_check_lets_through, inline_outcome,
+        mysql_shell_config, owning_tab_of, plan_refusal_text, plan_refused, psql_database,
+        psql_shell_config, resolve_cli_with, resolve_native_cli, sqlite_shell_config, test_outcome,
+        timeout_message, tx_engine, unique_name,
     };
     use floem::prelude::{SignalGet, SignalUpdate};
     use floem::reactive::RwSignal;
@@ -13499,17 +13546,28 @@ mod app_tests {
     /// **failed**: the action is dropped and the refusal is taken. That is the
     /// branch the query-plan modal was never told about.
     fn refusing_gate() -> ConnGateElse {
-        Rc::new(move |_action: Action, refused: Action| refused())
+        Rc::new(move |_action: Action, refused: Rc<dyn Fn(Refusal)>| refused(Refusal::NotConnected))
+    }
+
+    /// The other of the gate's two refusals: the user switched connection while
+    /// the ping was in flight. Both used to arrive as `NotConnected`.
+    fn switched_gate() -> ConnGateElse {
+        Rc::new(move |_action: Action, refused: Rc<dyn Fn(Refusal)>| {
+            refused(Refusal::ConnectionChanged)
+        })
     }
 
     /// The same, holding both halves so the caller decides which one lands —
     /// `with_conn_else` on a `Disconnected` connection, before the ping answers.
     #[allow(clippy::type_complexity)]
-    fn deferring_gate_else() -> (ConnGateElse, Rc<RefCell<Option<(Action, Action)>>>) {
-        let held: Rc<RefCell<Option<(Action, Action)>>> = Rc::new(RefCell::new(None));
+    fn deferring_gate_else() -> (
+        ConnGateElse,
+        Rc<RefCell<Option<(Action, Rc<dyn Fn(Refusal)>)>>>,
+    ) {
+        let held: Rc<RefCell<Option<(Action, Rc<dyn Fn(Refusal)>)>>> = Rc::new(RefCell::new(None));
         let slot = held.clone();
         let gate: ConnGateElse =
-            Rc::new(move |a: Action, r: Action| *slot.borrow_mut() = Some((a, r)));
+            Rc::new(move |a: Action, r: Rc<dyn Fn(Refusal)>| *slot.borrow_mut() = Some((a, r)));
         (gate, held)
     }
 
@@ -13564,7 +13622,104 @@ mod app_tests {
         );
     }
 
-    /// The second refusal, and the one the pinned wrapper owns rather than the
+    /// **The gate's *other* refusal, which used to arrive as this one.**
+    ///
+    /// `with_conn_else` distinguishes two: the connection did not answer, and
+    /// the user switched connection while the ping was in flight. Its `refused`
+    /// callback took no argument, so `gate1_on_tab_answered` minted
+    /// `Refusal::NotConnected` for both — and the query-plan modal then read
+    /// "the server didn't answer the health check" about a server that had
+    /// answered perfectly well, for a connection the user had simply left. The
+    /// *error modal* had the right sentence throughout; the caller's own state
+    /// machine did not, and nothing compared them.
+    #[test]
+    fn a_plan_launch_refused_by_a_connection_switch_says_that_and_not_the_other() {
+        let active = RwSignal::new(7usize);
+        let plan_state = RwSignal::new(schemaic_ui::PlanState::Running);
+        let ran: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
+        let moved_on_said = RwSignal::new(0usize);
+
+        let sink = ran.clone();
+        let action: Rc<dyn Fn((String, bool))> =
+            Rc::new(move |(sql, _analyze)| sink.borrow_mut().push(sql));
+        let moved_on: Rc<dyn Fn()> = Rc::new(move || moved_on_said.update(|n| *n += 1));
+
+        let gated = gate1_on_tab_answered(
+            &switched_gate(),
+            &action,
+            active,
+            &plan_refused(plan_state, &moved_on),
+        );
+        gated(("SELECT 1".to_string(), false));
+
+        assert!(ran.borrow().is_empty(), "the gate refused, so nothing ran");
+        match plan_state.get_untracked() {
+            schemaic_ui::PlanState::Failed(msg) => {
+                assert_eq!(msg, plan_refusal_text(Refusal::ConnectionChanged));
+                assert_ne!(
+                    msg,
+                    plan_refusal_text(Refusal::NotConnected),
+                    "the modal blames a health check that answered, on a \
+                     connection the user had left"
+                );
+                assert!(msg.contains("switched connection"), "{msg}");
+            }
+            other => panic!("the modal is still spinning: {other:?}"),
+        }
+        // The tab did not move, so the tab modal is not owed one.
+        assert_eq!(moved_on_said.get_untracked(), 0);
+    }
+
+    /// **A refused check is not overridden by a status that says "don't know".**
+    ///
+    /// The override exists so a check landing *after* a newer one has said the
+    /// server is up does not raise "Not connected" over a header reading
+    /// Connected — a superseded failure is answering a question somebody else
+    /// answered better. It was spelled `!conn_status.is_down()`, and
+    /// `ConnStatus::Unknown` is not down, by design: it covers "not checked yet"
+    /// and "the tunnel is still coming up".
+    ///
+    /// `check_conn_then`'s two early exits set exactly that status and answer
+    /// `Reachable(false)` — no such connection, and an SSH tunnel that is not up
+    /// — so the override fired on the two answers it was least entitled to. The
+    /// action ran, and the user got the driver's raw connect error where
+    /// `answer_none`'s own doc says they should have had the gate's sentence.
+    #[test]
+    fn an_unknown_status_does_not_override_a_failed_health_check() {
+        use schemaic_core::connection::ConnStatus;
+        // The case the override is *for*: our ping failed, a newer one succeeded.
+        assert!(health_check_lets_through(
+            CheckAnswer::Reachable(false),
+            ConnStatus::Connected
+        ));
+        // A successful ping goes through whatever the cached status says.
+        for now in [
+            ConnStatus::Unknown,
+            ConnStatus::Connected,
+            ConnStatus::Disconnected,
+        ] {
+            assert!(health_check_lets_through(CheckAnswer::Reachable(true), now));
+        }
+        // …and the two `answer_none` exits, which are the defect.
+        assert!(
+            !health_check_lets_through(CheckAnswer::Reachable(false), ConnStatus::Unknown),
+            "a check that could not even be made was overridden by the status it \
+             had just set itself"
+        );
+        assert!(!health_check_lets_through(
+            CheckAnswer::Reachable(false),
+            ConnStatus::Disconnected
+        ));
+        // A connection switch is refused by the arm above this one and never
+        // reaches the override; asserted so the predicate cannot quietly become
+        // the thing that decides it.
+        assert!(!health_check_lets_through(
+            CheckAnswer::ConnectionChanged,
+            ConnStatus::Unknown
+        ));
+    }
+
+    /// The third refusal, and the one the pinned wrapper owns rather than the
     /// gate: the check takes up to five seconds, the user clicks another tab
     /// while it does, and the deferred launch is dropped. It owes the modal the
     /// same answer — and *additionally* the "you switched tabs" error every
