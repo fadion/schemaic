@@ -2443,6 +2443,20 @@ fn exported_rows(gs: GridState) -> (ResultSet, Vec<usize>) {
     grid_cells(&rs, &order, &formats, &dirty, &new_rows).exported()
 }
 
+/// How many rows [`exported_rows`] would hand back, without building them —
+/// see [`schemaic_core::edit::GridCells::exported_row_count`].
+///
+/// Through `GridCells` like everything else that asks the resolved grid a
+/// question, rather than spelled out here: the identity it relies on is the
+/// resolver's, and a second copy of it in this file is how the menu and the
+/// file came to disagree in the first place.
+fn exported_row_count(gs: GridState) -> usize {
+    let (rs, order) = (gs.rs.get_untracked(), gs.order.get_untracked());
+    let (dirty, new_rows) = (gs.dirty.get_untracked(), gs.new_rows.get_untracked());
+    let formats = gs.formats.get_untracked();
+    grid_cells(&rs, &order, &formats, &dirty, &new_rows).exported_row_count()
+}
+
 /// Render the whole result in `format`. The single dispatch point for both the
 /// copy menu and the save-to-file menu, so the two can't drift.
 fn render_export(gs: GridState, format: ExportFormat) -> String {
@@ -2522,7 +2536,15 @@ fn export_menu(
     // "Fetched rows (200k)" over a file holding 200,003, while the export
     // modal's own denominator (`order.len()`) said 200,003: two figures for one
     // file, three lines apart. One derivation now, and it is the file's.
-    let fetched = exported_rows(gs).1.len();
+    // **The count, not the rows.** This was `exported_rows(gs).1.len()`, which
+    // runs the whole resolve to read a `len()`: with any pending ＋ Row,
+    // `ResultSet::append_rows` does `Arc::make_mut` on every column and the
+    // order is copied twice — synchronously on the UI thread, per click of the
+    // Download icon, and only here, on the large truncated results where it
+    // costs most, because the cheap branch above returns first.
+    // `exported_row_count` is the same number by construction and builds
+    // nothing.
+    let fetched = exported_row_count(gs);
     vec![
         MenuEntry::sub(
             format!(
@@ -10828,8 +10850,15 @@ mod cell_preview_tests {
                 .find("\n}")
                 .unwrap_or_else(|| panic!("`{name}` has no end — this gate is stale"));
             let f = &body[at..at + end];
+            // **Two resolvers, and both are legal.** `exported_row_count` is
+            // `exported_rows`' cheap half: the same number by construction, with
+            // nothing built — which is what `export_menu` needs, since it names
+            // a file rather than writing one, and building the whole resolved
+            // result to read a `len()` is `Arc::make_mut` on every column, on
+            // the UI thread, per click. Listed here rather than exempting the
+            // function, so a path that stops resolving at all is still caught.
             assert!(
-                f.contains("exported_rows("),
+                f.contains("exported_rows(") || f.contains("exported_row_count("),
                 "`{name}` does not resolve the grid's staged edits before \
                  rendering, so it disagrees with Ctrl+C:\n{f}"
             );
@@ -10838,13 +10867,16 @@ mod cell_preview_tests {
                 "`{name}` still reads the fetched result directly:\n{f}"
             );
         }
-        // And the resolver itself goes through `GridCells`, rather than
-        // reaching for the overlay a second time.
-        let at = body
-            .find("fn exported_rows(")
-            .expect("`exported_rows` is gone");
-        let end = body[at..].find("\n}").expect("no end");
-        assert!(body[at..at + end].contains("grid_cells("));
+        // And both resolvers go through `GridCells`, rather than reaching for
+        // the overlay a second time — which is how the menu and the file came to
+        // disagree about a row count in the first place.
+        for name in ["fn exported_rows(", "fn exported_row_count("] {
+            let at = body
+                .find(name)
+                .unwrap_or_else(|| panic!("`{name}` is gone — this gate is stale"));
+            let end = body[at..].find("\n}").expect("no end");
+            assert!(body[at..at + end].contains("grid_cells("), "{name}");
+        }
     }
 
     /// **The join guard is on the two actions, so no menu can route around it.**

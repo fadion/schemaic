@@ -1384,6 +1384,27 @@ impl GridCells<'_> {
         (out, order)
     }
 
+    /// How many rows [`GridCells::exported`] would hand back, **without
+    /// building them.**
+    ///
+    /// The export menu names its "Fetched rows (N)" entry after this, and it was
+    /// taking `exported().1.len()` — which runs the whole resolve first. With
+    /// any pending ＋ Row that is `ResultSet::append_rows` doing `Arc::make_mut`
+    /// on *every* column, plus two copies of the order, synchronously on the UI
+    /// thread, per click of the Download icon — and only on the large truncated
+    /// results, because the cheap branch above returns before reaching it.
+    ///
+    /// The identity is unconditional, which is what makes the cheap answer the
+    /// same answer: the display order is a permutation of the stored rows, so it
+    /// contributes `nreal` whether it is the real order or the rebuilt identity,
+    /// and the pending rows are appended past its end. Pinned by
+    /// `the_named_row_count_is_the_one_the_file_holds`, which asserts the two
+    /// agree over an unsorted, a short and a sorted order rather than restating
+    /// the arithmetic.
+    pub fn exported_row_count(&self) -> usize {
+        self.rs.row_count() + self.new_rows.len()
+    }
+
     /// The block `(r0, c0, r1, c1)` as an AI attachment: its column names, its
     /// rows **as the user sees them**, and how many rows were selected in all.
     ///
@@ -4003,6 +4024,63 @@ mod tests {
         let tsv_lines: Vec<&str> = tsv.lines().collect();
         assert!(tsv_lines[0].contains("Bob"), "{tsv}");
         assert!(tsv_lines[1].contains("Alicia"), "{tsv}");
+    }
+
+    /// **The number the menu names is the number the file holds**, and it is
+    /// answered without building the file.
+    ///
+    /// The export menu's "Fetched rows (N)" took `exported().1.len()`, which
+    /// runs the whole resolve to read a `len()` — `Arc::make_mut` on every
+    /// column for any pending ＋ Row, plus two copies of the order, on the UI
+    /// thread, per click, and only on the large truncated results where it costs
+    /// most. `exported_row_count` is the cheap answer, and this pins that it is
+    /// the *same* answer rather than restating its arithmetic: over an unsorted
+    /// order, a short one (the identity-rebuild branch) and a sorted one, with
+    /// and without staged rows.
+    #[test]
+    fn the_named_row_count_is_the_one_the_file_holds() {
+        let rs = crate::model::ResultSet::from_rows(
+            vec![
+                col("id", "INT", "t", true, false),
+                col("name", "VARCHAR", "t", false, false),
+            ],
+            vec![
+                vec![Value::Int(1), Value::Str("Alice".into())],
+                vec![Value::Int(2), Value::Str("Bob".into())],
+                vec![Value::Int(3), Value::Str("Cara".into())],
+            ],
+        );
+        let formats = vec![crate::format::ColumnFormat::None; 2];
+        let mut dirty = HashMap::new();
+        dirty.insert((0, 1), CellEdit::Text("Alicia".into()));
+        let staged = |n: usize| -> Vec<HashMap<usize, CellEdit>> {
+            (0..n)
+                .map(|i| {
+                    let mut r = HashMap::new();
+                    r.insert(1, CellEdit::Text(format!("new {i}")));
+                    r
+                })
+                .collect()
+        };
+        for order in [
+            vec![0, 1, 2],
+            // Sorted: display order is a permutation of the stored rows.
+            vec![2, 0, 1],
+            // Short — `exported` rebuilds the identity rather than dropping
+            // rows, and the count has to follow it.
+            vec![0],
+            Vec::new(),
+        ] {
+            for n in [0usize, 1, 3] {
+                let new_rows = staged(n);
+                let c = cells(&rs, &order, &formats, &dirty, &new_rows);
+                assert_eq!(
+                    c.exported_row_count(),
+                    c.exported().1.len(),
+                    "order {order:?}, {n} staged"
+                );
+            }
+        }
     }
 
     /// A clean grid exports exactly what it fetched — the resolution is not
