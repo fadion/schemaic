@@ -251,6 +251,38 @@ pub fn dump_verdict(read: ReadEnd, write: WriteEnd) -> DumpVerdict {
     }
 }
 
+/// What a **cancelled dump** says.
+///
+/// [`crate::export::export_cancel_note`]'s twin, and deliberately not that
+/// function: it ends "the rows that were written are in …", which is right for a
+/// result export, because a result export is nothing but rows. This file is
+/// `CREATE TABLE`s and triggers as well, and a structure-only one has no rows at
+/// all — so borrowing that wording would describe a file that is not there. The
+/// half that must not drift is *where the fragment went*, and both spellings
+/// take it from [`crate::export::part_path`], the one function that knows the
+/// suffix.
+///
+/// `partial` is the same fact [`DumpVerdict::Failed::partial`] carries, and it
+/// is here for the same reason it was added there: `fetch_schema` takes the
+/// cancellation token because it is the longest phase on a large database, and
+/// it returns *before* the writer is spawned — so a cancel during the schema
+/// read has created nothing, while the sentence pointed at a `.part` regardless
+/// and sent the user to look for it.
+///
+/// Here rather than in the view for [`dump_verdict`]'s reason: it was a
+/// `format!` inside a Floem closure, which is why the unconditional half went
+/// unnoticed.
+pub fn cancel_note(name: &str, partial: bool) -> String {
+    if partial {
+        format!(
+            "Export cancelled — {name} was not changed; what had been written is in {}",
+            crate::export::part_path(name)
+        )
+    } else {
+        format!("Export cancelled — {name} was not changed.")
+    }
+}
+
 /// The session switch that turns foreign-key enforcement off and back on, when
 /// the engine has one an ordinary user can throw.
 ///
@@ -3218,6 +3250,38 @@ mod tests {
         assert_eq!(
             dump_verdict(ReadEnd::Cancelled, WriteEnd::Wrote),
             DumpVerdict::Cancelled { partial: true }
+        );
+    }
+
+    /// **The sentence follows the fact**, and it is the dump's own sentence
+    /// rather than the result export's.
+    ///
+    /// A cancel during the schema read has created nothing — `fetch_schema`
+    /// takes the token because it is the longest phase, and returns before the
+    /// writer is spawned — so pointing at `shop.sql.part` sends the user to look
+    /// for a file that is not there, on an arm they are unlikely to check twice.
+    /// And `export_cancel_note` is not the answer either: it ends "the rows that
+    /// were written are in …", which describes a result export and not a file of
+    /// `CREATE TABLE`s that may hold no rows at all.
+    #[test]
+    fn a_cancelled_dump_names_a_fragment_only_when_there_is_one() {
+        let with = cancel_note("shop.sql", true);
+        assert!(with.contains("shop.sql.part"), "{with}");
+        assert!(with.contains("was not changed"), "{with}");
+        // Not the result export's wording: this file is not only rows.
+        assert!(!with.contains("the rows that were written"), "{with}");
+
+        let without = cancel_note("shop.sql", false);
+        assert!(
+            !without.contains(".part"),
+            "a cancel that wrote nothing points at a fragment: {without}"
+        );
+        assert!(without.contains("was not changed"), "{without}");
+        // The suffix comes from the one function that knows it, in the half that
+        // has one.
+        assert!(
+            with.contains(&crate::export::part_path("shop.sql")),
+            "{with}"
         );
     }
 

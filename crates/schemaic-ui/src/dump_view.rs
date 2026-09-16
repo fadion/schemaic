@@ -278,6 +278,12 @@ fn run_dump(ui: Ui, target: DumpTarget) {
                 // The half that must not drift is *where the fragment went*, and
                 // that comes from `part_path` — the one function that knows the
                 // suffix — in both spellings.
+                //
+                // It is `dump::cancel_note` rather than a `format!` here for the
+                // reason `dump_verdict` is not written out in this file: the
+                // sentence had two halves and only one of them was ever said. A
+                // cancel during the schema read creates no `.part` at all, and
+                // this pointed at one regardless.
                 match outcome {
                     // **Through `export_note`, which is where a caveat is
                     // worded.** The tally carries what the file could not hold —
@@ -314,14 +320,9 @@ fn run_dump(ui: Ui, target: DumpTarget) {
                                 .unwrap_or_default(),
                         )))
                     }
-                    // Through `export_cancel_note`, which is the function that
-                    // already knows both sentences — and which takes `partial`
-                    // for exactly this reason. The unconditional sentence here
-                    // pointed at a `.part` that a cancel during the schema read
-                    // never created.
-                    DumpOutcome::Cancelled { partial } => d.error.set(Some(
-                        schemaic_core::export::export_cancel_note(&name, partial),
-                    )),
+                    DumpOutcome::Cancelled { partial } => d
+                        .error
+                        .set(Some(schemaic_core::dump::cancel_note(&name, partial))),
                     DumpOutcome::Failed { message, partial } => {
                         d.error.set(Some(schemaic_core::export::export_failure_note(
                             &message,
