@@ -660,9 +660,24 @@ async fn list_schema(
             ),
         };
     }
-    let names = match db.fetch_databases().await {
-        Ok(d) => listed_databases(d, hidden, default_db),
-        Err(e) => return (format!("Error listing databases: {e}"), true),
+    // **The first read of the overview form, and it had no deadline at all.**
+    // This is the tool's advertised entry point — what a fresh turn asks first —
+    // and `fetch_databases` is `SHOW DATABASES` on MySQL: behind an
+    // `ALTER TABLE`'s metadata lock, or on a server that has stopped answering
+    // without dropping the socket, it blocks for the server's own time. `serve`
+    // is a single sequential loop with no outer timeout, so for the whole of
+    // that the MCP server answers nothing — not `initialize`, not `tools/list`,
+    // not `ping`. That is the wedge this file's deadlines exist to close, one
+    // line above the read that was given one.
+    //
+    // `with_deadline_abandoning`, for the reason spelled out below: this read
+    // takes no `CancellationToken` on any of the three engines, and
+    // `with_deadline` over a tokenless read is a wait for the server rather
+    // than a bound on ours.
+    let names = match with_deadline_abandoning(db.fetch_databases()).await {
+        Some(Ok(d)) => listed_databases(d, hidden, default_db),
+        Some(Err(e)) => return (format!("Error listing databases: {e}"), true),
+        None => return ("Listing databases timed out (30s).".to_string(), true),
     };
     let mut dbs = Vec::with_capacity(names.len());
     for name in names {
@@ -676,7 +691,7 @@ async fn list_schema(
         // sequential and answers nothing while this runs.
         //
         // **Bounded in time, but not cancelled at the server**, and that is the
-        // one of the six reads where those differ: `fetch_table_list` takes no
+        // one of the two reads where those differ: `fetch_table_list` takes no
         // `CancellationToken` — it is a name listing, not the full
         // introspection — so the statement runs to completion on the server
         // after we stop waiting. The wedge this is about is *ours*, so bounding
@@ -1027,7 +1042,16 @@ async fn propose_change(
     for c in &changes.changes {
         out.push_str(&format!("- {}\n", c.summary()));
     }
-    out.push_str(&format!("\nSQL:\n{}\n", changes.emit().join("\n")));
+    // **`editor_script`, not `emit().join`.** This is a fifth builder joining
+    // emitted statements into one script, and the rule the other four keep is
+    // that every such join goes through `ddl::client_script` — which terminates
+    // each statement and wraps a compound MySQL body in `DELIMITER $$`. A
+    // single-object `ChangeSet` is exactly where a trigger or routine body
+    // lives, so a raw join hands the model a `CREATE TRIGGER … BEGIN …; …; END`
+    // that the app's own splitter cuts at the internal semicolons. It also
+    // carries `withheld_header`, so a change this engine refuses is disclosed
+    // here instead of printed as if it were part of the plan.
+    out.push_str(&format!("\nSQL:\n{}\n", changes.editor_script()));
     let risks = changes.destructive();
     if !risks.is_empty() {
         out.push_str("\nDestructive — the preview will say so too:\n");
@@ -1216,6 +1240,68 @@ mod tests {
                  `with_deadline_abandoning`:\n{line}"
             );
         }
+    }
+
+    /// **The property both halves above were reaching for, stated once.**
+    ///
+    /// Each of them names a spelling: one enumerates `CancellationToken::new()`
+    /// sites, the other is a literal pair check for `with_deadline(` and
+    /// `fetch_table_list` on one line. Neither could see `list_schema`'s
+    /// `db.fetch_databases().await` — the overview form's *first* read, the
+    /// tool's advertised entry point, with no deadline at all — because it
+    /// builds no token and names no function either gate knows. The commit that
+    /// wrote the second half audited this very function, restated its read count
+    /// from four to six, and still did not count that one; there are seven.
+    ///
+    /// So: **every awaited `db.…()` read in production code is lexically inside
+    /// a deadline wrapper.** No hand-maintained list, so a new read has to be
+    /// wrapped rather than added to an array. The floor is there because a
+    /// needle that stops matching must not read as a clean file.
+    #[test]
+    fn no_database_read_is_awaited_without_a_deadline() {
+        let body = schemaic_ui::source_gate::production_code(include_str!("mcp.rs"));
+        let mut checked = 0usize;
+        let mut offenders: Vec<String> = Vec::new();
+        let mut from = 0usize;
+        while let Some(rel) = body[from..]
+            .find("db.fetch_")
+            .into_iter()
+            .chain(body[from..].find("db.run_"))
+            .min()
+        {
+            let at = from + rel;
+            from = at + 1;
+            checked += 1;
+            // **The whole call, not one line.** The wrapper is the call this one
+            // is an argument to, so it is to the left — but rustfmt breaks a
+            // long call across lines, and two of the four wrapped reads here are
+            // written that way. A line-oriented scan would report both as
+            // offenders and, worse, would report a broken *unwrapped* one as
+            // clean. So: the nearest `with_deadline` behind this read counts
+            // only if no statement boundary stands between them.
+            let before = &body[..at];
+            let wrapped = before.rfind("with_deadline").is_some_and(|w| {
+                !before[w..].contains(';')
+                    && !before[w..].contains('{')
+                    && !before[w..].contains('}')
+            });
+            if !wrapped {
+                let line = 1 + before.bytes().filter(|c| *c == b'\n').count();
+                let text = body[at..].split('\n').next().unwrap_or_default();
+                offenders.push(format!("{line}: {}", text.trim()));
+            }
+        }
+        assert!(
+            checked >= 7,
+            "the needle stopped matching: {checked} database reads found, and this \
+             module has at least seven — a gate that scans nothing reports success"
+        );
+        assert!(
+            offenders.is_empty(),
+            "database reads awaited with no deadline; the serve loop is sequential, \
+             so one slow read answers nothing and wedges every request behind it:\n{}",
+            offenders.join("\n")
+        );
     }
 
     /// Tool names the server advertises, in order.
