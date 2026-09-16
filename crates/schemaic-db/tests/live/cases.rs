@@ -111,6 +111,14 @@ pub static MYSQL_FAMILY: &[TypeCase] = &[
         "18446744073709551615",
         "18446744073709551615",
     ),
+    // **The padding is the server's own rendering of the value**, and both
+    // engines send it over the text protocol and *not* over the binary one a
+    // prepared statement uses — which is why this case is here rather than in a
+    // pure test: `INT(4) UNSIGNED ZEROFILL` holding 7 reads back as `0007` on a
+    // `SELECT` and as `7` on the re-fetch, and only a server can say so. The
+    // write-back half runs `0007` back through the quoter and the key, where
+    // the server coerces it to the same number.
+    case("int_zerofill", "INT(4) UNSIGNED ZEROFILL", "7", "0007"),
     case(
         "decimal_wide",
         "DECIMAL(30,10)",

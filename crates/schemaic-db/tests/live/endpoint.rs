@@ -270,9 +270,9 @@ pub static MARIADB: Target = Target {
     running_sleeps_sql: "SELECT COUNT(*) FROM information_schema.PROCESSLIST \n         WHERE INFO LIKE CONCAT('%{head}', '{tail}%')",
     types: cases::MYSQL_FAMILY,
     extra_types: cases::MARIADB_ONLY,
-    expected_cases: 24,
-    expected_writable_cases: 23,
-    expected_keyed_cases: 19,
+    expected_cases: 25,
+    expected_writable_cases: 24,
+    expected_keyed_cases: 20,
 };
 
 pub static MYSQL: Target = Target {
@@ -301,9 +301,9 @@ pub static MYSQL: Target = Target {
     running_sleeps_sql: "SELECT COUNT(*) FROM information_schema.PROCESSLIST \n         WHERE INFO LIKE CONCAT('%{head}', '{tail}%')",
     types: cases::MYSQL_FAMILY,
     extra_types: cases::MYSQL_ONLY,
-    expected_cases: 24,
-    expected_writable_cases: 23,
-    expected_keyed_cases: 19,
+    expected_cases: 25,
+    expected_writable_cases: 24,
+    expected_keyed_cases: 20,
 };
 
 pub static POSTGRES: Target = Target {
@@ -546,6 +546,19 @@ fn engines_var() -> Option<Vec<String>> {
 /// tier that asserts something without connecting to anything. So adding a case
 /// fails *here*, with the right number in the message, rather than passing
 /// silently in the matrix.
+///
+/// **Where "here" is, exactly.** Needing no server and being *built* are
+/// different properties, and this test has only the first: the target declares
+/// `required-features = ["live-tests"]`, so a developer's `cargo test
+/// --workspace` does not compile it and cannot run this. What does run it is
+/// CI — `.github/workflows/ci.yml`'s `live` job builds this target and runs it
+/// against `mariadb:11`, `mysql:8.4` and `postgres:16` on every push and every
+/// pull request, blocking, with no `continue-on-error` — so a stale constant is
+/// a red required check on the next push rather than a number nobody notices.
+/// That gap between the local bar and the CI bar is the deliberate purity
+/// boundary `Cargo.toml`'s feature block describes, not a hole; this paragraph
+/// is here because the sentence above it was once read as promising the local
+/// run too.
 #[test]
 fn every_leg_declares_the_number_of_cases_it_has() {
     for t in ALL {

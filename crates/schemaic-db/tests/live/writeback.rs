@@ -549,6 +549,15 @@ async fn seed_rows(scratch: &Scratch, table: &str, ddl: &str) {
 pub async fn a_spliced_row_is_the_row_a_fresh_select_would_show(target: &'static Target) {
     let scratch = Scratch::create(target, "refetch").await;
     let t = scratch.qualified("t");
+    // **`ZEROFILL` is the MySQL family's own instance of this defect**, and the
+    // sharpest one: the text protocol sends `0007` and the binary protocol
+    // sends the number 7, so the column is in the table only where the engine
+    // has the attribute. PostgreSQL has nothing to add here.
+    let padded = !matches!(
+        target.engine.dialect(),
+        schemaic_core::intel::SqlDialect::Postgres
+    );
+    let pad_col = if padded { ", pad" } else { "" };
     // Shapes whose *text* form the binary protocol does not reproduce on its
     // own: a datetime with a zero time, a time-of-day, and a 32-bit float.
     // Deliberately awkward, for the reason the DDL shapes are.
@@ -561,7 +570,7 @@ pub async fn a_spliced_row_is_the_row_a_fresh_select_would_show(target: &'static
         _ => format!(
             "CREATE TABLE {t} (id INT PRIMARY KEY, note VARCHAR(20), \
              due DATETIME, micros DATETIME(3), plain DATE, dur TIME, \
-             ratio FLOAT, exact DOUBLE)"
+             ratio FLOAT, exact DOUBLE, pad INT(4) UNSIGNED ZEROFILL)"
         ),
     };
     scratch.exec(&ddl).await;
@@ -571,14 +580,16 @@ pub async fn a_spliced_row_is_the_row_a_fresh_select_would_show(target: &'static
     // a float whose `f64` widening is visible.
     scratch
         .exec(&format!(
-            "INSERT INTO {t} (id, note, due, micros, plain, dur, ratio, exact) \
+            "INSERT INTO {t} (id, note, due, micros, plain, dur, ratio, exact{pad_col}) \
              VALUES (1, 'a', '2024-01-15 00:00:00', '2024-01-15 08:09:10.120', \
-             '2024-01-15', '10:30:00', 3.14, 3.14)"
+             '2024-01-15', '10:30:00', 3.14, 3.14{})",
+            if padded { ", 7" } else { "" }
         ))
         .await;
 
-    let select =
-        format!("SELECT id, note, due, micros, plain, dur, ratio, exact FROM {t} ORDER BY id");
+    let select = format!(
+        "SELECT id, note, due, micros, plain, dur, ratio, exact{pad_col} FROM {t} ORDER BY id"
+    );
     let (rs, model) = scratch.edit_model(&select).await;
     let template = schemaic_core::edit::refetch_template(&rs, &model).expect("a single base table");
 
