@@ -2216,7 +2216,22 @@ const NO_SESSIONS_MSG: &str = "this connection's engine has no server sessions";
 /// `contains_collapsed_ignore_ascii_case` justifies its `O(n·m)` scan as "short
 /// needles over a **bounded list**" — the list was bounded, the haystack was
 /// not.
-const MY_PROCESSLIST_SQL: &str = "SELECT ID, USER, HOST, DB, COMMAND, TIME, LEFT(INFO, 65536) \
+/// **The cap is in *bytes*, so it is taken over the binary form.** `INFO` is a
+/// character column — `utf8mb3` on both engines (measured: MariaDB 10.11.14
+/// reports `longtext`/`utf8mb3`, MySQL 8.4.11 `varchar(65535)`/`utf8mb3`) — and
+/// `LEFT(str, n)` returns `n` **characters**. Measured on both:
+/// `LENGTH(LEFT(<three CJK characters>, 3))` is `9`, not `3`. So the plain
+/// `LEFT(INFO, 65536)` admitted up to 3× [`MY_INFO_MAX`], and the `const`
+/// assert that pins the panel's ceiling is written in bytes — 500 rows of
+/// non-Latin text against an asserted 64 MiB is ~96 MB, on exactly the
+/// bulk-loader load this cap is for.
+///
+/// `CONVERT(… USING binary)` makes `LEFT` count bytes (measured: the same
+/// expression gives `3`); converting back to `utf8mb4` restores a string the
+/// driver decodes, and a cut that lands mid-character comes back as the
+/// replacement character rather than as invalid UTF-8.
+const MY_PROCESSLIST_SQL: &str = "SELECT ID, USER, HOST, DB, COMMAND, TIME, \
+     CONVERT(LEFT(CONVERT(INFO USING binary), 65536) USING utf8mb4) \
      FROM information_schema.PROCESSLIST \
      WHERE ID <> CONNECTION_ID() AND COMMAND <> 'Daemon' AND USER <> 'system user' \
      ORDER BY (COMMAND <> 'Sleep') DESC, TIME DESC LIMIT ";
@@ -6284,10 +6299,22 @@ mod tests {
     /// the cap in the statement has to be the constant that documents it.
     #[test]
     fn the_mysql_session_list_caps_the_statement_text() {
+        // **The number *and* the unit.** The first spelling checked only that
+        // the SQL repeated the same digits, so `LEFT(INFO, 65536)` — which
+        // counts **characters** over a `utf8mb3` column — satisfied a constant
+        // documented in bytes and a `const` assert written in bytes. Measured on
+        // MariaDB 10.11.14 and MySQL 8.4.11: `LENGTH(LEFT(<three CJK
+        // characters>, 3))` is `9` under the plain form and `3` under the binary
+        // one, so the ceiling was up to 3x off in the direction that matters.
         assert!(
-            MY_PROCESSLIST_SQL.contains(&format!("LEFT(INFO, {MY_INFO_MAX})")),
+            MY_PROCESSLIST_SQL.contains(&format!("{MY_INFO_MAX})")),
             "the statement text is unbounded, or the cap has drifted from \
              MY_INFO_MAX:\n{MY_PROCESSLIST_SQL}"
+        );
+        assert!(
+            MY_PROCESSLIST_SQL.contains("LEFT(CONVERT(INFO USING binary)"),
+            "the cap counts characters over a utf8mb3 column while MY_INFO_MAX \
+             and the const assert below are in bytes:\n{MY_PROCESSLIST_SQL}"
         );
         // Generous against what the row draws, and bounded against what the
         // panel can hold: both halves of the balance the constant argues.
