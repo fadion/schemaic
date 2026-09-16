@@ -4277,8 +4277,31 @@ impl ChangeSet {
                 cl.push(format!("DROP COLUMN {}", self.q(name)));
             }
         }
+        // **One pass over `self.changes`, and only over the changes this engine
+        // supports.** Two separate things live in that sentence:
+        //
+        // * *One* pass, because `apply_positions` computes each `AFTER` against
+        //   a simulation it advances in target order and `reorder_moves` then
+        //   permutes `changes` into that order. Building the list in two passes
+        //   — every `AlterColumn`, then every `AddColumn` — threw that order
+        //   away, so a positioned `ADD` could never precede a positioned
+        //   `MODIFY`. The designer drew `[e,b,c,a,d]` and the table landed
+        //   `[e,b,a,c,d]`: no error, nothing withheld, "applied" reported.
+        //   `ordered_column_clauses` cannot repair it, because a plain
+        //   `MODIFY`'s `provides` is `None` and nothing is waiting on it.
+        // * *Supported*, because `unsupported()` and this are two halves of one
+        //   decision. Every other emitter that can meet a refused change filters
+        //   on this predicate — `view_statements`, `routine_statements`, the
+        //   container builders, `event_statements`. The column clauses were the
+        //   one family that did not, and that was sound only while MySQL's
+        //   `supports_change` had no `false` arm an `AlterColumn` could reach.
+        //   Once it did, the INCOMPLETE header said a change had been left out
+        //   with that very statement printed below it.
         let mut col_clauses: Vec<ColumnClause> = Vec::new();
         for c in &self.changes {
+            if !supports_change(d, c) {
+                continue;
+            }
             if let Change::AlterColumn {
                 from,
                 to,
@@ -4313,8 +4336,6 @@ impl ChangeSet {
                     needs: anchor_of(position),
                 });
             }
-        }
-        for c in &self.changes {
             if let Change::AddColumn { column, position } = c {
                 let pos = position.as_ref().map(|p| p.sql(d)).unwrap_or_default();
                 col_clauses.push(ColumnClause {
@@ -11287,6 +11308,23 @@ mod tests {
                  withheld — {:?}",
                 cs.emit()
             );
+            // **`unsupported()` and `emit()` are two halves of one decision.**
+            // The predicate refused the change and the emitter emitted it
+            // anyway, so the INCOMPLETE header said the statement below it had
+            // been left out. Copy and Open-in-editor are deliberately not
+            // disabled, so that sentence is the only thing telling the user
+            // what is missing — and it was false about the one statement whose
+            // `STORED -> VIRTUAL` direction silently un-materialises the column.
+            let script = cs.emit().join("\n");
+            assert!(
+                !script.contains("MODIFY COLUMN `g`") && !script.contains("CHANGE COLUMN `g`"),
+                "{from} -> {to}: withheld change is in emit() — {script}"
+            );
+            assert!(
+                !cs.editor_script().contains("COLUMN `g`"),
+                "{from} -> {to}: withheld change is in editor_script() — {}",
+                cs.editor_script()
+            );
         }
         // The other two engines write the keyword, so the same edit is a plan
         // there rather than a refusal.
@@ -13148,7 +13186,21 @@ mod tests {
                 {
                     cols[at] = col.clone();
                 }
-                cols.retain(|c| *c != col || clause.starts_with("ADD COLUMN"));
+                // **A clause with no position moves nothing**, so the model must
+                // leave the column where it is — an `ADD` with no position goes
+                // last, which is where MySQL puts it. The first spelling of this
+                // deleted an unmoved column from the modelled table (the
+                // `None => cols.len()` arm was stranded behind the `positioned`
+                // guard below it), so any case with a retype that does not move
+                // failed for a reason that was not the code's.
+                let positioned = clause.contains("AFTER `") || clause.contains(" FIRST");
+                if !positioned {
+                    if clause.starts_with("ADD COLUMN") {
+                        cols.push(col);
+                    }
+                    continue;
+                }
+                cols.retain(|c| *c != col);
                 let at = match clause.rfind("AFTER `") {
                     Some(i) => {
                         let anchor = clause[i + 7..].split('`').next().unwrap_or_default();
@@ -13157,14 +13209,9 @@ mod tests {
                             .map(|p| p + 1)
                             .unwrap_or(cols.len())
                     }
-                    None if clause.contains(" FIRST") => 0,
-                    // No position clause: the column keeps where it was, which
-                    // the `retain` above has just undone — put it back.
-                    None => cols.len(),
+                    None => 0,
                 };
-                if clause.contains("AFTER `") || clause.contains(" FIRST") {
-                    cols.insert(at.min(cols.len()), col);
-                }
+                cols.insert(at.min(cols.len()), col);
             }
             cols
         }
@@ -13193,6 +13240,47 @@ mod tests {
         d2.columns.swap(0, 2);
         let sql2 = diff(&t, &d2, MySql).emit().join("\n");
         assert_eq!(replay(&["a", "b", "c"], &sql2), d2.column_names(), "{sql2}");
+
+        // **A plan that also adds a column**, which is the other half of the
+        // class and the one the two cases above cannot reach: `emit_mysql` built
+        // its clause list in two passes — every `AlterColumn`, then every
+        // `AddColumn` — so a positioned `ADD` could never precede a positioned
+        // `MODIFY` however `reorder_moves` had ordered `changes`. The simulation
+        // put the `ADD` first; the emitter put it in the middle.
+        let t4 = TableInfo {
+            name: "t".into(),
+            columns: vec![
+                col("a", "int"),
+                col("b", "int"),
+                col("c", "int"),
+                col("d", "int"),
+            ],
+            ..Default::default()
+        };
+        let mut d3 = TableDraft::from_table(&t4);
+        d3.columns.insert(0, ColumnDraft::new(col("e", "int")));
+        // [e, a, b, c, d] -> [e, b, c, a, d]
+        let a = d3.columns.remove(1);
+        d3.columns.insert(3, a);
+        assert_eq!(d3.column_names(), vec!["e", "b", "c", "a", "d"]);
+        let sql3 = diff(&t4, &d3, MySql).emit().join("\n");
+        assert_eq!(
+            replay(&["a", "b", "c", "d"], &sql3),
+            d3.column_names(),
+            "the table lands in an order nobody drew:\n{sql3}"
+        );
+
+        // A retype that does **not** move, beside one that does — the shape the
+        // replay helper used to model by deleting the column.
+        let mut d4 = TableDraft::from_table(&t4);
+        d4.columns[1].info.type_name = "bigint".into();
+        d4.columns.swap(0, 3);
+        let sql4 = diff(&t4, &d4, MySql).emit().join("\n");
+        assert_eq!(
+            replay(&["a", "b", "c", "d"], &sql4),
+            d4.column_names(),
+            "{sql4}"
+        );
     }
 
     /// The other direction, which is why the fix is a dependency order and not
