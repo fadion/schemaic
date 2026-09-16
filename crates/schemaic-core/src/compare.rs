@@ -1599,7 +1599,11 @@ fn fk_rank(
         .iter()
         .map(|t| display_name(t.schema.as_deref(), &t.name))
         .collect();
-    let (order, cycles) = crate::dump::order_tables(tables, &chosen, dialect);
+    // No `home`: a comparison's two sides are two different databases, so there
+    // is no single one for `dump::fk_targets` to resolve a bare key against.
+    // The conservative answer — an extra edge — only ever orders one more table
+    // ahead of another.
+    let (order, cycles) = crate::dump::order_tables(tables, &chosen, dialect, None);
     let n = order.len();
     let rank = order
         .into_iter()

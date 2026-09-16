@@ -569,12 +569,28 @@ pub fn sequence_resync_sql(t: &TableInfo, dialect: SqlDialect) -> Vec<String> {
 ///
 /// Only two namespaces that both exist and differ are a miss: one side unknown
 /// still cannot be answered no.
-fn fk_targets(fk: &crate::schema::ForeignKeyInfo, owner: &TableInfo, cand: &TableInfo) -> bool {
+///
+/// **`home` is what makes that answerable on MySQL at all.** There
+/// `ref_schema` is the *database* ([`crate::ddl::ref_schema_is_database`]) and
+/// `TableInfo::schema` is always `None` — a database *is* its namespace — so
+/// both sides of the comparison were unknown, the `_` arm fired, and a key
+/// matched on `ref_table` **alone**. A cross-database
+/// `REFERENCES archive.customers` was classified as in-dump because a table
+/// called `customers` was in the dump; the caller then stripped its qualifier
+/// and the restored file pointed the key at its own `customers`. Passing the
+/// database being dumped gives every candidate the namespace it really has.
+/// `None` where there is no single home database — PostgreSQL, where the
+/// namespace is on the object, and the comparison's ordering, where the two
+/// sides are two different databases.
+fn fk_targets<'a>(
+    fk: &'a crate::schema::ForeignKeyInfo,
+    owner: &'a TableInfo,
+    cand: &'a TableInfo,
+    home: Option<&'a str>,
+) -> bool {
+    let ns = |t: &'a TableInfo| t.schema.as_deref().or(home);
     fk.ref_table == cand.name
-        && match (
-            fk.ref_schema.as_deref().or(owner.schema.as_deref()),
-            cand.schema.as_deref(),
-        ) {
+        && match (fk.ref_schema.as_deref().or_else(|| ns(owner)), ns(cand)) {
             (Some(a), Some(b)) => a == b,
             _ => true,
         }
@@ -590,10 +606,15 @@ fn fk_targets(fk: &crate::schema::ForeignKeyInfo, owner: &TableInfo, cand: &Tabl
 /// so one edge is broken at the smallest name — the file still carries every
 /// table, and [`DumpPlan::cycles`] is what tells the reader the order alone
 /// can't be trusted.
+///
+/// `home` is the database these tables were read from, on an engine where a
+/// foreign key's `ref_schema` names a database — see [`fk_targets`], which is
+/// what needs it. `None` everywhere else.
 pub fn order_tables(
     tables: &[TableInfo],
     chosen: &[String],
     dialect: SqlDialect,
+    home: Option<&str>,
 ) -> (Vec<usize>, bool) {
     let key = |i: usize| display_name(tables[i].schema.as_deref(), &tables[i].name);
     let mut picked: Vec<usize> = (0..tables.len())
@@ -617,7 +638,7 @@ pub fn order_tables(
                         && tables[i]
                             .foreign_keys
                             .iter()
-                            .any(|fk| fk_targets(fk, &tables[i], &tables[j]))
+                            .any(|fk| fk_targets(fk, &tables[i], &tables[j], home))
                 })
                 .map(|(pos, _)| pos)
                 .collect()
@@ -844,7 +865,10 @@ pub fn plan(
     if opts.is_empty() {
         return DumpPlan::default();
     }
-    let (order, cycles) = order_tables(&schema.tables, chosen, dialect);
+    // The database being dumped is the namespace every table in it is in, on
+    // the engine that reports a key's target as a database — see `fk_targets`.
+    let home = crate::ddl::ref_schema_is_database(dialect).then_some(database);
+    let (order, cycles) = order_tables(&schema.tables, chosen, dialect, home);
     // Everything ticked that this introspection could not resolve. Computed even
     // when nothing resolved, so the empty-plan arm can carry it too.
     let missing: Vec<String> = chosen
@@ -915,11 +939,12 @@ pub fn plan(
             if t.is_view || t.foreign_keys.is_empty() {
                 continue;
             }
-            let (here, elsewhere): (Vec<_>, Vec<_>) = t
-                .foreign_keys
-                .iter()
-                .cloned()
-                .partition(|fk| order.iter().any(|&j| fk_targets(fk, t, &schema.tables[j])));
+            let (here, elsewhere): (Vec<_>, Vec<_>) =
+                t.foreign_keys.iter().cloned().partition(|fk| {
+                    order
+                        .iter()
+                        .any(|&j| fk_targets(fk, t, &schema.tables[j], home))
+                });
             if !needs_fk_section(t) {
                 dangling_fks += elsewhere.len();
                 continue;
@@ -956,7 +981,16 @@ pub fn plan(
                         // half. PostgreSQL's `ref_schema` is a namespace — part
                         // of the object rather than its address — so the
                         // capability decides, not the engine.
-                        if crate::ddl::ref_schema_is_database(dialect) {
+                        //
+                        // **Only when it really is this database's name.**
+                        // `fk_targets` is what decides `here`, and until it was
+                        // given `home` it matched a cross-database key on
+                        // `ref_table` alone — so `REFERENCES archive.customers`
+                        // landed in `here` and this strip retargeted it at the
+                        // dump's own `customers`. The guard is restated here as
+                        // well so the rule holds at the line that does the
+                        // stripping, not only at the one that partitions.
+                        if home.is_some() && fk.ref_schema.as_deref() == home {
                             fk.ref_schema = None;
                         }
                         Change::AddForeignKey(Box::new(fk))
@@ -2050,7 +2084,7 @@ mod tests {
     fn a_referenced_table_is_created_before_the_table_referencing_it() {
         // `orders` → `customers`, declared in the wrong order on purpose.
         let s = schema_of(vec![refs(table("orders"), "customers"), table("customers")]);
-        let (order, cycles) = order_tables(&s.tables, &all(&s), SqlDialect::MySql);
+        let (order, cycles) = order_tables(&s.tables, &all(&s), SqlDialect::MySql, None);
         assert_eq!(names(&s, &order), vec!["customers", "orders"]);
         assert!(!cycles);
     }
@@ -2063,7 +2097,7 @@ mod tests {
             refs(table("products"), "customers"),
             table("customers"),
         ]);
-        let (order, cycles) = order_tables(&s.tables, &all(&s), SqlDialect::MySql);
+        let (order, cycles) = order_tables(&s.tables, &all(&s), SqlDialect::MySql, None);
         let out = names(&s, &order);
         assert!(!cycles);
         assert_eq!(out[0], "customers");
@@ -2077,7 +2111,7 @@ mod tests {
     fn a_self_reference_is_not_a_cycle() {
         // An employee's manager is an employee. One table, orderable.
         let s = schema_of(vec![refs(table("employees"), "employees")]);
-        let (order, cycles) = order_tables(&s.tables, &all(&s), SqlDialect::MySql);
+        let (order, cycles) = order_tables(&s.tables, &all(&s), SqlDialect::MySql, None);
         assert_eq!(names(&s, &order), vec!["employees"]);
         assert!(!cycles, "a self-reference orders fine — it is one table");
     }
@@ -2085,7 +2119,7 @@ mod tests {
     #[test]
     fn a_two_table_cycle_still_dumps_every_table_and_says_so() {
         let s = schema_of(vec![refs(table("a"), "b"), refs(table("b"), "a")]);
-        let (order, cycles) = order_tables(&s.tables, &all(&s), SqlDialect::MySql);
+        let (order, cycles) = order_tables(&s.tables, &all(&s), SqlDialect::MySql, None);
         assert!(
             cycles,
             "no order satisfies both keys — the caller must know"
@@ -2096,7 +2130,8 @@ mod tests {
     #[test]
     fn an_fk_to_a_table_outside_the_selection_does_not_order_it_in() {
         let s = schema_of(vec![refs(table("orders"), "archive"), table("archive")]);
-        let (order, cycles) = order_tables(&s.tables, &["orders".to_string()], SqlDialect::MySql);
+        let (order, cycles) =
+            order_tables(&s.tables, &["orders".to_string()], SqlDialect::MySql, None);
         assert_eq!(names(&s, &order), vec!["orders"]);
         assert!(!cycles);
     }
@@ -2104,14 +2139,14 @@ mod tests {
     #[test]
     fn views_come_after_every_base_table() {
         let s = schema_of(vec![view("v_recent"), table("orders"), table("customers")]);
-        let (order, _) = order_tables(&s.tables, &all(&s), SqlDialect::MySql);
+        let (order, _) = order_tables(&s.tables, &all(&s), SqlDialect::MySql, None);
         assert_eq!(names(&s, &order).last().unwrap(), "v_recent");
     }
 
     #[test]
     fn ties_break_by_name_so_two_dumps_of_one_schema_match() {
         let s = schema_of(vec![table("zebra"), table("apple"), table("mango")]);
-        let (order, _) = order_tables(&s.tables, &all(&s), SqlDialect::MySql);
+        let (order, _) = order_tables(&s.tables, &all(&s), SqlDialect::MySql, None);
         assert_eq!(names(&s, &order), vec!["apple", "mango", "zebra"]);
     }
 
@@ -2516,6 +2551,60 @@ mod tests {
             SqlDialect::Postgres,
         ));
         assert!(text.contains("\"app\".\"customers\""), "{text}");
+    }
+
+    /// **A key pointing at another database is not a key inside the dump**, and
+    /// stripping its qualifier retargets it.
+    ///
+    /// `fk_targets` compared `fk.ref_schema.or(owner.schema)` against
+    /// `cand.schema` — and on MySQL `TableInfo::schema` is always `None`,
+    /// because a database *is* its namespace. Both sides unknown, so the
+    /// "cannot answer no" arm fired and the key matched on `ref_table` alone: a
+    /// cross-database `REFERENCES archive.customers` was classified as in-dump
+    /// because a table called `customers` was in the dump, and the strip then
+    /// emitted it bare. Restoring that file points the key at the dump's own
+    /// `customers` — a different table. If the rows happen to satisfy it the
+    /// server creates the constraint **silently**; if they do not, the restore
+    /// dies at ERROR 1452 after every row has landed.
+    ///
+    /// Premise measured on MariaDB 10.11.14: a cross-database InnoDB key is
+    /// legal and `information_schema.KEY_COLUMN_USAGE` reports
+    /// `REFERENCED_TABLE_SCHEMA = 'zz_archive'` for it.
+    #[test]
+    fn a_foreign_key_into_another_database_keeps_its_qualifier() {
+        let mut orders = refs(table("orders"), "customers");
+        orders.foreign_keys[0].ref_schema = Some("archive".to_string());
+        let s = schema_of(vec![orders, table("customers")]);
+        let text = text_of(&plan(
+            &s,
+            "shop",
+            &all(&s),
+            DumpOptions::default(),
+            SqlDialect::MySql,
+        ));
+        assert!(
+            !text.contains("REFERENCES `customers`"),
+            "the key was retargeted at the dump's own table:\n{text}"
+        );
+        // It is a key pointing outside the export, so the file's own header
+        // says it was left out — `dropped_fks` is what writes that sentence,
+        // and the misclassification is what used to swallow it.
+        assert!(
+            text.to_lowercase().contains("foreign key"),
+            "a key left out of the file says nothing:\n{text}"
+        );
+        // A same-database key, explicit or bare, is still restated bare.
+        let mut same = refs(table("orders"), "customers");
+        same.foreign_keys[0].ref_schema = Some("shop".to_string());
+        let s = schema_of(vec![same, table("customers")]);
+        let text = text_of(&plan(
+            &s,
+            "shop",
+            &all(&s),
+            DumpOptions::default(),
+            SqlDialect::MySql,
+        ));
+        assert!(text.contains("REFERENCES `customers`"), "{text}");
     }
 
     #[test]
@@ -3487,7 +3576,7 @@ mod tests {
         let mut last = view("z_totals");
         last.view_definition = Some("SELECT * FROM orders".to_string());
         let s = schema_of(vec![table("orders"), base, on_top, last]);
-        let (order, cycles) = order_tables(&s.tables, &all(&s), SqlDialect::MySql);
+        let (order, cycles) = order_tables(&s.tables, &all(&s), SqlDialect::MySql, None);
         assert!(!cycles);
         let got = names(&s, &order);
         let at = |n: &str| got.iter().position(|g| g == n).unwrap();
@@ -3506,7 +3595,7 @@ mod tests {
         first.view_definition =
             Some("-- see z_view\nSELECT 'z_view' AS note, z_view_backup FROM orders".to_string());
         let s = schema_of(vec![table("orders"), first, view("z_view")]);
-        let (order, _) = order_tables(&s.tables, &all(&s), SqlDialect::MySql);
+        let (order, _) = order_tables(&s.tables, &all(&s), SqlDialect::MySql, None);
         let got = names(&s, &order);
         // No edge, so the name tie-break stands.
         assert_eq!(got, vec!["orders", "a_view", "z_view"]);
