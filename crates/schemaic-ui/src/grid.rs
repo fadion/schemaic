@@ -470,6 +470,23 @@ struct GridState {
     /// blocked during a generation — so discarding mid-generation and adding a
     /// fresh row landed the reply's values on top of what the user was typing.
     new_rows_gen: RwSignal<u64>,
+    /// The `PanelView`'s [`crate::PanelView::staging_gen`] — the identity of the
+    /// staged trio, bumped whenever it is thrown away wholesale.
+    ///
+    /// **Distinct from `new_rows_gen`, which is about pending-row *indices*.**
+    /// That one is bumped only when the pending rows themselves go, because its
+    /// consumer (an in-flight AI seed) cares about nothing else; discarding a
+    /// dirty cell must not abandon a generation whose row indices still mean
+    /// what they meant. This one is bumped whenever *any* of the three staged
+    /// kinds is thrown away, because its consumer — a commit's landing — is
+    /// about to clear staging by position and by key, and after a discard both
+    /// address somebody else's work.
+    ///
+    /// Discard is deliberately still live during a commit: the write can sit on
+    /// `innodb_lock_wait_timeout` for fifty seconds, and taking the user's only
+    /// way out of that is worse than making the landing check whose staging it
+    /// is holding.
+    staging_gen: RwSignal<u64>,
     /// Pulse phase (radians) advanced by a ~45ms tick while `ai_busy`; the
     /// generating cells read it to breathe their wash. `pulse_running` guards
     /// against starting a second tick loop.
@@ -681,6 +698,9 @@ impl GridState {
             del_rows: gctx
                 .panel
                 .map_or_else(|| RwSignal::new(HashSet::new()), |p| p.del_rows),
+            staging_gen: gctx
+                .panel
+                .map_or_else(|| RwSignal::new(0), |p| p.staging_gen),
             selecting: RwSignal::new(false),
             row_selecting: RwSignal::new(false),
             edit_model: RwSignal::new(Arc::new(EditModel::default())),
@@ -2024,25 +2044,65 @@ fn hand_back_on_close(flag: RwSignal<bool>, back: Rc<dyn Fn()>) {
 /// Over the signals rather than over the `GridState` that holds them, because
 /// those signals belong to the `PanelView` and a `GridState` cannot be built in
 /// a test — which is exactly how this path came to have none.
+///
+/// **"The first `staged_new`" is only true while nobody has emptied the vector
+/// in between.** ✗ Discard is live during a commit — deliberately, because the
+/// write can sit on `innodb_lock_wait_timeout` for fifty seconds and taking the
+/// user's only way out of that is worse — and it clears all three staged kinds.
+/// Stage a row, commit, discard, stage another: the second row is at position 0,
+/// the landing drains `..staged_new`, and the row the user is still typing
+/// disappears with no error and no trace. The key-addressed halves fail the same
+/// way — a re-edit of a committed cell carries the cell's own key, and a
+/// re-staged deletion of row 5 is still row 5 — so the guard is one question
+/// asked once, not three.
+///
+/// `took.generation` is [`crate::PanelView::staging_gen`] as it stood when the
+/// commit assembled its write. If it has moved, everything staged now was staged
+/// after the discard, none of it is what this commit wrote, and there is nothing
+/// here for the landing to clear.
 pub(crate) fn drop_committed_staging(
+    staging_gen: RwSignal<u64>,
     dirty: RwSignal<DirtyCells>,
     new_rows: RwSignal<Vec<HashMap<usize, CellEdit>>>,
     del_rows: RwSignal<HashSet<usize>>,
-    committed: &HashSet<(usize, usize)>,
-    staged_new: usize,
-    staged_del: &HashSet<usize>,
+    took: &CommittedStaging,
 ) {
-    if staged_new > 0 {
+    // `try_get_untracked`, not `get_untracked`: the landing is async and the
+    // `PanelView` that owns the signal may already be disposed — the same
+    // reason `apply_splice` opens with `alive()`.
+    if staging_gen.try_get_untracked() != Some(took.generation) {
+        return;
+    }
+    if took.new_rows > 0 {
         new_rows.update(|rows| {
-            rows.drain(..staged_new.min(rows.len()));
+            rows.drain(..took.new_rows.min(rows.len()));
         });
     }
-    if !staged_del.is_empty() {
-        crate::widgets::retain_if_any(del_rows, |r| !staged_del.contains(r));
+    if !took.del_rows.is_empty() {
+        crate::widgets::retain_if_any(del_rows, |r| !took.del_rows.contains(r));
     }
-    if !committed.is_empty() {
-        dirty.update(|d| drop_committed(d, committed));
+    if !took.cells.is_empty() {
+        dirty.update(|d| drop_committed(d, &took.cells));
     }
+}
+
+/// What a commit took from the staging it was assembled from: the addresses its
+/// landing will clear, and the identity that says whether they still mean
+/// anything.
+///
+/// One value rather than four parameters because the four are one fact and were
+/// already being carried together through the commit's closure — and because the
+/// identity is the term it is easiest to leave out when a fifth caller appears.
+pub(crate) struct CommittedStaging {
+    /// [`crate::PanelView::staging_gen`] when the write was assembled.
+    pub(crate) generation: u64,
+    /// The staged cells, by `(data row, column)`.
+    pub(crate) cells: HashSet<(usize, usize)>,
+    /// How many pending rows were staged — they are the first of the vector,
+    /// since staging appends.
+    pub(crate) new_rows: usize,
+    /// The data rows marked for deletion.
+    pub(crate) del_rows: HashSet<usize>,
 }
 
 /// The grid body's rebuild key: sort state, frozen column, and **how many**
@@ -5093,13 +5153,16 @@ fn commit_grid(gs: GridState) {
     if gs.edit_cell.get_untracked().is_some() {
         gs.commit_edit();
     }
-    // The staged keys this write is assembled from. Nothing stops the user staging
-    // another edit while the commit is in flight, and that one hasn't been written.
-    let committed: HashSet<(usize, usize)> = gs.dirty.get_untracked().keys().copied().collect();
-    // The same question for the other two staged kinds, and for the same
-    // reason — see `drop_committed_staging`.
-    let staged_new = gs.new_rows.with_untracked(Vec::len);
-    let staged_del = gs.del_rows.get_untracked();
+    // What this write is assembled from. Nothing stops the user staging another
+    // edit while the commit is in flight, and that one hasn't been written —
+    // and nothing stops them discarding the lot, which is what `generation`
+    // answers. See `drop_committed_staging`.
+    let took = CommittedStaging {
+        generation: gs.staging_gen.get_untracked(),
+        cells: gs.dirty.get_untracked().keys().copied().collect(),
+        new_rows: gs.new_rows.with_untracked(Vec::len),
+        del_rows: gs.del_rows.get_untracked(),
+    };
     let write = GridWrite {
         updates: gs.build_edits(),
         inserts: gs.build_inserts(),
@@ -5127,18 +5190,20 @@ fn commit_grid(gs: GridState) {
         gs.commit_wait.set(None);
         match outcome {
             // Fresh DB values for the edited rows — splice in place, keep scroll.
-            CommitDone::Spliced(rows) => gs.apply_splice(rows, &committed),
+            // The rows go in either way (they are the server's, and the grid
+            // should show them); only the *staging* half is conditional, for
+            // `drop_committed_staging`'s reason.
+            CommitDone::Spliced(rows) => {
+                let none = HashSet::new();
+                let mine = gs.staging_gen.try_get_untracked() == Some(took.generation);
+                gs.apply_splice(rows, if mine { &took.cells } else { &none });
+            }
             // The app *may* have re-run the query — it skips the re-run when the
             // committed tab is no longer active, and then nothing else clears
             // what this commit wrote. See `drop_committed_staging`.
-            CommitDone::FullReran => drop_committed_staging(
-                gs.dirty,
-                gs.new_rows,
-                gs.del_rows,
-                &committed,
-                staged_new,
-                &staged_del,
-            ),
+            CommitDone::FullReran => {
+                drop_committed_staging(gs.staging_gen, gs.dirty, gs.new_rows, gs.del_rows, &took)
+            }
             CommitDone::Failed(msg) => gs.commit_err.set(Some(msg)),
         }
     });
@@ -7138,6 +7203,15 @@ fn edit_row_panel(gs: GridState, max_rows: RwSignal<usize>) -> impl IntoView {
 /// Discard all staged changes — cell edits, pending new rows, and pending row
 /// deletions (the toolbar ✗) — closing any open in-cell editor.
 fn discard_edits(gs: GridState) {
+    // **Taken before anything is cleared**, because it decides whether a commit
+    // in flight is still holding staging that belongs to it. Any of the three
+    // kinds going is enough: the landing drops pending rows by *position* and
+    // dirty cells by *key*, and after a discard the next staged row occupies
+    // position 0 and the next edit to the same cell carries the same key. See
+    // `GridState::staging_gen`.
+    let had_staging = gs.dirty.with_untracked(|d| !d.is_empty())
+        || gs.new_rows.with_untracked(|r| !r.is_empty())
+        || gs.del_rows.with_untracked(|r| !r.is_empty());
     // Every one of these is guarded, because a discard mostly throws away *one*
     // kind of staged change and announcing the other two anyway is what rebuilt
     // the grid body under the keyboard — see [`crate::widgets::clear_if_any`].
@@ -7161,6 +7235,9 @@ fn discard_edits(gs: GridState) {
     // `commit_err.get_untracked().is_some()`, which is why `7a5e458`'s sweep for
     // the old shape found the other two copies and not this one.
     gs.clear_bar();
+    if had_staging {
+        gs.staging_gen.update(|g| *g = g.wrapping_add(1));
+    }
 }
 
 /// Move the grid selection to the next (`forward`) / previous cell whose

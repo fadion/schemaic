@@ -3171,6 +3171,16 @@ pub struct PanelView {
     pub new_rows: RwSignal<Vec<std::collections::HashMap<usize, schemaic_core::model::CellEdit>>>,
     /// Data rows marked for deletion and not yet committed.
     pub del_rows: RwSignal<std::collections::HashSet<usize>>,
+    /// The identity of the trio above, bumped whenever it is thrown away
+    /// wholesale — by ✗ Discard or by a panel load replacing the rows.
+    ///
+    /// **Here rather than on `GridState`, for the reason the trio itself is.**
+    /// Its one consumer is a commit's landing, which is async and arrives after
+    /// the grid it started in may be gone; a signal created in the grid's scope
+    /// would already be disposed and every landing would read "not mine" —
+    /// turning the guard into the bug `drop_committed_staging` exists to fix.
+    /// It has to live exactly as long as the staging it describes.
+    pub staging_gen: RwSignal<u64>,
 }
 
 impl PanelView {
@@ -3183,6 +3193,7 @@ impl PanelView {
             dirty: cx.create_rw_signal(Default::default()),
             new_rows: cx.create_rw_signal(Vec::new()),
             del_rows: cx.create_rw_signal(Default::default()),
+            staging_gen: cx.create_rw_signal(0),
         }
     }
 
@@ -3202,9 +3213,20 @@ impl PanelView {
     /// where `update` still notifies every subscriber, and the grid body is
     /// keyed on one of them.
     fn clear_staged(&self) {
+        // Same question as `grid::discard_edits` asks, and for the same
+        // consumer: a commit in flight captured this trio by position and by
+        // key, and once it is gone neither address means what it meant. Taken
+        // before the clears, and bumped only if there was something to clear —
+        // this runs on every panel load.
+        let had_staging = self.dirty.with_untracked(|d| !d.is_empty())
+            || self.new_rows.with_untracked(|r| !r.is_empty())
+            || self.del_rows.with_untracked(|r| !r.is_empty());
         clear_if_any(self.dirty);
         clear_if_any(self.new_rows);
         clear_if_any(self.del_rows);
+        if had_staging {
+            self.staging_gen.update(|g| *g = g.wrapping_add(1));
+        }
     }
 }
 
@@ -13164,10 +13186,12 @@ mod result_panel_tab_tests {
         });
 
         // What the commit captured when it was assembled.
-        let committed: HashSet<(usize, usize)> =
-            view.dirty.with_untracked(|d| d.keys().copied().collect());
-        let staged_new = view.new_rows.with_untracked(Vec::len);
-        let staged_del = view.del_rows.get_untracked();
+        let took = crate::grid::CommittedStaging {
+            generation: view.staging_gen.get_untracked(),
+            cells: view.dirty.with_untracked(|d| d.keys().copied().collect()),
+            new_rows: view.new_rows.with_untracked(Vec::len),
+            del_rows: view.del_rows.get_untracked(),
+        };
 
         // …and a second pending row staged while it was in flight, which this
         // commit did **not** write and must survive.
@@ -13179,12 +13203,11 @@ mod result_panel_tab_tests {
         });
 
         crate::grid::drop_committed_staging(
+            view.staging_gen,
             view.dirty,
             view.new_rows,
             view.del_rows,
-            &committed,
-            staged_new,
-            &staged_del,
+            &took,
         );
 
         assert!(view.dirty.with_untracked(HashMap::is_empty));
@@ -13202,6 +13225,111 @@ mod result_panel_tab_tests {
                 schemaic_core::model::CellEdit::Text("still mine".into())
             )),
             "and it is the *later* one that survived"
+        );
+    }
+
+    /// **✗ Discard during a commit, then staging again.**
+    ///
+    /// The landing drains the pending rows by *position* — "the first
+    /// `staged_new`, since staging appends" — which is true only while nobody
+    /// has emptied the vector in between. Discard is live during a commit
+    /// (deliberately: the write can sit on `innodb_lock_wait_timeout` for fifty
+    /// seconds), so stage a row, commit, discard, stage another, and the row the
+    /// user is still typing is at position 0 when the landing arrives. It went
+    /// with no error and no trace.
+    ///
+    /// The key-addressed halves fail identically and are asserted here too: a
+    /// re-edit of a committed cell carries that cell's own key, and a re-staged
+    /// deletion of row 7 is still row 7, so `drop_committed`'s key set and
+    /// `staged_del` both name work that was never written.
+    ///
+    /// The composition, not the predicate — `staging_gen`'s own arithmetic is
+    /// trivial and a test of it alone is green against this bug. What is under
+    /// test is the landing's decision over the panel's live signals.
+    #[test]
+    fn a_commit_that_lands_after_a_discard_clears_none_of_the_new_staging() {
+        use std::collections::HashMap;
+        let t = tab();
+        let id = t.begin_run(&["SELECT * FROM customers".to_string()])[0];
+        let view = t
+            .result_tabs
+            .with_untracked(|v| v.iter().find(|p| p.id == id).map(|p| p.view))
+            .expect("the panel");
+
+        view.dirty.update(|d| {
+            d.insert((0, 1), schemaic_core::model::CellEdit::Text("Ada".into()));
+        });
+        view.new_rows.update(|r| {
+            r.push(HashMap::from([(
+                1,
+                schemaic_core::model::CellEdit::Text("committed".into()),
+            )]))
+        });
+        view.del_rows.update(|d| {
+            d.insert(7);
+        });
+
+        // What the commit captured when it was assembled.
+        let took = crate::grid::CommittedStaging {
+            generation: view.staging_gen.get_untracked(),
+            cells: view.dirty.with_untracked(|d| d.keys().copied().collect()),
+            new_rows: view.new_rows.with_untracked(Vec::len),
+            del_rows: view.del_rows.get_untracked(),
+        };
+
+        // ✗ Discard, mid-flight. `clear_staged` is the same clear-and-bump the
+        // toolbar's discard performs.
+        view.clear_staged();
+
+        // …and the user starts again: a new pending row at position 0, a new
+        // edit to the very cell that was committed, and row 7 marked again.
+        view.dirty.update(|d| {
+            d.insert((0, 1), schemaic_core::model::CellEdit::Text("Grace".into()));
+        });
+        view.new_rows.update(|r| {
+            r.push(HashMap::from([(
+                1,
+                schemaic_core::model::CellEdit::Text("still mine".into()),
+            )]))
+        });
+        view.del_rows.update(|d| {
+            d.insert(7);
+        });
+
+        crate::grid::drop_committed_staging(
+            view.staging_gen,
+            view.dirty,
+            view.new_rows,
+            view.del_rows,
+            &took,
+        );
+
+        assert_eq!(
+            view.new_rows.with_untracked(Vec::len),
+            1,
+            "the pending row staged after the discard was drained by position"
+        );
+        assert_eq!(
+            view.new_rows
+                .with_untracked(|r| r[0].get(&1).map(|v| format!("{v:?}"))),
+            Some(format!(
+                "{:?}",
+                schemaic_core::model::CellEdit::Text("still mine".into())
+            )),
+            "and the surviving row is the user's, not the committed one"
+        );
+        assert_eq!(
+            view.dirty
+                .with_untracked(|d| d.get(&(0, 1)).map(|v| format!("{v:?}"))),
+            Some(format!(
+                "{:?}",
+                schemaic_core::model::CellEdit::Text("Grace".into())
+            )),
+            "the re-edit carries the committed cell's key and is not that commit's to drop"
+        );
+        assert!(
+            view.del_rows.with_untracked(|d| d.contains(&7)),
+            "the re-staged deletion is not that commit's to drop either"
         );
     }
 
