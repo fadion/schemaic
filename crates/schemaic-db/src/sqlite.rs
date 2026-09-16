@@ -6463,6 +6463,31 @@ mod tests {
         assert_eq!(got[0].0, 1);
         assert_eq!(got[0].1[0].display(), "2", "the rowid comes back too");
         assert_eq!(got[0].1[2].display(), "written");
+
+        // **The half that can fail.** Everything above is satisfied by `WHERE
+        // rowid = 2` alone, so it passes with the engine's
+        // `.chain(template.confirm_cols.iter())` deleted — the very zip
+        // `876b987`'s message says this test now covers. The confirming columns
+        // are only visible when they *disagree*: move one behind the key's back,
+        // the way another session or an `AFTER UPDATE` trigger would, and a key
+        // that carries them matches nothing while a truncated one still returns
+        // the row.
+        keeper
+            .execute("UPDATE t SET a = 'TWO' WHERE rowid = 2", [])
+            .unwrap();
+        let key = schemaic_core::edit::refetch_key(&template, &rs, 1, &edited);
+        let got = refetch_rows(
+            &db,
+            &template,
+            &[RefetchRow { data_row: 1, key }],
+            CancellationToken::new(),
+        )
+        .await
+        .expect("refetch");
+        assert!(
+            got.is_empty(),
+            "a confirming column moved, so the key identifies no row: {got:?}"
+        );
     }
 
     /// **A confirmed re-fetch that misses is not "the row is gone".**

@@ -7271,6 +7271,31 @@ mod tests {
         );
     }
 
+    /// **The confirming half of the `WHERE`, which no test reached.**
+    /// `confirm_cols` is populated only by SQLite's implicit-rowid key
+    /// (`sqlite.rs`'s `implicit_key`), so on this builder it is empty in every
+    /// round trip the suite runs and the `.chain(confirm_cols)` above could be
+    /// deleted with the whole suite green. The chain is still this builder's
+    /// contract — the placeholders it writes are bound in
+    /// `edit::refetch_key`'s order, key first — so it is asserted here
+    /// directly, with a template that has both halves.
+    #[test]
+    fn build_refetch_sql_confirms_with_the_columns_after_the_key() {
+        let t = RefetchTemplate {
+            database: "db".to_string(),
+            schema: None,
+            table: "t".to_string(),
+            columns: vec!["rowid".to_string(), "a".to_string(), "b".to_string()],
+            key_cols: vec![0],
+            confirm_cols: vec![1, 2],
+        };
+        assert_eq!(
+            build_refetch_sql(&t),
+            "SELECT `rowid`, `a`, `b` FROM `db`.`t` \
+             WHERE `rowid` <=> ? AND `a` <=> ? AND `b` <=> ? LIMIT 1"
+        );
+    }
+
     #[test]
     fn build_refetch_sql_escapes_identifiers() {
         let t = RefetchTemplate {
