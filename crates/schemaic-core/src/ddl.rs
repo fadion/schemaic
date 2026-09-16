@@ -19911,6 +19911,20 @@ mod sqlite_rebuild_tests {
     }
 
     /// Nothing withheld, nothing prepended — the ordinary script is untouched.
+    ///
+    /// **The last assertion was `assert_eq!(cs.editor_script(),
+    /// cs.editor_script())`.** It had been an anti-drift comparison between the
+    /// two script builders; `d316d35` repointed `.script()` to `editor_script()`
+    /// and repointed *both* sides, leaving a value compared with itself. It is
+    /// the only survivor of that repointing, and it could not go red for any
+    /// change to either builder.
+    ///
+    /// Restated as the two things "untouched" means. The editor's script is
+    /// exactly the client script over the emitted statements — no preamble at
+    /// all, which is stronger than "does not start with `--`", since a prefix
+    /// could be added that does not. And the export's script is the editor's,
+    /// because the only reason they may differ is a redacted password and this
+    /// plan carries none.
     #[test]
     fn a_complete_plan_gets_no_header() {
         let t = table();
@@ -19923,7 +19937,16 @@ mod sqlite_rebuild_tests {
             "{}",
             cs.editor_script()
         );
-        assert_eq!(cs.editor_script(), cs.editor_script());
+        assert_eq!(
+            cs.editor_script(),
+            client_script(&cs.emit(), SqlDialect::Sqlite),
+            "a complete plan's editor script is the client script and nothing else"
+        );
+        assert_eq!(
+            cs.export_script(),
+            cs.editor_script(),
+            "nothing is redacted here, so the two builders must not diverge"
+        );
     }
 
     /// The rebuild's body — everything between the foreign-key guard, which
