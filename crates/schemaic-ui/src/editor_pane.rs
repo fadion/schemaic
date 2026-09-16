@@ -3746,7 +3746,15 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                 // clicking back into the editor hands the keyboard to the
                 // results grid and typing inserts nothing. See
                 // `widgets::note_pointer_focus`.
-                crate::widgets::note_pointer_focus();
+                //
+                // **Only a primary press**, for `widgets::press_places_focus`'
+                // reason: floem clears focus on every press and re-places it
+                // only then, so reporting a right-click here claims focus that
+                // was never placed — and the dismissal then skips the hand-back
+                // that is the only thing left to move the keyboard.
+                if crate::widgets::press_places_focus(pe.button) {
+                    crate::widgets::note_pointer_focus();
+                }
                 // Any click in the editor clears the picked-statement highlight
                 // and dismisses the unsafe-run notice (without executing).
                 highlight.set(None);

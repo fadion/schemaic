@@ -93,6 +93,27 @@ pub(crate) fn pointer_placed_focus() -> bool {
     POINTER_PLACED_FOCUS.with(|d| d.get())
 }
 
+/// Does a press with this button **place** focus?
+///
+/// **Only a primary one, and that is floem's rule, not a preference.** On every
+/// `PointerDown` floem clears `app_state.focus`
+/// (`floem-0.2.0/src/window_handle.rs:226-228`) and puts it back only
+/// `if event.button.is_primary()` (`context.rs:173-181`). So a right-click
+/// clears focus and places none.
+///
+/// [`note_pointer_focus`]'s report was unconditional, which made that case the
+/// exact failure the suppression exists to prevent, one button over: a
+/// right-click on the schema tree, the terminal or an `edit_field` reported
+/// focus that was never placed, `begin_pointer_dismissal` marked the dismissal,
+/// the open menu's `focus_root` skipped its hand-back, and the keyboard was dead
+/// until a left-click. Verbatim the failure
+/// `a_press_that_placed_no_focus_does_not_suppress_the_hand_back` is written
+/// about — it covers "the press landed on chrome" and not "the press landed on
+/// a focusable view with the wrong button".
+pub(crate) fn press_places_focus(button: floem::pointer::PointerButton) -> bool {
+    button.is_primary()
+}
+
 /// Attach [`note_pointer_focus`] to a view that floem gives focus to when it is
 /// clicked: the pair to spell at every such site, so the report is one call
 /// rather than a listener each site writes out.
@@ -106,9 +127,18 @@ pub(crate) fn pointer_placed_focus() -> bool {
 /// `menu_return_gate::every_navigable_view_reports_the_press_that_focuses_it`
 /// keeps the first half honest; the second half is a census this comment is the
 /// record of, because a floem built-in announces nothing a gate could match.
+/// **Gated on [`press_places_focus`]**, because floem re-places focus only on a
+/// primary press — an unconditional report is a claim about a right-click that
+/// floem never honours.
 pub(crate) fn takes_pointer_focus<V: IntoView + 'static>(view: V) -> V::V {
     view.into_view()
-        .on_event_cont(EventListener::PointerDown, |_| note_pointer_focus())
+        .on_event_cont(EventListener::PointerDown, |e| {
+            if let floem::event::Event::PointerDown(pe) = e
+                && press_places_focus(pe.button)
+            {
+                note_pointer_focus();
+            }
+        })
 }
 
 /// **A press dismissed a menu, and the press has already placed focus.**
@@ -6560,6 +6590,68 @@ mod menu_return_gate {
             "only {seen} navigable views found — the grid body, the schema tree, \
              the terminal, both row-panel controls and the two `widgets` \
              helpers each have one"
+        );
+    }
+
+    /// **And the report is about a press floem will actually honour.**
+    ///
+    /// The gate above asks whether a navigable view reports at all; this asks
+    /// what it reports *about*. Floem clears `app_state.focus` on every
+    /// `PointerDown` (`window_handle.rs:226-228`) and re-places it only
+    /// `if event.button.is_primary()` (`context.rs:173-181`), so a right-click
+    /// on a focusable view leaves nothing holding the keyboard — and an
+    /// unconditional report then told `begin_pointer_dismissal` the opposite.
+    /// The open menu's `focus_root` skipped its hand-back, and the keyboard was
+    /// dead until a left-click: a right-click on the schema tree, the terminal
+    /// or an `edit_field`.
+    ///
+    /// Two halves, because the predicate alone is one line of floem's own rule
+    /// and could be right while nothing asked it: the value, and then a source
+    /// check that both production callers do.
+    #[test]
+    fn only_a_primary_press_is_reported_as_placing_focus() {
+        use super::press_places_focus;
+        use floem::pointer::PointerButton;
+        assert!(press_places_focus(PointerButton::Primary));
+        assert!(!press_places_focus(PointerButton::Secondary));
+        assert!(!press_places_focus(PointerButton::Auxiliary));
+        assert!(!press_places_focus(PointerButton::X1));
+        assert!(!press_places_focus(PointerButton::X2));
+        assert!(!press_places_focus(PointerButton::None));
+
+        // The composition: every production `note_pointer_focus()` is behind the
+        // predicate. There are two — `takes_pointer_focus`, which every
+        // `keyboard_navigable` view goes through, and the SQL editor's own
+        // `PointerDown`, which is focusable with no `keyboard_navigable` to
+        // find.
+        let gate = format!("{}_places_focus(", "press");
+        let call = format!("{}_pointer_focus()", "note");
+        let mut seen = 0usize;
+        for (name, src) in crate::source_gate::crate_sources() {
+            let body = crate::source_gate::production_code(&src);
+            let mut from = 0usize;
+            while let Some(rel) = body[from..].find(&call) {
+                let at = from + rel;
+                from = at + call.len();
+                // The definition is not a call site.
+                if body[..at].ends_with("pub(crate) fn ") {
+                    continue;
+                }
+                seen += 1;
+                let window = &body[at.saturating_sub(400)..at];
+                assert!(
+                    window.contains(&gate),
+                    "{name}: a `{call}` with no `{gate}` above it — it claims \
+                     focus for a press floem does not place any on, and the \
+                     dismissal then skips the hand-back that is the only thing \
+                     left to move the keyboard"
+                );
+            }
+        }
+        assert!(
+            seen >= 2,
+            "only {seen} report sites found — `takes_pointer_focus` and the SQL \
+             editor each have one"
         );
     }
 
