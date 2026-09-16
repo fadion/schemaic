@@ -401,6 +401,27 @@ pub struct MonitorEntry {
     /// render the first thousand changes for ever while the log and its export went
     /// on sliding underneath.
     pub seq: u64,
+    /// The watched table's column list **as it was when this entry was
+    /// recorded**.
+    ///
+    /// **Everything about a change is positional, and the position's meaning can
+    /// move under the log.** A `FieldChange { col: 1 }` means "the second
+    /// column"; which column that *is* comes from a list held beside the log,
+    /// not in it. That was sound while the list could only be written once per
+    /// monitor session — until the baseline restart that answers an `ALTER`
+    /// mid-session re-opened the branch that writes it. From that moment the log
+    /// held entries recorded against the old list and the export rendered all of
+    /// them against the new one: after
+    /// `ALTER TABLE orders ADD COLUMN note TEXT AFTER id`, every earlier UPDATE
+    /// was exported under `note` instead of `name`, and every earlier
+    /// INSERT/DELETE row — "the only remaining record of a row the database no
+    /// longer has", per [`log_result_set`] — had each value one column left of
+    /// its heading. Silently: the restart notice goes to the poll's error slot,
+    /// which the next poll clears.
+    ///
+    /// An `Arc`, because every entry of a poll shares one list and the log runs
+    /// to [`LOG_CAP`].
+    pub cols: std::sync::Arc<Vec<String>>,
 }
 
 /// Stamp `changes` with `at`, append them to `log`, and trim it to [`LOG_CAP`] —
@@ -410,13 +431,22 @@ pub struct MonitorEntry {
 /// has to be assigned where it is appended (it is `last + 1`, and the log is never
 /// reordered), and the cap has to be applied in the same breath or the caveat the
 /// status line prints could disagree with what the log holds.
-pub fn append_changes(log: &mut Vec<MonitorEntry>, at: &str, changes: Vec<RowChange>) -> usize {
+pub fn append_changes(
+    log: &mut Vec<MonitorEntry>,
+    at: &str,
+    changes: Vec<RowChange>,
+    cols: &std::sync::Arc<Vec<String>>,
+) -> usize {
     let first = log.last().map(|e| e.seq + 1).unwrap_or(0);
     for (seq, change) in (first..).zip(changes) {
         log.push(MonitorEntry {
             at: at.to_string(),
             change,
             seq,
+            // Taken here rather than read at render time, for the reason
+            // `MonitorEntry::cols` gives: the list beside the log can be
+            // rewritten mid-session and the entries cannot follow it.
+            cols: cols.clone(),
         });
     }
     trim_log(log)
@@ -504,15 +534,69 @@ pub const LOG_FORMATS: [crate::export::ExportFormat; 5] = [
 /// export is the record someone keeps; silently narrowing it is the one failure
 /// mode that can't be noticed later.
 pub fn log_result_set(entries: &[MonitorEntry], cols: &[String]) -> ResultSet {
+    // **Every entry is projected under the names it was recorded with**, not
+    // under whichever list happens to be current. A baseline restart rewrites
+    // that list mid-session, and the log cannot follow it: rendering an entry's
+    // index `i` as `cols[i]` put every pre-`ALTER` change under the wrong
+    // heading and shifted every pre-`ALTER` row one column off it, in the one
+    // artefact that is the only remaining record of a row the database no longer
+    // has. So the output columns are the *union* of the names seen, in the order
+    // they were first seen, and each entry's value lands under its own name —
+    // which needs no gap marker, because nothing is mis-stated to begin with.
+    //
+    // `cols` still leads, so an unchanged session exports exactly as before: its
+    // entries all carry that same list, and the union is it.
+    // An entry with no list of its own is one recorded before entries carried
+    // them — a restored log, or a test fixture. `cols` is its answer, which is
+    // what the single-list form did for every entry.
+    fn names_of<'a>(e: &'a MonitorEntry, cols: &'a [String]) -> &'a [String] {
+        if e.cols.is_empty() { cols } else { &e.cols }
+    }
+    let width_of = |e: &MonitorEntry| {
+        e.change
+            .fields
+            .iter()
+            .map(|f| f.col + 1)
+            .chain(std::iter::once(e.change.cells.len()))
+            .chain(std::iter::once(names_of(e, cols).len()))
+            .max()
+            .unwrap_or(0)
+    };
+    // The name an entry gives its index `i`, with the same fallbacks the single
+    // list had.
+    let name_at = |names: &[String], i: usize| {
+        names
+            .get(i)
+            .filter(|n| !n.is_empty())
+            .cloned()
+            .unwrap_or_else(|| unnamed_column(i))
+    };
+
     let width = entries
         .iter()
-        .flat_map(|e| {
-            let fields = e.change.fields.iter().map(|f| f.col + 1);
-            fields.chain(std::iter::once(e.change.cells.len()))
-        })
-        .chain(std::iter::once(cols.len()))
+        .map(width_of)
         .max()
-        .unwrap_or(0);
+        .unwrap_or(0)
+        .max(cols.len());
+    let mut headings: Vec<String> = Vec::new();
+    let push = |h: &mut Vec<String>, n: String| {
+        if !h.contains(&n) {
+            h.push(n);
+        }
+    };
+    for i in 0..cols.len() {
+        push(&mut headings, name_at(cols, i));
+    }
+    for e in entries {
+        for i in 0..width_of(e) {
+            push(&mut headings, name_at(names_of(e, cols), i));
+        }
+    }
+    // An index nobody named — a log wider than every list it carries, which the
+    // single-list form covered with a placeholder.
+    for i in headings.len()..width {
+        push(&mut headings, unnamed_column(i));
+    }
 
     let text_col = |name: String| Column {
         name,
@@ -522,25 +606,28 @@ pub fn log_result_set(entries: &[MonitorEntry], cols: &[String]) -> ResultSet {
     let columns: Vec<Column> = ["Time", "Action", "Key"]
         .into_iter()
         .map(|n| text_col(n.to_string()))
-        .chain((0..width).map(|i| {
-            text_col(
-                cols.get(i)
-                    .filter(|n| !n.is_empty())
-                    .cloned()
-                    .unwrap_or_else(|| unnamed_column(i)),
-            )
-        }))
+        .chain(headings.iter().cloned().map(text_col))
         .collect();
 
     let rows = entries
         .iter()
         .map(|e| {
-            let mut row = Vec::with_capacity(3 + width);
+            let mut row = Vec::with_capacity(3 + headings.len());
             row.push(Value::Str(e.at.clone()));
             row.push(Value::Str(action_label(e.change.kind).to_string()));
             row.push(Value::Str(e.change.key.join(", ")));
-            for i in 0..width {
-                row.push(log_cell(&e.change, i));
+            // This entry's index for each heading, or nothing where its own
+            // column list has no such name.
+            let w = width_of(e);
+            let mine: Vec<Option<usize>> = headings
+                .iter()
+                .map(|h| (0..w).find(|&i| name_at(names_of(e, cols), i) == *h))
+                .collect();
+            for at in mine {
+                row.push(match at {
+                    Some(i) => log_cell(&e.change, i),
+                    None => Value::Null,
+                });
             }
             row
         })
@@ -1254,6 +1341,10 @@ mod tests {
                 cells: cells(cells_in),
             },
             seq: 0,
+            // Empty: these fixtures predate the per-entry list, and that is the
+            // case `log_result_set` answers with the list it is handed — the
+            // compatibility path a restored log takes too.
+            cols: std::sync::Arc::new(Vec::new()),
         }
     }
 
@@ -1269,16 +1360,23 @@ mod tests {
             fields: Vec::new(),
             cells: Vec::new(),
         };
+        let none = std::sync::Arc::new(Vec::new());
         let mut log: Vec<MonitorEntry> = Vec::new();
-        assert_eq!(append_changes(&mut log, "0:01", vec![change("a")]), 0);
-        assert_eq!(append_changes(&mut log, "0:02", vec![change("b")]), 0);
+        assert_eq!(
+            append_changes(&mut log, "0:01", vec![change("a")], &none),
+            0
+        );
+        assert_eq!(
+            append_changes(&mut log, "0:02", vec![change("b")], &none),
+            0
+        );
         assert_eq!(log.iter().map(|e| e.seq).collect::<Vec<_>>(), vec![0, 1]);
         assert_eq!(log[1].at, "0:02", "each carries its own observation time");
 
         // Fill to the cap, then past it: the front is dropped and the numbers keep
         // climbing, so no two live entries ever share one.
         let rest: Vec<RowChange> = (0..LOG_CAP).map(|i| change(&i.to_string())).collect();
-        let dropped = append_changes(&mut log, "0:03", rest);
+        let dropped = append_changes(&mut log, "0:03", rest, &none);
         assert_eq!(dropped, 2, "the two oldest went");
         assert_eq!(log.len(), LOG_CAP);
         assert_eq!(log.first().unwrap().seq, 2);
@@ -1512,6 +1610,7 @@ mod tests {
                 cells: vec![None, None],
             },
             seq: 0,
+            cols: std::sync::Arc::new(Vec::new()),
         }];
         let rs = log_result_set(&log, &["note".into(), "extra".into()]);
         let order: Vec<usize> = (0..rs.row_count()).collect();
@@ -1634,6 +1733,72 @@ mod tests {
         );
     }
 
+    /// **A column list that moved under the log must not re-head what was
+    /// recorded before it moved.**
+    ///
+    /// Everything about a change is positional: `FieldChange { col: 1 }` means
+    /// "the second column", and which column that *is* came from a list held
+    /// beside the log. That was sound while the list could only be written once
+    /// per monitor session — until the baseline restart answering an `ALTER`
+    /// re-opened the branch that writes it. `orders(id, name, total)`, a few
+    /// UPDATEs to `name`, then
+    /// `ALTER TABLE orders ADD COLUMN note TEXT AFTER id`: every earlier UPDATE
+    /// exported under `note`, and every earlier INSERT/DELETE row — "the only
+    /// remaining record of a row the database no longer has" — one column left
+    /// of its heading. Nothing in the file said so: the restart notice goes to
+    /// the poll's error slot, which the next poll clears.
+    #[test]
+    fn a_change_is_exported_under_the_names_it_was_recorded_with() {
+        let before = std::sync::Arc::new(vec![
+            "id".to_string(),
+            "name".to_string(),
+            "total".to_string(),
+        ]);
+        let after = std::sync::Arc::new(vec![
+            "id".to_string(),
+            "note".to_string(),
+            "name".to_string(),
+            "total".to_string(),
+        ]);
+        let update = |col: usize, old: &str, new: &str| RowChange {
+            kind: ChangeKind::Update,
+            key: vec!["7".to_string()],
+            fields: vec![FieldChange {
+                col,
+                old: Some(old.to_string()),
+                new: Some(new.to_string()),
+            }],
+            cells: Vec::new(),
+        };
+        let mut log: Vec<MonitorEntry> = Vec::new();
+        // Recorded under the old list: index 1 is `name`.
+        append_changes(&mut log, "0:01", vec![update(1, "ann", "bob")], &before);
+        // …then the table gained a column, and index 1 is now `note`.
+        append_changes(&mut log, "0:09", vec![update(1, "x", "y")], &after);
+
+        let rs = log_result_set(&log, &after);
+        let heading: Vec<&str> = rs.columns.iter().map(|c| c.name.as_str()).collect();
+        let at = |n: &str| heading.iter().position(|h| *h == n).expect(n);
+        let cell = |row: usize, n: &str| rs.cell(row, at(n)).expect("in range").display();
+
+        // The pre-`ALTER` change is still headed `name`, and `note` — a column
+        // that did not exist when it was recorded — says nothing about it.
+        assert_eq!(cell(0, "name"), "ann → bob", "{heading:?}");
+        assert_eq!(cell(0, "note"), "NULL", "{heading:?}");
+        // The post-`ALTER` change is headed `note`, which is what index 1 means
+        // now.
+        assert_eq!(cell(1, "note"), "x → y", "{heading:?}");
+        assert_eq!(cell(1, "name"), "NULL", "{heading:?}");
+        // Every name from both shapes is present, once.
+        for n in ["id", "note", "name", "total"] {
+            assert_eq!(
+                heading.iter().filter(|h| **h == n).count(),
+                1,
+                "{n} in {heading:?}"
+            );
+        }
+    }
+
     /// **The bound is on the view, and on nothing else.** The export is the
     /// record, and it must still carry every column of every change — which is
     /// the property that makes truncating the line acceptable at all.
@@ -1651,6 +1816,7 @@ mod tests {
                 fields: Vec::new(),
                 cells,
             }],
+            &std::sync::Arc::new(wide.clone()),
         );
 
         let rs = log_result_set(&log, &wide);

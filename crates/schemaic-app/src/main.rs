@@ -12334,7 +12334,14 @@ fn monitor_apply(ctx: MonitorCtx, my_gen: u64, out: Result<ResultSet, String>) {
                         // number the rendered list is keyed on is assigned there,
                         // and the cap is applied there too, so the modal's caveat
                         // can't disagree with what the log holds.
-                        dropped = schemaic_core::monitor::append_changes(log, &at, changes);
+                        // **The list in force *now*, stamped onto the entries
+                        // now.** A baseline restart rewrites `ctx.cols`
+                        // mid-session and the log cannot follow it; carrying
+                        // the list with the entries is what stops every earlier
+                        // change being re-headed against a list it was never
+                        // recorded under. See `MonitorEntry::cols`.
+                        let cols = std::sync::Arc::new(ctx.cols.get_untracked());
+                        dropped = schemaic_core::monitor::append_changes(log, &at, changes, &cols);
                     });
                     if dropped > 0 {
                         ctx.dropped.update(|n| *n += dropped);
@@ -13263,6 +13270,20 @@ mod app_tests {
             "`monitor_apply` asks the question and does not restart the \
              baseline, so the stale snapshot is still what the next poll diffs \
              against"
+        );
+        // **And the composition with the caller, which is where the restart's
+        // cost landed.** Restarting re-opens the branch that writes `ctx.cols`,
+        // so from that moment the column list beside the log describes a shape
+        // the earlier entries were never recorded under. The entries have to
+        // carry their own list, or every pre-`ALTER` change is exported under
+        // the wrong heading — in the artefact `log_result_set`'s own doc calls
+        // the only remaining record of a row the database no longer has.
+        let stamp = format!("{}(log, &at, changes, &cols)", "append_changes");
+        assert!(
+            body.contains(&stamp),
+            "the log is appended without the column list in force at the time; \
+             a baseline restart then re-heads every earlier entry against a \
+             shape it was not recorded under — see `MonitorEntry::cols`"
         );
     }
 

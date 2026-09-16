@@ -640,7 +640,17 @@ fn entry_row(
     }) else {
         return crate::widgets::nothing();
     };
-    let names = cols.get_untracked();
+    // **The entry's own list, not the modal's current one.** A baseline restart
+    // answering an `ALTER` rewrites `monitor_cols` mid-session while the log
+    // keeps entries indexed against the previous list, so reading the signal
+    // here named every earlier change's field wrong — the same defect the export
+    // had, on screen. `cols` is still the fallback, for a log written before
+    // entries carried their own.
+    let names: Vec<String> = if entry.cols.is_empty() {
+        cols.get_untracked()
+    } else {
+        entry.cols.as_ref().clone()
+    };
     // **`fn() -> Color`, not a `Color`** — the same rule `data_view` states two
     // functions below and for the same reason: these rows are keyed on
     // `entry.seq`, so a theme switch rebuilds none of them. `theme::chip_active()`
