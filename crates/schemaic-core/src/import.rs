@@ -1470,20 +1470,46 @@ fn open_xlsx_within<R: std::io::Read>(
 /// wrong with them. A refusal here would replace a real diagnosis with a size
 /// complaint about a file that has no size problem.
 ///
+/// **An entry this cannot size is skipped, not an exit.** That sentence above
+/// is about the *archive*, and the same `?` was once applied to a case it does
+/// not cover: a readable archive holding one entry whose record the scan could
+/// not follow. `by_index_raw` is not a directory read — it seeks to the entry's
+/// declared `local_header_offset` and checks the local-file-header magic, which
+/// `ZipArchive::new` never does — so a four-byte tamper to the central-directory
+/// record of an entry no workbook reader opens turned the ceiling off for the
+/// whole archive, while calamine (which reaches every part `by_name`) read it
+/// happily. Skipping is safe in the direction that matters: the sum is a lower
+/// bound and the message says so.
+///
 /// The ceiling is a parameter so the decision is testable without building a
 /// two-gigabyte fixture; the one caller passes [`XLSX_MAX_INFLATED_BYTES`].
 fn inflated_refusal(bytes: &[u8], ceiling: u64) -> Option<String> {
     let mut zin = zip::ZipArchive::new(std::io::Cursor::new(bytes)).ok()?;
     let mut total: u64 = 0;
     for i in 0..zin.len() {
-        let entry = zin.by_index_raw(i).ok()?;
+        let Ok(entry) = zin.by_index_raw(i) else {
+            continue;
+        };
         total = total.saturating_add(entry.size());
         if total > ceiling {
+            // **What the sentence may promise is bounded by what the sum
+            // measures.** It measures *declared uncompressed XML bytes*; what
+            // calamine then holds is the parsed shared-strings table, a
+            // `Vec<String>` filled eagerly before any sheet is touched. Measured
+            // against calamine 0.36.1 with a counting allocator, a 64 MiB
+            // `xl/sharedStrings.xml` of minimal `<si><t>a</t></si>` entries costs
+            // 99 MB live — **1.48×** the quantity the bound counts, and that is a
+            // floor: the allocator charges `Layout::size()`, so a one-character
+            // `String` counts 1 byte where a real allocator's minimum chunk is
+            // 16–32, and `<si><t/></si>` pushes it to ~1.85× with no rounding at
+            // all. So "the most this can hold in memory" was a promise in the
+            // wrong unit, understated by about half. The sentence now says what
+            // the bound is actually about.
             return Some(format!(
                 "This workbook is {} on disk but unpacks to at least {}, and an Excel file has \
-                 to be read whole before any of it can be shown — {} is the most this can hold \
-                 in memory. Export the sheet as CSV and import that instead; a CSV loads in \
-                 constant memory.",
+                 to be read whole before any of it can be shown — {} of unpacked content is the \
+                 most this will open, and it needs more memory than that to hold it. Export the \
+                 sheet as CSV and import that instead; a CSV loads in constant memory.",
                 crate::format::human_bytes(bytes.len() as i64),
                 crate::format::human_bytes(total as i64),
                 crate::format::human_bytes(ceiling as i64),
@@ -1980,24 +2006,55 @@ pub fn json_memory_warning(format: ImportFormat, file_bytes: u64) -> Option<Stri
 /// | 120 k × 50, every cell a distinct 60-char string | 21 MB | 32 MB | 1.5× | 18 ms |
 ///
 /// The ratio is stable because what is held is the file's own bytes plus the
-/// strings of the rows actually read — not the sheet. 4× is that measurement
-/// with headroom for a workbook shaped unlike either, and it is still an
-/// over-estimate rather than an under-one, which is the direction a warning has
-/// to be wrong in.
-pub const XLSX_MEMORY_FACTOR: u64 = 4;
+/// strings of the rows actually read — not the sheet.
+///
+/// **But the warning stands in front of the *load*, and `read_sample` is the
+/// preview.** Those two paths do not cost the same thing: `row_iter`'s `Xlsx`
+/// arm materialises every row of the sheet into a `Vec<(Record, u64)>` before it
+/// hands out the first one, so its cost is linear in *cells* where the preview's
+/// is linear in rows read. Quoting the preview's 4× for the load was an
+/// under-estimate on both paths, which is the direction a warning may not be
+/// wrong in. Re-measured with a counting global allocator over
+/// `schemaic_core::import` itself, `--release`, on a `rust_xlsxwriter` workbook
+/// of the shape this doc's table uses (alternating numbers and short distinct
+/// strings):
+///
+/// | Workbook | File | `read_sample` peak | `row_iter` peak | Held after build |
+/// | --- | --- | --- | --- | --- |
+/// | 100 k × 50 | 23.3 MB | 128.0 MB (5.49×) | 309.5 MB (**13.27×**) | 181.6 MB (7.79×) |
+/// | 20 k × 50 | 4.7 MB | — | 13.53× | 36.5 bytes/cell |
+///
+/// The ratios are stable across scale because the buffer is linear in cells. 14×
+/// is the larger measurement rounded up, which is the over-estimate the warning
+/// needs. It is *not* the streaming rewrite — `xlsx_records` already streams
+/// through a callback, and the buffer exists only because `RowIter` is an
+/// `Iterator` rather than an internal-iteration walk, as the CSV arm is.
+pub const XLSX_MEMORY_FACTOR: u64 = 14;
+
+/// The estimate above which [`xlsx_memory_warning`] must already have spoken.
+///
+/// Not a limit — nothing refuses at it. It is the number that gives
+/// [`XLSX_WARN_BYTES`] its meaning: "the point at which the estimate stops being
+/// something a machine absorbs without noticing", which was prose and is now a
+/// figure the two constants are pinned against, so raising either one without
+/// the other fails a test rather than silently moving the disclosure past the
+/// cost.
+pub const XLSX_DISCLOSURE_BUDGET: u64 = 1024 * 1024 * 1024;
 
 /// Past this file size, [`xlsx_memory_warning`] speaks up.
 ///
-/// Higher than it was (40 MiB), because the thing it was warning about is gone:
-/// at 25× a 40 MiB workbook was estimated at 1 GiB and measured 1,085 MB, and it
-/// now costs 64 MB. Set at [`JSON_WARN_BYTES`] — the point at which the estimate
-/// stops being something a machine absorbs without noticing.
+/// **Derived from [`XLSX_MEMORY_FACTOR`], not set beside it.** It was
+/// [`JSON_WARN_BYTES`] on the reasoning that the two factors were near enough
+/// (4× against JSON's 5×) for one threshold to mean the same thing for both —
+/// which stopped being true when the Excel factor was re-measured against the
+/// load path it actually guards. At 14× a 200 MiB workbook costs ~2.8 GB and
+/// the sentence in front of it had not been said yet.
 ///
-/// The two factors are near enough that the same threshold means the same thing
-/// for both (4× here against JSON's 5×, so ~800 MiB against ~1 GiB), which is
-/// why this is the same number rather than one derived from the ratio the way
-/// the old 40 MiB was.
-pub const XLSX_WARN_BYTES: u64 = 200 * 1024 * 1024;
+/// So the relationship is the definition: the warning fires before the estimate
+/// reaches [`XLSX_DISCLOSURE_BUDGET`], and
+/// `a_large_workbook_is_disclosed_before_it_costs` is what holds the two
+/// together.
+pub const XLSX_WARN_BYTES: u64 = XLSX_DISCLOSURE_BUDGET / XLSX_MEMORY_FACTOR;
 
 /// Roughly the peak memory an Excel import of `file_bytes` will need.
 pub fn xlsx_load_estimate(file_bytes: u64) -> u64 {
@@ -4517,6 +4574,150 @@ mod tests {
         // And with the shipping ceiling both still open: the bound is generous.
         assert!(open_xlsx(&bomb[..]).is_ok());
         assert!(open_xlsx(&good[..]).is_ok());
+    }
+
+    /// **The disclosure has to arrive before the cost, and the two constants
+    /// that decide that were set independently.**
+    ///
+    /// `XLSX_MEMORY_FACTOR` was measured on `read_sample` — the preview — and
+    /// quoted by `xlsx_memory_warning`, which stands in front of the *load*;
+    /// `XLSX_WARN_BYTES` was copied from JSON's on the reasoning that 4× and 5×
+    /// were near enough. The load's measured ratio is 13.27×, so at the old
+    /// pair a 200 MiB workbook cost ~2.8 GB and was disclosed as ~800 MB, and a
+    /// 23 MB workbook cost ~310 MB and was disclosed as nothing at all.
+    ///
+    /// This is a pin on the relationship, not a measurement of it — a unit test
+    /// cannot weigh a load. What it can do is fail when someone moves one of the
+    /// two without the other, which is how they drifted apart.
+    #[test]
+    fn a_large_workbook_is_disclosed_before_it_costs() {
+        // The warning fires strictly before the estimate reaches the budget.
+        assert!(
+            xlsx_load_estimate(XLSX_WARN_BYTES) <= XLSX_DISCLOSURE_BUDGET,
+            "a workbook at the threshold already costs {} against a {} budget",
+            crate::format::human_bytes(xlsx_load_estimate(XLSX_WARN_BYTES) as i64),
+            crate::format::human_bytes(XLSX_DISCLOSURE_BUDGET as i64),
+        );
+        assert!(
+            xlsx_memory_warning(ImportFormat::Xlsx, XLSX_WARN_BYTES + 1).is_some(),
+            "nothing is said one byte past the threshold"
+        );
+        // The factor is at least the load path's measured ratio. 13.27× at
+        // 100k × 50 and 13.53× at 20k × 50, both `--release` with a counting
+        // global allocator over this module.
+        assert!(
+            XLSX_MEMORY_FACTOR >= 14,
+            "the factor is below the measured load ratio"
+        );
+        // And the estimate is an over-estimate at the measured shape: a 23.3 MB
+        // workbook of 100k × 50 peaked at 309.5 MB.
+        assert!(
+            xlsx_load_estimate(23_315_012) >= 309_468_534,
+            "the estimate understates the shape it was measured on"
+        );
+    }
+
+    /// **The inflated-size refusal may not promise a memory ceiling**, because
+    /// the quantity it counts is not memory.
+    ///
+    /// It sums the central directory's *declared uncompressed bytes*; what
+    /// calamine then holds is the parsed shared-strings table, a `Vec<String>`.
+    /// Measured against calamine 0.36.1, a 64 MiB `xl/sharedStrings.xml` of
+    /// minimal entries costs 99 MB live — 1.48× the counted quantity, and that
+    /// is a floor. So a workbook admitted at the ceiling costs half again as
+    /// much as the sentence said was "the most this can hold in memory".
+    #[test]
+    fn the_inflated_refusal_does_not_promise_a_memory_ceiling() {
+        let good = workbook(&[("Sheet1", &[&[Cell::Text("id")], &[Cell::Num(1.0)]])]);
+        let bomb = with_entry(&good, "xl/bomb.bin", &vec![b'0'; 4 * 1024 * 1024]);
+        let msg = inflated_refusal(&bomb, 1024 * 1024).expect("over the ceiling");
+        assert!(
+            !msg.contains("most this can hold in memory"),
+            "the refusal promises a ceiling in the wrong unit: {msg}"
+        );
+        // It still names the ceiling and still says the file is the problem.
+        assert!(msg.contains("unpacks to at least"), "{msg}");
+        assert!(msg.contains("unpacked content"), "{msg}");
+    }
+
+    /// **One unreadable entry must not turn the bound off.**
+    ///
+    /// `by_index_raw` is not a directory read: it seeks to the entry's declared
+    /// `local_header_offset` and checks the local-file-header magic. A `?` on
+    /// that abandoned the whole scan and answered `None`, which `open_xlsx_within`
+    /// reads as "no size problem" — so a four-byte tamper to the central-directory
+    /// record of an entry **no workbook reader ever opens** turned the ceiling
+    /// off for the archive. `ZipArchive::new` never visits a local header, and
+    /// calamine reaches every part `by_name`, so the archive still opens, lists
+    /// and reads fine; only the bound was skipped.
+    ///
+    /// The decoy is written *before* the bomb, which is the whole of the attack:
+    /// the scan dies at index 1 and the bomb at index 2 is never summed.
+    #[test]
+    fn an_entry_that_cannot_be_sized_does_not_turn_the_bound_off() {
+        let good = workbook(&[("Sheet1", &[&[Cell::Text("id")], &[Cell::Num(1.0)]])]);
+        let decoy = with_entry(&good, "docProps/thumbnail.jpeg", b"not really a jpeg");
+        let bomb = with_entry(&decoy, "xl/bomb.bin", &vec![b'0'; 4 * 1024 * 1024]);
+        // The premise: intact, the bomb is refused over a 1 MiB ceiling.
+        assert!(inflated_refusal(&bomb, 1024 * 1024).is_some());
+
+        let tampered = break_local_header_offset(&bomb, "docProps/thumbnail.jpeg");
+        // Still a readable archive by every route a workbook reader takes.
+        let mut zin = zip::ZipArchive::new(std::io::Cursor::new(&tampered[..]))
+            .expect("the central directory is intact");
+        assert!(zin.by_name("xl/bomb.bin").is_ok(), "the bomb still reads");
+        let decoy_at = zin
+            .index_for_name("docProps/thumbnail.jpeg")
+            .expect("the decoy is listed");
+        let bomb_at = zin
+            .index_for_name("xl/bomb.bin")
+            .expect("the bomb is listed");
+        assert!(decoy_at < bomb_at, "the decoy must be scanned first");
+        assert!(
+            zin.by_index_raw(decoy_at).is_err(),
+            "the fixture must break the entry it claims to"
+        );
+
+        let msg = inflated_refusal(&tampered, 1024 * 1024)
+            .expect("a broken decoy entry turned the ceiling off");
+        assert!(msg.contains("unpacks"), "{msg}");
+        // And the seam: opening it answers with the bound's own reason.
+        let err = match open_xlsx_within(&tampered[..], 1024 * 1024) {
+            Err(e) => e,
+            Ok(_) => panic!("a workbook over the ceiling was opened"),
+        };
+        assert!(err.to_string().contains("unpacks"), "{err}");
+        // An archive whose *directory* cannot be read is still calamine's to
+        // diagnose — the doc's case, which this must not widen.
+        assert!(inflated_refusal(b"not a zip", 1).is_none());
+    }
+
+    /// Point one central-directory record's `local_header_offset` at a byte that
+    /// is not `PK\x03\x04`, leaving every other field — including the declared
+    /// uncompressed size — exactly as it was.
+    ///
+    /// The record layout is fixed: signature, 38 bytes of header, then the
+    /// four-byte offset at 42, then the name.
+    fn break_local_header_offset(zip: &[u8], name: &str) -> Vec<u8> {
+        let mut out = zip.to_vec();
+        let sig = [b'P', b'K', 1, 2];
+        let mut at = 0;
+        while at + 46 <= out.len() {
+            if out[at..at + 4] != sig {
+                at += 1;
+                continue;
+            }
+            let n = u16::from_le_bytes([out[at + 28], out[at + 29]]) as usize;
+            if out.get(at + 46..at + 46 + n) == Some(name.as_bytes()) {
+                // Byte 1 is inside the first local header, so it is a real
+                // offset into the archive and not a truncation — the read gets
+                // as far as the magic check and fails there.
+                out[at + 42..at + 46].copy_from_slice(&1u32.to_le_bytes());
+                return out;
+            }
+            at += 46 + n;
+        }
+        panic!("no central-directory record for {name}");
     }
 
     /// A copy of `xlsx` with one extra entry, for the fixture above — the same
