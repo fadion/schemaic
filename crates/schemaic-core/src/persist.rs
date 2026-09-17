@@ -2869,8 +2869,8 @@ mod tests {
             // *old* file's mode onto it).
             let dir = Dir::new("modes");
             let path = dir.0.join("connections.json");
-            write_json(Some(path.clone()), &"first");
-            write_json(Some(path.clone()), &"second");
+            write_json(Some(path.clone()), &"first", Saving::Replacing);
+            write_json(Some(path.clone()), &"second", Saving::Replacing);
             assert_eq!(mode(&path), 0o600);
             assert_eq!(mode(&sibling(&path, ".bak")), 0o600);
             // And the directory itself, so anything added later is protected by
@@ -2915,7 +2915,7 @@ mod tests {
             // nothing would ever remove.
             let dir = Dir::new("sweep");
             let path = dir.0.join("ui_state.json");
-            write_json(Some(path.clone()), &"v");
+            write_json(Some(path.clone()), &"v", Saving::Replacing);
             let tmp = sibling(&path, ".tmp");
             std::fs::write(&tmp, b"orphan").unwrap();
             let v: String = read_json(Some(path.clone()));
