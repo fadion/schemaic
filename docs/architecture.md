@@ -10413,7 +10413,11 @@ existing prose was left alone.
     focus from one on chrome that placed none, floem answering neither question. Spell the decorator
     beside every `.keyboard_navigable()`;
     `menu_return_gate::every_navigable_view_reports_the_press_that_focuses_it` fails on a site that
-    doesn't, and the Tab gotchas below carry the bug that bought it.
+    doesn't, and the Tab gotchas below carry the bug that bought it. **There are three one-tick
+    press flags, not two** — `note_pointer_on_completion`/`blur_dismisses_completion` is the third,
+    the completion popup's report that a press landed on *it*, which is how the editor's blur tells
+    a click on a suggestion from a click away from the editor. All three are set during the press's
+    own dispatch and cleared on the next tick, for the same reason.
     **Three free predicates decide what a key *is*, and the first two were each missing their
     modifier term.**
     `presses(key, mods)` is "does this press a button": a bare Space or Enter and nothing else,
@@ -19332,6 +19336,36 @@ Re-introducing the anti-patterns these guard against is a regression:
   view with no report above it; what it cannot see is floem's own focusable views, which carry no
   `.keyboard_navigable()` for a needle to match and are a census kept by hand in
   `takes_pointer_focus`'s doc.
+- **A view that must survive its own click cannot be keyed on a signal a `PointerDown` will
+  change.** An `on_click`/`on_click_stop` fires on the `PointerUp`, so the view has to still be in
+  the tree when the release lands — and floem takes `app_state.focus` on the press
+  (`window_handle.rs:227-231`), so any `FocusLost` effect that press causes runs in the middle of
+  the same gesture. The completion popup was both halves at once: it is a `dyn_container` keyed on
+  `(comp.open, comp.items)` and the SQL editor's `editor_view_focus_lost` effect closed `comp.open`
+  unconditionally, so a press on a completion row tore that row out of the view tree before its own
+  release. Clicking a suggestion inserted **nothing** and left the editor with no keyboard focus:
+  `accept_completion` never ran, and neither did the deferred `claim_keyboard` hand-back the row's
+  click carries — one of the places the deferred-hand-back rule above enumerates, written for the
+  moment *after* an accept and assuming the accept had happened, so it sat green over a distinct
+  defect earlier in the same gesture. Keyboard accept (↓ then Enter) worked throughout, because
+  nothing takes focus away mid-keystroke, so the popup looked healthy to anyone driving it from the
+  keyboard.
+  **The fix is a third one-tick press flag**, beside `begin_pointer_dismissal`/`hand_back_wanted`
+  and `note_pointer_focus`/`pointer_placed_focus` above: the popup container reports its own press
+  through `widgets::note_pointer_on_completion`, and the editor's blur closes `comp.open`/`comp.sig`
+  only `if blur_dismisses_completion()` — which is still true of the presses that *should* dismiss
+  it, on the schema panel, the terminal or another tab. The report is `on_event_cont` and never
+  `on_event_stop`, for the reason `takes_pointer_focus` gives: the press must go on reaching the
+  workspace root that closes the menus. And it is reliable for the reason that decorator is — a
+  view's own listeners run during event dispatch (`context.rs:405-423`) while `FocusLost` is
+  dispatched from `focus_changed` *after* that loop returns (`window_handle.rs:361`) — so a press on
+  the popup has always reported by the time the blur asks. `cell_editors::take_calendar_press` is
+  the same shape one layer down, for the in-cell calendar.
+  `widgets::tests::the_completion_popup_reports_its_press_and_the_blur_reads_it` is a **source**
+  gate rather than a unit test, because neither half is wrong on its own: the predicate was not
+  wrong, it did not exist, and the defect was the composition of two views. Each half asserts the
+  surrounding term still exists (`on_click_stop` in `completion.rs`, `editor_view_focus_lost` in
+  `editor_pane.rs`), so a rename cannot make it pass by matching nothing.
 - **A `.hide()`n control is still in the Tab order** — `hide()` is `display: none`, so the view is
   still in the tree and still registered in the ring, and Tab moves focus onto something nobody can
   see. Every engine-conditional block that was built-and-hidden is therefore now **built

@@ -7864,8 +7864,9 @@ mod menu_key_tests {
         clear_press_flags();
     }
 
-    /// Both flags are per-press and cleared on the next tick; the tests drive
-    /// that reset by hand, because `exec_after` has no loop to run on here.
+    /// All three flags are per-press and cleared on the next tick; the tests
+    /// drive that reset by hand, because `exec_after` has no loop to run on
+    /// here.
     fn clear_press_flags() {
         POINTER_DISMISSAL.with(|d| d.set(false));
         POINTER_PLACED_FOCUS.with(|d| d.set(false));
