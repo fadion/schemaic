@@ -78,10 +78,22 @@ for tag in "${tags[@]}"; do
     # `gh` also exits non-zero when it matched no asset, which is the only reason
     # the old spelling worked at all; that case is recognised by its message and
     # left to the glob below, which is the fact that actually decides it.
+    #
+    # **`release not found` is deliberately *not* one of those messages.** Every
+    # tag in this loop came out of `gh release list` seconds earlier, so "there
+    # is no such release" is not a fact about the release — it is the API
+    # disagreeing with itself, which is precisely the half-propagated or
+    # rate-limited case this guard exists for. Classifying it as benign put the
+    # guard's own failure mode back inside it: the tag was skipped in silence,
+    # `kept` reached RETAIN from the releases before it, and the documented
+    # `apt-get install schemaic=<old>` rollback broke with nothing said. Measured
+    # against `gh` 2.96.0: a missing release says exactly `release not found`,
+    # and a real release with no matching asset says `no assets match the file
+    # pattern` — two different sentences for two different facts.
     err="${tmp}.err"
     if ! gh release download "$tag" --repo "$GH_REPO" --dir "$tmp" \
         --pattern '*.deb' --pattern '*.rpm' --clobber 2>"$err"; then
-        if ! grep -qiE 'no assets|no artifact|asset.*not found|release not found' "$err"; then
+        if ! grep -qiE 'no assets|no artifact|asset.*not found' "$err"; then
             echo "::error::downloading ${tag}'s packages failed" >&2
             cat "$err" >&2
             echo "refusing to publish a repository that would silently omit ${tag}" >&2
