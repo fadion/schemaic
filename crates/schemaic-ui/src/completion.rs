@@ -1147,6 +1147,19 @@ pub(crate) fn completion_popup(
                     .border_radius(6.0)
             })
             .clip()
+            // **Say that this press landed on the popup, before the blur asks.**
+            // The editor's `FocusLost` effect closes `comp.open`, which is what
+            // this `dyn_container` is keyed on — so without this the rows were
+            // torn out of the tree on the `PointerDown` and the row's own
+            // `on_click_stop` below, which fires on the `PointerUp`, never ran.
+            // Nothing was inserted and the editor was left without the keyboard.
+            //
+            // `on_event_cont`, never `on_event_stop`, for the same reason
+            // `note_pointer_focus` gives: the press must go on reaching the
+            // workspace root, which is what closes the menus.
+            .on_event_cont(floem::event::EventListener::PointerDown, |_| {
+                crate::widgets::note_pointer_on_completion();
+            })
             .into_any()
         },
     )

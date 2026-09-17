@@ -55,6 +55,9 @@ thread_local! {
     /// True from a press that landed on a view which takes the keyboard until
     /// the tick after it — see [`note_pointer_focus`].
     static POINTER_PLACED_FOCUS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// True from a press that landed **inside the completion popup** until the
+    /// tick after it — see [`note_pointer_on_completion`].
+    static POINTER_ON_COMPLETION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// **This press landed on me, and I take the keyboard.** Called by every view
@@ -196,6 +199,43 @@ pub(crate) fn begin_pointer_dismissal() {
 /// back, or leave it where the press that dismissed it put it.
 pub(crate) fn hand_back_wanted() -> bool {
     !POINTER_DISMISSAL.with(|d| d.get())
+}
+
+/// **This press landed inside the completion popup, so the editor's blur is not
+/// "the user clicked away".** Called from the popup's own `PointerDown`.
+///
+/// The third member of this family, and it exists because the editor's blur
+/// dismisses the popup — which is right for a press on the schema panel, the
+/// terminal or another tab, and wrong for a press on the popup itself. Clicking
+/// a completion row inserted **nothing** and left the editor without the
+/// keyboard: floem takes `app_state.focus` on a `PointerDown`
+/// (`window_handle.rs:227-231`), the editor's `FocusLost` closed `comp.open`,
+/// the `dyn_container` keyed on it tore the rows out of the view tree, and the
+/// row's `on_click_stop` — which fires on `PointerUp` — never ran, so
+/// `accept_completion` was never reached and neither was the deferred
+/// [`claim_keyboard`] hand-back written for it. Keyboard accept was unaffected
+/// throughout, because nothing takes focus away mid-keystroke.
+///
+/// **The ordering is floem's, and it is the same one [`note_pointer_focus`]
+/// relies on**: a view's own listeners run during the event dispatch
+/// (`context.rs:405-423`), while `FocusLost` is dispatched from
+/// `focus_changed` *after* that loop has returned (`window_handle.rs:361`). So
+/// a press on the popup has always reported here by the time the blur asks.
+///
+/// Cleared on the next tick like both siblings, so a press the popup absorbed
+/// cannot leave a stale `true` for the next one to read.
+pub(crate) fn note_pointer_on_completion() {
+    POINTER_ON_COMPLETION.with(|d| d.set(true));
+    floem::action::exec_after(std::time::Duration::ZERO, |_| {
+        POINTER_ON_COMPLETION.with(|d| d.set(false));
+    });
+}
+
+/// Whether an editor blur arriving right now should dismiss the completion
+/// popup, or leave it standing because the press that caused the blur landed on
+/// the popup itself.
+pub(crate) fn blur_dismisses_completion() -> bool {
+    !POINTER_ON_COMPLETION.with(|d| d.get())
 }
 
 /// **"I am taking the keyboard now."** Announce a deliberate focus move, so a
@@ -7829,6 +7869,83 @@ mod menu_key_tests {
     fn clear_press_flags() {
         POINTER_DISMISSAL.with(|d| d.set(false));
         POINTER_PLACED_FOCUS.with(|d| d.set(false));
+        POINTER_ON_COMPLETION.with(|d| d.set(false));
+    }
+
+    /// **A press on the completion popup is not a press away from the editor.**
+    ///
+    /// The predicate alone, which is the half that proves nothing on its own —
+    /// see the gate below, which is where the bug actually was.
+    #[test]
+    fn a_press_on_the_completion_popup_spares_the_popup() {
+        clear_press_flags();
+        assert!(
+            blur_dismisses_completion(),
+            "with no press on the popup, an editor blur dismisses it — that is \
+             the schema-panel/terminal/other-tab case and must keep working"
+        );
+        POINTER_ON_COMPLETION.with(|d| d.set(true));
+        assert!(
+            !blur_dismisses_completion(),
+            "the press landed on the popup; the blur it caused must not close it"
+        );
+        clear_press_flags();
+        assert!(blur_dismisses_completion());
+    }
+
+    /// **The two halves the click needs, asserted where they are spelled.**
+    ///
+    /// This is the test that would have failed, and the reason it is a source
+    /// gate rather than a unit test: both halves live in views, and the defect
+    /// was their *composition* — the predicate above was not wrong, it did not
+    /// exist, and the blur closed `comp.open` unconditionally. Clicking a
+    /// completion row then inserted nothing and left the editor without the
+    /// keyboard, because closing `comp.open` rebuilds the `dyn_container` keyed
+    /// on it and the row was gone before its `on_click_stop` could fire on the
+    /// `PointerUp`.
+    ///
+    /// A gate needs a floor, so each half asserts the surrounding term still
+    /// exists: a rename that left nothing to look for would pass silently,
+    /// which is the failure mode source gates are most prone to.
+    #[test]
+    fn the_completion_popup_reports_its_press_and_the_blur_reads_it() {
+        let read = |file: &str| {
+            let src = std::fs::read_to_string(
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("src")
+                    .join(file),
+            )
+            .unwrap_or_else(|e| panic!("reading {file}: {e}"));
+            crate::source_gate::production_code(&src)
+        };
+
+        let popup = read("completion.rs");
+        assert!(
+            popup.contains("on_click_stop"),
+            "completion.rs no longer accepts a row on click — rewrite this gate \
+             rather than deleting it"
+        );
+        assert!(
+            popup.contains("note_pointer_on_completion()"),
+            "the completion popup stopped reporting its own press. The editor's \
+             `FocusLost` will close `comp.open`, the `dyn_container` keyed on it \
+             will tear out the row under the pointer, and `on_click_stop` — \
+             which fires on the `PointerUp` — will never run: clicking a \
+             completion inserts nothing and leaves the editor without the keyboard"
+        );
+
+        let pane = read("editor_pane.rs");
+        assert!(
+            pane.contains("editor_view_focus_lost"),
+            "editor_pane.rs no longer tracks the editor's blur — rewrite this \
+             gate rather than deleting it"
+        );
+        assert!(
+            pane.contains("blur_dismisses_completion()"),
+            "the editor's blur closes the completion popup without asking \
+             whether the press that caused it landed on the popup itself — the \
+             defect this pair exists to prevent"
+        );
     }
 
     // The grid toolbar's Copy icon, and Save's a few px to its right.

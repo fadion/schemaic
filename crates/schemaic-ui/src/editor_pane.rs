@@ -3461,9 +3461,18 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
             ed_blur.editor_view_focus_lost.track();
             editor_focused.set(false);
             // Clicking away from the editor (schema panel, terminal, another tab)
-            // dismisses a stray completion popup + signature help too.
-            comp.open.set(false);
-            comp.sig.set(None);
+            // dismisses a stray completion popup + signature help too — but a
+            // press on the *popup* is not clicking away, and this ran for that
+            // too. Closing `comp.open` here rebuilds the `dyn_container` keyed
+            // on it, so the row under the pointer was gone before its
+            // `on_click_stop` could fire on the `PointerUp`: clicking a
+            // completion inserted nothing and left the editor without the
+            // keyboard. The popup reports the press from its own `PointerDown`,
+            // which floem dispatches before this `FocusLost`.
+            if crate::widgets::blur_dismisses_completion() {
+                comp.open.set(false);
+                comp.sig.set(None);
+            }
         });
         // Signature help follows the *caret*, not just edits: recompute on every
         // cursor change (typing, arrow keys, click) so it tracks the active parameter
