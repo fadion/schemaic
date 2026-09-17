@@ -197,7 +197,7 @@ a generic one.
   hide. The PG slice explicitly cross-checks against the MySQL one.
 - **Testing is TDD by house rule** — an L6 finding names the test that should exist, and a fix
   starts red.
-- **Never bulk-rewrite source with a script.** CLAUDE.md says why; it cost ~900 lines once. The
+- **Never bulk-rewrite source with a script.** `AGENTS.md` says why; it cost ~900 lines once. The
   ledger falls under the same rule and is worse off, since it isn't in git (reference §5).
 
 ## Scope decisions

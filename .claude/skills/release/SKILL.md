@@ -121,8 +121,7 @@ them:
 git commit -m "chore: release vX.Y.Z"
 ```
 
-Per the project's commit convention this still needs the
-`Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>` trailer — use
+Per the project's commit convention this carries no attribution trailer — use
 `git commit -F <file>` if a multi-line message is easier to get right than
 shell quoting.
 

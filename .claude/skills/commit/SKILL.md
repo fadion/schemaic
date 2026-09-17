@@ -1,6 +1,6 @@
 ---
 name: commit
-description: Schemaic's commit flow — group the working tree into logical changes, run the pre-commit bar, then write the Conventional Commits message with its required trailer. Use whenever the user asks to commit ("commit this", "commit the changes", "make a commit", "commit what we just did"), including when they ask only for the message. Also carries the single-pass prompt for reviewing a range of commits, for when the user asks for one. Not for pushing, tagging or releasing — that's the `release` skill — and not for the full pre-release audit, which is `release-review`.
+description: Schemaic's commit flow — group the working tree into logical changes, run the pre-commit bar, then write the Conventional Commits message. Use whenever the user asks to commit ("commit this", "commit the changes", "make a commit", "commit what we just did"), including when they ask only for the message. Also carries the single-pass prompt for reviewing a range of commits, for when the user asks for one. Not for pushing, tagging or releasing — that's the `release` skill — and not for the full pre-release audit, which is `release-review`.
 ---
 
 # Committing in Schemaic
@@ -53,7 +53,7 @@ a call rather than an accident.
 cargo test --workspace
 ```
 
-CLAUDE.md makes a green workspace suite a **pre-commit** rule, and it is the only
+`AGENTS.md` makes a green workspace suite a **pre-commit** rule, and it is the only
 one. Green, and no `#[ignore]` added by this change.
 
 ```bash
@@ -154,13 +154,14 @@ ordinary commits.
 
 ## Phase 2 — the commit
 
-Format, per CLAUDE.md, which stays the authority:
+Format, per `AGENTS.md`, which stays the authority:
 
 - `type(scope): subject` — imperative, no trailing period, lower-case after the colon
 - types: `feat` `fix` `refactor` `perf` `docs` `test` `chore` `build` `ci`
 - scope = the crate or module the change centers on (`grid`, `editor`, `schema`, `ai`, `sql`, `theme`, `db`, `ci`…); omit only when genuinely cross-cutting
 - optional body after a blank line, explaining the **why** — the diff already says what
-- every message ends with the trailer `Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>`
+- **no attribution trailer** — no `Co-Authored-By:`, no "Generated with" line. The history was
+  rewritten once to strip them from all 1418 commits; a new one puts it straight back.
 
 ```bash
 git log --oneline -20
@@ -181,8 +182,6 @@ git commit -F - <<'EOF'
 type(scope): subject
 
 Body.
-
-Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
 EOF
 ```
 

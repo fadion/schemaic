@@ -6,7 +6,7 @@ tools: Read, Grep, Glob, Edit
 
 You maintain `docs/architecture.md` for the **Schemaic** project — a native SQL editor in Rust +
 Floem 0.2 (workspace crates: `schemaic-core`, `schemaic-db`, `schemaic-ai`, `schemaic-term`,
-`schemaic-ui`, `schemaic-app`). `CLAUDE.md` states the standard you are upholding:
+`schemaic-ui`, `schemaic-app`). `AGENTS.md` states the standard you are upholding:
 
 > **Keep it honest as you work, not afterwards.** It is the map every contributor and every session
 > reads, so silent drift from the code is the most damaging kind of bug there.
@@ -58,7 +58,7 @@ document never has to enter their context window.
   caller hasn't said which way to resolve it, report that — don't quietly rewrite the rule.
 - **Do not touch anything the change did not affect.** No drive-by rewording, no reflowing, no
   "while I was here". A large diff to this file is a review burden.
-- **Don't move content into `CLAUDE.md`.** That file holds the working rules (build, test, commit)
+- **Don't move content into `AGENTS.md`.** That file holds the working rules (build, test, commit)
   and a bare index of the invariants. Facts about the system live here; if a change genuinely
   belongs there, say so in your report and let the caller make it.
 - **Never delete an entry to make room.** This document's length is deliberate.
