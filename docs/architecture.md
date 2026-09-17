@@ -11459,7 +11459,7 @@ existing prose was left alone.
     workspace group beside `properties_overlay`/`erd_overlay`/`monitor_overlay` and counted by
     `workspace_modals_up`.
     **It renders nothing while one of its own forms or the DDL preview is up.** Its `dyn_container`
-    is keyed on `(target, hidden, live_read_only)`, where `hidden` reads
+    is keyed on `(target, hidden, target_read_only)`, where `hidden` reads
     `ddl.account`/`ddl.grant`/`ddl.preview`,
     and the outer fill style asks the same question. That is the pairing every schema editor already
     has with the preview one level up, and here it is load-bearing rather than tidy: the two account
@@ -11472,11 +11472,24 @@ existing prose was left alone.
     gate is computed once per container build. Nothing re-ran it when the flag moved, so flipping the
     connection to read-only from the status bar left **Drop** lit, the "This connection is
     read-only." note absent, and Apply enabled on a preview that then silently did nothing.
-    `live_read_only` is the *tracked* reader of that flag and sits deliberately beside
+    `target_read_only` is the *tracked* reader of that flag and sits deliberately beside
     `table_designer::edit_ctx`'s untracked one: `get_untracked` is the right reading at a click and
     the wrong one as a container key, since a browser keyed on it has to rebuild when the answer
     changes — which is the whole point of the question. Both readings are wanted here, so there are
     two.
+    **That third term is load-bearing in a way the function's own doc obscures, so a test pins it.**
+    `write_gate` calls `target_read_only` again *inside* the builder, and that function's doc says it
+    reads tracked — true of the function, which uses `.with` rather than `.with_untracked`, and not
+    true of that caller, since a `dyn_container` builder is not a tracking scope. The gate inside
+    reads the right value only because the key's own term already forced the rebuild, so the doc
+    reads like coverage for a read that has none, and dropping the term on the strength of it is a
+    one-line edit that compiles, looks like a simplification and reproduces Server Activity's bug
+    exactly. `the_browser_key_carries_the_read_only_flag` is a source gate over this module's
+    production text (through `source_gate::production_code`, not a cut at the first `#[cfg(test)]`):
+    it finds the container by `target.get()` in its key and fails unless `target_read_only(` appears
+    in the ten lines from there — a window deliberately short of the builder's own `write_gate` call,
+    which is the read that must *not* be mistaken for the key's — with a `checked == 1` floor so a
+    rename leaves it failing rather than asserting over nothing.
     **The fetch effect therefore lives *above* that container and keys on the target alone.**
     `hidden` moves whenever a form or the preview opens *or closes*, so an effect created inside the
     child re-ran on every one of those transitions: a full `fetch_principals` — a fresh connection,
@@ -17503,6 +17516,24 @@ Re-introducing the anti-patterns these guard against is a regression:
   `the_import_button_says_a_read_only_connection_rather_than_going_quiet` reads all three off the
   source, all three living in view closures, and asserts the `accept_launch` call as well — a
   disabled button is not what stops the write.
+  **And the state that guard exists for is, as far as the code can be read, unreachable — which is
+  written down here so the next reader neither hunts for the race nor deletes the guard for want of
+  one.** The question was whether the flag can move while this modal stands, and the answer is that
+  nothing can move it. The modal has exactly one opener in the tree, the schema tree's context-menu
+  **Import** entry, disabled on a `read_only` snapshot taken where the menu is built; there is no
+  palette, shortcut, toolbar, menu-bar, MCP or drag-and-drop route to it, and
+  `conn_actions.open_import` is a *different feature* — importing connections from another client,
+  `connection_import.rs` — rather than a second door. The only writer of an existing connection's
+  `read_only` is `main.rs`'s `toggle_read_only`, wired to the status bar's `ro_seg` click and to
+  nothing else: no shortcut, and nothing server- or background-driven (`db::session`'s read-only
+  *transaction* detection is a different, session-scoped fact that shares the words). A modal
+  backdrop covers the whole window, so neither that segment nor Manage Connections is reachable
+  while Import is up. What is left is the pre-open race — a context menu whose snapshot went stale
+  between the right-click and the press — and the root-level pointer-down dismissal closes that,
+  since any competing click dismisses the menu before its own handler runs. So the live read is
+  defence in depth, and deliberately kept: it is here because this is the question every destructive
+  launch asks, asked the same way everywhere, which is what stops the *next* opener — a palette
+  entry, a toolbar button — from arriving without one.
   **The Drop was the plainest instance of failing it**, and it is the one of that pane's three
   actions the rule bites on — its neighbours refuse read-only inside `open_for_new` /
   `open_for_grant`. Its launch read an `enabled` `bool` captured when the account row was *built*, so
@@ -18813,7 +18844,17 @@ Re-introducing the anti-patterns these guard against is a regression:
   **No gate came out of any of the three.** A crude scan finds **61** `dyn_container` builders
   across `schemaic-ui` + `schemaic-app` that read a signal with `.get()`; most are reading something
   already in their own key, which is harmless, and nothing mechanical separates those from the frozen
-  ones. Sorting them is its own pass, and it is in `TODO.md` rather than here.
+  ones. **That sorting pass has since been walked by hand, and came back clean — with one hole,
+  named below.** Every site visited either reads only what its own key already carries, or reads
+  elsewhere inside a nested tracking scope (a `.style()`, a label, a tooltip), or is a transient
+  right-click or dropdown menu deliberately reading `get_untracked()` at raise time, which is that
+  genre's convention rather than a lapse; `schemaic-app/src/main.rs` contributes nothing at all, its
+  two hits for the name being comments. One site was fragile rather than wrong and now carries a
+  test — the Users browser's container, written up under `users_view.rs`.
+  **The hole is `grid.rs` and `editor_pane.rs`**, the two largest populations, which were sampled
+  representatively rather than walked exhaustively. Every site sampled matched the discipline, and
+  that is a weaker claim than the one above it; `TODO.md` names those two files as the work left. A
+  frozen read found there is something the pass never looked at, not a regression of it.
   Where the read has a *later* moment that wants it — a press, a tip, a right-click that builds a
   menu — the remedy is to move the read there rather than to widen the key, which is what both the
   activity panel's row menu and the snippet row's do.
