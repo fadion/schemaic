@@ -7018,9 +7018,21 @@ existing prose was left alone.
         `index_facts`, `unused_note` and `shows_free` all exist to prevent. `TableStats::total_bytes`
         — the *table's* data plus indexes, which `storage_section` really does print — is a
         different function and is still here.
-- `schemaic-db` — MySQL/MariaDB (`mysql_async`) + SSH tunnels (`ssh.rs`), PostgreSQL in `pg.rs`,
-  SQLite in `sqlite.rs`, and
-  the pinned manual-transaction connection in `session.rs`. **`Db::fetch_sessions`/
+- `schemaic-db` — MySQL/MariaDB (`mysql_async`) in `mysql.rs`, PostgreSQL in `pg.rs`,
+  SQLite in `sqlite.rs`, SSH tunnels in `ssh.rs`, and
+  the pinned manual-transaction connection in `session.rs`.
+  **`mysql.rs` is being filled a piece at a time and this sentence is ahead of it.** For most of
+  the crate's life MySQL had no module — its bodies were inline in `lib.rs`, so `pg.rs` and
+  `sqlite.rs` were peers of each other and of nothing else, and the crate doc opened by saying so.
+  Each step moves one family of entry points and leaves the rest inline, so until the move is
+  finished `lib.rs` still holds MySQL bodies and the two convention tests
+  (`every_engine_module_answers_the_whole_interface`,
+  `the_dispatcher_calls_both_engine_modules_for_every_entry_point`) still check two engines rather
+  than three. **What may move is decided by who reads it, not by what it is named**: `assemble_schema`,
+  `ColRow`, `IdxRow`, `FkColRow`, `TxScope`, `DdlError`, `lock_wait_sql` and the
+  `NumKind`/`num_kind`/`parse_as`/`parse_typed` family are all called from `pg.rs` despite their
+  MySQL-flavoured vocabulary and stay in `lib.rs`; `ident_sqlite` is the mirror-image trap, sitting
+  next to MySQL's own `ident` and belonging to neither. **`Db::fetch_sessions`/
   `Db::kill_session`** are the Server Activity panel's whole backend, and they are up to three
   queries per engine rather than one: MySQL runs `information_schema.PROCESSLIST` (required —
   without it there
