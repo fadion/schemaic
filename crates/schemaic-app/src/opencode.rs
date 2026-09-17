@@ -77,9 +77,28 @@ use std::path::{Path, PathBuf};
 /// life, and the plugin bootstrap `--pure` skips is paid at most once per
 /// instance rather than once per turn.
 fn instance_root(kind: &str) -> Option<PathBuf> {
-    let dir = schemaic_core::persist::private_dir(kind)?.join(instance_tag());
+    // The per-kind base is created owner-only by `private_dir`; the instance
+    // directory under it inherits that. The *path* comes from
+    // `instance_path_in` rather than being spelled a second time here, so the
+    // two cannot drift.
+    schemaic_core::persist::private_dir(kind)?;
+    let dir = instance_path_in(&schemaic_core::persist::config_dir()?, kind);
     std::fs::create_dir_all(&dir).ok()?;
     Some(dir)
+}
+
+/// Where a kind's per-instance root **is**, without creating anything.
+///
+/// Split out of [`instance_root`] because the only question the test has is
+/// about the *path*, and asking [`instance_root`] for it made the test create
+/// directories — under `config_dir()`, which is the developer's own
+/// `%APPDATA%\schemaic`, not a fixture. Every `cargo test` left a
+/// `pid-<test-process>` behind in `opencode/` and another in
+/// `opencode-inline/`; 275 of each had accumulated here before anyone looked.
+/// `sweep` does collect them, but only when the app next starts, and the
+/// suite is supposed to touch no filesystem at all.
+fn instance_path_in(config: &Path, kind: &str) -> PathBuf {
+    schemaic_core::persist::private_dir_in(config, kind).join(instance_tag())
 }
 
 /// This process's name for its own config roots.
@@ -381,13 +400,13 @@ mod tests {
     /// first's next question at its own database and access level.
     #[test]
     fn no_two_configs_that_must_differ_can_land_on_one_path() {
-        let Some(session) = super::instance_root("opencode") else {
-            // No config directory on this machine: nothing to assert about
-            // roots that cannot be created. `write` returns `None` there and the
-            // caller refuses the session.
-            return;
-        };
-        let inline = super::instance_root("opencode-inline").expect("a sibling root");
+        // A fixture path, not `config_dir()`. Asking `instance_root` made this
+        // test *create* the directories it was asking about, in the developer's
+        // own `%APPDATA%\schemaic` — see `instance_path_in`. The question was
+        // always about the path, and the path needs no filesystem.
+        let config = std::path::Path::new("/schemaic-fixture-config");
+        let session = super::instance_path_in(config, "opencode");
+        let inline = super::instance_path_in(config, "opencode-inline");
         assert_ne!(
             session, inline,
             "a chat session and a one-shot would share one opencode.json"
@@ -406,6 +425,48 @@ mod tests {
         assert!(session.ends_with(&tag), "{session:?}");
         assert!(inline.ends_with(&tag), "{inline:?}");
         assert_ne!(tag, "pid-", "the tag carries no instance identity");
+    }
+
+    /// **No test in this module may call [`super::instance_root`].**
+    ///
+    /// It is the one function here that touches the filesystem, and it touches
+    /// it under `config_dir()` — the developer's real `%APPDATA%\schemaic`,
+    /// never a fixture. `no_two_configs_that_must_differ_can_land_on_one_path`
+    /// called it for a path it could have computed, and every `cargo test` on
+    /// this machine therefore left two `pid-<test-process>` directories in the
+    /// user's own configuration; 275 of each had piled up. The suite is
+    /// supposed to touch no filesystem, so the rule is a gate rather than a
+    /// resolution.
+    ///
+    /// Counted rather than grepped for absence: `production_code` strips
+    /// `#[cfg(test)]` items, so any occurrence the full source has and the
+    /// production cut does not is a call from a test.
+    #[test]
+    fn no_test_here_asks_for_a_directory_instead_of_a_path() {
+        let src = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("src")
+                .join("opencode.rs"),
+        )
+        .expect("opencode.rs");
+        let production = schemaic_ui::source_gate::production_code(&src);
+        // Split so this assertion is not itself a match — the gate lives in the
+        // `#[cfg(test)]` half it is counting, so a literal needle would make the
+        // full source exceed the production cut by exactly one, for ever.
+        let needle = format!("instance_{}(", "root");
+        // The floor: a rename would leave nothing to count and pass silently.
+        assert!(
+            production.contains(&needle),
+            "`instance_root` is gone — rewrite this gate rather than deleting \
+             it, and point it at whatever now creates the instance directory"
+        );
+        assert_eq!(
+            src.matches(&needle).count(),
+            production.matches(&needle).count(),
+            "a test in this module calls `instance_root`, which creates \
+             directories under the real `config_dir()`. Ask `instance_path_in` \
+             for the path instead — that is what it exists for"
+        );
     }
 
     #[test]
