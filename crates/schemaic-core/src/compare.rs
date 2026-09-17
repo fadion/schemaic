@@ -1742,7 +1742,8 @@ fn fk_rank(
 /// differ reads carry the name of the database they were read from rather than
 /// anything about the object:
 ///
-/// - a foreign key's [`ForeignKeyInfo::ref_schema`] is `REFERENCED_TABLE_SCHEMA`,
+/// - a foreign key's [`ForeignKeyInfo::ref_schema`](crate::schema::ForeignKeyInfo::ref_schema)
+///   is `REFERENCED_TABLE_SCHEMA`,
 ///   which on that engine *is* the database ([`ddl::ref_schema_is_database`]);
 /// - a view's [`TableInfo::view_definition`] is the server's rewritten body,
 ///   qualified throughout ([`ddl::view_definition_is_qualified`]).
@@ -1758,7 +1759,7 @@ fn fk_rank(
 /// **Re-addressed rather than stripped**, and the difference matters twice.
 /// Stripping loses the distinction the fix has to keep — MySQL allows a key into
 /// another database, one of those *is* a difference, and
-/// [`ddl::fks_equal`]'s rule that an absent namespace matches an explicit one
+/// `ddl::fks_equal`'s rule that an absent namespace matches an explicit one
 /// would have made a cross-database key compare equal to a local one. And a
 /// re-addressed right side is the side the plan is *built from*, so the
 /// statement that comes out already names the database it will run against
@@ -1767,7 +1768,8 @@ fn fk_rank(
 /// The left side is never touched: it is the target, and it is already in its
 /// own terms.
 ///
-/// [`ViewOptions::definer`] is cleared on both sides, and that is a different
+/// [`ViewOptions::definer`](crate::schema::ViewOptions::definer) is cleared on
+/// both sides, and that is a different
 /// judgement — see [`without_definer`].
 ///
 /// Borrows when there is nothing to re-address, which is every PostgreSQL and

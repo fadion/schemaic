@@ -580,7 +580,8 @@ pub(crate) fn presses(key: &Key, mods: floem::keyboard::Modifiers) -> bool {
 /// (`window_handle.rs`). So once **F6** put the keyboard in the results toolbar
 /// strip — the app's first ring outside an overlay, and the documented way in —
 /// `Ctrl+Tab` stepped to the next toolbar icon and tab switching stopped, as did
-/// `Ctrl+Shift+Tab` and, on macOS, `Cmd+Tab` through [`shortcuts::primary_held`].
+/// `Ctrl+Shift+Tab` and, on macOS, `Cmd+Tab` through
+/// [`shortcuts::primary_held`](crate::shortcuts::primary_held).
 /// Inside a modal the same consumption is harmless, because the window root
 /// returns `Continue` for everything once a modal is up — which is why the strip
 /// is the surface where it bit.
@@ -1774,7 +1775,7 @@ pub(crate) fn fact_note(
 ///
 /// **Both terms of that subtraction have to be at the same scale, and both have
 /// to be resolved at the same moment.** `stack_gap` is a `fn` for
-/// [`crate::dividers::scaled_arg_gate`]'s reason: a length resolved at *build*
+/// `dividers::scaled_arg_gate`'s reason: a length resolved at *build*
 /// freezes at the scale the view was built at, while `theme::scaled(20.0)` here
 /// is read inside the style closure and re-runs. Three of the four callers
 /// passed `theme::scaled(16.0)` evaluated in the builder against the same

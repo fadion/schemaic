@@ -11204,7 +11204,7 @@ fn footer_text(s: String) -> AnyView {
 /// because it is what makes `anchor_here`'s single spelling load-bearing rather
 /// than tidy, not because a second caller is expected.
 ///
-/// `margin` is a `fn` for [`dividers::scaled_arg_gate`]'s reason: a length
+/// `margin` is a `fn` for `dividers::scaled_arg_gate`'s reason: a length
 /// resolved at build freezes at the scale the view was built at. It was a raw
 /// `f64` and its one caller passed the literal `15.0`, so at Large every other
 /// gap in the footer was 24 and this one stayed 15, and at Small every other

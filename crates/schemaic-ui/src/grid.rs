@@ -2368,7 +2368,7 @@ fn attached_rows(
 /// rows be judged by a local database's setting.
 ///
 /// **`conn_at_load`, not the live `conn_id`** — the same distinction
-/// [`GridState::set_format`] makes, and the field's own doc states why. A tab
+/// [`set_format`] makes, and the field's own doc states why. A tab
 /// can be rebound while its result stays on screen: reading the live signal let
 /// rows fetched on a schema-only connection be attached to the assistant as
 /// soon as the tab was pointed somewhere more permissive, without refetching a
