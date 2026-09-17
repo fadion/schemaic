@@ -888,7 +888,7 @@ async fn assert_matches_draft(
     }
     for g in &got_ix {
         let drafted = want_ix.iter().any(|w| w.0 == g.0);
-        let backs_a_key = want_fk.iter().any(|f| *f == g.0);
+        let backs_a_key = want_fk.contains(&g.0);
         if !drafted && !backs_a_key {
             lost.push(format!(
                 "  index {:?}: the server has it and the draft does not — a drop the \
@@ -903,7 +903,7 @@ async fn assert_matches_draft(
         }
     }
     for g in &after.foreign_keys {
-        if !want_fk.iter().any(|w| *w == g.name) {
+        if !want_fk.contains(&g.name) {
             lost.push(format!(
                 "  foreign key {:?}: the server has it and the draft does not",
                 g.name
@@ -924,7 +924,7 @@ async fn assert_matches_draft(
     // the user has not named and the server invents a name for it, so the two
     // cannot be matched by name in either direction.
     for g in &after.check_constraints {
-        if !g.name.is_empty() && !want_ck.iter().any(|w| *w == g.name) {
+        if !g.name.is_empty() && !want_ck.contains(&g.name) {
             lost.push(format!(
                 "  check {:?}: the server has it and the draft does not",
                 g.name

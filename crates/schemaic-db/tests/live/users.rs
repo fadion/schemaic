@@ -321,7 +321,6 @@ impl ScratchAccount {
             host: host.to_string(),
             kind,
             password: password.to_string(),
-            ..Default::default()
         };
         let principal = draft.principal(dialect);
         let me = ScratchAccount {
