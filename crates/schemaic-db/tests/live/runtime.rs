@@ -13,8 +13,7 @@
 //! only a cancel if the server stops: a client that returns early while the
 //! statement runs on has told the user something untrue about their database.
 
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use schemaic_core::model::Value;
@@ -475,26 +474,38 @@ pub async fn a_cancelled_script_stops_at_the_server_and_reports_what_ran(target:
     // the tier's threaded leg-tests contending on one server, which is the load
     // that made PostgreSQL lose the previous race — fired the token at t=3 s
     // and then failed saying "the cancel took 3.0s, so the sleep ran to
-    // completion". The sleep had never started. `saw_row` is what separates the
-    // two: the blind arming now fails as itself, above the assertions that
+    // completion". The sleep had never started. `sleep_reached` is what separates
+    // the two: the blind arming now fails as itself, above the assertions that
     // would otherwise describe it as something else.
+    //
+    // **It records the *instant*, not a flag, because the elapsed assertion
+    // below measures from it.** The same probe answers both questions: a row
+    // that is visible means statement 2 has committed, so the sleep is the
+    // statement now running — and the moment that becomes true is the only
+    // clock the cancel can honestly be timed against.
     let cancel = CancellationToken::new();
     let armed = cancel.clone();
     let probe = scratch.db.clone();
     let database = scratch.database.clone();
     let probe_sql = format!("SELECT COUNT(*) FROM {t}");
-    let saw_row = Arc::new(AtomicBool::new(false));
-    let reached = Arc::clone(&saw_row);
+    let sleep_reached: Arc<OnceLock<Instant>> = Arc::new(OnceLock::new());
+    let reached = Arc::clone(&sleep_reached);
     tokio::spawn(async move {
         let deadline = Instant::now() + ARM_FALLBACK;
         while Instant::now() < deadline {
+            // Taken *before* the poll, not after it: the row may have appeared
+            // at any point since the previous poll, so the start of the poll
+            // that found it is the later bound this test is entitled to assume.
+            // Reading the clock afterwards would credit the cancel with however
+            // long the probe's own query took.
+            let asked = Instant::now();
             let seen = probe
                 .fetch_query(Some(&database), &probe_sql, 1, CancellationToken::new())
                 .await
                 .ok()
                 .and_then(|rs| rs.cell(0, 0).map(|c| c.display().to_string()));
             if seen.as_deref() == Some("1") {
-                reached.store(true, Ordering::SeqCst);
+                let _ = reached.set(asked);
                 break;
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
@@ -504,24 +515,43 @@ pub async fn a_cancelled_script_stops_at_the_server_and_reports_what_ran(target:
 
     let started = Instant::now();
     let (end, ran) = run_script_with(&scratch, &stmts, cancel).await;
-    let elapsed = started.elapsed();
+    let finished = Instant::now();
+    let elapsed = finished - started;
 
-    assert!(
-        saw_row.load(Ordering::SeqCst),
-        "{}: the script had not run its first two statements after {ARM_FALLBACK:?}, so the \
-         cancel was armed blind — this is a slow server, not the accounting bug the assertions \
-         below are about",
-        target.name
-    );
+    let Some(&at_sleep) = sleep_reached.get() else {
+        panic!(
+            "{}: the script had not run its first two statements after {ARM_FALLBACK:?}, so the \
+             cancel was armed blind — this is a slow server, not the accounting bug the \
+             assertions below are about",
+            target.name
+        );
+    };
     assert_eq!(
         end,
         ExecEnd::Cancelled,
         "{}: the run ended as {end:?} rather than cancelled",
         target.name
     );
+    // **Timed from the sleep, not from the script.** `started` is taken before
+    // the `CREATE TABLE`, so an elapsed measured against it also contains
+    // however long the two statements *ahead* of the sleep took — and under the
+    // whole tier's concurrent load that term is seconds, not milliseconds. This
+    // failed at 341/1 with "the cancel took 4.02s, so the sleep ran to
+    // completion" on a run where the cancel had in fact returned promptly: the
+    // assertion named the sleep while measuring the setup.
+    //
+    // `at_sleep` is the start of the poll that found statement 2's row, so it
+    // is a point *no later* than the sleep's own start and `since_sleep` is an
+    // over-estimate of the quantity the sentence claims — the safe direction,
+    // because it can only fail this test early, never late. The margin still
+    // discriminates: had the sleep run its full `SLEEP_SECS`, `since_sleep`
+    // would read `SLEEP_SECS` plus that over-estimate, which is over two
+    // seconds clear of the limit.
+    let since_sleep = finished - at_sleep;
     assert!(
-        elapsed < Duration::from_secs(SLEEP_SECS) - CANCEL_MARGIN,
-        "{}: the cancel took {elapsed:?}, so the sleep ran to completion",
+        since_sleep < Duration::from_secs(SLEEP_SECS) - CANCEL_MARGIN,
+        "{}: the run went on for {since_sleep:?} after the sleep started ({elapsed:?} for the \
+         script as a whole), so the sleep ran to completion",
         target.name
     );
     assert!(
@@ -703,12 +733,15 @@ pub const SLEEP_SECS: u64 = 5;
 /// How long [`a_cancelled_script_stops_at_the_server_and_reports_what_ran`]
 /// waits for the script's own progress before arming the token blind.
 ///
-/// **Strictly shorter than the elapsed limit the test asserts**
-/// (`SLEEP_SECS - CANCEL_MARGIN`, 3 s), and that gap is the whole point: when
-/// the two were equal, a leg that missed the row fired the token at the exact
-/// instant the assertion expired and failed with a diagnosis naming the one
-/// thing that had not happened. Written as a subtraction from the same two
-/// constants so shortening either keeps the ordering.
+/// **A budget for the arming, no longer a term in the assertion.** It used to
+/// be the same 3 s the elapsed assertion measured against, so a leg that missed
+/// the row fired the token at the exact instant the assertion expired and
+/// failed with a diagnosis naming the one thing that had not happened; it was
+/// then shortened to sit strictly inside that limit. The limit is now measured
+/// from the moment the row appeared rather than from the start of the script,
+/// so a slow arming no longer enters the arithmetic at all — a run that never
+/// sees the row fails as the blind arming it is. Kept as a subtraction from the
+/// same two constants so the old ordering survives anyone shortening either.
 const ARM_FALLBACK: Duration = Duration::from_secs(SLEEP_SECS)
     .saturating_sub(CANCEL_MARGIN)
     .saturating_sub(Duration::from_secs(1));
