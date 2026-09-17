@@ -148,6 +148,30 @@ download_to() {
     fi
 }
 
+# The `--with-colons` listing of the key file `$1`, or empty if this `gpg`
+# could not read it.
+#
+# **Two spellings, because `--show-keys` is not everywhere.** It arrived in
+# GnuPG 2.1.23; SLES 12, Leap 42 and CentOS 7 ship the 2.0 series, where it is
+# an `invalid option` — the listing comes back empty and every caller reads that
+# as "this key is broken". That refused the correct published key on exactly the
+# machines the armoured route exists for, and it refused it twice: once in
+# `key_fingerprint` and again in `only_one_key`, whose `^pub:` count came back 0.
+# `--with-fingerprint` answers the same question and predates both; measured
+# against GnuPG 2.0.22, 2.2.40 and a no-`gpg` image.
+#
+# One function rather than the two-line dance at each site, because there were
+# two sites and only one of them was ever written down.
+gpg_key_listing() {
+    local f="$1" out
+    out="$(gpg --batch --with-colons --show-keys --fingerprint "$f" 2>/dev/null)"
+    case "$out" in
+        *"
+pub:"* | "pub:"*) printf '%s\n' "$out"; return 0 ;;
+    esac
+    gpg --batch --with-colons --with-fingerprint "$f" 2>/dev/null
+}
+
 # The fingerprint of the primary key in `$1`, upper-case hex, or empty.
 #
 # **Two implementations because the binary keyring exists for machines with no
@@ -165,14 +189,16 @@ download_to() {
 key_fingerprint() {
     local f="$1" out
     if has gpg; then
-        out="$(gpg --batch --with-colons --show-keys --fingerprint "$f" 2>/dev/null \
-            | awk -F: '/^fpr:/ { print $10; exit }')"
+        out="$(gpg_key_listing "$f" | awk -F: '/^fpr:/ { print $10; exit }')"
         if [ -n "$out" ]; then
             printf '%s\n' "$out"
             return 0
         fi
         # An armoured file `gpg` refused is a broken file, not a reason to fall
-        # through to a parser that only understands the binary form.
+        # through to a parser that only understands the binary form — but only
+        # once `gpg` has actually been asked in a spelling it understands, which
+        # is what `gpg_key_listing` is for. Reaching here now means every
+        # spelling failed, which is the file and not the option.
         if grep -q 'BEGIN PGP PUBLIC KEY BLOCK' "$f" 2>/dev/null; then
             return 1
         fi
@@ -285,7 +311,10 @@ require_published_key() {
 only_one_key() {
     local f="$1" n bin rc
     if has gpg; then
-        n="$(gpg --batch --with-colons --show-keys "$f" 2>/dev/null | grep -c '^pub:' || true)"
+        n="$(gpg_key_listing "$f" | grep -c '^pub:' || true)"
+        # A `gpg` that could read nothing answers 0, which is not "one key" —
+        # so this stays fail-closed either way, and the listing helper is what
+        # keeps a 2.0-series `gpg` from landing here on a perfectly good key.
         [ "$n" = 1 ]
         return $?
     fi
