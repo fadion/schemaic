@@ -1095,3 +1095,55 @@ fn footer(
     )
     .into_any()
 }
+
+#[cfg(test)]
+mod tests {
+    /// The browser's read-only term stays in the `dyn_container` **key**.
+    ///
+    /// `target_read_only`'s own doc says it reads "tracked", and that is true of
+    /// the function — it uses `.with`, not `.with_untracked`. It is not true of
+    /// every caller, and the difference is the whole hazard: a `dyn_container`
+    /// builder is not a tracking scope in floem 0.2, so the `target_read_only`
+    /// that `write_gate` performs *inside* this builder subscribes to nothing.
+    /// It reads the right value today only because the key's own `ro` term
+    /// already forced the rebuild.
+    ///
+    /// So the doc reads like coverage for a read that has none, and dropping
+    /// `ro` from the key on the strength of it is a one-line edit that compiles,
+    /// looks like a simplification, and reproduces Server Activity's bug exactly:
+    /// the status bar flips to read-only and **Drop** and **Privileges** stay lit
+    /// on a browser that has not rebuilt. The composition of a pure function with
+    /// its caller is the seam, which is where this class of bug always sits.
+    #[test]
+    fn the_browser_key_carries_the_read_only_flag() {
+        let src =
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/users_view.rs"))
+                .expect("this module's own source");
+        // The shared walk, not a cut at the first `#[cfg(test)]` — which is
+        // positional and not comment-aware. See `source_gate::production_code`.
+        let body = crate::source_gate::production_code(&src);
+        let lines: Vec<&str> = body.lines().collect();
+        let mut checked = 0;
+        for (i, l) in lines.iter().enumerate() {
+            if !l.contains("dyn_container(") {
+                continue;
+            }
+            // The key is the first argument, and this one is six lines of it.
+            // Ten is short of the builder's own `write_gate` call, which is the
+            // read that must *not* be mistaken for the key's.
+            let window = lines[i..(i + 10).min(lines.len())].join("\n");
+            if !window.contains("target.get()") {
+                continue;
+            }
+            checked += 1;
+            assert!(
+                window.contains("target_read_only("),
+                "the browser's container at line {} no longer keys on the \
+                 read-only flag; the `write_gate` call in its builder does not \
+                 track, so the flag can flip with Drop and Privileges left lit",
+                i + 1
+            );
+        }
+        assert_eq!(checked, 1, "this gate is stale — it found {checked}");
+    }
+}
