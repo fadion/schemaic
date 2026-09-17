@@ -609,8 +609,13 @@ pub fn config_path() -> Option<PathBuf> {
     Some(config_dir()?.join("ui_state.json"))
 }
 
+/// The credential store's file name, in one place because two questions read
+/// it: where the file lives, and — in [`corrupt_sibling_is_swept`] — whether a
+/// recovery notice about it may promise the copy it names will still be there.
+const CONNECTIONS_FILE: &str = "connections.json";
+
 fn connections_path() -> Option<PathBuf> {
-    Some(config_dir()?.join("connections.json"))
+    Some(config_dir()?.join(CONNECTIONS_FILE))
 }
 
 /// Where something that must not be world-readable belongs, given a config
@@ -967,18 +972,48 @@ pub(crate) fn read_bytes<T: Default + for<'de> Deserialize<'de>>(
     value
 }
 
+/// Whether a later save is going to remove this store's `.corrupt` sibling out
+/// from under the user.
+///
+/// **One store, and it is the credential file.** The `.corrupt` an unreadable
+/// primary leaves behind is the only copy of what was in it, and
+/// [`recovery_notice`] points the user straight at it — so nothing may delete it
+/// as the side effect of an unrelated deletion. `connections.json` is the
+/// exception, because under the no-keyring fallback that copy holds the DB
+/// password, the SSH password and the key passphrase in the clear, in a file
+/// that cannot be parsed and therefore cannot be rewritten without them. There
+/// the scrub wins and the *notice* has to be the qualified one, which is the
+/// question this predicate answers.
+///
+/// A predicate rather than the check written into the notice, because the scrub
+/// and the sentence describing it are 500 lines apart and drifted once already.
+fn corrupt_sibling_is_swept(path: &Path) -> bool {
+    path.file_name().is_some_and(|n| n == CONNECTIONS_FILE)
+}
+
 /// The user-facing notice for a config file that didn't parse: what failed, that
 /// the original was kept, and where it went. Named by file name rather than full
 /// path — the modal is a sentence, not a log line.
+///
+/// For the one store whose copy is swept later it says so. The notice is an
+/// instruction — *your data is in this file, go and get it* — and for
+/// `connections.json` the next connection delete takes the file away; a user
+/// told only the first half plans around a file that will not be there.
 fn recovery_notice(path: &Path, err: &str) -> String {
     let name = path
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| path.display().to_string());
+    let temporary = if corrupt_sibling_is_swept(path) {
+        "\nThat copy can hold passwords in the clear, so it is removed the next time you \
+         delete a connection — recover anything you need from it before then."
+    } else {
+        ""
+    };
     format!(
         "{name} could not be read ({err}).\n\
          The unreadable file was kept as {name}.corrupt; Schemaic fell back to its backup, or \
-         to defaults if the backup was unreadable too."
+         to defaults if the backup was unreadable too.{temporary}"
     )
 }
 
@@ -1120,11 +1155,16 @@ fn write_json<T: Serialize>(path: Option<PathBuf>, value: &T, saving: Saving) {
 /// back as [`Load::Corrupt`], and the backup is read. That is the recovery, and
 /// it is why the sync is not paid for here: [`write_file_atomic`] keeps no
 /// `.bak` by design, so it has nothing else and does sync.
-pub(crate) fn write_bytes(store: &dyn FileStore, path: &Path, json: &[u8], saving: Saving) {
+///
+/// Answers **whether the new content landed**, because a caller that has more
+/// to sweep than the `.bak` — [`write_secret_store`] — owes the sweep the same
+/// ordering this function gives its own: a save that could not land must leave
+/// every copy it found.
+pub(crate) fn write_bytes(store: &dyn FileStore, path: &Path, json: &[u8], saving: Saving) -> bool {
     store.ensure_parent(path);
     let tmp = sibling(path, ".tmp");
     if store.write(&tmp, json).is_err() {
-        return;
+        return false;
     }
     // Re-write rather than `fs::copy`, which would carry the *old* file's mode
     // onto the backup — including a 0644 left by a build from before this.
@@ -1141,24 +1181,68 @@ pub(crate) fn write_bytes(store: &dyn FileStore, path: &Path, json: &[u8], savin
         store.remove(&tmp);
     }
     if saving == Saving::Erasing && landed {
-        remove_erased_siblings(store, path);
+        store.remove(&sibling(path, ".bak"));
     }
+    landed
 }
 
-/// Every sibling copy of `path` an erasure has to reach.
+/// Every sibling copy of `path`, for a store whose contents are **secrets**.
 ///
-/// **Two, not one.** The `.bak` is the obvious one — [`Saving::Erasing`] was
-/// written about it. The `.corrupt` is the one nothing else in the workspace
-/// ever removes: [`read_bytes`] renames an unparseable primary aside *whole*
-/// (`{path}.corrupt`) and falls back to the backup, and from then on that file
-/// sits in the config directory for the life of the install. For
-/// `connections.json` under the no-keyring fallback it holds the DB password,
-/// the SSH password and the key passphrase in the clear; for `history.json` and
-/// `snippets.json` it holds the user's own SQL. A confirm reading "This can't
-/// be undone" is a claim about the directory, not about one file in it.
-fn remove_erased_siblings(store: &dyn FileStore, path: &Path) {
+/// **Two, and the second one is not free.** The `.bak` is what
+/// [`Saving::Erasing`] was written about, and every erasing save reaches it: it
+/// is the previous generation of the file being written, so everything in it
+/// except the erased row is already in the new primary and removing it loses
+/// exactly what the user asked to lose.
+///
+/// The `.corrupt` is a different kind of file and the difference is the whole
+/// reason this is not on the ordinary erasing path. [`read_bytes`] renames an
+/// unparseable primary aside *whole* and falls back to the `.bak`, which is one
+/// generation **older** — so the `.corrupt` can hold rows the primary being
+/// written never had, and [`recovery_notice`] tells the user in as many words to
+/// go and read them out of it. Nothing else in the workspace removes that file;
+/// for a while every `Saving::Erasing` save did, which meant deleting one
+/// snippet silently destroyed the recovery file the startup modal had just
+/// named, along with the snippets that existed only in it.
+///
+/// `connections.json` is the one store where the scrub still wins: under the
+/// no-keyring fallback that copy holds the DB password, the SSH password and the
+/// key passphrase in the clear, in a file that by definition cannot be parsed
+/// and so cannot be rewritten without them, and a confirm reading "This can't be
+/// undone" over a credential is a claim about the directory. The cost — a
+/// connection delete taking the copy that also held the *other* connections — is
+/// paid for by [`corrupt_sibling_is_swept`], which is what makes that store's
+/// recovery notice say the copy is temporary.
+fn remove_secret_siblings(store: &dyn FileStore, path: &Path) {
     store.remove(&sibling(path, ".bak"));
     store.remove(&sibling(path, ".corrupt"));
+}
+
+/// [`write_bytes`] for a store whose siblings are credential files: the erasure
+/// reaches the `.corrupt` as well, once the new content is safely in place.
+///
+/// Separate from [`write_bytes`] rather than a third [`Saving`] arm, because the
+/// question is about the *store* and `write_bytes` is deliberately store-blind —
+/// it takes a `&dyn FileStore` and a `&Path` and cannot tell `connections.json`
+/// from `snippets.json`. Asking it to decide is how the `.corrupt` scrub came to
+/// apply to every store in the first place.
+///
+/// **Which stores those are is [`corrupt_sibling_is_swept`], asked here** rather
+/// than settled by the choice of function. The same predicate decides whether
+/// [`recovery_notice`] warns the user that the copy it names is temporary, so
+/// the sweep and the sentence describing it cannot come apart: a second secret
+/// store routed through here without being added to the predicate gets the
+/// ordinary notice *and* the ordinary treatment, not one of each.
+///
+/// Takes the [`FileStore`] as an argument like everything else here, so it is
+/// testable without a disk; [`save_connections`] is the only production caller.
+fn write_secret_store<T: Serialize>(store: &dyn FileStore, path: &Path, value: &T, saving: Saving) {
+    let Ok(json) = serde_json::to_vec_pretty(value) else {
+        return;
+    };
+    let landed = write_bytes(store, path, &json, saving);
+    if saving == Saving::Erasing && landed && corrupt_sibling_is_swept(path) {
+        remove_secret_siblings(store, path);
+    }
 }
 
 /// The file a save should actually replace: `path` with any symlink standing in
@@ -1443,8 +1527,15 @@ pub fn load_connections() -> ConnectionsFile {
 /// user confirms a modal telling them the opposite. Ordinary saves stay
 /// [`Saving::Replacing`]: this is the only config file with no second copy
 /// anywhere, and losing it loses every connection.
+///
+/// It is also the one store whose erasure reaches the `.corrupt` sibling;
+/// [`remove_secret_siblings`] is where that costs something and why it is still
+/// the right answer here.
 pub fn save_connections(file: &ConnectionsFile, saving: Saving) {
-    write_json(connections_path(), file, saving);
+    let Some(path) = connections_path() else {
+        return;
+    };
+    write_secret_store(&Fs, &path, file, saving);
 }
 
 /// Remove the sibling copies of `connections.json` (best effort).
@@ -1456,11 +1547,11 @@ pub fn save_connections(file: &ConnectionsFile, saving: Saving) {
 /// rest; a fresh (already-sanitized) `.bak` is regenerated on the next save.
 ///
 /// The `.corrupt` sibling goes with it, for the reason
-/// [`remove_erased_siblings`] gives: it is the same plaintext, in a file the
+/// [`remove_secret_siblings`] gives: it is the same plaintext, in a file the
 /// migration cannot rewrite and nothing else ever deletes.
 pub fn clear_connections_backup() {
     if let Some(path) = connections_path() {
-        remove_erased_siblings(&Fs, &path);
+        remove_secret_siblings(&Fs, &path);
     }
 }
 
@@ -1469,8 +1560,8 @@ mod tests {
     use super::{
         ConnectionsFile, FileStore, Load, RECOVERIES, Recovered, RightPanelState, Saving, UiState,
         ai_harness_to_persist, classify, legacy_ai_run_queries_in, missing_notice, private_dir_in,
-        read_bytes, recover, recovery_notice, remove_erased_siblings, sibling, statement_timeout,
-        statement_timeout_label, take_recoveries, usable_base, write_bytes,
+        read_bytes, recover, recovery_notice, remove_secret_siblings, sibling, statement_timeout,
+        statement_timeout_label, take_recoveries, usable_base, write_bytes, write_secret_store,
     };
     use std::cell::RefCell;
     use std::collections::HashMap;
@@ -1733,6 +1824,11 @@ mod tests {
     }
 
     const CFG: &str = "/cfg/ui.json";
+    /// The credential store, whose erasure sweeps one sibling more than an
+    /// ordinary store's does. The real file name, because the name is what
+    /// `corrupt_sibling_is_swept` reads — a path spelled anything else is an
+    /// ordinary store and gets the ordinary treatment.
+    const CREDS: &str = "/cfg/connections.json";
 
     /// Serialises the tests that touch [`RECOVERIES`], which is a process global:
     /// one test asserting it holds exactly what it queued, and another whose
@@ -1788,75 +1884,148 @@ mod tests {
         assert!(fs.get("/cfg/ui.json.bak").is_some(), "nothing was erased");
     }
 
-    /// **The `.corrupt` sibling is the erasure's second copy, and nothing else
-    /// ever removes it.** A store that failed to parse once is renamed aside
-    /// whole; for `connections.json` that sibling holds the plaintext fallback
-    /// password, the SSH password and the key passphrase. The user then
-    /// confirms a delete that says "This can't be undone" and the erasing save
-    /// scrubs the `.bak` and walks past the `.corrupt`.
+    /// **A `.corrupt` is not a generation of the store being written.** The
+    /// `.bak` an erasing save sweeps is the previous generation of *this* file:
+    /// everything in it except the erased row is already in the new primary, so
+    /// removing it loses exactly what the user asked to lose. The `.corrupt` is
+    /// an orphan from a generation that *broke*, and the primary now being
+    /// written came back off the `.bak`, which is one generation **older** — so
+    /// it can hold rows the primary never had. Deleting one snippet must not
+    /// take them with it.
     #[test]
-    fn an_erasing_save_removes_the_corrupt_sibling_too() {
+    fn an_erasing_save_keeps_a_corrupt_sibling_it_did_not_write() {
         let fs = FakeFs::default();
-        fs.put("/cfg/ui.json.corrupt", r#"["a","b"]"#);
+        fs.put("/cfg/ui.json.corrupt", r#"["a","b","only-here"]"#);
         write_bytes(&fs, Path::new(CFG), br#"["a","b"]"#, Saving::Replacing);
         write_bytes(&fs, Path::new(CFG), br#"["a"]"#, Saving::Erasing);
-        assert!(
-            fs.get("/cfg/ui.json.corrupt").is_none(),
-            "the erased entry is still readable in the .corrupt sibling"
+        assert_eq!(
+            fs.get("/cfg/ui.json.corrupt").as_deref(),
+            Some(&br#"["a","b","only-here"]"#[..]),
+            "deleting one row destroyed the recovery file the startup notice named"
         );
+        // The `.bak` half is untouched by this: it *is* a generation of this
+        // store, and the erasure still has to reach it.
+        assert!(fs.get("/cfg/ui.json.bak").is_none());
     }
 
-    /// The same ordering the `.bak` removal has: a save that could not land
-    /// leaves **every** copy it found, because the primary is now the only
-    /// thing that did not get written.
+    /// **The composition, on the store the notice is about.** `read_bytes` is
+    /// what creates a `.corrupt` and `recovery_notice` is what tells the user to
+    /// go and read it; an erasing save 500 lines away is what used to destroy
+    /// it. This runs the real sequence: a primary goes bad, recovery renames it
+    /// aside and falls back to the older backup, the user deletes a *different*
+    /// row, and what only the renamed file still holds is there to be recovered.
     #[test]
-    fn an_erasing_save_that_cannot_stage_keeps_the_corrupt_sibling() {
-        let fs = FakeFs::default();
-        fs.put("/cfg/ui.json.corrupt", r#"["a","b"]"#);
-        write_bytes(&fs, Path::new(CFG), br#"["a","b"]"#, Saving::Replacing);
-        fs.unwritable
-            .borrow_mut()
-            .push(PathBuf::from("/cfg/ui.json.tmp"));
-        write_bytes(&fs, Path::new(CFG), br#"[]"#, Saving::Erasing);
-        assert!(
-            fs.get("/cfg/ui.json.corrupt").is_some(),
-            "nothing was erased"
-        );
-    }
-
-    /// **The composition, not either half.** `read_bytes` is what creates a
-    /// `.corrupt`, and an erasing save is what has to answer for it — the two
-    /// are 500 lines apart and each is correct on its own. This runs the real
-    /// sequence: a primary goes bad, recovery renames it aside, the user
-    /// deletes a row, and the deleted row must not still be in the directory.
-    #[test]
-    fn a_recovery_then_an_erasure_leaves_nothing_of_the_erased_row() {
+    fn a_recovery_then_a_one_row_erasure_keeps_the_rows_it_did_not_erase() {
         let _guard = recovery_lock();
         let fs = FakeFs::default();
+        // Two saves, so the `.bak` is one generation behind: the recovery falls
+        // back to a file that never had the second row.
+        write_bytes(&fs, Path::new(CFG), br#"["keep"]"#, Saving::Replacing);
         write_bytes(
             &fs,
             Path::new(CFG),
-            br#"["keep","secret"]"#,
-            Saving::Replacing,
-        );
-        write_bytes(
-            &fs,
-            Path::new(CFG),
-            br#"["keep","secret"]"#,
+            br#"["keep","only-in-the-primary"]"#,
             Saving::Replacing,
         );
         // Truncated, not replaced: the shape a power loss mid-write leaves, and
-        // the reason a `.corrupt` is worth keeping at all — every byte that was
-        // in the file is still readable in it.
-        fs.put(CFG, r#"["keep","secret""#);
+        // the reason a `.corrupt` is worth keeping at all.
+        fs.put(CFG, r#"["keep","only-in-the-primary""#);
         let _: Vec<String> = read_bytes(&fs, Path::new(CFG));
         let _ = take_recoveries();
         assert!(
             fs.get("/cfg/ui.json.corrupt").is_some(),
             "the fixture needs the rename to have happened"
         );
-        write_bytes(&fs, Path::new(CFG), br#"["keep"]"#, Saving::Erasing);
-        for sibling in ["/cfg/ui.json.bak", "/cfg/ui.json.corrupt"] {
+        // The user deletes the row that *did* survive into the primary.
+        write_bytes(&fs, Path::new(CFG), br#"[]"#, Saving::Erasing);
+        let left = fs.get("/cfg/ui.json.corrupt").unwrap_or_default();
+        assert!(
+            String::from_utf8_lossy(&left).contains("only-in-the-primary"),
+            "the row the user never erased is gone, and nothing said so"
+        );
+    }
+
+    /// **The credential store is where the `.corrupt` scrub still belongs.** A
+    /// `connections.json` that failed to parse once holds the plaintext fallback
+    /// DB password, the SSH password and the key passphrase for the life of the
+    /// install, in a file the app cannot rewrite because it cannot parse it. The
+    /// user then confirms a delete saying "This can't be undone", so both
+    /// siblings go — and the price, the copy also holding the connections they
+    /// kept, is what `corrupt_sibling_is_swept` makes the notice admit.
+    #[test]
+    fn deleting_a_connection_sweeps_the_corrupt_sibling_too() {
+        let fs = FakeFs::default();
+        fs.put("/cfg/connections.json.corrupt", r#"{"password":"hunter2"}"#);
+        write_secret_store(&fs, Path::new(CREDS), &vec!["a", "b"], Saving::Replacing);
+        write_secret_store(&fs, Path::new(CREDS), &vec!["a", "b"], Saving::Replacing);
+        assert!(fs.get("/cfg/connections.json.bak").is_some());
+        write_secret_store(&fs, Path::new(CREDS), &vec!["a"], Saving::Erasing);
+        assert!(fs.get("/cfg/connections.json.bak").is_none());
+        assert!(
+            fs.get("/cfg/connections.json.corrupt").is_none(),
+            "the deleted connection's credentials are still readable in the .corrupt sibling"
+        );
+    }
+
+    /// The same land-before-you-sweep ordering the `.bak` removal has, on the
+    /// sibling one function further out: a save that could not stage leaves
+    /// **every** copy it found, because the primary is now the only thing that
+    /// did not get written.
+    #[test]
+    fn a_credential_erasure_that_cannot_stage_keeps_both_siblings() {
+        let fs = FakeFs::default();
+        fs.put("/cfg/connections.json.corrupt", r#"{"password":"hunter2"}"#);
+        write_secret_store(&fs, Path::new(CREDS), &vec!["a", "b"], Saving::Replacing);
+        write_secret_store(&fs, Path::new(CREDS), &vec!["a", "b"], Saving::Replacing);
+        assert!(fs.get("/cfg/connections.json.bak").is_some());
+        fs.unwritable
+            .borrow_mut()
+            .push(PathBuf::from("/cfg/connections.json.tmp"));
+        write_secret_store(&fs, Path::new(CREDS), &Vec::<&str>::new(), Saving::Erasing);
+        assert!(
+            fs.get("/cfg/connections.json.bak").is_some(),
+            "nothing was erased"
+        );
+        assert!(
+            fs.get("/cfg/connections.json.corrupt").is_some(),
+            "nothing was erased"
+        );
+    }
+
+    /// **The composition, not either half.** `read_bytes` is what creates a
+    /// `.corrupt`, and the credential store's erasing save is what has to answer
+    /// for it — the two are 500 lines apart and each is correct on its own. This
+    /// runs the real sequence: a primary goes bad, recovery renames it aside,
+    /// the user deletes a connection, and the deleted connection's secrets must
+    /// not still be in the directory.
+    #[test]
+    fn a_recovery_then_an_erasure_leaves_nothing_of_the_erased_row() {
+        let _guard = recovery_lock();
+        let fs = FakeFs::default();
+        write_secret_store(
+            &fs,
+            Path::new(CREDS),
+            &vec!["keep", "secret"],
+            Saving::Replacing,
+        );
+        write_secret_store(
+            &fs,
+            Path::new(CREDS),
+            &vec!["keep", "secret"],
+            Saving::Replacing,
+        );
+        // Truncated, not replaced: the shape a power loss mid-write leaves, and
+        // the reason a `.corrupt` is worth keeping at all — every byte that was
+        // in the file is still readable in it.
+        fs.put(CREDS, r#"["keep","secret""#);
+        let _: Vec<String> = read_bytes(&fs, Path::new(CREDS));
+        let _ = take_recoveries();
+        assert!(
+            fs.get("/cfg/connections.json.corrupt").is_some(),
+            "the fixture needs the rename to have happened"
+        );
+        write_secret_store(&fs, Path::new(CREDS), &vec!["keep"], Saving::Erasing);
+        for sibling in ["/cfg/connections.json.bak", "/cfg/connections.json.corrupt"] {
             let left = fs.get(sibling).unwrap_or_default();
             assert!(
                 !String::from_utf8_lossy(&left).contains("secret"),
@@ -1872,11 +2041,11 @@ mod tests {
     #[test]
     fn clearing_the_siblings_reaches_both_of_them() {
         let fs = FakeFs::default();
-        fs.put("/cfg/ui.json.bak", r#"{"password":"hunter2"}"#);
-        fs.put("/cfg/ui.json.corrupt", r#"{"password":"hunter2"}"#);
-        remove_erased_siblings(&fs, Path::new(CFG));
-        assert!(fs.get("/cfg/ui.json.bak").is_none());
-        assert!(fs.get("/cfg/ui.json.corrupt").is_none());
+        fs.put("/cfg/connections.json.bak", r#"{"password":"hunter2"}"#);
+        fs.put("/cfg/connections.json.corrupt", r#"{"password":"hunter2"}"#);
+        remove_secret_siblings(&fs, Path::new(CREDS));
+        assert!(fs.get("/cfg/connections.json.bak").is_none());
+        assert!(fs.get("/cfg/connections.json.corrupt").is_none());
     }
 
     #[test]
@@ -2375,6 +2544,46 @@ mod tests {
         assert!(n.contains("connections.json.corrupt"), "{n}");
         // No directory noise — the modal is a sentence, not a log line.
         assert!(!n.contains("/cfg/"), "{n}");
+    }
+
+    /// **The sweep and the sentence about it read one predicate.** They are 500
+    /// lines apart, and the version of this that shipped had the scrub with no
+    /// sentence at all — so the pin is the *composition*: the store whose notice
+    /// stays silent must also keep its `.corrupt` through an erasing save, even
+    /// on the path that is allowed to sweep it.
+    #[test]
+    fn a_store_the_notice_makes_no_promise_about_keeps_its_corrupt_sibling() {
+        let fs = FakeFs::default();
+        fs.put("/cfg/ui.json.corrupt", r#"["a","b"]"#);
+        write_secret_store(&fs, Path::new(CFG), &vec!["a", "b"], Saving::Replacing);
+        write_secret_store(&fs, Path::new(CFG), &vec!["a"], Saving::Erasing);
+        assert!(
+            !recovery_notice(Path::new(CFG), "eof").contains("delete a connection"),
+            "the notice promises nothing about this store, so the sweep may not touch it"
+        );
+        assert!(
+            fs.get("/cfg/ui.json.corrupt").is_some(),
+            "swept a sibling the notice did not warn about"
+        );
+    }
+
+    /// **The one store whose `.corrupt` really is temporary says so.** The
+    /// notice names the file and the user goes and opens it — for
+    /// `connections.json` the next connection delete scrubs it, because that
+    /// copy holds the plaintext fallback DB password, the SSH password and the
+    /// key passphrase and nothing else ever removes it. A promise the app
+    /// breaks by design has to be written as the qualified thing it is; the
+    /// other stores' notice must *not* carry the warning, because for them it
+    /// is now false.
+    #[test]
+    fn only_the_credential_store_warns_that_its_corrupt_copy_is_temporary() {
+        let creds = recovery_notice(
+            Path::new("/cfg/connections.json"),
+            "unexpected end of input",
+        );
+        assert!(creds.contains("delete a connection"), "{creds}");
+        let ordinary = recovery_notice(Path::new("/cfg/snippets.json"), "unexpected end of input");
+        assert!(!ordinary.contains("delete a connection"), "{ordinary}");
     }
 
     #[test]

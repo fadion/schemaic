@@ -5421,21 +5421,61 @@ existing prose was left alone.
     another query run; a clear followed by a quit left it there indefinitely. The user's own SQL is
     content this module already treats as sensitive (`open_private_append` narrows the log for
     exactly that reason) and the Settings modal's **Log file** row is an explicit invitation to open
-    that folder and share it. An erasing save takes no `.bak` and removes every earlier sibling
-    **after** the new file lands.
-    **Which siblings those are is `remove_erased_siblings`, and there are two.** The `.bak` is the
-    one `Saving::Erasing` was written about; the `.corrupt` is the one nothing in the workspace ever
-    removed, because `read_bytes` renames an unparseable primary aside *whole* and from then on that
-    file sits in the config directory for the life of the install — the user's own SQL for
-    `history.json` and `snippets.json`, and under the no-keyring fallback the DB password, the SSH
-    password and the key passphrase for `connections.json`. A confirm reading "This can't be undone"
-    is a claim about the directory and not about one file in it
-    (`an_erasing_save_removes_the_corrupt_sibling_too`, with
-    `an_erasing_save_that_cannot_stage_keeps_the_corrupt_sibling` holding the same
-    land-before-you-sweep ordering the `.bak` has). `clear_connections_backup` — the scrub the
-    secret layer runs right after a migration save, when the `.bak` still holds the plaintext that
-    migration just moved into the keyring — calls the same function, so it clears both siblings now
-    rather than only the `.bak`.
+    that folder and share it. An erasing save takes no `.bak` and removes the one it found **after**
+    the new file lands.
+    **The sibling an erasing save removes is the `.bak`, and only the `.bak`** — the other one is a
+    different kind of file, and the difference is the whole of the rule. The `.bak` is the previous
+    generation of the store being written, so everything in it except the erased row is already in
+    the new primary and removing it loses exactly what the user asked to lose; every `Saving::Erasing`
+    save still reaches it. The `.corrupt` is an orphan from a generation that *broke*: `read_bytes`
+    renames an unparseable primary aside *whole* and the primary now being written came back off the
+    `.bak`, which is one generation **older**, so the `.corrupt` can hold rows the primary never had
+    — and `recovery_notice` has already told the user, by name, to go and read them out of it. Unlike
+    the `.bak`, which is a silent copy and the whole reason `Saving::Erasing` exists, that file was
+    announced in a modal, so the privacy argument that justifies scrubbing the `.bak` does not carry
+    across. For a while every erasing save removed both, and **every erasing call site is a *per-row*
+    erasure** — one snippet, one chat, one history row, a deleted connection's cascade across twelve
+    stores — never an erasure of the whole store, so deleting one snippet destroyed
+    `snippets.json.corrupt` and with it the snippets that existed only there, with no message, as the
+    side effect of deleting a *different* row
+    (`an_erasing_save_keeps_a_corrupt_sibling_it_did_not_write`, and the composition in
+    `a_recovery_then_a_one_row_erasure_keeps_the_rows_it_did_not_erase`).
+    **`connections.json` is the one store where the scrub still wins**, because under the no-keyring
+    fallback that copy holds the DB password, the SSH password and the key passphrase in the clear,
+    in a file that by definition cannot be parsed and therefore cannot be rewritten without them.
+    `remove_secret_siblings` is that two-sibling scrub — the old `remove_erased_siblings` under a
+    name that says which stores it is for — and it has two callers, both `connections.json`:
+    `clear_connections_backup`, the scrub the secret layer runs right after a migration save when the
+    `.bak` still holds the plaintext that migration just moved into the keyring
+    (`clearing_the_siblings_reaches_both_of_them`), and `write_secret_store`, whose only production
+    caller is `save_connections`. **`write_secret_store` is a function beside `write_bytes` rather
+    than a third `Saving` arm**, because the question is about the *store* and `write_bytes` is
+    deliberately store-blind: it takes a `&dyn FileStore` and a `&Path` and cannot tell
+    `connections.json` from `snippets.json`, and asking it to decide is how the blanket rule arose in
+    the first place. It takes the `FileStore` as an argument like everything else here, so it is
+    testable without a disk, and `write_bytes` now answers **whether the new content landed** so a
+    caller with more to sweep inherits the same land-before-you-sweep ordering the `.bak` has
+    (`deleting_a_connection_sweeps_the_corrupt_sibling_too`, with
+    `a_credential_erasure_that_cannot_stage_keeps_both_siblings` holding the ordering, and
+    `a_recovery_then_an_erasure_leaves_nothing_of_the_erased_row` now run on the credential path,
+    which is where the "This can't be undone" claim is still made about the whole directory).
+    **A promise the app breaks by design is written as the qualified thing it is.**
+    `corrupt_sibling_is_swept(path)` answers whether a later save will take this store's `.corrupt`
+    out from under the user — true for `connections.json` alone — and `recovery_notice` asks it and
+    appends a second sentence for that store: the copy can hold passwords in the clear, so it is
+    removed the next time you delete a connection, recover anything you need from it first. The other
+    stores' notice must **not** carry that warning, because for them it is now false
+    (`only_the_credential_store_warns_that_its_corrupt_copy_is_temporary`). **`write_secret_store`
+    asks the same predicate before it sweeps**, rather than letting the choice of function settle
+    it, so the sweep and the sentence describing it cannot come apart: a second secret store routed
+    through that function without being added to the predicate gets the ordinary notice *and* the
+    ordinary treatment, not one of each
+    (`a_store_the_notice_makes_no_promise_about_keeps_its_corrupt_sibling` is the composition, and it
+    is the pin that fails if the predicate is dropped from either reader). It is a predicate rather
+    than the test written inline into the notice because the scrub and the sentence describing it sit
+    500 lines apart and have drifted once already — the shipped version had the scrub and no sentence
+    at all — and `CONNECTIONS_FILE` is the one spelling `connections_path` and the predicate both
+    read.
     Erasing is a property of the save and not of a particular store, which is why it
     is a parameter rather than a `clear_*_backup` per file; `save_json_erasing` is the public entry,
     and the erasing callers are the history panel's trash, one history row removed from its menu, a
@@ -5524,7 +5564,9 @@ existing prose was left alone.
     so `app_tests::every_lazy_config_load_reports_what_it_recovered` is a *count* instead: the lazy
     `diagrams.json` loads across both crates must be outnumbered by the `report_recoveries` calls,
     the extra one being the startup drain.
-    `recovery_notice` is the corrupt-file sentence; `missing_notice` is the vanished-file one, and
+    `recovery_notice` is the corrupt-file sentence — plus, for the one store whose `.corrupt` a later
+    save sweeps, the qualification `corrupt_sibling_is_swept` decides above; `missing_notice` is the
+    vanished-file one, and
     it says the disappearance rather than repairing it quietly, because the sibling the file came
     back from is the only copy until the next save lands and a user who does not know that has no
     reason to take a backup. `load_json_strict` is the loader for *security* state rather than for
