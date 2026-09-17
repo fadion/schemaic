@@ -255,8 +255,9 @@ Recovery, if it happens anyway: `git show HEAD:<path> > <path>` per file. Plain 
 - **Conventional Commits** — `type(scope): subject`, imperative, no trailing period, lower-case
   after the colon. Types: `feat`/`fix`/`refactor`/`perf`/`docs`/`test`/`chore`/`build`/`ci`. Scope
   = the crate/module the change centers on (`grid`, `editor`, `schema`, `ai`, `sql`, `theme`, `db`,
-  `ci`…); omit only when cross-cutting. Optional body (blank line first) explains the *why*. Every
-  message ends with the trailer `Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>`. Example:
+  `ci`…); omit only when cross-cutting. Optional body (blank line first) explains the *why*. **No
+  attribution trailer** — no `Co-Authored-By:`, no "Generated with" line; the history was rewritten
+  once to strip them and a new one puts it straight back. Example:
   `feat(grid): add row cloning via context menu`.
 - **Version bumps are explicit-only.** Bump only when asked; never as a side effect of an unrelated
   commit. Edit **one** place — `[workspace.package].version` in the root `Cargo.toml` (all crates
