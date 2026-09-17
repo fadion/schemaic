@@ -424,10 +424,22 @@ pub fn implicit_commit(engine: TxEngine, sql: &str) -> bool {
             | "TRUNCATE"
             | "UNINSTALL"
             | "UNLOCK"
-            // Opening a new transaction commits the current one. `START` is
-            // here for both readings: `START TRANSACTION` opens one, and
-            // `START REPLICA`/`SLAVE`/`GROUP_REPLICATION` open nothing but are
-            // in MySQL's replication-control group, which commits.
+            // Opening a new transaction commits the current one, which is why
+            // `START` is here — for `START TRANSACTION`, and on **MySQL** for
+            // the replication `START`s too.
+            //
+            // **Not the reading `tx_after` uses for them any more.** This
+            // comment used to claim the entry covered
+            // `START REPLICA`/`SLAVE`/`GROUP_REPLICATION` as well, on MySQL's
+            // replication-control group committing. MySQL's does; MariaDB's does
+            // not (measured: `START SLAVE` and `START ALL SLAVES` left a MariaDB
+            // 10.11.14 transaction open, `START REPLICA` committed a MySQL
+            // 8.4.11 one), and both are `TxEngine::MySql`. So `tx_after`
+            // answers `TxAfter::Ask` for them and never reaches this list.
+            // The entry still earns its place twice over: `START TRANSACTION`,
+            // and the **failure** path, where `failure_committed` uses this
+            // list to decide whether a round trip is worth paying for and the
+            // server's answer — not the text — settles it.
             | "BEGIN"
             | "START"
             // The rest of that group, which matched nothing at all — so the
@@ -509,9 +521,14 @@ pub enum TxAfter {
     /// and open another in the same breath (`COMMIT AND CHAIN`).
     Open,
     /// **The statement's text cannot decide it.** Ask the connection —
-    /// `Session::tx_alive`, the probe a failed DDL already uses. The only
-    /// statement here is `SET autocommit`, whose effect depends on the value the
-    /// variable *had*, which no text carries.
+    /// `Session::tx_alive`, the probe a failed DDL already uses.
+    ///
+    /// Two statements, for two different reasons. `SET autocommit`, whose effect
+    /// depends on the value the variable *had*, which no text carries. And a
+    /// replication `START`, where the text carries the fact perfectly well and
+    /// the *engines* disagree about it: `START REPLICA` commits on MySQL 8.4.11
+    /// and leaves the transaction open on MariaDB 10.11.14, and both are
+    /// [`TxEngine::MySql`]. See [`tx_after`]'s `START` arm.
     Ask,
 }
 
@@ -531,13 +548,17 @@ pub enum TxAfter {
 ///    A `ROLLBACK TO [SAVEPOINT] s` is **not** one of these — it discards work
 ///    inside the transaction and leaves it open — and neither is
 ///    `RELEASE SAVEPOINT`.
-/// 2. **The statements that leave a new transaction open** — `BEGIN`, `START`,
-///    and `COMMIT`/`ROLLBACK … AND CHAIN`. This is `tx_open_after`'s original
-///    carve-out: treating them as plain closers would clear the flag, the next
-///    statement would decide it needed its own `BEGIN`, and on MySQL that second
-///    `BEGIN` would implicitly commit everything in between.
+/// 2. **The statements that leave a new transaction open** — `BEGIN`,
+///    `START TRANSACTION`, and `COMMIT`/`ROLLBACK … AND CHAIN`. This is
+///    `tx_open_after`'s original carve-out: treating them as plain closers would
+///    clear the flag, the next statement would decide it needed its own `BEGIN`,
+///    and on MySQL that second `BEGIN` would implicitly commit everything in
+///    between. **`START TRANSACTION`, not bare `START`** — the over-broad
+///    reading is the bug the arm below is written against, and saying `START`
+///    here is how it got made in the first place.
 /// 3. **Everything [`implicit_commit`] names** — MySQL's non-transactional DDL
-///    and `SET PASSWORD`.
+///    and `SET PASSWORD` — except the replication `START`s, which reach
+///    [`TxAfter::Ask`] instead because the two engines disagree about them.
 pub fn tx_after(engine: TxEngine, sql: &str) -> TxAfter {
     // The dialect only decides how the *lexer* reads the head keyword, and both
     // engines spell these the same, so MySQL's rules answer for both — the
@@ -581,17 +602,32 @@ pub fn tx_after(engine: TxEngine, sql: &str) -> TxAfter {
         // open. Either way there is a transaction afterwards, which is the whole
         // of what this answers.
         "BEGIN" => TxAfter::Open,
-        // **`START` alone is not an opener.** `START TRANSACTION` is; MySQL's
-        // other three — `START REPLICA`, `START SLAVE`,
+        // **`START` alone is not an opener.** `START TRANSACTION` is; the
+        // others — `START REPLICA`, `START SLAVE`, `START ALL SLAVES`,
         // `START GROUP_REPLICATION` — open nothing, and matching the bare
         // keyword set the session's flag over no transaction. `ensure_tx` then
         // issued no `BEGIN` for the next statement, so it ran auto-committed
         // and permanent while the pill counted it and Rollback reported an undo
         // that never happened — the failure group 1 of this doc exists for,
-        // reached from the other side. They fall through to `implicit_commit`,
-        // which is where they belong: MySQL lists the replication-control
-        // statements among those that commit.
+        // reached from the other side.
         "START" if word(0) == Some("TRANSACTION") => TxAfter::Open,
+        // **…and whether they *close* one is not in the text either.** They used
+        // to fall through to `implicit_commit`, on the reading that MySQL lists
+        // the replication-control statements among those that commit. It does,
+        // and MariaDB does not — and both engines are `TxEngine::MySql` here.
+        // Measured, with `FLUSH LOGS` as the control: on MySQL 8.4.11
+        // `START REPLICA` commits; on MariaDB 10.11.14 `START SLAVE` and
+        // `START ALL SLAVES` succeed inside an open transaction and leave it
+        // open, so the following `ROLLBACK` still undid the delete. `Closed`
+        // there is the worse of the two errors — `TxState::is_open` is what
+        // raises the close/disconnect "you'll lose work" prompt, so the tab
+        // reported nothing open while the server held the work, and withdrew
+        // Rollback in the same breath. `Ask` is what the enum has for a fact
+        // that is about the connection rather than the text: assume it survived,
+        // then probe. The `STOP`/`RESET`/`CHANGE` group keeps falling through —
+        // it commits on MySQL, and MariaDB refuses it inside a transaction
+        // (*ERROR 1192*), which is `failure_committed`'s path, not this one.
+        "START" => TxAfter::Ask,
         _ if implicit_commit(engine, sql) => TxAfter::Closed,
         _ => TxAfter::Unchanged,
     }
@@ -1995,15 +2031,18 @@ mod tests {
     /// same seam the first group of `tx_after`'s doc exists for, reached from
     /// the other side.
     ///
-    /// They are not `Unchanged` either: MySQL lists the replication-control
-    /// statements among those that cause an implicit commit, so the transaction
-    /// that *was* open is gone. **Measured on MySQL 8.4.11**: inside an open
-    /// transaction holding a `DELETE`, a `STOP REPLICA` and a `RESET REPLICA`
-    /// each made the delete permanent — the following `ROLLBACK` succeeded and
-    /// the row did not come back. MariaDB 10.11.14 refuses both there instead
-    /// (*ERROR 1192: Can't execute the given command because you have … an
-    /// active transaction*), which `failure_committed` already handles: it
-    /// asks the server whether the transaction survived.
+    /// Whether they *close* one is a second question, and this test no longer
+    /// answers it — the two engines disagree and both are [`TxEngine::MySql`],
+    /// so it goes to the connection. See
+    /// `a_replication_start_cannot_be_read_off_the_text`.
+    ///
+    /// **Measured on MySQL 8.4.11**: inside an open transaction holding a
+    /// `DELETE`, a `STOP REPLICA` and a `RESET REPLICA` each made the delete
+    /// permanent — the following `ROLLBACK` succeeded and the row did not come
+    /// back. MariaDB 10.11.14 refuses both there instead (*ERROR 1192: Can't
+    /// execute the given command because you have … an active transaction*),
+    /// which `failure_committed` already handles: it asks the server whether the
+    /// transaction survived.
     #[test]
     fn only_start_transaction_opens_one() {
         for sql in [
@@ -2019,14 +2058,22 @@ mod tests {
             );
             assert_ne!(tx_open_after(TxEngine::MySql, sql), Some(true), "{sql}");
             // The composition, not the predicate alone: the pill must not start
-            // counting a transaction the server never opened.
+            // counting a transaction the server never opened. **Through the
+            // probe now** — whether one of these *closes* a transaction differs
+            // between the two engines behind `TxEngine::MySql`, so the text no
+            // longer pretends to know (`a_replication_start_cannot_be_read_off_
+            // the_text`). `OkAndClosed` is the outcome the session upgrades to
+            // when it has asked the connection, which is what `TxAfter::Ask`
+            // exists to produce.
             assert!(
                 !TxState::Idle
-                    .on_statement(TxEngine::MySql, sql, StmtOutcome::Ok)
+                    .on_statement(TxEngine::MySql, sql, StmtOutcome::OkAndClosed)
                     .is_open(),
                 "{sql}"
             );
         }
+        // Whether they *close* one is a different question, and the text cannot
+        // answer it — see `a_replication_start_cannot_be_read_off_the_text`.
         // And the one that does still does, noise word or comment in between.
         for sql in [
             "START TRANSACTION",
@@ -2063,6 +2110,66 @@ mod tests {
             TxEngine::MySql,
             "RESET PERSIST IF EXISTS x"
         ));
+    }
+
+    /// **`START REPLICA` commits on MySQL and does not on MariaDB, so the text
+    /// cannot decide it — and both engines are [`TxEngine::MySql`].**
+    ///
+    /// The arm read MySQL's implicit-commit list and answered [`TxAfter::Closed`]
+    /// for every `START` that is not `START TRANSACTION`. Measured instead, with
+    /// `FLUSH LOGS` as the control that proves the method sees a real commit:
+    ///
+    /// | statement | MySQL 8.4.11 | MariaDB 10.11.14 |
+    /// |---|---|---|
+    /// | `FLUSH LOGS` (control) | commits | commits |
+    /// | `START REPLICA` / `START SLAVE` | **commits** | **does not commit** |
+    /// | `START ALL SLAVES` | no such syntax | **does not commit** |
+    /// | `STOP REPLICA`, `RESET REPLICA` | commits | refuses inside a transaction (*ERROR 1192*) |
+    ///
+    /// Method: `START TRANSACTION; DELETE …; <statement>; ROLLBACK;` then count
+    /// the rows. On MariaDB with a master configured so the statement succeeds,
+    /// `START SLAVE` and `START ALL SLAVES` both left the row restored — the
+    /// transaction was still there for the `ROLLBACK` to undo.
+    ///
+    /// So `Closed` is a false claim on MariaDB, and the *worse* direction of the
+    /// two: [`TxState::is_open`] drives the close/disconnect "you'll lose work"
+    /// prompt, so the tab reported no transaction while the server held one and
+    /// the user's uncommitted work went at close with nothing said. Rollback was
+    /// withdrawn at the same time — the one action that would have saved it.
+    ///
+    /// [`TxAfter::Ask`] is the answer the enum already has for this: assume the
+    /// transaction survived and probe the connection, which lands correctly on
+    /// both engines. The `STOP`/`RESET`/`CHANGE` group is left alone — it
+    /// commits on MySQL, and MariaDB refuses it inside a transaction, which is
+    /// the failure path `failure_committed` already probes.
+    #[test]
+    fn a_replication_start_cannot_be_read_off_the_text() {
+        for sql in [
+            "START REPLICA",
+            "START SLAVE",
+            "START ALL SLAVES",
+            "START GROUP_REPLICATION",
+            "start all slaves",
+            "START REPLICA UNTIL SOURCE_LOG_FILE = 'x'",
+        ] {
+            assert_eq!(tx_after(TxEngine::MySql, sql), TxAfter::Ask, "{sql}");
+            // **The composition, which is where the harm was.** The predicate
+            // alone only mis-labels a statement; it is this call that withdraws
+            // Commit, Rollback and the close prompt from a live transaction.
+            let next =
+                TxState::Open { stmts: 2 }.on_statement(TxEngine::MySql, sql, StmtOutcome::Ok);
+            assert!(next.is_open(), "{sql} lost the transaction from the pill");
+            assert!(next.can_commit(), "{sql} withdrew Commit");
+        }
+        // `START TRANSACTION` is untouched, and so is the group that really does
+        // commit on both engines.
+        assert_eq!(
+            tx_after(TxEngine::MySql, "START TRANSACTION"),
+            TxAfter::Open
+        );
+        for sql in ["STOP REPLICA", "RESET REPLICA ALL", "FLUSH LOGS"] {
+            assert_eq!(tx_after(TxEngine::MySql, sql), TxAfter::Closed, "{sql}");
+        }
     }
 
     /// **MySQL's one documented exception to its own implicit-commit list.**

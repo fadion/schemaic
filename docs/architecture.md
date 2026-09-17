@@ -4494,10 +4494,12 @@ existing prose was left alone.
     `ROLLBACK TO [SAVEPOINT]`, which discards work *inside* the transaction and leaves it open, and
     not `RELEASE SAVEPOINT`); `TxAfter::Open` for the statements that leave a *new* transaction
     (`BEGIN` unconditionally, `START` only ahead of `TRANSACTION`, and `COMMIT`/`ROLLBACK … AND
-    CHAIN`); `TxAfter::Ask` for a MySQL
-    `SET autocommit`, that variable being MySQL's alone and `tx_alive` having no PostgreSQL probe to
-    answer with; and `Unchanged` otherwise. `tx_open_after` is derived from it, `set_commits` is
-    down to `SET PASSWORD`, and `set_touches_autocommit` is the new sibling. `Ask` routes to
+    CHAIN`); `TxAfter::Ask` for the two cases no text carries — a MySQL `SET autocommit`, whose
+    effect turns on the value the variable *had*, and a replication `START`, where the two engines
+    behind `TxEngine::MySql` disagree (below) — both MySQL-only, that variable being MySQL's alone
+    and `tx_alive` having no PostgreSQL probe to answer with; and `Unchanged` otherwise.
+    `tx_open_after` is derived from it, `set_commits` is down to `SET PASSWORD`, and
+    `set_touches_autocommit` is the new sibling. `Ask` routes to
     `Session::tx_alive` — the probe a failed DDL already used, so no new machinery — and the probe's
     answer reaches the pill, which cannot ask, as the new `StmtOutcome::OkAndClosed`. The old
     agreement test asserted only that the two consumers *had an opinion*, never which, which is
@@ -4507,10 +4509,32 @@ existing prose was left alone.
     open no transaction.** `START REPLICA` — with `START SLAVE` and `START GROUP_REPLICATION` — set
     `Session::in_tx` true over nothing; `ensure_tx` then issued no `BEGIN`, the next statement ran
     auto-committed and permanent, and Rollback reported an undo that never happened, which is the
-    failure the closers group exists for reached from the other side. The three fall through to
-    `implicit_commit` now, where they belong — MySQL lists the replication-control statements among
-    those that commit — and that list had matched **none** of them, so the pill kept counting a
-    transaction the server had already ended. `STOP`, `RESET` and `CHANGE` are its new entries
+    failure the closers group exists for reached from the other side. **Whether they *close* one is
+    a second question, and the text cannot answer it.** They fell through to `implicit_commit`, on
+    the reading that MySQL lists the replication-control statements among those that commit.
+    It does, and MariaDB does not — and both engines are `TxEngine::MySql` here, so the arm answered
+    `Closed` for a statement that leaves a MariaDB transaction open. Measured with `FLUSH LOGS` as
+    the control, it being unambiguously in MySQL's implicit-commit group, so a method that cannot see
+    *it* commit is a broken method: on MySQL 8.4.11 `START REPLICA` commits, and on MariaDB 10.11.14
+    `START SLAVE` and `START ALL SLAVES` do not — `START TRANSACTION; DELETE … LIMIT 1;
+    <statement>; ROLLBACK;` brought the row back. Reproducing that on MariaDB needs a master
+    configured, or the statement fails with *ERROR 1200* before it can say anything; a dummy
+    unreachable one is enough. And `Closed` is the worse of the two errors rather than the safe one:
+    `TxState::is_open` is what raises the close/disconnect "you'll lose work" prompt, so the tab
+    reported no transaction while the server still held one and the user's uncommitted work was
+    discarded at close with nothing said, Commit and Rollback withdrawn in the same breath —
+    Rollback being the one action that would have saved it. The review finding behind this
+    (`S1.2-L1-01`) had the direction backwards, reading the arm as over-reporting `Open`. So
+    `"START" => TxAfter::Ask` is the arm now, sitting below the `TRANSACTION` one: assume the
+    transaction survived, then probe, which lands right on both engines — MariaDB's probe says the
+    transaction is alive so the flag stays, MySQL's says it is gone so it clears.
+    `a_replication_start_cannot_be_read_off_the_text` pins the composition as well as the predicate,
+    and `only_start_transaction_opens_one`'s composition assertion now runs through
+    `StmtOutcome::OkAndClosed`, the outcome the session upgrades to once it has asked, because the
+    text no longer decides it. **`implicit_commit`'s list is unchanged**, `START` included —
+    `START TRANSACTION` does commit the previous transaction — and it still answers "did this commit"
+    for the `STOP`/`RESET`/`CHANGE` group, which had matched **none** of them, so the pill kept
+    counting a transaction the server had already ended. `STOP`, `RESET` and `CHANGE` are its entries
     (`STOP REPLICA`/`SLAVE`, `RESET REPLICA`/`SLAVE`/`MASTER`, `CHANGE REPLICATION SOURCE TO`/
     `CHANGE MASTER TO`; no other statement in the language leads with `CHANGE`), with MySQL's own
     carve-out for `RESET PERSIST` beside the `CREATE`/`DROP TEMPORARY` one. **Measured on MySQL
@@ -16904,8 +16928,13 @@ Re-introducing the anti-patterns these guard against is a regression:
   In-transaction writes nest under a `SAVEPOINT` (`TxScope`) so the 1-row guard can roll back its own
   batch without ending the user's transaction, and the transaction *state* is the pure, tested
   `schemaic_core::tx::TxState` — engine divergence (PG poisons on error, MySQL implicitly commits on
-  DDL) belongs there, not in UI conditionals. **The one thing the session asks the server rather
-  than the statement text** is whether a failed statement left the transaction alive: `tx_alive`
+  DDL) belongs there, not in UI conditionals. **Asking the server is the fallback wherever the
+  statement's text cannot carry the fact, and there are three such places.** The original is a
+  *failed* statement: `implicit_commit` gates the round trip, `failure_committed` decides, and the
+  outcome is `StmtOutcome::FailedAndCommitted`. The other two are *successful* statements sharing
+  one line — a MySQL `SET autocommit` and a replication `START`, the two things `tx::tx_after` says
+  `Ask` for — and both clear `in_tx` and upgrade the outcome to `StmtOutcome::OkAndClosed`, which
+  is how the pill, which cannot ask, gets the answer too. The probe answers all three: `tx_alive`
   (private to `session.rs`) tries `@@in_transaction` — MariaDB's, exact, no privilege needed, counts
   a read-only transaction — and falls back to a scoped `information_schema.INNODB_TRX` count, which
   both servers have and which needs the `PROCESS` privilege the Server Activity panel already

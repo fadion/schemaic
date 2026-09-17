@@ -512,13 +512,24 @@ impl Session {
             }
         }
         let mut out = Session::classify(&mut guard, result).await;
-        // **The one successful statement whose text cannot decide this**, so it
-        // asks the server instead of guessing: `SET autocommit`, whose effect on
-        // the current transaction depends on the value the variable *had*.
-        // Schemaic never sets it, so it is the server default of 1 and
-        // `SET autocommit = 1` commits nothing — while the old reading cleared
-        // the flag, and the next statement's `BEGIN` then implicitly committed
-        // the user's uncommitted work (measured on MariaDB 10.11.14).
+        // **The successful statements whose text cannot decide this**, so they
+        // ask the server instead of guessing. Two, for two different reasons,
+        // and `tx::TxAfter::Ask` is what routes both here.
+        //
+        // `SET autocommit`, whose effect on the current transaction depends on
+        // the value the variable *had*. Schemaic never sets it, so it is the
+        // server default of 1 and `SET autocommit = 1` commits nothing — while
+        // the old reading cleared the flag, and the next statement's `BEGIN`
+        // then implicitly committed the user's uncommitted work (measured on
+        // MariaDB 10.11.14).
+        //
+        // And a replication `START`, where the text carries the fact perfectly
+        // well and the *engines* disagree about it: `START REPLICA` commits on
+        // MySQL 8.4.11, and `START SLAVE`/`START ALL SLAVES` leave a MariaDB
+        // 10.11.14 transaction open — both `TxEngine::MySql` here, so one answer
+        // cannot serve them. Guessing `Closed` was the worse half: it withdrew
+        // Rollback and the close prompt from a transaction the server still
+        // held.
         //
         // `None` from the probe is the conservative reading: leave the flag
         // alone, which says the transaction is still open. The pill cannot ask,
