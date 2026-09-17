@@ -17391,8 +17391,9 @@ Re-introducing the anti-patterns these guard against is a regression:
   reach: a 4,000-row commit into a `MyISAM` table, cancelled 300 ms in, returned `Err(Cancelled)` —
   the variant the modal renders as "nothing was written" — over 2,151 permanently-written rows on
   MariaDB and 159 on MySQL before the fix, and said "the rollback did NOT undo them" after it. The
-  review ranked this latent because no production caller can cancel the token yet; it is not latent
-  at the DB layer. The gate carries both halves now: `commit_writes` holds no `tokio::select!`, and
+  review ranked this latent because no production caller can cancel the token — which is a decision
+  rather than unfinished wiring, and *Data grid* says why; it is not latent at the DB layer. The
+  gate carries both halves now: `commit_writes` holds no `tokio::select!`, and
   `write_on`'s cancel path kills the query, awaits the killed statement and asks `rollback` what it
   achieved.
   `one_row_verdict` states only what the guard saw — it runs *before* the rollback and can't
@@ -21462,6 +21463,25 @@ this bundle's.
   bounded like `run_ddl`'s `lock_wait_sql` — a timeout is right for a modal that refuses every
   exit, wrong for a cell edit that could just have waited a moment longer. `commit_seq` is what
   keeps an earlier commit's timer from narrating a later one.
+- **A grid commit is deliberately not cancellable, and the shape of the code is the statement.**
+  `main.rs` mints the commit's `CancellationToken` *inside* the `handle.spawn`, where nothing
+  outside the spawned future can ever reach it to call `.cancel()`. Every other long operation does
+  the opposite — `script_token`, `import_token`, `dump_token`, `export_token` and the per-tab
+  `tokens` map are minted *before* the spawn and parked in a slot a view's Cancel/Stop handler
+  reaches — so a token minted after that boundary is one nothing can cancel, and that is the intent.
+  The affordance for a write that will not return is the bar above: **Roll back _tab_**, which ends
+  the *other* transaction holding the lock rather than the write waiting on it. **The parameter is
+  not a stub**, which is the counter-intuitive half and the reason this is written down at all. Both
+  commit paths honour the token in full — `Db::commit_writes` through `write_on`, which checks
+  between staged statements and mid-statement, kills the query server-side, *awaits* the killed
+  statement so the connection's result stream stays in sync, and then asks the server what an
+  explicit `ROLLBACK` achieved; a Manual tab's through `Session::commit_writes`, whose savepoint and
+  `classify_isolated` answer for what survived. That machinery is there because a
+  cancelled-and-dropped write once left durable `MyISAM` rows under a report saying nothing was
+  written — the measured account is under *Write-back is transactional…* in *Architecture
+  invariants*. So wiring a Stop control here would need no `schemaic-db` change at all: only the
+  token slot, the cancel closure and the button. It is a product decision not taken, not a gap in
+  the plumbing, and a release review's `R1-L2-01` turned on reading it as the latter.
 - **Type-aware headers** show `type_name` under the name (two-line, `grid_header_h()`). A sorted column's
   name + chevron use `grid_sort()`; a column with selected cells gets a `grid_col_sel()` header
   background. **Key icons** (PK = gold key-round, single-col index = blue key-square, FK = purple

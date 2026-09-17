@@ -5061,6 +5061,38 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                     (done)(outcome);
                 });
                 handle.spawn(async move {
+                    // **Minted here, inside the spawn, because a grid commit is
+                    // deliberately not cancellable — this is not the oversight
+                    // it looks like.** Every other long operation mints its
+                    // token *before* the spawn and parks it in a slot a view can
+                    // reach (`script_token`, `import_token`, `dump_token`, and
+                    // `tokens` per tab for a query run); a token minted after
+                    // the boundary is one nothing can ever cancel, and that is
+                    // the intent. The affordance for a write that will not
+                    // return is `arm_wait_note`'s bar offering **Roll back
+                    // _tab_**, which ends the *other* transaction holding the
+                    // lock — Schemaic owns both, which is the whole reason that
+                    // bar can say something no other tool can.
+                    //
+                    // The parameter is not a stub, and the distinction matters
+                    // to anyone changing this: **both** branches below honour
+                    // the token in full, by different machinery. `Db::
+                    // commit_writes` goes through `write_on` — checked between
+                    // staged statements and mid-statement, a server-side
+                    // `kill_query`, the killed future still awaited so the
+                    // connection's result stream stays in sync, then an
+                    // explicit `ROLLBACK` whose result is *asked of the server*
+                    // rather than assumed. `Session::commit_writes` does not
+                    // take that path at all — it passes `None` to `write_on`
+                    // and owns the cancel itself, around a savepoint-scoped
+                    // write, with `classify_isolated` answering for what
+                    // survived. That machinery exists because dropping a
+                    // cancelled write left durable MyISAM rows under a report
+                    // saying nothing was written. So wiring a Stop control here
+                    // needs no `schemaic-db` change — only the slot, the
+                    // closure and the button, and the same token already covers
+                    // the post-commit re-fetch below. It is a product decision
+                    // that has not been taken, not a gap in the plumbing.
                     let token = CancellationToken::new();
                     // Both branches write the rows and then, on success, re-read
                     // them. The session branch keeps both on the pinned
