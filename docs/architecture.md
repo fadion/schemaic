@@ -17953,7 +17953,23 @@ Re-introducing the anti-patterns these guard against is a regression:
   `KEYRING` constants the script already held and never consulted, and any `Trusted:` field is
   refused outright, deb822's `Trusted: yes` turning apt's signature verification off for the entry
   entirely. It is this same rule a third time: a value written into a user's source list is identity,
-  and a check on its *shape* is not a check on its *identity*.
+  and a check on its *shape* is not a check on its *identity*. Demonstrated in WSL against a local
+  mirror of the *genuine* published site — the real `schemaic-archive-keyring.gpg` and `schemaic.asc`
+  fetched from `https://fadion.github.io/schemaic`, served over HTTP, with only the repository
+  configuration altered and only `SITE` changed in the script, which is the staging shape the
+  composed-keyring demonstration used. Six attacks, six refusals, and nothing installed in any of
+  them — no source or repo file, no keyring, no rpm-database key, no binary — each one preceded by
+  `[+] Signing key verified: ABDBDC3958F3FAFC734273796566ECED7795DC1A`, which is the finding's whole
+  point: the key check passes and the configuration decides what the key is used for. On `debian:12`,
+  a foreign `URIs:`, a `Trusted: yes` field, and an inline armoured key in `Signed-By:` — the deb822
+  form that carries the attacker's key in the file nothing checked; on `fedora:41`, a foreign
+  `baseurl=`, `gpgcheck=0`, and a foreign `gpgkey=`. Each refusal names the line it expected
+  (`expected a line: URIs: http://…/deb`, `expected a line: gpgkey=http://…/schemaic.asc`) except
+  `Trusted:`, whose separate branch says *"the downloaded apt source asks apt to trust it without a
+  signature."* The controls are half the demonstration: a well-formed configuration naming the mirror
+  passes on both families and proceeds — *"Repository added, signed by the published key"* on deb,
+  *"Repository added, with signature checking on"* on rpm — each then failing only at `apt-get
+  update` / `dnf install`, because the mirror carries no actual package repository.
 - **Splitting `lib.rs` / `main.rs`:** grep the line range for interleaved unrelated `fn`s first; a
   helper still used by code that stays goes to `widgets.rs` (glob-imported), not the new leaf
   module; mark cross-called items `pub(crate)`; build + `cargo fmt` + smoke-launch each step.
