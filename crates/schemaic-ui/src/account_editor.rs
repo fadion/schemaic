@@ -467,7 +467,7 @@ fn account_form(
     }
 
     if kind == PrincipalKind::User {
-        // **Masked, like the app's four other secret fields.** This was the one
+        // **Masked, like the app's three other secret fields.** This was the one
         // that was not: the real characters were in the editor's own document,
         // so they were on screen and a select-all away from the clipboard.
         // `masked_edit_field` keeps only `*`s in the document and replays each

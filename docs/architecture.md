@@ -12465,7 +12465,7 @@ existing prose was left alone.
     between a plan and a server, and a statement shown there with a field blanked out would not be
     the statement it ran — but nothing *leaves* the preview carrying it, which is
     `ChangeSet::export_script`'s job. **The field itself is
-    `connection_form::masked_edit_field`**, the same one the four saved-connection secrets wear:
+    `connection_form::masked_edit_field`**, the same one the three saved-connection secrets wear:
     this was the app's only *unmasked* secret field, so its real characters were on screen and a
     Ctrl+A/Ctrl+C from the clipboard. That helper is `pub(crate)` precisely so there is one of them
     — a second masking widget is how the two come to disagree about the replay rule, which is the
