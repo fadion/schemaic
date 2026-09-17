@@ -1295,9 +1295,24 @@ pub fn one_row_verdict(step: WriteStep<'_>, affected: u64) -> Result<(), String>
 pub enum Rollback {
     /// Every statement in the batch was undone.
     Complete,
-    /// The server reported it couldn't undo everything (MySQL warning 1196), or
-    /// the rollback itself failed — either way, what was written is still there.
+    /// The **server reported** it couldn't undo everything — MySQL warning
+    /// 1196, raised when the batch touched a non-transactional table. What was
+    /// written is still there, and the engine is why.
     Incomplete,
+    /// The rollback could not be **confirmed**: the connection failed before the
+    /// server answered, or its warnings could not be read back.
+    ///
+    /// **Its own variant, because the sentence `Incomplete` carries is a claim
+    /// about the storage engine and this route never asked one.** Both answers
+    /// used to be `Incomplete`, so a dropped socket mid-import told the user
+    /// "this table's storage engine is not transactional, so the rows already
+    /// written remain" — about an InnoDB table the server had in fact rolled
+    /// back the moment the connection died, sending them to audit a table that
+    /// was exactly as they left it.
+    ///
+    /// It is the conservative answer, not a reassuring one: nothing is known,
+    /// and the note says so.
+    Unknown,
 }
 
 impl Rollback {
@@ -1310,6 +1325,11 @@ impl Rollback {
             Rollback::Incomplete => {
                 " — the rollback did NOT undo them: this table's storage engine is \
                  not transactional, so the rows already written remain. Check the \
+                 table before retrying."
+            }
+            Rollback::Unknown => {
+                " — and the rollback could not be confirmed: the connection failed \
+                 before the server answered. Rows may or may not remain. Check the \
                  table before retrying."
             }
         }
@@ -2553,6 +2573,43 @@ mod tests {
         assert!(!msg.contains("rolled back all changes"), "{msg}");
         assert!(msg.contains("not transactional"), "{msg}");
         assert!(msg.contains("remain"), "{msg}");
+    }
+
+    /// **An unconfirmed rollback is not an incomplete one**, and the difference
+    /// is what the user does next.
+    ///
+    /// `Incomplete`'s sentence is a claim about the *storage engine* — "this
+    /// table's storage engine is not transactional, so the rows already written
+    /// remain" — and only MySQL's warning 1196 establishes that. The other two
+    /// routes into the classifier establish nothing: a `ROLLBACK` sent down a
+    /// socket that is already gone never reached a server, and an InnoDB table
+    /// on such a connection has almost certainly been rolled back by the server
+    /// itself. Told `Incomplete`, the user audits a table that is exactly as
+    /// they left it — and takes the sentence less seriously the next time it is
+    /// true.
+    #[test]
+    fn an_unconfirmed_rollback_does_not_blame_the_storage_engine() {
+        let msg = Rollback::Unknown.note();
+        assert!(!msg.contains("rolled back all changes"), "{msg}");
+        assert!(
+            !msg.contains("not transactional"),
+            "the note blames an engine nothing on this route asked about: {msg}"
+        );
+        // It is the conservative answer, not a reassuring one.
+        assert!(msg.contains("could not be confirmed"), "{msg}");
+        assert!(msg.contains("may or may not"), "{msg}");
+        assert!(msg.contains("Check the table"), "{msg}");
+        // …and the three answers are three different sentences.
+        let all = [
+            Rollback::Complete.note(),
+            Rollback::Incomplete.note(),
+            Rollback::Unknown.note(),
+        ];
+        for (i, a) in all.iter().enumerate() {
+            for b in all.iter().skip(i + 1) {
+                assert_ne!(a, b, "two rollback outcomes read the same");
+            }
+        }
     }
 
     #[test]

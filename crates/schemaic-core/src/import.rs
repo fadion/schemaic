@@ -2683,11 +2683,15 @@ pub const INSERT_BATCH_ROWS: usize = 500;
 /// 10.11.14 at its ship default `max_allowed_packet` of 16 MiB, the server does
 /// not refuse it: it answers `ERROR 2006 (HY000) Server has gone away` and
 /// **closes the connection**. `import_on`'s error arm then tries to `ROLLBACK`
-/// down a socket that is already gone, so the result is `Rollback::Incomplete` —
-/// the "the rows may still be there" wording, produced rather than merely
+/// down a socket that is already gone, so the result is `Rollback::Unknown` —
+/// the "rows may or may not remain" wording, produced rather than merely
 /// disclosed — and on a non-transactional MySQL table the batches already sent
-/// really are durable. All of it lands *after* `validate` has reported the file
-/// clean, because row size is not something it could have checked.
+/// really are durable. (It used to be `Rollback::Incomplete`, which asserts the
+/// *engine* is the reason; nothing on this route asked the engine anything, and
+/// an InnoDB table the server rolled back itself when the socket died was
+/// reported as one holding rows.) All of it lands *after* `validate` has
+/// reported the file clean, because row size is not something it could have
+/// checked.
 ///
 /// It is engine-divergent, which is why the row bound survived: the same 20 MB
 /// batch is accepted by MySQL 8.4.11, whose default is 64 MiB. The identical

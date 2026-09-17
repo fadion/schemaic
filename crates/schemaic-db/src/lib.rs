@@ -5795,16 +5795,35 @@ pub(crate) async fn write_on(
 /// had just said it couldn't provide.
 ///
 /// `SHOW WARNINGS` is read immediately after, since the next statement clears
-/// it. Anything unreadable resolves to [`Rollback::Incomplete`] — the write
-/// path must not claim more than it knows.
+/// it. Anything unreadable resolves to [`Rollback::Unknown`] — the write path
+/// must not claim more than it knows.
+///
+/// **`Unknown`, not `Incomplete`, and the difference is a sentence the user
+/// acts on.** `Incomplete` says *this table's storage engine is not
+/// transactional, so the rows already written remain* — a claim about the
+/// engine, which only warning 1196 establishes. The other two routes here
+/// establish nothing: a `ROLLBACK` sent down a socket that is already gone never
+/// reached a server, and the server had almost certainly rolled the transaction
+/// back itself when the connection dropped. Told `Incomplete`, the user audits
+/// an InnoDB table that is exactly as they left it.
+///
+/// The unreadable-warnings route was worse than misdescribed — it was silently
+/// `Complete`. `unwrap_or_default()` turns a failed `SHOW WARNINGS` into an
+/// empty vector, no 1196 is found, and the write path then promised a clean
+/// rollback on the strength of a query that did not run. The paragraph above
+/// has claimed otherwise since it was written.
 async fn rollback(conn: &mut Conn, sql: &str) -> Rollback {
     /// `ER_WARNING_NOT_COMPLETE_ROLLBACK`.
     const INCOMPLETE_ROLLBACK: u32 = 1196;
     if conn.query_drop(sql).await.is_err() {
-        return Rollback::Incomplete;
+        return Rollback::Unknown;
     }
-    let warnings: Vec<(String, u32, String)> =
-        conn.query("SHOW WARNINGS").await.unwrap_or_default();
+    let Ok(warnings) = conn
+        .query::<(String, u32, String), _>("SHOW WARNINGS")
+        .await
+    else {
+        return Rollback::Unknown;
+    };
     if warnings
         .iter()
         .any(|(_, code, _)| *code == INCOMPLETE_ROLLBACK)
