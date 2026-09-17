@@ -234,18 +234,23 @@ pub async fn one_of_two_triggers_can_be_dropped_without_the_other(target: &'stat
         "{}: the second trigger did not land",
         target.name
     );
-    // The identity gate, over a set of two: still no change proposed.
-    let settled = ddl::diff_triggers(
-        &both.triggers,
-        &TriggerSetDraft::from_table(&both),
-        target.engine.dialect(),
+    // The drafted event actually landed. Nothing else here looks at it, so an
+    // emitter that wrote the second trigger out as `BEFORE INSERT` like the
+    // first would leave a set of two the rest of this test cannot tell apart.
+    let up2 = both
+        .triggers
+        .iter()
+        .find(|t| t.name == "up2")
+        .unwrap_or_else(|| panic!("{}: the second trigger is not in the model", target.name));
+    assert_eq!(
+        up2.events,
+        [TriggerEvent::Update],
+        "{}: the second trigger did not land on the event it was drafted for",
+        target.name
     );
-    assert!(
-        settled.changes.is_empty(),
-        "{}: a two-trigger set proposed {:?}",
-        target.name,
-        settled.changes
-    );
+    // The settle gate, over a set of two — the case where "the set changed" and
+    // "this trigger changed" stop being the same statement.
+    assert_writes_back_unchanged(&scratch, target, "adding a second trigger").await;
 
     // Drop only the AFTER one.
     let mut draft = TriggerSetDraft::from_table(&both);
@@ -303,19 +308,10 @@ pub async fn a_renamed_trigger_still_fires(target: &'static Target) {
         target.name
     );
 
-    // And it still round-trips, so the editor is not left proposing the rename
-    // again every time it opens.
-    let settled = ddl::diff_triggers(
-        &after.triggers,
-        &TriggerSetDraft::from_table(&after),
-        target.engine.dialect(),
-    );
-    assert!(
-        settled.changes.is_empty(),
-        "{}: after the rename the trigger no longer round-trips: {:?}",
-        target.name,
-        settled.changes
-    );
+    // And the renamed trigger survives a trip back through the emitter — the
+    // case where the draft's `original` and its `name` differ, which the
+    // identity test's fresh fixture never has.
+    assert_writes_back_unchanged(&scratch, target, "the rename").await;
 
     scratch.teardown().await;
 }
@@ -409,6 +405,72 @@ fn wide_trigger(scratch: &Scratch, target: &Target, name: &str) -> TriggerDraft 
 async fn apply(scratch: &Scratch, current: &TableInfo, draft: &TriggerSetDraft, target: &Target) {
     let set = ddl::diff_triggers(&current.triggers, draft, target.engine.dialect());
     scratch.apply_plan(&set, "trigger").await;
+}
+
+/// The trigger set the server now reports, written back through the emitter,
+/// comes back **unchanged** — asked after a specific edit rather than on a fresh
+/// fixture.
+///
+/// **This is the shape a settle assertion has to have here, and two tests had
+/// the other one.** `TriggerSetDraft::from_table(&after)` builds each draft's
+/// `info` by cloning the very `TriggerInfo` the diff then compares it against,
+/// so `diff_triggers(&after.triggers, &from_table(&after))` compares one
+/// expression with itself: it answers "0 changes" for anything the server could
+/// return, a silently rewritten trigger included, and the message those sites
+/// carried — "the editor is not left proposing the rename again" — was not a
+/// claim their code made. `ddl::an_untouched_trigger_set_is_not_a_change` pins
+/// the vacuity without a server.
+///
+/// **And the obvious repair does not work**, which is worth stating so it is not
+/// tried again: `diff_triggers(&after.triggers, the_draft_that_was_applied)` —
+/// the shape that *is* right for a table — proposes a drop and a create on all
+/// three engines, because [`TriggerDraft::original`] is pre-apply bookkeeping.
+/// A draft that renamed `up` to `up_renamed` still carries `original: Some("up")`
+/// after the rename has landed, and a newly pushed trigger still carries
+/// `original: None`; against the server's new reading both read as further work.
+/// The editor re-derives its draft from a fresh reading after an apply, so that
+/// staleness is the test's, not the app's.
+///
+/// So the same escape [`views`](crate::views) uses, in the shape triggers allow:
+/// an **empty** current forces the emitter to write every trigger out, the
+/// statements run, and the two assertions compare values the server produced at
+/// two different times.
+async fn assert_writes_back_unchanged(scratch: &Scratch, target: &Target, what: &str) {
+    let dialect = target.engine.dialect();
+    let before = table_of(scratch).await;
+    let draft = TriggerSetDraft::from_table(&before);
+
+    // Drop first: `CREATE TRIGGER` of a name that already exists is an error on
+    // both engines, and the editor's own path for a changed trigger is a drop
+    // and a create. `TriggerSetDraft::default()` would lose the table it is
+    // *on*, and PostgreSQL's `DROP TRIGGER … ON ""` names nothing.
+    let mut empty = draft.clone();
+    empty.triggers.clear();
+    let drop_set = ddl::diff_triggers(&before.triggers, &empty, dialect);
+    assert!(
+        !drop_set.changes.is_empty(),
+        "{}: the settle gate is vacuous after {what} — dropping every trigger \
+         proposed no change",
+        target.name
+    );
+    run_ddl(scratch, &drop_set.emit(), target).await;
+
+    let create_set = ddl::diff_triggers(&[], &draft, dialect);
+    assert!(
+        !create_set.changes.is_empty(),
+        "{}: the settle gate is vacuous after {what} — the server's own triggers \
+         against an empty set proposed no change",
+        target.name
+    );
+    run_ddl(scratch, &create_set.emit(), target).await;
+
+    let after = table_of(scratch).await;
+    assert_eq!(
+        after.triggers, before.triggers,
+        "{}: after {what} the trigger set changed by being written back through \
+         the emitter",
+        target.name
+    );
 }
 
 /// Run an already-emitted plan, failing loudly with the statement that refused.
