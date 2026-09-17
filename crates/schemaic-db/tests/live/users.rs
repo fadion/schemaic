@@ -19,7 +19,7 @@
 use schemaic_core::ddl;
 use schemaic_core::intel::SqlDialect;
 use schemaic_core::users::{
-    self, AccountDraft, GrantDraft, GrantLevelKind, Principal, PrincipalKind,
+    self, AccountDraft, GrantDraft, GrantLevelKind, PasswordReset, Principal, PrincipalKind,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -605,7 +605,10 @@ async fn listed_principal(target: &'static Target, account: &ScratchAccount) -> 
 /// `CREATE USER u IDENTIFIED BY 'hun'` exactly as readily as
 /// `… BY 'hunter2***'`; only connecting as the account tells the two apart, and
 /// that is precisely the failure mode — an account that exists, with a
-/// credential nobody holds, and no `ALTER USER` path in the app to repair it.
+/// credential nobody holds. There is an `ALTER USER` path now —
+/// `a_reset_password_replaces_the_one_the_account_had`, below — so the account
+/// is repairable rather than only droppable; a create that writes the wrong
+/// credential is still a create that went wrong, which is what this asserts.
 ///
 /// The password carries `'`, `\` and `*` on purpose: the quote and the
 /// backslash are `ddl_string`'s job (and MySQL's `NO_BACKSLASH_ESCAPES` is where
@@ -646,6 +649,85 @@ pub async fn a_created_account_can_log_in_with_the_password_it_was_given(target:
             .await
             .is_err(),
         "{}: the server accepted a password this account was never given",
+        target.endpoint()
+    );
+
+    account.teardown().await;
+    scratch.teardown().await;
+}
+
+/// **A reset lands, and the old password stops working.**
+///
+/// The repair path the test above says did not exist. `ALTER USER … IDENTIFIED
+/// BY` and `ALTER ROLE … PASSWORD` are two different statements for one act, and
+/// which engine takes which is a claim only a server can settle — MySQL's
+/// `ALTER ROLE` is about roles, not about the password of a user, so getting the
+/// pair backwards is a statement that parses on one engine and means something
+/// else on the other.
+///
+/// **Both halves, and the second is the point.** That the new password works
+/// would pass against a server that had ignored the statement entirely and left
+/// the old one in place, since the account would still be there and the *new*
+/// login is the only thing a one-sided test checks. So the old password is tried
+/// afterwards and must be refused; together they say the credential moved rather
+/// than that a credential exists.
+///
+/// The passwords carry `'`, `\` and `*` for the reason the create test's does:
+/// the quote and backslash are `ddl_string`'s, and the asterisk is the character
+/// the account editor's mask is written in.
+pub async fn a_reset_password_replaces_the_one_the_account_had(target: &'static Target) {
+    let scratch = Scratch::create(target, "pwreset").await;
+    let was = r"o'l\d***x";
+    let now = r"n3w'p\w***";
+    let account =
+        ScratchAccount::create_with_password(target, &scratch, "r", PrincipalKind::User, was, "")
+            .await;
+
+    // The premise: it really did have the old password, so the refusal at the
+    // end is the reset's doing and not a login that never worked.
+    target
+        .db_as(&account.principal.name, was)
+        .ping(std::time::Duration::from_secs(10))
+        .await
+        .unwrap_or_else(|e| {
+            panic!(
+                "{}: the account will not take the password it was created with, \
+                 so this test cannot tell a reset from a broken create: {e}",
+                target.endpoint()
+            )
+        });
+
+    // **The account as the *server* lists it**, not as this test drafted it —
+    // the distinction `a_created_role_is_one_the_server_accepts` was written
+    // for. MariaDB stores a host the draft does not, and `ALTER USER` naming
+    // the wrong one is an error rather than a silent miss.
+    let listed = listed_principal(target, &account).await;
+    account
+        .run(ddl::Change::SetAccountPassword(Box::new(PasswordReset {
+            account: listed,
+            password: now.to_string(),
+        })))
+        .await;
+
+    target
+        .db_as(&account.principal.name, now)
+        .ping(std::time::Duration::from_secs(10))
+        .await
+        .unwrap_or_else(|e| {
+            panic!(
+                "{}: the reset was accepted but the account will not take the new \
+                 password: {e}",
+                target.endpoint()
+            )
+        });
+
+    assert!(
+        target
+            .db_as(&account.principal.name, was)
+            .ping(std::time::Duration::from_secs(10))
+            .await
+            .is_err(),
+        "{}: the old password still works, so the reset changed nothing",
         target.endpoint()
     );
 

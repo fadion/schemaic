@@ -6,11 +6,25 @@
 //! is the same one every other editor here reaches. Neither ever runs a
 //! statement itself.
 //!
-//! **Two forms, because they are two questions.** The account form only ever
-//! *creates* — an account is dropped from its own row in the browser, and
-//! neither engine offers a rename that is safe to perform, which is the same
-//! shape [`crate::database_editor`] has and for the same reasons. The grant form
-//! only ever changes privileges, and it never touches the account itself.
+//! **Two forms, because they are two questions.** The account form *creates* an
+//! account, or **resets an existing one's password** — and those two are one
+//! form rather than two because the password field is the whole of the second,
+//! and `masked_edit_field` is `pub(crate)` precisely so there is one of it. The
+//! grant form only ever changes privileges, and it never touches the account
+//! itself.
+//!
+//! **A password reset is the only `ALTER` on an account this app emits.** An
+//! account is still dropped from its own row in the browser, and neither engine
+//! offers a rename that is safe to perform. The reset exists because it was the
+//! one gap that could not be worked around: `CREATE USER … IDENTIFIED BY` with
+//! the wrong password produced an account this app could then only drop, and the
+//! repair meant reaching for another client.
+//!
+//! Which statement the form means is carried on [`AccountTarget::resetting`],
+//! not inferred from whether some field is filled — `account_change` reads the
+//! subject from there, so a reset cannot rename or re-host the account it is
+//! resetting. That mapping is invisible in a rendered form, which is the kind
+//! that ships backwards, so it has a test.
 //!
 //! **The grant form is one form for four statements.** Grant or revoke,
 //! privileges or a role: two dropdowns, and the mapping between them and
@@ -160,6 +174,57 @@ pub(crate) fn open_for_new(ui: &Ui, from: &UsersTarget, database: &str) {
         database: database.to_string(),
         dialect: from.dialect,
         read_only: ctx.read_only,
+        resetting: None,
+    }));
+}
+
+/// Open the account form to **reset an existing account's password**.
+///
+/// The same door, the same refusal, the same anchor as [`open_for_new`] — and
+/// the same form, which is the point: the masked field is `pub(crate)` so there
+/// is exactly one of it, and a second modal to type a password into would be a
+/// second place for the replay rule to be got subtly wrong.
+///
+/// **Blank, every time**, for the reason `open_for_new` is: the draft carries a
+/// password, and a form that reopened holding the last one would put a
+/// credential on screen nobody typed this time. The draft's other fields are
+/// seeded from `account` so the form can say whose password it is about, and
+/// `account_change` reads the statement's subject from `resetting` rather than
+/// from them — a reset must not be able to rename or re-host the account it is
+/// resetting.
+///
+/// The caller has already asked `users::supports_password_reset`; that is what
+/// dims the button, and this is what makes the refusal real.
+pub(crate) fn open_for_reset(ui: &Ui, from: &UsersTarget, database: &str, account: &Principal) {
+    let ctx = edit_ctx(ui);
+    if ctx.read_only {
+        return;
+    }
+    // A role has no password on either engine. The browser dims the button, and
+    // this is the same refusal one step in — `set_password_sql` would return
+    // `None` and the plan would be empty, which reads as a broken button rather
+    // than a refused one.
+    if !schemaic_core::users::supports_password_reset(from.dialect, account.kind) {
+        return;
+    }
+    let d = ui.ddl;
+    d.session.update(|g| *g += 1);
+    reset_then_seed(
+        d,
+        d.account_draft,
+        AccountDraft {
+            name: account.name.clone(),
+            host: account.host.clone().unwrap_or_default(),
+            kind: account.kind,
+            password: String::new(),
+        },
+    );
+    d.account.set(Some(AccountTarget {
+        conn_id: from.conn_id,
+        database: database.to_string(),
+        dialect: from.dialect,
+        read_only: ctx.read_only,
+        resetting: Some(account.clone()),
     }));
 }
 
@@ -326,7 +391,10 @@ where
 /// the database editor's Owner uses.
 #[allow(clippy::too_many_arguments)]
 fn suggested_field<D: Clone + 'static>(
-    ui: &Ui,
+    // `OverlayUi`, not `&Ui`: the chevron reads two signals off it and this
+    // function reads none, so a whole-bundle parameter here was budget spent on
+    // nothing. See `whole_ui_gate`.
+    overlay: crate::OverlayUi,
     draft: RwSignal<D>,
     initial: String,
     placeholder: &'static str,
@@ -356,7 +424,14 @@ fn suggested_field<D: Clone + 'static>(
             },
         )
         .style(move |s| s.width(field_w())),
-        suggest_chevron(ui, sig, options, empty_note, ring.clone(), tabindex + 1),
+        suggest_chevron(
+            overlay,
+            sig,
+            options,
+            empty_note,
+            ring.clone(),
+            tabindex + 1,
+        ),
     ))
     .style(|s| s.flex_row().items_center().gap(theme::scaled(2.0)))
     .into_any()
@@ -386,7 +461,19 @@ pub(crate) fn grant_form_shape(d: &GrantDraft) -> (GrantSubject, bool, Option<Gr
 /// What this form is asking for. Pure, and out of the render for the reason the
 /// database editor's `change_of` is: which of the two statements a draft becomes
 /// is not visible in a rendered form.
-pub(crate) fn account_change(draft: &AccountDraft) -> ddl::Change {
+pub(crate) fn account_change(draft: &AccountDraft, resetting: Option<&Principal>) -> ddl::Change {
+    // **The subject comes from `resetting`, never from the draft.** The form
+    // seeds the draft's name and host so it can say whose password this is, and
+    // reading them back here would let a reset rename or re-host the very
+    // account it is resetting — silently, since `ALTER USER 'b'@'%'` on an
+    // account that does not exist is an error the preview would blame on the
+    // server.
+    if let Some(account) = resetting {
+        return ddl::Change::SetAccountPassword(Box::new(schemaic_core::users::PasswordReset {
+            account: account.clone(),
+            password: draft.password.clone(),
+        }));
+    }
     let mut d = draft.clone();
     d.name = d.name.trim().to_string();
     d.host = d.host.trim().to_string();
@@ -401,6 +488,28 @@ fn account_form(
 ) -> AnyView {
     let draft = d.account_draft;
     let mut rows: Vec<AnyView> = Vec::new();
+
+    // **A reset is the password row and nothing else.** Kind, name and host all
+    // describe an account that does not exist yet; on an account that does they
+    // are not merely redundant but wrong to offer, because editing one would
+    // read as changing it and `account_change` deliberately ignores them. So the
+    // form states whose password this is, in a line that cannot be typed into,
+    // and shows the one field that can.
+    if let Some(account) = &target.resetting {
+        rows.push(
+            form_setting(
+                "Account",
+                text(account.display())
+                    .style(|s| s.font_size(theme::font_body()).color(theme::text()))
+                    .into_any(),
+            )
+            .into_any(),
+        );
+        rows.push(password_row(d, ring));
+        return v_stack_from_iter(rows)
+            .style(|s| s.width_full().flex_col().gap(theme::scaled(10.0)))
+            .into_any();
+    }
 
     // **The kind picker comes first**, because it decides what the rest of the
     // form means: a role takes no host and no password on either engine, and the
@@ -467,49 +576,61 @@ fn account_form(
     }
 
     if kind == PrincipalKind::User {
-        // **Masked, like the app's three other secret fields.** This was the one
-        // that was not: the real characters were in the editor's own document,
-        // so they were on screen and a select-all away from the clipboard.
-        // `masked_edit_field` keeps only `*`s in the document and replays each
-        // edit onto the value from the editor's own delta, which is why there is
-        // one of it rather than a second copy here. **This form is why the
-        // replay has to be exact rather than close**: the connection form's
-        // mangled password fails to connect and can be retyped, while this one
-        // reaches `CREATE USER … IDENTIFIED BY` and the app has no `ALTER USER`
-        // to correct it afterwards.
-        let pw = floem::reactive::create_rw_signal(seed.password.clone());
-        create_effect(move |prev: Option<String>| {
-            let v = pw.get();
-            if prev.is_some_and(|p| p != v) {
-                draft.update(|d| d.password = v.clone());
-            }
-            v
-        });
-        rows.push(
-            form_setting(
-                "Password",
-                crate::connection_form::masked_edit_field(pw, ring, 30)
-                    .style(|s| s.width(field_w()))
-                    .into_any(),
-            )
-            .into_any(),
-        );
-        // The one field in the app whose value reaches a screenshot, so it says
-        // so where it is typed rather than only in the module comment.
-        rows.push(
-            text("The password appears in the previewed SQL, which is the statement that runs.")
-                .style(|s| {
-                    s.font_size(theme::font_hint())
-                        .color(theme::text_faint())
-                        .width_full()
-                })
-                .into_any(),
-        );
+        rows.push(password_row(d, ring));
     }
 
     v_stack_from_iter(rows)
         .style(|s| s.flex_col().gap(form_gap()).width_full())
         .into_any()
+}
+
+/// The masked password field and the sentence under it, shared by the form's two
+/// modes.
+///
+/// **Masked, like the app's three other secret fields.** This was the one that
+/// was not: the real characters were in the editor's own document, so they were
+/// on screen and a select-all away from the clipboard. `masked_edit_field` keeps
+/// only `*`s in the document and replays each edit onto the value from the
+/// editor's own delta, which is why there is one of it rather than a second copy
+/// here — and why this row is one function rather than one per mode.
+///
+/// **This form is why the replay has to be exact rather than close**: the
+/// connection form's mangled password fails to connect and can be retyped, while
+/// this one reaches `CREATE USER … IDENTIFIED BY` or `ALTER USER … IDENTIFIED
+/// BY`, and a mangled reset locks the account out of whatever was using it.
+///
+/// It seeds from the draft *untracked*: the seed is the value this row starts
+/// from, and reading it tracked would rebuild the field on every keystroke it
+/// itself caused.
+fn password_row(d: crate::DdlUi, ring: FocusRing) -> AnyView {
+    let draft = d.account_draft;
+    let pw = floem::reactive::create_rw_signal(draft.with_untracked(|a| a.password.clone()));
+    create_effect(move |prev: Option<String>| {
+        let v = pw.get();
+        if prev.is_some_and(|p| p != v) {
+            draft.update(|d| d.password = v.clone());
+        }
+        v
+    });
+    v_stack((
+        form_setting(
+            "Password",
+            crate::connection_form::masked_edit_field(pw, ring, 30)
+                .style(|s| s.width(field_w()))
+                .into_any(),
+        ),
+        // The one field in the app whose value reaches a screenshot, so it says
+        // so where it is typed rather than only in the module comment.
+        text("The password appears in the previewed SQL, which is the statement that runs.").style(
+            |s| {
+                s.font_size(theme::font_hint())
+                    .color(theme::text_faint())
+                    .width_full()
+            },
+        ),
+    ))
+    .style(|s| s.flex_col().gap(form_gap()).width_full())
+    .into_any()
 }
 
 /// The picked/not-picked outline every toggle in these two forms wears.
@@ -594,17 +715,37 @@ pub(crate) fn account_editor_overlay(ui: Ui) -> impl IntoView {
             ))
             .style(|s| s.width_full().flex_grow(1.0_f32).min_height(0.0));
 
+            // **The two modes require different fields, so they say different
+            // things.** A create needs a name; a reset has one already and needs
+            // the password, because `set_password_sql` refuses a blank one —
+            // `ALTER USER … IDENTIFIED BY ''` sets a *blank* password rather
+            // than leaving one unset. Without this arm the button would be live
+            // over an empty field and the plan would come back with nothing in
+            // it, which reads as the app being broken.
+            let resetting = target.resetting.is_some();
             let status = dyn_container(
                 // `with`, not `get`: this re-runs on every edit of the draft and
                 // asks one question about one field, so cloning the whole
                 // `AccountDraft` to reach it is the defect `consts`'
                 // `get_clone_gate` is named for.
-                move || d.account_draft.with(|a| a.name.trim().is_empty()),
-                move |empty_name| {
-                    if empty_name {
-                        text("A name is required.")
-                            .style(|s| s.color(theme::error()).font_size(theme::font_label()))
-                            .into_any()
+                move || {
+                    d.account_draft.with(|a| {
+                        if resetting {
+                            a.password.is_empty()
+                        } else {
+                            a.name.trim().is_empty()
+                        }
+                    })
+                },
+                move |missing| {
+                    if missing {
+                        text(if resetting {
+                            "A password is required."
+                        } else {
+                            "A name is required."
+                        })
+                        .style(|s| s.color(theme::error()).font_size(theme::font_label()))
+                        .into_any()
                     } else {
                         crate::widgets::nothing().into_any()
                     }
@@ -620,7 +761,10 @@ pub(crate) fn account_editor_overlay(ui: Ui) -> impl IntoView {
                     let ui = preview_ui.clone();
                     let target = preview_target.clone();
                     let ring = ring_actions.clone();
-                    let ready = !draft.name.trim().is_empty();
+                    let ready = match &target.resetting {
+                        Some(_) => !draft.password.is_empty(),
+                        None => !draft.name.trim().is_empty(),
+                    };
                     h_stack((
                         action_button(
                             "Cancel",
@@ -642,7 +786,7 @@ pub(crate) fn account_editor_overlay(ui: Ui) -> impl IntoView {
                                     &ui,
                                     (&target).into(),
                                     &subject,
-                                    account_change(&draft),
+                                    account_change(&draft, target.resetting.as_ref()),
                                 );
                             },
                         ),
@@ -654,7 +798,13 @@ pub(crate) fn account_editor_overlay(ui: Ui) -> impl IntoView {
 
             let close_x: Rc<dyn Fn()> = Rc::new(close);
             modal_shell(
-                "Create account".to_string(),
+                // No ellipsis, per the house rule — and the two modes are named
+                // apart because "Create account" over a form that will emit an
+                // `ALTER` is the one thing the title may not do.
+                match target.resetting.is_some() {
+                    true => "Reset password".to_string(),
+                    false => "Create account".to_string(),
+                },
                 ShellParts {
                     body: body.into_any(),
                     status: status.into_any(),
@@ -746,7 +896,7 @@ fn grant_form(
                 form_setting(
                     "Role",
                     suggested_field(
-                        ui,
+                        ui.overlay,
                         draft,
                         seed.role.clone(),
                         "role_name",
@@ -834,7 +984,7 @@ fn grant_form(
                         form_setting(
                             q_label,
                             suggested_field(
-                                ui,
+                                ui.overlay,
                                 draft,
                                 seed.qualifier.clone(),
                                 q_placeholder,
@@ -1409,11 +1559,102 @@ mod form_shape_tests {
 /// schema tree, where the active connection *is* the target, so
 /// `read_only: ctx.read_only` beside `conn_id: ctx.conn_id` is right there.
 #[cfg(test)]
+mod account_change_tests {
+    use super::*;
+
+    fn an_account() -> Principal {
+        Principal {
+            name: "app".into(),
+            host: Some("10.0.0.%".into()),
+            kind: PrincipalKind::User,
+            system: false,
+            attributes: Vec::new(),
+        }
+    }
+
+    /// No `resetting` means the form is creating, and the draft is the subject.
+    #[test]
+    fn without_a_reset_target_the_form_creates() {
+        let d = AccountDraft {
+            name: "  app  ".into(),
+            host: "  %  ".into(),
+            kind: PrincipalKind::User,
+            password: "hunter2".into(),
+        };
+        match account_change(&d, None) {
+            ddl::Change::CreateAccount(a) => {
+                // Trimmed on the way out, which is the other thing this function
+                // does and the reason it is not a bare constructor call.
+                assert_eq!(a.name, "app");
+                assert_eq!(a.host, "%");
+                assert_eq!(a.password, "hunter2");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// **The subject comes from the target, and the draft cannot move it.**
+    ///
+    /// The draft is seeded from the account so the form can say whose password
+    /// it is about, which means its `name` and `host` are live fields sitting
+    /// next to a statement that must not read them. This hands it a draft naming
+    /// a *different* account — what a form that let those fields be edited would
+    /// produce — and asserts the statement still names the one being reset.
+    /// Reading them back would emit `ALTER USER 'somebody_else'@'%'`, which on an
+    /// account that does not exist is an error the preview would blame on the
+    /// server.
+    #[test]
+    fn a_reset_names_the_target_rather_than_the_draft() {
+        let d = AccountDraft {
+            name: "somebody_else".into(),
+            host: "%".into(),
+            kind: PrincipalKind::User,
+            password: "hunter2".into(),
+        };
+        match account_change(&d, Some(&an_account())) {
+            ddl::Change::SetAccountPassword(r) => {
+                assert_eq!(r.account, an_account());
+                assert_eq!(r.password, "hunter2");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// The composition, not the two halves: the change this form builds is the
+    /// one the emitter turns into the statement the preview shows.
+    #[test]
+    fn the_reset_the_form_builds_emits_the_alter_for_that_account() {
+        let d = AccountDraft {
+            name: "ignored".into(),
+            host: "ignored".into(),
+            kind: PrincipalKind::User,
+            password: "hunter2".into(),
+        };
+        let change = account_change(&d, Some(&an_account()));
+        let cs = ddl::account("app", SqlDialect::MySql, change);
+        assert_eq!(
+            cs.emit(),
+            ["ALTER USER 'app'@'10.0.0.%' IDENTIFIED BY 'hunter2';"]
+        );
+        // And nothing that leaves the preview carries it.
+        let (clean, redacted) = cs.without_secrets();
+        assert!(redacted);
+        assert!(!clean.emit().iter().any(|s| s.contains("hunter2")));
+    }
+}
+
+#[cfg(test)]
 mod anchor_gate {
     /// What must not appear: the switcher, used as an address.
     const FORBIDDEN: &[&str] = &["ctx.conn_id", "ctx.dialect"];
     /// What must appear instead, once per door.
     const REQUIRED: &[&str] = &["conn_id: from.conn_id,", "dialect: from.dialect,"];
+    /// **The doors this file has**, as a number the gates below count against.
+    /// A fourth `open_for_*` raises it here and nowhere else — and raising it
+    /// without writing the two lines the gates look for is what they exist to
+    /// refuse. It went from two to three when `open_for_reset` landed, and both
+    /// gates caught it.
+    const DOORS: usize = 3;
 
     #[test]
     fn no_account_form_takes_its_address_from_the_switcher() {
@@ -1437,9 +1678,9 @@ mod anchor_gate {
         for want in REQUIRED {
             assert_eq!(
                 body.matches(want).count(),
-                2,
-                "`{want}` should appear once in each of the two doors — did one \
-                 of them stop reading the browser's captured target?"
+                DOORS,
+                "`{want}` should appear once in each of the {DOORS} doors — did \
+                 one of them stop reading the browser's captured target?"
             );
         }
         for bad in FORBIDDEN {
@@ -1454,12 +1695,12 @@ mod anchor_gate {
         }
     }
 
-    /// And the refusal is untouched by all of it: both doors still guard
-    /// themselves in the step that launches, which is `read_only_door_gate`'s
+    /// And the refusal is untouched by all of it: every door still guards
+    /// itself in the step that launches, which is `read_only_door_gate`'s
     /// rule for all fifteen. Asserted here too because this fix moved the two
     /// lines that gate finds them by.
     #[test]
-    fn both_doors_still_refuse_a_read_only_connection_first() {
+    fn every_door_still_refuses_a_read_only_connection_first() {
         let src = std::fs::read_to_string(
             std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join("src")
@@ -1467,7 +1708,7 @@ mod anchor_gate {
         )
         .expect("account_editor.rs");
         let body = crate::source_gate::production_code(&src);
-        assert_eq!(body.matches("if ctx.read_only {").count(), 2);
-        assert_eq!(body.matches("read_only: ctx.read_only,").count(), 2);
+        assert_eq!(body.matches("if ctx.read_only {").count(), DOORS);
+        assert_eq!(body.matches("read_only: ctx.read_only,").count(), DOORS);
     }
 }

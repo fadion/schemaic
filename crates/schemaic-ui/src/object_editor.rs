@@ -703,7 +703,7 @@ fn domain_form(
                 )
                 .style(move |s| s.width(field_w())),
                 suggest_chevron(
-                    ui,
+                    ui.overlay,
                     sig,
                     move || {
                         ddl::common_types(dialect)

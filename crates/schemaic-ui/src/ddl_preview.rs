@@ -1487,6 +1487,7 @@ mod tests {
             database: "db".into(),
             dialect: SqlDialect::MySql,
             read_only: false,
+            resetting: None,
         }));
         d.grant.set(Some(crate::GrantTarget {
             conn_id: 1,
@@ -1673,6 +1674,7 @@ mod tests {
                     database: "db".into(),
                     dialect: SqlDialect::MySql,
                     read_only: false,
+                    resetting: None,
                 }))
             }),
             ("grant", |d| {

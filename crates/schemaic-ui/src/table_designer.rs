@@ -692,23 +692,28 @@ fn field_view(
 /// is what lets that land with no rebuild: rebuilding the row when the reply
 /// came would tear down the field the user may be typing in, which is the hazard
 /// `object_editor`'s module comment states.
-// `use<F>`: the view captures the options closure and nothing else — in
-// particular not the `&Ui` it read the two `Copy` overlay signals off, so it can
-// outlive that borrow and be returned from a form builder that took `ui` by
-// reference. `F` has to be named for that list to be writable at all.
+// `use<F>`: the view captures the options closure and nothing else, so it can be
+// returned from a form builder that took `ui` by reference. `F` has to be named
+// for that list to be writable at all.
+//
+// **It takes `OverlayUi`, not `&Ui`** — the two signals it reads are the whole
+// of its interest in the bundle, and a `&Ui` here was four files' worth of
+// `whole_ui_gate` budget spent on two `Copy` fields. `OverlayUi` is itself
+// `Copy`, so this is by value and the borrow the comment above worried about is
+// gone with it.
 /// `empty_note` is what the menu says when [`suggest_chevron`]'s `options`
 /// answer nothing — see the "nothing to suggest" arm for why the menu is not
 /// simply withheld.
 pub(crate) fn suggest_chevron<F: Fn() -> Vec<String> + 'static>(
-    ui: &Ui,
+    overlay: crate::OverlayUi,
     sig: RwSignal<String>,
     options: F,
     empty_note: &'static str,
     ring: FocusRing,
     tabindex: u32,
 ) -> impl IntoView + use<F> {
-    let popup = ui.overlay.popup_menu;
-    let anchor = ui.overlay.popup_anchor;
+    let popup = overlay.popup_menu;
+    let anchor = overlay.popup_anchor;
     // **The chevron's own id, so the menu can open under the chevron.** The
     // shared `popup_menu` channel falls back to `last_mouse` when no anchor is
     // set, which is right for a right-click and wrong for a button: reached by
@@ -818,7 +823,7 @@ fn bound_field_with_menu(
     h_stack((
         field_view(sig, width, placeholder, mono, ring.clone(), tabindex),
         suggest_chevron(
-            ui,
+            ui.overlay,
             sig,
             move || options.clone(),
             "No suggestions",

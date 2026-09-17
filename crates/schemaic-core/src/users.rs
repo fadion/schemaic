@@ -1492,6 +1492,78 @@ pub fn account_draft_sql(d: &AccountDraft, dialect: SqlDialect) -> Option<String
     Some(sql)
 }
 
+/// A password reset on an account that already exists.
+///
+/// Its own type rather than a reuse of [`AccountDraft`], because the two answer
+/// different questions: a draft describes an account that does not exist yet and
+/// carries every field `CREATE` needs, while this names one the browser listed
+/// and carries the single field being changed. Handing `CREATE`'s shape to an
+/// `ALTER` is how a reset comes to silently reset the host as well.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PasswordReset {
+    /// The account as the browser read it — host included on MySQL, because
+    /// `ALTER USER 'app'` and `ALTER USER 'app'@'10.0.0.%'` are two accounts.
+    pub account: Principal,
+    /// **Held in memory only**, on the same terms as [`AccountDraft::password`],
+    /// and scrubbed by `ChangeSet::without_secrets` on the way to anything but
+    /// the preview.
+    pub password: String,
+}
+
+/// Can `dialect` change the password of an existing account of `kind`?
+///
+/// **Computed from [`supports_users`], not restated.** An engine with accounts
+/// has an `ALTER` for them — MySQL since 5.7.6, PostgreSQL since roles existed —
+/// so the dialect half of this question is the one already answered, and a
+/// fourth engine gets a consistent answer rather than whichever side a new
+/// constant left it on.
+///
+/// The `kind` half is real and not about the engine: a role takes no password on
+/// either engine, which is the same rule [`account_draft_sql`] applies to
+/// `CREATE`. MySQL rejects one outright, and a PostgreSQL role with `LOGIN` off
+/// has nothing to authenticate.
+pub fn supports_password_reset(dialect: SqlDialect, kind: PrincipalKind) -> bool {
+    supports_users(dialect) && kind == PrincipalKind::User
+}
+
+/// `ALTER USER … IDENTIFIED BY` / `ALTER ROLE … PASSWORD`, or `None` where the
+/// account cannot have a password reset at all.
+///
+/// **The password is in the statement, and the statement is in the preview**, on
+/// exactly the terms [`account_draft_sql`] sets out: the preview is the app's one
+/// gate between a plan and a server, and a statement shown with the password
+/// blanked would not be the statement it ran.
+///
+/// **An empty password is refused rather than emitted.** `ALTER USER … IDENTIFIED
+/// BY ''` is a legal statement on MySQL and it sets a *blank* password, which is
+/// the one outcome nobody reaches this form intending — `CREATE` can leave a
+/// password unset because an account that has never had one is a real thing, but
+/// clearing one that exists is a lock left open rather than a lock not yet
+/// fitted. A caller wanting that has `Change::DropAccount`, or the engine's own
+/// client.
+///
+/// PostgreSQL is spelled `ALTER ROLE` for a user too: `ALTER USER` is an alias
+/// the manual keeps for compatibility, and the browser's own `GRANT` statements
+/// already read `ROLE` throughout, so one word here keeps the preview internally
+/// consistent.
+pub fn set_password_sql(r: &PasswordReset, dialect: SqlDialect) -> Option<String> {
+    if !supports_password_reset(dialect, r.account.kind)
+        || r.account.name.trim().is_empty()
+        || r.password.is_empty()
+    {
+        return None;
+    }
+    let who = account_sql(&r.account, dialect);
+    let (verb, clause) = match dialect {
+        SqlDialect::MySql => ("ALTER USER", "IDENTIFIED BY"),
+        SqlDialect::Postgres | SqlDialect::Sqlite => ("ALTER ROLE", "PASSWORD"),
+    };
+    Some(format!(
+        "{verb} {who} {clause} {}",
+        crate::schema::ddl_string(&r.password, dialect)
+    ))
+}
+
 /// `DROP USER` / `DROP ROLE` for an existing account.
 pub fn drop_account_sql(p: &Principal, dialect: SqlDialect) -> String {
     let keyword = match p.kind {
@@ -2885,6 +2957,94 @@ mod tests {
                 .unwrap()
                 .contains("PASSWORD")
         );
+    }
+
+    // ── password reset ───────────────────────────────────────────────────────
+
+    fn reset(pw: &str) -> PasswordReset {
+        PasswordReset {
+            account: my_account(),
+            password: pw.to_string(),
+        }
+    }
+
+    #[test]
+    fn a_reset_names_the_account_with_its_host_on_mysql() {
+        assert_eq!(
+            set_password_sql(&reset("hunter2"), SqlDialect::MySql).unwrap(),
+            "ALTER USER 'app'@'%' IDENTIFIED BY 'hunter2'"
+        );
+    }
+
+    /// PostgreSQL gets `ALTER ROLE` for a user too, and no host — the same two
+    /// distinctions `account_sql` already makes for `CREATE`.
+    #[test]
+    fn a_reset_is_alter_role_without_a_host_on_postgres() {
+        let mut r = reset("hunter2");
+        r.account.host = None;
+        assert_eq!(
+            set_password_sql(&r, SqlDialect::Postgres).unwrap(),
+            "ALTER ROLE \"app\" PASSWORD 'hunter2'"
+        );
+    }
+
+    /// **A blank password is refused, not emitted.** `ALTER USER … IDENTIFIED BY
+    /// ''` is legal and sets a blank password — a lock left open, where
+    /// `CREATE`'s missing clause is a lock not yet fitted, which is why the two
+    /// treat an empty string differently.
+    #[test]
+    fn a_blank_reset_has_no_statement() {
+        assert_eq!(set_password_sql(&reset(""), SqlDialect::MySql), None);
+    }
+
+    #[test]
+    fn a_nameless_reset_has_no_statement() {
+        let mut r = reset("hunter2");
+        r.account.name = "   ".into();
+        assert_eq!(set_password_sql(&r, SqlDialect::MySql), None);
+    }
+
+    /// A role takes no password on either engine — the same rule
+    /// `account_draft_sql` applies to `CREATE`.
+    #[test]
+    fn a_role_cannot_have_its_password_reset() {
+        let mut r = reset("hunter2");
+        r.account.kind = PrincipalKind::Role;
+        for d in [SqlDialect::MySql, SqlDialect::Postgres] {
+            assert_eq!(set_password_sql(&r, d), None, "{d:?}");
+            assert!(!supports_password_reset(d, PrincipalKind::Role), "{d:?}");
+        }
+    }
+
+    /// The capability is computed from `supports_users`, so SQLite — which has
+    /// no accounts — refuses without a second list of engines to keep in step.
+    #[test]
+    fn password_reset_follows_whether_the_engine_has_accounts_at_all() {
+        for d in [SqlDialect::MySql, SqlDialect::Postgres, SqlDialect::Sqlite] {
+            assert_eq!(
+                supports_password_reset(d, PrincipalKind::User),
+                supports_users(d),
+                "{d:?}"
+            );
+        }
+        assert_eq!(
+            set_password_sql(&reset("hunter2"), SqlDialect::Sqlite),
+            None
+        );
+    }
+
+    /// The password is a string literal, so a quote in it is escaped rather than
+    /// ending the statement — `ddl_string`'s job, asserted here because this is
+    /// the second caller and a hand-rolled `format!` is how the first would have
+    /// been got wrong.
+    #[test]
+    fn a_quote_in_the_password_is_escaped() {
+        let sql = set_password_sql(&reset("it's"), SqlDialect::MySql).unwrap();
+        assert!(
+            !sql.ends_with("'it'"),
+            "the quote closed the literal early: {sql}"
+        );
+        assert!(sql.contains("it") && sql.ends_with('\''), "{sql}");
     }
 
     #[test]

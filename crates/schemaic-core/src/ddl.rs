@@ -2567,6 +2567,15 @@ pub enum Change {
     /// account came off a list, so one that isn't there means the list is stale
     /// and the user is about to be told a drop succeeded that dropped nothing.
     DropAccount(Box<crate::users::Principal>),
+    /// `ALTER USER … IDENTIFIED BY` / `ALTER ROLE … PASSWORD`, on an account the
+    /// browser listed.
+    ///
+    /// The only `ALTER` on an account this module emits. Every other attribute
+    /// an account carries is read-only here, which is a scope decision rather
+    /// than an oversight: a password that cannot be repaired from the app left
+    /// `CREATE USER` as a statement whose one mistake meant reaching for another
+    /// client, and that is the gap this closes.
+    SetAccountPassword(Box<crate::users::PasswordReset>),
     /// `GRANT … ON … TO …`.
     GrantPrivileges(Box<crate::users::PrivilegeChange>),
     /// `REVOKE … ON … FROM …`.
@@ -2580,11 +2589,11 @@ pub enum Change {
 
 /// Is `change` about an **account** rather than about anything in the schema?
 ///
-/// The six arms of the Users and privileges browser's write half. They are
+/// The seven arms of the Users and privileges browser's write half. They are
 /// grouped by this predicate rather than matched one at a time because every
 /// downstream question — which statements they emit, whether the engine has them
 /// at all, whether they belong in a table's plan — is the same question for all
-/// six.
+/// seven.
 ///
 /// **They are not [`is_server_level`]**, even though an account belongs to the
 /// server, and the reason is PostgreSQL: `GRANT SELECT ON TABLE public.users`
@@ -2600,6 +2609,7 @@ pub fn is_account_change(change: &Change) -> bool {
         change,
         Change::CreateAccount(_)
             | Change::DropAccount(_)
+            | Change::SetAccountPassword(_)
             | Change::GrantPrivileges(_)
             | Change::RevokePrivileges(_)
             | Change::GrantRole(_)
@@ -3085,6 +3095,12 @@ impl Change {
             Change::DropAccount(p) => {
                 format!("Drop {} {}", p.kind.label().to_lowercase(), p.display())
             }
+            // The account's own `display()`, host included, because on MySQL
+            // `app@%` and `app@10.0.0.%` are two accounts with two passwords and
+            // a summary naming only `app` would not say which one is moving.
+            Change::SetAccountPassword(r) => {
+                format!("Set password for {}", r.account.display())
+            }
             Change::GrantPrivileges(c) => format!(
                 "Grant {} to {}",
                 Self::privilege_words(&c.privileges),
@@ -3537,6 +3553,20 @@ impl Change {
                  again from memory. Anything still connected as it keeps running \
                  until it disconnects.",
                 p.display()
+            )],
+            // **A reset is not undoable, which is the part that surprises.**
+            // Nothing is destroyed and the account keeps every privilege it
+            // holds, so this reads as the mildest thing in the list — but the
+            // *old* password is not recoverable from anywhere, by this app or by
+            // the server, so every client still configured with it is broken
+            // until each one is found and changed. That is the sentence, and it
+            // is why this change is not in `risk_is_reversible`.
+            Change::SetAccountPassword(r) => vec![format!(
+                "Changes {}'s password. The old one cannot be recovered, so \
+                 anything still configured with it — an application, a job, \
+                 another developer's client — fails to connect until it is \
+                 updated by hand. Sessions already open keep running.",
+                r.account.display()
             )],
             // Taking a privilege away is destructive in the sense this list
             // means — something that worked stops working — but it destroys no
@@ -4173,10 +4203,12 @@ impl ChangeSet {
     ///
     /// Separate from [`export_script`](Self::export_script) so the *decision* —
     /// which changes carry a secret — is a pure function with a test, rather
-    /// than a condition inside a formatter. A seventh account change that
+    /// than a condition inside a formatter. An eighth account change that
     /// carries one has to be added here, and
     /// `every_account_change_that_carries_a_password_is_scrubbed` is what says
-    /// so.
+    /// so. **It has already caught the seventh**:
+    /// [`Change::SetAccountPassword`] went in with its emitter and its fixture
+    /// and without this arm, and the test named the leaking statement.
     pub fn without_secrets(&self) -> (ChangeSet, bool) {
         let mut out = self.clone();
         let mut redacted = false;
@@ -4185,6 +4217,12 @@ impl ChangeSet {
                 && !d.password.is_empty()
             {
                 d.password = PASSWORD_PLACEHOLDER.to_string();
+                redacted = true;
+            }
+            if let Change::SetAccountPassword(r) = c
+                && !r.password.is_empty()
+            {
+                r.password = PASSWORD_PLACEHOLDER.to_string();
                 redacted = true;
             }
         }
@@ -5339,6 +5377,19 @@ impl ChangeSet {
                 if let Some(sql) = crate::users::account_draft_sql(draft, d) {
                     push(sql);
                 }
+            }
+        }
+        // **After the creates and before the grants.** A password reset names an
+        // account that already exists, so it does not depend on the block above;
+        // it sits here rather than later so that a plan doing both reads in the
+        // order the statements happen, and `None` — a role, a blank password, an
+        // engine without accounts — emits nothing rather than half a statement,
+        // the same backstop `CreateAccount` has.
+        for c in mine.iter() {
+            if let Change::SetAccountPassword(r) = c
+                && let Some(sql) = crate::users::set_password_sql(r, d)
+            {
+                push(sql);
             }
         }
         for c in mine.iter() {
@@ -22197,6 +22248,15 @@ mod database_tests {
                 ..Default::default()
             })),
             Change::DropAccount(Box::new(an_account())),
+            // **Carries a password, unlike `CreateAccount` above**, because
+            // `set_password_sql` refuses a blank one on purpose — an
+            // `ALTER USER … IDENTIFIED BY ''` sets a *blank* password rather
+            // than leaving one unset — so a blank fixture here would emit
+            // nothing and read as an unwritten arm.
+            Change::SetAccountPassword(Box::new(crate::users::PasswordReset {
+                account: an_account(),
+                password: "s3cret".into(),
+            })),
             Change::GrantPrivileges(a_privilege_change(&["SELECT"])),
             Change::RevokePrivileges(a_privilege_change(&["SELECT"])),
             Change::GrantRole(Box::new(crate::users::RoleChange {
@@ -22241,10 +22301,11 @@ mod database_tests {
             every_account_change().len(),
             "the list repeats a variant, so one is untested behind another"
         );
-        // The six the module has. A new one lands in `is_account_change` (or it
-        // is not an account change at all), which is what makes this the right
-        // side to count from.
-        assert_eq!(listed.len(), 6);
+        // The seven the module has. A new one lands in `is_account_change` (or
+        // it is not an account change at all), which is what makes this the
+        // right side to count from. It caught the seventh,
+        // `SetAccountPassword`, on the way in.
+        assert_eq!(listed.len(), 7);
     }
 
     /// **`unsupported()` has to be able to withhold a level the engine has not
@@ -22386,6 +22447,9 @@ mod database_tests {
             // Give each variant that *has* a password field a real one.
             if let Change::CreateAccount(d) = &mut c {
                 d.password = "hunter2".into();
+            }
+            if let Change::SetAccountPassword(r) = &mut c {
+                r.password = "hunter2".into();
             }
             let cs = account("app@%", MySql, c);
             let (clean, redacted) = cs.without_secrets();

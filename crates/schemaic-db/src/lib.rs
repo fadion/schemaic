@@ -4976,8 +4976,10 @@ impl Db {
         // which doubles a backslash because that is what MySQL does with one by
         // default — and on a session carrying `NO_BACKSLASH_ESCAPES` the doubled
         // literal stores two. On a `CREATE USER … IDENTIFIED BY` that is an
-        // account nobody can log in to, with no `ALTER USER` in this app to
-        // correct it.
+        // account nobody can log in to — repairable now that the browser offers
+        // a password reset, but through the same `ddl_string` this would have
+        // got wrong, so the reset would store the same mangled value and the
+        // escape has to be right here rather than fixable afterwards.
         //
         // **Scoped to the plan, never to the connection.** A user who sets that
         // mode means it for the SQL they *type*, and pinning it at connect time

@@ -283,7 +283,14 @@ fn optional_field(
             },
         )
         .style(move |s| s.width(field_w())),
-        suggest_chevron(ui, sig, options, empty_note, ring.clone(), tabindex + 1),
+        suggest_chevron(
+            ui.overlay,
+            sig,
+            options,
+            empty_note,
+            ring.clone(),
+            tabindex + 1,
+        ),
     ))
     .style(|s| s.flex_row().items_center().gap(theme::scaled(2.0)))
     .into_any()

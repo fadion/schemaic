@@ -1304,6 +1304,17 @@ pub struct AccountTarget {
     pub database: String,
     pub dialect: SqlDialect,
     pub read_only: bool,
+    /// The existing account whose password is being reset, or `None` when the
+    /// form is creating one.
+    ///
+    /// **The mode, carried on the target rather than inferred from the draft.**
+    /// A reset and a create fill the same `AccountDraft` and reach the same
+    /// masked field, and the only thing separating them is which statement the
+    /// form means — so guessing it from whether some field happens to be
+    /// populated is how a reset comes to emit a `CREATE USER` for an account
+    /// that already exists. Carried whole, like [`GrantTarget::account`], because
+    /// `users::account_sql` needs the host too and a MySQL account *is* the pair.
+    pub resetting: Option<schemaic_core::users::Principal>,
 }
 
 /// The grant editor's target; doubles as its open flag.
@@ -14568,7 +14579,9 @@ mod whole_ui_gate {
         ("settings.rs", 4),
         ("snippet_edit.rs", 1),
         ("snippet_panel.rs", 1),
-        ("table_designer.rs", 33),
+        // 33 → 32: `suggest_chevron` took `&Ui` for two `Copy` overlay signals
+        // and now takes `OverlayUi`.
+        ("table_designer.rs", 32),
         // 2, for `compare_view.rs`'s reason: `tab_chip(tab: Tab, ui: Ui)`.
         ("tabs.rs", 2),
         ("trigger_editor.rs", 11),

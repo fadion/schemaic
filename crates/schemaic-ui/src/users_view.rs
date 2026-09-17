@@ -878,6 +878,37 @@ fn actions_row(
         },
     );
 
+    // **Absent on a role rather than dimmed**, the call every per-engine and
+    // per-kind field in this crate makes: a role takes no password on either
+    // engine, so there is nothing here for a dimmed button to promise. Asked as
+    // a capability — `supports_password_reset` folds "does this engine have
+    // accounts" into the same answer — rather than as a `dialect ==`.
+    let reset = schemaic_core::users::supports_password_reset(target.dialect, p.kind).then(|| {
+        let reset_ui = ui.clone();
+        let reset_target = target.clone();
+        let reset_who = p.clone();
+        action_button(
+            "Reset password",
+            ActionKind::Quiet,
+            enabled,
+            ring.clone(),
+            13,
+            move || {
+                // The refusal is inside `open_for_reset`, in the step that
+                // launches it — `enabled` here is a `bool` captured when this
+                // row was built, which is what `widgets::accept_launch`'s
+                // contract forbids as the whole guard.
+                crate::account_editor::open_for_reset(
+                    &reset_ui,
+                    &reset_target,
+                    &reset_target.database.clone().unwrap_or_default(),
+                    &reset_who,
+                );
+            },
+        )
+        .into_any()
+    });
+
     let drop_ui = ui.clone();
     let drop_target = target.clone();
     let drop_who = p.clone();
@@ -887,7 +918,9 @@ fn actions_row(
     // whichever the switcher points at by the time the confirm is answered.
     let plan_conn_id = target.conn_id;
     let confirm = ui.overlay.confirm;
-    let drop = action_button("Drop", ActionKind::Danger, enabled, ring, 13, move || {
+    // 14, after Reset password at 13 — the tab order follows the row, and Drop
+    // stays last of the three because it is the destructive one.
+    let drop = action_button("Drop", ActionKind::Danger, enabled, ring, 14, move || {
         let ui = drop_ui.clone();
         // **The launch guards itself, in the step that launches it.** `enabled`
         // is a `bool` captured when this row was built, so the disabled button
@@ -956,8 +989,14 @@ fn actions_row(
         WriteGate::ReadOnly => Some("This connection is read-only."),
         _ => None,
     };
+    // Built from an iterator rather than a tuple because the middle button is
+    // absent on a role — see `reset`.
+    let buttons: Vec<AnyView> = [Some(grant.into_any()), reset, Some(drop.into_any())]
+        .into_iter()
+        .flatten()
+        .collect();
     let mut rows: Vec<AnyView> = vec![
-        h_stack((grant, drop))
+        h_stack_from_iter(buttons)
             .style(|s| s.flex_row().items_center().gap(action_gap()))
             .into_any(),
     ];

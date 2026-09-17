@@ -204,6 +204,7 @@ live_suite!(
         a_created_account_is_one_the_server_then_lists,
         an_account_created_at_a_host_is_listed_and_dropped_at_it,
         a_created_account_can_log_in_with_the_password_it_was_given,
+        a_reset_password_replaces_the_one_the_account_had,
         a_created_role_is_one_the_server_accepts,
         a_granted_privilege_comes_back_and_a_revoke_takes_it_off,
         a_grant_at_every_level_reads_back_naming_that_object,
