@@ -431,17 +431,49 @@ existing prose was left alone.
     read `RETURNING` as an alias for `zap` in `DELETE FROM zap RETURNING *` — reserved on
     PostgreSQL, so the standard archive idiom was squiggled as broken. **Not dialect-gated**, because
     MariaDB has `RETURNING` too.
-    **The typo checker is off where `FUNCTIONS` is not the engine's catalog** —
-    `builtin_functions_are_authoritative`, an exhaustive `match` answering true for MySQL only,
-    beside `ops` and `ident_quote` for the reason those are. That table's own doc says it is the
-    authoritative catalog of *MySQL/MariaDB* builtins, and the checker was spending its `dialect` on
-    `skip_noncode` and `is_sql_keyword` and never on the two catalog questions: on PostgreSQL it
+    **The typo checker runs only where the app holds the engine's own catalog** — `builtin_catalog`
+    answers that with one exhaustive `match` **returning the catalog itself**: `FUNCTIONS` for
+    MySQL, `SQLITE_FUNCTIONS` for SQLite, `None` for PostgreSQL, and `is_known_function` and
+    `is_probable_function_typo` take it as a parameter. Reaching for the module-level `FUNCTIONS`
+    inside those two was the defect under the original bug: the checker spent its `dialect` on
+    `skip_noncode` and `is_sql_keyword` and never on the catalog questions, so on PostgreSQL it
     failed to recognise the engine's real functions *and* measured its edit distances against another
-    engine's, so `btrim`, `to_number`, `make_date` and `make_time` — core builtins, verified on PG
-    16.15 — were all four squiggled as misspelled. Losing a nicety on two engines beats the app
-    calling correct SQL broken. **Writing `PG_FUNCTIONS`/`SQLITE_FUNCTIONS` is what flips it on** for
-    them, a data task `TODO.md` carries; an incomplete list would reintroduce the same false
-    positives for whatever it omits, which is why it is not attempted halfway.
+    engine's, and `btrim`, `to_number`, `make_date` and `make_time` — core builtins, verified on PG
+    16.15 — were all four squiggled as misspelled. Losing a nicety on an engine beats the app calling
+    correct SQL broken. A `builtin_functions_are_authoritative` bool stood beside the catalog and has
+    been **deleted**: returning the catalog *is* answering whether this app's builtins are
+    authoritative here, and asking one question at two sites is one more place to forget an engine.
+    **`SQLITE_FUNCTIONS` turned the checker on for SQLite** — 157 entries, written lower-case the way
+    SQLite's own documentation writes them while `FUNCTIONS` stays upper-case for MySQL's, which
+    costs nothing because both comparisons are case-insensitive at either end.
+    **PostgreSQL stays `None` deliberately, and a hand-written list is not what changes that**: the
+    checker only ever speaks about a near miss of a name it *holds*, so a partial catalog
+    reintroduces the original false positives for whatever it omits — `to_date` squiggled because
+    `to_char` made the list. SQLite could be written out by hand because its builtins are a small
+    closed set its documentation enumerates; PostgreSQL's are not, and the honest source for them is
+    `pg_catalog` on a real server.
+    **A catalog is data, so the engine checks it** — `schemaic-db/tests/sqlite_catalog.rs`, which
+    lives over there rather than beside the catalog because only that crate links rusqlite, and needs
+    no server, no file and no network (the in-memory-SQLite allowance).
+    `every_function_the_engine_reports_is_in_the_catalog` asks `pragma_function_list` on an in-memory
+    connection — the engine's own answer to the same question, rather than anyone's memory of the
+    documentation — and fails on any name the engine has and the list lacks, because that is a
+    squiggle under correct SQL. Run against the hand-written list it found **23** missing names: the
+    whole R-tree family (`rtreecheck`, `rtreedepth`, `rtreenode`), the FTS3/5 family (`matchinfo`,
+    `offsets`, `optimize`, `fts3_tokenizer`, the `fts5_*` set),
+    `json_array_insert`/`jsonb_array_insert`, `unistr`, `subtype`, `sqlite_log` and
+    `current_date`/`current_time`/`current_timestamp`. It also settled that SQLite has `if()` as an
+    alias of `iif()`, which the documentation does not lead with. **The check is one-directional on
+    purpose**, and `over_listing` says so rather than leaving the asymmetry to be discovered and
+    "fixed": this build has `SQLITE_ENABLE_MATH_FUNCTIONS` off, so the engine reports none of the 29
+    math functions nor `sqlite_offset`, and `pragma_function_list` reports no table-valued function,
+    so `json_each`/`json_tree` never appear either. Those stay listed, because a `.db` is a file
+    other tools open and squiggling `sqrt(x)` to describe a local compile flag is the false positive
+    the catalog exists to prevent; `over_listing` asserts only that the overhang stays *explicable* —
+    every name in it belongs to one of those named families. Both tests skip `sqlite_rename_*` (the
+    rename machinery `ALTER TABLE` drives, not callable API, and names no user should be nudged
+    toward) and the `->`/`->>` operators, which the checker cannot reach since it only looks at a
+    word followed by `(`.
     **A builtin's name plus a `_` or a digit is a *derived* name, not a misspelling**, and
     `is_probable_function_typo` refuses those outright. Its own doc already claimed the design
     avoided flagging `format_x` as a typo of `FORMAT` — by not loosening the distance threshold —
@@ -16821,10 +16853,15 @@ Re-introducing the anti-patterns these guard against is a regression:
   they are the shape to copy when there is no statement to probe. `ddl::trigger_names_are_schema_scoped`
   is a fact about each engine's *namespace* — whether a trigger name is unique per schema or per
   table — measured on all four servers rather than derived from `supports_change`, and
-  `intel::builtin_functions_are_authoritative` is a fact about whose builtin catalog `FUNCTIONS`
-  actually is. Neither has a capability to be computed from, so the compiler's exhaustiveness is
+  `intel::builtin_catalog` is a fact about which builtin catalog, if any, this app holds for an
+  engine. Neither has a capability to be computed from, so the compiler's exhaustiveness is
   the only thing that will make a fourth engine answer instead of inheriting whichever side a `==`
   left open — which is exactly what happened to the typo checker on PostgreSQL and SQLite.
+  `builtin_catalog` also shows the shape one step further on: it **returns the catalog**
+  (`Option<&'static [SqlFunction]>`) rather than sitting beside a bool, and the
+  `builtin_functions_are_authoritative` that did sit beside it was deleted — "is this app's list
+  authoritative here" and "which list" are one question, and answering it twice is two arms to keep
+  in step instead of one.
   **The rule has a gate now, and it is a ratchet rather than a ban.** `ui::engine_comparison_gate`
   scans both view crates' production source (`source_gate::crate_sources`, so `schemaic-app` is in
   it too) for `SqlDialect::` and holds each file to a **per-file budget with a written reason**,

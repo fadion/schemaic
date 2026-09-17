@@ -980,6 +980,565 @@ pub const FUNCTIONS: &[SqlFunction] = &[
     f("BIT_COUNT", "BIT_COUNT(n)", "Number of set bits"),
 ];
 
+/// The authoritative catalog of **SQLite** built-in functions, trusted by the
+/// typo checker on that dialect.
+///
+/// **Written lower-case**, the way SQLite's own documentation writes them, where
+/// [`FUNCTIONS`] is upper-case for MySQL's. Both comparisons are
+/// case-insensitive at either end, so the difference costs nothing and each
+/// catalog reads like the manual it came from.
+///
+/// **When in doubt, include.** The checker only speaks about a word that is a
+/// near miss of something *in* the catalog, so an omission costs at most a
+/// missed typo while a wrong inclusion costs nothing at all — but a name left
+/// out that a user really calls gets their correct SQL squiggled, which is the
+/// exact failure that switched this checker off for two engines.
+///
+/// **So the compile-time-optional families are listed even where this build does
+/// not have them.** `pragma_function_list` on the SQLite this workspace links
+/// reports neither the math functions (`SQLITE_ENABLE_MATH_FUNCTIONS` is off)
+/// nor `sqlite_offset`, and reports no table-valued function, so `json_each` and
+/// `json_tree` are absent from it too. All of them stay: a `.db` is a file that
+/// other tools open, and squiggling `sqrt(x)` — which is correct SQL almost
+/// everywhere — to describe a local build option would be the false positive
+/// this catalog exists to avoid. A build without one turns the call into a
+/// runtime error the engine reports properly, and says so far better than a
+/// "misspelled function" squiggle would.
+///
+/// The other direction is *not* a matter of taste, and
+/// `sqlite_catalog::every_function_the_engine_reports_is_in_the_catalog` holds
+/// it: a name the linked engine reports and this list omits is a false positive
+/// waiting for whoever types it. That test is how the extension families below
+/// (R-tree, FTS3/5) got here at all.
+///
+/// Rename-machinery functions (`sqlite_rename_*`) are the one deliberate
+/// omission: they are not callable API, and listing them would offer the
+/// near-miss test names no user should be nudged toward. The `->` and `->>`
+/// operators are skipped for the duller reason that the checker only ever looks
+/// at a word followed by `(`.
+pub const SQLITE_FUNCTIONS: &[SqlFunction] = &[
+    // ── Aggregate ────────────────────────────────────────────────────────────
+    f("avg", "avg(X)", "Mean of the non-NULL values in the group"),
+    f(
+        "count",
+        "count(X)",
+        "Count of non-NULL values (count(*) counts all rows)",
+    ),
+    f(
+        "group_concat",
+        "group_concat(X, sep)",
+        "Values joined by sep (a comma when omitted)",
+    ),
+    f(
+        "string_agg",
+        "string_agg(X, sep)",
+        "Values joined by sep — group_concat's two-argument alias",
+    ),
+    f("sum", "sum(X)", "Sum of the non-NULL values; NULL if none"),
+    f(
+        "total",
+        "total(X)",
+        "Sum as a float, returning 0.0 rather than NULL for an empty group",
+    ),
+    // ── Window ───────────────────────────────────────────────────────────────
+    f(
+        "row_number",
+        "row_number()",
+        "Position of the row within its partition",
+    ),
+    f("rank", "rank()", "Rank with gaps after ties"),
+    f("dense_rank", "dense_rank()", "Rank with no gaps after ties"),
+    f("percent_rank", "percent_rank()", "(rank - 1) / (rows - 1)"),
+    f(
+        "cume_dist",
+        "cume_dist()",
+        "Cumulative distribution of the row within its partition",
+    ),
+    f("ntile", "ntile(N)", "Partition split into N buckets"),
+    f("lag", "lag(X, offset, default)", "X from an earlier row"),
+    f("lead", "lead(X, offset, default)", "X from a later row"),
+    f(
+        "first_value",
+        "first_value(X)",
+        "X from the first row of the window frame",
+    ),
+    f(
+        "last_value",
+        "last_value(X)",
+        "X from the last row of the window frame",
+    ),
+    f(
+        "nth_value",
+        "nth_value(X, N)",
+        "X from the Nth row of the window frame",
+    ),
+    // ── String ───────────────────────────────────────────────────────────────
+    f("char", "char(X, ...)", "String of the given unicode points"),
+    f(
+        "concat",
+        "concat(X, ...)",
+        "Arguments joined, skipping NULLs",
+    ),
+    f(
+        "concat_ws",
+        "concat_ws(sep, X, ...)",
+        "Arguments joined by sep, skipping NULLs",
+    ),
+    f("format", "format(fmt, ...)", "printf-style formatting"),
+    f(
+        "glob",
+        "glob(pattern, X)",
+        "Unix glob match, case-sensitive",
+    ),
+    f("hex", "hex(X)", "Upper-case hex of the blob or string"),
+    f("instr", "instr(X, Y)", "1-based position of Y in X, else 0"),
+    f(
+        "length",
+        "length(X)",
+        "Characters in a string, bytes in a blob",
+    ),
+    f("like", "like(pattern, X, escape)", "LIKE match"),
+    f("likelihood", "likelihood(X, p)", "X, with a planner hint p"),
+    f("likely", "likely(X)", "X, hinting it is usually true"),
+    f("lower", "lower(X)", "ASCII-lower-cased copy"),
+    f(
+        "ltrim",
+        "ltrim(X, Y)",
+        "X with leading Y characters removed",
+    ),
+    f(
+        "octet_length",
+        "octet_length(X)",
+        "Bytes in X as it is stored",
+    ),
+    f("printf", "printf(fmt, ...)", "format()'s original name"),
+    f("quote", "quote(X)", "X as a literal safe to paste into SQL"),
+    f(
+        "replace",
+        "replace(X, Y, Z)",
+        "X with every Y replaced by Z",
+    ),
+    f(
+        "rtrim",
+        "rtrim(X, Y)",
+        "X with trailing Y characters removed",
+    ),
+    f("soundex", "soundex(X)", "Soundex code of X"),
+    f("substr", "substr(X, start, len)", "Substring of X"),
+    f("substring", "substring(X, start, len)", "substr's alias"),
+    f(
+        "trim",
+        "trim(X, Y)",
+        "X with leading and trailing Y removed",
+    ),
+    f("unhex", "unhex(X, ignore)", "Blob decoded from hex text"),
+    f("unicode", "unicode(X)", "Code point of X's first character"),
+    f("unlikely", "unlikely(X)", "X, hinting it is usually false"),
+    f("upper", "upper(X)", "ASCII-upper-cased copy"),
+    // ── Numeric ──────────────────────────────────────────────────────────────
+    f("abs", "abs(X)", "Absolute value"),
+    f("max", "max(X, ...)", "Largest argument, or group maximum"),
+    f("min", "min(X, ...)", "Smallest argument, or group minimum"),
+    f("random", "random()", "Pseudo-random 64-bit integer"),
+    f("randomblob", "randomblob(N)", "N pseudo-random bytes"),
+    f("round", "round(X, N)", "X rounded to N decimal places"),
+    f("sign", "sign(X)", "-1, 0 or 1 by the sign of X"),
+    f("zeroblob", "zeroblob(N)", "A blob of N zero bytes"),
+    // Math functions — SQLITE_ENABLE_MATH_FUNCTIONS, on in ordinary builds.
+    f("acos", "acos(X)", "Arc cosine, in radians"),
+    f("acosh", "acosh(X)", "Inverse hyperbolic cosine"),
+    f("asin", "asin(X)", "Arc sine, in radians"),
+    f("asinh", "asinh(X)", "Inverse hyperbolic sine"),
+    f("atan", "atan(X)", "Arc tangent, in radians"),
+    f("atan2", "atan2(Y, X)", "Arc tangent of Y/X, in radians"),
+    f("atanh", "atanh(X)", "Inverse hyperbolic tangent"),
+    f("ceil", "ceil(X)", "Smallest integer not less than X"),
+    f("ceiling", "ceiling(X)", "ceil's alias"),
+    f("cos", "cos(X)", "Cosine of X radians"),
+    f("cosh", "cosh(X)", "Hyperbolic cosine"),
+    f("degrees", "degrees(X)", "X radians in degrees"),
+    f("exp", "exp(X)", "e raised to X"),
+    f("floor", "floor(X)", "Largest integer not greater than X"),
+    f("ln", "ln(X)", "Natural logarithm"),
+    f(
+        "log",
+        "log(B, X)",
+        "Logarithm of X to base B (base 10 if alone)",
+    ),
+    f("log10", "log10(X)", "Base-10 logarithm"),
+    f("log2", "log2(X)", "Base-2 logarithm"),
+    f("mod", "mod(X, Y)", "Remainder of X / Y, as floats"),
+    f("pi", "pi()", "The constant pi"),
+    f("pow", "pow(X, Y)", "X raised to Y"),
+    f("power", "power(X, Y)", "pow's alias"),
+    f("radians", "radians(X)", "X degrees in radians"),
+    f("sin", "sin(X)", "Sine of X radians"),
+    f("sinh", "sinh(X)", "Hyperbolic sine"),
+    f("sqrt", "sqrt(X)", "Square root"),
+    f("tan", "tan(X)", "Tangent of X radians"),
+    f("tanh", "tanh(X)", "Hyperbolic tangent"),
+    f("trunc", "trunc(X)", "X truncated toward zero"),
+    // ── Date and time ────────────────────────────────────────────────────────
+    f("date", "date(time, modifier, ...)", "Date as YYYY-MM-DD"),
+    f("time", "time(time, modifier, ...)", "Time as HH:MM:SS"),
+    f(
+        "datetime",
+        "datetime(time, modifier, ...)",
+        "Date and time as YYYY-MM-DD HH:MM:SS",
+    ),
+    f(
+        "julianday",
+        "julianday(time, modifier, ...)",
+        "Julian day number",
+    ),
+    f(
+        "unixepoch",
+        "unixepoch(time, modifier, ...)",
+        "Seconds since 1970-01-01",
+    ),
+    f(
+        "strftime",
+        "strftime(fmt, time, modifier, ...)",
+        "Date and time formatted by fmt",
+    ),
+    f(
+        "timediff",
+        "timediff(A, B)",
+        "A minus B, as a time interval",
+    ),
+    f("current_date", "current_date", "Today's date, in UTC"),
+    f("current_time", "current_time", "The time now, in UTC"),
+    f(
+        "current_timestamp",
+        "current_timestamp",
+        "The date and time now, in UTC",
+    ),
+    // ── Control flow and typing ──────────────────────────────────────────────
+    f("coalesce", "coalesce(X, Y, ...)", "First non-NULL argument"),
+    f("iif", "iif(cond, then, else)", "then when cond is true"),
+    f("if", "if(cond, then, else)", "iif's alias"),
+    f("ifnull", "ifnull(X, Y)", "X unless it is NULL, then Y"),
+    f("nullif", "nullif(X, Y)", "X unless it equals Y, then NULL"),
+    f("typeof", "typeof(X)", "X's storage class as text"),
+    // ── Database and session ─────────────────────────────────────────────────
+    f("changes", "changes()", "Rows changed by the last statement"),
+    f(
+        "total_changes",
+        "total_changes()",
+        "Rows changed since the connection opened",
+    ),
+    f(
+        "last_insert_rowid",
+        "last_insert_rowid()",
+        "Rowid of the most recent insert",
+    ),
+    f(
+        "load_extension",
+        "load_extension(path, entry)",
+        "Load an SQLite extension",
+    ),
+    f(
+        "sqlite_offset",
+        "sqlite_offset(X)",
+        "Byte offset of X's record",
+    ),
+    f(
+        "sqlite_source_id",
+        "sqlite_source_id()",
+        "Build's source id",
+    ),
+    f(
+        "sqlite_version",
+        "sqlite_version()",
+        "Library version string",
+    ),
+    f(
+        "sqlite_compileoption_get",
+        "sqlite_compileoption_get(N)",
+        "The Nth compile-time option",
+    ),
+    f(
+        "sqlite_compileoption_used",
+        "sqlite_compileoption_used(X)",
+        "Whether option X was compiled in",
+    ),
+    // ── JSON ─────────────────────────────────────────────────────────────────
+    f("json", "json(X)", "X minified and validated as JSON"),
+    f("jsonb", "jsonb(X)", "X as SQLite's binary JSON"),
+    f(
+        "json_array",
+        "json_array(X, ...)",
+        "A JSON array of the arguments",
+    ),
+    f(
+        "jsonb_array",
+        "jsonb_array(X, ...)",
+        "json_array as binary JSON",
+    ),
+    f(
+        "json_array_length",
+        "json_array_length(X, path)",
+        "Elements in the JSON array",
+    ),
+    f(
+        "json_error_position",
+        "json_error_position(X)",
+        "Character position of X's first JSON error",
+    ),
+    f(
+        "json_extract",
+        "json_extract(X, path, ...)",
+        "Value at each path",
+    ),
+    f(
+        "jsonb_extract",
+        "jsonb_extract(X, path, ...)",
+        "json_extract as binary JSON",
+    ),
+    f(
+        "json_insert",
+        "json_insert(X, path, value, ...)",
+        "X with values added where absent",
+    ),
+    f(
+        "jsonb_insert",
+        "jsonb_insert(X, path, value, ...)",
+        "json_insert as binary JSON",
+    ),
+    f(
+        "json_object",
+        "json_object(label, value, ...)",
+        "A JSON object of the pairs",
+    ),
+    f(
+        "jsonb_object",
+        "jsonb_object(label, value, ...)",
+        "json_object as binary JSON",
+    ),
+    f("json_patch", "json_patch(X, Y)", "X merged with patch Y"),
+    f(
+        "jsonb_patch",
+        "jsonb_patch(X, Y)",
+        "json_patch as binary JSON",
+    ),
+    f("json_pretty", "json_pretty(X)", "X indented for reading"),
+    f(
+        "json_quote",
+        "json_quote(X)",
+        "X as a JSON value, quoting if it is text",
+    ),
+    f(
+        "json_remove",
+        "json_remove(X, path, ...)",
+        "X with each path removed",
+    ),
+    f(
+        "jsonb_remove",
+        "jsonb_remove(X, path, ...)",
+        "json_remove as binary JSON",
+    ),
+    f(
+        "json_replace",
+        "json_replace(X, path, value, ...)",
+        "X with values replaced where present",
+    ),
+    f(
+        "jsonb_replace",
+        "jsonb_replace(X, path, value, ...)",
+        "json_replace as binary JSON",
+    ),
+    f(
+        "json_set",
+        "json_set(X, path, value, ...)",
+        "X with values set, present or not",
+    ),
+    f(
+        "jsonb_set",
+        "jsonb_set(X, path, value, ...)",
+        "json_set as binary JSON",
+    ),
+    f(
+        "json_type",
+        "json_type(X, path)",
+        "Type of the value at path",
+    ),
+    f(
+        "json_valid",
+        "json_valid(X, flags)",
+        "Whether X parses as JSON",
+    ),
+    f(
+        "json_group_array",
+        "json_group_array(X)",
+        "The group's values as a JSON array",
+    ),
+    f(
+        "jsonb_group_array",
+        "jsonb_group_array(X)",
+        "json_group_array as binary JSON",
+    ),
+    f(
+        "json_group_object",
+        "json_group_object(label, value)",
+        "The group's pairs as a JSON object",
+    ),
+    f(
+        "jsonb_group_object",
+        "jsonb_group_object(label, value)",
+        "json_group_object as binary JSON",
+    ),
+    f(
+        "json_each",
+        "json_each(X, path)",
+        "One row per element of X",
+    ),
+    f(
+        "json_tree",
+        "json_tree(X, path)",
+        "One row per element of X, recursively",
+    ),
+    f(
+        "json_array_insert",
+        "json_array_insert(X, path, value, ...)",
+        "X with values inserted into the array at each path",
+    ),
+    f(
+        "jsonb_array_insert",
+        "jsonb_array_insert(X, path, value, ...)",
+        "json_array_insert as binary JSON",
+    ),
+    // ── Full-text search (FTS3/5) ────────────────────────────────────────────
+    f(
+        "bm25",
+        "bm25(table, ...)",
+        "FTS5 relevance score for the row",
+    ),
+    f(
+        "highlight",
+        "highlight(table, col, open, close)",
+        "Column text with matches wrapped",
+    ),
+    f(
+        "snippet",
+        "snippet(table, col, open, close, ellipsis, tokens)",
+        "A short extract around the match",
+    ),
+    f(
+        "match",
+        "match(pattern, X)",
+        "The MATCH operator, as a call",
+    ),
+    f("fts5", "fts5(...)", "The FTS5 extension's entry point"),
+    f(
+        "fts5_source_id",
+        "fts5_source_id()",
+        "FTS5 build's source id",
+    ),
+    f(
+        "fts5_locale",
+        "fts5_locale(locale, text)",
+        "Text tagged with a locale for indexing",
+    ),
+    f(
+        "fts5_get_locale",
+        "fts5_get_locale(table, col)",
+        "The locale a row's column was indexed under",
+    ),
+    f(
+        "fts5_insttoken",
+        "fts5_insttoken(X)",
+        "Token instance marker for FTS5 queries",
+    ),
+    f(
+        "fts3_tokenizer",
+        "fts3_tokenizer(name, module)",
+        "Register or fetch an FTS3 tokenizer",
+    ),
+    f(
+        "matchinfo",
+        "matchinfo(table, fmt)",
+        "FTS3/4 match statistics as a blob",
+    ),
+    f(
+        "offsets",
+        "offsets(table)",
+        "FTS3/4 byte offsets of each match",
+    ),
+    f(
+        "optimize",
+        "optimize(table)",
+        "Merge an FTS3/4 index into one b-tree",
+    ),
+    // ── R-tree ───────────────────────────────────────────────────────────────
+    f(
+        "rtreecheck",
+        "rtreecheck(table)",
+        "Report inconsistencies in an R-tree index",
+    ),
+    f(
+        "rtreedepth",
+        "rtreedepth(X)",
+        "Depth of an R-tree node blob",
+    ),
+    f(
+        "rtreenode",
+        "rtreenode(dims, X)",
+        "An R-tree node blob rendered as text",
+    ),
+    // ── Introspection ────────────────────────────────────────────────────────
+    f(
+        "subtype",
+        "subtype(X)",
+        "X's subtype, for extension authors",
+    ),
+    f("unistr", "unistr(X)", "X with \\uXXXX escapes decoded"),
+    f(
+        "unistr_quote",
+        "unistr_quote(X)",
+        "X as a literal, escaping non-ASCII as \\uXXXX",
+    ),
+    f(
+        "sqlite_log",
+        "sqlite_log(code, message)",
+        "Write a message to SQLite's error log",
+    ),
+];
+
+/// The builtin catalog `dialect`'s engine actually has, or `None` where this app
+/// does not carry one.
+///
+/// **This is the capability, not a bool beside it.** Returning the catalog *is*
+/// answering "are this app's builtins authoritative here", so there is one arm
+/// per engine and one place to forget an engine rather than two. A separate
+/// `builtin_functions_are_authoritative` stood here and was deleted for saying
+/// the same thing a second time. `None` is not "no builtins" — PostgreSQL has
+/// some 2,900 — it is "this app cannot say", which is the distinction the
+/// checker needs.
+///
+/// The checker used to spend its `dialect` on `skip_noncode` and `is_sql_keyword`
+/// and never on the catalog questions, so on PostgreSQL it failed to recognise
+/// the engine's real functions *and* measured its distances against MySQL's:
+/// `btrim`, `to_number`, `make_date` and `make_time` are core builtins (verified
+/// on PG 16.15) and all four were squiggled as misspelled. Telling somebody that
+/// correct SQL is misspelled is worse than saying nothing, so the checker is off
+/// wherever the catalog would not be the engine's.
+///
+/// [`SQLITE_FUNCTIONS`] has since given SQLite an answer. **PostgreSQL still has
+/// none, and a hand-curated list is not the way to change that**: the checker
+/// speaks only about near misses of names it holds, so a partial catalog
+/// reintroduces exactly the original false positives for whatever it omits —
+/// `to_date` squiggled because `to_char` made the list. SQLite could be written
+/// out by hand because its builtins are a small closed set its own documentation
+/// enumerates; PostgreSQL's are not that, and the honest source for them is
+/// `pg_catalog` on a real server rather than anyone's memory.
+fn builtin_catalog(dialect: SqlDialect) -> Option<&'static [SqlFunction]> {
+    match dialect {
+        SqlDialect::MySql => Some(FUNCTIONS),
+        SqlDialect::Sqlite => Some(SQLITE_FUNCTIONS),
+        SqlDialect::Postgres => None,
+    }
+}
+
 /// The function names (upper-case), for the typo checker and keyword-set membership.
 pub fn function_names() -> impl Iterator<Item = &'static str> {
     FUNCTIONS.iter().map(|f| f.name)
@@ -4497,10 +5056,12 @@ fn typo_checks(
 
 /// Flag a word in **function-call position** (`word(`) that is a near-miss of a
 /// known builtin but isn't itself one — a probable typo like `COUTN(...)` for
-/// `COUNT(...)`. Conservative: the name must be within edit distance of an entry in
-/// the [`FUNCTIONS`] catalog, so user-defined functions and unlisted builtins pass
-/// through untouched; qualified calls (`pkg.func(`) and real schema identifiers are
-/// skipped too.
+/// `COUNT(...)`. Conservative: the name must be within edit distance of an entry
+/// in **whichever catalog [`builtin_catalog`] returns for this dialect** —
+/// [`FUNCTIONS`] on MySQL, [`SQLITE_FUNCTIONS`] on SQLite, and nothing at all on
+/// PostgreSQL, where the check does not run. So user-defined functions and
+/// unlisted builtins pass through untouched; qualified calls (`pkg.func(`) and
+/// real schema identifiers are skipped too.
 fn function_typo_checks(
     sql: &str,
     lo: usize,
@@ -4509,16 +5070,16 @@ fn function_typo_checks(
     dialect: SqlDialect,
     out: &mut Vec<Diagnostic>,
 ) {
-    // **Only where the catalog is this engine's** — see
-    // `builtin_functions_are_authoritative`. Measured against PG 16.15,
+    // **Only where the catalog is this engine's** — see `builtin_catalog`,
+    // which answers that by returning it. Measured against PG 16.15,
     // `btrim`, `to_number`, `make_date` and `make_time` are core builtins and
     // all four were squiggled "looks like a misspelled function" in a
     // PostgreSQL tab: the checker did not recognise the engine's own functions
     // *and* measured its distances against another engine's list. Telling
     // somebody that correct SQL is misspelled is worse than saying nothing.
-    if !builtin_functions_are_authoritative(dialect) {
+    let Some(builtins) = builtin_catalog(dialect) else {
         return;
-    }
+    };
     let b = sql.as_bytes();
     let mut i = lo;
     while i < hi {
@@ -4544,11 +5105,11 @@ fn function_typo_checks(
             let qualified = s > lo && b[s - 1] == b'.';
             if is_call
                 && !qualified
-                && !is_known_function(&lw)
+                && !is_known_function(builtins, &lw)
                 && !is_sql_keyword(word)
                 && !STMT_KEYWORDS.iter().any(|k| k.eq_ignore_ascii_case(word))
                 && !catalog.known_idents.contains(&lw)
-                && is_probable_function_typo(word)
+                && is_probable_function_typo(builtins, word)
             {
                 out.push(Diagnostic {
                     range: (s, j),
@@ -4563,36 +5124,12 @@ fn function_typo_checks(
     }
 }
 
-/// Case-insensitive membership in the builtin function catalog.
-fn is_known_function(word_lower: &str) -> bool {
-    function_names().any(|f| f.eq_ignore_ascii_case(word_lower))
-}
-
-/// Is [`FUNCTIONS`] the builtin catalog of `dialect`?
-///
-/// **MySQL and MariaDB only, and the table's own doc says so** — "the
-/// authoritative catalog of *MySQL/MariaDB* built-in functions". The typo
-/// checker spent its `dialect` on `skip_noncode` and `is_sql_keyword` and never
-/// on the two catalog questions, so on PostgreSQL it failed to recognise the
-/// engine's real functions *and* measured its distances against another
-/// engine's: `btrim`, `to_number`, `make_date` and `make_time` are core
-/// builtins (verified on PG 16.15) and all four were squiggled as misspelled.
-///
-/// So the checker is off where its catalog is not the engine's. That loses a
-/// nicety on two engines and stops the app calling correct SQL broken, which is
-/// the direction that matters. **Writing `PG_FUNCTIONS` / `SQLITE_FUNCTIONS` is
-/// what flips this to `true`** for them — a data task, and an incomplete list
-/// would reintroduce the same false positives for whatever it omits, so it is
-/// deliberately not attempted here.
-///
-/// An exhaustive `match`, like [`ops`](crate::sqlfmt) and `ident_quote`: a
-/// lexical or builtin table really is per dialect, and a fourth engine must be
-/// made to answer rather than inherit whichever side a `==` left open.
-fn builtin_functions_are_authoritative(dialect: SqlDialect) -> bool {
-    match dialect {
-        SqlDialect::MySql => true,
-        SqlDialect::Postgres | SqlDialect::Sqlite => false,
-    }
+/// Case-insensitive membership in `builtins`, the catalog of the dialect being
+/// checked — never in whichever catalog happened to be in scope.
+fn is_known_function(builtins: &[SqlFunction], word_lower: &str) -> bool {
+    builtins
+        .iter()
+        .any(|f| f.name.eq_ignore_ascii_case(word_lower))
 }
 
 /// Is `word` a near-miss of a known builtin function name? A near-miss is a small
@@ -4601,11 +5138,14 @@ fn builtin_functions_are_authoritative(dialect: SqlDialect) -> bool {
 /// Levenshtein but by far the most common typo, so it's matched explicitly rather
 /// than by loosening the distance threshold (which would flag names like
 /// `format_x` as a typo of `FORMAT`).
-fn is_probable_function_typo(word: &str) -> bool {
+fn is_probable_function_typo(builtins: &[SqlFunction], word: &str) -> bool {
     if word.len() < 4 {
         return false;
     }
     let up = word.to_ascii_uppercase();
+    // Both catalogs are compared upper-cased, so a catalog written the way its
+    // own engine writes it (SQLite's is lower-case) measures the same distances.
+    let names = || builtins.iter().map(|f| f.name.to_ascii_uppercase());
     // **A builtin's name plus a `_` or a digit is a *derived* name, not a
     // misspelling.** The doc above says the design avoids flagging `format_x`
     // as a typo of `FORMAT`; at length 8 the threshold is already 2, so it
@@ -4616,17 +5156,17 @@ fn is_probable_function_typo(word: &str) -> bool {
     // The separator is what keeps this narrow: a *letter* continuation is how a
     // real typo looks (`SUBSTRIN` is `SUBSTR` plus `IN`, and is a dropped `G`
     // from `SUBSTRING`), so those still get flagged.
-    if function_names().any(|f| {
+    if names().any(|f| {
         up.len() > f.len()
-            && up.starts_with(f)
+            && up.starts_with(&f)
             && matches!(up.as_bytes()[f.len()], b'_' | b'0'..=b'9')
     }) {
         return false;
     }
     let thresh = if word.len() >= 7 { 2 } else { 1 };
-    function_names().any(|f| {
+    names().any(|f| {
         let close = (f.len() as isize - up.len() as isize).unsigned_abs() <= thresh
-            && crate::sql::edit_distance(&up, f) <= thresh;
+            && crate::sql::edit_distance(&up, &f) <= thresh;
         close || is_adjacent_transposition(up.as_bytes(), f.as_bytes())
     })
 }
@@ -8736,7 +9276,7 @@ mod tests {
         // A builtin that used to be missing from the suggestion set is now present
         // and trusted by the typo checker.
         assert!(function_names().any(|f| f == "POWER"));
-        assert!(is_known_function("power"));
+        assert!(is_known_function(FUNCTIONS, "power"));
         // A comprehensive catalog.
         assert!(FUNCTIONS.len() > 150, "only {} functions", FUNCTIONS.len());
         // Each entry is well-formed: unique upper-case name, signature leads with the
@@ -9458,13 +9998,11 @@ mod tests {
             "SELECT make_date(2024, 1, 1) FROM employees",
             "SELECT make_time(1, 2, 3) FROM employees",
         ] {
-            for dialect in [SqlDialect::Postgres, SqlDialect::Sqlite] {
-                let d = diag_d(sql, dialect);
-                assert!(
-                    !d.iter().any(|x| x.message.contains("misspelled function")),
-                    "{sql} on {dialect:?}: {d:?}"
-                );
-            }
+            let d = diag_d(sql, SqlDialect::Postgres);
+            assert!(
+                !d.iter().any(|x| x.message.contains("misspelled function")),
+                "{sql} on Postgres: {d:?}"
+            );
         }
         // MySQL, where the catalog *is* the engine's, still catches a typo.
         assert!(
@@ -9472,6 +10010,170 @@ mod tests {
                 .iter()
                 .any(|x| x.message.contains("misspelled function"))
         );
+    }
+
+    /// **SQLite answers for its own functions**, which is what having a catalog
+    /// of them buys: `SQLITE_FUNCTIONS` exists, so
+    /// `builtin_functions_are_authoritative` says yes for that dialect and the
+    /// checker runs there.
+    ///
+    /// The four names above are *not* SQLite builtins, and two of them are near
+    /// misses of ones that are (`btrim` of `ltrim`, `to_number` of `typeof`
+    /// under the length-7 threshold). Flagging them in a SQLite tab is the
+    /// checker working, not the bug that switched it off: there the complaint
+    /// was that correct SQL was called misspelled, and `btrim(name)` in SQLite
+    /// is not correct SQL.
+    #[test]
+    fn sqlite_measures_against_its_own_catalog() {
+        // Its own builtins, across every family the catalog carries, pass.
+        for sql in [
+            "SELECT ifnull(name, 'x') FROM employees",
+            "SELECT group_concat(name, ',') FROM employees",
+            "SELECT strftime('%Y', hired) FROM employees",
+            "SELECT json_extract(doc, '$.a') FROM employees",
+            "SELECT row_number() OVER () FROM employees",
+            "SELECT randomblob(4) FROM employees",
+            "SELECT unixepoch() FROM employees",
+            "SELECT last_insert_rowid() FROM employees",
+        ] {
+            let d = diag_d(sql, SqlDialect::Sqlite);
+            assert!(
+                !d.iter().any(|x| x.message.contains("misspelled function")),
+                "{sql} on Sqlite: {d:?}"
+            );
+        }
+        // And a typo of one of them is caught, which is the whole point.
+        for sql in [
+            "SELECT ifnul(name, 'x') FROM employees",
+            "SELECT gruop_concat(name) FROM employees",
+            "SELECT strftmie('%Y', hired) FROM employees",
+        ] {
+            let d = diag_d(sql, SqlDialect::Sqlite);
+            assert!(
+                d.iter().any(|x| x.message.contains("misspelled function")),
+                "{sql} on Sqlite was not flagged: {d:?}"
+            );
+        }
+    }
+
+    /// **A MySQL builtin SQLite does not have is not in SQLite's catalog**, and
+    /// one SQLite does have is not missing from it.
+    ///
+    /// The guard against the obvious regression: pointing SQLite at `FUNCTIONS`
+    /// would satisfy the dialect plumbing while answering MySQL's question, and
+    /// so would a `SQLITE_FUNCTIONS` someone topped up from the MySQL list.
+    /// Asked of the catalog rather than through a diagnostic, because the
+    /// diagnostic additionally requires a near miss — see the test below for why
+    /// that is a separate property.
+    #[test]
+    fn a_mysql_builtin_is_not_a_sqlite_one() {
+        // `if` is *not* in this list, though it looks like it belongs: SQLite
+        // has `if()` as an alias of `iif()`, which `pragma_function_list`
+        // reports and the documentation does not lead with. Asking the engine is
+        // how that was settled — see `schemaic-db`'s `sqlite_catalog` tests.
+        for name in ["curdate", "ucase", "lcase", "now", "sha2"] {
+            assert!(
+                !is_known_function(SQLITE_FUNCTIONS, name),
+                "{name} is MySQL's, and SQLite's catalog claims it"
+            );
+        }
+        for name in ["ifnull", "strftime", "randomblob", "json_extract", "typeof"] {
+            assert!(
+                is_known_function(SQLITE_FUNCTIONS, name),
+                "{name} is SQLite's own and its catalog is missing it"
+            );
+        }
+    }
+
+    /// **An unknown name that resembles nothing is left alone**, on SQLite as on
+    /// MySQL.
+    ///
+    /// `curdate()` in a SQLite tab is an error the engine will report, and the
+    /// checker still says nothing about it: no builtin of SQLite's is within the
+    /// edit distance, so there is no correction to suggest and a bare "unknown"
+    /// squiggle would fire on every user-defined function too. The checker
+    /// proposes *corrections*, and declining to invent one is the conservatism
+    /// that makes it safe to have on at all.
+    #[test]
+    fn an_unknown_name_resembling_nothing_is_left_alone() {
+        for sql in [
+            "SELECT curdate() FROM employees",
+            "SELECT my_helper(name) FROM employees",
+        ] {
+            let d = diag_d(sql, SqlDialect::Sqlite);
+            assert!(
+                !d.iter().any(|x| x.message.contains("misspelled function")),
+                "{sql} on Sqlite: {d:?}"
+            );
+        }
+    }
+
+    /// The catalogs answer per dialect, and PostgreSQL still has none.
+    ///
+    /// Stated as its own test because the whole design rests on it: an engine
+    /// whose catalog the app does not have must keep the checker *off* rather
+    /// than inherit whichever list is nearest.
+    #[test]
+    fn only_the_engines_with_a_catalog_are_authoritative() {
+        // By content, not by pointer: a `const` is inlined at each use, so the
+        // two references to one catalog are two addresses.
+        let mysql = builtin_catalog(SqlDialect::MySql).expect("MySQL's catalog");
+        assert_eq!(mysql.len(), FUNCTIONS.len());
+        assert!(
+            is_known_function(mysql, "curdate"),
+            "MySQL's own is missing"
+        );
+        assert!(
+            !is_known_function(mysql, "strftime"),
+            "MySQL got SQLite's catalog"
+        );
+
+        let sqlite = builtin_catalog(SqlDialect::Sqlite).expect("SQLite's catalog");
+        assert_eq!(sqlite.len(), SQLITE_FUNCTIONS.len());
+        assert!(
+            is_known_function(sqlite, "strftime"),
+            "SQLite's own is missing"
+        );
+        assert!(
+            !is_known_function(sqlite, "curdate"),
+            "SQLite got MySQL's catalog"
+        );
+        assert!(
+            builtin_catalog(SqlDialect::Postgres).is_none(),
+            "PG_FUNCTIONS does not exist, so the checker must stay off there — \
+             see `builtin_catalog`"
+        );
+    }
+
+    /// The SQLite catalog is sane, on the same terms `FUNCTIONS` is held to.
+    #[test]
+    fn sqlite_function_catalog_is_sane() {
+        assert!(
+            SQLITE_FUNCTIONS.len() > 100,
+            "only {} entries — a short catalog is how false positives come back",
+            SQLITE_FUNCTIONS.len()
+        );
+        let mut seen = std::collections::HashSet::new();
+        for f in SQLITE_FUNCTIONS {
+            assert!(seen.insert(f.name), "duplicate entry {}", f.name);
+            // **Lower-case, unlike `FUNCTIONS`.** SQLite's own documentation
+            // writes them that way, and the comparison is case-insensitive at
+            // both ends, so the catalog reads like the engine's manual.
+            assert!(
+                f.name
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_'),
+                "{} is not written the way SQLite writes it",
+                f.name
+            );
+            assert!(
+                f.signature.starts_with(f.name),
+                "{}'s signature does not start with its name: {}",
+                f.name,
+                f.signature
+            );
+            assert!(!f.summary.is_empty(), "{} has no summary", f.name);
+        }
     }
 
     /// A builtin's name plus a `_` or a digit is a derived name, and
