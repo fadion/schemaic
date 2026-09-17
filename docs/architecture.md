@@ -2332,13 +2332,14 @@ existing prose was left alone.
     the ordinary in-database path — which is what `DdlScope` and `Db::run_server_ddl` are for.
     `DROP SCHEMA` is never `CASCADE`, the same call `DropObject` makes: cascading drops every
     table in the namespace, so the server is left to refuse and name what is still in there.
-    **Six account changes join them in not addressing `ChangeSet::table`** — `CreateAccount`,
-    `DropAccount`, `Grant`/`RevokePrivileges` and `Grant`/`RevokeRole`, the Users and privileges
+    **Seven account changes join them in not addressing `ChangeSet::table`** — `CreateAccount`,
+    `SetAccountPassword`, `DropAccount`, `Grant`/`RevokePrivileges` and `Grant`/`RevokeRole`, the
+    Users and privileges
     browser's write half — built by `ddl::account(subject, dialect, change)`, a sibling of
     `server_level` whose `subject` is the account's display name (`app@%`, or a bare role) and lands
     in `ChangeSet::table` only so the preview's title names what the plan is about; each change
     carries its own account. `is_account_change` groups them because every downstream question is
-    the same question for all six, and the load-bearing answer is that **they are not
+    the same question for all seven, and the load-bearing answer is that **they are not
     `is_server_level`**. An account belongs to the server, but the server-level route deliberately
     connects to no particular database, and a PostgreSQL `GRANT SELECT ON TABLE public.users` names
     an object in *one database's* catalogue — it would grant on whatever the maintenance database
@@ -2358,10 +2359,20 @@ existing prose was left alone.
     `ChangeSet::account_statements` emits them at the **end** of the plan, called from `emit_mysql`
     and `emit_postgres` beside `container_drops` and filtered on `supports_change` like its
     neighbours — a privilege is stated *on* something, so it comes after whatever the plan creates.
-    Within the group the order is **create → grant → revoke → drop**, the only one that composes: an
+    Within the group the order is **create → set password → grant → revoke → drop**, the only one
+    that composes: an
     account has to exist before it can be granted anything and has to still exist while it is.
     `an_account_is_created_before_it_is_granted_and_dropped_after` hand-builds the mixed set nothing
     produces yet, exactly as `a_container_is_created_first_and_dropped_last` does one level up.
+    `SetAccountPassword` is the **one `ALTER` on an account this module emits**, and it takes the
+    second slot because it names an account that already exists: nothing above it is a dependency,
+    so it sits there only to make a plan that does both read in the order the statements happen. It
+    is deliberately **not** in `risk_is_reversible`. Nothing is destroyed and the account keeps every
+    privilege, which is exactly what makes it read mild — but the old password cannot be recovered by
+    this app or by the server, so every client still configured with it is broken until each one is
+    found and changed by hand, and that is the sentence `risks` writes. Its `summary` names the
+    account through `Principal::display`, host included, because on MySQL `app@%` and `app@10.0.0.%`
+    are two accounts with two passwords and a line naming only `app` would not say which one moved.
     `summary`'s arms run their privilege list through `privilege_words`, which names them while
     there are three or fewer and counts them beyond: eighteen is a legal selection at MySQL's
     database level, and the summary is one line above Apply. An empty list reads **"no privileges",
@@ -2369,7 +2380,8 @@ existing prose was left alone.
     "1 Change", listed it, and showed an empty SQL box under a dimmed Apply: a change described with
     nothing behind it. The form's Apply asks `GrantDraft::is_ready` first, so this is reachable only
     by a caller that builds the change directly. `risks` speaks for `DropAccount`,
-    `RevokePrivileges`, `RevokeRole`, **`CreateAccount`** and — narrowly — `GrantPrivileges`, and
+    `RevokePrivileges`, `RevokeRole`, **`CreateAccount`**, `SetAccountPassword` and — narrowly —
+    `GrantPrivileges`, and
     the account drop's sentence says
     what is actually lost — **its privileges, not its data**, with no record of them left anywhere
     to put back — plus the surprise that anything still connected as it keeps running until it
@@ -2402,8 +2414,9 @@ existing prose was left alone.
     modal where that heading has to keep its meaning. It is here rather than in the view because it
     is a claim about the changes.
     **What leaves the preview is `ChangeSet::export_script`, and it carries no password.** A
-    `CREATE USER … IDENTIFIED BY 'hunter2'` is the one plan this app emits that holds a plaintext
-    credential, and both exits from the modal put it somewhere durable: *Open in editor* makes a
+    `CREATE USER … IDENTIFIED BY 'hunter2'` was the one plan this app emits that holds a plaintext
+    credential — `ALTER USER … IDENTIFIED BY` is the second — and both exits from the modal put it
+    somewhere durable: *Open in editor* makes a
     query tab whose text the next session save writes into `tabs.json` in the clear and restores on
     every launch, and *Copy* puts it on the OS clipboard, which on Windows persists in Clipboard
     History and cloud-syncs. Three doc sites asserted the opposite ("never persisted, never
@@ -2416,7 +2429,9 @@ existing prose was left alone.
     header on the script says the password is missing and what to replace. `without_secrets` is
     separate so the *decision* — which changes carry a secret — is a pure function with a test
     (`every_account_change_that_carries_a_password_is_scrubbed`), which a seventh such change has to
-    extend. The preview itself still renders `statements`, which is the statement that runs: a
+    extend — **and the seventh has since arrived and been caught by it**: `SetAccountPassword` went
+    in with its emitter and its fixture and without its arm here, and that test named the leaking
+    statement. The preview itself still renders `statements`, which is the statement that runs: a
     modal showing a blanked-out plan would not be showing the plan.
     `grant_change(draft, account)` is the last piece: the mapping from the grant form's Action and
     Subject dropdowns (two toggles when the test was named) to those four statements, out of the
@@ -2424,7 +2439,13 @@ existing prose was left alone.
     kind that ships backwards (`the_forms_two_toggles_choose_between_exactly_four_changes`).
     `every_account_change_the_engine_accepts_emits_a_statement` is a hand-written list, extended on
     purpose when a seventh arrives, and `an_account_change_sqlite_refuses_is_withheld_not_silent` is
-    the other side of it.
+    the other side of it. **What holds that list to the variants that exist is
+    `every_account_change_is_in_the_list_the_account_tests_walk`**, which counts discriminants rather
+    than trusting the fixture: hand-written means a new variant has to be added on purpose, and
+    nothing otherwise stops three tests passing over six while a seventh walks past them. It found
+    the literal still reading six when `SetAccountPassword` landed. The fixture for that arm carries
+    a real password where `CreateAccount`'s is blank, because `set_password_sql` refuses an empty one
+    — a blank fixture would emit nothing and read exactly like an arm nobody wrote.
     What actually varies for views moved down a level, into
     two narrower facts that are false on SQLite and only there. `supports_or_replace_view` — SQLite has no
     `CREATE OR REPLACE VIEW` in any form, so a redefinition there is a `DROP` plus a `CREATE`, the
@@ -3348,7 +3369,7 @@ existing prose was left alone.
     — extracted `pub` for this caller rather than having the aggregate compare headings as strings,
     which would agree with every set the day one is reworded. It only titles a non-empty
     `destructive()` list, so a create-only plan's heading is never read at all, and since
-    `Change::risk_is_reversible` is true of the three account changes alone, a compare plan with a
+    `Change::risk_is_reversible` is true of the four account changes alone, a compare plan with a
     risk block to head always reads "This can't be undone".
     **`summaries`, `destructive` and `unsupported` name the object on every line**, prefixing each
     with `schema.object` through the private `SchemaPlan::subject_of` — the three answers that are
@@ -4227,7 +4248,25 @@ existing prose was left alone.
     membership pair, and `AccountDraft` + `account_draft_sql` the `CREATE USER`/`CREATE ROLE` — a
     role takes no host and no password on either engine, and an empty password emits **no clause at
     all**, which is a real account on both (PostgreSQL's must authenticate some other way, MySQL's
-    has simply not been given one yet). `drop_account_sql` is the last, and like `DropDatabase` never
+    has simply not been given one yet). `PasswordReset` + `set_password_sql` are the `ALTER` beside
+    that pair, and `PasswordReset` is deliberately **not** a second use of `AccountDraft`: a draft
+    describes an account that does not exist yet and carries every field `CREATE` needs, while this
+    names one the browser listed and carries the single field that is changing — handing `CREATE`'s
+    shape to an `ALTER` is how a reset comes to reset the host as well. The statement is
+    `ALTER USER … IDENTIFIED BY` on MySQL and `ALTER ROLE … PASSWORD` on PostgreSQL, `ROLE` there for
+    a user too, since `ALTER USER` is an alias the manual keeps for compatibility and the browser's
+    own `GRANT` statements already read `ROLE` throughout. **An empty password returns `None` rather
+    than emitting**, which is the one place this parts company with the clause above:
+    `ALTER USER … IDENTIFIED BY ''` is a legal statement that sets a *blank* password, where
+    `CREATE`'s missing clause leaves one unset — a lock left open against a lock not yet fitted — so
+    a caller who wants that has `DropAccount` or the engine's own client. An empty account name is
+    refused on the same call, the backstop under the form's gate that `privilege_sql`'s empty list
+    is. `supports_password_reset(dialect, kind)` is the capability, *computed* as
+    `supports_users(dialect) && kind == PrincipalKind::User` rather than restated as a list of
+    engines: an engine with accounts has an `ALTER` for them, so the dialect half is a question
+    already answered and a fourth engine gets one answer instead of two, while the `kind` half is
+    real and not about the engine at all — a role takes no password on either, the same rule
+    `account_draft_sql` applies to `CREATE`. `drop_account_sql` is the last, and like `DropDatabase` never
     `IF EXISTS`: the account came off the browser's list, so one that isn't there means the list is
     stale and a drop that dropped nothing is about to be reported as a success.
     `GrantDraft` is the grant form's state, held here so the view holds none of it — `subject`
@@ -8780,11 +8819,23 @@ existing prose was left alone.
   `ScratchAccount::create_with_password` is the path and `Target::db_as` is the assertion: the server
   accepts `IDENTIFIED BY 'hun'` exactly as readily as `… BY 'hunter2***'`, so **only a login tells
   the two apart**, and the failure being guarded is an account that exists with a credential nobody
-  holds and no `ALTER USER` path in the app to repair it. A wrong password is asserted to be
+  holds — written when the app had no `ALTER USER` path to repair one, which it now has and which
+  the paragraph below covers. A wrong password is asserted to be
   *refused* beside it, or the login would pass on a server that accepts anything. The password
   carries `'`, `\` and `*` on purpose — the first two are `ddl_string`'s job (and MySQL's
   `NO_BACKSLASH_ESCAPES` is where that went wrong) and the third is the character the account
-  editor's mask is written in. The grant round trip reads its
+  editor's mask is written in.
+  **`a_reset_password_replaces_the_one_the_account_had` is the repair, and it is here because which
+  engine spells it which way is a claim only a server settles.** `ALTER USER … IDENTIFIED BY` and
+  `ALTER ROLE … PASSWORD` are two statements for one act, and MySQL's `ALTER ROLE` is about roles
+  rather than about a user's password — so the pair taken backwards parses on one engine and means
+  something else on the other. **It asserts both halves**: the new password is accepted *and* the old
+  one is then refused, because a server that ignored the statement entirely would pass a test that
+  only tried the new one, the account still being there and the new login the only thing a one-sided
+  test looks at. It reads the account back out of the catalogue before resetting
+  (`listed_principal`) — the distinction `a_created_role_is_one_the_server_accepts` was written for,
+  since MariaDB stores a host the draft does not and an `ALTER USER` naming the wrong one is an error
+  rather than a silent miss. Green on MariaDB, MySQL and PostgreSQL. The grant round trip reads its
   privilege **off `users::privileges_for`** rather than naming one, and that is the tier earning its
   keep: naming `SELECT` was the first version and PostgreSQL refused the plan, a database being an
   *object* there that carries only `CONNECT`, `CREATE` and `TEMPORARY` rather than a shorthand for
@@ -11486,7 +11537,7 @@ existing prose was left alone.
     - Both requests outlive a close, so each checks `overlay.properties` still holds the target it
       was asked about before writing.
   - `users_view.rs` — the **Users and privileges** browser (`users_overlay`), over `core::users`.
-    It lists the server's accounts, shows one account's privileges, and is where the four write
+    It lists the server's accounts, shows one account's privileges, and is where the five write
     actions are raised from — the forms themselves are `account_editor.rs`. Mounted in the
     workspace group beside `properties_overlay`/`erd_overlay`/`monitor_overlay` and counted by
     `workspace_modals_up`.
@@ -11604,14 +11655,22 @@ existing prose was left alone.
     **Each write action sits beside the thing it acts on**, not in the footer: `+ New account` at the
     foot of the list column, under the list it adds to rather than beside the box that searches it,
     so the column reads top to bottom as *find one, or make one*; and a `Privileges` /
-    `Drop` pair under the selected account's name. That pair is an `Option<AnyView>` the detail pane
+    `Reset password` / `Drop` row under the selected account's name. That row is an `Option<AnyView>`
+    the detail pane
     **extends its section list with**, never an `empty()` placeholder: the stack has a 16px gap and
     floem gaps an empty child like any other, so an absent actions row left a hole between the
-    account's name and its attributes — the trap `properties::stats_body` states. That pair sits in
-    **the modal's own `FocusRing`, at 12 and 13**: they built a `FocusRing::new()` of their own with
-    no focus root stepping it, so clicking one focused it and Tab then cycled the pair forever with
-    Escape the only way out. 1 and 2 would put them *before* the search field, so they take the two
-    stops after the list's last fixed one (11) and before the footer's `ACTION_TAB`. The footer's
+    account's name and its attributes — the trap `properties::stats_body` states. **Reset password is
+    absent on a role rather than dimmed**, the call every per-engine and per-kind affordance in this
+    crate makes: a role takes no password on either engine, so there is nothing there for a dimmed
+    button to promise, and the question is asked as `users::supports_password_reset` rather than as a
+    `dialect ==` — that one capability folds "does this engine have accounts" into the same answer.
+    The row sits in
+    **the modal's own `FocusRing`, at 12, 13 and 14**: they built a `FocusRing::new()` of their own
+    with no focus root stepping it, so clicking one focused it and Tab then cycled the pair forever
+    with Escape the only way out. 1 and 2 would put them *before* the search field, so they take the
+    stops after the list's last fixed one (11) and before the footer's `ACTION_TAB`. Reset password
+    took 13 and moved Drop to 14, so the Tab order follows the row and Drop stays last of the three
+    because it is the destructive one. The footer's
     actions are about the *modal* —
     re-read the server, copy what is shown, close it — and a Drop down there would sit one Tab from
     Close, which is the wrong pair of neighbours for an irreversible action. **Refresh is the way
@@ -12469,12 +12528,15 @@ existing prose was left alone.
     `ddl_preview::preview_container` is the one exit, and it reads that level off the change
     (`ddl::is_server_level`) rather than taking a caller's word for it.
   - `account_editor.rs` — the Users and privileges browser's **write half**: two overlays in one
-    module, `account_editor_overlay` (create an account) and `grant_editor_overlay` (grant or
+    module, `account_editor_overlay` (create an account, or reset one's password) and
+    `grant_editor_overlay` (grant or
     revoke), both raised from `users_view` and both ending at `ddl_preview::preview_account`, which
     is the third sibling of `preview_change`/`preview_container` and the only thing here that runs
     anything. Mounted in the modal layer's DDL group sharing `object_editor.rs`'s tuple element,
-    counted by `ddl_editors_up`, and on `PAINTS_A_BACKDROP` as one file with two overlays. The
-    read-only refusal is inside `open_for_new`/`open_for_grant` rather than at the button, the same
+    counted by `ddl_editors_up`, and on `PAINTS_A_BACKDROP` as one file with two overlays — **two
+    overlays behind three doors**, since the account form has two modes and an opener for each. The
+    read-only refusal is inside `open_for_new`/`open_for_reset`/`open_for_grant` rather than at the
+    button, the same
     rule `database_editor::open_for_new` follows: a launch guards itself in the step that launches
     it, and the browser's dimming is what *says* the action is unavailable.
     **A form's *address* comes from the browser that raised it, not from the connection switcher.**
@@ -12488,17 +12550,45 @@ existing prose was left alone.
     write action, Drop, was already spelled this way eight lines below. **`read_only` deliberately
     stays live**: it is the refusal, not the address — a connection marked read-only while the
     browser is open must stop the write it is about to authorise — and it is also the stamp
-    `read_only_door_gate` finds these two doors by. `account_editor::anchor_gate` holds both halves,
-    and it is a **source** gate because the decision is two struct literals inside `fn`s that take
+    `read_only_door_gate` finds this file's doors by. `account_editor::anchor_gate` holds both
+    halves,
+    and it is a **source** gate because the decision is struct literals inside `fn`s that take
     the whole `Ui`: building one in a test is 36 fields and 91 more transitively. What it can see
     mechanically is the spelling — `ctx.conn_id`/`ctx.dialect` must not appear in this file's
     production code, `conn_id: from.conn_id,` and `dialect: from.dialect,` must appear once per door,
     and `edit_ctx(ui)` must still be called at all, which is the floor that stops a rename leaving
-    nothing to look for. Scoped to this file on purpose: every other editor is launched from the
+    nothing to look for. **The door count is a `DOORS` constant, not a literal in each assertion**:
+    it went 2 → 3 when `open_for_reset` landed, both halves of the gate caught the new door, and a
+    fourth `open_for_*` raises the number in one place. **That third door was paid for rather than
+    added**: another `ui: &Ui` would have raised this file's `whole_ui_gate` budget, and the
+    ratchet's only legal direction is down, so `suggested_field` and the
+    `table_designer::suggest_chevron` it
+    wraps both narrowed from `&Ui` to `crate::OverlayUi` — the two `Copy` signals (`popup_menu`,
+    `popup_anchor`) are the whole of the chevron's interest in the bundle — across four call sites,
+    which is what takes `table_designer.rs`'s entry 33 → 32 in a change about accounts.
+    Scoped to this file on purpose: every other editor is launched from the
     schema tree, where the active connection *is* the target.
-    The account form **only ever creates** — the shape `database_editor` has and for the same
-    reasons: an account is dropped from its own row in the browser, and neither engine offers a
-    rename that is safe to perform. Its Kind picker comes first because it decides what the rest of
+    The account form **creates, or resets one account's password — and never renames** — near enough
+    the shape `database_editor` has and for the same reasons: an account is dropped from its own row
+    in the browser, and neither engine offers a
+    rename that is safe to perform. **Which of the two it means rides on `AccountTarget::resetting`**
+    (`Option<Principal>`), not on whether some field happens to be filled: `account_change(draft,
+    resetting)` reads the statement's *subject* from there, so a reset cannot rename or re-host the
+    account it is resetting even though the form seeds the draft's name and host in order to say
+    whose password it is — reading them back would do it silently, `ALTER USER 'b'@'%'` on an account
+    that does not exist being an error the preview would blame on the server. That mapping is
+    invisible in a rendered form, which is the kind that ships backwards, so
+    `account_change_tests::a_reset_names_the_target_rather_than_the_draft` and
+    `the_reset_the_form_builds_emits_the_alter_for_that_account` pin it — the second over the
+    composition rather than the function alone. A reset is **a second mode, not a second modal**: the
+    body is the account's name as static text plus the one password row, the title reads "Reset
+    password" (a form that will emit an `ALTER` under "Create account" being the one thing the title
+    may not do), readiness and the status line ask a different question per mode — a create needs a
+    name, a reset needs a non-empty password, because `set_password_sql` refuses a blank one and the
+    plan would otherwise come back empty and read as the app being broken — and `password_row` was
+    extracted so both modes wear the one `masked_edit_field`, which is why that widget is
+    `pub(crate)`.
+    In create mode its Kind picker comes first because it decides what the rest of
     the form means: a role takes no host and no password on either engine, so those fields **vanish
     rather than sitting there inert**, and Host is absent on PostgreSQL, which has no such thing at
     all. **The form holds a password, and nothing else in this crate does.** It is blanked on every
@@ -12515,7 +12605,9 @@ existing prose was left alone.
     Ctrl+A/Ctrl+C from the clipboard. That helper is `pub(crate)` precisely so there is one of them
     — a second masking widget is how the two come to disagree about the replay rule, which is the
     part that is easy to get subtly wrong, and it is the same widget that reaches
-    `CREATE USER … IDENTIFIED BY`.
+    `CREATE USER … IDENTIFIED BY` and `ALTER USER … IDENTIFIED BY`. **This form is why the replay has
+    to be exact rather than close**: the connection form's mangled password fails to connect and can
+    be retyped, while a mangled reset locks the account out of whatever was using it.
     **Every fixed-list choice in both forms is the app's `<select>`** — `settings::focusable_dropdown`,
     the control the settings modals wear, so the popup, the keyboard, the tinted current value and
     the chevron box are one implementation. Four rows moved onto it: the account form's **Kind**, and
@@ -17063,8 +17155,9 @@ Re-introducing the anti-patterns these guard against is a regression:
   **And it includes a script the user asked for a copy of.** The DDL preview's *Copy* and *Open in
   editor* both put their text somewhere durable — the OS clipboard, which on Windows persists in
   Clipboard History and cloud-syncs, and a query tab whose text the next session save writes into
-  `tabs.json` in the clear — so the one plan that carries a plaintext credential,
-  `CREATE USER … IDENTIFIED BY '…'`, was leaving through both while three doc sites said it was
+  `tabs.json` in the clear — so the plans that carry a plaintext credential,
+  `CREATE USER … IDENTIFIED BY '…'` and now `ALTER USER … IDENTIFIED BY '…'`, were leaving through
+  both while three doc sites said it was
   "never persisted, never logged". What goes out is `ChangeSet::export_script`, which re-emits from
   a set cloned with `ddl::PASSWORD_PLACEHOLDER` in each secret's place; the modal still *renders*
   the real statement, because a preview showing a blanked-out plan is not showing the plan.
@@ -17571,8 +17664,9 @@ Re-introducing the anti-patterns these guard against is a regression:
   defence in depth, and deliberately kept: it is here because this is the question every destructive
   launch asks, asked the same way everywhere, which is what stops the *next* opener — a palette
   entry, a toolbar button — from arriving without one.
-  **The Drop was the plainest instance of failing it**, and it is the one of that pane's three
+  **The Drop was the plainest instance of failing it**, and it is the one of that pane's write
   actions the rule bites on — its neighbours refuse read-only inside `open_for_new` /
+  `open_for_reset` /
   `open_for_grant`. Its launch read an `enabled` `bool` captured when the account row was *built*, so
   the disabled button was the whole guard, which is verbatim what this rule forbids. It asks
   `accept_launch` at the click **and again inside the `Confirm`'s `resolve`** — the deferred half
@@ -17620,11 +17714,13 @@ Re-introducing the anti-patterns these guard against is a regression:
   `ddl_preview::PlanTarget`s, which capture the context a Drop-container menu fired in so the
   confirmation cannot be answered against a connection the user switched to meanwhile; the refusal
   on that stamp is `preview_container`'s and there is no door there to guard.
-  **`account_editor`'s two doors keep `read_only: ctx.read_only,` even though their `conn_id` and
+  **`account_editor`'s doors keep `read_only: ctx.read_only,` even though their `conn_id` and
   `dialect` no longer come from `ctx`** — the flag is the refusal, not the address, and it has to
   follow a connection marked read-only while the browser is open. `anchor_gate` asserts the same two
-  lines from the other side, because the fix that moved their address moved the lines this gate
-  finds them by.
+  lines from the other side, counting them against its own `DOORS`, because the fix that moved their
+  address moved the lines this gate finds them by. There are three of them now: `open_for_reset` is
+  the sixteenth door in the crate and arrived with the refusal already written, which is the shape
+  the campaign above exists to make ordinary.
 - **No floem `Dropdown` — every `<select>` in the app drops the app's own menu.** A control that
   offers a fixed list is built with `settings::in_ring_picker` (or one of its two thin wrappers,
   `focusable_dropdown` and `table_designer::focusable_owned_dropdown`); nothing constructs a

@@ -9207,7 +9207,7 @@ pub fn supports_change(dialect: SqlDialect, change: &Change) -> bool {
             return false;
         }
         // **And the level, for the two changes that carry one.** This arm used
-        // to answer for all six variants on "does this engine have accounts",
+        // to answer for all seven variants on "does this engine have accounts",
         // which made `unsupported()` blind to the one thing accounts can ask an
         // engine for and not get: `GRANT … ON *.* ` has no PostgreSQL grammar
         // and `ON SCHEMA` has no MySQL one. Blind meant no INCOMPLETE header,
@@ -9218,6 +9218,19 @@ pub fn supports_change(dialect: SqlDialect, change: &Change) -> bool {
         return match change {
             Change::GrantPrivileges(c) | Change::RevokePrivileges(c) => {
                 crate::users::levels_for(dialect).contains(&c.level.kind())
+            }
+            // **And the kind, for the one change that is about a password.** A
+            // role has none on either engine, so a reset of one is not a thing
+            // this engine can be asked for — the same shape as the level above,
+            // one field along. Left to `set_password_sql` returning `None` it
+            // degraded to exactly what the comment above describes: no
+            // INCOMPLETE header, `apply`'s withheld guard silent, and Apply
+            // enabled over a plan that then emitted nothing at all. The browser
+            // never offers it and `open_for_reset` refuses it, so this is the
+            // third gate rather than the only one — which is why it is here and
+            // not left to the two above it.
+            Change::SetAccountPassword(r) => {
+                crate::users::supports_password_reset(dialect, r.account.kind)
             }
             _ => true,
         };
@@ -22306,6 +22319,47 @@ mod database_tests {
         // right side to count from. It caught the seventh,
         // `SetAccountPassword`, on the way in.
         assert_eq!(listed.len(), 7);
+    }
+
+    /// **And a password the engine has not got either.** A role takes none on
+    /// either engine, so `supports_change` has to say so — left to
+    /// `set_password_sql` returning `None`, a reset of a role reached
+    /// `account_statements` as "supported", emitted nothing, and produced a plan
+    /// with Apply enabled over no statements and no INCOMPLETE header to say
+    /// why. That is the degraded shape the level arm beside it was written to
+    /// stop, one field along.
+    #[test]
+    fn a_reset_of_a_role_is_withheld_rather_than_emitting_nothing() {
+        let mut role = an_account();
+        role.kind = crate::users::PrincipalKind::Role;
+        let change = Change::SetAccountPassword(Box::new(crate::users::PasswordReset {
+            account: role,
+            password: "hunter2".into(),
+        }));
+        for d in [MySql, Postgres] {
+            assert!(
+                !supports_change(d, &change),
+                "{d:?}: a role has no password to reset"
+            );
+            let cs = account("app", d, change.clone());
+            assert!(cs.emit().is_empty(), "{d:?}");
+            assert!(
+                !cs.unsupported().is_empty(),
+                "{d:?}: withheld silently — the preview writes no INCOMPLETE \
+                 header and Apply stands over an empty plan"
+            );
+        }
+        // The user arm is unaffected: that is the case this whole path is for.
+        let user = Change::SetAccountPassword(Box::new(crate::users::PasswordReset {
+            account: an_account(),
+            password: "hunter2".into(),
+        }));
+        assert!(supports_change(MySql, &user));
+        assert_eq!(cs_len(MySql, user), 1);
+    }
+
+    fn cs_len(d: SqlDialect, change: Change) -> usize {
+        account("app", d, change).emit().len()
     }
 
     /// **`unsupported()` has to be able to withhold a level the engine has not

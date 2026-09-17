@@ -4391,10 +4391,12 @@ mod engine_comparison_gate {
 /// that opens it** — the `widgets::accept_launch` rule, applied to the launches
 /// that open a DDL form rather than to a button.
 ///
-/// **Fifteen doors across eight files** stamp `EditCtx::read_only` into the
-/// target they open. Three already refused (`account_editor`'s two and
+/// **Sixteen doors across eight files** stamp `EditCtx::read_only` into the
+/// target they open. Three already refused (`account_editor`'s first two and
 /// `database_editor`'s one, which is where the rule is stated in the
-/// imperative); the other twelve did not. Apply is refused on that stamp
+/// imperative); the other twelve did not, and the sixteenth —
+/// `account_editor::open_for_reset` — arrived with its refusal already written,
+/// which is what the campaign below exists to make ordinary. Apply is refused on that stamp
 /// downstream, so no write ever escaped. What did was the *door*: on a
 /// connection marked read-only the
 /// schema tree's double-click, its keyboard activation, Find-Anywhere, **Edit
@@ -4473,7 +4475,7 @@ mod read_only_door_gate {
         // finding nothing at all — the failure mode `crate_sources` guards
         // against for the whole family.
         assert!(
-            doors >= 15,
+            doors >= 16,
             "only {doors} editor doors found — is `{STAMP}` still the spelling?"
         );
         for (file, why) in EXEMPT {

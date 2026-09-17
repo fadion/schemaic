@@ -261,7 +261,7 @@ pub(crate) fn open_for_grant(ui: &Ui, from: &UsersTarget, database: &str, accoun
         // the address, and `WriteGate` reads it the same way. A connection
         // marked read-only while the browser is open must stop the write it is
         // about to authorise — which is also why it is still the stamp
-        // `read_only_door_gate` finds these two doors by.
+        // `read_only_door_gate` finds this file's doors by.
         conn_id: from.conn_id,
         database: database.to_string(),
         account: account.clone(),
