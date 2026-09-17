@@ -151,7 +151,12 @@ pub fn set_interval(rules: &mut Vec<IntervalRule>, conn_id: u64, secs: u64) {
 }
 
 /// Forget `conn_id`'s interval — the connection was deleted, and nothing keyed to
-/// it should outlive it (ids are reused).
+/// it should outlive it.
+///
+/// The reason used to be that ids are reused; they are not any more
+/// ([`crate::connection::Connection::next_id_after`]). What remains is the plain
+/// one: a rule keyed to a connection that is gone is a row nothing will read, in
+/// a file the user can open.
 pub fn clear_conn(rules: &mut Vec<IntervalRule>, conn_id: u64) {
     rules.retain(|r| r.conn_id != conn_id);
 }

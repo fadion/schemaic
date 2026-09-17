@@ -10058,20 +10058,25 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             // dropped on the floor and the only report was a `tracing::warn!`,
             // which a released GUI build discards — while the modal the user
             // just confirmed told them the keyring entries were unrecoverable.
-            // They are not: `next_id` is `max + 1`, so deleting the
-            // highest-numbered connection frees its id, and the next connection
-            // created takes it and hydrates the dead one's password, SSH
-            // password and key passphrase on the launch after that. The form
-            // shows a filled mask and the connection sends server A's
-            // credential to server B.
+            // They are not: an entry a `forget` could not reach outlives the
+            // connection, and the confirm has already said it would not.
+            //
+            // **What it no longer says is "avoid creating a new connection".**
+            // That advice was about id reuse — `next_id` was `max + 1`, so
+            // deleting the highest-numbered connection freed its id and the next
+            // one created inherited these very secrets. `next_id_after` floors
+            // that against `ConnectionsFile::highest_id`, which only rises, so
+            // there is no longer a way for the user to walk into it and no
+            // instruction to give them. What is left is the disclosure itself:
+            // the material is still at rest in the OS keyring, under an account
+            // nothing will read again.
             if !secrets::forget_connection(id) {
                 persist::queue_notice(
                     "Schemaic could not reach the OS keyring, so the deleted connection's \
                      stored password and SSH secrets are **still in it**.\n\
                      They will be removed the next time a connection is deleted or saved \
-                     while the keyring is reachable. Until then, avoid creating a new \
-                     connection: ids are reused, and a new one taking this id would be \
-                     given those secrets."
+                     while the keyring is reachable. No new connection can be given them \
+                     in the meantime — connection ids are never reused."
                         .to_string(),
                 );
             }
@@ -10084,15 +10089,23 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             );
             // The **live** session too, which the line above does not touch: it
             // clears the transcript on disk while a `claude` child goes on holding
-            // an MCP endpoint aimed at the server just deleted. `needs_respawn`
-            // usually covers this by the side door, since deleting the active
-            // connection moves `active_conn` and a different id always respawns —
-            // but not when the id is *recycled*. `next_id` is `max + 1`, so
-            // deleting the highest-numbered connection frees its id for the next
-            // one created; that connection becomes active under the same id, and
-            // with the settings unchanged nothing asks for a respawn. The
-            // assistant would answer about the deleted connection's server from a
-            // new connection's panel.
+            // an MCP endpoint aimed at the server just deleted.
+            //
+            // `needs_respawn` covers most of this by the side door, since deleting
+            // the active connection moves `active_conn` and a different id always
+            // respawns. It used to have a hole — `next_id` was `max + 1`, so
+            // deleting the highest-numbered connection freed its id, the next
+            // connection created became active under that same id, and with the
+            // settings unchanged nothing asked for a respawn, leaving the
+            // assistant answering about the deleted server from a new
+            // connection's panel. `next_id_after` closed that: an id is never
+            // handed out twice.
+            //
+            // **This stays regardless**, and is no weaker for the hole being
+            // gone: a session aimed at a server the user has just deleted must
+            // not outlive it, whatever id comes next. Relying on the side door
+            // would make the teardown depend on how ids happen to be allocated,
+            // which is exactly the coupling that produced the hole.
             let ours = ai_session
                 .borrow()
                 .as_ref()
@@ -10272,9 +10285,11 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             (save_db_colors)(persist::Saving::Erasing);
             db_favorites.update(|v| schemaic_core::favorite::clear_conn(v, id));
             (save_db_favorites)(persist::Saving::Erasing);
-            // Its poll interval too — connection ids are reused, and the next
-            // connection to take this one would inherit a choice nobody made for
-            // it. `save_ui` follows from the effect watching this store.
+            // Its poll interval too. Not because the id could come back —
+            // `next_id_after` sees to that — but because a rule keyed to a
+            // connection that is gone is a row nothing will ever read, in a file
+            // the user can open. `save_ui` follows from the effect watching this
+            // store.
             activity_intervals.update(|v| schemaic_core::activity::clear_conn(v, id));
             // Same rule for what it had put away with the eye. The flat set this
             // replaced could not do it at all, so a deleted connection's hidden

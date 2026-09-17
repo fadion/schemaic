@@ -1379,9 +1379,18 @@ existing prose was left alone.
     `every_format_is_covered_by_a_parity_test` partitions **by `is_text()`** — a seventh binary
     format defaulting to `true` lands in the text half and the census passes. The gate's needle was
     the predicate the defect was in. `every_variant_is_in_all` is the one that does not have that
-    shape: it derives the count from a `match` with one arm per variant, so a new variant fails to
-    compile until its author has put it in `ExportFormat::ALL` and moved the count, and it checks
-    `ALL` for duplicates as well — two of one format would make the sum agree for the wrong reason. **The filter is `clipboard_formats()`, not `.filter(|f|
+    shape — but it used to *be* that state rather than the guard against it: it summed `1` over `ALL`
+    and asserted the total was `6`, then asserted `ALL.len() == n`, which is `6 == 6` twice over,
+    both terms read off the same `[ExportFormat; 6]`. A seventh variant left out of `ALL` compiles
+    the moment the exhaustive `match`es have their arms, and the whole module goes on passing by not
+    looking at it. Nothing in the type system relates the enum to the array, so the check is **this
+    module's own source**: the variant names the enum declares against the names the `ALL` literal
+    lists, with both sides held to the real `ALL`'s length so a parser that stops matching fails
+    rather than comparing an empty set with an empty set. (Reading the repository's own source is the
+    sanctioned exception to the no-filesystem rule, and it is `doc_coverage.rs`'s shape for the same
+    kind of question.) It checks `ALL` for duplicates as well — two of one format would make the
+    counts agree for the wrong reason — while the sibling half, that a new variant must *answer*
+    `is_text` and `writes_incrementally` rather than defaulting to `true`, stays a compile error. **The filter is `clipboard_formats()`, not `.filter(|f|
     f.is_text())` written at the call site**: the predicate had a test and its application did not,
     so deleting the filter left the whole suite green and shipped an Excel entry that clears the
     clipboard. The composition is the part that can regress, so the composition is what has a name
@@ -1656,6 +1665,25 @@ existing prose was left alone.
     its own sentence — *its first JSON record is larger than the N MiB the preview reads* — rather
     than on corruption. Below the cap with nothing parsed it is still a short or broken file, and
     still reported as one.
+    **And saying so was still a dead end, which is why that case is a variant rather than a
+    message.** `ImportError::PreviewRecordTooLarge { cap }` is not a read failure: the file is valid
+    and the whole-file walk reads it end to end — only the preview cannot be built from a prefix.
+    Spelled as a `Read(String)` it reached the modal through the same channel as "this file is
+    corrupt", the sample stayed `None`, and Next is gated on the sample, so a valid JSON file whose
+    first record holds one long text or base64 column could not be imported **at all**.
+    `read_json_columns` is the answer: it reads that first record alone, unbounded in bytes and
+    bounded in memory, deserializing every value as `serde::de::IgnoredAny` — which parses and
+    discards without allocating, so a two-gigabyte record costs its key names — and hands back the
+    keys with no rows. The mapping step needs a column list and nothing else to be usable. `Sample`
+    carries `values_withheld` to say that is what happened, a flag rather than an inference from
+    `rows.is_empty()`, because a file with a header and no records has exactly that shape and the two
+    deserve different notes. **`probe_sample(open, format, cfg, limit)` is the composition**, and it
+    lives in core rather than in the probe's closure for the usual reason: neither half was wrong —
+    `read_sample` correctly refuses to invent a preview and the modal correctly gates Next on having
+    one — and a decision written into a view closure is a decision no test can reach, which is how it
+    stayed that way. It reopens the file (the first reader is spent by then, and the failure is not
+    knowable until it has been) and falls back for that one variant only; a truncated or malformed
+    file still fails, on the same bytes, through the second reader.
     **Excel is the third format, and a workbook is a file with several tables in it.**
     `infer_format` takes `xlsx`/`xlsm` and deliberately **not** `.xls`/`.xlsb` — different formats
     this reader cannot open, where guessing would trade a clear "unsupported file" for a parse error
@@ -2149,7 +2177,14 @@ existing prose was left alone.
     `order_status_v2` is not a hit — and deliberately **not** through `intel::code_word_hits_in`,
     because a sequence's name lives inside a string literal in that default, which is precisely what
     a code mask hides. An internal sequence is skipped: it comes back with its column, so it is not
-    missing. The names are qualified unconditionally, unlike `display_name`, since *where* the
+    missing. **So is one this file emits a local twin of** — an unqualified mention resolves through
+    the search path, so a `sales` table whose column is typed `status` was reporting `archive.status`
+    missing while the file itself emits `CREATE TYPE sales.status`. The suppression is per *kind*,
+    never across all three: a sequence named `status` must not silence a real dependency on an enum
+    of that name, those being separate catalogues in PostgreSQL. A **qualified** mention is
+    definitive and suppresses nothing — `archive.status`, or a `nextval('archive.status_seq')`, names
+    that object and no other whatever else the file creates.
+    The names are qualified unconditionally, unlike `display_name`, since *where* the
     missing object lives is the whole point of the sentence and `public` — the namespace
     `display_name` drops as the default — is the case this is usually about.
     **That block is gated on `opts.structure`, because the sentence is about the structure section.**
@@ -4648,8 +4683,12 @@ existing prose was left alone.
     complete the twelve server-only rows DataGrip just handed over; `dedupe` collapses repeats
     *after* that, keeping the **first** description of a server, so the survivor is the one that
     already has the name a human chose — and **merging rather than discarding**, through `absorb`,
-    which takes from the dropped row whatever the survivor lacks (an empty password, an empty SSH
-    block, a `Tls` still at its default) and nothing else. It only discarded, on the strength of
+    which takes from the dropped row whatever the survivor lacks — an empty password, and the TLS
+    material below — and nothing else. There is deliberately **no `ssh` arm**: a tunnel is not a
+    field a source can merely be missing, it decides *which* machine `db.internal:5432` is, so two
+    rows differing in it are two connections and `same_endpoint` says so; moving one across gave the
+    survivor an SSH session to a jump host the user never configured for it, on every connect, with
+    no SSH column in the review list to show it. It only discarded, on the strength of
     `fill_missing_passwords` having run first, and that function's only matcher opens with
     `is_postgres`: there is no `~/.my.cnf` analogue, so on MySQL the source order did the *opposite*
     of the rationale `conn_sources::discover` states for it — a DBeaver row, whose passwords this
@@ -4657,6 +4696,22 @@ existing prose was left alone.
     tagged the survivor `ImportNote::NoPassword` with the password sitting in plaintext in a file
     the same scan had just read. Merging closes the class rather than that one file, and takes
     **only what the survivor lacks**, a later and worse row never overwriting a better one's value.
+    **TLS is the exception to "a field at a time", because the three paths are not independent
+    fields and merging them one by one builds a configuration neither source described.** The mode
+    merges by strength (`SslMode::stronger_of`, never an equality sentinel — that branch was once
+    guarded by `a.tls == Tls::default()` while `blank()` was floored at `Prefer`, so it was false for
+    every row this module produces and the merge simply never ran). Its material does not follow the
+    same rule. A `VerifyFull` row with an empty `ca_path` is not *missing* a CA — in every client
+    imported from here an absent path means the system trust store, the ordinary way to verify a
+    public certificate — so filling it from a weaker row pins the trust anchor to a CA that did not
+    issue the server's certificate, and **every** connect then fails with a verification error the
+    user has no way to trace back to an import they ran once. The CA crosses only onto an empty
+    `ca_path` and only while the survivor's own mode does not protect *strictly* more than the
+    absorbed row's (`SslMode::protects_more_than`): at that point the dropped row's verification is
+    at least as demanding, and its anchor is the one that belongs with it. The client certificate and
+    its key cross **as a unit** or not at all — taken a field at a time, a survivor holding a
+    certificate takes the other row's key and the handshake fails on a mismatched pair, a config that
+    existed in neither source.
     The dropped row's notes do not come across, being about a row that is gone; the one exception is
     `NoPassword`, retracted from a survivor that has just gained one. And `mark_existing` runs last, so a
     row that repeats a saved connection is shown with `ImportNote::AlreadySaved` and left unticked
@@ -4858,7 +4913,12 @@ existing prose was left alone.
     `verifies_hostname`) rather than matched at a call site, plus `stronger_of`, which is the rule
     for merging two descriptions of one connection and the direction an *import* must move
     (`conn_import` had a DBeaver SSL block silently clamping a URL's `verify-full` down to
-    `require`). `Tls::plan` collapses the five into the four decisions a handshake is made of —
+    `require`), and `protects_more_than`, the **strict** half of the same ladder. `stronger_of`
+    answers *which* mode wins and says nothing about whether there was a contest, and a merge needs
+    both: the winning mode, and whether the losing row's TLS material should travel with it — see
+    `conn_import`'s `absorb`. It lives on the type for `rung`'s reason, a caller spelling the
+    comparison out being the variant-matching this type exists to prevent, and ties are the case that
+    matters: a merge gated on it must let a tie through, which a `stronger_of(b) == self` would not. `Tls::plan` collapses the five into the four decisions a handshake is made of —
     `TlsPlan` — which is what `schemaic_db::tls` translates for the two drivers; `Prefer` alone
     carries `fallback_to_plaintext`, and `hostname_override` is what keeps a **tunnelled**
     `verify-full` checking the far end's certificate instead of `127.0.0.1`. The `SslModeRaw` shim
@@ -5380,7 +5440,24 @@ existing prose was left alone.
     is a parameter rather than a `clear_*_backup` per file; `save_json_erasing` is the public entry,
     and the erasing callers are the history panel's trash, one history row removed from its menu, a
     deleted connection's history, chats and snippets, the AI panel's New chat, one snippet deleted
-    from the snippet panel, and the connection delete itself. `persist_chat` takes a `Saving`, so the
+    from the snippet panel, and the connection delete itself. **`write_json_store(file, value,
+    saving)` is the third entry point beside the two fixed-verb ones**, and it exists because some
+    stores are written by a single shared closure that both a menu upsert and the connection delete
+    reach: the colour, favourite, formatter and `ui_state` savers are `Rc<dyn Fn(persist::Saving)>`,
+    and neither `save_json` nor `save_json_erasing` can serve a closure whose verb is the caller's.
+    It is the same `write_json` with the argument passed through rather than written in, not a third
+    policy. The alternative — the closure deciding for itself — is how those stores came to keep a
+    deleted connection's databases, tables and columns in their `.bak` siblings under a confirm
+    saying they could not be recovered. **The connection delete erases *all* of its stores now**; it
+    erased four and the other five were ordinary saves, so `ui_state.json.bak` kept the deleted
+    connection's expanded tree and hidden databases, `db_colors.json.bak` and `favorites.json.bak`
+    its databases and tables, `format.json.bak` its columns, and `diagrams.json.bak` its ER-diagram
+    layout — three of them named in `Saving`'s own doc as having exactly this property. The four
+    that were right were the four whose save already took a `Saving`; the five that were wrong were
+    the five written by a shared `Fn()` with nowhere to say it. `Ui::save_formats`, `save_db_colors`,
+    `save_db_favorites` and the app's `save_ui` take one, and the delete closure's own gate asserts a
+    floor of nine erasing saves in it.
+    `persist_chat` takes a `Saving`, so the
     caller says whether a turn finished or a transcript was replaced with nothing; `main.rs`'s
     `save_snippets` closure is `Rc<dyn Fn(persist::Saving)>` for the same reason; and
     `persist::save_connections` takes one, with `app::secrets::save_connections` and `persist_conns`
@@ -5390,6 +5467,23 @@ existing prose was left alone.
     the removed row's host, port, user, database and SSH coordinates (and, with no working keyring,
     its three plaintext secrets) land in `connections.json.bak` at the moment the user confirms a
     modal telling them the opposite.
+    **`ConnectionsFile::highest_id` is the other thing a delete leaves behind, and it is a
+    high-water mark that only rises.** `Connection::next_id` answers "past every id *in use*", whose
+    own doc explains that an id freed by a delete stays free "because whatever still refers to it
+    would otherwise be adopted by the next connection created" — true of a gap in the middle and
+    false at the top, where deleting the highest-numbered connection lowers the maximum and the very
+    next connection created takes the id just released. The id is the whole of the keyring account
+    string (`conn.{id}.password` and its three siblings), so that connection hydrates the dead one's
+    password, SSH password and key passphrase, shows a filled mask, and sends server A's credential
+    to server B. The delete path already asks the keyring to forget them and says so when it could
+    not — but a notice is a disclosure, not a barrier. `Connection::next_id_after(existing,
+    high_water)` is the barrier, and every mint site in `main.rs` takes it
+    (`every_minted_connection_id_is_past_the_high_water_mark` forbids the bare `next_id` there and
+    checks the mark is actually written). The field is `#[serde(default)]`, so a file written before
+    it reads `0` and the answer is exactly the old one — the guarantee begins at the first save
+    rather than being claimed for ids handed out before it existed — and the app seeds the signal to
+    at least the maximum in the file, so an older `connections.json` still cannot hand back an id
+    that is in use.
     **An absent primary is not a first run**, and treating it as one was silent data loss.
     `recover(primary, staged, backup)` returns the value *and* a `Recovered` — `Primary`,
     `FirstRun`, `Corrupt(err)` or `Restored(sibling)` — and an absent primary walks `.tmp` then
@@ -5783,6 +5877,20 @@ existing prose was left alone.
       and Fill were simply dead on such a table. `clip_cell` keeps newlines where `summary::clip`
       flattens them, these values going into a JSON string where a newline escapes to one token
       rather than breaking a line-oriented list.
+      **Clipping the cell narrowed that class and did not close it, because the size is a product of
+      three terms and it bounded one.** The app samples twenty whole rows and every column of each
+      goes in, so 20 × C × 201 crosses `arg_limit()` — 30,000 UTF-16 units on Windows — at roughly
+      **eight** long-text columns, which an ordinary `articles` or `audit_log` table reaches; the
+      third term is the DDL, spliced whole, and a wide table with a comment on every column is
+      thousands of characters before a row is sampled. So the two aggregates are bounded as well:
+      `SEED_SAMPLE_CHARS` (10,000) is what the sampled rows may take *all together* and
+      `SEED_DDL_CHARS` (12,000) what the table's definition may. `fitting_rows` keeps as many
+      **trailing** rows as fit — trailing because the section says "most recent last" and those are
+      what the model is asked to imitate — and keeps **whole** rows, the block being fenced JSON
+      where half an object is not an example of the shape to emit; a single row that does not fit
+      alone yields none, with the dropped count saying so. `clip_ddl` says so out loud when it bites,
+      for `schema_section`'s reason: a model handed a truncated `CREATE TABLE` with no note reads it
+      as the whole table and omits the columns it cannot see rather than inventing them.
     - `propose.rs` — the AI's proposed table change, as a **patch**: `Proposal`/`ProposedOp`
       deserialize the model's JSON (`{"add_column": {…}}`, externally tagged, `deny_unknown_fields`
       so an invented key fails loudly instead of being dropped), and `apply` lays the ops over
@@ -6362,6 +6470,16 @@ existing prose was left alone.
     variable across `WSLENV` with `/u` and never `/p`** — `/p` is the flag for a value needing
     Win→WSL path translation, and by the time a WSL config is built there is deliberately no such
     value left to translate.
+    `tunnelled_verify_blocker` is its sibling for the other transport a CLI session cannot express.
+    The app's own connect path rewrites the endpoint to `127.0.0.1:<local>` and carries
+    `hostname_override: Some(conn.host)` in the same step; the CLI builders take that rewritten
+    `Connection` with its `tls` block untouched, and neither client has an equivalent — `mysql` has
+    no hostname-override option and `psql` would need the `PGHOST`/`PGHOSTADDR` split — so the client
+    was told to dial the loopback and check the certificate against it, and refused its own server's
+    certificate. Only the two verifying rungs ask: `require` and below name no certificate, so the
+    loopback address *is* the address and nothing is compared. A refusal rather than a silent drop to
+    `require`, which would open a session that says TLS and checks nothing on a connection whose
+    whole point is that it checks — the direction `SslMode::STRICTEST` already sends a guess.
   - **Small persisted / UI-state models**, each a flat `Vec` keyed by `conn_id` and each pure +
     tested (they share `history.rs`'s shape; a new one belongs here, not in the UI):
     - `search_history.rs` — recent Find-Anywhere targets (`MAX_PER_CONN`, newest-first, deduped).
@@ -14074,9 +14192,21 @@ existing prose was left alone.
     `L+130` and does not, and the footer settles at `… Read only Commit` — a lone commit action with
     no pill saying a transaction is open and no Rollback beside it. It is *stable* rather than a
     flicker, because once Commit is drawn the pill re-predicts `L+187` and still does not fit.
-    `footer_seg_may_return(width, shown, left_shown)` is the missing term: `collapsing_seg` takes its
-    left neighbour's shown-flag and publishes its own, so a segment may return only while everything
-    to its left already has, and the hidden set stays a suffix.
+    `footer_seg_may_return(measured, shown, left_shown)` is the missing term: `collapsing_seg` takes
+    its left neighbour's shown-flag and publishes its own, so a segment may return only while
+    everything to its left already has, and the hidden set stays a suffix.
+    **`measured` is a signal of its own, and it replaced `width > 0.0`, which conflated two states.**
+    A zero width means either that floem has never laid the segment out — it returns before the
+    resize and move listeners for a hidden view, so one hidden from the start never is — or that it
+    was measured and is **empty**, which the Tx pill, Commit and Rollback are the moment a
+    transaction commits and `mode_seg` is on a SQLite connection. Only the first has no edge to
+    predict; the second *is* an edge, at `x + 0`. Conflating them froze the second out for the
+    session: it kept the stale, non-fitting edge it held while it had width, `width > 0.0` then
+    locked its `shown` flag false, and because the flags chain left-to-right every segment to its
+    right was blocked behind it — commit a transaction, narrow the window until CPU and RAM go, widen
+    it again, and they never came back. Both geometry handlers share one body,
+    `footer_seg_settled_edge(measured, shown, x, w, prev)`, so `on_move` and `on_resize` cannot
+    answer differently about which of the two `prev`-keeping cases they are in.
     `the_prediction_agrees_with_the_measurement_it_causes` pins the anti-oscillation property for
     **one** segment in isolation, which is the limit worth knowing about it: with two or more hidden
     segments sharing a `left_edge`, the prediction agrees with the measurement only for whichever
@@ -14501,9 +14631,14 @@ existing prose was left alone.
   since `ai_send` replays the conversation into the next session's prompt. `delete_conn_now` drops
   the live AI session too, and not merely for symmetry: it already cleared the *saved* transcript,
   but the running `claude` child survived, and while deleting the active connection usually moves
-  `active_conn` and so respawns by the side door, `next_id` is `max + 1` — deleting the
-  highest-numbered connection frees its id for the next one created, which becomes active under the
-  same id with settings unchanged, and nothing asks for a respawn.
+  `active_conn` and so respawns by the side door, that door had a hole: `next_id` was `max + 1`, so
+  deleting the highest-numbered connection freed its id for the next one created, which became
+  active under the same id with settings unchanged, and nothing asked for a respawn.
+  `Connection::next_id_after` has since closed the hole — an id is never handed out twice — and the
+  drop stays regardless, and is no weaker for it. A session aimed at a server the user has just
+  deleted must not outlive it whatever id comes next, and leaving that to the side door would make
+  the teardown depend on how ids happen to be allocated, which is the coupling that produced the
+  hole in the first place.
   **Pointing the panel at a connection is `reset_ai_panel`, and it is one closure because
   `active_conn` moves in two places and only one of them did it.** It drops the live session, clears
   the staged attachment (rows belong to the connection they were taken from), swaps in the
@@ -15439,10 +15574,32 @@ existing prose was left alone.
     process still running, **refuse**; another process gone, or its pid reissued to something with
     a different start time, take it. Declining to claim is safe either way, because the startup
     sweep clears the full tool set for a crashed owner. What a session got is `Claimed`, three
-    states rather than a bool: `Mine(claim)` cleans up on teardown, `Shared` registers and grants
-    anyway — both are idempotent upserts of the same state and this session needs the tools — but
-    **withdraws nothing on the way out**, the owner still being the owner, and `Refused` installs
-    nothing at all.
+    states rather than a bool: `Mine(claim)` cleans up on teardown, `Shared` gets **no tools** and
+    withdraws nothing on the way out, and `Refused` installs nothing at all. `Shared` used to
+    register and grant anyway, on the premise that "both are idempotent upserts of the same state" —
+    false for the registration, `agy mcp add` being an upsert of the **one machine-global** entry
+    whose `--endpoint-file` names *that window's* connection. The second window repointed the shared
+    registration at its own endpoint, the first window's next `agy` respawn read the registry and
+    began answering questions about connection A by querying connection **B** with B's credentials,
+    and when B's session ended `AiSession::drop` removed B's endpoint file, leaving the registration
+    naming a file that is gone. A registration that names one endpoint file cannot serve two
+    connections, so the second window says it has no database tools rather than quietly taking the
+    first one's.
+    **And the claim is read back, because the write is atomic and the decision is not.** `may_claim`
+    reads the marker, `write_file_atomic` replaces it, and nothing holds the file between the two:
+    two windows starting an AI turn at the same moment both read "no live claim", both wrote, and
+    both returned `Mine` — both then running `agy mcp add` against the machine-global registration,
+    which is the hijack this marker exists to prevent, while `release` correctly declined to remove a
+    marker that was not its own so the loser withdrew nothing and the winner's grant outlived them
+    both. The rename is atomic, so exactly one marker survives, and the nonce says whose:
+    `claim_outcome(mine, settled)` answers `Mine` only when the claim on disk *is* this session's and
+    `Shared` otherwise, which is already the honest answer for a loser. It is split out of `claim`
+    so the decision has a test, everything around it being a filesystem and two processes. **What
+    this does not close**, stated rather than implied: two writes that both land before either
+    read-back still both see themselves, and the second rename orphans the first's marker — the
+    window is between one process's rename and its own next read rather than the whole of
+    `agy mcp add`. Closing it outright needs an `O_EXCL` create, which the takeover path (a marker
+    left by a dead process) cannot use.
     **The claim goes first and is released last, and the first half is what changed.** It used to be
     written *after* `agy mcp add` and after the grant, so from the instant the registration landed
     until the claim returned there was machine-global state that no marker accounted for, and another
@@ -15831,14 +15988,25 @@ existing prose was left alone.
     `rename`**, so the folder is untouched, and the modal asks. The list still reaches all three
     reporting arms as well — `export::files_note`/`files_cancel_note`/`files_failure_note` take it
     and `replaced_clause` renders it — because an approved run has still destroyed something worth
-    naming. **What they take is `core::dump::destroyed(&replaced, &published)`, not the census.** The
+    naming. **What they take is `core::dump::destroyed(&replaced, &published, &attempted)`, not the
+    census.** The
     census has to be read before the first rename or this export's own output contaminates it, but
     only the *finished* arm is reached with the loop complete, and the whole-plan list went verbatim
     to all three — so pressing Stop while the first table was still streaming reported *"Export
     cancelled — no file was finished, so nothing was written to out. 3 existing files were replaced:
     orders.csv, items.csv, users.csv."* Two flatly contradictory sentences, of which the false one is
     also the **only** disclosure that a folder export destroys anything, wrong in the direction that
-    sends a user looking for a backup they do not need.
+    sends a user looking for a backup they do not need. **`attempted` is the third argument because a
+    `.part` dies at the *start* of a table's attempt, not at its end**: the rename that publishes
+    `orders.csv` consumes `orders.csv.part`, so publishing is one way to destroy it — but the writer
+    truncates the fragment with `File::create` before it writes a byte, and both the cancel and the
+    failure arms then sweep it. A table whose retry was stopped or failed therefore destroyed the
+    fragment an earlier run had left, and nothing named it, `published` holding only the tables that
+    finished — so the one file `export_failure_note` had just taught the user to care about was the
+    one the report was silent about. `published` is a subset of `attempted`, so the published-sibling
+    rule is the same rule; it stays a term of its own because a published file is destroyed under its
+    *own* name as well as its fragment's. A fragment whose table the export never reached is still
+    sitting there and is still not named, which is unchanged.
     **The per-file resolution is `core::dump::dump_verdict` too, not a second copy of it.** Those
     five arms were written out again here and the copy diverged in the one arm the extraction exists
     to protect: `WriteEnd::Failed` carries the writer's own words, which already begin
@@ -16237,14 +16405,29 @@ Re-introducing the anti-patterns these guard against is a regression:
   without which the wrapper could pass by refusing everything).
   **A caller that has already started a state machine needs the refusal handed back, and that is
   `gate1_on_tab_answered` over `ConnGateElse`** — a `ConnGate` whose *second* action runs instead of
-  the first, and only when the gate has decided the connection is unreachable. `with_conn` is now
+  the first, and only when the gate has decided not to proceed. `with_conn` is now
   `with_conn_else` with a no-op refusal, so there is one gate and one "Not connected to X" message
   rather than two that can drift apart. What it is for: `open_plan` sets `PlanState::Running` and
   *then* calls the gated action, so a gate that refused silently left the query-plan modal rendering
   `loading_dots("Explaining")` for ever behind the error modal — dismissing the error left a modal
-  claiming work was in flight over a server that was down, and only Escape got out of it. Both
-  refusals come back as a `Refusal`: `NotConnected` from the gate, `TabMovedOn` from the pinning.
-  `plan_refused` turns either into the `PlanState::Failed` the modal can render, raising
+  claiming work was in flight over a server that was down, and only Escape got out of it. The
+  refusals come back as a `Refusal`, and there are **three**: `NotConnected` and `ConnectionChanged`
+  from the gate, `TabMovedOn` from the pinning. The second is its own variant because the sentence is
+  different and the old one was false — `ConnGateElse`'s refusal callback took no argument, so both
+  of the gate's answers arrived as `NotConnected` and the query-plan modal read "the server didn't
+  answer the health check" about a server that had answered perfectly well, for a connection the user
+  had simply left. The error modal already distinguished the two; the caller's own state machine did
+  not, which is why `ConnGateElse` hands the `Refusal` across the boundary rather than an
+  argument-less `Action`. The same distinction is `CheckAnswer`'s third answer one layer down.
+  **And a superseded check lets the action through on `ConnStatus::Connected`, not on "not down".**
+  `health_check_lets_through` re-reads the status so a check landing after a newer one has said the
+  server is up does not raise "Not connected" over a header reading Connected — but it asked
+  `!is_down()`, and `Unknown` is not down by design, covering "not checked yet" and "the tunnel is
+  still coming up". `check_conn_then`'s two early exits set exactly that status and answer
+  `Reachable(false)`: no such connection, and an SSH tunnel that is not up. So the override fired on
+  the answers it was least entitled to, the action ran against a connection with no tunnel, and the
+  user got the driver's raw connect error in place of the gate's sentence.
+  `plan_refused` turns any of them into the `PlanState::Failed` the modal can render, raising
   `run_moved_on` for the tab case as well so each channel is said once, and `plan_refusal_text`
   writes the two sentences — separate from the wiring because the words were never the defect,
   nobody calling them was. `run_plan`'s two arguments are carried as a `(String, bool)` pair so the
@@ -16296,10 +16479,24 @@ Re-introducing the anti-patterns these guard against is a regression:
   `ScriptRequest::approved` has, and for the same stated reason: *the guard being a step the
   launcher had to remember is how one `return` came to be all that stood between a read-only
   connection and a file.* The type covers the two fields; `main.rs`'s
-  `the_unguarded_run_has_only_its_two_stated_callers` covers what a type cannot — a *third* closure
-  calling the raw `run` with a bare `String`, which is exactly how `open_table_filtered` came to be
-  unguarded. `spawn_table_tab`'s own generated `table_query` `SELECT` goes through the mint too,
-  because a caller that happens to generate only reads is a property of the caller.
+  `the_unguarded_run_has_only_its_three_stated_callers` covers what a type cannot — a *fourth*
+  closure calling the raw `run` with a bare `String`, which is exactly how `open_table_filtered`
+  came to be unguarded. `spawn_table_tab`'s own generated `table_query` `SELECT` goes through the
+  mint too, because a caller that happens to generate only reads is a property of the caller.
+  **The third caller is the post-commit re-fetch, and it was the one the census could not see.** It
+  replays the tab's `base_sql` on the pinned connection after a grid commit, and its whole guard was
+  a `read_only_reason` filter followed by a bare `(run)(sql)` — a step the launcher had to remember,
+  which is the shape this invariant exists to forbid. It ends in a `RerunRequest` now, with the
+  filter kept in front of the mint because neither question implies the other: `read_only_reason` is
+  narrower on three axes (one statement, a read head this engine really has, no denied word, so a
+  `SELECT SLEEP(600)` or a second statement appended to the base is refused), while `OUTFILE` /
+  `DUMPFILE` are in `WRITE_KEYWORDS` and, outside MySQL, in no deny list — so the composition is
+  stronger than either half. The census that was meant to notice took lines beginning `run(`, and
+  this site spells its call `(run)(sql);`, which begins with `(`: the one caller not taking its SQL
+  from a request was the one caller the gate could not see, while the gate reported the class closed
+  at two. `raw_run_calls` is a token scan over whole calls — `(run)(` normalised to `run(`, a
+  preceding word byte, `.` or `:` marking some other function, parens balanced — so a call rustfmt
+  has wrapped is counted too.
   **Running a `.sql` script is the third such path, and it is refused the other way round.**
   `sql::script_verdict` gates `script.rs`'s runner. `run_verdict` takes the statements; a script has
   tens of thousands of them, arriving a block at a time, and *none of them read* at the moment the
@@ -16373,6 +16570,20 @@ Re-introducing the anti-patterns these guard against is a regression:
   fragments for the reason every source gate here assembles them — the test names both launch sites
   in its own prose, so a literal anchor matches there first, and that caught this one on its first
   run.
+  **Dimming the two doors was not the gate, though, and for a while it was the whole protection.**
+  Two disabled controls are what *says* the action is unavailable — the shape the destructive-launch
+  rule calls insufficient — and these two did not even ask the same question: the tree entry asks
+  `active_conn`, which is what the launch opens, while the terminal button asked the active *tab*'s
+  `conn_id` through `active_tab_read_only`, which answers "writable" when no tab matches it at all —
+  so with the terminal open and no tab on the active connection the button was lit over a connection
+  the app refuses a grid commit on. Both doors ask `active_conn` now, and
+  `open_db_cli` refuses at the launch regardless of either, on
+  `connection::read_only_of(cs, conn.id)` read live from
+  the connection it is about to open — `ddl_preview::apply`'s reason: the flag moves from the status
+  bar while a menu stands open — and spawns a message shell saying so rather than nothing.
+  `opening_the_database_cli_refuses_a_read_only_connection_at_the_launch` reads that closure's own
+  span and asserts both halves, because either alone is the bug: the launch has to refuse, and the
+  refusal has to be about the connection being launched.
 - **A row reaches the model only where `AiData` says it may, and the level is the connection's.**
   Every path that can put a cell value in a prompt — `run_query`, `describe_table`'s samples, the
   grid's attach-to-chat, AI Summary, AI Fill, AI Seed — is gated on
@@ -17056,7 +17267,17 @@ Re-introducing the anti-patterns these guard against is a regression:
   and `ROLLBACK` *succeeds* there while raising warning 1196. So no write path may discard a
   rollback's outcome (`let _ = conn.query_drop("ROLLBACK")` was the bug): roll back through
   `rollback()`, which reads `SHOW WARNINGS`, and append `core::model::Rollback::note()` to the
-  error. **A cancel is an exit like any other**: `Db::import_rows` used to `kill_query` and
+  error. **`Rollback` has three arms, and the third is there because two of them were one sentence.**
+  `Incomplete` is warning 1196 and nothing else — it is the only thing that licenses *"this table's
+  storage engine is not transactional, so the rows already written remain"*, which is a claim about
+  the engine. A `ROLLBACK` down a socket that is already gone establishes nothing of the kind: the
+  server had almost certainly rolled the transaction back itself when the connection dropped, so a
+  user told `Incomplete` went to audit an InnoDB table that was exactly as they left it. That route
+  and an unreadable `SHOW WARNINGS` are `Unknown` now, whose note says the rollback could not be
+  confirmed and the rows may or may not remain. The unreadable-warnings route was worse than
+  misdescribed — `unwrap_or_default()` turned a failed `SHOW WARNINGS` into an empty vector, no 1196
+  was found, and the write path promised a clean rollback on the strength of a query that did not
+  run, which `rollback`'s own doc had claimed otherwise about since it was written. **A cancel is an exit like any other**: `Db::import_rows` used to `kill_query` and
   disconnect, and the modal then said "the transaction rolled back, so nothing was written" —
   which on those engines is false, so the user re-ran the import and doubled ~250k rows. It rolls
   back on the same connection now and reports what that achieved, `DbError::Cancelled` meaning the
@@ -17196,6 +17417,16 @@ Re-introducing the anti-patterns these guard against is a regression:
   `only_the_plans_own_connection_is_asked`: a tab keeps the connection it was opened on, so another
   connection going read-only must not refuse this plan. Server Activity's kills were the second
   instance of the same shape and are written up under `activity_panel.rs`.
+  **The import modal was the third, and it had copied the guard without the sentence.** `run_import`
+  asks the live flag and `accept_launch` refuses the write — the dangerous half, and it is right —
+  but it refuses *silently*, so Import stayed lit, said nothing and did nothing: verbatim the failure
+  `plan_read_only`'s own doc records, on the modal that copied its guard. Three things, because the
+  defect is that they came apart: the enable term is `ready && !busy && !read_only`, the footer
+  carries the read-only note beside it, and the flag rides in the mapping step's `dyn_container`
+  **key** rather than being read in the builder, which is not a tracking scope.
+  `the_import_button_says_a_read_only_connection_rather_than_going_quiet` reads all three off the
+  source, all three living in view closures, and asserts the `accept_launch` call as well — a
+  disabled button is not what stops the write.
   **The Drop was the plainest instance of failing it**, and it is the one of that pane's three
   actions the rule bites on — its neighbours refuse read-only inside `open_for_new` /
   `open_for_grant`. Its launch read an `enabled` `bool` captured when the account row was *built*, so
@@ -17388,7 +17619,14 @@ Re-introducing the anti-patterns these guard against is a regression:
   refusal lands on the one arm `open_db_cli` already had for "no client found" (a message spawned in
   the terminal panel, and no engine badge) and none of them can be forgotten at a call site. Don't
   add a second gate in a caller, and don't spell one of these decisions inline: `open_url` spawns
-  whatever `launch::url_open_argv` hands it and decides nothing itself.
+  whatever `launch::url_open_argv` hands it and decides nothing itself. **`tunnelled_verify_blocker`
+  was the refusal that lived only in a caller's `if`**, and it is asked inside both
+  `mysql_shell_config` and `psql_shell_config` now, beside `wsl_tls_blocker`. `open_db_cli` still
+  asks it earlier, where the endpoint is rewritten, so a verifying tunnelled connection is told why
+  before it is told the tunnel is down — but the builder is the authority, because a second launch
+  path would compile with the check absent.
+  `both_cli_builders_refuse_a_tunnelled_verifying_connection_themselves` reads both builders' spans
+  for it.
 - **Every schema-search surface matches through one predicate.** The schema tree's filter box and
   the Find-Anywhere palette answer the same question over the same `DbSchema`, so they go through
   `schema::TableInfo::matches_search` (name or any column) and `schema::ObjectItem::matches_search`
@@ -17593,7 +17831,14 @@ Re-introducing the anti-patterns these guard against is a regression:
   since one of the two writing a different path is exactly the drift that matters and a presence
   test would pass on it. `Origin` and `Suite` are read out of `build-apt-repo.sh`
   (`ORIGIN="Schemaic"`, `SUITE="stable"`) and out of `packaging/repo/README.md`, which is the prose
-  telling users to pin `"Schemaic:stable"`.
+  telling users to pin `"Schemaic:stable"`. **`Components` and `Architectures` are the same class of
+  value one field further down the deb822 stanza**, and they had no guard at all: the index is laid
+  out under `dists/stable/<component>/binary-<arch>/`, so one side moving alone publishes an index at
+  a path the source lists do not ask for and `apt update` 404s on every machine that already has one.
+  Three places, deliberately — the stanza the user installs (`build-site.sh`), the builder that lays
+  the index out (`build-apt-repo.sh`'s `COMPONENT`/`ARCH`), and the checker that fetches it
+  (`verify-site.py`, which hard-codes `main/binary-amd64` and so would otherwise notice a mismatch
+  only as a missing file, and only if the *other* side moved).
   **The published key fingerprint is the last of these values, and the one the packaging README
   designates *the* independent channel** — "a fingerprint you can only check against the same server
   the key came from is not a check at all, and this repository's history is a channel that server
@@ -17610,8 +17855,16 @@ Re-introducing the anti-patterns these guard against is a regression:
   `exit` and the hand parser that hashes packet 0. Both answered with the genuine fingerprint,
   "Signing key verified" was printed, and then the **whole file** was installed: apt trusts every key
   in a `Signed-By` keyring, and `rpm --import` puts every block into the machine's *global* keyring,
-  where it validates packages from any repository, permanently, with no line of the uninstall
-  instructions removing it. `only_one_key` refuses a file holding more than one public key — `gpg`
+  where it validates packages from any repository, permanently — and not one of the three rpm
+  uninstall lines removed it, so somebody following them to the letter was left trusting a signing
+  key for software they had just removed. The debian route's line already removes `${KEYRING}`, a
+  file this script installed and nothing else uses; the rpm route has no such file, and its
+  instructions now end in `sudo rpm -e --allmatches gpg-pubkey-<id>`, the id derived from
+  `KEY_FINGERPRINT` (its last eight hex digits, lower-cased) rather than written out, so the two
+  cannot drift from the value CI already pins. Not on the `SCHEMAIC_NO_REPO` branch, which installs
+  through `rpm -i --nosignature` and never imports a key: a line that fails, on the branch where the
+  user is least able to tell whether that mattered. `only_one_key` refuses a file holding more than
+  one public key — `gpg`
   counts `^pub:` where it is present, and a new `count_public_key_packets` walks the packet stream
   where it is not, so the deb route's promise that a slim container needs no `gpg` still holds; a
   stream that does not walk cleanly to its end is a failure rather than a count, the whole point
@@ -18930,6 +19183,24 @@ Re-introducing the anti-patterns these guard against is a regression:
   every path that drops focus, floem's included; a counter answers the only question a deferred
   mover has — *is my hand-back still the latest word on the keyboard?* — and settles the race in
   both orders, which is the property the test pins.
+  **Every deferred hand-back to the editor must say which it is — claim, or stand down — and that is
+  a workspace gate now.** Focus is handed back a frame late in several places (the run menu, Ctrl+K
+  twice, the find close, the goto close and submit, the completion row's click) because the focus
+  floem takes is cleared during the frame's own dispatch, so asking for it back inside the handler is
+  undone by the frame that stole it. Deferring makes the request *land*; it does not make it *win*,
+  and two immediate timers queued in one pass are decided by whichever lands last. A **mover** — the
+  user did something whose whole point is that the editor ends up focused — calls `claim_keyboard`;
+  a **hand-back** reads the generation instead, through `keyboard_claim_unchanged` or, for the
+  tab-mount autofocus, `innermost_focus_root` (an overlay owns the keyboard while it is up). A block
+  that does neither wins or loses by timing. Two of the five siblings claimed and three did not,
+  which is the failure this is one gate rather than five notes about: a hand-back written without
+  looking at the other four. `source_gate::tests::a_deferred_editor_hand_back_claims_or_stands_down`
+  walks every `exec_after` in the workspace that holds a `request_focus()` on an `editor_view_id` and
+  fails on one that does neither, with a floor so it cannot pass by matching nothing. It is scoped to
+  the **editor's** id deliberately: the grid's keyboard home is the other side of the same protocol
+  and reads the generation rather than claiming it, and a picker's mount autofocus is a third
+  question — a rule wide enough for all three would have to be "or does something else", which is not
+  a rule.
   This is the durable form of what
   `set_menu_return` does for one case: fixing the sites one at a time is what produced the tree's
   cursor regression below.
@@ -20426,6 +20697,27 @@ this bundle's.
   one itself — passing `0` as the data index for a pending row, which is what `data_row` passes and
   for the same reason, there being no result row behind one and every consumer reading `pending`
   first.
+  **What the commit's landing clears is addressed by position and by key, and ✗ Discard is live
+  while the write is in flight.** `commit_grid` captures a `CommittedStaging` — the staged cell
+  keys, how many pending rows there were, the rows marked for deletion — and `drop_committed_staging`
+  drains exactly those when the write lands, because the app skips the re-run when the committed tab
+  is no longer active and then nothing else un-stages what was written (pressing Ctrl+Enter again
+  inserted the row a second time; a re-issued `DELETE` matched 0 rows and rolled the batch back).
+  Discard stays live deliberately — a write can sit on `innodb_lock_wait_timeout` for fifty seconds
+  and taking the user's only way out of that is worse — and it empties all three kinds, after which
+  *"the first `staged_new`"* names a different row: stage a row, commit, discard, stage another, and
+  the landing drained the row the user was still typing, with no error and no trace. The
+  key-addressed halves fail the same way, a re-edit of a committed cell carrying that cell's own key
+  and a re-staged deletion of row 5 still being row 5, so the guard is **one question asked once**:
+  `PanelView::staging_gen` is bumped wherever the trio is thrown away wholesale (Discard, and
+  `clear_staged` on a panel load), the commit snapshots it, and a landing whose generation has moved
+  clears nothing. It lives on `PanelView` rather than on `GridState` for the reason the trio does —
+  its one consumer is an async landing that may arrive after the grid it started in is gone, and a
+  signal created in the grid's scope would read "not mine" every time, which is the bug this exists
+  to fix. The splice arm puts the server's rows in either way (they are the server's, and the grid
+  should show them) and makes only the *staging* half conditional.
+  `drop_committed_staging` takes the four signals rather than a `GridState`, which cannot be built
+  in a test — exactly how this path came to have none.
 - **A column whose legal values are written down doesn't edit as text.** Booleans, `ENUM`s, `SET`s
   and dates get their own control, in the grid *and* in the row panel, over
   `core::celledit` + `core::date` (the rules) and `ui::cell_editors` (the widgets) — both of which
@@ -20948,7 +21240,7 @@ this bundle's.
   overlap: a 12-column result at the 200,000-row cap is 2,400,000 cells, so the count covers rows
   0..166,666 while a caret at row 100,000 covered 100,000..199,999 and then 0..66,666 — and a single
   match at row 80,000 was counted and could not be reached, Enter, next and prev all doing nothing
-  while the bar said there was a match. The mirror case reads `0/N+` with the caret sitting on the
+  while the bar said there was a match. The mirror case read `0/N+` with the caret sitting on the
   matched cell. The walk is over `0..budget` **itself** now — the count's window, exactly — starting
   at the caret within it and wrapping inside it, so a cell past the budget is neither counted nor
   jumped to, which is the agreement the paragraph above claims. `find_hits_within(cells, q, budget)`
@@ -20958,7 +21250,17 @@ this bundle's.
   split out of `grid_find` for the reason `find_hits` already is: the decision is testable without
   a live grid, and a budget nothing asserts is a constant nobody would miss. The cells themselves
   are read through `edit::GridCells::with_text`, which is what took two heap allocations per cell
-  off that walk. `grid_view` keeps at most one of
+  off that walk.
+  **`0` in that readout means two different things, and only one of them is `0`.** `find_pos`'
+  binary search answers `0` both when the caret is not on a match and when it is on one the
+  *collection* never reached, and the second is still reachable through the other budget:
+  `find_hits_within` also stops at `FIND_MAX_HITS`, while the jump's window is the cell budget alone,
+  so past 100,000 matches the caret can land — correctly, on a highlighted cell — beyond where
+  collection stopped, and the bar read `0/100000+` over a match the user can see. `find_readout`
+  renders that case as `–/N+`: a readout that admits it does not know is better than one
+  contradicting the grid beneath it. With `more` false the count is complete, `0` really does mean
+  "not on a match", and the familiar `0/N` is right.
+  `grid_view` keeps at most one of
   the two open, as the editor does with its own pair — in **both** directions: the exclusion
   tracked `goto_open` alone, so Ctrl+F over an open Go-to-row left both mounted on one anchor and
   you typed into the one you couldn't see. Go to row resolves through the pure
@@ -21065,7 +21367,15 @@ this bundle's.
       staging call and that `clone_rows` does not reach `add_cloned_rows` itself.
     - **Delete:** right-click **Delete row** or the **Del** key marks a real row (`gs.del_rows`) with a
       red wash; marking clears its staged edits. `build_deletes` keys each `RowDelete` by the table's
-      `key_cols` + original values.
+      `key_cols` + original values. **A *modified* Del is nobody's**, and that arm says so with
+      `m.is_empty()`: `grid_key` is not only the grid body's handler — the results strip hands it
+      every modified key it declines (`widgets::strip_defers` is `!mods.is_empty()` minus
+      ArrowLeft/ArrowRight/Escape) — so with the keyboard on a toolbar button **Ctrl+Delete staged a
+      row deletion**, and Shift+Enter opened the in-cell editor. Neither is a binding the strip
+      advertises, and before the strip began forwarding neither reached the grid at all. The
+      plain-Enter arm carries the same guard (the arm above it claims Ctrl), and
+      `the_staging_key_arms_refuse_a_modified_press` reads `grid_key`'s own span for both — a source
+      gate because the handler needs a `GridState`.
   Inserts/deletes change membership/order → those commits **full-re-run** the query (pure-UPDATE
   splices in place). A NOT-NULL-no-default omission or duplicate-key clone fails the transaction and
   surfaces the error — nothing half-applied.

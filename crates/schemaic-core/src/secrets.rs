@@ -454,7 +454,13 @@ impl Sanitized {
 
 /// Remove every stored secret for a deleted connection. Returns whether they are
 /// all definitely gone — `false` means at least one entry may still be in the
-/// keyring, which matters because connection ids are reused.
+/// keyring.
+///
+/// **That used to matter because ids were reused**, so a surviving entry would be
+/// handed to the next connection created;
+/// [`crate::connection::Connection::next_id_after`] closed that. It still
+/// matters, for the reason it would have anyway: the user confirmed a deletion
+/// that said the credential was unrecoverable, and it is still at rest.
 pub fn forget(id: u64, store: &dyn SecretStore) -> bool {
     let mut gone = true;
     for kind in SecretKind::ALL {
