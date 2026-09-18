@@ -481,6 +481,27 @@ existing prose was left alone.
     test the query that generated the file and fails on any name `PG_FUNCTIONS` lacks. It sits in the
     live tier rather than beside the catalog because its oracle is a *server*, where SQLite's is a
     linked library.
+    **MySQL/MariaDB's half is `live::mariadb_catalog`, and until it landed `FUNCTIONS` was the one
+    catalog of the three with no oracle at all** — SQLite's answers to the linked library,
+    PostgreSQL's to `pg_catalog`, and the list the two engines that ship most are checked against was
+    written from memory of the documentation with nothing behind it. It found **54** names MariaDB
+    10.11 really has and the list lacked, every one of them a squiggle under correct SQL on the
+    engine this app was built for first — the same class of bug that switched the checker off for
+    PostgreSQL, sitting unnoticed on the default engine rather than the newest one. `FUNCTIONS` grew
+    by **57** entries: those 54, plus three dynamic-column forms added so that family is listed whole
+    rather than half, half a family being worse for the completion popup than either all of it or
+    none. Three family sections are new — **Dynamic columns (MariaDB)**, **Oracle-mode variants
+    (MariaDB)** (`SUBSTR_ORACLE`, `DECODE_ORACLE`, `LPAD_ORACLE` …, callable in any `sql_mode`, which
+    is why the server reports them and the checker must not squiggle them) and **Replication &
+    cluster** (`MASTER_GTID_WAIT`, `BINLOG_GTID_POS`, the `WSREP_*` trio, `DECODE_HISTOGRAM`) — plus
+    a small **XML** one (`EXTRACTVALUE`, `UPDATEXML`).
+    **`FUNCTIONS` is one catalog for two engines and feeds autocomplete as well as the checker**, so
+    the cost of that is paid in the popup: `rank.rs` walks it whatever the engine, and a MySQL 8 tab
+    is now offered `NVL`, `SUBSTR_ORACLE` and the rest of MariaDB's own names. The shape is unchanged
+    and so is the open question — this made the list 57 names longer, not differently structured —
+    and the reverse allowance is deliberate for the same reason: the five names MySQL 8 has and
+    MariaDB never got stay listed rather than squiggling `UUID_TO_BIN` for the MySQL user who typed
+    it, which is what the test's `MYSQL_ONLY` is.
     **A builtin's name plus a `_` or a digit is a *derived* name, not a misspelling**, and
     `is_probable_function_typo` refuses those outright. Its own doc already claimed the design
     avoided flagging `format_x` as a typo of `FORMAT` — by not loosening the distance threshold —
@@ -8545,15 +8566,39 @@ existing prose was left alone.
   a capability instead of comparing a dialect. **MariaDB is a leg of its own**, not a MySQL
   stand-in: the divergences are in exactly what this crate reads, which is how a MySQL 8
   `CHECK_CLAUSE` escaping quirk once hid behind a MariaDB that returned runnable text.
-  **`pg_catalog.rs` is the one module outside the macro, and the one that names an engine.** It
-  holds `core::pg_builtins::PG_FUNCTIONS` to what the server under test reports — every name the
-  server has is in the catalog, the overhang is exactly the 24 grammar-only forms (`over_listing`),
-  and those 24 are really in the catalog (`the_grammar_forms_are_in_the_catalog`, so the allowance
-  cannot outlive what it was granted for). The tier's rule still stands and this is not a hole in
-  it: the subject here is one engine's *data file* rather than a claim about how the DB layer
-  behaves, and there is no version of "is PostgreSQL's builtin list complete" MariaDB could answer.
-  It carries its own `POSTGRES.enabled()` check, which is what the macro would otherwise have given
-  it.
+  **`pg_catalog.rs` and `mariadb_catalog.rs` are the two modules outside the macro, and the two that
+  name an engine.** `pg_catalog.rs` holds `core::pg_builtins::PG_FUNCTIONS` to what the server under
+  test reports — every name the server has is in the catalog, the overhang is exactly the 24
+  grammar-only forms (`over_listing`), and those 24 are really in the catalog
+  (`the_grammar_forms_are_in_the_catalog`, so the allowance cannot outlive what it was granted for).
+  The tier's rule still stands and this is not a hole in it: the subject of each is one engine's
+  *data file* rather than a claim about how the DB layer behaves, and there is no version of "is
+  PostgreSQL's builtin list complete" MariaDB could answer. Each carries its own `enabled()` check
+  for its own target, which is what the macro would otherwise have given it.
+  **`mariadb_catalog.rs` is that rule's second instance, for `intel::FUNCTIONS`** — the catalog the
+  checker trusts on MySQL and MariaDB, and the one that had no oracle of any kind until this module.
+  Its design point is **two server oracles rather than one plus a hand-written excuse**:
+  `information_schema.SQL_FUNCTIONS` (MariaDB 10.11+, 261 rows on 10.11.14) lists only the builtins
+  the parser resolves through its function-creator hash, so every builtin spelled as its own grammar
+  rule — `LEFT`, `IF`, `AVG`, `CURRENT_DATE`, the `COLUMN_*` dynamic-column forms — is absent from
+  it. Those turn out to be exactly MariaDB's *reserved words*, so `information_schema.KEYWORDS` (696
+  rows) accounts for them without anybody writing a list, and `over_listing` measures the catalog
+  against the **union** of the two views. That is the deliberate contrast with `pg_catalog`, whose
+  over-listing direction needs the hand-written `GRAMMAR_ONLY` and its 24 names: a list in a test
+  file is a second thing that has to be kept true, and here the server keeps it. Two small
+  hand-written lists do remain, each held by a test of its own. `MYSQL_ONLY` is the five names MySQL
+  8 has and MariaDB never got (`bin_to_uuid`, `is_uuid`, `json_storage_size`, `regexp_like`,
+  `uuid_to_bin`), carried because `FUNCTIONS` serves both engines, and
+  `the_mysql_only_names_are_in_the_catalog` keeps the excuse from outliving what it excuses.
+  `NOT_CALLABLE` is one name, `schemas`, which `SQL_FUNCTIONS` reports and the parser will not accept
+  as a call because it is the reserved word of `SHOW SCHEMAS` — a claim about the parser, so
+  `the_uncallable_name_is_still_uncallable` *executes* `SELECT schemas()` and requires a syntax
+  error, and requires the name absent from `FUNCTIONS` as well, so the completion popup cannot come
+  to offer something that will not parse. **MySQL is unguarded here, and that is stated rather than
+  left to be discovered**: MySQL has no `SQL_FUNCTIONS` (`mysql.func` holds loadable UDFs, not
+  builtins), so a builtin MySQL 8 added and MariaDB never got is held by nothing but those five known
+  names. Both oracles carry a row-count floor, for the reason the whole tier exists: an empty result
+  would pass the missing-name test having asserted nothing.
   **`endpoint.rs` is where a leg comes from**, and it is the whole environment contract: three
   `SCHEMAIC_IT_<ENGINE>_HOST`/`_PORT`/`_USER`/`_PASSWORD` groups with localhost defaults, plus
   `SCHEMAIC_IT_ENGINES` as the one way to run fewer than all three. An *unreachable* endpoint is a
@@ -9066,9 +9111,13 @@ existing prose was left alone.
   needed it yet: streaming a genuinely large export, and multi-schema PostgreSQL.
   **It is gated as a *target*, not at runtime.** The manifest declares the target
   `required-features = ["live-tests"]`, so `cargo test --workspace` does not build it and the pure
-  tier stays pure by construction. It is **306 tests** as this is written — 100 suite functions
-  expanded across the three legs by `main.rs`'s macro, plus the six that need no server (the four
-  name-guard cases, `endpoint.rs`'s declared-case count, and the skip-notice source gate) — and it
+  tier stays pure by construction. It is **352 tests** as this is written — 113 suite functions
+  expanded across the three legs by `main.rs`'s macro (339), the seven in the two catalog oracles
+  outside it (`pg_catalog`'s three and `mariadb_catalog`'s four), and the six that need no server
+  (the four name-guard cases, `endpoint.rs`'s declared-case count, and the skip-notice source gate).
+  The figure this sentence carried for a while was 306, a count that had never included the oracles
+  and went stale as the suite grew; `cargo test -p schemaic-db --features live-tests --test live --
+  --list` is where to re-derive it rather than adjust it by hand. It
   is reachable from this Windows environment again,
   which several fixes in the same range were measured against after being written blind. With the feature on, an unreachable server is a **failure** —
   a harness that noticed a missing endpoint and returned would report a green suite that asserted

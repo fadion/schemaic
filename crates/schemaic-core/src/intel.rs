@@ -218,6 +218,16 @@ pub(crate) const fn f(
 /// autocomplete and trusted by the typo checker. Grouped by family; each carries its
 /// parameter signature so the completion popup can show it. (Aggregate/window
 /// functions are included — they complete in value position like any other call.)
+///
+/// **`live::mariadb_catalog` is the oracle**, the way `sqlite_catalog` is
+/// [`SQLITE_FUNCTIONS`]' and `live::pg_catalog` is
+/// [`crate::pg_builtins::PG_FUNCTIONS`]'. It reads MariaDB's own
+/// `information_schema.SQL_FUNCTIONS` and `KEYWORDS` and fails on a name this
+/// list lacks. Until it was written this catalog had nothing behind it and was
+/// short by 54 names the engine really has — each one a squiggle under correct
+/// SQL. **Only MariaDB can answer**: MySQL ships no equivalent view, so a
+/// builtin MySQL 8 added and MariaDB never got is held by that test's
+/// `MYSQL_ONLY` list alone.
 pub const FUNCTIONS: &[SqlFunction] = &[
     // ── Aggregate ────────────────────────────────────────────────────────────
     f(
@@ -300,6 +310,21 @@ pub const FUNCTIONS: &[SqlFunction] = &[
         "NTH_VALUE(expr, n) OVER (...)",
         "Nth value in the window frame",
     ),
+    f(
+        "MEDIAN",
+        "MEDIAN(expr) OVER (...)",
+        "Middle value of the window (MariaDB)",
+    ),
+    f(
+        "PERCENTILE_CONT",
+        "PERCENTILE_CONT(p) WITHIN GROUP (ORDER BY expr) OVER (...)",
+        "Interpolated percentile (MariaDB)",
+    ),
+    f(
+        "PERCENTILE_DISC",
+        "PERCENTILE_DISC(p) WITHIN GROUP (ORDER BY expr) OVER (...)",
+        "Percentile as an actual value (MariaDB)",
+    ),
     // ── String ───────────────────────────────────────────────────────────────
     f(
         "ASCII",
@@ -323,6 +348,7 @@ pub const FUNCTIONS: &[SqlFunction] = &[
         "CHARACTER_LENGTH(str)",
         "Length of str in characters",
     ),
+    f("CHR", "CHR(n)", "One character for a code point (MariaDB)"),
     f("CONCAT", "CONCAT(str, ...)", "Concatenate strings"),
     f(
         "CONCAT_WS",
@@ -366,6 +392,11 @@ pub const FUNCTIONS: &[SqlFunction] = &[
     f("LEFT", "LEFT(str, len)", "Leftmost len characters"),
     f("LENGTH", "LENGTH(str)", "Length of str in bytes"),
     f(
+        "LENGTHB",
+        "LENGTHB(str)",
+        "Length of str in bytes, whatever the mode (MariaDB)",
+    ),
+    f(
         "LOCATE",
         "LOCATE(substr, str [, pos])",
         "Position of substr, optionally from pos",
@@ -386,6 +417,11 @@ pub const FUNCTIONS: &[SqlFunction] = &[
         "MID",
         "MID(str, pos, len)",
         "Substring (alias of SUBSTRING)",
+    ),
+    f(
+        "NATURAL_SORT_KEY",
+        "NATURAL_SORT_KEY(str)",
+        "Sort key that orders embedded numbers numerically (MariaDB)",
     ),
     f("OCT", "OCT(n)", "Octal string representation of n"),
     f(
@@ -438,6 +474,11 @@ pub const FUNCTIONS: &[SqlFunction] = &[
         "Right-pad str to len with pad",
     ),
     f("RTRIM", "RTRIM(str)", "Trim trailing spaces"),
+    f(
+        "SFORMAT",
+        "SFORMAT(format, arg, ...)",
+        "Format a string, fmtlib-style (MariaDB)",
+    ),
     f("SOUNDEX", "SOUNDEX(str)", "Soundex phonetic key"),
     f("SPACE", "SPACE(n)", "A string of n spaces"),
     f(
@@ -461,6 +502,11 @@ pub const FUNCTIONS: &[SqlFunction] = &[
         "Substring before the count-th delimiter",
     ),
     f("TO_BASE64", "TO_BASE64(str)", "Base-64 encode"),
+    f(
+        "TO_CHAR",
+        "TO_CHAR(expr [, format])",
+        "Format a date or number as a string (MariaDB)",
+    ),
     f(
         "TRIM",
         "TRIM([{BOTH|LEADING|TRAILING} [rem] FROM] str)",
@@ -490,6 +536,11 @@ pub const FUNCTIONS: &[SqlFunction] = &[
     f("COS", "COS(x)", "Cosine"),
     f("COT", "COT(x)", "Cotangent"),
     f("CRC32", "CRC32(str)", "Cyclic redundancy check value"),
+    f(
+        "CRC32C",
+        "CRC32C([par,] str)",
+        "CRC using the Castagnoli polynomial (MariaDB)",
+    ),
     f("DEGREES", "DEGREES(x)", "Radians to degrees"),
     f("EXP", "EXP(x)", "e raised to the power x"),
     f("FLOOR", "FLOOR(x)", "Largest integer <= x"),
@@ -529,6 +580,11 @@ pub const FUNCTIONS: &[SqlFunction] = &[
         "ADDTIME",
         "ADDTIME(expr1, expr2)",
         "Add two time/datetime values",
+    ),
+    f(
+        "ADD_MONTHS",
+        "ADD_MONTHS(date, months)",
+        "Add whole months, clamped to month end (MariaDB)",
     ),
     f(
         "CONVERT_TZ",
@@ -711,6 +767,16 @@ pub const FUNCTIONS: &[SqlFunction] = &[
         "NULL if the two are equal, else expr1",
     ),
     f(
+        "NVL",
+        "NVL(expr1, expr2)",
+        "expr1, or expr2 when expr1 is NULL (MariaDB)",
+    ),
+    f(
+        "NVL2",
+        "NVL2(expr, if_not_null, if_null)",
+        "Pick by whether expr is NULL (MariaDB)",
+    ),
+    f(
         "INTERVAL",
         "INTERVAL(n, n1, n2, ...)",
         "Index of the last value <= n",
@@ -744,6 +810,11 @@ pub const FUNCTIONS: &[SqlFunction] = &[
         "Insert into arrays at paths",
     ),
     f(
+        "JSON_COMPACT",
+        "JSON_COMPACT(json)",
+        "Re-print a document with no whitespace (MariaDB)",
+    ),
+    f(
         "JSON_CONTAINS",
         "JSON_CONTAINS(target, candidate [, path])",
         "Whether target contains candidate",
@@ -757,6 +828,21 @@ pub const FUNCTIONS: &[SqlFunction] = &[
         "JSON_DEPTH",
         "JSON_DEPTH(json)",
         "Maximum depth of a JSON document",
+    ),
+    f(
+        "JSON_DETAILED",
+        "JSON_DETAILED(json [, tab_size])",
+        "Re-print a document indented (MariaDB)",
+    ),
+    f(
+        "JSON_EQUALS",
+        "JSON_EQUALS(json1, json2)",
+        "Whether two documents are equal (MariaDB)",
+    ),
+    f(
+        "JSON_EXISTS",
+        "JSON_EXISTS(json, path)",
+        "Whether a path exists (MariaDB)",
     ),
     f(
         "JSON_EXTRACT",
@@ -779,6 +865,16 @@ pub const FUNCTIONS: &[SqlFunction] = &[
         "Number of elements",
     ),
     f(
+        "JSON_LOOSE",
+        "JSON_LOOSE(json)",
+        "Re-print a document with a space after each value (MariaDB)",
+    ),
+    f(
+        "JSON_MERGE",
+        "JSON_MERGE(json, ...)",
+        "Merge documents (deprecated; see JSON_MERGE_PRESERVE)",
+    ),
+    f(
         "JSON_MERGE_PATCH",
         "JSON_MERGE_PATCH(json, ...)",
         "RFC 7386 merge of documents",
@@ -799,6 +895,11 @@ pub const FUNCTIONS: &[SqlFunction] = &[
         "Aggregate pairs into a JSON object",
     ),
     f(
+        "JSON_NORMALIZE",
+        "JSON_NORMALIZE(json)",
+        "Canonical form, for comparing documents (MariaDB)",
+    ),
+    f(
         "JSON_OVERLAPS",
         "JSON_OVERLAPS(json1, json2)",
         "Whether two documents share elements",
@@ -807,6 +908,11 @@ pub const FUNCTIONS: &[SqlFunction] = &[
         "JSON_PRETTY",
         "JSON_PRETTY(json)",
         "Pretty-print a JSON document",
+    ),
+    f(
+        "JSON_QUERY",
+        "JSON_QUERY(json, path)",
+        "Object or array at a path (MariaDB)",
     ),
     f(
         "JSON_QUOTE",
@@ -843,6 +949,11 @@ pub const FUNCTIONS: &[SqlFunction] = &[
         "JSON_VALID",
         "JSON_VALID(val)",
         "Whether a value is valid JSON",
+    ),
+    f(
+        "JSON_VALUE",
+        "JSON_VALUE(json, path)",
+        "Scalar at a path, unquoted (MariaDB)",
     ),
     f(
         "JSON_STORAGE_SIZE",
@@ -903,6 +1014,41 @@ pub const FUNCTIONS: &[SqlFunction] = &[
     ),
     f("COMPRESS", "COMPRESS(str)", "Compress a string"),
     f(
+        "DES_ENCRYPT",
+        "DES_ENCRYPT(str [, key])",
+        "Triple-DES encrypt (deprecated)",
+    ),
+    f(
+        "DES_DECRYPT",
+        "DES_DECRYPT(crypt [, key])",
+        "Triple-DES decrypt (deprecated)",
+    ),
+    f(
+        "ENCODE",
+        "ENCODE(str, pass)",
+        "Encrypt with a password (deprecated)",
+    ),
+    f(
+        "DECODE",
+        "DECODE(crypt, pass)",
+        "Reverse ENCODE (deprecated; DECODE_ORACLE is the CASE-like one)",
+    ),
+    f(
+        "ENCRYPT",
+        "ENCRYPT(str [, salt])",
+        "Unix crypt(3) hash (deprecated)",
+    ),
+    f(
+        "PASSWORD",
+        "PASSWORD(str)",
+        "Hash in the authentication plugin's format",
+    ),
+    f(
+        "OLD_PASSWORD",
+        "OLD_PASSWORD(str)",
+        "Pre-4.1 password hash (deprecated)",
+    ),
+    f(
         "UNCOMPRESS",
         "UNCOMPRESS(str)",
         "Uncompress a compressed string",
@@ -923,6 +1069,11 @@ pub const FUNCTIONS: &[SqlFunction] = &[
     f("RANDOM_BYTES", "RANDOM_BYTES(len)", "len random bytes"),
     f("UUID", "UUID()", "A version-1 UUID string"),
     f("UUID_SHORT", "UUID_SHORT()", "A 64-bit unique integer"),
+    f(
+        "SYS_GUID",
+        "SYS_GUID()",
+        "A UUID with no separators (MariaDB)",
+    ),
     f(
         "UUID_TO_BIN",
         "UUID_TO_BIN(uuid [, swap_flag])",
@@ -970,6 +1121,11 @@ pub const FUNCTIONS: &[SqlFunction] = &[
         "Release a named advisory lock",
     ),
     f(
+        "RELEASE_ALL_LOCKS",
+        "RELEASE_ALL_LOCKS()",
+        "Release every lock this connection holds",
+    ),
+    f(
         "IS_FREE_LOCK",
         "IS_FREE_LOCK(name)",
         "Whether a named lock is free",
@@ -985,6 +1141,158 @@ pub const FUNCTIONS: &[SqlFunction] = &[
         "A column with the given name and value",
     ),
     f("BIT_COUNT", "BIT_COUNT(n)", "Number of set bits"),
+    f(
+        "LOAD_FILE",
+        "LOAD_FILE(path)",
+        "Contents of a file on the server",
+    ),
+    // ── XML ──────────────────────────────────────────────────────────────────
+    f(
+        "EXTRACTVALUE",
+        "EXTRACTVALUE(xml, xpath)",
+        "Text at an XPath expression",
+    ),
+    f(
+        "UPDATEXML",
+        "UPDATEXML(xml, xpath, replacement)",
+        "Replace the fragment an XPath selects",
+    ),
+    // ── Dynamic columns (MariaDB) ────────────────────────────────────────────
+    // Split down the middle by how MariaDB parses them, not by what they do: the
+    // four *readers* (`COLUMN_EXISTS`, `COLUMN_LIST`, `COLUMN_CHECK`,
+    // `COLUMN_JSON`) go through the parser's function-creator hash and so appear
+    // in `information_schema.SQL_FUNCTIONS`, while the four that build or alter a
+    // blob (`COLUMN_CREATE`, `COLUMN_ADD`, `COLUMN_DELETE`, `COLUMN_GET`) have
+    // their own grammar rules and reach the server's answer only through
+    // `information_schema.KEYWORDS`. `live::mariadb_catalog` reads that union, so
+    // both halves are guarded — they are listed together because half a family is
+    // worse for the completion popup than either all of it or none.
+    f(
+        "COLUMN_CREATE",
+        "COLUMN_CREATE(name, value [, ...])",
+        "Build a dynamic-column blob",
+    ),
+    f(
+        "COLUMN_ADD",
+        "COLUMN_ADD(blob, name, value [, ...])",
+        "Add or replace dynamic columns",
+    ),
+    f(
+        "COLUMN_DELETE",
+        "COLUMN_DELETE(blob, name [, ...])",
+        "Remove dynamic columns",
+    ),
+    f(
+        "COLUMN_GET",
+        "COLUMN_GET(blob, name AS type)",
+        "Read one dynamic column",
+    ),
+    f(
+        "COLUMN_EXISTS",
+        "COLUMN_EXISTS(blob, name)",
+        "Whether a dynamic column is present",
+    ),
+    f(
+        "COLUMN_LIST",
+        "COLUMN_LIST(blob)",
+        "Comma-separated dynamic-column names",
+    ),
+    f(
+        "COLUMN_CHECK",
+        "COLUMN_CHECK(blob)",
+        "Whether a dynamic-column blob is well-formed",
+    ),
+    f(
+        "COLUMN_JSON",
+        "COLUMN_JSON(blob)",
+        "Dynamic columns as a JSON object",
+    ),
+    // ── Oracle-mode variants (MariaDB) ───────────────────────────────────────
+    // The names the parser gives Oracle's semantics for functions MariaDB already
+    // has under a plain name — `SUBSTR_ORACLE` counts from 1 and treats 0 as 1,
+    // and so on. They are callable in any `sql_mode`, which is why the server
+    // reports them and the checker must not squiggle them.
+    f(
+        "CONCAT_OPERATOR_ORACLE",
+        "CONCAT_OPERATOR_ORACLE(str, ...)",
+        "Concatenate, treating NULL as empty",
+    ),
+    f(
+        "DECODE_ORACLE",
+        "DECODE_ORACLE(expr, search, result [, ...] [, default])",
+        "CASE-like value lookup",
+    ),
+    f(
+        "LPAD_ORACLE",
+        "LPAD_ORACLE(str, len [, pad])",
+        "Left-pad, returning NULL for an empty result",
+    ),
+    f(
+        "RPAD_ORACLE",
+        "RPAD_ORACLE(str, len [, pad])",
+        "Right-pad, returning NULL for an empty result",
+    ),
+    f(
+        "LTRIM_ORACLE",
+        "LTRIM_ORACLE(str [, rem])",
+        "Trim leading characters, Oracle semantics",
+    ),
+    f(
+        "RTRIM_ORACLE",
+        "RTRIM_ORACLE(str [, rem])",
+        "Trim trailing characters, Oracle semantics",
+    ),
+    f(
+        "TRIM_ORACLE",
+        "TRIM_ORACLE([{BOTH|LEADING|TRAILING} [rem] FROM] str)",
+        "Trim characters, Oracle semantics",
+    ),
+    f(
+        "REPLACE_ORACLE",
+        "REPLACE_ORACLE(str, from, to)",
+        "Replace, treating an empty string as NULL",
+    ),
+    f(
+        "SUBSTR_ORACLE",
+        "SUBSTR_ORACLE(str, pos [, len])",
+        "Substring, Oracle semantics",
+    ),
+    // ── Replication & cluster ────────────────────────────────────────────────
+    f(
+        "MASTER_POS_WAIT",
+        "MASTER_POS_WAIT(log, pos [, timeout] [, connection])",
+        "Block until the replica reaches a binlog position",
+    ),
+    f(
+        "MASTER_GTID_WAIT",
+        "MASTER_GTID_WAIT(gtid [, timeout])",
+        "Block until the replica reaches a GTID (MariaDB)",
+    ),
+    f(
+        "BINLOG_GTID_POS",
+        "BINLOG_GTID_POS(log, pos)",
+        "GTID position for a binlog file and offset (MariaDB)",
+    ),
+    f(
+        "WSREP_LAST_SEEN_GTID",
+        "WSREP_LAST_SEEN_GTID()",
+        "Last write-set GTID this node saw (Galera)",
+    ),
+    f(
+        "WSREP_LAST_WRITTEN_GTID",
+        "WSREP_LAST_WRITTEN_GTID()",
+        "GTID of this connection's last write (Galera)",
+    ),
+    f(
+        "WSREP_SYNC_WAIT_UPTO_GTID",
+        "WSREP_SYNC_WAIT_UPTO_GTID(gtid [, timeout])",
+        "Block until a write-set GTID is applied (Galera)",
+    ),
+    f(
+        "DECODE_HISTOGRAM",
+        "DECODE_HISTOGRAM(type, histogram)",
+        "Readable form of a stored statistics histogram (MariaDB)",
+    ),
 ];
 
 /// The authoritative catalog of **SQLite** built-in functions, trusted by the

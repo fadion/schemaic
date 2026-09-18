@@ -26,17 +26,19 @@
 //! The macro takes them grouped by module because the group a test belongs to is
 //! the one thing its name does not say.
 //!
-//! **[`pg_catalog`] is the one module outside it**, and its own docs say why: it
-//! guards one engine's data file rather than a claim about the DB layer, so
-//! there is no version of it the other two legs could answer. Its tests carry
-//! their own `enabled()` check, which is what the macro would otherwise have
-//! given them.
+//! **[`pg_catalog`] and [`mariadb_catalog`] are the modules outside it**, and
+//! their own docs say why: each guards one engine's builtin-function catalog
+//! rather than a claim about the DB layer, so there is no version of it the
+//! other legs could answer — the oracle is a system view only that engine has.
+//! Their tests carry their own `enabled()` check, which is what the macro would
+//! otherwise have given them.
 
 mod blob;
 mod cases;
 mod ddl;
 mod editable;
 mod endpoint;
+mod mariadb_catalog;
 mod namespaces;
 mod pg_catalog;
 mod routines;
