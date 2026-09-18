@@ -454,17 +454,25 @@ impl From<&crate::GrantTarget> for PlanTarget {
 /// Send **one** change straight to the preview, skipping the designer — how
 /// every context-menu shortcut works. Same modal, same warnings, same Apply: the
 /// shortcut saves the designer, not the review.
+///
+/// **It reads the live switcher on purpose**, unlike [`preview_container`] —
+/// which is why `conn` is named in the signature rather than hidden inside a
+/// root bundle. A context-menu shortcut is answered in the same gesture that
+/// raised it, so there is no window in which the user could switch connection
+/// between the two; the `PlanTarget` forms exist for the plans that *are*
+/// answered later.
 pub(crate) fn preview_change(
-    ui: &Ui,
+    conn: crate::ConnUi,
+    ddl: DdlUi,
     database: &str,
     table: &str,
     schema: Option<&str>,
     change: schemaic_core::ddl::Change,
 ) {
-    let ctx = crate::table_designer::edit_ctx(ui.conn);
+    let ctx = crate::table_designer::edit_ctx(conn);
     let cs = schemaic_core::ddl::single(table, schema, ctx.dialect, change);
     open_preview(
-        ui.ddl,
+        ddl,
         preview_of(
             ctx.conn_id,
             database,
@@ -494,12 +502,14 @@ pub(crate) fn preview_change(
 /// `ALTER` comes to restate an old column definition and silently revert a
 /// change that has already landed.
 pub(crate) fn preview_proposal(
-    ui: &Ui,
+    conn: crate::ConnUi,
+    schema: crate::SchemaUi,
+    ddl: DdlUi,
     database: &str,
     proposal: &schemaic_core::propose::Proposal,
 ) -> Result<(), String> {
-    let ctx = crate::table_designer::edit_ctx(ui.conn);
-    let Some(loaded) = crate::table_designer::loaded_schema(ui.schema, database) else {
+    let ctx = crate::table_designer::edit_ctx(conn);
+    let Some(loaded) = crate::table_designer::loaded_schema(schema, database) else {
         return Err(format!(
             "{} isn't loaded in {database} right now — open the database in the schema tree, or \
              wait for a refresh to finish, and try again.",
@@ -524,7 +534,7 @@ pub(crate) fn preview_proposal(
     // very same change.
     let target = schemaic_core::ddl::Target::new(
         ctx.dialect,
-        crate::table_designer::db_flavour(ui.schema, database),
+        crate::table_designer::db_flavour(schema, database),
     );
     let cs = schemaic_core::ddl::diff(info, &draft, target);
     if cs.is_empty() {
@@ -533,7 +543,7 @@ pub(crate) fn preview_proposal(
         ));
     }
     open_preview(
-        ui.ddl,
+        ddl,
         preview_of(ctx.conn_id, database, subject, &cs, ctx.read_only),
     );
     Ok(())

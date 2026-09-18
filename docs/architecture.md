@@ -14823,11 +14823,18 @@ existing prose was left alone.
     which took `database_editor.rs` to **3** — `open_for_new`, `container_names` and `fetch_roles`.
     A caller cannot be narrower than what it calls, so a `&Ui` helper is a budget floor under every
     file that reaches it; look down the call graph before concluding a function needs the root.
+    **Three named bundles can still be the narrower signature, and can say something the root one
+    hid.** `preview_change` takes `(ConnUi, DdlUi)` and `preview_proposal`
+    `(ConnUi, SchemaUi, DdlUi)`; the count looks like a step backwards until you read what `conn`
+    being *named* asserts — these two answer a context-menu shortcut off the **live switcher**,
+    where their `PlanTarget` siblings deliberately do not, and that is now visible at every call
+    site rather than only in the prose two paragraphs up. The rule is the signature saying what the
+    function depends on, not the parameter count.
     **The live number is the sum of `BUDGET`, not the "roughly 140" above**, which describes the
-    state the gate found and by design never moves. That sum went **206 → 143** over this run:
+    state the gate found and by design never moves. That sum went **206 → 141** over this run:
     `table_designer.rs` 29 → 26 → 10 → 4, `object_editor.rs` 14 → 5 → 4, `routine_editor.rs` 12 → 6,
     `event_editor.rs` 11 → 5, `trigger_editor.rs` 11 → 8 → 7, `view_editor.rs` 10 → 6,
-    `database_editor.rs` 7 → 3, `ddl_preview.rs` 6 → 4, `overlays.rs` 15 → 13. Every step is
+    `database_editor.rs` 7 → 3, `ddl_preview.rs` 6 → 4 → 2, `overlays.rs` 15 → 13. Every step is
     recorded against its own entry with what it narrowed *to*, so read the list for where a file
     stands rather than inferring it from a paragraph.
     It is a **budget, not a ban**, because narrowing 140 signatures is a campaign and a gate that

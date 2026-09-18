@@ -14580,7 +14580,15 @@ mod whole_ui_gate {
         // and read nothing else, so they take `DdlUi`. That is what let
         // `database_editor`'s overlay off the root bundle as well — a helper
         // still on `&Ui` is a blocker for every caller of it.
-        ("ddl_preview.rs", 4),
+        //
+        // 4 → 2: `preview_change` takes `(ConnUi, DdlUi)` and
+        // `preview_proposal` `(ConnUi, SchemaUi, DdlUi)`. Three parameters is
+        // still the narrower signature, and here it says something the root
+        // bundle hid: these two read the **live switcher** where the
+        // `PlanTarget` pair deliberately does not, and `conn` being named is
+        // what makes that visible at the call site. The two left are `apply`
+        // and the overlay.
+        ("ddl_preview.rs", 2),
         ("dump_view.rs", 9),
         ("erd_view.rs", 1),
         // 11 → 5: the four `bound_*` helpers take `RwSignal<EventDraft>` — the

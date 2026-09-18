@@ -2444,7 +2444,8 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                             entries.push(
                                 MenuEntry::action("Refresh view", move || {
                                     crate::ddl_preview::preview_change(
-                                        &ui,
+                                        ui.conn,
+                                        ui.ddl,
                                         &db,
                                         &tbl,
                                         ns.as_deref(),
@@ -2496,7 +2497,8 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                                         resolve: Rc::new(move |yes| {
                                             if yes {
                                                 crate::ddl_preview::preview_change(
-                                                    &ui,
+                                                    ui.conn,
+                                                    ui.ddl,
                                                     &db,
                                                     &tbl,
                                                     ns.as_deref(),
@@ -2539,7 +2541,8 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                                         resolve: Rc::new(move |yes| {
                                             if yes {
                                                 crate::ddl_preview::preview_change(
-                                                    &ui,
+                                                    ui.conn,
+                                                    ui.ddl,
                                                     &db,
                                                     &tbl,
                                                     ns.as_deref(),
@@ -2725,7 +2728,8 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                                     theme::error,
                                     move || {
                                         crate::ddl_preview::preview_change(
-                                            &ui,
+                                            ui.conn,
+                                            ui.ddl,
                                             &src.database,
                                             &src.table,
                                             src.schema.as_deref(),
@@ -2747,7 +2751,8 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                             entries.push(
                                 MenuEntry::action_colored("Drop index", theme::error, move || {
                                     crate::ddl_preview::preview_change(
-                                        &ui,
+                                        ui.conn,
+                                        ui.ddl,
                                         &src.database,
                                         &src.table,
                                         src.schema.as_deref(),

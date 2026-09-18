@@ -223,7 +223,7 @@ pub(crate) fn ai_panel(ui: Ui) -> impl IntoView {
                         );
                     }
                 };
-                crate::ddl_preview::preview_proposal(&ui, &db, &proposal)
+                crate::ddl_preview::preview_proposal(ui.conn, ui.schema, ui.ddl, &db, &proposal)
             })
         },
         // Which lexer colours a SQL block. **The tab's connection**, not the
