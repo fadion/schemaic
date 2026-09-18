@@ -21527,6 +21527,13 @@ this bundle's.
   drains exactly those when the write lands, because the app skips the re-run when the committed tab
   is no longer active and then nothing else un-stages what was written (pressing Ctrl+Enter again
   inserted the row a second time; a re-issued `DELETE` matched 0 rows and rolled the batch back).
+  **That skip is `model::settle_after_switch`**, which answers both halves of "the tab moved on" at
+  once and is the write-back report's last piece of logic to leave `app_view` for core: whether to
+  launch the re-fetch, and what to report. A `Spliced` for a grid that is no longer on screen is
+  reported as `FullReran` rather than delivered — the rows are right, but claiming a splice would
+  tell the reader their edits were reconciled into a view that never received them, which is the
+  report claiming more than was delivered. A `Failed` is unchanged by a switch: the message is still
+  true and the staged edits are still there to retry.
   Discard stays live deliberately — a write can sit on `innodb_lock_wait_timeout` for fifty seconds
   and taking the user's only way out of that is worse — and it empties all three kinds, after which
   *"the first `staged_new`"* names a different row: stage a row, commit, discard, stage another, and

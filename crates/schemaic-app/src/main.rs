@@ -5038,26 +5038,18 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                         .update(|t| *t = t.on_statement(engine, "SELECT", stmt));
                 });
                 let finish = create_ext_action(cx, move |outcome: CommitDone| {
-                    // A full re-run must happen on the UI thread and only if the
-                    // committed tab is still active — `run` targets the active tab,
-                    // so refreshing after the user switched away would run this
-                    // tab's SQL against a different tab (H4). If they switched, skip
-                    // it; the commit already succeeded (the tab's cached result is
-                    // then stale until a manual re-run, matching prior behaviour).
-                    // A splice with the tab no longer active is downgraded to a
-                    // no-op (the grid it targeted is gone).
-                    let still_active = active.get_untracked() == id;
-                    let outcome = match outcome {
-                        CommitDone::FullReran => {
-                            if still_active && let Some(req) = refetch_req.clone() {
-                                run(req.into_sql());
-                            }
-                            CommitDone::FullReran
-                        }
-                        CommitDone::Spliced(rows) if still_active => CommitDone::Spliced(rows),
-                        CommitDone::Spliced(_) => CommitDone::FullReran,
-                        other => other,
-                    };
+                    // This closure gathers signals; `model::settle_after_switch`
+                    // decides. The re-run must happen on the UI thread and only
+                    // for the tab that asked — `run` targets whichever tab is
+                    // *active*, so firing it after the user switched away would
+                    // run this tab's SQL into another tab's grid (H4).
+                    let (refetch, outcome) = schemaic_core::model::settle_after_switch(
+                        active.get_untracked() == id,
+                        outcome,
+                    );
+                    if refetch && let Some(req) = refetch_req.clone() {
+                        run(req.into_sql());
+                    }
                     (done)(outcome);
                 });
                 handle.spawn(async move {

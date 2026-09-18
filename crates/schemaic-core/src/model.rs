@@ -1636,6 +1636,33 @@ pub enum CommitDone {
     Failed(String),
 }
 
+/// What a commit reports once the tab it targeted may have moved on, and
+/// whether the caller should still launch the post-commit re-fetch.
+///
+/// **Two answers, because they are not the same question.** The re-run targets
+/// whatever tab is *active*, so firing it after the user switched away would run
+/// one tab's SQL against another's grid. A splice is the milder half of the same
+/// problem: the rows are correct but the grid they were computed for is no
+/// longer on screen, so claiming `Spliced` would tell the reader their edits are
+/// reconciled in a view that never received them. Reported as `FullReran`
+/// instead, which is the honest "the result you are looking at was rebuilt, or
+/// needs to be" — the invariant that the report never claims more than was
+/// delivered.
+///
+/// A commit that failed says so either way: a switch does not make an error
+/// less true, and the staged edits are still there to be retried.
+///
+/// Returns `(should_refetch, reported)`.
+pub fn settle_after_switch(still_active: bool, outcome: CommitDone) -> (bool, CommitDone) {
+    match outcome {
+        // The only arm that re-runs, and only for the tab that asked.
+        CommitDone::FullReran => (still_active, CommitDone::FullReran),
+        CommitDone::Spliced(rows) if still_active => (false, CommitDone::Spliced(rows)),
+        CommitDone::Spliced(_) => (false, CommitDone::FullReran),
+        other => (false, other),
+    }
+}
+
 /// UI-facing lifecycle of a query in a tab. Shared between the app (writer)
 /// and the UI (reader) through a Floem signal.
 #[derive(Clone, Debug)]
@@ -2985,5 +3012,90 @@ mod tests {
         assert_eq!(goto_target("200k", 200_000, 3).unwrap().anchor.0, 199_999);
         assert_eq!(goto_target("abc", 100, 3), None);
         assert_eq!(goto_target("1", 0, 3), None, "an empty grid");
+    }
+
+    // ── settle_after_switch ─────────────────────────────────────────────────
+    //
+    // The post-commit report, once the tab that started the commit may no
+    // longer be the active one.
+
+    fn spliced() -> CommitDone {
+        CommitDone::Spliced(vec![(3, vec![Value::Int(7)])])
+    }
+
+    /// The tab is still where the user left it: both arms behave as the engine
+    /// answered, and the re-fetch is launched.
+    #[test]
+    fn the_tab_that_asked_gets_what_the_engine_gave_it() {
+        let (refetch, out) = settle_after_switch(true, CommitDone::FullReran);
+        assert!(refetch);
+        assert!(matches!(out, CommitDone::FullReran));
+
+        let (refetch, out) = settle_after_switch(true, spliced());
+        assert!(
+            !refetch,
+            "a splice needs no re-run — that is the point of it"
+        );
+        assert!(matches!(out, CommitDone::Spliced(r) if r.len() == 1));
+    }
+
+    /// **The re-fetch is skipped, not retargeted.** It runs against whichever
+    /// tab is active, so firing it after a switch would run one tab's SQL into
+    /// another tab's grid. The commit still succeeded; the stale result is a
+    /// manual re-run away.
+    #[test]
+    fn a_switch_away_cancels_the_refetch_and_still_reports_the_rerun() {
+        let (refetch, out) = settle_after_switch(false, CommitDone::FullReran);
+        assert!(!refetch);
+        assert!(matches!(out, CommitDone::FullReran));
+    }
+
+    /// **A splice into a grid nobody is looking at is downgraded, not
+    /// delivered.** The rows are right, but reporting `Spliced` would claim the
+    /// reader's edits were reconciled into a view that never got them — more
+    /// than was delivered.
+    #[test]
+    fn a_splice_the_grid_cannot_receive_is_reported_as_a_rebuild() {
+        let (refetch, out) = settle_after_switch(false, spliced());
+        assert!(!refetch, "and it does not turn into a re-run either");
+        assert!(matches!(out, CommitDone::FullReran));
+    }
+
+    /// A failure is a failure whether or not the user switched: the message is
+    /// still true and the staged edits are still there to retry.
+    #[test]
+    fn a_failure_survives_a_switch_unchanged() {
+        for still_active in [true, false] {
+            let (refetch, out) = settle_after_switch(
+                still_active,
+                CommitDone::Failed("deadlock found".to_string()),
+            );
+            assert!(!refetch);
+            assert!(matches!(out, CommitDone::Failed(m) if m == "deadlock found"));
+        }
+    }
+
+    /// The `should_refetch` half is **only** ever true for `FullReran`, which is
+    /// the whole of the re-run gate — a new `CommitDone` arm defaulting into it
+    /// is the regression this pins.
+    #[test]
+    fn nothing_but_a_full_rerun_on_the_active_tab_asks_for_a_refetch() {
+        let every = [
+            CommitDone::FullReran,
+            spliced(),
+            CommitDone::Failed("x".into()),
+        ];
+        for outcome in every {
+            let asks = settle_after_switch(true, outcome.clone()).0;
+            assert_eq!(
+                asks,
+                matches!(outcome, CommitDone::FullReran),
+                "{outcome:?} on the active tab"
+            );
+            assert!(
+                !settle_after_switch(false, outcome).0,
+                "and never after a switch"
+            );
+        }
     }
 }
