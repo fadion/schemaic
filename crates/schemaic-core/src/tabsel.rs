@@ -297,6 +297,26 @@ pub fn is_blank_slate(pinned: bool, query: &str, results_untouched: bool, has_pa
     !pinned && query.trim().is_empty() && results_untouched && !has_path
 }
 
+/// Does a tab being **closed** carry anything the reopen ring should keep — a
+/// query, a table source, a name the user gave it, or a file binding?
+///
+/// The write side of the same ring [`has_reopenable`] reads, and deliberately
+/// **not** `!is_blank_slate`: that one asks whether a tab may be *reused in
+/// place*, over a different set of four terms. It weighs `pinned` (a pinned tab
+/// is never closed by this path anyway, so it says nothing here) and
+/// `results_untouched` (a scrolled result is not work worth restoring — the
+/// reopened tab re-runs the query), while this one has to weigh `source` and
+/// `name`, which that question does not ask about at all. Two predicates
+/// spelled as one negation of the other would have to answer for six terms
+/// between them, and each would carry two it does not mean.
+///
+/// A file-backed tab is worth restoring even when the file is empty, for the
+/// reason `is_blank_slate`'s fourth term gives: the binding to the path is the
+/// thing being lost.
+pub fn worth_remembering(query: &str, has_source: bool, has_name: bool, has_path: bool) -> bool {
+    !query.trim().is_empty() || has_source || has_name || has_path
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -725,5 +745,43 @@ mod tests {
         // The one that is not about emptiness: reusing a file-bound tab drops
         // the binding, and the next Ctrl+S goes somewhere else.
         assert!(!is_blank_slate(false, "", true, true), "bound to a file");
+    }
+
+    /// The ring's write side. A tab with none of the four is a blank the user
+    /// opened and closed again; putting it in the ring pushes a real one out.
+    #[test]
+    fn a_tab_holding_nothing_is_not_worth_reopening() {
+        assert!(!worth_remembering("", false, false, false));
+        assert!(!worth_remembering("  \n\t ", false, false, false));
+    }
+
+    /// Any one of the four is enough on its own, and each is asserted alone —
+    /// an `&&` written where an `||` was meant loses three of them silently.
+    #[test]
+    fn any_one_reason_is_enough_to_remember_a_closed_tab() {
+        assert!(worth_remembering("SELECT 1", false, false, false), "query");
+        // An empty query with a table behind it: the table tab, which is the
+        // most-reopened kind there is and carries no text at all.
+        assert!(worth_remembering("", true, false, false), "table source");
+        assert!(worth_remembering("", false, true, false), "a given name");
+        // Empty file, and still worth it: the binding is what is lost.
+        assert!(worth_remembering("", false, false, true), "a file binding");
+    }
+
+    /// **Not the negation of `is_blank_slate`**, and this is where they part:
+    /// a table tab with no text is *not* a blank slate to reuse and *is* worth
+    /// remembering — agreement — but a tab whose results were merely scrolled
+    /// is refused reuse while holding nothing to restore.
+    #[test]
+    fn the_reuse_question_and_the_reopen_question_are_not_the_same_one() {
+        // A scrolled-but-empty tab: not reusable, not worth the ring either.
+        assert!(!is_blank_slate(false, "", false, false), "not reusable");
+        assert!(
+            !worth_remembering("", false, false, false),
+            "and nothing to keep — `!is_blank_slate` would have kept it"
+        );
+        // A pinned empty tab is the same shape from the other side.
+        assert!(!is_blank_slate(true, "", true, false));
+        assert!(!worth_remembering("", false, false, false));
     }
 }

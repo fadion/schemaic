@@ -7039,6 +7039,22 @@ existing prose was left alone.
       corrected — so both now match on the enum; the other two keep asking `scoped_database`, and
       `scoped_database_still_answers_exactly_what_the_scope_says` walks every state so the two cannot
       drift.
+      **The reopen ring's two ends are both here, and they are not the same predicate.**
+      `worth_remembering(query, has_source, has_name, has_path)` is the write end — does a closing
+      tab carry anything to restore — and `has_reopenable(closed, conn)` the read end, which the
+      menu entry dims on, asked *per connection* because the ring spans them and reopening does not
+      (a non-empty ring holding only another connection's tabs offered a click that did nothing).
+      `worth_remembering` is deliberately **not** `!is_blank_slate`, although both look like
+      "is this tab empty". `is_blank_slate` asks whether a freshly-built tab may replace the active
+      one *in place*, and weighs `pinned` and `results_untouched` — neither of which says anything
+      about what is worth keeping: a pinned tab never reaches the closing path at all, and a merely
+      *scrolled* result is not work, since a reopened tab re-runs its query. `worth_remembering` in
+      turn weighs `source` and `name`, which the reuse question does not ask about — and `source` is
+      the one that matters most, because a table tab is the most-reopened kind there is and carries
+      no query text whatsoever. Spelled as one negation of the other, the pair would answer for six
+      terms between them and each would carry two it does not mean.
+      They agree on the term both do hold: a tab bound to a `.sql` file is neither reusable nor
+      forgettable even when the file is empty, because the binding to the path is the thing at stake.
     - `palette.rs` — parses the command palette's `>` command mode into
       `Parsed::{Search,Filter,Command{name,arg}}`. The hard part is when typing stops filtering the
       command list and becomes an argument: longest-word-prefix match against the caller's

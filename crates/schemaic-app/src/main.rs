@@ -6064,9 +6064,15 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                 let source = tab.source.get_untracked();
                 let name = tab.name.get_untracked();
                 let path = tab.path.get_untracked();
-                // A file-backed tab is worth restoring even when the file is
-                // empty: the binding to the path is the thing being lost.
-                if query.trim().is_empty() && source.is_none() && name.is_none() && path.is_none() {
+                // This closure gathers signals; `tabsel::worth_remembering`
+                // decides — and it is deliberately not `!is_blank_slate`, which
+                // asks a different question over a different four terms.
+                if !schemaic_core::tabsel::worth_remembering(
+                    &query,
+                    source.is_some(),
+                    name.is_some(),
+                    path.is_some(),
+                ) {
                     return;
                 }
                 let mut ring = recently_closed.borrow_mut();
