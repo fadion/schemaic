@@ -1,21 +1,47 @@
 //! Database access for Schemaic: the [`Db`] façade and the engine dispatch
 //! behind it.
 //!
-//! **Three engines, and they are not equal.** Every public method here connects,
+//! **Three engines, and three modules.** Every public method here connects,
 //! runs, disconnects (the one-connection-per-operation invariant, with its two
 //! stated exceptions in [`session`] and [`Db::run_script`]), and dispatches on
-//! [`Engine`]: PostgreSQL to [`pg`], SQLite to [`sqlite`], MySQL to [`mysql`].
-//! **That last one is being moved here a piece at a time** — the bodies not yet
-//! in `mysql.rs` are still inline below, so `pg.rs` and `sqlite.rs` are peers of
-//! `mysql.rs` for the entry points it has taken over and peers of this file for
-//! the rest. What makes it bearable is that [`Engine`] is an
-//! enum: a fourth variant is a compiler error at every dispatch site. What it
-//! does not catch is a fourth engine *module* that omits a function, since the
-//! engine interface here is a **naming convention rather than a trait** —
-//! deliberately, because the signatures genuinely differ (`sqlite::fetch_query`
-//! takes no database, since there is one). `ENGINE_ENTRY_POINTS` is that
-//! convention written down, and `every_engine_module_answers_the_whole_interface`
-//! is what holds a module to it.
+//! [`Engine`]: MySQL to [`mysql`], PostgreSQL to [`pg`], SQLite to [`sqlite`].
+//! **No operation here runs a statement**; this file is the façade and the
+//! dispatch, and every arm is a call into an engine module.
+//!
+//! The one exception is deliberate and worth naming rather than leaving to be
+//! discovered: [`Db`]'s **connection plumbing** is still MySQL's. `open`,
+//! `open_serverless`, `opts`, `opts_with_tls`, `dial` and [`Db::kill_query`] all
+//! speak `mysql_async` and nothing in `pg.rs` or `sqlite.rs` calls any of them —
+//! those two build their own clients. So `kill_query`'s `KILL QUERY <id>` is the
+//! last statement text in this file. It sits here because it belongs to the
+//! handle rather than to an operation, and moving a type's constructor out of
+//! the module that defines the type is a different question from moving its
+//! bodies; `TODO.md` carries it as the question rather than the answer.
+//!
+//! For most of the crate's life that was not true. MySQL had no module — its
+//! bodies were inline below, so `pg.rs` and `sqlite.rs` were peers of each other
+//! and of nothing else, and this paragraph had to open by warning about it. Both
+//! tests that hold the convention could only ever check two engines out of
+//! three, and the engine that ships most was the one they could not check.
+//!
+//! What makes the dispatch bearable is that [`Engine`] is an enum: a fourth
+//! variant is a compiler error at every dispatch site. What it does not catch is
+//! a fourth engine *module* that omits a function, since the engine interface
+//! here is a **naming convention rather than a trait** — deliberately, because
+//! the signatures genuinely differ (`sqlite::fetch_query` takes no database,
+//! since there is one; `mysql::run_batch` takes a `USE` scope its peers have no
+//! statement for). `ENGINE_ENTRY_POINTS` is that convention written down, and
+//! `every_engine_module_answers_the_whole_interface` is what holds a module to
+//! it.
+//!
+//! **What stays here is what more than one engine reads.** `assemble_schema`,
+//! `ColRow`, `IdxRow`, `FkColRow`, `TxScope`, `DdlError`, `lock_wait_sql`,
+//! `next_batch_off_executor`, `order_by_clause` and the `NumKind` / `num_kind` /
+//! `parse_as` / `parse_typed` family are all called from `pg.rs` despite some of
+//! them wearing MySQL-flavoured vocabulary, and moving any of them into an
+//! engine module would make another engine depend on a module named for one it
+//! is not. `ident_sqlite` is the mirror-image trap: it belongs to `sqlite.rs`
+//! and sits here beside nothing in particular.
 //!
 //! A query runs on a **dedicated connection** whose id is captured up front, so
 //! it can be cancelled server-side from a second connection — `KILL QUERY` on
@@ -50,9 +76,6 @@ use schemaic_core::model::{
     GridWrite, RefetchRow, RefetchTemplate, ResultBuilder, ResultSet, Value,
 };
 
-// The three write-back dispatchers below hand off to these; every one of them is
-// MySQL's body, and `pg.rs` has its own under the same names.
-use crate::mysql::{blob_on, refetch_on, write_on};
 use schemaic_core::schema::{
     ColumnInfo, DbSchema, EventSource, ForeignKeyInfo, IndexInfo, TableInfo, TriggerSource,
 };
@@ -221,9 +244,15 @@ fn writer_gone() -> DbError {
 /// `fetch_blob` is no error at all until somebody writes that arm.
 ///
 /// So the list is written down, and
-/// `every_engine_module_answers_the_whole_interface` holds each module to it.
-/// MySQL is not in that check because it has no module of its own — its bodies
-/// are inline in this file, which is the asymmetry the crate doc opens with.
+/// `every_engine_module_answers_the_whole_interface` holds each module to it —
+/// **all three of them.** MySQL was absent from that check for as long as it had
+/// no module of its own, and joining the list was not a formality: it found
+/// `mysql.rs` answering ten of thirteen. `commit_writes`, `refetch_rows` and
+/// `fetch_blob` existed there only as `write_on`, `refetch_on` and `blob_on` —
+/// the bodies a pinned `session` connection calls directly — with the door
+/// itself still spelled out in the dispatcher. Both convention tests named all
+/// three the moment MySQL was added to them, which is exactly the omission they
+/// describe.
 ///
 /// Test-only: it is a statement *about* the code rather than something the code
 /// reads, which is the same reason `source_gate`'s machinery next door is.
@@ -2008,80 +2037,8 @@ impl Db {
         match self.engine {
             Engine::Postgres => pg::run_script(self, database, rx, cancel).await,
             Engine::Sqlite => sqlite::run_script(self, rx, cancel).await,
-            Engine::MySql => self.run_script_mysql(database, rx, cancel).await,
+            Engine::MySql => mysql::run_script(self, database, rx, cancel).await,
         }
-    }
-
-    async fn run_script_mysql(
-        &self,
-        database: &str,
-        mut rx: tokio::sync::mpsc::Receiver<schemaic_core::script::Statement>,
-        cancel: CancellationToken,
-    ) -> (schemaic_core::script::ExecEnd, usize) {
-        use schemaic_core::script::ExecEnd;
-        let mut conn = match self.open(Some(database), false).await {
-            Ok(c) => c,
-            Err(e) => return (ExecEnd::Connect(e.to_string()), 0),
-        };
-        let conn_id = conn.id();
-        // **No lock bound is set here.** See `pg::run_script` for the whole
-        // reasoning: `DDL_LOCK_WAIT_SECS` is documented for the Apply modal's
-        // short reviewed plan, and a restore that dies at statement N with N−1
-        // applied and no transaction of ours to roll back is worse than
-        // waiting. `mysql <` sets nothing either, and Stop here kills the
-        // running statement server-side.
-        let mut ran = 0usize;
-        let end = loop {
-            // Cancel has to be reachable **while waiting for the next
-            // statement**, not only while one is running. A load stalled on a
-            // slow disk spends most of its life here, and a Stop that only
-            // landed between statements would look ignored.
-            let next = tokio::select! {
-                s = rx.recv() => s,
-                _ = cancel.cancelled() => break ExecEnd::Cancelled,
-            };
-            let Some(st) = next else { break ExecEnd::Done };
-            // **The killed statement is awaited, not dropped.** `KILL QUERY` is
-            // a request — MySQL documents that it may be ignored during an
-            // online `ALTER`'s commit phase — so throwing the future away left
-            // `ran` a floor while the panel presents it as the count. Scoped so
-            // the borrow of `st.sql` ends before the `Failed` arm moves it.
-            let step = {
-                let mut fut = std::pin::pin!(conn.query_drop(&st.sql));
-                let raced = tokio::select! {
-                    r = fut.as_mut() => Some(r),
-                    _ = cancel.cancelled() => None,
-                };
-                match raced {
-                    Some(Ok(())) => pg::ScriptStep::Ran,
-                    Some(Err(e)) => pg::ScriptStep::Failed(e.to_string()),
-                    None => {
-                        self.kill_query(conn_id).await;
-                        pg::ScriptStep::Cancelled {
-                            ran: fut.await.is_ok(),
-                        }
-                    }
-                }
-            };
-            match step {
-                pg::ScriptStep::Ran => ran += 1,
-                pg::ScriptStep::Cancelled { ran: landed } => {
-                    if landed {
-                        ran += 1;
-                    }
-                    break ExecEnd::Cancelled;
-                }
-                pg::ScriptStep::Failed(message) => {
-                    break ExecEnd::Failed {
-                        message,
-                        sql: st.sql,
-                        line: st.line,
-                    };
-                }
-            }
-        };
-        let _ = conn.disconnect().await;
-        (end, ran)
     }
 }
 
@@ -2105,9 +2062,8 @@ impl Db {
 /// table every statement already executed is durable, so a cancelled commit of
 /// three staged `INSERT`s that got two in reported "nothing was written", left
 /// all three staged, and a second Commit landed the two again. That is
-/// [`cancelled_import`]'s documented contract read backwards, and `import_on`
-/// three hundred lines up and `pg::commit_writes` both already did it the other
-/// way.
+/// `mysql::cancelled_import`'s documented contract read backwards, and
+/// `mysql::import_on` and `pg::commit_writes` both already did it the other way.
 impl Db {
     pub async fn commit_writes(
         &self,
@@ -2118,37 +2074,10 @@ impl Db {
             return Ok(0);
         }
         match self.engine {
-            Engine::Postgres => return pg::commit_writes(self, write, cancel).await,
-            Engine::Sqlite => return sqlite::commit_writes(self, write, cancel).await,
-            Engine::MySql => {}
+            Engine::Postgres => pg::commit_writes(self, write, cancel).await,
+            Engine::Sqlite => sqlite::commit_writes(self, write, cancel).await,
+            Engine::MySql => mysql::commit_writes(self, write, cancel).await,
         }
-        // `client_found_rows` so the 1-row guard counts matches, not changes.
-        let mut conn = self.open(None, true).await?;
-        let conn_id = conn.id();
-
-        // **The cancel is inside `write_on`, not a race around it** — the same
-        // rule `import_rows` states three hundred lines up, for the same
-        // measured reason. A `tokio::select!` over the whole write dropped that
-        // future *mid-statement* (the `&mut conn` re-borrow in the cancel arm
-        // only compiles because the branch futures are dropped first), which
-        // leaves a `mysql_async` connection's result stream desynchronised:
-        // measured there on MariaDB 10.11.14 and MySQL 8.4.11, after the drop
-        // the following `ROLLBACK` "succeeded" and `SHOW WARNINGS` was empty.
-        // So the `ROLLBACK` this method's doc is about classified `Complete`
-        // off a reply that was not its own, and a cancelled Commit of three
-        // staged `INSERT`s into a `MyISAM` table reported "nothing was written"
-        // over two rows that were permanently there — the exact failure the
-        // `ROLLBACK` was added to prevent, one exit further along.
-        let outcome = write_on(
-            &mut conn,
-            write,
-            TxScope::Own,
-            Some((self, conn_id, &cancel)),
-        )
-        .await;
-
-        let _ = conn.disconnect().await;
-        outcome
     }
 }
 
@@ -2171,21 +2100,10 @@ impl Db {
             return Ok(Vec::new());
         }
         match self.engine {
-            Engine::Postgres => return pg::refetch_rows(self, template, rows, cancel).await,
-            Engine::Sqlite => return sqlite::refetch_rows(self, template, rows, cancel).await,
-            Engine::MySql => {}
+            Engine::Postgres => pg::refetch_rows(self, template, rows, cancel).await,
+            Engine::Sqlite => sqlite::refetch_rows(self, template, rows, cancel).await,
+            Engine::MySql => mysql::refetch_rows(self, template, rows, cancel).await,
         }
-        let mut conn = self.open(None, false).await?;
-        let conn_id = conn.id();
-        let outcome = tokio::select! {
-            r = refetch_on(&mut conn, template, rows) => r,
-            _ = cancel.cancelled() => {
-                self.kill_query(conn_id).await;
-                Err(DbError::Cancelled)
-            }
-        };
-        let _ = conn.disconnect().await;
-        outcome
     }
 }
 
@@ -2204,7 +2122,7 @@ impl Db {
     /// difference is a MySQL limit worth knowing.** PostgreSQL and SQLite really
     /// do leave the bytes on the server — the `SELECT` behind a grid asks for a
     /// placeholder. MySQL's does not: `convert_row` receives the whole value and
-    /// *then* substitutes [`binary_display`], so the row still has to cross the
+    /// *then* substitutes [`binary_display`](schemaic_core::model::binary_display), so the row still has to cross the
     /// wire whole. A row whose blob exceeds the server's `max_allowed_packet`
     /// (16 MiB by default on MariaDB — a **quarter** of
     /// [`schemaic_core::blob::FETCH_CAP`]) therefore fails the ordinary grid
@@ -2225,25 +2143,10 @@ impl Db {
         cancel: CancellationToken,
     ) -> Result<Option<BlobValue>, DbError> {
         match self.engine {
-            Engine::Postgres => return pg::fetch_blob(self, r, cancel).await,
-            Engine::Sqlite => return sqlite::fetch_blob(self, r, cancel).await,
-            Engine::MySql => {}
+            Engine::Postgres => pg::fetch_blob(self, r, cancel).await,
+            Engine::Sqlite => sqlite::fetch_blob(self, r, cancel).await,
+            Engine::MySql => mysql::fetch_blob(self, r, cancel).await,
         }
-        // `None`, not the target database: `build_blob_select` qualifies the
-        // table as `db`.`table` itself, so the session default is never
-        // consulted and a `USE` would be a round trip that decides nothing —
-        // the same shape `refetch_rows` below already has.
-        let mut conn = self.open(None, false).await?;
-        let conn_id = conn.id();
-        let outcome = tokio::select! {
-            res = blob_on(&mut conn, r) => res,
-            _ = cancel.cancelled() => {
-                self.kill_query(conn_id).await;
-                Err(DbError::Cancelled)
-            }
-        };
-        let _ = conn.disconnect().await;
-        outcome
     }
 }
 
@@ -2538,7 +2441,14 @@ mod tests {
     /// than an omission.
     #[test]
     fn every_engine_module_answers_the_whole_interface() {
+        // **Three, at last.** `mysql.rs` was absent from this list for most of
+        // the crate's life, not as an omission but because there was no such
+        // module — MySQL's bodies were inline below, so the one test that
+        // notices a module answering twelve of thirteen could only ever check
+        // two engines out of three, and the engine that ships most was the one
+        // it could not check.
         for (name, src) in [
+            ("mysql.rs", include_str!("mysql.rs")),
             ("pg.rs", include_str!("pg.rs")),
             ("sqlite.rs", include_str!("sqlite.rs")),
         ] {
@@ -2559,10 +2469,10 @@ mod tests {
     /// And the dispatcher reaches all three engines for each of them, so the
     /// convention is not a list of names nothing calls.
     #[test]
-    fn the_dispatcher_calls_both_engine_modules_for_every_entry_point() {
+    fn the_dispatcher_calls_every_engine_module_for_every_entry_point() {
         let me = include_str!("lib.rs");
         for f in ENGINE_ENTRY_POINTS {
-            for module in ["pg", "sqlite"] {
+            for module in ["mysql", "pg", "sqlite"] {
                 assert!(
                     me.contains(&format!("{module}::{f}(")),
                     "nothing in the dispatcher calls `{module}::{f}` — either the \

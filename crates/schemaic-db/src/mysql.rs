@@ -11,8 +11,18 @@
 //! of nothing else, and every reader had to be told so before reading the
 //! dispatcher. The two tests that hold the convention —
 //! `every_engine_module_answers_the_whole_interface` and
-//! `the_dispatcher_calls_both_engine_modules_for_every_entry_point` — could only
-//! ever check two engines out of three for the same reason.
+//! `the_dispatcher_calls_every_engine_module_for_every_entry_point` — could only
+//! ever check two engines out of three for the same reason, and the engine that
+//! ships most was the one they could not check. Both check this module now, and
+//! the first thing they did was find three entry points it was missing.
+//!
+//! **Organised by family, not by layer**: each group of functions is preceded by
+//! the entry points that reach it, so the users queries sit under
+//! `fetch_principals`, the wire decoders under `fetch_query`, and the statement
+//! builders under `commit_writes`. The alternative — every `pub(crate)` door at
+//! the top and every helper below — reads well in a table of contents and badly
+//! at the point where somebody is trying to find out what `collect_schema` is
+//! for.
 //!
 //! **What stays in `lib.rs` is what more than one engine reads**, which is the
 //! rule for what may move here at all: `assemble_schema`, `ColRow`, `IdxRow`,
@@ -52,7 +62,7 @@ use mysql_async::Params;
 use crate::{
     ColRow, Db, DbError, DdlError, EXPLAIN_ROW_CAP, FkColRow, IdxRow, ImportTarget, NumKind,
     RowDest, RowSource, TxScope, assemble_schema, err_clone, lock_wait_sql,
-    next_batch_off_executor, num_kind, order_by_clause, parse_as, parse_typed,
+    next_batch_off_executor, num_kind, order_by_clause, parse_as, parse_typed, pg,
 };
 
 /// The binary collation id (`binary`) — a column with this charset holds raw
@@ -6820,9 +6830,9 @@ mod write_tests {
             .map_or(rest.len(), |i| i + 1);
         let body = &rest[..end];
         assert!(
-            body.contains("mysql::write_on") || body.contains("write_on("),
-            "`commit_writes` no longer reaches `write_on`, so the rest of this \
-             gate is asking about a path it does not take"
+            body.contains("mysql::commit_writes("),
+            "the dispatcher no longer reaches this module's `commit_writes`, so \
+             the rest of this gate is asking about a path it does not take"
         );
         // The write itself is not raced. Assembled, so this paragraph is not the
         // hit.
@@ -6885,4 +6895,161 @@ mod write_tests {
             );
         }
     }
+}
+
+/// Run a whole `.sql` file on **one** connection.
+///
+/// The one-connection-per-operation invariant's second stated exception, and
+/// the reason is session state: a dump's `SET FOREIGN_KEY_CHECKS`, its own
+/// `BEGIN`, its `DELIMITER` all have to outlive the statement that set them.
+pub(crate) async fn run_script(
+    db: &Db,
+    database: &str,
+    mut rx: tokio::sync::mpsc::Receiver<schemaic_core::script::Statement>,
+    cancel: CancellationToken,
+) -> (schemaic_core::script::ExecEnd, usize) {
+    use schemaic_core::script::ExecEnd;
+    let mut conn = match db.open(Some(database), false).await {
+        Ok(c) => c,
+        Err(e) => return (ExecEnd::Connect(e.to_string()), 0),
+    };
+    let conn_id = conn.id();
+    // **No lock bound is set here.** See `pg::run_script` for the whole
+    // reasoning: `DDL_LOCK_WAIT_SECS` is documented for the Apply modal's
+    // short reviewed plan, and a restore that dies at statement N with N−1
+    // applied and no transaction of ours to roll back is worse than
+    // waiting. `mysql <` sets nothing either, and Stop here kills the
+    // running statement server-side.
+    let mut ran = 0usize;
+    let end = loop {
+        // Cancel has to be reachable **while waiting for the next
+        // statement**, not only while one is running. A load stalled on a
+        // slow disk spends most of its life here, and a Stop that only
+        // landed between statements would look ignored.
+        let next = tokio::select! {
+            s = rx.recv() => s,
+            _ = cancel.cancelled() => break ExecEnd::Cancelled,
+        };
+        let Some(st) = next else { break ExecEnd::Done };
+        // **The killed statement is awaited, not dropped.** `KILL QUERY` is
+        // a request — MySQL documents that it may be ignored during an
+        // online `ALTER`'s commit phase — so throwing the future away left
+        // `ran` a floor while the panel presents it as the count. Scoped so
+        // the borrow of `st.sql` ends before the `Failed` arm moves it.
+        let step = {
+            let mut fut = std::pin::pin!(conn.query_drop(&st.sql));
+            let raced = tokio::select! {
+                r = fut.as_mut() => Some(r),
+                _ = cancel.cancelled() => None,
+            };
+            match raced {
+                Some(Ok(())) => pg::ScriptStep::Ran,
+                Some(Err(e)) => pg::ScriptStep::Failed(e.to_string()),
+                None => {
+                    db.kill_query(conn_id).await;
+                    pg::ScriptStep::Cancelled {
+                        ran: fut.await.is_ok(),
+                    }
+                }
+            }
+        };
+        match step {
+            pg::ScriptStep::Ran => ran += 1,
+            pg::ScriptStep::Cancelled { ran: landed } => {
+                if landed {
+                    ran += 1;
+                }
+                break ExecEnd::Cancelled;
+            }
+            pg::ScriptStep::Failed(message) => {
+                break ExecEnd::Failed {
+                    message,
+                    sql: st.sql,
+                    line: st.line,
+                };
+            }
+        }
+    };
+    let _ = conn.disconnect().await;
+    (end, ran)
+}
+
+/// Apply a staged batch of grid mutations in one transaction.
+///
+/// **Named for the entry point, not for the body it calls.** `write_on` does the
+/// work and `session.rs` calls that directly for a pinned manual-transaction
+/// connection; this is the fresh-connection door, and it exists under this name
+/// because `ENGINE_ENTRY_POINTS` is the interface and
+/// `every_engine_module_answers_the_whole_interface` is what holds a module to
+/// it. Both convention tests found all three of these missing the moment MySQL
+/// joined the list they check.
+pub(crate) async fn commit_writes(
+    db: &Db,
+    write: &GridWrite,
+    cancel: CancellationToken,
+) -> Result<u64, DbError> {
+    // `client_found_rows` so the 1-row guard counts matches, not changes.
+    let mut conn = db.open(None, true).await?;
+    let conn_id = conn.id();
+
+    // **The cancel is inside `write_on`, not a race around it** — the same
+    // rule `import_rows` states three hundred lines up, for the same
+    // measured reason. A `tokio::select!` over the whole write dropped that
+    // future *mid-statement* (the `&mut conn` re-borrow in the cancel arm
+    // only compiles because the branch futures are dropped first), which
+    // leaves a `mysql_async` connection's result stream desynchronised:
+    // measured there on MariaDB 10.11.14 and MySQL 8.4.11, after the drop
+    // the following `ROLLBACK` "succeeded" and `SHOW WARNINGS` was empty.
+    // So the `ROLLBACK` this method's doc is about classified `Complete`
+    // off a reply that was not its own, and a cancelled Commit of three
+    // staged `INSERT`s into a `MyISAM` table reported "nothing was written"
+    // over two rows that were permanently there — the exact failure the
+    // `ROLLBACK` was added to prevent, one exit further along.
+    let outcome = write_on(&mut conn, write, TxScope::Own, Some((db, conn_id, &cancel))).await;
+
+    let _ = conn.disconnect().await;
+    outcome
+}
+
+/// Re-read the rows a write just touched, so the grid shows what landed.
+pub(crate) async fn refetch_rows(
+    db: &Db,
+    template: &RefetchTemplate,
+    rows: &[RefetchRow],
+    cancel: CancellationToken,
+) -> Result<Vec<(usize, Vec<Value>)>, DbError> {
+    let mut conn = db.open(None, false).await?;
+    let conn_id = conn.id();
+    let outcome = tokio::select! {
+        r = refetch_on(&mut conn, template, rows) => r,
+        _ = cancel.cancelled() => {
+            db.kill_query(conn_id).await;
+            Err(DbError::Cancelled)
+        }
+    };
+    let _ = conn.disconnect().await;
+    outcome
+}
+
+/// Read one binary cell's bytes, bounded by what a packet holds.
+pub(crate) async fn fetch_blob(
+    db: &Db,
+    r: &BlobRef,
+    cancel: CancellationToken,
+) -> Result<Option<BlobValue>, DbError> {
+    // `None`, not the target database: `build_blob_select` qualifies the
+    // table as `db`.`table` itself, so the session default is never
+    // consulted and a `USE` would be a round trip that decides nothing —
+    // the same shape `refetch_rows` below already has.
+    let mut conn = db.open(None, false).await?;
+    let conn_id = conn.id();
+    let outcome = tokio::select! {
+        res = blob_on(&mut conn, r) => res,
+        _ = cancel.cancelled() => {
+            db.kill_query(conn_id).await;
+            Err(DbError::Cancelled)
+        }
+    };
+    let _ = conn.disconnect().await;
+    outcome
 }
