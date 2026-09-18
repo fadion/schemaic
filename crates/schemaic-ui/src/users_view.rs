@@ -46,7 +46,10 @@ use crate::widgets::{
     focus_root_with_ring, in_ring_button, modal_footer_split, modal_pad_h, modal_title_owned,
     modal_w, panel_style,
 };
-use crate::{FieldCfg, GrantsState, Ui, UsersState, UsersTarget, edit_field, icons, theme};
+use crate::{
+    ConnUi, DdlUi, FieldCfg, GrantsState, OverlayUi, Ui, UsersState, UsersTarget, edit_field,
+    icons, theme,
+};
 
 /// Modal width. The grant pane holds SQL, and a MySQL grant on a namespaced
 /// table (`` GRANT SELECT ON `warehouse`.`shipment_line` TO `app`@`%` ``) is
@@ -204,7 +207,7 @@ pub(crate) fn users_overlay(ui: Ui) -> impl IntoView {
             // `+ New account` live while `Privileges`/`Drop` are dimmed, with
             // nothing to say which is right — and it re-walks the connection
             // list for an answer that cannot differ between them.
-            let gate = write_gate(&ui, &t);
+            let gate = write_gate(ui.conn, &t);
             let right = v_stack((
                 detail_pane(&ui, &t, gate, ring.clone()),
                 footer(&ui, &t, state, filter, grants, close.clone(), ring.clone()),
@@ -383,7 +386,7 @@ fn list_pane(ui: &Ui, target: &UsersTarget, gate: WriteGate, ring: FocusRing) ->
                 .min_height(0.0)
                 .margin_top(theme::scaled(10.0))
         })),
-        new_account_row(ui, target, gate, ring),
+        new_account_row(ui.conn, ui.ddl, target, gate, ring),
     ))
     .style(|s| {
         // **Full height, and nothing cuts across it.** The footer used to span
@@ -529,7 +532,15 @@ fn detail_pane(ui: &Ui, target: &UsersTarget, gate: WriteGate, ring: FocusRing) 
                 // other, so an absent actions row left a hole between the name
                 // and the attributes — the trap `properties::stats_body` states.
                 let mut sections: Vec<AnyView> = vec![heading(&p)];
-                sections.extend(actions_row(&ui, &target, gate, &p, ring.clone()));
+                sections.extend(actions_row(
+                    ui.conn,
+                    ui.ddl,
+                    ui.overlay,
+                    &target,
+                    gate,
+                    &p,
+                    ring.clone(),
+                ));
                 if !p.attributes.is_empty() {
                     sections.push(section(
                         "Attributes",
@@ -706,10 +717,10 @@ fn statement_row(sql: &str, dialect: SqlDialect) -> AnyView {
 /// The decision itself is in `core` — it is an ordering of four answers, which
 /// is exactly the kind of thing an 860-line view is the wrong place to keep and
 /// the reason it had no test.
-fn write_gate(ui: &Ui, target: &UsersTarget) -> WriteGate {
+fn write_gate(conn: ConnUi, target: &UsersTarget) -> WriteGate {
     WriteGate::of(
         target.dialect,
-        target_read_only(ui.conn.connections, target),
+        target_read_only(conn.connections, target),
         target.database.is_some(),
     )
 }
@@ -767,13 +778,17 @@ fn read_only_tracked(conns: RwSignal<Vec<Connection>>, conn_id: u64) -> bool {
 /// Connections' `New connection` row has, and in the same place: under the list
 /// it adds to rather than beside the box that searches it, so the column reads
 /// top to bottom as *find one, or make one*.
-fn new_account_row(ui: &Ui, target: &UsersTarget, gate: WriteGate, ring: FocusRing) -> AnyView {
+fn new_account_row(
+    conn: ConnUi,
+    ddl: DdlUi,
+    target: &UsersTarget,
+    gate: WriteGate,
+    ring: FocusRing,
+) -> AnyView {
     if !gate.offered() {
         return crate::widgets::nothing().into_any();
     }
     let enabled = gate.enabled();
-    // The two `Copy` bundles the door names, not a `Ui` clone.
-    let (conn, ddl) = (ui.conn, ui.ddl);
     let database = target.database.clone().unwrap_or_default();
     // The whole target, not just its database: the form is for the server the
     // browser was opened on, and the switcher may have moved. See
@@ -830,7 +845,9 @@ fn new_account_row(ui: &Ui, target: &UsersTarget, gate: WriteGate, ring: FocusRi
 /// about one account. A Drop in the footer would also sit one Tab away from
 /// Close, which is the wrong pair of neighbours for an irreversible action.
 fn actions_row(
-    ui: &Ui,
+    conn: ConnUi,
+    ddl: DdlUi,
+    overlay: OverlayUi,
     target: &UsersTarget,
     gate: WriteGate,
     p: &Principal,
@@ -851,7 +868,7 @@ fn actions_row(
     }
     let enabled = gate.enabled();
 
-    let (grant_conn, grant_ddl) = (ui.conn, ui.ddl);
+    let (grant_conn, grant_ddl) = (conn, ddl);
     let grant_target = target.clone();
     let grant_who = p.clone();
     let grant = action_button(
@@ -886,7 +903,7 @@ fn actions_row(
     // a capability — `supports_password_reset` folds "does this engine have
     // accounts" into the same answer — rather than as a `dialect ==`.
     let reset = schemaic_core::users::supports_password_reset(target.dialect, p.kind).then(|| {
-        let (reset_conn, reset_ddl) = (ui.conn, ui.ddl);
+        let (reset_conn, reset_ddl) = (conn, ddl);
         let reset_target = target.clone();
         let reset_who = p.clone();
         action_button(
@@ -912,7 +929,6 @@ fn actions_row(
         .into_any()
     });
 
-    let drop_ui = ui.clone();
     let drop_target = target.clone();
     let drop_who = p.clone();
     let risk_dialect = target.dialect;
@@ -920,11 +936,10 @@ fn actions_row(
     // the preview must be built for the server this account lives on, not for
     // whichever the switcher points at by the time the confirm is answered.
     let plan_conn_id = target.conn_id;
-    let confirm = ui.overlay.confirm;
+    let confirm = overlay.confirm;
     // 14, after Reset password at 13 — the tab order follows the row, and Drop
     // stays last of the three because it is the destructive one.
     let drop = action_button("Drop", ActionKind::Danger, enabled, ring, 14, move || {
-        let ui = drop_ui.clone();
         // **The launch guards itself, in the step that launches it.** `enabled`
         // is a `bool` captured when this row was built, so the disabled button
         // *was* the whole guard — verbatim what `widgets::accept_launch`'s
@@ -936,10 +951,7 @@ fn actions_row(
         // `plan_conn_id` below is the one the account lives on — so after a
         // connection switch this asked about the wrong server, in both
         // directions. `read_only_of` is the one answer to that question.
-        if !crate::widgets::accept_launch(
-            false,
-            launch_read_only(ui.conn.connections, plan_conn_id),
-        ) {
+        if !crate::widgets::accept_launch(false, launch_read_only(conn.connections, plan_conn_id)) {
             return;
         }
         let database = drop_target.database.clone().unwrap_or_default();
@@ -961,10 +973,10 @@ fn actions_row(
                 // time after the button was pressed — the deferred half
                 // `accept_dialog_launch` exists for. The flag can flip while the
                 // red confirm stands.
-                let read_only = launch_read_only(ui.conn.connections, plan_conn_id);
+                let read_only = launch_read_only(conn.connections, plan_conn_id);
                 if yes && crate::widgets::accept_launch(false, read_only) {
                     crate::ddl_preview::preview_account(
-                        ui.ddl,
+                        ddl,
                         crate::ddl_preview::PlanTarget {
                             conn_id: plan_conn_id,
                             database: database.clone(),

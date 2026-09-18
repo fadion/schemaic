@@ -14952,8 +14952,19 @@ existing prose was left alone.
     `ui.overlay` alone and takes `OverlayUi` beside the `DdlUi` it already had; and the two overlays
     fall out of those — `account_editor_overlay(DdlUi)` and `grant_editor_overlay(DdlUi, OverlayUi)`.
     Its callers in `users_view.rs` (New account, Privileges, Reset password) carry `(ui.conn,
-    ui.ddl)` rather than a `Ui` clone, and that file stays at 8 — the propagation shows up as
-    rewritten call sites, not as a lower number, which is the easy thing to overcount.
+    ui.ddl)` rather than a `Ui` clone — which is how a propagating narrowing first shows up, as
+    rewritten call sites rather than as a lower number, and is the easy thing to overcount.
+    **Then the number did move, 8 → 5**, because those rewritten call sites left three functions
+    holding a bundle for nothing: `write_gate` takes `ConnUi`, `new_account_row` `(ConnUi, DdlUi)`
+    and `actions_row` `(ConnUi, DdlUi, OverlayUi)` — Grant, Reset and Drop, which is exactly what
+    the three doors under them now name. Read that as the second half of the same step rather than
+    a separate pass: a caller cannot be narrower than what it calls, so every door that comes down
+    leaves its callers narrowable and *nothing points that out* — the ratchet is satisfied by a
+    file that stands still. **The five left in `users_view.rs` are a different shape and want a
+    different answer**: the modal root, its two panes, the footer and `open_for_server` each reach
+    `OverlayUi` *and* an action out of `schema_actions`, on top of `target`, `gate` and a
+    `FocusRing` they already carry, so the next step there is a browser-local context struct — what
+    `schema_tree::SchemaTreeCtx` is for its rows — not three more parameters apiece.
     **Three named bundles can still be the narrower signature, and can say something the root one
     hid.** `preview_change` takes `(ConnUi, DdlUi)` and `preview_proposal`
     `(ConnUi, SchemaUi, DdlUi)`; the count looks like a step backwards until you read what `conn`
@@ -14962,12 +14973,12 @@ existing prose was left alone.
     site rather than only in the prose two paragraphs up. The rule is the signature saying what the
     function depends on, not the parameter count.
     **The live number is the sum of `BUDGET`, not the "roughly 140" above**, which describes the
-    state the gate found and by design never moves. That sum went **206 → 110** over this run:
+    state the gate found and by design never moves. That sum went **206 → 107** over this run:
     `table_designer.rs` 29 → 26 → 10 → 4, `object_editor.rs` 14 → 5 → 4 → **0**,
     `routine_editor.rs` 12 → 6 → **0**, `event_editor.rs` 11 → 5 → **0**,
     `trigger_editor.rs` 11 → 8 → 7 → **0**, `view_editor.rs` 10 → 6, `database_editor.rs` 7 → 3,
     `ddl_preview.rs` 6 → 4 → 2, `overlays.rs` 15 → 13, `account_editor.rs` 6 → **0**,
-    `schema_tree.rs` 6 → 3. Every step is recorded against its own entry with what it narrowed *to*,
+    `schema_tree.rs` 6 → 3, `users_view.rs` 9 → 8 → 5. Every step is recorded against its own entry with what it narrowed *to*,
     so read the list for where a file stands rather than inferring it from a paragraph — and a file
     that reaches zero leaves the list altogether, which is the one way an entry is ever removed and
     the point at which it may not take a `Ui` again at all. **Five files have left it** — the three DDL-object editors, then

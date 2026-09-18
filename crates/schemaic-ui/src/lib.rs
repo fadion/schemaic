@@ -14706,7 +14706,17 @@ mod whole_ui_gate {
         // signal it actually reads rather than the root bundle, which is this
         // rule's own prescription and was the right shape anyway — the decision
         // is `connection::read_only_of` over a list.
-        ("users_view.rs", 8),
+        //
+        // 8 → 5: the three functions the `account_editor` narrowing had left
+        // holding a bundle for nothing — `write_gate` takes `ConnUi`,
+        // `new_account_row` `(ConnUi, DdlUi)` and `actions_row`
+        // `(ConnUi, DdlUi, OverlayUi)`, which is Grant, Reset and Drop and
+        // exactly what the three doors below them now name. The five left are
+        // the modal root, its two panes, the footer and `open_for_server`, and
+        // those are a different shape: each reaches `OverlayUi` *and* an action
+        // out of `schema_actions`, so the next step there is a browser-local
+        // context the way `schema_tree` has one, not another parameter each.
+        ("users_view.rs", 5),
         // 10 → 6: `bound_field` and `bound_choice` take the
         // `RwSignal<ViewDraft>` they write, `form` takes `DdlUi`, and — unlike
         // every sibling editor's — **the overlay takes `DdlUi` too**. Nothing
