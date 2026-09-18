@@ -7021,18 +7021,68 @@ existing prose was left alone.
 - `schemaic-db` — MySQL/MariaDB (`mysql_async`) in `mysql.rs`, PostgreSQL in `pg.rs`,
   SQLite in `sqlite.rs`, SSH tunnels in `ssh.rs`, and
   the pinned manual-transaction connection in `session.rs`.
-  **`mysql.rs` is being filled a piece at a time and this sentence is ahead of it.** For most of
-  the crate's life MySQL had no module — its bodies were inline in `lib.rs`, so `pg.rs` and
-  `sqlite.rs` were peers of each other and of nothing else, and the crate doc opened by saying so.
-  Each step moves one family of entry points and leaves the rest inline, so until the move is
-  finished `lib.rs` still holds MySQL bodies and the two convention tests
-  (`every_engine_module_answers_the_whole_interface`,
-  `the_dispatcher_calls_both_engine_modules_for_every_entry_point`) still check two engines rather
-  than three. **What may move is decided by who reads it, not by what it is named**: `assemble_schema`,
-  `ColRow`, `IdxRow`, `FkColRow`, `TxScope`, `DdlError`, `lock_wait_sql` and the
+  **Three engines and three modules — the move is finished.** For most of the crate's life MySQL
+  had no module: its bodies were inline in `lib.rs`, so `pg.rs` and `sqlite.rs` were peers of each
+  other and of nothing else, and the crate doc opened by warning about it. Six steps moved one
+  family of entry points each — account introspection; Server Activity and table statistics;
+  `collect_schema` with everything it folds plus the four lazy `SHOW CREATE` reads; the wire
+  decoders and the read paths; DDL, scripts, imports and write-back; and finally `run_script` with
+  the convention flip — taking `lib.rs` from 9,590 lines to about 3,100 beside `mysql.rs`'s 7,055, and
+  leaving no `Engine::MySql` arm in `lib.rs` that is not a call into `mysql::`. (The one dispatch
+  arm in the file that still builds SQL is SQLite's inside `fetch_table`, which is not one of
+  `ENGINE_ENTRY_POINTS`' thirteen and so is outside the census below.) Both convention tests read
+  three engines now, and the second is renamed for it:
+  `every_engine_module_answers_the_whole_interface` and
+  `the_dispatcher_calls_every_engine_module_for_every_entry_point`.
+  **Flipping them to three is what found the last three doors.** `commit_writes`, `refetch_rows`
+  and `fetch_blob` existed in `mysql.rs` only as `write_on`, `refetch_on` and `blob_on` — the
+  bodies `session.rs` calls directly — while the dispatcher's arm was still inline, so the interface
+  had three names MySQL answered only from the inside. Both tests named all three, which is the
+  census doing what the compiler cannot: a fourth engine *variant* is a compile error at every
+  dispatch site, a module answering twelve of thirteen is not.
+  **The census also caught a mistake byte-identity could not.** One step moved a *line range*
+  rather than an item list and swept three public `impl Db` methods — `commit_writes`,
+  `refetch_rows`, `fetch_blob` — into `mysql.rs` with it, where they compiled perfectly, an
+  inherent `impl Db` block being legal in any module of the crate. The moved lines were
+  byte-for-byte what left; it was *which* lines that was wrong, and the thing that said so was
+  `the_dispatcher_calls_every_engine_module_for_every_entry_point`: "nothing in the dispatcher calls
+  `pg::fetch_blob`".
+  **Two of this crate's source gates had to be repaired for the move, each in the way a source gate
+  fails — by passing.** `only_one_function_decides_which_mysql_family_server_this_is` opened
+  `src/lib.rs` by name and asserted no line re-derives `contains("mariadb")`; once `collect_schema`
+  moved, that scan would have found nothing, because there was no MySQL introspection left in
+  `lib.rs` to offend, while a second spelling in `mysql.rs` went unread. It walks every `.rs` in the
+  crate's `src` now, with a floor (`scanned >= 5`) so a moved directory fails rather than scanning
+  nothing, and it was watched red by planting an offender in `mysql.rs`. The second failure is the
+  mirror of it: **a gate that ends up in the same file as its subject becomes its own first
+  match**, so a literal `find("async fn import_on(")` finds the test's own line before the function
+  and the "body" it then measures is twenty lines of the test. The import gate's floor caught that
+  one — *only 0 notes* — which is what a floor is for, and the timeout gate's first version failed
+  on `ping` for the same reason. Both needles are assembled from fragments now, the way the
+  `mariadb` gate always did it.
+  **What stays in `lib.rs` is decided by who reads a thing, not by what it is named**:
+  `assemble_schema`, `ColRow`, `IdxRow`, `FkColRow`, `TxScope`, `DdlError`, `lock_wait_sql`,
+  `next_batch_off_executor`, `order_by_clause` and the
   `NumKind`/`num_kind`/`parse_as`/`parse_typed` family are all called from `pg.rs` despite their
-  MySQL-flavoured vocabulary and stay in `lib.rs`; `ident_sqlite` is the mirror-image trap, sitting
-  next to MySQL's own `ident` and belonging to neither. **`Db::fetch_sessions`/
+  MySQL-flavoured vocabulary, and moving any of them into an engine module would make one engine
+  depend on a module named for another; `ident_sqlite` is the mirror-image trap, sitting
+  next to MySQL's own `ident` and belonging to neither. The rule covers the tests as well, which is
+  the half that was got wrong: the `assemble_schema_*` tests travelled to `mysql.rs` with one step
+  and had to come back, a test for a function two engines share not belonging in one engine's
+  module.
+  **`mysql::run_batch` takes two arguments `pg::run_batch` does not** — the `USE` scope and the
+  dialect — because `USE` is MySQL's alone, so only that arm can move the batch's current database
+  mid-run and only it has to make a later statement's result label follow. That is the concrete
+  answer to why the engine interface is a **naming convention** (`ENGINE_ENTRY_POINTS`) rather than
+  a trait: a convention carries an asymmetry a trait would have to flatten into a parameter every
+  engine takes and two ignore.
+  **One remainder is named in the crate doc rather than left to be discovered**: `Db`'s connection
+  plumbing is still MySQL's. `open`, `open_serverless`, `opts`, `opts_with_tls`, `dial` and
+  `Db::kill_query` all speak `mysql_async` and nothing in `pg.rs` or `sqlite.rs` calls any of them —
+  those two build their own clients — so `kill_query`'s `KILL QUERY <id>` is the one statement
+  `lib.rs` still *sends* itself. It sits there because it belongs to the handle rather than to an
+  operation, and moving a type's constructor out of the module that defines the type is a different
+  question from moving its bodies; `TODO.md` carries it as the question rather than the answer. **`Db::fetch_sessions`/
   `Db::kill_session`** are the Server Activity panel's whole backend, and they are up to three
   queries per engine rather than one: MySQL runs `information_schema.PROCESSLIST` (required —
   without it there
@@ -7097,7 +7147,13 @@ existing prose was left alone.
   times the deadline it claims. `every_reachability_path_is_bounded_by_a_timeout` is a source gate
   over `ping`/`fetch_databases`/`fetch_sessions`/`kill_session` **and `fetch_table`**, because the
   failure is a host that never answers and no unit test can stage one — a closed port is *refused*,
-  instantly, and only a packet filter reproduces the hang.
+  instantly, and only a packet filter reproduces the hang. **Its table names a file per method,
+  because the bound is not always where the public method is.** Two shapes exist and both are
+  right: `fetch_sessions`, `kill_session` and `fetch_table` wrap the whole dispatch in `lib.rs`, so
+  the bound belongs to the public method, while `ping` and `fetch_databases` are bounded per engine
+  — `pg::ping` takes the deadline as a parameter, and SQLite's wraps an `open` that can block on a
+  dead network share. Writing the file down per method is what stops the gate reading a file its
+  subject has left, which is how a source gate stops testing anything without failing.
   **`fetch_table` is the app's second forever-timer, and this gate's own doc used to say in so many
   words that `fetch_sessions` was the only one.** The Live
   Monitor re-arms `fetch_table` every two seconds for as long as its modal is open, and the premise
@@ -18163,6 +18219,16 @@ Re-introducing the anti-patterns these guard against is a regression:
   reads a file by name passes vacuously the moment the name is wrong, so break a term, watch it
   fail, and put it back. Both were done for this cut, and the second is the one that would have
   caught a gate left pointing at `lib.rs`.
+  **`schemaic-db`'s MySQL extraction is the second worked example, and it adds two things.** Move
+  an *item list*, never a line range: one of its six steps took a range and swept three unrelated
+  public `impl Db` methods across with it, which compiled — an inherent `impl` is legal in any
+  module of the crate — with the moved lines byte-for-byte what left, so the diff read clean and
+  the placement was wrong. What said so was a census naming every entry point
+  (`the_dispatcher_calls_every_engine_module_for_every_entry_point`), which is the check byte
+  identity cannot be. And a gate that lands in the **same file as its subject becomes its own first
+  match**, since a literal `find("async fn import_on(")` finds the test's own line before the
+  function: assemble the needle from fragments, prefer reading the directory to naming a file, and
+  give every source gate a floor so a scan that finds nothing fails rather than passes.
 
 ## UI conventions
 

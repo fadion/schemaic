@@ -5,18 +5,29 @@
 //! runs, disconnects (the one-connection-per-operation invariant, with its two
 //! stated exceptions in [`session`] and [`Db::run_script`]), and dispatches on
 //! [`Engine`]: MySQL to [`mysql`], PostgreSQL to [`pg`], SQLite to [`sqlite`].
-//! **No operation here runs a statement**; this file is the façade and the
-//! dispatch, and every arm is a call into an engine module.
+//! **No `Engine::MySql` arm here runs a statement** — every one of them is a
+//! call into [`mysql`]. Two things that sounds like and is not, both worth
+//! stating so neither is over-read:
 //!
-//! The one exception is deliberate and worth naming rather than leaving to be
-//! discovered: [`Db`]'s **connection plumbing** is still MySQL's. `open`,
-//! `open_serverless`, `opts`, `opts_with_tls`, `dial` and [`Db::kill_query`] all
-//! speak `mysql_async` and nothing in `pg.rs` or `sqlite.rs` calls any of them —
-//! those two build their own clients. So `kill_query`'s `KILL QUERY <id>` is the
-//! last statement text in this file. It sits here because it belongs to the
-//! handle rather than to an operation, and moving a type's constructor out of
-//! the module that defines the type is a different question from moving its
-//! bodies; `TODO.md` carries it as the question rather than the answer.
+//! *Not* "no arm builds SQL". SQLite's arm of [`Db::fetch_table`] still assembles
+//! its `SELECT … LIMIT` inline and re-enters [`Db::fetch_query`]; `fetch_table`
+//! is not one of `ENGINE_ENTRY_POINTS`' thirteen, so the census below never looks
+//! at it.
+//!
+//! *Not* "no statement text is left". `lock_wait_sql` writes MySQL's
+//! `SET SESSION lock_wait_timeout`, and `TxScope` writes `BEGIN`, `COMMIT` and
+//! `ROLLBACK TO SAVEPOINT` — both stay because more than one engine reads them,
+//! and both are strings an engine module runs rather than statements this file
+//! sends. [`Db::kill_query`]'s `KILL QUERY <id>` is the only statement `lib.rs`
+//! still sends itself.
+//!
+//! It sends it because [`Db`]'s **connection plumbing** is still MySQL's: `open`,
+//! `open_serverless`, `opts`, `opts_with_tls`, `dial` and `kill_query` all speak
+//! `mysql_async`, and nothing in `pg.rs` or `sqlite.rs` calls any of them — those
+//! two build their own clients. That sits here because it belongs to the handle
+//! rather than to an operation, and moving a type's constructor out of the module
+//! that defines the type is a different question from moving its bodies;
+//! `TODO.md` carries it as the question rather than the answer.
 //!
 //! For most of the crate's life that was not true. MySQL had no module — its
 //! bodies were inline below, so `pg.rs` and `sqlite.rs` were peers of each other
@@ -2421,13 +2432,6 @@ pub(crate) fn parse_typed(s: String, type_name: &str) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
-    // **Tests here reaching into the engine module, which is the wrong
-    // direction** — and temporary, like the production import at the top of this
-    // file. The decoder tests that need these sit interleaved with tests for
-    // `value_to_param`, `build_refetch_sql` and `build_blob_select`, write-back
-    // builders that have not moved yet; the whole block goes across with them
-    // rather than being split by hand now and again later. When it does, this
-    // import is what fails.
 
     /// **A fourth engine variant is a compiler error; a fourth engine module is
     /// not.** [`ENGINE_ENTRY_POINTS`] is the interface the dispatcher expects by
@@ -2436,9 +2440,12 @@ mod tests {
     /// `fetch_blob`, which compiles until somebody writes that dispatch arm.
     ///
     /// Reading the source is the subject because the thing under test is a
-    /// *file*, exactly as `core/tests/doc_coverage.rs` reads `src/*.rs`. MySQL
-    /// is absent on purpose: it has no module, which is the asymmetry rather
-    /// than an omission.
+    /// *file*, exactly as `core/tests/doc_coverage.rs` reads `src/*.rs`.
+    ///
+    /// **MySQL was absent from this for most of the crate's life**, not as an
+    /// omission but because there was no `mysql.rs` for it to name — which meant
+    /// the engine that ships most was the one engine this could never be about.
+    /// Adding it found three doors it answered only from the inside.
     #[test]
     fn every_engine_module_answers_the_whole_interface() {
         // **Three, at last.** `mysql.rs` was absent from this list for most of
