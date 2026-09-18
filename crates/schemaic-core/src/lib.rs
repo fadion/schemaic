@@ -40,6 +40,7 @@ pub mod pairs;
 pub mod palette;
 pub mod params;
 pub mod persist;
+pub mod pg_builtins;
 pub mod plan;
 pub mod prompt;
 pub mod propose;

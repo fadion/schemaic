@@ -433,7 +433,7 @@ existing prose was left alone.
     MariaDB has `RETURNING` too.
     **The typo checker runs only where the app holds the engine's own catalog** — `builtin_catalog`
     answers that with one exhaustive `match` **returning the catalog itself**: `FUNCTIONS` for
-    MySQL, `SQLITE_FUNCTIONS` for SQLite, `None` for PostgreSQL, and `is_known_function` and
+    MySQL, `SQLITE_FUNCTIONS` for SQLite, `PG_FUNCTIONS` for PostgreSQL, and `is_known_function` and
     `is_probable_function_typo` take it as a parameter. Reaching for the module-level `FUNCTIONS`
     inside those two was the defect under the original bug: the checker spent its `dialect` on
     `skip_noncode` and `is_sql_keyword` and never on the catalog questions, so on PostgreSQL it
@@ -446,12 +446,15 @@ existing prose was left alone.
     **`SQLITE_FUNCTIONS` turned the checker on for SQLite** — 157 entries, written lower-case the way
     SQLite's own documentation writes them while `FUNCTIONS` stays upper-case for MySQL's, which
     costs nothing because both comparisons are case-insensitive at either end.
-    **PostgreSQL stays `None` deliberately, and a hand-written list is not what changes that**: the
+    **PostgreSQL has one now, and a hand-written list was never what could give it one**: the
     checker only ever speaks about a near miss of a name it *holds*, so a partial catalog
     reintroduces the original false positives for whatever it omits — `to_date` squiggled because
     `to_char` made the list. SQLite could be written out by hand because its builtins are a small
     closed set its documentation enumerates; PostgreSQL's are not, and the honest source for them is
-    `pg_catalog` on a real server.
+    `pg_catalog` on a real server, which is what `pg_builtins.rs` below was *generated* from. **The
+    `Option` outlives that**: all three engines answer `Some` today, and the `None` arm stays for the
+    *fourth*, which has to land on it rather than inherit whichever list is nearest — the original
+    bug, one engine further on.
     **A catalog is data, so the engine checks it** — `schemaic-db/tests/sqlite_catalog.rs`, which
     lives over there rather than beside the catalog because only that crate links rusqlite, and needs
     no server, no file and no network (the in-memory-SQLite allowance).
@@ -474,6 +477,10 @@ existing prose was left alone.
     rename machinery `ALTER TABLE` drives, not callable API, and names no user should be nudged
     toward) and the `->`/`->>` operators, which the checker cannot reach since it only looks at a
     word followed by `(`.
+    **PostgreSQL's half of that same rule is `live::pg_catalog`**, which re-asks the server under
+    test the query that generated the file and fails on any name `PG_FUNCTIONS` lacks. It sits in the
+    live tier rather than beside the catalog because its oracle is a *server*, where SQLite's is a
+    linked library.
     **A builtin's name plus a `_` or a digit is a *derived* name, not a misspelling**, and
     `is_probable_function_typo` refuses those outright. Its own doc already claimed the design
     avoided flagging `format_x` as a typo of `FORMAT` — by not loosening the distance threshold —
@@ -484,6 +491,14 @@ existing prose was left alone.
     `G` from `SUBSTRING`, so those are still flagged. It is the same shape as the transposition case
     the function already carries — a named exception rather than a wider distance, because widening
     the distance is what produced this class in the first place.
+    **Both of its loops are length-first now, and that is a cost change PostgreSQL's catalog forced.**
+    It used to map the catalog to an upper-cased `String` per entry, twice over, per candidate word,
+    per statement, on the editor's 120 ms debounce — affordable against MySQL's few hundred entries
+    and not against `PG_FUNCTIONS`' 2,706. The derived-name loop compares the bytes case-insensitively
+    and allocates nothing; the distance loop tests `f.name.len()` against the word's and upper-cases
+    only the survivors. Neither loses a match: the derived-name test already required the word to be
+    the longer string, and `is_adjacent_transposition` returns `false` outright on a length mismatch,
+    so a name further than `thresh` from the word in length could satisfy neither arm.
     **`diagnostics` runs over the whole document on the UI thread 120 ms after a keystroke, with no
     size cap, and two things in it were redoing work the statement could not change.**
     `static_words` is every keyword and builtin name this crate knows, lowercased, behind a
@@ -725,6 +740,39 @@ existing prose was left alone.
     `SELECT a`, which parses perfectly and means something else entirely. That is what
     `noise_in_the_middle_is_not_stitched_around` pins, and it is the reason the guard exists. The
     cost is deliberate: a valid statement this parser cannot handle is refused rather than shown.
+  - `pg_builtins.rs` — the **PostgreSQL builtin catalog**, the third entry in
+    `intel::builtin_catalog` and the one that could not be written by hand, and the reason the typo
+    checker is on for this engine at all. `PG_FUNCTIONS` is 2,706 entries and the split is the point:
+    **2,682 are generated** from `pg_catalog` on a real PostgreSQL 16.15 — the query that produced
+    them is in the module doc — and **24 are written by hand** because PostgreSQL's *grammar*
+    implements those call forms with no `pg_proc` row to read them from —
+    `trim`, `coalesce`, `cast`, `greatest`, `least`, `nullif`, `row`, `treat`, `grouping`, the
+    `current_time`/`localtime` family, the `xml*` constructors and the SQL/JSON constructors, each
+    verified by executing it on the server rather than recalled from the grammar file.
+    **That second half was found by a test, not by reasoning**: with the generated list alone wired
+    in, `intel::tests::corpus_valid_queries_are_clean_against_a_loaded_catalog` failed on
+    `SELECT TRIM(BOTH ' ' FROM name)` with `` `TRIM` looks like a misspelled function ``, because the
+    grammar rewrites `trim` to `btrim` and `pg_catalog` has no `trim` row. `substring`, `position`,
+    `overlay`, `extract`, `normalize`, `xmlexists`, `json_object` and `unnest` are deliberately *not*
+    in that half: they have real `pg_proc` rows as well as grammar, so the query already found them.
+    **Nothing is filtered out of the generated half.** Type I/O functions (`int4in`), operator
+    implementations (`texteq`), index support functions (`btint4cmp`) and aggregate transition
+    functions (`int8_avg`) are all callable SQL, and the catalog's job is to not squiggle a name the
+    engine really has; a curated "user-facing" subset would be a hand-written list again, with the
+    same failure mode and no test able to see it. The cost is named rather than waved away — the
+    near-miss net is drawn around ten times as many names as MySQL's — and
+    `intel::tests::an_ordinary_user_function_survives_the_pg_catalog` is what keeps it honest,
+    holding ten ordinary application names (`calc_total`, `audit_log`, `trim_name`) to no squiggle.
+    **Names are lower-case**, like `SQLITE_FUNCTIONS` and unlike `FUNCTIONS`, which costs nothing
+    because both comparisons are case-insensitive at either end — `pg_function_catalog_is_sane` pins
+    it, along with a size floor set well under 2,682 so a later major version may add or drop names
+    without a failure that says nothing. **The signature is one overload, not all of them**: `abs`
+    alone has six and the completion popup has one line, so the representative is the fewest-argument
+    one, spelled with types rather than parameter names because that is what PostgreSQL's own
+    documentation prints for an overload set; summaries are the server's `obj_description`, verbatim
+    but for the leading capital. `intel::f` is `pub(crate)` for this module alone, so 2,682 generated
+    entries need no second spelling of the `SqlFunction` literal. What holds the file to a real server
+    is `live::pg_catalog`, under `tests/live/` below.
   - `filter.rs` — the header filter/sort bar: a dialect-aware `sqlparser` **AST rewrite** that
     splices a `WHERE`/`ORDER BY` into the `SELECT` that produced the result and hands back SQL to
     re-run — so filtering covers the whole table, not the loaded page. `build_query` rewrites only
@@ -8446,6 +8494,15 @@ existing prose was left alone.
   a capability instead of comparing a dialect. **MariaDB is a leg of its own**, not a MySQL
   stand-in: the divergences are in exactly what this crate reads, which is how a MySQL 8
   `CHECK_CLAUSE` escaping quirk once hid behind a MariaDB that returned runnable text.
+  **`pg_catalog.rs` is the one module outside the macro, and the one that names an engine.** It
+  holds `core::pg_builtins::PG_FUNCTIONS` to what the server under test reports — every name the
+  server has is in the catalog, the overhang is exactly the 24 grammar-only forms (`over_listing`),
+  and those 24 are really in the catalog (`the_grammar_forms_are_in_the_catalog`, so the allowance
+  cannot outlive what it was granted for). The tier's rule still stands and this is not a hole in
+  it: the subject here is one engine's *data file* rather than a claim about how the DB layer
+  behaves, and there is no version of "is PostgreSQL's builtin list complete" MariaDB could answer.
+  It carries its own `POSTGRES.enabled()` check, which is what the macro would otherwise have given
+  it.
   **`endpoint.rs` is where a leg comes from**, and it is the whole environment contract: three
   `SCHEMAIC_IT_<ENGINE>_HOST`/`_PORT`/`_USER`/`_PASSWORD` groups with localhost defaults, plus
   `SCHEMAIC_IT_ENGINES` as the one way to run fewer than all three. An *unreachable* endpoint is a

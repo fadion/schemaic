@@ -199,7 +199,14 @@ pub struct SqlFunction {
     pub summary: &'static str,
 }
 
-const fn f(name: &'static str, signature: &'static str, summary: &'static str) -> SqlFunction {
+/// Builds one catalog entry. `pub(crate)` only so [`crate::pg_builtins`], which
+/// is mostly generated rather than written, can build its 2,706 of them from
+/// here rather than carry a second spelling of the same struct literal.
+pub(crate) const fn f(
+    name: &'static str,
+    signature: &'static str,
+    summary: &'static str,
+) -> SqlFunction {
     SqlFunction {
         name,
         signature,
@@ -1511,9 +1518,12 @@ pub const SQLITE_FUNCTIONS: &[SqlFunction] = &[
 /// answering "are this app's builtins authoritative here", so there is one arm
 /// per engine and one place to forget an engine rather than two. A separate
 /// `builtin_functions_are_authoritative` stood here and was deleted for saying
-/// the same thing a second time. `None` is not "no builtins" — PostgreSQL has
-/// some 2,900 — it is "this app cannot say", which is the distinction the
-/// checker needs.
+/// the same thing a second time. `None` is not "no builtins" — it is "this app
+/// cannot say", which is the distinction the checker needs. **All three engines
+/// answer `Some` today, and the `None` arm stays because a fourth engine must
+/// land on it** rather than inherit whichever list is nearest: that is the whole
+/// bug below, and `Option` is what keeps the fix from depending on somebody
+/// remembering to add an arm.
 ///
 /// The checker used to spend its `dialect` on `skip_noncode` and `is_sql_keyword`
 /// and never on the catalog questions, so on PostgreSQL it failed to recognise
@@ -1523,19 +1533,19 @@ pub const SQLITE_FUNCTIONS: &[SqlFunction] = &[
 /// correct SQL is misspelled is worse than saying nothing, so the checker is off
 /// wherever the catalog would not be the engine's.
 ///
-/// [`SQLITE_FUNCTIONS`] has since given SQLite an answer. **PostgreSQL still has
-/// none, and a hand-curated list is not the way to change that**: the checker
-/// speaks only about near misses of names it holds, so a partial catalog
-/// reintroduces exactly the original false positives for whatever it omits —
-/// `to_date` squiggled because `to_char` made the list. SQLite could be written
-/// out by hand because its builtins are a small closed set its own documentation
-/// enumerates; PostgreSQL's are not that, and the honest source for them is
-/// `pg_catalog` on a real server rather than anyone's memory.
+/// [`SQLITE_FUNCTIONS`] answered that for SQLite by hand, because its builtins
+/// are a small closed set its own documentation enumerates. PostgreSQL's are
+/// not, and a hand-curated list would have been the original false positives
+/// again — `to_date` squiggled because `to_char` made somebody's list. So
+/// [`crate::pg_builtins::PG_FUNCTIONS`] is *generated* from `pg_catalog` on a
+/// real server, all 2,682 names of it, plus the 24 call forms the grammar
+/// implements without a `pg_proc` row — and `live::pg_catalog` re-asks the
+/// server under test whether the file is still complete.
 fn builtin_catalog(dialect: SqlDialect) -> Option<&'static [SqlFunction]> {
     match dialect {
         SqlDialect::MySql => Some(FUNCTIONS),
         SqlDialect::Sqlite => Some(SQLITE_FUNCTIONS),
-        SqlDialect::Postgres => None,
+        SqlDialect::Postgres => Some(crate::pg_builtins::PG_FUNCTIONS),
     }
 }
 
@@ -5058,10 +5068,11 @@ fn typo_checks(
 /// known builtin but isn't itself one — a probable typo like `COUTN(...)` for
 /// `COUNT(...)`. Conservative: the name must be within edit distance of an entry
 /// in **whichever catalog [`builtin_catalog`] returns for this dialect** —
-/// [`FUNCTIONS`] on MySQL, [`SQLITE_FUNCTIONS`] on SQLite, and nothing at all on
-/// PostgreSQL, where the check does not run. So user-defined functions and
-/// unlisted builtins pass through untouched; qualified calls (`pkg.func(`) and
-/// real schema identifiers are skipped too.
+/// [`FUNCTIONS`] on MySQL, [`SQLITE_FUNCTIONS`] on SQLite,
+/// [`crate::pg_builtins::PG_FUNCTIONS`] on PostgreSQL, and nothing at all for an
+/// engine this app carries no catalog for, where the check does not run. So
+/// user-defined functions and unlisted builtins pass through untouched;
+/// qualified calls (`pkg.func(`) and real schema identifiers are skipped too.
 fn function_typo_checks(
     sql: &str,
     lo: usize,
@@ -5077,6 +5088,8 @@ fn function_typo_checks(
     // PostgreSQL tab: the checker did not recognise the engine's own functions
     // *and* measured its distances against another engine's list. Telling
     // somebody that correct SQL is misspelled is worse than saying nothing.
+    // PostgreSQL has its own catalog now; the early return is what a fourth
+    // engine gets until it does too.
     let Some(builtins) = builtin_catalog(dialect) else {
         return;
     };
@@ -5143,9 +5156,20 @@ fn is_probable_function_typo(builtins: &[SqlFunction], word: &str) -> bool {
         return false;
     }
     let up = word.to_ascii_uppercase();
-    // Both catalogs are compared upper-cased, so a catalog written the way its
-    // own engine writes it (SQLite's is lower-case) measures the same distances.
-    let names = || builtins.iter().map(|f| f.name.to_ascii_uppercase());
+    let ub = up.as_bytes();
+    // Every catalog is compared upper-cased, so one written the way its own
+    // engine writes it (SQLite's and PostgreSQL's are lower-case) measures the
+    // same distances.
+    //
+    // **The upper-casing is deferred behind a length test rather than mapped
+    // over the catalog**, which it used to be. That allocated one `String` per
+    // entry per word, twice over, on a 120 ms debounce while the user types —
+    // affordable at MySQL's 250 entries and not at PostgreSQL's 2,682. Both
+    // filters below are length-first, and neither loses a match: the prefix test
+    // already required `up` to be the longer string, and
+    // [`is_adjacent_transposition`] returns `false` outright on a length
+    // mismatch, so a name further than `thresh` from `up` in length cannot
+    // satisfy either arm.
     // **A builtin's name plus a `_` or a digit is a *derived* name, not a
     // misspelling.** The doc above says the design avoids flagging `format_x`
     // as a typo of `FORMAT`; at length 8 the threshold is already 2, so it
@@ -5156,18 +5180,22 @@ fn is_probable_function_typo(builtins: &[SqlFunction], word: &str) -> bool {
     // The separator is what keeps this narrow: a *letter* continuation is how a
     // real typo looks (`SUBSTRIN` is `SUBSTR` plus `IN`, and is a dropped `G`
     // from `SUBSTRING`), so those still get flagged.
-    if names().any(|f| {
-        up.len() > f.len()
-            && up.starts_with(&f)
-            && matches!(up.as_bytes()[f.len()], b'_' | b'0'..=b'9')
+    if builtins.iter().any(|f| {
+        let n = f.name.len();
+        ub.len() > n
+            && ub[..n].eq_ignore_ascii_case(f.name.as_bytes())
+            && matches!(ub[n], b'_' | b'0'..=b'9')
     }) {
         return false;
     }
     let thresh = if word.len() >= 7 { 2 } else { 1 };
-    names().any(|f| {
-        let close = (f.len() as isize - up.len() as isize).unsigned_abs() <= thresh
-            && crate::sql::edit_distance(&up, &f) <= thresh;
-        close || is_adjacent_transposition(up.as_bytes(), f.as_bytes())
+    builtins.iter().any(|f| {
+        if (f.name.len() as isize - up.len() as isize).unsigned_abs() > thresh {
+            return false;
+        }
+        let name = f.name.to_ascii_uppercase();
+        crate::sql::edit_distance(&up, &name) <= thresh
+            || is_adjacent_transposition(ub, name.as_bytes())
     })
 }
 
@@ -10056,6 +10084,50 @@ mod tests {
         }
     }
 
+    /// **PostgreSQL answers for its own functions too**, which is the whole of
+    /// what [`crate::pg_builtins::PG_FUNCTIONS`] buys.
+    ///
+    /// The four names in
+    /// [`a_postgres_builtin_is_not_a_misspelled_mysql_one`] are the ones the bug
+    /// squiggled; this test keeps them quiet *and* asks the other half, which
+    /// that test could not: that a real typo in a PostgreSQL tab is now caught.
+    /// Before the catalog existed the checker returned before reading a byte, so
+    /// the positive half is the one that fails against the unfixed tree.
+    #[test]
+    fn postgres_measures_against_its_own_catalog() {
+        // Its own builtins, across the families a hand-written list forgets.
+        for sql in [
+            "SELECT btrim(name) FROM employees",
+            "SELECT to_number(name, '99') FROM employees",
+            "SELECT make_date(2024, 1, 1) FROM employees",
+            "SELECT make_time(1, 2, 3) FROM employees",
+            "SELECT regexp_replace(name, 'a', 'b') FROM employees",
+            "SELECT jsonb_build_object('a', 1) FROM employees",
+            "SELECT generate_series(1, 10)",
+            "SELECT pg_typeof(name) FROM employees",
+            "SELECT string_agg(name, ',') FROM employees",
+            "SELECT date_trunc('day', hired) FROM employees",
+        ] {
+            let d = diag_d(sql, SqlDialect::Postgres);
+            assert!(
+                !d.iter().any(|x| x.message.contains("misspelled function")),
+                "{sql} on Postgres: {d:?}"
+            );
+        }
+        // And a typo of one of them is caught, which is the whole point.
+        for sql in [
+            "SELECT btirm(name) FROM employees",
+            "SELECT regexp_raplace(name, 'a', 'b') FROM employees",
+            "SELECT generate_seires(1, 10)",
+        ] {
+            let d = diag_d(sql, SqlDialect::Postgres);
+            assert!(
+                d.iter().any(|x| x.message.contains("misspelled function")),
+                "{sql} on Postgres was not flagged: {d:?}"
+            );
+        }
+    }
+
     /// **A MySQL builtin SQLite does not have is not in SQLite's catalog**, and
     /// one SQLite does have is not missing from it.
     ///
@@ -10108,11 +10180,12 @@ mod tests {
         }
     }
 
-    /// The catalogs answer per dialect, and PostgreSQL still has none.
+    /// The catalogs answer per dialect, and no engine borrows another's.
     ///
     /// Stated as its own test because the whole design rests on it: an engine
     /// whose catalog the app does not have must keep the checker *off* rather
-    /// than inherit whichever list is nearest.
+    /// than inherit whichever list is nearest. All three answer `Some` now, so
+    /// what this guards is the cross-wiring rather than the `None`.
     #[test]
     fn only_the_engines_with_a_catalog_are_authoritative() {
         // By content, not by pointer: a `const` is inlined at each use, so the
@@ -10138,11 +10211,94 @@ mod tests {
             !is_known_function(sqlite, "curdate"),
             "SQLite got MySQL's catalog"
         );
+        let postgres = builtin_catalog(SqlDialect::Postgres).expect("PostgreSQL's catalog");
+        assert_eq!(postgres.len(), crate::pg_builtins::PG_FUNCTIONS.len());
         assert!(
-            builtin_catalog(SqlDialect::Postgres).is_none(),
-            "PG_FUNCTIONS does not exist, so the checker must stay off there — \
-             see `builtin_catalog`"
+            is_known_function(postgres, "btrim"),
+            "PostgreSQL's own is missing"
         );
+        assert!(
+            !is_known_function(postgres, "curdate"),
+            "PostgreSQL got MySQL's catalog"
+        );
+        assert!(
+            !is_known_function(mysql, "btrim") && !is_known_function(sqlite, "btrim"),
+            "PostgreSQL's catalog leaked into another engine's"
+        );
+    }
+
+    /// The PostgreSQL catalog is sane, on the same terms the other two are.
+    ///
+    /// It is generated rather than typed, so what can go wrong with it is
+    /// different: not a forgotten name but a regeneration that silently emitted
+    /// a fraction of the server's answer, or one that let a non-identifier
+    /// through. The size floor is set well under the 2,682 of PG 16.15 so a
+    /// later major version can add or drop names without a failure that says
+    /// nothing; `live::pg_catalog` is what holds the exact list to the server.
+    #[test]
+    fn pg_function_catalog_is_sane() {
+        use crate::pg_builtins::PG_FUNCTIONS;
+        assert!(
+            PG_FUNCTIONS.len() > 2000,
+            "only {} entries — a short catalog is how false positives come back",
+            PG_FUNCTIONS.len()
+        );
+        let mut seen = std::collections::HashSet::new();
+        for f in PG_FUNCTIONS {
+            assert!(seen.insert(f.name), "duplicate entry {}", f.name);
+            // **Lower-case, unlike `FUNCTIONS`**, the way `pg_catalog` stores
+            // them and PostgreSQL's own documentation writes them.
+            assert!(
+                f.name
+                    .bytes()
+                    .next()
+                    .is_some_and(|b| b.is_ascii_lowercase())
+                    && f.name
+                        .bytes()
+                        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_'),
+                "{} is not an identifier the checker could ever see",
+                f.name
+            );
+            assert!(
+                f.signature.starts_with(f.name),
+                "{}'s signature does not name it: {}",
+                f.name,
+                f.signature
+            );
+            assert!(!f.summary.is_empty(), "{} has no summary", f.name);
+        }
+    }
+
+    /// **A name a user would plausibly define is not squiggled by the size of
+    /// the PostgreSQL catalog.**
+    ///
+    /// The near-miss net is drawn around every entry, so a catalog ten times the
+    /// size of MySQL's is ten times as many things a user-defined function can
+    /// be within one edit of. That is the cost side of generating the list
+    /// rather than curating it, and it is worth a test rather than an argument:
+    /// these are ordinary application function names, and none of them is a
+    /// correction anybody wants offered.
+    #[test]
+    fn an_ordinary_user_function_survives_the_pg_catalog() {
+        for name in [
+            "calc_total",
+            "user_login",
+            "send_invoice",
+            "order_total",
+            "audit_log",
+            "sync_orders",
+            "fetch_rate",
+            "apply_discount",
+            "customer_name",
+            "trim_name",
+        ] {
+            let sql = format!("SELECT {name}(id) FROM employees");
+            let d = diag_d(&sql, SqlDialect::Postgres);
+            assert!(
+                !d.iter().any(|x| x.message.contains("misspelled function")),
+                "{sql} on Postgres: {d:?}"
+            );
+        }
     }
 
     /// The SQLite catalog is sane, on the same terms `FUNCTIONS` is held to.
