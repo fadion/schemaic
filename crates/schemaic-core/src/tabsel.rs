@@ -242,6 +242,61 @@ pub fn tab_scope(tab: Option<(u64, Option<String>)>, active_conn: u64) -> TabSco
     }
 }
 
+/// Where a tab enters the strip so that the pinned block stays contiguous at
+/// the left edge: the number of leading pinned tabs.
+///
+/// **Leading**, not total — a pinned tab sitting to the right of an unpinned one
+/// does not extend the block, because the block is what the left edge already
+/// holds and the whole point is to put the newcomer at its far side.
+///
+/// `pinned` is the strip **as it will be at the moment of insertion**, which for
+/// a re-pin means after the tab has been taken out. Correct both ways round: a
+/// newly pinned tab lands just after the existing pinned ones, and a newly
+/// unpinned one lands in the first unpinned slot.
+///
+/// This was spelled out twice in `app_view` — `take_while(…).count()` in the
+/// pin toggle and again in the duplicate, with the second layering a clamp on
+/// top. Two assemblies that happen to agree are two rules nobody is comparing,
+/// and neither could be tested where it stood.
+pub fn pinned_boundary(pinned: &[bool]) -> usize {
+    pinned.iter().take_while(|p| **p).count()
+}
+
+/// Where a duplicate of the tab at `source` goes: immediately after it, but
+/// never inside the pinned block.
+///
+/// A duplicate is always unpinned, so duplicating a pinned tab cannot put it at
+/// `source + 1` — that slot is inside the block, and the invariant
+/// [`pinned_boundary`] exists for would break. `None` means the source is no
+/// longer in the strip, which puts the duplicate at the end.
+pub fn duplicate_slot(pinned: &[bool], source: Option<usize>) -> usize {
+    source
+        .map(|i| i + 1)
+        .unwrap_or(pinned.len())
+        .max(pinned_boundary(pinned))
+}
+
+/// Whether the reopen-closed-tab ring holds anything for `conn`.
+///
+/// The ring spans connections and reopening does not, so the menu entry has to
+/// ask the same per-connection question the action applies rather than "is the
+/// ring empty" — otherwise it offers a click that does nothing whenever the
+/// last closed tab was on another connection.
+pub fn has_reopenable(closed: &[u64], conn: u64) -> bool {
+    closed.contains(&conn)
+}
+
+/// Whether a freshly-built tab may replace the active one **in place** rather
+/// than opening beside it — the "app opened on an empty Query 1" case.
+///
+/// All four have to hold, and the fourth is the one that is not about
+/// emptiness: a tab bound to a `.sql` file is not a blank slate even when the
+/// file is empty, because reusing it drops the binding silently and the next
+/// Ctrl+S goes somewhere else.
+pub fn is_blank_slate(pinned: bool, query: &str, results_untouched: bool, has_path: bool) -> bool {
+    !pinned && query.trim().is_empty() && results_untouched && !has_path
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -595,5 +650,80 @@ mod tests {
     #[test]
     fn a_pinned_tab_may_still_be_the_one_kept() {
         assert_eq!(others_to_close(&closable(), 10, 3), vec![1, 5]);
+    }
+
+    #[test]
+    fn the_boundary_of_a_strip_with_no_pins_is_its_left_edge() {
+        assert_eq!(pinned_boundary(&[]), 0);
+        assert_eq!(pinned_boundary(&[false, false, false]), 0);
+    }
+
+    #[test]
+    fn the_boundary_of_an_all_pinned_strip_is_its_right_edge() {
+        assert_eq!(pinned_boundary(&[true, true, true]), 3);
+    }
+
+    /// **Leading, not total.** A pinned tab to the right of an unpinned one is
+    /// a strip that is already out of order; counting it would move the
+    /// boundary past unpinned tabs and make the disorder permanent.
+    #[test]
+    fn a_pin_past_the_block_does_not_extend_it() {
+        assert_eq!(pinned_boundary(&[true, true, false, true]), 2);
+        assert_eq!(pinned_boundary(&[false, true]), 0);
+    }
+
+    #[test]
+    fn a_duplicate_of_an_unpinned_tab_lands_just_after_it() {
+        assert_eq!(duplicate_slot(&[true, false, false], Some(1)), 2);
+        assert_eq!(duplicate_slot(&[false, false, false], Some(0)), 1);
+    }
+
+    /// The seam the two helpers meet at, and the one a test of either alone
+    /// would miss: a duplicate is always unpinned, so `source + 1` inside the
+    /// pinned block is the one answer that must not survive.
+    #[test]
+    fn a_duplicate_of_a_pinned_tab_clears_the_pinned_block() {
+        // Three pinned; duplicating the first would otherwise land at 1.
+        assert_eq!(duplicate_slot(&[true, true, true, false], Some(0)), 3);
+        assert_eq!(duplicate_slot(&[true, true, true, false], Some(1)), 3);
+        // The last pinned tab's "just after" already is the boundary.
+        assert_eq!(duplicate_slot(&[true, true, true, false], Some(2)), 3);
+    }
+
+    /// A source that is no longer in the strip puts the duplicate at the end,
+    /// which is past the boundary on any strip.
+    #[test]
+    fn a_duplicate_with_no_source_goes_to_the_end() {
+        assert_eq!(duplicate_slot(&[true, false, false], None), 3);
+        assert_eq!(duplicate_slot(&[true, true], None), 2);
+        assert_eq!(duplicate_slot(&[], None), 0);
+    }
+
+    #[test]
+    fn the_ring_is_asked_per_connection_not_whether_it_is_empty() {
+        assert!(has_reopenable(&[10, 11], 10));
+        assert!(has_reopenable(&[11, 10], 10));
+        // The failure this replaces: a non-empty ring holding only another
+        // connection's tabs offered a click that did nothing.
+        assert!(!has_reopenable(&[11, 12], 10));
+        assert!(!has_reopenable(&[], 10));
+    }
+
+    #[test]
+    fn a_fresh_empty_tab_is_a_blank_slate() {
+        assert!(is_blank_slate(false, "", true, false));
+        assert!(is_blank_slate(false, "   \n\t ", true, false));
+    }
+
+    /// Each of the four on its own is enough to refuse, so each is asserted on
+    /// its own — a reuse that ignores any one of them destroys work.
+    #[test]
+    fn any_one_reason_is_enough_to_refuse_reuse() {
+        assert!(!is_blank_slate(true, "", true, false), "pinned");
+        assert!(!is_blank_slate(false, "SELECT 1", true, false), "has query");
+        assert!(!is_blank_slate(false, "", false, false), "has results");
+        // The one that is not about emptiness: reusing a file-bound tab drops
+        // the binding, and the next Ctrl+S goes somewhere else.
+        assert!(!is_blank_slate(false, "", true, true), "bound to a file");
     }
 }

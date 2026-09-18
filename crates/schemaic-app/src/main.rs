@@ -6416,18 +6416,18 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
     // slate (empty editor, no results / no Run-Everything panels, no `.sql` file)
     // — the common "app opened on an empty Query 1" case — else open it as a new tab.
     // Keeps the reused tab's visible number so it reads as the same tab.
+    // This closure gathers signals; `tabsel::is_blank_slate` decides.
     let place_tab: Rc<dyn Fn(Tab)> = Rc::new(move |new_tab: Tab| {
         let active_id = active.get_untracked();
         let reuse_at = tabs.with_untracked(|v| {
             v.iter().position(|t| t.id == active_id).filter(|&i| {
                 let t = &v[i];
-                !t.pinned.get_untracked()
-                    && t.query.get_untracked().trim().is_empty()
-                    && t.results_untouched()
-                    // A tab bound to a `.sql` file is not a blank slate even when
-                    // the file is empty: reusing it would silently drop the
-                    // binding, and the next Ctrl+S would go somewhere else.
-                    && t.path.with_untracked(|p| p.is_none())
+                schemaic_core::tabsel::is_blank_slate(
+                    t.pinned.get_untracked(),
+                    &t.query.get_untracked(),
+                    t.results_untouched(),
+                    t.path.with_untracked(|p| p.is_some()),
+                )
             })
         });
         // When reusing a blank tab in place, its (empty) signals are replaced by
@@ -6467,8 +6467,10 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
         tabs.update(|v| {
             if let Some(pos) = v.iter().position(|x| x.id == id) {
                 let tab = v.remove(pos);
-                let boundary = v.iter().take_while(|x| x.pinned.get_untracked()).count();
-                v.insert(boundary, tab);
+                // The strip as it is at the moment of insertion — the tab is
+                // already out — which is what `pinned_boundary` is defined over.
+                let pinned: Vec<bool> = v.iter().map(|x| x.pinned.get_untracked()).collect();
+                v.insert(schemaic_core::tabsel::pinned_boundary(&pinned), tab);
             }
         });
     });
@@ -6496,14 +6498,9 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                 let mut nt = nt;
                 let used = used_labels(v, nt.conn_id.get_untracked());
                 nt.label = smallest_free_label(&used);
-                let boundary = v.iter().take_while(|t| t.pinned.get_untracked()).count();
-                let at = v
-                    .iter()
-                    .position(|t| t.id == id)
-                    .map(|i| i + 1)
-                    .unwrap_or(v.len())
-                    .max(boundary);
-                v.insert(at, nt);
+                let pinned: Vec<bool> = v.iter().map(|t| t.pinned.get_untracked()).collect();
+                let source = v.iter().position(|t| t.id == id);
+                v.insert(schemaic_core::tabsel::duplicate_slot(&pinned, source), nt);
             });
             schemaic_ui::activate(active, new_id);
         })
@@ -7299,11 +7296,12 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
     // Does the ring hold anything for the active connection? Same per-connection
     // scoping `reopen_closed_tab` itself applies, so the tab menu can dim the
     // entry instead of offering a click that does nothing.
+    // This closure gathers signals; `tabsel::has_reopenable` decides.
     let can_reopen_closed_tab: Rc<dyn Fn() -> bool> = {
         let recently_closed = recently_closed.clone();
         Rc::new(move || {
-            let conn = active_conn.get_untracked();
-            recently_closed.borrow().iter().any(|s| s.conn_id == conn)
+            let conns: Vec<u64> = recently_closed.borrow().iter().map(|s| s.conn_id).collect();
+            schemaic_core::tabsel::has_reopenable(&conns, active_conn.get_untracked())
         })
     };
 
