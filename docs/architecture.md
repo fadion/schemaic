@@ -7148,13 +7148,38 @@ existing prose was left alone.
   answer to why the engine interface is a **naming convention** (`ENGINE_ENTRY_POINTS`) rather than
   a trait: a convention carries an asymmetry a trait would have to flatten into a parameter every
   engine takes and two ignore.
+  **The last statement `lib.rs` sent itself is gone, and that is a property now rather than a
+  claim.** `Db::kill_query` — a `query_drop` of `KILL QUERY <id>` — is
+  `mysql::kill_query(db, conn_id)`, which is where every one of its callers already was: thirteen in
+  `mysql.rs` and four in `session.rs`, all four inside `Backend::MySql` arms.
+  `the_dispatcher_executes_nothing_itself` scans `lib.rs` for the driver's own verbs —
+  `query_drop`/`query_iter`/`query_first` and the three `exec_` spellings, with `//` lines stripped
+  first — and fails on any of them. It is named for the driver verbs rather than for SQL because a
+  scan for keywords cannot tell a statement from a doc comment about one, and this file is largely
+  doc comments about which statement lives where; the verbs are **assembled** from two arrays for
+  the reason the timeout census next door assembles its `stop` marker, the first spelling of the
+  test having tripped on its own source. Read the rule narrowly: it is not "no statement text is
+  left in `lib.rs`". `lock_wait_sql` and `TxScope`'s `BEGIN`/`COMMIT`/`ROLLBACK TO SAVEPOINT` stay,
+  because more than one engine reads them and they are strings an engine module *runs*. What has
+  gone is `lib.rs` executing one.
+  **The payoff beyond the rule is that the two spellings of `KILL QUERY` are adjacent — and still
+  deliberately two functions.** `mysql::kill_session` had been writing `KILL QUERY {id}` for
+  `KillKind::Query` all along, a file away. It answers the Server Activity panel: gated on a
+  capability, takes the `i64` the server reported, returns an error the panel shows, and opens
+  `db.open(None, ..)`. `mysql::kill_query` is the *cancel* path — reached because a statement this
+  app is itself waiting on has to stop, taking the `u32` the driver reported for its own connection,
+  ignoring failure because the caller's `select!` has given up on the statement either way, and
+  opening `Db::open_serverless`, since a `KILL` names no object and a connection that first has to
+  open the user's database is one more thing that can hang on a server already misbehaving. Merging
+  them would have to flatten all four of those differences; sitting next to each other is what lets
+  the next reader see they are the same sentence to the server.
   **One remainder is named in the crate doc rather than left to be discovered**: `Db`'s connection
-  plumbing is still MySQL's. `open`, `open_serverless`, `opts`, `opts_with_tls`, `dial` and
-  `Db::kill_query` all speak `mysql_async` and nothing in `pg.rs` or `sqlite.rs` calls any of them —
-  those two build their own clients — so `kill_query`'s `KILL QUERY <id>` is the one statement
-  `lib.rs` still *sends* itself. It sits there because it belongs to the handle rather than to an
-  operation, and moving a type's constructor out of the module that defines the type is a different
-  question from moving its bodies; `TODO.md` carries it as the question rather than the answer. **`Db::fetch_sessions`/
+  plumbing is still MySQL's. `open`, `open_serverless`, `opts`, `opts_with_tls` and `dial` all speak
+  `mysql_async` and nothing in `pg.rs` or `sqlite.rs` calls any of them — those two build their own
+  clients. It sits there because it belongs to the handle rather than to an operation, and moving a
+  type's constructor out of the module that defines the type is a different question from moving its
+  bodies. That is the answer rather than an open question; `TODO.md` used to carry it as one, and no
+  longer does. **`Db::fetch_sessions`/
   `Db::kill_session`** are the Server Activity panel's whole backend, and they are up to three
   queries per engine rather than one: MySQL runs `information_schema.PROCESSLIST` (required —
   without it there
@@ -7211,7 +7236,7 @@ existing prose was left alone.
   generation and then refreshes, so the in-flight guard is keyed on a generation the refresh has
   just moved and cannot suppress it. Three alt-tabs inside one connect left three connects hanging
   at once. The deadline is the fix that does not depend on that guard. `kill_session` earns
-  `CANCEL_TIMEOUT` for the reason `Db::kill_query` already cites — the premise of reaching it is
+  `CANCEL_TIMEOUT` for the reason `mysql::kill_query` already cites — the premise of reaching it is
   that something on that server is misbehaving — and its timeout is reported as an error rather
   than as a claim the kill failed: the statement may well have landed, and the next poll settles it.
   Around the dispatch and not inside each arm, for `Db::fetch_databases`' reason: PostgreSQL's

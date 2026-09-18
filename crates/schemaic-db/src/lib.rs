@@ -18,16 +18,19 @@
 //! `SET SESSION lock_wait_timeout`, and `TxScope` writes `BEGIN`, `COMMIT` and
 //! `ROLLBACK TO SAVEPOINT` — both stay because more than one engine reads them,
 //! and both are strings an engine module runs rather than statements this file
-//! sends. [`Db::kill_query`]'s `KILL QUERY <id>` is the only statement `lib.rs`
-//! still sends itself.
+//! sends. **This file now sends none**, which is a property rather than a claim:
+//! `the_dispatcher_executes_nothing_itself` scans it for the driver's own verbs.
+//! `Db::kill_query` was the last one, a `query_drop` of `KILL QUERY <id>`, and it
+//! is [`mysql::kill_query`] now — beside the `kill_session` that had been writing
+//! the same statement a second time all along, which is the thing being in one
+//! file buys.
 //!
-//! It sends it because [`Db`]'s **connection plumbing** is still MySQL's: `open`,
-//! `open_serverless`, `opts`, `opts_with_tls`, `dial` and `kill_query` all speak
-//! `mysql_async`, and nothing in `pg.rs` or `sqlite.rs` calls any of them — those
-//! two build their own clients. That sits here because it belongs to the handle
-//! rather than to an operation, and moving a type's constructor out of the module
-//! that defines the type is a different question from moving its bodies;
-//! `TODO.md` carries it as the question rather than the answer.
+//! What is left of MySQL's here is [`Db`]'s **connection plumbing**: `open`,
+//! `open_serverless`, `opts`, `opts_with_tls` and `dial` all speak `mysql_async`,
+//! and nothing in `pg.rs` or `sqlite.rs` calls any of them — those two build their
+//! own clients. That sits here because it belongs to the handle rather than to an
+//! operation, and moving a type's constructor out of the module that defines the
+//! type is a different question from moving its bodies.
 //!
 //! For most of the crate's life that was not true. MySQL had no module — its
 //! bodies were inline below, so `pg.rs` and `sqlite.rs` were peers of each other
@@ -79,7 +82,6 @@ pub use session::{Outcome, Session};
 
 use std::collections::HashMap;
 
-use mysql_async::prelude::Queryable;
 use mysql_async::{Conn, OptsBuilder};
 use schemaic_core::activity::{self, KillKind, SessionInfo};
 use schemaic_core::blob::{BlobRef, BlobValue};
@@ -689,26 +691,6 @@ impl Db {
                     .await
                     .map_err(|e| DbError::Connect(e.to_string()))
             }
-        }
-    }
-
-    /// Best-effort server-side cancel: connect afresh and `KILL QUERY <id>`.
-    ///
-    /// **Bounded by [`CANCEL_TIMEOUT`].** The whole reason this is reached is
-    /// that something is not responding, and it answers that by opening a
-    /// *fresh* connection — full TCP, a TLS handshake, and on `prefer` possibly
-    /// a second connect — to a host that may be gone. Unbounded, a Stop against
-    /// a dead server hangs inside a modal whose every exit maps to that same
-    /// Stop, and the only way out is killing the process.
-    pub(crate) async fn kill_query(&self, conn_id: u32) {
-        let kill = async {
-            if let Ok(mut killer) = self.open_serverless(false).await {
-                let _ = killer.query_drop(format!("KILL QUERY {conn_id}")).await;
-                let _ = killer.disconnect().await;
-            }
-        };
-        if tokio::time::timeout(CANCEL_TIMEOUT, kill).await.is_err() {
-            tracing::debug!("kill query timed out after {CANCEL_TIMEOUT:?}");
         }
     }
 }
@@ -1460,7 +1442,7 @@ impl Db {
     ///
     /// Every sibling in this file already bounds itself for a host that stops
     /// answering at the packet level: [`Db::ping`] and [`Db::fetch_databases`]
-    /// take the same five seconds, [`Db::kill_query`] takes [`CANCEL_TIMEOUT`],
+    /// take the same five seconds, [`mysql::kill_query`] takes [`CANCEL_TIMEOUT`],
     /// and the unbounded reads all take a `CancellationToken`. This took
     /// neither, so a poll against a black-holed host blocked for the OS TCP
     /// connect timeout — 21.0 s on MySQL, 63 s on PostgreSQL, this file's own
@@ -1504,14 +1486,14 @@ impl Db {
     /// **A fresh connection, always.** The session being killed may be the one
     /// holding up everything else, and on MySQL a `KILL` issued from a connection
     /// that is itself waiting on that lock never gets sent — the same reason
-    /// [`Db::kill_query`] opens its own.
+    /// [`mysql::kill_query`] opens its own.
     ///
     /// Gated on [`supports_kill`](schemaic_core::activity::supports_kill), the
     /// capability the panel's own menu asks — see [`Db::fetch_sessions`] for why
     /// that is not the same thing as the engine `match` below it.
     ///
     /// **Bounded by [`CANCEL_TIMEOUT`]**, for the reason that constant exists and
-    /// [`Db::kill_query`] already cites: the whole premise of reaching this is
+    /// [`mysql::kill_query`] already cites: the whole premise of reaching this is
     /// that something on that server is not behaving, and the answer is to open
     /// a *fresh* connection to it — full TCP, a TLS handshake, possibly a second
     /// connect on `prefer`. Unbounded, a Kill against a host that has stopped
@@ -2468,6 +2450,47 @@ mod tests {
                      naming convention (see `ENGINE_ENTRY_POINTS`), so a module \
                      that omits one compiles cleanly until the dispatch arm for \
                      it is written"
+                );
+            }
+        }
+    }
+
+    /// **The dispatcher dispatches; it does not run statements.**
+    ///
+    /// The thing the three-module extraction was for, stated as a property
+    /// rather than left to the crate doc's word. `lib.rs` still *holds*
+    /// statement text — `lock_wait_sql`, `TxScope`'s `BEGIN`/`COMMIT`/`ROLLBACK
+    /// TO SAVEPOINT` — and that is deliberate: more than one engine reads them,
+    /// and they are strings an engine module runs. What must not come back is
+    /// this file **executing** one, which is what `Db::kill_query` did with a
+    /// `query_drop` of `KILL QUERY <id>` until it moved to `mysql::kill_query`,
+    /// next to the `kill_session` that had been spelling the same statement a
+    /// second time all along.
+    ///
+    /// Named for the driver verbs rather than for SQL, because a scan for
+    /// keywords cannot tell a statement from a doc comment about one, and these
+    /// are the only ways a `mysql_async` connection is made to do anything.
+    #[test]
+    fn the_dispatcher_executes_nothing_itself() {
+        let me = include_str!("lib.rs");
+        let body = me
+            .lines()
+            // Doc comments and ordinary comments talk about these by name, and
+            // this file is one long argument about which statement lives where.
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        // **Assembled, not written out**, the way the timeout census next door
+        // assembles its `stop` marker: a test that names the thing it forbids
+        // trips on its own source, and the first spelling of this one did.
+        for kind in ["query", "exec"] {
+            for tail in ["_drop(", "_iter(", "_first("] {
+                let verb = format!("{kind}{tail}");
+                assert!(
+                    !body.contains(&verb),
+                    "`lib.rs` calls `{verb}` — it is the dispatcher, and a \
+                     statement it runs itself is one no engine module owns. \
+                     Put it in `mysql.rs` beside the others"
                 );
             }
         }

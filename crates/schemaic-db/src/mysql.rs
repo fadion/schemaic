@@ -388,6 +388,45 @@ pub(crate) async fn kill_session(db: &Db, id: i64, kind: KillKind) -> Result<(),
     out
 }
 
+/// Best-effort server-side cancel: connect afresh and `KILL QUERY <id>`.
+///
+/// **The same statement [`kill_session`] writes for [`KillKind::Query`], and
+/// deliberately not the same function.** That one answers the Server Activity
+/// panel: it is gated on a capability, it takes the `i64` the server reported,
+/// and it hands back an error the panel shows. This one is the *cancel* path —
+/// it is reached because a statement this app is itself waiting on has to stop,
+/// it takes the `u32` the driver reported for its own connection, and a failure
+/// is nothing to report, because the caller's `select!` has already given up on
+/// the statement either way. They sat in two files until the extraction
+/// finished; sitting in one is what lets the next reader see they are the same
+/// sentence to the server.
+///
+/// **A different door, too**: [`Db::open_serverless`] rather than `db.open`,
+/// because a `KILL` names no object and a connection that first has to open the
+/// user's database is one more thing that can hang on a server already
+/// misbehaving.
+///
+/// **Bounded by [`crate::CANCEL_TIMEOUT`].** The whole reason this is reached is
+/// that something is not responding, and it answers that by opening a *fresh*
+/// connection — full TCP, a TLS handshake, and on `prefer` possibly a second
+/// connect — to a host that may be gone. Unbounded, a Stop against a dead server
+/// hangs inside a modal whose every exit maps to that same Stop, and the only
+/// way out is killing the process.
+pub(crate) async fn kill_query(db: &Db, conn_id: u32) {
+    let kill = async {
+        if let Ok(mut killer) = db.open_serverless(false).await {
+            let _ = killer.query_drop(format!("KILL QUERY {conn_id}")).await;
+            let _ = killer.disconnect().await;
+        }
+    };
+    if tokio::time::timeout(crate::CANCEL_TIMEOUT, kill)
+        .await
+        .is_err()
+    {
+        tracing::debug!("kill query timed out after {:?}", crate::CANCEL_TIMEOUT);
+    }
+}
+
 /// Row and size estimates, and index statistics, for one database.
 pub(crate) async fn fetch_table_stats(db: &Db, database: &str) -> Result<SchemaStats, DbError> {
     let mut conn = db.open(None, false).await?;
@@ -938,7 +977,7 @@ pub(crate) async fn fetch_schema(
     let out = tokio::select! {
         r = collect_schema(&mut conn, database) => r,
         _ = cancel.cancelled() => {
-            db.kill_query(conn_id).await;
+            kill_query(db, conn_id).await;
             Err(DbError::Cancelled)
         }
     };
@@ -4768,7 +4807,7 @@ pub(crate) async fn fetch_query(
     let outcome = tokio::select! {
         r = collect_rows(&mut conn, sql, dest, true) => r,
         _ = cancel.cancelled() => {
-            db.kill_query(conn_id).await;
+            kill_query(db, conn_id).await;
             Err(DbError::Cancelled)
         }
     };
@@ -4833,7 +4872,7 @@ pub(crate) async fn run_batch(
             // the connection clean.
             r = collect_rows(&mut conn, sql, &mut dest, false) => r,
             _ = cancel.cancelled() => {
-                db.kill_query(conn_id).await;
+                kill_query(db, conn_id).await;
                 Err(DbError::Cancelled)
             }
         };
@@ -4905,7 +4944,7 @@ async fn explain_in_rolled_back_tx(
     let outcome = tokio::select! {
         r = collect_rows(&mut conn, cmd, &mut dest, true) => r,
         _ = cancel.cancelled() => {
-            db.kill_query(conn_id).await;
+            kill_query(db, conn_id).await;
             Err(DbError::Cancelled)
         }
     };
@@ -4996,7 +5035,7 @@ pub(crate) async fn count_rows(
             .map_err(|e| DbError::Query(e.to_string()))
             .and_then(|n| n.ok_or_else(|| DbError::Query("COUNT(*) returned no row".into()))),
         _ = cancel.cancelled() => {
-            db.kill_query(conn_id).await;
+            kill_query(db, conn_id).await;
             Err(DbError::Cancelled)
         }
     };
@@ -5327,7 +5366,7 @@ async fn import_on(
             match raced {
                 Some(r) => Some(r),
                 None => {
-                    db.kill_query(conn_id).await;
+                    kill_query(db, conn_id).await;
                     let _ = fut.await;
                     None
                 }
@@ -5434,7 +5473,7 @@ pub(crate) async fn write_on(
                 match raced {
                     Some(r) => Some(r),
                     None => {
-                        db.kill_query(conn_id).await;
+                        kill_query(db, conn_id).await;
                         let _ = fut.await;
                         None
                     }
@@ -5915,7 +5954,7 @@ pub(crate) async fn run_ddl(
         let step = tokio::select! {
             r = conn.query_drop(sql) => r.map_err(|e| DbError::Query(e.to_string())),
             _ = cancel.cancelled() => {
-                db.kill_query(conn_id).await;
+                kill_query(db, conn_id).await;
                 Err(DbError::Cancelled)
             }
         };
@@ -5975,7 +6014,7 @@ pub(crate) async fn run_server_ddl(
         let step = tokio::select! {
             r = conn.query_drop(sql) => r.map_err(|e| DbError::Query(e.to_string())),
             _ = cancel.cancelled() => {
-                db.kill_query(conn_id).await;
+                kill_query(db, conn_id).await;
                 Err(DbError::Cancelled)
             }
         };
@@ -6858,7 +6897,7 @@ mod write_tests {
              hold half the batch"
         );
         assert!(
-            wob.contains("db.kill_query(conn_id).await") && wob.contains("let _ = fut.await;"),
+            wob.contains("kill_query(db, conn_id).await") && wob.contains("let _ = fut.await;"),
             "the killed statement is not awaited, so the next statement reads \
              its reply — see `import_on`, which states the rule"
         );
@@ -6946,7 +6985,7 @@ pub(crate) async fn run_script(
                 Some(Ok(())) => pg::ScriptStep::Ran,
                 Some(Err(e)) => pg::ScriptStep::Failed(e.to_string()),
                 None => {
-                    db.kill_query(conn_id).await;
+                    kill_query(db, conn_id).await;
                     pg::ScriptStep::Cancelled {
                         ran: fut.await.is_ok(),
                     }
@@ -7023,7 +7062,7 @@ pub(crate) async fn refetch_rows(
     let outcome = tokio::select! {
         r = refetch_on(&mut conn, template, rows) => r,
         _ = cancel.cancelled() => {
-            db.kill_query(conn_id).await;
+            kill_query(db, conn_id).await;
             Err(DbError::Cancelled)
         }
     };
@@ -7046,7 +7085,7 @@ pub(crate) async fn fetch_blob(
     let outcome = tokio::select! {
         res = blob_on(&mut conn, r) => res,
         _ = cancel.cancelled() => {
-            db.kill_query(conn_id).await;
+            kill_query(db, conn_id).await;
             Err(DbError::Cancelled)
         }
     };

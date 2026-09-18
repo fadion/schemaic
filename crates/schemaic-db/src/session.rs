@@ -441,7 +441,7 @@ impl Session {
                     // leave it clean for the next one.
                     r = collect_rows(conn, sql, &mut dest, false) => r,
                     _ = cancel.cancelled() => {
-                        self.db.kill_query(conn_id).await;
+                        crate::mysql::kill_query(&self.db, conn_id).await;
                         Err(DbError::Cancelled)
                     }
                 }
@@ -659,7 +659,7 @@ impl Session {
                 tokio::select! {
                     r = write_on(conn, write, TxScope::Savepoint, None) => r,
                     _ = cancel.cancelled() => {
-                        self.db.kill_query(conn_id).await;
+                        crate::mysql::kill_query(&self.db, conn_id).await;
                         Err(DbError::Cancelled)
                     }
                 }
@@ -723,7 +723,7 @@ impl Session {
                 tokio::select! {
                     res = blob_on(conn, r) => res,
                     _ = cancel.cancelled() => {
-                        self.db.kill_query(conn_id).await;
+                        crate::mysql::kill_query(&self.db, conn_id).await;
                         Err(DbError::Cancelled)
                     }
                 }
@@ -780,7 +780,7 @@ impl Session {
                 tokio::select! {
                     r = refetch_on(conn, template, rows) => r,
                     _ = cancel.cancelled() => {
-                        self.db.kill_query(conn_id).await;
+                        crate::mysql::kill_query(&self.db, conn_id).await;
                         Err(DbError::Cancelled)
                     }
                 }
