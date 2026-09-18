@@ -4375,6 +4375,16 @@ existing prose was left alone.
     the range's **final byte**, not the one holding `end`, so a range stopping just after a newline
     covers the line it ended and not the empty one after it. `DiffRow`/`build_diff_rows`/
     `DIFF_CONTEXT`, which built the old preview *list*, went with the box that displayed it.
+    **`inline_plan_summary` is the one line the Ctrl+K verdict bar says about a plan** — `2 hunks ·
+    3 − / 5 +`, singular for a single hunk, and `No changes suggested` where there is no plan to
+    count. That sentence covers "nothing was suggested" and "the model is still working" together,
+    because `InlineView::plan()` answers `None` for both and the bar is only ever on screen once the
+    request has settled; an *empty* plan is a different thing and keeps its zeroes, which is the
+    pair a test pins. It lives here rather than in the view that draws it because the view built the
+    string inside a `dyn_container` builder, which floem 0.2 does not track, so the counts could
+    freeze beside a diff that had moved on — splitting the sentence out is what let the view's half
+    be a `label` closure and this half be tested at all (*Floem 0.2 gotchas*, the builder-freeze
+    entry).
     **`inline_splice` is one function because the preview and the accept have to agree.** It returns
     both the text that will actually go into `full[start..end]` and the whole buffer that results, so
     `inline_plan` diffs the same string Accept writes. Computed separately, a CRLF buffer plus an LF
@@ -13246,6 +13256,17 @@ existing prose was left alone.
     change count, read off the *published* plan so there is
     no second diff of the same text — anchored under the added rows. Neither covers the editor any
     more, so the compact↔expanded animation went with the box it was growing.
+    **That count is `diff::inline_plan_summary` drawn by a `label` closure, and the closure is the
+    point.** The footer's container is keyed on `verdict_shape` — `cmdk.open` and whether `inline_ai`
+    is `Ready` — which never reads `cmdk.preview`, so the sentence built in the builder's body
+    subscribed to nothing and would freeze at whatever the plan said when the bar last became
+    `Ready`, while the editor's own phantom rows moved on (`inline_band_runs` is a *key*, so it does
+    track it). Stale counts beside a correct diff is the shape of it. Nobody saw that happen: it read
+    right only because the effect that writes `preview` derives it from the same `inline_ai` variant
+    the key already tracks — an invariant this view neither states nor depends on, which makes it a
+    latent bug rather than an observed one.
+    `cmdk_preview_gate::a_preview_read_sits_in_a_tracking_scope` scans this file so every
+    `cmdk.preview` read stays inside one.
     **The overlay's `dyn_container` is keyed on a `Memo` of `(open, is_ready)` — not on the state,
     and not on a bare closure**, and both halves of that are load-bearing. Keyed on the state, every
     Idle → Busy → Failed transition rebuilt the question field, and a freshly built `edit_field` has
@@ -19119,10 +19140,32 @@ Re-introducing the anti-patterns these guard against is a regression:
   genre's convention rather than a lapse; `schemaic-app/src/main.rs` contributes nothing at all, its
   two hits for the name being comments. One site was fragile rather than wrong and now carries a
   test — the Users browser's container, written up under `users_view.rs`.
-  **The hole is `grid.rs` and `editor_pane.rs`**, the two largest populations, which were sampled
-  representatively rather than walked exhaustively. Every site sampled matched the discipline, and
-  that is a weaker claim than the one above it; `TODO.md` names those two files as the work left. A
-  frozen read found there is something the pass never looked at, not a regression of it.
+  **The hole was `grid.rs` and `editor_pane.rs`**, the two largest populations, and they have since
+  been walked site by site as well — 23 `dyn_container` call sites in the first, 19 in the second.
+  That walk turned up the only two genuinely frozen reads in the whole sweep, one per file. The
+  grid's header chevron is written up under *Data grid*: `header_cell` computed its sort indicator
+  from `gs.server_sort_dir(ci)`, a tracked `grid_query` read, at build time, while being called from
+  the grid body's builder and the virtualised header row's — neither key mentions `grid_query`. The
+  Ctrl+K verdict footer is under `editor_pane.rs`: its `N hunks · X − / Y +` line came from a
+  `cmdk.preview.get()` in the builder of a container keyed on `verdict_shape`, which reads
+  `cmdk.open` and whether `inline_ai` is `Ready` and never the plan. Both reads now sit in a
+  closure, and each leaves a `source_gate`-family scan of its own file behind it —
+  `grid::header_sort_tests::a_server_sort_read_sits_in_a_tracking_scope` and
+  `editor_pane::cmdk_preview_gate::a_preview_read_sits_in_a_tracking_scope`, each asserting that
+  every read of that one signal in that one file sits within three lines of a `move |`. Both were
+  watched failing against the unfixed tree, naming `grid.rs:9305` and `editor_pane.rs:661`. They are
+  per-file and per-signal on purpose: the general gate is still the one the paragraph above says
+  cannot be written, and this is what a hand walk can leave behind so a swept file does not quietly
+  reacquire the bug.
+  **The rule both fixes are instances of: a *structural* choice that depends on a signal — which
+  child is built — needs that signal in the container's key or a container of its own. Only a
+  choice about *style* may be left to a `.style()` closure**, which floem does re-run. The chevron
+  needs both halves at once, which is why it is the clearer of the two: the column name's colour is
+  a style and reads the indicator inside its style closure, while sorted-versus-unsorted is a
+  chevron icon against a zero-width spacer — different *children*, which no style closure can switch
+  between — so that slot is a nested `dyn_container` over the same closure. Reaching for the style
+  closure alone is the tidier-looking mistake here, and it silently keeps whichever child the
+  builder happened to make first.
   Where the read has a *later* moment that wants it — a press, a tip, a right-click that builds a
   menu — the remedy is to move the read there rather than to widen the key, which is what both the
   activity panel's row menu and the snippet row's do.
@@ -21842,8 +21885,33 @@ this bundle's.
   token slot, the cancel closure and the button. It is a product decision not taken, not a gap in
   the plumbing, and a release review's `R1-L2-01` turned on reading it as the latter.
 - **Type-aware headers** show `type_name` under the name (two-line, `grid_header_h()`). A sorted column's
-  name + chevron use `grid_sort()`; a column with selected cells gets a `grid_col_sel()` header
-  background. **Key icons** (PK = gold key-round, single-col index = blue key-square, FK = purple
+  name + chevron use `chip_active()`; a column with selected cells gets a `grid_col_sel()` header
+  background.
+  **Which sort the chevron draws is `header_sort_indicator(server_dir, client, ci)`, and it is read
+  through a closure rather than computed in `header_cell`'s body.** A filter/sort-eligible result
+  keeps its order server-side in `grid_query`; everything else sorts the loaded page in memory. The
+  two are meant to be mutually exclusive, and the pure function prefers the server's answer outright
+  rather than combining them, so that premise never has to hold for the header to be right
+  (`the_server_sort_outranks_the_client_one`). The read has to be a closure because
+  `gs.server_sort_dir(ci)` tracks `grid_query` while `header_cell` is called from the body's builder
+  and again from the virtualised header row's, and neither key mentions `grid_query` — a builder is
+  not a tracking scope, so the value computed there subscribed to nothing and the chevron froze.
+  **It is reachable, not theoretical**: `cycle_server_sort` writes the new order and *then* calls
+  `apply_grid_query`, which has three exits that set `view_err` and re-run nothing — `build_query`
+  answering `Ok(None)` on a statement it cannot rewrite, a `BadCondition`, and the write guard's
+  `RerunRequest::approved` refusing. `filterable()` only asks that `base_sql` and
+  `insert_target()` are both `Some`, never whether an `ORDER BY` can actually be spliced in, so the
+  gap is the join shape `edit::insert_target`'s own doc is written around —
+  `SELECT o.* FROM orders o JOIN order_lines l ON l.order_id = o.id`, where every column has an
+  `orders` origin so `insert_target` is `Some`, while `build_query` rejects the join. Clicking such
+  a header left the bottom bar saying the query cannot be filtered while the header went on drawing
+  the order before last, disagreeing with a `grid_query` that had already changed; a *successful*
+  re-run hid the whole class by rebuilding the grid from a new `ResultSet`. The chevron slot itself
+  is a nested `dyn_container` over that closure, because sorted and unsorted are different children
+  — the general rule is under *Floem 0.2 gotchas* — and
+  `a_server_sort_read_sits_in_a_tracking_scope` scans this file so the read cannot migrate back out
+  of a closure.
+  **Key icons** (PK = gold key-round, single-col index = blue key-square, FK = purple
   key-square; colours shared with the schema tree via `key_primary/index/foreign`) come from
   `column_key_map`, cross-referencing the tab's `source` against the loaded schema (`db_nodes`). Only
   populated when the tab was opened from a table with schema loaded; arbitrary SELECTs get none.

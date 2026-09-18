@@ -9269,6 +9269,24 @@ fn format_submenu(gs: GridState, ci: usize) -> Vec<MenuEntry> {
 /// Clickable, two-line header cell (name + SQL type). Sorts on click, shows a
 /// chevron for the active sort, a key icon for PK/index/FK columns, a selected-
 /// column background, and carries a right-edge resize divider.
+/// Whether display column `ci`'s header draws a chevron, and which way it
+/// points: `(sorted, ascending)`.
+///
+/// `server_dir` is [`GridState::server_sort_dir`] — the order living in
+/// `grid_query`, which a filter/sort-eligible result re-runs against the server
+/// — and `client` is the in-memory sort of the loaded page. **The server's
+/// answer wins outright** where there is one: the two are meant to be mutually
+/// exclusive (an eligible result never client-sorts), and having the header
+/// prefer one rather than combine them is what keeps that from mattering.
+fn header_sort_indicator(server_dir: Option<bool>, client: SortState, ci: usize) -> (bool, bool) {
+    let sorted = server_dir.is_some() || matches!(client, Some((c, _)) if c == ci);
+    let asc = match server_dir {
+        Some(a) => a,
+        None => matches!(client, Some((c, true)) if c == ci),
+    };
+    (sorted, asc)
+}
+
 fn header_cell(
     gs: GridState,
     ci: usize,
@@ -9283,19 +9301,25 @@ fn header_cell(
     let numeric = col.map(|c| c.is_numeric()).unwrap_or(false);
     // Sort indicator: for filter/sort-eligible results the order lives in the
     // server-side `grid_query` (real column name); otherwise it's the client sort.
-    // The two are mutually exclusive (eligible results never client-sort).
-    let server_dir = gs.server_sort_dir(ci);
-    let sorted = server_dir.is_some() || matches!(sort_val, Some((c, _)) if c == ci);
-    let asc = match server_dir {
-        Some(a) => a,
-        None => matches!(sort_val, Some((c, true)) if c == ci),
-    };
+    // Which one wins is `header_sort_indicator`, with its tests.
+    //
+    // **A closure, not a value read here.** `server_sort_dir` reads
+    // `gs.grid_query`, and this function is called from the grid body's
+    // `dyn_container` builder and again from the virtualised header row's —
+    // neither of which floem 0.2 wraps in a tracking effect, and neither of
+    // whose keys mentions `grid_query`. So a value computed here subscribed to
+    // nothing: `cycle_server_sort` writes the new order and *then* calls
+    // `apply_grid_query`, which has three exits that set `view_err` and re-run
+    // nothing, and on any of them the bar said the query could not be sorted
+    // while the header went on drawing the order before last. A successful
+    // re-run hid it by rebuilding the grid from a new `ResultSet`.
+    let indicator = move || header_sort_indicator(gs.server_sort_dir(ci), sort_val, ci);
     let key = key_map.get(&ci).copied();
 
     // Name + (when sorted) a chevron 7px to its right, both in the sort colour.
     let name_line = text(name).style(move |s| {
         let s = s.font_size(theme::font_label()).font_bold();
-        if sorted {
+        if indicator().0 {
             s.color(theme::chip_active())
         } else {
             s.color(theme::text_dim())
@@ -9304,28 +9328,33 @@ fn header_cell(
     // A 14px-tall trailing slot in both states so the sorted chevron doesn't grow
     // the row (which would nudge the type line down). The unsorted slot is
     // zero-width, so it adds no horizontal gap.
-    let trailing = if sorted {
-        let chev = if asc {
-            icons::CHEVRON_UP
+    //
+    // A container rather than a styled view because the two states are different
+    // *children*, which no style closure can switch between.
+    let trailing = dyn_container(indicator, move |(sorted, asc)| {
+        if sorted {
+            let chev = if asc {
+                icons::CHEVRON_UP
+            } else {
+                icons::CHEVRON_DOWN
+            };
+            icons::icon(chev, 14.0)
+                .style(|s| {
+                    s.color(theme::chip_active())
+                        .margin_left(theme::scaled(7.0))
+                        .flex_shrink(0.0_f32)
+                })
+                .into_any()
         } else {
-            icons::CHEVRON_DOWN
-        };
-        icons::icon(chev, 14.0)
-            .style(|s| {
-                s.color(theme::chip_active())
-                    .margin_left(theme::scaled(7.0))
-                    .flex_shrink(0.0_f32)
-            })
-            .into_any()
-    } else {
-        empty()
-            .style(|s| {
-                s.height(theme::scaled(14.0))
-                    .width(0.0)
-                    .flex_shrink(0.0_f32)
-            })
-            .into_any()
-    };
+            empty()
+                .style(|s| {
+                    s.height(theme::scaled(14.0))
+                        .width(0.0)
+                        .flex_shrink(0.0_f32)
+                })
+                .into_any()
+        }
+    });
     let name_row = h_stack((name_line, trailing)).style(|s| s.items_center());
     // SQL type, nudged 2px lower for a touch more breathing room under the name.
     let type_line = text(type_name).style(|s| {
@@ -11358,6 +11387,88 @@ mod popup_channel_gate {
 
 /// What the grid body's rebuild key does when a pending row is *filled* rather
 /// than added.
+#[cfg(test)]
+mod header_sort_tests {
+    use super::*;
+
+    /// **The server's sort wins, and a column with neither is not sorted.**
+    ///
+    /// The two sorts are meant to be mutually exclusive — an eligible result
+    /// never client-sorts — but the header has to draw *something* either way,
+    /// and which one it reads is the decision. Pulled out of `header_cell` so it
+    /// can be asked at all: that function builds a view and needs a
+    /// `GridState`, which no `#[test]` can make.
+    #[test]
+    fn the_server_sort_outranks_the_client_one() {
+        // Server sorted, ascending — the client sort is not consulted.
+        assert_eq!(header_sort_indicator(Some(true), None, 3), (true, true));
+        assert_eq!(
+            header_sort_indicator(Some(false), Some((3, true)), 3),
+            (true, false),
+            "the client's ASC overrode the server's DESC"
+        );
+        // No server sort: the client's, and only for *this* column.
+        assert_eq!(
+            header_sort_indicator(None, Some((3, true)), 3),
+            (true, true)
+        );
+        assert_eq!(
+            header_sort_indicator(None, Some((3, false)), 3),
+            (true, false)
+        );
+        assert_eq!(
+            header_sort_indicator(None, Some((4, true)), 3),
+            (false, false),
+            "another column's sort lit this one's chevron"
+        );
+        assert_eq!(header_sort_indicator(None, None, 3), (false, false));
+    }
+
+    /// **Every `server_sort_dir` call sits inside a closure.**
+    ///
+    /// It reads `gs.grid_query`, and `header_cell` is called from the grid
+    /// body's `dyn_container` builder and again from the virtualised header
+    /// row's — neither of which floem 0.2 wraps in a tracking effect, and
+    /// neither of whose keys mentions `grid_query`. Computed once at build, the
+    /// chevron froze.
+    ///
+    /// Not a theoretical freeze: `cycle_server_sort` mutates `grid_query` and
+    /// *then* calls `apply_grid_query`, which has three exits that set
+    /// `view_err` and re-run nothing — an un-rewritable base statement, a bad
+    /// condition, and the write guard's refusal. `filterable()` does not ask
+    /// whether `build_query` can actually splice an `ORDER BY` in, so clicking a
+    /// header on such a result left the bottom bar saying the query cannot be
+    /// filtered while the header still drew the *previous* sort, disagreeing
+    /// with a `grid_query` that had already changed. A successful re-run hid it
+    /// by rebuilding the whole grid from a new `ResultSet`.
+    #[test]
+    fn a_server_sort_read_sits_in_a_tracking_scope() {
+        let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/grid.rs"))
+            .expect("this module's own source");
+        // The shared walk, not a cut at the first `#[cfg(test)]` — which is
+        // positional and not comment-aware. See `source_gate::production_code`.
+        let body = crate::source_gate::production_code(&src);
+        let lines: Vec<&str> = body.lines().collect();
+        let mut checked = 0;
+        for (i, l) in lines.iter().enumerate() {
+            if !l.contains("server_sort_dir(") || l.contains("fn server_sort_dir") {
+                continue;
+            }
+            checked += 1;
+            let window = lines[i.saturating_sub(3)..=i].join("\n");
+            assert!(
+                window.contains("move |"),
+                "the `server_sort_dir` call at line {} is not inside a closure, \
+                 so it subscribes to nothing: `header_cell` runs in a \
+                 `dyn_container` builder, which floem 0.2 does not track, and \
+                 neither container's key reads `grid_query`",
+                i + 1
+            );
+        }
+        assert_eq!(checked, 1, "this gate is stale — it found {checked}");
+    }
+}
+
 #[cfg(test)]
 mod body_key_tests {
     use super::*;

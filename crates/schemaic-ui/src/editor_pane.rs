@@ -658,16 +658,6 @@ fn cmdk_popup(
                 {
                     let discard_b = discard.clone();
                     let accept_b = accept.clone();
-                    let summary = match cmdk.preview.get().as_ref().and_then(|v| v.plan()) {
-                        Some(p) => format!(
-                            "{} hunk{} · {} − / {} +",
-                            p.hunks.len(),
-                            if p.hunks.len() == 1 { "" } else { "s" },
-                            p.removed,
-                            p.added
-                        ),
-                        None => "No changes suggested".to_string(),
-                    };
                     // Floem gives no way to pass a pointer event on once a view is
                     // eligible for it — the child walk `break`s on the first such
                     // view, handled or not (`context.rs:143-158`) — so a 26px bar
@@ -710,9 +700,27 @@ fn cmdk_popup(
                                     })
                             }),
                         empty().style(|s| s.flex_grow(1.0_f32)),
-                        text(summary)
-                            .style(|s| s.color(theme::text_muted()).font_size(theme::font_body()))
-                            .on_event_stop(EventListener::PointerWheel, fwd_wheel),
+                        // **A `label`, not the `text` of a string built above.**
+                        // This container's key is `verdict_shape` —
+                        // `cmdk.open` and whether `inline_ai` is `Ready` — and a
+                        // `dyn_container` builder is not a tracking scope in
+                        // floem 0.2, so a summary computed there subscribed to
+                        // nothing and would freeze at whatever the plan said
+                        // when the bar last became `Ready`. The editor's own
+                        // phantom rows would not: they come from
+                        // `inline_band_runs`, which is a *key*. Stale counts
+                        // beside a correct diff is the shape of it. It read
+                        // right only because the effect that writes `preview`
+                        // derives it from the same `inline_ai` variant the key
+                        // already tracks — an invariant this view neither states
+                        // nor depends on. The closure is a tracking scope.
+                        label(move || {
+                            cmdk.preview.with(|p| {
+                                diff::inline_plan_summary(p.as_ref().and_then(|v| v.plan()))
+                            })
+                        })
+                        .style(|s| s.color(theme::text_muted()).font_size(theme::font_body()))
+                        .on_event_stop(EventListener::PointerWheel, fwd_wheel),
                     ))
                     .style(move |s| {
                         s.flex_row()
@@ -5660,6 +5668,61 @@ fn floor_char_boundary(s: &str, i: usize) -> usize {
         i -= 1;
     }
     i
+}
+
+#[cfg(test)]
+mod cmdk_preview_gate {
+    /// **Every read of `cmdk.preview` in this file happens inside a tracking
+    /// scope.**
+    ///
+    /// The verdict footer is a `dyn_container` keyed on `verdict_shape` —
+    /// `(cmdk.open, whether inline_ai is Ready)` — and a `dyn_container` builder
+    /// is not a tracking scope in floem 0.2. So the `"N hunks · X − / Y +"` line
+    /// was computed once per rebuild from a `cmdk.preview.get()` in the
+    /// builder's body, subscribing to nothing: a plan that changed without the
+    /// `Ready` bool flipping would leave the counts frozen beside a diff the
+    /// editor's own phantom rows had already updated, because those are drawn by
+    /// `inline_band_runs`, which is a `dyn_container` **key** and does track it.
+    ///
+    /// It read right only because the effect that writes `preview` derives it
+    /// from the same `inline_ai` variant the key already reads — an invariant
+    /// this view neither states nor depends on, and exactly the seam
+    /// `AGENTS.md` names: a pure function composed with its caller. So the gate
+    /// is on the composition and not on the formatting, which
+    /// [`super::inline_diff::tests`] covers on its own.
+    #[test]
+    fn a_preview_read_sits_in_a_tracking_scope() {
+        let src =
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/editor_pane.rs"))
+                .expect("this module's own source");
+        // The shared walk, not a cut at the first `#[cfg(test)]` — which is
+        // positional and not comment-aware. See `source_gate::production_code`.
+        let body = crate::source_gate::production_code(&src);
+        let lines: Vec<&str> = body.lines().collect();
+        let mut checked = 0;
+        for (i, l) in lines.iter().enumerate() {
+            // Passing the signal on (`inline_band_runs(&ed, cmdk.preview)`) is
+            // not a read; only `.get()`/`.with()` here subscribe.
+            if !l.contains("cmdk.preview.get()") && !l.contains("cmdk.preview.with(") {
+                continue;
+            }
+            checked += 1;
+            // Three lines back, which reaches the `label(move ||` / `.style(move
+            // |s|` / key closure a rustfmt-broken call puts the read under, and
+            // does not reach the `let discard_b` / `let accept_b` bindings the
+            // frozen version sat below.
+            let window = lines[i.saturating_sub(3)..=i].join("\n");
+            assert!(
+                window.contains("move |"),
+                "the `cmdk.preview` read at line {} is not inside a closure, so \
+                 it subscribes to nothing: the verdict container's key reads \
+                 only `cmdk.open` and whether `inline_ai` is `Ready`, and the \
+                 builder is not a tracking scope in floem 0.2",
+                i + 1
+            );
+        }
+        assert_eq!(checked, 1, "this gate is stale — it found {checked}");
+    }
 }
 
 #[cfg(test)]

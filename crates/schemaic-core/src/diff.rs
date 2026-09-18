@@ -160,6 +160,33 @@ impl InlinePlan {
     }
 }
 
+/// The one line the Ctrl+K verdict bar says about a suggestion:
+/// `2 hunks · 3 − / 5 +`, or a sentence where there is no plan to count.
+///
+/// `None` is both "nothing has been suggested" and "the model is still
+/// working" — [`crate::diff::InlinePlan`]'s caller reaches this through
+/// `InlineView::plan()`, which answers `None` for the working state too. One
+/// sentence covers both because the bar is only ever on screen once the request
+/// has settled.
+///
+/// **Here rather than in the view that draws it** because the view drew it in a
+/// `dyn_container` builder, which is not a tracking scope in floem 0.2, so the
+/// string was computed once per rebuild and the counts could freeze beside a
+/// diff that had moved on. Splitting the sentence out is what let the reactive
+/// read be a `label` closure and this half be tested at all.
+pub fn inline_plan_summary(plan: Option<&InlinePlan>) -> String {
+    let Some(p) = plan else {
+        return "No changes suggested".to_string();
+    };
+    format!(
+        "{} hunk{} · {} − / {} +",
+        p.hunks.len(),
+        if p.hunks.len() == 1 { "" } else { "s" },
+        p.removed,
+        p.added
+    )
+}
+
 /// What an inline-AI reply would do to the buffer: the text that will actually be
 /// spliced into `full[start..end]`, and the whole buffer that results.
 ///
@@ -275,6 +302,44 @@ pub fn inline_plan(old: &str, new: &str) -> InlinePlan {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The verdict bar's sentence, including the plural the old inline version
+    /// got right and nothing held it to.
+    #[test]
+    fn a_plan_summary_counts_hunks_and_lines() {
+        let hunk = |del: std::ops::Range<usize>, add: &[&str]| InlineHunk {
+            del,
+            add: add.iter().map(|s| s.to_string()).collect(),
+            anchor: 0,
+            before: false,
+        };
+        let one = InlinePlan {
+            hunks: vec![hunk(0..1, &["a"])],
+            added: 1,
+            removed: 1,
+        };
+        assert_eq!(inline_plan_summary(Some(&one)), "1 hunk · 1 − / 1 +");
+        let two = InlinePlan {
+            hunks: vec![hunk(0..1, &["a"]), hunk(4..6, &[])],
+            added: 1,
+            removed: 3,
+        };
+        assert_eq!(inline_plan_summary(Some(&two)), "2 hunks · 3 − / 1 +");
+    }
+
+    /// No plan is a sentence, not a row of zeroes — and an *empty* plan is not
+    /// that case. `InlineView::plan()` answers `None` while the model is still
+    /// working, so this string stands for "nothing to count yet" as well as for
+    /// "nothing suggested"; a settled plan with no hunks keeps its zeroes,
+    /// which is what the bar said before this moved out of the view.
+    #[test]
+    fn a_missing_plan_is_a_sentence_and_an_empty_one_is_not() {
+        assert_eq!(inline_plan_summary(None), "No changes suggested");
+        assert_eq!(
+            inline_plan_summary(Some(&InlinePlan::default())),
+            "0 hunks · 0 − / 0 +"
+        );
+    }
 
     #[test]
     fn a_byte_range_names_the_lines_it_covers() {
