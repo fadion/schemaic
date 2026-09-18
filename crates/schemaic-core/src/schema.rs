@@ -5101,6 +5101,34 @@ impl SchemaState {
     }
 }
 
+/// How long a catalogue read must have been running before the schema panel's
+/// header says so.
+///
+/// **Not zero, and that is the whole of the design.** [`SchemaState::
+/// begin_refresh`] measures a local refresh at 48 ms on MySQL and 134 ms on
+/// PostgreSQL, and states the consequence for the *rows*: a glyph that appears
+/// and vanishes inside that reads as a rendering fault rather than as progress,
+/// so the rows deliberately show nothing. A header indicator that appeared
+/// instantly would inherit exactly that problem — and worse, because applying
+/// any DDL refreshes, so it would strobe after every schema edit.
+///
+/// The header is still the right place to report a read that is genuinely
+/// *long*: the rows of an already-loaded database stay on screen through a
+/// refresh (that is what `begin_refresh` preserves), so without this nothing
+/// anywhere says a multi-second re-introspection is in flight. 400 ms is past
+/// every measured local refresh and roughly where a wait stops feeling
+/// instantaneous.
+pub const READ_NOTICE_DELAY: std::time::Duration = std::time::Duration::from_millis(400);
+
+/// Should the schema panel's header report a catalogue read in progress?
+///
+/// Both terms matter: a read that has finished says nothing however long it
+/// ran, and a read still running says nothing until it has outlasted
+/// [`READ_NOTICE_DELAY`].
+pub fn report_read(reading: bool, for_how_long: std::time::Duration) -> bool {
+    reading && for_how_long >= READ_NOTICE_DELAY
+}
+
 #[cfg(test)]
 mod trigger_tests {
     use super::*;
@@ -5889,6 +5917,59 @@ mod sqlite_affinity_tests {
         assert_eq!(sqlite_affinity(" varbinary(16) "), SqliteAffinity::Numeric);
         assert_eq!(sqlite_affinity("VarBinary(16)"), SqliteAffinity::Numeric);
         assert_eq!(sqlite_affinity("tinyblob"), SqliteAffinity::Blob);
+    }
+}
+
+#[cfg(test)]
+mod read_notice_tests {
+    use super::*;
+    use std::time::Duration;
+
+    /// The ordinary local refresh, which is what the delay exists to stay out
+    /// of: `begin_refresh` measures 48 ms on MySQL and 134 ms on PostgreSQL,
+    /// and every applied DDL causes one. Reporting any of those would put a
+    /// glyph on screen for two frames after every schema edit.
+    #[test]
+    fn a_refresh_that_finishes_quickly_is_never_announced() {
+        for ms in [0, 48, 134, 250, 399] {
+            assert!(
+                !report_read(true, Duration::from_millis(ms)),
+                "{ms} ms was announced"
+            );
+        }
+    }
+
+    /// The case the header exists for: a re-introspection long enough that the
+    /// rows on screen — which a refresh deliberately leaves in place — are the
+    /// only thing saying anything, and they say nothing.
+    #[test]
+    fn a_read_that_outlasts_the_delay_is_announced() {
+        assert!(report_read(true, READ_NOTICE_DELAY));
+        assert!(report_read(true, Duration::from_secs(3)));
+    }
+
+    /// The other term, and not redundant: a read that has *ended* says nothing
+    /// however long it ran, so the notice cannot outlive the work.
+    #[test]
+    fn a_finished_read_is_never_announced_however_long_it_took() {
+        for ms in [0, 400, 30_000] {
+            assert!(!report_read(false, Duration::from_millis(ms)));
+        }
+    }
+
+    /// **The delay is longer than the refreshes it must not fire on**, which is
+    /// the property the constant is chosen for rather than an arbitrary round
+    /// number. Pinned here so lowering it has to argue with the measurement in
+    /// `begin_refresh`'s doc rather than quietly reintroducing the flicker.
+    #[test]
+    fn the_delay_clears_every_measured_local_refresh() {
+        // The two figures `SchemaState::begin_refresh` records.
+        for measured in [Duration::from_millis(48), Duration::from_millis(134)] {
+            assert!(
+                READ_NOTICE_DELAY > measured,
+                "a {measured:?} refresh would flicker"
+            );
+        }
     }
 }
 

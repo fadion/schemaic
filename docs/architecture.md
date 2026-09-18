@@ -5571,6 +5571,18 @@ existing prose was left alone.
     refresh is meant to leave alone. Not writing is the only way to keep it. Nothing marks the
     row as busy meanwhile, deliberately: at these durations an indicator is a glyph flickering
     for a frame or two, which reads as a rendering fault rather than as progress.
+    **`READ_NOTICE_DELAY` and `report_read` are the other half of that decision, not a reversal
+    of it.** Keeping the rows also means nothing below the header said a re-introspection was in
+    flight, so on a database big enough for the read to take seconds pressing Refresh read as the
+    app having ignored the click; the panel's *title* reports that case instead
+    (`schema_tree::schema_panel`). `report_read(reading, for_how_long)` is
+    `reading && for_how_long >= READ_NOTICE_DELAY`, and the delay is 400 ms precisely because of
+    the two figures above — an instant header indicator would inherit the rows' flicker exactly,
+    and worse, since applying any DDL refreshes too, so it would strobe after every schema edit.
+    Both terms are load-bearing: a read that has *ended* says nothing however long it ran, so the
+    notice cannot outlive the work. `read_notice_tests::the_delay_clears_every_measured_local_refresh`
+    asserts the constant exceeds both 48 ms and 134 ms, so lowering it has to argue with the
+    measurement rather than quietly reintroducing the flicker.
     **There are two refresh paths and both go through it**, via the app's one
     `start_fetch` (`FetchSchemaFn`): the per-database one
     (`refresh_db`) and the connection-wide one (`load_schema`, the SCHEMA header's Refresh),
@@ -13175,6 +13187,25 @@ existing prose was left alone.
     it (`a_riskless_change_still_asks_something`).
   - `schema_tree.rs` — SCHEMA sidebar (`schema_panel` + db/table/column/key row builders + keyboard
     nav).
+    **The panel's title is the only place a long catalogue read can be reported.**
+    `SchemaState::begin_refresh` deliberately leaves an already-loaded database's rows on screen
+    through a refresh, and the per-database `Loading` row only ever appears for a *first* load — the
+    case that was visible already — so on a database big enough for the read to take seconds
+    nothing anywhere said a re-introspection was in flight and pressing Refresh read as the app
+    having ignored the click. The title animates in place instead, `SCHEMA` → `SCHEMA...` through
+    `widgets::loading_dots`, which already takes the prefix; a label beside it would be a second
+    thing to lay out in a panel whose width the user sets. **It is delayed, not immediate** — the
+    effect arms `exec_after(schema::READ_NOTICE_DELAY, …)`, and the 400 ms is the same reasoning
+    `begin_refresh` gives for the rows showing nothing, applied to the header (*core::schema*, where
+    the constant and `report_read` live and are tested). The effect watches
+    `db_nodes`' `refreshing` signals and arms on the **rising edge only**, off its own previous
+    value: a second database starting while the first is still out must not queue a second timer for
+    the same notice. Any fall clears the notice immediately, without waiting for a timer. The
+    timer's write is `try_update` because switching connections disposes the scope it was armed in,
+    and the read it was going to report with it. The busy branch restates `section_title`'s bold
+    face and padding on its own container rather than sharing a helper — `section_title` styles the
+    text and this styles the box the dots live in, so a helper would have to return a view either
+    way.
     **A right-click on the tree's empty space raises its own menu** — `Refresh`,
     `Users and privileges` and `Create database`, all three about the *panel* rather than about
     anything in it,

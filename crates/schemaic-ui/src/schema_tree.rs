@@ -1563,7 +1563,69 @@ pub(crate) fn schema_panel(ui: Ui) -> impl IntoView {
     // gear's `margin_right(14)` sets its 14px inset from the panel edge.
     let icons_group =
         h_stack((eye, gear)).style(|s| s.flex_row().items_start().flex_shrink(0.0_f32));
-    let title_row = h_stack((section_title("SCHEMA"), icons_group))
+
+    // **The title is the only place a long catalogue read can be reported.**
+    // `SchemaState::begin_refresh` deliberately leaves an already-loaded
+    // database's rows on screen through a refresh, so nothing below the header
+    // says one is in flight — on a database big enough to take seconds that
+    // reads as the app having ignored the click. The per-database `Loading`
+    // row only ever appears for a *first* load, which is the case that was
+    // already visible.
+    //
+    // Reported by animating the title itself rather than by adding a label
+    // beside it: `loading_dots` takes the prefix, so this is `SCHEMA` →
+    // `SCHEMA...` in place, with no second thing to lay out in a panel whose
+    // width the user sets.
+    //
+    // **Delayed, not immediate** — see `schema::READ_NOTICE_DELAY`, which is
+    // the same reasoning `begin_refresh` gives for the rows showing nothing:
+    // a local refresh lands in 48–134 ms and every applied DDL causes one, so
+    // an instant indicator would strobe after every schema edit.
+    let reading = RwSignal::new(false);
+    create_effect(move |was: Option<bool>| {
+        let busy = db_nodes.with(|ns| ns.iter().any(|n| n.refreshing.get()));
+        if !busy {
+            reading.set(false);
+        } else if was != Some(true) {
+            // The rising edge only. A second database starting while the first
+            // is still out must not queue a second timer for the same notice.
+            exec_after(schemaic_core::schema::READ_NOTICE_DELAY, move |_| {
+                let still = db_nodes.with_untracked(|ns| {
+                    ns.iter()
+                        .any(|n| n.refreshing.try_get_untracked().unwrap_or(false))
+                });
+                // `try_update`: switching connections disposes the scope this
+                // timer was armed in, and the read it is reporting with it.
+                let _ = reading.try_update(|v| {
+                    *v = schemaic_core::schema::report_read(
+                        still,
+                        schemaic_core::schema::READ_NOTICE_DELAY,
+                    )
+                });
+            });
+        }
+        busy
+    });
+    let title = dyn_container(
+        move || reading.get(),
+        move |busy| {
+            if !busy {
+                return section_title("SCHEMA").into_any();
+            }
+            // Same face as `section_title` — it styles the text itself, and
+            // this styles the box the dots live in, so the two are set here
+            // rather than shared through a helper that would have to return a
+            // view either way.
+            container(loading_dots("SCHEMA", theme::text_muted, theme::font_title))
+                .style(|s| {
+                    s.font_bold()
+                        .padding_horiz(theme::scaled(12.0))
+                        .padding_vert(theme::scaled(8.0))
+                })
+                .into_any()
+        },
+    );
+    let title_row = h_stack((title, icons_group))
         .style(|s| s.width_full().flex_row().items_start().justify_between());
 
     v_stack((
