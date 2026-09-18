@@ -14612,7 +14612,9 @@ mod whole_ui_gate {
         // three `open_for_*`, which write across `ddl`, `schema` and the peer
         // editors, plus the overlay itself.
         // 5 → 4: this file's own private `loaded_schema` — a near-copy of
-        // `table_designer`'s, reading only `db_nodes` — takes `SchemaUi`.
+        // `table_designer`'s, reading only `db_nodes` — took `SchemaUi`, and
+        // has since been deleted outright in favour of the shared funnel
+        // (`one_funnel_gate`); the count is unchanged either way.
         ("object_editor.rs", 4),
         // 15 → 13: `confirm_overlay` takes the one `RwSignal` it reads, and
         // `date_pick_overlay` takes `OverlayUi` (both its signals are in it).

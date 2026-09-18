@@ -5605,13 +5605,20 @@ existing prose was left alone.
     funnel all four schema editors go through — answers `None` for: seeding a draft from a
     pre-apply `TableInfo` is what makes MySQL's `MODIFY COLUMN` silently restate the old column
     definition, and `risks()` discloses nothing because from the plan's view nothing changed.
-    **`object_editor` has a private near-copy of `loaded_schema` that does *not* apply that
-    filter**, and it is open rather than settled. It feeds `ddl::type_dependents` — the columns a
-    rebuild would re-cast, read off the tree's schema — so it carries the staleness exposure the
-    funnel refuses.
-    It has not been unified because the two failures are not obviously ranked: refusing during a
-    refresh would hand that call site an **empty** dependent list rather than a stale one, and which
-    of those is the safer wrong answer for a rebuild is a judgement nobody has made.
+    **`object_editor` had a private near-copy of `loaded_schema` that did *not* apply that filter**,
+    and it fed `ddl::type_dependents` — the columns a rebuild would re-cast — so within the window
+    the refresh holds a superseded schema `Loaded`, the type editor built its rebuild against
+    columns an applied `ALTER` had already moved past. It goes through the funnel now and
+    `open_for_object` **refuses to open** on its `None`, which is what `open_for_table` already
+    does for the same window. The alternative — unify and let the call site take the funnel's
+    `None` as an *empty* dependent list — was rejected as the worse of the two wrong answers: a
+    stale list at least resembles the type's real dependents, while an empty one emits a rebuild
+    that re-casts nothing and looks like a clean plan. The refusal costs one round trip's worth of
+    a menu entry that appears to do nothing, which is the same price every other editor pays.
+    `object_editor::one_funnel_gate` is what keeps the copy from coming back: the decision is a
+    `return` in a function that opens a modal, so there is no value to assert on, but there is a
+    private `fn loaded_schema(` to refuse and a shared call to require — and that is what actually
+    regressed.
     The plan behind the reuse is `plan_nodes`, pure and tested: it decides that a dropped and
     re-created database gets a **fresh** id rather than colliding with a live node, that reordering
     the server's list renumbers nothing (the tree keys on id), and that a reload against an empty

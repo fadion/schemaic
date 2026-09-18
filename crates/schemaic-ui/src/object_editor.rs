@@ -33,7 +33,7 @@ use floem::prelude::*;
 use floem::reactive::create_effect;
 
 use schemaic_core::ddl::{self, DomainDraft, EnumDraft, ObjectDraft, ObjectKind, SequenceDraft};
-use schemaic_core::schema::{CheckInfo, ObjectItem, SchemaState, SequenceInfo, SequenceOwner};
+use schemaic_core::schema::{CheckInfo, ObjectItem, SequenceInfo, SequenceOwner};
 
 use crate::table_designer::{edit_ctx, focusable_owned_dropdown, suggest_chevron};
 use crate::widgets::{
@@ -90,27 +90,20 @@ fn open_editor(ui: &Ui, target: ObjectTarget, draft: ObjectDraft) {
     d.object.set(Some(target));
 }
 
-/// The introspected schema of one database, when it has loaded.
-fn loaded_schema(
-    ui: crate::SchemaUi,
-    database: &str,
-) -> Option<std::sync::Arc<schemaic_core::schema::DbSchema>> {
-    ui.db_nodes.with_untracked(|nodes| {
-        nodes
-            .iter()
-            .find(|n| n.database == database)
-            .and_then(|n| match n.schema.get_untracked() {
-                SchemaState::Loaded(s) => Some(s),
-                _ => None,
-            })
-    })
-}
-
 /// Open the editor on an existing object.
 ///
 /// The dependents are read **now**, off the schema the tree is showing: they are
 /// the columns a rebuild would re-cast, found by the type's *current* name, which
 /// the draft may be about to change.
+///
+/// **Through `table_designer::loaded_schema`, which refuses while a
+/// re-introspection is in flight** — the one funnel every editor seeds from.
+/// This file carried a private copy of that reader with the `refreshing` term
+/// left out, so within the window `begin_refresh` holds a superseded schema
+/// `Loaded` (it does, so the tree doesn't blank) the dependent list was read off
+/// a database that an applied `ALTER` had already moved past, and the rebuild
+/// re-cast columns that were no longer what it thought. Opening is refused for
+/// that window instead, which is the answer `open_for_table` gives it.
 ///
 /// **A routine goes to [`crate::routine_editor`] instead.** It is an
 /// [`ObjectItem`] because it is browsed beside the types — one folder machinery,
@@ -147,10 +140,10 @@ pub(crate) fn open_for_object(ui: &Ui, database: &str, item: &ObjectItem) {
     if ctx.read_only {
         return;
     }
-    let dependents = match loaded_schema(ui.schema, database) {
-        Some(s) => ddl::type_dependents(&s, item.schema(), item.name()),
-        None => Vec::new(),
+    let Some(loaded) = crate::table_designer::loaded_schema(ui.schema, database) else {
+        return;
     };
+    let dependents = ddl::type_dependents(&loaded, item.schema(), item.name());
     let Some(draft) = ObjectDraft::from_item(item) else {
         return;
     };
@@ -1269,6 +1262,53 @@ pub(crate) fn object_editor_overlay(ui: Ui) -> impl IntoView {
             s
         }
     })
+}
+
+/// **The type editor seeds from the one funnel, like every other editor.**
+///
+/// `table_designer::loaded_schema` refuses while a re-introspection of the
+/// database is in flight — `begin_refresh` keeps a `Loaded` database loaded
+/// across a refetch so the tree doesn't blank, so `Loaded` no longer means
+/// *current*. This file used to carry its own private copy of that reader with
+/// the `refreshing` term left out, and read `ddl::type_dependents` through it:
+/// the columns a rebuild would re-cast, taken off a schema that may be one
+/// `ALTER` out of date. Refusing to open is the same answer
+/// `table_designer::open_for_table` gives, for the same window.
+///
+/// A source gate rather than a unit test because the decision is a `return` in
+/// a function that opens a modal, and there is no value to assert on. What it
+/// can check is that the private copy has not come back and that the call is
+/// still the shared one — which is what actually regressed.
+#[cfg(test)]
+mod one_funnel_gate {
+    #[test]
+    fn the_type_editor_seeds_through_the_refresh_aware_reader() {
+        let src = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("src")
+                .join("object_editor.rs"),
+        )
+        .expect("object_editor.rs");
+        let body = crate::source_gate::production_code(&src);
+
+        assert!(
+            !body.contains("fn loaded_schema("),
+            "object_editor.rs has its own `loaded_schema` again. The funnel is \
+             `table_designer::loaded_schema`, and the term a private copy keeps \
+             losing is `.filter(|n| !n.refreshing.get_untracked())` — without \
+             it this editor reads its dependents off a schema that a refresh \
+             has already superseded."
+        );
+
+        let at = body
+            .find("fn open_for_object(")
+            .expect("`open_for_object` is gone — rewrite this gate, don't delete it");
+        let end = crate::source_gate::item_end(&body, at).expect("no end to `open_for_object`");
+        assert!(
+            body[at..end].contains("table_designer::loaded_schema("),
+            "`open_for_object` no longer seeds from the shared funnel"
+        );
+    }
 }
 
 #[cfg(test)]
