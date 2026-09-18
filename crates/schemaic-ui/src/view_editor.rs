@@ -40,8 +40,8 @@ use crate::widgets::{
     modal_title_owned, modal_w, panel_style,
 };
 use crate::{
-    DdlPreview, FieldCfg, Ui, ViewAlgoDoneFn, ViewAlgoRequest, ViewTarget, ddl_preview, edit_field,
-    object_location, theme,
+    DdlPreview, DdlUi, FieldCfg, Ui, ViewAlgoDoneFn, ViewAlgoRequest, ViewTarget, ddl_preview,
+    edit_field, object_location, theme,
 };
 
 fn panel_w() -> f64 {
@@ -227,12 +227,11 @@ pub(crate) fn is_editable_view(info: Option<&schemaic_core::schema::TableInfo>) 
 /// an edit. The form is built once per open — nothing here is keyed on the
 /// draft — because a draft-keyed field would be torn down mid-keystroke.
 fn bound_field(
-    ui: &Ui,
+    draft: RwSignal<ViewDraft>,
     initial: String,
     cfg: FieldCfg,
     apply: impl Fn(&mut ViewDraft, &str) + 'static,
 ) -> AnyView {
-    let draft = ui.ddl.view_draft;
     let sig = floem::reactive::create_rw_signal(initial);
     create_effect(move |prev: Option<String>| {
         let v = sig.get();
@@ -247,14 +246,13 @@ fn bound_field(
 /// A dropdown over a fixed set of option values, bound to the draft. The empty
 /// string is the "unset" entry and shows as `—`.
 fn bound_choice(
-    ui: &Ui,
+    draft: RwSignal<ViewDraft>,
     initial: String,
     options: Vec<String>,
     ring: FocusRing,
     tabindex: u32,
     apply: impl Fn(&mut ViewDraft, &str) + 'static,
 ) -> AnyView {
-    let draft = ui.ddl.view_draft;
     let sig = floem::reactive::create_rw_signal(initial);
     focusable_owned_dropdown(
         move || sig.get(),
@@ -272,8 +270,8 @@ fn bound_choice(
     .into_any()
 }
 
-fn form(ui: Ui, target: &ViewTarget, ring: FocusRing) -> AnyView {
-    let d = ui.ddl.view_draft;
+fn form(ui: DdlUi, target: &ViewTarget, ring: FocusRing) -> AnyView {
+    let d = ui.view_draft;
     let draft = d.get_untracked();
     // Asked per engine rather than as `pg` / `!pg`: SQLite is a third shape, not
     // MySQL's, and every option below belongs to exactly one of them.
@@ -285,7 +283,7 @@ fn form(ui: Ui, target: &ViewTarget, ring: FocusRing) -> AnyView {
     let name = form_setting(
         "Name",
         bound_field(
-            &ui,
+            d,
             draft.name.clone(),
             FieldCfg {
                 placeholder: "view_name",
@@ -305,14 +303,14 @@ fn form(ui: Ui, target: &ViewTarget, ring: FocusRing) -> AnyView {
     let body = form_setting(
         "SELECT statement",
         bound_field(
-            &ui,
+            d,
             draft.select.clone(),
             FieldCfg {
                 multiline: true,
                 no_wrap: true,
                 mono: true,
                 font_size: theme::font_body,
-                max_rows: Some(ui.ddl.view_rows),
+                max_rows: Some(ui.view_rows),
                 placeholder: "SELECT …",
                 focus: Some((ring.clone(), 20)),
                 // It's SQL: Tab indents. Escape leaves.
@@ -335,7 +333,7 @@ fn form(ui: Ui, target: &ViewTarget, ring: FocusRing) -> AnyView {
         form_setting(
             "Check option",
             bound_choice(
-                &ui,
+                d,
                 draft.options.check_option.clone().unwrap_or_default(),
                 ["", "CASCADED", "LOCAL"]
                     .iter()
@@ -359,7 +357,7 @@ fn form(ui: Ui, target: &ViewTarget, ring: FocusRing) -> AnyView {
         form_setting(
             "Column names",
             bound_field(
-                &ui,
+                d,
                 draft.options.column_list.clone().unwrap_or_default(),
                 FieldCfg {
                     placeholder: "optional — taken from the SELECT when empty",
@@ -390,7 +388,7 @@ fn form(ui: Ui, target: &ViewTarget, ring: FocusRing) -> AnyView {
         let security = form_setting(
             "SQL security",
             bound_choice(
-                &ui,
+                d,
                 draft.options.security.clone().unwrap_or_default(),
                 ["", "DEFINER", "INVOKER"]
                     .iter()
@@ -483,8 +481,13 @@ fn preview_from(target: &ViewTarget, draft: &ViewDraft, cs: &ddl::ChangeSet) -> 
 
 /// The view editor. Absolutely positioned over the workspace when
 /// `ui.ddl.view` is `Some`.
-pub(crate) fn view_editor_overlay(ui: Ui) -> impl IntoView {
-    let d = ui.ddl;
+///
+/// Takes [`DdlUi`] rather than the root bundle: unlike the sibling editors'
+/// overlays, nothing under here is an *opening* path — the draft, the target,
+/// the body's row cap and the preview it hands off to all live in this one
+/// child bundle, and `fetch_algorithm` is reached from `open_for_view` rather
+/// than from the modal.
+pub(crate) fn view_editor_overlay(d: DdlUi) -> impl IntoView {
     let close = move || d.view.set(None);
 
     // The preview stacks on top and this stays open behind it (Cancel there
@@ -507,7 +510,6 @@ pub(crate) fn view_editor_overlay(ui: Ui) -> impl IntoView {
             let Some(target) = d.view.get_untracked() else {
                 return empty().into_any();
             };
-            let ui = ui.clone();
             let title = match &target.current {
                 Some(t) => format!(
                     "Edit view {}.{}",
@@ -525,14 +527,13 @@ pub(crate) fn view_editor_overlay(ui: Ui) -> impl IntoView {
             let ring = FocusRing::new();
             let root_ring = ring.clone();
 
-            let body = crate::widgets::autohide(scroll(
-                form(ui.clone(), &target, ring.clone()).style(|s| {
+            let body =
+                crate::widgets::autohide(scroll(form(d, &target, ring.clone()).style(|s| {
                     s.width_full()
                         .padding_horiz(modal_pad_h())
                         .padding_vert(theme::scaled(18.0))
-                }),
-            ))
-            .style(|s| s.width_full().flex_grow(1.0_f32).min_height(0.0));
+                })))
+                .style(|s| s.width_full().flex_grow(1.0_f32).min_height(0.0));
 
             // Validation first (it blocks), then the change count.
             //
@@ -576,7 +577,6 @@ pub(crate) fn view_editor_overlay(ui: Ui) -> impl IntoView {
                 },
             );
 
-            let preview_ui = ui.clone();
             let ring_actions = ring.clone();
             // Keyed on the target for the same reason `status` is, and it
             // matters more here: this decides whether **Preview SQL** is enabled
@@ -584,7 +584,6 @@ pub(crate) fn view_editor_overlay(ui: Ui) -> impl IntoView {
             let actions = dyn_container(
                 move || (d.view.get(), d.view_draft.get()),
                 move |(current, draft)| {
-                    let ui = preview_ui.clone();
                     let Some(target) = current else {
                         return empty().into_any();
                     };
@@ -608,10 +607,7 @@ pub(crate) fn view_editor_overlay(ui: Ui) -> impl IntoView {
                             ACTION_TAB + 10,
                             move || {
                                 let cs = change_set(&target, &draft);
-                                ddl_preview::open_preview(
-                                    ui.ddl,
-                                    preview_from(&target, &draft, &cs),
-                                );
+                                ddl_preview::open_preview(d, preview_from(&target, &draft, &cs));
                             },
                         ),
                     ))

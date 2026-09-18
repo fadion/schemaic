@@ -14563,8 +14563,20 @@ mod whole_ui_gate {
         ("compare_view.rs", 8),
         ("connection_form.rs", 1),
         ("connection_import.rs", 6),
-        ("database_editor.rs", 7),
-        ("ddl_preview.rs", 6),
+        // 7 → 3: `bound_field` takes the `RwSignal<DatabaseDraft>` it writes,
+        // `optional_field` takes that plus `OverlayUi` (its `suggest_chevron`
+        // is the only other thing it reaches), `form` takes `DdlUi` and
+        // `OverlayUi`, and so does the overlay — naming two child bundles is
+        // narrower than naming neither, and the one thing that had kept it on
+        // the root was `ddl_preview::preview_container`, which takes `DdlUi`
+        // now. The three left are `open_for_new`, `container_names` and
+        // `fetch_roles`.
+        ("database_editor.rs", 3),
+        // 6 → 4: `preview_container` and `preview_account` forwarded `ui.ddl`
+        // and read nothing else, so they take `DdlUi`. That is what let
+        // `database_editor`'s overlay off the root bundle as well — a helper
+        // still on `&Ui` is a blocker for every caller of it.
+        ("ddl_preview.rs", 4),
         ("dump_view.rs", 9),
         ("erd_view.rs", 1),
         // 11 → 5: the four `bound_*` helpers take `RwSignal<EventDraft>` — the
@@ -14652,7 +14664,14 @@ mod whole_ui_gate {
         // rule's own prescription and was the right shape anyway — the decision
         // is `connection::read_only_of` over a list.
         ("users_view.rs", 8),
-        ("view_editor.rs", 10),
+        // 10 → 6: `bound_field` and `bound_choice` take the
+        // `RwSignal<ViewDraft>` they write, `form` takes `DdlUi`, and — unlike
+        // every sibling editor's — **the overlay takes `DdlUi` too**. Nothing
+        // under it is an opening path: `fetch_algorithm` is reached from
+        // `open_for_view`, not from the modal, so the draft, the target, the
+        // body's row cap and the preview hand-off are the whole of what it
+        // touches. The six left are exactly the opening path.
+        ("view_editor.rs", 6),
         // `MenuFlags::of`, which gathers a flag out of six child bundles and so
         // genuinely needs the root one — the case the doc above calls taking
         // "the child bundle … which is what those bundles are for", six times

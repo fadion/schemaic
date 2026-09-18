@@ -14757,9 +14757,14 @@ existing prose was left alone.
     what a next pass should reach for first.** A **form or list** function takes the child
     bundle — `DdlUi` in every one of these, with `OverlayUi` named beside it where a suggestion
     chevron needs the dropdown channel (`object_editor`'s `form`/`domain_form`, `table_designer`'s
-    `table_section`/`column_form`) — while a **field helper** takes the bare signal it writes:
-    `RwSignal<TableDraft>`, `RwSignal<EventDraft>`, `RwSignal<RoutineDraft>`,
-    `RwSignal<TriggerSetDraft>`. A field that binds one signal should say which one. Because the
+    `table_section`/`column_form`, `database_editor`'s `form`) — while a **field helper** takes the
+    bare signal it writes: `RwSignal<TableDraft>`, `RwSignal<EventDraft>`, `RwSignal<RoutineDraft>`,
+    `RwSignal<TriggerSetDraft>`, `RwSignal<ViewDraft>`, `RwSignal<DatabaseDraft>`. A field that binds
+    one signal should say which one. **The chevron is a rider on that half too, not only on the
+    form half**: `database_editor::optional_field` is a field helper and still takes `OverlayUi`
+    beside its `RwSignal<DatabaseDraft>`, because the fields it builds are free text *plus* a
+    `suggest_chevron` — so the rule is "the bare signal it writes, plus the dropdown channel where
+    the field itself carries one", never "a helper may not name a bundle". Because the
     child bundles are `Copy`, narrowing deletes clones rather than merely renaming a parameter: the
     designer's three growing lists each kept an `add_ui` and a `del_ui` alive for their two action
     closures, four of its lists were cloning a `Ui` *per row* to deliver one `Copy` signal, and
@@ -14773,10 +14778,29 @@ existing prose was left alone.
     `loaded_table`, `loaded_schema`, `default_schema`, `table_names` — are called from five other
     modules. Those six could take `SchemaUi`, which is `Copy`; that is a change to shared helpers
     rather than to that file, and it has not been done.
+    **An editor's *overlay* is the usual holdout, and `view_editor_overlay` is the first one that
+    was not.** Every sibling editor's overlay keeps the root bundle because something under it
+    opens something else; this one has no such path — `fetch_algorithm` is reached from
+    `open_for_view`, not from the modal — so the draft, the target, the body's row cap
+    (`view_rows`, read by `form`) and the hand-off to `ddl_preview::open_preview` are the whole of
+    what it touches, it takes `DdlUi`, and `modals.rs` passes `ui.ddl`. That is what leaves
+    `view_editor.rs` at **6**: exactly the six opening functions, `open_editor`, `open_for_view`,
+    `fetch_algorithm`, `open_for_new`, `open_from_query` and `open_blank`.
+    `database_editor_overlay` went the same way one step later, and **what had been holding it was
+    a helper, not its own shape** — which is the more useful half of the lesson. Its direct reads
+    were only `ui.ddl` and `ui.overlay`, the two-bundle shape `object_editor`'s `form`/`domain_form`
+    already established as narrower than naming neither; what kept it on the root bundle was its
+    Preview SQL button calling `ddl_preview::preview_container(&Ui, …)`, a helper that forwarded
+    `ui.ddl` and read nothing else. Narrowing that one signature (and `preview_account` beside it,
+    the same shape) took `ddl_preview.rs` 6 → 4 **and** let the overlay take `(DdlUi, OverlayUi)`,
+    which took `database_editor.rs` to **3** — `open_for_new`, `container_names` and `fetch_roles`.
+    A caller cannot be narrower than what it calls, so a `&Ui` helper is a budget floor under every
+    file that reaches it; look down the call graph before concluding a function needs the root.
     **The live number is the sum of `BUDGET`, not the "roughly 140" above**, which describes the
-    state the gate found and by design never moves. That sum went **206 → 161** over this run:
+    state the gate found and by design never moves. That sum went **206 → 151** over this run:
     `table_designer.rs` 29 → 26 → 10, `object_editor.rs` 14 → 5, `routine_editor.rs` 12 → 6,
-    `event_editor.rs` 11 → 5, `trigger_editor.rs` 11 → 8, `overlays.rs` 15 → 13. Every step is
+    `event_editor.rs` 11 → 5, `trigger_editor.rs` 11 → 8, `view_editor.rs` 10 → 6,
+    `database_editor.rs` 7 → 3, `ddl_preview.rs` 6 → 4, `overlays.rs` 15 → 13. Every step is
     recorded against its own entry with what it narrowed *to*, so read the list for where a file
     stands rather than inferring it from a paragraph.
     It is a **budget, not a ban**, because narrowing 140 signatures is a campaign and a gate that

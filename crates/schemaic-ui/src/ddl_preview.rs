@@ -26,7 +26,7 @@ use crate::widgets::{
     autohide, exit_action, focus_root_with_ring, form_section, form_section_owned,
     modal_footer_split, modal_h, modal_pad_h, modal_title_owned, modal_w, panel_style,
 };
-use crate::{DdlOutcome, DdlPreview, DdlRunRequest, FieldCfg, Ui, edit_field, icons, theme};
+use crate::{DdlOutcome, DdlPreview, DdlRunRequest, DdlUi, FieldCfg, Ui, edit_field, icons, theme};
 
 fn panel_w() -> f64 {
     modal_w(660.0)
@@ -335,12 +335,12 @@ pub(crate) fn preview_of_plan(
 /// too: for a namespace it is the database the plan runs in, and for a database
 /// it is the empty string [`crate::DdlScope::Server`] wants.
 pub(crate) fn preview_container(
-    ui: &Ui,
+    ui: DdlUi,
     on: PlanTarget,
     subject: &str,
     change: schemaic_core::ddl::Change,
 ) {
-    open_preview(ui.ddl, container_preview(&on, subject, change));
+    open_preview(ui, container_preview(&on, subject, change));
 }
 
 /// The plan itself, with no `Ui` in reach — so the claim that it is built
@@ -375,14 +375,14 @@ pub(crate) fn container_preview(
 /// previewed after a switch to PostgreSQL was emitted at the wrong dialect, and
 /// the wrong connection's read-only flag decided whether Apply was offered.
 pub(crate) fn preview_account(
-    ui: &Ui,
+    ui: DdlUi,
     on: PlanTarget,
     subject: &str,
     change: schemaic_core::ddl::Change,
 ) {
     let cs = schemaic_core::ddl::account(subject, on.dialect, change);
     open_preview(
-        ui.ddl,
+        ui,
         preview_of(on.conn_id, &on.database, subject, &cs, on.read_only),
     );
 }

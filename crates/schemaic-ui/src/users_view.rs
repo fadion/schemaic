@@ -961,7 +961,7 @@ fn actions_row(
                 let read_only = launch_read_only(ui.conn.connections, plan_conn_id);
                 if yes && crate::widgets::accept_launch(false, read_only) {
                     crate::ddl_preview::preview_account(
-                        &ui,
+                        ui.ddl,
                         crate::ddl_preview::PlanTarget {
                             conn_id: plan_conn_id,
                             database: database.clone(),

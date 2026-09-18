@@ -1708,7 +1708,7 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                                     resolve: Rc::new(move |yes| {
                                         if yes {
                                             crate::ddl_preview::preview_container(
-                                                &ui,
+                                                ui.ddl,
                                                 on.clone(),
                                                 &db,
                                                 schemaic_core::ddl::Change::DropDatabase {
@@ -1943,7 +1943,7 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                                     resolve: Rc::new(move |yes| {
                                         if yes {
                                             crate::ddl_preview::preview_container(
-                                                &ui,
+                                                ui.ddl,
                                                 on.clone(),
                                                 &ns,
                                                 schemaic_core::ddl::Change::DropSchema {

@@ -37,7 +37,9 @@ use crate::widgets::{
     form_section, form_setting, modal_footer_split, modal_h, modal_pad_h, modal_title_owned,
     modal_w, panel_style,
 };
-use crate::{ContainerKind, DatabaseTarget, FieldCfg, Ui, ddl_preview, edit_field, theme};
+use crate::{
+    ContainerKind, DatabaseTarget, DdlUi, FieldCfg, OverlayUi, Ui, ddl_preview, edit_field, theme,
+};
 
 fn panel_w() -> f64 {
     modal_w(520.0)
@@ -219,12 +221,11 @@ pub(crate) fn change_of(kind: ContainerKind, draft: &DatabaseDraft) -> ddl::Chan
 /// editor's: the local signal is seeded once on build and the effect writes back
 /// only on a genuine change, so a rebuild can't read as an edit.
 fn bound_field(
-    ui: &Ui,
+    draft: RwSignal<DatabaseDraft>,
     initial: String,
     cfg: FieldCfg,
     apply: impl Fn(&mut DatabaseDraft, &str) + 'static,
 ) -> AnyView {
-    let draft = ui.ddl.database_draft;
     let sig = floem::reactive::create_rw_signal(initial);
     create_effect(move |prev: Option<String>| {
         let v = sig.get();
@@ -253,7 +254,8 @@ fn bound_field(
 /// their indices by ten.
 #[allow(clippy::too_many_arguments)] // a UI builder; grouping into a struct adds no clarity
 fn optional_field(
-    ui: &Ui,
+    draft: RwSignal<DatabaseDraft>,
+    overlay: OverlayUi,
     initial: Option<String>,
     placeholder: &'static str,
     options: impl Fn() -> Vec<String> + 'static,
@@ -264,7 +266,6 @@ fn optional_field(
     tabindex: u32,
     apply: impl Fn(&mut DatabaseDraft, Option<String>) + 'static,
 ) -> AnyView {
-    let draft = ui.ddl.database_draft;
     let sig = floem::reactive::create_rw_signal(initial.unwrap_or_default());
     create_effect(move |prev: Option<String>| {
         let v = sig.get();
@@ -284,7 +285,7 @@ fn optional_field(
         )
         .style(move |s| s.width(field_w())),
         suggest_chevron(
-            ui.overlay,
+            overlay,
             sig,
             options,
             empty_note,
@@ -296,11 +297,18 @@ fn optional_field(
     .into_any()
 }
 
-fn form(ui: &Ui, target: &DatabaseTarget, draft: &DatabaseDraft, ring: FocusRing) -> AnyView {
+fn form(
+    ui: DdlUi,
+    overlay: OverlayUi,
+    target: &DatabaseTarget,
+    draft: &DatabaseDraft,
+    ring: FocusRing,
+) -> AnyView {
+    let bound = ui.database_draft;
     let name = form_setting(
         "Name",
         bound_field(
-            ui,
+            bound,
             draft.name.clone(),
             FieldCfg {
                 placeholder: match target.kind {
@@ -342,7 +350,8 @@ fn form(ui: &Ui, target: &DatabaseTarget, draft: &DatabaseDraft, ring: FocusRing
             form_setting(
                 "Character set",
                 optional_field(
-                    ui,
+                    bound,
+                    overlay,
                     draft.charset.clone(),
                     "server default",
                     || ddl::MYSQL_CHARSETS.iter().map(|c| c.to_string()).collect(),
@@ -358,7 +367,8 @@ fn form(ui: &Ui, target: &DatabaseTarget, draft: &DatabaseDraft, ring: FocusRing
             form_setting(
                 "Collation",
                 optional_field(
-                    ui,
+                    bound,
+                    overlay,
                     draft.collation.clone(),
                     "server default",
                     || {
@@ -381,12 +391,13 @@ fn form(ui: &Ui, target: &DatabaseTarget, draft: &DatabaseDraft, ring: FocusRing
         // fetch started in `open_for_new`, which lands after this form is built;
         // `suggest_chevron` calls this closure at press time, so a late reply
         // reaches the menu without rebuilding the field.
-        let roles = ui.ddl.roles;
+        let roles = ui.roles;
         rows.push(
             form_setting(
                 "Owner",
                 optional_field(
-                    ui,
+                    bound,
+                    overlay,
                     draft.owner.clone(),
                     "you",
                     move || roles.get_untracked(),
@@ -410,8 +421,13 @@ fn form(ui: &Ui, target: &DatabaseTarget, draft: &DatabaseDraft, ring: FocusRing
 
 // ── the modal ────────────────────────────────────────────────────────────────
 
-pub(crate) fn database_editor_overlay(ui: Ui) -> impl IntoView {
-    let d = ui.ddl;
+/// Takes the two child bundles it reads rather than the root one: `DdlUi` for
+/// the draft and the plan hand-off, `OverlayUi` for the form's suggestion
+/// chevrons. Naming both is narrower than naming neither — the rule
+/// `object_editor`'s `form`/`domain_form` already follow — and nothing under
+/// here is an opening path now that `ddl_preview::preview_container` takes
+/// `DdlUi` too.
+pub(crate) fn database_editor_overlay(d: DdlUi, overlay: OverlayUi) -> impl IntoView {
     let close = move || d.database.set(None);
 
     dyn_container(
@@ -431,7 +447,6 @@ pub(crate) fn database_editor_overlay(ui: Ui) -> impl IntoView {
             let Some(target) = d.database.get_untracked() else {
                 return empty().into_any();
             };
-            let ui = ui.clone();
             let title = match (target.kind, target.database.as_deref()) {
                 (ContainerKind::Schema, Some(db)) => format!("Create schema in {db}"),
                 (kind, _) => format!("Create {}", kind.label()),
@@ -445,7 +460,7 @@ pub(crate) fn database_editor_overlay(ui: Ui) -> impl IntoView {
             // object editor's module comment states.
             let seed = d.database_draft.get_untracked();
             let body = crate::widgets::autohide(scroll(
-                form(&ui, &target, &seed, ring.clone()).style(|s| {
+                form(d, overlay, &target, &seed, ring.clone()).style(|s| {
                     s.width_full()
                         .padding_horiz(modal_pad_h())
                         .padding_vert(theme::scaled(18.0))
@@ -476,13 +491,11 @@ pub(crate) fn database_editor_overlay(ui: Ui) -> impl IntoView {
                 },
             );
 
-            let preview_ui = ui.clone();
             let preview_target = target.clone();
             let ring_actions = ring.clone();
             let actions = dyn_container(
                 move || d.database_draft.get(),
                 move |draft| {
-                    let ui = preview_ui.clone();
                     let target = preview_target.clone();
                     let ring = ring_actions.clone();
                     let ready = draft.validate().is_empty();
@@ -506,7 +519,7 @@ pub(crate) fn database_editor_overlay(ui: Ui) -> impl IntoView {
                                 // **The target the form was opened on**, not
                                 // the connection the switcher points at now.
                                 ddl_preview::preview_container(
-                                    &ui,
+                                    d,
                                     (&target).into(),
                                     &name,
                                     change_of(target.kind, &draft),

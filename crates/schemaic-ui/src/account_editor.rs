@@ -783,7 +783,7 @@ pub(crate) fn account_editor_overlay(ui: Ui) -> impl IntoView {
                             move || {
                                 let subject = draft.principal(target.dialect).display();
                                 ddl_preview::preview_account(
-                                    &ui,
+                                    ui.ddl,
                                     (&target).into(),
                                     &subject,
                                     account_change(&draft, target.resetting.as_ref()),
@@ -1205,7 +1205,7 @@ pub(crate) fn grant_editor_overlay(ui: Ui) -> impl IntoView {
                                 // drifts, rather than a preview of an empty plan.
                                 if let Some(change) = ddl::grant_change(&draft, &target.account) {
                                     ddl_preview::preview_account(
-                                        &ui,
+                                        ui.ddl,
                                         (&target).into(),
                                         &target.account.display(),
                                         change,
