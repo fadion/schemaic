@@ -451,6 +451,20 @@ existing prose was left alone.
     and suggesting a name the engine lacks is the same wrong as squiggling one it has, so both
     surfaces ask the one engine→catalog map rather than each keeping its own, and `None` means
     *offer nothing* on the same reasoning that makes it mean *say nothing*.
+    **`is_offered_builtin` is where those two surfaces part company again**, because trusting a name
+    and offering it are not the same question: `builtin_catalog` is what the checker **trusts**,
+    whole, and `is_offered_builtin(dialect, name)` is what `rank`'s `ClauseCtx::Column` arm filters
+    it through before the popup sees it. They differ on exactly one engine. MySQL's and SQLite's
+    catalogs were transcribed from their manuals and each already *is* the list a person would type,
+    so both arms are `true`; PostgreSQL's was read out of `pg_catalog`, so it carries the engine's
+    own plumbing — `int4in`, `btint4cmp`, `texteq` — which the checker must keep knowing and the
+    popup must not spend its forty rows on, and that arm asks `pg_builtins::is_suggested`.
+    **It is an exhaustive `match` on a dialect, and that is not the engine comparison the working
+    rules warn against**: what it asks is a property of how *this app's* data file was made, not a
+    server capability, so there is no yes/no behind it to compute from and a fourth engine's answer
+    depends on how its own catalog was written. A `dialect == Postgres` at the call site would be
+    the failure; one named predicate, here, with a reason per arm, is what keeps the question
+    answerable — the same argument `ddl::default_new_column_type` makes for its own `match`.
     **`SQLITE_FUNCTIONS` turned the checker on for SQLite** — 157 entries, written lower-case the way
     SQLite's own documentation writes them while `FUNCTIONS` stays upper-case for MySQL's, which
     costs nothing because both comparisons are case-insensitive at either end.
@@ -794,13 +808,44 @@ existing prose was left alone.
     near-miss net is drawn around ten times as many names as MySQL's — and
     `intel::tests::an_ordinary_user_function_survives_the_pg_catalog` is what keeps it honest,
     holding ten ordinary application names (`calc_total`, `audit_log`, `trim_name`) to no squiggle.
-    **The completion popup pays that cost too**, now that `rank` draws its function tier from
-    `builtin_catalog` and a PostgreSQL tab is therefore offered all 2,706: completion filters by
-    prefix and `rank::MAX_ROWS` caps the popup at 40, so the list is never dumped whole, and the
-    residual risk is a short prefix surfacing `int4in` or `btint4cmp` beside the name the user
-    wanted. A **mechanically derived** user-facing subset — one no hand maintains, so the failure
-    mode above cannot come back through it — is the next piece of work and is not written yet; a
-    curated list still is not it.
+    **The completion popup used to pay that cost too, and `PG_SUGGESTED` is what stopped it.** Once
+    `rank` drew its function tier from `builtin_catalog`, a PostgreSQL tab was offered all 2,706:
+    prefix filtering and `rank::MAX_ROWS`' cap of 40 meant the list was never dumped whole, but a
+    short prefix could surface `int4in` or `btint4cmp` beside the name the user wanted. So this
+    module holds a **second** list — `PG_SUGGESTED`, **863** of the 2,706, sorted, the subset
+    autocomplete offers — while `PG_FUNCTIONS` is unchanged and is still what the typo checker
+    trusts, whole. The two questions want different answers on this engine and nowhere else:
+    *is this a real function here* needs every name including the internals, because squiggling one
+    is a false positive under correct SQL, and *which name should the popup put under the caret*
+    needs something a person would type, because plumbing is noise in a list whose whole value is
+    being short. MySQL's and SQLite's catalogs never needed the distinction — transcribed from a
+    manual, each already *is* the shorter list — which is why the per-engine fact lives in
+    `intel::is_offered_builtin` rather than here.
+    **The cut is mechanical, and that is the whole of why it is allowed to exist**: a curated subset
+    would be a hand-written list again, with the failure mode above and no test able to see an
+    omission. The rule is "this function exists to implement something else", which the server can
+    answer about itself — a name is dropped when its `oid` appears as an operator's
+    `oprcode`/`oprrest`/`oprjoin`, an index support function (`pg_amproc`), any of `pg_aggregate`'s
+    support columns, a type's I/O, typmod, analyze or subscript routine, a `pg_cast` conversion, a
+    range's canonical/subdiff, a language handler or an access-method handler — or when it takes or
+    returns `internal`/`cstring`, or returns `trigger`, `event_trigger` or one of the handler
+    pseudo-types. That is **839** names. **The 24
+    `GRAMMAR_ONLY` call forms are unioned back in by hand, and necessarily**: they have no `pg_proc`
+    row, so no query over it can return them, and a server-only subset would have dropped
+    `coalesce`, `cast`, `trim`, `greatest` and `least` — the five most typed names in the list —
+    while looking like a tidy-up. 839 + 24 = 863.
+    **`is_suggested` is a binary search, so the sort is load-bearing in the quiet direction**: an
+    unsorted list answers `false` for names that *are* in it, which shows up as a function missing
+    from the popup and nowhere else, and `the_subset_is_sorted_and_has_no_duplicates` asserts strict
+    ascent rather than trusting the generator. In front of the search sits a `LONGEST_SUGGESTED`
+    (52) length fast-reject, a hand-written number that goes wrong silently in the same direction,
+    so `the_length_shortcut_rejects_nothing_real` asserts it against the real longest name and then
+    offers every name in the list back; case-folding is at the caller's end
+    (`matching_ignores_case_at_the_callers_end`). `every_suggested_name_is_in_the_catalog` keeps the
+    subset a subset — an offered name the catalog lacks would be a row the checker then squiggles —
+    and `the_cut_falls_between_plumbing_and_sql` pins both sides of the line, `coalesce`, `cast`,
+    `trim`, `btrim`, `jsonb_set` in and `int4in`, `btint4cmp`, `texteq`, `int8_avg` out. The live
+    half is `live::pg_catalog`'s `the_offered_subset_is_still_what_the_filter_answers`, below.
     **Names are lower-case**, like `SQLITE_FUNCTIONS` and unlike `FUNCTIONS`, which costs nothing
     because both comparisons are case-insensitive at either end — `pg_function_catalog_is_sane` pins
     it, along with a size floor set well under 2,682 so a later major version may add or drop names
@@ -6862,8 +6907,15 @@ existing prose was left alone.
       that through `rank` and not over the catalogs, because the catalogs were already right and the
       composition was what was broken; `ranked_on` is the existing `ranked` helper with the engine
       named, and `ranked` itself still passes `SqlDialect::MySql`, so every older test means what it
-      did. What this does *not* fix is the size of PostgreSQL's catalog reaching the popup — see
-      `pg_builtins.rs`. `SchemaIndex`/`ColMeta`/`Suggestion`/`SuggestKind`/`KeyKind` are the
+      did. **The size of PostgreSQL's catalog reaching the popup was the half that fix left open,
+      and the arm now filters through `intel::is_offered_builtin`** — `true` on MySQL and SQLite,
+      whose catalogs are already the user-facing list, and `pg_builtins::PG_SUGGESTED` membership on
+      PostgreSQL, so the tab is offered 863 names rather than 2,706 while the checker goes on
+      trusting all of them. `postgres_offers_the_subset_and_the_checker_still_sees_the_rest` asserts
+      **both** halves of that in one test, because either alone is satisfiable by a bug: a plumbing
+      name is required to be *in* `PG_FUNCTIONS` and *absent* from the ranked list, and `coalesce`
+      and `greatest` — grammar-only forms no `pg_proc` query can return — are required to survive.
+      `SchemaIndex`/`ColMeta`/`Suggestion`/`SuggestKind`/`KeyKind` are the
       vocabulary; `worth_offering` and `database_suggestion_visible` are the leaf rules `rank`
       itself composes. **`statement_identifiers` and `snippet_abbrev_rows` are not** — they are the
       *caller*'s leaf rules, called directly by `completion::recompute_completions` and handed back
@@ -8601,6 +8653,16 @@ existing prose was left alone.
   test reports — every name the server has is in the catalog, the overhang is exactly the 24
   grammar-only forms (`over_listing`), and those 24 are really in the catalog
   (`the_grammar_forms_are_in_the_catalog`, so the allowance cannot outlive what it was granted for).
+  **Its fourth test holds the offered subset to the same server**:
+  `the_offered_subset_is_still_what_the_filter_answers` carries the plumbing cut as SQL
+  (`SUGGEST_ORACLE`) and asserts `PG_SUGGESTED` equals that query's answer unioned with
+  `GRAMMAR_ONLY`, in **both** directions — a name the filter keeps and the list lacks is one
+  autocomplete will never suggest, a name the list carries and the filter no longer keeps is the
+  popup offering this server's plumbing. The query text lives in the test rather than beside
+  `PG_SUGGESTED` for the same reason `ORACLE` does: a generated file checked by re-running the
+  generator against itself checks nothing. It carries a row-count floor (>500) on the same
+  reasoning as the others, and it was watched fail — deleting `btrim` from the list produced
+  ``pg at 127.0.0.1:5432 as schemaic offers 1 name(s) `PG_SUGGESTED` does not … ["btrim"]``.
   The tier's rule still stands and this is not a hole in it: the subject of each is one engine's
   *data file* rather than a claim about how the DB layer behaves, and there is no version of "is
   PostgreSQL's builtin list complete" MariaDB could answer. Each carries its own `enabled()` check
@@ -9141,9 +9203,9 @@ existing prose was left alone.
   needed it yet: streaming a genuinely large export, and multi-schema PostgreSQL.
   **It is gated as a *target*, not at runtime.** The manifest declares the target
   `required-features = ["live-tests"]`, so `cargo test --workspace` does not build it and the pure
-  tier stays pure by construction. It is **352 tests** as this is written — 113 suite functions
-  expanded across the three legs by `main.rs`'s macro (339), the seven in the two catalog oracles
-  outside it (`pg_catalog`'s three and `mariadb_catalog`'s four), and the six that need no server
+  tier stays pure by construction. It is **353 tests** as this is written — 113 suite functions
+  expanded across the three legs by `main.rs`'s macro (339), the eight in the two catalog oracles
+  outside it (`pg_catalog`'s four and `mariadb_catalog`'s four), and the six that need no server
   (the four name-guard cases, `endpoint.rs`'s declared-case count, and the skip-notice source gate).
   The figure this sentence carried for a while was 306, a count that had never included the oracles
   and went stale as the suite grew; `cargo test -p schemaic-db --features live-tests --test live --

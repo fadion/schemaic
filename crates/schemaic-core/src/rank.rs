@@ -189,7 +189,7 @@ pub struct RankInput<'a> {
     pub active_db: Option<&'a str>,
     /// The tab's engine, which decides **which builtin catalog** is offered.
     ///
-    /// Not a nicety: without it `rank` walked [`FUNCTIONS`] on every engine, so
+    /// Not a nicety: without it `rank` walked [`crate::intel::FUNCTIONS`] on every engine, so
     /// a PostgreSQL tab was offered MySQL's names and a SQLite one the same —
     /// the typo checker's original bug, in the surface that *inserts* the word
     /// rather than the one that underlines it. It is asked as a dialect and
@@ -518,7 +518,11 @@ pub fn rank(schema: &SchemaIndex, input: &RankInput<'_>) -> Vec<Suggestion> {
                     }
                 }
             }
-            for fun in crate::intel::builtin_catalog(input.dialect).unwrap_or(&[]) {
+            for fun in crate::intel::builtin_catalog(input.dialect)
+                .unwrap_or(&[])
+                .iter()
+                .filter(|f| crate::intel::is_offered_builtin(input.dialect, f.name))
+            {
                 add(
                     &mut cands,
                     &mut seen,
@@ -954,6 +958,59 @@ mod tests {
         assert!(!offers(&on(SqlDialect::MySql, "zerob"), "zeroblob"));
         assert!(offers(&on(SqlDialect::MySql, "uuid_s"), "UUID_SHORT"));
         assert!(!offers(&on(SqlDialect::Sqlite, "uuid_s"), "uuid_short"));
+    }
+
+    /// PostgreSQL's catalog reaches the popup cut down, and the checker's
+    /// unchanged.
+    ///
+    /// `PG_FUNCTIONS` is read out of `pg_catalog` and so carries the engine's
+    /// own plumbing — `int4in`, `btint4cmp`, `texteq`. Those are real functions
+    /// and the checker must go on knowing them, but a completion list's whole
+    /// value is being short, and `int` is a prefix somebody types.
+    ///
+    /// The half that matters most is the second: the 24 call forms with no
+    /// `pg_proc` row cannot come out of a query over `pg_proc`, so a subset
+    /// derived only from the server would have dropped `coalesce` and `cast` —
+    /// the most typed names in the list — while looking like a tidy-up.
+    #[test]
+    fn postgres_offers_the_subset_and_the_checker_still_sees_the_rest() {
+        let s = shop();
+        let ctx = ClauseCtx::Column;
+        let pg = |p| ranked_on(&s, SqlDialect::Postgres, ctx.clone(), &[], p);
+
+        // Plumbing: in the catalog the checker trusts, out of the popup.
+        for internal in ["int4in", "btint4cmp", "texteq"] {
+            assert!(
+                crate::pg_builtins::PG_FUNCTIONS
+                    .iter()
+                    .any(|f| f.name == internal),
+                "{internal} must stay in the catalog — the checker reads it"
+            );
+            assert!(
+                !offers(&pg(&internal[..4]), internal),
+                "{internal} is plumbing and should not be offered"
+            );
+        }
+
+        // Ordinary functions, still offered.
+        assert!(offers(&pg("btri"), "btrim"));
+        assert!(offers(&pg("jsonb_b"), "jsonb_build_object"));
+        assert!(offers(&pg("date_t"), "date_trunc"));
+
+        // The grammar's own call forms, which no `pg_proc` query can return.
+        assert!(offers(&pg("coale"), "coalesce"));
+        assert!(offers(&pg("grea"), "greatest"));
+
+        // The two hand-written catalogs are already the user-facing list, so
+        // nothing is cut from them.
+        assert!(offers(
+            &ranked_on(&s, SqlDialect::MySql, ctx.clone(), &[], "ifnu"),
+            "IFNULL"
+        ));
+        assert!(offers(
+            &ranked_on(&s, SqlDialect::Sqlite, ctx.clone(), &[], "zerob"),
+            "zeroblob"
+        ));
     }
 
     /// One table whose columns are the three shapes a prefix can match —

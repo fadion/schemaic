@@ -1866,6 +1866,32 @@ pub(crate) fn builtin_catalog(dialect: SqlDialect) -> Option<&'static [SqlFuncti
     }
 }
 
+/// Whether autocomplete **offers** `name` on this engine, where
+/// [`builtin_catalog`] is what the typo checker **trusts**.
+///
+/// **The two questions differ on exactly one engine, and the difference is
+/// about how this app's catalogs were made rather than about SQL.** MySQL's and
+/// SQLite's were transcribed from their manuals, so each already *is* the list
+/// a person would want offered and there is nothing to cut. PostgreSQL's was
+/// read out of `pg_catalog`, so it carries the engine's own plumbing —
+/// `int4in`, `btint4cmp`, `texteq` — which the checker must keep knowing (they
+/// are callable SQL, and squiggling one is the false positive this whole
+/// area exists to avoid) and the popup must not spend its forty rows on.
+///
+/// **An exhaustive `match`, and that is deliberate.** It looks like the
+/// engine-comparison the working rules warn against, but the thing it asks is
+/// not a server capability: it is a property of the data file, and a fourth
+/// engine's answer depends on how *its* catalog was written rather than on
+/// anything the engine does. A `dialect == Postgres` at the call site would be
+/// the failure; one named predicate, here, with the reason per arm, is how the
+/// question stays answerable.
+pub(crate) fn is_offered_builtin(dialect: SqlDialect, name: &str) -> bool {
+    match dialect {
+        SqlDialect::MySql | SqlDialect::Sqlite => true,
+        SqlDialect::Postgres => crate::pg_builtins::is_suggested(name),
+    }
+}
+
 /// The function names (upper-case), for the typo checker and keyword-set membership.
 pub fn function_names() -> impl Iterator<Item = &'static str> {
     FUNCTIONS.iter().map(|f| f.name)

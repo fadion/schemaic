@@ -21,7 +21,7 @@
 
 use std::collections::HashSet;
 
-use schemaic_core::pg_builtins::PG_FUNCTIONS;
+use schemaic_core::pg_builtins::{PG_FUNCTIONS, PG_SUGGESTED};
 use tokio_util::sync::CancellationToken;
 
 use crate::endpoint::{self, POSTGRES};
@@ -36,6 +36,54 @@ const ORACLE: &str = "SELECT DISTINCT p.proname \
                        WHERE n.nspname = 'pg_catalog' \
                          AND p.prokind IN ('f', 'a', 'w') \
                          AND p.proname ~ '^[a-z][a-z0-9_]*$'";
+
+/// The cut `PG_SUGGESTED` records: every builtin **except** the ones that exist
+/// to implement something else.
+///
+/// The exclusion is read off the catalogs that point *at* a function — an
+/// operator's implementation or selectivity estimator, an index support
+/// function, any of `pg_aggregate`'s support columns, a type's I/O, typmod,
+/// analyze or subscript routine, a cast, a range's canonical/subdiff, a language
+/// or access-method handler — plus anything trafficking in `internal`/`cstring`
+/// or returning a handler pseudo-type. Nothing here is a name; that is the whole
+/// point, and it is why this can be re-asked rather than re-remembered.
+///
+/// Written out here rather than shared with `pg_builtins`, for the reason
+/// [`ORACLE`] is: a shared constant would let one edit move both the subset and
+/// the check on it.
+const SUGGEST_ORACLE: &str = "\
+WITH all_f AS ( \
+  SELECT p.oid, p.proname FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace \
+   WHERE n.nspname = 'pg_catalog' AND p.prokind IN ('f','a','w') \
+     AND p.proname ~ '^[a-z][a-z0-9_]*$' \
+), internal AS ( \
+  SELECT oprcode AS oid FROM pg_operator \
+  UNION SELECT oprrest FROM pg_operator UNION SELECT oprjoin FROM pg_operator \
+  UNION SELECT amproc FROM pg_amproc \
+  UNION SELECT aggtransfn FROM pg_aggregate UNION SELECT aggfinalfn FROM pg_aggregate \
+  UNION SELECT aggcombinefn FROM pg_aggregate UNION SELECT aggserialfn FROM pg_aggregate \
+  UNION SELECT aggdeserialfn FROM pg_aggregate UNION SELECT aggmtransfn FROM pg_aggregate \
+  UNION SELECT aggminvtransfn FROM pg_aggregate UNION SELECT aggmfinalfn FROM pg_aggregate \
+  UNION SELECT typinput FROM pg_type UNION SELECT typoutput FROM pg_type \
+  UNION SELECT typreceive FROM pg_type UNION SELECT typsend FROM pg_type \
+  UNION SELECT typmodin FROM pg_type UNION SELECT typmodout FROM pg_type \
+  UNION SELECT typanalyze FROM pg_type UNION SELECT typsubscript FROM pg_type \
+  UNION SELECT castfunc FROM pg_cast \
+  UNION SELECT rngcanonical FROM pg_range UNION SELECT rngsubdiff FROM pg_range \
+  UNION SELECT lanplcallfoid FROM pg_language UNION SELECT laninline FROM pg_language \
+  UNION SELECT lanvalidator FROM pg_language \
+  UNION SELECT amhandler FROM pg_am \
+), typed AS ( \
+  SELECT p.oid FROM pg_proc p \
+   WHERE p.prorettype IN ('cstring'::regtype,'internal'::regtype,'trigger'::regtype, \
+         'event_trigger'::regtype,'language_handler'::regtype,'fdw_handler'::regtype, \
+         'index_am_handler'::regtype,'table_am_handler'::regtype,'tsm_handler'::regtype) \
+      OR EXISTS (SELECT 1 FROM unnest(p.proargtypes) t(x) \
+                  WHERE x IN ('cstring'::regtype,'internal'::regtype)) \
+) \
+SELECT DISTINCT proname FROM all_f a \
+ WHERE a.oid NOT IN (SELECT oid FROM internal WHERE oid IS NOT NULL AND oid <> 0) \
+   AND a.oid NOT IN (SELECT oid FROM typed)";
 
 /// The call forms PostgreSQL's grammar implements without a `pg_proc` row, which
 /// is why the server cannot report them and [`over_listing`] must account for
@@ -149,6 +197,66 @@ async fn the_grammar_forms_are_in_the_catalog() {
         "`over_listing` excuses these from the server's answer, and \
          `PG_FUNCTIONS` does not carry them either, so nothing holds them at \
          all: {missing:?}"
+    );
+}
+
+/// `PG_SUGGESTED` is exactly what [`SUGGEST_ORACLE`] still answers, plus
+/// [`GRAMMAR_ONLY`].
+///
+/// The subset autocomplete offers is generated, like the catalog it is drawn
+/// from, so the thing that can rot is the same: a PostgreSQL release adds a
+/// function and the popup never learns it, or reclassifies one and the popup
+/// goes on offering plumbing. Asking the server is the only way to see either.
+///
+/// **The `GRAMMAR_ONLY` union is the half a query cannot cover**, and is why the
+/// subset is not simply the query's output: `coalesce`, `cast`, `trim`,
+/// `greatest` and `least` have no `pg_proc` row, so a server-derived list drops
+/// the five most typed names in it while looking like a tidy-up.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_offered_subset_is_still_what_the_filter_answers() {
+    if !POSTGRES.enabled() {
+        endpoint::note_skipped(&POSTGRES);
+        return;
+    }
+    let rs = POSTGRES
+        .base_db()
+        .fetch_query(None, SUGGEST_ORACLE, 10_000, CancellationToken::new())
+        .await
+        .unwrap_or_else(|e| {
+            panic!(
+                "live tier could not run the suggestion filter on {}: {e}",
+                POSTGRES.endpoint()
+            )
+        });
+    let mut expected: HashSet<String> = (0..rs.row_count())
+        .filter_map(|r| rs.cell(r, 0).map(|c| c.text().to_ascii_lowercase()))
+        .collect();
+    // Same floor, same reason as `server_function_names`: an empty answer would
+    // make the two comparisons below vacuous in the direction that matters.
+    assert!(
+        expected.len() > 500,
+        "only {} name(s) survived the filter, so this oracle is not answering",
+        expected.len()
+    );
+    expected.extend(GRAMMAR_ONLY.iter().map(|n| (*n).to_string()));
+
+    let ours: HashSet<String> = PG_SUGGESTED.iter().map(|n| (*n).to_string()).collect();
+
+    let missing: Vec<&String> = expected.difference(&ours).collect();
+    assert!(
+        missing.is_empty(),
+        "{} offers {} name(s) `PG_SUGGESTED` does not, so autocomplete will \
+         never suggest them. Re-run `SUGGEST_ORACLE` above and regenerate the \
+         list: {missing:?}",
+        POSTGRES.endpoint(),
+        missing.len()
+    );
+    let extra: Vec<&String> = ours.difference(&expected).collect();
+    assert!(
+        extra.is_empty(),
+        "`PG_SUGGESTED` carries {} name(s) the filter no longer keeps, so the \
+         popup is offering this server's plumbing: {extra:?}",
+        extra.len()
     );
 }
 
