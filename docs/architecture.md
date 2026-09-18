@@ -12913,11 +12913,13 @@ existing prose was left alone.
     wraps both narrowed from `&Ui` to `crate::OverlayUi` — the two `Copy` signals (`popup_menu`,
     `popup_anchor`) are the whole of the chevron's interest in the bundle — across four call sites,
     which is what takes `table_designer.rs`'s entry 33 → 32 in a change about accounts. That entry
-    stands at **29** since: `clamp_selection` and `swap_selected` narrowed to `DdlUi` — every signal
+    went to **29** next: `clamp_selection` and `swap_selected` narrowed to `DdlUi` — every signal
     either of them touches is in that one child bundle, which is the ratchet's own prescription —
     and `default_type` went away outright rather than being narrowed, its decision now
     `ddl::default_new_column_type` with a test behind it. `DdlUi` being `Copy` is what let the
-    columns list stop cloning the whole `Ui` four times to reach it.
+    columns list stop cloning the whole `Ui` four times to reach it. It stands at **10** since the
+    campaign written up under `lib.rs` took the file's whole form-and-list half to `DdlUi` and its
+    field helpers to `RwSignal<TableDraft>`.
     Scoped to this file on purpose: every other editor is launched from the
     schema tree, where the active connection *is* the target.
     The account form **creates, or resets one account's password — and never renames** — near enough
@@ -14740,7 +14742,8 @@ existing prose was left alone.
     **How far the root `Ui` bundle travels is a ratchet now — `whole_ui_gate`.** `Ui` has 36 fields
     and transitively pulls `OverlayUi`'s 51 and `DdlUi`'s 40, and it was passed *unnarrowed* into
     roughly 140 signatures across this crate while the per-domain child bundles that exist for
-    exactly this purpose narrowed a call at **two** sites in the whole of it. Two costs, both
+    exactly this purpose narrowed a call at **two** sites in the whole of it — the state the gate
+    found on the day it landed, not the state now. Two costs, both
     concrete. No such function can be unit-tested: `ddl_preview::connection_label` touched 1 of the
     36 and encoded a real decision — the `connection N` fallback — and testing that fallback meant
     building a 36-field bundle inside a Floem reactive scope. And a signature stops saying what it
@@ -14750,6 +14753,32 @@ existing prose was left alone.
     one-field views went first — `connection_label` takes the one `RwSignal<Vec<Connection>>` and
     its decision is `core::connection::label_of` with a three-line test, and
     `compare_view::left_db_type`/`side_label` and `event_editor::taken_names` were the same shape.
+    **Then the DDL editors and the designer went through, and the split that fell out of them is
+    what a next pass should reach for first.** A **form or list** function takes the child
+    bundle — `DdlUi` in every one of these, with `OverlayUi` named beside it where a suggestion
+    chevron needs the dropdown channel (`object_editor`'s `form`/`domain_form`, `table_designer`'s
+    `table_section`/`column_form`) — while a **field helper** takes the bare signal it writes:
+    `RwSignal<TableDraft>`, `RwSignal<EventDraft>`, `RwSignal<RoutineDraft>`,
+    `RwSignal<TriggerSetDraft>`. A field that binds one signal should say which one. Because the
+    child bundles are `Copy`, narrowing deletes clones rather than merely renaming a parameter: the
+    designer's three growing lists each kept an `add_ui` and a `del_ui` alive for their two action
+    closures, four of its lists were cloning a `Ui` *per row* to deliver one `Copy` signal, and
+    `event_editor::schedule_form` cloned one three times to hand a dropdown a single signal.
+    **The arm that stops it is an *opening* path.** Anything reaching `edit_ctx`, the schema tree or
+    another editor's `open_for_*` genuinely wants the root bundle, and two are written into the
+    budget comments so the next pass does not re-argue them: `trigger_editor`'s `pg_action` is where
+    the "edit this function" button opens the *routine* editor and `form` is the only thing that can
+    hand it a root bundle, which is why that file stops at **8** where its siblings reached 5 and 6;
+    and the six shared readers left in `table_designer.rs` — `edit_ctx`, `db_flavour`,
+    `loaded_table`, `loaded_schema`, `default_schema`, `table_names` — are called from five other
+    modules. Those six could take `SchemaUi`, which is `Copy`; that is a change to shared helpers
+    rather than to that file, and it has not been done.
+    **The live number is the sum of `BUDGET`, not the "roughly 140" above**, which describes the
+    state the gate found and by design never moves. That sum went **206 → 161** over this run:
+    `table_designer.rs` 29 → 26 → 10, `object_editor.rs` 14 → 5, `routine_editor.rs` 12 → 6,
+    `event_editor.rs` 11 → 5, `trigger_editor.rs` 11 → 8, `overlays.rs` 15 → 13. Every step is
+    recorded against its own entry with what it narrowed *to*, so read the list for where a file
+    stands rather than inferring it from a paragraph.
     It is a **budget, not a ban**, because narrowing 140 signatures is a campaign and a gate that
     fails on the day it lands teaches nothing: `BUDGET` holds what each file declares *now* and the
     only legal direction is down, so a new `ui: Ui` in a listed file fails and a file not on the list

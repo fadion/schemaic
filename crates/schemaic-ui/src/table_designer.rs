@@ -38,8 +38,8 @@ use crate::widgets::{
     modal_pad_h, modal_title_owned, modal_w, panel_style,
 };
 use crate::{
-    DdlPreview, DdlUi, DesignerTab, DesignerTarget, FieldCfg, PopupAnchor, Ui, ddl_preview,
-    edit_field, icons, object_location, theme,
+    DdlPreview, DdlUi, DesignerTab, DesignerTarget, FieldCfg, OverlayUi, PopupAnchor, Ui,
+    ddl_preview, edit_field, icons, object_location, theme,
 };
 
 fn panel_w() -> f64 {
@@ -133,8 +133,7 @@ pub(crate) const LIST_TAB: u32 = 5;
 
 /// Open the designer on `target`, seeding the draft from the table it names (or
 /// a blank one for a new table).
-pub(crate) fn open_designer(ui: &Ui, target: DesignerTarget) {
-    let d = ui.ddl;
+pub(crate) fn open_designer(d: DdlUi, target: DesignerTarget) {
     // A new editing session — see `DdlUi::session`.
     d.session.update(|g| *g += 1);
     let draft = match &target.current {
@@ -401,7 +400,7 @@ pub(crate) fn open_for_table(
         _ => None,
     };
     open_designer(
-        ui,
+        ui.ddl,
         DesignerTarget {
             conn_id: ctx.conn_id,
             database: database.to_string(),
@@ -485,7 +484,7 @@ pub(crate) fn open_for_new(ui: &Ui, database: &str, schema: Option<&str>) {
         return;
     }
     open_designer(
-        ui,
+        ui.ddl,
         DesignerTarget {
             conn_id: ctx.conn_id,
             database: database.to_string(),
@@ -510,8 +509,7 @@ pub(crate) fn open_for_new(ui: &Ui, database: &str, schema: Option<&str>) {
 /// strip out entirely (what it did until now) meant a keyboard user could only
 /// ever edit the section the designer happened to open on, since `open_designer`
 /// always lands on Table.
-fn tab_strip(ui: Ui, ring: FocusRing) -> impl IntoView {
-    let d = ui.ddl;
+fn tab_strip(d: DdlUi, ring: FocusRing) -> impl IntoView {
     let strip = h_stack_from_iter(DesignerTab::ALL.into_iter().map(move |t| {
         text(t.label())
             .on_click_stop(move |_| {
@@ -575,10 +573,13 @@ fn tab_strip(ui: Ui, ring: FocusRing) -> impl IntoView {
 /// value it already holds — and `RwSignal::set` never dedups, so every rebuild of
 /// the form would look like an edit and re-render the list.
 ///
-/// Returns an erased `AnyView` rather than `impl IntoView`: the opaque form would
-/// capture the `&Ui` borrow, which every caller outlives.
+/// Returns an erased `AnyView` rather than `impl IntoView`. That began as a
+/// borrow problem — the opaque form captured the `&Ui` these took, which every
+/// caller outlived — and the borrow is gone now that they take the draft signal,
+/// which is `Copy`. The erasure stays because the callers build heterogeneous
+/// row lists out of these and would erase them anyway.
 fn bound_field(
-    ui: &Ui,
+    draft: RwSignal<TableDraft>,
     initial: String,
     width: fn() -> f64,
     placeholder: &'static str,
@@ -587,7 +588,7 @@ fn bound_field(
     apply: impl Fn(&mut TableDraft, &str) + 'static,
 ) -> AnyView {
     field_view(
-        bound_signal(ui, initial, apply),
+        bound_signal(draft, initial, apply),
         width,
         placeholder,
         false,
@@ -602,7 +603,7 @@ fn bound_field(
 /// generated statement verbatim, and `varchar(255)` / `CURRENT_TIMESTAMP(3)`
 /// read as code.
 fn sql_field(
-    ui: &Ui,
+    draft: RwSignal<TableDraft>,
     initial: String,
     width: fn() -> f64,
     placeholder: &'static str,
@@ -611,7 +612,7 @@ fn sql_field(
     apply: impl Fn(&mut TableDraft, &str) + 'static,
 ) -> AnyView {
     field_view(
-        bound_signal(ui, initial, apply),
+        bound_signal(draft, initial, apply),
         width,
         placeholder,
         true,
@@ -625,11 +626,10 @@ fn sql_field(
 /// the draft to the value it already holds — and `RwSignal::set` never dedups,
 /// so every rebuild of the form would look like an edit and re-render the list.
 fn bound_signal(
-    ui: &Ui,
+    draft: RwSignal<TableDraft>,
     initial: String,
     apply: impl Fn(&mut TableDraft, &str) + 'static,
 ) -> RwSignal<String> {
-    let draft = ui.ddl.draft;
     let sig = floem::reactive::create_rw_signal(initial);
     create_effect(move |prev: Option<String>| {
         let v = sig.get();
@@ -809,7 +809,8 @@ pub(crate) fn suggest_chevron<F: Fn() -> Vec<String> + 'static>(
 /// [`bound_field`] plus a [`suggest_chevron`] writing into it.
 #[allow(clippy::too_many_arguments)] // a UI builder; grouping into a struct adds no clarity
 fn bound_field_with_menu(
-    ui: &Ui,
+    draft: RwSignal<TableDraft>,
+    overlay: OverlayUi,
     initial: String,
     width: fn() -> f64,
     placeholder: &'static str,
@@ -819,11 +820,11 @@ fn bound_field_with_menu(
     tabindex: u32,
     apply: impl Fn(&mut TableDraft, &str) + 'static,
 ) -> AnyView {
-    let sig = bound_signal(ui, initial, apply);
+    let sig = bound_signal(draft, initial, apply);
     h_stack((
         field_view(sig, width, placeholder, mono, ring.clone(), tabindex),
         suggest_chevron(
-            ui.overlay,
+            overlay,
             sig,
             move || options.clone(),
             "No suggestions",
@@ -888,7 +889,7 @@ pub(crate) fn focusable_owned_dropdown(
 
 /// A toggle row bound to the draft, same shape as the settings modals'.
 fn bound_toggle(
-    ui: &Ui,
+    draft: RwSignal<TableDraft>,
     title: &'static str,
     hint: &'static str,
     initial: bool,
@@ -896,7 +897,6 @@ fn bound_toggle(
     tabindex: u32,
     apply: impl Fn(&mut TableDraft, bool) + 'static,
 ) -> AnyView {
-    let draft = ui.ddl.draft;
     let sig = floem::reactive::create_rw_signal(initial);
     create_effect(move |prev: Option<bool>| {
         let v = sig.get();
@@ -1210,8 +1210,14 @@ fn field_with_hint(field: impl IntoView + 'static, h: &'static str) -> impl Into
 
 // ── the Table section ────────────────────────────────────────────────────────
 
-fn table_section(ui: Ui, target: &DesignerTarget, ring: FocusRing) -> AnyView {
-    let d = ui.ddl.draft;
+/// Takes `OverlayUi` too, for the collation field's suggestion chevron.
+fn table_section(
+    ddl: DdlUi,
+    overlay: OverlayUi,
+    target: &DesignerTarget,
+    ring: FocusRing,
+) -> AnyView {
+    let d = ddl.draft;
     // **The engine, not "not PostgreSQL".** A storage engine and a table
     // collation are MySQL's, and asking the question the other way put SQLite —
     // which has neither, and no comments either — on the side that gets both.
@@ -1221,7 +1227,7 @@ fn table_section(ui: Ui, target: &DesignerTarget, ring: FocusRing) -> AnyView {
     let name = form_setting(
         "Name",
         bound_field(
-            &ui,
+            d,
             draft.name.clone(),
             field_w,
             "table_name",
@@ -1237,7 +1243,7 @@ fn table_section(ui: Ui, target: &DesignerTarget, ring: FocusRing) -> AnyView {
         form_setting(
             "Comment",
             bound_field(
-                &ui,
+                d,
                 draft.comment.clone().unwrap_or_default(),
                 sentence_field_w,
                 "What this table is for",
@@ -1259,7 +1265,8 @@ fn table_section(ui: Ui, target: &DesignerTarget, ring: FocusRing) -> AnyView {
             form_setting(
                 "Engine",
                 bound_field_with_menu(
-                    &ui,
+                    d,
+                    overlay,
                     draft.engine.clone().unwrap_or_default(),
                     field_w,
                     "InnoDB",
@@ -1274,7 +1281,7 @@ fn table_section(ui: Ui, target: &DesignerTarget, ring: FocusRing) -> AnyView {
             form_setting(
                 "Collation",
                 bound_field(
-                    &ui,
+                    d,
                     draft.collation.clone().unwrap_or_default(),
                     field_w,
                     "utf8mb4_general_ci",
@@ -1301,11 +1308,9 @@ fn table_section(ui: Ui, target: &DesignerTarget, ring: FocusRing) -> AnyView {
 
 // ── the Columns section ──────────────────────────────────────────────────────
 
-fn columns_list(ui: Ui, ring: FocusRing) -> AnyView {
-    let d = ui.ddl;
+fn columns_list(d: DdlUi, ring: FocusRing) -> AnyView {
     let draft = d.draft.get_untracked();
-    // The one signal the rows need. Was a `Ui` cloned again per row.
-    let selected = ui.ddl.selected;
+    let selected = d.selected;
     let rows = v_stack_from_iter(draft.columns.iter().enumerate().map(|(i, c)| {
         let is_pk = draft.is_in_primary_key(i);
         list_row(
@@ -1375,8 +1380,10 @@ fn columns_list(ui: Ui, ring: FocusRing) -> AnyView {
     .into_any()
 }
 
-fn column_form(ui: Ui, target: &DesignerTarget, ring: FocusRing) -> AnyView {
-    let d = ui.ddl;
+/// Takes `OverlayUi` as well as `DdlUi`: the type field's suggestion chevron is
+/// a dropdown, and that channel is the whole of what it needs the second bundle
+/// for.
+fn column_form(d: DdlUi, overlay: OverlayUi, target: &DesignerTarget, ring: FocusRing) -> AnyView {
     let i = d.selected.get_untracked();
     let draft = d.draft.get_untracked();
     let Some(c) = draft.columns.get(i).map(|c| c.info.clone()) else {
@@ -1394,7 +1401,7 @@ fn column_form(ui: Ui, target: &DesignerTarget, ring: FocusRing) -> AnyView {
     let name = form_setting(
         "Name",
         bound_field(
-            &ui,
+            d.draft,
             c.name.clone(),
             field_w,
             "column_name",
@@ -1407,7 +1414,8 @@ fn column_form(ui: Ui, target: &DesignerTarget, ring: FocusRing) -> AnyView {
         "Type",
         field_with_hint(
             bound_field_with_menu(
-                &ui,
+                d.draft,
+                overlay,
                 c.type_name.clone(),
                 field_w,
                 "varchar(255)",
@@ -1428,7 +1436,7 @@ fn column_form(ui: Ui, target: &DesignerTarget, ring: FocusRing) -> AnyView {
         ),
     );
     let nullable = bound_toggle(
-        &ui,
+        d.draft,
         "Nullable",
         "Allow NULL in this column.",
         c.nullable,
@@ -1441,7 +1449,7 @@ fn column_form(ui: Ui, target: &DesignerTarget, ring: FocusRing) -> AnyView {
         },
     );
     let primary = bound_toggle(
-        &ui,
+        d.draft,
         "Primary key",
         // The order is the **column** order, not the order these were switched
         // on — that is what `2279fcb` fixed, and this hint still promised the
@@ -1455,7 +1463,7 @@ fn column_form(ui: Ui, target: &DesignerTarget, ring: FocusRing) -> AnyView {
         move |d, v| d.set_in_primary_key(i, v),
     );
     let auto = bound_toggle(
-        &ui,
+        d.draft,
         if pg { "Identity" } else { "Auto-increment" },
         if pg {
             "The server assigns the value (GENERATED BY DEFAULT AS IDENTITY)."
@@ -1475,7 +1483,7 @@ fn column_form(ui: Ui, target: &DesignerTarget, ring: FocusRing) -> AnyView {
         "Default",
         field_with_hint(
             sql_field(
-                &ui,
+                d.draft,
                 c.default.clone().unwrap_or_default(),
                 field_w,
                 "",
@@ -1494,7 +1502,7 @@ fn column_form(ui: Ui, target: &DesignerTarget, ring: FocusRing) -> AnyView {
         "Generated from",
         field_with_hint(
             sql_field(
-                &ui,
+                d.draft,
                 c.generated.clone().unwrap_or_default(),
                 field_w,
                 "",
@@ -1513,7 +1521,7 @@ fn column_form(ui: Ui, target: &DesignerTarget, ring: FocusRing) -> AnyView {
         form_setting(
             "Comment",
             bound_field(
-                &ui,
+                d.draft,
                 c.comment.clone().unwrap_or_default(),
                 field_w,
                 "",
@@ -1533,7 +1541,7 @@ fn column_form(ui: Ui, target: &DesignerTarget, ring: FocusRing) -> AnyView {
     let collation = form_setting(
         "Collation",
         bound_field(
-            &ui,
+            d.draft,
             c.collation.clone().unwrap_or_default(),
             field_w,
             "",
@@ -1554,7 +1562,7 @@ fn column_form(ui: Ui, target: &DesignerTarget, ring: FocusRing) -> AnyView {
         form_setting(
             "On update",
             bound_field(
-                &ui,
+                d.draft,
                 c.on_update.clone().unwrap_or_default(),
                 field_w,
                 "CURRENT_TIMESTAMP",
@@ -1584,11 +1592,9 @@ fn column_form(ui: Ui, target: &DesignerTarget, ring: FocusRing) -> AnyView {
 
 // ── the Indexes section ──────────────────────────────────────────────────────
 
-fn indexes_list(ui: Ui, ring: FocusRing) -> AnyView {
-    let d = ui.ddl;
+fn indexes_list(d: DdlUi, ring: FocusRing) -> AnyView {
     let draft = d.draft.get_untracked();
-    // The one signal the rows need. Was a `Ui` cloned again per row.
-    let selected = ui.ddl.selected;
+    let selected = d.selected;
     let rows = v_stack_from_iter(draft.indexes.iter().enumerate().map(|(i, ix)| {
         list_row(
             selected,
@@ -1604,18 +1610,15 @@ fn indexes_list(ui: Ui, ring: FocusRing) -> AnyView {
     }))
     .style(|s| s.flex_col().width_full());
 
-    let add_ui = ui.clone();
-    let del_ui = ui.clone();
     list_pane(
         rows,
         list_actions(
             move || {
-                let ui = add_ui.clone();
-                ui.ddl.draft.update(|d| {
+                d.draft.update(|d| {
                     let names: Vec<String> =
                         d.indexes.iter().map(|i| i.info.name.clone()).collect();
                     // The **first** column, not the selected one: while the
-                    // Indexes section is showing, `ui.ddl.selected` indexes
+                    // Indexes section is showing, `DdlUi::selected` indexes
                     // `d.indexes` — the two lists share one selection signal and
                     // `tab_strip` resets it to 0 on every section change — so
                     // there is no selected *column* here to seed from. The
@@ -1633,19 +1636,18 @@ fn indexes_list(ui: Ui, ring: FocusRing) -> AnyView {
                         ..Default::default()
                     }));
                 });
-                let n = ui.ddl.draft.with_untracked(|d| d.indexes.len());
-                ui.ddl.selected.set(n.saturating_sub(1));
-                ui.ddl.rev.update(|r| *r += 1);
+                let n = d.draft.with_untracked(|dr| dr.indexes.len());
+                d.selected.set(n.saturating_sub(1));
+                d.rev.update(|r| *r += 1);
             },
             move || {
-                let ui = del_ui.clone();
-                let i = ui.ddl.selected.get_untracked();
-                ui.ddl.draft.update(|d| {
-                    if i < d.indexes.len() {
-                        d.indexes.remove(i);
+                let i = d.selected.get_untracked();
+                d.draft.update(|dr| {
+                    if i < dr.indexes.len() {
+                        dr.indexes.remove(i);
                     }
                 });
-                clamp_selection(ui.ddl, |d| d.indexes.len());
+                clamp_selection(d, |dr| dr.indexes.len());
             },
             None,
             None,
@@ -1659,8 +1661,7 @@ fn indexes_list(ui: Ui, ring: FocusRing) -> AnyView {
     .into_any()
 }
 
-fn index_form(ui: Ui, target: &DesignerTarget, ring: FocusRing) -> AnyView {
-    let d = ui.ddl;
+fn index_form(d: DdlUi, target: &DesignerTarget, ring: FocusRing) -> AnyView {
     let i = d.selected.get_untracked();
     let draft = d.draft.get_untracked();
     let Some(ix) = draft.indexes.get(i).map(|x| x.info.clone()) else {
@@ -1682,7 +1683,7 @@ fn index_form(ui: Ui, target: &DesignerTarget, ring: FocusRing) -> AnyView {
                 "Method",
                 field_with_hint(
                     bound_field(
-                        &ui,
+                        d.draft,
                         ix.method.clone().unwrap_or_default(),
                         word_field_w,
                         "btree",
@@ -1702,7 +1703,7 @@ fn index_form(ui: Ui, target: &DesignerTarget, ring: FocusRing) -> AnyView {
                 "Only rows where",
                 field_with_hint(
                     bound_field(
-                        &ui,
+                        d.draft,
                         ix.predicate.clone().unwrap_or_default(),
                         list_field_w,
                         "",
@@ -1729,7 +1730,7 @@ fn index_form(ui: Ui, target: &DesignerTarget, ring: FocusRing) -> AnyView {
         form_setting(
             "Name",
             bound_field(
-                &ui,
+                d.draft,
                 ix.name.clone(),
                 field_w,
                 "index_name",
@@ -1746,7 +1747,7 @@ fn index_form(ui: Ui, target: &DesignerTarget, ring: FocusRing) -> AnyView {
             "Columns",
             field_with_hint(
                 bound_field(
-                    &ui,
+                    d.draft,
                     key_list_text(&ix.columns),
                     list_field_w,
                     "id, name",
@@ -1762,7 +1763,7 @@ fn index_form(ui: Ui, target: &DesignerTarget, ring: FocusRing) -> AnyView {
             ),
         ),
         bound_toggle(
-            &ui,
+            d.draft,
             "Unique",
             "Refuse duplicate values across these columns.",
             ix.unique,
@@ -1787,11 +1788,9 @@ fn index_form(ui: Ui, target: &DesignerTarget, ring: FocusRing) -> AnyView {
 
 // ── the Foreign keys section ─────────────────────────────────────────────────
 
-fn fks_list(ui: Ui, ring: FocusRing) -> AnyView {
-    let d = ui.ddl;
+fn fks_list(d: DdlUi, ring: FocusRing) -> AnyView {
     let draft = d.draft.get_untracked();
-    // The one signal the rows need. Was a `Ui` cloned again per row.
-    let selected = ui.ddl.selected;
+    let selected = d.selected;
     let rows = v_stack_from_iter(draft.foreign_keys.iter().enumerate().map(|(i, fk)| {
         list_row(
             selected,
@@ -1803,36 +1802,35 @@ fn fks_list(ui: Ui, ring: FocusRing) -> AnyView {
     }))
     .style(|s| s.flex_col().width_full());
 
-    let add_ui = ui.clone();
-    let del_ui = ui.clone();
     list_pane(
         rows,
         list_actions(
             move || {
-                let ui = add_ui.clone();
-                ui.ddl.draft.update(|d| {
-                    let names: Vec<String> =
-                        d.foreign_keys.iter().map(|f| f.info.name.clone()).collect();
-                    let first = d.columns.first().map(|c| c.info.name.clone());
-                    d.foreign_keys.push(ForeignKeyDraft::new(ForeignKeyInfo {
-                        name: unique_name(&names, &format!("fk_{}", d.name)),
+                d.draft.update(|dr| {
+                    let names: Vec<String> = dr
+                        .foreign_keys
+                        .iter()
+                        .map(|f| f.info.name.clone())
+                        .collect();
+                    let first = dr.columns.first().map(|c| c.info.name.clone());
+                    dr.foreign_keys.push(ForeignKeyDraft::new(ForeignKeyInfo {
+                        name: unique_name(&names, &format!("fk_{}", dr.name)),
                         columns: first.into_iter().collect(),
                         ..Default::default()
                     }));
                 });
-                let n = ui.ddl.draft.with_untracked(|d| d.foreign_keys.len());
-                ui.ddl.selected.set(n.saturating_sub(1));
-                ui.ddl.rev.update(|r| *r += 1);
+                let n = d.draft.with_untracked(|dr| dr.foreign_keys.len());
+                d.selected.set(n.saturating_sub(1));
+                d.rev.update(|r| *r += 1);
             },
             move || {
-                let ui = del_ui.clone();
-                let i = ui.ddl.selected.get_untracked();
-                ui.ddl.draft.update(|d| {
-                    if i < d.foreign_keys.len() {
-                        d.foreign_keys.remove(i);
+                let i = d.selected.get_untracked();
+                d.draft.update(|dr| {
+                    if i < dr.foreign_keys.len() {
+                        dr.foreign_keys.remove(i);
                     }
                 });
-                clamp_selection(ui.ddl, |d| d.foreign_keys.len());
+                clamp_selection(d, |dr| dr.foreign_keys.len());
             },
             None,
             None,
@@ -1852,8 +1850,7 @@ fn action_label(a: Option<&str>) -> String {
     a.unwrap_or("NO ACTION").to_string()
 }
 
-fn fk_form(ui: Ui, target: &DesignerTarget, ring: FocusRing) -> AnyView {
-    let d = ui.ddl;
+fn fk_form(d: DdlUi, target: &DesignerTarget, ring: FocusRing) -> AnyView {
     let i = d.selected.get_untracked();
     let draft = d.draft.get_untracked();
     let Some(fk) = draft.foreign_keys.get(i).map(|f| f.info.clone()) else {
@@ -1945,7 +1942,7 @@ fn fk_form(ui: Ui, target: &DesignerTarget, ring: FocusRing) -> AnyView {
         form_setting(
             "Name",
             bound_field(
-                &ui,
+                d.draft,
                 fk.name.clone(),
                 field_w,
                 "fk_name",
@@ -1962,7 +1959,7 @@ fn fk_form(ui: Ui, target: &DesignerTarget, ring: FocusRing) -> AnyView {
             "Columns",
             field_with_hint(
                 bound_field(
-                    &ui,
+                    d.draft,
                     fk.columns.join(", "),
                     key_field_w,
                     "customer_id",
@@ -1981,7 +1978,7 @@ fn fk_form(ui: Ui, target: &DesignerTarget, ring: FocusRing) -> AnyView {
         form_setting(
             "References columns",
             bound_field(
-                &ui,
+                d.draft,
                 fk.ref_columns.join(", "),
                 key_field_w,
                 "id",
@@ -2006,11 +2003,9 @@ fn fk_form(ui: Ui, target: &DesignerTarget, ring: FocusRing) -> AnyView {
     .into_any()
 }
 
-fn checks_list(ui: Ui, ring: FocusRing) -> AnyView {
-    let d = ui.ddl;
+fn checks_list(d: DdlUi, ring: FocusRing) -> AnyView {
     let draft = d.draft.get_untracked();
-    // The one signal the rows need. Was a `Ui` cloned again per row.
-    let selected = ui.ddl.selected;
+    let selected = d.selected;
     let rows = v_stack_from_iter(draft.check_constraints.iter().enumerate().map(|(i, ck)| {
         list_row(
             selected,
@@ -2024,37 +2019,33 @@ fn checks_list(ui: Ui, ring: FocusRing) -> AnyView {
     }))
     .style(|s| s.flex_col().width_full());
 
-    let add_ui = ui.clone();
-    let del_ui = ui.clone();
     list_pane(
         rows,
         list_actions(
             move || {
-                let ui = add_ui.clone();
-                ui.ddl.draft.update(|d| {
-                    let names: Vec<String> = d
+                d.draft.update(|dr| {
+                    let names: Vec<String> = dr
                         .check_constraints
                         .iter()
                         .map(|c| c.info.name.clone())
                         .collect();
-                    d.check_constraints.push(CheckDraft::new(CheckInfo {
-                        name: unique_name(&names, &format!("{}_chk", d.name)),
+                    dr.check_constraints.push(CheckDraft::new(CheckInfo {
+                        name: unique_name(&names, &format!("{}_chk", dr.name)),
                         ..Default::default()
                     }));
                 });
-                let n = ui.ddl.draft.with_untracked(|d| d.check_constraints.len());
-                ui.ddl.selected.set(n.saturating_sub(1));
-                ui.ddl.rev.update(|r| *r += 1);
+                let n = d.draft.with_untracked(|dr| dr.check_constraints.len());
+                d.selected.set(n.saturating_sub(1));
+                d.rev.update(|r| *r += 1);
             },
             move || {
-                let ui = del_ui.clone();
-                let i = ui.ddl.selected.get_untracked();
-                ui.ddl.draft.update(|d| {
-                    if i < d.check_constraints.len() {
-                        d.check_constraints.remove(i);
+                let i = d.selected.get_untracked();
+                d.draft.update(|dr| {
+                    if i < dr.check_constraints.len() {
+                        dr.check_constraints.remove(i);
                     }
                 });
-                clamp_selection(ui.ddl, |d| d.check_constraints.len());
+                clamp_selection(d, |dr| dr.check_constraints.len());
             },
             None,
             None,
@@ -2069,12 +2060,11 @@ fn checks_list(ui: Ui, ring: FocusRing) -> AnyView {
 }
 
 fn check_form(
-    ui: Ui,
+    d: DdlUi,
     dialect: SqlDialect,
     target_flavour: ServerFlavour,
     ring: FocusRing,
 ) -> AnyView {
-    let d = ui.ddl;
     let i = d.selected.get_untracked();
     let draft = d.draft.get_untracked();
     let Some(ck) = draft.check_constraints.get(i).map(|c| c.info.clone()) else {
@@ -2084,7 +2074,7 @@ fn check_form(
     let name = form_setting(
         "Name",
         bound_field(
-            &ui,
+            d.draft,
             ck.name.clone(),
             field_w,
             "qty_positive",
@@ -2101,7 +2091,7 @@ fn check_form(
         "Expression",
         field_with_hint(
             bound_field(
-                &ui,
+                d.draft,
                 ck.expression.clone(),
                 sentence_field_w,
                 "qty > 0",
@@ -2134,7 +2124,7 @@ fn check_form(
         crate::widgets::nothing()
     } else {
         bound_toggle(
-            &ui,
+            d.draft,
             "Enforced",
             "Off records the constraint without applying it — existing and new rows are both accepted.",
             ck.enforced,
@@ -2295,18 +2285,18 @@ pub(crate) fn table_designer_overlay(ui: Ui) -> impl IntoView {
             let ring = FocusRing::new();
             let root_ring = ring.clone();
 
-            let list_ui = ui.clone();
+            let overlay = ui.overlay;
             let list_ring = ring.clone();
             let list = dyn_container(
                 move || (d.tab.get(), d.draft.get()),
                 move |(tab, _)| {
-                    let (ui, ring) = (list_ui.clone(), list_ring.clone());
+                    let ring = list_ring.clone();
                     match tab {
                         DesignerTab::Table => empty().into_any(),
-                        DesignerTab::Columns => columns_list(ui, ring),
-                        DesignerTab::Indexes => indexes_list(ui, ring),
-                        DesignerTab::ForeignKeys => fks_list(ui, ring),
-                        DesignerTab::Checks => checks_list(ui, ring),
+                        DesignerTab::Columns => columns_list(d, ring),
+                        DesignerTab::Indexes => indexes_list(d, ring),
+                        DesignerTab::ForeignKeys => fks_list(d, ring),
+                        DesignerTab::Checks => checks_list(d, ring),
                     }
                 },
             )
@@ -2318,7 +2308,6 @@ pub(crate) fn table_designer_overlay(ui: Ui) -> impl IntoView {
                 }
             });
 
-            let form_ui = ui.clone();
             let form_target = target.clone();
             let form_ring = ring.clone();
             let form = dyn_container(
@@ -2327,15 +2316,14 @@ pub(crate) fn table_designer_overlay(ui: Ui) -> impl IntoView {
                 // unchanged, so nothing else here would notice.
                 move || (d.tab.get(), d.selected.get(), d.rev.get()),
                 move |(tab, ..)| {
-                    let ui = form_ui.clone();
                     let ring = form_ring.clone();
                     match tab {
-                        DesignerTab::Table => table_section(ui, &form_target, ring),
-                        DesignerTab::Columns => column_form(ui, &form_target, ring),
-                        DesignerTab::Indexes => index_form(ui, &form_target, ring),
-                        DesignerTab::ForeignKeys => fk_form(ui, &form_target, ring),
+                        DesignerTab::Table => table_section(d, overlay, &form_target, ring),
+                        DesignerTab::Columns => column_form(d, overlay, &form_target, ring),
+                        DesignerTab::Indexes => index_form(d, &form_target, ring),
+                        DesignerTab::ForeignKeys => fk_form(d, &form_target, ring),
                         DesignerTab::Checks => {
-                            check_form(ui, form_target.dialect, form_target.flavour, ring)
+                            check_form(d, form_target.dialect, form_target.flavour, ring)
                         }
                     }
                 },
@@ -2432,7 +2420,7 @@ pub(crate) fn table_designer_overlay(ui: Ui) -> impl IntoView {
             let close_x: Rc<dyn Fn()> = Rc::new(close);
             let panel = v_stack((
                 modal_title_owned(title, close_x, root_ring.clone()),
-                tab_strip(ui.clone(), ring.clone()),
+                tab_strip(d, ring.clone()),
                 body,
                 // The count sits at the far left, the actions at the far right —
                 // it's what those actions are *about*, not a label on them.

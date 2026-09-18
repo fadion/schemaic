@@ -14621,7 +14621,22 @@ mod whole_ui_gate {
         // bundle was carried for — four lists were cloning a `Ui` *per row* to
         // deliver one `Copy` signal, and `trigger_editor.rs` was keeping a
         // `rows_ui` clone alive for the same reason.
-        ("table_designer.rs", 26),
+        //
+        // 26 → 10: the whole form and list half takes `DdlUi` — `tab_strip`,
+        // the four `*_list`s, the five `*_form`s and `open_designer` — and the
+        // five `bound_*` field helpers take the `RwSignal<TableDraft>` they
+        // write. `table_section` and `column_form` take `OverlayUi` beside it,
+        // for the suggestion chevron and nothing else.
+        //
+        // **The ten left are one kind of thing**: `edit_ctx`, `db_flavour`,
+        // `loaded_table`, `loaded_schema`, `default_schema` and `table_names`
+        // read the connection and the schema tree and are called from five
+        // other modules; `open_for_table`, `preview_draft_edit` and
+        // `open_for_new` are opening paths; and the overlay is the root. The
+        // first six could take `SchemaUi`, which is `Copy` — that is a change
+        // to shared helpers rather than to this file, so it belongs in its own
+        // commit.
+        ("table_designer.rs", 10),
         // 2, for `compare_view.rs`'s reason: `tab_chip(tab: Tab, ui: Ui)`.
         ("tabs.rs", 2),
         // 11 → 8: `bound_field` and `bound_choice` take
