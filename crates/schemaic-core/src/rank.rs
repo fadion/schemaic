@@ -25,8 +25,7 @@ use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use crate::intel::{
-    ClauseCtx, Continuation, FUNCTIONS, JoinTarget, SQL_KEYWORDS, STMT_KEYWORDS, StarExpansion,
-    TableRef,
+    ClauseCtx, Continuation, JoinTarget, SQL_KEYWORDS, STMT_KEYWORDS, StarExpansion, TableRef,
 };
 use crate::schema::{ColumnTypeClass, classify_column_type};
 use crate::sql::{is_word_byte, is_word_start};
@@ -188,6 +187,16 @@ pub struct RankInput<'a> {
     pub used: &'a HashSet<String>,
     /// The tab's database, for the "don't offer the database you are in" rule.
     pub active_db: Option<&'a str>,
+    /// The tab's engine, which decides **which builtin catalog** is offered.
+    ///
+    /// Not a nicety: without it `rank` walked [`FUNCTIONS`] on every engine, so
+    /// a PostgreSQL tab was offered MySQL's names and a SQLite one the same —
+    /// the typo checker's original bug, in the surface that *inserts* the word
+    /// rather than the one that underlines it. It is asked as a dialect and
+    /// answered by [`crate::intel::builtin_catalog`], the one place that maps an
+    /// engine to its catalog, so a fourth engine lands on `None` and is offered
+    /// nothing rather than inheriting whichever list is nearest.
+    pub dialect: crate::intel::SqlDialect,
 }
 
 /// Rank the candidates a caret position offers.
@@ -509,7 +518,7 @@ pub fn rank(schema: &SchemaIndex, input: &RankInput<'_>) -> Vec<Suggestion> {
                     }
                 }
             }
-            for fun in FUNCTIONS {
+            for fun in crate::intel::builtin_catalog(input.dialect).unwrap_or(&[]) {
                 add(
                     &mut cands,
                     &mut seen,
@@ -873,6 +882,17 @@ mod tests {
         scope: &[TableRef],
         prefix: &str,
     ) -> Vec<String> {
+        ranked_on(schema, SqlDialect::MySql, ctx, scope, prefix)
+    }
+
+    /// [`ranked`], on a named engine.
+    fn ranked_on(
+        schema: &SchemaIndex,
+        dialect: SqlDialect,
+        ctx: ClauseCtx,
+        scope: &[TableRef],
+        prefix: &str,
+    ) -> Vec<String> {
         let cont = Continuation::default();
         let used = HashSet::new();
         rank(
@@ -887,11 +907,53 @@ mod tests {
                 star: None,
                 used: &used,
                 active_db: Some("shop"),
+                dialect,
             },
         )
         .into_iter()
         .map(|s| s.text)
         .collect()
+    }
+
+    /// Does the ranked list offer this name, however either side spells its case?
+    fn offers(rows: &[String], name: &str) -> bool {
+        rows.iter().any(|r| r.eq_ignore_ascii_case(name))
+    }
+
+    /// The builtins offered are the engine's own, not whichever catalog is
+    /// nearest.
+    ///
+    /// This is the typo checker's original bug in the other surface: `rank`
+    /// walked `FUNCTIONS` whatever the dialect, so a PostgreSQL tab was offered
+    /// `IFNULL` — a name that engine does not have, and the completion popup
+    /// saying so is worse than it saying nothing — while `btrim`, which it does
+    /// have, was not offered at all. `intel::builtin_catalog` is the same answer
+    /// to both questions, which is why this asks it rather than a second map.
+    ///
+    /// Asserted through `rank` rather than over the catalogs, because the
+    /// catalogs were already right and the composition was what was broken.
+    #[test]
+    fn each_dialect_is_offered_its_own_builtins() {
+        let s = shop();
+        let ctx = ClauseCtx::Column;
+        let on = |d, p| ranked_on(&s, d, ctx.clone(), &[], p);
+
+        // MySQL's, and PostgreSQL has no such function.
+        assert!(offers(&on(SqlDialect::MySql, "ifnu"), "IFNULL"));
+        assert!(offers(&on(SqlDialect::Sqlite, "ifnu"), "ifnull"));
+        assert!(!offers(&on(SqlDialect::Postgres, "ifnu"), "ifnull"));
+
+        // PostgreSQL's, and neither of the others has it.
+        assert!(offers(&on(SqlDialect::Postgres, "btri"), "btrim"));
+        assert!(!offers(&on(SqlDialect::MySql, "btri"), "btrim"));
+        assert!(!offers(&on(SqlDialect::Sqlite, "btri"), "btrim"));
+
+        // SQLite's, and MySQL's list is not it either — the third engine was
+        // being offered the first's just as silently.
+        assert!(offers(&on(SqlDialect::Sqlite, "zerob"), "zeroblob"));
+        assert!(!offers(&on(SqlDialect::MySql, "zerob"), "zeroblob"));
+        assert!(offers(&on(SqlDialect::MySql, "uuid_s"), "UUID_SHORT"));
+        assert!(!offers(&on(SqlDialect::Sqlite, "uuid_s"), "uuid_short"));
     }
 
     /// One table whose columns are the three shapes a prefix can match —
@@ -973,6 +1035,7 @@ mod tests {
                 star: None,
                 used: &used,
                 active_db: Some("shop"),
+                dialect: SqlDialect::MySql,
             },
         )
         .into_iter()
@@ -1010,6 +1073,7 @@ mod tests {
                     star: Some(exp),
                     used: &used,
                     active_db: Some("shop"),
+                    dialect: SqlDialect::MySql,
                 },
             )
             .into_iter()
@@ -1068,6 +1132,7 @@ mod tests {
                     star: None,
                     used: &used,
                     active_db: Some("shop"),
+                    dialect: SqlDialect::MySql,
                 },
             )
         };
@@ -1132,6 +1197,7 @@ mod tests {
                 star: None,
                 used: &used,
                 active_db: Some("shop"),
+                dialect: SqlDialect::MySql,
             },
         );
         let email = out.iter().find(|s| s.text == "email").expect("offered");
@@ -1168,6 +1234,7 @@ mod tests {
                     star: None,
                     used: &used,
                     active_db: Some("shop"),
+                    dialect: SqlDialect::MySql,
                 },
             )
         };
@@ -1209,6 +1276,7 @@ mod tests {
                 star: None,
                 used: &used,
                 active_db: Some("shop"),
+                dialect: SqlDialect::MySql,
             },
         )
         .into_iter()
@@ -1251,6 +1319,7 @@ mod tests {
                 star: None,
                 used: &used,
                 active_db: Some("shop"),
+                dialect: SqlDialect::MySql,
             },
         );
         let first = out.first().expect("something is offered");
@@ -1314,6 +1383,7 @@ mod tests {
                 star: None,
                 used: &used,
                 active_db: Some("shop"),
+                dialect: SqlDialect::MySql,
             },
         );
         let first = out.first().expect("something is offered");

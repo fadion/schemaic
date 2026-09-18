@@ -443,6 +443,14 @@ existing prose was left alone.
     correct SQL broken. A `builtin_functions_are_authoritative` bool stood beside the catalog and has
     been **deleted**: returning the catalog *is* answering whether this app's builtins are
     authoritative here, and asking one question at two sites is one more place to forget an engine.
+    **`rank::rank` is its second caller, and `builtin_catalog` is `pub(crate)` for it** — the
+    completion popup went on walking `FUNCTIONS` on every engine for as long as the checker had been
+    fixed, so a PostgreSQL tab was offered `IFNULL` and `GROUP_CONCAT`, names that engine does not
+    have, and never `btrim`, which it does; SQLite was handed MySQL's list just as silently. That is
+    the original bug in the surface that *inserts* the word rather than the one that underlines it,
+    and suggesting a name the engine lacks is the same wrong as squiggling one it has, so both
+    surfaces ask the one engine→catalog map rather than each keeping its own, and `None` means
+    *offer nothing* on the same reasoning that makes it mean *say nothing*.
     **`SQLITE_FUNCTIONS` turned the checker on for SQLite** — 157 entries, written lower-case the way
     SQLite's own documentation writes them while `FUNCTIONS` stays upper-case for MySQL's, which
     costs nothing because both comparisons are case-insensitive at either end.
@@ -496,8 +504,10 @@ existing prose was left alone.
     cluster** (`MASTER_GTID_WAIT`, `BINLOG_GTID_POS`, the `WSREP_*` trio, `DECODE_HISTOGRAM`) — plus
     a small **XML** one (`EXTRACTVALUE`, `UPDATEXML`).
     **`FUNCTIONS` is one catalog for two engines and feeds autocomplete as well as the checker**, so
-    the cost of that is paid in the popup: `rank.rs` walks it whatever the engine, and a MySQL 8 tab
-    is now offered `NVL`, `SUBSTR_ORACLE` and the rest of MariaDB's own names. The shape is unchanged
+    the cost of that is paid in the popup: a MySQL 8 tab is now offered `NVL`, `SUBSTR_ORACLE` and
+    the rest of MariaDB's own names. `rank.rs` reaches this catalog through `builtin_catalog` now
+    rather than naming it, so the overhang stops at the two engines that share it instead of
+    reaching every tab — which it did, and which is the bug above. The shape is unchanged
     and so is the open question — this made the list 57 names longer, not differently structured —
     and the reverse allowance is deliberate for the same reason: the five names MySQL 8 has and
     MariaDB never got stay listed rather than squiggling `UUID_TO_BIN` for the MySQL user who typed
@@ -784,6 +794,13 @@ existing prose was left alone.
     near-miss net is drawn around ten times as many names as MySQL's — and
     `intel::tests::an_ordinary_user_function_survives_the_pg_catalog` is what keeps it honest,
     holding ten ordinary application names (`calc_total`, `audit_log`, `trim_name`) to no squiggle.
+    **The completion popup pays that cost too**, now that `rank` draws its function tier from
+    `builtin_catalog` and a PostgreSQL tab is therefore offered all 2,706: completion filters by
+    prefix and `rank::MAX_ROWS` caps the popup at 40, so the list is never dumped whole, and the
+    residual risk is a short prefix surfacing `int4in` or `btint4cmp` beside the name the user
+    wanted. A **mechanically derived** user-facing subset — one no hand maintains, so the failure
+    mode above cannot come back through it — is the next piece of work and is not written yet; a
+    curated list still is not it.
     **Names are lower-case**, like `SQLITE_FUNCTIONS` and unlike `FUNCTIONS`, which costs nothing
     because both comparisons are case-insensitive at either end — `pg_function_catalog_is_sane` pins
     it, along with a size floor set well under 2,682 so a later major version may add or drop names
@@ -6833,7 +6850,20 @@ existing prose was left alone.
       in what order. `rank(&SchemaIndex, &RankInput)` collects candidates into context tiers (dedup
       by text, first/lowest tier wins, and a candidate equal to the typed prefix is dropped), scores
       each by `fuzzy_score` plus `recency_bonus`, and sorts by tier, then score, then length,
-      capped at `MAX_ROWS`. `SchemaIndex`/`ColMeta`/`Suggestion`/`SuggestKind`/`KeyKind` are the
+      capped at `MAX_ROWS`. **`RankInput::dialect` decides which builtin catalog the function tier is
+      drawn from, and it is not a nicety**: the `ClauseCtx::Column` arm used to walk
+      `intel::FUNCTIONS` whatever the engine, so a PostgreSQL tab was offered `IFNULL` and
+      `GROUP_CONCAT` — names that engine does not have — and never `btrim`, which it does, while a
+      SQLite tab got MySQL's list just as silently. It is the typo checker's original PostgreSQL bug
+      in the surface that *inserts* the word rather than the one that underlines it, so the arm asks
+      `intel::builtin_catalog(input.dialect)` — the one engine→catalog map, `pub(crate)` for this
+      caller — and reads its `None` as an empty slice, leaving a fourth engine offered nothing rather
+      than inheriting whichever list is nearest. `each_dialect_is_offered_its_own_builtins` asserts
+      that through `rank` and not over the catalogs, because the catalogs were already right and the
+      composition was what was broken; `ranked_on` is the existing `ranked` helper with the engine
+      named, and `ranked` itself still passes `SqlDialect::MySql`, so every older test means what it
+      did. What this does *not* fix is the size of PostgreSQL's catalog reaching the popup — see
+      `pg_builtins.rs`. `SchemaIndex`/`ColMeta`/`Suggestion`/`SuggestKind`/`KeyKind` are the
       vocabulary; `worth_offering` and `database_suggestion_visible` are the leaf rules `rank`
       itself composes. **`statement_identifiers` and `snippet_abbrev_rows` are not** — they are the
       *caller*'s leaf rules, called directly by `completion::recompute_completions` and handed back
@@ -17226,7 +17256,9 @@ Re-introducing the anti-patterns these guard against is a regression:
   (`Option<&'static [SqlFunction]>`) rather than sitting beside a bool, and the
   `builtin_functions_are_authoritative` that did sit beside it was deleted — "is this app's list
   authoritative here" and "which list" are one question, and answering it twice is two arms to keep
-  in step instead of one.
+  in step instead of one. The typo checker and `rank::rank` both ask it now, which is that argument
+  at the other end: two surfaces, one map, so a fourth engine is forgotten in one place rather than
+  two — and it was two, for as long as the popup named `FUNCTIONS` itself.
   **The rule has a gate now, and it is a ratchet rather than a ban.** `ui::engine_comparison_gate`
   scans both view crates' production source (`source_gate::crate_sources`, so `schemaic-app` is in
   it too) for `SqlDialect::` and holds each file to a **per-file budget with a written reason**,

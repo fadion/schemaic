@@ -1833,6 +1833,15 @@ pub const SQLITE_FUNCTIONS: &[SqlFunction] = &[
 /// bug below, and `Option` is what keeps the fix from depending on somebody
 /// remembering to add an arm.
 ///
+/// **Two callers, and it took the second one a while to arrive.**
+/// [`crate::rank::rank`] asks it as well now, because the bug below had an exact
+/// twin in autocomplete: the checker was taught the question and the completion
+/// popup went on walking [`FUNCTIONS`] on every engine, offering a PostgreSQL
+/// tab `IFNULL` and never `btrim`. Suggesting a name the engine does not have is
+/// the same wrong as underlining one it does, so both surfaces route here rather
+/// than each keeping a map. `None` means *offer nothing*, on the same reasoning
+/// that makes it mean *say nothing*.
+///
 /// The checker used to spend its `dialect` on `skip_noncode` and `is_sql_keyword`
 /// and never on the catalog questions, so on PostgreSQL it failed to recognise
 /// the engine's real functions *and* measured its distances against MySQL's:
@@ -1849,7 +1858,7 @@ pub const SQLITE_FUNCTIONS: &[SqlFunction] = &[
 /// real server, all 2,682 names of it, plus the 24 call forms the grammar
 /// implements without a `pg_proc` row — and `live::pg_catalog` re-asks the
 /// server under test whether the file is still complete.
-fn builtin_catalog(dialect: SqlDialect) -> Option<&'static [SqlFunction]> {
+pub(crate) fn builtin_catalog(dialect: SqlDialect) -> Option<&'static [SqlFunction]> {
     match dialect {
         SqlDialect::MySql => Some(FUNCTIONS),
         SqlDialect::Sqlite => Some(SQLITE_FUNCTIONS),

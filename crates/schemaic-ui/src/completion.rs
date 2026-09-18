@@ -776,6 +776,7 @@ pub(crate) fn recompute_completions(
             star: star.as_ref(),
             used: &used,
             active_db,
+            dialect,
         },
     );
 
