@@ -907,7 +907,7 @@ fn with_nav_scroll(view: AnyView, nav: Nav, key: String, menu: Option<CtxOpener>
 /// the distinction the rest of the app draws: absent means "not on this engine",
 /// dimmed means "not here".
 fn blank_space_menu(ui: &Ui) -> Vec<widgets::MenuEntry> {
-    let ctx = crate::table_designer::edit_ctx(ui);
+    let ctx = crate::table_designer::edit_ctx(ui.conn);
     blank_space_entries(
         ctx.dialect,
         ctx.read_only,

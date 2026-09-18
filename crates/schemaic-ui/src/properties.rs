@@ -134,7 +134,7 @@ pub(crate) fn properties_overlay(ui: Ui) -> impl IntoView {
             // No round trip, and it is what gives a view something to show on an
             // engine that publishes no statistics for one.
             let info = crate::table_designer::loaded_table(
-                &ui,
+                ui.schema,
                 &t.database,
                 t.schema.as_deref(),
                 &t.table,
@@ -755,7 +755,7 @@ fn footer(
     // read-only from the status bar, and the button would stay live. What makes
     // it so in both directions is the refusal inside `open_for_table` /
     // `open_for_view`; this decides only what the button *says*.
-    let ctx = crate::table_designer::edit_ctx(&ui);
+    let ctx = crate::table_designer::edit_ctx(ui.conn);
     let editable_view = crate::view_editor::is_editable_view(info.as_ref());
     let can_edit = !ctx.read_only
         && info.as_ref().is_some_and(|i| {

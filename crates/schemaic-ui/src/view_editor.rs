@@ -80,13 +80,13 @@ fn open_editor(ui: &Ui, target: ViewTarget, draft: ViewDraft) {
 /// Open the editor on an existing view. A base table isn't one, and a view whose
 /// schema hasn't loaded has no body to edit.
 pub(crate) fn open_for_view(ui: &Ui, database: &str, schema: Option<&str>, view: &str) {
-    let Some(info) = loaded_table(ui, database, schema, view).filter(|t| t.is_view) else {
+    let Some(info) = loaded_table(ui.schema, database, schema, view).filter(|t| t.is_view) else {
         return;
     };
     let Some(draft) = ViewDraft::from_table(&info) else {
         return;
     };
-    let ctx = edit_ctx(ui);
+    let ctx = edit_ctx(ui.conn);
     // Three of this editor's four launchers carry a read-only term; the fourth
     // is the schema tree's Edit view, which shares its `.disabled` with Edit
     // table and had never had one. The refusal belongs here either way — see
@@ -178,12 +178,12 @@ pub(crate) fn open_for_new(ui: &Ui, database: &str, schema: Option<&str>) {
 /// The namespace comes from [`crate::table_designer::default_schema`], the same answer
 /// the tree's own Create view gives on a database node.
 pub(crate) fn open_from_query(ui: &Ui, database: &str, select: &str) {
-    let schema = crate::table_designer::default_schema(ui, database);
+    let schema = crate::table_designer::default_schema(ui.conn, ui.schema, database);
     open_blank(ui, database, schema.as_deref(), select);
 }
 
 fn open_blank(ui: &Ui, database: &str, schema: Option<&str>, body: &str) {
-    let ctx = edit_ctx(ui);
+    let ctx = edit_ctx(ui.conn);
     // Both blank doors at once — Create view and "Create view from this query",
     // the second of which is an editor context-menu entry rather than a tree
     // one and so has no dimmed sibling to speak for it.

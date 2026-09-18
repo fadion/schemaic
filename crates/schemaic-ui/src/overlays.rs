@@ -160,7 +160,7 @@ fn export_submenu(
                 preselect.map(str::to_string),
             );
             MenuEntry::action(format.label(), move || {
-                let ctx = crate::table_designer::edit_ctx(&ui);
+                let ctx = crate::table_designer::edit_ctx(ui.conn);
                 crate::dump_view::open_dump(
                     ui.clone(),
                     ctx.conn_id,
@@ -203,7 +203,7 @@ fn create_submenu(
     schema: Option<&str>,
     read_only: bool,
 ) -> Option<MenuEntry> {
-    let dialect = crate::table_designer::edit_ctx(ui).dialect;
+    let dialect = crate::table_designer::edit_ctx(ui.conn).dialect;
     let entries = create_children(dialect, read_only);
     if entries.is_empty() {
         return None;
@@ -1271,7 +1271,7 @@ pub(crate) fn schema_settings_overlay(ui: Ui) -> impl IntoView {
             let collapse_all = collapse_all.clone();
             let toggle_sizes = toggle_sizes.clone();
             // Read once for every gate below, which ask the same questions of it.
-            let ctx = crate::table_designer::edit_ctx(&ui);
+            let ctx = crate::table_designer::edit_ctx(ui.conn);
             let down = ui.conn.conn_status.get_untracked().is_down();
             let read_only = conn_read_only(&ui.conn.connections, ui.conn.active_conn);
             // **Which rows, in which order, and which are inert is data** — see
@@ -1630,7 +1630,7 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                         // menu could have given for free.
                         entries.push(
                             MenuEntry::action("Import", move || {
-                                let ctx = crate::table_designer::edit_ctx(&iui);
+                                let ctx = crate::table_designer::edit_ctx(iui.conn);
                                 crate::script_view::open_script(
                                     iui.clone(),
                                     ctx.conn_id,
@@ -1647,7 +1647,11 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                     // namespace (other namespaces get their own node), so a new
                     // table lands where the tree says it will.
                     {
-                        let ns = crate::table_designer::default_schema(&import_ui, &menu.name);
+                        let ns = crate::table_designer::default_schema(
+                            import_ui.conn,
+                            import_ui.schema,
+                            &menu.name,
+                        );
                         entries.extend(create_submenu(
                             &import_ui,
                             &menu.name,
@@ -1663,7 +1667,7 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                     // statement (SQLite, where a database is a file), the same
                     // call the Create entries above make.
                     if schemaic_core::ddl::supports_database_editing(
-                        crate::table_designer::edit_ctx(&import_ui).dialect,
+                        crate::table_designer::edit_ctx(import_ui.conn).dialect,
                     ) {
                         let ui = import_ui.clone();
                         let confirm = ui.overlay.confirm;
@@ -1678,7 +1682,7 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                                 // built against whichever one they switched to.
                                 // The dialect this closure already reads for the
                                 // risk sentence comes from the same place.
-                                let ctx = crate::table_designer::edit_ctx(&ui);
+                                let ctx = crate::table_designer::edit_ctx(ui.conn);
                                 let on = crate::ddl_preview::PlanTarget {
                                     conn_id: ctx.conn_id,
                                     // Server-level: `DdlScope::Server` wants the
@@ -1797,7 +1801,7 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                                         if !yes {
                                             return;
                                         }
-                                        let ctx = crate::table_designer::edit_ctx(&ui);
+                                        let ctx = crate::table_designer::edit_ctx(ui.conn);
                                         // **A routine is addressed by signature,
                                         // not by name.** `drop_object` refuses one
                                         // (and would emit a statement that is right
@@ -1882,7 +1886,7 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                         // node above and for the same reason.
                         entries.push(
                             MenuEntry::action("Import", move || {
-                                let ctx = crate::table_designer::edit_ctx(&iui);
+                                let ctx = crate::table_designer::edit_ctx(iui.conn);
                                 crate::script_view::open_script(
                                     iui.clone(),
                                     ctx.conn_id,
@@ -1914,7 +1918,7 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                     // refused by the server — which is what the risk sentence
                     // this confirm borrows actually says.
                     if schemaic_core::ddl::supports_namespace_editing(
-                        crate::table_designer::edit_ctx(&import_ui).dialect,
+                        crate::table_designer::edit_ctx(import_ui.conn).dialect,
                     ) {
                         let ui = import_ui.clone();
                         let confirm = ui.overlay.confirm;
@@ -1924,7 +1928,7 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                                 let (ui, db, ns) = (ui.clone(), db.clone(), ns.clone());
                                 // Captured at menu-fire time, for the reason the
                                 // Drop-database entry above states.
-                                let ctx = crate::table_designer::edit_ctx(&ui);
+                                let ctx = crate::table_designer::edit_ctx(ui.conn);
                                 let on = crate::ddl_preview::PlanTarget {
                                     conn_id: ctx.conn_id,
                                     // A namespace is dropped **in** its database.
@@ -2149,7 +2153,7 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                             // `entries.push(` reads as a top-level entry to
                             // `menu_order_gate`, which would then demand a place
                             // in the skeleton for a label that isn't in the menu.
-                            let dialect = crate::table_designer::edit_ctx(&import_ui).dialect;
+                            let dialect = crate::table_designer::edit_ctx(import_ui.conn).dialect;
                             let db = database.as_str();
                             let items = vec![
                                 MenuEntry::action("Create", generate(ddl.clone())),
@@ -2243,7 +2247,7 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                         let db = database.clone();
                         let ns = schema.clone();
                         let has_columns = info.as_ref().is_some_and(|i| !i.columns.is_empty());
-                        let dialect = crate::table_designer::edit_ctx(&ui).dialect;
+                        let dialect = crate::table_designer::edit_ctx(ui.conn).dialect;
                         // A view Schemaic can edit — read before `info` is moved
                         // into the Import entry below.
                         let editable_view = crate::view_editor::is_editable_view(info.as_ref());
@@ -2597,7 +2601,7 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                     let read_only = conn_read_only(&connections, active_conn);
                     entries.push(MenuEntry::Separator);
                     let offers = field_entries(
-                        crate::table_designer::edit_ctx(&import_ui).dialect,
+                        crate::table_designer::edit_ctx(import_ui.conn).dialect,
                         source_shape(db_nodes, &source),
                     );
                     if offers.edit {
@@ -2659,7 +2663,7 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                     let read_only = conn_read_only(&connections, active_conn);
                     entries.push(MenuEntry::Separator);
                     let offers = key_entries(
-                        crate::table_designer::edit_ctx(&import_ui).dialect,
+                        crate::table_designer::edit_ctx(import_ui.conn).dialect,
                         index.constraint.as_deref(),
                         source_shape(db_nodes, &source),
                     );

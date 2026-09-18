@@ -84,7 +84,7 @@ fn field_w() -> f64 {
 /// appears. The entries stay dimmed, because that is what *says* the action is
 /// unavailable; this is what makes it so.
 pub(crate) fn open_for_new(ui: &Ui, kind: ContainerKind, database: Option<&str>) {
-    let ctx = edit_ctx(ui);
+    let ctx = edit_ctx(ui.conn);
     if ctx.read_only {
         return;
     }

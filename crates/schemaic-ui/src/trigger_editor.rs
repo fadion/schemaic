@@ -310,10 +310,10 @@ fn fetch_functions(ui: &Ui) {
 /// live, `+` added a trigger and Preview SQL lit up on a connection the app had
 /// been told not to write to. See `database_editor::open_for_new`.
 pub(crate) fn open_for_table(ui: &Ui, database: &str, schema: Option<&str>, table: &str) {
-    let Some(info) = loaded_table(ui, database, schema, table) else {
+    let Some(info) = loaded_table(ui.schema, database, schema, table) else {
         return;
     };
-    let ctx = edit_ctx(ui);
+    let ctx = edit_ctx(ui.conn);
     if ctx.read_only {
         return;
     }
@@ -327,7 +327,7 @@ pub(crate) fn open_for_table(ui: &Ui, database: &str, schema: Option<&str>, tabl
             dialect: ctx.dialect,
             is_view: info.is_view,
             current: info.triggers.clone(),
-            sibling_triggers: sibling_trigger_names(ui, database, &info, ctx.dialect),
+            sibling_triggers: sibling_trigger_names(ui.schema, database, &info, ctx.dialect),
             read_only: ctx.read_only,
         },
         TriggerSetDraft::from_table(&info),
@@ -342,7 +342,7 @@ pub(crate) fn open_for_table(ui: &Ui, database: &str, schema: Option<&str>, tabl
 /// wider list is not a restriction the server imposes and avoiding it would
 /// propose `new_trigger_2` for no reason the user can see.
 fn sibling_trigger_names(
-    ui: &Ui,
+    ui: crate::SchemaUi,
     database: &str,
     info: &schemaic_core::schema::TableInfo,
     dialect: SqlDialect,

@@ -156,7 +156,7 @@ fn reset_then_seed<T: 'static>(d: crate::DdlUi, draft: floem::reactive::RwSignal
 /// reasoning is written out once, over `open_for_grant`'s copy of the same four
 /// lines, and `anchor_gate` is what holds both to it.
 pub(crate) fn open_for_new(ui: &Ui, from: &UsersTarget, database: &str) {
-    let ctx = edit_ctx(ui);
+    let ctx = edit_ctx(ui.conn);
     if ctx.read_only {
         return;
     }
@@ -196,7 +196,7 @@ pub(crate) fn open_for_new(ui: &Ui, from: &UsersTarget, database: &str) {
 /// The caller has already asked `users::supports_password_reset`; that is what
 /// dims the button, and this is what makes the refusal real.
 pub(crate) fn open_for_reset(ui: &Ui, from: &UsersTarget, database: &str, account: &Principal) {
-    let ctx = edit_ctx(ui);
+    let ctx = edit_ctx(ui.conn);
     if ctx.read_only {
         return;
     }
@@ -232,7 +232,7 @@ pub(crate) fn open_for_reset(ui: &Ui, from: &UsersTarget, database: &str, accoun
 /// same anchor — the account was fetched from `from`'s server, so the grant has
 /// to run there.
 pub(crate) fn open_for_grant(ui: &Ui, from: &UsersTarget, database: &str, account: &Principal) {
-    let ctx = edit_ctx(ui);
+    let ctx = edit_ctx(ui.conn);
     if ctx.read_only {
         return;
     }
@@ -1671,7 +1671,10 @@ mod anchor_gate {
         // The floor, which is the failure mode a source gate is most prone to:
         // a rename would leave nothing to look for and pass silently.
         assert!(
-            body.contains("edit_ctx(ui)"),
+            // Argument-agnostic: `edit_ctx` took `&Ui` when this gate was
+            // written and takes `ConnUi` now, and the floor is that the
+            // launchers still *call* it — not how they spell the bundle.
+            body.contains("edit_ctx("),
             "the launchers no longer call `edit_ctx` — rewrite this gate rather \
              than deleting it: `read_only` is still supposed to come from there"
         );

@@ -38,8 +38,8 @@ use crate::widgets::{
     modal_pad_h, modal_title_owned, modal_w, panel_style,
 };
 use crate::{
-    DdlPreview, DdlUi, DesignerTab, DesignerTarget, FieldCfg, OverlayUi, PopupAnchor, Ui,
-    ddl_preview, edit_field, icons, object_location, theme,
+    ConnUi, DdlPreview, DdlUi, DesignerTab, DesignerTarget, FieldCfg, OverlayUi, PopupAnchor,
+    SchemaUi, Ui, ddl_preview, edit_field, icons, object_location, theme,
 };
 
 fn panel_w() -> f64 {
@@ -179,13 +179,13 @@ pub(crate) struct EditCtx {
     pub exists: bool,
 }
 
-pub(crate) fn edit_ctx(ui: &Ui) -> EditCtx {
-    let conn_id = ui.conn.active_conn.get_untracked();
+pub(crate) fn edit_ctx(ui: ConnUi) -> EditCtx {
+    let conn_id = ui.active_conn.get_untracked();
     // Both answers out of one borrow, and `read_only` out of
     // `connection::read_only_of` rather than off the clone: the fail-open default
     // for an id the registry has lost is documented and tested there, and this
     // was one of seven places that decided it independently.
-    let (conn, read_only) = ui.conn.connections.with_untracked(|cs| {
+    let (conn, read_only) = ui.connections.with_untracked(|cs| {
         (
             schemaic_core::connection::by_id(cs, conn_id).cloned(),
             schemaic_core::connection::read_only_of(cs, conn_id),
@@ -211,8 +211,8 @@ pub(crate) fn edit_ctx(ui: &Ui) -> EditCtx {
 /// `SELECT VERSION()` was actually asked — see [`ServerFlavour`]. `Unknown`
 /// until the schema loads, which is the honest answer and the one that makes a
 /// per-flavour control hide rather than guess.
-pub(crate) fn db_flavour(ui: &Ui, database: &str) -> ServerFlavour {
-    ui.schema.db_nodes.with_untracked(|nodes| {
+pub(crate) fn db_flavour(ui: SchemaUi, database: &str) -> ServerFlavour {
+    ui.db_nodes.with_untracked(|nodes| {
         nodes
             .iter()
             .find(|n| n.database == database)
@@ -243,7 +243,7 @@ pub(crate) fn db_flavour(ui: &Ui, database: &str) -> ServerFlavour {
 /// the window is one round trip. Opening a designer on a model known to be stale
 /// is the outcome worth refusing.
 pub(crate) fn loaded_table(
-    ui: &Ui,
+    ui: SchemaUi,
     database: &str,
     schema: Option<&str>,
     table: &str,
@@ -264,10 +264,10 @@ pub(crate) fn loaded_table(
 /// [`schemaic_core::propose::resolve_target`] so the card and the MCP tool land
 /// on the same table.
 pub(crate) fn loaded_schema(
-    ui: &Ui,
+    ui: SchemaUi,
     database: &str,
 ) -> Option<std::sync::Arc<schemaic_core::schema::DbSchema>> {
-    ui.schema.db_nodes.with_untracked(|nodes| {
+    ui.db_nodes.with_untracked(|nodes| {
         nodes
             .iter()
             .find(|n| n.database == database)
@@ -297,11 +297,11 @@ pub(crate) fn loaded_schema(
 /// The loaded schema still refines it, and that is worth keeping: a PostgreSQL
 /// database really does report its namespaces, and `schemas()` being empty is a
 /// genuine "this database has no namespace level" rather than "not looked yet".
-pub(crate) fn default_schema(ui: &Ui, database: &str) -> Option<String> {
-    if edit_ctx(ui).dialect != schemaic_core::intel::SqlDialect::Postgres {
+pub(crate) fn default_schema(conn: ConnUi, ui: SchemaUi, database: &str) -> Option<String> {
+    if edit_ctx(conn).dialect != schemaic_core::intel::SqlDialect::Postgres {
         return None;
     }
-    let loaded_without_namespaces = ui.schema.db_nodes.with_untracked(|nodes| {
+    let loaded_without_namespaces = ui.db_nodes.with_untracked(|nodes| {
         nodes
             .iter()
             .find(|n| n.database == database)
@@ -315,8 +315,8 @@ pub(crate) fn default_schema(ui: &Ui, database: &str) -> Option<String> {
 
 /// Every table name in a database, for the foreign-key target picker. Views are
 /// left out — a foreign key can't reference one.
-fn table_names(ui: &Ui, database: &str, schema: Option<&str>) -> Vec<String> {
-    ui.schema.db_nodes.with_untracked(|nodes| {
+fn table_names(ui: SchemaUi, database: &str, schema: Option<&str>) -> Vec<String> {
+    ui.db_nodes.with_untracked(|nodes| {
         nodes
             .iter()
             .find(|n| n.database == database)
@@ -369,7 +369,7 @@ pub(crate) fn open_for_table(
     table: &str,
     focus: DesignerFocus<'_>,
 ) {
-    let Some(info) = loaded_table(ui, database, schema, table) else {
+    let Some(info) = loaded_table(ui.schema, database, schema, table) else {
         return;
     };
     // **A view is not a table, and this is the designer for a table.** Every
@@ -381,7 +381,7 @@ pub(crate) fn open_for_table(
     if info.is_view {
         return;
     }
-    let ctx = edit_ctx(ui);
+    let ctx = edit_ctx(ui.conn);
     // **The third lock, and the one this door had none of.** Of its four
     // launchers — Edit table, Edit column, Edit index and the Properties
     // panel's handoff — only the last carried a read-only term, and that one is
@@ -404,11 +404,11 @@ pub(crate) fn open_for_table(
         DesignerTarget {
             conn_id: ctx.conn_id,
             database: database.to_string(),
-            flavour: db_flavour(ui, database),
+            flavour: db_flavour(ui.schema, database),
             schema: info.schema.clone(),
             dialect: ctx.dialect,
             current: Some(info),
-            tables: table_names(ui, database, schema),
+            tables: table_names(ui.schema, database, schema),
             read_only: ctx.read_only,
         },
     );
@@ -450,16 +450,16 @@ pub(crate) fn preview_draft_edit(
     // rules which checks stand on the column being removed.
     edit: impl FnOnce(&mut TableDraft, SqlDialect),
 ) {
-    let Some(info) = loaded_table(ui, database, schema, table) else {
+    let Some(info) = loaded_table(ui.schema, database, schema, table) else {
         return;
     };
-    let ctx = edit_ctx(ui);
+    let ctx = edit_ctx(ui.conn);
     let mut draft = TableDraft::from_table(&info);
     edit(&mut draft, ctx.dialect);
     let cs = ddl::diff(
         &info,
         &draft,
-        ddl::Target::new(ctx.dialect, db_flavour(ui, database)),
+        ddl::Target::new(ctx.dialect, db_flavour(ui.schema, database)),
     );
     if cs.is_empty() {
         return;
@@ -478,7 +478,7 @@ pub(crate) fn preview_draft_edit(
 
 /// Open the designer on a blank draft — Create table.
 pub(crate) fn open_for_new(ui: &Ui, database: &str, schema: Option<&str>) {
-    let ctx = edit_ctx(ui);
+    let ctx = edit_ctx(ui.conn);
     // `create_children` already dims the entry; this is what makes it so.
     if ctx.read_only {
         return;
@@ -488,11 +488,11 @@ pub(crate) fn open_for_new(ui: &Ui, database: &str, schema: Option<&str>) {
         DesignerTarget {
             conn_id: ctx.conn_id,
             database: database.to_string(),
-            flavour: db_flavour(ui, database),
+            flavour: db_flavour(ui.schema, database),
             schema: schema.map(str::to_string),
             dialect: ctx.dialect,
             current: None,
-            tables: table_names(ui, database, schema),
+            tables: table_names(ui.schema, database, schema),
             read_only: ctx.read_only,
         },
     );

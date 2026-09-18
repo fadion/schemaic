@@ -8276,9 +8276,13 @@ fn center(ui: Ui) -> impl IntoView {
     let open_properties: PropertiesFn = {
         let ui = ui.clone();
         Rc::new(move |conn_id: u64, src: TableSource| {
-            let is_view =
-                table_designer::loaded_table(&ui, &src.database, src.schema.as_deref(), &src.table)
-                    .is_some_and(|t| t.is_view);
+            let is_view = table_designer::loaded_table(
+                ui.schema,
+                &src.database,
+                src.schema.as_deref(),
+                &src.table,
+            )
+            .is_some_and(|t| t.is_view);
             properties::open_for_table(
                 &ui,
                 conn_id,
@@ -14599,7 +14603,9 @@ mod whole_ui_gate {
         // neither. The five left are the *opening* path — `open_editor` and the
         // three `open_for_*`, which write across `ddl`, `schema` and the peer
         // editors, plus the overlay itself.
-        ("object_editor.rs", 5),
+        // 5 → 4: this file's own private `loaded_schema` — a near-copy of
+        // `table_designer`'s, reading only `db_nodes` — takes `SchemaUi`.
+        ("object_editor.rs", 4),
         // 15 → 13: `confirm_overlay` takes the one `RwSignal` it reads, and
         // `date_pick_overlay` takes `OverlayUi` (both its signals are in it).
         // `error_modal_overlay` stays on the root bundle and is the contrast
@@ -14640,15 +14646,21 @@ mod whole_ui_gate {
         // write. `table_section` and `column_form` take `OverlayUi` beside it,
         // for the suggestion chevron and nothing else.
         //
-        // **The ten left are one kind of thing**: `edit_ctx`, `db_flavour`,
-        // `loaded_table`, `loaded_schema`, `default_schema` and `table_names`
-        // read the connection and the schema tree and are called from five
-        // other modules; `open_for_table`, `preview_draft_edit` and
-        // `open_for_new` are opening paths; and the overlay is the root. The
-        // first six could take `SchemaUi`, which is `Copy` — that is a change
-        // to shared helpers rather than to this file, so it belongs in its own
-        // commit.
-        ("table_designer.rs", 10),
+        // 10 → 4: the six **shared readers** other modules call — `db_flavour`,
+        // `loaded_table`, `loaded_schema` and `table_names` on `SchemaUi`,
+        // `edit_ctx` on `ConnUi`, `default_schema` on both — which is what the
+        // entry above had put off as a change to shared helpers rather than to
+        // this file. It is, and it took two *other* entries down with it —
+        // `object_editor.rs` 5 → 4 and `trigger_editor.rs` 8 → 7 — because
+        // nothing that calls a `&Ui` helper can be narrower than the helper.
+        // (Two, not five: several more modules had call sites rewritten without
+        // their budgets moving, which is what a propagating narrowing looks
+        // like from the outside and is easy to overcount.)
+        //
+        // **The four left are opening paths and the overlay**: `open_for_table`,
+        // `preview_draft_edit` and `open_for_new` each write across `ddl`,
+        // `schema` and the peer editors.
+        ("table_designer.rs", 4),
         // 2, for `compare_view.rs`'s reason: `tab_chip(tab: Tab, ui: Ui)`.
         ("tabs.rs", 2),
         // 11 → 8: `bound_field` and `bound_choice` take
@@ -14658,7 +14670,10 @@ mod whole_ui_gate {
         // which is an opening path and wants the root bundle, and `form` is the
         // only thing that can hand it one. Sibling files got to 5 and 6; this
         // one stops at 8 for a reason, not for want of another pass.
-        ("trigger_editor.rs", 8),
+        //
+        // 8 → 7: `sibling_trigger_names` reads `loaded_schema` and nothing
+        // else, so it followed that helper onto `SchemaUi`.
+        ("trigger_editor.rs", 7),
         // 9 → 8: the browser's read-only question takes the connection registry
         // signal it actually reads rather than the root bundle, which is this
         // rule's own prescription and was the right shape anyway — the decision

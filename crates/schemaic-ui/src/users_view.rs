@@ -105,7 +105,7 @@ fn label_w() -> f64 {
 /// cluster-wide half. There is no read-only refusal at this door, unlike the
 /// schema editors': browsing accounts writes nothing.
 pub(crate) fn open_for_server(ui: &Ui, conn_id: u64, database: Option<&str>) {
-    let ctx = crate::table_designer::edit_ctx(ui);
+    let ctx = crate::table_designer::edit_ctx(ui.conn);
     ui.overlay.users_state.set(UsersState::Loading);
     ui.overlay.users_selected.set(None);
     ui.overlay.users_grants.set(GrantsState::Idle);

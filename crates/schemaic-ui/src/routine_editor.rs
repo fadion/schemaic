@@ -113,7 +113,7 @@ fn open(ui: &Ui, target: RoutineTarget, draft: RoutineDraft) {
 /// Find-Anywhere both call without consulting the menu's gate, and the two
 /// `open_for_new`s are reached from `create_submenu` directly.
 pub(crate) fn open_for_routine(ui: &Ui, database: &str, r: &RoutineInfo) {
-    let ctx = edit_ctx(ui);
+    let ctx = edit_ctx(ui.conn);
     if ctx.read_only {
         return;
     }
@@ -132,7 +132,7 @@ pub(crate) fn open_for_routine(ui: &Ui, database: &str, r: &RoutineInfo) {
 
 /// Open the editor on a blank draft — Create function / Create procedure.
 pub(crate) fn open_for_new(ui: &Ui, database: &str, schema: Option<&str>, kind: RoutineKind) {
-    let ctx = edit_ctx(ui);
+    let ctx = edit_ctx(ui.conn);
     if ctx.read_only {
         return;
     }
@@ -169,7 +169,7 @@ pub(crate) fn open_for_new(ui: &Ui, database: &str, schema: Option<&str>, kind: 
 /// intact. A flag would have been a second source of truth for something the
 /// signal already answers.
 pub(crate) fn open_for_new_trigger_function(ui: &Ui, database: &str, schema: Option<&str>) {
-    let ctx = edit_ctx(ui);
+    let ctx = edit_ctx(ui.conn);
     if ctx.read_only {
         return;
     }

@@ -461,7 +461,7 @@ pub(crate) fn preview_change(
     schema: Option<&str>,
     change: schemaic_core::ddl::Change,
 ) {
-    let ctx = crate::table_designer::edit_ctx(ui);
+    let ctx = crate::table_designer::edit_ctx(ui.conn);
     let cs = schemaic_core::ddl::single(table, schema, ctx.dialect, change);
     open_preview(
         ui.ddl,
@@ -498,8 +498,8 @@ pub(crate) fn preview_proposal(
     database: &str,
     proposal: &schemaic_core::propose::Proposal,
 ) -> Result<(), String> {
-    let ctx = crate::table_designer::edit_ctx(ui);
-    let Some(loaded) = crate::table_designer::loaded_schema(ui, database) else {
+    let ctx = crate::table_designer::edit_ctx(ui.conn);
+    let Some(loaded) = crate::table_designer::loaded_schema(ui.schema, database) else {
         return Err(format!(
             "{} isn't loaded in {database} right now — open the database in the schema tree, or \
              wait for a refresh to finish, and try again.",
@@ -524,7 +524,7 @@ pub(crate) fn preview_proposal(
     // very same change.
     let target = schemaic_core::ddl::Target::new(
         ctx.dialect,
-        crate::table_designer::db_flavour(ui, database),
+        crate::table_designer::db_flavour(ui.schema, database),
     );
     let cs = schemaic_core::ddl::diff(info, &draft, target);
     if cs.is_empty() {

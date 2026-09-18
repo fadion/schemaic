@@ -113,7 +113,7 @@ fn open(ui: &Ui, target: EventTarget, draft: EventDraft) {
 /// Find-Anywhere — none of which consults the menu's gate), and `open_for_new`
 /// from `create_submenu` directly.
 pub(crate) fn open_for_event(ui: &Ui, database: &str, e: &EventInfo) {
-    let ctx = edit_ctx(ui);
+    let ctx = edit_ctx(ui.conn);
     if ctx.read_only {
         return;
     }
@@ -132,7 +132,7 @@ pub(crate) fn open_for_event(ui: &Ui, database: &str, e: &EventInfo) {
 
 /// Open the editor on a blank draft — Create event.
 pub(crate) fn open_for_new(ui: &Ui, database: &str, schema: Option<&str>) {
-    let ctx = edit_ctx(ui);
+    let ctx = edit_ctx(ui.conn);
     if ctx.read_only {
         return;
     }

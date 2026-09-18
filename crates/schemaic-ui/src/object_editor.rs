@@ -92,10 +92,10 @@ fn open_editor(ui: &Ui, target: ObjectTarget, draft: ObjectDraft) {
 
 /// The introspected schema of one database, when it has loaded.
 fn loaded_schema(
-    ui: &Ui,
+    ui: crate::SchemaUi,
     database: &str,
 ) -> Option<std::sync::Arc<schemaic_core::schema::DbSchema>> {
-    ui.schema.db_nodes.with_untracked(|nodes| {
+    ui.db_nodes.with_untracked(|nodes| {
         nodes
             .iter()
             .find(|n| n.database == database)
@@ -138,7 +138,7 @@ pub(crate) fn open_for_object(ui: &Ui, database: &str, item: &ObjectItem) {
         crate::event_editor::open_for_event(ui, database, e);
         return;
     }
-    let ctx = edit_ctx(ui);
+    let ctx = edit_ctx(ui.conn);
     // The other half of the menu's own gate. `overlays.rs`' entry spells it
     // `read_only || !editable` and only the `!editable` term had been moved
     // here, so the three paths that bypass the menu — double-click, keyboard
@@ -147,7 +147,7 @@ pub(crate) fn open_for_object(ui: &Ui, database: &str, item: &ObjectItem) {
     if ctx.read_only {
         return;
     }
-    let dependents = match loaded_schema(ui, database) {
+    let dependents = match loaded_schema(ui.schema, database) {
         Some(s) => ddl::type_dependents(&s, item.schema(), item.name()),
         None => Vec::new(),
     };
@@ -180,7 +180,7 @@ pub(crate) fn open_for_new(ui: &Ui, database: &str, schema: Option<&str>, kind: 
         crate::event_editor::open_for_new(ui, database, schema);
         return;
     }
-    let ctx = edit_ctx(ui);
+    let ctx = edit_ctx(ui.conn);
     // As at the door above: `create_children` dims every entry on a read-only
     // connection, and this is what makes it so.
     if ctx.read_only {

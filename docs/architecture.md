@@ -5605,6 +5605,13 @@ existing prose was left alone.
     funnel all four schema editors go through — answers `None` for: seeding a draft from a
     pre-apply `TableInfo` is what makes MySQL's `MODIFY COLUMN` silently restate the old column
     definition, and `risks()` discloses nothing because from the plan's view nothing changed.
+    **`object_editor` has a private near-copy of `loaded_schema` that does *not* apply that
+    filter**, and it is open rather than settled. It feeds `ddl::type_dependents` — the columns a
+    rebuild would re-cast, read off the tree's schema — so it carries the staleness exposure the
+    funnel refuses.
+    It has not been unified because the two failures are not obviously ranked: refusing during a
+    refresh would hand that call site an **empty** dependent list rather than a stale one, and which
+    of those is the safer wrong answer for a rebuild is a judgement nobody has made.
     The plan behind the reuse is `plan_nodes`, pure and tested: it decides that a dropped and
     re-created database gets a **fresh** id rather than colliding with a live node, that reordering
     the server's list renumbers nothing (the tree keys on id), and that a reload against an empty
@@ -12903,10 +12910,15 @@ existing prose was left alone.
     the whole `Ui`: building one in a test is 36 fields and 91 more transitively. What it can see
     mechanically is the spelling — `ctx.conn_id`/`ctx.dialect` must not appear in this file's
     production code, `conn_id: from.conn_id,` and `dialect: from.dialect,` must appear once per door,
-    and `edit_ctx(ui)` must still be called at all, which is the floor that stops a rename leaving
-    nothing to look for. **The door count is a `DOORS` constant, not a literal in each assertion**:
-    it went 2 → 3 when `open_for_reset` landed, both halves of the gate caught the new door, and a
-    fourth `open_for_*` raises the number in one place. **That third door was paid for rather than
+    and `edit_ctx` must still be called at all, which is the floor that stops a rename leaving
+    nothing to look for. **That floor was itself keyed on a call *spelling*, and the spelling
+    moved**: it asserted `edit_ctx(ui)` until `edit_ctx` narrowed from `&Ui` to `ConnUi` under
+    `whole_ui_gate`, at which point the gate failed on a signature change that touched nothing it
+    guards. It asks for `edit_ctx(` now, argument-agnostic — the general hazard being that a source
+    gate written against how a call is spelled is coupled to every refactor of the callee, not only
+    to the behaviour it exists to protect. **The door count is a `DOORS` constant, not a literal in
+    each assertion**: it went 2 → 3 when `open_for_reset` landed, both halves of the gate caught the
+    new door, and a fourth `open_for_*` raises the number in one place. **That third door was paid for rather than
     added**: another `ui: &Ui` would have raised this file's `whole_ui_gate` budget, and the
     ratchet's only legal direction is down, so `suggested_field` and the
     `table_designer::suggest_chevron` it
@@ -14769,15 +14781,30 @@ existing prose was left alone.
     designer's three growing lists each kept an `add_ui` and a `del_ui` alive for their two action
     closures, four of its lists were cloning a `Ui` *per row* to deliver one `Copy` signal, and
     `event_editor::schedule_form` cloned one three times to hand a dropdown a single signal.
-    **The arm that stops it is an *opening* path.** Anything reaching `edit_ctx`, the schema tree or
-    another editor's `open_for_*` genuinely wants the root bundle, and two are written into the
+    **The arm that stops it is an *opening* path.** Anything reaching the schema tree or another
+    editor's `open_for_*` genuinely wants the root bundle — `edit_ctx` stood on that list too until
+    it was read properly, which is the correction below — and two are written into the
     budget comments so the next pass does not re-argue them: `trigger_editor`'s `pg_action` is where
     the "edit this function" button opens the *routine* editor and `form` is the only thing that can
-    hand it a root bundle, which is why that file stops at **8** where its siblings reached 5 and 6;
-    and the six shared readers left in `table_designer.rs` — `edit_ctx`, `db_flavour`,
-    `loaded_table`, `loaded_schema`, `default_schema`, `table_names` — are called from five other
-    modules. Those six could take `SchemaUi`, which is `Copy`; that is a change to shared helpers
-    rather than to that file, and it has not been done.
+    hand it a root bundle, which is why that file stops at **7** where its siblings reached 5 and 6;
+    and the six shared readers in `table_designer.rs` — `edit_ctx`, `db_flavour`, `loaded_table`,
+    `loaded_schema`, `default_schema`, `table_names` — are called from across the crate. Those six
+    have now narrowed, and **the plan once written here was wrong about one of them**: the four
+    that read only `db_nodes` (`db_flavour`, `loaded_table`, `loaded_schema`, `table_names`) take
+    `SchemaUi`, but `edit_ctx` reads `ui.conn.active_conn` and `ui.conn.connections` and touches the
+    schema tree not at all, so it takes `ConnUi`; `default_schema(conn: ConnUi, ui: SchemaUi,
+    database: &str)` takes both, because it asks `edit_ctx` for the dialect and then the tree
+    whether the database's namespaces loaded. What had held `edit_ctx` back was its **39 call
+    sites** — the count, not the shape.
+    **The narrowing propagated, and that is the real lesson of that pass** — the lesson
+    `ddl_preview::preview_container` had already taught below, now with numbers. A caller cannot be
+    narrower than what it calls, so six shared helpers coming down took three budget entries with
+    them: `table_designer.rs` **10 → 4**, leaving `open_for_table`, `preview_draft_edit`,
+    `open_for_new` and the overlay; `object_editor.rs` **5 → 4**, its own private `loaded_schema` —
+    a near-copy of `table_designer`'s — following onto `SchemaUi`; and `trigger_editor.rs`
+    **8 → 7**, since `sibling_trigger_names` reads `loaded_schema` and nothing else. That last one
+    takes nothing away from the sentence above: `pg_action` and `form` are still on the root bundle
+    and are still why that file stops where it does.
     **An editor's *overlay* is the usual holdout, and `view_editor_overlay` is the first one that
     was not.** Every sibling editor's overlay keeps the root bundle because something under it
     opens something else; this one has no such path — `fetch_algorithm` is reached from
@@ -14797,9 +14824,9 @@ existing prose was left alone.
     A caller cannot be narrower than what it calls, so a `&Ui` helper is a budget floor under every
     file that reaches it; look down the call graph before concluding a function needs the root.
     **The live number is the sum of `BUDGET`, not the "roughly 140" above**, which describes the
-    state the gate found and by design never moves. That sum went **206 → 151** over this run:
-    `table_designer.rs` 29 → 26 → 10, `object_editor.rs` 14 → 5, `routine_editor.rs` 12 → 6,
-    `event_editor.rs` 11 → 5, `trigger_editor.rs` 11 → 8, `view_editor.rs` 10 → 6,
+    state the gate found and by design never moves. That sum went **206 → 143** over this run:
+    `table_designer.rs` 29 → 26 → 10 → 4, `object_editor.rs` 14 → 5 → 4, `routine_editor.rs` 12 → 6,
+    `event_editor.rs` 11 → 5, `trigger_editor.rs` 11 → 8 → 7, `view_editor.rs` 10 → 6,
     `database_editor.rs` 7 → 3, `ddl_preview.rs` 6 → 4, `overlays.rs` 15 → 13. Every step is
     recorded against its own entry with what it narrowed *to*, so read the list for where a file
     stands rather than inferring it from a paragraph.
