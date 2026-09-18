@@ -42,17 +42,15 @@ pub use session::{Outcome, Session};
 
 use std::collections::HashMap;
 
-use futures_util::StreamExt;
-use mysql_async::consts::{ColumnFlags, ColumnType};
+use mysql_async::consts::ColumnFlags;
 use mysql_async::prelude::Queryable;
 use mysql_async::{Column as MyColumn, Conn, Row, Value as MyValue};
 use mysql_async::{OptsBuilder, Params};
 use schemaic_core::activity::{self, KillKind, SessionInfo};
 use schemaic_core::blob::{BlobRef, BlobValue, FETCH_CAP};
 use schemaic_core::model::{
-    CellEdit, Column, ColumnFlags as CoreColFlags, ColumnOrigin, GridWrite, RefetchRow,
-    RefetchTemplate, ResultBuilder, ResultSet, Rollback, RowDelete, RowEdit, RowInsert, Value,
-    WriteStep, binary_display, one_row_verdict,
+    CellEdit, Column, GridWrite, RefetchRow, RefetchTemplate, ResultBuilder, ResultSet, Rollback,
+    RowDelete, RowEdit, RowInsert, Value, WriteStep, one_row_verdict,
 };
 use schemaic_core::schema::{
     ColumnInfo, DbSchema, EventSource, ForeignKeyInfo, IndexInfo, TableInfo, TriggerSource,
@@ -60,6 +58,13 @@ use schemaic_core::schema::{
 use schemaic_core::stats::{SchemaStats, count_rows_sql};
 use schemaic_core::users::{self, Grants, Principal};
 use tokio_util::sync::CancellationToken;
+
+// **Reached back into the engine module, which is the wrong direction** — and
+// temporary. The write-back paths below (`refetch_on` and its neighbours) are
+// the last MySQL bodies still in this file; they move in the next step and take
+// these three with them. Listed here rather than spelled `mysql::` at each call
+// site so that the day they leave, this import is what fails.
+use crate::mysql::{convert_row, fractional_scales, map_column};
 
 #[derive(Debug, thiserror::Error)]
 pub enum DbError {
@@ -209,10 +214,6 @@ impl RowDest {
 fn writer_gone() -> DbError {
     DbError::Query("the export stopped reading".to_string())
 }
-
-/// The binary collation id (`binary`) — a column with this charset holds raw
-/// bytes (BLOB/BINARY/VARBINARY) rather than text.
-const BINARY_CHARSET: u16 = 63;
 
 /// What an engine module has to answer, by name.
 ///
@@ -812,24 +813,7 @@ impl Db {
         let mut rs = match self.engine {
             Engine::Postgres => pg::fetch_query(self, database, sql, dest, cancel).await?,
             Engine::Sqlite => sqlite::fetch_query(self, sql, dest, cancel).await?,
-            Engine::MySql => {
-                let mut conn = self.open(database, false).await?;
-                // The connection id, so a second connection can KILL its in-flight query.
-                let conn_id = conn.id();
-
-                let outcome = tokio::select! {
-                    // `early_stop`: this connection is torn down right after, so we can bail
-                    // out of the row stream at the cap without draining the rest.
-                    r = collect_rows(&mut conn, sql, dest, true) => r,
-                    _ = cancel.cancelled() => {
-                        self.kill_query(conn_id).await;
-                        Err(DbError::Cancelled)
-                    }
-                };
-
-                let _ = conn.disconnect().await;
-                outcome?
-            }
+            Engine::MySql => mysql::fetch_query(self, database, sql, dest, cancel).await?,
         };
         // A SQLite connection has exactly one database and the caller passes none,
         // so the label comes from the engine rather than from a scope nobody set.
@@ -892,18 +876,10 @@ impl Db {
                     );
                     return self.fetch_query(None, &sql, limit, cancel).await;
                 }
-                Engine::MySql => {}
+                Engine::MySql => {
+                    mysql::fetch_table(self, database, schema, table, order_by, limit, cancel).await
+                }
             }
-            // MySQL has no namespace level — the database already is one.
-            debug_assert!(schema.is_none(), "MySQL tables carry no namespace");
-            let sql = format!(
-                "SELECT * FROM {}.{}{} LIMIT {}",
-                ident(database),
-                ident(table),
-                order_by_clause(order_by, ident),
-                limit
-            );
-            self.fetch_query(Some(database), &sql, limit, cancel).await
         };
         tokio::time::timeout(PING_TIMEOUT, fetch)
             .await
@@ -913,7 +889,7 @@ impl Db {
 
 /// A plan's row count is tiny (classic EXPLAIN) or one big row (tree-format
 /// `EXPLAIN ANALYZE`); this cap is only a backstop.
-const EXPLAIN_ROW_CAP: usize = 10_000;
+pub(crate) const EXPLAIN_ROW_CAP: usize = 10_000;
 
 impl Db {
     /// Run `EXPLAIN sql` (or `EXPLAIN ANALYZE sql`) and return the plan as a
@@ -964,58 +940,8 @@ impl Db {
                     .fetch_query(database, &plan, EXPLAIN_ROW_CAP, cancel)
                     .await;
             }
-            Engine::MySql => {}
+            Engine::MySql => mysql::explain(self, database, sql, analyze, cancel).await,
         }
-        let (primary, fallback) = explain_commands(sql, analyze);
-        if !analyze {
-            return self
-                .fetch_query(database, &primary, EXPLAIN_ROW_CAP, cancel)
-                .await;
-        }
-        match self
-            .explain_in_rolled_back_tx(database, &primary, cancel.clone())
-            .await
-        {
-            // MariaDB: `EXPLAIN ANALYZE` is invalid — retry with `ANALYZE <stmt>`.
-            Err(DbError::Query(_)) if fallback.is_some() => {
-                self.explain_in_rolled_back_tx(database, &fallback.unwrap(), cancel)
-                    .await
-            }
-            other => other,
-        }
-    }
-
-    /// Run one analyzing-EXPLAIN command on a single connection, wrapped in a
-    /// transaction that is always rolled back. Separate from [`Db::fetch_query`]
-    /// because that opens a fresh connection per call, which would put the
-    /// `BEGIN`, the measurement and the `ROLLBACK` on three different sessions.
-    async fn explain_in_rolled_back_tx(
-        &self,
-        database: Option<&str>,
-        cmd: &str,
-        cancel: CancellationToken,
-    ) -> Result<ResultSet, DbError> {
-        let mut conn = self.open(database, false).await?;
-        let conn_id = conn.id();
-        if let Err(e) = conn.query_drop("BEGIN").await {
-            let _ = conn.disconnect().await;
-            return Err(DbError::Query(e.to_string()));
-        }
-
-        let mut dest = RowDest::Capped(EXPLAIN_ROW_CAP);
-        let outcome = tokio::select! {
-            r = collect_rows(&mut conn, cmd, &mut dest, true) => r,
-            _ = cancel.cancelled() => {
-                self.kill_query(conn_id).await;
-                Err(DbError::Cancelled)
-            }
-        };
-
-        // Unconditional. Dropping the connection would roll back too, but saying
-        // so explicitly is what makes the guarantee readable at the call site.
-        let _ = conn.query_drop("ROLLBACK").await;
-        let _ = conn.disconnect().await;
-        outcome
     }
 
     /// Validate `sql` against the server **without executing it**: prepare it via
@@ -1187,49 +1113,10 @@ impl Db {
             return Ok(());
         }
         match self.engine {
-            Engine::Postgres => return pg::prepare_check(self, database, sql).await,
-            Engine::Sqlite => return sqlite::prepare_check(self, stmt).await,
-            Engine::MySql => {}
+            Engine::Postgres => pg::prepare_check(self, database, sql).await,
+            Engine::Sqlite => sqlite::prepare_check(self, stmt).await,
+            Engine::MySql => mysql::prepare_check(self, database, stmt).await,
         }
-        let mut conn = self.open(database, false).await?;
-        let result = match conn.prep(stmt).await {
-            Ok(prepared) => {
-                let _ = conn.close(prepared).await;
-                Ok(())
-            }
-            Err(e) => {
-                let msg = e.to_string();
-                // 1295 = "not supported in the prepared statement protocol": we
-                // can't validate it, so don't flag a false error.
-                if msg.contains("1295")
-                    || msg
-                        .to_ascii_lowercase()
-                        .contains("prepared statement protocol")
-                {
-                    Ok(())
-                } else {
-                    Err(DbError::Query(msg))
-                }
-            }
-        };
-        let _ = conn.disconnect().await;
-        result
-    }
-}
-
-/// The `EXPLAIN`/`ANALYZE` command(s) for `sql`: the statement is trimmed of a
-/// trailing `;`, then wrapped. Returns `(primary, fallback)` — for `analyze` the
-/// fallback is MariaDB's `ANALYZE <stmt>` (MySQL uses `EXPLAIN ANALYZE`); plain
-/// `EXPLAIN` has no fallback. Pure so the wrapping/fallback logic is unit-tested.
-fn explain_commands(sql: &str, analyze: bool) -> (String, Option<String>) {
-    let stmt = sql.trim().trim_end_matches(';').trim_end();
-    if analyze {
-        (
-            format!("EXPLAIN ANALYZE {stmt}"),
-            Some(format!("ANALYZE {stmt}")),
-        )
-    } else {
-        (format!("EXPLAIN {stmt}"), None)
     }
 }
 
@@ -1269,7 +1156,7 @@ impl Db {
         let dialect = self.engine.dialect();
         let scope = std::sync::Arc::new(std::sync::Mutex::new(database.map(str::to_string)));
         let stamp = scope.clone();
-        let mut on_result = {
+        let on_result = {
             let mut inner = on_result;
             move |i: usize, r: Result<ResultSet, DbError>| {
                 inner(
@@ -1284,7 +1171,6 @@ impl Db {
         match self.engine {
             Engine::Postgres => {
                 pg::run_batch(self, database, stmts, row_cap, cancel, on_result).await;
-                return;
             }
             Engine::Sqlite => {
                 // **One connection, like the other two arms and like this
@@ -1303,66 +1189,22 @@ impl Db {
                 // The `scope` stamping above is still a no-op for an engine with
                 // one database.
                 sqlite::run_batch(self, stmts, row_cap, cancel, on_result).await;
-                return;
             }
-            Engine::MySql => {}
+            // `scope` and the dialect go across because `USE` is MySQL's alone —
+            // see `mysql::run_batch` for why one engine's arm takes two
+            // arguments its peers do not.
+            Engine::MySql => {
+                mysql::run_batch(
+                    self, database, stmts, row_cap, cancel, on_result, scope, dialect,
+                )
+                .await;
+            }
         }
-        let mut conn = match self.open(database, false).await {
-            Ok(c) => c,
-            Err(e) => {
-                // Couldn't even connect: fail the first statement, cancel the rest.
-                for (i, _) in stmts.iter().enumerate() {
-                    on_result(
-                        i,
-                        if i == 0 {
-                            Err(err_clone(&e))
-                        } else {
-                            Err(DbError::Cancelled)
-                        },
-                    );
-                }
-                return;
-            }
-        };
-        let conn_id = conn.id();
-
-        let mut stopped = false;
-        for (i, sql) in stmts.iter().enumerate() {
-            if stopped || cancel.is_cancelled() {
-                on_result(i, Err(DbError::Cancelled));
-                continue;
-            }
-            let mut dest = RowDest::Capped(row_cap);
-            let outcome = tokio::select! {
-                // `early_stop = false`: the connection is reused for the next
-                // statement, so a truncated result must be drained fully to leave
-                // the connection clean.
-                r = collect_rows(&mut conn, sql, &mut dest, false) => r,
-                _ = cancel.cancelled() => {
-                    self.kill_query(conn_id).await;
-                    Err(DbError::Cancelled)
-                }
-            };
-            if outcome.is_err() {
-                stopped = true;
-            }
-            // Before the sink, so a `USE` labels its own (empty) result with the
-            // database it moved to — which is what the statement did.
-            if outcome.is_ok()
-                && schemaic_core::sql::leading_keyword(sql, dialect).as_deref() == Some("USE")
-                && let Ok(mut scope) = scope.lock()
-            {
-                *scope = schemaic_core::sql::use_target(sql, dialect);
-            }
-            on_result(i, outcome);
-        }
-
-        let _ = conn.disconnect().await;
     }
 }
 
 /// `DbError` isn't `Clone`; this reproduces one for the "connect failed" fan-out.
-fn err_clone(e: &DbError) -> DbError {
+pub(crate) fn err_clone(e: &DbError) -> DbError {
     match e {
         DbError::Connect(s) => DbError::Connect(s.clone()),
         DbError::Query(s) => DbError::Query(s.clone()),
@@ -1424,20 +1266,9 @@ impl Db {
                     Err(_) => Err(DbError::Connect("timed out".to_string())),
                 };
             }
-            Engine::MySql => {}
+            // Bounded inside, like its two neighbours — see `mysql::ping`.
+            Engine::MySql => mysql::ping(self, timeout).await,
         }
-        let check = async {
-            let mut conn = self.open(None, false).await?;
-            let r = conn
-                .query_drop("SELECT 1")
-                .await
-                .map_err(|e| DbError::Query(e.to_string()));
-            let _ = conn.disconnect().await;
-            r
-        };
-        tokio::time::timeout(timeout, check)
-            .await
-            .map_err(|_| DbError::Connect("timed out".to_string()))?
     }
 
     /// List the user databases on a server (excludes the built-in system schemas),
@@ -1454,28 +1285,10 @@ impl Db {
             // Both already bounded inside, and PostgreSQL's needs to be bounded
             // *around* the sequence rather than per attempt: `connect_maintenance`
             // tries three candidate databases in turn.
-            Engine::Postgres => return pg::fetch_databases(self).await,
-            Engine::Sqlite => return sqlite::fetch_databases(self).await,
-            Engine::MySql => {}
+            Engine::Postgres => pg::fetch_databases(self).await,
+            Engine::Sqlite => sqlite::fetch_databases(self).await,
+            Engine::MySql => mysql::fetch_databases(self).await,
         }
-        let listing = async {
-            let mut conn = self.open(None, false).await?;
-            let out = conn
-                .query_map(
-                    "SELECT CAST(SCHEMA_NAME AS CHAR) AS n FROM information_schema.SCHEMATA \
-                 WHERE SCHEMA_NAME NOT IN \
-                   ('information_schema','mysql','performance_schema','sys') \
-                 ORDER BY SCHEMA_NAME",
-                    |n: String| n,
-                )
-                .await
-                .map_err(|e| DbError::Query(e.to_string()));
-            let _ = conn.disconnect().await;
-            out
-        };
-        tokio::time::timeout(PING_TIMEOUT, listing)
-            .await
-            .map_err(|_| DbError::Connect("timed out".to_string()))?
     }
 
     /// Introspect one database's schema (tables → columns + indexes) via
@@ -1578,26 +1391,10 @@ impl Db {
     ) -> Result<u64, DbError> {
         let sql = count_rows_sql(schema, table, self.engine.dialect());
         match self.engine {
-            Engine::Postgres => return pg::count_rows(self, database, &sql, cancel).await,
-            Engine::Sqlite => return sqlite::count_rows(self, &sql, cancel).await,
-            Engine::MySql => {}
+            Engine::Postgres => pg::count_rows(self, database, &sql, cancel).await,
+            Engine::Sqlite => sqlite::count_rows(self, &sql, cancel).await,
+            Engine::MySql => mysql::count_rows(self, database, &sql, cancel).await,
         }
-        let mut conn = self.open(Some(database), false).await?;
-        // The connection id, so a second connection can KILL the scan — the same
-        // shape `fetch_query` uses, and the only thing that actually stops work
-        // already running on the server.
-        let conn_id = conn.id();
-        let out = tokio::select! {
-            r = conn.query_first::<u64, _>(sql) => r
-                .map_err(|e| DbError::Query(e.to_string()))
-                .and_then(|n| n.ok_or_else(|| DbError::Query("COUNT(*) returned no row".into()))),
-            _ = cancel.cancelled() => {
-                self.kill_query(conn_id).await;
-                Err(DbError::Cancelled)
-            }
-        };
-        let _ = conn.disconnect().await;
-        out
     }
 
     /// Every session currently connected to this server, with the lock waits
@@ -1962,471 +1759,6 @@ pub(crate) fn assemble_schema(
         tables,
         ..Default::default()
     }
-}
-
-/// Run the (unprepared, text-protocol) statement, stopping at the row cap, and
-/// materialize it into a [`ResultSet`]. When `early_stop` is true, the row
-/// stream is abandoned as soon as the cap is hit (the caller tears the
-/// connection down); when false, the rest is drained so the connection stays
-/// reusable for the next statement in a batch.
-pub(crate) async fn collect_rows(
-    conn: &mut Conn,
-    sql: &str,
-    dest: &mut RowDest,
-    early_stop: bool,
-) -> Result<ResultSet, DbError> {
-    let row_cap = dest.cap();
-    let qerr = |e: mysql_async::Error| DbError::Query(e.to_string());
-    let start = std::time::Instant::now();
-
-    let mut result = conn.query_iter(sql).await.map_err(qerr)?;
-
-    // Column metadata arrives before any rows, and is present even for a
-    // zero-row SELECT. A statement that returns no result set (DML/DDL) has no
-    // columns — that's how we tell a grid apart from an affected-rows outcome.
-    let columns: Vec<Column> = result.columns_ref().iter().map(map_column).collect();
-
-    if columns.is_empty() {
-        let affected = result.affected_rows();
-        // Drain the (empty) result so the connection is clean.
-        let _ = result.collect::<Row>().await;
-        return Ok(
-            ResultSet::affected_rows(columns, affected).with_elapsed(start.elapsed().as_millis())
-        );
-    }
-
-    // Which columns hold raw bytes, answered **once for the result** rather than
-    // once per cell. `Column::is_binary` splits a type name and walks a keyword
-    // list; at the 200k-row cap on a wide result that is tens of millions of
-    // calls in the row loop, for an answer that cannot change between rows.
-    let binary: Vec<bool> = columns.iter().map(Column::is_binary).collect();
-    // Every value here arrives as `Bytes`, so nothing reads this — hoisted with
-    // its siblings because `convert_row` is one function and a caller that
-    // *could* hit a typed arm must not be the one that forgot to supply it.
-    let scale = fractional_scales(result.columns_ref());
-    // Likewise unread on this path — the padding is already in the bytes the
-    // server sent — and supplied for the same reason: one function, one set of
-    // per-column facts, whichever protocol the caller is on.
-    let zerofill = zerofill_widths(result.columns_ref());
-    // Hoisted for the same reason, and asked of the type name only: a bit-field's
-    // bytes are a number, and nothing but the column says so.
-    let bit: Vec<bool> = columns
-        .iter()
-        .map(|c| schemaic_core::model::type_is_bit(&c.type_name))
-        .collect();
-    // And how each column's text parses, for the same reason and with the
-    // same lifetime — see `convert_row`.
-    let kinds: Vec<NumKind> = columns.iter().map(|c| num_kind(&c.type_name)).collect();
-    // Assemble the result columnar, one row at a time, so we never hold a
-    // row-major `Vec<Vec<Value>>` copy alongside the final storage.
-    let chunk_capacity = dest.chunk_capacity();
-    let mut builder = ResultBuilder::with_capacity(columns, chunk_capacity);
-    let mut truncated = false;
-    if let Some(mut stream) = result.stream::<Row>().await.map_err(qerr)? {
-        while let Some(row) = stream.next().await {
-            let row = row.map_err(qerr)?;
-            if builder.row_count() < row_cap {
-                let cells = convert_row(
-                    &row,
-                    builder.columns(),
-                    &binary,
-                    &bit,
-                    &scale,
-                    &kinds,
-                    &zerofill,
-                );
-                builder.push_row(&cells);
-                // A stream hands the block over here and keeps reading into an
-                // empty builder; a capped read never fills a chunk, so this is
-                // dead weight for it and nothing more.
-                if dest.chunk_full(builder.row_count(), builder.text_bytes()) {
-                    dest.flush(&mut builder, chunk_capacity).await?;
-                }
-            } else {
-                // A row beyond the cap exists → the result is truncated.
-                truncated = true;
-                if early_stop {
-                    break;
-                }
-                // else: keep draining (discarding) to leave the conn clean.
-            }
-        }
-    }
-
-    // The tail: a stream's last block is usually short and may be empty, and the
-    // export needs that last block even when it is — the columns for its header
-    // come from the first chunk, and a table with no rows has only this one. Not
-    // reached by a statement that returns no columns at all, which returned
-    // above; `Db::stream_query` refuses those rather than letting the writer see
-    // an empty stream and call the file finished.
-    dest.flush(&mut builder, 0).await?;
-    builder.set_truncated(truncated);
-    builder.set_elapsed(start.elapsed().as_millis());
-    Ok(builder.finish())
-}
-
-/// Map a wire column definition to our [`Column`], capturing its origin
-/// (real database/table/column + key flags) when the server reports one.
-/// Expression/aggregate/literal columns carry an empty `org_table`, which we
-/// surface as `origin: None` — the signal that such a column is not editable.
-fn map_column(c: &MyColumn) -> Column {
-    let type_name = type_name_of(c);
-    let binary = is_binary_data_type(&type_name);
-    let f = c.flags();
-    let flags = CoreColFlags {
-        primary_key: f.contains(ColumnFlags::PRI_KEY_FLAG),
-        unique_key: f.contains(ColumnFlags::UNIQUE_KEY_FLAG),
-        not_null: f.contains(ColumnFlags::NOT_NULL_FLAG),
-        auto_increment: f.contains(ColumnFlags::AUTO_INCREMENT_FLAG),
-        no_default: f.contains(ColumnFlags::NO_DEFAULT_VALUE_FLAG),
-    };
-    let origin = column_origin(
-        &c.schema_str(),
-        &c.org_table_str(),
-        &c.org_name_str(),
-        flags,
-        binary,
-    );
-    Column {
-        name: c.name_str().to_string(),
-        type_name,
-        origin,
-    }
-}
-
-/// Is the resolved SQL type a *binary-data* column (raw bytes), not merely
-/// "binary charset"? Numeric / temporal columns also report charset 63, so this
-/// keys off the resolved type name. Such values can't round-trip through the
-/// text protocol losslessly, so the editing system treats them as read-only.
-///
-/// The list itself lives in `core::model::type_is_binary`, which is the same
-/// question the export path asks of a column with no wire provenance to consult
-/// — a second copy here is how the two would come to disagree.
-fn is_binary_data_type(type_name: &str) -> bool {
-    schemaic_core::model::type_is_binary(type_name)
-}
-
-/// Build a column's [`ColumnOrigin`] from its wire provenance, or `None` when
-/// `org_table` is empty — an expression/aggregate/literal with no single base
-/// column, the signal that such a column is not editable.
-fn column_origin(
-    schema: &str,
-    org_table: &str,
-    org_name: &str,
-    flags: CoreColFlags,
-    binary: bool,
-) -> Option<ColumnOrigin> {
-    if org_table.is_empty() {
-        return None;
-    }
-    Some(ColumnOrigin {
-        database: schema.to_string(),
-        // MySQL has no namespace between database and table — `schema` here is
-        // the wire protocol's `org_schema`, i.e. the database.
-        schema: None,
-        table: org_table.to_string(),
-        column: org_name.to_string(),
-        flags,
-        binary,
-        // MySQL's own row identity is always a column of the table; it has no
-        // analogue of SQLite's `rowid`.
-        implicit_key: false,
-    })
-}
-
-/// Reconstruct a human SQL type name (`VARCHAR`, `INT UNSIGNED`, `DATETIME`, …)
-/// from the wire column type + flags + charset — matching what the old sqlx
-/// `type_info().name()` produced, so `parse_typed` and the UI keep behaving.
-fn type_name_of(c: &MyColumn) -> String {
-    resolve_type_name(
-        c.column_type(),
-        c.flags().contains(ColumnFlags::UNSIGNED_FLAG),
-        c.character_set() == BINARY_CHARSET,
-        c.flags().contains(ColumnFlags::ZEROFILL_FLAG),
-    )
-}
-
-/// Pure core of [`type_name_of`]: map a wire column type + UNSIGNED flag + binary
-/// charset to a human SQL type name. Split out so the mapping (which drives
-/// `parse_typed` and editability) is unit-tested without a wire column object.
-///
-/// **`ZEROFILL` is here because it changes what a value *is* over the wire**,
-/// not merely how it was declared: the server renders such a column padded to
-/// its display width (`0007`), and the type name is the only thing
-/// [`num_kind`] is given to decide whether the cell's text is the value.
-fn resolve_type_name(ct: ColumnType, unsigned: bool, binary: bool, zerofill: bool) -> String {
-    let base = match ct {
-        ColumnType::MYSQL_TYPE_TINY => "TINYINT",
-        ColumnType::MYSQL_TYPE_SHORT => "SMALLINT",
-        ColumnType::MYSQL_TYPE_INT24 => "MEDIUMINT",
-        ColumnType::MYSQL_TYPE_LONG => "INT",
-        ColumnType::MYSQL_TYPE_LONGLONG => "BIGINT",
-        ColumnType::MYSQL_TYPE_FLOAT => "FLOAT",
-        ColumnType::MYSQL_TYPE_DOUBLE => "DOUBLE",
-        ColumnType::MYSQL_TYPE_DECIMAL | ColumnType::MYSQL_TYPE_NEWDECIMAL => "DECIMAL",
-        ColumnType::MYSQL_TYPE_YEAR => "YEAR",
-        ColumnType::MYSQL_TYPE_BIT => "BIT",
-        ColumnType::MYSQL_TYPE_TIMESTAMP | ColumnType::MYSQL_TYPE_TIMESTAMP2 => "TIMESTAMP",
-        ColumnType::MYSQL_TYPE_DATE | ColumnType::MYSQL_TYPE_NEWDATE => "DATE",
-        ColumnType::MYSQL_TYPE_TIME | ColumnType::MYSQL_TYPE_TIME2 => "TIME",
-        ColumnType::MYSQL_TYPE_DATETIME | ColumnType::MYSQL_TYPE_DATETIME2 => "DATETIME",
-        ColumnType::MYSQL_TYPE_JSON => "JSON",
-        ColumnType::MYSQL_TYPE_ENUM => "ENUM",
-        ColumnType::MYSQL_TYPE_SET => "SET",
-        ColumnType::MYSQL_TYPE_GEOMETRY => "GEOMETRY",
-        ColumnType::MYSQL_TYPE_VAR_STRING | ColumnType::MYSQL_TYPE_VARCHAR => {
-            if binary {
-                "VARBINARY"
-            } else {
-                "VARCHAR"
-            }
-        }
-        ColumnType::MYSQL_TYPE_STRING => {
-            if binary {
-                "BINARY"
-            } else {
-                "CHAR"
-            }
-        }
-        ColumnType::MYSQL_TYPE_TINY_BLOB => {
-            if binary {
-                "TINYBLOB"
-            } else {
-                "TINYTEXT"
-            }
-        }
-        ColumnType::MYSQL_TYPE_MEDIUM_BLOB => {
-            if binary {
-                "MEDIUMBLOB"
-            } else {
-                "MEDIUMTEXT"
-            }
-        }
-        ColumnType::MYSQL_TYPE_LONG_BLOB => {
-            if binary {
-                "LONGBLOB"
-            } else {
-                "LONGTEXT"
-            }
-        }
-        ColumnType::MYSQL_TYPE_BLOB => {
-            if binary {
-                "BLOB"
-            } else {
-                "TEXT"
-            }
-        }
-        ColumnType::MYSQL_TYPE_NULL => "NULL",
-        _ => "UNKNOWN",
-    };
-    // MySQL reports UNSIGNED only for the numeric types.
-    let numeric = matches!(
-        ct,
-        ColumnType::MYSQL_TYPE_TINY
-            | ColumnType::MYSQL_TYPE_SHORT
-            | ColumnType::MYSQL_TYPE_INT24
-            | ColumnType::MYSQL_TYPE_LONG
-            | ColumnType::MYSQL_TYPE_LONGLONG
-            | ColumnType::MYSQL_TYPE_FLOAT
-            | ColumnType::MYSQL_TYPE_DOUBLE
-            | ColumnType::MYSQL_TYPE_DECIMAL
-            | ColumnType::MYSQL_TYPE_NEWDECIMAL
-    );
-    let mut name = base.to_string();
-    if numeric && unsigned {
-        name.push_str(" UNSIGNED");
-    }
-    if numeric && zerofill {
-        name.push_str(" ZEROFILL");
-    }
-    name
-}
-
-/// Convert one wire row into our typed cells. Over the text protocol every
-/// non-NULL value arrives as `Bytes` (its textual form), so we parse it with the
-/// column's type exactly as the old code did; the typed arms cover the binary
-/// protocol defensively.
-///
-/// `binary[i]` is whether column `i` holds raw bytes, computed **once for the
-/// result** by the caller: `Column::is_binary` splits a type name and walks a
-/// keyword list, which is not an answer to re-derive per cell in a loop that
-/// runs up to the row cap times the column count.
-///
-/// **A raw-bytes column is the exception, and it used to be a data bug.** A
-/// BLOB/BINARY/BIT value arrives as its literal bytes, and
-/// `from_utf8_lossy`-ing those produced mojibake that *looks like data* — so a
-/// CSV or `INSERT` export wrote the replacement characters as the value and
-/// re-imported as the wrong bytes. It renders as `binary_display` now, the same
-/// `<n bytes>` SQLite and PostgreSQL show, which says what it is and cannot be
-/// mistaken for the value.
-fn convert_row(
-    row: &Row,
-    columns: &[Column],
-    binary: &[bool],
-    bit: &[bool],
-    scale: &[u32],
-    kinds: &[NumKind],
-    zerofill: &[Option<usize>],
-) -> Vec<Value> {
-    (0..columns.len())
-        .map(|i| match row.as_ref(i) {
-            None | Some(MyValue::NULL) => Value::Null,
-            Some(MyValue::Bytes(b)) if binary.get(i).copied().unwrap_or(false) => {
-                Value::Str(binary_display(b.len()))
-            }
-            // **A bit-field arrives as bytes and is a number.** Nothing in the
-            // value says so — only the column's type does — and lossy-decoding
-            // those bytes as text is how a `BIT(8)` holding 10 became a newline
-            // character. `bit_value` reads them the way MySQL wrote them and the
-            // way it takes them back.
-            //
-            // `UInt`, not `Str`: the number is the value, and a `Value::Str`
-            // carries a *quoted* literal into every export. `'10'` assigned to a
-            // `BIT` column is the raw bits of its two bytes — 12594 on a
-            // `BIT(16)`, "Data too long" on a `BIT(8)` — so the round trip that
-            // taking `BIT` off the binary list was meant to enable was writing
-            // wrong data instead of withholding it. The grid shows the same
-            // digits either way.
-            Some(MyValue::Bytes(b)) if bit.get(i).copied().unwrap_or(false) => {
-                schemaic_core::model::bit_cell(b)
-            }
-            // **`parse_as` with a kind computed once, not `parse_typed`.**
-            // `parse_typed` is `parse_as(num_kind(type_name), s)`, and
-            // `num_kind` opens by uppercasing the type name — a heap
-            // allocation — then walks up to eight `starts_with` scans and a
-            // `contains`, for an answer that is a property of the *column*
-            // and cannot vary between rows. Both docs say so: `num_kind`'s
-            // reads "Called once per column", and `parse_typed`'s says "What
-            // a row loop should call is `parse_as` with a kind it computed
-            // once". This is the row loop. `binary` and `bit` above are
-            // hoisted for exactly this reason, with a comment pricing it at
-            // "tens of millions of calls in the row loop" at the 200k cap on
-            // a wide result.
-            Some(MyValue::Bytes(b)) => parse_as(
-                kinds.get(i).copied().unwrap_or(NumKind::Text),
-                String::from_utf8_lossy(b).into_owned(),
-            ),
-            // **The one integer the binary protocol renders differently.** A
-            // `ZEROFILL` column arrives here as a bare number while the text
-            // protocol sent it padded, so it is re-rendered to the column's
-            // display width — see `zerofill_value`. Every other column has
-            // `None` and passes straight through.
-            Some(MyValue::Int(n)) => zerofill_value(
-                Value::Int(*n),
-                zerofill.get(i).copied().flatten(),
-                scale.get(i).copied().unwrap_or(0),
-            ),
-            Some(MyValue::UInt(n)) => zerofill_value(
-                Value::UInt(*n),
-                zerofill.get(i).copied().flatten(),
-                scale.get(i).copied().unwrap_or(0),
-            ),
-            // A `ZEROFILL` double is padded here for the same reason an integer
-            // is — see `zerofill_value`. Without the width it is the bare float,
-            // exactly as before.
-            Some(MyValue::Double(f)) => zerofill_value(
-                Value::Float(*f),
-                zerofill.get(i).copied().flatten(),
-                scale.get(i).copied().unwrap_or(0),
-            ),
-            // A `ZEROFILL` `FLOAT`, for the same reason as the `DOUBLE` above.
-            // Without the width this falls through to `binary_as_text`, whose
-            // `f32` rendering is deliberate and unchanged — which is why the
-            // arm is guarded rather than unconditional.
-            Some(MyValue::Float(f)) if zerofill.get(i).copied().flatten().is_some() => {
-                zerofill_value(
-                    Value::Float(f64::from(*f)),
-                    zerofill.get(i).copied().flatten(),
-                    scale.get(i).copied().unwrap_or(0),
-                )
-            }
-            // **The binary protocol's own shapes, rendered the way the text
-            // protocol renders the same column.** See `binary_as_text`; the
-            // catch-all below is `as_sql`, which is a *SQL literal* and not what
-            // the load produced.
-            Some(other) => match binary_as_text(
-                other,
-                &columns[i].type_name,
-                scale.get(i).copied().unwrap_or(0),
-            ) {
-                Some(text) => parse_typed(text, &columns[i].type_name),
-                None => Value::Str(other.as_sql(false).trim_matches('\'').to_string()),
-            },
-        })
-        .collect()
-}
-
-/// One binary-protocol value as the **text protocol's** rendering of the same
-/// column — or `None` for a shape that needs no translation.
-///
-/// **The two protocols are two different readings of one row, and this app uses
-/// both.** `collect_rows` loads a result with `query_iter` (text), where every
-/// value arrives as `Bytes` and `parse_typed` keeps the server's own characters;
-/// `refetch_on` re-reads one row with `exec_iter` (binary, because it is a
-/// prepared statement with the key bound), where MySQL sends `DATETIME` as
-/// `Date`, `TIME` as `Time` and `FLOAT` as an `f32`. Those fell to `convert_row`'s
-/// catch-all, `MyValue::as_sql`, which renders a **SQL literal** rather than the
-/// text form: `mysql_common` prints a `Date` with a zero time as `'YYYY-MM-DD'`
-/// and a `Time` as `'{:03}:{:02}:{:02}'`.
-///
-/// So on MariaDB 10.11.14 and MySQL 8.4.11, editing one column of
-/// `(1, 'a', '2024-01-15 00:00:00', '10:30:00', 3.14)` and committing spliced
-/// the row back with `2024-01-15`, `010:30:00` and `3.140000104904175` in three
-/// cells the user never touched — measured. Re-running the query restored them,
-/// so the grid disagreed with itself about the same row, and a CSV, clipboard or
-/// `INSERT` export taken in between wrote the wrong text out.
-///
-/// The fraction follows the **column's declared precision**, which is what the
-/// server's own text form does: a `DATETIME(3)` reads `…:00.000` and a bare
-/// `DATETIME` reads `…:00`. An `f32` goes through its shortest round-tripping
-/// text, which is what MySQL prints for a `FLOAT` and what `3.14f32 as f64`
-/// destroys.
-fn binary_as_text(v: &MyValue, type_name: &str, scale: u32) -> Option<String> {
-    let scale = scale.min(6);
-    let frac = |us: u32| match scale {
-        0 => String::new(),
-        n => format!(".{:0>width$}", us / 10u32.pow(6 - n), width = n as usize),
-    };
-    match v {
-        // A bare `DATE` column has no time to print; every other temporal does,
-        // zero or not.
-        MyValue::Date(y, m, d, h, mi, sec, us) => {
-            Some(if type_name.trim().eq_ignore_ascii_case("date") {
-                format!("{y:04}-{m:02}-{d:02}")
-            } else {
-                format!("{y:04}-{m:02}-{d:02} {h:02}:{mi:02}:{sec:02}{}", frac(*us))
-            })
-        }
-        // `TIME` is a *duration*: it runs past 24 hours and can be negative, so
-        // the day part folds into the hours rather than being dropped.
-        MyValue::Time(neg, days, h, mi, sec, us) => {
-            let hours = u32::from(*h) + days * 24;
-            Some(format!(
-                "{}{hours:02}:{mi:02}:{sec:02}{}",
-                if *neg { "-" } else { "" },
-                frac(*us)
-            ))
-        }
-        // `{}` on an `f32` is its shortest round-tripping form, which is what the
-        // server prints. Widening to `f64` first is what produced
-        // `3.140000104904175`.
-        MyValue::Float(f) => Some(f.to_string()),
-        _ => None,
-    }
-}
-
-/// The fractional-seconds precision of each column, off the **wire** rather than
-/// off the type name.
-///
-/// The column-definition packet carries it (`decimals`), and the resolved type
-/// name does not: `type_name_of` builds `DATETIME` from the type code with no
-/// precision in it, so a `DATETIME(3)` and a bare `DATETIME` are indistinguishable
-/// by name. The binary protocol always sends microseconds, so without this a
-/// `DATETIME(3)` holding `.120` came back with no fraction at all and a bare
-/// `DATETIME` would have grown six zeroes — both a cell the user never edited,
-/// changing under them.
-fn fractional_scales(columns: &[MyColumn]) -> Vec<u32> {
-    columns.iter().map(|c| u32::from(c.decimals())).collect()
 }
 
 /// Why a DDL run stopped, and — the part that matters — **how much of it
@@ -2990,7 +2322,7 @@ fn cancelled_write(undone: Rollback) -> DbError {
 /// ` ORDER BY a, b` for the Live Monitor's window, or `""` when there is no key
 /// to order by. `quote` is the engine's identifier quoter, so the two callers
 /// can't drift on quoting.
-fn order_by_clause(cols: Option<&[String]>, quote: fn(&str) -> String) -> String {
+pub(crate) fn order_by_clause(cols: Option<&[String]>, quote: fn(&str) -> String) -> String {
     match cols.filter(|c| !c.is_empty()) {
         Some(cols) => format!(
             " ORDER BY {}",
@@ -3920,7 +3252,7 @@ pub(crate) fn parse_as(kind: NumKind, s: String) -> Value {
 ///
 /// Padding only, never truncation: a value wider than the declared width is the
 /// server's to render, and `format!` leaves it alone.
-fn zerofill_value(v: Value, width: Option<usize>, scale: u32) -> Value {
+pub(crate) fn zerofill_value(v: Value, width: Option<usize>, scale: u32) -> Value {
     let Some(w) = width else {
         return v;
     };
@@ -3942,7 +3274,7 @@ fn zerofill_value(v: Value, width: Option<usize>, scale: u32) -> Value {
 /// Per-column display width for the `ZEROFILL` columns of a result, `None` for
 /// every other column — computed **once for the result**, like
 /// [`fractional_scales`] beside it, because it is a fact about the column.
-fn zerofill_widths(columns: &[MyColumn]) -> Vec<Option<usize>> {
+pub(crate) fn zerofill_widths(columns: &[MyColumn]) -> Vec<Option<usize>> {
     columns
         .iter()
         .map(|c| {
@@ -3968,6 +3300,15 @@ pub(crate) fn parse_typed(s: String, type_name: &str) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // **Tests here reaching into the engine module, which is the wrong
+    // direction** — and temporary, like the production import at the top of this
+    // file. The decoder tests that need these sit interleaved with tests for
+    // `value_to_param`, `build_refetch_sql` and `build_blob_select`, write-back
+    // builders that have not moved yet; the whole block goes across with them
+    // rather than being split by hand now and again later. When it does, this
+    // import is what fails.
+    use crate::mysql::{binary_as_text, resolve_type_name};
+    use mysql_async::consts::ColumnType;
 
     /// **A fourth engine variant is a compiler error; a fourth engine module is
     /// not.** [`ENGINE_ENTRY_POINTS`] is the interface the dispatcher expects by
@@ -5083,133 +4424,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn resolve_type_name_maps_common_types() {
-        let non_binary = false;
-        let plain = false;
-        assert_eq!(
-            resolve_type_name(ColumnType::MYSQL_TYPE_LONG, false, non_binary, plain),
-            "INT"
-        );
-        assert_eq!(
-            resolve_type_name(ColumnType::MYSQL_TYPE_LONGLONG, false, non_binary, plain),
-            "BIGINT"
-        );
-        assert_eq!(
-            resolve_type_name(ColumnType::MYSQL_TYPE_NEWDECIMAL, false, non_binary, plain),
-            "DECIMAL"
-        );
-        assert_eq!(
-            resolve_type_name(ColumnType::MYSQL_TYPE_DATETIME, false, non_binary, plain),
-            "DATETIME"
-        );
-        assert_eq!(
-            resolve_type_name(ColumnType::MYSQL_TYPE_JSON, false, non_binary, plain),
-            "JSON"
-        );
-    }
-
-    #[test]
-    fn resolve_type_name_binary_charset_flips_string_and_blob_types() {
-        // charset 63 (binary) turns text types into their binary counterparts.
-        let plain = false;
-        assert_eq!(
-            resolve_type_name(ColumnType::MYSQL_TYPE_VAR_STRING, false, true, plain),
-            "VARBINARY"
-        );
-        assert_eq!(
-            resolve_type_name(ColumnType::MYSQL_TYPE_VAR_STRING, false, false, plain),
-            "VARCHAR"
-        );
-        assert_eq!(
-            resolve_type_name(ColumnType::MYSQL_TYPE_STRING, false, true, plain),
-            "BINARY"
-        );
-        assert_eq!(
-            resolve_type_name(ColumnType::MYSQL_TYPE_STRING, false, false, plain),
-            "CHAR"
-        );
-        assert_eq!(
-            resolve_type_name(ColumnType::MYSQL_TYPE_BLOB, false, true, plain),
-            "BLOB"
-        );
-        assert_eq!(
-            resolve_type_name(ColumnType::MYSQL_TYPE_BLOB, false, false, plain),
-            "TEXT"
-        );
-    }
-
-    #[test]
-    fn resolve_type_name_unsigned_only_on_numeric_types() {
-        let plain = false;
-        // UNSIGNED suffix appended for numerics…
-        assert_eq!(
-            resolve_type_name(ColumnType::MYSQL_TYPE_LONG, true, false, plain),
-            "INT UNSIGNED"
-        );
-        assert_eq!(
-            resolve_type_name(ColumnType::MYSQL_TYPE_NEWDECIMAL, true, false, plain),
-            "DECIMAL UNSIGNED"
-        );
-        // …but never for non-numeric types, even if the flag is set.
-        assert_eq!(
-            resolve_type_name(ColumnType::MYSQL_TYPE_DATETIME, true, false, plain),
-            "DATETIME"
-        );
-        assert_eq!(
-            resolve_type_name(ColumnType::MYSQL_TYPE_VAR_STRING, true, false, plain),
-            "VARCHAR"
-        );
-    }
-
-    #[test]
-    fn is_binary_data_type_flags_only_raw_byte_types() {
-        for t in [
-            "VARBINARY",
-            "BINARY",
-            "BLOB",
-            "TINYBLOB",
-            "LONGBLOB",
-            "GEOMETRY",
-        ] {
-            assert!(is_binary_data_type(t), "{t} should be binary data");
-        }
-        // Temporal/numeric report charset 63 too, but aren't binary DATA — and
-        // `BIT` is in that company rather than with the blobs: it arrives as
-        // bytes and is a *number*, which `convert_row` reads with `bit_display`
-        // (see `core::model::type_is_bit`). Being on the list above made a
-        // `BIT(8)` read `<1 bytes>`, kept it out of the CSV and JSON exports, and
-        // made the column read-only.
-        for t in [
-            "DATETIME", "INT", "VARCHAR", "TEXT", "JSON", "DECIMAL", "BIT",
-        ] {
-            assert!(!is_binary_data_type(t), "{t} should not be binary data");
-        }
-    }
-
-    #[test]
-    fn column_origin_none_for_empty_org_table() {
-        let flags = CoreColFlags::default();
-        // Expression/aggregate/literal → empty org_table → not editable.
-        assert!(column_origin("db", "", "expr", flags, false).is_none());
-    }
-
-    #[test]
-    fn column_origin_some_carries_provenance_and_flags() {
-        let flags = CoreColFlags {
-            primary_key: true,
-            not_null: true,
-            ..Default::default()
-        };
-        let o = column_origin("shop", "users", "id", flags, false).expect("has base table");
-        assert_eq!(o.database, "shop");
-        assert_eq!(o.table, "users");
-        assert_eq!(o.column, "id");
-        assert!(o.flags.primary_key);
-        assert!(o.flags.not_null);
-        assert!(!o.binary);
-    }
-
     fn s(x: &str) -> String {
         x.to_string()
     }
@@ -5427,26 +4641,6 @@ mod tests {
         let views = [(s("v"), s(""))];
         let schema = assemble_schema(None, &tables, &[], &[], &[], &views);
         assert!(schema.tables[0].view_definition.is_none());
-    }
-
-    #[test]
-    fn explain_commands_plain_has_no_fallback() {
-        let (primary, fallback) = explain_commands("SELECT * FROM t", false);
-        assert_eq!(primary, "EXPLAIN SELECT * FROM t");
-        assert!(fallback.is_none());
-    }
-
-    #[test]
-    fn explain_commands_analyze_offers_mariadb_fallback() {
-        let (primary, fallback) = explain_commands("SELECT 1", true);
-        assert_eq!(primary, "EXPLAIN ANALYZE SELECT 1");
-        assert_eq!(fallback.as_deref(), Some("ANALYZE SELECT 1"));
-    }
-
-    #[test]
-    fn explain_commands_strips_trailing_semicolon_and_space() {
-        let (primary, _) = explain_commands("  SELECT 1 ;  ", false);
-        assert_eq!(primary, "EXPLAIN SELECT 1");
     }
 
     /// This crate's three identifier quoters answer to `core`'s, so the SQL a

@@ -39,7 +39,8 @@ use tokio::sync::Mutex;
 use tokio_postgres::Client;
 use tokio_util::sync::CancellationToken;
 
-use crate::{Db, DbError, Engine, TxScope, blob_on, collect_rows, pg, refetch_on, write_on};
+use crate::mysql::collect_rows;
+use crate::{Db, DbError, Engine, TxScope, blob_on, pg, refetch_on, write_on};
 
 /// An operation's result plus what it means for the enclosing transaction.
 ///
