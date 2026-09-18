@@ -6600,7 +6600,7 @@ pub fn workspace(ui: Ui, window: WindowId) -> impl IntoView {
         // submenu rather than a surface competing with it.
         // Below the menus: a calendar is dismissed by the same press that opens
         // one, and never draws over one.
-        date_pick_overlay(ui.clone()),
+        date_pick_overlay(ui.overlay),
         popup_menu_overlay(ui),
         // **After even the popup menu**, because it draws that menu's own open
         // submenu. A submenu is hoisted out of the row it belongs to and drawn
@@ -14574,7 +14574,11 @@ mod whole_ui_gate {
         ("modals.rs", 5),
         ("monitor_view.rs", 1),
         ("object_editor.rs", 14),
-        ("overlays.rs", 15),
+        // 15 → 13: `confirm_overlay` takes the one `RwSignal` it reads, and
+        // `date_pick_overlay` takes `OverlayUi` (both its signals are in it).
+        // `error_modal_overlay` stays on the root bundle and is the contrast
+        // worth keeping in view — it genuinely reaches five child bundles.
+        ("overlays.rs", 13),
         ("plan_view.rs", 1),
         ("properties.rs", 5),
         ("routine_editor.rs", 12),

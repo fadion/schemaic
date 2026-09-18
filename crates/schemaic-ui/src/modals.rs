@@ -319,7 +319,7 @@ pub(crate) fn modal_layer(ui: Ui, modal_up: impl Fn() -> bool + Copy + 'static) 
         // Its own `absolute().inset(0)` needs a box to resolve against, hence the
         // wrapper — and the wrapper must be out of flow while nothing is asked,
         // or it would eat every click in the app.
-        confirm_overlay(ui.clone()).style(move |s| {
+        confirm_overlay(ui.overlay.confirm).style(move |s| {
             if confirm_up.get().is_some() {
                 s.absolute().inset(0.0)
             } else {

@@ -28,8 +28,8 @@ use crate::widgets::{
     modal_w, panel_style, window_size,
 };
 use crate::{
-    ConnNode, CtxKind, CtxMenu, PopupAnchor, RightPanel, TxChoice, Ui, icons, right_panel_allowed,
-    schema_panel_allowed, search_box, theme,
+    Confirm, ConnNode, CtxKind, CtxMenu, OverlayUi, PopupAnchor, RightPanel, TxChoice, Ui, icons,
+    right_panel_allowed, schema_panel_allowed, search_box, theme,
 };
 
 /// Width of the schema tree's context menu (its panel's `min_width`), which is
@@ -2860,8 +2860,8 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
 /// switch or a closed row panel disposes it. The channel is cleared at every one
 /// of those points, and this reads through `try_get` as the backstop — a
 /// disposed signal closes the panel instead of panicking in a style closure.
-pub(crate) fn date_pick_overlay(ui: Ui) -> impl IntoView {
-    let pick = ui.overlay.date_pick;
+pub(crate) fn date_pick_overlay(ui: OverlayUi) -> impl IntoView {
+    let pick = ui.date_pick;
     let close: Rc<dyn Fn()> = Rc::new(move || pick.set(None));
     let close_child = close.clone();
     // Escape is answered at the window root, because a panel like this is not the
@@ -5149,9 +5149,7 @@ pub(crate) fn tx_prompt_overlay(ui: Ui) -> impl IntoView {
 ///
 /// Generic by design — raise it through [`crate::Confirm`] rather than writing
 /// another one-off modal.
-pub(crate) fn confirm_overlay(ui: Ui) -> impl IntoView {
-    let confirm = ui.overlay.confirm;
-
+pub(crate) fn confirm_overlay(confirm: RwSignal<Option<Confirm>>) -> impl IntoView {
     dyn_container(
         move || confirm.get(),
         move |c| {
