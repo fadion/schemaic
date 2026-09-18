@@ -6310,6 +6310,16 @@ existing prose was left alone.
       than in the view: it trims, like the send icon and Enter and like `user_prompts` itself, and
       the view's own copy did not — so one space in the box refused the recall silently, the row
       disagreeing with itself about whether anything was typed.
+      `regenerate_keep_len` is **Regenerate**'s half of the same territory: how far back to truncate
+      before re-asking — every trailing assistant and error turn *and the user prompt they answered*,
+      because `ai_send` re-adds that prompt and keeping it would show the question twice. Two turns
+      can trail (an answer that streamed and then errored), which is why it is a `rposition` for the
+      last user message rather than a peel of one. It answers a **keep-length**, not a drop-count,
+      so `Vec::truncate` takes it directly: the drop-count spelling is a `len() - n` at the call
+      site, one empty transcript away from an underflow panic. With no user message to re-ask it
+      keeps everything rather than clearing the conversation — the caller refuses earlier anyway,
+      and a decision that is only safe because of its caller is the composition this file's testing
+      rule warns about.
       `ChatMessage::fingerprint` is what the panel's per-message memo compares. The memo held a
       whole `ChatMessage`, so every streamed chunk deep-cloned and deep-compared all N of them —
       over segments that include a tool call's untruncated result — and kept a permanent second

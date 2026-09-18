@@ -337,6 +337,27 @@ pub fn user_prompts(msgs: &[ChatMessage]) -> Vec<String> {
     out
 }
 
+/// How many messages a **Regenerate** keeps — the length to truncate the
+/// transcript to before re-asking.
+///
+/// It drops the trailing assistant and error turns *and the user prompt they
+/// answered*, because `ai_send` re-adds that prompt: keeping it would show the
+/// question twice. Returned as a keep-length rather than a drop-count so the
+/// caller's `Vec::truncate` takes it directly — a drop-count subtracted at the
+/// call site is one `len() - n` away from an underflow panic on an empty
+/// transcript.
+///
+/// `msgs.len()` when there is no user message to regenerate from, which keeps
+/// everything and is the right answer for a transcript that has nothing to
+/// re-ask. The caller already refuses earlier in that case; this does not rely
+/// on it.
+pub fn regenerate_keep_len(msgs: &[ChatMessage]) -> usize {
+    match msgs.iter().rposition(|m| m.role == Role::User) {
+        Some(at) => at,
+        None => msgs.len(),
+    }
+}
+
 /// Step the recall cursor over `len` prompts (index 0 = newest), where `None` is
 /// the empty box the recall started from.
 ///
@@ -667,6 +688,82 @@ mod tests {
     fn user_prompts_of_an_empty_conversation_is_empty() {
         assert!(user_prompts(&[]).is_empty());
         assert!(user_prompts(&[assistant("hi")]).is_empty());
+    }
+
+    // ── regenerate_keep_len ─────────────────────────────────────────────────
+
+    /// The ordinary shape: one completed turn at the end goes, prompt and all,
+    /// because `ai_send` re-adds the prompt.
+    #[test]
+    fn regenerate_drops_the_last_turn_and_the_question_that_asked_it() {
+        let msgs = vec![
+            ChatMessage::user("first".into()),
+            assistant("reply"),
+            ChatMessage::user("second".into()),
+            assistant("reply"),
+        ];
+        assert_eq!(regenerate_keep_len(&msgs), 2);
+    }
+
+    /// **Every trailing non-user message, not just one.** A turn that streamed
+    /// an answer and then errored leaves two, and keeping either would put a
+    /// stale reply above the regenerated one.
+    #[test]
+    fn regenerate_drops_an_answer_and_the_error_that_followed_it() {
+        let msgs = vec![
+            ChatMessage::user("q".into()),
+            assistant("partial"),
+            ChatMessage {
+                role: Role::Error,
+                ..assistant("stream ended")
+            },
+        ];
+        assert_eq!(regenerate_keep_len(&msgs), 0);
+    }
+
+    /// A prompt with no reply yet — the user regenerates a turn that failed to
+    /// produce anything. The prompt itself still goes.
+    #[test]
+    fn regenerate_of_an_unanswered_prompt_drops_the_prompt() {
+        let msgs = vec![
+            ChatMessage::user("a".into()),
+            assistant("reply"),
+            ChatMessage::user("b".into()),
+        ];
+        assert_eq!(regenerate_keep_len(&msgs), 2);
+    }
+
+    /// **Nothing to regenerate keeps everything**, rather than clearing the
+    /// transcript. A keep-length is what makes this safe: the drop-count
+    /// spelling would be `len() - n` and underflow on the empty case.
+    #[test]
+    fn regenerate_with_no_question_to_re_ask_keeps_the_whole_transcript() {
+        assert_eq!(regenerate_keep_len(&[]), 0);
+        let only_replies = vec![assistant("hi"), assistant("there")];
+        assert_eq!(regenerate_keep_len(&only_replies), 2);
+    }
+
+    /// The composition the call site performs, since that is the seam: the
+    /// truncation leaves a transcript whose last message is the *previous*
+    /// turn's answer, ready for `ai_send` to append the re-asked prompt.
+    #[test]
+    fn truncating_to_the_keep_length_leaves_the_turn_before_it_intact() {
+        let mut msgs = vec![
+            ChatMessage::user("first".into()),
+            assistant("kept"),
+            ChatMessage::user("second".into()),
+            assistant("discarded"),
+        ];
+        msgs.truncate(regenerate_keep_len(&msgs));
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs[0].role, Role::User);
+        assert_eq!(msgs[1].segs, vec![Seg::Text("kept".to_string())]);
+        // And it is idempotent in the sense that matters: regenerating twice
+        // walks back two turns rather than panicking or clearing.
+        msgs.truncate(regenerate_keep_len(&msgs));
+        assert!(msgs.is_empty());
+        msgs.truncate(regenerate_keep_len(&msgs));
+        assert!(msgs.is_empty());
     }
 
     #[test]

@@ -10840,12 +10840,8 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             };
             // Remove the last turn from the transcript: the trailing assistant/
             // error message(s) AND the user prompt itself (`ai_send` re-adds it).
-            ai_messages.update(|v| {
-                while v.last().is_some_and(|m| m.role != Role::User) {
-                    v.pop();
-                }
-                v.pop(); // the user prompt being regenerated
-            });
+            // `transcript::regenerate_keep_len` decides how far back that is.
+            ai_messages.update(|v| v.truncate(schemaic_core::transcript::regenerate_keep_len(v)));
             // Drop the live session so the re-ask runs in a FRESH `claude` process
             // — a true regenerate. Re-sending into the existing session left the
             // discarded answer in the model's context, so it just rephrased it
