@@ -990,8 +990,12 @@ pub(crate) fn list_actions(
 }
 
 /// One row of an item list.
+///
+/// Takes the selection signal, not the root bundle: a row is a label, a detail
+/// and "am I the selected index", and `ui.ddl.selected` was every use the whole
+/// `Ui` was carried for.
 pub(crate) fn list_row(
-    ui: Ui,
+    selected: RwSignal<usize>,
     idx: usize,
     label: String,
     detail: String,
@@ -999,7 +1003,7 @@ pub(crate) fn list_row(
     // tint follows a live theme switch.
     icon: Option<crate::widgets::MenuIcon>,
 ) -> impl IntoView {
-    list_row_inner(ui, idx, label, detail, icon, true)
+    list_row_inner(selected, idx, label, detail, icon, true)
 }
 
 /// [`list_row`] for a list where **nothing** carries an icon.
@@ -1007,19 +1011,23 @@ pub(crate) fn list_row(
 /// The icon slot is reserved even when a row has none, so a keyed and an unkeyed
 /// column line up. A list where no row can ever have one — triggers — would just
 /// be indented by a gutter that never fills, so it doesn't reserve it.
-pub(crate) fn list_row_plain(ui: Ui, idx: usize, label: String, detail: String) -> impl IntoView {
-    list_row_inner(ui, idx, label, detail, None, false)
+pub(crate) fn list_row_plain(
+    selected: RwSignal<usize>,
+    idx: usize,
+    label: String,
+    detail: String,
+) -> impl IntoView {
+    list_row_inner(selected, idx, label, detail, None, false)
 }
 
 fn list_row_inner(
-    ui: Ui,
+    selected: RwSignal<usize>,
     idx: usize,
     label: String,
     detail: String,
     icon: Option<crate::widgets::MenuIcon>,
     reserve_icon: bool,
 ) -> impl IntoView {
-    let selected = ui.ddl.selected;
     let mark: AnyView = match icon {
         Some((glyph, color)) => icons::icon(glyph, 13.0)
             .style(move |s| s.color(color()).flex_shrink(0.0_f32))
@@ -1296,11 +1304,12 @@ fn table_section(ui: Ui, target: &DesignerTarget, ring: FocusRing) -> AnyView {
 fn columns_list(ui: Ui, ring: FocusRing) -> AnyView {
     let d = ui.ddl;
     let draft = d.draft.get_untracked();
-    let ui_rows = ui.clone();
+    // The one signal the rows need. Was a `Ui` cloned again per row.
+    let selected = ui.ddl.selected;
     let rows = v_stack_from_iter(draft.columns.iter().enumerate().map(|(i, c)| {
         let is_pk = draft.is_in_primary_key(i);
         list_row(
-            ui_rows.clone(),
+            selected,
             i,
             c.info.name.clone(),
             c.info.type_name.clone(),
@@ -1578,10 +1587,11 @@ fn column_form(ui: Ui, target: &DesignerTarget, ring: FocusRing) -> AnyView {
 fn indexes_list(ui: Ui, ring: FocusRing) -> AnyView {
     let d = ui.ddl;
     let draft = d.draft.get_untracked();
-    let ui_rows = ui.clone();
+    // The one signal the rows need. Was a `Ui` cloned again per row.
+    let selected = ui.ddl.selected;
     let rows = v_stack_from_iter(draft.indexes.iter().enumerate().map(|(i, ix)| {
         list_row(
-            ui_rows.clone(),
+            selected,
             i,
             ix.info.name.clone(),
             if ix.info.unique {
@@ -1780,10 +1790,11 @@ fn index_form(ui: Ui, target: &DesignerTarget, ring: FocusRing) -> AnyView {
 fn fks_list(ui: Ui, ring: FocusRing) -> AnyView {
     let d = ui.ddl;
     let draft = d.draft.get_untracked();
-    let ui_rows = ui.clone();
+    // The one signal the rows need. Was a `Ui` cloned again per row.
+    let selected = ui.ddl.selected;
     let rows = v_stack_from_iter(draft.foreign_keys.iter().enumerate().map(|(i, fk)| {
         list_row(
-            ui_rows.clone(),
+            selected,
             i,
             fk.info.name.clone(),
             format!("→ {}", fk.info.ref_table),
@@ -1998,10 +2009,11 @@ fn fk_form(ui: Ui, target: &DesignerTarget, ring: FocusRing) -> AnyView {
 fn checks_list(ui: Ui, ring: FocusRing) -> AnyView {
     let d = ui.ddl;
     let draft = d.draft.get_untracked();
-    let ui_rows = ui.clone();
+    // The one signal the rows need. Was a `Ui` cloned again per row.
+    let selected = ui.ddl.selected;
     let rows = v_stack_from_iter(draft.check_constraints.iter().enumerate().map(|(i, ck)| {
         list_row(
-            ui_rows.clone(),
+            selected,
             i,
             ck.info.name.clone(),
             // The predicate *is* the constraint — a list of names alone would

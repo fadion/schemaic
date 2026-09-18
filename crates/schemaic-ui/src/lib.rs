@@ -14591,7 +14591,14 @@ mod whole_ui_gate {
         // is gone outright, its decision now `ddl::default_new_column_type` with
         // a test. `DdlUi` is `Copy`, so the columns list also stopped cloning
         // the whole `Ui` four times to reach it.
-        ("table_designer.rs", 29),
+        //
+        // 29 → 26: `list_row`, `list_row_plain` and `list_row_inner` take the
+        // `RwSignal<usize>` they read. A row is a label, a detail and "am I the
+        // selected index", and `ui.ddl.selected` was the whole of what the
+        // bundle was carried for — four lists were cloning a `Ui` *per row* to
+        // deliver one `Copy` signal, and `trigger_editor.rs` was keeping a
+        // `rows_ui` clone alive for the same reason.
+        ("table_designer.rs", 26),
         // 2, for `compare_view.rs`'s reason: `tab_chip(tab: Tab, ui: Ui)`.
         ("tabs.rs", 2),
         ("trigger_editor.rs", 11),

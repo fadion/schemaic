@@ -1220,7 +1220,6 @@ fn trigger_list(
     let selected = ui.ddl.selected;
     let rev = ui.ddl.rev;
 
-    let rows_ui = ui.clone();
     let rows = dyn_container(
         move || d.get(),
         move |draft| {
@@ -1239,7 +1238,7 @@ fn trigger_list(
                             .collect::<Vec<_>>()
                             .join("/")
                     );
-                    list_row_plain(rows_ui.clone(), i, t.info.name.clone(), detail).into_any()
+                    list_row_plain(selected, i, t.info.name.clone(), detail).into_any()
                 })
                 .collect();
             v_stack_from_iter(rows)
