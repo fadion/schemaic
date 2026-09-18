@@ -14567,7 +14567,12 @@ mod whole_ui_gate {
         ("ddl_preview.rs", 6),
         ("dump_view.rs", 9),
         ("erd_view.rs", 1),
-        ("event_editor.rs", 11),
+        // 11 → 5: the four `bound_*` helpers take `RwSignal<EventDraft>` — the
+        // one signal each writes — and `schedule_form`/`event_form` take
+        // `DdlUi`. The five left are the opening path plus the overlay, and
+        // `open` is among them for a reason worth knowing: it ends by calling
+        // `fetch_source`, which needs `schema_actions` as well as `ddl`.
+        ("event_editor.rs", 5),
         ("history_panel.rs", 1),
         ("import_view.rs", 9),
         ("lib.rs", 6),
@@ -14590,7 +14595,12 @@ mod whole_ui_gate {
         ("overlays.rs", 13),
         ("plan_view.rs", 1),
         ("properties.rs", 5),
-        ("routine_editor.rs", 12),
+        // 12 → 6: the four `bound_*` helpers take `RwSignal<RoutineDraft>`,
+        // `routine_form` takes `DdlUi`, and `taken_names` takes the one
+        // `db_nodes` signal it reads — which is what its twin in
+        // `event_editor.rs` already did, so this was the half still holding the
+        // root bundle for a question both answer the same way.
+        ("routine_editor.rs", 6),
         ("schema_tree.rs", 6),
         ("script_view.rs", 6),
         ("settings.rs", 4),
@@ -14614,7 +14624,14 @@ mod whole_ui_gate {
         ("table_designer.rs", 26),
         // 2, for `compare_view.rs`'s reason: `tab_chip(tab: Tab, ui: Ui)`.
         ("tabs.rs", 2),
-        ("trigger_editor.rs", 11),
+        // 11 → 8: `bound_field` and `bound_choice` take
+        // `RwSignal<TriggerSetDraft>`, and `trigger_list` takes `DdlUi`.
+        // **`form` and `pg_action` are deliberately not narrowed** — `pg_action`
+        // is where the "edit this function" button opens the *routine* editor,
+        // which is an opening path and wants the root bundle, and `form` is the
+        // only thing that can hand it one. Sibling files got to 5 and 6; this
+        // one stops at 8 for a reason, not for want of another pass.
+        ("trigger_editor.rs", 8),
         // 9 → 8: the browser's read-only question takes the connection registry
         // signal it actually reads rather than the root bundle, which is this
         // rule's own prescription and was the right shape anyway — the decision

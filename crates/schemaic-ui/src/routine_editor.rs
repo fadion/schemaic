@@ -56,8 +56,8 @@ use crate::widgets::{
     modal_w, panel_style,
 };
 use crate::{
-    FieldCfg, RoutineSrcDoneFn, RoutineSrcRequest, RoutineTarget, Ui, ddl_preview, edit_field,
-    object_location, theme,
+    DdlUi, FieldCfg, RoutineSrcDoneFn, RoutineSrcRequest, RoutineTarget, Ui, ddl_preview,
+    edit_field, object_location, theme,
 };
 
 /// Matches the trigger editor's, deliberately: the two are reached from one
@@ -147,7 +147,10 @@ pub(crate) fn open_for_new(ui: &Ui, database: &str, schema: Option<&str>, kind: 
         },
         RoutineDraft::blank(
             kind,
-            unique_name(&taken_names(ui, database, schema, kind), stem(kind)),
+            unique_name(
+                &taken_names(ui.schema.db_nodes, database, schema, kind),
+                stem(kind),
+            ),
             schema.map(str::to_string),
             ctx.dialect,
         ),
@@ -204,8 +207,17 @@ fn stem(kind: RoutineKind) -> &'static str {
 /// The names already taken in this namespace, so a new routine doesn't propose
 /// one of them. Read off the schema the tree is showing — the same list the
 /// folder was rendered from, so the proposal agrees with what the user can see.
-fn taken_names(ui: &Ui, database: &str, schema: Option<&str>, kind: RoutineKind) -> Vec<String> {
-    ui.schema.db_nodes.with_untracked(|nodes| {
+///
+/// **Takes the one signal it reads**, the way `event_editor::taken_names` does —
+/// the two are the same function over a different collection, and this one was
+/// the half still holding the root bundle.
+fn taken_names(
+    db_nodes: RwSignal<Vec<crate::ConnNode>>,
+    database: &str,
+    schema: Option<&str>,
+    kind: RoutineKind,
+) -> Vec<String> {
+    db_nodes.with_untracked(|nodes| {
         let Some(node) = nodes.iter().find(|n| n.database == database) else {
             return Vec::new();
         };
@@ -343,12 +355,17 @@ fn fetch_source(ui: &Ui) {
 /// and the effect writes back only on a genuine change, so a rebuild can't read
 /// as an edit.
 fn bound_field(
-    ui: &Ui,
+    draft: RwSignal<RoutineDraft>,
     initial: String,
     cfg: FieldCfg,
     apply: impl Fn(&mut RoutineDraft, &str) + 'static,
 ) -> AnyView {
-    bound_field_on(ui, floem::reactive::create_rw_signal(initial), cfg, apply)
+    bound_field_on(
+        draft,
+        floem::reactive::create_rw_signal(initial),
+        cfg,
+        apply,
+    )
 }
 
 /// [`bound_field`] over a signal the **caller** owns.
@@ -361,12 +378,11 @@ fn bound_field(
 /// for an edit, and an external correction propagates into the draft the same
 /// way a keystroke does.
 fn bound_field_on(
-    ui: &Ui,
+    draft: RwSignal<RoutineDraft>,
     sig: RwSignal<String>,
     cfg: FieldCfg,
     apply: impl Fn(&mut RoutineDraft, &str) + 'static,
 ) -> AnyView {
-    let draft = ui.ddl.routine_draft;
     create_effect(move |prev: Option<String>| {
         let v = sig.get();
         if prev.is_some_and(|p| p != v) {
@@ -384,14 +400,13 @@ fn bound_field_on(
 /// SQL spelling (`MODIFIES SQL DATA`) is also the only sensible label, and
 /// whose *parse* is what closes the loop.
 fn bound_choice<T: Clone + PartialEq + 'static>(
-    ui: &Ui,
+    draft: RwSignal<RoutineDraft>,
     initial: T,
     options: Vec<(String, T)>,
     ring: FocusRing,
     tabindex: u32,
     apply: impl Fn(&mut RoutineDraft, T) + 'static,
 ) -> AnyView {
-    let draft = ui.ddl.routine_draft;
     let labels: Vec<String> = options.iter().map(|(l, _)| l.clone()).collect();
     let start = options
         .iter()
@@ -420,7 +435,7 @@ fn bound_choice<T: Clone + PartialEq + 'static>(
 }
 
 fn bound_toggle(
-    ui: &Ui,
+    draft: RwSignal<RoutineDraft>,
     label: &'static str,
     hint: &'static str,
     initial: bool,
@@ -428,7 +443,6 @@ fn bound_toggle(
     tabindex: u32,
     apply: impl Fn(&mut RoutineDraft, bool) + 'static,
 ) -> AnyView {
-    let draft = ui.ddl.routine_draft;
     let sig = floem::reactive::create_rw_signal(initial);
     create_effect(move |prev: Option<bool>| {
         let v = sig.get();
@@ -452,8 +466,8 @@ const TAB_LANGUAGE: u32 = 40;
 const TAB_BODY: u32 = 50;
 const TAB_OPT: u32 = 60;
 
-fn routine_form(ui: Ui, target: &RoutineTarget, ring: FocusRing) -> AnyView {
-    let d = ui.ddl.routine_draft;
+fn routine_form(ui: DdlUi, target: &RoutineTarget, ring: FocusRing) -> AnyView {
+    let d = ui.routine_draft;
     let draft = d.get_untracked();
     let postgres = target.dialect == SqlDialect::Postgres;
     let is_function = draft.info.kind == RoutineKind::Function;
@@ -466,7 +480,7 @@ fn routine_form(ui: Ui, target: &RoutineTarget, ring: FocusRing) -> AnyView {
     let name = form_setting(
         "Name",
         bound_field(
-            &ui,
+            d,
             draft.info.name.clone(),
             FieldCfg {
                 placeholder: "audit_fn",
@@ -487,7 +501,7 @@ fn routine_form(ui: Ui, target: &RoutineTarget, ring: FocusRing) -> AnyView {
         form_setting(
             "Parameters",
             bound_field(
-                &ui,
+                d,
                 draft.info.arguments.clone(),
                 FieldCfg {
                     placeholder: if postgres {
@@ -511,7 +525,7 @@ fn routine_form(ui: Ui, target: &RoutineTarget, ring: FocusRing) -> AnyView {
         form_setting(
             "Returns",
             bound_field(
-                &ui,
+                d,
                 draft.info.returns.clone(),
                 FieldCfg {
                     placeholder: if postgres { "integer" } else { "INT" },
@@ -563,8 +577,8 @@ fn routine_form(ui: Ui, target: &RoutineTarget, ring: FocusRing) -> AnyView {
     let body = form_setting(
         "Body",
         bound_field_on(
-            &ui,
-            ui.ddl.routine_body,
+            d,
+            ui.routine_body,
             FieldCfg {
                 placeholder: if postgres {
                     "BEGIN\n    RETURN NEW;\nEND;"
@@ -573,7 +587,7 @@ fn routine_form(ui: Ui, target: &RoutineTarget, ring: FocusRing) -> AnyView {
                 },
                 mono: true,
                 multiline: true,
-                max_rows: Some(ui.ddl.view_rows),
+                max_rows: Some(ui.view_rows),
                 // Logical lines, so the box hugs its content on the first frame
                 // instead of guessing from a width that hasn't settled.
                 no_wrap: true,
@@ -607,7 +621,7 @@ fn routine_form(ui: Ui, target: &RoutineTarget, ring: FocusRing) -> AnyView {
                 form_setting(
                     "Volatility",
                     bound_choice(
-                        &ui,
+                        d,
                         draft.info.volatility,
                         vec![
                             ("VOLATILE".to_string(), Volatility::Volatile),
@@ -622,7 +636,7 @@ fn routine_form(ui: Ui, target: &RoutineTarget, ring: FocusRing) -> AnyView {
                 .into_any(),
             );
             options.push(bound_toggle(
-                &ui,
+                d,
                 "Strict",
                 "RETURNS NULL ON NULL INPUT — the body doesn't run when an argument \
                  is NULL.",
@@ -633,7 +647,7 @@ fn routine_form(ui: Ui, target: &RoutineTarget, ring: FocusRing) -> AnyView {
             ));
         }
         options.push(bound_toggle(
-            &ui,
+            d,
             "Security definer",
             "Runs with the owner's rights instead of the caller's. Pin a search_path \
              below when you use this.",
@@ -660,7 +674,7 @@ fn routine_form(ui: Ui, target: &RoutineTarget, ring: FocusRing) -> AnyView {
         );
     } else {
         options.push(bound_toggle(
-            &ui,
+            d,
             "Deterministic",
             "Promises the same result for the same arguments. A server with binary \
              logging refuses a non-deterministic routine unless it trusts creators.",
@@ -673,7 +687,7 @@ fn routine_form(ui: Ui, target: &RoutineTarget, ring: FocusRing) -> AnyView {
             form_setting(
                 "Data access",
                 bound_choice(
-                    &ui,
+                    d,
                     draft.info.data_access,
                     vec![
                         ("CONTAINS SQL".to_string(), SqlDataAccess::ContainsSql),
@@ -692,7 +706,7 @@ fn routine_form(ui: Ui, target: &RoutineTarget, ring: FocusRing) -> AnyView {
             .into_any(),
         );
         options.push(bound_toggle(
-            &ui,
+            d,
             "Security definer",
             "Runs with the definer's rights instead of the caller's. This is MySQL's \
              default — turning it off is SQL SECURITY INVOKER.",
@@ -710,7 +724,7 @@ fn routine_form(ui: Ui, target: &RoutineTarget, ring: FocusRing) -> AnyView {
             form_setting(
                 "Definer",
                 bound_field(
-                    &ui,
+                    d,
                     draft.info.definer.clone().unwrap_or_default(),
                     FieldCfg {
                         placeholder: "root@localhost",
@@ -731,7 +745,7 @@ fn routine_form(ui: Ui, target: &RoutineTarget, ring: FocusRing) -> AnyView {
             form_setting(
                 "Comment",
                 bound_field(
-                    &ui,
+                    d,
                     draft.info.comment.clone().unwrap_or_default(),
                     FieldCfg {
                         placeholder: "what it does",
@@ -842,7 +856,7 @@ pub(crate) fn routine_editor_overlay(ui: Ui) -> impl IntoView {
             let root_ring = ring.clone();
 
             let body = crate::widgets::autohide(scroll(
-                routine_form(ui.clone(), &target, ring.clone()).style(|s| {
+                routine_form(ui.ddl, &target, ring.clone()).style(|s| {
                     s.width_full()
                         .padding_horiz(modal_pad_h())
                         .padding_vert(theme::scaled(18.0))
@@ -856,7 +870,7 @@ pub(crate) fn routine_editor_overlay(ui: Ui) -> impl IntoView {
             // from, and it cannot change while this modal is up — the schema
             // reload that would change it runs after Apply, which closes this.
             let taken = taken_names(
-                &ui,
+                ui.schema.db_nodes,
                 &target.database,
                 d.routine_draft
                     .with_untracked(|r| r.info.schema.clone())

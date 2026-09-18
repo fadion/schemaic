@@ -48,7 +48,7 @@ use crate::widgets::{
     modal_w, panel_style,
 };
 use crate::{
-    EventSrcDoneFn, EventSrcRequest, EventTarget, FieldCfg, Ui, ddl_preview, edit_field,
+    DdlUi, EventSrcDoneFn, EventSrcRequest, EventTarget, FieldCfg, Ui, ddl_preview, edit_field,
     object_location, theme,
 };
 
@@ -272,23 +272,27 @@ fn fetch_source(ui: &Ui) {
 /// editor's: seeded once on build, and the effect writes back only on a genuine
 /// change, so a rebuild can't read as an edit.
 fn bound_field(
-    ui: &Ui,
+    draft: RwSignal<EventDraft>,
     initial: String,
     cfg: FieldCfg,
     apply: impl Fn(&mut EventDraft, &str) + 'static,
 ) -> AnyView {
-    bound_field_on(ui, floem::reactive::create_rw_signal(initial), cfg, apply)
+    bound_field_on(
+        draft,
+        floem::reactive::create_rw_signal(initial),
+        cfg,
+        apply,
+    )
 }
 
 /// [`bound_field`] over a signal the **caller** owns — the Body, whose text a
 /// late `SHOW CREATE` reply has to correct after the form is built.
 fn bound_field_on(
-    ui: &Ui,
+    draft: RwSignal<EventDraft>,
     sig: RwSignal<String>,
     cfg: FieldCfg,
     apply: impl Fn(&mut EventDraft, &str) + 'static,
 ) -> AnyView {
-    let draft = ui.ddl.event_draft;
     create_effect(move |prev: Option<String>| {
         let v = sig.get();
         if prev.is_some_and(|p| p != v) {
@@ -300,7 +304,7 @@ fn bound_field_on(
 }
 
 fn bound_toggle(
-    ui: &Ui,
+    draft: RwSignal<EventDraft>,
     label: &'static str,
     hint: &'static str,
     initial: bool,
@@ -308,7 +312,6 @@ fn bound_toggle(
     tabindex: u32,
     apply: impl Fn(&mut EventDraft, bool) + 'static,
 ) -> AnyView {
-    let draft = ui.ddl.event_draft;
     let sig = floem::reactive::create_rw_signal(initial);
     create_effect(move |prev: Option<bool>| {
         let v = sig.get();
@@ -325,8 +328,8 @@ fn bound_toggle(
 /// One helper because every schedule control does the same two-step — read the
 /// shape, put a modified one back — and doing it inline in five places is how
 /// one of them ends up writing the wrong arm.
-fn edit_schedule(ui: &Ui, f: impl Fn(&mut EventSchedule) + 'static) {
-    ui.ddl.event_draft.update(|d| f(&mut d.info.schedule));
+fn edit_schedule(draft: RwSignal<EventDraft>, f: impl Fn(&mut EventSchedule) + 'static) {
+    draft.update(|d| f(&mut d.info.schedule));
 }
 
 // ── the form ─────────────────────────────────────────────────────────────────
@@ -357,13 +360,12 @@ const TAB_OPT: u32 = 200;
 /// draft-keyed field is torn down mid-keystroke, which is the bug the routine
 /// editor's `open_key` memo exists for. Switching the shape is a click on a
 /// dropdown, so no caret is lost when this one does rebuild.
-fn schedule_form(ui: Ui, ring: FocusRing) -> AnyView {
-    let d = ui.ddl.event_draft;
+fn schedule_form(ui: DdlUi, ring: FocusRing) -> AnyView {
+    let d = ui.event_draft;
     let recurring =
         floem::reactive::create_rw_signal(!d.with_untracked(|dr| dr.info.schedule.is_one_shot()));
 
     let shape = {
-        let ui = ui.clone();
         let sig = floem::reactive::create_rw_signal(
             if recurring.get_untracked() {
                 SCHED_EVERY
@@ -390,7 +392,7 @@ fn schedule_form(ui: Ui, ring: FocusRing) -> AnyView {
                     // rebuilt by the flag and seed themselves from the draft, so
                     // flipping the flag first would seed them from the shape
                     // that is being replaced.
-                    edit_schedule(&ui, move |s| {
+                    edit_schedule(d, move |s| {
                         let is_every = !s.is_one_shot();
                         if is_every == want_every {
                             return;
@@ -417,7 +419,6 @@ fn schedule_form(ui: Ui, ring: FocusRing) -> AnyView {
     let fields = dyn_container(
         move || recurring.get(),
         move |every| {
-            let ui = ui.clone();
             let ring = ring.clone();
             if !every {
                 let at = d.with_untracked(|dr| match &dr.info.schedule {
@@ -427,7 +428,7 @@ fn schedule_form(ui: Ui, ring: FocusRing) -> AnyView {
                 return form_setting(
                     "At",
                     bound_field(
-                        &ui,
+                        d,
                         at,
                         FieldCfg {
                             // Quoted, because the field holds **SQL**: the
@@ -478,7 +479,7 @@ fn schedule_form(ui: Ui, ring: FocusRing) -> AnyView {
             // on every preview round trip, so a list seeded from the draft forgets
             // an exotic unit the moment the user moves off it. Same rule as
             // `status_choices`.
-            let server_unit = ui.ddl.event.with_untracked(|t| {
+            let server_unit = ui.event.with_untracked(|t| {
                 t.as_ref()
                     .and_then(|t| t.current.as_ref())
                     .and_then(|c| match &c.schedule {
@@ -488,12 +489,11 @@ fn schedule_form(ui: Ui, ring: FocusRing) -> AnyView {
             });
             let units = interval_units(server_unit.as_deref(), &unit);
             let unit_sig = floem::reactive::create_rw_signal(unit);
-            let unit_ui = ui.clone();
             let interval = form_setting(
                 "Every",
                 h_stack((
                     bound_field(
-                        &ui,
+                        d,
                         value,
                         FieldCfg {
                             placeholder: "1",
@@ -520,7 +520,7 @@ fn schedule_form(ui: Ui, ring: FocusRing) -> AnyView {
                                 return;
                             }
                             unit_sig.set(v.clone());
-                            edit_schedule(&unit_ui, move |s| {
+                            edit_schedule(d, move |s| {
                                 if let EventSchedule::Every { unit, .. } = s {
                                     unit.clone_from(&v);
                                 }
@@ -538,7 +538,7 @@ fn schedule_form(ui: Ui, ring: FocusRing) -> AnyView {
                 form_setting(
                     label,
                     bound_field(
-                        &ui,
+                        d,
                         initial,
                         FieldCfg {
                             placeholder: "'2026-01-01 03:00:00'",
@@ -625,8 +625,8 @@ fn interval_units(server: Option<&str>, draft: &str) -> Vec<String> {
     units
 }
 
-fn event_form(ui: Ui, ring: FocusRing) -> AnyView {
-    let d = ui.ddl.event_draft;
+fn event_form(ui: DdlUi, ring: FocusRing) -> AnyView {
+    let d = ui.event_draft;
     let draft = d.get_untracked();
     // **What the server said, kept beside what the user is editing.** Every
     // dropdown that offers "the standard list, plus whatever this event already
@@ -635,7 +635,6 @@ fn event_form(ui: Ui, ring: FocusRing) -> AnyView {
     // seeded from the draft forgets the exotic entry the moment the user moves off
     // it — see `status_choices`.
     let server = ui
-        .ddl
         .event
         .with_untracked(|t| t.as_ref().and_then(|t| t.current.clone()));
     let server_status = server.as_ref().map(|c| c.status);
@@ -643,7 +642,7 @@ fn event_form(ui: Ui, ring: FocusRing) -> AnyView {
     let name = form_setting(
         "Name",
         bound_field(
-            &ui,
+            d,
             draft.info.name.clone(),
             FieldCfg {
                 placeholder: "nightly_purge",
@@ -658,13 +657,13 @@ fn event_form(ui: Ui, ring: FocusRing) -> AnyView {
     let body = form_setting(
         "Body",
         bound_field_on(
-            &ui,
-            ui.ddl.event_body,
+            d,
+            ui.event_body,
             FieldCfg {
                 placeholder: "DELETE FROM sessions WHERE expires_at < NOW()",
                 mono: true,
                 multiline: true,
-                max_rows: Some(ui.ddl.view_rows),
+                max_rows: Some(ui.view_rows),
                 // Logical lines, so the box hugs its content on the first frame
                 // instead of guessing from a width that hasn't settled.
                 no_wrap: true,
@@ -723,7 +722,7 @@ fn event_form(ui: Ui, ring: FocusRing) -> AnyView {
     }
 
     options.push(bound_toggle(
-        &ui,
+        d,
         "Preserve after it completes",
         "ON COMPLETION PRESERVE. Off is MySQL's default and means the server deletes \
          the event once its last run is past — which for a one-off is immediately \
@@ -741,7 +740,7 @@ fn event_form(ui: Ui, ring: FocusRing) -> AnyView {
         form_setting(
             "Definer",
             bound_field(
-                &ui,
+                d,
                 draft.info.definer.clone().unwrap_or_default(),
                 FieldCfg {
                     placeholder: "root@localhost",
@@ -763,7 +762,7 @@ fn event_form(ui: Ui, ring: FocusRing) -> AnyView {
         form_setting(
             "Comment",
             bound_field(
-                &ui,
+                d,
                 draft.info.comment.clone().unwrap_or_default(),
                 FieldCfg {
                     placeholder: "what it does",
@@ -786,7 +785,7 @@ fn event_form(ui: Ui, ring: FocusRing) -> AnyView {
             .style(|s| s.margin_top(theme::scaled(4.0)))
             .into_any(),
     );
-    rows.push(schedule_form(ui.clone(), ring.clone()));
+    rows.push(schedule_form(ui, ring.clone()));
     rows.push(
         form_section("Body")
             .style(|s| s.margin_top(theme::scaled(4.0)))
@@ -862,7 +861,7 @@ pub(crate) fn event_editor_overlay(ui: Ui) -> impl IntoView {
             let root_ring = ring.clone();
 
             let body =
-                crate::widgets::autohide(scroll(event_form(ui.clone(), ring.clone()).style(|s| {
+                crate::widgets::autohide(scroll(event_form(ui.ddl, ring.clone()).style(|s| {
                     s.width_full()
                         .padding_horiz(modal_pad_h())
                         .padding_vert(theme::scaled(18.0))

@@ -75,8 +75,8 @@ use crate::widgets::{
     panel_style,
 };
 use crate::{
-    DdlPreview, FieldCfg, TriggerFnDoneFn, TriggerFnRequest, TriggerSrcDoneFn, TriggerSrcRequest,
-    TriggerTarget, Ui, ddl_preview, edit_field, object_location, theme,
+    DdlPreview, DdlUi, FieldCfg, TriggerFnDoneFn, TriggerFnRequest, TriggerSrcDoneFn,
+    TriggerSrcRequest, TriggerTarget, Ui, ddl_preview, edit_field, object_location, theme,
 };
 
 /// Matches the table designer's, deliberately: this is the same list-plus-form
@@ -422,13 +422,12 @@ pub(crate) fn is_editable_trigger(t: &TriggerInfo) -> bool {
 /// as an edit. The form is built once per open — nothing is keyed on the draft —
 /// because a draft-keyed field would be torn down mid-keystroke.
 fn bound_field(
-    ui: &Ui,
+    draft: RwSignal<TriggerSetDraft>,
     i: usize,
     initial: String,
     cfg: FieldCfg,
     apply: impl Fn(&mut TriggerDraft, &str) + 'static,
 ) -> AnyView {
-    let draft = ui.ddl.trigger_draft;
     let sig = floem::reactive::create_rw_signal(initial);
     create_effect(move |prev: Option<String>| {
         let v = sig.get();
@@ -448,7 +447,7 @@ fn bound_field(
 }
 
 fn bound_choice(
-    ui: &Ui,
+    draft: RwSignal<TriggerSetDraft>,
     i: usize,
     initial: String,
     options: Vec<String>,
@@ -456,7 +455,6 @@ fn bound_choice(
     tabindex: u32,
     apply: impl Fn(&mut TriggerDraft, &str) + 'static,
 ) -> AnyView {
-    let draft = ui.ddl.trigger_draft;
     let sig = floem::reactive::create_rw_signal(initial);
     focusable_owned_dropdown(
         move || sig.get(),
@@ -674,7 +672,7 @@ fn form(ui: Ui, target: &TriggerTarget, i: usize, ring: FocusRing) -> AnyView {
     let name = form_setting(
         "Name",
         bound_field(
-            &ui,
+            d,
             i,
             draft.info.name.clone(),
             FieldCfg {
@@ -709,7 +707,7 @@ fn form(ui: Ui, target: &TriggerTarget, i: usize, ring: FocusRing) -> AnyView {
     let timing = form_setting(
         "Timing",
         bound_choice(
-            &ui,
+            d,
             i,
             draft.info.timing.sql().to_string(),
             timings,
@@ -782,7 +780,7 @@ fn form(ui: Ui, target: &TriggerTarget, i: usize, ring: FocusRing) -> AnyView {
         form_setting(
             "Event",
             bound_choice(
-                &ui,
+                d,
                 i,
                 draft
                     .info
@@ -811,7 +809,7 @@ fn form(ui: Ui, target: &TriggerTarget, i: usize, ring: FocusRing) -> AnyView {
         form_setting(
             "Fires",
             bound_choice(
-                &ui,
+                d,
                 i,
                 draft.info.level.sql().to_string(),
                 vec!["FOR EACH ROW".into(), "FOR EACH STATEMENT".into()],
@@ -839,7 +837,7 @@ fn form(ui: Ui, target: &TriggerTarget, i: usize, ring: FocusRing) -> AnyView {
         form_setting(
             "When",
             bound_field(
-                &ui,
+                d,
                 i,
                 draft.info.condition.clone().unwrap_or_default(),
                 FieldCfg {
@@ -872,7 +870,7 @@ fn form(ui: Ui, target: &TriggerTarget, i: usize, ring: FocusRing) -> AnyView {
         form_setting(
             "Of columns",
             bound_field(
-                &ui,
+                d,
                 i,
                 draft.info.update_columns.join(", "),
                 FieldCfg {
@@ -902,7 +900,7 @@ fn form(ui: Ui, target: &TriggerTarget, i: usize, ring: FocusRing) -> AnyView {
         form_setting(
             "Body",
             bound_field(
-                &ui,
+                d,
                 i,
                 match &draft.info.action {
                     TriggerAction::Body(b) => b.clone(),
@@ -1013,6 +1011,8 @@ fn fn_names(f: &RoutineInfo, sql: &str) -> bool {
     sql.replace('"', "") == fn_display(f)
 }
 
+/// Keeps the root bundle: the "edit this function" button opens the *routine*
+/// editor, which is an opening path and needs more than `DdlUi`.
 fn pg_action(
     ui: &Ui,
     i: usize,
@@ -1207,7 +1207,7 @@ fn change_set(target: &TriggerTarget, draft: &TriggerSetDraft) -> ddl::ChangeSet
 /// Re-renders on every draft change — unlike the form, which must not — so a
 /// rename shows in the list as you type it. Same split as the designer's.
 fn trigger_list(
-    ui: Ui,
+    ui: DdlUi,
     dialect: SqlDialect,
     is_view: bool,
     table: String,
@@ -1216,9 +1216,9 @@ fn trigger_list(
     reserved: Vec<String>,
     ring: FocusRing,
 ) -> impl IntoView {
-    let d = ui.ddl.trigger_draft;
-    let selected = ui.ddl.selected;
-    let rev = ui.ddl.rev;
+    let d = ui.trigger_draft;
+    let selected = ui.selected;
+    let rev = ui.rev;
 
     let rows = dyn_container(
         move || d.get(),
@@ -1398,7 +1398,7 @@ pub(crate) fn trigger_editor_overlay(ui: Ui) -> impl IntoView {
 
             let body = h_stack((
                 trigger_list(
-                    ui.clone(),
+                    ui.ddl,
                     target.dialect,
                     target.is_view,
                     target.table.clone(),
