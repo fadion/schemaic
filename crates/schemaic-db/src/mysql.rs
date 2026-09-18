@@ -30,10 +30,12 @@ use mysql_async::consts::{ColumnFlags, ColumnType};
 use mysql_async::prelude::Queryable;
 use mysql_async::{Column as MyColumn, Conn, Row, Value as MyValue};
 use schemaic_core::activity::{self, KillKind, SessionInfo};
+use schemaic_core::blob::{BlobRef, BlobValue, FETCH_CAP};
 use schemaic_core::intel::SqlDialect;
 use schemaic_core::model::{
-    Column, ColumnFlags as CoreColFlags, ColumnOrigin, ResultBuilder, ResultSet, Value,
-    binary_display,
+    CellEdit, Column, ColumnFlags as CoreColFlags, ColumnOrigin, GridWrite, RefetchRow,
+    RefetchTemplate, ResultBuilder, ResultSet, Rollback, RowDelete, RowEdit, RowInsert, Value,
+    WriteStep, binary_display, one_row_verdict,
 };
 use schemaic_core::schema::{
     CheckInfo, ColumnInfo, DbSchema, EventInfo, EventSchedule, EventSource, EventStatus,
@@ -45,10 +47,12 @@ use schemaic_core::users::{self, Grants, MyUserRow, Principal};
 use schemaic_core::{export, sql};
 use tokio_util::sync::CancellationToken;
 
+use mysql_async::Params;
+
 use crate::{
-    ColRow, Db, DbError, EXPLAIN_ROW_CAP, FkColRow, IdxRow, NumKind, RowDest, assemble_schema,
-    err_clone, ident, num_kind, order_by_clause, parse_as, parse_typed, zerofill_value,
-    zerofill_widths,
+    ColRow, Db, DbError, DdlError, EXPLAIN_ROW_CAP, FkColRow, IdxRow, ImportTarget, NumKind,
+    RowDest, RowSource, TxScope, assemble_schema, err_clone, lock_wait_sql,
+    next_batch_off_executor, num_kind, order_by_clause, parse_as, parse_typed,
 };
 
 /// The binary collation id (`binary`) — a column with this charset holds raw
@@ -2917,10 +2921,23 @@ mod schema_tests {
     /// error leaves the function without the note, and that is what this reads.
     #[test]
     fn every_import_exit_says_what_the_rollback_achieved() {
-        let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/lib.rs"))
+        // **`mysql.rs`, because that is where `import_on` is.** This opened
+        // `lib.rs` while the body lived there, and a gate that names a file is
+        // worthless the moment its subject leaves it. What saved this one is the
+        // `.expect` below: looking for a function by name and panicking when it
+        // is absent fails loudly, where a scan that merely finds no offender
+        // passes quietly over an empty file. Both shapes exist in this crate and
+        // only one of them announces the move.
+        let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/mysql.rs"))
             .expect("this module's own source");
+        // **Assembled, so this test is not its own first match.** Now that the
+        // gate and its subject share a file, a literal needle finds the line
+        // below before it finds the function, and the "body" measured is twenty
+        // lines of the test. The floor caught it — `only 0 notes` — which is
+        // what a floor is for.
+        let needle = format!("async fn import{}on(", '_');
         let at = src
-            .find("async fn import_on(")
+            .find(&needle)
             .expect("`import_on` is gone or was renamed");
         let rest = &src[at..];
         let end = rest[1..]
@@ -5198,5 +5215,1674 @@ mod explain_tests {
     fn explain_commands_strips_trailing_semicolon_and_space() {
         let (primary, _) = explain_commands("  SELECT 1 ;  ", false);
         assert_eq!(primary, "EXPLAIN SELECT 1");
+    }
+}
+/// What a cancelled import reports, given what its `ROLLBACK` achieved.
+///
+/// **Cancelling is a write-path exit like any other, so it reports what the
+/// rollback achieved.** It used to `kill_query` and disconnect, and the modal
+/// then said, unconditionally, "the transaction rolled back, so nothing was
+/// written" — which on `MyISAM`/`MEMORY`/`ARCHIVE`/`CSV` is false: every batch
+/// already executed is durable there, so the user re-ran the import and doubled
+/// the rows it had already loaded.
+///
+/// [`DbError::Cancelled`] is what the modal renders as "nothing was written",
+/// so it is only for [`Rollback::Complete`]; anything else carries
+/// [`Rollback::note`], which says the rows may still be there.
+fn cancelled_import(undone: Rollback) -> DbError {
+    match undone {
+        Rollback::Complete => DbError::Cancelled,
+        undone => DbError::Query(format!("Import cancelled{}", undone.note())),
+    }
+}
+
+/// [`cancelled_import`]'s twin for a cancelled **grid write-back**, and the
+/// same rule for the same reason.
+///
+/// Separate only because the sentence names a different act: "Import cancelled"
+/// is wrong over a Commit, and the whole point of the non-`Complete` arm is
+/// that the user reads it and knows what may still be in the table.
+fn cancelled_write(undone: Rollback) -> DbError {
+    match undone {
+        Rollback::Complete => DbError::Cancelled,
+        undone => DbError::Query(format!("Commit cancelled{}", undone.note())),
+    }
+}
+
+/// The MySQL half of [`Db::import_rows`], on an already-open connection.
+async fn import_on(
+    db: &Db,
+    conn: &mut Conn,
+    conn_id: u32,
+    dialect: schemaic_core::intel::SqlDialect,
+    target: &ImportTarget<'_>,
+    rows: RowSource<'_>,
+    cancel: &CancellationToken,
+) -> Result<u64, DbError> {
+    let qerr = |e: mysql_async::Error| DbError::Query(e.to_string());
+    let cols: Vec<&str> = target.columns.iter().map(String::as_str).collect();
+    conn.query_drop("BEGIN").await.map_err(qerr)?;
+
+    let mut total: u64 = 0;
+    // The row the byte ceiling held back from the previous batch — see
+    // `next_batch`. It lives here so it cannot be lost between two of them.
+    let mut held: Option<Vec<Value>> = None;
+    loop {
+        // **Between batches**, where the connection is idle and a `ROLLBACK`
+        // is the connection's own next statement. A Stop pressed while the
+        // reader is pulling rows lands here — `next_batch_off_executor` blocks
+        // the task, so nothing could have observed the token earlier anyway.
+        if cancel.is_cancelled() {
+            return Err(cancelled_import(rollback(conn, "ROLLBACK").await));
+        }
+        // A reader error (a bad record, a value that wouldn't coerce) has to undo
+        // the transaction too — returning straight out would leave it open until
+        // the connection drops, which is a lock held for no reason.
+        let batch = match next_batch_off_executor(rows, &mut held) {
+            Ok(Some(b)) => b,
+            Ok(None) => break,
+            Err(e) => {
+                let undone = rollback(conn, "ROLLBACK").await;
+                return Err(match (e, undone) {
+                    // Only worth saying when it isn't what the message implies.
+                    (e, Rollback::Complete) => e,
+                    (DbError::Query(msg), undone) => {
+                        DbError::Query(format!("{msg}{}", undone.note()))
+                    }
+                    (e, _) => e,
+                });
+            }
+        };
+        let Some(sql) = schemaic_core::import::build_insert(
+            target.database,
+            target.schema,
+            target.table,
+            &cols,
+            &batch,
+            dialect,
+        ) else {
+            continue;
+        };
+        // **The killed statement is awaited, not dropped** — the same rule
+        // `run_script_mysql` states, and for a sharper reason here: dropping it
+        // desynchronises the result stream, and everything after that
+        // (`ROLLBACK`, the `SHOW WARNINGS` behind `Rollback`) then reads
+        // somebody else's reply. Scoped so the borrow ends before the rollback.
+        let step = {
+            let mut fut = std::pin::pin!(conn.query_drop(&sql));
+            let raced = tokio::select! {
+                r = fut.as_mut() => Some(r),
+                _ = cancel.cancelled() => None,
+            };
+            match raced {
+                Some(r) => Some(r),
+                None => {
+                    db.kill_query(conn_id).await;
+                    let _ = fut.await;
+                    None
+                }
+            }
+        };
+        match step {
+            Some(Ok(())) => {}
+            Some(Err(e)) => {
+                let msg = e.to_string();
+                let undone = rollback(conn, "ROLLBACK").await;
+                return Err(DbError::Query(format!("{msg}{}", undone.note())));
+            }
+            None => return Err(cancelled_import(rollback(conn, "ROLLBACK").await)),
+        }
+        let affected = conn.affected_rows();
+        if affected != batch.len() as u64 {
+            let n = batch.len();
+            let undone = rollback(conn, "ROLLBACK").await;
+            return Err(DbError::Query(format!(
+                "a batch of {n} rows inserted {affected}{}",
+                undone.note()
+            )));
+        }
+        total += affected;
+    }
+
+    // A Stop pressed after the last batch and before the commit is still a
+    // Stop: committing here would land the whole import the user just stopped.
+    if cancel.is_cancelled() {
+        return Err(cancelled_import(rollback(conn, "ROLLBACK").await));
+    }
+    // **The fifth exit, and the one that had no `Rollback::note`.** Every other
+    // failure here says what the rollback achieved; this one returned the
+    // driver's bare sentence. On a MySQL `MyISAM`/`MEMORY`/`ARCHIVE`/`CSV`
+    // target — the tables this whole apparatus exists for — a connection that
+    // dies during the `COMMIT` left every row of the file durable in the table
+    // while the modal showed "Server has gone away" and nothing else. Asking
+    // for the rollback is what produces the answer: on a dead socket it fails
+    // too, and `Rollback::note` is what turns that into a sentence about the
+    // data rather than about the socket.
+    if let Err(e) = conn.query_drop("COMMIT").await {
+        let msg = qerr(e).to_string();
+        let undone = rollback(conn, "ROLLBACK").await;
+        return Err(DbError::Query(format!("{msg}{}", undone.note())));
+    }
+    Ok(total)
+}
+
+/// Apply a staged batch of grid mutations on an already-open connection:
+/// deletes → updates → inserts, each required to affect exactly one row, the
+/// whole batch rolled back if any doesn't. `scope` decides whether that
+/// atomicity comes from a transaction of its own or a nested savepoint.
+///
+/// Deletes run first so "delete a row, then insert one with the same unique key"
+/// works. The caller is responsible for `client_found_rows` being on — the guard
+/// counts *matched* rows, not *changed* ones.
+///
+/// **`cancel` is handled *here*, not raced around this future.** That is the
+/// rule [`Db::import_rows`] states with its measurement: a `tokio::select!`
+/// around the whole write drops it mid-statement, and a dropped `mysql_async`
+/// statement leaves the connection's result stream desynchronised — after which
+/// the `ROLLBACK` and the `SHOW WARNINGS` behind [`Rollback`] read replies that
+/// are not their own and `Complete` is claimed off garbage. Inside, the batch
+/// stops between statements, or after *awaiting* a statement it killed, so the
+/// rollback goes out on an intact protocol and [`cancelled_write`] can be
+/// believed.
+///
+/// `None` for a caller that does not cancel — or that owns the cancel itself,
+/// as [`crate::session::Session::commit_writes`] does, where the batch is a
+/// savepoint inside the user's transaction and `classify_isolated` is what
+/// answers for it.
+pub(crate) async fn write_on(
+    conn: &mut Conn,
+    write: &GridWrite,
+    scope: TxScope,
+    cancel: Option<(&Db, u32, &CancellationToken)>,
+) -> Result<u64, DbError> {
+    let qerr = |e: mysql_async::Error| DbError::Query(e.to_string());
+    conn.query_drop(scope.begin_sql()).await.map_err(qerr)?;
+
+    // One statement + its 1-row check. On a miss the batch is undone and the
+    // error describes what happened, in the caller's terms — the verdict and its
+    // wording are `one_row_verdict`, shared with the PostgreSQL executor, and
+    // what the rollback *achieved* is asked of the server rather than assumed.
+    async fn one(
+        conn: &mut Conn,
+        scope: TxScope,
+        sql: String,
+        params: Params,
+        step: WriteStep<'_>,
+        cancel: Option<(&Db, u32, &CancellationToken)>,
+    ) -> Result<u64, DbError> {
+        // **The killed statement is awaited, not dropped** — see this
+        // function's doc, and `import_on`, which states the rule and the
+        // measurement behind it. Scoped so the borrow ends before the rollback.
+        let sent = match cancel {
+            None => Some(conn.exec_drop(sql, params).await),
+            Some((db, conn_id, token)) => {
+                let mut fut = std::pin::pin!(conn.exec_drop(sql, params));
+                let raced = tokio::select! {
+                    r = fut.as_mut() => Some(r),
+                    _ = token.cancelled() => None,
+                };
+                match raced {
+                    Some(r) => Some(r),
+                    None => {
+                        db.kill_query(conn_id).await;
+                        let _ = fut.await;
+                        None
+                    }
+                }
+            }
+        };
+        let Some(sent) = sent else {
+            return Err(cancelled_write(rollback(conn, scope.rollback_sql()).await));
+        };
+        if let Err(e) = sent {
+            let msg = e.to_string();
+            let undone = rollback(conn, scope.rollback_sql()).await;
+            return Err(DbError::Query(format!("{msg}{}", undone.note())));
+        }
+        let affected = conn.affected_rows();
+        if let Err(msg) = one_row_verdict(step, affected) {
+            let undone = rollback(conn, scope.rollback_sql()).await;
+            return Err(DbError::Query(format!("{msg}{}", undone.note())));
+        }
+        Ok(affected)
+    }
+
+    let mut total: u64 = 0;
+    // Deletes → updates → inserts, ordered by `GridWrite::plan` rather than by
+    // three loops each engine has to keep in step.
+    for step in write.plan() {
+        // Between statements, where the protocol is whole.
+        if cancel.is_some_and(|(_, _, t)| t.is_cancelled()) {
+            return Err(cancelled_write(rollback(conn, scope.rollback_sql()).await));
+        }
+        let (sql, params) = match step {
+            WriteStep::Delete(del) => build_delete(del),
+            WriteStep::Update(edit) => build_update(edit),
+            WriteStep::Insert(ins) => build_insert(ins),
+        };
+        total += one(conn, scope, sql, params, step, cancel).await?;
+    }
+
+    if let Err(e) = conn.query_drop(scope.commit_sql()).await {
+        let msg = e.to_string();
+        let undone = rollback(conn, scope.rollback_sql()).await;
+        return Err(DbError::Query(format!("{msg}{}", undone.note())));
+    }
+    Ok(total)
+}
+
+/// Roll back, and find out from the server whether it worked.
+///
+/// MySQL's `ROLLBACK` **succeeds** when the transaction touched a
+/// non-transactional table (`MyISAM`, `MEMORY`, `ARCHIVE`, `CSV`) and raises
+/// warning **1196** — *"Some non-transactional changed tables couldn't be rolled
+/// back"* — instead. Every rollback on this path used to be `let _ =
+/// conn.query_drop(…)`, discarding the result *and* the server's own statement
+/// that the undo was partial, so the write path promised an atomicity the engine
+/// had just said it couldn't provide.
+///
+/// `SHOW WARNINGS` is read immediately after, since the next statement clears
+/// it. Anything unreadable resolves to [`Rollback::Unknown`] — the write path
+/// must not claim more than it knows.
+///
+/// **`Unknown`, not `Incomplete`, and the difference is a sentence the user
+/// acts on.** `Incomplete` says *this table's storage engine is not
+/// transactional, so the rows already written remain* — a claim about the
+/// engine, which only warning 1196 establishes. The other two routes here
+/// establish nothing: a `ROLLBACK` sent down a socket that is already gone never
+/// reached a server, and the server had almost certainly rolled the transaction
+/// back itself when the connection dropped. Told `Incomplete`, the user audits
+/// an InnoDB table that is exactly as they left it.
+///
+/// The unreadable-warnings route was worse than misdescribed — it was silently
+/// `Complete`. `unwrap_or_default()` turns a failed `SHOW WARNINGS` into an
+/// empty vector, no 1196 is found, and the write path then promised a clean
+/// rollback on the strength of a query that did not run. The paragraph above
+/// has claimed otherwise since it was written.
+async fn rollback(conn: &mut Conn, sql: &str) -> Rollback {
+    /// `ER_WARNING_NOT_COMPLETE_ROLLBACK`.
+    const INCOMPLETE_ROLLBACK: u32 = 1196;
+    if conn.query_drop(sql).await.is_err() {
+        return Rollback::Unknown;
+    }
+    let Ok(warnings) = conn
+        .query::<(String, u32, String), _>("SHOW WARNINGS")
+        .await
+    else {
+        return Rollback::Unknown;
+    };
+    if warnings
+        .iter()
+        .any(|(_, code, _)| *code == INCOMPLETE_ROLLBACK)
+    {
+        Rollback::Incomplete
+    } else {
+        Rollback::Complete
+    }
+}
+
+/// [`Db::fetch_blob`]'s MySQL body, on an already-open connection — so the
+/// pinned connection of a manual-transaction tab can run the same read and see
+/// its own uncommitted bytes.
+pub(crate) async fn blob_on(conn: &mut Conn, r: &BlobRef) -> Result<Option<BlobValue>, DbError> {
+    let (sql, params) = build_blob_select(r);
+    let row: Option<mysql_async::Row> = conn
+        .exec_first(sql, params)
+        .await
+        .map_err(|e| DbError::Query(e.to_string()))?;
+    let Some(row) = row else { return Ok(None) };
+    // `OCTET_LENGTH(NULL)` is NULL, which is how a NULL cell arrives here.
+    let Some(len) = row.get::<Option<u64>, _>(0).flatten() else {
+        return Ok(None);
+    };
+    let bytes = row
+        .get::<Option<Vec<u8>>, _>(1)
+        .flatten()
+        .unwrap_or_default();
+    Ok(Some(BlobValue { bytes, len }))
+}
+
+/// The most this connection can be asked for, in the server's own words.
+///
+/// **A row has to fit in one `max_allowed_packet`, and on MySQL the blob really
+/// does cross the wire** — the row is not spared the way PostgreSQL's and
+/// SQLite's are. MariaDB ships that setting at 16 MiB, a **quarter** of
+/// [`FETCH_CAP`], so asking for the full 64 MiB of a large value did not fail
+/// politely: measured against MariaDB 10.11 with a 20 MiB `LONGBLOB`, the
+/// server dropped the connection mid-row (`ERROR 2013`), taking a
+/// manual-transaction tab's pinned session and its uncommitted work with it.
+///
+/// Read from `@@max_allowed_packet` **inside the statement** rather than in a
+/// round trip of its own, so there is no window for the setting to change
+/// between the asking and the reading, and no second query on a path that is
+/// one click.
+///
+/// The 1 MiB of headroom is for everything else in the packet — the
+/// `OCTET_LENGTH` column, the row and column framing, the protocol's own
+/// bookkeeping — and is deliberately generous, because being 100 bytes over
+/// costs the whole connection while being 1 MiB under costs a truncation the
+/// panel already knows how to describe. `GREATEST` keeps the arithmetic
+/// positive on a server configured below the headroom (MariaDB's floor is
+/// 1 KiB), and the `CAST` keeps the subtraction from wrapping in unsigned.
+const PACKET_ROOM: &str = "GREATEST(1024, CAST(@@max_allowed_packet AS SIGNED) - 1048576)";
+
+/// Build the `SELECT OCTET_LENGTH(c), SUBSTRING(c, 1, LEAST(?, …)) … WHERE
+/// <key> <=> ? … LIMIT 1` behind [`blob_on`].
+///
+/// **The length and the bytes come from one row of one statement**, not two
+/// queries: asked separately they can straddle another session's `UPDATE`, and
+/// the pair is what [`BlobValue::truncated`] reads to decide whether saving the
+/// buffer would write a file that is not the data.
+///
+/// `SUBSTRING` on a binary string is byte-indexed in MySQL (it is
+/// character-indexed only for a character string), so the cap really is octets.
+/// **Two caps, and the smaller wins**: ours ([`FETCH_CAP`], bound) and the
+/// server's ([`PACKET_ROOM`], read live). Neither subsumes the other — a small
+/// `max_allowed_packet` bounds a large blob, and a large one leaves `FETCH_CAP`
+/// the operative limit — and a value cut by either arrives with its true
+/// `OCTET_LENGTH` beside it, so [`BlobValue::truncated`] answers `true` and the
+/// panel shows the prefix and refuses to save it. That is the whole point of
+/// capping rather than erroring: 16 MiB of a 20 MiB value, honestly labelled,
+/// beats a dropped connection.
+///
+/// The WHERE is `build_update`'s, NULL-safe `<=>` and all — the identity of a
+/// row is one thing on this path, whether it is being written or read.
+fn build_blob_select(r: &BlobRef) -> (String, Params) {
+    let mut params: Vec<MyValue> = Vec::with_capacity(r.key.len() + 1);
+    params.push(MyValue::UInt(FETCH_CAP as u64));
+    let where_sql = r
+        .key
+        .iter()
+        .map(|(col, val)| {
+            params.push(value_to_param(val));
+            format!("{} <=> ?", ident(col))
+        })
+        .collect::<Vec<_>>()
+        .join(" AND ");
+    let col = ident(&r.column);
+    let sql = format!(
+        "SELECT OCTET_LENGTH({col}), SUBSTRING({col}, 1, LEAST(?, {PACKET_ROOM})) \
+         FROM {}.{} WHERE {where_sql} LIMIT 1",
+        ident(&r.database),
+        ident(&r.table),
+    );
+    (sql, Params::Positional(params))
+}
+
+/// Re-`SELECT` just-edited rows on an already-open connection. Read-only, so it
+/// is safe both on a fresh connection and inside an open transaction — and
+/// inside one it is *required*, since only that connection can see the
+/// uncommitted rows it just wrote.
+pub(crate) async fn refetch_on(
+    conn: &mut Conn,
+    template: &RefetchTemplate,
+    rows: &[RefetchRow],
+) -> Result<Vec<(usize, Vec<Value>)>, DbError> {
+    let sql = build_refetch_sql(template);
+    let qerr = |e: mysql_async::Error| DbError::Query(e.to_string());
+    let mut out = Vec::with_capacity(rows.len());
+    for row in rows {
+        let params: Vec<MyValue> = row.key.iter().map(value_to_param).collect();
+        let mut result = conn
+            .exec_iter(sql.as_str(), Params::Positional(params))
+            .await
+            .map_err(qerr)?;
+        // Column metadata (owned) before consuming the result stream.
+        let columns: Vec<Column> = result.columns_ref().iter().map(map_column).collect();
+        // **Before the collect**, which consumes the result and empties
+        // `columns_ref`. The declared fractional precision is only on the wire.
+        let scale = fractional_scales(result.columns_ref());
+        // **This is the path that needs it.** A prepared statement sends a
+        // `ZEROFILL` column as a bare integer, so the splice would otherwise
+        // paint `7` over the `0007` the load read — see `zerofill_value`.
+        let zerofill = zerofill_widths(result.columns_ref());
+        let fetched: Vec<Row> = result.collect::<Row>().await.map_err(qerr)?;
+        if let Some(r) = fetched.first() {
+            let binary: Vec<bool> = columns.iter().map(Column::is_binary).collect();
+            let bit: Vec<bool> = columns
+                .iter()
+                .map(|c| schemaic_core::model::type_is_bit(&c.type_name))
+                .collect();
+            let kinds: Vec<NumKind> = columns.iter().map(|c| num_kind(&c.type_name)).collect();
+            out.push((
+                row.data_row,
+                convert_row(r, &columns, &binary, &bit, &scale, &kinds, &zerofill),
+            ));
+        }
+    }
+    Ok(out)
+}
+
+/// One staged cell value as a MySQL bound parameter.
+///
+/// `Text` and `Bytes` both become `MyValue::Bytes` — the wire has one
+/// length-prefixed octet-string and the server coerces it to the column type —
+/// but they arrive there by different routes and only one of them is reversible:
+/// `Text` is the user's characters encoded as UTF-8, `Bytes` is the octets
+/// themselves, unencoded. Collapsing the two at the *call site* is what would
+/// hurt, because `String::into_bytes` on a lossily-decoded blob is not the blob.
+fn cell_param(v: &CellEdit) -> MyValue {
+    match v {
+        CellEdit::Text(t) => MyValue::Bytes(t.clone().into_bytes()),
+        CellEdit::Bytes(b) => MyValue::Bytes(b.to_vec()),
+        CellEdit::Null => MyValue::NULL,
+    }
+}
+
+/// Build a parameterized `UPDATE db.table SET … WHERE …` for one row edit.
+/// Identifiers are backtick-escaped; every value is a bound parameter.
+fn build_update(edit: &RowEdit) -> (String, Params) {
+    let mut params: Vec<MyValue> = Vec::with_capacity(edit.set.len() + edit.key.len());
+    let set_sql = edit
+        .set
+        .iter()
+        .map(|(col, val)| {
+            params.push(cell_param(val));
+            format!("{} = ?", ident(col))
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let where_sql = edit
+        .key
+        .iter()
+        .map(|(col, val)| {
+            params.push(value_to_param(val));
+            // NULL-safe equality so a NULL key value matches (plain `= NULL`
+            // never does). Float/binary keys are excluded upstream in
+            // `resolve_key`, where they can't be matched reliably at all.
+            format!("{} <=> ?", ident(col))
+        })
+        .collect::<Vec<_>>()
+        .join(" AND ");
+    let sql = format!(
+        "UPDATE {}.{} SET {set_sql} WHERE {where_sql}",
+        ident(&edit.database),
+        ident(&edit.table),
+    );
+    (sql, Params::Positional(params))
+}
+
+/// Build a parameterized `INSERT INTO db.table (cols) VALUES (?, …)` for one new
+/// row. Identifiers are backtick-escaped; every value is a bound parameter — see
+/// [`cell_param`]. Columns not listed take their server default — with none
+/// listed, `() VALUES ()` inserts an all-defaults row.
+fn build_insert(ins: &RowInsert) -> (String, Params) {
+    let mut params: Vec<MyValue> = Vec::with_capacity(ins.cols.len());
+    let cols_sql = ins
+        .cols
+        .iter()
+        .map(|(col, val)| {
+            params.push(cell_param(val));
+            ident(col)
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let placeholders = vec!["?"; ins.cols.len()].join(", ");
+    let sql = format!(
+        "INSERT INTO {}.{} ({cols_sql}) VALUES ({placeholders})",
+        ident(&ins.database),
+        ident(&ins.table),
+    );
+    (sql, Params::Positional(params))
+}
+
+/// Build a parameterized `DELETE FROM db.table WHERE …` for one row, keyed by its
+/// identity (NULL-safe `<=>` per key column, like `build_update`'s WHERE). Every
+/// value is a bound parameter.
+fn build_delete(del: &RowDelete) -> (String, Params) {
+    let mut params: Vec<MyValue> = Vec::with_capacity(del.key.len());
+    let where_sql = del
+        .key
+        .iter()
+        .map(|(col, val)| {
+            params.push(value_to_param(val));
+            format!("{} <=> ?", ident(col))
+        })
+        .collect::<Vec<_>>()
+        .join(" AND ");
+    let sql = format!(
+        "DELETE FROM {}.{} WHERE {where_sql}",
+        ident(&del.database),
+        ident(&del.table),
+    );
+    (sql, Params::Positional(params))
+}
+
+/// Build the `SELECT … WHERE <key> <=> ? … LIMIT 1` used to re-fetch one edited
+/// row after a commit. Identifiers are backtick-escaped; the key columns become
+/// positional NULL-safe placeholders (bound by the caller from each row's key,
+/// in `template.key_cols` order). Pure so the SQL shape is unit-tested.
+fn build_refetch_sql(template: &RefetchTemplate) -> String {
+    let cols_sql = template
+        .columns
+        .iter()
+        .map(|c| ident(c))
+        .collect::<Vec<_>>()
+        .join(", ");
+    // Key first, then the confirming columns — the order `edit::refetch_key`
+    // builds the values in, and the reason they are here at all is
+    // `RefetchTemplate::confirm_cols`: the write's own `WHERE` carries them and
+    // this copy dropped them.
+    let where_sql = template
+        .key_cols
+        .iter()
+        .chain(template.confirm_cols.iter())
+        .map(|&kci| format!("{} <=> ?", ident(&template.columns[kci])))
+        .collect::<Vec<_>>()
+        .join(" AND ");
+    format!(
+        "SELECT {cols_sql} FROM {}.{} WHERE {where_sql} LIMIT 1",
+        ident(&template.database),
+        ident(&template.table),
+    )
+}
+
+/// Backtick-quote an identifier, doubling any embedded backtick.
+///
+/// The one identifier-quoting rule, pinned to this path's only engine — these
+/// statements are built for MySQL by construction (the PostgreSQL write path is
+/// `pg.rs`'s).
+pub(crate) fn ident(name: &str) -> String {
+    schemaic_core::export::ident_sql(name, schemaic_core::intel::SqlDialect::MySql)
+}
+
+/// Convert a typed cell value into a bound parameter for a `WHERE` comparison.
+fn value_to_param(v: &Value) -> MyValue {
+    match v {
+        Value::Null => MyValue::NULL,
+        Value::Int(i) => MyValue::Int(*i),
+        Value::UInt(u) => MyValue::UInt(*u),
+        Value::Float(f) => MyValue::Double(*f),
+        Value::Str(s) => MyValue::Bytes(s.clone().into_bytes()),
+    }
+}
+
+/// Re-render a **binary-protocol** number the way the text protocol would have
+/// sent it, for a `ZEROFILL` column — `width` is the column's display width, or
+/// `None` for every other column, which passes through untouched. `scale` is the
+/// column's declared decimals, which a float needs and an integer ignores.
+///
+/// **The two protocols disagree about these cells and only one of them is the
+/// user's answer.** A prepared statement — which is what the post-commit
+/// re-fetch runs — sends `Int(7)` for the cell `SELECT` sent as `0007`
+/// (measured on MariaDB 10.11.14 and MySQL 8.4). Without this the splice would
+/// paint `7` over the padded value the load put in the grid, and the column
+/// would disagree with itself about a cell the user never edited.
+///
+/// **Floats are `ZEROFILL` columns too**, and covering the integer arms alone
+/// left exactly that disagreement on them. MySQL's numeric-type syntax admits
+/// the attribute on `FLOAT[(M,D)]` and `DOUBLE[(M,D)]`, and `zerofill_widths`
+/// answers `Some` for every numeric column carrying the flag — so the width was
+/// computed, carried into `convert_row`, and consumed by two of the arms that
+/// could use it. Measured on MariaDB 10.11.14 **and** MySQL 8.4.11, where the
+/// form is deprecated but still accepted: `DOUBLE(10,2) UNSIGNED ZEROFILL`
+/// holding `123.45` reads back `0000123.45` over the text protocol, and
+/// `FLOAT(8,2) UNSIGNED ZEROFILL` holding `12.5` reads `00012.50`. The splice
+/// painted `123.45` over the first of those, in a cell the user never touched,
+/// and an export taken before the next full re-run wrote the unpadded text out.
+///
+/// The scale is part of it: the server pads to `width` *including* the decimal
+/// point and the fraction, so `{n:0w$.p$}` is the same rendering.
+///
+/// Padding only, never truncation: a value wider than the declared width is the
+/// server's to render, and `format!` leaves it alone.
+pub(crate) fn zerofill_value(v: Value, width: Option<usize>, scale: u32) -> Value {
+    let Some(w) = width else {
+        return v;
+    };
+    let p = scale as usize;
+    match v {
+        Value::Int(n) => Value::Str(format!("{n:0w$}")),
+        Value::UInt(n) => Value::Str(format!("{n:0w$}")),
+        // **`NOT_FIXED_DEC` is not a scale.** A `FLOAT`/`DOUBLE` declared
+        // without `(M,D)` reports `decimals = 31`, and formatting to
+        // thirty-one places would invent digits the server never sent. There
+        // the shortest round-tripping form is what the text protocol prints,
+        // padded — the same reading `binary_as_text` takes for an `f32`.
+        Value::Float(f) if p >= 31 => Value::Str(format!("{:0>w$}", f.to_string())),
+        Value::Float(f) => Value::Str(format!("{f:0w$.p$}")),
+        other => other,
+    }
+}
+
+/// Per-column display width for the `ZEROFILL` columns of a result, `None` for
+/// every other column — computed **once for the result**, like
+/// [`fractional_scales`] beside it, because it is a fact about the column.
+pub(crate) fn zerofill_widths(columns: &[MyColumn]) -> Vec<Option<usize>> {
+    columns
+        .iter()
+        .map(|c| {
+            c.flags()
+                .contains(ColumnFlags::ZEROFILL_FLAG)
+                .then(|| c.column_length() as usize)
+        })
+        .collect()
+}
+
+// ── DDL, scripts, imports and write-back ─────────────────────────────────────
+
+/// Run a reviewed plan against one database.
+///
+/// The `fail` shape is the caller's — see [`crate::Db::run_ddl`] for why a
+/// half-applied plan reports *which* statement stopped it and how many are
+/// already in effect rather than pretending to roll back.
+pub(crate) async fn run_ddl(
+    db: &Db,
+    database: &str,
+    stmts: &[String],
+    cancel: CancellationToken,
+    fail: impl Fn(usize, usize, DbError) -> DdlError,
+) -> Result<(), DdlError> {
+    let mut conn = db
+        .open(Some(database), false)
+        .await
+        .map_err(|e| fail(0, 0, e))?;
+    let conn_id = conn.id();
+    // Best-effort: a server old enough not to have the variable keeps its own
+    // default rather than failing the plan over the bound.
+    let _ = conn.query_drop(lock_wait_sql(db.engine)).await;
+    // Best-effort too, and for the same reason the dump writes it into the
+    // file: every literal in `stmts` was written by `export::sql_literal`,
+    // which doubles a backslash because that is what MySQL does with one by
+    // default — and on a session carrying `NO_BACKSLASH_ESCAPES` the doubled
+    // literal stores two. On a `CREATE USER … IDENTIFIED BY` that is an
+    // account nobody can log in to — repairable now that the browser offers
+    // a password reset, but through the same `ddl_string` this would have
+    // got wrong, so the reset would store the same mangled value and the
+    // escape has to be right here rather than fixable afterwards.
+    //
+    // **Scoped to the plan, never to the connection.** A user who sets that
+    // mode means it for the SQL they *type*, and pinning it at connect time
+    // would quietly change what their own statements mean. This connection
+    // runs one reviewed plan and is disconnected on the way out, per the
+    // one-connection-per-operation rule, so nothing here outlives the call.
+    if let Some(sql) = schemaic_core::export::literal_mode_sql(db.engine.dialect()) {
+        let _ = conn.query_drop(sql).await;
+    }
+    let dialect = db.engine.dialect();
+    let mut out = Ok(());
+    for (i, sql) in stmts.iter().enumerate() {
+        let step = tokio::select! {
+            r = conn.query_drop(sql) => r.map_err(|e| DbError::Query(e.to_string())),
+            _ = cancel.cancelled() => {
+                db.kill_query(conn_id).await;
+                Err(DbError::Cancelled)
+            }
+        };
+        if let Err(e) = step {
+            // **What applied, not what succeeded.** A routine, trigger or
+            // event edit is emitted wrapped in a session guard, and those
+            // `SET`s succeed against session variables on a connection this
+            // function disconnects four lines down — nothing about them
+            // outlives the call. Counting them made a rejected `ALTER EVENT`
+            // report "2 earlier statements already applied and cannot be
+            // rolled back" over a plan that had changed nothing, on the app's
+            // only disclosure of a genuinely half-applied migration.
+            //
+            // The decision is `ddl::applied_count`'s, and it is there rather
+            // than a counter here because it is a decision about emitted SQL
+            // and this loop has only strings — which is how the scaffolding
+            // came to be counted in the first place.
+            out = Err(fail(
+                i,
+                schemaic_core::ddl::applied_count(stmts, i, dialect),
+                e,
+            ));
+            break;
+        }
+    }
+    let _ = conn.disconnect().await;
+    out
+}
+
+/// Run a plan about a **container** — a database or a schema — on a connection
+/// attached to no database.
+pub(crate) async fn run_server_ddl(
+    db: &Db,
+    stmts: &[String],
+    cancel: CancellationToken,
+    fail: impl Fn(usize, usize, DbError) -> DdlError,
+) -> Result<(), DdlError> {
+    // **Serverless, not `open(None)`.** `avoid` names the database this
+    // plan is about to drop or create, and `open(None)` fills an unnamed
+    // database in from the connection's own — so `DROP DATABASE shop` on a
+    // connection configured for `shop` ran on a session pointed at its
+    // target. The comment here used to claim the opposite, and was true
+    // until the connection gained a configured database. (PostgreSQL still
+    // reads `avoid` in its own arm above: it must connect to *some*
+    // database, so it picks one that is not the target. MySQL needs none.)
+    let mut conn = db.open_serverless(false).await.map_err(|e| fail(0, 0, e))?;
+    let conn_id = conn.id();
+    let _ = conn.query_drop(lock_wait_sql(db.engine)).await;
+    // The same literal-mode pin `run_ddl` sets, for the same reason: a
+    // container plan carries literals too (a `CREATE DATABASE`'s comment,
+    // a collation name), and this connection is as short-lived as that one.
+    if let Some(sql) = schemaic_core::export::literal_mode_sql(db.engine.dialect()) {
+        let _ = conn.query_drop(sql).await;
+    }
+    let mut out = Ok(());
+    for (i, sql) in stmts.iter().enumerate() {
+        let step = tokio::select! {
+            r = conn.query_drop(sql) => r.map_err(|e| DbError::Query(e.to_string())),
+            _ = cancel.cancelled() => {
+                db.kill_query(conn_id).await;
+                Err(DbError::Cancelled)
+            }
+        };
+        if let Err(e) = step {
+            // No session-guard scaffolding on this path — every statement
+            // here is one the user reviewed — so what applied is simply how
+            // many ran, and `ddl::applied_count` has nothing to discount.
+            out = Err(fail(i, i, e));
+            break;
+        }
+    }
+    let _ = conn.disconnect().await;
+    out
+}
+
+/// Bulk-insert `rows` into `target`, in batches, cancellable between them.
+pub(crate) async fn import_rows(
+    db: &Db,
+    target: ImportTarget<'_>,
+    rows: RowSource<'_>,
+    cancel: CancellationToken,
+) -> Result<u64, DbError> {
+    let mut conn = db.open(Some(target.database), false).await?;
+    let conn_id = conn.id();
+    // **The cancel is inside the loop, not a race around it.** This was
+    // `tokio::select!` over the whole of `import_on`, and the cancel arm
+    // then *dropped* that future mid-statement — which leaves a
+    // `mysql_async` connection's result stream desynchronised. Measured on
+    // MariaDB 10.11.14 and MySQL 8.4.11: after the drop, `SELECT
+    // CONNECTION_ID()` came back `Ok(None)`, the following `ROLLBACK`
+    // "succeeded" and `SHOW WARNINGS` was empty — so the rollback below
+    // classified `Complete` off a reply that was not its own, and a
+    // cancelled import into a `MyISAM` table reported `DbError::Cancelled`
+    // (the variant the modal renders as *"nothing was written"*) over 1,000
+    // rows that were permanently there. That is the exact failure this
+    // path's `Rollback::note()` was added to prevent, still live on the one
+    // exit that dropped the connection out from under it.
+    //
+    // `import_on` now owns the token and stops at a point where the
+    // protocol is intact: between batches, or after awaiting a statement it
+    // killed — the same "the killed statement is awaited, not dropped"
+    // rule `run_script_mysql` states.
+    let outcome = import_on(
+        db,
+        &mut conn,
+        conn_id,
+        db.engine.dialect(),
+        &target,
+        rows,
+        &cancel,
+    )
+    .await;
+    let _ = conn.disconnect().await;
+    outcome
+}
+
+/// The write paths and the wire decoders, tested beside what they build.
+#[cfg(test)]
+mod write_tests {
+    use super::*;
+    // `the_write_paths_quote_identifiers_the_way_core_does` asks about both
+    // quoters at once, which is the point of it: the test is that each engine's
+    // statements are quoted the way `core::export` would. SQLite's lives in
+    // `lib.rs` beside `sqlite.rs`'s use of it.
+    use crate::ident_sqlite;
+
+    #[test]
+    fn build_insert_sql_shapes() {
+        // Normal insert: listed columns → backtick-quoted names + placeholders.
+        let ins = RowInsert {
+            database: "db".to_string(),
+            schema: None,
+            table: "users".to_string(),
+            cols: vec![
+                ("name".to_string(), CellEdit::Text("Ada".to_string())),
+                ("email".to_string(), CellEdit::Null), // explicit NULL
+            ],
+        };
+        let (sql, _) = build_insert(&ins);
+        assert_eq!(
+            sql,
+            "INSERT INTO `db`.`users` (`name`, `email`) VALUES (?, ?)"
+        );
+
+        // All-defaults insert (no columns set) → `() VALUES ()`.
+        let empty = RowInsert {
+            database: "db".to_string(),
+            schema: None,
+            table: "t".to_string(),
+            cols: vec![],
+        };
+        let (sql, _) = build_insert(&empty);
+        assert_eq!(sql, "INSERT INTO `db`.`t` () VALUES ()");
+
+        // Identifiers with backticks are doubled.
+        let weird = RowInsert {
+            database: "d`b".to_string(),
+            schema: None,
+            table: "t".to_string(),
+            cols: vec![("a`b".to_string(), CellEdit::Text("x".to_string()))],
+        };
+        let (sql, _) = build_insert(&weird);
+        assert_eq!(sql, "INSERT INTO `d``b`.`t` (`a``b`) VALUES (?)");
+    }
+
+    #[test]
+    fn build_delete_sql_shape() {
+        // NULL-safe equality per key column (composite key joins with AND).
+        let del = RowDelete {
+            database: "db".to_string(),
+            schema: None,
+            table: "users".to_string(),
+            key: vec![
+                ("id".to_string(), Value::Int(7)),
+                ("tenant".to_string(), Value::Str("acme".to_string())),
+            ],
+        };
+        let (sql, _) = build_delete(&del);
+        assert_eq!(
+            sql,
+            "DELETE FROM `db`.`users` WHERE `id` <=> ? AND `tenant` <=> ?"
+        );
+    }
+
+    fn positional(p: &Params) -> &[MyValue] {
+        match p {
+            Params::Positional(v) => v.as_slice(),
+            _ => panic!("expected positional params"),
+        }
+    }
+
+    #[test]
+    fn build_update_sql_and_param_order() {
+        // SET params come first (in column order), then WHERE key params.
+        let edit = RowEdit {
+            database: "db".to_string(),
+            schema: None,
+            table: "users".to_string(),
+            set: vec![
+                ("name".to_string(), CellEdit::Text("Ada".to_string())),
+                ("nickname".to_string(), CellEdit::Null), // set to NULL
+            ],
+            key: vec![("id".to_string(), Value::Int(7))],
+        };
+        let (sql, params) = build_update(&edit);
+        assert_eq!(
+            sql,
+            "UPDATE `db`.`users` SET `name` = ?, `nickname` = ? WHERE `id` <=> ?"
+        );
+        let p = positional(&params);
+        assert_eq!(p.len(), 3);
+        assert!(matches!(&p[0], MyValue::Bytes(b) if b == b"Ada"));
+        assert!(matches!(p[1], MyValue::NULL));
+        assert!(matches!(p[2], MyValue::Int(7)));
+    }
+
+    /// **Bytes bind as bytes, and the two shapes are not the same param.**
+    /// `MyValue::Bytes` is the wire shape both take, which is exactly why this
+    /// is worth pinning: `Text` reaches it through `String::into_bytes` (UTF-8
+    /// encoding the user's characters) and `Bytes` reaches it unencoded, so the
+    /// two agree on every ASCII fixture and diverge on the first byte a blob
+    /// actually contains. The fixture is a PNG header for that reason — `0x89`
+    /// is not valid UTF-8 on its own, so a `Bytes` value that had gone through
+    /// the text arm could not have arrived intact.
+    #[test]
+    fn build_update_binds_bytes_unencoded_next_to_a_text_column() {
+        let png = vec![0x89u8, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+        let edit = RowEdit {
+            database: "sakila".to_string(),
+            schema: None,
+            table: "staff".to_string(),
+            set: vec![
+                ("first_name".to_string(), CellEdit::Text("Ada".to_string())),
+                ("picture".to_string(), CellEdit::bytes(png.clone())),
+                ("last_name".to_string(), CellEdit::Null),
+            ],
+            key: vec![("staff_id".to_string(), Value::Int(1))],
+        };
+        let (sql, params) = build_update(&edit);
+        assert_eq!(
+            sql,
+            "UPDATE `sakila`.`staff` SET `first_name` = ?, `picture` = ?, `last_name` = ? \
+             WHERE `staff_id` <=> ?"
+        );
+        let p = positional(&params);
+        assert_eq!(p.len(), 4);
+        assert!(matches!(&p[0], MyValue::Bytes(b) if b == b"Ada"));
+        assert!(
+            matches!(&p[1], MyValue::Bytes(b) if *b == png),
+            "the blob's own octets, not a re-encoding of them"
+        );
+        assert!(matches!(p[2], MyValue::NULL));
+        assert!(matches!(p[3], MyValue::Int(1)));
+    }
+
+    /// The same for an `INSERT` — a new row can carry a file too, and the
+    /// `VALUES` list binds in column order.
+    #[test]
+    fn build_insert_binds_bytes_in_column_order() {
+        let ins = RowInsert {
+            database: "db".to_string(),
+            schema: None,
+            table: "docs".to_string(),
+            cols: vec![
+                (
+                    "payload".to_string(),
+                    CellEdit::bytes(vec![0xFF, 0x00, 0xFE]),
+                ),
+                ("title".to_string(), CellEdit::Text("x".to_string())),
+            ],
+        };
+        let (sql, params) = build_insert(&ins);
+        assert_eq!(
+            sql,
+            "INSERT INTO `db`.`docs` (`payload`, `title`) VALUES (?, ?)"
+        );
+        let p = positional(&params);
+        assert!(matches!(&p[0], MyValue::Bytes(b) if *b == vec![0xFFu8, 0x00, 0xFE]));
+        assert!(matches!(&p[1], MyValue::Bytes(b) if b == b"x"));
+    }
+
+    /// An empty file is a value, not an absence: zero bytes bind as a zero-length
+    /// param, which MySQL stores as an empty blob. `NULL` is the other thing, and
+    /// the two must not collapse — a `NOT NULL BLOB` column accepts the first and
+    /// rejects the second.
+    #[test]
+    fn zero_bytes_is_an_empty_blob_and_not_null() {
+        let ins = RowInsert {
+            database: "db".to_string(),
+            schema: None,
+            table: "docs".to_string(),
+            cols: vec![("payload".to_string(), CellEdit::bytes(Vec::new()))],
+        };
+        let (_, params) = build_insert(&ins);
+        let p = positional(&params);
+        assert!(matches!(&p[0], MyValue::Bytes(b) if b.is_empty()));
+        assert!(!matches!(p[0], MyValue::NULL));
+    }
+
+    #[test]
+    fn build_update_escapes_backtick_identifiers() {
+        let edit = RowEdit {
+            database: "d`b".to_string(),
+            schema: None,
+            table: "t`t".to_string(),
+            set: vec![("a`b".to_string(), CellEdit::Text("x".to_string()))],
+            key: vec![("k`k".to_string(), Value::Int(1))],
+        };
+        let (sql, _) = build_update(&edit);
+        assert_eq!(
+            sql,
+            "UPDATE `d``b`.`t``t` SET `a``b` = ? WHERE `k``k` <=> ?"
+        );
+    }
+
+    #[test]
+    fn ident_doubles_embedded_backticks() {
+        assert_eq!(ident("plain"), "`plain`");
+        assert_eq!(ident("a`b"), "`a``b`");
+        // Two backticks → each doubled (four), wrapped → six backticks.
+        assert_eq!(ident("``"), "`".repeat(6));
+    }
+
+    #[test]
+    fn value_to_param_maps_each_variant() {
+        assert!(matches!(value_to_param(&Value::Null), MyValue::NULL));
+        assert!(matches!(value_to_param(&Value::Int(-3)), MyValue::Int(-3)));
+        assert!(matches!(value_to_param(&Value::UInt(3)), MyValue::UInt(3)));
+        assert!(matches!(value_to_param(&Value::Float(1.5)), MyValue::Double(f) if f == 1.5));
+        assert!(matches!(value_to_param(&Value::Str("s".into())), MyValue::Bytes(b) if b == b"s"));
+    }
+
+    // ── the two protocols, and the one row read through both ────────────
+
+    /// **The re-fetch reads the same row over a different protocol**, and its
+    /// answer is spliced straight over the cells on screen. `collect_rows` uses
+    /// `query_iter` (text), where every value is `Bytes`; `refetch_on` uses
+    /// `exec_iter` (binary, the statement being prepared with the key bound),
+    /// where MySQL sends `DATETIME` as `Date`, `TIME` as `Time` and `FLOAT` as an
+    /// `f32`. Those fell to `convert_row`'s catch-all, `MyValue::as_sql` — a
+    /// **SQL literal**, not the text form — which prints a `Date` with a zero
+    /// time as `'YYYY-MM-DD'` and a `Time` as `'{:03}:{:02}:{:02}'`.
+    ///
+    /// Measured on MariaDB 10.11.14 and MySQL 8.4.11: editing one column of
+    /// `(1, 'a', '2024-01-15 00:00:00', '10:30:00', 3.14)` spliced the row back
+    /// with `2024-01-15`, `010:30:00` and `3.140000104904175` in three cells
+    /// nobody touched. Re-running the query restored them, so the grid disagreed
+    /// with itself about one row, and any export taken in between wrote the wrong
+    /// text.
+    #[test]
+    fn a_binary_temporal_reads_back_as_the_text_protocol_wrote_it() {
+        // The zero time a `DATETIME` carries and `as_sql` drops.
+        assert_eq!(
+            binary_as_text(&MyValue::Date(2024, 1, 15, 0, 0, 0, 0), "DATETIME", 0).as_deref(),
+            Some("2024-01-15 00:00:00")
+        );
+        // A bare `DATE` has no time to print, and must not grow one.
+        assert_eq!(
+            binary_as_text(&MyValue::Date(2024, 1, 15, 0, 0, 0, 0), "DATE", 0).as_deref(),
+            Some("2024-01-15")
+        );
+        // `TIME` is a duration: `as_sql`'s `{:03}` made this `010:30:00`.
+        assert_eq!(
+            binary_as_text(&MyValue::Time(false, 0, 10, 30, 0, 0), "TIME", 0).as_deref(),
+            Some("10:30:00")
+        );
+        // …which runs past a day, and backwards.
+        assert_eq!(
+            binary_as_text(&MyValue::Time(false, 3, 2, 0, 0, 0), "TIME", 0).as_deref(),
+            Some("74:00:00")
+        );
+        assert_eq!(
+            binary_as_text(&MyValue::Time(true, 0, 1, 2, 3, 0), "TIME", 0).as_deref(),
+            Some("-01:02:03")
+        );
+        // An `f32` widened to `f64` is what produced `3.140000104904175`; the
+        // value here is one whose widening is visible without being a constant
+        // clippy recognises — `0.1f32 as f64` is `0.10000000149011612`.
+        assert_eq!(
+            binary_as_text(&MyValue::Float(0.1), "FLOAT", 0).as_deref(),
+            Some("0.1")
+        );
+        assert_ne!(
+            (0.1f32 as f64).to_string(),
+            "0.1",
+            "if this ever holds, the widening was never the bug"
+        );
+        // A `DOUBLE` was already right and stays out of this.
+        assert_eq!(binary_as_text(&MyValue::Double(1.25), "DOUBLE", 0), None);
+        assert_eq!(binary_as_text(&MyValue::Int(7), "INT", 0), None);
+    }
+
+    /// **The declared precision, and only that.** A `DATETIME(3)` reads
+    /// `…:00.120` and a bare `DATETIME` reads `…:00`, so the fraction cannot come
+    /// from the value — the binary protocol always sends microseconds, and
+    /// `.120` trimmed of trailing zeros would be `.12`. It comes off the wire's
+    /// column definition, which is also the only place it is: `type_name_of`
+    /// builds `DATETIME` from the type code with no precision in it.
+    #[test]
+    fn the_fraction_follows_the_columns_declared_precision() {
+        let at = |scale| {
+            binary_as_text(
+                &MyValue::Date(2024, 1, 15, 8, 9, 10, 120_000),
+                "DATETIME",
+                scale,
+            )
+            .expect("a temporal")
+        };
+        assert_eq!(at(0), "2024-01-15 08:09:10");
+        assert_eq!(at(3), "2024-01-15 08:09:10.120");
+        assert_eq!(at(6), "2024-01-15 08:09:10.120000");
+        // MySQL's own maximum, so a server answering more does not widen it.
+        assert_eq!(at(9), "2024-01-15 08:09:10.120000");
+        assert_eq!(
+            binary_as_text(&MyValue::Time(false, 0, 10, 30, 0, 500_000), "TIME", 1).as_deref(),
+            Some("10:30:00.5")
+        );
+    }
+
+    /// **A hoisted kind has to answer what the per-cell call answered.**
+    ///
+    /// `convert_row` called `parse_typed` per cell, which is
+    /// `parse_as(num_kind(type_name), s)` — and `num_kind` opens by
+    /// uppercasing the type name, then walks up to eight `starts_with` scans
+    /// and a `contains`, for a property of the *column*. Both docs already
+    /// said so ("Called once per column"; "What a row loop should call is
+    /// `parse_as` with a kind it computed once"), and the two sibling
+    /// classifications beside it in the row loop were hoisted on exactly that
+    /// reasoning.
+    ///
+    /// The answer must not move, so this is the equivalence: over every type
+    /// spelling the mapping distinguishes, `parse_as(num_kind(t), s)` is
+    /// `parse_typed(s, t)`.
+    #[test]
+    fn a_kind_computed_once_parses_a_cell_the_way_the_per_cell_call_did() {
+        let types = [
+            "TINYINT",
+            "SMALLINT",
+            "MEDIUMINT",
+            "INT",
+            "BIGINT",
+            "YEAR",
+            "INT UNSIGNED",
+            "BIGINT UNSIGNED",
+            "tinyint unsigned",
+            "FLOAT",
+            "DOUBLE",
+            "DECIMAL(10,2)",
+            "VARCHAR(255)",
+            "TEXT",
+            "DATETIME",
+            "",
+        ];
+        let cells = ["42", "-1", "0", "3.5", "18446744073709551615", "abc", ""];
+        for t in types {
+            let kind = num_kind(t);
+            for c in cells {
+                assert_eq!(
+                    parse_as(kind, c.to_string()),
+                    parse_typed(c.to_string(), t),
+                    "{t:?} / {c:?}"
+                );
+            }
+        }
+    }
+
+    /// A column index past the end falls back to `Text`, which is what a
+    /// value with no column to describe it has to be — the row loop indexes
+    /// `kinds` the same way it indexes `binary` and `bit`, both of which take
+    /// the same defensive default.
+    #[test]
+    fn a_missing_kind_is_text() {
+        let kinds: Vec<NumKind> = vec![NumKind::Int];
+        assert_eq!(
+            kinds.get(9).copied().unwrap_or(NumKind::Text),
+            NumKind::Text
+        );
+        assert!(matches!(
+            parse_as(NumKind::Text, "42".to_string()),
+            Value::Str(_)
+        ));
+    }
+
+    /// **A `ZEROFILL` column's padding is the server's own rendering, and it is
+    /// the value the user sees in `mysql` and in DataGrip.** `INT(4) UNSIGNED
+    /// ZEROFILL` holding 7 arrives over the text protocol as `0007`
+    /// (**measured** on MariaDB 10.11.14 and MySQL 8.4 — both send the padded
+    /// bytes and set `ZEROFILL_FLAG` with the display width in
+    /// `column_length`), and parsing it as a number threw the padding away in
+    /// the grid and in every export, on the path whose doc promises the cell
+    /// keeps its exact text.
+    ///
+    /// `Text` costs nothing here that matters: `Column::is_numeric` reads the
+    /// **leading** type token, so the column still right-aligns, and a
+    /// fixed-width zero-padded unsigned sorts identically as text.
+    #[test]
+    fn a_zerofill_column_keeps_the_padding_the_server_sent() {
+        assert_eq!(num_kind("INT(4) UNSIGNED ZEROFILL"), NumKind::Text);
+        assert_eq!(num_kind("BIGINT(8) UNSIGNED ZEROFILL"), NumKind::Text);
+        assert!(matches!(
+            parse_typed("0007".into(), "INT(4) UNSIGNED ZEROFILL"),
+            Value::Str(s) if s == "0007"
+        ));
+        // Without the attribute nothing changes: an ordinary unsigned integer is
+        // still a number, which is what the hoisted kind array is mostly for.
+        assert_eq!(num_kind("INT UNSIGNED"), NumKind::UInt);
+        assert_eq!(num_kind("INT"), NumKind::Int);
+    }
+
+    /// The wire flag has to reach the type name, or `num_kind` above cannot see
+    /// it — the type name is the only thing it is given.
+    #[test]
+    fn resolve_type_name_carries_the_zerofill_attribute() {
+        assert_eq!(
+            resolve_type_name(ColumnType::MYSQL_TYPE_LONG, true, false, true),
+            "INT UNSIGNED ZEROFILL"
+        );
+        // ZEROFILL implies UNSIGNED on the server, but the flags are
+        // independent on the wire; the name is built from what arrived.
+        assert_eq!(
+            resolve_type_name(ColumnType::MYSQL_TYPE_LONGLONG, false, false, true),
+            "BIGINT ZEROFILL"
+        );
+        assert_eq!(
+            resolve_type_name(ColumnType::MYSQL_TYPE_LONG, true, false, false),
+            "INT UNSIGNED"
+        );
+        // Non-numeric types never carry it, the way they never carry UNSIGNED.
+        assert_eq!(
+            resolve_type_name(ColumnType::MYSQL_TYPE_VAR_STRING, true, false, true),
+            "VARCHAR"
+        );
+    }
+
+    /// **The other protocol, which sends no padding at all.** The post-commit
+    /// re-fetch runs a *prepared* statement, and the binary protocol carries an
+    /// integer: `Int(7)` for the same cell the text protocol sent as `0007`
+    /// (measured on both engines). Left alone, the splice would paint `7` over
+    /// the `0007` the load put there and the grid would disagree with itself
+    /// about a cell nobody edited — so the re-fetch re-renders it the way the
+    /// server would have, from the display width the wire also carries.
+    #[test]
+    fn a_zerofill_cell_from_the_binary_protocol_is_padded_back() {
+        assert!(matches!(
+            zerofill_value(Value::Int(7), Some(4), 0),
+            Value::Str(s) if s == "0007"
+        ));
+        assert!(matches!(
+            zerofill_value(Value::UInt(42), Some(8), 0),
+            Value::Str(s) if s == "00000042"
+        ));
+        // A value already at or over the width is untouched by the padding.
+        assert!(matches!(
+            zerofill_value(Value::UInt(12345), Some(4), 0),
+            Value::Str(s) if s == "12345"
+        ));
+        // No width means no ZEROFILL: every other column passes through whole.
+        assert!(matches!(
+            zerofill_value(Value::Int(7), None, 0),
+            Value::Int(7)
+        ));
+        assert!(matches!(
+            zerofill_value(Value::Str("0007".into()), Some(4), 0),
+            Value::Str(s) if s == "0007"
+        ));
+        assert!(matches!(
+            zerofill_value(Value::Null, Some(4), 0),
+            Value::Null
+        ));
+    }
+
+    /// **A float is a `ZEROFILL` column too**, and the first spelling of this
+    /// covered the integer arms alone — so `zerofill_widths`, which answers
+    /// `Some` for every numeric column carrying the flag, computed a width that
+    /// two of the three arms that could use it threw away. The splice then
+    /// painted `123.45` over the `0000123.45` the text load had put in the grid,
+    /// in a cell the user never touched, and an export taken before the next
+    /// full re-run wrote the unpadded text out.
+    ///
+    /// Measured on MariaDB 10.11.14 **and** MySQL 8.4.11, where the `(M,D)` form
+    /// is deprecated and still accepted: `DOUBLE(10,2) UNSIGNED ZEROFILL`
+    /// holding `123.45` reads back `0000123.45`, and `FLOAT(8,2) UNSIGNED
+    /// ZEROFILL` holding `12.5` reads `00012.50`.
+    #[test]
+    fn a_zerofill_float_is_padded_to_its_declared_scale() {
+        assert!(matches!(
+            zerofill_value(Value::Float(123.45), Some(10), 2),
+            Value::Str(s) if s == "0000123.45"
+        ));
+        // The scale is part of the rendering: a trailing zero the server prints
+        // is not noise, it is the column's declared precision.
+        assert!(matches!(
+            zerofill_value(Value::Float(12.5), Some(8), 2),
+            Value::Str(s) if s == "00012.50"
+        ));
+        // **`NOT_FIXED_DEC` is not a scale.** A float declared without `(M,D)`
+        // reports `decimals = 31`; formatting to thirty-one places would invent
+        // digits the server never sent, so the shortest round-tripping form is
+        // padded instead.
+        assert!(matches!(
+            zerofill_value(Value::Float(1.5), Some(6), 31),
+            Value::Str(s) if s == "0001.5"
+        ));
+        // And no width is still no ZEROFILL.
+        assert!(matches!(
+            zerofill_value(Value::Float(1.5), None, 2),
+            Value::Float(f) if f == 1.5
+        ));
+    }
+
+    #[test]
+    fn parse_typed_integers_unsigned_floats_and_fallback() {
+        // Signed integer types.
+        assert!(matches!(parse_typed("42".into(), "INT"), Value::Int(42)));
+        assert!(matches!(parse_typed("-1".into(), "BIGINT"), Value::Int(-1)));
+        assert!(matches!(
+            parse_typed("2024".into(), "YEAR"),
+            Value::Int(2024)
+        ));
+        // Unsigned.
+        assert!(matches!(
+            parse_typed("42".into(), "INT UNSIGNED"),
+            Value::UInt(42)
+        ));
+        // A negative into an UNSIGNED column can't parse → lossless string fallback.
+        assert!(matches!(
+            parse_typed("-1".into(), "INT UNSIGNED"),
+            Value::Str(s) if s == "-1"
+        ));
+        // Floats.
+        assert!(matches!(parse_typed("1.5".into(), "DOUBLE"), Value::Float(f) if f == 1.5));
+        assert!(matches!(parse_typed("3.0".into(), "FLOAT"), Value::Float(f) if f == 3.0));
+        // DECIMAL stays an exact string (never a lossy float).
+        assert!(matches!(
+            parse_typed("1.10".into(), "DECIMAL(10,2)"),
+            Value::Str(s) if s == "1.10"
+        ));
+        // Non-numeric type → string.
+        assert!(matches!(
+            parse_typed("hi".into(), "VARCHAR(20)"),
+            Value::Str(s) if s == "hi"
+        ));
+        // Unparseable integer → string fallback, never a panic.
+        assert!(matches!(
+            parse_typed("NaN".into(), "INT"),
+            Value::Str(s) if s == "NaN"
+        ));
+    }
+
+    #[test]
+    fn build_refetch_sql_single_key() {
+        let t = RefetchTemplate {
+            database: "db".to_string(),
+            schema: None,
+            table: "users".to_string(),
+            columns: vec!["id".to_string(), "name".to_string()],
+            key_cols: vec![0],
+            confirm_cols: Vec::new(),
+        };
+        assert_eq!(
+            build_refetch_sql(&t),
+            "SELECT `id`, `name` FROM `db`.`users` WHERE `id` <=> ? LIMIT 1"
+        );
+    }
+
+    #[test]
+    fn build_refetch_sql_composite_key_joins_with_and() {
+        let t = RefetchTemplate {
+            database: "db".to_string(),
+            schema: None,
+            table: "t".to_string(),
+            columns: vec!["a".to_string(), "b".to_string(), "c".to_string()],
+            key_cols: vec![0, 2],
+            confirm_cols: Vec::new(),
+        };
+        assert_eq!(
+            build_refetch_sql(&t),
+            "SELECT `a`, `b`, `c` FROM `db`.`t` WHERE `a` <=> ? AND `c` <=> ? LIMIT 1"
+        );
+    }
+
+    /// **The confirming half of the `WHERE`, which no test reached.**
+    /// `confirm_cols` is populated only by SQLite's implicit-rowid key
+    /// (`sqlite.rs`'s `implicit_key`), so on this builder it is empty in every
+    /// round trip the suite runs and the `.chain(confirm_cols)` above could be
+    /// deleted with the whole suite green. The chain is still this builder's
+    /// contract — the placeholders it writes are bound in
+    /// `edit::refetch_key`'s order, key first — so it is asserted here
+    /// directly, with a template that has both halves.
+    #[test]
+    fn build_refetch_sql_confirms_with_the_columns_after_the_key() {
+        let t = RefetchTemplate {
+            database: "db".to_string(),
+            schema: None,
+            table: "t".to_string(),
+            columns: vec!["rowid".to_string(), "a".to_string(), "b".to_string()],
+            key_cols: vec![0],
+            confirm_cols: vec![1, 2],
+        };
+        assert_eq!(
+            build_refetch_sql(&t),
+            "SELECT `rowid`, `a`, `b` FROM `db`.`t` \
+             WHERE `rowid` <=> ? AND `a` <=> ? AND `b` <=> ? LIMIT 1"
+        );
+    }
+
+    #[test]
+    fn build_refetch_sql_escapes_identifiers() {
+        let t = RefetchTemplate {
+            database: "d`b".to_string(),
+            schema: None,
+            table: "t`t".to_string(),
+            columns: vec!["a`b".to_string()],
+            key_cols: vec![0],
+            confirm_cols: Vec::new(),
+        };
+        assert_eq!(
+            build_refetch_sql(&t),
+            "SELECT `a``b` FROM `d``b`.`t``t` WHERE `a``b` <=> ? LIMIT 1"
+        );
+    }
+
+    fn blob_ref(key: &[(&str, Value)]) -> BlobRef {
+        BlobRef {
+            database: "db".to_string(),
+            schema: None,
+            table: "staff".to_string(),
+            column: "picture".to_string(),
+            key: key
+                .iter()
+                .map(|(c, v)| (c.to_string(), v.clone()))
+                .collect(),
+        }
+    }
+
+    /// **The cap binds before the key.** The `SUBSTRING` placeholder sits in the
+    /// select list and every key placeholder in the `WHERE` after it, so the
+    /// parameter vector has to be built in that order — reversed, MySQL reads
+    /// the row's id as a byte count and the key as a length, and the statement
+    /// still runs.
+    #[test]
+    fn build_blob_select_binds_the_cap_first_then_the_key() {
+        let (sql, params) = build_blob_select(&blob_ref(&[("staff_id", Value::UInt(1))]));
+        assert_eq!(
+            sql,
+            "SELECT OCTET_LENGTH(`picture`), SUBSTRING(`picture`, 1, \
+             LEAST(?, GREATEST(1024, CAST(@@max_allowed_packet AS SIGNED) - 1048576))) \
+             FROM `db`.`staff` WHERE `staff_id` <=> ? LIMIT 1"
+        );
+        let Params::Positional(p) = params else {
+            panic!("positional params expected");
+        };
+        assert_eq!(p.len(), 2);
+        assert_eq!(p[0], MyValue::UInt(FETCH_CAP as u64));
+        assert_eq!(p[1], MyValue::UInt(1));
+    }
+
+    /// A composite key joins with `AND`, in `row_key` order — the same WHERE
+    /// `build_update` builds, because it is the same row identity.
+    #[test]
+    fn build_blob_select_joins_a_composite_key_with_and() {
+        let (sql, params) = build_blob_select(&blob_ref(&[
+            ("a", Value::Int(1)),
+            ("b", Value::Str("x".to_string())),
+        ]));
+        assert!(
+            sql.ends_with("WHERE `a` <=> ? AND `b` <=> ? LIMIT 1"),
+            "{sql}"
+        );
+        let Params::Positional(p) = params else {
+            panic!("positional params expected");
+        };
+        assert_eq!(p.len(), 3, "cap + two key values");
+    }
+
+    /// A NULL key value still compares, because the WHERE is NULL-safe — a
+    /// plain `= NULL` would silently match no row and report the cell empty.
+    #[test]
+    fn build_blob_select_keeps_the_null_safe_comparison() {
+        let (sql, _) = build_blob_select(&blob_ref(&[("k", Value::Null)]));
+        assert!(sql.contains("`k` <=> ?"), "{sql}");
+    }
+
+    #[test]
+    fn build_blob_select_escapes_every_identifier() {
+        let r = BlobRef {
+            database: "d`b".to_string(),
+            schema: None,
+            table: "t`t".to_string(),
+            column: "c`c".to_string(),
+            key: vec![("k`k".to_string(), Value::Int(1))],
+        };
+        let (sql, _) = build_blob_select(&r);
+        assert_eq!(
+            sql,
+            "SELECT OCTET_LENGTH(`c``c`), SUBSTRING(`c``c`, 1, \
+             LEAST(?, GREATEST(1024, CAST(@@max_allowed_packet AS SIGNED) - 1048576))) \
+             FROM `d``b`.`t``t` WHERE `k``k` <=> ? LIMIT 1"
+        );
+    }
+
+    /// **The server's limit is the other cap, and the smaller of the two wins.**
+    /// `FETCH_CAP` stays bound as a parameter — the statement must not carry a
+    /// second literal — while `max_allowed_packet` is read live inside the
+    /// statement, because it is the server's answer and it can change under a
+    /// long-lived connection.
+    ///
+    /// Asking for the full 64 MiB unconditionally is not a polite failure on
+    /// MySQL: measured against MariaDB 10.11 (`max_allowed_packet` = 16 MiB) a
+    /// 20 MiB `LONGBLOB` dropped the connection mid-row. The cap turns that into
+    /// a truncated read the panel already describes.
+    #[test]
+    fn build_blob_select_bounds_the_read_by_the_servers_packet_limit() {
+        let (sql, params) = build_blob_select(&blob_ref(&[("id", Value::Int(1))]));
+        assert!(
+            sql.contains(
+                "LEAST(?, GREATEST(1024, CAST(@@max_allowed_packet AS SIGNED) - 1048576))"
+            ),
+            "the two caps must both be in the length, smaller winning: {sql}"
+        );
+        assert!(
+            !sql.contains(&FETCH_CAP.to_string()),
+            "our cap is bound, not written into the statement: {sql}"
+        );
+        let Params::Positional(p) = params else {
+            panic!("positional params expected");
+        };
+        assert_eq!(
+            p[0],
+            MyValue::UInt(FETCH_CAP as u64),
+            "and it is still the first parameter, ahead of the key"
+        );
+    }
+
+    /// This crate's three identifier quoters answer to `core`'s, so the SQL a
+    /// write path builds can't drift from the SQL the export and DDL paths
+    /// **A cancelled write reports `Cancelled` only when the rollback really
+    /// undid it**, which is the same rule `cancelled_import` states and the
+    /// grid's commit did not follow.
+    #[test]
+    fn a_cancelled_write_says_so_only_when_the_rollback_was_complete() {
+        assert!(matches!(
+            cancelled_write(Rollback::Complete),
+            DbError::Cancelled
+        ));
+        match cancelled_write(Rollback::Incomplete) {
+            DbError::Query(msg) => {
+                assert!(msg.starts_with("Commit cancelled"), "{msg}");
+                assert!(
+                    msg.contains("remain"),
+                    "the note that says the rows may still be there is missing: {msg}"
+                );
+            }
+            other => panic!("an incomplete undo reported as {other:?}"),
+        }
+        // And it names the right act: "Import cancelled" over a Commit is the
+        // sentence `cancelled_import` would have given.
+        assert!(
+            !format!("{:?}", cancelled_write(Rollback::Incomplete)).contains("Import"),
+            "a cancelled commit reported as a cancelled import"
+        );
+    }
+
+    /// **And the composition, which the test above cannot reach.**
+    ///
+    /// `DbError::Cancelled` is what the modal renders as "nothing was written",
+    /// so the whole question is whether the cancel arm *asks*. It did not: it
+    /// killed the query, disconnected, and returned `Cancelled` on the strength
+    /// of the connection drop undoing the transaction — true on InnoDB and
+    /// false on `MyISAM`/`MEMORY`/`ARCHIVE`/`CSV`, where a cancelled commit of
+    /// three staged `INSERT`s that got two in reported "nothing was written",
+    /// left all three staged, and a second Commit landed the two again.
+    ///
+    /// A source gate for `import_on`'s reason one function up: every arm of
+    /// `commit_writes` needs a live MySQL connection to reach, and a unit test
+    /// of `cancelled_write` alone is green against the defect — the seam is
+    /// between the predicate and its caller, which is the shape CLAUDE.md's
+    /// testing section names.
+    ///
+    /// **And the half that gate could not see: *where* the cancel happens.**
+    /// Asking `rollback` is worth nothing if the connection cannot hear the
+    /// answer, and a `tokio::select!` around the whole write is exactly that —
+    /// the cancel arm runs only after the branch futures are dropped, which is
+    /// why its `&mut conn` re-borrow compiles at all, so the killed statement is
+    /// dropped rather than awaited and the stream is torn. `import_rows` removed
+    /// that construct three hundred lines up for this reason and recorded the
+    /// measurement; `commit_writes` kept it and then put a `ROLLBACK` on the
+    /// torn connection, which is how `Complete` came to be claimed off a reply
+    /// that was not its own.
+    #[test]
+    fn the_grid_commits_cancel_arm_goes_through_a_rollback() {
+        // **Two files now, and the split is the whole repair.** `commit_writes`
+        // is a dispatcher in `lib.rs`; `write_on` is the body, here. The first
+        // half used to read a fixed 2400-byte slice off `commit_writes` — which
+        // once covered the write loop and now covers three match arms and the
+        // start of the next method, so it would have kept passing while
+        // asserting nothing about the code it names. It is measured to the end
+        // of the method instead.
+        let lib = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/lib.rs"))
+            .expect("the dispatcher's source");
+        let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/mysql.rs"))
+            .expect("this module's own source");
+        // Assembled, so this test is not its own first match — see
+        // `every_import_exit_says_what_the_rollback_achieved`.
+        let sig = format!("    pub async fn commit{}writes(", '_');
+        let at = lib
+            .find(&sig)
+            .expect("`commit_writes` is gone or was renamed");
+        let rest = &lib[at..];
+        let end = rest[1..]
+            .find("\n    pub async fn ")
+            .map_or(rest.len(), |i| i + 1);
+        let body = &rest[..end];
+        assert!(
+            body.contains("mysql::write_on") || body.contains("write_on("),
+            "`commit_writes` no longer reaches `write_on`, so the rest of this \
+             gate is asking about a path it does not take"
+        );
+        // The write itself is not raced. Assembled, so this paragraph is not the
+        // hit.
+        let raced = format!("{}! {{", "tokio::select");
+        assert!(
+            !body.contains(&raced),
+            "`commit_writes` races the write future again: the cancel arm drops \
+             it mid-statement, which desynchronises the connection's result \
+             stream, and the `ROLLBACK` below then reads somebody else's reply. \
+             Hand the token into `write_on`, the way `import_rows` does."
+        );
+        // …and the cancel still leaves through a rollback whose outcome is asked
+        // for, which is now `write_on`'s job.
+        let wo_sig = format!("pub(crate) async fn write{}on(", '_');
+        let wo = src
+            .find(&wo_sig)
+            .expect("`write_on` is gone or was renamed");
+        let wob = &src[wo..wo + 3000];
+        assert!(
+            wob.contains("rollback(") && wob.contains("cancelled_write("),
+            "the cancel path returns without asking what the rollback achieved, \
+             so it claims 'nothing was written' about a MySQL table that may \
+             hold half the batch"
+        );
+        assert!(
+            wob.contains("db.kill_query(conn_id).await") && wob.contains("let _ = fut.await;"),
+            "the killed statement is not awaited, so the next statement reads \
+             its reply — see `import_on`, which states the rule"
+        );
+    }
+
+    /// build. Each is engine-fixed by construction — `pg.rs` only ever emits
+    /// PostgreSQL, `sqlite.rs`'s statements only ever SQLite, this module's
+    /// remaining builders only ever MySQL — which is why they take no dialect and
+    /// why the binding has to be asserted rather than typed.
+    #[test]
+    fn the_write_paths_quote_identifiers_the_way_core_does() {
+        use schemaic_core::export::ident_sql;
+        use schemaic_core::intel::SqlDialect;
+        for name in [
+            "plain",
+            "MixedCase",
+            "with space",
+            "a`b",
+            "a\"b",
+            "both`and\"",
+            "sélect",
+            "",
+        ] {
+            assert_eq!(ident(name), ident_sql(name, SqlDialect::MySql), "{name:?}");
+            assert_eq!(
+                crate::pg::pg_ident_for_test(name),
+                ident_sql(name, SqlDialect::Postgres),
+                "{name:?}"
+            );
+            assert_eq!(
+                ident_sqlite(name),
+                ident_sql(name, SqlDialect::Sqlite),
+                "{name:?}"
+            );
+        }
     }
 }

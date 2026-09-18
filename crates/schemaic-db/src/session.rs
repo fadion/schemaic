@@ -39,8 +39,13 @@ use tokio::sync::Mutex;
 use tokio_postgres::Client;
 use tokio_util::sync::CancellationToken;
 
-use crate::mysql::collect_rows;
-use crate::{Db, DbError, Engine, TxScope, blob_on, pg, refetch_on, write_on};
+// **All four come from `mysql`, and that is what they always were**: each takes
+// a `mysql_async::Conn`, so these are the MySQL bodies a pinned
+// manual-transaction connection runs. `pg.rs` has its own `write_on`, `blob_on`
+// and `refetch_on` under the same names, which is why the module path is the
+// only thing that ever distinguished them.
+use crate::mysql::{blob_on, collect_rows, refetch_on, write_on};
+use crate::{Db, DbError, Engine, TxScope, pg};
 
 /// An operation's result plus what it means for the enclosing transaction.
 ///
