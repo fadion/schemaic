@@ -7874,6 +7874,30 @@ pub fn supports_table_design(dialect: SqlDialect) -> bool {
     )
 }
 
+/// The type a **new** column gets in the designer before the user picks one.
+///
+/// `varchar(255)` everywhere but PostgreSQL, where it is `text`. The difference
+/// is not a preference: on MySQL and MariaDB the length is the ordinary way to
+/// declare a string column and 255 is the historical default width, while on
+/// PostgreSQL `varchar(255)` is a constraint the server *enforces* — one nobody
+/// asked for, on a column the user has not finished describing — and `text`
+/// there costs nothing, being the same storage with no limit. SQLite keeps the
+/// MySQL spelling because its declared length is a note rather than a promise
+/// (see [`enforces_declared_byte_length`]): the parameter is ignored outright
+/// and `varchar(255)` is TEXT affinity, so the two spellings mean the same
+/// thing to that engine.
+///
+/// An exhaustive `match` rather than a capability, for `intel::builtin_catalog`'s
+/// reason: "which type name" has no yes/no behind it to compute from, so a
+/// fourth engine has to be answered for rather than inherit whichever arm a
+/// comparison left open.
+pub fn default_new_column_type(dialect: SqlDialect) -> &'static str {
+    match dialect {
+        SqlDialect::MySql | SqlDialect::Sqlite => "varchar(255)",
+        SqlDialect::Postgres => "text",
+    }
+}
+
 /// Can `dialect` **place** a column — put one anywhere but at the end?
 ///
 /// MySQL says `AFTER`/`FIRST` on the `MODIFY` it is already writing. SQLite has
@@ -13444,6 +13468,29 @@ mod tests {
         assert!(
             !supports_column_reorder(Postgres),
             "PostgreSQL has no statement that moves a column"
+        );
+    }
+
+    /// **A new column's placeholder type is the engine's, and PostgreSQL's is
+    /// the one that differs** — not a preference: `varchar(255)` there is a
+    /// limit the server enforces on a column the user has not finished
+    /// describing.
+    ///
+    /// Asserted against the literal strings rather than "they differ", because
+    /// what the designer puts in the field is the thing that can regress, and a
+    /// test that only says "PostgreSQL is not MySQL" passes on any two values.
+    #[test]
+    fn a_new_column_starts_at_the_engines_own_string_type() {
+        assert_eq!(default_new_column_type(MySql), "varchar(255)");
+        assert_eq!(
+            default_new_column_type(Sqlite),
+            "varchar(255)",
+            "SQLite ignores the length, so the MySQL spelling means the same"
+        );
+        assert_eq!(
+            default_new_column_type(Postgres),
+            "text",
+            "a length PostgreSQL enforces is not a placeholder"
         );
     }
 

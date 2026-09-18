@@ -38,8 +38,8 @@ use crate::widgets::{
     modal_pad_h, modal_title_owned, modal_w, panel_style,
 };
 use crate::{
-    DdlPreview, DesignerTab, DesignerTarget, FieldCfg, PopupAnchor, Ui, ddl_preview, edit_field,
-    icons, object_location, theme,
+    DdlPreview, DdlUi, DesignerTab, DesignerTarget, FieldCfg, PopupAnchor, Ui, ddl_preview,
+    edit_field, icons, object_location, theme,
 };
 
 fn panel_w() -> f64 {
@@ -1309,10 +1309,6 @@ fn columns_list(ui: Ui, ring: FocusRing) -> AnyView {
     }))
     .style(|s| s.flex_col().width_full());
 
-    let add_ui = ui.clone();
-    let del_ui = ui.clone();
-    let up_ui = ui.clone();
-    let down_ui = ui.clone();
     let can_reorder = d
         .designer
         .get_untracked()
@@ -1320,39 +1316,46 @@ fn columns_list(ui: Ui, ring: FocusRing) -> AnyView {
     list_pane(
         rows,
         list_actions(
+            // `DdlUi` is `Copy`, so these four closures capture the bundle
+            // itself where they used to each clone the whole `Ui` to reach it.
             move || {
-                let ui = add_ui.clone();
-                ui.ddl.draft.update(|d| {
-                    d.columns.push(ColumnDraft::new(ColumnInfo {
-                        name: unique_name(&d.column_names(), "column"),
-                        type_name: default_type(&ui),
+                // The dialect, read the way `can_reorder` reads it just above:
+                // the placeholder type a new column starts at is the engine's,
+                // and which one is `ddl::default_new_column_type` with its test.
+                let dialect = d
+                    .designer
+                    .get_untracked()
+                    .map(|t| t.dialect)
+                    .unwrap_or_default();
+                d.draft.update(|dr| {
+                    dr.columns.push(ColumnDraft::new(ColumnInfo {
+                        name: unique_name(&dr.column_names(), "column"),
+                        type_name: schemaic_core::ddl::default_new_column_type(dialect).to_string(),
                         nullable: true,
                         ..Default::default()
                     }))
                 });
-                let n = ui.ddl.draft.with_untracked(|d| d.columns.len());
-                ui.ddl.selected.set(n.saturating_sub(1));
-                ui.ddl.rev.update(|r| *r += 1);
+                let n = d.draft.with_untracked(|dr| dr.columns.len());
+                d.selected.set(n.saturating_sub(1));
+                d.rev.update(|r| *r += 1);
             },
             move || {
-                let ui = del_ui.clone();
-                // The dialect, read the way `can_reorder` reads it just above:
-                // removing a column takes the checks that stand on it, and which
+                // Removing a column takes the checks that stand on it, and which
                 // predicates *name* a column is the engine's question (quoting
                 // and case). No target means no draft to edit.
-                let Some(dialect) = ui.ddl.designer.get_untracked().map(|t| t.dialect) else {
+                let Some(dialect) = d.designer.get_untracked().map(|t| t.dialect) else {
                     return;
                 };
-                let i = ui.ddl.selected.get_untracked();
-                ui.ddl.draft.update(|d| d.remove_column(i, dialect));
-                clamp_selection(&ui, |d| d.columns.len());
+                let i = d.selected.get_untracked();
+                d.draft.update(|dr| dr.remove_column(i, dialect));
+                clamp_selection(d, |dr| dr.columns.len());
             },
             // Which engines can place a column, and why each can or can't, is
             // `ddl::supports_column_reorder` — the same predicate `ddl::diff`
             // asks before it raises the move, so the arrows and the plan cannot
             // drift apart. It was a `!= SqlDialect::Postgres` at both sites.
-            can_reorder.then(|| Rc::new(move || swap_selected(&up_ui, -1)) as Rc<dyn Fn()>),
-            can_reorder.then(|| Rc::new(move || swap_selected(&down_ui, 1)) as Rc<dyn Fn()>),
+            can_reorder.then(|| Rc::new(move || swap_selected(d, -1)) as Rc<dyn Fn()>),
+            can_reorder.then(|| Rc::new(move || swap_selected(d, 1)) as Rc<dyn Fn()>),
             ring.clone(),
         ),
         d.selected,
@@ -1632,7 +1635,7 @@ fn indexes_list(ui: Ui, ring: FocusRing) -> AnyView {
                         d.indexes.remove(i);
                     }
                 });
-                clamp_selection(&ui, |d| d.indexes.len());
+                clamp_selection(ui.ddl, |d| d.indexes.len());
             },
             None,
             None,
@@ -1818,7 +1821,7 @@ fn fks_list(ui: Ui, ring: FocusRing) -> AnyView {
                         d.foreign_keys.remove(i);
                     }
                 });
-                clamp_selection(&ui, |d| d.foreign_keys.len());
+                clamp_selection(ui.ddl, |d| d.foreign_keys.len());
             },
             None,
             None,
@@ -2039,7 +2042,7 @@ fn checks_list(ui: Ui, ring: FocusRing) -> AnyView {
                         d.check_constraints.remove(i);
                     }
                 });
-                clamp_selection(&ui, |d| d.check_constraints.len());
+                clamp_selection(ui.ddl, |d| d.check_constraints.len());
             },
             None,
             None,
@@ -2182,25 +2185,16 @@ fn unique_name(taken: &[String], base: &str) -> String {
 
 /// The type a new column starts as — a sane, obviously-editable default per
 /// engine rather than an empty field that fails validation on sight.
-fn default_type(ui: &Ui) -> String {
-    let pg = ui
-        .ddl
-        .designer
-        .get_untracked()
-        .is_some_and(|t| t.dialect == SqlDialect::Postgres);
-    if pg {
-        "text".to_string()
-    } else {
-        "varchar(255)".to_string()
-    }
-}
-
 /// Keep the selection on a real row after a removal.
-fn clamp_selection(ui: &Ui, len: impl Fn(&TableDraft) -> usize) {
-    let n = ui.ddl.draft.with_untracked(|d| len(d));
-    let i = ui.ddl.selected.get_untracked();
-    ui.ddl.selected.set(i.min(n.saturating_sub(1)));
-    ui.ddl.rev.update(|r| *r += 1);
+///
+/// Takes the `ddl` bundle rather than `&Ui`, which is `whole_ui_gate`'s rule —
+/// every signal it touches is in that one child bundle, and `DdlUi` is `Copy`,
+/// so the call sites lost a `Ui` clone apiece as well.
+fn clamp_selection(d: DdlUi, len: impl Fn(&TableDraft) -> usize) {
+    let n = d.draft.with_untracked(|dr| len(dr));
+    let i = d.selected.get_untracked();
+    d.selected.set(i.min(n.saturating_sub(1)));
+    d.rev.update(|r| *r += 1);
 }
 
 /// Where "move the item at `i` by `delta`" lands, or `None` when it can't.
@@ -2215,15 +2209,17 @@ fn swap_target(len: usize, i: usize, delta: isize) -> Option<usize> {
 }
 
 /// Move the selected item one place, taking the selection with it.
-fn swap_selected(ui: &Ui, delta: isize) {
-    let i = ui.ddl.selected.get_untracked();
-    let len = ui.ddl.draft.with_untracked(|d| d.columns.len());
+///
+/// The `ddl` bundle, for [`clamp_selection`]'s reason.
+fn swap_selected(d: DdlUi, delta: isize) {
+    let i = d.selected.get_untracked();
+    let len = d.draft.with_untracked(|dr| dr.columns.len());
     let Some(j) = swap_target(len, i, delta) else {
         return;
     };
-    ui.ddl.draft.update(|d| d.columns.swap(i, j));
-    ui.ddl.selected.set(j);
-    ui.ddl.rev.update(|r| *r += 1);
+    d.draft.update(|dr| dr.columns.swap(i, j));
+    d.selected.set(j);
+    d.rev.update(|r| *r += 1);
 }
 
 // ── the modal ────────────────────────────────────────────────────────────────

@@ -2300,6 +2300,20 @@ existing prose was left alone.
     sequence that explicit inserts leave where it was — while MySQL's `AUTO_INCREMENT` and SQLite's
     `rowid` both advance from the data already in the table, so there is nothing to resync;
     `dump::sequence_resync_sql` is the one caller, and this replaced the `!= Postgres` it shipped as.
+    **One member of the family answers with a *value* rather than a yes.** `default_new_column_type`
+    is the placeholder type the designer drops into a new column's field before the user has picked
+    one: `varchar(255)` on MySQL and SQLite, `text` on PostgreSQL. The difference is not house style
+    — on PostgreSQL `varchar(255)` is a limit the **server enforces**, on a column the user has not
+    finished describing, while `text` there is the same storage with no limit; SQLite keeps MySQL's
+    spelling because its declared length is a note rather than a promise, which is what
+    `enforces_declared_byte_length` says just below — the parameter is ignored outright and
+    `varchar(255)` is TEXT affinity, so the two spellings mean the same thing to that engine. It is
+    an exhaustive `match` rather than a capability for `intel::builtin_catalog`'s reason: *which type
+    name* has no yes/no behind it to compute from, so a fourth engine has to be answered for instead
+    of inheriting whichever arm a comparison left open. It replaced an `== SqlDialect::Postgres`
+    inside `table_designer::default_type`, which is gone;
+    `a_new_column_starts_at_the_engines_own_string_type` asserts the literal strings rather than that
+    they differ, since a test saying only "PostgreSQL is not MySQL" passes on any two values.
     **Three more answer for things outside the designer entirely.** `enforces_declared_byte_length`
     asks whether a column's *declared* type binds how many bytes a value in it may hold: MySQL's is a
     promise, enforced with `ERROR 1406: Data too long`; PostgreSQL's `bytea` declares no length to
@@ -12177,7 +12191,11 @@ existing prose was left alone.
     right one and stay offered on SQLite: MySQL moves a column with `AFTER`, SQLite gets there by
     rebuilding — the new table is created in the draft's column order, so a move costs nothing
     beyond the rebuild already under way — and PostgreSQL has neither, where an arrow would promise
-    an edit no statement can carry out.
+    an edit no statement can carry out. **A fourth question left the crate rather than becoming a
+    predicate.** The placeholder type a new column starts at was an `== Postgres` in this file's own
+    `default_type`; it is `ddl::default_new_column_type` now — a value, not a capability — and the
+    local function is gone, taking one of this file's admitted `engine_comparison_gate` comparisons
+    (9 → 8) with it.
     **Every path ends at `ddl_preview`** — designer, Create table, and the context-menu
     shortcuts — so there's one place that shows the SQL, one that names what's destroyed, and
     one "Open in editor" escape hatch. Never run generated DDL without it.
@@ -12700,7 +12718,12 @@ existing prose was left alone.
     `table_designer::suggest_chevron` it
     wraps both narrowed from `&Ui` to `crate::OverlayUi` — the two `Copy` signals (`popup_menu`,
     `popup_anchor`) are the whole of the chevron's interest in the bundle — across four call sites,
-    which is what takes `table_designer.rs`'s entry 33 → 32 in a change about accounts.
+    which is what takes `table_designer.rs`'s entry 33 → 32 in a change about accounts. That entry
+    stands at **29** since: `clamp_selection` and `swap_selected` narrowed to `DdlUi` — every signal
+    either of them touches is in that one child bundle, which is the ratchet's own prescription —
+    and `default_type` went away outright rather than being narrowed, its decision now
+    `ddl::default_new_column_type` with a test behind it. `DdlUi` being `Copy` is what let the
+    columns list stop cloning the whole `Ui` four times to reach it.
     Scoped to this file on purpose: every other editor is launched from the
     schema tree, where the active connection *is* the target.
     The account form **creates, or resets one account's password — and never renames** — near enough

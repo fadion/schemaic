@@ -4216,13 +4216,15 @@ mod engine_comparison_gate {
         ),
         (
             "table_designer.rs",
-            9,
+            8,
             "**Partly not clean.** `has_comments != Sqlite` (twice) and \
              `has_on_update == MySql` are capability questions with no \
              predicate — `ddl::supports_column_comments` and \
              `supports_on_update_current_timestamp` are the two this file is \
              waiting for. The Postgres ones (identity, `NOT ENFORCED`, the \
-             storage row) are per-engine column *grammar*.",
+             storage row) are per-engine column *grammar*. 9 → 8: a new \
+             column's placeholder type was an `== Postgres` here and is now \
+             `ddl::default_new_column_type`, answering for all three.",
         ),
         (
             "trigger_editor.rs",
@@ -14583,7 +14585,13 @@ mod whole_ui_gate {
         ("snippet_panel.rs", 1),
         // 33 → 32: `suggest_chevron` took `&Ui` for two `Copy` overlay signals
         // and now takes `OverlayUi`.
-        ("table_designer.rs", 32),
+        //
+        // 32 → 29: `clamp_selection` and `swap_selected` take `DdlUi` — every
+        // signal either touches is in that one child bundle — and `default_type`
+        // is gone outright, its decision now `ddl::default_new_column_type` with
+        // a test. `DdlUi` is `Copy`, so the columns list also stopped cloning
+        // the whole `Ui` four times to reach it.
+        ("table_designer.rs", 29),
         // 2, for `compare_view.rs`'s reason: `tab_chip(tab: Tab, ui: Ui)`.
         ("tabs.rs", 2),
         ("trigger_editor.rs", 11),
