@@ -31,6 +31,7 @@ use floem::kurbo::{Point, Rect};
 use floem::peniko::Color;
 use floem::prelude::*;
 use floem::reactive::create_effect;
+use floem::views::{VirtualDirection, VirtualItemSize, VirtualVector, virtual_stack};
 
 use schemaic_core::export::{ExportFormat, suggested_filename};
 use schemaic_core::monitor::{
@@ -81,6 +82,41 @@ fn col_gap() -> f64 {
 }
 fn row_pad_h() -> f64 {
     theme::scaled(14.0)
+}
+/// One change row's **whole** vertical box, gap included.
+///
+/// **Decreed rather than derived**, and the row is given this height rather than
+/// the `padding_vert(7)` + `gap(2)` it used to reach the same 29px with. That is
+/// what [`VirtualItemSize::Fixed`] needs: `virtual_stack` places child `i` at
+/// `i * item_size`, so a height computed one way for the layout and another way
+/// for the stack is a list that drifts further out of place the further you
+/// scroll. `blob_view`'s hex dump is the same shape for the same reason.
+/// `conn_import`'s `ROW_VIEW_CAP` chose a cap over a virtual stack precisely
+/// because *its* rows are two lines or three; a change row is always one, which
+/// is what makes `Fixed` honest here.
+fn mon_row_h() -> f64 {
+    theme::scaled(29.0)
+}
+
+/// Row source for the change log's virtual stack.
+///
+/// **The sequence numbers, not the entries**, for the two reasons the list's own
+/// comment gives: the keyed diff has to key on the entry rather than on its
+/// position, because the log is a sliding window whose index set never changes;
+/// and iterating `u64` keeps the whole `Vec<MonitorEntry>` from being deep-copied
+/// twice per landing poll.
+struct LogSeqs(Vec<u64>);
+
+impl VirtualVector<u64> for LogSeqs {
+    fn total_len(&self) -> usize {
+        self.0.len()
+    }
+
+    fn slice(&mut self, range: std::ops::Range<usize>) -> impl Iterator<Item = u64> {
+        let end = range.end.min(self.0.len());
+        let start = range.start.min(end);
+        self.0[start..end].iter().copied()
+    }
 }
 
 /// Old-value tint (removed) and new-value tint (added), shared by updates + inserts.
@@ -490,16 +526,60 @@ pub(crate) fn monitor_overlay(ui: Ui) -> impl IntoView {
                     let seqs = floem::reactive::create_memo(move |_| {
                         log.with(|l| l.iter().map(|e| e.seq).collect::<Vec<u64>>())
                     });
-                    let list = dyn_stack(
-                        move || seqs.get(),
+                    // **Only the visible rows are built.** A `dyn_stack` built
+                    // all of them, and at `LOG_CAP` that is 1,000 rows of
+                    // fifteen-odd text views apiece: measured on MariaDB
+                    // 10.11.14 against a ten-column table, the process grew from
+                    // 336 MB with an empty log to 813 MB with a full one, dead
+                    // linear at ~0.46 MB per row across 250/500/750/1,000. The
+                    // *data* behind those rows is well under a megabyte in
+                    // total, so effectively all of it was the view tree.
+                    // Windowed, the same full log measures 335 MB.
+                    //
+                    // `LogSeqs` and the `u64` key keep both of the older list's
+                    // properties — see its doc.
+                    let widest = RwSignal::new(0.0_f64);
+                    let list = virtual_stack(
+                        VirtualDirection::Vertical,
+                        VirtualItemSize::Fixed(Box::new(mon_row_h)),
+                        move || LogSeqs(seqs.get()),
                         |seq| *seq,
-                        move |seq| entry_row(log, seq, cols),
+                        move |seq| {
+                            // **The widest row *seen*, and it never shrinks.**
+                            // These rows are content-sized — the Data column has
+                            // no width, so the list is as wide as its widest
+                            // row — and with only the visible ones mounted that
+                            // maximum would change as you scroll. The header
+                            // mirrors `hscroll`, so a range that shrinks past
+                            // the current offset drags both it and the header
+                            // sideways under a vertical gesture. Monotone, the
+                            // range can only grow, which a scrollbar reads as
+                            // more content arriving rather than as the view
+                            // moving.
+                            //
+                            // **Nothing resets it, and nothing needs to.** The
+                            // signal is owned by this builder, and the builder's
+                            // own key is the empty↔non-empty edge — so Clear
+                            // disposes it and a refilling log gets a fresh zero.
+                            // An effect watching for an empty log would never
+                            // have run.
+                            //
+                            // Reasoned from the layout, not measured: the
+                            // horizontal gesture could not be driven through the
+                            // synthetic-input harness, so the *symptom* this
+                            // prevents was never put on screen.
+                            entry_row(log, seq, cols).on_resize(move |r| {
+                                if r.width() > widest.get_untracked() + 0.5 {
+                                    widest.set(r.width());
+                                }
+                            })
+                        },
                     )
-                    .style(|s| {
+                    .style(move |s| {
                         s.flex_col()
                             .padding_horiz(row_pad_h())
                             .padding_vert(theme::scaled(8.0))
-                            .gap(theme::scaled(2.0))
+                            .min_width(widest.get() + row_pad_h() * 2.0)
                     });
                     let (list_scroll, by_user) = with_scroll_gesture(shift_hscroll(
                         list.on_resize(move |r| content_h.set(r.height())),
@@ -691,9 +771,11 @@ fn entry_row(
         data_view(&entry.change, &names),
     ))
     .style(|s| {
-        s.items_center()
-            .gap(col_gap())
-            .padding_vert(theme::scaled(7.0))
+        // **A height, where this was `padding_vert(7.0)` and a 2px gap on the
+        // stack.** Same 29px pitch, but stated once — see [`mon_row_h`] for why
+        // the virtual stack cannot be trusted with a height it did not decide.
+        // `items_center` is what puts the line back in the middle of it.
+        s.items_center().gap(col_gap()).height(mon_row_h())
     })
     .into_any()
 }
@@ -979,6 +1061,32 @@ fn cell(c: &Option<String>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **The virtual stack may ask for rows the log no longer has.**
+    ///
+    /// The log is a sliding window that a landing poll shortens from the front
+    /// and lengthens at the back, and `virtual_stack` computes the range it
+    /// wants from the viewport it last laid out — so a range whose end is past
+    /// `total_len` is an ordinary race, not a bug in the caller. Indexing a
+    /// slice with it panics, and a panic in a layout pass takes the window with
+    /// it. Clamping is what the `slice` here does about that, and it is the one
+    /// thing in `LogSeqs` worth asserting: the rest of the type is a length and
+    /// a copy.
+    #[test]
+    fn a_range_past_the_end_of_the_log_is_clamped_rather_than_panicking() {
+        let mut seqs = LogSeqs(vec![7, 8, 9]);
+        assert_eq!(seqs.total_len(), 3);
+        assert_eq!(seqs.slice(0..3).collect::<Vec<_>>(), vec![7, 8, 9]);
+        assert_eq!(seqs.slice(1..2).collect::<Vec<_>>(), vec![8]);
+        // Past the end in one direction, then in both.
+        assert_eq!(seqs.slice(1..9).collect::<Vec<_>>(), vec![8, 9]);
+        assert!(seqs.slice(5..9).collect::<Vec<_>>().is_empty());
+        // And the empty log, which is every session's first frame and the state
+        // Clear returns it to.
+        let mut none = LogSeqs(Vec::new());
+        assert_eq!(none.total_len(), 0);
+        assert!(none.slice(0..20).collect::<Vec<_>>().is_empty());
+    }
 
     /// `status_line` with no error and nothing paused/capped — the two truncation
     /// flags are what most of these vary.

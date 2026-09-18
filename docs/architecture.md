@@ -3968,8 +3968,10 @@ existing prose was left alone.
     **`DATA_COLS_SHOWN` (12) is a third bound, and it is on *views* rather than on the log.** The
     modal's Data column renders one span per column name plus one per value — four per changed field
     on an update — uncapped in the table's width, times `LOG_CAP` rows: **23,000 views at 10 table
-    columns, 63,000 at 30 and 123,000 at 60** (counted, not estimated), in a mounted list showing
-    about twenty, paid by every layout and paint pass for as long as the modal is open. Twelve
+    columns, 63,000 at 30 and 123,000 at 60** (counted, not estimated), in a list showing about
+    twenty, paid by every layout and paint pass for as long as the modal is open. Those totals are
+    no longer all resident — the modal's list is a `virtual_stack` now, so only the visible rows are
+    built — and the cap stands anyway, because the argument for it was never the total. Twelve
     because that column is one non-wrapping line already being scrolled horizontally to read: past a
     dozen `col=value` pairs nobody is reading it as a line, they are reading the export. The log
     keeps every column and `log_result_set` exports every column, which is what makes truncating the
@@ -11287,7 +11289,9 @@ existing prose was left alone.
     of 140,000 is the failure this would otherwise introduce. A cap rather than a `virtual_stack`,
     because an import row is two lines or three depending on whether it carries notes, so
     virtualizing means a `VirtualItemSize::Fn` restating the layout — and there is no screenshot
-    harness here to catch it being wrong.
+    harness here to catch it being wrong. The Live Monitor's change log answered the same question
+    the other way, because a change row is always one line and `Fixed` is therefore honest for it;
+    the rule that splits the two is a Floem gotcha.
   - `dividers.rs` — the two **panel** dividers: `h_resize_handle` (the schema tree's and the right
     panel's edges) and `v_resize_handle` (the editor/results split), plus the `DelayedHover` they
     share. Not `window_chrome::resize_zones`, which resizes the *window* and is mounted outside the
@@ -13986,8 +13990,9 @@ existing prose was left alone.
     while the log and its export went on moving. The unconditional rebuild was what hid that.
     **And the stack iterates the sequence numbers, not the entries.** `log.get()` deep-copies the
     whole `Vec<MonitorEntry>` — every entry carries the watched row's full `Vec<Option<String>>` —
-    and `dyn_stack` copies it again into its own `SmallVec`: **1.19 / 2.81 / 5.34 ms per landing
-    poll at 10 / 30 / 60 table columns**, on the UI thread, at an interval as short as a second. A
+    and the stack copies it again into its own storage (a `SmallVec`, in the `dyn_stack` this was
+    measured against): **1.19 / 2.81 / 5.34 ms per landing poll at 10 / 30 / 60 table columns**, on
+    the UI thread, at an interval as short as a second. A
     memo of `Vec<u64>` is 8 KiB at `LOG_CAP` and copies in microseconds, and `entry_row(log, seq,
     cols)` then clones the *one* entry it is for — which floem asks for only when the key is new.
     The log is appended in ascending `seq` and never reordered, so that lookup is a binary search; a
@@ -13995,12 +14000,37 @@ existing prose was left alone.
     which is what the row would have shown anyway. The Data column inside it is bounded at
     `monitor::DATA_COLS_SHOWN` with `data_overflow_label` saying so — see that entry for the view
     counts.
-    **A `virtual_stack` over the log is deliberately not done**, and this is the paragraph to read
-    before reaching for one: the rows are content-sized so a long change list scrolls horizontally
-    instead of wrapping, and the table header mirrors the body's `hscroll`. Windowing vertically
-    means the widest row in the *window* sets the content width, so scrolling would make that width
-    — and the header sitting on it — jump. The cap on what each row builds is the bound taken
-    instead. Three icon buttons sit in the sub-header between the status line and
+    **The list is a `virtual_stack` over a `LogSeqs` row source**, and this paragraph used to say
+    the opposite. A `dyn_stack` built every entry: at `LOG_CAP` that is 1,000 rows of fifteen-odd
+    text views apiece, each carrying its own shaped text layout. Measured on the real app against
+    MariaDB 10.11.14, a ten-column 250-row table polled every 2s, the process held 336 MB with an
+    empty log and **813 MB** with a full one — dead linear at 336 / 470 / 584 / 699 / 813 MB across
+    0 / 250 / 500 / 750 / 1,000 rows, about **0.46 MB per mounted row**. The log's own data at 1,000
+    entries is well under a megabyte, so effectively all of that was the view tree; virtualised, the
+    same full log costs 335 MB. `LogSeqs` is a `VirtualVector<u64>` and keeps both properties the
+    old list argued for above — the keyed diff still keys on `seq`, and the stack still iterates
+    sequence numbers instead of deep-copying `Vec<MonitorEntry>`. Its `slice` **clamps** the range
+    it is handed: `virtual_stack` computes what it wants from the viewport it last laid out, a
+    landing poll can shorten the log underneath that, and indexing a slice with a stale range panics
+    inside a layout pass — which takes the window with it.
+    `a_range_past_the_end_of_the_log_is_clamped_rather_than_panicking` pins it.
+    **The row's height is `mon_row_h()` (29) on the row itself**, where it was `padding_vert(7.0)`
+    plus a 2px gap on the stack reaching the same pitch: `VirtualItemSize::Fixed` places child `i`
+    at `i * item_size`, so a height computed one way for layout and another for the stack drifts
+    further out of place the further you scroll — see the Floem gotcha, which is also where the
+    contrast with `conn_import::ROW_VIEW_CAP` lives.
+    **The width objection the old paragraph raised is answered rather than withdrawn.** The rows are
+    content-sized so a long change list scrolls horizontally instead of wrapping, and the table
+    header mirrors the body's `hscroll`; with only the visible rows mounted, the widest row in the
+    *window* would set the content width, so a range that shrank past the current offset would drag
+    the body and the header sideways under a *vertical* gesture. `widest` is the widest row ever
+    seen — monotone, never shrinking, and needing no reset because the signal is owned by the
+    non-empty arm of the body container, whose key *is* the empty↔non-empty edge, so Clear disposes
+    it and a refilling log gets a fresh zero — and the stack's
+    `min_width` reads it, so the range can only grow. That failure is **reasoned from the layout,
+    not observed**: synthetic shift+wheel never reached floem's horizontal scroll, so unlike the
+    memory figures above nothing measured it. The Data column's `DATA_COLS_SHOWN` cap stays, on the
+    line rather than on the list. Three icon buttons sit in the sub-header between the status line and
     the interval dropdown — Pause, Clear, Export — and they join the modal's `FocusRing` at
     tabindex 10/11/12 with the dropdown moved to 13, so a monitor is watchable with both hands off
     the mouse. **Pause holds the fetch, not the loop**: `monitor_tick` reads the three signals and
@@ -19493,6 +19523,24 @@ Re-introducing the anti-patterns these guard against is a regression:
   child, *then* wrap, then give the wrapper `width_full()` so the row has a width to resolve its own
   `width_full()` against. This is the only menu in the app whose rows carry a tooltip, which is why
   it is the only one that had it.
+- **A `VirtualItemSize::Fixed` is a promise about the child's height, and the child has to keep it.**
+  `virtual_stack` places child `i` at `i * item_size` and derives the range it builds from the same
+  arithmetic, so a row whose real height is *assembled* — padding plus a parent `gap` — drifts
+  further out of place the further you scroll even when the two agree on the pitch at row zero, and
+  the rows it believes are on screen stop being the ones that are. State the number once and give it
+  to the row: `monitor_view::mon_row_h` is that number and `entry_row` takes it as a `.height(…)`,
+  where it used to reach the same 29px through `padding_vert(7.0)` and a 2px stack gap;
+  `blob_view`'s hex dump is the same shape. The corollary decides *which* lists may be virtualised
+  at all — `Fixed` is honest only for a row that is always one line, which is why
+  `conn_import::ROW_VIEW_CAP` took a cap instead: its rows are two lines or three, so virtualising
+  them means a `VirtualItemSize::Fn` restating the layout, with no screenshot harness to catch it
+  being wrong. **And a vertically-virtualised list of content-sized rows has a horizontal problem
+  too**: only the mounted rows contribute to the content width, so it moves as you scroll, and
+  anything mirroring the scroll offset — the monitor's table header — is dragged sideways by a
+  purely vertical gesture. The answer there is a monotone `min_width`: the widest row *seen*, never
+  shrinking, and owned by whatever scope the list's own emptiness disposes, so that clearing the
+  list is what resets it rather than an effect watching for it (reasoned from the layout rather than
+  observed — see `monitor_view`'s entry).
 - **`s.hide()`/`s.flex()` (display none/flex) beat height/scale for a reactive show-hide** — adds/
   removes the element from layout cleanly (no clip/overflow/leftover space). Prefer it to animating
   height when you don't need the animation.
