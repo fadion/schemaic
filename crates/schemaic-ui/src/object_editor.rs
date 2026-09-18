@@ -42,7 +42,8 @@ use crate::widgets::{
     modal_title_owned, modal_w, panel_style, row_button, row_gap,
 };
 use crate::{
-    DdlPreview, FieldCfg, ObjectTarget, Ui, ddl_preview, edit_field, icons, object_location, theme,
+    DdlPreview, DdlUi, FieldCfg, ObjectTarget, OverlayUi, Ui, ddl_preview, edit_field, icons,
+    object_location, theme,
 };
 
 fn panel_w() -> f64 {
@@ -237,12 +238,12 @@ pub(crate) fn is_editable_object(item: &ObjectItem) -> bool {
 /// and the effect writes back only on a genuine change, so a rebuild can't read
 /// as an edit.
 fn bound_field(
-    ui: &Ui,
+    ui: DdlUi,
     initial: String,
     cfg: FieldCfg,
     apply: impl Fn(&mut ObjectDraft, &str) + 'static,
 ) -> AnyView {
-    let draft = ui.ddl.object_draft;
+    let draft = ui.object_draft;
     let sig = floem::reactive::create_rw_signal(initial);
     create_effect(move |prev: Option<String>| {
         let v = sig.get();
@@ -262,15 +263,15 @@ fn bound_field(
 /// withdrawn as soon as the text parses. One message per field, keyed by its
 /// label, so two bad fields report two problems and neither erases the other.
 fn num_field(
-    ui: &Ui,
+    ui: DdlUi,
     label: &'static str,
     initial: String,
     ring: FocusRing,
     tabindex: u32,
     apply: impl Fn(&mut SequenceDraft, &str) -> Result<(), ()> + 'static,
 ) -> AnyView {
-    let draft = ui.ddl.object_draft;
-    let errs = ui.ddl.object_errors;
+    let draft = ui.object_draft;
+    let errs = ui.object_errors;
     let sig = floem::reactive::create_rw_signal(initial);
     create_effect(move |prev: Option<String>| {
         let v = sig.get();
@@ -306,7 +307,7 @@ fn num_field(
 
 /// A toggle bound to the draft.
 fn bound_toggle(
-    ui: &Ui,
+    ui: DdlUi,
     title: &'static str,
     hint: &'static str,
     initial: bool,
@@ -314,7 +315,7 @@ fn bound_toggle(
     tabindex: u32,
     apply: impl Fn(&mut ObjectDraft, bool) + 'static,
 ) -> AnyView {
-    let draft = ui.ddl.object_draft;
+    let draft = ui.object_draft;
     let sig = floem::reactive::create_rw_signal(initial);
     create_effect(move |prev: Option<bool>| {
         let v = sig.get();
@@ -337,10 +338,9 @@ fn bound_toggle(
 /// `ring` places each row's field in the modal's Tab order, one stop per value
 /// from `VALUE_TAB` upwards; the move/remove buttons stay pointer-only, like
 /// every other button here.
-fn enum_values(ui: &Ui, ring: FocusRing) -> AnyView {
-    let draft = ui.ddl.object_draft;
-    let rev = ui.ddl.object_rev;
-    let ui = ui.clone();
+fn enum_values(ui: DdlUi, ring: FocusRing) -> AnyView {
+    let draft = ui.object_draft;
+    let rev = ui.object_rev;
     dyn_container(
         // Structural only: adding, removing or moving rebuilds the rows; typing
         // into one must not, or the field being typed into is torn down.
@@ -351,7 +351,6 @@ fn enum_values(ui: &Ui, ring: FocusRing) -> AnyView {
                 _ => Vec::new(),
             });
             let n = values.len();
-            let ui = ui.clone();
             let ring = ring.clone();
             let add_ring = ring.clone();
             let rows = v_stack_from_iter(values.into_iter().enumerate().map(move |(i, v)| {
@@ -362,7 +361,7 @@ fn enum_values(ui: &Ui, ring: FocusRing) -> AnyView {
                 let base = VALUE_TAB + i as u32 * ROW_TAB_STRIDE;
                 let btn = base + ROW_BUTTON_TAB;
                 let field = bound_field(
-                    &ui,
+                    ui,
                     v,
                     FieldCfg {
                         placeholder: "value",
@@ -461,7 +460,7 @@ fn enum_values(ui: &Ui, ring: FocusRing) -> AnyView {
     .into_any()
 }
 
-fn enum_form(ui: &Ui, d: &EnumDraft, ring: FocusRing) -> AnyView {
+fn enum_form(ui: DdlUi, d: &EnumDraft, ring: FocusRing) -> AnyView {
     let name = form_setting(
         "Name",
         bound_field(
@@ -520,10 +519,9 @@ fn enum_form(ui: &Ui, d: &EnumDraft, ring: FocusRing) -> AnyView {
 /// order is the type's meaning.
 /// Each row owns a `ROW_TAB_STRIDE` block from `VALUE_TAB` upwards: its name,
 /// its predicate, then its remove button.
-fn domain_checks(ui: &Ui, ring: FocusRing) -> AnyView {
-    let draft = ui.ddl.object_draft;
-    let rev = ui.ddl.object_rev;
-    let ui = ui.clone();
+fn domain_checks(ui: DdlUi, ring: FocusRing) -> AnyView {
+    let draft = ui.object_draft;
+    let rev = ui.object_rev;
     dyn_container(
         move || rev.get(),
         move |_| {
@@ -531,14 +529,13 @@ fn domain_checks(ui: &Ui, ring: FocusRing) -> AnyView {
                 ObjectDraft::Domain(dom) => dom.info.checks.clone(),
                 _ => Vec::new(),
             });
-            let ui = ui.clone();
             let ring = ring.clone();
             let add_ring = ring.clone();
             let n = checks.len();
             let rows = v_stack_from_iter(checks.into_iter().enumerate().map(move |(i, ck)| {
                 let base = VALUE_TAB + i as u32 * ROW_TAB_STRIDE;
                 let name = bound_field(
-                    &ui,
+                    ui,
                     ck.name.clone(),
                     FieldCfg {
                         placeholder: "constraint_name",
@@ -555,7 +552,7 @@ fn domain_checks(ui: &Ui, ring: FocusRing) -> AnyView {
                 )
                 .style(|s| s.width(theme::scaled(190.0)).flex_shrink(0.0_f32));
                 let expr = bound_field(
-                    &ui,
+                    ui,
                     ck.expression.clone(),
                     FieldCfg {
                         placeholder: "VALUE > 0",
@@ -644,13 +641,17 @@ fn domain_checks(ui: &Ui, ring: FocusRing) -> AnyView {
     .into_any()
 }
 
+/// Takes the two child bundles it reads rather than the root: the draft lives in
+/// `DdlUi`, and `suggest_chevron`'s dropdown channel is the whole of what
+/// `OverlayUi` is for here.
 fn domain_form(
-    ui: &Ui,
+    ui: DdlUi,
+    overlay: OverlayUi,
     d: &DomainDraft,
     dialect: schemaic_core::intel::SqlDialect,
     ring: FocusRing,
 ) -> AnyView {
-    let draft = ui.ddl.object_draft;
+    let draft = ui.object_draft;
     let name = form_setting(
         "Name",
         bound_field(
@@ -703,7 +704,7 @@ fn domain_form(
                 )
                 .style(move |s| s.width(field_w())),
                 suggest_chevron(
-                    ui.overlay,
+                    overlay,
                     sig,
                     move || {
                         ddl::common_types(dialect)
@@ -829,12 +830,12 @@ fn restart_seed(restart: Option<i64>) -> String {
 }
 
 fn sequence_form(
-    ui: &Ui,
+    ui: DdlUi,
     d: &SequenceDraft,
     orig_owner: Option<SequenceOwner>,
     ring: FocusRing,
 ) -> AnyView {
-    let draft = ui.ddl.object_draft;
+    let draft = ui.object_draft;
     let name = form_setting(
         "Name",
         bound_field(
@@ -976,7 +977,7 @@ fn sequence_form(
             None => "Restart at — the counter has not been used".to_string(),
         },
         {
-            let errs = ui.ddl.object_errors;
+            let errs = ui.object_errors;
             let sig = floem::reactive::create_rw_signal(restart_seed(d.restart));
             create_effect(move |prev: Option<String>| {
                 let v = sig.get();
@@ -1094,12 +1095,12 @@ fn sequence_form(
 
 // ── the modal ────────────────────────────────────────────────────────────────
 
-fn form(ui: &Ui, target: &ObjectTarget, ring: FocusRing) -> AnyView {
-    let draft = ui.ddl.object_draft.get_untracked();
+fn form(ui: DdlUi, overlay: OverlayUi, target: &ObjectTarget, ring: FocusRing) -> AnyView {
+    let draft = ui.object_draft.get_untracked();
     // No "In {database}" row: the modal title names the place now.
     let body = match &draft {
         ObjectDraft::Enum(d) => enum_form(ui, d, ring),
-        ObjectDraft::Domain(d) => domain_form(ui, d, target.dialect, ring),
+        ObjectDraft::Domain(d) => domain_form(ui, overlay, d, target.dialect, ring),
         ObjectDraft::Sequence(d) => sequence_form(
             ui,
             d,
@@ -1164,13 +1165,14 @@ pub(crate) fn object_editor_overlay(ui: Ui) -> impl IntoView {
             let ring = FocusRing::new();
             let root_ring = ring.clone();
 
-            let body =
-                crate::widgets::autohide(scroll(form(&ui, &target, ring.clone()).style(|s| {
+            let body = crate::widgets::autohide(scroll(
+                form(ui.ddl, ui.overlay, &target, ring.clone()).style(|s| {
                     s.width_full()
                         .padding_horiz(modal_pad_h())
                         .padding_vert(theme::scaled(18.0))
-                })))
-                .style(|s| s.width_full().flex_grow(1.0_f32).min_height(0.0));
+                }),
+            ))
+            .style(|s| s.width_full().flex_grow(1.0_f32).min_height(0.0));
 
             // Validation first (it blocks), then the change count. A field whose
             // text isn't a number yet is a validation failure like any other.

@@ -14573,7 +14573,16 @@ mod whole_ui_gate {
         ("lib.rs", 6),
         ("modals.rs", 5),
         ("monitor_view.rs", 1),
-        ("object_editor.rs", 14),
+        // 14 → 5: every function *inside* the form takes `DdlUi`, which is where
+        // the draft, the revision counter and the parse errors all live — that
+        // was nine signatures reaching the root bundle for one child of it.
+        // `domain_form` and `form` take `DdlUi` **and** `OverlayUi` rather than
+        // the root, because `suggest_chevron`'s dropdown channel is the second
+        // thing they need and naming both is still narrower than naming
+        // neither. The five left are the *opening* path — `open_editor` and the
+        // three `open_for_*`, which write across `ddl`, `schema` and the peer
+        // editors, plus the overlay itself.
+        ("object_editor.rs", 5),
         // 15 → 13: `confirm_overlay` takes the one `RwSignal` it reads, and
         // `date_pick_overlay` takes `OverlayUi` (both its signals are in it).
         // `error_modal_overlay` stays on the root bundle and is the contrast
