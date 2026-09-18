@@ -48,8 +48,8 @@ use crate::widgets::{
     modal_w, panel_style,
 };
 use crate::{
-    DdlUi, EventSrcDoneFn, EventSrcRequest, EventTarget, FieldCfg, Ui, ddl_preview, edit_field,
-    object_location, theme,
+    ConnUi, DdlUi, EventSrcDoneFn, EventSrcFn, EventSrcRequest, EventTarget, FieldCfg, SchemaUi,
+    ddl_preview, edit_field, object_location, theme,
 };
 
 /// Matches the routine editor's: the two are siblings in every way that shows,
@@ -81,8 +81,7 @@ const SCHED_AT: &str = "Once";
 
 // ── opening ──────────────────────────────────────────────────────────────────
 
-fn open(ui: &Ui, target: EventTarget, draft: EventDraft) {
-    let d = ui.ddl;
+fn open(d: DdlUi, source: &EventSrcFn, target: EventTarget, draft: EventDraft) {
     // A new editing session: any lazy fetch still in flight for the last one is
     // now for the wrong target and must not land.
     d.session.update(|g| *g += 1);
@@ -102,7 +101,7 @@ fn open(ui: &Ui, target: EventTarget, draft: EventDraft) {
     // One list, in `ddl_preview` — five hand-written copies had already drifted.
     ddl_preview::close_peers(d, false);
     d.event.set(Some(target));
-    fetch_source(ui);
+    fetch_source(d, source);
 }
 
 /// Open the editor on an existing event.
@@ -112,13 +111,24 @@ fn open(ui: &Ui, target: EventTarget, draft: EventDraft) {
 /// `object_editor::open_for_object` (double-click, keyboard activation,
 /// Find-Anywhere — none of which consults the menu's gate), and `open_for_new`
 /// from `create_submenu` directly.
-pub(crate) fn open_for_event(ui: &Ui, database: &str, e: &EventInfo) {
-    let ctx = edit_ctx(ui.conn);
+///
+/// **The `source` argument is named at the door** for the reason
+/// `routine_editor::open_for_routine` gives: every door here ends in
+/// [`fetch_source`], the one thing in the module that talks to the server.
+pub(crate) fn open_for_event(
+    conn: ConnUi,
+    d: DdlUi,
+    source: &EventSrcFn,
+    database: &str,
+    e: &EventInfo,
+) {
+    let ctx = edit_ctx(conn);
     if ctx.read_only {
         return;
     }
     open(
-        ui,
+        d,
+        source,
         EventTarget {
             conn_id: ctx.conn_id,
             database: database.to_string(),
@@ -131,13 +141,21 @@ pub(crate) fn open_for_event(ui: &Ui, database: &str, e: &EventInfo) {
 }
 
 /// Open the editor on a blank draft — Create event.
-pub(crate) fn open_for_new(ui: &Ui, database: &str, schema: Option<&str>) {
-    let ctx = edit_ctx(ui.conn);
+pub(crate) fn open_for_new(
+    conn: ConnUi,
+    db_nodes: RwSignal<Vec<crate::ConnNode>>,
+    d: DdlUi,
+    source: &EventSrcFn,
+    database: &str,
+    schema: Option<&str>,
+) {
+    let ctx = edit_ctx(conn);
     if ctx.read_only {
         return;
     }
     open(
-        ui,
+        d,
+        source,
         EventTarget {
             conn_id: ctx.conn_id,
             database: database.to_string(),
@@ -146,10 +164,7 @@ pub(crate) fn open_for_new(ui: &Ui, database: &str, schema: Option<&str>) {
             read_only: ctx.read_only,
         },
         EventDraft::blank(
-            unique_name(
-                &taken_names(ui.schema.db_nodes, database, schema),
-                "new_event",
-            ),
+            unique_name(&taken_names(db_nodes, database, schema), "new_event"),
             schema.map(str::to_string),
         ),
     );
@@ -193,8 +208,7 @@ fn taken_names(
 ///
 /// The session guard is what makes a slow reply safe: the user can close this
 /// modal and open another event while the read is in flight.
-fn fetch_source(ui: &Ui) {
-    let d = ui.ddl;
+fn fetch_source(d: DdlUi, source: &EventSrcFn) {
     let Some(target) = d.event.get_untracked() else {
         return;
     };
@@ -256,7 +270,7 @@ fn fetch_source(ui: &Ui) {
             }
         });
     });
-    (ui.schema_actions.event_source.clone())(
+    (source)(
         EventSrcRequest {
             conn_id: target.conn_id,
             database: target.database.clone(),
@@ -816,8 +830,11 @@ fn change_set(target: &EventTarget, draft: &EventDraft) -> ddl::ChangeSet {
 
 /// The event editor. Absolutely positioned over the workspace when
 /// `ui.ddl.event` is `Some`.
-pub(crate) fn event_editor_overlay(ui: Ui) -> impl IntoView {
-    let d = ui.ddl;
+///
+/// **Takes the two child bundles it reads**, as the routine editor's overlay
+/// does: nothing under it is an opening path, so the draft, the preview
+/// hand-off and the sibling-name list are the whole of it.
+pub(crate) fn event_editor_overlay(d: DdlUi, schema: SchemaUi) -> impl IntoView {
     let close = move || d.event.set(None);
 
     // **A memo, not the raw pair** — `overlay_open_key` carries the reason:
@@ -835,7 +852,6 @@ pub(crate) fn event_editor_overlay(ui: Ui) -> impl IntoView {
             let Some(target) = d.event.get_untracked() else {
                 return empty().into_any();
             };
-            let ui = ui.clone();
             let title = match &target.current {
                 Some(e) => format!(
                     "Edit event {}.{}",
@@ -860,20 +876,19 @@ pub(crate) fn event_editor_overlay(ui: Ui) -> impl IntoView {
             let ring = FocusRing::new();
             let root_ring = ring.clone();
 
-            let body =
-                crate::widgets::autohide(scroll(event_form(ui.ddl, ring.clone()).style(|s| {
-                    s.width_full()
-                        .padding_horiz(modal_pad_h())
-                        .padding_vert(theme::scaled(18.0))
-                })))
-                .style(|s| s.width_full().flex_grow(1.0_f32).min_height(0.0));
+            let body = crate::widgets::autohide(scroll(event_form(d, ring.clone()).style(|s| {
+                s.width_full()
+                    .padding_horiz(modal_pad_h())
+                    .padding_vert(theme::scaled(18.0))
+            })))
+            .style(|s| s.width_full().flex_grow(1.0_f32).min_height(0.0));
 
             // Every event in this database, so the footer can see a rename
             // landing on one. Read once per open rather than per keystroke: it
             // is the same `db_nodes` snapshot the tree is drawing from, and the
             // reload that would change it runs after Apply, which closes this.
             let taken = taken_names(
-                ui.schema.db_nodes,
+                schema.db_nodes,
                 &target.database,
                 d.event_draft
                     .with_untracked(|e| e.info.schema.clone())
@@ -942,7 +957,6 @@ pub(crate) fn event_editor_overlay(ui: Ui) -> impl IntoView {
                 },
             );
 
-            let preview_ui = ui.clone();
             let ring_actions = ring.clone();
             let actions = dyn_container(
                 move || {
@@ -953,7 +967,6 @@ pub(crate) fn event_editor_overlay(ui: Ui) -> impl IntoView {
                     )
                 },
                 move |(current, draft, (pending, stale))| {
-                    let ui = preview_ui.clone();
                     let Some(target) = current else {
                         return empty().into_any();
                     };
@@ -990,7 +1003,7 @@ pub(crate) fn event_editor_overlay(ui: Ui) -> impl IntoView {
                             move || {
                                 let cs = change_set(&target, &draft);
                                 ddl_preview::open_preview(
-                                    ui.ddl,
+                                    d,
                                     ddl_preview::preview_of(
                                         target.conn_id,
                                         &target.database,

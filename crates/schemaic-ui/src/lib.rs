@@ -14556,7 +14556,13 @@ mod whole_ui_gate {
     /// Lower an entry when you narrow one; never raise one. A file that reaches
     /// zero comes off the list, and then cannot take `Ui` again.
     const BUDGET: &[(&str, usize)] = &[
-        ("account_editor.rs", 6),
+        // `account_editor.rs` is **off the list** — 6 to zero. Its three doors
+        // (`open_for_new`, `open_for_reset`, `open_for_grant`) read `edit_ctx`
+        // and write the draft and nothing else, so they take `(ConnUi, DdlUi)`;
+        // `grant_form` took `&Ui` for `ui.overlay` alone, so it takes
+        // `OverlayUi` beside the `DdlUi` it already had; and the two overlays
+        // follow from those — `account_editor_overlay(DdlUi)` and
+        // `grant_editor_overlay(DdlUi, OverlayUi)`.
         ("activity_panel.rs", 1),
         ("ai_panel.rs", 1),
         ("blob_view.rs", 1),
@@ -14591,31 +14597,15 @@ mod whole_ui_gate {
         ("ddl_preview.rs", 2),
         ("dump_view.rs", 9),
         ("erd_view.rs", 1),
-        // 11 → 5: the four `bound_*` helpers take `RwSignal<EventDraft>` — the
-        // one signal each writes — and `schedule_form`/`event_form` take
-        // `DdlUi`. The five left are the opening path plus the overlay, and
-        // `open` is among them for a reason worth knowing: it ends by calling
-        // `fetch_source`, which needs `schema_actions` as well as `ddl`.
-        ("event_editor.rs", 5),
+        // `event_editor.rs` is **off the list** — see the note under
+        // `routine_editor.rs`, which came off with it.
         ("history_panel.rs", 1),
         ("import_view.rs", 9),
         ("lib.rs", 6),
         ("modals.rs", 5),
         ("monitor_view.rs", 1),
-        // 14 → 5: every function *inside* the form takes `DdlUi`, which is where
-        // the draft, the revision counter and the parse errors all live — that
-        // was nine signatures reaching the root bundle for one child of it.
-        // `domain_form` and `form` take `DdlUi` **and** `OverlayUi` rather than
-        // the root, because `suggest_chevron`'s dropdown channel is the second
-        // thing they need and naming both is still narrower than naming
-        // neither. The five left are the *opening* path — `open_editor` and the
-        // three `open_for_*`, which write across `ddl`, `schema` and the peer
-        // editors, plus the overlay itself.
-        // 5 → 4: this file's own private `loaded_schema` — a near-copy of
-        // `table_designer`'s, reading only `db_nodes` — took `SchemaUi`, and
-        // has since been deleted outright in favour of the shared funnel
-        // (`one_funnel_gate`); the count is unchanged either way.
-        ("object_editor.rs", 4),
+        // `object_editor.rs` is **off the list** — see the note under
+        // `routine_editor.rs`, which came off with it.
         // 15 → 13: `confirm_overlay` takes the one `RwSignal` it reads, and
         // `date_pick_overlay` takes `OverlayUi` (both its signals are in it).
         // `error_modal_overlay` stays on the root bundle and is the contrast
@@ -14623,13 +14613,37 @@ mod whole_ui_gate {
         ("overlays.rs", 13),
         ("plan_view.rs", 1),
         ("properties.rs", 5),
-        // 12 → 6: the four `bound_*` helpers take `RwSignal<RoutineDraft>`,
-        // `routine_form` takes `DdlUi`, and `taken_names` takes the one
-        // `db_nodes` signal it reads — which is what its twin in
-        // `event_editor.rs` already did, so this was the half still holding the
-        // root bundle for a question both answer the same way.
-        ("routine_editor.rs", 6),
-        ("schema_tree.rs", 6),
+        // `routine_editor.rs`, `event_editor.rs` and `object_editor.rs` are
+        // **off the list** — 6, 5 and 4 to zero, and the three had to move
+        // together because `object_editor`'s doors *are* the other two's.
+        //
+        // What unblocked them is that the thing keeping all three on the root
+        // bundle was one dependency, named for the first time: each door ends in
+        // a `fetch_source` that reads the object's real body off the server, so
+        // the door now takes the fetch (`&RoutineSrcFn` / `&EventSrcFn`) beside
+        // `ConnUi` and `DdlUi`, and `object_editor`'s two doors — which route by
+        // *kind* to whichever of the two editors owns it — take the
+        // `&SchemaActions` both fetches live on rather than two parameters of
+        // which exactly one is ever used. The overlays needed none of it:
+        // `fetch_source` is reached from `open`, never from the modal, so both
+        // take `(DdlUi, SchemaUi)` and `object_editor`'s takes
+        // `(DdlUi, OverlayUi)`.
+        //
+        // The call sites are where this pays: `schema_tree`'s object rows were
+        // cloning a whole `Ui` **per row** to reach a door, and the palette's
+        // `open_object` was holding one per build. Both carry three `Copy`
+        // bundles and one `Rc` now. (Per *row* is the tree's cost only — the
+        // palette builds `open_object` once and clones the `Rc` per row, which
+        // an earlier draft of this comment ran together.)
+        // 6 → 3: `object_row` takes the `SchemaTreeCtx` its caller was already
+        // holding rather than a `Ui` plus four of that struct's own fields, and
+        // `object_group_nodes`/`object_group_node` drop the `ui` parameter that
+        // was a second clone of the `ctx.ui` passed beside it. The three left
+        // are `blank_space_menu` and `schema_panel` — both opening paths into
+        // `database_editor`, which still takes the root bundle — and the
+        // `SchemaTreeCtx::ui` field itself, which the counter sees and which the
+        // table rows still read for `table_colors` and `table_sizes`.
+        ("schema_tree.rs", 3),
         ("script_view.rs", 6),
         ("settings.rs", 4),
         ("snippet_edit.rs", 1),
@@ -14673,17 +14687,21 @@ mod whole_ui_gate {
         ("table_designer.rs", 4),
         // 2, for `compare_view.rs`'s reason: `tab_chip(tab: Tab, ui: Ui)`.
         ("tabs.rs", 2),
-        // 11 → 8: `bound_field` and `bound_choice` take
-        // `RwSignal<TriggerSetDraft>`, and `trigger_list` takes `DdlUi`.
-        // **`form` and `pg_action` are deliberately not narrowed** — `pg_action`
-        // is where the "edit this function" button opens the *routine* editor,
-        // which is an opening path and wants the root bundle, and `form` is the
-        // only thing that can hand it one. Sibling files got to 5 and 6; this
-        // one stops at 8 for a reason, not for want of another pass.
+        // `trigger_editor.rs` is **off the list** — and the way it got there is
+        // the entry worth keeping, because this file's comment used to say it
+        // would not: *"`form` and `pg_action` are deliberately not narrowed —
+        // `pg_action` is where the 'edit this function' button opens the routine
+        // editor, which is an opening path and wants the root bundle … this one
+        // stops at 8 for a reason, not for want of another pass."* That reason
+        // was real when it was written and was **spent by the pass above**,
+        // silently: once the routine editor's doors took `(ConnUi, DdlUi,
+        // &RoutineSrcFn)` themselves, nothing downstream needed a root bundle to
+        // hand them, and `pg_action` turned out to read exactly those three and
+        // nothing else. The ratchet could not catch that — it only forbids going
+        // *up* — so a justification for a floor can lapse while the number it
+        // defends stays put. **Re-read a "deliberately not narrowed" against the
+        // callee before trusting it**; it describes the callee, not this file.
         //
-        // 8 → 7: `sibling_trigger_names` reads `loaded_schema` and nothing
-        // else, so it followed that helper onto `SchemaUi`.
-        ("trigger_editor.rs", 7),
         // 9 → 8: the browser's read-only question takes the connection registry
         // signal it actually reads rather than the root bundle, which is this
         // rule's own prescription and was the right shape anyway — the decision

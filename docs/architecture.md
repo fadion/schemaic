@@ -12842,7 +12842,11 @@ existing prose was left alone.
     module's own `open_for_object`/`open_for_new` are what route those to `routine_editor` and
     `event_editor` — so the tree, the palette and the menu all keep asking one function to open an
     object, and a routine handed to a type form would have to be an explicit mistake rather than
-    whichever arm compiles.
+    whichever arm compiles. That routing is also why both doors take the whole `&SchemaActions`
+    bundle rather than the two source-fetch closures the editors behind them actually want
+    (`&RoutineSrcFn`, `&EventSrcFn`): the kind is decided *inside*, so naming both would put two
+    parameters at every call site of which exactly one is ever used — the narrowing pass that took
+    all three files off `whole_ui_gate`'s list is written up under `lib.rs`.
     Same
     seed-local-signals-then-write-back rule as the other editors, and three more written down:
     the list rows are keyed on `object_rev`, a **structural** counter, so typing into a row
@@ -12951,8 +12955,10 @@ existing prose was left alone.
     browser is open must stop the write it is about to authorise — and it is also the stamp
     `read_only_door_gate` finds this file's doors by. `account_editor::anchor_gate` holds both
     halves,
-    and it is a **source** gate because the decision is struct literals inside `fn`s that take
-    the whole `Ui`: building one in a test is 36 fields and 91 more transitively. What it can see
+    and it is a **source** gate because the decision is struct literals inside `fn`s that write a
+    reactive bundle. When it was written those `fn`s took the whole `Ui` — 36 fields and 91 more
+    transitively to build in a test; the doors take `(ConnUi, DdlUi, …)` since this file came off
+    `whole_ui_gate`'s list, which is smaller and still a `DdlUi`'s 40 fields inside a Floem scope. What it can see
     mechanically is the spelling — `ctx.conn_id`/`ctx.dialect` must not appear in this file's
     production code, `conn_id: from.conn_id,` and `dialect: from.dialect,` must appear once per door,
     and `edit_ctx` must still be called at all, which is the floor that stops a rename leaving
@@ -12974,9 +12980,11 @@ existing prose was left alone.
     either of them touches is in that one child bundle, which is the ratchet's own prescription —
     and `default_type` went away outright rather than being narrowed, its decision now
     `ddl::default_new_column_type` with a test behind it. `DdlUi` being `Copy` is what let the
-    columns list stop cloning the whole `Ui` four times to reach it. It stands at **10** since the
+    columns list stop cloning the whole `Ui` four times to reach it. It reached **10** when the
     campaign written up under `lib.rs` took the file's whole form-and-list half to `DdlUi` and its
-    field helpers to `RwSignal<TableDraft>`.
+    field helpers to `RwSignal<TableDraft>`, and **4** when the six shared readers came down after
+    it; the `lib.rs` write-up carries the steps, and this sentence said 10 for a while after that
+    stopped being true.
     Scoped to this file on purpose: every other editor is launched from the
     schema tree, where the active connection *is* the target.
     The account form **creates, or resets one account's password — and never renames** — near enough
@@ -14823,9 +14831,14 @@ existing prose was left alone.
     concrete. No such function can be unit-tested: `ddl_preview::connection_label` touched 1 of the
     36 and encoded a real decision — the `connection N` fallback — and testing that fallback meant
     building a 36-field bundle inside a Floem reactive scope. And a signature stops saying what it
-    depends on: `schema_tree::object_row` takes `ui: Ui` and dereferences it *zero* times, the only
-    use being a clone forwarded into `object_editor::open_for_object`, so it holds live handles to
-    ~127 signals it never reads and a change to `OverlayUi` has no readable blast radius. Four
+    depends on: `schema_tree::object_row` took `ui: Ui` and dereferenced it *zero* times, the only
+    use being a clone forwarded into `object_editor::open_for_object`, so it held live handles to
+    ~127 signals it never read and a change to `OverlayUi` had no readable blast radius. **Wholly
+    past tense now — don't go looking for that shape.** The door narrowed first, which turned the
+    one use into four named fields; then the row itself did, and it takes the `SchemaTreeCtx` its
+    caller was already holding in place of a `Ui` plus four of that struct's own fields
+    (`context_menu`, `dialect`, `nav`, `indent_levels`) — the signature had been four pieces of the
+    context passed one by one with a duplicate of its `ui` beside them. Four
     one-field views went first — `connection_label` takes the one `RwSignal<Vec<Connection>>` and
     its decision is `core::connection::label_of` with a three-line test, and
     `compare_view::left_db_type`/`side_label` and `event_editor::taken_names` were the same shape.
@@ -14845,12 +14858,14 @@ existing prose was left alone.
     designer's three growing lists each kept an `add_ui` and a `del_ui` alive for their two action
     closures, four of its lists were cloning a `Ui` *per row* to deliver one `Copy` signal, and
     `event_editor::schedule_form` cloned one three times to hand a dropdown a single signal.
-    **The arm that stops it is an *opening* path.** Anything reaching the schema tree or another
-    editor's `open_for_*` genuinely wants the root bundle — `edit_ctx` stood on that list too until
-    it was read properly, which is the correction below — and two are written into the
-    budget comments so the next pass does not re-argue them: `trigger_editor`'s `pg_action` is where
-    the "edit this function" button opens the *routine* editor and `form` is the only thing that can
-    hand it a root bundle, which is why that file stops at **7** where its siblings reached 5 and 6;
+    **The arm that stops it is an *opening* path — and it has since been beaten, so read it as a
+    claim to check rather than a licence.** Anything reaching the schema tree or another
+    editor's `open_for_*` looks like it genuinely wants the root bundle — `edit_ctx` stood on that
+    list too until it was read properly, which is the correction below — and two were written into
+    the budget comments so the next pass would not re-argue them: `trigger_editor`'s `pg_action` was
+    where the "edit this function" button opened the *routine* editor, and `form` the only thing
+    that could hand it a root bundle, which was why that file stopped at **7** where its siblings
+    reached 5 and 6 — both halves of which have since stopped being true, worked through below;
     and the six shared readers in `table_designer.rs` — `edit_ctx`, `db_flavour`, `loaded_table`,
     `loaded_schema`, `default_schema`, `table_names` — are called from across the crate. Those six
     have now narrowed, and **the plan once written here was wrong about one of them**: the four
@@ -14867,10 +14882,11 @@ existing prose was left alone.
     `open_for_new` and the overlay; `object_editor.rs` **5 → 4**, its own private `loaded_schema` —
     a near-copy of `table_designer`'s — following onto `SchemaUi`; and `trigger_editor.rs`
     **8 → 7**, since `sibling_trigger_names` reads `loaded_schema` and nothing else. That last one
-    takes nothing away from the sentence above: `pg_action` and `form` are still on the root bundle
-    and are still why that file stops where it does.
+    took nothing away from the sentence above at the time — `pg_action` and `form` were still on the
+    root bundle and were still why that file stopped where it did. They are not, and it does not;
+    see below.
     **An editor's *overlay* is the usual holdout, and `view_editor_overlay` is the first one that
-    was not.** Every sibling editor's overlay keeps the root bundle because something under it
+    was not.** Every sibling editor's overlay kept the root bundle because something under it
     opens something else; this one has no such path — `fetch_algorithm` is reached from
     `open_for_view`, not from the modal — so the draft, the target, the body's row cap
     (`view_rows`, read by `form`) and the hand-off to `ddl_preview::open_preview` are the whole of
@@ -14887,6 +14903,57 @@ existing prose was left alone.
     which took `database_editor.rs` to **3** — `open_for_new`, `container_names` and `fetch_roles`.
     A caller cannot be narrower than what it calls, so a `&Ui` helper is a budget floor under every
     file that reaches it; look down the call graph before concluding a function needs the root.
+    **Then three whole files came off the list, doors included, and what unblocked them was naming
+    one dependency.** `routine_editor.rs` (6), `event_editor.rs` (5) and `object_editor.rs` (4)
+    declare no `ui: Ui` parameter at all now, and they had to move together because
+    `object_editor`'s doors *are* the other two's — `ObjectDraft::from_item`/`blank` return `None`
+    for a routine and for an event, and `open_for_object`/`open_for_new` are what route those on.
+    The single thing keeping all three on the root bundle was that a door ends in a `fetch_source`
+    reading the object's real body off the server: `routine_editor::fetch_source(ui: &Ui)` was the
+    only function in its whole module reaching `ui.schema_actions`. It takes the one closure it
+    calls now (`fetch_source(d: DdlUi, source: &RoutineSrcFn)`, and `&EventSrcFn` in the sibling),
+    and each door carries that fetch beside `ConnUi` and `DdlUi` — the dependency stated rather
+    than reachable. **`object_editor`'s two doors take the whole `&SchemaActions` child bundle
+    instead of both closures, and that is deliberate**: they route by object *kind* to whichever
+    editor owns it, so naming `&RoutineSrcFn` and `&EventSrcFn` separately would be two parameters
+    of which exactly one is ever used, at every call site, for a choice made inside the callee. The
+    overlays needed no fetch at all — `fetch_source` is reached from `open`, never from the modal,
+    which is exactly the shape `view_editor_overlay` established above — so
+    `routine_editor_overlay` and `event_editor_overlay` take `(DdlUi, SchemaUi)` and
+    `object_editor_overlay` takes `(DdlUi, OverlayUi)`. The call sites are where it is paid back:
+    `schema_tree::object_row` was cloning a whole `Ui` **per row** to reach the door and the
+    palette's `open_object` closure was holding one, and both now carry three `Copy` bundles and
+    one `Rc<SchemaActions>`.
+    **That pass also spent the reason written against `trigger_editor.rs`'s 7 — and the lapse, not
+    the narrowing, is the entry worth keeping.** This document and that file's `BUDGET` comment both
+    said `form` and `pg_action` were *deliberately* not narrowed, because `pg_action` is where the
+    "edit this function" button opens the routine editor and only a root bundle could be handed on;
+    it stopped at 7 "for a reason, not for want of another pass". That reason was true when it was
+    written and was spent the moment the routine editor's own doors took `(ConnUi, DdlUi,
+    &RoutineSrcFn)`, at which point `pg_action` turned out to read exactly those three and nothing
+    else. Nothing could catch it: the ratchet only forbids going *up*, so **a justification for a
+    floor can lapse silently while the number it defends stays put** — a "deliberately not narrowed"
+    describes the *callee*, not the file, so re-read it against the callee before trusting it.
+    `trigger_editor.rs` is off the list now, 7 to zero: `pg_action` and `form` take `(ConnUi, DdlUi,
+    &RoutineSrcFn)`, which is exactly the union those two buttons hand on, and the rest followed —
+    `fetch_sources(DdlUi, &TriggerSrcFn)`, `fetch_functions(DdlUi, &TriggerFnFn)`,
+    `open_editor(DdlUi, &SchemaActions, …)` and `open_for_table(ConnUi, SchemaUi, DdlUi,
+    &SchemaActions, …)`, the two `&SchemaActions` for `object_editor`'s reason — the dialect decides
+    *inside* `open_editor` whether `trigger_source` or `trigger_functions` runs.
+    **`trigger_editor_overlay` is the one overlay in the crate that genuinely needs an action**, and
+    it is the real exception to *the overlays needed no fetch at all* two paragraphs up rather than a
+    miss: it takes `(ConnUi, DdlUi, Rc<SchemaActions>)`. Every sibling's fetch runs from an `open`,
+    so the door can absorb it; this one has a *second, later* trigger — `refetch_functions_on_return` re-reads the function list when
+    the nested routine editor closes back to it, because a function just created has to appear in the
+    dropdown — so the action cannot be left at the door.
+    **`account_editor.rs` came off in the same pass, 6 to zero, and needed no such argument.** Its
+    three doors (`open_for_new`, `open_for_reset`, `open_for_grant`) read `edit_ctx` and write the
+    draft and nothing else, so each takes `(ConnUi, DdlUi, …)`; `grant_form` took `&Ui` for
+    `ui.overlay` alone and takes `OverlayUi` beside the `DdlUi` it already had; and the two overlays
+    fall out of those — `account_editor_overlay(DdlUi)` and `grant_editor_overlay(DdlUi, OverlayUi)`.
+    Its callers in `users_view.rs` (New account, Privileges, Reset password) carry `(ui.conn,
+    ui.ddl)` rather than a `Ui` clone, and that file stays at 8 — the propagation shows up as
+    rewritten call sites, not as a lower number, which is the easy thing to overcount.
     **Three named bundles can still be the narrower signature, and can say something the root one
     hid.** `preview_change` takes `(ConnUi, DdlUi)` and `preview_proposal`
     `(ConnUi, SchemaUi, DdlUi)`; the count looks like a step backwards until you read what `conn`
@@ -14895,12 +14962,17 @@ existing prose was left alone.
     site rather than only in the prose two paragraphs up. The rule is the signature saying what the
     function depends on, not the parameter count.
     **The live number is the sum of `BUDGET`, not the "roughly 140" above**, which describes the
-    state the gate found and by design never moves. That sum went **206 → 141** over this run:
-    `table_designer.rs` 29 → 26 → 10 → 4, `object_editor.rs` 14 → 5 → 4, `routine_editor.rs` 12 → 6,
-    `event_editor.rs` 11 → 5, `trigger_editor.rs` 11 → 8 → 7, `view_editor.rs` 10 → 6,
-    `database_editor.rs` 7 → 3, `ddl_preview.rs` 6 → 4 → 2, `overlays.rs` 15 → 13. Every step is
-    recorded against its own entry with what it narrowed *to*, so read the list for where a file
-    stands rather than inferring it from a paragraph.
+    state the gate found and by design never moves. That sum went **206 → 110** over this run:
+    `table_designer.rs` 29 → 26 → 10 → 4, `object_editor.rs` 14 → 5 → 4 → **0**,
+    `routine_editor.rs` 12 → 6 → **0**, `event_editor.rs` 11 → 5 → **0**,
+    `trigger_editor.rs` 11 → 8 → 7 → **0**, `view_editor.rs` 10 → 6, `database_editor.rs` 7 → 3,
+    `ddl_preview.rs` 6 → 4 → 2, `overlays.rs` 15 → 13, `account_editor.rs` 6 → **0**,
+    `schema_tree.rs` 6 → 3. Every step is recorded against its own entry with what it narrowed *to*,
+    so read the list for where a file stands rather than inferring it from a paragraph — and a file
+    that reaches zero leaves the list altogether, which is the one way an entry is ever removed and
+    the point at which it may not take a `Ui` again at all. **Five files have left it** — the three DDL-object editors, then
+    `trigger_editor.rs` and `account_editor.rs` — and each left a comment behind where it sat,
+    because a name absent from `BUDGET` says nothing on its own about whether it was ever on it.
     It is a **budget, not a ban**, because narrowing 140 signatures is a campaign and a gate that
     fails on the day it lands teaches nothing: `BUDGET` holds what each file declares *now* and the
     only legal direction is down, so a new `ui: Ui` in a listed file fails and a file not on the list

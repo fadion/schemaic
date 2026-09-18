@@ -1375,7 +1375,10 @@ pub(crate) fn schema_panel(ui: Ui) -> impl IntoView {
                                     if object_key(&node.database, scope, kind, o.name()) == sel {
                                         if crate::object_editor::is_editable_object(o) {
                                             crate::object_editor::open_for_object(
-                                                &nav_ui,
+                                                nav_ui.conn,
+                                                nav_ui.schema,
+                                                nav_ui.ddl,
+                                                &nav_ui.schema_actions,
                                                 &node.database,
                                                 o,
                                             );
@@ -1972,7 +1975,6 @@ fn db_node(conn: ConnNode, ctx: SchemaTreeCtx) -> impl IntoView {
                         .cloned()
                         .collect();
                     let objects = object_group_nodes(
-                        node_ui.clone(),
                         db.clone(),
                         None,
                         schema.clone(),
@@ -2030,7 +2032,6 @@ fn schema_node(
     filt: String,
     ctx: SchemaTreeCtx,
 ) -> impl IntoView {
-    let node_ui = ctx.ui.clone();
     let SchemaTreeCtx {
         expanded,
         filter,
@@ -2150,7 +2151,6 @@ fn schema_node(
             let db = database.clone();
             let ctx = ctx.clone();
             let objects = object_group_nodes(
-                node_ui.clone(),
                 db.clone(),
                 Some(ns_children.clone()),
                 schema.clone(),
@@ -2189,8 +2189,12 @@ fn schema_node(
 /// The `Types`/`Domains`/`Sequences` folders for one tree level, after its
 /// tables. Empty when the database has none — which is every MySQL connection,
 /// so nothing about that tree changes.
+///
+/// **No `ui` beside the `ctx`.** Both this and [`object_group_node`] took one,
+/// and every caller passed a clone of the very `Ui` the `ctx` it passed beside
+/// it was already carrying — two clones of the same bundle per folder level, and
+/// two parameters where the struct's doc had already said which one holds it.
 fn object_group_nodes(
-    ui: Ui,
     database: String,
     scope_ns: Option<String>,
     schema: std::sync::Arc<DbSchema>,
@@ -2221,7 +2225,6 @@ fn object_group_nodes(
         .collect();
     v_stack_from_iter(groups.into_iter().map(move |(kind, items)| {
         object_group_node(
-            ui.clone(),
             database.clone(),
             scope_ns.clone(),
             kind,
@@ -2235,7 +2238,6 @@ fn object_group_nodes(
 
 /// One folder: a header row over the objects of that kind.
 fn object_group_node(
-    ui: Ui,
     database: String,
     scope_ns: Option<String>,
     kind: ObjectKind,
@@ -2244,6 +2246,8 @@ fn object_group_node(
     ctx: SchemaTreeCtx,
 ) -> impl IntoView {
     let FolderItems { items, count } = items;
+    // The rows take the whole context; this level reads five of its fields.
+    let row_ctx = ctx.clone();
     let SchemaTreeCtx {
         expanded,
         filter,
@@ -2353,65 +2357,71 @@ fn object_group_node(
 
     let key_children = key.clone();
     let ns_hit_base = scope_ns.clone();
-    let children = dyn_container(
-        dedup_key(move || (expanded.with(|e| e.contains(&key_children)), filter.get())),
-        move |(open, filt)| {
-            let filt = filt.trim().to_lowercase();
-            let filtering = !filt.is_empty();
-            let ns_hit = ns_hit_base
-                .as_deref()
-                .is_some_and(|s| object_name_matches(s, &filt));
-            // A filter that matched inside this folder opens it, the same way a
-            // column match force-reveals its table. `nav_rows` mirrors this.
-            if !open && !(filtering && !parent_hit && !ns_hit) {
-                return empty().into_any();
-            }
-            let term = (!filt.is_empty()).then(|| filt.clone());
-            let shown: Vec<ObjectItem> = objects_shown(&items, parent_hit, ns_hit, &filt)
-                .into_iter()
-                .cloned()
-                .collect();
-            if shown.is_empty() {
-                return empty().into_any();
-            }
-            let db = database.clone();
-            let ns = scope_ns.clone();
-            let ui = ui.clone();
-            v_stack_from_iter(shown.into_iter().map(move |o| {
-                object_row(
-                    ui.clone(),
-                    db.clone(),
-                    ns.clone(),
-                    o,
-                    context_menu,
-                    dialect,
-                    term.clone(),
-                    nav,
-                    indent_levels,
-                )
-            }))
-            .style(|s| s.flex_col())
-            .into_any()
-        },
-    );
+    let children =
+        dyn_container(
+            dedup_key(move || (expanded.with(|e| e.contains(&key_children)), filter.get())),
+            move |(open, filt)| {
+                let filt = filt.trim().to_lowercase();
+                let filtering = !filt.is_empty();
+                let ns_hit = ns_hit_base
+                    .as_deref()
+                    .is_some_and(|s| object_name_matches(s, &filt));
+                // A filter that matched inside this folder opens it, the same way a
+                // column match force-reveals its table. `nav_rows` mirrors this.
+                if !open && !(filtering && !parent_hit && !ns_hit) {
+                    return empty().into_any();
+                }
+                let term = (!filt.is_empty()).then(|| filt.clone());
+                let shown: Vec<ObjectItem> = objects_shown(&items, parent_hit, ns_hit, &filt)
+                    .into_iter()
+                    .cloned()
+                    .collect();
+                if shown.is_empty() {
+                    return empty().into_any();
+                }
+                let db = database.clone();
+                let ns = scope_ns.clone();
+                let row_ctx = row_ctx.clone();
+                v_stack_from_iter(shown.into_iter().map(move |o| {
+                    object_row(row_ctx.clone(), db.clone(), ns.clone(), o, term.clone())
+                }))
+                .style(|s| s.flex_col())
+                .into_any()
+            },
+        );
 
     v_stack((header, children)).style(|s| s.flex_col())
 }
 
 /// One object (leaf): its icon, name, and a dim summary — an enum's values, a
 /// domain's base type, a sequence's owner.
-#[allow(clippy::too_many_arguments)]
+///
+/// **Takes the row context rather than five hand-picked pieces of it.**
+/// `context_menu`, `dialect`, `nav` and `indent_levels` were all read off the
+/// same [`SchemaTreeCtx`] the caller was holding and passed one by one, and the
+/// fifth — `ui: Ui` — was a second clone of the `ctx.ui` beside them. `term` is
+/// the one argument that is genuinely not in the context: it is this render's
+/// filter text, not the tree's.
+///
+/// The context is cloned per row where a `Ui` was before, which is the same
+/// order of cost and is transient either way — it is destructured here and
+/// dropped. What the row *keeps* is what shrank: the double-click closure holds
+/// three `Copy` bundles and one `Rc` instead of a whole `Ui`.
 fn object_row(
-    ui: Ui,
+    ctx: SchemaTreeCtx,
     database: String,
     scope_ns: Option<String>,
     o: ObjectItem,
-    context_menu: RwSignal<Option<CtxMenu>>,
-    dialect: SqlDialect,
     term: Option<String>,
-    nav: Nav,
-    indent_levels: u32,
 ) -> impl IntoView {
+    let SchemaTreeCtx {
+        ui,
+        context_menu,
+        dialect,
+        nav,
+        indent_levels,
+        ..
+    } = ctx;
     let scope = match &scope_ns {
         Some(ns) => TableScope::Namespace(ns.as_str()),
         None => TableScope::Flat,
@@ -2477,10 +2487,14 @@ fn object_row(
     // Double-click opens the editor, the way a table row does — and the same
     // action Enter takes, which is what makes these leaves worth navigating to.
     .on_double_click_stop({
-        let (ui, db, obj) = (ui.clone(), database.clone(), o.clone());
+        // The four child bundles the door names, not a `Ui` clone per row —
+        // three of them are `Copy` and the fourth is one `Rc`.
+        let (conn, tree, ddl) = (ui.conn, ui.schema, ui.ddl);
+        let actions = ui.schema_actions.clone();
+        let (db, obj) = (database.clone(), o.clone());
         move |_| {
             if crate::object_editor::is_editable_object(&obj) {
-                crate::object_editor::open_for_object(&ui, &db, &obj);
+                crate::object_editor::open_for_object(conn, tree, ddl, &actions, &db, &obj);
             }
         }
     })

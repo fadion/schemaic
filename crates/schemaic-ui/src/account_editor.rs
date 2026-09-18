@@ -58,7 +58,8 @@ use crate::widgets::{
     modal_pad_h, modal_title_owned, modal_w, panel_style,
 };
 use crate::{
-    AccountTarget, FieldCfg, GrantTarget, Ui, UsersTarget, ddl_preview, edit_field, theme,
+    AccountTarget, ConnUi, DdlUi, FieldCfg, GrantTarget, OverlayUi, UsersTarget, ddl_preview,
+    edit_field, theme,
 };
 
 fn panel_w() -> f64 {
@@ -155,12 +156,11 @@ fn reset_then_seed<T: 'static>(d: crate::DdlUi, draft: floem::reactive::RwSignal
 /// `dialect` come from** — not `edit_ctx`, which reads the switcher *now*. The
 /// reasoning is written out once, over `open_for_grant`'s copy of the same four
 /// lines, and `anchor_gate` is what holds both to it.
-pub(crate) fn open_for_new(ui: &Ui, from: &UsersTarget, database: &str) {
-    let ctx = edit_ctx(ui.conn);
+pub(crate) fn open_for_new(conn: ConnUi, d: DdlUi, from: &UsersTarget, database: &str) {
+    let ctx = edit_ctx(conn);
     if ctx.read_only {
         return;
     }
-    let d = ui.ddl;
     // A new editing session — see `DdlUi::session`.
     d.session.update(|g| *g += 1);
     // **Blank, every time.** The draft carries a password, and a form that
@@ -195,8 +195,14 @@ pub(crate) fn open_for_new(ui: &Ui, from: &UsersTarget, database: &str) {
 ///
 /// The caller has already asked `users::supports_password_reset`; that is what
 /// dims the button, and this is what makes the refusal real.
-pub(crate) fn open_for_reset(ui: &Ui, from: &UsersTarget, database: &str, account: &Principal) {
-    let ctx = edit_ctx(ui.conn);
+pub(crate) fn open_for_reset(
+    conn: ConnUi,
+    d: DdlUi,
+    from: &UsersTarget,
+    database: &str,
+    account: &Principal,
+) {
+    let ctx = edit_ctx(conn);
     if ctx.read_only {
         return;
     }
@@ -207,7 +213,6 @@ pub(crate) fn open_for_reset(ui: &Ui, from: &UsersTarget, database: &str, accoun
     if !schemaic_core::users::supports_password_reset(from.dialect, account.kind) {
         return;
     }
-    let d = ui.ddl;
     d.session.update(|g| *g += 1);
     reset_then_seed(
         d,
@@ -231,12 +236,17 @@ pub(crate) fn open_for_reset(ui: &Ui, from: &UsersTarget, database: &str, accoun
 /// Open the grant form for one account. Same refusal at the same door, and the
 /// same anchor — the account was fetched from `from`'s server, so the grant has
 /// to run there.
-pub(crate) fn open_for_grant(ui: &Ui, from: &UsersTarget, database: &str, account: &Principal) {
-    let ctx = edit_ctx(ui.conn);
+pub(crate) fn open_for_grant(
+    conn: ConnUi,
+    d: DdlUi,
+    from: &UsersTarget,
+    database: &str,
+    account: &Principal,
+) {
+    let ctx = edit_ctx(conn);
     if ctx.read_only {
         return;
     }
-    let d = ui.ddl;
     d.session.update(|g| *g += 1);
     reset_then_seed(d, d.grant_draft, initial_grant_draft(from.dialect));
     d.grant.set(Some(GrantTarget {
@@ -650,8 +660,10 @@ fn picked_outline(s: floem::style::Style, picked: bool) -> floem::style::Style {
     })
 }
 
-pub(crate) fn account_editor_overlay(ui: Ui) -> impl IntoView {
-    let d = ui.ddl;
+/// **Takes `DdlUi` alone.** Nothing under this modal is an opening path — the
+/// three doors above are — so the draft, the target and the preview hand-off are
+/// the whole of what it touches.
+pub(crate) fn account_editor_overlay(d: DdlUi) -> impl IntoView {
     // **The draft goes with the form.** `account_draft` is app-lifetime, so
     // clearing only the target left the plaintext password in a signal for the
     // rest of the process — after Cancel as much as after Apply. The form
@@ -681,7 +693,6 @@ pub(crate) fn account_editor_overlay(ui: Ui) -> impl IntoView {
             };
             let ring = FocusRing::new();
             let root_ring = ring.clone();
-            let ui = ui.clone();
 
             // **Keyed on a memo over the form's shape, not on the draft.**
             // `dyn_container` has no equality check of its own — floem's
@@ -752,13 +763,11 @@ pub(crate) fn account_editor_overlay(ui: Ui) -> impl IntoView {
                 },
             );
 
-            let preview_ui = ui.clone();
             let preview_target = target.clone();
             let ring_actions = root_ring.clone();
             let actions = dyn_container(
                 move || d.account_draft.get(),
                 move |draft| {
-                    let ui = preview_ui.clone();
                     let target = preview_target.clone();
                     let ring = ring_actions.clone();
                     let ready = match &target.resetting {
@@ -783,7 +792,7 @@ pub(crate) fn account_editor_overlay(ui: Ui) -> impl IntoView {
                             move || {
                                 let subject = draft.principal(target.dialect).display();
                                 ddl_preview::preview_account(
-                                    ui.ddl,
+                                    d,
                                     (&target).into(),
                                     &subject,
                                     account_change(&draft, target.resetting.as_ref()),
@@ -841,11 +850,11 @@ fn action_label(revoke: bool) -> &'static str {
 }
 
 fn grant_form(
-    ui: &Ui,
+    overlay: OverlayUi,
     target: &GrantTarget,
     seed: &GrantDraft,
     ring: FocusRing,
-    d: crate::DdlUi,
+    d: DdlUi,
 ) -> AnyView {
     let draft = d.grant_draft;
     let dialect = target.dialect;
@@ -891,12 +900,12 @@ fn grant_form(
             // The browser's own account list behind the field, filtered to the
             // roles — a shortcut, not a constraint: a role made since the
             // browser opened can still be typed.
-            let roles = ui.overlay.users_state;
+            let roles = overlay.users_state;
             rows.push(
                 form_setting(
                     "Role",
                     suggested_field(
-                        ui.overlay,
+                        overlay,
                         draft,
                         seed.role.clone(),
                         "role_name",
@@ -984,7 +993,7 @@ fn grant_form(
                         form_setting(
                             q_label,
                             suggested_field(
-                                ui.overlay,
+                                overlay,
                                 draft,
                                 seed.qualifier.clone(),
                                 q_placeholder,
@@ -1091,8 +1100,10 @@ fn privilege_tag(
     .into_any()
 }
 
-pub(crate) fn grant_editor_overlay(ui: Ui) -> impl IntoView {
-    let d = ui.ddl;
+/// **Takes `DdlUi` and `OverlayUi`**, the pair [`grant_form`] needs: the draft
+/// and target on one, the Role and qualifier fields' suggestion dropdown on the
+/// other. Nothing under it is an opening path.
+pub(crate) fn grant_editor_overlay(d: DdlUi, overlay: OverlayUi) -> impl IntoView {
     // The grant draft carries no secret, but it takes the same rule for the same
     // reason its sibling above does: one closing behaviour, so the pair cannot
     // drift into two.
@@ -1117,7 +1128,6 @@ pub(crate) fn grant_editor_overlay(ui: Ui) -> impl IntoView {
             };
             let ring = FocusRing::new();
             let root_ring = ring.clone();
-            let ui = ui.clone();
 
             // **Keyed on a memo over the form's shape, not on its contents.**
             // Which fields exist depends on the two dropdowns and the level; the
@@ -1126,14 +1136,13 @@ pub(crate) fn grant_editor_overlay(ui: Ui) -> impl IntoView {
             // every keystroke in a name field and on every privilege tag. See
             // the account form above, and `widgets::overlay_open_key`.
             let shape = floem::reactive::create_memo(move |_| d.grant_draft.with(grant_form_shape));
-            let body_ui = ui.clone();
             let body_target = target.clone();
             let body = autohide(scroll(
                 dyn_container(
                     move || shape.get(),
                     move |_| {
                         grant_form(
-                            &body_ui,
+                            overlay,
                             &body_target,
                             &d.grant_draft.get_untracked(),
                             ring.clone(),
@@ -1173,13 +1182,11 @@ pub(crate) fn grant_editor_overlay(ui: Ui) -> impl IntoView {
                 },
             );
 
-            let preview_ui = ui.clone();
             let preview_target = target.clone();
             let ring_actions = root_ring.clone();
             let actions = dyn_container(
                 move || d.grant_draft.get(),
                 move |draft| {
-                    let ui = preview_ui.clone();
                     let target = preview_target.clone();
                     let ring = ring_actions.clone();
                     let ready = draft.is_ready(&target.account);
@@ -1205,7 +1212,7 @@ pub(crate) fn grant_editor_overlay(ui: Ui) -> impl IntoView {
                                 // drifts, rather than a preview of an empty plan.
                                 if let Some(change) = ddl::grant_change(&draft, &target.account) {
                                     ddl_preview::preview_account(
-                                        ui.ddl,
+                                        d,
                                         (&target).into(),
                                         &target.account.display(),
                                         change,

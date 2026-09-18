@@ -56,8 +56,8 @@ use crate::widgets::{
     modal_w, panel_style,
 };
 use crate::{
-    DdlUi, FieldCfg, RoutineSrcDoneFn, RoutineSrcRequest, RoutineTarget, Ui, ddl_preview,
-    edit_field, object_location, theme,
+    ConnUi, DdlUi, FieldCfg, RoutineSrcDoneFn, RoutineSrcFn, RoutineSrcRequest, RoutineTarget,
+    SchemaUi, ddl_preview, edit_field, object_location, theme,
 };
 
 /// Matches the trigger editor's, deliberately: the two are reached from one
@@ -75,8 +75,7 @@ const BODY_ROWS: usize = 12;
 
 // ── opening ──────────────────────────────────────────────────────────────────
 
-fn open(ui: &Ui, target: RoutineTarget, draft: RoutineDraft) {
-    let d = ui.ddl;
+fn open(d: DdlUi, source: &RoutineSrcFn, target: RoutineTarget, draft: RoutineDraft) {
     // A new editing session: any lazy fetch still in flight for the last one is
     // now for the wrong target and must not land.
     d.session.update(|g| *g += 1);
@@ -102,7 +101,7 @@ fn open(ui: &Ui, target: RoutineTarget, draft: RoutineDraft) {
     // list in `ddl_preview`.
     ddl_preview::close_peers(d, true);
     d.routine.set(Some(target));
-    fetch_source(ui);
+    fetch_source(d, source);
 }
 
 /// Open the editor on an existing routine.
@@ -112,13 +111,27 @@ fn open(ui: &Ui, target: RoutineTarget, draft: RoutineDraft) {
 /// `object_editor::open_for_object`, which the tree's double-click and
 /// Find-Anywhere both call without consulting the menu's gate, and the two
 /// `open_for_new`s are reached from `create_submenu` directly.
-pub(crate) fn open_for_routine(ui: &Ui, database: &str, r: &RoutineInfo) {
-    let ctx = edit_ctx(ui.conn);
+///
+/// **The `source` argument is the shape this file's narrowing turns on.** Every
+/// door here ends in [`open`], which ends in [`fetch_source`], which is the one
+/// thing in the module that talks to the server — so the fetch it will make is
+/// named at the door rather than reached for out of the root bundle two calls
+/// later. `object_editor`'s doors forward it, and that is what says at *their*
+/// signature that opening an object can start a read.
+pub(crate) fn open_for_routine(
+    conn: ConnUi,
+    d: DdlUi,
+    source: &RoutineSrcFn,
+    database: &str,
+    r: &RoutineInfo,
+) {
+    let ctx = edit_ctx(conn);
     if ctx.read_only {
         return;
     }
     open(
-        ui,
+        d,
+        source,
         RoutineTarget {
             conn_id: ctx.conn_id,
             database: database.to_string(),
@@ -131,13 +144,22 @@ pub(crate) fn open_for_routine(ui: &Ui, database: &str, r: &RoutineInfo) {
 }
 
 /// Open the editor on a blank draft — Create function / Create procedure.
-pub(crate) fn open_for_new(ui: &Ui, database: &str, schema: Option<&str>, kind: RoutineKind) {
-    let ctx = edit_ctx(ui.conn);
+pub(crate) fn open_for_new(
+    conn: ConnUi,
+    db_nodes: RwSignal<Vec<crate::ConnNode>>,
+    d: DdlUi,
+    source: &RoutineSrcFn,
+    database: &str,
+    schema: Option<&str>,
+    kind: RoutineKind,
+) {
+    let ctx = edit_ctx(conn);
     if ctx.read_only {
         return;
     }
     open(
-        ui,
+        d,
+        source,
         RoutineTarget {
             conn_id: ctx.conn_id,
             database: database.to_string(),
@@ -147,10 +169,7 @@ pub(crate) fn open_for_new(ui: &Ui, database: &str, schema: Option<&str>, kind: 
         },
         RoutineDraft::blank(
             kind,
-            unique_name(
-                &taken_names(ui.schema.db_nodes, database, schema, kind),
-                stem(kind),
-            ),
+            unique_name(&taken_names(db_nodes, database, schema, kind), stem(kind)),
             schema.map(str::to_string),
             ctx.dialect,
         ),
@@ -168,21 +187,28 @@ pub(crate) fn open_for_new(ui: &Ui, database: &str, schema: Option<&str>, kind: 
 /// never cleared, so closing this one simply reveals it again with its draft
 /// intact. A flag would have been a second source of truth for something the
 /// signal already answers.
-pub(crate) fn open_for_new_trigger_function(ui: &Ui, database: &str, schema: Option<&str>) {
-    let ctx = edit_ctx(ui.conn);
+pub(crate) fn open_for_new_trigger_function(
+    conn: ConnUi,
+    d: DdlUi,
+    source: &RoutineSrcFn,
+    database: &str,
+    schema: Option<&str>,
+) {
+    let ctx = edit_ctx(conn);
     if ctx.read_only {
         return;
     }
     // Against the functions already fetched for this database, so a second
     // "New function…" doesn't propose a name the first one took.
-    let taken: Vec<String> = ui.ddl.functions.with_untracked(|l| {
+    let taken: Vec<String> = d.functions.with_untracked(|l| {
         l.iter()
             .filter(|f| f.schema.as_deref() == schema)
             .map(|f| f.name.clone())
             .collect()
     });
     open(
-        ui,
+        d,
+        source,
         RoutineTarget {
             conn_id: ctx.conn_id,
             database: database.to_string(),
@@ -254,8 +280,7 @@ fn taken_names(
 ///
 /// The session guard is what makes a slow reply safe — the user can close this
 /// modal and open another routine while the read is in flight.
-fn fetch_source(ui: &Ui) {
-    let d = ui.ddl;
+fn fetch_source(d: DdlUi, source: &RoutineSrcFn) {
     let Some(target) = d.routine.get_untracked() else {
         return;
     };
@@ -336,7 +361,7 @@ fn fetch_source(ui: &Ui) {
             }
         });
     });
-    (ui.schema_actions.routine_source.clone())(
+    (source)(
         RoutineSrcRequest {
             conn_id: target.conn_id,
             database: target.database.clone(),
@@ -800,8 +825,13 @@ fn change_set(target: &RoutineTarget, draft: &RoutineDraft) -> ddl::ChangeSet {
 
 /// The routine editor. Absolutely positioned over the workspace when
 /// `ui.ddl.routine` is `Some`.
-pub(crate) fn routine_editor_overlay(ui: Ui) -> impl IntoView {
-    let d = ui.ddl;
+///
+/// **Takes the two child bundles it reads, like the view editor's overlay.**
+/// Nothing under it is an opening path — `fetch_source` is reached from [`open`],
+/// not from the modal — so the draft, the body's row cap, the preview hand-off
+/// and the sibling-name list are the whole of what it touches, and the last of
+/// those is the only thing outside `DdlUi`.
+pub(crate) fn routine_editor_overlay(d: DdlUi, schema: SchemaUi) -> impl IntoView {
     // Closing just clears this one. A trigger editor underneath was never
     // cleared, so it reappears with its draft intact — which is why
     // "New function…" isn't a one-way door out of a half-filled trigger form.
@@ -822,7 +852,6 @@ pub(crate) fn routine_editor_overlay(ui: Ui) -> impl IntoView {
             let Some(target) = d.routine.get_untracked() else {
                 return empty().into_any();
             };
-            let ui = ui.clone();
             let dialect = target.dialect;
             let title = match &target.current {
                 // The parameter list is part of the title where the engine
@@ -856,7 +885,7 @@ pub(crate) fn routine_editor_overlay(ui: Ui) -> impl IntoView {
             let root_ring = ring.clone();
 
             let body = crate::widgets::autohide(scroll(
-                routine_form(ui.ddl, &target, ring.clone()).style(|s| {
+                routine_form(d, &target, ring.clone()).style(|s| {
                     s.width_full()
                         .padding_horiz(modal_pad_h())
                         .padding_vert(theme::scaled(18.0))
@@ -870,7 +899,7 @@ pub(crate) fn routine_editor_overlay(ui: Ui) -> impl IntoView {
             // from, and it cannot change while this modal is up — the schema
             // reload that would change it runs after Apply, which closes this.
             let taken = taken_names(
-                ui.schema.db_nodes,
+                schema.db_nodes,
                 &target.database,
                 d.routine_draft
                     .with_untracked(|r| r.info.schema.clone())
@@ -949,7 +978,6 @@ pub(crate) fn routine_editor_overlay(ui: Ui) -> impl IntoView {
                 },
             );
 
-            let preview_ui = ui.clone();
             let ring_actions = ring.clone();
             // Keyed on the target for the same reason `status` is, and it
             // matters more here: this decides whether **Preview SQL** is enabled
@@ -963,7 +991,6 @@ pub(crate) fn routine_editor_overlay(ui: Ui) -> impl IntoView {
                     )
                 },
                 move |(current, draft, (pending, stale))| {
-                    let ui = preview_ui.clone();
                     let Some(target) = current else {
                         return empty().into_any();
                     };
@@ -1006,7 +1033,7 @@ pub(crate) fn routine_editor_overlay(ui: Ui) -> impl IntoView {
                             move || {
                                 let cs = change_set(&target, &draft);
                                 ddl_preview::open_preview(
-                                    ui.ddl,
+                                    d,
                                     ddl_preview::preview_of(
                                         target.conn_id,
                                         &target.database,

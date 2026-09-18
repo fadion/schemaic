@@ -75,8 +75,9 @@ use crate::widgets::{
     panel_style,
 };
 use crate::{
-    DdlPreview, DdlUi, FieldCfg, TriggerFnDoneFn, TriggerFnRequest, TriggerSrcDoneFn,
-    TriggerSrcRequest, TriggerTarget, Ui, ddl_preview, edit_field, object_location, theme,
+    ConnUi, DdlPreview, DdlUi, FieldCfg, RoutineSrcFn, SchemaActions, SchemaUi, TriggerFnDoneFn,
+    TriggerFnFn, TriggerFnRequest, TriggerSrcDoneFn, TriggerSrcFn, TriggerSrcRequest,
+    TriggerTarget, ddl_preview, edit_field, object_location, theme,
 };
 
 /// Matches the table designer's, deliberately: this is the same list-plus-form
@@ -105,8 +106,11 @@ const NEW_BODY_SQLITE: &str = "BEGIN\n    SELECT 1;\nEND";
 
 // ── opening ──────────────────────────────────────────────────────────────────
 
-fn open_editor(ui: &Ui, target: TriggerTarget, draft: TriggerSetDraft) {
-    let d = ui.ddl;
+/// **Takes `&SchemaActions` rather than the two fetches below it**, for
+/// `object_editor::open_for_object`'s reason: which of them runs is decided here,
+/// off the dialect, so naming both would be two parameters of which exactly one
+/// is ever used at the one call site.
+fn open_editor(d: DdlUi, actions: &SchemaActions, target: TriggerTarget, draft: TriggerSetDraft) {
     let pg = target.dialect == SqlDialect::Postgres;
     // A new editing session: any lazy fetch still in flight for the last one is
     // now for the wrong target and must not land.
@@ -124,13 +128,13 @@ fn open_editor(ui: &Ui, target: TriggerTarget, draft: TriggerSetDraft) {
     let dialect = target.dialect;
     d.trigger.set(Some(target));
     if pg {
-        fetch_functions(ui);
+        fetch_functions(d, &actions.trigger_functions);
     } else if dialect == SqlDialect::MySql {
         // MySQL's correction alone, and asked for by name: SQLite's bodies come
         // from `sqlite_master`, which is the source, so there is nothing to
         // correct — and `trigger_source` is a `SHOW CREATE TRIGGER` no SQLite
         // connection can answer.
-        fetch_sources(ui);
+        fetch_sources(d, &actions.trigger_source);
     }
 }
 
@@ -151,8 +155,7 @@ fn open_editor(ui: &Ui, target: TriggerTarget, draft: TriggerSetDraft) {
 /// leave the draft emitting it. A draft the user has already edited is left
 /// alone — the round trip lands in milliseconds, but "unlikely" is not a reason
 /// to overwrite what somebody typed.
-fn fetch_sources(ui: &Ui) {
-    let d = ui.ddl;
+fn fetch_sources(d: DdlUi, source: &TriggerSrcFn) {
     let Some((conn_id, database, names)) = d.trigger.with_untracked(|t| {
         t.as_ref().map(|t| {
             (
@@ -247,7 +250,7 @@ fn fetch_sources(ui: &Ui) {
                 }
             });
         });
-        (ui.schema_actions.trigger_source)(
+        (source)(
             TriggerSrcRequest {
                 conn_id,
                 database: database.clone(),
@@ -285,8 +288,7 @@ fn refetch_functions_on_return(prev: Option<bool>, fn_open: bool, trigger_open: 
 /// preview opens. See [`crate::DdlUi::session`]: with the old guard an in-flight
 /// fetch from one database landed on a modal since reopened on another, and
 /// opening the preview mid-fetch threw the result away for good.
-fn fetch_functions(ui: &Ui) {
-    let d = ui.ddl;
+fn fetch_functions(d: DdlUi, fns_of: &TriggerFnFn) {
     let Some((conn_id, database)) = d
         .trigger
         .with_untracked(|t| t.as_ref().map(|t| (t.conn_id, t.database.clone())))
@@ -300,7 +302,7 @@ fn fetch_functions(ui: &Ui) {
         }
         d.functions.set(fns);
     });
-    (ui.schema_actions.trigger_functions)(TriggerFnRequest { conn_id, database }, done);
+    (fns_of)(TriggerFnRequest { conn_id, database }, done);
 }
 
 /// Open the editor on a table's triggers.
@@ -309,16 +311,25 @@ fn fetch_functions(ui: &Ui) {
 /// until the refusal below there was no gated route to it at all: the list was
 /// live, `+` added a trigger and Preview SQL lit up on a connection the app had
 /// been told not to write to. See `database_editor::open_for_new`.
-pub(crate) fn open_for_table(ui: &Ui, database: &str, schema: Option<&str>, table: &str) {
-    let Some(info) = loaded_table(ui.schema, database, schema, table) else {
+pub(crate) fn open_for_table(
+    conn: ConnUi,
+    tree: SchemaUi,
+    d: DdlUi,
+    actions: &SchemaActions,
+    database: &str,
+    schema: Option<&str>,
+    table: &str,
+) {
+    let Some(info) = loaded_table(tree, database, schema, table) else {
         return;
     };
-    let ctx = edit_ctx(ui.conn);
+    let ctx = edit_ctx(conn);
     if ctx.read_only {
         return;
     }
     open_editor(
-        ui,
+        d,
+        actions,
         TriggerTarget {
             conn_id: ctx.conn_id,
             database: database.to_string(),
@@ -327,7 +338,7 @@ pub(crate) fn open_for_table(ui: &Ui, database: &str, schema: Option<&str>, tabl
             dialect: ctx.dialect,
             is_view: info.is_view,
             current: info.triggers.clone(),
-            sibling_triggers: sibling_trigger_names(ui.schema, database, &info, ctx.dialect),
+            sibling_triggers: sibling_trigger_names(tree, database, &info, ctx.dialect),
             read_only: ctx.read_only,
         },
         TriggerSetDraft::from_table(&info),
@@ -630,8 +641,15 @@ pub(crate) fn value_rows(
 ///
 /// Built once per `(selected, rev)` — never keyed on the draft — for the reason
 /// the designer's form isn't: a draft-keyed form is torn down mid-keystroke.
-fn form(ui: Ui, target: &TriggerTarget, i: usize, ring: FocusRing) -> AnyView {
-    let d = ui.ddl.trigger_draft;
+fn form(
+    conn: ConnUi,
+    ui: DdlUi,
+    source: &RoutineSrcFn,
+    target: &TriggerTarget,
+    i: usize,
+    ring: FocusRing,
+) -> AnyView {
+    let d = ui.trigger_draft;
     let Some(draft) = d.with_untracked(|s| s.triggers.get(i).cloned()) else {
         // Same empty state the designer's tabs show, in the same place: this pane
         // is otherwise a blank half of the modal with no indication that the list
@@ -895,7 +913,7 @@ fn form(ui: Ui, target: &TriggerTarget, i: usize, ring: FocusRing) -> AnyView {
 
     // The action: a body on MySQL, a function to call on PostgreSQL.
     let action: AnyView = if pg {
-        pg_action(&ui, i, &draft, target, ring.clone()).into_any()
+        pg_action(conn, ui, source, i, &draft, target, ring.clone()).into_any()
     } else {
         form_setting(
             "Body",
@@ -910,7 +928,7 @@ fn form(ui: Ui, target: &TriggerTarget, i: usize, ring: FocusRing) -> AnyView {
                     placeholder: "BEGIN … END",
                     mono: true,
                     multiline: true,
-                    max_rows: Some(ui.ddl.view_rows),
+                    max_rows: Some(ui.view_rows),
                     // Height from the *logical* line count, not the wrapped one.
                     // Wrapped rows depend on the box's width, which isn't settled
                     // on the first layout pass inside this flex row — so the box
@@ -1040,17 +1058,23 @@ fn matching<'a>(list: &'a [RoutineInfo], sql: &str) -> Option<&'a RoutineInfo> {
     hits.next().is_none().then_some(first)
 }
 
-/// Keeps the root bundle: the "edit this function" button opens the *routine*
-/// editor, which is an opening path and needs more than `DdlUi`.
+/// **Three narrow arguments in place of the root bundle.** The reason it kept
+/// one — the "edit this function" button opens the *routine* editor,
+/// which is an opening path — stopped being one when that editor's doors took
+/// `(ConnUi, DdlUi, &RoutineSrcFn)` themselves: this is the union of what those
+/// two buttons hand on, and nothing else here reads the bundle at all.
+#[allow(clippy::too_many_arguments)]
 fn pg_action(
-    ui: &Ui,
+    conn: ConnUi,
+    ui: DdlUi,
+    source: &RoutineSrcFn,
     i: usize,
     draft: &TriggerDraft,
     target: &TriggerTarget,
     ring: FocusRing,
 ) -> AnyView {
-    let d = ui.ddl.trigger_draft;
-    let fns = ui.ddl.functions;
+    let d = ui.trigger_draft;
+    let fns = ui.functions;
     // `TriggerAction::Function::name` is **emittable SQL** on both producers:
     // introspection's `tgfoid::regproc::text` already comes back correctly
     // quoted and conditionally qualified, and the picker now writes the same
@@ -1135,7 +1159,10 @@ fn pg_action(
         },
     );
 
-    let new_ui = ui.clone();
+    // The routine editor's doors name the bundles and the one fetch they use, so
+    // this button carries those rather than a `Ui` clone.
+    let (new_conn, new_ddl) = (conn, ui);
+    let new_source = source.clone();
     let database = target.database.clone();
     let schema = draft.info.schema.clone();
     // `control_button`, not the footer's: these sit *in* the form beside the
@@ -1154,14 +1181,21 @@ fn pg_action(
     // reads as arbitrary rather than reversed. Nothing machine-checks
     // adjacency: the tabindex gates check collisions and ceilings.
     let new_btn = control_button("New function", ring.clone(), 62, move || {
-        crate::routine_editor::open_for_new_trigger_function(&new_ui, &database, schema.as_deref());
+        crate::routine_editor::open_for_new_trigger_function(
+            new_conn,
+            new_ddl,
+            &new_source,
+            &database,
+            schema.as_deref(),
+        );
     });
 
     // Editing an existing function lives here rather than in the schema tree
     // because this is where the list exists: it is fetched lazily when this
     // editor opens, so the tree — built synchronously from `db_nodes` — has
     // nothing to offer.
-    let edit_ui = ui.clone();
+    let (edit_conn, edit_ddl) = (conn, ui);
+    let edit_source = source.clone();
     let edit_db = target.database.clone();
     let edit_ring = ring.clone();
     let edit_btn = dyn_container(
@@ -1176,11 +1210,11 @@ fn pg_action(
             // That is why Edit stayed disabled on a stock `public` function
             // long after the qualified case was fixed.
             let found = matching(&list, &named).cloned();
-            let ui = edit_ui.clone();
+            let source = edit_source.clone();
             let db = edit_db.clone();
             control_button_enabled("Edit", found.is_some(), ring, 61, move || {
                 if let Some(f) = &found {
-                    crate::routine_editor::open_for_routine(&ui, &db, f);
+                    crate::routine_editor::open_for_routine(edit_conn, edit_ddl, &source, &db, f);
                 }
             })
         },
@@ -1342,8 +1376,17 @@ fn preview_from(target: &TriggerTarget, cs: &ddl::ChangeSet) -> DdlPreview {
 
 /// The trigger editor. Absolutely positioned over the workspace when
 /// `ui.ddl.trigger` is `Some`.
-pub(crate) fn trigger_editor_overlay(ui: Ui) -> impl IntoView {
-    let d = ui.ddl;
+///
+/// **The one overlay in the crate that still needs an action.** Its siblings'
+/// fetches all run from an `open`; this one has a second, later trigger — the
+/// function list is re-read when the nested routine editor closes back to here
+/// — so `&SchemaActions` comes in beside the two bundles, and `PostgreSQL`'s
+/// function picker hands its own `routine_source` on to the editor it opens.
+pub(crate) fn trigger_editor_overlay(
+    conn: ConnUi,
+    d: DdlUi,
+    schema_actions: Rc<SchemaActions>,
+) -> impl IntoView {
     let close = move || d.trigger.set(None);
 
     // Re-fetch the function list when the routine editor closes back to here:
@@ -1351,11 +1394,11 @@ pub(crate) fn trigger_editor_overlay(ui: Ui) -> impl IntoView {
     // put it there before the next schema reload. Created once, outside the
     // `dyn_container`, so it survives the panel being rebuilt.
     {
-        let ui = ui.clone();
+        let fns_of = schema_actions.trigger_functions.clone();
         create_effect(move |prev: Option<bool>| {
             let fn_open = d.routine.get().is_some();
             if refetch_functions_on_return(prev, fn_open, d.trigger.get_untracked().is_some()) {
-                fetch_functions(&ui);
+                fetch_functions(d, &fns_of);
             }
             fn_open
         });
@@ -1396,7 +1439,6 @@ pub(crate) fn trigger_editor_overlay(ui: Ui) -> impl IntoView {
             let Some(target) = d.trigger.get_untracked() else {
                 return empty().into_any();
             };
-            let ui = ui.clone();
             let title = format!(
                 "Triggers on {}.{}",
                 object_location(&target.database, target.schema.as_deref()),
@@ -1414,14 +1456,14 @@ pub(crate) fn trigger_editor_overlay(ui: Ui) -> impl IntoView {
             let ring = FocusRing::new();
             let root_ring = ring.clone();
 
-            let form_ui = ui.clone();
+            let form_source = schema_actions.routine_source.clone();
             let form_target = target.clone();
             let form_ring = ring.clone();
-            let (selected, rev) = (ui.ddl.selected, ui.ddl.rev);
+            let (selected, rev) = (d.selected, d.rev);
             let detail = dyn_container(
                 move || (selected.get(), rev.get()),
                 move |(i, _)| {
-                    form(form_ui.clone(), &form_target, i, form_ring.clone())
+                    form(conn, d, &form_source, &form_target, i, form_ring.clone())
                         .style(|s| s.width_full())
                         .into_any()
                 },
@@ -1429,7 +1471,7 @@ pub(crate) fn trigger_editor_overlay(ui: Ui) -> impl IntoView {
 
             let body = h_stack((
                 trigger_list(
-                    ui.ddl,
+                    d,
                     target.dialect,
                     target.is_view,
                     target.table.clone(),
@@ -1483,13 +1525,11 @@ pub(crate) fn trigger_editor_overlay(ui: Ui) -> impl IntoView {
                 },
             );
 
-            let preview_ui = ui.clone();
             let preview_target = target.clone();
             let ring_actions = ring.clone();
             let actions = dyn_container(
                 move || d.trigger_draft.get(),
                 move |draft| {
-                    let ui = preview_ui.clone();
                     let target = preview_target.clone();
                     let ring = ring_actions.clone();
                     let cs = change_set(&target, &draft);
@@ -1514,7 +1554,7 @@ pub(crate) fn trigger_editor_overlay(ui: Ui) -> impl IntoView {
                             ACTION_TAB + 10,
                             move || {
                                 let cs = change_set(&target, &draft);
-                                ddl_preview::open_preview(ui.ddl, preview_from(&target, &cs));
+                                ddl_preview::open_preview(d, preview_from(&target, &cs));
                             },
                         ),
                     ))

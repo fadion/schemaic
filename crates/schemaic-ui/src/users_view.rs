@@ -772,7 +772,8 @@ fn new_account_row(ui: &Ui, target: &UsersTarget, gate: WriteGate, ring: FocusRi
         return crate::widgets::nothing().into_any();
     }
     let enabled = gate.enabled();
-    let ui = ui.clone();
+    // The two `Copy` bundles the door names, not a `Ui` clone.
+    let (conn, ddl) = (ui.conn, ui.ddl);
     let database = target.database.clone().unwrap_or_default();
     // The whole target, not just its database: the form is for the server the
     // browser was opened on, and the switcher may have moved. See
@@ -782,7 +783,7 @@ fn new_account_row(ui: &Ui, target: &UsersTarget, gate: WriteGate, ring: FocusRi
         // The read-only refusal is inside `open_for_new`, so this launch is
         // guarded in the same step that launches it — the dimming says the
         // action is unavailable, this is what makes it so.
-        crate::account_editor::open_for_new(&ui, &anchor, &database);
+        crate::account_editor::open_for_new(conn, ddl, &anchor, &database);
     };
     let open_click = open.clone();
     in_ring_button(
@@ -850,7 +851,7 @@ fn actions_row(
     }
     let enabled = gate.enabled();
 
-    let grant_ui = ui.clone();
+    let (grant_conn, grant_ddl) = (ui.conn, ui.ddl);
     let grant_target = target.clone();
     let grant_who = p.clone();
     let grant = action_button(
@@ -870,7 +871,8 @@ fn actions_row(
             // `grant_target` whole, not only its database — the account was
             // read off *this* server's catalog, so the grant has to run there.
             crate::account_editor::open_for_grant(
-                &grant_ui,
+                grant_conn,
+                grant_ddl,
                 &grant_target,
                 &grant_target.database.clone().unwrap_or_default(),
                 &grant_who,
@@ -884,7 +886,7 @@ fn actions_row(
     // a capability — `supports_password_reset` folds "does this engine have
     // accounts" into the same answer — rather than as a `dialect ==`.
     let reset = schemaic_core::users::supports_password_reset(target.dialect, p.kind).then(|| {
-        let reset_ui = ui.clone();
+        let (reset_conn, reset_ddl) = (ui.conn, ui.ddl);
         let reset_target = target.clone();
         let reset_who = p.clone();
         action_button(
@@ -899,7 +901,8 @@ fn actions_row(
                 // row was built, which is what `widgets::accept_launch`'s
                 // contract forbids as the whole guard.
                 crate::account_editor::open_for_reset(
-                    &reset_ui,
+                    reset_conn,
+                    reset_ddl,
                     &reset_target,
                     &reset_target.database.clone().unwrap_or_default(),
                     &reset_who,

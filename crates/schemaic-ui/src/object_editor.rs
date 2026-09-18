@@ -42,8 +42,8 @@ use crate::widgets::{
     modal_title_owned, modal_w, panel_style, row_button, row_gap,
 };
 use crate::{
-    DdlPreview, DdlUi, FieldCfg, ObjectTarget, OverlayUi, Ui, ddl_preview, edit_field, icons,
-    object_location, theme,
+    ConnUi, DdlPreview, DdlUi, FieldCfg, ObjectTarget, OverlayUi, SchemaActions, SchemaUi,
+    ddl_preview, edit_field, icons, object_location, theme,
 };
 
 fn panel_w() -> f64 {
@@ -73,8 +73,7 @@ fn num_gap() -> f64 {
 
 // ── opening ──────────────────────────────────────────────────────────────────
 
-fn open_editor(ui: &Ui, target: ObjectTarget, draft: ObjectDraft) {
-    let d = ui.ddl;
+fn open_editor(d: DdlUi, target: ObjectTarget, draft: ObjectDraft) {
     // A new editing session — see `DdlUi::session`.
     d.session.update(|g| *g += 1);
     d.object_draft.set(draft);
@@ -112,7 +111,22 @@ fn open_editor(ui: &Ui, target: ObjectTarget, draft: ObjectDraft) {
 /// to be made rather than falling through to whichever arm compiles. The routing
 /// lives here rather than at each call site so the tree, the palette and the
 /// menu can all keep asking one function to open an object.
-pub(crate) fn open_for_object(ui: &Ui, database: &str, item: &ObjectItem) {
+///
+/// **`actions` is the whole [`SchemaActions`] bundle, where the two editors it
+/// routes to each name their one fetch.** That is deliberate rather than a step
+/// not taken: this door is the seam where the *kind* decides which editor opens,
+/// so naming `routine_source` and `event_source` separately here would be two
+/// parameters of which exactly one is ever used, at every call site, for a
+/// choice made inside. The bundle says the honest thing — opening an object can
+/// start a server read — and the door below it still names the single fetch.
+pub(crate) fn open_for_object(
+    conn: ConnUi,
+    tree: SchemaUi,
+    d: DdlUi,
+    actions: &SchemaActions,
+    database: &str,
+    item: &ObjectItem,
+) {
     // The gate first, so a path that reaches here without consulting it (a
     // remembered palette hit, a double-click) can't open an editor on a routine
     // the emitter would re-write wrongly.
@@ -120,7 +134,7 @@ pub(crate) fn open_for_object(ui: &Ui, database: &str, item: &ObjectItem) {
         return;
     }
     if let Some(r) = item.routine() {
-        crate::routine_editor::open_for_routine(ui, database, r);
+        crate::routine_editor::open_for_routine(conn, d, &actions.routine_source, database, r);
         return;
     }
     // An event is browsed beside the types for the same reason a routine is, and
@@ -128,10 +142,10 @@ pub(crate) fn open_for_object(ui: &Ui, database: &str, item: &ObjectItem) {
     // returns `None` for one, so the split has to be made here rather than
     // falling through to whichever arm compiles.
     if let Some(e) = item.event() {
-        crate::event_editor::open_for_event(ui, database, e);
+        crate::event_editor::open_for_event(conn, d, &actions.event_source, database, e);
         return;
     }
-    let ctx = edit_ctx(ui.conn);
+    let ctx = edit_ctx(conn);
     // The other half of the menu's own gate. `overlays.rs`' entry spells it
     // `read_only || !editable` and only the `!editable` term had been moved
     // here, so the three paths that bypass the menu — double-click, keyboard
@@ -140,7 +154,7 @@ pub(crate) fn open_for_object(ui: &Ui, database: &str, item: &ObjectItem) {
     if ctx.read_only {
         return;
     }
-    let Some(loaded) = crate::table_designer::loaded_schema(ui.schema, database) else {
+    let Some(loaded) = crate::table_designer::loaded_schema(tree, database) else {
         return;
     };
     let dependents = ddl::type_dependents(&loaded, item.schema(), item.name());
@@ -148,7 +162,7 @@ pub(crate) fn open_for_object(ui: &Ui, database: &str, item: &ObjectItem) {
         return;
     };
     open_editor(
-        ui,
+        d,
         ObjectTarget {
             conn_id: ctx.conn_id,
             database: database.to_string(),
@@ -164,16 +178,39 @@ pub(crate) fn open_for_object(ui: &Ui, database: &str, item: &ObjectItem) {
 
 /// Open the editor on a blank draft — Create type / domain / sequence, or the
 /// routine editor for the two kinds this modal doesn't hold.
-pub(crate) fn open_for_new(ui: &Ui, database: &str, schema: Option<&str>, kind: ObjectKind) {
+pub(crate) fn open_for_new(
+    conn: ConnUi,
+    tree: SchemaUi,
+    d: DdlUi,
+    actions: &SchemaActions,
+    database: &str,
+    schema: Option<&str>,
+    kind: ObjectKind,
+) {
     if let Some(rk) = kind.routine_kind() {
-        crate::routine_editor::open_for_new(ui, database, schema, rk);
+        crate::routine_editor::open_for_new(
+            conn,
+            tree.db_nodes,
+            d,
+            &actions.routine_source,
+            database,
+            schema,
+            rk,
+        );
         return;
     }
     if kind == ObjectKind::Event {
-        crate::event_editor::open_for_new(ui, database, schema);
+        crate::event_editor::open_for_new(
+            conn,
+            tree.db_nodes,
+            d,
+            &actions.event_source,
+            database,
+            schema,
+        );
         return;
     }
-    let ctx = edit_ctx(ui.conn);
+    let ctx = edit_ctx(conn);
     // As at the door above: `create_children` dims every entry on a read-only
     // connection, and this is what makes it so.
     if ctx.read_only {
@@ -189,7 +226,7 @@ pub(crate) fn open_for_new(ui: &Ui, database: &str, schema: Option<&str>, kind: 
         return;
     };
     open_editor(
-        ui,
+        d,
         ObjectTarget {
             conn_id: ctx.conn_id,
             database: database.to_string(),
@@ -1128,8 +1165,12 @@ fn change_set(target: &ObjectTarget, draft: &ObjectDraft) -> ddl::ChangeSet {
 
 /// The object editor. Absolutely positioned over the workspace when
 /// `ui.ddl.object` is `Some`.
-pub(crate) fn object_editor_overlay(ui: Ui) -> impl IntoView {
-    let d = ui.ddl;
+///
+/// **Takes `DdlUi` and `OverlayUi`**, the pair its [`form`] already took:
+/// nothing under the modal is an opening path, so the draft, the validation
+/// errors, the preview hand-off and the domain form's suggestion chevron are
+/// the whole of it.
+pub(crate) fn object_editor_overlay(d: DdlUi, overlay: OverlayUi) -> impl IntoView {
     let close = move || d.object.set(None);
 
     dyn_container(
@@ -1144,7 +1185,6 @@ pub(crate) fn object_editor_overlay(ui: Ui) -> impl IntoView {
             let Some(target) = d.object.get_untracked() else {
                 return empty().into_any();
             };
-            let ui = ui.clone();
             let kind = d.object_draft.with_untracked(|dr| dr.kind());
             let location = object_location(&target.database, target.schema.as_deref());
             let title = match &target.current {
@@ -1159,7 +1199,7 @@ pub(crate) fn object_editor_overlay(ui: Ui) -> impl IntoView {
             let root_ring = ring.clone();
 
             let body = crate::widgets::autohide(scroll(
-                form(ui.ddl, ui.overlay, &target, ring.clone()).style(|s| {
+                form(d, overlay, &target, ring.clone()).style(|s| {
                     s.width_full()
                         .padding_horiz(modal_pad_h())
                         .padding_vert(theme::scaled(18.0))
@@ -1194,13 +1234,11 @@ pub(crate) fn object_editor_overlay(ui: Ui) -> impl IntoView {
                 },
             );
 
-            let preview_ui = ui.clone();
             let preview_target = target.clone();
             let ring_actions = ring.clone();
             let actions = dyn_container(
                 move || (d.object_draft.get(), d.object_errors.get()),
                 move |(draft, errs)| {
-                    let ui = preview_ui.clone();
                     let target = preview_target.clone();
                     let ring = ring_actions.clone();
                     let cs = change_set(&target, &draft);
@@ -1222,10 +1260,7 @@ pub(crate) fn object_editor_overlay(ui: Ui) -> impl IntoView {
                             ACTION_TAB + 10,
                             move || {
                                 let cs = change_set(&target, &draft);
-                                ddl_preview::open_preview(
-                                    ui.ddl,
-                                    preview_from(&target, &draft, &cs),
-                                );
+                                ddl_preview::open_preview(d, preview_from(&target, &draft, &cs));
                             },
                         ),
                     ))

@@ -218,7 +218,15 @@ fn create_submenu(
                 }
                 CreateKind::View => crate::view_editor::open_for_new(&ui, &db, ns.as_deref()),
                 CreateKind::Object(kind) => {
-                    crate::object_editor::open_for_new(&ui, &db, ns.as_deref(), kind);
+                    crate::object_editor::open_for_new(
+                        ui.conn,
+                        ui.schema,
+                        ui.ddl,
+                        &ui.schema_actions,
+                        &db,
+                        ns.as_deref(),
+                        kind,
+                    );
                 }
                 // A database is made *beside* this node, so it takes no database
                 // — see `DatabaseTarget::database`. A namespace is made inside
@@ -1774,7 +1782,14 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                         // which of them the row under the cursor is.
                         entries.push(
                             MenuEntry::action(format!("Edit {}", kind.label()), move || {
-                                crate::object_editor::open_for_object(&ui, &db, &obj);
+                                crate::object_editor::open_for_object(
+                                    ui.conn,
+                                    ui.schema,
+                                    ui.ddl,
+                                    &ui.schema_actions,
+                                    &db,
+                                    &obj,
+                                );
                             })
                             .disabled(read_only || !editable),
                         );
@@ -1997,7 +2012,15 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                         // object row's "Edit type".
                         entries.push(
                             MenuEntry::action(format!("Create {}", kind.label()), move || {
-                                crate::object_editor::open_for_new(&ui, &db, ns.as_deref(), kind);
+                                crate::object_editor::open_for_new(
+                                    ui.conn,
+                                    ui.schema,
+                                    ui.ddl,
+                                    &ui.schema_actions,
+                                    &db,
+                                    ns.as_deref(),
+                                    kind,
+                                );
                             })
                             .disabled(conn_read_only(&connections, active_conn)),
                         );
@@ -2402,7 +2425,10 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                                     },
                                     move || {
                                         crate::trigger_editor::open_for_table(
-                                            &ui,
+                                            ui.conn,
+                                            ui.schema,
+                                            ui.ddl,
+                                            &ui.schema_actions,
                                             &db,
                                             ns.as_deref(),
                                             &tbl,
@@ -4597,9 +4623,10 @@ pub(crate) fn find_overlay(ui: Ui) -> impl IntoView {
     // bundle because the editor lives in this crate; the palette needs no help
     // from the app to reach it.
     let open_object: Rc<dyn Fn(String, schemaic_core::schema::ObjectItem)> = {
-        let ui = ui.clone();
+        let (conn, tree, ddl) = (ui.conn, ui.schema, ui.ddl);
+        let actions = ui.schema_actions.clone();
         Rc::new(move |database, item| {
-            crate::object_editor::open_for_object(&ui, &database, &item);
+            crate::object_editor::open_for_object(conn, tree, ddl, &actions, &database, &item);
         })
     };
 

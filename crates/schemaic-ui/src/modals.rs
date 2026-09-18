@@ -144,9 +144,13 @@ pub(crate) fn modal_layer(ui: Ui, modal_up: impl Fn() -> bool + Copy + 'static) 
                 // opened is up, and every `open` here clears the other two
                 // targets.
                 stack((
-                    trigger_editor::trigger_editor_overlay(ui.clone()),
-                    routine_editor::routine_editor_overlay(ui.clone()),
-                    event_editor::event_editor_overlay(ui.clone()),
+                    trigger_editor::trigger_editor_overlay(
+                        ui.conn,
+                        ui.ddl,
+                        ui.schema_actions.clone(),
+                    ),
+                    routine_editor::routine_editor_overlay(ui.ddl, ui.schema),
+                    event_editor::event_editor_overlay(ui.ddl, ui.schema),
                 ))
                 .style(move |s| {
                     if trigger_open.get().is_some()
@@ -167,10 +171,10 @@ pub(crate) fn modal_layer(ui: Ui, modal_up: impl Fn() -> bool + Copy + 'static) 
                 // failure the event editor shipped with, stated at
                 // `ddl_editors_up`.
                 stack((
-                    object_editor::object_editor_overlay(ui.clone()),
+                    object_editor::object_editor_overlay(ui.ddl, ui.overlay),
                     database_editor::database_editor_overlay(ui.ddl, ui.overlay),
-                    account_editor::account_editor_overlay(ui.clone()),
-                    account_editor::grant_editor_overlay(ui.clone()),
+                    account_editor::account_editor_overlay(ui.ddl),
+                    account_editor::grant_editor_overlay(ui.ddl, ui.overlay),
                 ))
                 .style(move |s| {
                     if object_open.get().is_some()
