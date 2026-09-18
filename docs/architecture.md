@@ -12660,6 +12660,30 @@ existing prose was left alone.
     form intact, with no "return to trigger" flag to be a second source of truth. `is_editable_trigger`
     is the entry point's gate: a constraint trigger's deferral settings aren't modelled, so it is
     listed and droppable but not editable, the call a materialized view gets.
+    **Which function a trigger names is asked in one place — `matching` — and the picker and the
+    Edit button both ask it there.** `TriggerAction::Function::name` is emittable SQL on both
+    producers, so *showing* it means mapping back through the fetched list: `fn_names` drops the
+    quotes and compares against `fn_display`, which is always qualified. That exact comparison is
+    only half the answer, because `tgfoid::regproc::text` — and `fn_sql`'s `qualified_ident`, by the
+    same search-path rule — omit the schema whenever `search_path` already resolves the name, which
+    on a stock server is every function in `public`. So the stored SQL for the commonest trigger
+    there is the bare `audit_fn`, it matched nothing, and the picker listed that function **twice**
+    (once as the "whatever the draft names stays selectable" fallback row, once as the real fetched
+    row) with **Edit permanently disabled**, putting "edit the function this trigger calls" out of
+    reach for it. `matching` tries `fn_names` first and then, only for a name carrying no `.`, a
+    **unique** match on the bare name: two schemas holding `audit_fn` is exactly when a guess would
+    bind the display to the wrong function, so that case stays unresolved and shows the stored SQL
+    verbatim — the honest degradation the module already chose.
+    **The reason it could hide for so long is that there were two spellings of "which function is
+    this".** `display_of` asked `fn_names`; the Edit button independently compared `fn_display`
+    against the already-displayed string, and those two agree only while `display_of` has
+    *succeeded* — the moment it falls back to showing the stored SQL verbatim, Edit's comparison is
+    silently `None`, which is why Edit stayed grey on a stock `public` function long after the
+    qualified case was fixed. Both call sites go through `matching` now, so the seam is closed by
+    construction rather than by a test. `a_stored_name_matches_its_function_in_either_quoting` pins
+    the qualified half and `a_bare_stored_name_resolves_when_only_one_function_can_be_meant` the
+    bare one, including the ambiguous pair it must refuse. Resolving a display never fabricates an
+    edit: `display_of` feeds the `sel` display signal and never the draft.
     **`TriggerTarget::sibling_triggers` is read at the door, because the modal cannot see far
     enough.** On MySQL, MariaDB and SQLite a trigger name is unique across the whole *schema*
     (`ddl::trigger_names_are_schema_scoped`), so the second table in a database to get a trigger

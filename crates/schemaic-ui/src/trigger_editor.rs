@@ -1011,6 +1011,35 @@ fn fn_names(f: &RoutineInfo, sql: &str) -> bool {
     sql.replace('"', "") == fn_display(f)
 }
 
+/// The function a trigger's stored SQL is bound to, if this list holds it.
+///
+/// **One place, because the two callers were asking it differently.**
+/// `display_of` asked [`fn_names`]; the Edit button compared [`fn_display`] to
+/// the *already-displayed* string, so the two agreed only while the first
+/// succeeded and disagreed silently when it did not.
+///
+/// **The second arm is the one that was missing.** `tgfoid::regproc::text`
+/// drops the schema whenever `search_path` already resolves the name, so a
+/// trigger on a stock server's `public` function stores the bare `audit_fn`
+/// while [`fn_display`] is always qualified — and [`fn_names`] alone therefore
+/// answered `false` for the commonest trigger there is. A bare name is matched
+/// only when **exactly one** function in the list carries it: two schemas
+/// holding `audit_fn` is precisely when a guess would name the wrong one, and
+/// no match shows the stored SQL verbatim, which the module already treats as
+/// the honest answer.
+fn matching<'a>(list: &'a [RoutineInfo], sql: &str) -> Option<&'a RoutineInfo> {
+    if let Some(f) = list.iter().find(|f| fn_names(f, sql)) {
+        return Some(f);
+    }
+    let bare = sql.replace('"', "");
+    if bare.contains('.') {
+        return None;
+    }
+    let mut hits = list.iter().filter(|f| f.name == bare);
+    let first = hits.next()?;
+    hits.next().is_none().then_some(first)
+}
+
 /// Keeps the root bundle: the "edit this function" button opens the *routine*
 /// editor, which is an opening path and needs more than `DdlUi`.
 fn pg_action(
@@ -1031,8 +1060,7 @@ fn pg_action(
         TriggerAction::Body(_) => String::new(),
     };
     let display_of = move |sql: &str, list: &[RoutineInfo]| -> String {
-        list.iter()
-            .find(|f| fn_names(f, sql))
+        matching(list, sql)
             .map(fn_display)
             // Not in the list — the fetch hasn't landed, or it isn't a trigger
             // function any more. Showing the stored SQL verbatim is honest;
@@ -1140,11 +1168,14 @@ fn pg_action(
         move || (sel.get(), fns.get()),
         move |(named, list)| {
             let ring = edit_ring.clone();
-            // Compared against the same built display string the picker shows.
-            // This used to compare the bare `proname` against introspection's
-            // *pre-quoted qualified* name, so it never matched and Edit was
-            // permanently disabled for exactly the functions that needed it.
-            let found = list.iter().find(|f| fn_display(f) == named).cloned();
+            // Through `matching`, like the picker — a *second* spelling of
+            // "which function is this" is how the two came apart: comparing
+            // `fn_display` to the already-displayed string agreed with
+            // `display_of` only while `display_of` had succeeded, and was
+            // silently `None` whenever it had fallen back to the stored SQL.
+            // That is why Edit stayed disabled on a stock `public` function
+            // long after the qualified case was fixed.
+            let found = matching(&list, &named).cloned();
             let ui = edit_ui.clone();
             let db = edit_db.clone();
             control_button_enabled("Edit", found.is_some(), ring, 61, move || {
@@ -1692,6 +1723,54 @@ mod tests {
         let quoted = routine("s22", "My Fn");
         assert!(fn_names(&quoted, "s22.\"My Fn\""));
         assert!(fn_names(&quoted, "\"s22\".\"My Fn\""));
+    }
+
+    /// **`regproc` omits the schema when `search_path` already resolves it**,
+    /// which on a stock server is every function in `public` — so the stored SQL
+    /// for the commonest trigger there is the bare `audit_fn`, and
+    /// [`fn_names`] alone answers `false` for it because [`fn_display`] is
+    /// always qualified.
+    ///
+    /// Found by hand, on a stock PostgreSQL 16 with one trigger on one
+    /// `public` function: the picker listed that function **twice** — once as
+    /// the unresolved stored name and once as the real row — and **Edit was
+    /// permanently disabled**, which is word for word the fault
+    /// [`a_stored_name_matches_its_function_in_either_quoting`] was written to
+    /// close. It closed the `s22.` half; the `public` half is the one nearly
+    /// everybody has.
+    ///
+    /// A bare name is only resolvable when it is **unambiguous**. Two schemas
+    /// holding `audit_fn` is exactly when guessing would bind the display to
+    /// the wrong function, so that case stays unresolved and shows the stored
+    /// SQL verbatim — the honest degradation the module already chose.
+    #[test]
+    fn a_bare_stored_name_resolves_when_only_one_function_can_be_meant() {
+        let pubfn = routine("public", "audit_fn");
+        let other = routine("s22", "other_fn");
+
+        // The case that was broken: one candidate, named bare.
+        assert_eq!(
+            matching(&[pubfn.clone(), other.clone()], "audit_fn").map(fn_display),
+            Some("public.audit_fn".to_string())
+        );
+        // Quoted bare, which `regproc` emits for a name needing it.
+        assert_eq!(
+            matching(&[routine("public", "My Fn")], "\"My Fn\"").map(fn_display),
+            Some("public.My Fn".to_string())
+        );
+
+        // Still exact where the schema is spelled out — the older test's case,
+        // asserted here too because this is the function both now go through.
+        assert_eq!(
+            matching(&[pubfn.clone(), routine("s22", "audit_fn")], "s22.audit_fn").map(fn_display),
+            Some("s22.audit_fn".to_string())
+        );
+
+        // Ambiguous: two schemas, one bare name, no guess.
+        assert!(matching(&[pubfn.clone(), routine("s22", "audit_fn")], "audit_fn").is_none());
+        // Absent entirely.
+        assert!(matching(&[pubfn], "nope").is_none());
+        assert!(matching(&[], "audit_fn").is_none());
     }
 
     /// **The composition, not `unique_name`.** `unique_name(&["new_trigger"],
