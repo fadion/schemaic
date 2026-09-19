@@ -15353,10 +15353,9 @@ existing prose was left alone.
     so read the list for where a file stands rather than inferring it from a paragraph — and a file
     that reaches zero leaves the list altogether, which is the one way an entry is ever removed and
     the point at which it may not take a `Ui` again at all. **Thirteen files have left it** — the
-    three DDL-object editors, then
-    `trigger_editor.rs`, `account_editor.rs`, `users_view.rs`, `import_view.rs`, `dump_view.rs`,
-    `compare_view.rs`, `script_view.rs`, `view_editor.rs`, `database_editor.rs` and
-    `table_designer.rs` — and each left a comment behind where it sat,
+    three DDL-object editors, then `trigger_editor.rs`, `account_editor.rs`, `users_view.rs`,
+    `import_view.rs`, `dump_view.rs`, `compare_view.rs`, `script_view.rs`, `view_editor.rs`,
+    `database_editor.rs` and `table_designer.rs` — and each left a comment behind where it sat,
     because a name absent from `BUDGET` says nothing on its own about whether it was ever on it.
     It is a **budget, not a ban**, because narrowing 140 signatures is a campaign and a gate that
     fails on the day it lands teaches nothing: `BUDGET` holds what each file declares *now* and the
