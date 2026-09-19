@@ -47,7 +47,7 @@ use crate::widgets::{
     ACTION_TAB, ActionKind, FocusRing, action_button, focus_root_with_ring, modal_footer_split,
     modal_h, modal_pad_h, modal_title_owned, modal_w, panel_style,
 };
-use crate::{BlobLoadRequest, BlobSaveRequest, Ui};
+use crate::{BlobLoadRequest, BlobSaveRequest, TabsActions};
 
 /// The cell the panel is open on — what it needs to *say*, not what it needs to
 /// fetch.
@@ -131,7 +131,7 @@ pub enum BlobState {
     Failed(String),
 }
 
-/// The panel's signals. Owned by [`Ui`], like every other modal's.
+/// The panel's signals. Owned by [`crate::Ui`], like every other modal's.
 #[derive(Clone, Copy)]
 pub struct BlobUi {
     /// The cell being looked at; `Some` ⇒ the modal is up.
@@ -689,11 +689,10 @@ fn phase_of(state: &BlobState) -> Phase {
 }
 
 /// The binary-cell panel, mounted in the modal layer.
-pub(crate) fn blob_overlay(ui: Ui) -> impl IntoView {
-    let b = ui.blob;
-    let save = ui.tab_actions.save_blob.clone();
-    let load = ui.tab_actions.load_blob.clone();
-    let cancel = ui.tab_actions.cancel_blob.clone();
+pub(crate) fn blob_overlay(b: BlobUi, tab_actions: Rc<TabsActions>) -> impl IntoView {
+    let save = tab_actions.save_blob.clone();
+    let load = tab_actions.load_blob.clone();
+    let cancel = tab_actions.cancel_blob.clone();
 
     // One decision for every exit — the ✕, the footer button and Escape — so
     // the three cannot disagree.

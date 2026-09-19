@@ -12625,6 +12625,12 @@ existing prose was left alone.
     be narrower than the widest of them, and `open_for_new(&Ui, …)` here was the widest. How this
     file got from 29 to 4 is under `lib.rs`'s `whole_ui_gate`, and the steps before that are in
     `account_editor.rs`'s entry, the change that started them.
+    **`ddl_preview.rs` left that list too**, in the tail's one-pass sweep, its last two being
+    `apply(DdlUi, ConnUi, DdlFn)` and `ddl_preview_overlay(DdlUi, ConnUi, DdlFn, Rc<dyn Fn()>,
+    open_query)` — `conn` named in both because `plan_read_only` is asked of the connection list
+    live, at the click and in the footer, rather than read off the stamp the plan was built with.
+    Narrowing it took the `Ui` import out of the file and broke an intra-doc `[`Ui`]` link that only
+    the rustdoc `-D warnings` build noticed; it is `[`crate::Ui`]` now.
     **Every path ends at `ddl_preview`** — designer, Create table, and the context-menu
     shortcuts — so there's one place that shows the SQL, one that names what's destroyed, and
     one "Open in editor" escape hatch. Never run generated DDL without it.
@@ -15460,27 +15466,76 @@ existing prose was left alone.
     is their union: eleven bundles, a parameter list longer than the function. Neither is a
     candidate, which is what a floor looks like when it is the function's own reach rather than a
     callee holding it there.
+    **Then the whole tail came off in one pass — twelve files — and the lesson is about the ratchet
+    rather than about any of them: the tail was never hard.** `tabs.rs` (2), `ddl_preview.rs` (2),
+    `widgets.rs` (1), and `snippet_panel.rs`, `snippet_edit.rs`, `plan_view.rs`, `monitor_view.rs`,
+    `history_panel.rs`, `erd_view.rs`, `connection_form.rs`, `blob_view.rs` and `activity_panel.rs`
+    at 1 each all read two to five bundles into locals at the top and never said `ui` again — only
+    the signatures had not caught up, which is `connection_import.rs`'s tell above seen twelve more
+    times. They sat at 1 or 2 for the length of the campaign because **a small number reads as a
+    small remainder rather than as an easy one**, and the attention went to the files with the big
+    numbers. That is the standing hazard of a per-file budget: the total looks like progress while
+    saying nothing about which entries are cheap.
+    **Two lapsed floors made the sweep possible, and both are the kind this section already warns
+    about.** `widgets.rs`'s `MenuFlags::of` was justified in `BUDGET` as gathering a flag out of
+    "six child bundles" and so genuinely needing the root one. It is **five** — `overlay`, `schema`,
+    `conn`, `tabs_ui`, `activity` — and five named parameters is an ordinary signature, so it takes
+    `MenuFlags::of(OverlayUi, SchemaUi, ConnUi, TabsUi, ActivityUi)` and gathers its eight flags out
+    of those. The count *is* the whole of the argument for taking a root bundle, which makes
+    miscounting it the whole of the mistake: `trigger_editor.rs`'s lapse above was a justification
+    that named a callee and stopped being true, this one was a justification that named a number and
+    was never true, and the ratchet can check neither. Second, once `MenuFlags` is passed as a
+    **value** rather than computed inside each panel, the three side panels that reached `schema`
+    and `tabs_ui` *only* to build one stopped needing them at all: `activity_panel`, `snippet_panel`
+    and `history_panel` take `menus: MenuFlags` beside their own bundles — which is also what keeps
+    each of them under clippy's seven-argument limit — and `lib.rs`'s right-panel branch builds the
+    flags once per panel.
+    The rest were ordinary once said out loud: `tab_bar(TabsUi, ConnUi, OverlayUi,
+    RwSignal<Vec<DbColorRule>>, Rc<TabsActions>)` with `tab_chip(Tab, …)` carrying the same four
+    behind it, where the chip had been cloning a whole `Ui` **per tab** — the same per-row cost the
+    schema tree's object rows and `import_view`'s mapping rows shed;
+    `ddl_preview_overlay(DdlUi, ConnUi, DdlFn, Rc<dyn Fn()>, open_query)` with
+    `apply(DdlUi, ConnUi, DdlFn)` under it; `erd_overlay(OverlayUi, SchemaUi,
+    RwSignal<Vec<TableColorRule>>, Rc<TabsActions>)`; `monitor_overlay(OverlayUi, Rc<TabsActions>)`;
+    `blob_overlay(BlobUi, Rc<TabsActions>)`; `manage_modal(ConnUi, OverlayUi, Rc<ConnActions>)`;
+    `plan_overlay(OverlayUi, ConnUi, LayoutUi, Rc<TabsActions>, Rc<AiActions>)`; and
+    `snippet_edit_overlay(OverlayUi, SnippetsUi, Rc<SnippetActions>)`.
+    **`ai_panel.rs` stays at 1 and is the tail's one refusal.** Excluding the menu flags it now
+    takes
+    as a value, it still reaches eight bundles — `ai`, `ai_actions`, `conn`, `ddl`, `overlay`,
+    `schema`, `tab_actions`, `tabs_ui` — because the assistant reads the schema for context, opens a
+    query tab, and hands a plan to the DDL preview. That is `center`'s shape at panel scale: wide
+    because what it does is wide, and past clippy's limit if named.
+    **One gate fired during that sweep, and it is the only one in the crate that could have caught
+    this class.** The rustdoc `-D warnings` build failed on `blob_view.rs`'s ``/// Owned by [`Ui`]``
+    and on `ddl_preview.rs`'s `[`Ui`]` — intra-doc links that resolved only while the file imported
+    `Ui`, which narrowing the signatures took away. Both are ``[`crate::Ui`]`` now. **Narrowing a
+    module's imports can break a doc link with nothing else noticing**: `cargo test`, `clippy` and
+    `fmt` were all green at that moment, and rustdoc is the gate no local habit runs.
     **The live number is the sum of `BUDGET`, not the "roughly 140" above**, which describes the
-    state the gate found and by design never moves. That sum went **206 → 28** over this run:
+    state the gate found and by design never moves. That sum went **206 → 14** over this run:
     `table_designer.rs` 29 → 26 → 10 → 4 → **0**, `object_editor.rs` 14 → 5 → 4 → **0**,
     `routine_editor.rs` 12 → 6 → **0**, `event_editor.rs` 11 → 5 → **0**,
     `trigger_editor.rs` 11 → 8 → 7 → **0**, `view_editor.rs` 10 → 6 → **0**,
     `database_editor.rs` 7 → 3 → **0**,
-    `ddl_preview.rs` 6 → 4 → 2, `overlays.rs` 15 → 13 → 4, `account_editor.rs` 6 → **0**,
+    `ddl_preview.rs` 6 → 4 → 2 → **0**, `overlays.rs` 15 → 13 → 4, `account_editor.rs` 6 → **0**,
     `schema_tree.rs` 6 → 3 → 2, `users_view.rs` 9 → 8 → 5 → **0**, `import_view.rs` 9 → **0**,
     `dump_view.rs` 9 → **0**, `compare_view.rs` 8 → **0**, `script_view.rs` 6 → **0**,
     `connection_import.rs` 6 → **0**, `properties.rs` 5 → **0**, `settings.rs` 4 → **0**,
-    `modals.rs` 5 → 2, `lib.rs` 6 → 5.
+    `modals.rs` 5 → 2, `lib.rs` 6 → 5, and the tail's rest — `tabs.rs` 2 → **0**, `widgets.rs`
+    1 → **0** and nine panels and modals 1 → **0** — leaving `ai_panel.rs` alone at 1.
     Every step is recorded against its own entry with what it narrowed *to*,
     so read the list for where a file stands rather than inferring it from a paragraph — and a file
     that reaches zero leaves the list altogether, which is the one way an entry is ever removed and
-    the point at which it may not take a `Ui` again at all. **Sixteen files have left it** — the
-    three DDL-object editors, then `trigger_editor.rs`, `account_editor.rs`, `users_view.rs`,
+    the point at which it may not take a `Ui` again at all. **Twenty-eight files have left it** —
+    the three DDL-object editors, then `trigger_editor.rs`, `account_editor.rs`, `users_view.rs`,
     `import_view.rs`, `dump_view.rs`, `compare_view.rs`, `script_view.rs`, `view_editor.rs`,
     `database_editor.rs`, `table_designer.rs`, `connection_import.rs`, `properties.rs` and
-    `settings.rs` — and each left a comment
+    `settings.rs`, and then the tail's twelve above — and each left a comment
     behind where it sat, because a name absent from `BUDGET` says nothing on its own about whether
-    it was ever on it.
+    it was ever on it. The twelve share **one** block, filed where the first of them alphabetically
+    (`activity_panel.rs`) sat, because what there is to say about them is the sweep and not any one
+    file.
     It is a **budget, not a ban**, because narrowing 140 signatures is a campaign and a gate that
     fails on the day it lands teaches nothing: `BUDGET` holds what each file declares *now* and the
     only legal direction is down, so a new `ui: Ui` in a listed file fails and a file not on the list
@@ -15499,11 +15554,12 @@ existing prose was left alone.
     ratchet's own rule — *a file not on the list may not take one at all* — was walked past by any
     new one-line signature in any file. `compare_view.rs` went 6 → 8 and `tabs.rs` 1 → 2, which was
     what those files declared *then* rather than a widening — `body_for` and `ready_body` both take
-    `OverlayUi` now and `compare_view.rs` is off the list altogether, so read that pair as the
-    counter's history rather than as live signatures — and `widgets.rs` joins the list at 1:
-    `MenuFlags::of`, which gathers a flag out of six child bundles and so genuinely needs the root
-    one — the case the rule's own advice about taking the child bundle covers, six times over, and
-    invisible until the counter learned to read `&crate::Ui`.
+    `OverlayUi` now and `compare_view.rs` is off the list altogether, as `tabs.rs` now is, so read
+    that pair as the counter's history rather than as live signatures — and `widgets.rs` joined at
+    1 for `MenuFlags::of`, invisible until the counter learned to read `&crate::Ui`. Read that as
+    history too, and in both directions: the entry it joined at said the function gathered its flags
+    out of "six child bundles" and so genuinely needed the root one, the tail sweep above found it
+    was five, and `widgets.rs` is off the list.
     **The footer's left segments collapse right-to-left, and coming *back* is a different question
     from going away.** `collapsing_seg` hides a status segment once its right edge comes within
     `footer_collapse_gap()` of the right-hand icon group, and a hidden one freezes its measured edge,
@@ -21561,7 +21617,8 @@ renders the themed panel; the caller positions it absolutely. Used by the schema
   eight `MenuId`s (`Popup`, `Context`, the five panel-owned flags — the schema eye and gear, the
   connection switcher, the active-database selector, the Server Activity clock — and `DatePick`, the
   date field's calendar, which is a *grid of days* rather than a menu but is dismissed by every
-  gesture that dismisses one), gathered by `MenuFlags::of(&ui)` and closed by `close_except(keep)`.
+  gesture that dismisses one), gathered by `MenuFlags::of(OverlayUi, SchemaUi, ConnUi, TabsUi,
+  ActivityUi)` and closed by `close_except(keep)`.
   The calendar's membership is the whole reason the list is a list: it is opened from the row panel
   and from an open grid cell, it is closed by the workspace root, **and** it has to be closed by `GridState::dismiss_overlays`
   when a grid cell is clicked — a press the cell consumes, so the root never sees it. Reaching that
@@ -21584,7 +21641,11 @@ renders the themed panel; the caller positions it absolutely. Used by the schema
   selector's call sits **after** its "nothing offerable" early return, so an inert trigger closes
   nothing; its absorb is unconditional, because the root's dismissal is about the *other* menus and
   pressing a dead control should not close one elsewhere. `query_pane` carries a `menus: MenuFlags`
-  on `QueryPaneParams` to make that call possible at all — `editor_pane` has no `Ui`.
+  on `QueryPaneParams` to make that call possible at all — `editor_pane` has no `Ui`. The three
+  right-column panels take the flags the same way now: `activity_panel`, `snippet_panel` and
+  `history_panel` each carry a `menus: MenuFlags` built at the call site in `lib.rs`'s right-panel
+  branch, which is what let them stop taking `schema` and `tabs_ui` at all (`lib.rs`'s
+  `whole_ui_gate`) — they reached those two only to build this.
   **`widgets::menu_trigger_gate::every_click_opened_menu_closes_the_others_itself` is what holds it**,
   a sibling of `popup_anchor_gate` and a source scan for the same reason: the thing under test is a
   set of call sites. It reads every `src/*.rs` in the crate with the test modules cut off and asserts

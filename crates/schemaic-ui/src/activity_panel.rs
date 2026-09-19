@@ -34,7 +34,10 @@ use crate::widgets::{
     MenuEntry, autohide, debounced, highlight_mono, highlight_text, section_title, toolbar_icon,
     tooltip_style,
 };
-use crate::{ActivityState, FieldCfg, Ui, edit_field, icons, theme};
+use crate::{
+    ActivityActions, ActivityState, ActivityUi, ConnUi, FieldCfg, OverlayUi, edit_field, icons,
+    theme,
+};
 
 /// What the panel says on a SQLite connection. Only reachable by a connection
 /// switch or a restored layout — the footer toggle and the palette both decline
@@ -57,23 +60,26 @@ fn state_color(state: SessionState) -> fn() -> floem::peniko::Color {
     }
 }
 
-pub(crate) fn activity_panel(ui: Ui) -> impl IntoView {
-    let state = ui.activity.state;
-    let interval = ui.activity.interval;
-    let busy = ui.activity.busy;
-    let menu_open = ui.activity.menu_open;
-    let menu_anchor = ui.activity.menu_anchor;
-    let refresh = ui.activity_actions.refresh.clone();
-    let kill = ui.activity_actions.kill.clone();
-    let overlay = ui.overlay;
-    let menus = crate::widgets::MenuFlags::of(&ui);
+pub(crate) fn activity_panel(
+    activity: ActivityUi,
+    conn: ConnUi,
+    overlay: OverlayUi,
+    actions: Rc<ActivityActions>,
+    menus: crate::widgets::MenuFlags,
+) -> impl IntoView {
+    let state = activity.state;
+    let interval = activity.interval;
+    let busy = activity.busy;
+    let menu_open = activity.menu_open;
+    let menu_anchor = activity.menu_anchor;
+    let refresh = actions.refresh.clone();
+    let kill = actions.kill.clone();
     // **Reactive**, because a connection switch and the read-only toggle both
     // change the answer while this panel is up, and the entries this dims are
     // the most destructive thing the app can do to a server it was told not to
     // write to. A `Memo` rather than a read here: the two containers below read
     // it inside their own bodies, and a value captured at build would freeze.
     let read_only = {
-        let conn = ui.conn;
         floem::reactive::create_memo(move |_| {
             let id = conn.active_conn.get();
             conn.connections
@@ -133,7 +139,7 @@ pub(crate) fn activity_panel(ui: Ui) -> impl IntoView {
     // A refused kill, above the list it did **not** replace. Its own container so
     // a snapshot arriving underneath doesn't rebuild it and it doesn't rebuild the
     // snapshot — the two are independent facts.
-    let kill_error = ui.activity.kill_error;
+    let kill_error = activity.kill_error;
     let kill_error_line = dyn_container(
         move || kill_error.get(),
         move |e| match e {

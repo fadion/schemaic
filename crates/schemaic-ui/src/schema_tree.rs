@@ -1088,7 +1088,8 @@ pub(crate) fn schema_panel(ui: Ui) -> impl IntoView {
     // so the root dismissal handler never runs for them).
     // One list, in `widgets::MenuFlags` — three copies of it in three files is
     // how the activity clock's dropdown came to be missing from this one.
-    let menus = crate::widgets::MenuFlags::of(&ui);
+    let menus =
+        crate::widgets::MenuFlags::of(ui.overlay, ui.schema, ui.conn, ui.tabs_ui, ui.activity);
     // Search filter (local to the panel). `filter_input` is bound to the search box
     // (updates per keystroke); `filter` is its debounced mirror — the tree filters,
     // highlights, and re-expands off `filter`, so a burst of typing churns the

@@ -28,21 +28,24 @@ use crate::theme::{font_body, font_label};
 use crate::widgets::{
     MenuEntry, autohide, debounced, highlight_sql_mono, highlight_text, section_title, toolbar_icon,
 };
-use crate::{FieldCfg, OverlayUi, Ui, edit_field, icons, theme};
+use crate::{ConnUi, FieldCfg, OverlayUi, SnippetActions, SnippetsUi, edit_field, icons, theme};
 
-pub(crate) fn snippet_panel(ui: Ui) -> impl IntoView {
-    let items = ui.snippets.items;
-    let actions = ui.snippet_actions.clone();
-    let active_conn = ui.conn.active_conn;
-    let overlay = ui.overlay;
-    let menus = crate::widgets::MenuFlags::of(&ui);
+pub(crate) fn snippet_panel(
+    snippets: SnippetsUi,
+    conn: ConnUi,
+    overlay: OverlayUi,
+    actions: Rc<SnippetActions>,
+    menus: crate::widgets::MenuFlags,
+) -> impl IntoView {
+    let items = snippets.items;
+    let active_conn = conn.active_conn;
     // The panel is scoped to the **active connection**, so its dialect comes
     // from that connection rather than from the active tab: a tab keeps the
     // connection it was opened on, and the library in front of you is the one
     // for the connection selected above it. One memo on `ConnUi`, shared with
     // the history panel and the app — see `ConnUi::dialect` for why it has to
     // be tracked.
-    let dialect = ui.conn.dialect;
+    let dialect = conn.dialect;
 
     // Panel-local, like the history panel's: the filter resets when the panel is
     // re-opened, and the rename buffer belongs to this build of the list.
@@ -124,7 +127,7 @@ pub(crate) fn snippet_panel(ui: Ui) -> impl IntoView {
     // Title row: "SNIPPET LIBRARY" left, a + right — save what the editor holds.
     // Unlike the history panel's trash this destroys nothing, so it doesn't ask.
     let save_current = actions.save_current.clone();
-    let can_save = ui.snippets.can_save;
+    let can_save = snippets.can_save;
     let plus = toolbar_icon(
         icons::PLUS,
         5.0,

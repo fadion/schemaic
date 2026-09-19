@@ -87,7 +87,7 @@ pub(crate) fn modal_layer(ui: Ui, modal_up: impl Fn() -> bool + Copy + 'static) 
         // of this tuple, above every group, so the ordering is no longer this
         // entry's business — but the failure is worth remembering, because it is
         // the same one the DDL preview and the popup menu each hit.
-        manage_modal(ui.clone()),
+        manage_modal(ui.conn, ui.overlay, ui.conn_actions.clone()),
         // **Directly above Manage Connections**, which is what raises it: the
         // import modal is a question asked about the list behind it, and closing
         // it returns to that list. Same rule the confirm at the foot of this
@@ -107,7 +107,11 @@ pub(crate) fn modal_layer(ui: Ui, modal_up: impl Fn() -> bool + Copy + 'static) 
             let dump_open = ui.dump.target;
             let script_open = ui.script.target;
             stack((
-                crate::snippet_edit::snippet_edit_overlay(ui.clone()),
+                crate::snippet_edit::snippet_edit_overlay(
+                    ui.overlay,
+                    ui.snippets,
+                    ui.snippet_actions.clone(),
+                ),
                 import_view::import_overlay(import_view::ImportCtx::new(
                     ui.import,
                     ui.conn,
@@ -203,7 +207,13 @@ pub(crate) fn modal_layer(ui: Ui, modal_up: impl Fn() -> bool + Copy + 'static) 
                         s
                     }
                 }),
-                ddl_preview::ddl_preview_overlay(ui.clone()),
+                ddl_preview::ddl_preview_overlay(
+                    ui.ddl,
+                    ui.conn,
+                    ui.schema_actions.run_ddl.clone(),
+                    ui.schema_actions.ddl_cancel.clone(),
+                    ui.tab_actions.open_query.clone(),
+                ),
                 // **Last in this group, because the DDL preview raises it.**
                 // `run_ddl` asks about every open transaction on the connection
                 // *before* applying (`tx::ddl_blocking_tabs`), and the preview is
@@ -222,7 +232,13 @@ pub(crate) fn modal_layer(ui: Ui, modal_up: impl Fn() -> bool + Copy + 'static) 
                 }
             })
         },
-        plan_overlay(ui.clone()),
+        plan_overlay(
+            ui.overlay,
+            ui.conn,
+            ui.layout,
+            ui.tab_actions.clone(),
+            ui.ai_actions.clone(),
+        ),
         // Monitor + ER-diagram modals share one tuple element (the workspace stack
         // is at Floem's 16-arity `ViewTuple` limit). The wrapper must fill the
         // layer when either is open — so their own `.absolute().inset(0)` resolves
@@ -230,8 +246,13 @@ pub(crate) fn modal_layer(ui: Ui, modal_up: impl Fn() -> bool + Copy + 'static) 
         // but stay out-of-flow (zero-size) when both are closed, or it would
         // intercept every click meant for the app beneath it.
         stack((
-            monitor_overlay(ui.clone()),
-            erd_overlay(ui.clone()),
+            monitor_overlay(ui.overlay, ui.tab_actions.clone()),
+            erd_overlay(
+                ui.overlay,
+                ui.schema,
+                ui.table_colors,
+                ui.tab_actions.clone(),
+            ),
             properties::properties_overlay(properties::PropertiesCtx::new(
                 ui.overlay,
                 ui.schema,
@@ -249,7 +270,7 @@ pub(crate) fn modal_layer(ui: Ui, modal_up: impl Fn() -> bool + Copy + 'static) 
             // properties modal beside it, it is a question asked *about the
             // result on screen* rather than about the schema tree, and it is
             // raised from the grid's own cell menu.
-            crate::blob_view::blob_overlay(ui.clone()),
+            crate::blob_view::blob_overlay(ui.blob, ui.tab_actions.clone()),
             // Schema compare belongs here for the reason the ER diagram does:
             // it is a full-window reading of a database raised from the tree,
             // and it hands off to the DDL preview rather than writing anything

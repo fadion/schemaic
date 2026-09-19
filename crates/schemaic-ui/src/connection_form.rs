@@ -38,7 +38,7 @@ use crate::widgets::{
     form_label_style, in_ring_button, loading_dots, menu_item_style, modal_h, modal_title, modal_w,
     nav_group, panel_style,
 };
-use crate::{DraftSignals, FieldCfg, Ui, edit_field, icons, theme};
+use crate::{ConnActions, ConnUi, DraftSignals, FieldCfg, OverlayUi, edit_field, icons, theme};
 
 /// How long Save's check stands in for its label. Long enough to be read on a
 /// glance away from the button, short enough that it can't still be showing when
@@ -612,24 +612,24 @@ pub(crate) fn masked_edit_field(
 }
 
 // Manage Connections: list + editable form (create / update / delete).
-pub(crate) fn manage_modal(ui: Ui) -> impl IntoView {
-    let open = ui.conn.manage_open;
-    let connections = ui.conn.connections;
-    let draft = ui.conn.draft;
-    let select_conn = ui.conn_actions.select_conn.clone();
-    let new_conn = ui.conn_actions.new_conn.clone();
-    let open_import = ui.conn_actions.open_import.clone();
-    let save_conn = ui.conn_actions.save_conn.clone();
-    let duplicate_conn = ui.conn_actions.duplicate_conn.clone();
-    let delete_conn = ui.conn_actions.delete_conn.clone();
-    let test_conn = ui.conn_actions.test_conn.clone();
+pub(crate) fn manage_modal(conn: ConnUi, o: OverlayUi, actions: Rc<ConnActions>) -> impl IntoView {
+    let open = conn.manage_open;
+    let connections = conn.connections;
+    let draft = conn.draft;
+    let select_conn = actions.select_conn.clone();
+    let new_conn = actions.new_conn.clone();
+    let open_import = actions.open_import.clone();
+    let save_conn = actions.save_conn.clone();
+    let duplicate_conn = actions.duplicate_conn.clone();
+    let delete_conn = actions.delete_conn.clone();
+    let test_conn = actions.test_conn.clone();
     // The list's right-click menu goes through the app-wide popup channel, like
     // every other menu — it is rendered at the workspace root, which is the only
     // surface painted above this modal's panel.
-    let popup_menu = ui.overlay.popup_menu;
-    let popup_anchor = ui.overlay.popup_anchor;
-    let popup_width = ui.overlay.popup_width;
-    let conn_test = ui.conn.conn_test;
+    let popup_menu = o.popup_menu;
+    let popup_anchor = o.popup_anchor;
+    let popup_width = o.popup_width;
+    let conn_test = conn.conn_test;
     // Transient confirmations standing in for the two safe actions' labels: a
     // check on Save, the result icon on Test. Created here (once, in the stable
     // workspace scope), not inside the open/close `dyn_container`, so a deferred

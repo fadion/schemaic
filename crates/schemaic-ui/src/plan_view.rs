@@ -28,19 +28,27 @@ use crate::widgets::{
     autohide, loading_dots, measure_text_px_at, measure_text_px_bold_at, modal_body_h,
     modal_title_borderless, modal_w, panel_style, shift_hscroll,
 };
-use crate::{PlanState, RightPanel, Ui, icons, theme};
+use crate::{
+    AiActions, ConnUi, LayoutUi, OverlayUi, PlanState, RightPanel, TabsActions, icons, theme,
+};
 
-pub(crate) fn plan_overlay(ui: Ui) -> impl IntoView {
-    let plan_open = ui.overlay.plan_open;
-    let plan_state = ui.overlay.plan_state;
-    let plan_sql = ui.overlay.plan_sql;
-    let plan_analyze = ui.overlay.plan_analyze;
-    let run_plan = ui.tab_actions.run_plan.clone();
-    let ai_send = ui.ai_actions.send.clone();
-    let right_panel = ui.layout.right_panel;
+pub(crate) fn plan_overlay(
+    o: OverlayUi,
+    conn: ConnUi,
+    layout: LayoutUi,
+    tab_actions: Rc<TabsActions>,
+    ai_actions: Rc<AiActions>,
+) -> impl IntoView {
+    let plan_open = o.plan_open;
+    let plan_state = o.plan_state;
+    let plan_sql = o.plan_sql;
+    let plan_analyze = o.plan_analyze;
+    let run_plan = tab_actions.run_plan.clone();
+    let ai_send = ai_actions.send.clone();
+    let right_panel = layout.right_panel;
     // The active connection's dialect, so the write-check (which gates offering
     // EXPLAIN ANALYZE) parses the statement in the right dialect.
-    let (connections, active_conn) = (ui.conn.connections, ui.conn.active_conn);
+    let (connections, active_conn) = (conn.connections, conn.active_conn);
     let plan_dialect = move || {
         connections
             .with_untracked(|cs| {

@@ -25,7 +25,7 @@ use crate::widgets::{
     MenuEntry, autohide, debounced, highlight_sql_mono, highlight_text, menu_panel_width,
     section_title, toolbar_icon,
 };
-use crate::{Ui, db_color_dot, icons, theme};
+use crate::{ConnUi, HistoryActions, HistoryUi, OverlayUi, db_color_dot, icons, theme};
 
 /// Current wall-clock time, unix millis (for relative "x ago" labels).
 fn now_millis() -> u64 {
@@ -35,14 +35,18 @@ fn now_millis() -> u64 {
         .unwrap_or(0)
 }
 
-pub(crate) fn history_panel(ui: Ui) -> impl IntoView {
-    let entries = ui.history.entries;
-    let active_conn = ui.conn.active_conn;
-    let open_history = ui.history_actions.open.clone();
-    let clear = ui.history_actions.clear.clone();
-    let db_colors = ui.db_colors;
-    let overlay = ui.overlay;
-    let menus = crate::widgets::MenuFlags::of(&ui);
+pub(crate) fn history_panel(
+    history: HistoryUi,
+    conn: ConnUi,
+    overlay: OverlayUi,
+    db_colors: RwSignal<Vec<DbColorRule>>,
+    actions: Rc<HistoryActions>,
+    menus: crate::widgets::MenuFlags,
+) -> impl IntoView {
+    let entries = history.entries;
+    let active_conn = conn.active_conn;
+    let open_history = actions.open.clone();
+    let clear = actions.clear.clone();
 
     // The row menu, raised at the pointer through the app-wide popup channel —
     // the same route the snippet library's rows take. Built here rather than
@@ -51,7 +55,7 @@ pub(crate) fn history_panel(ui: Ui) -> impl IntoView {
     // every row would say otherwise.
     let open_menu: Rc<dyn Fn(HistoryEntry)> = {
         let open = open_history.clone();
-        let remove = ui.history_actions.remove.clone();
+        let remove = actions.remove.clone();
         Rc::new(move |entry: HistoryEntry| {
             menus.close_except(Some(crate::widgets::MenuId::Popup));
             overlay.popup_anchor.set(None);
@@ -69,7 +73,7 @@ pub(crate) fn history_panel(ui: Ui) -> impl IntoView {
     // right one for all of them — and it is now literally the same memo the
     // snippet library reads, rather than a third copy of it. See
     // `ConnUi::dialect` for why it has to be tracked.
-    let dialect = ui.conn.dialect;
+    let dialect = conn.dialect;
 
     // Panel-local search filter (matched against SQL / database / tab name). Local
     // to this panel build — resets when the History panel is re-opened.
@@ -173,7 +177,7 @@ pub(crate) fn history_panel(ui: Ui) -> impl IntoView {
     // The count goes through `history::count_conn` rather than an inline filter:
     // it is a promise about what the next click deletes, and `clear_conn` is what
     // fulfils it — a test pins the two together.
-    let confirm = ui.overlay.confirm;
+    let confirm = overlay.confirm;
     let clearable = create_memo(move |_| {
         let conn = active_conn.get();
         entries.with(|v| history::count_conn(v, conn))

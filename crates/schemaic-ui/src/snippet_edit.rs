@@ -23,7 +23,7 @@ use crate::widgets::{
 };
 use schemaic_core::snippet;
 
-use crate::{FieldCfg, Ui, edit_field, theme};
+use crate::{FieldCfg, OverlayUi, SnippetActions, SnippetsUi, edit_field, theme};
 
 fn panel_w() -> f64 {
     modal_w(680.0)
@@ -39,9 +39,13 @@ const BODY_MIN_ROWS: usize = 3;
 // is the one caller, and a second "open me" helper here would be a second way to
 // raise the same modal.
 
-pub(crate) fn snippet_edit_overlay(ui: Ui) -> impl IntoView {
-    let open = ui.overlay.snippet_edit;
-    let library = ui.snippets.items;
+pub(crate) fn snippet_edit_overlay(
+    o: OverlayUi,
+    snippets: SnippetsUi,
+    actions: Rc<SnippetActions>,
+) -> impl IntoView {
+    let open = o.snippet_edit;
+    let library = snippets.items;
     let close = move || open.set(None);
 
     dyn_container(
@@ -59,7 +63,7 @@ pub(crate) fn snippet_edit_overlay(ui: Ui) -> impl IntoView {
             else {
                 return empty().into_any();
             };
-            let actions = ui.snippet_actions.clone();
+            let actions = actions.clone();
 
             let name = RwSignal::new(snip.name.clone());
             let abbrev = RwSignal::new(snip.abbrev.clone().unwrap_or_default());

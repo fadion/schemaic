@@ -1,5 +1,5 @@
 //! The query-tab strip above the editor: `tab_bar` renders the row of flat,
-//! full-height tabs (+ the "＋" new-tab button) from `ui.tabs_ui.tabs`, and
+//! full-height tabs (+ the "＋" new-tab button) from `tabs_ui.tabs`, and
 //! `tab_chip` is one tab (click to activate, ×/middle-click to close). A flashing
 //! tab is hidden for the duration of its flash. `tab_bar` is wired into `center`.
 
@@ -14,19 +14,29 @@ use floem::views::TooltipExt;
 
 use crate::consts::{chat_pad_h, tab_bar_h, tab_max_w};
 use crate::widgets::{MenuEntry, measure_text_px, wheel_hscroll};
-use crate::{FieldCfg, Tab, Ui, bg_transparent, db_color_dot, edit_field, icons, theme};
+use crate::{
+    ConnUi, DbColorRule, FieldCfg, OverlayUi, Tab, TabsActions, TabsUi, bg_transparent,
+    db_color_dot, edit_field, icons, theme,
+};
 
 // ===== moved from lib.rs (tab bar) =====
 // ── Tab bar ─────────────────────────────────────────────────────────────────
-pub(crate) fn tab_bar(ui: Ui) -> impl IntoView {
-    let tabs = ui.tabs_ui.tabs;
-    let flashing = ui.tabs_ui.flashing;
-    let active_conn = ui.conn.active_conn;
-    let conn_status = ui.conn.conn_status;
-    let add_tab = ui.tab_actions.add_tab.clone();
-    // Each chip gets its own `Ui` handle — for the close/pin/duplicate actions and
-    // the shared popup-menu channel that the right-click context menu opens on.
-    let chip_ui = ui;
+pub(crate) fn tab_bar(
+    tabs_ui: TabsUi,
+    conn: ConnUi,
+    o: OverlayUi,
+    db_colors: RwSignal<Vec<DbColorRule>>,
+    tab_actions: Rc<TabsActions>,
+) -> impl IntoView {
+    let tabs = tabs_ui.tabs;
+    let flashing = tabs_ui.flashing;
+    let active_conn = conn.active_conn;
+    let conn_status = conn.conn_status;
+    let add_tab = tab_actions.add_tab.clone();
+    // Each chip takes the four things it acts on — the close/pin/duplicate
+    // actions, the tab state they act on, the shared popup-menu channel the
+    // right-click menu opens on, and the colour store for its identity dot.
+    let chip_actions = tab_actions.clone();
     // A flashing tab's chip is hidden for the duration of the flash. Flat,
     // full-height tabs sit flush (no gap); each draws its own right separator.
     // Only the active connection's tabs: a tab belongs to a connection, so
@@ -43,7 +53,7 @@ pub(crate) fn tab_bar(ui: Ui) -> impl IntoView {
         // signal), so including it makes a renumber (e.g. reopen-closed-tab
         // restoring the original "Query N") rebuild the chip with the new number.
         |t: &Tab| (t.id, t.label),
-        move |t| tab_chip(t, chip_ui.clone()),
+        move |t| tab_chip(t, tabs_ui, o, db_colors, chip_actions.clone()),
     )
     .style(|s| s.flex_row().height_full());
 
@@ -112,22 +122,27 @@ fn tab_file_w() -> f64 {
     theme::scaled(19.0)
 }
 
-fn tab_chip(tab: Tab, ui: Ui) -> impl IntoView {
-    let active = ui.tabs_ui.active;
-    let close_tab = ui.tab_actions.close_tab.clone();
-    let db_colors = ui.db_colors;
-    let toggle_pin = ui.tab_actions.toggle_pin.clone();
-    let duplicate = ui.tab_actions.duplicate_tab.clone();
-    let reopen = ui.tab_actions.reopen_closed_tab.clone();
-    let can_reopen = ui.tab_actions.can_reopen_closed_tab.clone();
-    let close_all = ui.tab_actions.close_all_tabs.clone();
-    let close_others = ui.tab_actions.close_other_tabs.clone();
-    let can_close_others = ui.tab_actions.can_close_other_tabs.clone();
-    let open_file = ui.tab_actions.open_sql_file.clone();
-    let save_file = ui.tab_actions.save_sql_file.clone();
-    let save_file_as = ui.tab_actions.save_sql_file_as.clone();
-    let reload_file = ui.tab_actions.reload_sql_file.clone();
-    let overlay = ui.overlay;
+fn tab_chip(
+    tab: Tab,
+    tabs_ui: TabsUi,
+    o: OverlayUi,
+    db_colors: RwSignal<Vec<DbColorRule>>,
+    tab_actions: Rc<TabsActions>,
+) -> impl IntoView {
+    let active = tabs_ui.active;
+    let close_tab = tab_actions.close_tab.clone();
+    let toggle_pin = tab_actions.toggle_pin.clone();
+    let duplicate = tab_actions.duplicate_tab.clone();
+    let reopen = tab_actions.reopen_closed_tab.clone();
+    let can_reopen = tab_actions.can_reopen_closed_tab.clone();
+    let close_all = tab_actions.close_all_tabs.clone();
+    let close_others = tab_actions.close_other_tabs.clone();
+    let can_close_others = tab_actions.can_close_other_tabs.clone();
+    let open_file = tab_actions.open_sql_file.clone();
+    let save_file = tab_actions.save_sql_file.clone();
+    let save_file_as = tab_actions.save_sql_file_as.clone();
+    let reload_file = tab_actions.reload_sql_file.clone();
+    let overlay = o;
 
     // Commit the inline rename: an empty/blank name reverts to the default
     // "Query N" (stored as `None`). Called from Enter and from focus-loss.

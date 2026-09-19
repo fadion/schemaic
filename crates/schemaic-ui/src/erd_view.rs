@@ -60,7 +60,7 @@ use crate::widgets::{
     MenuEntry, centered_msg, measure_text_px_at, measure_text_px_bold_at, modal_title_borderless,
     panel_style, window_size,
 };
-use crate::{ConnNode, Ui, icons, theme};
+use crate::{ConnNode, OverlayUi, SchemaUi, TableColorRule, TabsActions, icons, theme};
 
 /// How strongly a table's identity colour tints its card header.
 ///
@@ -1919,11 +1919,15 @@ fn zoom_unit(zoom: RwSignal<f64>, zoom_out: Rc<dyn Fn()>, zoom_in: Rc<dyn Fn()>)
         .into_any()
 }
 
-pub(crate) fn erd_overlay(ui: Ui) -> impl IntoView {
-    let erd_sig = ui.overlay.erd;
-    let db_nodes = ui.schema.db_nodes;
-    let open_table = ui.tab_actions.open_table.clone();
-    let table_colors = ui.table_colors;
+pub(crate) fn erd_overlay(
+    o: OverlayUi,
+    schema: SchemaUi,
+    table_colors: RwSignal<Vec<TableColorRule>>,
+    tab_actions: Rc<TabsActions>,
+) -> impl IntoView {
+    let erd_sig = o.erd;
+    let db_nodes = schema.db_nodes;
+    let open_table = tab_actions.open_table.clone();
     let win = window_size();
 
     dyn_container(
@@ -1944,8 +1948,8 @@ pub(crate) fn erd_overlay(ui: Ui) -> impl IntoView {
             // question with an answer. Every exit routes through here: the ✕,
             // Escape, the dismiss layer, and double-clicking a table to reveal it.
             let close: Rc<dyn Fn()> = {
-                let popup = ui.overlay.popup_menu;
-                let popup_anchor = ui.overlay.popup_anchor;
+                let popup = o.popup_menu;
+                let popup_anchor = o.popup_anchor;
                 Rc::new(move || {
                     popup.set(None);
                     popup_anchor.set(None);
@@ -2024,10 +2028,7 @@ pub(crate) fn erd_overlay(ui: Ui) -> impl IntoView {
             // Loads *and* reports what the load recovered — see
             // `load_diagram_layouts`, which exists so a lazy load cannot be
             // written without its notice.
-            let saved = crate::load_diagram_layouts(
-                ui.overlay.error_modal_text,
-                ui.overlay.error_modal_open,
-            );
+            let saved = crate::load_diagram_layouts(o.error_modal_text, o.error_modal_open);
             if let Some(s) = schemaic_core::erd::get_layout(
                 &saved,
                 target.conn_id,
@@ -2071,8 +2072,7 @@ pub(crate) fn erd_overlay(ui: Ui) -> impl IntoView {
                 // diagram's record put those cards on top of whatever the user
                 // had arranged there. See `erd::layout_key`.
                 let seed = target.seed.clone();
-                let (err_text, err_open) =
-                    (ui.overlay.error_modal_text, ui.overlay.error_modal_open);
+                let (err_text, err_open) = (o.error_modal_text, o.error_modal_open);
                 Rc::new(move || {
                     // The report matters here more than on the read side: if the
                     // `.bak` was unreadable too, the `save_json` below writes the
@@ -2232,7 +2232,7 @@ pub(crate) fn erd_overlay(ui: Ui) -> impl IntoView {
 
             let save: Rc<dyn Fn(erd_export::ErdExportFormat)> = {
                 let render = render.clone();
-                let export = ui.tab_actions.export_erd.clone();
+                let export = tab_actions.export_erd.clone();
                 let scope_name = scope.clone();
                 let say = say.clone();
                 Rc::new(move |fmt| {
@@ -2377,9 +2377,9 @@ pub(crate) fn erd_overlay(ui: Ui) -> impl IntoView {
             // surface in `workspace`'s root stack bar `submenu_layer` (which
             // draws this menu's own "Copy as"), and so the only one painted above
             // this modal.
-            let popup = ui.overlay.popup_menu;
-            let popup_anchor = ui.overlay.popup_anchor;
-            let popup_width = ui.overlay.popup_width;
+            let popup = o.popup_menu;
+            let popup_anchor = o.popup_anchor;
+            let popup_width = o.popup_width;
             // The anchor is the **button's** rect, so the panel hangs off the
             // control's bottom edge rather than the glyph's, which sits its padding
             // higher. It is also what tells the button the menu already up is its

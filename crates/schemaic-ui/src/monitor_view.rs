@@ -44,7 +44,7 @@ use crate::widgets::{
     autohide_state, follow_after_scroll, loading_dots, modal_h, modal_w, panel_style,
     shift_hscroll, thin_scroll, with_scroll_gesture,
 };
-use crate::{MenuEntry, PopupAnchor};
+use crate::{MenuEntry, OverlayUi, PopupAnchor, TabsActions};
 
 /// The log's rows are shorter than a chat bubble, so it counts as "at the bottom"
 /// a little tighter than the AI panel's `follow_slack`. Scaled for the reason
@@ -52,7 +52,7 @@ use crate::{MenuEntry, PopupAnchor};
 fn monitor_follow_slack() -> f64 {
     theme::scaled(24.0)
 }
-use crate::{MonitorEntry, Ui, icons, theme};
+use crate::{MonitorEntry, icons, theme};
 
 /// Modal size (fixed so the log scrolls within it). The width carries the
 /// sub-header's three icon buttons and the interval dropdown alongside a status
@@ -127,28 +127,28 @@ fn new_color() -> Color {
     Color::rgb8(0x71, 0xC3, 0x71)
 }
 
-pub(crate) fn monitor_overlay(ui: Ui) -> impl IntoView {
-    let open = ui.overlay.monitor_open;
-    let title = ui.overlay.monitor_title;
-    let cols = ui.overlay.monitor_cols;
-    let log = ui.overlay.monitor_log;
-    let error = ui.overlay.monitor_error;
-    let partial = ui.overlay.monitor_partial;
-    let interval = ui.overlay.monitor_interval;
-    let paused = ui.overlay.monitor_paused;
-    let export_err = ui.overlay.monitor_export_err;
-    let exported = ui.overlay.monitor_exported;
-    let dropped = ui.overlay.monitor_dropped;
-    let confirm = ui.overlay.confirm;
+pub(crate) fn monitor_overlay(o: OverlayUi, tab_actions: Rc<TabsActions>) -> impl IntoView {
+    let open = o.monitor_open;
+    let title = o.monitor_title;
+    let cols = o.monitor_cols;
+    let log = o.monitor_log;
+    let error = o.monitor_error;
+    let partial = o.monitor_partial;
+    let interval = o.monitor_interval;
+    let paused = o.monitor_paused;
+    let export_err = o.monitor_export_err;
+    let exported = o.monitor_exported;
+    let dropped = o.monitor_dropped;
+    let confirm = o.confirm;
     // Where an export failure lands when the modal has already closed.
-    let error_modal_text = ui.overlay.error_modal_text;
-    let error_modal_open = ui.overlay.error_modal_open;
+    let error_modal_text = o.error_modal_text;
+    let error_modal_open = o.error_modal_open;
     // The shared popup channel — `popup_menu_overlay` is mounted last in the
     // workspace stack, so a menu raised from in here paints above this modal and
     // its backdrop rather than behind them.
-    let popup_menu = ui.overlay.popup_menu;
-    let popup_anchor = ui.overlay.popup_anchor;
-    let export_file = ui.tab_actions.export_file.clone();
+    let popup_menu = o.popup_menu;
+    let popup_anchor = o.popup_anchor;
+    let export_file = tab_actions.export_file.clone();
 
     dyn_container(
         move || open.get(),

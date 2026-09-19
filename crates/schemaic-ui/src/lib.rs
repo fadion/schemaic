@@ -6651,7 +6651,8 @@ pub fn workspace(ui: Ui, window: WindowId) -> impl IntoView {
             widgets::hoisted_submenu().set(None);
         }
     });
-    let root_menus = widgets::MenuFlags::of(&ui);
+    let root_menus =
+        widgets::MenuFlags::of(ui.overlay, ui.schema, ui.conn, ui.tabs_ui, ui.activity);
     // **Published once, here, before any view that opens a menu is built.** Every
     // `<select>`-shaped control in the app drops the shared popup menu, and most
     // of them are built by helpers two calls deep from anything holding a `Ui` —
@@ -7129,7 +7130,7 @@ fn switcher_chrome(s: floem::style::Style) -> floem::style::Style {
 fn header(ui: Ui, chrome: window_chrome::WindowChrome) -> impl IntoView {
     let connections = ui.conn.connections;
     let active_conn = ui.conn.active_conn;
-    let menus = widgets::MenuFlags::of(&ui);
+    let menus = widgets::MenuFlags::of(ui.overlay, ui.schema, ui.conn, ui.tabs_ui, ui.activity);
     let conn_menu_open = ui.conn.conn_menu_open;
     let conn_status = ui.conn.conn_status;
     let find_open = ui.overlay.find_open;
@@ -8075,11 +8076,49 @@ fn body(
                 ui_right.tab_actions.open_db_cli.clone(),
             )
             .into_any(),
-            RightPanel::History => history_panel(ui_right.clone()).into_any(),
-            RightPanel::Snippets => {
-                crate::snippet_panel::snippet_panel(ui_right.clone()).into_any()
-            }
-            RightPanel::Activity => activity_panel(ui_right.clone()).into_any(),
+            RightPanel::History => history_panel(
+                ui_right.history,
+                ui_right.conn,
+                ui_right.overlay,
+                ui_right.db_colors,
+                ui_right.history_actions.clone(),
+                crate::widgets::MenuFlags::of(
+                    ui_right.overlay,
+                    ui_right.schema,
+                    ui_right.conn,
+                    ui_right.tabs_ui,
+                    ui_right.activity,
+                ),
+            )
+            .into_any(),
+            RightPanel::Snippets => crate::snippet_panel::snippet_panel(
+                ui_right.snippets,
+                ui_right.conn,
+                ui_right.overlay,
+                ui_right.snippet_actions.clone(),
+                crate::widgets::MenuFlags::of(
+                    ui_right.overlay,
+                    ui_right.schema,
+                    ui_right.conn,
+                    ui_right.tabs_ui,
+                    ui_right.activity,
+                ),
+            )
+            .into_any(),
+            RightPanel::Activity => activity_panel(
+                ui_right.activity,
+                ui_right.conn,
+                ui_right.overlay,
+                ui_right.activity_actions.clone(),
+                crate::widgets::MenuFlags::of(
+                    ui_right.overlay,
+                    ui_right.schema,
+                    ui_right.conn,
+                    ui_right.tabs_ui,
+                    ui_right.activity,
+                ),
+            )
+            .into_any(),
             _ => ai_panel(ui_right.clone()).into_any(),
         },
     );
@@ -8456,7 +8495,7 @@ fn center(ui: Ui) -> impl IntoView {
     // dropdown calls this before opening so it's mutually exclusive with the schema
     // eye/settings (and other) dropdowns.
     // The same list every menu trigger uses — see `widgets::MenuFlags`.
-    let all_menus = widgets::MenuFlags::of(&ui);
+    let all_menus = widgets::MenuFlags::of(ui.overlay, ui.schema, ui.conn, ui.tabs_ui, ui.activity);
     let dismiss_menus: Rc<dyn Fn()> = Rc::new(move || all_menus.close_except(None));
     let commit_edits = ui.tab_actions.commit_edits.clone();
     let export_file = ui.tab_actions.export_file.clone();
@@ -8787,7 +8826,13 @@ fn center(ui: Ui) -> impl IntoView {
     // setting). Wrapping the tab bar in a `stack` pins the 2px line to the bar's
     // bottom edge as a no-layout overlay, so enabling it never nudges the editor.
     let tabs_row = stack((
-        tab_bar(ui.clone()),
+        tab_bar(
+            ui.tabs_ui,
+            ui.conn,
+            ui.overlay,
+            ui.db_colors,
+            ui.tab_actions.clone(),
+        ),
         conn_edge_border(connections, active_conn, false),
     ))
     .style(|s| s.width_full().flex_shrink(0.0_f32));
@@ -14768,9 +14813,6 @@ mod whole_ui_gate {
         // `OverlayUi` beside the `DdlUi` it already had; and the two overlays
         // follow from those — `account_editor_overlay(DdlUi)` and
         // `grant_editor_overlay(DdlUi, OverlayUi)`.
-        ("activity_panel.rs", 1),
-        ("ai_panel.rs", 1),
-        ("blob_view.rs", 1),
         // `compare_view.rs` is **off the list** — 8 to zero, the third module
         // to take the drivers-take-a-ctx/renderers-take-the-bundle split.
         // `open_compare`, `body_for`, `ready_body` and `filter_bar` touch
@@ -14791,7 +14833,6 @@ mod whole_ui_gate {
         // 6: `body_for` and `ready_body` take `ui` *second*, which the counter
         // could not see until it counted parameters rather than line shapes" —
         // and both of those functions are on `OverlayUi` now.
-        ("connection_form.rs", 1),
         // `connection_import.rs` is **off the list** — 6 to zero, and it is the
         // cleanest sweep in the campaign because the module has exactly one
         // piece of state: every one of its six read `ui.conn.import` and
@@ -14832,9 +14873,13 @@ mod whole_ui_gate {
         // still the narrower signature, and here it says something the root
         // bundle hid: these two read the **live switcher** where the
         // `PlanTarget` pair deliberately does not, and `conn` being named is
-        // what makes that visible at the call site. The two left are `apply`
-        // and the overlay.
-        ("ddl_preview.rs", 2),
+        // what makes that visible at the call site.
+        //
+        // 2 → **0** in the tail's sweep: `apply(DdlUi, ConnUi, DdlFn)` and
+        // `ddl_preview_overlay(DdlUi, ConnUi, DdlFn, Rc<dyn Fn()>,
+        // open_query)`. `conn` is named in both because `plan_read_only` is
+        // asked of the connection list **live** — at the click and in the
+        // footer — rather than read off the stamp the plan was built with.
         // `dump_view.rs` is **off the list** — 9 to zero, the same
         // drivers-take-a-ctx/renderers-take-the-bundle split as `import_view.rs`
         // beside it. `table_picker` takes `DumpUi`, as `dump_options` and
@@ -14857,10 +14902,8 @@ mod whole_ui_gate {
         // `export_progress_overlay` is the grid export's modal sharing this
         // file, not this modal, and it says so now: `(ExportUi, Rc<dyn Fn()>)`,
         // neither of which is on `DumpCtx`.
-        ("erd_view.rs", 1),
         // `event_editor.rs` is **off the list** — see the note under
         // `routine_editor.rs`, which came off with it.
-        ("history_panel.rs", 1),
         // `import_view.rs` is **off the list** — 9 to zero, and it is the shape
         // `users_view.rs` prescribed applied to a module where the split was
         // already visible: **the drivers take a ctx, the renderers take the
@@ -14896,6 +14939,36 @@ mod whole_ui_gate {
         // widest of them, and `center` is the widest thing in the crate. Read
         // it as `overlays.rs`'s `create_submenu` before the two editor doors
         // came down: a number held there by a callee, not by its own shape.
+        // **Twelve files left the list in one pass — the whole tail — and
+        // the tail was never hard.** `tabs.rs`, `ddl_preview.rs`,
+        // `widgets.rs`, `snippet_panel.rs`, `snippet_edit.rs`, `plan_view.rs`,
+        // `monitor_view.rs`, `history_panel.rs`, `erd_view.rs`,
+        // `connection_form.rs`, `blob_view.rs` and `activity_panel.rs` all
+        // read two to five bundles into locals at the top and never said `ui`
+        // again; only the signatures had not caught up. They sat at 1 or 2 for
+        // the length of the campaign because **a small number reads as a small
+        // remainder rather than as an easy one**, and the files with the big
+        // numbers got the attention.
+        //
+        // Two things made the sweep possible, and both were themselves
+        // lapsed floors. `widgets.rs`'s `MenuFlags::of` was justified as
+        // genuinely needing the root bundle out of "six child bundles"; it is
+        // five, and five named parameters is a signature — the count is the
+        // whole of that argument, which makes miscounting it the whole of the
+        // mistake. And once `MenuFlags` is a *value*, the three side panels
+        // that only reached `schema` and `tabs_ui` to build one stopped
+        // needing them at all: `activity_panel`, `snippet_panel` and
+        // `history_panel` take the flags rather than the bundles to compute
+        // them, which is what keeps each under clippy's limit.
+        //
+        // `ai_panel.rs` stays at **1**, and it is the tail's one refusal.
+        // Excluding the menu flags it now takes as a value, it still reaches
+        // eight bundles — `ai`, `ai_actions`, `conn`, `ddl`, `overlay`,
+        // `schema`, `tab_actions`, `tabs_ui` — because the assistant reads the
+        // schema for context, opens a query tab, and hands a plan to the DDL
+        // preview. That is `center`'s shape at panel scale: wide because what
+        // it does is wide, and past clippy's limit if named.
+        ("ai_panel.rs", 1),
         ("lib.rs", 5),
         // 5 → 2: the three **group predicates** take the bundles they read —
         // `ddl_modals_up(OverlayUi, ImportUi, DumpUi, ScriptUi, DdlUi)`,
@@ -14918,7 +14991,6 @@ mod whole_ui_gate {
         // above that closure and nothing inside it, which is why the gate
         // neither broke nor went blind.
         ("modals.rs", 2),
-        ("monitor_view.rs", 1),
         // `object_editor.rs` is **off the list** — see the note under
         // `routine_editor.rs`, which came off with it.
         // 15 → 13: `confirm_overlay` takes the one `RwSignal` it reads, and
@@ -14954,7 +15026,6 @@ mod whole_ui_gate {
         // they *do* is wide. Lowering one means giving it a context struct, and
         // `view_editor.rs` records when that is the wrong answer.
         ("overlays.rs", 4),
-        ("plan_view.rs", 1),
         // `properties.rs` is **off the list** — 5 to zero, on a `PropertiesCtx`
         // rather than named bundles, and the footer is why. The panel itself
         // reads `overlay` and the loaded schema; its **Edit** routes to the
@@ -15068,8 +15139,6 @@ mod whole_ui_gate {
         // Zero *parameters* is what this list tracks; zero *mentions* is a
         // different measurement, and a file can be off the list while its
         // prose still names the bundle — `users_view.rs` does, three times.
-        ("snippet_edit.rs", 1),
-        ("snippet_panel.rs", 1),
         // 33 → 32: `suggest_chevron` took `&Ui` for two `Copy` overlay signals
         // and now takes `OverlayUi`.
         //
@@ -15114,7 +15183,6 @@ mod whole_ui_gate {
         // routes to four different editors' doors, so it could not be narrower
         // than the widest of them.
         // 2, for `compare_view.rs`'s reason: `tab_chip(tab: Tab, ui: Ui)`.
-        ("tabs.rs", 2),
         // `trigger_editor.rs` is **off the list** — and the way it got there is
         // the entry worth keeping, because this file's comment used to say it
         // would not: *"`form` and `pg_action` are deliberately not narrowed —
@@ -15172,11 +15240,15 @@ mod whole_ui_gate {
         // `open_from_query` that plus `SchemaUi`. A ctx would have handed the
         // `ViewAlgoFn` to every one of them.
         //
-        // 1: `MenuFlags::of`, which gathers a flag out of six child bundles and so
-        // genuinely needs the root one — the case the doc above calls taking
-        // "the child bundle … which is what those bundles are for", six times
-        // over. It was invisible until the counter learned `&crate::Ui`.
-        ("widgets.rs", 1),
+        // **`widgets.rs`'s entry was here, and what it said is why the sweep
+        // above was possible.** It read: "1: `MenuFlags::of`, which gathers a
+        // flag out of six child bundles and so genuinely needs the root one …
+        // six times over." It gathers out of **five**, and five named
+        // parameters is an ordinary signature — so the justification was not a
+        // reason that lapsed but a number that was never right, and the
+        // ratchet cannot check either kind. The entry is gone; the sentence is
+        // kept here because it is the clearest example in the file of a floor
+        // defended by a count nobody counted.
     ];
 
     /// How many `ui: Ui` / `ui: &Ui` parameters a file declares.

@@ -2967,16 +2967,30 @@ pub(crate) struct MenuFlags {
 }
 
 impl MenuFlags {
-    pub(crate) fn of(ui: &crate::Ui) -> Self {
+    /// Gather the eight flags out of the five bundles that hold them.
+    ///
+    /// **It took `&Ui` and the `BUDGET` note said it "genuinely needs the root
+    /// one", out of "six child bundles".** It is five, and five named
+    /// parameters is a signature — so the note was both a miscount and the
+    /// wrong conclusion from it. The count is the whole of the argument for
+    /// taking a root bundle, which makes getting it wrong the whole of the
+    /// mistake.
+    pub(crate) fn of(
+        overlay: crate::OverlayUi,
+        schema: crate::SchemaUi,
+        conn: crate::ConnUi,
+        tabs_ui: crate::TabsUi,
+        activity: crate::ActivityUi,
+    ) -> Self {
         Self {
-            popup: ui.overlay.popup_menu,
-            context: ui.overlay.context_menu,
-            schema_eye: ui.schema.db_menu_open,
-            schema_gear: ui.schema.schema_menu_open,
-            connection: ui.conn.conn_menu_open,
-            active_db: ui.tabs_ui.active_db_menu_open,
-            activity_clock: ui.activity.menu_open,
-            date_pick: ui.overlay.date_pick,
+            popup: overlay.popup_menu,
+            context: overlay.context_menu,
+            schema_eye: schema.db_menu_open,
+            schema_gear: schema.schema_menu_open,
+            connection: conn.conn_menu_open,
+            active_db: tabs_ui.active_db_menu_open,
+            activity_clock: activity.menu_open,
+            date_pick: overlay.date_pick,
         }
     }
 

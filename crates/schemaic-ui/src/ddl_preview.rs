@@ -26,7 +26,9 @@ use crate::widgets::{
     autohide, exit_action, focus_root_with_ring, form_section, form_section_owned,
     modal_footer_split, modal_h, modal_pad_h, modal_title_owned, modal_w, panel_style,
 };
-use crate::{DdlOutcome, DdlPreview, DdlRunRequest, DdlUi, FieldCfg, Ui, edit_field, icons, theme};
+use crate::{
+    ConnUi, DdlFn, DdlOutcome, DdlPreview, DdlRunRequest, DdlUi, FieldCfg, edit_field, icons, theme,
+};
 
 fn panel_w() -> f64 {
     modal_w(660.0)
@@ -159,7 +161,7 @@ pub(crate) fn close_preview(d: crate::DdlUi) {
 
 /// Open the preview on a change set.
 ///
-/// Takes the `DdlUi` rather than the whole [`Ui`] because that is all it uses,
+/// Takes the `DdlUi` rather than the whole [`crate::Ui`] because that is all it uses,
 /// and because a bundle of 250 signals is not constructible in a test — which
 /// is what left `the_sql_box_shows_the_statement_that_runs` unwritten while the
 /// box showed the wrong text.
@@ -743,8 +745,7 @@ pub(crate) fn plan_read_only(
 }
 
 /// Hand the plan to the app, and fold the outcome back into the modal.
-fn apply(ui: Ui) {
-    let d = ui.ddl;
+fn apply(d: DdlUi, conn: ConnUi, run_ddl: DdlFn) {
     let Some(p) = d.preview.get_untracked() else {
         return;
     };
@@ -756,10 +757,7 @@ fn apply(ui: Ui) {
     // the moment Run is pressed, and two destructive modals must not answer the
     // same question two different ways. The stamp stays, because the note
     // beside the footer is about the preview as opened; the *guard* is this.
-    let read_only = ui
-        .conn
-        .connections
-        .with_untracked(|cs| plan_read_only(cs, &p));
+    let read_only = conn.connections.with_untracked(|cs| plan_read_only(cs, &p));
     if !crate::widgets::accept_launch(d.applying.get_untracked(), read_only) {
         return;
     }
@@ -772,7 +770,7 @@ fn apply(ui: Ui) {
     d.applying.set(true);
     d.error.set(None);
     let opened = d.generation.get_untracked();
-    (ui.schema_actions.run_ddl)(
+    (run_ddl)(
         DdlRunRequest {
             conn_id: p.conn_id,
             database: p.database.clone(),
@@ -804,7 +802,7 @@ fn apply(ui: Ui) {
 }
 
 /// The DDL preview modal. Absolutely positioned over the workspace when
-/// `ui.ddl.preview` is `Some`.
+/// `d.preview` is `Some`.
 /// The connection this plan runs against, by name.
 ///
 /// Falls back to the id rather than to nothing: a title that silently drops the
@@ -861,11 +859,16 @@ fn exit_cancellable(dialect: Option<SqlDialect>) -> bool {
     dialect.is_some_and(schemaic_core::ddl::ddl_rolls_back_as_a_whole)
 }
 
-pub(crate) fn ddl_preview_overlay(ui: Ui) -> impl IntoView {
-    let d = ui.ddl;
+pub(crate) fn ddl_preview_overlay(
+    d: DdlUi,
+    conn: ConnUi,
+    run_ddl: DdlFn,
+    ddl_cancel: Rc<dyn Fn()>,
+    open_query: Rc<dyn Fn(String, Option<String>)>,
+) -> impl IntoView {
     // The connection list, for the footer's two live read-only reads — see
     // [`plan_read_only`].
-    let conns = ui.conn.connections;
+    let conns = conn.connections;
     // Closing returns to the designer when it's still open behind — the draft is
     // untouched, so Cancel here means "not yet", not "throw it away".
     //
@@ -895,14 +898,14 @@ pub(crate) fn ddl_preview_overlay(ui: Ui) -> impl IntoView {
     // second clause, and it leaves no comparison to grep for.
     let cancellable =
         move || exit_cancellable(d.preview.with_untracked(|p| p.as_ref().map(|p| p.dialect)));
-    let cancel_apply = ui.schema_actions.clone();
-    // An `Rc` rather than a bare closure: it now holds the actions bundle, so it
-    // is no longer `Copy` and the three exits share one.
+    let cancel_apply = ddl_cancel.clone();
+    // An `Rc` rather than a bare closure: it now holds a cancel action, so it is
+    // no longer `Copy` and the three exits share one.
     let exit: Rc<dyn Fn()> = Rc::new(move || {
         let cancellable = cancellable();
         match exit_action(d.applying.get_untracked(), cancellable) {
             ExitAction::Close => close_preview(d),
-            ExitAction::Cancel => (cancel_apply.ddl_cancel)(),
+            ExitAction::Cancel => (cancel_apply)(),
             ExitAction::Ignore => {}
         }
     });
@@ -914,12 +917,12 @@ pub(crate) fn ddl_preview_overlay(ui: Ui) -> impl IntoView {
                 return empty().into_any();
             }
             let exit = exit.clone();
-            let ui = ui.clone();
+            let run_ddl = run_ddl.clone();
             let Some(p) = d.preview.get_untracked() else {
                 return empty().into_any();
             };
-            // Read before `ui` is moved into the footer's closures.
-            let title = preview_title(&connection_label(ui.conn.connections, p.conn_id), &p);
+            // Read before the bundles are moved into the footer's closures.
+            let title = preview_title(&connection_label(conn.connections, p.conn_id), &p);
 
             // The script box, then the footer. The box is read-only, but it is
             // the thing this modal exists to be *read*, and Tab is how a keyboard
@@ -1007,7 +1010,7 @@ pub(crate) fn ddl_preview_overlay(ui: Ui) -> impl IntoView {
             // The script's own actions — neither of them answers the question the
             // footer is asking, so they sit recessed at the far left rather than
             // in the Back/Apply pair.
-            let ui_side = ui.clone();
+            let open_query_side = open_query.clone();
             let ring_side = ring.clone();
             let side = dyn_container(
                 move || (d.applying.get(), d.applied.get()),
@@ -1051,7 +1054,7 @@ pub(crate) fn ddl_preview_overlay(ui: Ui) -> impl IntoView {
                             Some(p.database.clone()).filter(|d| !d.is_empty())
                         }
                     };
-                    let open_query = ui_side.tab_actions.open_query.clone();
+                    let open_query = open_query_side.clone();
                     h_stack((
                         action_button_icon(
                             "Copy",
@@ -1104,7 +1107,7 @@ pub(crate) fn ddl_preview_overlay(ui: Ui) -> impl IntoView {
                     )
                 },
                 move |(busy, applied, read_only)| {
-                    let ui = ui.clone();
+                    let run_ddl = run_ddl.clone();
                     let ring = ring_actions.clone();
                     let exit = footer_exit.clone();
                     if applied {
@@ -1181,7 +1184,7 @@ pub(crate) fn ddl_preview_overlay(ui: Ui) -> impl IntoView {
                                 && p.withheld.is_empty(),
                             ring,
                             ACTION_TAB + 30,
-                            move || apply(ui.clone()),
+                            move || apply(d, conn, run_ddl.clone()),
                         ),
                     ))
                     .style(|s| s.flex_row().items_center().gap(action_gap()))
