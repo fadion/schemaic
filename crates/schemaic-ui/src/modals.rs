@@ -151,7 +151,7 @@ pub(crate) fn modal_layer(ui: Ui, modal_up: impl Fn() -> bool + Copy + 'static) 
                         s
                     }
                 }),
-                table_designer::table_designer_overlay(ui.clone()),
+                table_designer::table_designer_overlay(ui.ddl, ui.overlay),
                 view_editor::view_editor_overlay(ui.ddl),
                 // The trigger, routine and event editors share one tuple
                 // element — this stack is at Floem's 16-arity `ViewTuple`
@@ -212,7 +212,7 @@ pub(crate) fn modal_layer(ui: Ui, modal_up: impl Fn() -> bool + Copy + 'static) 
                 // looked hung on "Applying…" with nothing to answer and no way to
                 // reach it. Same rule as `manage_modal` above and the popup menu
                 // below: whatever can raise a question comes first.
-                tx_prompt_overlay(ui.clone()),
+                tx_prompt_overlay(ui.overlay),
             ))
             .style(move |s| {
                 if ddl_modals_up() {

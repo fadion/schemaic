@@ -118,6 +118,17 @@ impl DumpCtx {
             cancel: actions.dump_cancel.clone(),
         }
     }
+
+    /// The live connection's id, dialect and read-only flag, read at a click.
+    ///
+    /// Here rather than at the call site so `conn` can stay private: the export
+    /// submenu needs the dialect to open this modal and nothing else out of the
+    /// registry, and handing it a `ConnUi` beside a ctx that already holds one
+    /// is two names for the same bundle — the shape `whole_ui_gate`'s own note
+    /// on `SchemaTreeCtx` warns about, one level down.
+    pub(crate) fn edit_ctx(&self) -> crate::table_designer::EditCtx {
+        crate::table_designer::edit_ctx(self.conn)
+    }
 }
 
 /// The panel's nominal size, scaled like every other modal's.

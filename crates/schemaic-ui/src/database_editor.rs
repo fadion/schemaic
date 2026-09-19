@@ -38,7 +38,8 @@ use crate::widgets::{
     modal_w, panel_style,
 };
 use crate::{
-    ContainerKind, DatabaseTarget, DdlUi, FieldCfg, OverlayUi, Ui, ddl_preview, edit_field, theme,
+    ConnUi, ContainerKind, DatabaseTarget, DdlUi, FieldCfg, OverlayUi, RolesFn, SchemaUi,
+    ddl_preview, edit_field, theme,
 };
 
 fn panel_w() -> f64 {
@@ -83,17 +84,23 @@ fn field_w() -> f64 {
 /// One refusal at the door is the only version that stays true when a fifth home
 /// appears. The entries stay dimmed, because that is what *says* the action is
 /// unavailable; this is what makes it so.
-pub(crate) fn open_for_new(ui: &Ui, kind: ContainerKind, database: Option<&str>) {
-    let ctx = edit_ctx(ui.conn);
+pub(crate) fn open_for_new(
+    conn: ConnUi,
+    schema: SchemaUi,
+    d: DdlUi,
+    roles: &RolesFn,
+    kind: ContainerKind,
+    database: Option<&str>,
+) {
+    let ctx = edit_ctx(conn);
     if ctx.read_only {
         return;
     }
-    let d = ui.ddl;
     // A new editing session — see `DdlUi::session`.
     d.session.update(|g| *g += 1);
     d.database_draft
         .set(DatabaseDraft::blank(crate::trigger_editor::unique_name(
-            &container_names(ui, kind, database),
+            &container_names(schema, kind, database),
             match kind {
                 ContainerKind::Database => "new_database",
                 ContainerKind::Schema => "new_schema",
@@ -111,7 +118,7 @@ pub(crate) fn open_for_new(ui: &Ui, kind: ContainerKind, database: Option<&str>)
         dialect: ctx.dialect,
         read_only: ctx.read_only,
     }));
-    fetch_roles(ui, &ctx);
+    fetch_roles(d, roles, &ctx);
 }
 
 /// The container names already taken, so the form doesn't open on one of them.
@@ -133,8 +140,8 @@ pub(crate) fn open_for_new(ui: &Ui, kind: ContainerKind, database: Option<&str>)
 /// A namespace holding no objects at all is invisible here, for the same reason
 /// it is invisible in the tree: `DbSchema::schemas` derives the list from the
 /// objects. The cost is one avoidable round trip, not a wrong statement.
-fn container_names(ui: &Ui, kind: ContainerKind, database: Option<&str>) -> Vec<String> {
-    ui.schema
+fn container_names(schema: SchemaUi, kind: ContainerKind, database: Option<&str>) -> Vec<String> {
+    schema
         .db_nodes
         .with_untracked(|nodes| names_in(nodes, kind, database))
 }
@@ -169,14 +176,13 @@ fn names_in(nodes: &[crate::ConnNode], kind: ContainerKind, database: Option<&st
 /// started for a PostgreSQL connection can land after the user has closed the
 /// modal and reopened it on another. Failure writes nothing and says nothing —
 /// see [`crate::RolesFn`].
-fn fetch_roles(ui: &Ui, ctx: &crate::table_designer::EditCtx) {
-    let d = ui.ddl;
+fn fetch_roles(d: DdlUi, roles: &RolesFn, ctx: &crate::table_designer::EditCtx) {
     d.roles.set(Vec::new());
     if !schemaic_core::ddl::supports_owners(ctx.dialect) {
         return;
     }
     let asked = d.session.get_untracked();
-    (ui.schema_actions.roles)(
+    (roles)(
         ctx.conn_id,
         Rc::new(move |roles| {
             if d.session.get_untracked() == asked {

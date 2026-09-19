@@ -39,7 +39,7 @@ use crate::widgets::{
 };
 use crate::{
     ConnUi, DdlPreview, DdlUi, DesignerTab, DesignerTarget, FieldCfg, OverlayUi, PopupAnchor,
-    SchemaUi, Ui, ddl_preview, edit_field, icons, object_location, theme,
+    SchemaUi, ddl_preview, edit_field, icons, object_location, theme,
 };
 
 fn panel_w() -> f64 {
@@ -363,13 +363,15 @@ pub(crate) enum DesignerFocus<'a> {
 /// it was asked at all. The modal still opens — the request that failed is the
 /// landing, not the edit.
 pub(crate) fn open_for_table(
-    ui: &Ui,
+    conn: ConnUi,
+    schema_ui: SchemaUi,
+    d: DdlUi,
     database: &str,
     schema: Option<&str>,
     table: &str,
     focus: DesignerFocus<'_>,
 ) {
-    let Some(info) = loaded_table(ui.schema, database, schema, table) else {
+    let Some(info) = loaded_table(schema_ui, database, schema, table) else {
         return;
     };
     // **A view is not a table, and this is the designer for a table.** Every
@@ -381,7 +383,7 @@ pub(crate) fn open_for_table(
     if info.is_view {
         return;
     }
-    let ctx = edit_ctx(ui.conn);
+    let ctx = edit_ctx(conn);
     // **The third lock, and the one this door had none of.** Of its four
     // launchers — Edit table, Edit column, Edit index and the Properties
     // panel's handoff — only the last carried a read-only term, and that one is
@@ -400,23 +402,22 @@ pub(crate) fn open_for_table(
         _ => None,
     };
     open_designer(
-        ui.ddl,
+        d,
         DesignerTarget {
             conn_id: ctx.conn_id,
             database: database.to_string(),
-            flavour: db_flavour(ui.schema, database),
+            flavour: db_flavour(schema_ui, database),
             schema: info.schema.clone(),
             dialect: ctx.dialect,
             current: Some(info),
-            tables: table_names(ui.schema, database, schema),
+            tables: table_names(schema_ui, database, schema),
             read_only: ctx.read_only,
         },
     );
     let landing = match focus {
         DesignerFocus::Table => None,
         DesignerFocus::Column(_) => column_at.map(|i| (DesignerTab::Columns, i)),
-        DesignerFocus::Key { index, foreign_key } => ui
-            .ddl
+        DesignerFocus::Key { index, foreign_key } => d
             .draft
             .with_untracked(|d| d.find_key(index, foreign_key))
             .map(|k| match k {
@@ -427,9 +428,9 @@ pub(crate) fn open_for_table(
             }),
     };
     if let Some((tab, i)) = landing {
-        ui.ddl.tab.set(tab);
-        ui.ddl.selected.set(i);
-        ui.ddl.rev.update(|r| *r += 1);
+        d.tab.set(tab);
+        d.selected.set(i);
+        d.rev.update(|r| *r += 1);
     }
 }
 
@@ -441,7 +442,9 @@ pub(crate) fn open_for_table(
 /// column takes the index over it and any foreign key standing on it — emit the
 /// `DROP COLUMN` on its own and the server refuses it.
 pub(crate) fn preview_draft_edit(
-    ui: &Ui,
+    conn: ConnUi,
+    schema_ui: SchemaUi,
+    d: DdlUi,
     database: &str,
     schema: Option<&str>,
     table: &str,
@@ -450,22 +453,22 @@ pub(crate) fn preview_draft_edit(
     // rules which checks stand on the column being removed.
     edit: impl FnOnce(&mut TableDraft, SqlDialect),
 ) {
-    let Some(info) = loaded_table(ui.schema, database, schema, table) else {
+    let Some(info) = loaded_table(schema_ui, database, schema, table) else {
         return;
     };
-    let ctx = edit_ctx(ui.conn);
+    let ctx = edit_ctx(conn);
     let mut draft = TableDraft::from_table(&info);
     edit(&mut draft, ctx.dialect);
     let cs = ddl::diff(
         &info,
         &draft,
-        ddl::Target::new(ctx.dialect, db_flavour(ui.schema, database)),
+        ddl::Target::new(ctx.dialect, db_flavour(schema_ui, database)),
     );
     if cs.is_empty() {
         return;
     }
     ddl_preview::open_preview(
-        ui.ddl,
+        d,
         ddl_preview::preview_of(
             ctx.conn_id,
             database,
@@ -477,22 +480,28 @@ pub(crate) fn preview_draft_edit(
 }
 
 /// Open the designer on a blank draft — Create table.
-pub(crate) fn open_for_new(ui: &Ui, database: &str, schema: Option<&str>) {
-    let ctx = edit_ctx(ui.conn);
+pub(crate) fn open_for_new(
+    conn: ConnUi,
+    schema_ui: SchemaUi,
+    d: DdlUi,
+    database: &str,
+    schema: Option<&str>,
+) {
+    let ctx = edit_ctx(conn);
     // `create_children` already dims the entry; this is what makes it so.
     if ctx.read_only {
         return;
     }
     open_designer(
-        ui.ddl,
+        d,
         DesignerTarget {
             conn_id: ctx.conn_id,
             database: database.to_string(),
-            flavour: db_flavour(ui.schema, database),
+            flavour: db_flavour(schema_ui, database),
             schema: schema.map(str::to_string),
             dialect: ctx.dialect,
             current: None,
-            tables: table_names(ui.schema, database, schema),
+            tables: table_names(schema_ui, database, schema),
             read_only: ctx.read_only,
         },
     );
@@ -2239,8 +2248,7 @@ fn change_set(target: &DesignerTarget, draft: &TableDraft) -> ddl::ChangeSet {
 
 /// The table designer. Absolutely positioned over the workspace when
 /// `ui.ddl.designer` is `Some`.
-pub(crate) fn table_designer_overlay(ui: Ui) -> impl IntoView {
-    let d = ui.ddl;
+pub(crate) fn table_designer_overlay(d: DdlUi, overlay_ui: OverlayUi) -> impl IntoView {
     let close = move || d.designer.set(None);
 
     dyn_container(
@@ -2257,7 +2265,6 @@ pub(crate) fn table_designer_overlay(ui: Ui) -> impl IntoView {
             let Some(target) = d.designer.get_untracked() else {
                 return empty().into_any();
             };
-            let ui = ui.clone();
             let title = match &target.current {
                 Some(t) => format!(
                     "Edit {}.{}",
@@ -2285,7 +2292,7 @@ pub(crate) fn table_designer_overlay(ui: Ui) -> impl IntoView {
             let ring = FocusRing::new();
             let root_ring = ring.clone();
 
-            let overlay = ui.overlay;
+            let overlay = overlay_ui;
             let list_ring = ring.clone();
             let list = dyn_container(
                 move || (d.tab.get(), d.draft.get()),
@@ -2377,13 +2384,11 @@ pub(crate) fn table_designer_overlay(ui: Ui) -> impl IntoView {
                 },
             );
 
-            let preview_ui = ui.clone();
             let preview_target = target.clone();
             let ring_actions = ring.clone();
             let actions = dyn_container(
                 move || d.draft.get(),
                 move |draft| {
-                    let ui = preview_ui.clone();
                     let target = preview_target.clone();
                     let ring = ring_actions.clone();
                     let cs = change_set(&target, &draft);
@@ -2405,10 +2410,7 @@ pub(crate) fn table_designer_overlay(ui: Ui) -> impl IntoView {
                             ACTION_TAB + 10,
                             move || {
                                 let cs = change_set(&target, &draft);
-                                ddl_preview::open_preview(
-                                    ui.ddl,
-                                    preview_from(&target, &draft, &cs),
-                                );
+                                ddl_preview::open_preview(d, preview_from(&target, &draft, &cs));
                             },
                         ),
                     ))

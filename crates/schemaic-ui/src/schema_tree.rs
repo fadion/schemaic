@@ -922,9 +922,14 @@ fn blank_space_menu(ui: &Ui) -> Vec<widgets::MenuEntry> {
             // The read-only refusal lives in `open_for_new` itself, so every
             // one of this action's four homes is guarded by construction
             // rather than by each remembering to ask.
-            BlankKind::CreateDatabase => {
-                crate::database_editor::open_for_new(&ui, crate::ContainerKind::Database, None)
-            }
+            BlankKind::CreateDatabase => crate::database_editor::open_for_new(
+                ui.conn,
+                ui.schema,
+                ui.ddl,
+                &ui.schema_actions.roles,
+                crate::ContainerKind::Database,
+                None,
+            ),
             BlankKind::Refresh => (refresh)(),
             // The database is the active tab's, because that is the one
             // PostgreSQL's schema and table privileges can be read from — the

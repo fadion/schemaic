@@ -782,7 +782,9 @@ fn footer(
                 );
             } else {
                 crate::table_designer::open_for_table(
-                    &ui,
+                    ui.conn,
+                    ui.schema,
+                    ui.ddl,
                     &t.database,
                     t.schema.as_deref(),
                     &t.table,

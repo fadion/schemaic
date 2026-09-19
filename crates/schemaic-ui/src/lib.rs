@@ -6707,11 +6707,26 @@ pub fn workspace(ui: Ui, window: WindowId) -> impl IntoView {
 
     let root = stack((
         shell,
-        conn_menu_overlay(ui.clone()),
-        active_db_menu_overlay(ui.clone()),
-        db_visibility_overlay(ui.clone()),
-        schema_settings_overlay(ui.clone()),
-        activity_menu_overlay(ui.clone()),
+        conn_menu_overlay(
+            ui.conn,
+            ui.conn_actions.switch_conn.clone(),
+            ui.conn_actions.select_conn.clone(),
+        ),
+        active_db_menu_overlay(ui.tabs_ui, ui.schema, ui.tab_actions.set_active_db.clone()),
+        db_visibility_overlay(ui.schema, ui.schema_actions.toggle_db_hidden.clone()),
+        schema_settings_overlay(
+            ui.conn,
+            ui.schema,
+            ui.ddl,
+            ui.tabs_ui,
+            ui.overlay,
+            ui.schema_actions.clone(),
+        ),
+        activity_menu_overlay(
+            ui.activity,
+            ui.layout,
+            ui.activity_actions.set_interval.clone(),
+        ),
         context_menu_overlay(ui.clone()),
         // **Every modal, in one layer that starts below the title bar** — the
         // layer, its paint order and the four predicates that raise it live in
@@ -6742,7 +6757,7 @@ pub fn workspace(ui: Ui, window: WindowId) -> impl IntoView {
         // Below the menus: a calendar is dismissed by the same press that opens
         // one, and never draws over one.
         date_pick_overlay(ui.overlay),
-        popup_menu_overlay(ui),
+        popup_menu_overlay(ui.overlay),
         // **After even the popup menu**, because it draws that menu's own open
         // submenu. A submenu is hoisted out of the row it belongs to and drawn
         // here instead: nested under its row it would be painted but never
@@ -14770,9 +14785,19 @@ mod whole_ui_gate {
         // `OverlayUi`, and so does the overlay — naming two child bundles is
         // narrower than naming neither, and the one thing that had kept it on
         // the root was `ddl_preview::preview_container`, which takes `DdlUi`
-        // now. The three left are `open_for_new`, `container_names` and
-        // `fetch_roles`.
-        ("database_editor.rs", 3),
+        // now.
+        //
+        // 3 → **0**, and this one paid twice over. `open_for_new` takes
+        // `(ConnUi, SchemaUi, DdlUi, &RolesFn)` — the doors' rule, a fetch
+        // named — `container_names` takes `SchemaUi` and `fetch_roles`
+        // `(DdlUi, &RolesFn)`. **It was the single callee blocking two of
+        // `overlays.rs`'s entries**: both `create_submenu` and
+        // `schema_settings_overlay` reached the root bundle for
+        // `open_for_new(&Ui, …)` and nothing else, so neither could be
+        // narrower than it. That is the propagating-narrowing shape stated
+        // under `table_designer.rs` below, seen from the other end: when an
+        // entry will not come down, look at what it *calls* before concluding
+        // the entry is the problem.
         // 6 → 4: `preview_container` and `preview_account` forwarded `ui.ddl`
         // and read nothing else, so they take `DdlUi`. That is what let
         // `database_editor`'s overlay off the root bundle as well — a helper
@@ -14834,9 +14859,37 @@ mod whole_ui_gate {
         // `routine_editor.rs`, which came off with it.
         // 15 → 13: `confirm_overlay` takes the one `RwSignal` it reads, and
         // `date_pick_overlay` takes `OverlayUi` (both its signals are in it).
-        // `error_modal_overlay` stays on the root bundle and is the contrast
-        // worth keeping in view — it genuinely reaches five child bundles.
-        ("overlays.rs", 13),
+        //
+        // 13 → 4. Six of the nine were the small menu overlays, which read
+        // their bundles into locals at the top and never touch the root again:
+        // `popup_menu_overlay` and `tx_prompt_overlay` take `OverlayUi`,
+        // `db_visibility_overlay` `(SchemaUi, Rc<dyn Fn(String)>)`,
+        // `conn_menu_overlay` `(ConnUi, + the two `Rc`s it calls)`,
+        // `active_db_menu_overlay` `(TabsUi, SchemaUi, + one)` and
+        // `activity_menu_overlay` `(ActivityUi, LayoutUi, + one)`.
+        // `export_submenu` takes a **`DumpCtx`** and `schema_settings_overlay`
+        // and `create_submenu` name their bundles and actions — the last two
+        // only once `database_editor.rs` and `table_designer.rs` had come down,
+        // which is why those entries record it.
+        //
+        // **The four left are the file's real shape, and each is here for a
+        // reason that names a callee or a count** — re-read them against that,
+        // per the lapsed-justification rule the doc states:
+        //   - `context_menu_overlay` reaches **seventeen** fields. It is the
+        //     schema tree's whole right-click surface: every editor door, both
+        //     colour stores and their two savers, the import and export modals,
+        //     AI, and the tab actions. This is the case the gate's own doc
+        //     calls needing the root bundle, several times over.
+        //   - `palette_commands` reaches nine — Find Anywhere runs *every*
+        //     command the app has, so its dependency is the app.
+        //   - `find_overlay` reaches eight and is the same shape: it opens
+        //     objects, tables, snippets and tabs.
+        //   - `error_modal_overlay` reaches five and was already the contrast
+        //     worth keeping in view.
+        // None of the four is blocked by a callee; they are wide because what
+        // they *do* is wide. Lowering one means giving it a context struct, and
+        // `view_editor.rs` records when that is the wrong answer.
+        ("overlays.rs", 4),
         ("plan_view.rs", 1),
         ("properties.rs", 5),
         // `routine_editor.rs`, `event_editor.rs` and `object_editor.rs` are
@@ -14865,10 +14918,23 @@ mod whole_ui_gate {
         // holding rather than a `Ui` plus four of that struct's own fields, and
         // `object_group_nodes`/`object_group_node` drop the `ui` parameter that
         // was a second clone of the `ctx.ui` passed beside it. The three left
-        // are `blank_space_menu` and `schema_panel` — both opening paths into
-        // `database_editor`, which still takes the root bundle — and the
+        // are `blank_space_menu` and `schema_panel` — and the
         // `SchemaTreeCtx::ui` field itself, which the counter sees and which the
         // table rows still read for `table_colors` and `table_sizes`.
+        //
+        // **This floor's stated reason has already lapsed once — read the
+        // replacement, not the original.** It used to say those two were
+        // "opening paths into `database_editor`, which still takes the root
+        // bundle"; that was true until `database_editor.rs` went to zero, and
+        // it is the exact failure the `trigger_editor.rs` note below warns
+        // about. The floor is still right, for a different reason: the two are
+        // wide on their own merits — `blank_space_menu` reaches six bundles and
+        // `schema_panel` nine — which is `overlays.rs`'s remaining four, not a
+        // callee holding them. The one thing here that *could* still come down
+        // is the `ui` field on `SchemaTreeCtx`: it is carried for `table_colors`
+        // alone, and a named field would take this entry to 2 — the case the
+        // `users_view.rs` note calls a ctx that relocates the root bundle
+        // rather than narrowing it.
         ("schema_tree.rs", 3),
         // `script_view.rs` is **off the list** — 6 to zero, and it is the split
         // on a module that is nearly all driver: this modal is a file picker, a
@@ -14928,10 +14994,16 @@ mod whole_ui_gate {
         // their budgets moving, which is what a propagating narrowing looks
         // like from the outside and is easy to overcount.)
         //
-        // **The four left are opening paths and the overlay**: `open_for_table`,
-        // `preview_draft_edit` and `open_for_new` each write across `ddl`,
-        // `schema` and the peer editors.
-        ("table_designer.rs", 4),
+        // 4 → **0**. The three opening paths write across `ddl`, `schema` and
+        // the peer editors, so they name all three:
+        // `open_for_table(ConnUi, SchemaUi, DdlUi, …)`, and the same for
+        // `preview_draft_edit` and `open_for_new`. The overlay takes
+        // `(DdlUi, OverlayUi)` — the two it reads, no opening path under it.
+        //
+        // **This one unblocked `overlays.rs`'s `create_submenu`**, the second
+        // half of what `database_editor.rs` above had started: that submenu
+        // routes to four different editors' doors, so it could not be narrower
+        // than the widest of them.
         // 2, for `compare_view.rs`'s reason: `tab_chip(tab: Tab, ui: Ui)`.
         ("tabs.rs", 2),
         // `trigger_editor.rs` is **off the list** — and the way it got there is

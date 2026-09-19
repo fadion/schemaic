@@ -28,8 +28,9 @@ use crate::widgets::{
     modal_w, panel_style, window_size,
 };
 use crate::{
-    Confirm, ConnNode, CtxKind, CtxMenu, OverlayUi, PopupAnchor, RightPanel, TxChoice, Ui, icons,
-    right_panel_allowed, schema_panel_allowed, search_box, theme,
+    ActivityUi, Confirm, ConnNode, ConnUi, CtxKind, CtxMenu, DdlUi, LayoutUi, OverlayUi,
+    PopupAnchor, RightPanel, SchemaUi, TabsUi, TxChoice, Ui, icons, right_panel_allowed,
+    schema_panel_allowed, search_box, theme,
 };
 
 /// Width of the schema tree's context menu (its panel's `min_width`), which is
@@ -145,7 +146,7 @@ fn conn_read_only(connections: &RwSignal<Vec<Connection>>, active_conn: RwSignal
 /// Offered on a read-only connection, like the single entry it replaces: every
 /// one of these reads the server and writes a local file.
 fn export_submenu(
-    ui: &Ui,
+    dump: &crate::dump_view::DumpCtx,
     database: &str,
     schema: Option<&str>,
     preselect: Option<&str>,
@@ -153,22 +154,20 @@ fn export_submenu(
     let children = schemaic_core::export::ExportFormat::ALL
         .iter()
         .map(|&format| {
-            let (ui, db, ns, pre) = (
-                ui.clone(),
+            // A `DumpCtx` per format rather than a whole `Ui` per format: four
+            // `Copy` bundles and four `Rc`s against the root bundle's
+            // thirty-six fields, six times over, every time this menu is
+            // built.
+            let (dump, db, ns, pre) = (
+                dump.clone(),
                 database.to_string(),
                 schema.map(str::to_string),
                 preselect.map(str::to_string),
             );
             MenuEntry::action(format.label(), move || {
-                let ctx = crate::table_designer::edit_ctx(ui.conn);
+                let ctx = dump.edit_ctx();
                 crate::dump_view::open_dump(
-                    &crate::dump_view::DumpCtx::new(
-                        ui.dump,
-                        ui.script,
-                        ui.conn,
-                        ui.overlay,
-                        &ui.schema_actions,
-                    ),
+                    &dump,
                     ctx.conn_id,
                     db.clone(),
                     ns.clone(),
@@ -204,12 +203,15 @@ fn export_submenu(
 /// `None` when the engine offers nothing to create at all, so the caller leaves
 /// the row out rather than showing a submenu that opens onto nothing.
 fn create_submenu(
-    ui: &Ui,
+    conn: ConnUi,
+    schema_ui: SchemaUi,
+    ddl: DdlUi,
+    actions: &Rc<crate::SchemaActions>,
     database: &str,
     schema: Option<&str>,
     read_only: bool,
 ) -> Option<MenuEntry> {
-    let dialect = crate::table_designer::edit_ctx(ui.conn).dialect;
+    let dialect = crate::table_designer::edit_ctx(conn).dialect;
     let entries = create_children(dialect, read_only);
     if entries.is_empty() {
         return None;
@@ -217,20 +219,24 @@ fn create_submenu(
     let children = entries
         .into_iter()
         .map(|e| {
-            let (ui, db, ns) = (ui.clone(), database.to_string(), schema.map(str::to_string));
+            // The whole `SchemaActions` and not the one fetch each arm wants:
+            // `object_editor::open_for_new` routes by *kind* to whichever
+            // editor owns it and takes the bundle both its fetches live on, so
+            // naming them here would be two parameters of which exactly one is
+            // ever used — the shape that entry already records.
+            let (db, ns) = (database.to_string(), schema.map(str::to_string));
+            let actions = actions.clone();
             MenuEntry::action(e.label, move || match e.kind {
                 CreateKind::Table => {
-                    crate::table_designer::open_for_new(&ui, &db, ns.as_deref());
+                    crate::table_designer::open_for_new(conn, schema_ui, ddl, &db, ns.as_deref());
                 }
-                CreateKind::View => {
-                    crate::view_editor::open_for_new(ui.conn, ui.ddl, &db, ns.as_deref())
-                }
+                CreateKind::View => crate::view_editor::open_for_new(conn, ddl, &db, ns.as_deref()),
                 CreateKind::Object(kind) => {
                     crate::object_editor::open_for_new(
-                        ui.conn,
-                        ui.schema,
-                        ui.ddl,
-                        &ui.schema_actions,
+                        conn,
+                        schema_ui,
+                        ddl,
+                        &actions,
                         &db,
                         ns.as_deref(),
                         kind,
@@ -240,11 +246,19 @@ fn create_submenu(
                 // — see `DatabaseTarget::database`. A namespace is made inside
                 // the one the menu was raised on, and never inside `ns`: a
                 // namespace does not nest.
-                CreateKind::Database => {
-                    crate::database_editor::open_for_new(&ui, crate::ContainerKind::Database, None)
-                }
+                CreateKind::Database => crate::database_editor::open_for_new(
+                    conn,
+                    schema_ui,
+                    ddl,
+                    &actions.roles,
+                    crate::ContainerKind::Database,
+                    None,
+                ),
                 CreateKind::Schema => crate::database_editor::open_for_new(
-                    &ui,
+                    conn,
+                    schema_ui,
+                    ddl,
+                    &actions.roles,
                     crate::ContainerKind::Schema,
                     Some(&db),
                 ),
@@ -598,13 +612,15 @@ pub(crate) fn create_children(
 }
 
 // ===== moved from lib.rs (overlays) =====
-pub(crate) fn conn_menu_overlay(ui: Ui) -> impl IntoView {
-    let open = ui.conn.conn_menu_open;
-    let connections = ui.conn.connections;
-    let active_conn = ui.conn.active_conn;
-    let switch = ui.conn_actions.switch_conn.clone();
-    let manage_open = ui.conn.manage_open;
-    let select_conn = ui.conn_actions.select_conn.clone();
+pub(crate) fn conn_menu_overlay(
+    conn: ConnUi,
+    switch: Rc<dyn Fn(u64)>,
+    select_conn: Rc<dyn Fn(u64)>,
+) -> impl IntoView {
+    let open = conn.conn_menu_open;
+    let connections = conn.connections;
+    let active_conn = conn.active_conn;
+    let manage_open = conn.manage_open;
 
     dyn_container(
         move || open.get(),
@@ -810,13 +826,16 @@ pub(crate) fn conn_menu_overlay(ui: Ui) -> impl IntoView {
 // the connection's databases (reactive), highlights the active one in the accent
 // colour, and switches the active tab's database on click. Same look as the
 // connection menu; right-aligned under the trigger via `active_db_anchor`.
-pub(crate) fn active_db_menu_overlay(ui: Ui) -> impl IntoView {
-    let open = ui.tabs_ui.active_db_menu_open;
-    let db_nodes = ui.schema.db_nodes;
-    let active_db = ui.tabs_ui.active_db;
-    let set_db = ui.tab_actions.set_active_db.clone();
-    let anchor = ui.tabs_ui.active_db_anchor;
-    let hidden = ui.schema.hidden_dbs;
+pub(crate) fn active_db_menu_overlay(
+    tabs_ui: TabsUi,
+    schema: SchemaUi,
+    set_db: Rc<dyn Fn(String)>,
+) -> impl IntoView {
+    let open = tabs_ui.active_db_menu_open;
+    let db_nodes = schema.db_nodes;
+    let active_db = tabs_ui.active_db;
+    let anchor = tabs_ui.active_db_anchor;
+    let hidden = schema.hidden_dbs;
 
     // What this menu offers is what the SCHEMA tree shows — `schema::db_visible`,
     // the one predicate every list of databases asks. The eye hides a database
@@ -944,12 +963,11 @@ pub(crate) fn active_db_menu_overlay(ui: Ui) -> impl IntoView {
 // with a check — green if visible, dim if hidden. Clicking a row toggles it and
 // leaves the menu open (so several can be flipped at once). Same style as the
 // connection menu, positioned 3px below the gear.
-pub(crate) fn db_visibility_overlay(ui: Ui) -> impl IntoView {
-    let open = ui.schema.db_menu_open;
-    let anchor = ui.schema.db_menu_anchor;
-    let db_nodes = ui.schema.db_nodes;
-    let hidden = ui.schema.hidden_dbs;
-    let toggle = ui.schema_actions.toggle_db_hidden.clone();
+pub(crate) fn db_visibility_overlay(schema: SchemaUi, toggle: Rc<dyn Fn(String)>) -> impl IntoView {
+    let open = schema.db_menu_open;
+    let anchor = schema.db_menu_anchor;
+    let db_nodes = schema.db_nodes;
+    let hidden = schema.hidden_dbs;
 
     // Same flag hygiene as the active-database menu: a panel that cannot render
     // must not leave its flag set, or a later load pops a menu nobody asked for.
@@ -1050,12 +1068,15 @@ pub(crate) fn db_visibility_overlay(ui: Ui) -> impl IntoView {
 /// bottom-**right** corner, the panel's right edge is laid against it, and the
 /// result is clamped into the window on both sides — the edge detection is the
 /// clamp, not a special case.
-pub(crate) fn activity_menu_overlay(ui: Ui) -> impl IntoView {
-    let open = ui.activity.menu_open;
-    let anchor = ui.activity.menu_anchor;
-    let interval = ui.activity.interval;
-    let set_interval = ui.activity_actions.set_interval.clone();
-    let right_panel = ui.layout.right_panel;
+pub(crate) fn activity_menu_overlay(
+    activity: ActivityUi,
+    layout: LayoutUi,
+    set_interval: Rc<dyn Fn(u64)>,
+) -> impl IntoView {
+    let open = activity.menu_open;
+    let anchor = activity.menu_anchor;
+    let interval = activity.interval;
+    let right_panel = layout.right_panel;
 
     // A menu whose panel has gone (the user closed it, or switched to AI) must
     // not be left showing over another panel. Same flag hygiene as the two schema
@@ -1264,17 +1285,30 @@ pub(crate) fn gear_entries(
 // The SCHEMA settings dropdown (opened by the gear): Refresh, Collapse all, and
 // the size-column toggle. Same style as the other dropdowns, dropped 3px below
 // the gear.
-pub(crate) fn schema_settings_overlay(ui: Ui) -> impl IntoView {
-    let open = ui.schema.schema_menu_open;
-    let anchor = ui.schema.schema_menu_anchor;
-    let refresh = ui.schema_actions.refresh_schema.clone();
-    let collapse_all = ui.schema_actions.collapse_all.clone();
-    let toggle_sizes = ui.schema_actions.toggle_table_sizes.clone();
-    let sizes_on = ui.schema.table_sizes;
-    // Kept whole for the capability check below: which rows this menu has depends
-    // on the active connection, and the menu is rebuilt on each open, so it is read
-    // there rather than captured here.
-    let menu_ui = ui.clone();
+/// The SCHEMA gear's menu.
+///
+/// Takes `SchemaActions` whole rather than its four closures one by one, which
+/// is `create_submenu`'s case and the gate's own "take the child bundle, which
+/// is what those bundles are for": every action this menu can run —
+/// `refresh_schema`, `collapse_all`, `toggle_table_sizes`, and the `roles`
+/// fetch the Create-database door ends in — lives on that one bundle, and
+/// naming all four pushed the signature past clippy's argument limit, which is
+/// the same judgement stated by a lint.
+pub(crate) fn schema_settings_overlay(
+    conn: ConnUi,
+    schema: SchemaUi,
+    ddl: DdlUi,
+    tabs_ui: TabsUi,
+    overlay: OverlayUi,
+    actions: Rc<crate::SchemaActions>,
+) -> impl IntoView {
+    let refresh = actions.refresh_schema.clone();
+    let collapse_all = actions.collapse_all.clone();
+    let toggle_sizes = actions.toggle_table_sizes.clone();
+    let roles = actions.roles.clone();
+    let open = schema.schema_menu_open;
+    let anchor = schema.schema_menu_anchor;
+    let sizes_on = schema.table_sizes;
 
     dyn_container(
         move || open.get(),
@@ -1282,14 +1316,20 @@ pub(crate) fn schema_settings_overlay(ui: Ui) -> impl IntoView {
             if !is_open {
                 return empty().into_any();
             }
-            let ui = menu_ui.clone();
             let refresh = refresh.clone();
             let collapse_all = collapse_all.clone();
             let toggle_sizes = toggle_sizes.clone();
-            // Read once for every gate below, which ask the same questions of it.
-            let ctx = crate::table_designer::edit_ctx(ui.conn);
-            let down = ui.conn.conn_status.get_untracked().is_down();
-            let read_only = conn_read_only(&ui.conn.connections, ui.conn.active_conn);
+            let roles = roles.clone();
+            // **Read here, inside the builder, and once for every gate below.**
+            // Which rows this menu has depends on the active connection, and
+            // the menu is rebuilt on each open — so hoisting this to where
+            // `conn` is bound would freeze the capability set at the first
+            // open. (`ConnUi` is `Copy`, so nothing but the read moved when
+            // this function stopped taking the root bundle; the placement is
+            // the part that matters.)
+            let ctx = crate::table_designer::edit_ctx(conn);
+            let down = conn.conn_status.get_untracked().is_down();
+            let read_only = conn_read_only(&conn.connections, conn.active_conn);
             // **Which rows, in which order, and which are inert is data** — see
             // `gear_entries`. This builder turns each entry into a row and
             // nothing else, so the gates are asserted in a test rather than
@@ -1297,10 +1337,10 @@ pub(crate) fn schema_settings_overlay(ui: Ui) -> impl IntoView {
             let items: Vec<floem::AnyView> = gear_entries(ctx.dialect, ctx.exists, read_only, down)
                 .into_iter()
                 .map(|e| {
-                    let ui = ui.clone();
                     let refresh = refresh.clone();
                     let collapse_all = collapse_all.clone();
                     let toggle_sizes = toggle_sizes.clone();
+                    let roles = roles.clone();
                     let kind = e.kind;
                     // **Asked live, not captured.** `e.disabled` was resolved
                     // when the menu was built, and this menu stays open — see
@@ -1309,9 +1349,9 @@ pub(crate) fn schema_settings_overlay(ui: Ui) -> impl IntoView {
                     // updates in place), so reading `conn_status` inside it is
                     // what makes the dim arrive without the menu being
                     // reopened.
-                    let conn_status = ui.conn.conn_status;
-                    let connections = ui.conn.connections;
-                    let active_conn = ui.conn.active_conn;
+                    let conn_status = conn.conn_status;
+                    let connections = conn.connections;
+                    let active_conn = conn.active_conn;
                     let live_disabled = move || {
                         kind.disabled_when(
                             conn_read_only(&connections, active_conn),
@@ -1368,11 +1408,11 @@ pub(crate) fn schema_settings_overlay(ui: Ui) -> impl IntoView {
                             // privileges can be read from — see
                             // `users_view::open_for_server`.
                             GearKind::Users => {
-                                let database = ui.tabs_ui.active_db.get_untracked();
+                                let database = tabs_ui.active_db.get_untracked();
                                 crate::users_view::open_for_server(
-                                    ui.conn,
-                                    ui.overlay,
-                                    ui.conn.active_conn.get_untracked(),
+                                    conn,
+                                    overlay,
+                                    conn.active_conn.get_untracked(),
                                     database.as_deref(),
                                 );
                             }
@@ -1381,7 +1421,10 @@ pub(crate) fn schema_settings_overlay(ui: Ui) -> impl IntoView {
                             // construction — see it for why the guard moved
                             // off the four call sites.
                             GearKind::CreateDatabase => crate::database_editor::open_for_new(
-                                &ui,
+                                conn,
+                                schema,
+                                ddl,
+                                &roles,
                                 crate::ContainerKind::Database,
                                 None,
                             ),
@@ -1450,6 +1493,11 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
     let db_nodes = ui.schema.db_nodes;
     let connections = ui.conn.connections;
     let import_ui = ui.clone();
+    // Built once for the whole menu rather than per `Export ▸` submenu: the
+    // three targets that offer one (database, namespace, table) each hand it
+    // the same ctx, and each of its six formats clones that instead of a `Ui`.
+    let dump_ctx =
+        crate::dump_view::DumpCtx::new(ui.dump, ui.script, ui.conn, ui.overlay, &ui.schema_actions);
 
     // The entries for one target, built on demand. It is a closure rather than the
     // body of the `dyn_container` because the *placement* needs them too: how far
@@ -1660,7 +1708,7 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                             .disabled(conn_read_only(&connections, active_conn)),
                         );
                     }
-                    entries.push(export_submenu(&import_ui, &menu.name, None, None));
+                    entries.push(export_submenu(&dump_ctx, &menu.name, None, None));
                     // On PostgreSQL a database node stands for its `public`
                     // namespace (other namespaces get their own node), so a new
                     // table lands where the tree says it will.
@@ -1671,7 +1719,10 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                             &menu.name,
                         );
                         entries.extend(create_submenu(
-                            &import_ui,
+                            import_ui.conn,
+                            import_ui.schema,
+                            import_ui.ddl,
+                            &import_ui.schema_actions,
                             &menu.name,
                             ns.as_deref(),
                             conn_read_only(&connections, active_conn),
@@ -1926,14 +1977,12 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                     }
                     // This one *is* confined: the picker is filtered to the
                     // namespace, so a `sales` export carries no `public` table.
-                    entries.push(export_submenu(
-                        &import_ui,
-                        &database,
-                        Some(&menu.name),
-                        None,
-                    ));
+                    entries.push(export_submenu(&dump_ctx, &database, Some(&menu.name), None));
                     entries.extend(create_submenu(
-                        &import_ui,
+                        import_ui.conn,
+                        import_ui.schema,
+                        import_ui.ddl,
+                        &import_ui.schema_actions,
                         &database,
                         Some(&menu.name),
                         conn_read_only(&connections, active_conn),
@@ -2341,7 +2390,7 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                         // connection, unlike Import: this reads the server and
                         // writes a local file.
                         entries.push(export_submenu(
-                            &import_ui,
+                            &dump_ctx,
                             &database,
                             // The picker still offers the whole database: the
                             // namespace here is the *table's*, and narrowing to
@@ -2385,7 +2434,9 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                                             );
                                         } else {
                                             crate::table_designer::open_for_table(
-                                                &ui,
+                                                ui.conn,
+                                                ui.schema,
+                                                ui.ddl,
                                                 &db,
                                                 ns.as_deref(),
                                                 &tbl,
@@ -2653,7 +2704,9 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                         entries.push(
                             MenuEntry::action("Edit column", move || {
                                 crate::table_designer::open_for_table(
-                                    &ui,
+                                    ui.conn,
+                                    ui.schema,
+                                    ui.ddl,
                                     &src.database,
                                     src.schema.as_deref(),
                                     &src.table,
@@ -2680,7 +2733,9 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                             MenuEntry::action_colored("Drop", theme::error, move || {
                                 let col = col.clone();
                                 crate::table_designer::preview_draft_edit(
-                                    &ui,
+                                    ui.conn,
+                                    ui.schema,
+                                    ui.ddl,
                                     &src.database,
                                     src.schema.as_deref(),
                                     &src.table,
@@ -2733,7 +2788,9 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                         entries.push(
                             MenuEntry::action(label, move || {
                                 crate::table_designer::open_for_table(
-                                    &ui,
+                                    ui.conn,
+                                    ui.schema,
+                                    ui.ddl,
                                     &src.database,
                                     src.schema.as_deref(),
                                     &src.table,
@@ -2974,11 +3031,11 @@ fn menu_open_point(
 /// `menu_panel` from `ui.overlay.popup_menu` at the cursor, flipping the whole panel left
 /// / up if it would spill past the window edge (the grid sits mid-window, unlike
 /// the left-anchored schema menu). Submenus edge-flip themselves.
-pub(crate) fn popup_menu_overlay(ui: Ui) -> impl IntoView {
-    let popup = ui.overlay.popup_menu;
-    let last_mouse = ui.overlay.last_mouse;
-    let anchor = ui.overlay.popup_anchor;
-    let popup_width = ui.overlay.popup_width;
+pub(crate) fn popup_menu_overlay(o: OverlayUi) -> impl IntoView {
+    let popup = o.popup_menu;
+    let last_mouse = o.last_mouse;
+    let anchor = o.popup_anchor;
+    let popup_width = o.popup_width;
     // **Where the menu was opened, not where the pointer is now.**
     //
     // The placement closure below tracks `window_size()` and so re-runs on any
@@ -5043,8 +5100,8 @@ pub(crate) fn find_overlay(ui: Ui) -> impl IntoView {
 /// "never mind", and there's no safe default between committing and discarding
 /// someone's uncommitted writes. Cancel is spelled out as a button, and it
 /// abandons the action that raised the prompt rather than the transaction.
-pub(crate) fn tx_prompt_overlay(ui: Ui) -> impl IntoView {
-    let prompt = ui.overlay.tx_prompt;
+pub(crate) fn tx_prompt_overlay(o: OverlayUi) -> impl IntoView {
+    let prompt = o.tx_prompt;
 
     dyn_container(
         move || prompt.get(),

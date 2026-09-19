@@ -12340,10 +12340,11 @@ existing prose was left alone.
     pair it with the import it is the round trip of. **`Export` is a submenu of six**, one entry per
     `export::ExportFormat::ALL` — JSON, CSV, SQL, Markdown, HTML, Excel, in the order the grid's
     Download menu already lists them, so a user meets the formats in one order throughout the app.
-    All three nodes build it through the one `overlays::export_submenu(ui, database, schema,
-    preselect)`: the entry is the same offer wherever it appears and the arms differ only in what
-    they hand the picker, while spelled out per arm the six labels and their order would be three
-    lists to keep in step. It is the one label that sits inside a writing group
+    All three nodes build it through the one `overlays::export_submenu(&DumpCtx, database, schema,
+    preselect)`, over a single ctx `context_menu_overlay` builds for the whole menu: the entry is
+    the same offer wherever it appears and the arms differ only in what they hand the picker, while
+    spelled out per arm the six labels and their order would be three lists to keep in step. It is
+    the one label that sits inside a writing group
     without writing anything, which is why `menu_order_gate` exempts it from the skeleton by name:
     it writes a *file* and never the server, so it can never be the irreversible entry the ordering
     exists to place. The table
@@ -12497,7 +12498,11 @@ existing prose was left alone.
     and the `tables`/`run`/`files`/`cancel` closures — and `export_progress_overlay` is deliberately
     **not** on it, taking `(ExportUi, Rc<dyn Fn()>)` instead, because it is the grid export's modal
     and not this one. Where the ctx is built, and what nearly got left out of it, is under `lib.rs`'s
-    `whole_ui_gate`.
+    `whole_ui_gate`. **`edit_ctx()` is the one method on it**, added when the `Export ▸` submenu
+    started carrying a ctx rather than a `Ui`: it returns `table_designer::edit_ctx(self.conn)`, and
+    it exists so `conn` can stay private — the submenu needs the dialect and nothing else out of the
+    registry, and a `ConnUi` handed in beside a ctx that already holds one is two names for one
+    bundle.
     **The grid export's progress modal lives in this file too** (`export_progress_overlay`),
     which is a different feature reached from a different surface and is nonetheless this panel's
     footer with nothing above it: the same running line, the same red Stop in the same fixed slot,
@@ -12557,6 +12562,15 @@ existing prose was left alone.
     `default_type`; it is `ddl::default_new_column_type` now — a value, not a capability — and the
     local function is gone, taking one of this file's admitted `engine_comparison_gate` comparisons
     (9 → 8) with it.
+    **Off `whole_ui_gate`'s list, 4 to zero, and the last four were the three opening paths and the
+    overlay.** Those three write across `ddl`, `schema` and the peer editors, so they name all
+    three — `open_for_table(ConnUi, SchemaUi, DdlUi, …)`, and the same for `preview_draft_edit` and
+    `open_for_new` — while `table_designer_overlay` takes `(DdlUi, OverlayUi)`, there being no
+    opening path under it. **That last step is half of what unblocked `overlays.rs`**, the other
+    half being `database_editor.rs`: `create_submenu` routes to four editors' doors, so it could not
+    be narrower than the widest of them, and `open_for_new(&Ui, …)` here was the widest. How this
+    file got from 29 to 4 is under `lib.rs`'s `whole_ui_gate`, and the steps before that are in
+    `account_editor.rs`'s entry, the change that started them.
     **Every path ends at `ddl_preview`** — designer, Create table, and the context-menu
     shortcuts — so there's one place that shows the SQL, one that names what's destroyed, and
     one "Open in editor" escape hatch. Never run generated DDL without it.
@@ -13090,6 +13104,15 @@ existing prose was left alone.
     **different levels** — `CreateDatabase` is server-level and `CreateSchema` is not.
     `ddl_preview::preview_container` is the one exit, and it reads that level off the change
     (`ddl::is_server_level`) rather than taking a caller's word for it.
+    **Off `whole_ui_gate`'s list, 3 to zero, and this one paid twice over.** `open_for_new(ConnUi,
+    SchemaUi, DdlUi, &RolesFn, kind, database)` is the doors' rule — a door names the fetch it ends
+    in — with `container_names(SchemaUi, …)` and `fetch_roles(DdlUi, &RolesFn, …)` behind it. It
+    was also **the single callee blocking two of `overlays.rs`'s entries**:
+    `schema_settings_overlay` reached the root bundle for `open_for_new(&Ui, …)` and nothing else,
+    and `create_submenu` for that and `table_designer::open_for_new` beside it, so neither could be
+    narrower than this file. One thing the narrowing was *not* checked against: `fetch_roles`' round
+    trip went unexercised by hand, because MySQL has no owners and `ddl::supports_owners` returns
+    before the fetch fires — only a PostgreSQL **Create database** reaches it.
   - `account_editor.rs` — the Users and privileges browser's **write half**: two overlays in one
     module, `account_editor_overlay` (create an account, or reset one's password) and
     `grant_editor_overlay` (grant or
@@ -13142,9 +13165,10 @@ existing prose was left alone.
     `ddl::default_new_column_type` with a test behind it. `DdlUi` being `Copy` is what let the
     columns list stop cloning the whole `Ui` four times to reach it. It reached **10** when the
     campaign written up under `lib.rs` took the file's whole form-and-list half to `DdlUi` and its
-    field helpers to `RwSignal<TableDraft>`, and **4** when the six shared readers came down after
-    it; the `lib.rs` write-up carries the steps, and this sentence said 10 for a while after that
-    stopped being true.
+    field helpers to `RwSignal<TableDraft>`, **4** when the six shared readers came down after it,
+    and **zero** when the three opening paths and the overlay followed and the file left the list
+    altogether; the `lib.rs` write-up carries the steps, and this sentence said 10 for a while after
+    that stopped being true.
     Scoped to this file on purpose: every other editor is launched from the
     schema tree, where the active connection *is* the target.
     The account form **creates, or resets one account's password — and never renames** — near enough
@@ -13353,6 +13377,22 @@ existing prose was left alone.
     narrower name wrong. An empty `risks()` — an arm a later edit emptied — falls back to a question
     rather than to a modal with a blank body, which is an irreversible action asked with nothing in
     it (`a_riskless_change_still_asks_something`).
+    **`whole_ui_gate` 13 → 4, and six of the nine that came down were the small menus** — they read
+    their bundles into locals at the top and never touch the root again, so `popup_menu_overlay`
+    and `tx_prompt_overlay` take `OverlayUi`, `db_visibility_overlay` `SchemaUi`,
+    `conn_menu_overlay` `ConnUi`, `active_db_menu_overlay` `(TabsUi, SchemaUi)` and
+    `activity_menu_overlay` `(ActivityUi, LayoutUi)`, each beside the `Rc` closures it calls.
+    `export_submenu` takes the export modal's own `&DumpCtx`, and `schema_settings_overlay` and
+    `create_submenu` take `SchemaActions` whole — the last two only once `database_editor.rs` and
+    `table_designer.rs` had taken their `open_for_new` doors off the root bundle, which is the
+    tranche's own lesson and is under `lib.rs`'s `whole_ui_gate` with the counts. **The four left
+    are wide because what they do is wide, not because a callee holds them there**:
+    `context_menu_overlay` reaches seventeen `Ui` fields (the tree's whole right-click surface),
+    `palette_commands` nine, `find_overlay` eight and `error_modal_overlay` five. **Two call
+    spellings in this file are load-bearing and were kept through all of it**: `menu_order_gate`'s
+    `the_scan_sees_the_export_submenu_in_all_three_arms` reads this file's own source for lines
+    beginning `entries.push(export_submenu(` and `entries.extend(create_submenu(`, so changing what
+    those two calls *take* costs nothing and re-wrapping how they are *written* blinds the gate.
   - `schema_tree.rs` — SCHEMA sidebar (`schema_panel` + db/table/column/key row builders + keyboard
     nav).
     **The panel's title is the only place a long catalogue read can be reported.**
@@ -15259,21 +15299,64 @@ existing prose was left alone.
     where their `PlanTarget` siblings deliberately do not, and that is now visible at every call
     site rather than only in the prose two paragraphs up. The rule is the signature saying what the
     function depends on, not the parameter count.
+    **`overlays.rs` came down last, 13 to 4, and the *order* of that tranche is the whole of what
+    it teaches.** It had sat at 13 as the big one left and genuinely cross-cutting, and two of the
+    thirteen were not cross-cutting at all — they were downstream of two other files' doors. Six of
+    the nine that came off were the small menu overlays, which read their bundles into locals at the
+    top and never touch the root again: `popup_menu_overlay` and `tx_prompt_overlay` take
+    `OverlayUi`, `db_visibility_overlay` `(SchemaUi, Rc<dyn Fn(String)>)`, `conn_menu_overlay`
+    `ConnUi` beside the two `Rc`s it calls, `active_db_menu_overlay` `(TabsUi, SchemaUi, …)` and
+    `activity_menu_overlay` `(ActivityUi, LayoutUi, …)`. The other three are the interesting ones.
+    **`export_submenu` takes a `&DumpCtx`** — the ctx built for the export modal, reused here
+    because four of the five fields this submenu reads (`dump`, `script`, `conn`, `overlay`) *are*
+    its fields — and where it was cloning a whole `Ui` per format, six times per menu build, it
+    clones a `DumpCtx`; `context_menu_overlay` builds one for the whole menu and hands it to all
+    three arms that offer `Export ▸`. `DumpCtx` gained `edit_ctx()` for it, and gained it so `conn`
+    can stay private: the submenu wants the dialect and nothing else out of the registry, and a
+    `ConnUi` passed beside a ctx that already holds one is two names for one bundle.
+    **`schema_settings_overlay(conn, schema, ddl, tabs_ui, overlay, Rc<SchemaActions>)` and
+    `create_submenu(conn, schema_ui, ddl, &Rc<SchemaActions>, …)` take the actions bundle whole**,
+    which is `object_editor`'s doors' reason — every action either can run lives on that one
+    bundle — and for the gear it is also what a lint says: naming all four closures individually put
+    the signature at nine parameters, past clippy's `too_many_arguments` limit of seven. That is a
+    checkable instance of the judgement this section otherwise makes by hand, with a second opinion
+    attached to it.
+    **The four left each carry a reason that names a count rather than a callee**, which is what the
+    lapsed-justification rule above asks of a floor — it has to be re-readable.
+    `context_menu_overlay` reaches **seventeen** fields, the schema tree's whole right-click
+    surface: every editor door, both colour stores and their two savers, the import and export
+    modals, AI, the tab actions. `palette_commands` reaches nine, Find Anywhere running *every*
+    command the app has, so its dependency is the app; `find_overlay` reaches eight and is the same
+    shape, opening objects, tables, snippets and tabs; `error_modal_overlay` reaches five and was
+    already the recorded contrast. None of the four is blocked by a callee — they are wide because
+    what they do is wide.
+    **What did block two of the nine is the rule worth carrying out of this**: `create_submenu` and
+    `schema_settings_overlay` were each held there by exactly one callee still on the root bundle —
+    `database_editor::open_for_new(&Ui, …)` for the gear, that *and*
+    `table_designer::open_for_new(&Ui, …)` for the submenu — so until those came down neither could
+    be narrower than them. `database_editor.rs` went 3 to zero and `table_designer.rs` 4 to zero in
+    the same step, and each entry records it. Read it as the mirror of the propagating narrowing
+    above, where six shared `&Ui` readers coming down took `object_editor.rs` and
+    `trigger_editor.rs` with them: that one moves outward from the helper, this one asks the
+    question from the stuck end — **when an entry will not come down, look at what it calls before
+    concluding the entry is the problem.**
     **The live number is the sum of `BUDGET`, not the "roughly 140" above**, which describes the
-    state the gate found and by design never moves. That sum went **206 → 64** over this run:
-    `table_designer.rs` 29 → 26 → 10 → 4, `object_editor.rs` 14 → 5 → 4 → **0**,
+    state the gate found and by design never moves. That sum went **206 → 48** over this run:
+    `table_designer.rs` 29 → 26 → 10 → 4 → **0**, `object_editor.rs` 14 → 5 → 4 → **0**,
     `routine_editor.rs` 12 → 6 → **0**, `event_editor.rs` 11 → 5 → **0**,
     `trigger_editor.rs` 11 → 8 → 7 → **0**, `view_editor.rs` 10 → 6 → **0**,
-    `database_editor.rs` 7 → 3,
-    `ddl_preview.rs` 6 → 4 → 2, `overlays.rs` 15 → 13, `account_editor.rs` 6 → **0**,
+    `database_editor.rs` 7 → 3 → **0**,
+    `ddl_preview.rs` 6 → 4 → 2, `overlays.rs` 15 → 13 → 4, `account_editor.rs` 6 → **0**,
     `schema_tree.rs` 6 → 3, `users_view.rs` 9 → 8 → 5 → **0**, `import_view.rs` 9 → **0**,
     `dump_view.rs` 9 → **0**, `compare_view.rs` 8 → **0**, `script_view.rs` 6 → **0**.
     Every step is recorded against its own entry with what it narrowed *to*,
     so read the list for where a file stands rather than inferring it from a paragraph — and a file
     that reaches zero leaves the list altogether, which is the one way an entry is ever removed and
-    the point at which it may not take a `Ui` again at all. **Eleven files have left it** — the three DDL-object editors, then
+    the point at which it may not take a `Ui` again at all. **Thirteen files have left it** — the
+    three DDL-object editors, then
     `trigger_editor.rs`, `account_editor.rs`, `users_view.rs`, `import_view.rs`, `dump_view.rs`,
-    `compare_view.rs`, `script_view.rs` and `view_editor.rs` — and each left a comment behind where it sat,
+    `compare_view.rs`, `script_view.rs`, `view_editor.rs`, `database_editor.rs` and
+    `table_designer.rs` — and each left a comment behind where it sat,
     because a name absent from `BUDGET` says nothing on its own about whether it was ever on it.
     It is a **budget, not a ban**, because narrowing 140 signatures is a campaign and a gate that
     fails on the day it lands teaches nothing: `BUDGET` holds what each file declares *now* and the
