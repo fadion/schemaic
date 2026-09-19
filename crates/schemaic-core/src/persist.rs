@@ -604,6 +604,48 @@ pub fn ai_harness_to_persist(unknown: Option<&str>, running: &str) -> String {
     unknown.unwrap_or(running).to_string()
 }
 
+/// Fold a **legacy flat list** into its connection-keyed replacement, at most
+/// once, and say what is left of the legacy list.
+///
+/// [`UiState`] carries two of these pairs — `expanded`/`expanded_rules` and
+/// `hidden_dbs`/`hidden_db_rules` — and the app had the same fourteen lines
+/// written out twice for them, with the reasoning split across two comments
+/// each pointing at the other. This is that decision, once.
+///
+/// **Returns `(rules, legacy still pending)`, and the second half is the whole
+/// point.** The migration is refused when there are no connection ids to key
+/// by — `migrate_flat` answers `None` for "not yet", which is a different answer
+/// from "nothing to do" — and in that case the legacy list comes back *whole*,
+/// so the caller writes it out unchanged and a later launch can still migrate
+/// it. Clearing it there is the bug: a session whose `connections.json` did not
+/// load, or a user who had just deleted their last connection, had the flat list
+/// emptied by the first save and every previously hidden database turned
+/// permanently visible.
+///
+/// The migration is also refused when `stored` is already non-empty, because a
+/// file written by a version that kept both fields would otherwise have every
+/// rule duplicated on each launch.
+///
+/// Generic over the rule because the two callers differ in nothing else:
+/// [`crate::expanded::migrate_flat`] and [`crate::db_hidden::migrate_flat`]
+/// share the signature `fn(&[String], &[u64]) -> Option<Vec<R>>`.
+pub fn migrate_legacy_once<R>(
+    legacy: Vec<String>,
+    stored: Vec<R>,
+    conn_ids: &[u64],
+    migrate: impl FnOnce(&[String], &[u64]) -> Option<Vec<R>>,
+) -> (Vec<R>, Vec<String>) {
+    if !stored.is_empty() || legacy.is_empty() {
+        return (stored, legacy);
+    }
+    match migrate(&legacy, conn_ids) {
+        // Consumed: the legacy list is cleared so later saves stop writing it.
+        Some(migrated) => (migrated, Vec::new()),
+        // Not yet. Hand the legacy list back untouched.
+        None => (stored, legacy),
+    }
+}
+
 /// Path to the persisted UI-state file, if we can determine a config directory.
 pub fn config_path() -> Option<PathBuf> {
     Some(config_dir()?.join("ui_state.json"))
@@ -1559,12 +1601,99 @@ pub fn clear_connections_backup() {
 mod tests {
     use super::{
         ConnectionsFile, FileStore, Load, RECOVERIES, Recovered, RightPanelState, Saving, UiState,
-        ai_harness_to_persist, classify, legacy_ai_run_queries_in, missing_notice, private_dir_in,
-        read_bytes, recover, recovery_notice, remove_secret_siblings, sibling, statement_timeout,
-        statement_timeout_label, take_recoveries, usable_base, write_bytes, write_secret_store,
+        ai_harness_to_persist, classify, legacy_ai_run_queries_in, migrate_legacy_once,
+        missing_notice, private_dir_in, read_bytes, recover, recovery_notice,
+        remove_secret_siblings, sibling, statement_timeout, statement_timeout_label,
+        take_recoveries, usable_base, write_bytes, write_secret_store,
     };
     use std::cell::RefCell;
     use std::collections::HashMap;
+
+    /// **The bargain `migrate_legacy_once` exists for, and the half neither
+    /// `expanded::migrate_flat` nor `db_hidden::migrate_flat` could test.**
+    ///
+    /// Those two answer `None` for "no connection ids, so not yet"; each has (or
+    /// in `expanded`'s case, lacked) a test for that answer alone. What nothing
+    /// tested is the *composition* — that a `None` leaves the legacy list
+    /// intact, so it is carried back out to disk unchanged and a later launch
+    /// can still migrate it. That seam is where the original bug lived: a
+    /// session whose `connections.json` did not load, or a user who had deleted
+    /// their last connection, had the flat list cleared by the first save and
+    /// every previously hidden database turned permanently visible.
+    ///
+    /// Written as four cases because "not yet" and "nothing to do" are different
+    /// answers that must not collapse into each other.
+    #[test]
+    fn a_legacy_list_survives_a_migration_that_could_not_run() {
+        // The migration cannot run (no connection ids): rules stay as stored and
+        // the legacy list is handed back **whole**, for the next launch.
+        let (rules, pending) =
+            migrate_legacy_once(vec!["sys".to_string()], Vec::<u64>::new(), &[], |_, _| None);
+        assert!(
+            rules.is_empty(),
+            "nothing was migrated, so nothing is stored"
+        );
+        assert_eq!(
+            pending,
+            vec!["sys".to_string()],
+            "the legacy list must survive to be written back out — clearing it \
+             here is the bug this function exists to prevent"
+        );
+    }
+
+    #[test]
+    fn a_legacy_list_is_consumed_exactly_once() {
+        // The migration runs: its output is the stored rules, and the legacy
+        // list is emptied so the next save stops writing it.
+        let (rules, pending) =
+            migrate_legacy_once(vec!["sys".to_string()], Vec::new(), &[1, 2], |keys, ids| {
+                // One rule per (connection, key), as both real `migrate_flat`s do.
+                Some(
+                    ids.iter()
+                        .flat_map(|&c| keys.iter().map(move |_| c))
+                        .collect(),
+                )
+            });
+        assert_eq!(
+            rules,
+            vec![1u64, 2],
+            "the migration's own answer is what gets stored"
+        );
+        assert!(
+            pending.is_empty(),
+            "a consumed legacy list is cleared, or every later save rewrites it"
+        );
+    }
+
+    #[test]
+    fn stored_rules_are_never_overwritten_by_a_second_migration() {
+        // Already migrated on an earlier launch. The legacy list may still be
+        // non-empty (a file written by a version that kept both), and running
+        // the migration again would duplicate every rule.
+        let (rules, pending) =
+            migrate_legacy_once(vec!["sys".to_string()], vec![7u64], &[1], |_, _| {
+                panic!("must not run when rules are already present")
+            });
+        assert_eq!(rules, vec![7], "the stored rules win");
+        assert_eq!(
+            pending,
+            vec!["sys".to_string()],
+            "and the legacy list is left alone rather than silently dropped"
+        );
+    }
+
+    #[test]
+    fn an_empty_legacy_list_is_nothing_to_do_not_not_yet() {
+        // Nothing to migrate and nothing stored: the migration must not run at
+        // all, because `migrate_flat` over an empty list would answer `Some([])`
+        // on a connected launch and that is indistinguishable from a real
+        // result only if you let it get that far.
+        let (rules, pending) = migrate_legacy_once(Vec::new(), Vec::<u64>::new(), &[1], |_, _| {
+            panic!("must not run for an empty legacy list")
+        });
+        assert!(rules.is_empty());
+        assert!(pending.is_empty());
+    }
 
     /// **A set-but-empty or relative base is no base.**
     ///

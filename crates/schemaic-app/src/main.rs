@@ -1907,23 +1907,20 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
     // The effect below writes one back into the other, and `switch_conn` reloads
     // it; see both for the ordering that keeps them honest.
     //
-    // The legacy list is cleared only once it has actually been read, for
-    // `hidden_dbs`' reason immediately below.
-    let mut pending_legacy_expanded = ui_state.expanded;
-    let expanded_rules: RwSignal<Vec<schemaic_core::expanded::ExpandedRule>> = RwSignal::new({
-        let mut rules = ui_state.expanded_rules;
-        if rules.is_empty()
-            && !pending_legacy_expanded.is_empty()
-            && let Some(migrated) = schemaic_core::expanded::migrate_flat(
-                &pending_legacy_expanded,
-                &cf.connections.iter().map(|c| c.id).collect::<Vec<_>>(),
-            )
-        {
-            rules = migrated;
-            pending_legacy_expanded = Vec::new();
-        }
-        rules
-    });
+    // The legacy flat list is folded in at most once and cleared only if it was
+    // actually read — `persist::migrate_legacy_once` carries why, and is the one
+    // statement of it for both this pair and `hidden_dbs` below. It used to be
+    // these fourteen lines twice, with the reasoning split across two comments
+    // each pointing at the other.
+    let conn_ids: Vec<u64> = cf.connections.iter().map(|c| c.id).collect();
+    let (expanded_stored, pending_legacy_expanded) = persist::migrate_legacy_once(
+        ui_state.expanded,
+        ui_state.expanded_rules,
+        &conn_ids,
+        schemaic_core::expanded::migrate_flat,
+    );
+    let expanded_rules: RwSignal<Vec<schemaic_core::expanded::ExpandedRule>> =
+        RwSignal::new(expanded_stored);
     let pending_legacy_expanded = Rc::new(pending_legacy_expanded);
     let expanded: RwSignal<HashSet<String>> = RwSignal::new(
         expanded_rules.with_untracked(|r| schemaic_core::expanded::keys_for(r, active_id)),
@@ -1946,28 +1943,20 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
     // the connection currently being *looked at*, which is the question every
     // consumer is asking, so it is derived rather than kept in step by hand.
     //
-    // **The legacy list is only cleared once it has actually been read.** The
-    // migration runs at most once and `save_ui` writes the flat field empty from
-    // then on, so a launch whose `connections.json` did not load — or one where
-    // the user has deleted their last connection — used to turn every previously
-    // hidden database permanently visible: no connection ids, no rules, and the
-    // list gone by the first save. `migrate_flat` answers `None` for "not yet"
-    // now, and what it did not consume is carried back out to disk.
-    let mut pending_legacy_hidden = ui_state.hidden_dbs;
-    let hidden_db_rules: RwSignal<Vec<schemaic_core::db_hidden::DbHiddenRule>> = RwSignal::new({
-        let mut rules = ui_state.hidden_db_rules;
-        if rules.is_empty()
-            && !pending_legacy_hidden.is_empty()
-            && let Some(migrated) = schemaic_core::db_hidden::migrate_flat(
-                &pending_legacy_hidden,
-                &cf.connections.iter().map(|c| c.id).collect::<Vec<_>>(),
-            )
-        {
-            rules = migrated;
-            pending_legacy_hidden = Vec::new();
-        }
-        rules
-    });
+    // The same legacy bargain as `expanded` above, through the same function —
+    // and this is the pair whose loss was visible: a launch whose
+    // `connections.json` did not load, or one where the user had deleted their
+    // last connection, used to turn every previously hidden database
+    // permanently visible. `persist::migrate_legacy_once` has the full account
+    // and the tests.
+    let (hidden_stored, pending_legacy_hidden) = persist::migrate_legacy_once(
+        ui_state.hidden_dbs,
+        ui_state.hidden_db_rules,
+        &conn_ids,
+        schemaic_core::db_hidden::migrate_flat,
+    );
+    let hidden_db_rules: RwSignal<Vec<schemaic_core::db_hidden::DbHiddenRule>> =
+        RwSignal::new(hidden_stored);
     let pending_legacy_hidden = Rc::new(pending_legacy_hidden);
     let hidden_dbs: floem::reactive::Memo<HashSet<String>> = create_memo(move |_| {
         hidden_db_rules.with(|rules| schemaic_core::db_hidden::names_for(rules, active_conn.get()))

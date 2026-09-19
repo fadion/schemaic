@@ -5808,6 +5808,32 @@ existing prose was left alone.
     rather than being claimed for ids handed out before it existed — and the app seeds the signal to
     at least the maximum in the file, so an older `connections.json` still cannot hand back an id
     that is in use.
+    **`migrate_legacy_once` is the one statement of the legacy-field bargain, and the half it
+    returns is the whole point of it.** `UiState` carries two legacy/replacement pairs —
+    `expanded`/`expanded_rules` and `hidden_dbs`/`hidden_db_rules` — each *kept* as a field rather
+    than removed, because an upgrade must not lose the setting and a `Vec<String>` arriving where a
+    `Vec<Rule>` is expected fails the whole file's parse. `main.rs` had the same fourteen lines
+    written out twice for them, with the reasoning split across two comments each pointing at the
+    other; this is that decision once, generic over the rule because `expanded::migrate_flat` and
+    `db_hidden::migrate_flat` differ in nothing else (`fn(&[String], &[u64]) -> Option<Vec<R>>`). It
+    answers `(rules, legacy still pending)`, and the second element is the reason it exists at all:
+    the migration is refused when there are no connection ids to key by — a
+    `migrate_flat` `None` means *not yet*, which is a different answer from *nothing to do* — and
+    the legacy list then comes back **whole**, so `save_ui` writes it out unchanged and a later
+    launch can still migrate it. Clearing it there is the original bug: a session whose
+    `connections.json` did not load, or a user who had just deleted their last connection, had the
+    flat list emptied by the first save and every previously hidden database turned permanently
+    visible. The migration is refused a second way, when `stored` is already non-empty, or a file
+    written by a version that kept both fields has every rule duplicated on each launch.
+    **Its four tests are the reason it is a function at all**, rather than the deduplication.
+    `db_hidden` already had `no_connections_is_not_yet_rather_than_nothing_to_migrate` and `expanded`
+    had no migration test at all — and that one tests `migrate_flat` *in isolation*, while the bug
+    lived in its composition with the caller that cleared the list anyway. The four are
+    `a_legacy_list_survives_a_migration_that_could_not_run`,
+    `a_legacy_list_is_consumed_exactly_once`,
+    `stored_rules_are_never_overwritten_by_a_second_migration` and
+    `an_empty_legacy_list_is_nothing_to_do_not_not_yet`; the first was watched failing against the
+    `None => (stored, Vec::new())` this function exists to rule out.
     **An absent primary is not a first run**, and treating it as one was silent data loss.
     `recover(primary, staged, backup)` returns the value *and* a `Recovered` — `Primary`,
     `FirstRun`, `Corrupt(err)` or `Restored(sibling)` — and an absent primary walks `.tmp` then
@@ -6863,10 +6889,14 @@ existing prose was left alone.
       — produced no rules and lost the legacy list by the first save, turning every previously
       hidden database permanently visible with nothing said and no way to retry. `Some(vec![])` and
       `None` are therefore different answers: *there was nothing to migrate* against *there was
-      nobody to migrate it for*. `main.rs` carries the unconsumed flat list back out to disk rather
-      than writing the field empty. The regression test that missed this asserted the opposite
-      (`is_empty()`, which the bug satisfied), which is why the pinned one is named
-      `no_connections_is_not_yet_rather_than_nothing_to_migrate`.
+      nobody to migrate it for*. **The `None` is only half of what protects the setting**, and the
+      other half is a caller that carries the unconsumed flat list back out to disk rather than
+      writing the field empty: that half is `persist::migrate_legacy_once`, which hands the legacy
+      list back whole for `save_ui` to write unchanged. The regression test that missed this
+      asserted the opposite (`is_empty()`, which the bug satisfied), which is why the pinned one is
+      named `no_connections_is_not_yet_rather_than_nothing_to_migrate` — and it still tests
+      `migrate_flat` alone, so the composition it cannot see is pinned beside the function that owns
+      it (`a_legacy_list_survives_a_migration_that_could_not_run`).
     - `expanded.rs` — the `(conn_id, key)` set of open SCHEMA-tree nodes, modelled on `db_hidden.rs`
       line for line because it is **the third instance of that same mistake**. Every key it holds is
       name-only — `schema_tree::db_key` is `format!("db:{database}")`, and the same for
@@ -6893,7 +6923,10 @@ existing prose was left alone.
       `None` — not `Some(vec![])` — when there are no connection ids, `db_hidden::migrate_flat`'s
       argument verbatim because it is the same migration: it runs at most once with the flat field
       written empty from then on, so a launch whose `connections.json` failed to load would
-      otherwise collapse every tree permanently, with nothing said and no way to retry.
+      otherwise collapse every tree permanently, with nothing said and no way to retry. The
+      caller-side half of that — refusing the migration once and carrying the unconsumed list back
+      out — is `persist::migrate_legacy_once`, shared with `db_hidden` because the two pairs differ
+      in nothing but the rule type.
       **App side, `expanded` is the *active* connection's set and `expanded_rules` is the persisted
       truth.** A `create_effect` tracks `expanded` and writes it back through `set_keys`, reading
       `active_conn` **untracked** — that is the load-bearing half: tracking it would fire the effect
@@ -18940,6 +18973,17 @@ Re-introducing the anti-patterns these guard against is a regression:
   (`persisted_store_gate`, under `source_gate.rs`). Read the call sites before assuming a cut takes
   its invariant with it, and where it doesn't, say so in the module that doesn't have it — the risk
   is a module that reads as its siblings' peer and guarantees less than a reader will assume.
+  **`ui_state` is the sixth, and it is the one that did not move: some candidates are not liftable,
+  and saying so is the outcome.** It was next on the list after the three store cuts above and is
+  not store-shaped at all — the tell is a value assembled from dozens of *unrelated* signals.
+  `save_ui` reads twenty-nine of them (theme, scale, fonts, the AI settings, panel geometry, the row
+  limit, the statement timeout) into a thirty-one-field `UiState`, and each is also read by some
+  other part of `app_view` that has nothing to do with the save. A module for it takes either a
+  twenty-nine-parameter function or a struct holding all of them — which is `UiState` again, one
+  level removed, with a second place to forget a field. What was worth taking out was the duplicated
+  *decision* inside it rather than the state: `persist::migrate_legacy_once`, the legacy-list
+  bargain `main.rs` had written out twice. Record the refusal where the next session will look for
+  it, or the step gets attempted again.
 
 ## UI conventions
 
