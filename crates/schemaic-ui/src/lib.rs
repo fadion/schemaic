@@ -4499,6 +4499,55 @@ mod read_only_door_gate {
     }
 }
 
+/// **The ER layouts are read through one door, and that is what makes the rule
+/// checkable.**
+///
+/// `persist` renames an unreadable file to `.corrupt`, falls back to the `.bak`
+/// or to defaults, and queues a notice — a released GUI build discards stderr,
+/// so without the modal the user just sees their settings gone. The app drains
+/// that queue once, after the `Ui` literal, under a comment saying every config
+/// file has been read by then. Three were not: a diagram being opened, a drag
+/// being persisted, and the layout prune inside `delete_conn_now`. A truncated
+/// `diagrams.json` was renamed away and reported to nobody — and on the save
+/// side, if the `.bak` was unreadable too, the very next drag wrote the
+/// defaulted empty file over the recovered nothing.
+///
+/// **This gate used to live in `schemaic-app` and could only count.** Its own
+/// doc said the rule was *"positional and cannot be"* checked — no scan can
+/// answer "is this load inside `app_view`'s build?" — so it asserted that the
+/// two crates hold more `report_recoveries` calls than lazy loads. That was
+/// weaker than it read: the count was global across both files, so a site that
+/// loaded and said nothing while another reported twice passed it.
+///
+/// [`load_diagram_layouts`] does both halves in one call, so there is nothing
+/// left to pair, and what remains is a fact a scan *can* establish — the file is
+/// read in exactly one place. It moved here because that is where the door is.
+#[cfg(test)]
+mod diagram_layout_gate {
+    #[test]
+    fn diagram_layouts_are_loaded_through_the_one_reporting_door() {
+        let mut sites: Vec<String> = Vec::new();
+        for (file, code) in crate::source_gate::workspace_sources() {
+            // Assembled, so this gate does not match its own needle — the
+            // `source_gate` family's standing hazard. `workspace_sources` has
+            // already run each file through `production_code`.
+            let needle = ["load_json", "(\"diagrams", ".json\")"].concat();
+            for _ in 0..code.matches(&needle).count() {
+                sites.push(file.clone());
+            }
+        }
+        assert_eq!(
+            sites,
+            vec!["lib.rs".to_string()],
+            "`diagrams.json` must be read only by `load_diagram_layouts`, which \
+             reports what the read recovered. A second reader is a lazy load \
+             that renames a `.corrupt` file and tells the user nothing — and on \
+             a save path, writes the defaulted empty file over the recovered \
+             nothing. Found it in: {sites:?}"
+        );
+    }
+}
+
 /// **A persisted store written here is saved here, in the same closure.**
 ///
 /// Three small stores — identity colours, favourited databases, per-column
@@ -7829,6 +7878,41 @@ pub fn report_recoveries(text: RwSignal<Option<String>>, open: RwSignal<bool>) {
     }
     text.set(Some(notices.join("\n\n")));
     open.set(true);
+}
+
+/// Read `diagrams.json` **and report what that read recovered**, as one act.
+///
+/// The ER layouts are the app's only *lazy* config load: the startup drain runs
+/// once after the `Ui` literal, under a comment saying every config file has
+/// been read by then, and these three are not — a diagram being opened, a drag
+/// being persisted, and the layout prune inside `delete_conn_now`. Each owed
+/// its own [`report_recoveries`], and each carried its own copy of the comment
+/// saying so.
+///
+/// **The pairing is by construction now, which is what makes it checkable.**
+/// `every_lazy_config_load_reports_what_it_recovered` had to settle for
+/// counting — its own doc says *"the rule is positional and cannot be"*, since
+/// no scan can answer "is this load inside `app_view`'s build?" — so it asserted
+/// only that the two crates hold more reporters than lazy loads, globally. A
+/// site that loaded and said nothing while another reported twice would have
+/// passed. With one door there is nothing to pair: the gate now asserts that
+/// `diagrams.json` is *loaded in exactly one place*, which is a fact a scan can
+/// establish.
+///
+/// Takes the two signals rather than [`OverlayUi`] for [`report_recoveries`]'
+/// reason — the app's prune runs in a closure built long before the `Ui` literal
+/// exists.
+pub fn load_diagram_layouts(
+    text: RwSignal<Option<String>>,
+    open: RwSignal<bool>,
+) -> schemaic_core::erd::DiagramLayoutsFile {
+    let layouts = schemaic_core::persist::load_json("diagrams.json");
+    // After the read, before anything the caller does with it — and on the save
+    // side that ordering is load-bearing: if the `.bak` was unreadable too, the
+    // caller's `save_json` writes the defaulted empty file over the recovered
+    // nothing, so the notice has to be queued before that can happen.
+    report_recoveries(text, open);
+    layouts
 }
 
 /// Show `which` in the right column — the one door, for every panel.

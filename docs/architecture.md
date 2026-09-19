@@ -3856,9 +3856,11 @@ existing prose was left alone.
     already in `diagrams.json` is still the database diagram's and no migration is needed; only the
     table diagrams gain a record, and they had none worth keeping. `clear_conn_layouts`' `{conn_id}:`
     prefix still bounds the file either way. That file is read **lazily**, from inside `erd_view`'s drag handlers
-    rather than at startup, which is why both of its loads and `delete_conn_now`'s layout prune call
-    `schemaic_ui::report_recoveries` themselves — see `core/persist.rs` for the contract they were
-    breaking.
+    rather than at startup, which is why all three of its readers — the diagram's layout read, the
+    save-side re-read inside the drag's persist closure, and `delete_conn_now`'s layout prune — go
+    through `schemaic_ui::load_diagram_layouts`, which reports what the read recovered in the same
+    call; see `core/persist.rs` for the contract they were breaking and for the gate that now holds
+    them to that one door.
     **Find-in-diagram** is the pure half of the modal's Ctrl+F bar. `search(graph, needle)` returns
     one `NodeMatch { node, name, columns }` per node the term touches, kept per-card because both
     things the diagram does with a search are per-card: highlight the matched parts of a card, and
@@ -5869,11 +5871,27 @@ existing prose was left alone.
     `schemaic_ui::report_recoveries(text, open)` is the one reporter and the startup site calls it
     too rather than keeping a second spelling; it takes the two signals rather than an `OverlayUi`
     because the app's own lazy load is in a closure built long before the `Ui` literal exists, and it
-    is cheap on an empty queue so a lazy loader can call it unconditionally. The rule is
+    is cheap on an empty queue so a lazy loader can call it unconditionally. **All three lazy sites
+    reach it through one door now**: `schemaic_ui::load_diagram_layouts(text, open)` reads
+    `diagrams.json` and calls `report_recoveries` in that order, as a single act, so on the save side
+    the notice is queued before the caller's `save_json` can overwrite the recovered nothing. Each of
+    the three used to make both calls itself and carry its own copy of the comment saying why.
+    **That changed what can be checked, which is the part worth keeping.** The rule was
     **positional** — "is this load inside `app_view`'s build?" is not a question a scan can answer —
-    so `app_tests::every_lazy_config_load_reports_what_it_recovered` is a *count* instead: the lazy
-    `diagrams.json` loads across both crates must be outnumbered by the `report_recoveries` calls,
-    the extra one being the startup drain.
+    so `app_tests::every_lazy_config_load_reports_what_it_recovered` was a *count* instead: the lazy
+    `diagrams.json` loads across both crates had to be outnumbered by the `report_recoveries` calls,
+    the extra one being the startup drain. That was weaker than it read, because the count was global
+    across the two files — a site that loaded and said nothing, while another site reported twice,
+    passed it. With one door there is nothing left to pair, and what remains is a fact a scan *can*
+    establish: `diagrams.json` is read in exactly one place. So that gate is gone rather than
+    amended, replaced by
+    `schemaic_ui::diagram_layout_gate::diagram_layouts_are_loaded_through_the_one_reporting_door`,
+    which moved crates to sit where the door is. It collects every `load_json("diagrams.json")` over
+    `source_gate::workspace_sources()` and asserts the site list is exactly `["lib.rs"]`, so a
+    failure **names the offending file** where the count could only report a number one too low —
+    restoring the app-side direct load failed it with `left: ["lib.rs", "schemaic-app/main.rs"]`.
+    The lesson generalises: a rule that cannot be checked positionally can sometimes be made
+    *structural* instead, by reshaping the code until there is one site, and then it can.
     `recovery_notice` is the corrupt-file sentence — plus, for the one store whose `.corrupt` a later
     save sweeps, the qualification `corrupt_sibling_is_swept` decides above; `missing_notice` is the
     vanished-file one, and
@@ -11664,6 +11682,17 @@ existing prose was left alone.
     upserts through `GridState::fmt_rules` rather than a `format::` mutator, and giving the gate a
     second shape to recognise would weaken the one it has, so that store's rule is unguarded and the
     gate's doc says so instead of quietly folding it in.
+    **`lib.rs`'s `diagram_layout_gate::diagram_layouts_are_loaded_through_the_one_reporting_door` is
+    the fifth**, and it is what a rule that could only be *counted* looks like once the code has been
+    reshaped to make it greppable. Its subject is under `core/persist.rs`: every lazy `diagrams.json`
+    load must report what the read recovered, and the gate it replaced lived in `schemaic-app` and
+    could only assert that the two crates hold more reporters than loads, globally. With
+    `load_diagram_layouts` the one reader, the check becomes an exact site list — every
+    `load_json("diagrams.json")` over `workspace_sources()`, asserted equal to `["lib.rs"]` — so a
+    failure names the file that added a second reader instead of reporting a number that is one too
+    low. It moved into this crate because that is where the door is, and its needle is assembled from
+    fragments (`["load_json", "(\"diagrams", ".json\")"].concat()`) for this family's standing
+    reason: a gate in the same file as its subject is otherwise its own first match.
     `production_code` blanks every
     `#[cfg(test)]` **item** — brace-aware, skipping braces inside strings, chars and comments — and
     every `//` line; `crate_sources` enumerates the files to scan.
@@ -18984,6 +19013,15 @@ Re-introducing the anti-patterns these guard against is a regression:
   *decision* inside it rather than the state: `persist::migrate_legacy_once`, the legacy-list
   bargain `main.rs` had written out twice. Record the refusal where the next session will look for
   it, or the step gets attempted again.
+  **`diagrams` is the seventh, and it is the sixth's near miss: nothing to lift, and worth the visit
+  anyway.** Like `ui_state` it moved no code — the ER layout file is loaded and saved entirely in
+  `schemaic-ui`'s `erd_view.rs`, and the app side is the layout prune inside `delete_conn_now` —
+  but unlike `ui_state`, where the answer was simply *no*, it had something else to hand back: a rule
+  stated three times in three comments and held by a gate whose own doc admitted it could only count
+  (`core/persist.rs`'s lazy-load reporting contract). Reading a candidate for the cut is also reading
+  it for that, so when the answer to "what moves?" is *nothing*, ask what the duplication was
+  standing in for before closing the file — here it was one reporting door
+  (`schemaic_ui::load_diagram_layouts`) and a gate that can now name its offender.
 
 ## UI conventions
 

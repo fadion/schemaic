@@ -10008,13 +10008,11 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             // `SnippetStore::clear_conn` where the prune now lives.
             (snippet_clear_conn)(id);
             // Diagram layouts live only on disk (no signal) — load, prune, save.
-            // The third lazy load, and the third that owes the user the recovery
-            // notice the startup drain cannot carry: the prune-and-save here is
-            // unconditional, so a `.corrupt` rename would otherwise be followed
-            // immediately by writing the defaulted file back.
-            let mut layouts: schemaic_core::erd::DiagramLayoutsFile =
-                persist::load_json("diagrams.json");
-            schemaic_ui::report_recoveries(error_modal_text, error_modal_open);
+            // The third lazy load, through the one door that reports what the
+            // read recovered: the prune-and-save here is unconditional, so a
+            // `.corrupt` rename would otherwise be followed immediately by
+            // writing the defaulted file back.
+            let mut layouts = schemaic_ui::load_diagram_layouts(error_modal_text, error_modal_open);
             schemaic_core::erd::clear_conn_layouts(&mut layouts, id);
             persist::save_json_erasing("diagrams.json", &layouts);
         })
@@ -13890,91 +13888,6 @@ mod app_tests {
         );
     }
 
-    /// Every bump of `activity_gen` must arm the poll loop in the same breath.
-    ///
-    /// `activity_poll` carries the generation it was armed under and returns the
-    /// moment the signal differs — so a bump that nothing re-arms doesn't *pause*
-    /// Server Activity's auto-refresh, it **ends** it. That is what the kill
-    /// handler did: bump, `(refresh)()`, and the panel froze permanently after
-    /// any successful kill while the clock's tooltip still read "every 5s".
-    ///
-    /// The pairing has no runtime subject — `exec_after` and `main.rs`'s signal
-    /// graph are not reachable from a test — so the subject is the source text,
-    /// the way `core/tests/doc_coverage.rs` takes a file as its subject: the
-    /// signal has no direct writer left, because `rearm_activity` — which cannot
-    /// be spelled without the arm — is the only thing that writes it.
-    /// **A config load that is not covered by the startup drain owes its own
-    /// report.**
-    ///
-    /// `persist` renames an unreadable file to `.corrupt`, falls back to the
-    /// `.bak` or to defaults, and queues a notice — because a released GUI build
-    /// discards stderr, so without the modal the user just sees their settings
-    /// gone. The app drained that queue once, after the `Ui` literal, under a
-    /// comment saying every config file had been loaded by then.
-    ///
-    /// Three were not: the ER diagram's layout read and its save-side re-read,
-    /// both in drag handlers, and the layout prune inside `delete_conn_now`'s
-    /// click handler. So a truncated `diagrams.json` was renamed away and
-    /// reported to nobody — and on the save side, if the `.bak` was unreadable
-    /// too, the very next drag wrote the defaulted empty file over the recovered
-    /// nothing.
-    ///
-    /// The rule is positional and cannot be: "is this load inside `app_view`'s
-    /// build?" is not a question a scan can answer. So the gate is the
-    /// **count** — every `load_json` outside the build sequence pairs with a
-    /// `report_recoveries`, and the two crates hold as many reporters as they
-    /// have lazy loads.
-    #[test]
-    fn every_lazy_config_load_reports_what_it_recovered() {
-        let mut loads = 0usize;
-        let mut reports = 0usize;
-        for (name, code) in [
-            ("main.rs", production_main()),
-            (
-                "erd_view.rs",
-                // `CARGO_MANIFEST_DIR` is `<root>/crates/schemaic-app`, so one
-                // parent is the crates dir.
-                std::fs::read_to_string(
-                    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                        .parent()
-                        .expect("the crates dir")
-                        .join("schemaic-ui")
-                        .join("src")
-                        .join("erd_view.rs"),
-                )
-                .expect("erd_view.rs"),
-            ),
-        ] {
-            let body = schemaic_ui::source_gate::production_code(&code);
-            let code: String = body
-                .lines()
-                .filter(|l| !l.trim_start().starts_with("//"))
-                .collect::<Vec<_>>()
-                .join("\n");
-            // The lazy ones are exactly the `diagrams.json` loads: every other
-            // config file is read once, during `app_view`'s build, before the
-            // drain.
-            loads += code.matches("load_json(\"diagrams.json\")").count()
-                + code
-                    .matches("load_json::<schemaic_core::erd::DiagramLayoutsFile>")
-                    .count();
-            reports += code.matches("report_recoveries(").count();
-            let _ = name;
-        }
-        assert!(
-            loads >= 3,
-            "only {loads} lazy `diagrams.json` loads found — this gate has \
-             stopped seeing the sites it is written about"
-        );
-        assert!(
-            reports > loads,
-            "{loads} lazy config loads and only {reports} `report_recoveries` \
-             calls (one of which is the startup drain) — a load that recovers a \
-             `.corrupt` file and says nothing leaves the user's settings gone \
-             with no explanation"
-        );
-    }
-
     /// This file's production text — every source gate below reads it.
     ///
     /// **Through `source_gate::production_code`, not a cut at the first
@@ -14158,6 +14071,23 @@ mod app_tests {
         );
     }
 
+    /// Every bump of `activity_gen` must arm the poll loop in the same breath.
+    ///
+    /// `activity_poll` carries the generation it was armed under and returns the
+    /// moment the signal differs — so a bump that nothing re-arms doesn't *pause*
+    /// Server Activity's auto-refresh, it **ends** it. That is what the kill
+    /// handler did: bump, `(refresh)()`, and the panel froze permanently after
+    /// any successful kill while the clock's tooltip still read "every 5s".
+    ///
+    /// The pairing has no runtime subject — `exec_after` and `main.rs`'s signal
+    /// graph are not reachable from a test — so the subject is the source text,
+    /// the way `core/tests/doc_coverage.rs` takes a file as its subject: the
+    /// signal has no direct writer left, because `rearm_activity` — which cannot
+    /// be spelled without the arm — is the only thing that writes it.
+    ///
+    /// (This paragraph had drifted ~250 lines up the file and been swallowed
+    /// into the next gate's doc block, describing a test it was not attached
+    /// to; moving the diagram-layout gate out is what surfaced it.)
     #[test]
     fn every_activity_generation_bump_arms_the_poll_loop() {
         let writes: Vec<&str> = include_str!("main.rs")
