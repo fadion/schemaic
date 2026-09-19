@@ -4499,6 +4499,98 @@ mod read_only_door_gate {
     }
 }
 
+/// **A persisted store written here is saved here, in the same closure.**
+///
+/// Three small stores — identity colours, favourited databases, per-column
+/// formatters — live as `RwSignal`s on the [`Ui`] bundle with their save handed
+/// alongside, and every one of their mutations is in *this* crate: a Colour
+/// swatch, Favorite/Unfavorite, the grid's "Format as". The app side only loads
+/// and persists them, which is exactly what `app/ui_stores.rs` says it owns and
+/// why that module's own gate is the weak one — **this is the rule, and it can
+/// only be checked here.**
+///
+/// Forgetting the save is invisible in every way that matters until a restart:
+/// the signal updates, the dot appears on the node, the star turns gold, and the
+/// colour is gone the next time the app opens. There is no error, no failed
+/// write, nothing in the log — the user simply does not get to keep it. That is
+/// the class this gate exists for, and a fifth swatch entry copied from the four
+/// correct ones is how it would arrive.
+///
+/// **Anchored on the core mutator, not on the save.** The save is reached
+/// through a local alias at every site (`let save = save_db_colors.clone();`
+/// then `(save)(…)`), so a needle naming the bundle field would find nothing and
+/// pass vacuously. `db_color::upsert`, `db_color::table_upsert` and
+/// `favorite::toggle` are core API, are what a new site must call to change
+/// anything, and are stable in a way a local binding is not. What the window
+/// after them must contain is a `persist::Saving::`, which is what every save
+/// closure here takes — so the check is *"something was persisted"* rather than
+/// *"this exact name was called"*.
+///
+/// `format.json`'s writer in `grid.rs` is deliberately **not** covered: it
+/// upserts through `GridState::fmt_rules` rather than a `format::` mutator, and
+/// giving this gate a second shape to recognise would weaken the one it has.
+/// That store's rule is unguarded and says so here rather than being quietly
+/// folded in.
+#[cfg(test)]
+mod persisted_store_gate {
+    /// The calls that change a persisted store, and how far after one a save has
+    /// to appear. The window is generous — these sites are short closures, and a
+    /// tight bound would fail on rustfmt reflowing an argument list.
+    const MUTATORS: &[&str] = &[
+        "db_color::upsert(",
+        "db_color::table_upsert(",
+        "favorite::toggle(",
+    ];
+    const WINDOW: usize = 700;
+    /// What a save looks like from here: every one of these stores' savers takes
+    /// a `Saving`.
+    const SAVED: &str = "persist::Saving::";
+
+    #[test]
+    fn every_persisted_store_write_is_followed_by_its_save() {
+        let mut offenders: Vec<String> = Vec::new();
+        let mut seen = 0usize;
+        for (file, code) in crate::source_gate::crate_sources() {
+            for needle in MUTATORS {
+                let mut from = 0usize;
+                while let Some(rel) = code[from..].find(needle) {
+                    let at = from + rel;
+                    from = at + needle.len();
+                    seen += 1;
+                    let end = (at + WINDOW).min(code.len());
+                    // Char boundaries: this crate's sources carry non-ASCII in
+                    // strings, and slicing mid-character panics.
+                    let end = (at..=end)
+                        .rev()
+                        .find(|i| code.is_char_boundary(*i))
+                        .unwrap_or(at);
+                    if !code[at..end].contains(SAVED) {
+                        offenders.push(format!("{file}: {needle} with no save after it"));
+                    }
+                }
+            }
+        }
+        // The floor, and it is the whole reason this gate is not vacuous: four
+        // colour sites and one favourite. A rename in `schemaic-core` that made
+        // every needle stop matching would otherwise report success.
+        assert_eq!(
+            seen, 5,
+            "expected 5 persisted-store writes in this crate (4 colour, 1 \
+             favourite), found {seen} — if a site was added, add its save too \
+             and raise this number; if a mutator was renamed, fix the needle, \
+             because a gate that matches nothing passes"
+        );
+        assert!(
+            offenders.is_empty(),
+            "these change a persisted store without saving it, so the change is \
+             lost on restart with no error anywhere:\n    {}\n\nCall the \
+             store's save — `(save)(persist::Saving::Replacing)` — in the same \
+             closure, as the four sites in `overlays.rs` do.",
+            offenders.join("\n    ")
+        );
+    }
+}
+
 /// **A text box's width moves with the interface scale, or the text outgrows
 /// it.**
 ///

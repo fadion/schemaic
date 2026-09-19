@@ -25,6 +25,7 @@ mod opencode;
 mod script;
 mod secrets;
 mod snippet_store;
+mod ui_stores;
 mod update;
 
 /// Process-wide heap accounting (live/peak bytes), for leak-vs-retention
@@ -1649,56 +1650,20 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
         }
     });
 
-    // Per-column display formatters (persisted, keyed by connection+table+column;
-    // read + upserted by the results grid's "Format as" menu).
-    let formats = RwSignal::new(
-        persist::load_json::<schemaic_core::format::FormatsFile>("format.json").rules,
-    );
-    // **Takes its `Saving`**, like the snippet store's save and for the same
-    // reason: one of its callers is a deletion. See `Ui::save_formats`.
-    let save_formats: Rc<dyn Fn(persist::Saving)> = Rc::new(move |saving| {
-        persist::write_json_store(
-            "format.json",
-            &schemaic_core::format::FormatsFile {
-                rules: formats.get_untracked(),
-            },
-            saving,
-        );
-    });
-
-    // Identity colours, both stores out of one file (persisted; set from the schema
-    // tree's right-click menu). Per-database — keyed by connection+database, shown
-    // as a dot on the DB node, the active-DB selector and the database's query tabs
-    // — and per-table, keyed by connection+database+display name, shown as a dot on
-    // the table row and as a tint on the table's ER-diagram card header.
-    let colors = persist::load_json::<schemaic_core::db_color::DbColorsFile>("db_colors.json");
-    let db_colors = RwSignal::new(colors.rules);
-    let table_colors = RwSignal::new(colors.tables);
-    // One save for the pair — they share `db_colors.json`, so writing either half
-    // has to write both or the other is lost.
-    let save_db_colors: Rc<dyn Fn(persist::Saving)> = Rc::new(move |saving| {
-        persist::write_json_store(
-            "db_colors.json",
-            &schemaic_core::db_color::DbColorsFile {
-                rules: db_colors.get_untracked(),
-                tables: table_colors.get_untracked(),
-            },
-            saving,
-        );
-    });
-    // Favorited (bookmarked) databases — same standalone-file pattern as colours.
-    let db_favorites = RwSignal::new(
-        persist::load_json::<schemaic_core::favorite::FavoritesFile>("favorites.json").rules,
-    );
-    let save_db_favorites: Rc<dyn Fn(persist::Saving)> = Rc::new(move |saving| {
-        persist::write_json_store(
-            "favorites.json",
-            &schemaic_core::favorite::FavoritesFile {
-                rules: db_favorites.get_untracked(),
-            },
-            saving,
-        );
-    });
+    // Formatters, identity colours and favourites: the three stores the **UI**
+    // owns and this side only loads and persists. `ui_stores`' doc carries why
+    // they are one module and why it is shaped unlike `history_store` and
+    // `snippet_store` — their mutations are all in `schemaic-ui`, so the rule
+    // that every one of them saves is gated there, not here.
+    let ui_stores::UiStores {
+        formats,
+        save_formats,
+        db_colors,
+        table_colors,
+        save_db_colors,
+        db_favorites,
+        save_db_favorites,
+    } = ui_stores::wire();
 
     // Tab state. When "restore tabs on startup" is on and the last session saved
     // any tabs, rebuild them (query text + connection + source); otherwise start

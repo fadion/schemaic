@@ -4937,6 +4937,7 @@ dependencies = [
  "schemaic-db",
  "schemaic-term",
  "schemaic-ui",
+ "serde",
  "serde_json",
  "sysinfo",
  "tokio",

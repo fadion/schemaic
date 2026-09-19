@@ -17,6 +17,7 @@ schemaic-term = { workspace = true }
 floem = { workspace = true }
 tokio = { workspace = true, features = ["process", "io-util", "io-std"] }
 tokio-util = { workspace = true }
+serde = { workspace = true }
 serde_json = { workspace = true }
 sysinfo = { workspace = true }
 velopack = { workspace = true }
