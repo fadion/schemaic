@@ -17,6 +17,7 @@ mod antigravity;
 mod conn_sources;
 mod dump;
 mod heap;
+mod history_store;
 mod liveness;
 mod logging;
 mod mcp;
@@ -97,19 +98,6 @@ struct ClosedTab {
     disk_sql: Option<String>,
     file_format: schemaic_core::sqlfile::SqlFormat,
 }
-/// Record a run's statements and hand back one run id each, in order —
-/// `(conn_id, database, statements, tab_name)`. The ids are what
-/// [`FinishHistoryFn`] later reports those runs' outcomes against.
-///
-/// A **slice**, and one file write for the lot. It took a single statement and
-/// wrote the whole of `history.json` each time — clone the cross-connection
-/// vector, serialize it, temp file, read-back, `.bak`, rename — so Run Everything
-/// on a hundred-statement migration did that a hundred times in one UI-thread
-/// handler, ~500 fs operations and O(N × min(N, MAX_PER_CONN)) entry
-/// serializations, before the batch was even spawned. `finish_history` was given
-/// this shape by an earlier fix; only the launch half was left.
-type RecordHistoryFn = Rc<dyn Fn(u64, Option<String>, &[String], Option<String>) -> Vec<u64>>;
-
 /// Resolve the pinned session a tab's statements must run on: `Ok(None)` in
 /// Auto-commit (fresh connection per op, as everywhere else), `Err` when the tab
 /// is Manual but its connection isn't up.
@@ -132,14 +120,6 @@ type GuardCloseFn = GuardTxFn;
 /// initial load, the connection-wide Refresh and the per-database Refresh all
 /// take, so what the tree shows while a fetch is out is decided once.
 type FetchSchemaFn = Rc<dyn Fn(&ConnNode, Db)>;
-/// Fill in how runs went — `(run id, outcome)` per run, onto the history
-/// entries their launch already wrote — and delete the entries of runs that
-/// never happened.
-///
-/// A **slice**, not one run, because Run Everything lands a whole batch at once
-/// and each recorded run would otherwise cost a full rewrite of `history.json`.
-/// One call for the whole slice, and one file write for both halves.
-type FinishHistoryFn = Rc<dyn Fn(&[(u64, schemaic_core::history::RunResult)], &[u64])>;
 use schemaic_ai::harness::Harness;
 use schemaic_core::filter::{BrowseKey, Order, table_query};
 use schemaic_core::intel::SqlDialect;
@@ -1444,26 +1424,6 @@ fn fetch_still_wanted(spawned_at: u64, now: u64) -> bool {
     spawned_at == now
 }
 
-/// Where the session's run-id counter starts: past **every** id on disk, across
-/// all connections. Each `record_history` then hands out `seed + 1`, `+ 2`, …
-///
-/// Three properties, and the whole of the argument that a landing run reports
-/// against the entry it launched:
-///
-/// - **Global, not per-connection.** Ids are matched by `finish` without a
-///   connection filter, so a per-connection seed would let two connections issue
-///   the same id and let one run's outcome land on the other's entry.
-/// - **Only ever counting up.** Re-deriving `max + 1` per push would reuse an id
-///   the moment the per-connection cap evicted the entry holding the maximum —
-///   while the run holding it was still in flight.
-/// - **Never zero.** Entries written before run ids exist carry `0`, so the
-///   first id handed out must not be one, or a landing run would claim a legacy
-///   entry. `max().unwrap_or(0)` on an empty history seeds 0 and the first
-///   allocation is 1.
-fn run_id_seed(entries: &[schemaic_core::history::HistoryEntry]) -> u64 {
-    entries.iter().map(|e| e.run_id).max().unwrap_or(0)
-}
-
 /// What a finished run should record in history, or `None` for one that reached
 /// no verdict — still running, or cancelled, where the honest answer is the
 /// nothing the entry already says.
@@ -1656,11 +1616,12 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
     let connections = RwSignal::new(cf.connections.clone());
     let active_conn = RwSignal::new(active_id);
 
-    // Query history (persisted, newest-first across all connections; the panel
-    // filters to the active connection).
-    let history_entries = RwSignal::new(
-        persist::load_json::<schemaic_core::history::HistoryFile>("history.json").entries,
-    );
+    // Query history — the store, its run-id allocator and the five closures that
+    // may write it, all in `history_store` because the save each one takes is
+    // policy. Built here rather than beside the `Ui` literal because the run
+    // paths need `record`/`finish` long before that.
+    let history = history_store::wire(connections, active_conn);
+    let history_entries = history.entries;
 
     // Find-Anywhere per-connection search history. The overlay records activations
     // and reads recents directly on the signal; this effect persists on change.
@@ -2455,166 +2416,14 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
     let (ai_tx, ai_rx) = crossbeam_channel::unbounded::<AiStreamMsg>();
     let ai_stream = create_signal_from_channel(ai_rx);
 
-    // Run ids, handed out by `record_history` and quoted back by
-    // `finish_history` — see `HistoryEntry::run_id`. Seeded past every id on
-    // disk, and only ever counting up, so an id can't be reused while the run
-    // holding it is still in flight (which re-deriving `max + 1` per push would
-    // allow, once the per-connection cap evicted the entry holding the maximum).
-    let run_ids: Rc<Cell<u64>> = Rc::new(Cell::new(
-        history_entries.with_untracked(|v| run_id_seed(v)),
-    ));
-
-    // Record an executed query into the history (newest-first, capped) and persist
-    // it. Called from every run path (single Run, Run Current, Run Everything).
-    let record_history: RecordHistoryFn = {
-        let run_ids = run_ids.clone();
-        Rc::new(
-            move |conn_id: u64,
-                  database: Option<String>,
-                  stmts: &[String],
-                  tab_name: Option<String>| {
-                let ts = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_millis() as u64)
-                    .unwrap_or(0);
-                // The connection's own dialect: `push` skips credential-bearing
-                // statements, and where a string or comment ends differs per
-                // engine.
-                let dialect = connections
-                    .with_untracked(|cs| {
-                        cs.iter()
-                            .find(|c| c.id == conn_id)
-                            .map(|c| SqlDialect::from_db_type(&c.db_type))
-                    })
-                    .unwrap_or_default();
-                let mut ids = Vec::with_capacity(stmts.len());
-                // **One batch, not N pushes.** The per-connection cap applied on
-                // each push let a script longer than the cap evict the whole of
-                // the connection's real history — and its own dispatched
-                // statements with it — before anything ran; `finish_history`
-                // then dropped the tail and left nothing at all. `push_batch`
-                // defers the cap to `history::trim`, which runs once the
-                // outcomes are known. See `history::push_batch`.
-                let batch: Vec<_> = stmts
-                    .iter()
-                    .map(|sql| {
-                        let run_id = run_ids.get() + 1;
-                        run_ids.set(run_id);
-                        ids.push(run_id);
-                        schemaic_core::history::HistoryEntry {
-                            conn_id,
-                            database: database.clone(),
-                            sql: sql.clone(),
-                            ts,
-                            run_id,
-                            tab_name: tab_name.clone(),
-                            // Filled in by `finish_history` when the run lands.
-                            duration_ms: None,
-                            rows: None,
-                            rows_capped: false,
-                            outcome: schemaic_core::history::Outcome::Unknown,
-                        }
-                    })
-                    .collect();
-                let mut wrote = false;
-                history_entries.update(|v| {
-                    wrote = schemaic_core::history::push_batch(v, batch, dialect) > 0;
-                });
-                // Skipped when nothing was recorded — the same skip
-                // `finish_history` documents. A credential-bearing statement
-                // records nothing and used to cost a whole atomic rewrite for it.
-                if wrote {
-                    persist::save_json(
-                        "history.json",
-                        &schemaic_core::history::HistoryFile {
-                            entries: history_entries.get_untracked(),
-                        },
-                    );
-                }
-                ids
-            },
-        )
-    };
-
-    // Fill in how runs went, on the entries `record_history` wrote when they
-    // launched (see `history::finish` for why it is two passes and not one).
-    //
-    // Persists once for the whole slice, not once per statement: a save clones
-    // the entire history, serializes it, and does an atomic write (temp file,
-    // read-back, `.bak`, rename). Run Everything on a migration script lands a
-    // hundred statements in a single UI-thread callback, and one write each
-    // froze the window for as long as that took. The write is also skipped
-    // entirely when nothing was updated — a credential-bearing statement is
-    // never recorded, and would otherwise cost a file write for nothing.
-    // `dropped` is the runs that never happened — the tail of a script that
-    // stopped, which was pushed at launch and would otherwise evict the
-    // connection's real history under `MAX_PER_CONN`. See `history::drop_runs`.
-    let finish_history: FinishHistoryFn = Rc::new(
-        move |runs: &[(u64, schemaic_core::history::RunResult)], dropped: &[u64]| {
-            let updated = history_entries.try_update(|v| {
-                let mut any = schemaic_core::history::drop_runs(v, dropped);
-                for (run_id, result) in runs {
-                    any |= schemaic_core::history::finish(v, *run_id, *result);
-                }
-                // **The cap, now that the outcomes are known.** `push_batch`
-                // deliberately leaves the connection over it at launch so a
-                // script cannot evict history before anything has run; this is
-                // the only moment anything can tell a statement that ran from
-                // one that was never sent. Idempotent, so a batch that fitted
-                // reports no change and costs no write.
-                any |= schemaic_core::history::trim(v);
-                any
-            });
-            if updated != Some(true) {
-                return;
-            }
-            persist::save_json(
-                "history.json",
-                &schemaic_core::history::HistoryFile {
-                    entries: history_entries.get_untracked(),
-                },
-            );
-        },
-    );
-
-    // Clear the active connection's history (the panel's trash button), persisting.
-    let clear_history: Rc<dyn Fn()> = {
-        Rc::new(move || {
-            let conn = active_conn.get_untracked();
-            history_entries.update(|v| schemaic_core::history::clear_conn(v, conn));
-            // **Erasing.** The confirm behind this button reads "This can't be
-            // undone", and the ordinary save left every statement it named in
-            // `history.json.bak` until the next query run.
-            persist::save_json_erasing(
-                "history.json",
-                &schemaic_core::history::HistoryFile {
-                    entries: history_entries.get_untracked(),
-                },
-            );
-        })
-    };
-
-    // Delete one history entry (the row's menu), persisting. The write is
-    // skipped when nothing matched — a row already gone shouldn't cost a full
-    // rewrite of the file, which is what `remove`'s bool is for.
-    let remove_history: Rc<dyn Fn(schemaic_core::history::HistoryEntry)> = {
-        Rc::new(move |entry: schemaic_core::history::HistoryEntry| {
-            let mut hit = false;
-            history_entries.update(|v| {
-                hit = schemaic_core::history::remove(v, entry.conn_id, &entry.sql);
-            });
-            if hit {
-                // Erasing: the point of this save is that the row is gone, and
-                // the ordinary one would have left it in `history.json.bak`.
-                persist::save_json_erasing(
-                    "history.json",
-                    &schemaic_core::history::HistoryFile {
-                        entries: history_entries.get_untracked(),
-                    },
-                );
-            }
-        })
-    };
+    // Four of the store's five writers, from `history_store::wire` above.
+    // `record`/`finish` go to the run paths below; `clear`/`remove` to the panel
+    // at the `Ui` literal. The fifth, `clear_conn`, is taken by the
+    // connection-delete closure where it is used.
+    let record_history = history.record.clone();
+    let finish_history = history.finish.clone();
+    let clear_history = history.clear.clone();
+    let remove_history = history.remove.clone();
 
     // ── The snippet library ─────────────────────────────────────────────────
     //
@@ -10057,6 +9866,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
         let save_ui = save_ui.clone();
         let reset_activity = reset_activity.clone();
         let ai_session = ai_session.clone();
+        let history_clear_conn = history.clear_conn.clone();
         Rc::new(move |id: u64| {
             let was_active = active_conn.get_untracked() == id;
             // Release any pinned transaction connection on the connection being
@@ -10298,13 +10108,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             // whose save takes a `Saving`; the five that were wrong were the
             // five written by a shared `Fn()` closure with nowhere to say it.
             // They take one now.
-            history_entries.update(|v| schemaic_core::history::clear_conn(v, id));
-            persist::save_json_erasing(
-                "history.json",
-                &schemaic_core::history::HistoryFile {
-                    entries: history_entries.get_untracked(),
-                },
-            );
+            (history_clear_conn)(id);
             // Persisted by an effect on change.
             search_history.update(|v| schemaic_core::search_history::clear_conn(v, id));
             db_colors.update(|v| schemaic_core::db_color::clear_conn(v, id));
@@ -12998,8 +12802,21 @@ mod app_tests {
              pre-deletion generation stays in `<store>.bak` under a confirm saying \
              it cannot be recovered"
         );
+        // **Delegated erases count, and are named one by one.** A store whose
+        // pruning has moved into its own module still has to be erased here, but
+        // this gate cannot see the save any more — so the closure's call is what
+        // it counts, and the erase itself is gated where it now lives. The floor
+        // stays at 9: moving a store out must not be a way to lose one.
+        //
+        // `history_store::the_removal_paths_erase` is the other half for the one
+        // entry below; add a line here *and* a gate there, never only this line.
+        let delegated = ["(history_clear_conn)("];
         let erasing = region.matches("Saving::Erasing").count()
-            + region.matches("save_json_erasing(").count();
+            + region.matches("save_json_erasing(").count()
+            + delegated
+                .iter()
+                .map(|needle| region.matches(needle).count())
+                .sum::<usize>();
         assert!(
             erasing >= 9,
             "only {erasing} erasing saves in the delete closure; every store keyed \
@@ -14640,35 +14457,6 @@ mod app_tests {
             check_outcome((7, 3), (8, 3), false).answer,
             check_outcome((7, 3), (7, 4), false).answer
         );
-    }
-
-    /// The whole of the run-id allocator's correctness argument, which was
-    /// untested: deleting the `+ 1` at the call site or narrowing the seed to the
-    /// active connection left the suite green.
-    #[test]
-    fn a_run_id_is_seeded_past_every_id_on_disk() {
-        use super::run_id_seed;
-        use schemaic_core::history::{HistoryEntry, Outcome};
-        let e = |conn_id: u64, run_id: u64| HistoryEntry {
-            conn_id,
-            database: None,
-            sql: "SELECT 1".into(),
-            ts: 0,
-            run_id,
-            tab_name: None,
-            duration_ms: None,
-            rows: None,
-            rows_capped: false,
-            outcome: Outcome::Unknown,
-        };
-        // Across **all** connections: `finish` matches by id with no connection
-        // filter, so a per-connection seed would let one run's outcome land on
-        // another connection's entry.
-        assert_eq!(run_id_seed(&[e(1, 3), e(2, 9), e(1, 5)]), 9);
-        // Empty history seeds 0, so the first id handed out is 1 — never the 0
-        // that entries written before run ids carry.
-        assert_eq!(run_id_seed(&[]), 0);
-        assert_eq!(run_id_seed(&[e(1, 0), e(1, 0)]), 0);
     }
 
     /// The level `load_landing` doesn't reach. `try_update` guards a *disposed*

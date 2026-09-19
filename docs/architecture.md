@@ -5774,7 +5774,9 @@ existing prose was left alone.
     that were right were the four whose save already took a `Saving`; the five that were wrong were
     the five written by a shared `Fn()` with nowhere to say it. `Ui::save_formats`, `save_db_colors`,
     `save_db_favorites` and the app's `save_ui` take one, and the delete closure's own gate asserts a
-    floor of nine erasing saves in it.
+    floor of nine erasing saves in it — **one of the nine now delegated**, since the history store's
+    prune moved to `app/history_store.rs` and the closure holds only the call to it, whose erase is
+    gated there.
     `persist_chat` takes a `Saving`, so the
     caller says whether a turn finished or a transcript was replaced with nothing; `main.rs`'s
     `save_snippets` closure is `Rc<dyn Fn(persist::Saving)>` for the same reason; and
@@ -16848,6 +16850,42 @@ existing prose was left alone.
     `.part` file: the caller's `sweep()` deletes it three lines later, so the one sentence telling
     the user where their rows went named a path that no longer existed by the time they read it. It
     names the destination instead.
+  - `history_store.rs` — the query-history store: the persisted entry list, the run-id allocator,
+    and the five closures that write it. **Carved out of `app_view` because of an invariant, not a
+    line count**, which is the splitting procedure's own rule — and the invariant is that *every
+    mutation of this store is followed by a save, and which save is policy*. An ordinary
+    `persist::save_json` for a run recorded or finished; `persist::save_json_erasing` for the three
+    paths that **remove** — the panel's trash button, a row's Delete, and a connection being
+    deleted. That distinction is not cosmetic: an ordinary save copies the pre-change generation to
+    `history.json.bak`, so a confirm reading *"This can't be undone"* left every statement it named
+    on disk, and connection deletion's claim that the connection is not reconstructable from what is
+    left was false for the same reason. Before the cut the policy was five copies of the same
+    four-line block inside `app_view`, each choosing its own save; it is now stated once in a
+    private `save(entries, saving)`, which is also the only caller of the `FILE` const
+    (`"history.json"`) and the only place the `HistoryFile` wrapper is built.
+    `wire(connections, active_conn)` loads the file and hands back the `HistoryStore` — `entries`,
+    `record`, `finish`, `clear`, `remove`, `clear_conn` — with `RecordHistoryFn`, `FinishHistoryFn`
+    and `run_id_seed` (and its test) moved across from `main.rs`.
+    **`record` and `finish` are deliberately not in `HistoryActions`**: they go to the run paths,
+    being how a query run reports itself rather than something the panel offers, so the store hands
+    them out separately. **`open_history` deliberately stayed in `app_view`** — it is the history
+    panel's double-click, but what it does is open a *tab* from a `HistoryEntry`, so it needs the
+    tab-id allocator and the placement closure and never touches this store; it is put into
+    `HistoryActions` beside `clear` and `remove` at the `Ui` literal. And the connection-deletion
+    prune became a one-line `(history_clear_conn)(id)` call rather than moving, because the block it
+    sits in erases twelve stores in a row under an invariant of its own, and each store being one
+    line is what keeps that readable.
+    `the_removal_paths_erase` is the module's reason for existing, as a gate: exactly three erasing
+    and two replacing saves inside `wire`, and `history.json` named once, as `FILE`. It scans its own
+    file through `source_gate::production_code` and carries that family's hazard — a gate in the same
+    file as its subject is its own first match — so its needles are assembled from fragments and its
+    counts are exact rather than floors. **The other half of it is in `main.rs`, and the move is what
+    found it**: `app_tests::deleting_a_connection_erases_every_store_it_was_keyed_into` counts
+    erasing saves in the delete closure with a floor of nine, the move took one of them out of that
+    file, and it read eight and failed. The repair was not to lower the floor — that is what stops a
+    different store's erase going missing — but to teach it that a **delegated** erase still counts:
+    it also counts a listed `delegated` needle (`"(history_clear_conn)("`), and its comment says to
+    add a line there *and* a gate in the store's own module, never only the line.
   - `heap.rs` — process-wide heap accounting. `Tracking` is installed as the global allocator and
     adds only two atomics — **live** bytes (allocated − freed) and the running peak — over the
     system allocator. It exists to answer one question the OS can't: whether memory growth is a
@@ -18786,6 +18824,13 @@ Re-introducing the anti-patterns these guard against is a regression:
   match**, since a literal `find("async fn import_on(")` finds the test's own line before the
   function: assemble the needle from fragments, prefer reading the directory to naming a file, and
   give every source gate a floor so a scan that finds nothing fails rather than passes.
+  **`app/history_store.rs` is the third, and it is *a gate left pointing at the old file* from the
+  other side**: the gate that broke was not one that moved but one that stayed — `main.rs`'s census
+  of erasing saves in the connection-delete closure, which read eight against its floor of nine
+  because the store it was counting had left the file. A floor invites the repair of lowering it, and that is the wrong one,
+  since the floor is what stops a *different* store's erase going missing. The right one is to count
+  the **delegated** call the closure still makes and gate the erase itself in the module it moved
+  to, so a store cannot be lost by being moved out.
 
 ## UI conventions
 
