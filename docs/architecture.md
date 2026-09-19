@@ -12203,7 +12203,15 @@ existing prose was left alone.
       other modal does.
   - `import_view.rs` — the file-import modal (schema context menu → **Import**), over
     `core::import`. Two steps (Source → Mapping) in one panel driven by the `ImportUi` bundle;
-    `SchemaActions::import_probe`/`import_run` do the file + DB work off the UI thread. A probe or
+    `SchemaActions::import_probe`/`import_run` do the file + DB work off the UI thread, reached
+    through `ImportCtx`. **The drivers take that ctx; the renderers take the bundle.** `probe`,
+    `run_import`, `source_step` and `import_overlay` reach a fetch, the read-only flag or the schema
+    tree, so they take `ImportCtx` — `ImportUi`, `ConnUi`, `SchemaUi` and the probe/run/cancel
+    closures, and no `Ui`; `mapping_row`, `preview_table`, `issue_list` and `mapping_step` touch
+    nothing but the modal's own signals and take `ImportUi`, which is also what stopped the mapping
+    step cloning a whole `Ui` per row. `open_import` takes `ImportUi` alone. Why the split falls
+    there, and why a ctx on the second half would have been a widening, is under `lib.rs`'s
+    `whole_ui_gate`. A probe or
     an import can outlive the modal, so both callbacks check `ImportUi::generation` (bumped on
     every open) before writing — and a probe checks `probe_seq` (bumped per *request*) too, via
     `import::probe_verdict`: several probes of one file are routinely in flight, they report in
@@ -12262,8 +12270,8 @@ existing prose was left alone.
     sample and **skips the CSV sniffer for a workbook**: an `.xlsx`'s head is deflated ZIP bytes, so
     running the sniffer over it would let a compressed stream's byte frequencies decide `has_header`.
     While a load runs,
-    the footer's Cancel fires `SchemaActions::import_cancel` (the app owns the token, as it does
-    for query runs) instead of closing — the load rolls back on its own connection and the report
+    the footer's Cancel fires `SchemaActions::import_cancel`, as `ctx.cancel` (the app owns the
+    token, as it does for query runs) instead of closing — the load rolls back on its own connection and the report
     says what that achieved, which on a non-transactional MySQL table is that the rows already loaded
     are still there (`db::cancelled_import`; the modal renders `DbError::Cancelled` as *nothing was
     written*, so that variant is reserved for a rollback the server confirmed).
@@ -12460,6 +12468,19 @@ existing prose was left alone.
     `watch_connection` closes the modal when the active connection changes under it — the Export
     button would otherwise launch against a `conn_id` that is no longer selected — unless a dump is
     running.
+    **Off `whole_ui_gate`'s list, 9 to zero, and the split is `import_view.rs`'s beside it: the
+    drivers take a ctx, the renderers take the bundle.** `table_picker` touches nothing but the
+    modal's own signals and takes `DumpUi`, as `dump_options` and `table_row` beneath it already
+    did; `open_dump`, `run_export`, `run_dump`, `run_files`, `launch_files` and `dump_overlay` take
+    a `DumpCtx` — `run_export` among them not because it reads anything outside the modal, but
+    because it routes to one of the two launchers, which do.
+    `watch_connection` takes `(DumpUi, ConnUi)`, the two bundles it watches, rather than a ctx it
+    would read two fields of. `DumpCtx` holds eight things and no `Ui` — `dump`, `script` (cleared
+    on the way in, the two modals sharing one element of the modal-layer tuple), `conn`, `overlay`,
+    and the `tables`/`run`/`files`/`cancel` closures — and `export_progress_overlay` is deliberately
+    **not** on it, taking `(ExportUi, Rc<dyn Fn()>)` instead, because it is the grid export's modal
+    and not this one. Where the ctx is built, and what nearly got left out of it, is under `lib.rs`'s
+    `whole_ui_gate`.
     **The grid export's progress modal lives in this file too** (`export_progress_overlay`),
     which is a different feature reached from a different surface and is nonetheless this panel's
     footer with nothing above it: the same running line, the same red Stop in the same fixed slot,
@@ -15080,6 +15101,46 @@ existing prose was left alone.
     `ui.conn, ui.overlay`. Nothing about the browser's behaviour moved with it: the `dyn_container`
     key still carries `target_read_only`, `write_gate` still runs in the builder, and
     `the_browser_key_carries_the_read_only_flag` passes untouched.
+    **`import_view.rs` came off next, 9 to zero, and it is that lesson refined by a module where the
+    split was already visible: the drivers take a ctx, the renderers take the bundle.** Four of the
+    nine functions only read and write the modal's own signals, and now say so by taking `ImportUi` —
+    `mapping_row`, `preview_table`, `issue_list` and `mapping_step`; the four that *also* reach a
+    fetch, the read-only flag or the schema tree take a new `ImportCtx` — `probe`, `run_import`,
+    `source_step` and `import_overlay`. A context struct on a function that needs one bundle would be
+    a widening dressed as a convenience, which is the trap on the *other* side of the one
+    `SchemaTreeCtx` fell into. `ImportCtx` holds six things and no `Ui` — `import: ImportUi`,
+    `conn: ConnUi`, `schema: SchemaUi` and the `probe`/`run`/`cancel` closures — and is built by
+    naming the reads at its one call site, `ImportCtx::new(ui.import, ui.conn, ui.schema,
+    &ui.schema_actions)` in `modals.rs`. `open_import` stayed off it for `open_for_server`'s reason:
+    a door that only resets the modal's own signals has no business cloning three `Rc`s to do it, so
+    it takes `ImportUi` alone and its one call site — the table context menu's Import entry in
+    `overlays.rs` — passes `ui.import`. The mapping step's column list was cloning a whole `Ui` **per
+    row** to reach `mapping_row` and copies a `Copy` bundle now, the same cost the schema tree's
+    object rows shed. Nothing about the modal's behaviour moved with it: the two places that read
+    `ui.schema_actions.import_cancel` call `ctx.cancel`, which is that same closure, so the exit
+    path's `loading`-not-busy rule and the `TargetVerdict::Cancel` arm are untouched, and
+    `run_import`'s live read-only read is `ctx.conn.connections`, still `with_untracked` in the same
+    synchronous step as `accept_launch`.
+    **`dump_view.rs` went the same way directly after it, 9 to zero, and the field it nearly shipped
+    without is the entry worth keeping.** `table_picker` takes `DumpUi`; `open_dump`, `run_export`,
+    `run_dump`, `run_files`, `launch_files` and `dump_overlay` take a `DumpCtx`; `watch_connection`
+    takes `(DumpUi, ConnUi)`, the two bundles it watches, rather than a ctx it would read two fields
+    of. `DumpCtx` holds eight things and no `Ui` — `dump: DumpUi`, `script: ScriptUi`,
+    `conn: ConnUi`, `overlay: OverlayUi` and the `tables`/`run`/`files`/`cancel` closures — and is
+    built by naming the reads at each of its **two** call sites, `DumpCtx::new(ui.dump, ui.script,
+    ui.conn, ui.overlay, &ui.schema_actions)`, in `modals.rs` for the overlay and in `overlays.rs`'s
+    `export_submenu` for the door. **The `overlay` field was nearly left out, because a `ui.<field>`
+    census misses aliases**: `launch_files`' `FilesOutcome::WouldReplace` arm raises the app-wide
+    confirm, but it does so through a local alias — `ui_retry.overlay.confirm` as the module then
+    stood, `ctx_retry.overlay.confirm` now — so a grep for `ui.overlay` came back empty on the one
+    function in the module that reaches it. The compiler caught it, but only after the struct had
+    been written a field short — a census that read the aliases too would not have needed it to.
+    Nothing about the modal's behaviour moved with the
+    narrowing: `dump_overlay`'s exit calls `ctx.cancel`, which is the same closure
+    `ui.schema_actions.dump_cancel` was, and `launch_files`' `accept_dialog_launch` reads
+    `d.running`/`d.target` — the same two signals under the name already bound in that function.
+    `export_progress_overlay` stayed off the ctx and now says so in its signature,
+    `(ExportUi, Rc<dyn Fn()>)`, with `modals.rs` passing `ui.export, ui.tab_actions.export_cancel`.
     **Three named bundles can still be the narrower signature, and can say something the root one
     hid.** `preview_change` takes `(ConnUi, DdlUi)` and `preview_proposal`
     `(ConnUi, SchemaUi, DdlUi)`; the count looks like a step backwards until you read what `conn`
@@ -15088,16 +15149,17 @@ existing prose was left alone.
     site rather than only in the prose two paragraphs up. The rule is the signature saying what the
     function depends on, not the parameter count.
     **The live number is the sum of `BUDGET`, not the "roughly 140" above**, which describes the
-    state the gate found and by design never moves. That sum went **206 → 102** over this run:
+    state the gate found and by design never moves. That sum went **206 → 84** over this run:
     `table_designer.rs` 29 → 26 → 10 → 4, `object_editor.rs` 14 → 5 → 4 → **0**,
     `routine_editor.rs` 12 → 6 → **0**, `event_editor.rs` 11 → 5 → **0**,
     `trigger_editor.rs` 11 → 8 → 7 → **0**, `view_editor.rs` 10 → 6, `database_editor.rs` 7 → 3,
     `ddl_preview.rs` 6 → 4 → 2, `overlays.rs` 15 → 13, `account_editor.rs` 6 → **0**,
-    `schema_tree.rs` 6 → 3, `users_view.rs` 9 → 8 → 5 → **0**. Every step is recorded against its own entry with what it narrowed *to*,
+    `schema_tree.rs` 6 → 3, `users_view.rs` 9 → 8 → 5 → **0**, `import_view.rs` 9 → **0**,
+    `dump_view.rs` 9 → **0**. Every step is recorded against its own entry with what it narrowed *to*,
     so read the list for where a file stands rather than inferring it from a paragraph — and a file
     that reaches zero leaves the list altogether, which is the one way an entry is ever removed and
-    the point at which it may not take a `Ui` again at all. **Six files have left it** — the three DDL-object editors, then
-    `trigger_editor.rs`, `account_editor.rs` and `users_view.rs` — and each left a comment behind where it sat,
+    the point at which it may not take a `Ui` again at all. **Eight files have left it** — the three DDL-object editors, then
+    `trigger_editor.rs`, `account_editor.rs`, `users_view.rs`, `import_view.rs` and `dump_view.rs` — and each left a comment behind where it sat,
     because a name absent from `BUDGET` says nothing on its own about whether it was ever on it.
     It is a **budget, not a ban**, because narrowing 140 signatures is a campaign and a gate that
     fails on the day it lands teaches nothing: `BUDGET` holds what each file declares *now* and the

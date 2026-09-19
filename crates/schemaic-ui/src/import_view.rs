@@ -31,9 +31,58 @@ use crate::widgets::{
     modal_title_owned, modal_w, panel_style, shift_hscroll,
 };
 use crate::{
-    FieldCfg, ImportProbeRequest, ImportRunRequest, ImportStep, ImportTargetInfo, ImportUi, Ui,
-    edit_field, icons, theme,
+    ConnUi, FieldCfg, ImportFn, ImportProbeFn, ImportProbeRequest, ImportRunRequest, ImportStep,
+    ImportTargetInfo, ImportUi, SchemaUi, edit_field, icons, theme,
 };
+
+/// Everything the import modal reaches out of the root bundle.
+///
+/// **The drivers take this; the renderers take [`ImportUi`].** Four of the views
+/// below only read and write the modal's own signals, and those say so — a
+/// context struct on a function that needs one bundle is a widening dressed as a
+/// convenience. What genuinely needs gathering is the half that *acts*: a probe
+/// or a load also reaches a fetch, the read-only flag, or the schema tree.
+///
+/// Holds no `Ui`, for `whole_ui_gate`'s reason and `users_view::UsersCtx`'s: it
+/// is built by naming the reads at the one call site, so what this modal touches
+/// is visible there rather than inside a constructor that can quietly grow.
+#[derive(Clone)]
+pub(crate) struct ImportCtx {
+    /// The modal's own state — step, file, settings, sample, mapping, issues.
+    import: ImportUi,
+    /// The connection registry, for the read-only flag [`run_import`] asks
+    /// **live** in the same step as the launch.
+    conn: ConnUi,
+    /// The schema tree, watched so a target whose database has gone from it
+    /// closes the modal rather than importing into nothing.
+    schema: SchemaUi,
+    /// Read the file's opening records so the modal can show what it found.
+    probe: ImportProbeFn,
+    /// Check the file and, if it's clean, load it in one transaction.
+    run: ImportFn,
+    /// Stop the load, rolling it back. **Not the probe** — see the exit note in
+    /// [`import_overlay`].
+    cancel: Rc<dyn Fn()>,
+}
+
+impl ImportCtx {
+    /// Gather the modal's reads where the root bundle is in reach.
+    pub(crate) fn new(
+        import: ImportUi,
+        conn: ConnUi,
+        schema: SchemaUi,
+        actions: &crate::SchemaActions,
+    ) -> Self {
+        Self {
+            import,
+            conn,
+            schema,
+            probe: actions.import_probe.clone(),
+            run: actions.import_run.clone(),
+            cancel: actions.import_cancel.clone(),
+        }
+    }
+}
 
 /// Rows shown in the mapping step's preview. Enough to spot a wrong delimiter or
 /// an off-by-one mapping; not so many that the panel becomes a grid.
@@ -124,8 +173,11 @@ fn delimiter_display(d: u8) -> String {
 }
 
 /// Reset everything and open the modal on `target`.
-pub(crate) fn open_import(ui: &Ui, target: ImportTargetInfo) {
-    let i = ui.import;
+///
+/// Takes the bundle rather than [`ImportCtx`]: this door only writes the modal's
+/// own signals, so gathering the fetches for it would be three `Rc` clones spent
+/// on nothing.
+pub(crate) fn open_import(i: ImportUi, target: ImportTargetInfo) {
     i.step.set(ImportStep::Source);
     i.path.set(None);
     i.format.set(ImportFormat::Csv);
@@ -160,8 +212,8 @@ pub(crate) fn open_import(ui: &Ui, target: ImportTargetInfo) {
 /// Probe the picked file and fold the result into the modal's state. `sniff` asks
 /// for the dialect to be detected rather than taken from the controls — true on
 /// the first look at a file, false when the user changes a setting.
-fn probe(ui: Ui, sniff: bool) {
-    let i = ui.import;
+fn probe(ctx: &ImportCtx, sniff: bool) {
+    let i = ctx.import;
     let Some(path) = i.path.get_untracked() else {
         return;
     };
@@ -178,7 +230,7 @@ fn probe(ui: Ui, sniff: bool) {
     // flight — see `import::probe_verdict`.
     i.probe_seq.update(|n| *n += 1);
     let mine = (i.generation.get_untracked(), i.probe_seq.get_untracked());
-    (ui.schema_actions.import_probe)(
+    (ctx.probe)(
         ImportProbeRequest { path, format, cfg },
         Rc::new(move |res| {
             let current = (i.generation.get_untracked(), i.probe_seq.get_untracked());
@@ -286,14 +338,14 @@ fn delimiter_w() -> f64 {
 }
 
 /// Step 1 — the file and how to read it.
-fn source_step(ui: Ui, ring: FocusRing) -> impl IntoView {
-    let i = ui.import;
-    let ui_pick = ui.clone();
+fn source_step(ctx: &ImportCtx, ring: FocusRing) -> impl IntoView {
+    let i = ctx.import;
+    let ctx_pick = ctx.clone();
     // The first stop in the step, ahead of the Format picker at 10: without it a
     // keyboard user could reach every reading setting and never pick a file,
     // which is the one thing this step is for.
     let pick = control_button("Choose file…", ring.clone(), 5, move || {
-        let ui = ui_pick.clone();
+        let ctx = ctx_pick.clone();
         floem::action::open_file(
             floem::file::FileDialogOptions::new().title("Import into table"),
             move |file| {
@@ -307,15 +359,15 @@ fn source_step(ui: Ui, ring: FocusRing) -> impl IntoView {
                 // `format`, and it would otherwise fire here — while `path` still
                 // points at the *previous* file — racing a probe of the old file
                 // under the new format against the real one below.
-                ui.import.applying.set(true);
+                ctx.import.applying.set(true);
                 if let Some(name) = path.file_name().and_then(|n| n.to_str())
                     && let Some(f) = import::infer_format(name)
                 {
-                    ui.import.format.set(f);
+                    ctx.import.format.set(f);
                 }
-                ui.import.path.set(Some(path));
-                ui.import.applying.set(false);
-                probe(ui.clone(), true);
+                ctx.import.path.set(Some(path));
+                ctx.import.applying.set(false);
+                probe(&ctx, true);
             },
         );
     });
@@ -589,8 +641,7 @@ fn target_label(target: &Target, table: &schemaic_core::schema::TableInfo) -> St
 /// The dropdown reads and writes `mapping` directly instead of holding its own
 /// signal — one source of truth, so re-proposing the mapping after a settings
 /// change is a single `set` and every row follows it.
-fn mapping_row(ui: Ui, fi: usize, file_col: String, ring: FocusRing) -> impl IntoView {
-    let i = ui.import;
+fn mapping_row(i: ImportUi, fi: usize, file_col: String, ring: FocusRing) -> impl IntoView {
     let Some(info) = i.target.get_untracked() else {
         return empty().into_any();
     };
@@ -741,8 +792,7 @@ fn preview_cell(label: String, is_null: bool) -> impl IntoView {
 /// Header and body sit inside **one** horizontal scroll, so they can't drift out
 /// of alignment — the results grid needs a strict one-writer/one-reader rule
 /// because its two panes scroll separately, and nesting sidesteps that entirely.
-fn preview_table(ui: Ui) -> impl IntoView {
-    let i = ui.import;
+fn preview_table(i: ImportUi) -> impl IntoView {
     dyn_container(
         // **The NULL settings are part of the key**, and that is the whole fix
         // for the preview not being able to show a CSV NULL. They cannot change
@@ -884,8 +934,7 @@ fn preview_table(ui: Ui) -> impl IntoView {
 
 /// Problems the full check found. Present ⇒ the import was refused and nothing
 /// was written, which the heading has to say plainly.
-fn issue_list(ui: Ui) -> impl IntoView {
-    let i = ui.import;
+fn issue_list(i: ImportUi) -> impl IntoView {
     dyn_container(
         move || (i.issues.get(), i.more_issues.get()),
         move |(issues, more)| {
@@ -939,9 +988,7 @@ fn issue_list(ui: Ui) -> impl IntoView {
 }
 
 /// Step 2 — mapping, preview, and whatever the last check said.
-fn mapping_step(ui: Ui, ring: FocusRing) -> impl IntoView {
-    let i = ui.import;
-    let ui_rows = ui.clone();
+fn mapping_step(i: ImportUi, ring: FocusRing) -> impl IntoView {
     let rows = dyn_container(
         move || {
             i.sample
@@ -950,12 +997,11 @@ fn mapping_step(ui: Ui, ring: FocusRing) -> impl IntoView {
                 .unwrap_or_default()
         },
         move |cols| {
-            let ui = ui_rows.clone();
             let ring = ring.clone();
             v_stack_from_iter(
                 cols.into_iter()
                     .enumerate()
-                    .map(move |(fi, c)| mapping_row(ui.clone(), fi, c, ring.clone())),
+                    .map(move |(fi, c)| mapping_row(i, fi, c, ring.clone())),
             )
             .style(|s| s.flex_col())
             .into_any()
@@ -1057,8 +1103,8 @@ fn mapping_step(ui: Ui, ring: FocusRing) -> impl IntoView {
         engine_note,
         form_separator(|| GAP),
         form_section("Preview"),
-        preview_table(ui.clone()),
-        issue_list(ui).style(|s| s.margin_top(theme::scaled(16.0))),
+        preview_table(i),
+        issue_list(i).style(|s| s.margin_top(theme::scaled(16.0))),
     ))
     .style(|s| s.flex_col().gap(GAP).width_full())
 }
@@ -1072,8 +1118,8 @@ fn mapping_step(ui: Ui, ring: FocusRing) -> impl IntoView {
 /// So the mapping on screen was built from the config on screen. Loosen any one
 /// of those three and this becomes the mismatch that writes a file's `name`
 /// column into `email`.
-fn run_import(ui: Ui) {
-    let i = ui.import;
+fn run_import(ctx: &ImportCtx) {
+    let i = ctx.import;
     let (Some(target), Some(path)) = (i.target.get_untracked(), i.path.get_untracked()) else {
         return;
     };
@@ -1094,7 +1140,7 @@ fn run_import(ui: Ui) {
     // Asked **live**, for the reason `ddl_preview::apply` gives in full: two
     // destructive modals must not answer the same question two different ways,
     // and the flag can move while the modal is on screen.
-    let read_only = ui
+    let read_only = ctx
         .conn
         .connections
         .with_untracked(|cs| schemaic_core::connection::read_only_of(cs, target.conn_id));
@@ -1105,7 +1151,7 @@ fn run_import(ui: Ui) {
     i.error.set(None);
     i.issues.set(Vec::new());
     let opened = i.generation.get_untracked();
-    (ui.schema_actions.import_run)(
+    (ctx.run)(
         ImportRunRequest {
             target,
             path,
@@ -1149,8 +1195,8 @@ fn run_import(ui: Ui) {
 
 /// The import modal. Absolutely positioned over the workspace when
 /// `ui.import.target` is `Some`.
-pub(crate) fn import_overlay(ui: Ui) -> impl IntoView {
-    let i = ui.import;
+pub(crate) fn import_overlay(ctx: ImportCtx) -> impl IntoView {
+    let i = ctx.import;
     // Every exit — footer, Escape, ✕ — goes through one decision. While a load
     // is running this cancels (rolling the transaction back) instead of closing:
     // closing would hide a bulk write that is still going and would leave its
@@ -1164,10 +1210,10 @@ pub(crate) fn import_overlay(ui: Ui) -> impl IntoView {
     // unterminated quote reads for as long as the file is big, and Escape, ✕ and
     // Cancel were all inert for the duration.
     let exit: Rc<dyn Fn()> = {
-        let stop = ui.schema_actions.clone();
+        let stop = ctx.cancel.clone();
         Rc::new(move || match exit_action(i.loading.get_untracked(), true) {
             ExitAction::Close => i.target.set(None),
-            ExitAction::Cancel => (stop.import_cancel)(),
+            ExitAction::Cancel => (stop)(),
             // Unreachable for this modal (an import is always cancellable), but
             // matched explicitly so a future caller can't fall through to close.
             ExitAction::Ignore => {}
@@ -1191,7 +1237,7 @@ pub(crate) fn import_overlay(ui: Ui) -> impl IntoView {
     // tokens box — and each read re-proposes the mapping, so it would also stamp
     // over a hand-edited one.
     {
-        let ui = ui.clone();
+        let ctx = ctx.clone();
         create_effect(
             move |prev: Option<(String, bool, bool, ImportFormat, Option<String>)>| {
                 // The sheet belongs here for exactly the reason the delimiter does:
@@ -1212,7 +1258,7 @@ pub(crate) fn import_overlay(ui: Ui) -> impl IntoView {
                     && i.target.get_untracked().is_some()
                     && i.path.get_untracked().is_some()
                 {
-                    probe(ui.clone(), false);
+                    probe(&ctx, false);
                 }
                 cur
             },
@@ -1226,9 +1272,9 @@ pub(crate) fn import_overlay(ui: Ui) -> impl IntoView {
     // connection switch: the per-node `Loading` arm below never ran, because
     // there was no node left to be loading.
     {
-        let db_nodes = ui.schema.db_nodes;
-        let active_conn = ui.conn.active_conn;
-        let stop = ui.schema_actions.clone();
+        let db_nodes = ctx.schema.db_nodes;
+        let active_conn = ctx.conn.active_conn;
+        let stop = ctx.cancel.clone();
         create_effect(move |_| {
             db_nodes.track();
             if let Some(t) = i.target.get_untracked()
@@ -1267,7 +1313,7 @@ pub(crate) fn import_overlay(ui: Ui) -> impl IntoView {
                     // A load is running: cancelling rolls its transaction back,
                     // where closing would abandon a bulk write whose outcome has
                     // nowhere left to report.
-                    import::TargetVerdict::Cancel => (stop.import_cancel)(),
+                    import::TargetVerdict::Cancel => (stop)(),
                 }
             }
         });
@@ -1279,7 +1325,7 @@ pub(crate) fn import_overlay(ui: Ui) -> impl IntoView {
             if !open {
                 return empty().into_any();
             }
-            let ui = ui.clone();
+            let ctx = ctx.clone();
             let title = i
                 .target
                 .with_untracked(|t| t.as_ref().map(|t| t.display()).unwrap_or_default());
@@ -1290,8 +1336,8 @@ pub(crate) fn import_overlay(ui: Ui) -> impl IntoView {
             let ring = FocusRing::new();
             let root_ring = ring.clone();
             let body = match step {
-                ImportStep::Source => source_step(ui.clone(), ring.clone()).into_any(),
-                ImportStep::Mapping => mapping_step(ui.clone(), ring.clone()).into_any(),
+                ImportStep::Source => source_step(&ctx, ring.clone()).into_any(),
+                ImportStep::Mapping => mapping_step(i, ring.clone()).into_any(),
                 ImportStep::Done => text(format!(
                     "Imported {} row{} into {title}.",
                     i.imported.get_untracked(),
@@ -1327,10 +1373,8 @@ pub(crate) fn import_overlay(ui: Ui) -> impl IntoView {
             // modal ends with. Back is the exception to the "actions on the right"
             // rule — it moves *backwards* through the modal, so it sits at the far
             // left rather than in the group deciding what happens next.
-            let conns_ro = ui.conn.connections;
-            let ui_back = ui.clone();
-            let ui_next = ui.clone();
-            let ui_run = ui.clone();
+            let conns_ro = ctx.conn.connections;
+            let ctx_run = ctx.clone();
             let (exit_src, exit_map, exit_done, exit_x, exit_esc) = (
                 exit.clone(),
                 exit.clone(),
@@ -1345,7 +1389,6 @@ pub(crate) fn import_overlay(ui: Ui) -> impl IntoView {
                 ImportStep::Source => dyn_container(
                     move || (i.sample.with(Option::is_some), i.reading.get()),
                     move |(has_sample, busy)| {
-                        let ui = ui_next.clone();
                         let ring = ring_src.clone();
                         modal_footer(
                             h_stack((
@@ -1363,7 +1406,7 @@ pub(crate) fn import_overlay(ui: Ui) -> impl IntoView {
                                     has_sample && !busy,
                                     ring,
                                     ACTION_TAB + 10,
-                                    move || ui.import.step.set(ImportStep::Mapping),
+                                    move || i.step.set(ImportStep::Mapping),
                                 ),
                             ))
                             .style(|s| s.flex_row().items_center().gap(action_gap())),
@@ -1387,8 +1430,7 @@ pub(crate) fn import_overlay(ui: Ui) -> impl IntoView {
                         (i.loading.get(), i.mapping.get(), target, read_only)
                     },
                     move |(busy, mapping, target, read_only)| {
-                        let ui = ui_run.clone();
-                        let back = ui_back.clone();
+                        let ctx = ctx_run.clone();
                         let ring = ring_map.clone();
                         let ready = target
                             .map(|t| !import::insert_columns(&mapping, &t.table).is_empty())
@@ -1400,7 +1442,7 @@ pub(crate) fn import_overlay(ui: Ui) -> impl IntoView {
                                 !busy,
                                 ring.clone(),
                                 ACTION_TAB,
-                                move || back.import.step.set(ImportStep::Source),
+                                move || i.step.set(ImportStep::Source),
                             ),
                             h_stack((
                                 // Said where the disabled button is, rather than
@@ -1442,7 +1484,7 @@ pub(crate) fn import_overlay(ui: Ui) -> impl IntoView {
                                     ready && !busy && !read_only,
                                     ring,
                                     ACTION_TAB + 20,
-                                    move || run_import(ui.clone()),
+                                    move || run_import(&ctx),
                                 ),
                             ))
                             .style(|s| s.flex_row().items_center().gap(action_gap())),

@@ -162,7 +162,13 @@ fn export_submenu(
             MenuEntry::action(format.label(), move || {
                 let ctx = crate::table_designer::edit_ctx(ui.conn);
                 crate::dump_view::open_dump(
-                    ui.clone(),
+                    &crate::dump_view::DumpCtx::new(
+                        ui.dump,
+                        ui.script,
+                        ui.conn,
+                        ui.overlay,
+                        &ui.schema_actions,
+                    ),
                     ctx.conn_id,
                     db.clone(),
                     ns.clone(),
@@ -2309,7 +2315,7 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                                 MenuEntry::action("Import", move || {
                                     if let Some(info) = info.clone() {
                                         crate::import_view::open_import(
-                                            &ui,
+                                            ui.import,
                                             crate::ImportTargetInfo {
                                                 conn_id: active_conn.get_untracked(),
                                                 database: db.clone(),

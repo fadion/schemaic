@@ -49,7 +49,76 @@ use crate::widgets::{
 };
 use schemaic_core::export::ExportFormat;
 
-use crate::{DumpOutcome, DumpRequest, DumpTarget, FilesOutcome, FilesRequest, Ui};
+use crate::{
+    ConnUi, DumpFn, DumpOutcome, DumpRequest, DumpTablesFn, DumpTarget, DumpUi, ExportUi, FilesFn,
+    FilesOutcome, FilesRequest, OverlayUi, ScriptUi,
+};
+
+/// Everything the export modal reaches out of the root bundle.
+///
+/// **The drivers take this; the renderers take [`DumpUi`].** `table_picker`
+/// decides nothing that is not already in the modal's own signals, and says so —
+/// as `dump_options` and `table_row` beneath it already did. The rest either
+/// launch a write — which means a fetch — or watch something outside the modal,
+/// and those are what is gathered here. [`run_export`] is on it not because it
+/// reads anything outside the modal but because it **routes** to one of the two
+/// launchers, which do.
+///
+/// Holds no `Ui`, for `whole_ui_gate`'s reason: it is built by naming the reads
+/// at each of its two call sites, so what this modal touches is visible there.
+///
+/// [`export_progress_overlay`] is **not** on it. It is the grid export's modal —
+/// a different feature sharing this file — and it reads `ExportUi` and
+/// `TabsActions::export_cancel`, neither of which is here.
+#[derive(Clone)]
+pub(crate) struct DumpCtx {
+    /// The modal's own state — target, table list, selection, options,
+    /// progress, outcome.
+    dump: DumpUi,
+    /// The script modal's target, cleared on the way in. The two share one
+    /// element of the modal-layer tuple, so each opening has to close the other
+    /// — see [`open_dump`].
+    script: ScriptUi,
+    /// The connection registry, watched so a switch closes a modal that would
+    /// otherwise launch against a `conn_id` nobody is on — see
+    /// [`watch_connection`].
+    conn: ConnUi,
+    /// The app-wide confirm, for the one question this modal asks outside its
+    /// own panel: the folder export's *Replace files* prompt. Reached only from
+    /// [`launch_files`]'s `WouldReplace` arm.
+    overlay: OverlayUi,
+    /// One database's table and view names, for the picker.
+    tables: DumpTablesFn,
+    /// Introspect, plan and write the `.sql` dump.
+    run: DumpFn,
+    /// The same into a folder, one file per table — the other five formats.
+    files: FilesFn,
+    /// Stop whichever of the two is running. One stop for both because there is
+    /// one modal; see [`crate::SchemaActions::dump_cancel`].
+    cancel: Rc<dyn Fn()>,
+}
+
+impl DumpCtx {
+    /// Gather the modal's reads where the root bundle is in reach.
+    pub(crate) fn new(
+        dump: DumpUi,
+        script: ScriptUi,
+        conn: ConnUi,
+        overlay: OverlayUi,
+        actions: &crate::SchemaActions,
+    ) -> Self {
+        Self {
+            dump,
+            script,
+            conn,
+            overlay,
+            tables: actions.dump_tables.clone(),
+            run: actions.dump_run.clone(),
+            files: actions.files_run.clone(),
+            cancel: actions.dump_cancel.clone(),
+        }
+    }
+}
 
 /// The panel's nominal size, scaled like every other modal's.
 fn panel_w() -> f64 {
@@ -78,7 +147,7 @@ const TAB_OPTS: u32 = 100;
 /// what the modal *is*: `Sql` is the dump this module was written for, and the
 /// other five are a folder of one file per table. See [`DumpTarget::format`].
 pub(crate) fn open_dump(
-    ui: Ui,
+    ctx: &DumpCtx,
     conn_id: u64,
     database: String,
     schema: Option<String>,
@@ -86,10 +155,10 @@ pub(crate) fn open_dump(
     dialect: SqlDialect,
     format: ExportFormat,
 ) {
-    let d = ui.dump;
+    let d = ctx.dump;
     // The other half of `script_view::open_script`'s rule — the two share one
     // tuple element in the modal layer, and each fills it when open.
-    ui.script.target.set(None);
+    ctx.script.target.set(None);
     d.tables.set(Vec::new());
     d.chosen.set(Vec::new());
     d.progress.set(None);
@@ -107,7 +176,7 @@ pub(crate) fn open_dump(
     }));
 
     let opened = d.generation.get_untracked();
-    (ui.schema_actions.dump_tables)(
+    (ctx.tables)(
         conn_id,
         database,
         Rc::new(move |res| {
@@ -157,14 +226,14 @@ pub(crate) fn open_dump(
 /// must never happen is a modal opened on CSV launching the dump — so the
 /// question is asked once, of [`DumpTarget::writes_folder`], at the only point
 /// where either can start.
-fn run_export(ui: Ui) {
-    let Some(target) = ui.dump.target.get_untracked() else {
+fn run_export(ctx: &DumpCtx) {
+    let Some(target) = ctx.dump.target.get_untracked() else {
         return;
     };
     if target.writes_folder() {
-        run_files(ui, target);
+        run_files(ctx, target);
     } else {
-        run_dump(ui, target);
+        run_dump(ctx, target);
     }
 }
 
@@ -175,8 +244,8 @@ fn run_export(ui: Ui) {
 /// disabled style only takes effect on a later update pass
 /// (`widgets::accept_launch`, and the two imports that each opened their own
 /// transaction before it existed).
-fn run_dump(ui: Ui, target: DumpTarget) {
-    let d = ui.dump;
+fn run_dump(ctx: &DumpCtx, target: DumpTarget) {
+    let d = ctx.dump;
     // **Read at the moment of the launch, not before the dialog.** floem's save
     // dialog is not window-modal, so the modal stays live behind it: untick every
     // table, tick one, choose a filename — and the file was written from the
@@ -207,7 +276,7 @@ fn run_dump(ui: Ui, target: DumpTarget) {
             name: "SQL",
             extensions: &["sql"],
         }]);
-    let actions = ui.schema_actions.clone();
+    let run = ctx.run.clone();
     // Read **before** the dialog opens: the launch below has to be able to tell
     // "the modal that asked for this" from "a modal that has since been closed
     // and reopened on another database". The late-outcome guard further down
@@ -247,7 +316,7 @@ fn run_dump(ui: Ui, target: DumpTarget) {
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_else(|| path.display().to_string());
         let opened = d.generation.get_untracked();
-        (actions.dump_run)(
+        (run)(
             DumpRequest {
                 path,
                 conn_id: target.conn_id,
@@ -349,8 +418,9 @@ fn run_dump(ui: Ui, target: DumpTarget) {
 /// guard to lower, so there is nothing for the six toggles to say — which is why
 /// the modal hides them for these formats rather than passing values the writer
 /// would ignore.
-fn run_files(ui: Ui, target: DumpTarget) {
-    let d = ui.dump;
+fn run_files(ctx: &DumpCtx, target: DumpTarget) {
+    let d = ctx.dump;
+    let ctx = ctx.clone();
     if d.chosen.with_untracked(|c| c.is_empty()) {
         return;
     }
@@ -392,7 +462,7 @@ fn run_files(ui: Ui, target: DumpTarget) {
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_else(|| folder.display().to_string());
         launch_files(
-            ui.clone(),
+            &ctx,
             FilesRequest {
                 folder,
                 conn_id: target.conn_id,
@@ -424,19 +494,19 @@ fn run_files(ui: Ui, target: DumpTarget) {
 /// `accept_dialog_launch`, with the generation captured before the question, so
 /// a confirm answered after the modal moved to another database cannot start an
 /// export into it.
-fn launch_files(ui: Ui, req: FilesRequest, name: String) {
-    let d = ui.dump;
-    let actions = ui.schema_actions.clone();
+fn launch_files(ctx: &DumpCtx, req: FilesRequest, name: String) {
+    let d = ctx.dump;
+    let files = ctx.files.clone();
     d.running.set(true);
     d.error.set(None);
     d.done.set(None);
     d.progress.set(None);
     let opened = d.generation.get_untracked();
     {
-        let ui_retry = ui.clone();
+        let ctx_retry = ctx.clone();
         let req_retry = req.clone();
         let name_retry = name.clone();
-        (actions.files_run)(
+        (files)(
             req,
             Rc::new(move |outcome| {
                 if d.generation.get_untracked() != opened {
@@ -478,10 +548,10 @@ fn launch_files(ui: Ui, req: FilesRequest, name: String) {
                     // the same reason the three notes above are not written
                     // here.
                     FilesOutcome::WouldReplace { replaced } => {
-                        let ui = ui_retry.clone();
+                        let ctx = ctx_retry.clone();
                         let req = req_retry.clone();
                         let name = name_retry.clone();
-                        ui_retry.overlay.confirm.set(Some(crate::Confirm {
+                        ctx_retry.overlay.confirm.set(Some(crate::Confirm {
                             title: "Replace files".to_string(),
                             message: schemaic_core::dump::folder_replace_prompt(&name, &replaced),
                             resolve: Rc::new(move |yes| {
@@ -489,16 +559,16 @@ fn launch_files(ui: Ui, req: FilesRequest, name: String) {
                                     return;
                                 }
                                 if !crate::widgets::accept_dialog_launch(
-                                    ui.dump.running.get_untracked(),
+                                    d.running.get_untracked(),
                                     false,
-                                    ui.dump.target.get_untracked().is_some(),
+                                    d.target.get_untracked().is_some(),
                                     opened,
-                                    ui.dump.generation.get_untracked(),
+                                    d.generation.get_untracked(),
                                 ) {
                                     return;
                                 }
                                 launch_files(
-                                    ui.clone(),
+                                    &ctx,
                                     // The list the prompt named, which is what
                                     // the re-run's census is compared against.
                                     req.clone().approved(replaced.clone()),
@@ -649,8 +719,7 @@ fn table_row(
 }
 
 /// The picker: All / None, then the list.
-fn table_picker(ui: Ui, ring: FocusRing) -> impl IntoView {
-    let d = ui.dump;
+fn table_picker(d: DumpUi, ring: FocusRing) -> impl IntoView {
     // The selection as a set, computed once per change instead of once per row:
     // the list is the one signal every row in it reads. `chosen` stays a `Vec`
     // because it is what the request carries and what "Select all" resets from.
@@ -725,12 +794,12 @@ fn table_picker(ui: Ui, ring: FocusRing) -> impl IntoView {
 
 /// The dump modal. Absolutely positioned over the workspace while
 /// `ui.dump.target` is `Some`.
-pub(crate) fn dump_overlay(ui: Ui) -> impl IntoView {
-    let d = ui.dump;
+pub(crate) fn dump_overlay(ctx: DumpCtx) -> impl IntoView {
+    let d = ctx.dump;
     // Built once, with the modal rather than with each open: this view is
     // constructed at startup and the `dyn_container` below is what appears and
     // disappears, so an effect created here has the lifetime the modal does.
-    watch_connection(ui.clone());
+    watch_connection(d, ctx.conn);
     // One decision for every exit — footer, Escape, ✕ — so none of them can
     // disagree. While an export runs they **stop** it rather than closing, the
     // import modal's rule and for its reason: closing would hide a write that is
@@ -739,10 +808,10 @@ pub(crate) fn dump_overlay(ui: Ui) -> impl IntoView {
     // one place the user looks, by wearing the word Stop and the colour of an
     // action while that is what it does.
     let exit: Rc<dyn Fn()> = {
-        let stop = ui.schema_actions.clone();
+        let stop = ctx.cancel.clone();
         Rc::new(move || match exit_action(d.running.get_untracked(), true) {
             ExitAction::Close => d.target.set(None),
-            ExitAction::Cancel => (stop.dump_cancel)(),
+            ExitAction::Cancel => (stop)(),
             // Unreachable while `cancellable` is true, matched explicitly so a
             // later caller can't fall through to closing over a running export.
             ExitAction::Ignore => {}
@@ -756,7 +825,6 @@ pub(crate) fn dump_overlay(ui: Ui) -> impl IntoView {
                 return empty().into_any();
             };
             let ring = FocusRing::new();
-            let ui = ui.clone();
             let (exit_x, exit_esc, exit_footer) = (exit.clone(), exit.clone(), exit.clone());
 
             // **The two option sections are the dump's alone.** Every one of them
@@ -785,7 +853,7 @@ pub(crate) fn dump_overlay(ui: Ui) -> impl IntoView {
             // footer** — this body scrolls, so a progress line or an outcome put
             // here is one the user has to go looking for, and the whole point of
             // both is being seen without looking.
-            let body = v_stack((table_picker(ui.clone(), ring.clone()), options))
+            let body = v_stack((table_picker(d, ring.clone()), options))
                 .style(|s| s.flex_col().width_full().gap(theme::scaled(16.0)));
 
             // **Rebuilt on what enables it**, not read once while the panel is
@@ -798,7 +866,7 @@ pub(crate) fn dump_overlay(ui: Ui) -> impl IntoView {
             // The **left** half is where the run says what it is doing and how it
             // ended, so both live at eye level next to the buttons rather than at
             // the bottom of a body that scrolls.
-            let run_ui = ui.clone();
+            let run_ctx = ctx.clone();
             let footer_ring = ring.clone();
             let footer = dyn_container(
                 move || {
@@ -816,7 +884,7 @@ pub(crate) fn dump_overlay(ui: Ui) -> impl IntoView {
                     )
                 },
                 move |(running, none_chosen, no_content, done, error)| {
-                    let (run_ui, ring) = (run_ui.clone(), footer_ring.clone());
+                    let (run_ctx, ring) = (run_ctx.clone(), footer_ring.clone());
                     let exit = exit_footer.clone();
                     // **Text only, and no control beside it.** The progress line
                     // grows as the count does (`3 of 12, 9k` → `98k rows so far`),
@@ -916,7 +984,7 @@ pub(crate) fn dump_overlay(ui: Ui) -> impl IntoView {
                                 !running && !none_chosen && !no_content,
                                 ring,
                                 ACTION_TAB + 10,
-                                move || run_export(run_ui.clone()),
+                                move || run_export(&run_ctx),
                             ),
                         ))
                         .style(|s| s.items_center().gap(theme::scaled(8.0)))
@@ -993,9 +1061,7 @@ pub(crate) fn dump_overlay(ui: Ui) -> impl IntoView {
 /// runs, then the outcome and a Close. It does not close itself — see
 /// [`crate::ExportUi`] for why a modal that did could not confirm a fast export
 /// at all, and why the grid's bar no longer reports one.
-pub(crate) fn export_progress_overlay(ui: Ui) -> impl IntoView {
-    let e = ui.export;
-    let cancel = ui.tab_actions.export_cancel.clone();
+pub(crate) fn export_progress_overlay(e: ExportUi, cancel: Rc<dyn Fn()>) -> impl IntoView {
     // **One decision for every exit** — the footer button and Escape — so the two
     // cannot disagree, which is the rule `dump_overlay` states and the reason it
     // routes both through one closure. Here it matters more than there: the two
@@ -1209,9 +1275,8 @@ pub(crate) fn export_progress_overlay(ui: Ui) -> impl IntoView {
 /// A dump names a connection and a database; if the user switches connections
 /// the modal would still be describing the old one, and its Dump button would
 /// launch against a `conn_id` that is no longer selected.
-fn watch_connection(ui: Ui) {
-    let d = ui.dump;
-    let active = ui.conn.active_conn;
+fn watch_connection(d: DumpUi, conn: ConnUi) {
+    let active = conn.active_conn;
     create_effect(move |_| {
         let conn = active.get();
         if d.target

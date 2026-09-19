@@ -14771,12 +14771,47 @@ mod whole_ui_gate {
         // what makes that visible at the call site. The two left are `apply`
         // and the overlay.
         ("ddl_preview.rs", 2),
-        ("dump_view.rs", 9),
+        // `dump_view.rs` is **off the list** — 9 to zero, the same
+        // drivers-take-a-ctx/renderers-take-the-bundle split as `import_view.rs`
+        // beside it. `table_picker` takes `DumpUi`, as `dump_options` and
+        // `table_row` under it already did; `open_dump`, `run_export`,
+        // `run_dump`, `run_files`, `launch_files` and the overlay take
+        // `DumpCtx` — `run_export` among them not because it reads anything
+        // outside the modal but because it *routes* to one of the two
+        // launchers, which do. `watch_connection` takes the two bundles it
+        // watches (`DumpUi`, `ConnUi`) rather than a ctx it would read two
+        // fields of.
+        //
+        // **`DumpCtx` has an `overlay` field a `ui.<field>` census would have
+        // missed**, and that is the entry worth keeping: `launch_files`'
+        // `WouldReplace` arm raises the app-wide confirm, but it does so through
+        // a local alias (`ui_retry.overlay.confirm`), so a scan for `ui.overlay`
+        // came back empty on a function that reaches it. Read the *aliases* too,
+        // or the ctx is built one field short and the compiler is what tells
+        // you.
+        //
+        // `export_progress_overlay` is the grid export's modal sharing this
+        // file, not this modal, and it says so now: `(ExportUi, Rc<dyn Fn()>)`,
+        // neither of which is on `DumpCtx`.
         ("erd_view.rs", 1),
         // `event_editor.rs` is **off the list** — see the note under
         // `routine_editor.rs`, which came off with it.
         ("history_panel.rs", 1),
-        ("import_view.rs", 9),
+        // `import_view.rs` is **off the list** — 9 to zero, and it is the shape
+        // `users_view.rs` prescribed applied to a module where the split was
+        // already visible: **the drivers take a ctx, the renderers take the
+        // bundle.** `mapping_row`, `preview_table`, `issue_list` and
+        // `mapping_step` only read and write `ImportUi`, so they say so; the
+        // four that also reach a fetch, the read-only flag or the schema tree —
+        // `probe`, `run_import`, `source_step` and the overlay — take
+        // `ImportCtx` (`ImportUi`, `ConnUi`, `SchemaUi`, and the probe/run/
+        // cancel closures). A ctx on a function that needs one bundle would be
+        // a widening dressed as a convenience, which is the trap on the other
+        // side of `SchemaTreeCtx`'s.
+        //
+        // `open_import` takes `ImportUi` alone for `open_for_server`'s reason:
+        // a door that only resets the modal's own signals has no business
+        // cloning three `Rc`s to do it.
         ("lib.rs", 6),
         ("modals.rs", 5),
         ("monitor_view.rs", 1),

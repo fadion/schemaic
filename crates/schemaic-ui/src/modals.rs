@@ -108,7 +108,12 @@ pub(crate) fn modal_layer(ui: Ui, modal_up: impl Fn() -> bool + Copy + 'static) 
             let script_open = ui.script.target;
             stack((
                 crate::snippet_edit::snippet_edit_overlay(ui.clone()),
-                import_view::import_overlay(ui.clone()),
+                import_view::import_overlay(import_view::ImportCtx::new(
+                    ui.import,
+                    ui.conn,
+                    ui.schema,
+                    &ui.schema_actions,
+                )),
                 // Export and Import-a-script share one tuple element: this stack
                 // is at Floem's 16-arity `ViewTuple` limit, and the two are the
                 // same journey in opposite directions — both open on a database
@@ -125,7 +130,13 @@ pub(crate) fn modal_layer(ui: Ui, modal_up: impl Fn() -> bool + Copy + 'static) 
                 // layer exactly while one of its own members is open, which is
                 // the same rule the trigger/routine/event group below states.
                 stack((
-                    crate::dump_view::dump_overlay(ui.clone()),
+                    crate::dump_view::dump_overlay(crate::dump_view::DumpCtx::new(
+                        ui.dump,
+                        ui.script,
+                        ui.conn,
+                        ui.overlay,
+                        &ui.schema_actions,
+                    )),
                     crate::script_view::script_overlay(ui.clone()),
                 ))
                 .style(move |s| {
@@ -288,7 +299,7 @@ pub(crate) fn modal_layer(ui: Ui, modal_up: impl Fn() -> bool + Copy + 'static) 
         // own `absolute().inset(0)` gated on `target`, the way `manage_modal`,
         // `plan_overlay` and `find_overlay` do — so it is a loose child that
         // sizes itself, and `ddl_modals_up` no longer speaks for it.
-        crate::dump_view::export_progress_overlay(ui.clone()),
+        crate::dump_view::export_progress_overlay(ui.export, ui.tab_actions.export_cancel.clone()),
         // **The shared confirm, last, above every group.**
         //
         // A confirm is by definition raised *by* something already on screen, so
