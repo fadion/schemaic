@@ -222,7 +222,9 @@ fn create_submenu(
                 CreateKind::Table => {
                     crate::table_designer::open_for_new(&ui, &db, ns.as_deref());
                 }
-                CreateKind::View => crate::view_editor::open_for_new(&ui, &db, ns.as_deref()),
+                CreateKind::View => {
+                    crate::view_editor::open_for_new(ui.conn, ui.ddl, &db, ns.as_deref())
+                }
                 CreateKind::Object(kind) => {
                     crate::object_editor::open_for_new(
                         ui.conn,
@@ -2373,7 +2375,10 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                                     move || {
                                         if is_view {
                                             crate::view_editor::open_for_view(
-                                                &ui,
+                                                ui.conn,
+                                                ui.schema,
+                                                ui.ddl,
+                                                &ui.schema_actions.view_algorithm,
                                                 &db,
                                                 ns.as_deref(),
                                                 &tbl,

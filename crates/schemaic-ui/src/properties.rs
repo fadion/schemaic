@@ -771,7 +771,15 @@ fn footer(
         move || {
             (close)();
             if t.is_view {
-                crate::view_editor::open_for_view(&ui, &t.database, t.schema.as_deref(), &t.table);
+                crate::view_editor::open_for_view(
+                    ui.conn,
+                    ui.schema,
+                    ui.ddl,
+                    &ui.schema_actions.view_algorithm,
+                    &t.database,
+                    t.schema.as_deref(),
+                    &t.table,
+                );
             } else {
                 crate::table_designer::open_for_table(
                     &ui,

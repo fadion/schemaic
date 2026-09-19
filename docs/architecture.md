@@ -12707,6 +12707,27 @@ existing prose was left alone.
     form. Its materialized half is `ddl::is_materialized_view`, the same predicate the menu
     asks to *offer* the refresh: two hand-written copies are two chances for the editor and
     the menu to disagree about one node.
+    **Off `whole_ui_gate`'s list, 6 to zero, and the six were exactly the opening path** — the
+    overlay, the form and the two field helpers had come down a pass earlier. They went the way
+    `routine_editor.rs`, `event_editor.rs` and `object_editor.rs`'s doors went rather than the way
+    the five `…Ctx` modals did: **a door names the fetch it ends in**, so `open_for_view` takes
+    `(ConnUi, SchemaUi, DdlUi, &ViewAlgoFn)` and the `fetch_algorithm` it ends in takes `(DdlUi,
+    &ViewAlgoFn, …)`, while `open_for_new` and `open_blank` take `(ConnUi, DdlUi)`,
+    `open_from_query` that plus the `SchemaUi` `default_schema` asks, and `open_editor` takes
+    `DdlUi` alone. A `ViewCtx` would have been the wrong answer here: these are not one modal's
+    views sharing a body of state, they are four separate entry points into it, and **three of the
+    four want no fetch at all** — a ctx would have handed the `ViewAlgoFn` to every one of them,
+    which is the widening-dressed-as-a-convenience the `import_view.rs` entry already names, in its
+    other form. Nothing about the modal's behaviour moved with it: on MariaDB a view's **Edit view**
+    still opens with its body, check option, SQL security and definer, and the footer still reads
+    *No changes* seconds after opening — which is the state `fetch_algorithm`'s both-sides patch
+    exists to preserve, since patching only the draft makes a view open already-changed. **That
+    check cannot tell a fetch that landed from one that never fired**, though, because both leave
+    the diff clean: MariaDB reports `ALGORITHM` in `information_schema` where MySQL 8 does not, and
+    an `UNDEFINED` one folds to `None` anyway. The round trip itself is MySQL 8's path and is
+    covered by nothing here. The four doors are called from `overlays.rs` (the tree's Edit view and Create ▸
+    View), `properties.rs` (the properties modal's Edit) and `lib.rs`'s `create_view` callback (the
+    editor's *Create view from this query*).
   - `ui/window_chrome.rs` — the client-side window decorations: the caption buttons (minimize /
     maximize-restore / close), the drag strip, and the eight resize zones. Draws what
     `core::window_chrome::Chrome` decides, and contains no `cfg!(target_os = …)` of its own.
@@ -15038,9 +15059,10 @@ existing prose was left alone.
     opens something else; this one has no such path — `fetch_algorithm` is reached from
     `open_for_view`, not from the modal — so the draft, the target, the body's row cap
     (`view_rows`, read by `form`) and the hand-off to `ddl_preview::open_preview` are the whole of
-    what it touches, it takes `DdlUi`, and `modals.rs` passes `ui.ddl`. That is what leaves
+    what it touches, it takes `DdlUi`, and `modals.rs` passes `ui.ddl`. That left
     `view_editor.rs` at **6**: exactly the six opening functions, `open_editor`, `open_for_view`,
-    `fetch_algorithm`, `open_for_new`, `open_from_query` and `open_blank`.
+    `fetch_algorithm`, `open_for_new`, `open_from_query` and `open_blank` — all six of which have
+    since come down too, in the entry after `script_view.rs`'s below.
     `database_editor_overlay` went the same way one step later, and **what had been holding it was
     a helper, not its own shape** — which is the more useful half of the lesson. Its direct reads
     were only `ui.ddl` and `ui.overlay`, the two-bundle shape `object_editor`'s `form`/`domain_form`
@@ -15214,6 +15236,22 @@ existing prose was left alone.
     directions. Nothing about the modal's behaviour moved with it — `run_script` still asks `policy`
     and `ScriptRequest::approved` in the same synchronous step as `accept_launch`, and the exit
     path's `stop` is `ctx.cancel`, the same closure `ui.schema_actions.script_cancel` was.
+    **`view_editor.rs` came off after all five of those, 6 to zero, and it is the case where a ctx
+    would have been wrong** — worth writing down precisely because the run had just established the
+    ctx pattern five times over. Its six were the opening path and nothing else (the file's own
+    `BUDGET` comment said so), so they went the way `routine_editor.rs` and its two siblings' doors
+    went: **a door names the fetch it ends in**. `open_for_view` takes `(ConnUi, SchemaUi, DdlUi,
+    &ViewAlgoFn)` and `fetch_algorithm(DdlUi, &ViewAlgoFn, …)` — the one function in the module that
+    reaches the server — while `open_for_new` and `open_blank` take `(ConnUi, DdlUi)`,
+    `open_from_query` that plus the `SchemaUi` `default_schema` asks, and `open_editor` takes
+    `DdlUi`. A `ViewCtx` would have handed the `ViewAlgoFn` to all four doors: these are not one
+    modal's views sharing a body of state, they are four separate entry points into it, and three of
+    the four want no fetch at all — the "widening dressed as a convenience" `import_view.rs` already
+    names, in its other form. **So a ctx is for a modal's *body*, where the same bundles are wanted
+    repeatedly; the *doors* into a modal name what each one reaches, because they differ from each
+    other.** Its call sites are `overlays.rs` (the tree's Edit view and Create ▸ View),
+    `properties.rs` (the properties modal's Edit) and `lib.rs`'s `create_view` callback (the
+    editor's *Create view from this query*).
     **Three named bundles can still be the narrower signature, and can say something the root one
     hid.** `preview_change` takes `(ConnUi, DdlUi)` and `preview_proposal`
     `(ConnUi, SchemaUi, DdlUi)`; the count looks like a step backwards until you read what `conn`
@@ -15222,19 +15260,20 @@ existing prose was left alone.
     site rather than only in the prose two paragraphs up. The rule is the signature saying what the
     function depends on, not the parameter count.
     **The live number is the sum of `BUDGET`, not the "roughly 140" above**, which describes the
-    state the gate found and by design never moves. That sum went **206 → 70** over this run:
+    state the gate found and by design never moves. That sum went **206 → 64** over this run:
     `table_designer.rs` 29 → 26 → 10 → 4, `object_editor.rs` 14 → 5 → 4 → **0**,
     `routine_editor.rs` 12 → 6 → **0**, `event_editor.rs` 11 → 5 → **0**,
-    `trigger_editor.rs` 11 → 8 → 7 → **0**, `view_editor.rs` 10 → 6, `database_editor.rs` 7 → 3,
+    `trigger_editor.rs` 11 → 8 → 7 → **0**, `view_editor.rs` 10 → 6 → **0**,
+    `database_editor.rs` 7 → 3,
     `ddl_preview.rs` 6 → 4 → 2, `overlays.rs` 15 → 13, `account_editor.rs` 6 → **0**,
     `schema_tree.rs` 6 → 3, `users_view.rs` 9 → 8 → 5 → **0**, `import_view.rs` 9 → **0**,
     `dump_view.rs` 9 → **0**, `compare_view.rs` 8 → **0**, `script_view.rs` 6 → **0**.
     Every step is recorded against its own entry with what it narrowed *to*,
     so read the list for where a file stands rather than inferring it from a paragraph — and a file
     that reaches zero leaves the list altogether, which is the one way an entry is ever removed and
-    the point at which it may not take a `Ui` again at all. **Ten files have left it** — the three DDL-object editors, then
+    the point at which it may not take a `Ui` again at all. **Eleven files have left it** — the three DDL-object editors, then
     `trigger_editor.rs`, `account_editor.rs`, `users_view.rs`, `import_view.rs`, `dump_view.rs`,
-    `compare_view.rs` and `script_view.rs` — and each left a comment behind where it sat,
+    `compare_view.rs`, `script_view.rs` and `view_editor.rs` — and each left a comment behind where it sat,
     because a name absent from `BUDGET` says nothing on its own about whether it was ever on it.
     It is a **budget, not a ban**, because narrowing 140 signatures is a campaign and a gate that
     fails on the day it lands teaches nothing: `BUDGET` holds what each file declares *now* and the
@@ -19187,6 +19226,59 @@ Re-introducing the anti-patterns these guard against is a regression:
   it for that, so when the answer to "what moves?" is *nothing*, ask what the duplication was
   standing in for before closing the file — here it was one reporting door
   (`schemaic_ui::load_diagram_layouts`) and a gate that can now name its offender.
+  **The run paths are the eighth, and they are the sixth's answer for a different reason: there is
+  nothing left to push down.** They stood in `TODO.md` as one of two unsurveyed candidates; they are
+  surveyed now and the answer is no. Roughly 900 lines across three non-contiguous regions of
+  `main.rs` — `run_query_core`, `run`, `apply_view`, `run_all` and `cancel` in one, `guard_policy`,
+  `run_guard`, `run_moved_on`, `gated_run`/`gated_run_all`, `guarded_run`/`guarded_run_all` and
+  `run_anyway` in another — but every decision behind those closures is *already* a tested pure
+  function or a `schemaic-core` type: `GuardPolicy::of` and `sql::run_verdict`,
+  `params::prepare_run`, and the module-scope free functions `health_check_lets_through`,
+  `check_outcome`, `run_result` and `plan_refusal_text`. The guard block is a thin `match` over
+  `RunVerdict`, and its own comment says it — *"This closure gathers signals; it does not decide."*
+  What is left is orchestration to relocate, not a decision to lift. It also reads `active`, `tabs`,
+  `connections`/`active_conn`, `row_limit`, `statement_timeout`, `confirm_writes` and the shared
+  `db_for`/`session_for` closures, each with 40+ other call sites across `app_view`, which is the
+  `ui_state` shape again: a module that takes a giant parameter list or re-invents the struct.
+  **The third reason is the one to state most plainly**: the invariant genuinely worth protecting
+  here is already owned, by a source-scanning test *inside* `main.rs` —
+  `the_unguarded_run_has_only_its_three_stated_callers` reads `main.rs`'s own text and asserts the
+  exact list of raw `run(...)` call sites. Moving `run`/`run_query_core`/`run_all` out would
+  silently zero that gate's count unless the test moved with them and was rewritten to read the new
+  file, which is precisely the *gate left pointing at the old file* failure the third entry above
+  already records — and the subject here is the **write-guard invariant**, the one whose whole
+  history is a `return` going missing.
+  **The connection lifecycle is the ninth, and its no is the stronger of the two.** The body is
+  `persist_conns`, `toggle_read_only`, `use_conn`, `switch_conn`, `select_conn`/`new_conn`/
+  `duplicate_conn`/`test_conn`, `save_conn`, `delete_conn_now` and `delete_conn`, and it is neither
+  store-shaped nor decision-shaped. `delete_conn_now` is the app's one *coordinator* over every
+  persisted store: by direct write or by a per-store `clear_conn`/save it touches on the order of
+  two dozen signals — `tabs`, `tokens`, `tunnels`, `recently_closed`, `last_tab`, the four AI
+  signals, `saved_chats`, `connections`, `active_conn`, `draft`, `conn_status`, `health_failures`,
+  `search_history`, `db_colors`, `table_colors`, `db_favorites`, `activity_intervals`,
+  `hidden_db_rules`, `expanded_rules`, `formats` — plus the already-delegated `history.clear_conn`
+  and `snippet_store.clear_conn` and a dozen already-built closures. That is a *worse* instance of
+  the shape that stopped `ui_state`: not twenty-nine signals feeding one struct but around
+  twenty-five signals and a dozen closures captured by one body, and its breadth is the feature
+  rather than an accident — it is why the delete can erase every store in the right order. A
+  **partial** cut is worse again, because it splits the body's load-bearing invariant across two
+  files: `the_active_connection_is_moved_in_exactly_one_place` asserts exactly one `active_conn.set(`
+  in the whole file, in `use_conn`, and that `use_conn` has at least three callers — and those
+  callers are `switch_conn` plus *two sites inside `delete_conn_now`*. So "take switch, select, new,
+  duplicate and test, leave delete and save" is exactly the comes-apart-in-half failure the fourth
+  entry above records. And the eighth's file-anchored-gate problem applies here on **two**
+  invariants at once: `deleting_a_connection_erases_every_store_it_was_keyed_into` locates
+  `delete_conn_now`'s literal text in `main.rs`, and the `use_conn` gate reads
+  `include_str!("main.rs")`.
+  **The two are not cleanly separable from each other, either.** The connection-health gate
+  `check_conn`/`check_conn_then`/`with_conn`/`with_conn_else` sits under both the run guard and
+  `ConnActions::recheck_conn`, and is used directly by `commit_edits`, `add_tab`, `ai_send` and
+  `run_plan` — none of which belong to either candidate — so any cut touching it would have to leave
+  it behind or lift it to a third module neither body owns.
+  **With those two refused, the `app_view` splitting campaign is finished.** The store-shaped seam
+  was the whole of it; what remains is orchestration over widely-shared signals, guarded by gates
+  anchored to `main.rs`'s own source text. Read this as *surveyed, refused, here is why* rather than
+  as a list nobody has got to yet.
 
 ## UI conventions
 

@@ -40,8 +40,8 @@ use crate::widgets::{
     modal_title_owned, modal_w, panel_style,
 };
 use crate::{
-    DdlPreview, DdlUi, FieldCfg, Ui, ViewAlgoDoneFn, ViewAlgoRequest, ViewTarget, ddl_preview,
-    edit_field, object_location, theme,
+    ConnUi, DdlPreview, DdlUi, FieldCfg, SchemaUi, ViewAlgoDoneFn, ViewAlgoFn, ViewAlgoRequest,
+    ViewTarget, ddl_preview, edit_field, object_location, theme,
 };
 
 fn panel_w() -> f64 {
@@ -61,8 +61,7 @@ const NEW_BODY: &str = "SELECT * FROM ";
 
 // ── opening ──────────────────────────────────────────────────────────────────
 
-fn open_editor(ui: &Ui, target: ViewTarget, draft: ViewDraft) {
-    let d = ui.ddl;
+fn open_editor(d: DdlUi, target: ViewTarget, draft: ViewDraft) {
     // A new editing session — see `DdlUi::session`.
     d.session.update(|g| *g += 1);
     d.view_draft.set(draft);
@@ -79,14 +78,22 @@ fn open_editor(ui: &Ui, target: ViewTarget, draft: ViewDraft) {
 
 /// Open the editor on an existing view. A base table isn't one, and a view whose
 /// schema hasn't loaded has no body to edit.
-pub(crate) fn open_for_view(ui: &Ui, database: &str, schema: Option<&str>, view: &str) {
-    let Some(info) = loaded_table(ui.schema, database, schema, view).filter(|t| t.is_view) else {
+pub(crate) fn open_for_view(
+    conn: ConnUi,
+    schema_ui: SchemaUi,
+    d: DdlUi,
+    algorithm: &ViewAlgoFn,
+    database: &str,
+    schema: Option<&str>,
+    view: &str,
+) {
+    let Some(info) = loaded_table(schema_ui, database, schema, view).filter(|t| t.is_view) else {
         return;
     };
     let Some(draft) = ViewDraft::from_table(&info) else {
         return;
     };
-    let ctx = edit_ctx(ui.conn);
+    let ctx = edit_ctx(conn);
     // Three of this editor's four launchers carry a read-only term; the fourth
     // is the schema tree's Edit view, which shares its `.disabled` with Edit
     // table and had never had one. The refusal belongs here either way — see
@@ -104,7 +111,7 @@ pub(crate) fn open_for_view(ui: &Ui, database: &str, schema: Option<&str>, view:
             .is_some_and(|o| o.algorithm.is_none());
     let view_name = info.name.clone();
     open_editor(
-        ui,
+        d,
         ViewTarget {
             conn_id: ctx.conn_id,
             database: database.to_string(),
@@ -116,7 +123,7 @@ pub(crate) fn open_for_view(ui: &Ui, database: &str, schema: Option<&str>, view:
         draft,
     );
     if needs_algorithm {
-        fetch_algorithm(ui, ctx.conn_id, database.to_string(), view_name);
+        fetch_algorithm(d, algorithm, ctx.conn_id, database.to_string(), view_name);
     }
 }
 
@@ -129,8 +136,7 @@ pub(crate) fn open_for_view(ui: &Ui, database: &str, schema: Option<&str>, view:
 /// The draft is left alone if the user has already chosen an algorithm — the
 /// round-trip lands in milliseconds, but "unlikely" isn't a reason to overwrite
 /// what somebody typed.
-fn fetch_algorithm(ui: &Ui, conn_id: u64, database: String, view: String) {
-    let d = ui.ddl;
+fn fetch_algorithm(d: DdlUi, algorithm: &ViewAlgoFn, conn_id: u64, database: String, view: String) {
     let session = d.session.get_untracked();
     let done: ViewAlgoDoneFn = Rc::new(move |algo: Option<String>| {
         // The modal can be closed, or reopened on another view, before this
@@ -155,7 +161,7 @@ fn fetch_algorithm(ui: &Ui, conn_id: u64, database: String, view: String) {
             }
         });
     });
-    (ui.schema_actions.view_algorithm)(
+    (algorithm)(
         ViewAlgoRequest {
             conn_id,
             database,
@@ -166,8 +172,8 @@ fn fetch_algorithm(ui: &Ui, conn_id: u64, database: String, view: String) {
 }
 
 /// Open the editor on a blank draft — Create view.
-pub(crate) fn open_for_new(ui: &Ui, database: &str, schema: Option<&str>) {
-    open_blank(ui, database, schema, NEW_BODY)
+pub(crate) fn open_for_new(conn: ConnUi, d: DdlUi, database: &str, schema: Option<&str>) {
+    open_blank(conn, d, database, schema, NEW_BODY)
 }
 
 /// Create a view **out of the query you're looking at** — the editor's
@@ -177,13 +183,19 @@ pub(crate) fn open_for_new(ui: &Ui, database: &str, schema: Option<&str>) {
 ///
 /// The namespace comes from [`crate::table_designer::default_schema`], the same answer
 /// the tree's own Create view gives on a database node.
-pub(crate) fn open_from_query(ui: &Ui, database: &str, select: &str) {
-    let schema = crate::table_designer::default_schema(ui.conn, ui.schema, database);
-    open_blank(ui, database, schema.as_deref(), select);
+pub(crate) fn open_from_query(
+    conn: ConnUi,
+    schema_ui: SchemaUi,
+    d: DdlUi,
+    database: &str,
+    select: &str,
+) {
+    let schema = crate::table_designer::default_schema(conn, schema_ui, database);
+    open_blank(conn, d, database, schema.as_deref(), select);
 }
 
-fn open_blank(ui: &Ui, database: &str, schema: Option<&str>, body: &str) {
-    let ctx = edit_ctx(ui.conn);
+fn open_blank(conn: ConnUi, d: DdlUi, database: &str, schema: Option<&str>, body: &str) {
+    let ctx = edit_ctx(conn);
     // Both blank doors at once — Create view and "Create view from this query",
     // the second of which is an editor context-menu entry rather than a tree
     // one and so has no dimmed sibling to speak for it.
@@ -193,7 +205,7 @@ fn open_blank(ui: &Ui, database: &str, schema: Option<&str>, body: &str) {
     let mut draft = ViewDraft::blank("new_view", schema.map(str::to_string));
     draft.select = body.to_string();
     open_editor(
-        ui,
+        d,
         ViewTarget {
             conn_id: ctx.conn_id,
             database: database.to_string(),

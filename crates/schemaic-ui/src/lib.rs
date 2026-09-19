@@ -8516,7 +8516,7 @@ fn center(ui: Ui) -> impl IntoView {
         let ui = ui.clone();
         Rc::new(move |select: String| {
             if let Some(db) = active_db.get_untracked() {
-                view_editor::open_from_query(&ui, &db, &select);
+                view_editor::open_from_query(ui.conn, ui.schema, ui.ddl, &db, &select);
             }
         })
     };
@@ -14973,15 +14973,25 @@ mod whole_ui_gate {
         // `open_for_server` stayed off it: it is the one function here that
         // touches neither fetch, so it takes `(ConnUi, OverlayUi)` and clones
         // no `Rc` to write five signals.
-        // 10 → 6: `bound_field` and `bound_choice` take the
+        // `view_editor.rs` is **off the list** — 10 → 6 → 0. The first half
+        // was the modal: `bound_field` and `bound_choice` take the
         // `RwSignal<ViewDraft>` they write, `form` takes `DdlUi`, and — unlike
-        // every sibling editor's — **the overlay takes `DdlUi` too**. Nothing
-        // under it is an opening path: `fetch_algorithm` is reached from
-        // `open_for_view`, not from the modal, so the draft, the target, the
-        // body's row cap and the preview hand-off are the whole of what it
-        // touches. The six left are exactly the opening path.
-        ("view_editor.rs", 6),
-        // `MenuFlags::of`, which gathers a flag out of six child bundles and so
+        // every sibling editor's — the overlay takes `DdlUi` too, because
+        // nothing under it is an opening path.
+        //
+        // The six that were left were "exactly the opening path", and they went
+        // the way `routine_editor.rs` and its two siblings did rather than the
+        // way the modals did: **a door names the fetch it ends in**, so
+        // `open_for_view` takes `(ConnUi, SchemaUi, DdlUi, &ViewAlgoFn)` and
+        // `fetch_algorithm` takes `(DdlUi, &ViewAlgoFn)`. A `ViewCtx` would
+        // have been the wrong answer here and the contrast is the point: these
+        // are not one modal's views sharing a body of state, they are four
+        // separate entry points into it, and three of the four want no fetch at
+        // all — `open_for_new` and `open_blank` take `(ConnUi, DdlUi)`,
+        // `open_from_query` that plus `SchemaUi`. A ctx would have handed the
+        // `ViewAlgoFn` to every one of them.
+        //
+        // 1: `MenuFlags::of`, which gathers a flag out of six child bundles and so
         // genuinely needs the root one — the case the doc above calls taking
         // "the child bundle … which is what those bundles are for", six times
         // over. It was invisible until the counter learned `&crate::Ui`.
