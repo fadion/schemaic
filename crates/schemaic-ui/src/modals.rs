@@ -217,7 +217,12 @@ pub(crate) fn modal_layer(ui: Ui, modal_up: impl Fn() -> bool + Copy + 'static) 
             monitor_overlay(ui.clone()),
             erd_overlay(ui.clone()),
             properties::properties_overlay(ui.clone()),
-            users_view::users_overlay(ui.clone()),
+            users_view::users_overlay(users_view::UsersCtx::new(
+                ui.conn,
+                ui.ddl,
+                ui.overlay,
+                &ui.schema_actions,
+            )),
             // The binary-cell panel joins this group on the merits: like the
             // properties modal beside it, it is a question asked *about the
             // result on screen* rather than about the schema tree, and it is

@@ -47,8 +47,8 @@ use crate::widgets::{
     modal_w, panel_style,
 };
 use crate::{
-    ConnUi, DdlUi, FieldCfg, GrantsState, OverlayUi, Ui, UsersState, UsersTarget, edit_field,
-    icons, theme,
+    ConnUi, DdlUi, FieldCfg, GrantsState, OverlayUi, UsersState, UsersTarget, edit_field, icons,
+    theme,
 };
 
 /// Modal width. The grant pane holds SQL, and a MySQL grant on a namespaced
@@ -94,6 +94,62 @@ fn label_w() -> f64 {
     theme::scaled(124.0)
 }
 
+// ── what the browser reads ───────────────────────────────────────────────────
+
+/// Everything this modal reaches out of the root bundle, gathered once at the
+/// one place that holds it.
+///
+/// **Five reads, named at the call site.** `whole_ui_gate`'s rule is that a
+/// function names what it reads, and the four views below could not: each wants
+/// `OverlayUi` *and* one of the two fetches, three of them want `ConnUi` and
+/// `DdlUi` as well, so naming them one by one is four-to-five parameters on
+/// every signature and a fifth copy of the same list. This is
+/// `schema_tree::SchemaTreeCtx`'s shape for the same reason — and unlike that
+/// one it holds no `Ui`, so the browser depends on the bundles it uses rather
+/// than on the bundle that owns them.
+///
+/// Cheap to clone: three `Copy` bundles and two `Rc`s.
+#[derive(Clone)]
+pub(crate) struct UsersCtx {
+    /// The connection registry — the read-only flag the write gate turns on,
+    /// and the dialect the two doors below read through `edit_ctx`.
+    conn: ConnUi,
+    /// The account form and the DDL preview: what **+ New account**, **Grant**
+    /// and **Drop** raise, and what this modal hides itself behind while one of
+    /// them is up.
+    ddl: DdlUi,
+    /// The browser's own five signals — target, list, filter, selection,
+    /// grants.
+    overlay: OverlayUi,
+    /// Fetch the server's accounts. Kicked off by the modal on a new target,
+    /// and re-run by **Refresh**.
+    principals: Rc<dyn Fn(UsersTarget)>,
+    /// Fetch one account's privileges — what picking a row does.
+    grants: Rc<dyn Fn(UsersTarget, Principal)>,
+}
+
+impl UsersCtx {
+    /// Gather the browser's reads where the root bundle is in reach.
+    ///
+    /// Takes the three bundles and the action set rather than `&Ui`, so the
+    /// list of what this modal touches is written at its one call site instead
+    /// of hidden inside a constructor that could quietly grow.
+    pub(crate) fn new(
+        conn: ConnUi,
+        ddl: DdlUi,
+        overlay: OverlayUi,
+        actions: &crate::SchemaActions,
+    ) -> Self {
+        Self {
+            conn,
+            ddl,
+            overlay,
+            principals: actions.principals.clone(),
+            grants: actions.grants.clone(),
+        }
+    }
+}
+
 // ── opening ──────────────────────────────────────────────────────────────────
 
 /// Open the browser for one server.
@@ -107,25 +163,34 @@ fn label_w() -> f64 {
 /// `None` (no database selected) still answers for roles and for the
 /// cluster-wide half. There is no read-only refusal at this door, unlike the
 /// schema editors': browsing accounts writes nothing.
-pub(crate) fn open_for_server(ui: &Ui, conn_id: u64, database: Option<&str>) {
-    let ctx = crate::table_designer::edit_ctx(ui.conn);
-    ui.overlay.users_state.set(UsersState::Loading);
-    ui.overlay.users_selected.set(None);
-    ui.overlay.users_grants.set(GrantsState::Idle);
-    ui.overlay.users_filter.set(String::new());
-    ui.overlay.users.set(Some(UsersTarget {
+///
+/// Takes the two bundles rather than [`UsersCtx`] — this is the one place in the
+/// module that touches neither fetch, and a door that only writes five signals
+/// should not be cloning two `Rc`s to do it.
+pub(crate) fn open_for_server(
+    conn: ConnUi,
+    overlay: OverlayUi,
+    conn_id: u64,
+    database: Option<&str>,
+) {
+    let ctx = crate::table_designer::edit_ctx(conn);
+    overlay.users_state.set(UsersState::Loading);
+    overlay.users_selected.set(None);
+    overlay.users_grants.set(GrantsState::Idle);
+    overlay.users_filter.set(String::new());
+    overlay.users.set(Some(UsersTarget {
         conn_id,
         database: database.map(str::to_string),
         dialect: ctx.dialect,
     }));
 }
 
-pub(crate) fn users_overlay(ui: Ui) -> impl IntoView {
-    let target = ui.overlay.users;
-    let state = ui.overlay.users_state;
-    let filter = ui.overlay.users_filter;
-    let selected = ui.overlay.users_selected;
-    let grants = ui.overlay.users_grants;
+pub(crate) fn users_overlay(ctx: UsersCtx) -> impl IntoView {
+    let target = ctx.overlay.users;
+    let state = ctx.overlay.users_state;
+    let filter = ctx.overlay.users_filter;
+    let selected = ctx.overlay.users_selected;
+    let grants = ctx.overlay.users_grants;
 
     // **Nothing renders while an account form or the DDL preview is up.** Those
     // are raised *from here* and are painted in an earlier group of the modal
@@ -133,9 +198,9 @@ pub(crate) fn users_overlay(ui: Ui) -> impl IntoView {
     // very form it opened. This is the pairing every editor in the crate already
     // has with the preview, one level up: Cancel over there returns here with
     // the list intact.
-    let account_open = ui.ddl.account;
-    let grant_open = ui.ddl.grant;
-    let preview_open = ui.ddl.preview;
+    let account_open = ctx.ddl.account;
+    let grant_open = ctx.ddl.grant;
+    let preview_open = ctx.ddl.preview;
     let hidden = move || {
         account_open.get().is_some() || grant_open.get().is_some() || preview_open.get().is_some()
     };
@@ -150,7 +215,7 @@ pub(crate) fn users_overlay(ui: Ui) -> impl IntoView {
     // per opening: the closure reads no signal", which was true of the closure
     // and not of the scope it was created in.
     {
-        let fetch = ui.schema_actions.principals.clone();
+        let fetch = ctx.principals.clone();
         create_effect(move |prev: Option<Option<UsersTarget>>| {
             let t = target.get();
             // `create_effect` has no equality check of its own, so the compare
@@ -177,7 +242,7 @@ pub(crate) fn users_overlay(ui: Ui) -> impl IntoView {
     // remaining live-connection term disagree with its three captured ones the
     // moment the tree moved, which is the divergence `UsersTarget` exists to
     // prevent.
-    let key_conns = ui.conn.connections;
+    let key_conns = ctx.conn.connections;
     dyn_container(
         move || {
             let t = target.get();
@@ -188,7 +253,7 @@ pub(crate) fn users_overlay(ui: Ui) -> impl IntoView {
             let Some(t) = open.filter(|_| !hidden) else {
                 return empty().into_any();
             };
-            let ui = ui.clone();
+            let ctx = ctx.clone();
             let close: Rc<dyn Fn()> = Rc::new(move || {
                 target.set(None);
                 state.set(UsersState::Loading);
@@ -207,13 +272,13 @@ pub(crate) fn users_overlay(ui: Ui) -> impl IntoView {
             // `+ New account` live while `Privileges`/`Drop` are dimmed, with
             // nothing to say which is right — and it re-walks the connection
             // list for an answer that cannot differ between them.
-            let gate = write_gate(ui.conn, &t);
+            let gate = write_gate(ctx.conn, &t);
             let right = v_stack((
-                detail_pane(&ui, &t, gate, ring.clone()),
-                footer(&ui, &t, state, filter, grants, close.clone(), ring.clone()),
+                detail_pane(&ctx, &t, gate, ring.clone()),
+                footer(&ctx, &t, state, filter, grants, close.clone(), ring.clone()),
             ))
             .style(|s| s.flex_grow(1.0_f32).min_width(0.0).height_full().flex_col());
-            let body = h_stack((list_pane(&ui, &t, gate, ring.clone()), right)).style(|s| {
+            let body = h_stack((list_pane(&ctx, &t, gate, ring.clone()), right)).style(|s| {
                 s.width_full()
                     .flex_grow(1.0_f32)
                     .min_height(0.0)
@@ -257,12 +322,12 @@ pub(crate) fn users_overlay(ui: Ui) -> impl IntoView {
 
 // ── the list ─────────────────────────────────────────────────────────────────
 
-fn list_pane(ui: &Ui, target: &UsersTarget, gate: WriteGate, ring: FocusRing) -> AnyView {
-    let state = ui.overlay.users_state;
-    let filter = ui.overlay.users_filter;
-    let selected = ui.overlay.users_selected;
-    let grants = ui.overlay.users_grants;
-    let fetch = ui.schema_actions.grants.clone();
+fn list_pane(ctx: &UsersCtx, target: &UsersTarget, gate: WriteGate, ring: FocusRing) -> AnyView {
+    let state = ctx.overlay.users_state;
+    let filter = ctx.overlay.users_filter;
+    let selected = ctx.overlay.users_selected;
+    let grants = ctx.overlay.users_grants;
+    let fetch = ctx.grants.clone();
     let row_target = target.clone();
 
     let field = container(
@@ -386,7 +451,7 @@ fn list_pane(ui: &Ui, target: &UsersTarget, gate: WriteGate, ring: FocusRing) ->
                 .min_height(0.0)
                 .margin_top(theme::scaled(10.0))
         })),
-        new_account_row(ui.conn, ui.ddl, target, gate, ring),
+        new_account_row(ctx.conn, ctx.ddl, target, gate, ring),
     ))
     .style(|s| {
         // **Full height, and nothing cuts across it.** The footer used to span
@@ -510,12 +575,12 @@ fn account_row(
 
 // ── the detail pane ──────────────────────────────────────────────────────────
 
-fn detail_pane(ui: &Ui, target: &UsersTarget, gate: WriteGate, ring: FocusRing) -> AnyView {
-    let selected = ui.overlay.users_selected;
-    let grants = ui.overlay.users_grants;
+fn detail_pane(ctx: &UsersCtx, target: &UsersTarget, gate: WriteGate, ring: FocusRing) -> AnyView {
+    let selected = ctx.overlay.users_selected;
+    let grants = ctx.overlay.users_grants;
     // The target's, not the active connection's — see [`UsersTarget::dialect`].
     let dialect = target.dialect;
-    let ui = ui.clone();
+    let ctx = ctx.clone();
     let target = target.clone();
 
     let body = dyn_container(
@@ -533,9 +598,9 @@ fn detail_pane(ui: &Ui, target: &UsersTarget, gate: WriteGate, ring: FocusRing) 
                 // and the attributes — the trap `properties::stats_body` states.
                 let mut sections: Vec<AnyView> = vec![heading(&p)];
                 sections.extend(actions_row(
-                    ui.conn,
-                    ui.ddl,
-                    ui.overlay,
+                    ctx.conn,
+                    ctx.ddl,
+                    ctx.overlay,
                     &target,
                     gate,
                     &p,
@@ -1056,7 +1121,7 @@ fn note(icon: &'static str, color: fn() -> floem::peniko::Color, message: String
 
 /// The count on the left; Refresh, Copy and Close on the right.
 fn footer(
-    ui: &Ui,
+    ctx: &UsersCtx,
     target: &UsersTarget,
     state: RwSignal<UsersState>,
     filter: RwSignal<String>,
@@ -1069,9 +1134,9 @@ fn footer(
     // — a `DROP USER` applied from another client, or a fetch whose answer lost
     // a race — could only be corrected by closing the browser and reopening it.
     let refresh = {
-        let fetch = ui.schema_actions.principals.clone();
+        let fetch = ctx.principals.clone();
         let t = target.clone();
-        let selected = ui.overlay.users_selected;
+        let selected = ctx.overlay.users_selected;
         move || {
             // **The selection goes back to nothing**, because the account it
             // names may be the very one this refresh exists to notice is gone.

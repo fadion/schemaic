@@ -930,7 +930,8 @@ fn blank_space_menu(ui: &Ui) -> Vec<widgets::MenuEntry> {
             // PostgreSQL's schema and table privileges can be read from — the
             // same argument the gear's entry makes.
             BlankKind::Users => crate::users_view::open_for_server(
-                &ui,
+                ui.conn,
+                ui.overlay,
                 ui.conn.active_conn.get_untracked(),
                 ui.tabs_ui.active_db.get_untracked().as_deref(),
             ),

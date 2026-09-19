@@ -1362,7 +1362,8 @@ pub(crate) fn schema_settings_overlay(ui: Ui) -> impl IntoView {
                             GearKind::Users => {
                                 let database = ui.tabs_ui.active_db.get_untracked();
                                 crate::users_view::open_for_server(
-                                    &ui,
+                                    ui.conn,
+                                    ui.overlay,
                                     ui.conn.active_conn.get_untracked(),
                                     database.as_deref(),
                                 );

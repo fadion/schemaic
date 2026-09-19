@@ -14883,16 +14883,25 @@ mod whole_ui_gate {
         // rule's own prescription and was the right shape anyway — the decision
         // is `connection::read_only_of` over a list.
         //
-        // 8 → 5: the three functions the `account_editor` narrowing had left
-        // holding a bundle for nothing — `write_gate` takes `ConnUi`,
-        // `new_account_row` `(ConnUi, DdlUi)` and `actions_row`
-        // `(ConnUi, DdlUi, OverlayUi)`, which is Grant, Reset and Drop and
-        // exactly what the three doors below them now name. The five left are
-        // the modal root, its two panes, the footer and `open_for_server`, and
-        // those are a different shape: each reaches `OverlayUi` *and* an action
-        // out of `schema_actions`, so the next step there is a browser-local
-        // context the way `schema_tree` has one, not another parameter each.
-        ("users_view.rs", 5),
+        // `users_view.rs` is **off the list** — 9 to zero, and the last five
+        // went the way the entry here had predicted: the modal root, its two
+        // panes and the footer each wanted `OverlayUi` *and* an action out of
+        // `schema_actions`, three of them `ConnUi` and `DdlUi` besides, so they
+        // take a browser-local `UsersCtx` the way `schema_tree`'s rows take a
+        // `SchemaTreeCtx`.
+        //
+        // **The difference from `SchemaTreeCtx` is the part worth copying.**
+        // That struct carries a `Ui` field, which is why its file stops at 3
+        // rather than 0; `UsersCtx` holds the three bundles and the two fetches
+        // and no root bundle at all, so it is built by naming them —
+        // `UsersCtx::new(ui.conn, ui.ddl, ui.overlay, &ui.schema_actions)` at
+        // the one call site in `modals.rs` — rather than by a constructor that
+        // takes `&Ui` and can quietly grow. A context struct is only a
+        // narrowing if it is narrower than what it replaced.
+        //
+        // `open_for_server` stayed off it: it is the one function here that
+        // touches neither fetch, so it takes `(ConnUi, OverlayUi)` and clones
+        // no `Rc` to write five signals.
         // 10 → 6: `bound_field` and `bound_choice` take the
         // `RwSignal<ViewDraft>` they write, `form` takes `DdlUi`, and — unlike
         // every sibling editor's — **the overlay takes `DdlUi` too**. Nothing

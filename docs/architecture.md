@@ -12001,6 +12001,14 @@ existing prose was left alone.
     actions are raised from — the forms themselves are `account_editor.rs`. Mounted in the
     workspace group beside `properties_overlay`/`erd_overlay`/`monitor_overlay` and counted by
     `workspace_modals_up`.
+    **Everything it reads out of the root bundle is one struct, `UsersCtx`, and that struct holds no
+    `Ui`.** The modal root, both panes and the footer take it: `ConnUi`, `DdlUi` and `OverlayUi` —
+    three `Copy` bundles — plus the two fetch closures (`principals`, `grants`) as `Rc`s, which is
+    the whole of what the browser reaches for. It is built by naming those reads at its one call
+    site, `UsersCtx::new(ui.conn, ui.ddl, ui.overlay, &ui.schema_actions)` in `modals.rs`, rather
+    than by a constructor taking `&Ui`; that is what took this file off `whole_ui_gate`'s list
+    entirely, and `lib.rs` has why a context struct holding the root bundle would not have.
+    `open_for_server` is deliberately *not* on it — see below.
     **It renders nothing while one of its own forms or the DDL preview is up.** Its `dyn_container`
     is keyed on `(target, hidden, target_read_only)`, where `hidden` reads
     `ddl.account`/`ddl.grant`/`ddl.preview`,
@@ -12065,7 +12073,11 @@ existing prose was left alone.
     no saved connection (`ctx.exists`), and **dimmed on a down connection but not on a read-only
     one**: browsing accounts writes nothing, so the read-only refusal that guards `Create database`
     would be answering a question this action does not ask, while a connection that cannot be reached
-    would open the browser onto a fetch that fails. `open_for_server` is the one door, and it resets
+    would open the browser onto a fetch that fails. `open_for_server` is the one door; it takes
+    `(ConnUi, OverlayUi, conn_id, database)` rather than the `UsersCtx` its neighbours take, being
+    the only function here that touches neither fetch and so having no reason to clone two `Rc`s to
+    write five signals — its two call sites (`overlays.rs`'s gear entry, `schema_tree.rs`'s
+    blank-space menu) pass `ui.conn, ui.overlay`. It resets
     every signal it reads on the way in rather than on close, so a second opening cannot flash the
     previous server's accounts while the new list is in flight; the database it is given is the
     active tab's, because that is the one PostgreSQL's schema and table privileges can be read from.
@@ -15049,11 +15061,25 @@ existing prose was left alone.
     the three doors under them now name. Read that as the second half of the same step rather than
     a separate pass: a caller cannot be narrower than what it calls, so every door that comes down
     leaves its callers narrowable and *nothing points that out* — the ratchet is satisfied by a
-    file that stands still. **The five left in `users_view.rs` are a different shape and want a
-    different answer**: the modal root, its two panes, the footer and `open_for_server` each reach
-    `OverlayUi` *and* an action out of `schema_actions`, on top of `target`, `gate` and a
-    `FocusRing` they already carry, so the next step there is a browser-local context struct — what
-    `schema_tree::SchemaTreeCtx` is for its rows — not three more parameters apiece.
+    file that stands still. **The five left in `users_view.rs` were a different shape and got the
+    different answer this entry predicted — and the *difference* from `SchemaTreeCtx` is the part
+    worth copying.** The modal root, its two panes and the footer each reached `OverlayUi` *and* an
+    action out of `schema_actions`, on top of `target`, `gate` and a `FocusRing` they already carry,
+    so all four take a browser-local `UsersCtx` — the three `Copy` bundles (`ConnUi`, `DdlUi`,
+    `OverlayUi`) and the two fetch closures (`principals`, `grants`) as `Rc`s — the way
+    `schema_tree`'s rows take a `SchemaTreeCtx`. That struct, though, carries a `ui: Ui` *field*,
+    which the counter sees because it scans lines rather than signatures, and which is one of the
+    three `schema_tree.rs` still declares; `UsersCtx` holds no root bundle at all, so it is built by
+    **naming the reads at the call site** — `UsersCtx::new(ui.conn, ui.ddl, ui.overlay,
+    &ui.schema_actions)`, once, in `modals.rs` — rather than by a constructor that takes `&Ui` and
+    can quietly grow. **A context struct is only a narrowing if it is narrower than what it
+    replaced**: one that holds the root bundle relocates it. `open_for_server` deliberately stayed
+    *off* the ctx — it is the one function in the module that touches neither fetch, so it takes
+    `(ConnUi, OverlayUi, conn_id, database)` and clones no `Rc` to write five signals, and its two
+    call sites (the SCHEMA gear in `overlays.rs`, the blank-space menu in `schema_tree.rs`) pass
+    `ui.conn, ui.overlay`. Nothing about the browser's behaviour moved with it: the `dyn_container`
+    key still carries `target_read_only`, `write_gate` still runs in the builder, and
+    `the_browser_key_carries_the_read_only_flag` passes untouched.
     **Three named bundles can still be the narrower signature, and can say something the root one
     hid.** `preview_change` takes `(ConnUi, DdlUi)` and `preview_proposal`
     `(ConnUi, SchemaUi, DdlUi)`; the count looks like a step backwards until you read what `conn`
@@ -15062,16 +15088,16 @@ existing prose was left alone.
     site rather than only in the prose two paragraphs up. The rule is the signature saying what the
     function depends on, not the parameter count.
     **The live number is the sum of `BUDGET`, not the "roughly 140" above**, which describes the
-    state the gate found and by design never moves. That sum went **206 → 107** over this run:
+    state the gate found and by design never moves. That sum went **206 → 102** over this run:
     `table_designer.rs` 29 → 26 → 10 → 4, `object_editor.rs` 14 → 5 → 4 → **0**,
     `routine_editor.rs` 12 → 6 → **0**, `event_editor.rs` 11 → 5 → **0**,
     `trigger_editor.rs` 11 → 8 → 7 → **0**, `view_editor.rs` 10 → 6, `database_editor.rs` 7 → 3,
     `ddl_preview.rs` 6 → 4 → 2, `overlays.rs` 15 → 13, `account_editor.rs` 6 → **0**,
-    `schema_tree.rs` 6 → 3, `users_view.rs` 9 → 8 → 5. Every step is recorded against its own entry with what it narrowed *to*,
+    `schema_tree.rs` 6 → 3, `users_view.rs` 9 → 8 → 5 → **0**. Every step is recorded against its own entry with what it narrowed *to*,
     so read the list for where a file stands rather than inferring it from a paragraph — and a file
     that reaches zero leaves the list altogether, which is the one way an entry is ever removed and
-    the point at which it may not take a `Ui` again at all. **Five files have left it** — the three DDL-object editors, then
-    `trigger_editor.rs` and `account_editor.rs` — and each left a comment behind where it sat,
+    the point at which it may not take a `Ui` again at all. **Six files have left it** — the three DDL-object editors, then
+    `trigger_editor.rs`, `account_editor.rs` and `users_view.rs` — and each left a comment behind where it sat,
     because a name absent from `BUDGET` says nothing on its own about whether it was ever on it.
     It is a **budget, not a ban**, because narrowing 140 signatures is a campaign and a gate that
     fails on the day it lands teaches nothing: `BUDGET` holds what each file declares *now* and the
