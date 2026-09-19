@@ -92,7 +92,7 @@ pub(crate) fn modal_layer(ui: Ui, modal_up: impl Fn() -> bool + Copy + 'static) 
         // import modal is a question asked about the list behind it, and closing
         // it returns to that list. Same rule the confirm at the foot of this
         // tuple states — whatever can raise a question comes first.
-        crate::connection_import::conn_import_overlay(ui.clone()),
+        crate::connection_import::conn_import_overlay(ui.conn.import, ui.conn_actions.clone()),
         // Error modal + open-transaction prompt and the schema editors share one
         // tuple element, for the same 16-arity reason as monitor/ERD below (and
         // with the same fill-only-when-open wrapper, or it would eat every click).

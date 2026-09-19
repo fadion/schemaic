@@ -8068,7 +8068,13 @@ fn body(
     let right_inner = dyn_container(
         move || right_content.get(),
         move |panel| match panel {
-            RightPanel::Terminal => terminal_panel(ui_right.clone()).into_any(),
+            RightPanel::Terminal => terminal_panel(
+                ui_right.term,
+                ui_right.conn,
+                ui_right.term_actions.clone(),
+                ui_right.tab_actions.open_db_cli.clone(),
+            )
+            .into_any(),
             RightPanel::History => history_panel(ui_right.clone()).into_any(),
             RightPanel::Snippets => {
                 crate::snippet_panel::snippet_panel(ui_right.clone()).into_any()
@@ -9615,26 +9621,34 @@ fn terminal_grid(scr: Screen, font: u16, open_link: Rc<dyn Fn(String)>) -> impl 
     v_stack_from_iter(rows).style(|s| s.flex_col().min_width(0.0))
 }
 
-fn terminal_panel(ui: Ui) -> impl IntoView {
-    let screen = ui.term.screen;
-    let focused = ui.term.focused;
-    let input = ui.term_actions.input.clone();
-    let resize = ui.term_actions.resize.clone();
-    let scroll = ui.term_actions.scroll.clone();
-    let settings_open = ui.term.settings_open;
-    let sel_start = ui.term_actions.sel_start.clone();
-    let sel_update = ui.term_actions.sel_update.clone();
-    let sel_clear = ui.term_actions.sel_clear.clone();
-    let copy = ui.term_actions.copy.clone();
-    let paste = ui.term_actions.paste.clone();
-    let open_link = ui.term_actions.open_link.clone();
-    let restart = ui.term_actions.restart.clone();
-    let scroll_bottom = ui.term_actions.scroll_bottom.clone();
-    let open_cli = ui.tab_actions.open_db_cli.clone();
-    let db_label = ui.term.db_label;
-    let font_size = ui.term.font_size;
-    let copy_on_select = ui.term.copy_on_select;
-    let cursor_style = ui.term.cursor_style;
+/// Takes `TermActions` whole rather than its twelve closures one by one — the
+/// `schema_settings_overlay` case, several times over. `ConnUi` is here for the
+/// read-only memo below, and `open_db_cli` is the one action this panel reaches
+/// outside its own domain, so it is named.
+fn terminal_panel(
+    term: TermUi,
+    conn: ConnUi,
+    actions: Rc<TermActions>,
+    open_cli: Rc<dyn Fn(Option<String>)>,
+) -> impl IntoView {
+    let screen = term.screen;
+    let focused = term.focused;
+    let input = actions.input.clone();
+    let resize = actions.resize.clone();
+    let scroll = actions.scroll.clone();
+    let settings_open = term.settings_open;
+    let sel_start = actions.sel_start.clone();
+    let sel_update = actions.sel_update.clone();
+    let sel_clear = actions.sel_clear.clone();
+    let copy = actions.copy.clone();
+    let paste = actions.paste.clone();
+    let open_link = actions.open_link.clone();
+    let restart = actions.restart.clone();
+    let scroll_bottom = actions.scroll_bottom.clone();
+    let db_label = term.db_label;
+    let font_size = term.font_size;
+    let copy_on_select = term.copy_on_select;
+    let cursor_style = term.cursor_style;
 
     // Custom scrollback scrollbar state (the terminal isn't a Floem scroll): a
     // `shown` flag toggled by scroll activity, hidden 3s after it stops.
@@ -9662,8 +9676,8 @@ fn terminal_panel(ui: Ui) -> impl IntoView {
     // refuses a grid commit on. The schema tree's *Open in CLI* entry has always
     // asked this question; the two doors now ask the same one, and
     // `open_db_cli` guards its own launch regardless of either.
-    let cli_conns = ui.conn.connections;
-    let cli_active_conn = ui.conn.active_conn;
+    let cli_conns = conn.connections;
+    let cli_active_conn = conn.active_conn;
     let cli_read_only = create_memo(move |_| {
         cli_conns.with(|cs| schemaic_core::connection::read_only_of(cs, cli_active_conn.get()))
     });
@@ -14778,7 +14792,17 @@ mod whole_ui_gate {
         // could not see until it counted parameters rather than line shapes" —
         // and both of those functions are on `OverlayUi` now.
         ("connection_form.rs", 1),
-        ("connection_import.rs", 6),
+        // `connection_import.rs` is **off the list** — 6 to zero, and it is the
+        // cleanest sweep in the campaign because the module has exactly one
+        // piece of state: every one of its six read `ui.conn.import` and
+        // nothing else out of the signal half, so all six take
+        // `ConnImportUi`. Three also call an action, and those are named —
+        // `add_pasted_url`, `choose_import_file`/`scan_installed_clients`,
+        // `import_chosen`. The overlay takes `ConnActions` whole because it is
+        // the one that hands all four down.
+        //
+        // The tell that a module will go this way is a body that opens
+        // `let imp = ui.conn.import;` and never says `ui` again. Six did.
         // 7 → 3: `bound_field` takes the `RwSignal<DatabaseDraft>` it writes,
         // `optional_field` takes that plus `OverlayUi` (its `suggest_chevron`
         // is the only other thing it reaches), `form` takes `DdlUi` and
@@ -14852,7 +14876,27 @@ mod whole_ui_gate {
         // `open_import` takes `ImportUi` alone for `open_for_server`'s reason:
         // a door that only resets the modal's own signals has no business
         // cloning three `Rc`s to do it.
-        ("lib.rs", 6),
+        // 6 → 5: `terminal_panel` takes `(TermUi, ConnUi, Rc<TermActions>,
+        // open_db_cli)`. `TermActions` goes in whole — twelve closures named
+        // one by one is the `schema_settings_overlay` case several times over
+        // — and `open_db_cli` is named because it is the one action the panel
+        // reaches outside its own domain.
+        //
+        // **The five left are the app shell, and four are wide by nature**:
+        // `workspace` reaches eleven `Ui` fields, `center` **sixteen**,
+        // `footer` seven and `header` six. Naming any of those is past
+        // clippy's seven-argument limit or at it, which is the lint agreeing
+        // with the gate's "take the child bundle" — except there is no single
+        // child bundle to take, because what they span *is* the app.
+        //
+        // **The fifth, `body`, is a pass-through and is blocked by its
+        // children.** Its own reads are two — `layout` and `persist_layout` —
+        // but it clones the root bundle three times to hand to `schema_panel`,
+        // `center` and the right panel, so it cannot be narrower than the
+        // widest of them, and `center` is the widest thing in the crate. Read
+        // it as `overlays.rs`'s `create_submenu` before the two editor doors
+        // came down: a number held there by a callee, not by its own shape.
+        ("lib.rs", 5),
         ("modals.rs", 5),
         ("monitor_view.rs", 1),
         // `object_editor.rs` is **off the list** — see the note under

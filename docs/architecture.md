@@ -11498,7 +11498,12 @@ existing prose was left alone.
     `empty_message` (pure, tested) is why the scan button doesn't look dead on a
     machine with none of those clients: an empty list means three different things — an invitation,
     progress, an answer — and `ConnImportUi::scanned` is the bool that tells the first from the
-    third.
+    third. **The scan's *finding* path has no hand check behind it, and that is a limit of the
+    harness rather than of the scan**: a sandboxed launch redirects `APPDATA`, which is exactly what
+    `conn_sources::config_roots`/`data_roots` walk on Windows, so a scan run that way can only ever
+    find nothing. A session can confirm that the button fires and that the empty answer is the third
+    state; anything about a row the walk actually produced has to be read off the pure half
+    (`core::conn_import`) or checked by hand on an unredirected profile.
     A review list, not a form: a row is a *proposal* with a tick box, its name, where it points
     (`row_target`, mono — `user@host:port/db`, or the file's name on SQLite; pure and tested, and
     deliberately **not** a `scheme://` URL, since this project has no URL builder on purpose and
@@ -11543,6 +11548,17 @@ existing prose was left alone.
     harness here to catch it being wrong. The Live Monitor's change log answered the same question
     the other way, because a change row is always one line and `Fixed` is therefore honest for it;
     the rule that splits the two is a Floem gotcha.
+    **Off `whole_ui_gate`'s list, 6 to zero, and it is the cleanest sweep of that campaign because
+    the module has exactly one piece of state.** All six of its `&Ui` functions read
+    `ui.conn.import` and nothing else out of the signal half, so all six take `ConnImportUi`:
+    `paste_row`, `source_buttons`, `row_list`, `skipped_note` and `footer`, each beside the actions
+    it calls (`add_pasted_url`, `choose_import_file`/`scan_installed_clients`, `import_chosen`), and
+    `conn_import_overlay(ConnImportUi, Rc<ConnActions>)`, which takes the actions bundle whole for
+    `schema_settings_overlay`'s reason — it is the one that hands all four down. The tell is worth
+    carrying to the next module: **a body that opens `let imp = ui.conn.import;` and never says `ui`
+    again was already narrow and only had to say so**, and six of six were, which is why a file's
+    number says nothing about how hard it is to move — this 6 took minutes where `overlays.rs`'s
+    remaining 4 are immovable.
   - `dividers.rs` — the two **panel** dividers: `h_resize_handle` (the schema tree's and the right
     panel's edges) and `v_resize_handle` (the editor/results split), plus the `DelayedHover` they
     share. Not `window_chrome::resize_zones`, which resizes the *window* and is mounted outside the
@@ -15354,23 +15370,51 @@ existing prose was left alone.
     `trigger_editor.rs` with them: that one moves outward from the helper, this one asks the
     question from the stuck end — **when an entry will not come down, look at what it calls before
     concluding the entry is the problem.**
+    **`connection_import.rs` came off after that, 6 to zero, and it is the cleanest sweep of the
+    run** — the module has exactly one piece of state, so every one of its six functions read
+    `ui.conn.import` and nothing else out of the signal half, and all six take `ConnImportUi`:
+    `paste_row`, `source_buttons`, `row_list`, `skipped_note` and `footer` beside the actions they
+    call, and `conn_import_overlay(ConnImportUi, Rc<ConnActions>)`, which takes the actions bundle
+    whole for `schema_settings_overlay`'s reason — it is the one that hands all four down. **The
+    tell is a body that opens `let imp = ui.conn.import;` and never says `ui` again**: that function
+    was already narrow and only had to say so, and six of six were. It is the far end of the
+    spectrum from `context_menu_overlay`'s seventeen fields, and it is why **a file's number says
+    nothing about how hard it is to move** — this 6 took minutes, where `overlays.rs`'s remaining 4
+    are immovable.
+    **`lib.rs` itself went 6 → 5, and the five left are the app shell.** `terminal_panel` was the
+    one that came down: `(TermUi, ConnUi, Rc<TermActions>, Rc<dyn Fn(Option<String>)>)`, the last
+    being `tab_actions.open_db_cli`, named because it is the one action the panel reaches outside
+    its own domain, while `TermActions` goes in whole because the panel reads twelve closures off it
+    and naming twelve is the `schema_settings_overlay` case several times over; the `ConnUi` is
+    there for a read-only memo. **Four of the five are wide by nature** — `workspace` reaches eleven
+    `Ui` fields, `center` **sixteen** and is the widest function in the crate, `footer` seven,
+    `header` six — so naming any of them lands at or past clippy's seven-argument limit, which is
+    the lint agreeing with the gate, except that here there is no single child bundle to take
+    instead, because what they span *is* the app. **The fifth, `body`, is a pass-through blocked by
+    its children**: its own reads are two (`layout`, `persist_layout`), but it clones the root
+    bundle three times to hand to `schema_panel`, `center` and the right panel, so it cannot be
+    narrower than the widest of them. That is `create_submenu`'s shape before the two editor doors
+    came down — a number held there by a callee rather than by its own reads — with the difference
+    that this one has nowhere to go, because the callee holding it is the app's centre pane.
     **The live number is the sum of `BUDGET`, not the "roughly 140" above**, which describes the
-    state the gate found and by design never moves. That sum went **206 → 47** over this run:
+    state the gate found and by design never moves. That sum went **206 → 40** over this run:
     `table_designer.rs` 29 → 26 → 10 → 4 → **0**, `object_editor.rs` 14 → 5 → 4 → **0**,
     `routine_editor.rs` 12 → 6 → **0**, `event_editor.rs` 11 → 5 → **0**,
     `trigger_editor.rs` 11 → 8 → 7 → **0**, `view_editor.rs` 10 → 6 → **0**,
     `database_editor.rs` 7 → 3 → **0**,
     `ddl_preview.rs` 6 → 4 → 2, `overlays.rs` 15 → 13 → 4, `account_editor.rs` 6 → **0**,
     `schema_tree.rs` 6 → 3 → 2, `users_view.rs` 9 → 8 → 5 → **0**, `import_view.rs` 9 → **0**,
-    `dump_view.rs` 9 → **0**, `compare_view.rs` 8 → **0**, `script_view.rs` 6 → **0**.
+    `dump_view.rs` 9 → **0**, `compare_view.rs` 8 → **0**, `script_view.rs` 6 → **0**,
+    `connection_import.rs` 6 → **0**, `lib.rs` 6 → 5.
     Every step is recorded against its own entry with what it narrowed *to*,
     so read the list for where a file stands rather than inferring it from a paragraph — and a file
     that reaches zero leaves the list altogether, which is the one way an entry is ever removed and
-    the point at which it may not take a `Ui` again at all. **Thirteen files have left it** — the
+    the point at which it may not take a `Ui` again at all. **Fourteen files have left it** — the
     three DDL-object editors, then `trigger_editor.rs`, `account_editor.rs`, `users_view.rs`,
     `import_view.rs`, `dump_view.rs`, `compare_view.rs`, `script_view.rs`, `view_editor.rs`,
-    `database_editor.rs` and `table_designer.rs` — and each left a comment behind where it sat,
-    because a name absent from `BUDGET` says nothing on its own about whether it was ever on it.
+    `database_editor.rs`, `table_designer.rs` and `connection_import.rs` — and each left a comment
+    behind where it sat, because a name absent from `BUDGET` says nothing on its own about whether
+    it was ever on it.
     It is a **budget, not a ban**, because narrowing 140 signatures is a campaign and a gate that
     fails on the day it lands teaches nothing: `BUDGET` holds what each file declares *now* and the
     only legal direction is down, so a new `ui: Ui` in a listed file fails and a file not on the list

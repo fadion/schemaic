@@ -30,7 +30,7 @@ use crate::widgets::{
     focus_root_with_ring, form_hint, form_label_style, link_button, modal_h, modal_pad_h,
     modal_title, modal_w, panel_style,
 };
-use crate::{FieldCfg, Ui, edit_field, icons, theme};
+use crate::{ConnImportUi, FieldCfg, edit_field, icons, theme};
 
 /// Tab stops, spaced by 10 so a control can be inserted between two without
 /// renumbering — the convention `conn_form` uses.
@@ -43,8 +43,10 @@ const TAB_NONE: u32 = 60;
 
 /// The modal. Absolutely positioned over the workspace while
 /// `ui.conn.import.open` is true.
-pub(crate) fn conn_import_overlay(ui: Ui) -> impl IntoView {
-    let imp = ui.conn.import;
+pub(crate) fn conn_import_overlay(
+    imp: ConnImportUi,
+    actions: Rc<crate::ConnActions>,
+) -> impl IntoView {
     let open = imp.open;
 
     dyn_container(
@@ -54,7 +56,7 @@ pub(crate) fn conn_import_overlay(ui: Ui) -> impl IntoView {
                 return crate::widgets::nothing();
             }
             let ring = FocusRing::new();
-            let ui = ui.clone();
+            let actions = actions.clone();
             let close: Rc<dyn Fn()> = Rc::new(move || open.set(false));
             let (close_x, close_esc) = (close.clone(), close.clone());
 
@@ -64,10 +66,15 @@ pub(crate) fn conn_import_overlay(ui: Ui) -> impl IntoView {
             // installed here. The review list appears **below all three**, and
             // only once one of them has produced something.
             let body = v_stack((
-                paste_row(ui.clone(), ring.clone()),
-                source_buttons(ui.clone(), ring.clone()),
-                row_list(ui.clone(), ring.clone()),
-                skipped_note(ui.clone()),
+                paste_row(imp, actions.add_pasted_url.clone(), ring.clone()),
+                source_buttons(
+                    imp,
+                    actions.choose_import_file.clone(),
+                    actions.scan_installed_clients.clone(),
+                    ring.clone(),
+                ),
+                row_list(imp, ring.clone()),
+                skipped_note(imp),
             ))
             .style(|s| s.flex_col().width_full().gap(theme::scaled(14.0)));
 
@@ -80,7 +87,7 @@ pub(crate) fn conn_import_overlay(ui: Ui) -> impl IntoView {
                         .padding_vert(theme::scaled(16.0))
                 })))
                 .style(|s| s.width_full().flex_grow(1.0_f32).min_height(0.0)),
-                footer(ui, close, ring.clone()),
+                footer(imp, actions.import_chosen.clone(), close, ring.clone()),
             ))
             .on_click_stop(|_| {})
             .style(|s| panel_style(s).width(modal_w(560.0)).height(modal_h(520.0)));
@@ -116,9 +123,7 @@ pub(crate) fn conn_import_overlay(ui: Ui) -> impl IntoView {
 /// always works: a scan finds what is installed here, and a URL out of a
 /// colleague's message, a `.env` or a provider's dashboard is the case where
 /// nothing is installed at all.
-fn paste_row(ui: Ui, ring: FocusRing) -> impl IntoView {
-    let imp = ui.conn.import;
-    let add = ui.conn_actions.add_pasted_url.clone();
+fn paste_row(imp: ConnImportUi, add: Rc<dyn Fn()>, ring: FocusRing) -> impl IntoView {
     let submit = add.clone();
 
     let field = edit_field(
@@ -175,11 +180,14 @@ fn paste_row(ui: Ui, ring: FocusRing) -> impl IntoView {
 /// user's home directory, and a dialog that goes looking through it because it
 /// was opened is doing something nobody asked for; this way the three sources
 /// are three deliberate acts, and the modal opens instantly.
-fn source_buttons(ui: Ui, ring: FocusRing) -> impl IntoView {
-    let choose = ui.conn_actions.choose_import_file.clone();
-    let scan = ui.conn_actions.scan_installed_clients.clone();
-    let scanning = ui.conn.import.scanning;
-    let file_error = ui.conn.import.file_error;
+fn source_buttons(
+    imp: ConnImportUi,
+    choose: Rc<dyn Fn()>,
+    scan: Rc<dyn Fn()>,
+    ring: FocusRing,
+) -> impl IntoView {
+    let scanning = imp.scanning;
+    let file_error = imp.file_error;
 
     // **Under the buttons, not under the paste field.** A failed *Choose a
     // file…* used to be written into `paste_error`, so a file button's failure
@@ -250,8 +258,7 @@ fn row_of_buttons(
 /// An empty bordered box with a sentence in it is a control that does nothing,
 /// and it is the first thing on screen when the modal opens; a line of text
 /// pointing at the three buttons above is what that space is worth.
-fn row_list(ui: Ui, ring: FocusRing) -> impl IntoView {
-    let imp = ui.conn.import;
+fn row_list(imp: ConnImportUi, ring: FocusRing) -> impl IntoView {
     dyn_container(
         move || (imp.scanning.get(), imp.scanned.get(), imp.rows.get()),
         move |(scanning, scanned, rows)| {
@@ -468,8 +475,7 @@ fn capsule(label: String) -> impl IntoView {
 /// Shown rather than dropped: a user with twelve DataGrip data sources and four
 /// rows here needs to know the other eight were Oracle, not that the import is
 /// broken.
-fn skipped_note(ui: Ui) -> impl IntoView {
-    let imp = ui.conn.import;
+fn skipped_note(imp: ConnImportUi) -> impl IntoView {
     dyn_container(
         move || (imp.skipped.get(), imp.skipped_hidden.get()),
         move |(skipped, hidden)| match skipped_sentence(&skipped, hidden) {
@@ -521,10 +527,12 @@ fn skipped_sentence(skipped: &[Skipped], hidden: usize) -> Option<String> {
 }
 
 /// Close, and the one button that writes.
-fn footer(ui: Ui, close: Rc<dyn Fn()>, ring: FocusRing) -> impl IntoView {
-    let imp = ui.conn.import;
-    let run = ui.conn_actions.import_chosen.clone();
-
+fn footer(
+    imp: ConnImportUi,
+    run: Rc<dyn Fn()>,
+    close: Rc<dyn Fn()>,
+    ring: FocusRing,
+) -> impl IntoView {
     // **Keyed on whether anything is selected, not on how many.**
     // `action_button` takes a plain `bool`, so the enabled state has to be read
     // in a `dyn_container` — an Import button left enabled over an empty
