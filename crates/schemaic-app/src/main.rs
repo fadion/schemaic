@@ -24,6 +24,7 @@ mod mcp;
 mod opencode;
 mod script;
 mod secrets;
+mod snippet_store;
 mod update;
 
 /// Process-wide heap accounting (live/peak bytes), for leak-vs-retention
@@ -2428,27 +2429,12 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
     // ── The snippet library ─────────────────────────────────────────────────
     //
     // One persisted list across every connection; which of them a connection may
-    // see is `snippet::grouped`'s decision, in the core with tests. Saving,
-    // renaming, duplicating and deleting all write the whole file, as every
-    // other small store here does.
-    let snippets = RwSignal::new(
-        persist::load_json::<schemaic_core::snippet::SnippetsFile>("snippets.json").snippets,
-    );
-    // `Erasing` from the two paths that *remove* a snippet, `Replacing` from the
-    // edits — the shape `clear_history`/`remove_history` already have, and for
-    // the same reason: a snippet is the user's own SQL, written against a named
-    // server, and the ordinary save would copy the pre-delete file (body and
-    // all) to `snippets.json.bak` at the moment the modal said "This can't be
-    // undone". On a library nobody edits again, that copy is forever.
-    let save_snippets: Rc<dyn Fn(persist::Saving)> = Rc::new(move |saving| {
-        let file = schemaic_core::snippet::SnippetsFile {
-            snippets: snippets.get_untracked(),
-        };
-        match saving {
-            persist::Saving::Erasing => persist::save_json_erasing("snippets.json", &file),
-            persist::Saving::Replacing => persist::save_json("snippets.json", &file),
-        }
-    });
+    // see is `snippet::grouped`'s decision, in the core with tests. The store
+    // and its save policy are `snippet_store`'s, for `history_store`'s reason
+    // and under the same rule; what stays here is everything that reads a *tab*
+    // or raises a *modal*, which is the seam that module's doc describes.
+    let snippet_store = snippet_store::wire();
+    let snippets = snippet_store.snippets;
     // The active tab, for the actions that read or write one.
     let active_tab = move || {
         let id = active.get_untracked();
@@ -2487,28 +2473,9 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
         let sql = tab.query.get_untracked();
         schemaic_core::snippet::snippet_text(&sql, tab.selection.get_untracked())
     };
-    // Wall-clock millis, for "last used". The same reading `record_history`
-    // takes, and the same reason: it is when the user did the thing.
-    let snippet_now = || {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0)
-    };
-    // "This was used just now", for the row's `3d ago` and the recently-used
-    // sort. The gate is `snippet::is_builtin` — a built-in has nothing to
-    // record, and without it every insert of a shipped snippet rewrote
-    // `snippets.json` for no change.
-    let record_snippet_use: Rc<dyn Fn(u64)> = {
-        let save_snippets = save_snippets.clone();
-        Rc::new(move |id: u64| {
-            if schemaic_core::snippet::is_builtin(id) {
-                return;
-            }
-            snippets.update(|v| schemaic_core::snippet::touch(v, id, snippet_now()));
-            (save_snippets)(persist::Saving::Replacing);
-        })
-    };
+    let record_snippet_use = snippet_store.record_use.clone();
+    // Writes the *editor*, so it stays: the mounted editor owns the document and
+    // only the store half moved.
     let insert_snippet: Rc<dyn Fn(schemaic_core::snippet::Snippet)> = {
         let record_snippet_use = record_snippet_use.clone();
         Rc::new(move |snip: schemaic_core::snippet::Snippet| {
@@ -2522,26 +2489,14 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             (record_snippet_use)(snip.id);
         })
     };
+    // Both halves of the name and the body come from the *tab*, which is why
+    // this reads the editor here and hands the result to the store.
     let save_snippet_current: Rc<dyn Fn() -> Option<u64>> = {
-        let save_snippets = save_snippets.clone();
+        let create = snippet_store.create.clone();
         Rc::new(move || {
             let body = editor_snippet_text()?;
-            let id = snippets.with_untracked(|v| schemaic_core::snippet::next_id(v));
             let name = active_tab().map_or_else(|| "Snippet".to_string(), |t| t.title());
-            // The scope and the used-now stamp are `new_saved`'s, in core with
-            // the test that composes them with the panel's grouping and sort —
-            // both were a struct literal here, and both shipped wrong once.
-            snippets.update(|v| {
-                v.push(schemaic_core::snippet::new_saved(
-                    id,
-                    name,
-                    body,
-                    active_conn.get_untracked(),
-                    snippet_now(),
-                ))
-            });
-            (save_snippets)(persist::Saving::Replacing);
-            Some(id)
+            Some((create)(name, body, active_conn.get_untracked()))
         })
     };
     // What every snippet surface reads: the user's list plus the built-in pack
@@ -2569,84 +2524,42 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                 .is_some_and(|t| schemaic_core::snippet::can_save(&t.query.get()))
         })
     });
-    let rename_snippet: Rc<dyn Fn(u64, String)> = {
-        let save_snippets = save_snippets.clone();
-        Rc::new(move |id: u64, name: String| {
-            snippets.update(|v| {
-                if let Some(s) = v.iter_mut().find(|s| s.id == id) {
-                    s.name = name.clone();
-                }
-            });
-            (save_snippets)(persist::Saving::Replacing);
-        })
-    };
-    let set_snippet_abbrev: Rc<dyn Fn(u64, Option<String>)> = {
-        let save_snippets = save_snippets.clone();
-        Rc::new(move |id: u64, abbrev: Option<String>| {
-            snippets.update(|v| {
-                if let Some(s) = v.iter_mut().find(|s| s.id == id) {
-                    s.abbrev = abbrev.clone().filter(|a| !a.trim().is_empty());
-                }
-            });
-            (save_snippets)(persist::Saving::Replacing);
-        })
-    };
-    let set_snippet_body: Rc<dyn Fn(u64, String)> = {
-        let save_snippets = save_snippets.clone();
-        Rc::new(move |id: u64, body: String| {
-            snippets.update(|v| {
-                if let Some(s) = v.iter_mut().find(|s| s.id == id) {
-                    s.body = body.clone();
-                }
-            });
-            (save_snippets)(persist::Saving::Replacing);
-        })
-    };
-    let set_snippet_scope: Rc<dyn Fn(u64, schemaic_core::snippet::Scope)> = {
-        let save_snippets = save_snippets.clone();
-        Rc::new(move |id: u64, scope: schemaic_core::snippet::Scope| {
-            snippets.update(|v| {
-                if let Some(s) = v.iter_mut().find(|s| s.id == id) {
-                    s.scope = scope.clone();
-                }
-            });
-            (save_snippets)(persist::Saving::Replacing);
-        })
-    };
+    let rename_snippet = snippet_store.rename.clone();
+    let set_snippet_abbrev = snippet_store.set_abbrev.clone();
+    let set_snippet_body = snippet_store.set_body.clone();
+    let set_snippet_scope = snippet_store.set_scope.clone();
+    // The **lookup** is here and the copy is the store's: Duplicate exists mainly
+    // to get an editable copy of a built-in, and a built-in lives only in the
+    // merged library memo, which this module owns because it needs the active
+    // connection's dialect.
     let duplicate_snippet: Rc<dyn Fn(u64)> = {
-        let save_snippets = save_snippets.clone();
+        let duplicate_from = snippet_store.duplicate_from.clone();
         Rc::new(move |id: u64| {
-            // Looked up in the **merged** library: Duplicate exists mainly to
-            // get an editable copy of a built-in, and a built-in is not in the
-            // user's list to be found there.
             let Some(src) =
                 snippet_library.with_untracked(|v| v.iter().find(|s| s.id == id).cloned())
             else {
                 return;
             };
-            let new_id = snippets.with_untracked(|v| schemaic_core::snippet::next_id(v));
-            // The five things the copy does and does not inherit are
-            // `snippet::duplicate`'s, with the tests: they were a struct literal
-            // here, where nothing could call them.
-            snippets.update(|v| v.push(schemaic_core::snippet::duplicate(&src, new_id)));
-            (save_snippets)(persist::Saving::Replacing);
+            (duplicate_from)(src);
         })
     };
+    // **Asking is this function's job; erasing is the store's** — the split
+    // `delete_conn`/`delete_conn_now` already has below, and why
+    // `SnippetStore::remove` carries no confirm of its own.
     let remove_snippet: Rc<dyn Fn(u64)> = {
-        let save_snippets = save_snippets.clone();
+        let remove = snippet_store.remove.clone();
         Rc::new(move |id: u64| {
             let Some(snip) = snippets.with_untracked(|v| v.iter().find(|s| s.id == id).cloned())
             else {
                 return;
             };
-            let save_snippets = save_snippets.clone();
+            let remove = remove.clone();
             confirm.set(Some(Confirm {
                 title: "Delete snippet".to_string(),
                 message: format!("Delete “{}”? This can't be undone.", snip.name),
                 resolve: Rc::new(move |yes| {
                     if yes {
-                        snippets.update(|v| schemaic_core::snippet::remove(v, id));
-                        (save_snippets)(persist::Saving::Erasing);
+                        (remove)(id);
                     }
                 }),
             }));
@@ -9867,6 +9780,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
         let reset_activity = reset_activity.clone();
         let ai_session = ai_session.clone();
         let history_clear_conn = history.clear_conn.clone();
+        let snippet_clear_conn = snippet_store.clear_conn.clone();
         Rc::new(move |id: u64| {
             let was_active = active_conn.get_untracked() == id;
             // Release any pinned transaction connection on the connection being
@@ -10135,13 +10049,10 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             (save_ui)(persist::Saving::Erasing);
             formats.update(|v| schemaic_core::format::clear_conn(v, id));
             (save_formats)(persist::Saving::Erasing);
-            // The twelfth store, and it was the one missed. A connection-scoped
-            // snippet is a query the user wrote against *this* connection — so
-            // both reasons above apply to it, and the id-recycling one with
-            // force: the next connection to take this freed id would have found
-            // them waiting under "THIS CONNECTION".
-            snippets.update(|v| schemaic_core::snippet::clear_conn(v, id));
-            (save_snippets)(persist::Saving::Erasing);
+            // The twelfth store, and it was the one missed — why, and why the
+            // id-recycling reason applies to it with force, is on
+            // `SnippetStore::clear_conn` where the prune now lives.
+            (snippet_clear_conn)(id);
             // Diagram layouts live only on disk (no signal) — load, prune, save.
             // The third lazy load, and the third that owes the user the recovery
             // notice the startup drain cannot carry: the prune-and-save here is
@@ -12808,9 +12719,12 @@ mod app_tests {
         // it counts, and the erase itself is gated where it now lives. The floor
         // stays at 9: moving a store out must not be a way to lose one.
         //
-        // `history_store::the_removal_paths_erase` is the other half for the one
-        // entry below; add a line here *and* a gate there, never only this line.
-        let delegated = ["(history_clear_conn)("];
+        // Each entry below has its other half in the module it delegates to —
+        // `history_store::the_removal_paths_erase` and
+        // `snippet_store::the_remove_path_erases`, which are what prove the
+        // erase this gate can no longer see. Add a needle here *and* a gate
+        // there, never only the needle.
+        let delegated = ["(history_clear_conn)(", "(snippet_clear_conn)("];
         let erasing = region.matches("Saving::Erasing").count()
             + region.matches("save_json_erasing(").count()
             + delegated

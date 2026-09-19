@@ -5774,12 +5774,13 @@ existing prose was left alone.
     that were right were the four whose save already took a `Saving`; the five that were wrong were
     the five written by a shared `Fn()` with nowhere to say it. `Ui::save_formats`, `save_db_colors`,
     `save_db_favorites` and the app's `save_ui` take one, and the delete closure's own gate asserts a
-    floor of nine erasing saves in it — **one of the nine now delegated**, since the history store's
-    prune moved to `app/history_store.rs` and the closure holds only the call to it, whose erase is
-    gated there.
+    floor of nine erasing saves in it — **two of the nine now delegated**, since the history store's
+    prune moved to `app/history_store.rs` and the snippet store's to `app/snippet_store.rs`, the
+    closure holding only the call to each, whose erase is gated in the module it moved to.
     `persist_chat` takes a `Saving`, so the
-    caller says whether a turn finished or a transcript was replaced with nothing; `main.rs`'s
-    `save_snippets` closure is `Rc<dyn Fn(persist::Saving)>` for the same reason; and
+    caller says whether a turn finished or a transcript was replaced with nothing; the snippet
+    library's save says the same thing, now through `snippet_store`'s private `save(snippets,
+    saving)` rather than the `save_snippets` closure `main.rs` used to hold; and
     `persist::save_connections` takes one, with `app::secrets::save_connections` and `persist_conns`
     forwarding it. **Every connection save but the delete stays `Replacing`**, because
     `connections.json` is the one config file with no second copy anywhere and losing it loses every
@@ -16884,8 +16885,53 @@ existing prose was left alone.
     erasing saves in the delete closure with a floor of nine, the move took one of them out of that
     file, and it read eight and failed. The repair was not to lower the floor — that is what stops a
     different store's erase going missing — but to teach it that a **delegated** erase still counts:
-    it also counts a listed `delegated` needle (`"(history_clear_conn)("`), and its comment says to
+    it also counts a listed `delegated` needle (`"(history_clear_conn)("`, joined by
+    `"(snippet_clear_conn)("` when the snippet store followed), and its comment says to
     add a line there *and* a gate in the store's own module, never only the line.
+  - `snippet_store.rs` — the snippet library's store: the persisted **user** list and the nine
+    closures that write it. **The matched pair to `history_store.rs`, and the pairing is the
+    point** — two modules of the same shape rather than one "stores" grab-bag, because what
+    justifies each of them is the same invariant: every mutation of the store is followed by a save,
+    and which save is policy. `persist::save_json_erasing` from the two paths that **remove** — a
+    snippet deleted from its row's menu, and a deleted connection's connection-scoped snippets — and
+    an ordinary `persist::save_json` from the seven edits (`record_use`, `create`, `rename`,
+    `set_abbrev`, `set_body`, `set_scope`, `duplicate_from`). A snippet is the user's own SQL written
+    against a named server, so an ordinary save on the delete copies the pre-delete file — body and
+    all — to `snippets.json.bak` at the moment the modal says *"This can't be undone"*; on a library
+    nobody edits again, that copy is forever. The choice is stated once in a private
+    `save(snippets, saving)`, which is also the only caller of the `FILE` const (`"snippets.json"`)
+    and the only place `SnippetsFile` is built; `wire()` loads the file and hands back the
+    `SnippetStore`.
+    **The seam is the store against the editor, not the panel against the app**, which is what made
+    this cut non-obvious: what stays in `app_view` is everything that reads a *tab* or raises a
+    *modal*, so four closures came apart in half at that line rather than moving whole.
+    `insert_snippet` writes the active tab's `insert_req` — the mounted editor owns the document, so
+    writing `query` behind it loses the insertion's undo step — and then calls `record_use`.
+    `save_snippet_current` reads the selection through `snippet::snippet_text` and names the snippet
+    from the tab's title before calling `create(name, body, conn_id)`, which is why the store takes
+    both rather than reaching for them. `remove_snippet` raises the confirm and calls `remove(id)`
+    only on yes: **`SnippetStore::remove` carries no confirm of its own**, asking being the UI's job
+    and erasing the store's — the same split `delete_conn`/`delete_conn_now` already has in that
+    file. `duplicate_snippet` looks its source up in the **merged** library memo, Duplicate existing
+    mainly to get an editable copy of a built-in and a built-in not being in the user's list to be
+    found, then hands it to `duplicate_from`. `snippet_library` and `can_save_snippet` stay as memos
+    over signals this store does not own (`conn_dialect_memo`, the tab strip), and `active_tab`,
+    `conn_dialect_memo` and `editor_snippet_text` stay because they are shared — `active_tab` has
+    other readers in `app_view` and `conn_dialect_memo` goes into the `Ui` literal. **`snippets` is
+    the user's list alone, never the merged library**, which is what keeps the built-in pack in code
+    where a later release can fix one instead of copied into everybody's `snippets.json`.
+    `the_remove_path_erases` is the module's gate, deliberately spelled as the twin of
+    `history_store::the_removal_paths_erase` so the pair reads as one rule in two places: exactly
+    two erasing saves and seven replacing ones inside `wire`, and `snippets.json` named once, as
+    `FILE`. It reads its own source through `source_gate::production_code` and carries that family's
+    hazard — a gate in the same file as its subject is its own first match — so its needles are
+    assembled from fragments and its counts are **exact rather than floors**, which is not pedantry:
+    deleting `rename`'s save failed it at 6 ≠ 7, and what that spells is a writer silently no longer
+    persisting, which a floor would have passed. The other half is in `main.rs`, where
+    `deleting_a_connection_erases_every_store_it_was_keyed_into` gained its **second** delegated
+    needle (`"(snippet_clear_conn)("` beside `"(history_clear_conn)("`), exactly as its own comment
+    instructs. `clear_conn` is the prune that block's prose calls *the twelfth store, and the one
+    that was missed*, and that reasoning now also sits on `SnippetStore::clear_conn`'s doc.
   - `heap.rs` — process-wide heap accounting. `Tracking` is installed as the global allocator and
     adds only two atomics — **live** bytes (allocated − freed) and the running peak — over the
     system allocator. It exists to answer one question the OS can't: whether memory growth is a
@@ -18831,6 +18877,10 @@ Re-introducing the anti-patterns these guard against is a regression:
   since the floor is what stops a *different* store's erase going missing. The right one is to count
   the **delegated** call the closure still makes and gate the erase itself in the module it moved
   to, so a store cannot be lost by being moved out.
+  **`app/snippet_store.rs` is the fourth, and its lesson is where the line fell**: the seam was the
+  store against the editor and the modal rather than anything by feature area, so four of the
+  closures it touched came apart in half — the tab read or the confirm staying in `app_view`, the
+  write and its save moving — rather than moving whole.
 
 ## UI conventions
 
