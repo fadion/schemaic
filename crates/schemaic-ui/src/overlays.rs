@@ -1537,7 +1537,7 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                         let cdb = menu.name.clone();
                         entries.push(MenuEntry::action("Compare with", move || {
                             crate::compare_view::open_compare(
-                                &ui,
+                                ui.overlay,
                                 active_conn.get_untracked(),
                                 &cdb,
                             );
@@ -1647,7 +1647,8 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                             MenuEntry::action("Import", move || {
                                 let ctx = crate::table_designer::edit_ctx(iui.conn);
                                 crate::script_view::open_script(
-                                    iui.clone(),
+                                    iui.script,
+                                    iui.dump,
                                     ctx.conn_id,
                                     db.clone(),
                                     None,
@@ -1910,7 +1911,8 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                             MenuEntry::action("Import", move || {
                                 let ctx = crate::table_designer::edit_ctx(iui.conn);
                                 crate::script_view::open_script(
-                                    iui.clone(),
+                                    iui.script,
+                                    iui.dump,
                                     ctx.conn_id,
                                     db.clone(),
                                     Some(ns.clone()),

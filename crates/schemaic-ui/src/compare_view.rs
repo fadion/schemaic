@@ -47,7 +47,60 @@ use crate::widgets::{
     focus_root_with_ring, in_ring_button, link_button, loading_dots, modal_body_h,
     modal_footer_split, modal_pad_h, modal_title_owned, modal_w, panel_style,
 };
-use crate::{CompareSide, CompareState, CompareTarget, FieldCfg, Ui, edit_field, theme};
+use crate::{
+    CompareSide, CompareState, CompareTarget, ConnUi, DdlUi, FieldCfg, OverlayUi, edit_field, theme,
+};
+
+/// Everything the comparison modal reaches out of the root bundle.
+///
+/// **The drivers take this; the renderers take [`OverlayUi`].** The tree, the
+/// filter bar and the state switch above them read and write nothing but the
+/// eight `compare_*` signals, and say so. What is gathered here is the half that
+/// *acts*: a fetch, the connection registry the two side labels read, and the
+/// DDL preview the plan is handed to.
+///
+/// Holds no `Ui`, for `whole_ui_gate`'s reason and
+/// [`crate::users_view::UsersCtx`]'s: it is built by naming the reads at its one
+/// call site.
+#[derive(Clone)]
+pub(crate) struct CompareCtx {
+    /// The modal's own eight signals — target, state, selection, expansion,
+    /// focus, query, the identical-objects toggle, and the picker's database
+    /// list and its error.
+    overlay: OverlayUi,
+    /// The connection registry, for the two side labels and for the read-only
+    /// flag the plan hand-off carries into the preview.
+    conn: ConnUi,
+    /// The DDL preview — where Apply lives, and where the write guard is. This
+    /// modal never applies anything itself.
+    ddl: DdlUi,
+    /// Introspect **both** sides and land the result in `compare_state`.
+    fetch: Rc<dyn Fn(CompareTarget)>,
+    /// Stop whatever [`Self::fetch`] has in flight. Closing the modal cannot
+    /// do it — the token lives in the app beside the `Db` handles.
+    cancel: Rc<dyn Fn()>,
+    /// List one connection's databases, for the picker's second step.
+    list_dbs: Rc<dyn Fn(u64)>,
+}
+
+impl CompareCtx {
+    /// Gather the modal's reads where the root bundle is in reach.
+    pub(crate) fn new(
+        overlay: OverlayUi,
+        conn: ConnUi,
+        ddl: DdlUi,
+        actions: &crate::SchemaActions,
+    ) -> Self {
+        Self {
+            overlay,
+            conn,
+            ddl,
+            fetch: actions.compare_fetch.clone(),
+            cancel: actions.compare_cancel.clone(),
+            list_dbs: actions.compare_list_dbs.clone(),
+        }
+    }
+}
 
 /// Tab stops, top to bottom as the modal reads: the source picker, the filter
 /// box, then the two selection links. **The footer's button is not here** — it
@@ -83,9 +136,9 @@ fn picker_inset() -> f64 {
 }
 
 /// Open the comparison on `database`, with no right-hand side chosen yet.
-pub(crate) fn open_compare(ui: &Ui, conn_id: u64, database: &str) {
-    reset(ui.overlay);
-    ui.overlay.compare.set(Some(CompareTarget {
+pub(crate) fn open_compare(o: OverlayUi, conn_id: u64, database: &str) {
+    reset(o);
+    o.compare.set(Some(CompareTarget {
         left: CompareSide {
             conn_id,
             database: database.to_string(),
@@ -113,9 +166,9 @@ fn reset(o: crate::OverlayUi) {
     o.compare_dbs_err.set(None);
 }
 
-pub(crate) fn compare_overlay(ui: Ui) -> impl IntoView {
-    let target = ui.overlay.compare;
-    let state = ui.overlay.compare_state;
+pub(crate) fn compare_overlay(ctx: CompareCtx) -> impl IntoView {
+    let target = ctx.overlay.compare;
+    let state = ctx.overlay.compare_state;
 
     dyn_container(
         move || target.get(),
@@ -123,8 +176,8 @@ pub(crate) fn compare_overlay(ui: Ui) -> impl IntoView {
             let Some(t) = open else {
                 return empty().into_any();
             };
-            let ui = ui.clone();
-            let o = ui.overlay;
+            let ctx = ctx.clone();
+            let o = ctx.overlay;
             // **And stop the fetch**, which `reset` cannot: the token lives in
             // the app beside the `Db` handles, and until this existed its only
             // canceller was the *next* fetch. Escape mid-comparison therefore
@@ -132,7 +185,7 @@ pub(crate) fn compare_overlay(ui: Ui) -> impl IntoView {
             // gone — verbatim the waste `compare_fetch`'s own "whatever was in
             // flight is for a pair nobody is looking at" comment describes, on
             // the one path that never reaches it.
-            let cancel = ui.schema_actions.compare_cancel.clone();
+            let cancel = ctx.cancel.clone();
             let close: Rc<dyn Fn()> = Rc::new(move || {
                 (cancel)();
                 reset(o);
@@ -149,12 +202,12 @@ pub(crate) fn compare_overlay(ui: Ui) -> impl IntoView {
             // on the same change that replaces it, and two round trips per
             // pick. `properties_overlay` captures its target for this reason.
             if t.right.is_some() {
-                let fetch = ui.schema_actions.compare_fetch.clone();
+                let fetch = ctx.fetch.clone();
                 let t = t.clone();
                 create_effect(move |_| (fetch)(t.clone()));
             }
 
-            let head = sources_bar(ui.clone(), t.clone(), ring.clone());
+            let head = sources_bar(ctx.clone(), t.clone(), ring.clone());
             // **One place says what went wrong**, whichever step failed. A
             // listing that couldn't reach its server and a pair that can't be
             // compared are the same kind of news to the person reading, so a
@@ -164,17 +217,17 @@ pub(crate) fn compare_overlay(ui: Ui) -> impl IntoView {
             // listing, so clicking another connection clears the error and the
             // comparison that was already on screen comes straight back.
             let body = dyn_container(move || (state.get(), o.compare_dbs_err.get()), {
-                let (ui, ring) = (ui.clone(), ring.clone());
+                let ring = ring.clone();
                 move |(st, list_err)| match list_err {
                     Some(e) => failure(e).into_any(),
-                    None => body_for(st, &ui, ring.clone()),
+                    None => body_for(st, o, ring.clone()),
                 }
             })
             .style(|s| s.width_full().flex_col().flex_grow(1.0_f32).min_height(0.0));
 
             let title =
                 modal_title_owned("Compare schemas".to_string(), close.clone(), ring.clone());
-            let footer = footer(ui.clone(), close.clone(), ring.clone());
+            let footer = footer(ctx.clone(), close.clone(), ring.clone());
 
             let panel = v_stack((title, head, body, footer))
                 .on_click_stop(|_| {})
@@ -212,9 +265,10 @@ pub(crate) fn compare_overlay(ui: Ui) -> impl IntoView {
 /// half. **Left is what changes, right is the source of truth** — the arrow
 /// says so, because a comparison that reads the wrong way round generates a
 /// migration that runs on the wrong server.
-fn sources_bar(ui: Ui, t: CompareTarget, ring: FocusRing) -> impl IntoView {
-    let target = ui.overlay.compare;
-    let left_label = side_label(ui.conn.connections, &t.left);
+fn sources_bar(ctx: CompareCtx, t: CompareTarget, ring: FocusRing) -> impl IntoView {
+    let target = ctx.overlay.compare;
+    let conns = ctx.conn.connections;
+    let left_label = side_label(conns, &t.left);
 
     // An inline list rather than the popup menu, which anchors itself to a
     // measured rect: this control sits in a fixed header where a plain
@@ -234,7 +288,6 @@ fn sources_bar(ui: Ui, t: CompareTarget, ring: FocusRing) -> impl IntoView {
     // unchosen side reading "Choose a database" next to a "change" that had
     // nothing to change yet. The name is what a reader is already pointing at.
     let chosen_label = {
-        let ui = ui.clone();
         let ring = ring.clone();
         let toggle = move || picking.update(|p| *p = !*p);
         in_ring_button(
@@ -247,7 +300,7 @@ fn sources_bar(ui: Ui, t: CompareTarget, ring: FocusRing) -> impl IntoView {
             // spelled out because the asymmetry is invisible from the call.
             container(
                 label(move || match target.get().and_then(|t| t.right.clone()) {
-                    Some(s) => side_label(ui.conn.connections, &s),
+                    Some(s) => side_label(conns, &s),
                     None => "Choose a database".to_string(),
                 })
                 .style(|s| {
@@ -272,13 +325,16 @@ fn sources_bar(ui: Ui, t: CompareTarget, ring: FocusRing) -> impl IntoView {
         })
     };
 
-    let o = ui.overlay;
+    let o = ctx.overlay;
     let list = {
-        let ui = ui.clone();
+        // Pulled out of the ctx here rather than inside the builder below: a
+        // `dyn_container` builder is `Fn` and cannot move out of a captured
+        // struct, and both of these are wanted once per rebuild.
+        let list_dbs = ctx.list_dbs.clone();
         // The modal's own ring, like every other focusable here. A fresh
         // `FocusRing::new()` belongs to no focus root, so Tab cannot reach the
         // control and it paints no ring — invisible until clicked.
-        let left_type = left_db_type(ui.conn.connections, &t.left);
+        let left_type = left_db_type(conns, &t.left);
         dyn_container(
             move || (picking.get(), o.compare_dbs.get()),
             move |(open, listed)| {
@@ -329,10 +385,8 @@ fn sources_bar(ui: Ui, t: CompareTarget, ring: FocusRing) -> impl IntoView {
                     // a MySQL comparison is offering a click whose only possible
                     // outcome is the refusal below.
                     None => {
-                        let list_dbs = ui.schema_actions.compare_list_dbs.clone();
-                        let conns: Vec<_> = ui
-                            .conn
-                            .connections
+                        let list_dbs = list_dbs.clone();
+                        let conns: Vec<_> = conns
                             .get()
                             .into_iter()
                             .filter(|c| {
@@ -477,7 +531,7 @@ fn side_label(connections: RwSignal<Vec<Connection>>, side: &CompareSide) -> Str
 
 // ── the body, in whichever state the fetch is in ────────────────────────────
 
-fn body_for(st: CompareState, ui: &Ui, ring: FocusRing) -> AnyView {
+fn body_for(st: CompareState, o: OverlayUi, ring: FocusRing) -> AnyView {
     match st {
         CompareState::Idle => note("Choose a database to compare against.").into_any(),
         CompareState::Loading => container(loading_dots(
@@ -488,7 +542,7 @@ fn body_for(st: CompareState, ui: &Ui, ring: FocusRing) -> AnyView {
         .style(|s| s.padding(modal_pad_h()))
         .into_any(),
         CompareState::Failed(e) => failure(e).into_any(),
-        CompareState::Ready(c) => ready_body(c, ui, ring).into_any(),
+        CompareState::Ready(c) => ready_body(c, o, ring).into_any(),
     }
 }
 
@@ -512,8 +566,7 @@ fn note(msg: &'static str) -> impl IntoView {
 }
 
 /// The tree on the left, the two sides' text on the right.
-fn ready_body(c: Rc<SchemaComparison>, ui: &Ui, ring: FocusRing) -> impl IntoView {
-    let o = ui.overlay;
+fn ready_body(c: Rc<SchemaComparison>, o: OverlayUi, ring: FocusRing) -> impl IntoView {
     let tree = {
         let (c, o) = (c.clone(), o);
         dyn_container(
@@ -608,7 +661,7 @@ fn ready_body(c: Rc<SchemaComparison>, ui: &Ui, ring: FocusRing) -> impl IntoVie
     };
 
     v_stack((
-        filter_bar(ui.clone(), c.clone(), ring),
+        filter_bar(o, c.clone(), ring),
         cycle_note,
         h_stack((
             autohide(scroll(tree).style(|s| s.width_full())).style(|s| {
@@ -633,8 +686,7 @@ fn ready_body(c: Rc<SchemaComparison>, ui: &Ui, ring: FocusRing) -> impl IntoVie
 }
 
 /// The filter box, the identical-objects toggle, and the tick-everything pair.
-fn filter_bar(ui: Ui, c: Rc<SchemaComparison>, ring: FocusRing) -> impl IntoView {
-    let o = ui.overlay;
+fn filter_bar(o: OverlayUi, c: Rc<SchemaComparison>, ring: FocusRing) -> impl IntoView {
     let counts = c.counts();
     let mut summary = format!(
         "{} differ · {} only here · {} only there · {} identical",
@@ -1072,8 +1124,8 @@ fn diff_pane(e: &CompareEntry) -> impl IntoView {
 /// which is where Apply lives and where the write guard is.
 ///
 /// [`SchemaPlan`]: schemaic_core::compare::SchemaPlan
-fn footer(ui: Ui, close: Rc<dyn Fn()>, ring: FocusRing) -> impl IntoView {
-    let o = ui.overlay;
+fn footer(ctx: CompareCtx, close: Rc<dyn Fn()>, ring: FocusRing) -> impl IntoView {
+    let o = ctx.overlay;
     let state = o.compare_state;
 
     // The plan the tick-boxes describe, recomputed when either changes. A memo
@@ -1125,7 +1177,7 @@ fn footer(ui: Ui, close: Rc<dyn Fn()>, ring: FocusRing) -> impl IntoView {
         .style(|s| s.font_size(theme::font_hint()).color(theme::text_muted()));
 
     let preview = {
-        let ui = ui.clone();
+        let ctx = ctx.clone();
         let close = close.clone();
         // Keyed on a `Memo<bool>`, which only notifies when the value actually
         // changes. `dyn_container` has no equality check of its own, so keying
@@ -1136,14 +1188,14 @@ fn footer(ui: Ui, close: Rc<dyn Fn()>, ring: FocusRing) -> impl IntoView {
         dyn_container(
             move || any.get(),
             move |enabled| {
-                let (ui, close, ring) = (ui.clone(), close.clone(), ring.clone());
+                let (ctx, close, ring) = (ctx.clone(), close.clone(), ring.clone());
                 action_button(
                     "Preview migration",
                     ActionKind::Primary,
                     enabled,
                     ring,
                     ACTION_TAB,
-                    move || open_plan_preview(&ui, close.clone()),
+                    move || open_plan_preview(&ctx, close.clone()),
                 )
                 .into_any()
             },
@@ -1159,20 +1211,20 @@ fn plan_of(c: &SchemaComparison, selected: &HashSet<String>) -> schemaic_core::c
 }
 
 /// Build the plan the ticks describe and send it to the DDL preview.
-fn open_plan_preview(ui: &Ui, close: Rc<dyn Fn()>) {
-    let CompareState::Ready(c) = ui.overlay.compare_state.get_untracked() else {
+fn open_plan_preview(ctx: &CompareCtx, close: Rc<dyn Fn()>) {
+    let CompareState::Ready(c) = ctx.overlay.compare_state.get_untracked() else {
         return;
     };
-    let Some(t) = ui.overlay.compare.get_untracked() else {
+    let Some(t) = ctx.overlay.compare.get_untracked() else {
         return;
     };
-    let sel = ui.overlay.compare_selected.get_untracked();
+    let sel = ctx.overlay.compare_selected.get_untracked();
     let plan = plan_of(&c, &sel);
     if plan.is_empty() {
         return;
     }
 
-    let read_only = ui
+    let read_only = ctx
         .conn
         .connections
         .with_untracked(|cs| schemaic_core::connection::read_only_of(cs, t.left.conn_id));
@@ -1190,5 +1242,5 @@ fn open_plan_preview(ui: &Ui, close: Rc<dyn Fn()>) {
     // was ticked, and leaving the tree open behind it invites editing a
     // selection the preview no longer reflects.
     (close)();
-    crate::ddl_preview::open_preview(ui.ddl, preview);
+    crate::ddl_preview::open_preview(ctx.ddl, preview);
 }

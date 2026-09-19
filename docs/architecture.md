@@ -12316,6 +12316,23 @@ existing prose was left alone.
     The guard is `sql::script_verdict`, asked in the same synchronous step that launches
     (`widgets::accept_launch`) — see the write-guard invariant for why it is stricter than
     `run_verdict` rather than a second, laxer gate.
+    **Off `whole_ui_gate`'s list, 6 to zero, on a module that is nearly all driver** — this modal is
+    a file picker, a probe and a run — so the split `import_view.rs` established lands almost wholly
+    on one side: `pick_file`, `run_script` and `script_overlay` take a `ScriptCtx`, the overlay **by
+    value** for `compare_view.rs`'s return-type reason. `ScriptCtx` holds six things and no `Ui` —
+    `script: ScriptUi`, `conn: ConnUi`, `layout: LayoutUi` and the `probe`/`run`/`cancel` closures —
+    built once in `modals.rs` by naming the reads. The three that are *not* on it are the part worth
+    reading. `open_script` takes `(ScriptUi, DumpUi)`, `open_for_server`'s and `open_import`'s case a
+    third time: it only writes signals, and the `DumpUi` is the export modal it clears on the way in.
+    `watch_connection` takes the two bundles it watches. And **`policy` takes `(ConnUi, LayoutUi)`,
+    the write guard's two halves, named** — a `GuardPolicy` assembled out of a context struct would
+    hide which parts of the app decide whether a `.sql` file may run, and that is the one decision
+    here the write-guard invariant is about, this being the module whose guard that invariant's own
+    text cites. Behaviour did not move with the narrowing: `run_script` still asks `policy` and
+    `ScriptRequest::approved` in the same synchronous step as `accept_launch`, and the exit path's
+    `stop` is `ctx.cancel`, the closure `ui.schema_actions.script_cancel` was. What came *off*
+    `ScriptCtx` before it shipped, and why that is the mirror of `DumpCtx`'s near-miss, is under
+    `lib.rs`'s `whole_ui_gate`.
   - `dump_view.rs` — the **schema + data dump** modal, **Export** to the user, over `core::dump`.
     Three entry points and one modal: a database's schema context menu and a PostgreSQL namespace's,
     where it is the middle of **`Import → Export ▸ → Create ▸`** — the three entries about the node
@@ -14689,7 +14706,7 @@ existing prose was left alone.
     two databases side by side, and the migration between them. Not a tab — there is no tab kind in
     this app, `Tab`/`SavedTab` being query tabs — so it is the sixth entry of the modal layer's
     **workspace** group, beside the ERD and the binary-cell panel, and counted by
-    `workspace_modals_up`. `open_compare(ui, conn_id, database)` is the way in, from a database row's
+    `workspace_modals_up`. `open_compare(o, conn_id, database)` is the way in, from a database row's
     **Compare with** (beside ER Diagram in `overlays.rs`): it returns every signal the modal owns to
     its opening value through `reset` — the one door `close` goes through too, since two paths
     writing their own subsets is what left `show_same` cleared on open and not on close — and fixes
@@ -14698,6 +14715,15 @@ existing prose was left alone.
     each heading's tally, the diff pane's two sides and the plan the footer previews are all reads of
     one `SchemaComparison`, and an opinion of its own here would be the second differ the DDL
     invariant exists to prevent.
+    **The module names no `Ui` — it is off `whole_ui_gate`'s list, 8 to zero — and the split is
+    `import_view.rs`'s.** The renderers take `OverlayUi`, being the eight `compare_*` signals and
+    nothing else: `open_compare`, `reset`, `body_for`, `ready_body` and `filter_bar`. The four that
+    *act* take a `CompareCtx` — `overlay: OverlayUi`, `conn: ConnUi`, `ddl: DdlUi` and the
+    `fetch`/`cancel`/`list_dbs` closures, built once in `modals.rs` — and three of those four take it
+    **by value**, because they return `impl IntoView` and edition 2024's return-position `impl Trait`
+    captures every lifetime in scope, so a `&CompareCtx` would borrow the caller's local for the life
+    of the view and not compile; `open_plan_preview` returns `()` and takes the reference. That rule
+    and the rest of the campaign are under `lib.rs`.
     **It has its own fetch, and that is the deliberate divergence from `erd_overlay`.**
     `SchemaActions::compare_fetch` (implemented in `main.rs` beside `table_stats`) calls
     `Db::fetch_schema` on *both* sides. The diagram instead reads whatever the schema tree already
@@ -15141,6 +15167,53 @@ existing prose was left alone.
     `d.running`/`d.target` — the same two signals under the name already bound in that function.
     `export_progress_overlay` stayed off the ctx and now says so in its signature,
     `(ExportUi, Rc<dyn Fn()>)`, with `modals.rs` passing `ui.export, ui.tab_actions.export_cancel`.
+    **`compare_view.rs` closed the run, 8 to zero, and what it settled generalises past this file:
+    whether a ctx is taken by reference or by value is decided by the *return type*, not by taste.**
+    The split is `import_view.rs`'s again — `open_compare`, `body_for`, `ready_body` and
+    `filter_bar` touch nothing but the eight `compare_*` signals and take `OverlayUi` (`reset`
+    already did), while `compare_overlay`, `sources_bar`, `footer` and `open_plan_preview` take a
+    `CompareCtx`: `overlay: OverlayUi`, `conn: ConnUi`, `ddl: DdlUi` and the
+    `fetch`/`cancel`/`list_dbs` closures, no `Ui`, built once by naming the reads at its one call
+    site — `CompareCtx::new(ui.overlay, ui.conn, ui.ddl, &ui.schema_actions)` in `modals.rs`. The
+    door stayed off it for `open_for_server`'s and `open_import`'s reason, and its one call site (the
+    database row's **Compare with** in `overlays.rs`) passes `ui.overlay`. **The three that return
+    `impl IntoView` take the ctx *by value*, and that is forced rather than stylistic.** In edition
+    2024 a return-position `impl Trait` captures every lifetime in scope, so
+    `fn sources_bar(ctx: &CompareCtx, …) -> impl IntoView` borrows the caller's local for as long as
+    the view lives and does not compile — "`ctx` does not live long enough". `users_view`'s
+    `list_pane`/`detail_pane`/`footer` take `&UsersCtx` only because they return `AnyView`, which is
+    erased, and `open_plan_preview` returns `()` and takes the reference. So read the return type
+    before choosing: `AnyView` takes the borrow, `impl IntoView` takes the value. Otherwise the
+    by-value ones read as an oversight and the tidy-up into a borrow will not build. `sources_bar`
+    pulls `list_dbs` out of the ctx *before* the `dyn_container` builder closure for the neighbouring
+    reason — a builder is `Fn` and cannot move a field out of a captured struct. Nothing about the
+    modal's behaviour moved with the narrowing: the `dyn_container` key, the once-per-pair fetch
+    effect (still keyed on the branch rather than reading `target` inside), the cancel-on-close and
+    the plan hand-off to `ddl_preview::open_preview` are untouched, and `open_plan_preview`'s live
+    read-only read is `ctx.conn.connections`, still `with_untracked`.
+    **`script_view.rs` followed it, 6 to zero, and the field it nearly shipped *with* is the mirror
+    of `dump_view.rs`'s near-miss.** The module is nearly all driver — a file picker, a probe and a
+    run — so `pick_file`, `run_script` and `script_overlay` take a `ScriptCtx`, the overlay by value
+    because it returns `impl IntoView`, and the interesting half is the three that do not.
+    `open_script` takes `(ScriptUi, DumpUi)` for `open_for_server`'s and `open_import`'s reason — it
+    only writes signals, and `DumpUi` is there because opening this modal clears the export modal's
+    target, the sibling it shares a modal-layer tuple element with. `watch_connection` takes the two
+    bundles it watches. And **`policy(conn: ConnUi, layout: LayoutUi, dialect, conn_id) ->
+    GuardPolicy` names the write guard's two halves**: a policy assembled out of a context struct
+    would hide which parts of the app decide whether a `.sql` file may run, and this is the module
+    whose guard the write-guard invariant's own text cites (`sql::script_verdict`,
+    `ScriptRequest::approved`). `ScriptCtx` holds six things and no `Ui` — `script: ScriptUi`,
+    `conn: ConnUi`, `layout: LayoutUi` and the `probe`/`run`/`cancel` closures — built once by
+    naming the reads, `ScriptCtx::new(ui.script, ui.conn, ui.layout, &ui.schema_actions)` in
+    `modals.rs`. **It first carried a `dump: DumpUi` field, because `open_script` read it, and when
+    `open_script` came off the ctx that field had no reader left**: a ctx field with one reader
+    follows that reader out, and one left behind is a claim about what the modal touches that
+    nothing checks. The compiler caught this one only because the field went *completely* unread —
+    a field still read by some other path would have stayed, silently overstating the module's
+    reach. With `DumpCtx`'s alias census above that is the pair: a ctx can be wrong in both
+    directions. Nothing about the modal's behaviour moved with it — `run_script` still asks `policy`
+    and `ScriptRequest::approved` in the same synchronous step as `accept_launch`, and the exit
+    path's `stop` is `ctx.cancel`, the same closure `ui.schema_actions.script_cancel` was.
     **Three named bundles can still be the narrower signature, and can say something the root one
     hid.** `preview_change` takes `(ConnUi, DdlUi)` and `preview_proposal`
     `(ConnUi, SchemaUi, DdlUi)`; the count looks like a step backwards until you read what `conn`
@@ -15149,17 +15222,19 @@ existing prose was left alone.
     site rather than only in the prose two paragraphs up. The rule is the signature saying what the
     function depends on, not the parameter count.
     **The live number is the sum of `BUDGET`, not the "roughly 140" above**, which describes the
-    state the gate found and by design never moves. That sum went **206 → 84** over this run:
+    state the gate found and by design never moves. That sum went **206 → 70** over this run:
     `table_designer.rs` 29 → 26 → 10 → 4, `object_editor.rs` 14 → 5 → 4 → **0**,
     `routine_editor.rs` 12 → 6 → **0**, `event_editor.rs` 11 → 5 → **0**,
     `trigger_editor.rs` 11 → 8 → 7 → **0**, `view_editor.rs` 10 → 6, `database_editor.rs` 7 → 3,
     `ddl_preview.rs` 6 → 4 → 2, `overlays.rs` 15 → 13, `account_editor.rs` 6 → **0**,
     `schema_tree.rs` 6 → 3, `users_view.rs` 9 → 8 → 5 → **0**, `import_view.rs` 9 → **0**,
-    `dump_view.rs` 9 → **0**. Every step is recorded against its own entry with what it narrowed *to*,
+    `dump_view.rs` 9 → **0**, `compare_view.rs` 8 → **0**, `script_view.rs` 6 → **0**.
+    Every step is recorded against its own entry with what it narrowed *to*,
     so read the list for where a file stands rather than inferring it from a paragraph — and a file
     that reaches zero leaves the list altogether, which is the one way an entry is ever removed and
-    the point at which it may not take a `Ui` again at all. **Eight files have left it** — the three DDL-object editors, then
-    `trigger_editor.rs`, `account_editor.rs`, `users_view.rs`, `import_view.rs` and `dump_view.rs` — and each left a comment behind where it sat,
+    the point at which it may not take a `Ui` again at all. **Ten files have left it** — the three DDL-object editors, then
+    `trigger_editor.rs`, `account_editor.rs`, `users_view.rs`, `import_view.rs`, `dump_view.rs`,
+    `compare_view.rs` and `script_view.rs` — and each left a comment behind where it sat,
     because a name absent from `BUDGET` says nothing on its own about whether it was ever on it.
     It is a **budget, not a ban**, because narrowing 140 signatures is a campaign and a gate that
     fails on the day it lands teaches nothing: `BUDGET` holds what each file declares *now* and the
@@ -15177,8 +15252,10 @@ existing prose was left alone.
     (`compare_view.rs`'s `body_for` and `ready_body`, `tabs.rs`'s `tab_chip`), and the floor test
     asserts `found == allowed` through this same counter, so neither test could see them while the
     ratchet's own rule — *a file not on the list may not take one at all* — was walked past by any
-    new one-line signature in any file. `compare_view.rs` goes 6 → 8 and `tabs.rs` 1 → 2, which is
-    what those files declare *now* rather than a widening, and `widgets.rs` joins the list at 1:
+    new one-line signature in any file. `compare_view.rs` went 6 → 8 and `tabs.rs` 1 → 2, which was
+    what those files declared *then* rather than a widening — `body_for` and `ready_body` both take
+    `OverlayUi` now and `compare_view.rs` is off the list altogether, so read that pair as the
+    counter's history rather than as live signatures — and `widgets.rs` joins the list at 1:
     `MenuFlags::of`, which gathers a flag out of six child bundles and so genuinely needs the root
     one — the case the rule's own advice about taking the child bundle covers, six times over, and
     invisible until the counter learned to read `&crate::Ui`.

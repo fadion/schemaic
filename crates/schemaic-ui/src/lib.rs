@@ -14742,11 +14742,26 @@ mod whole_ui_gate {
         ("activity_panel.rs", 1),
         ("ai_panel.rs", 1),
         ("blob_view.rs", 1),
-        // 8, not 6: `body_for` and `ready_body` take `ui` *second*, which the
-        // counter could not see until it counted parameters rather than line
-        // shapes. The number is what the file declares now — the ratchet's rule
-        // — not a widening.
-        ("compare_view.rs", 8),
+        // `compare_view.rs` is **off the list** — 8 to zero, the third module
+        // to take the drivers-take-a-ctx/renderers-take-the-bundle split.
+        // `open_compare`, `body_for`, `ready_body` and `filter_bar` touch
+        // nothing but the eight `compare_*` signals and take `OverlayUi`;
+        // `compare_overlay`, `sources_bar`, `footer` and `open_plan_preview`
+        // take `CompareCtx` (`OverlayUi`, `ConnUi`, `DdlUi` and the
+        // fetch/cancel/list-dbs closures).
+        //
+        // **The three that return `impl IntoView` take the ctx by value**, which
+        // is not a style choice: in edition 2024 a return-position `impl Trait`
+        // captures every lifetime in scope, so `sources_bar(&CompareCtx) ->
+        // impl IntoView` borrows the caller's local for as long as the view
+        // lives and does not compile. `users_view`'s panes take `&UsersCtx`
+        // only because they return `AnyView`. Read the return type before
+        // choosing, or the by-value ones look like an oversight.
+        //
+        // The entry this replaces was the counter's own bug-fix note — "8, not
+        // 6: `body_for` and `ready_body` take `ui` *second*, which the counter
+        // could not see until it counted parameters rather than line shapes" —
+        // and both of those functions are on `OverlayUi` now.
         ("connection_form.rs", 1),
         ("connection_import.rs", 6),
         // 7 → 3: `bound_field` takes the `RwSignal<DatabaseDraft>` it writes,
@@ -14855,7 +14870,28 @@ mod whole_ui_gate {
         // `SchemaTreeCtx::ui` field itself, which the counter sees and which the
         // table rows still read for `table_colors` and `table_sizes`.
         ("schema_tree.rs", 3),
-        ("script_view.rs", 6),
+        // `script_view.rs` is **off the list** — 6 to zero, and it is the split
+        // on a module that is nearly all driver: this modal is a file picker, a
+        // probe and a run. `pick_file`, `run_script` and the overlay take
+        // `ScriptCtx` (`ScriptUi`, `ConnUi`, `LayoutUi` and the
+        // probe/run/cancel closures).
+        //
+        // The three that are *not* on it are the ones worth reading.
+        // `open_script` takes `(ScriptUi, DumpUi)` — it only writes signals, so
+        // it is `open_for_server`'s and `open_import`'s case a third time, and
+        // `DumpUi` is there because opening this modal clears the export one it
+        // shares a tuple element with. `watch_connection` takes the two bundles
+        // it watches. And **`policy` takes `(ConnUi, LayoutUi)`** — the write
+        // guard's two halves, named: a `GuardPolicy` assembled out of a context
+        // struct would hide which parts of the app decide whether a `.sql` file
+        // may run, which is the one decision here the write-guard invariant is
+        // about.
+        //
+        // `DumpUi` came *off* `ScriptCtx` when `open_script` did. A ctx field
+        // with one reader follows that reader out; left behind it is a claim
+        // about what the modal touches that nothing checks. The compiler caught
+        // this one only because the field went unread — a field still read by
+        // some other path would have stayed.
         ("settings.rs", 4),
         ("snippet_edit.rs", 1),
         ("snippet_panel.rs", 1),

@@ -137,7 +137,12 @@ pub(crate) fn modal_layer(ui: Ui, modal_up: impl Fn() -> bool + Copy + 'static) 
                         ui.overlay,
                         &ui.schema_actions,
                     )),
-                    crate::script_view::script_overlay(ui.clone()),
+                    crate::script_view::script_overlay(crate::script_view::ScriptCtx::new(
+                        ui.script,
+                        ui.conn,
+                        ui.layout,
+                        &ui.schema_actions,
+                    )),
                 ))
                 .style(move |s| {
                     if dump_open.get().is_some() || script_open.get().is_some() {
@@ -244,7 +249,12 @@ pub(crate) fn modal_layer(ui: Ui, modal_up: impl Fn() -> bool + Copy + 'static) 
             // and it hands off to the DDL preview rather than writing anything
             // itself — so it sits *under* the preview's own group, which is
             // what lets Apply appear over it.
-            crate::compare_view::compare_overlay(ui.clone()),
+            crate::compare_view::compare_overlay(crate::compare_view::CompareCtx::new(
+                ui.overlay,
+                ui.conn,
+                ui.ddl,
+                &ui.schema_actions,
+            )),
         ))
         .style(move |s| {
             if workspace_modals_up() {

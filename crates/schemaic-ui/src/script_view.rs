@@ -40,7 +40,63 @@ use crate::widgets::{
     focus_root_with_ring, form_hint, form_section, form_separator, modal_footer_split, modal_h,
     modal_pad_h, modal_title_owned, modal_w, panel_style,
 };
-use crate::{ScriptRequest, ScriptTarget, Ui};
+use crate::{
+    ConnUi, DumpUi, LayoutUi, ScriptFn, ScriptProbeFn, ScriptRequest, ScriptTarget, ScriptUi,
+};
+
+/// Everything the script modal reaches out of the root bundle.
+///
+/// **The drivers take this; the doors and the watchers take the bundles they
+/// touch.** What is gathered here is `pick_file`, `run_script` and the overlay:
+/// each reaches a fetch, and `run_script` reaches the write guard besides.
+/// [`open_script`] is not on it — it only writes signals — and nor are the two
+/// that name what they read for a reason: `watch_connection` takes the two
+/// bundles it watches, and [`policy`] takes `(ConnUi, LayoutUi)`, the write
+/// guard's two halves. A `GuardPolicy` assembled out of a context struct would
+/// hide which parts of the app decide whether a `.sql` file may run, and that is
+/// the one decision in this module the invariant is about.
+///
+/// Holds no `Ui`, for `whole_ui_gate`'s reason and
+/// [`crate::users_view::UsersCtx`]'s: it is built by naming the reads at its
+/// call sites.
+#[derive(Clone)]
+pub(crate) struct ScriptCtx {
+    /// The modal's own state — target, file, probe, progress, outcome.
+    script: ScriptUi,
+    /// The connection registry — watched by [`watch_connection`], and half of
+    /// what [`policy`] builds the write guard from.
+    conn: ConnUi,
+    /// The other half: the user's *confirm before writing* setting.
+    layout: LayoutUi,
+    /// Read a `.sql` file's opening statements so the modal can report what the
+    /// file will do before running it.
+    probe: ScriptProbeFn,
+    /// Run the file against a database, statement by statement. Reached only
+    /// through a [`ScriptRequest`] its own guard minted.
+    run: ScriptFn,
+    /// Stop the run. **What has already been applied stays applied** unless the
+    /// file opened its own transaction.
+    cancel: Rc<dyn Fn()>,
+}
+
+impl ScriptCtx {
+    /// Gather the modal's reads where the root bundle is in reach.
+    pub(crate) fn new(
+        script: ScriptUi,
+        conn: ConnUi,
+        layout: LayoutUi,
+        actions: &crate::SchemaActions,
+    ) -> Self {
+        Self {
+            script,
+            conn,
+            layout,
+            probe: actions.script_probe.clone(),
+            run: actions.script_run.clone(),
+            cancel: actions.script_cancel.clone(),
+        }
+    }
+}
 
 fn panel_w() -> f64 {
     modal_w(560.0)
@@ -53,21 +109,25 @@ fn panel_h() -> f64 {
 const TAB_PICK: u32 = 10;
 
 /// Open the modal on a database. Nothing is read until a file is picked.
+///
+/// Takes the two bundles rather than [`ScriptCtx`], for `users_view`'s
+/// `open_for_server` reason: nothing is read here, so the door only writes
+/// signals and has no business cloning three `Rc`s to do it.
 pub(crate) fn open_script(
-    ui: Ui,
+    s: ScriptUi,
+    dump: DumpUi,
     conn_id: u64,
     database: String,
     schema: Option<String>,
     dialect: SqlDialect,
 ) {
-    let s = ui.script;
     // **Clear the sibling this one shares a tuple element with.** The two are
     // painted in one nested `stack` and each fills the modal layer when open, so
     // both being set would stack two full-screen overlays. "Only ever one at a
     // time" was true by reachability alone; the trigger/routine/event group next
     // to it states the same rule and enforces it the same way, and relying on
     // reachability is how that group's members once ended up on screen together.
-    ui.dump.target.set(None);
+    dump.target.set(None);
     s.path.set(None);
     s.probe.set(None);
     s.probing.set(false);
@@ -91,16 +151,16 @@ pub(crate) fn open_script(
 /// [`schemaic_core::sql::script_verdict`] does not consult it — a policy
 /// assembled with a *made-up* value would be one that quietly starts lying the
 /// day the verdict does.
-fn policy(ui: &Ui, dialect: SqlDialect, conn_id: u64) -> GuardPolicy {
+fn policy(conn: ConnUi, layout: LayoutUi, dialect: SqlDialect, conn_id: u64) -> GuardPolicy {
     // **`GuardPolicy::of`, the same constructor the editor's runs go through.**
     // This used to be a struct literal, which made it a second policy that
     // happened to agree rather than the same one — and the modal's `dialect` is
     // the target's, captured at open, so it is restated over the constructor's.
-    let base = ui.conn.connections.with_untracked(|cs| {
+    let base = conn.connections.with_untracked(|cs| {
         GuardPolicy::of(
             schemaic_core::connection::by_id(cs, conn_id),
             false,
-            ui.layout.confirm_writes.get_untracked(),
+            layout.confirm_writes.get_untracked(),
         )
     });
     GuardPolicy { dialect, ..base }
@@ -109,8 +169,8 @@ fn policy(ui: &Ui, dialect: SqlDialect, conn_id: u64) -> GuardPolicy {
 /// Ask for a file and probe it. The probe is what the second half of the panel
 /// shows, and it is also the first thing that can tell the user they picked the
 /// wrong file.
-fn pick_file(ui: Ui) {
-    let s = ui.script;
+fn pick_file(ctx: &ScriptCtx) {
+    let s = ctx.script;
     let Some(target) = s.target.get_untracked() else {
         return;
     };
@@ -129,7 +189,7 @@ fn pick_file(ui: Ui) {
             name: "SQL script",
             extensions: &["sql"],
         }]);
-    let actions = ui.schema_actions.clone();
+    let probe = ctx.probe.clone();
     let asked_at = s.generation.get_untracked();
     floem::action::open_file(dialog, move |file| {
         let Some(path) = file.and_then(|f| f.path.first().cloned()) else {
@@ -165,7 +225,7 @@ fn pick_file(ui: Ui) {
         s.error.set(None);
         s.done.set(None);
         s.probing.set(true);
-        (actions.script_probe)(
+        (probe)(
             path,
             target.dialect,
             Rc::new(move |res| {
@@ -199,8 +259,8 @@ fn pick_file(ui: Ui) {
 /// **The guard and the launch are the same synchronous step** — the disabled
 /// button says a run is going, it does not prevent a second one
 /// (`widgets::accept_launch`).
-fn run_script(ui: Ui) {
-    let s = ui.script;
+fn run_script(ctx: &ScriptCtx) {
+    let s = ctx.script;
     let (Some(target), Some(path)) = (s.target.get_untracked(), s.path.get_untracked()) else {
         return;
     };
@@ -215,7 +275,7 @@ fn run_script(ui: Ui) {
     // none could ask the seam, because the seam was a `return` in a view.
     let name = file_name(&path);
     let request = match ScriptRequest::approved(
-        policy(&ui, target.dialect, target.conn_id),
+        policy(ctx.conn, ctx.layout, target.dialect, target.conn_id),
         path,
         &name,
         target.conn_id,
@@ -234,7 +294,7 @@ fn run_script(ui: Ui) {
     s.done.set(None);
     s.progress.set(None);
     let opened = s.generation.get_untracked();
-    (ui.schema_actions.script_run)(
+    (ctx.run)(
         request,
         Rc::new(move |outcome| {
             // Closing does not stop the run, so by the time it reports the modal
@@ -474,16 +534,16 @@ fn probe_body(p: &Probe) -> impl IntoView {
     .style(|s| s.flex_col().width_full().gap(theme::scaled(6.0)))
 }
 
-pub(crate) fn script_overlay(ui: Ui) -> impl IntoView {
-    let s = ui.script;
-    watch_connection(ui.clone());
+pub(crate) fn script_overlay(ctx: ScriptCtx) -> impl IntoView {
+    let s = ctx.script;
+    watch_connection(s, ctx.conn);
     // One decision for every exit — footer, Escape, ✕ — so none can disagree.
     // While a run goes they **stop** rather than close.
     let exit: Rc<dyn Fn()> = {
-        let stop = ui.schema_actions.clone();
+        let stop = ctx.cancel.clone();
         Rc::new(move || match exit_action(s.running.get_untracked(), true) {
             ExitAction::Close => s.target.set(None),
-            ExitAction::Cancel => (stop.script_cancel)(),
+            ExitAction::Cancel => (stop)(),
             ExitAction::Ignore => {}
         })
     };
@@ -495,7 +555,7 @@ pub(crate) fn script_overlay(ui: Ui) -> impl IntoView {
                 return empty().into_any();
             };
             let ring = FocusRing::new();
-            let ui = ui.clone();
+            let ctx = ctx.clone();
             let (exit_x, exit_esc, exit_footer) = (exit.clone(), exit.clone(), exit.clone());
 
             // The file row, in the table-import modal's shape: the button first,
@@ -505,18 +565,18 @@ pub(crate) fn script_overlay(ui: Ui) -> impl IntoView {
             // everywhere else here — it keeps its place rather than
             // disappearing, so the row does not move. The refusal itself is in
             // `pick_file`; this is only what it looks like.
-            let pick_ui = ui.clone();
+            let pick_ctx = ctx.clone();
             let pick_ring = ring.clone();
             let pick = dyn_container(
                 move || s.running.get(),
                 move |running| {
-                    let pick_ui = pick_ui.clone();
+                    let pick_ctx = pick_ctx.clone();
                     crate::widgets::control_button_enabled(
                         "Choose file…",
                         !running,
                         pick_ring.clone(),
                         TAB_PICK,
-                        move || pick_file(pick_ui.clone()),
+                        move || pick_file(&pick_ctx),
                     )
                 },
             );
@@ -589,7 +649,7 @@ pub(crate) fn script_overlay(ui: Ui) -> impl IntoView {
             ))
             .style(|st| st.flex_col().width_full().gap(theme::scaled(12.0)));
 
-            let run_ui = ui.clone();
+            let run_ctx = ctx.clone();
             let footer_ring = ring.clone();
             let footer = dyn_container(
                 move || {
@@ -606,7 +666,7 @@ pub(crate) fn script_overlay(ui: Ui) -> impl IntoView {
                     )
                 },
                 move |(running, ready, done, error)| {
-                    let (run_ui, ring) = (run_ui.clone(), footer_ring.clone());
+                    let (run_ctx, ring) = (run_ctx.clone(), footer_ring.clone());
                     let exit = exit_footer.clone();
                     // Its own `dyn_container`, so a progress tick doesn't rebuild
                     // the buttons and take the focus ring with them.
@@ -698,7 +758,7 @@ pub(crate) fn script_overlay(ui: Ui) -> impl IntoView {
                                 !running && ready,
                                 ring,
                                 ACTION_TAB + 10,
-                                move || run_script(run_ui.clone()),
+                                move || run_script(&run_ctx),
                             ),
                         ))
                         .style(|st| st.items_center().gap(theme::scaled(8.0)))
@@ -760,9 +820,8 @@ pub(crate) fn script_overlay(ui: Ui) -> impl IntoView {
 /// Close the modal when the connection it belongs to goes away — `dump_view`'s
 /// rule, for its reason: the modal would otherwise still be describing the old
 /// connection, and its Run button would reach the new one.
-fn watch_connection(ui: Ui) {
-    let s = ui.script;
-    let active = ui.conn.active_conn;
+fn watch_connection(s: ScriptUi, conn: ConnUi) {
+    let active = conn.active_conn;
     create_effect(move |_| {
         let conn = active.get();
         if s.target
