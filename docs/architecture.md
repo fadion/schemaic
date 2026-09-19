@@ -11024,6 +11024,15 @@ existing prose was left alone.
     preview, so the clause guards nothing that arises today; it is written down anyway, because the
     alternative is a member of this group whose correctness rests on a caller remembering to close
     itself first.
+    **`whole_ui_gate` 5 → 2, and the two left are the layer and the union.** The three group
+    predicates take the bundles they read — `ddl_modals_up(OverlayUi, ImportUi, DumpUi, ScriptUi,
+    DdlUi)`, `workspace_modals_up(OverlayUi, BlobUi, DdlUi)` and `settings_modals_up(TermUi, AiUi,
+    LayoutUi)` — each having already been a list of `Copy` flags read at the top and never touched
+    again, with only the signature not saying so. Neither of the other two is a candidate:
+    `modal_layer` reaches eighteen `Ui` fields and hands the bundle to every modal constructor in
+    the app, the widest thing in the crate after `center`, and `modal_backdrop_up` calls all three
+    predicates above and adds seven terms of its own, so what it needs is their union — eleven
+    bundles, a parameter list longer than the function.
   - `markdown.rs` — AI-chat `render_markdown`/`CodeActions`/`code_block` (pulldown-cmark). Its
     prose colour and its font size are both **baked into a text `AttrsList`** rather than read in a
     style closure, which an `AttrsList` is not — so this module's correctness depends on
@@ -11084,6 +11093,14 @@ existing prose was left alone.
     on (see **No floem `Dropdown`** below). `themed_toggle` is the un-ringed builder beneath, and
     is **private** on purpose: a control nobody can Tab to is one left out of the modal's keyboard
     order by accident.
+    **Off `whole_ui_gate`'s list, 4 to zero, and it is `connection_import.rs`'s sweep a second
+    time** — the module was narrow already and only had to say so, each of its four modals (the
+    three settings ones and Shortcuts) owning one domain and reading nothing else:
+    `term_settings_overlay(TermUi, Rc<TermActions>)`,
+    `ai_settings_overlay(AiUi, ConnUi, Rc<AiActions>)` — the `ConnUi` is the active connection's
+    data-access level, which the AI pane reports — `theme_settings_overlay(LayoutUi,
+    open_config_dir: Rc<dyn Fn()>)`, and `help_overlay(LayoutUi)`, which reads a single signal. The
+    module names no `Ui` anywhere now, prose included.
     **The body opens with a version caption, and the string it shows is composed in `schemaic-core`.**
     `settings_version_line` renders `core::app_version_label()` — `Schemaic v0.24.0`, built from
     `APP_NAME` and `APP_VERSION` (`env!("CARGO_PKG_VERSION")`, which inherits
@@ -11983,6 +12000,27 @@ existing prose was left alone.
     column/key counts and the collation come free from the in-memory `TableInfo`
     (`table_designer::loaded_table`), which is what gives a view something to show on an engine
     that publishes no statistics for one.
+    **Off `whole_ui_gate`'s list, 5 to zero, on a `PropertiesCtx` — and the footer is why.** The
+    panel itself reads only `overlay` and the loaded schema, but its **Edit** routes to the table
+    designer or the view editor, so it wants what those two doors want — `ConnUi`, `SchemaUi`,
+    `DdlUi` and the `ViewAlgoFn` the view editor's door ends in — on top of the four arguments
+    `footer` already carries. Named one by one that is nine parameters, past clippy's seven: the
+    lint
+    and the gate's "take the child bundle" agree, and the ctx is what they agree on. `PropertiesCtx`
+    holds eight things and no `Ui` — `overlay: OverlayUi`, `schema: SchemaUi`, `conn: ConnUi`,
+    `ddl: DdlUi` and the `stats`/`count_rows`/`count_cancel`/`view_algorithm` closures — built once
+    by naming the reads at its one call site, `PropertiesCtx::new(ui.overlay, ui.schema, ui.conn,
+    ui.ddl, &ui.schema_actions)` in `modals.rs`. `open_for_table` stayed off it for
+    `users_view::open_for_server`'s and `import_view::open_import`'s reason a fourth time — a door
+    that only writes the modal's own signals has no business cloning four `Rc`s to do it — so it
+    takes `OverlayUi`, and both its call sites (the table context menu in `overlays.rs`, the results
+    toolbar's `open_properties` callback in `lib.rs`) pass `ui.overlay`. **The detail worth
+    recording
+    is `stats_body`, which reads nothing at all**: it took a `&Ui` purely to carry it down to
+    `count_row`, whose two actions are the only reads on that path, and it carries a
+    `&PropertiesCtx` now — the same shape, honestly labelled. A parameter that exists only to be
+    passed on is still a dependency the signature is claiming, and that one was claiming the whole
+    bundle.
     - **Qualifying the figures is the feature.** An estimate prints `~4.21m` via
       `RowCount::label`, `Freshness::note` prints the staleness caveat in words, and an index is
       called unused only where `IndexStats::is_unused` says so — worded with its window attached,
@@ -15396,8 +15434,34 @@ existing prose was left alone.
     narrower than the widest of them. That is `create_submenu`'s shape before the two editor doors
     came down — a number held there by a callee rather than by its own reads — with the difference
     that this one has nowhere to go, because the callee holding it is the app's centre pane.
+    **`settings.rs` and `properties.rs` came off next, and the pair is this campaign's two answers
+    side by side.** `settings.rs` went 4 to zero the way `connection_import.rs` did — narrow
+    already and only having to say so, each of its four modals owning one domain and reading nothing
+    else: `term_settings_overlay(TermUi, Rc<TermActions>)`, `ai_settings_overlay(AiUi, ConnUi,
+    Rc<AiActions>)` — the `ConnUi` being the data-access level the AI pane reports —
+    `theme_settings_overlay(LayoutUi, open_config_dir)` and `help_overlay(LayoutUi)`, which reads a
+    single signal. `properties.rs` went 5 to zero the other way, on a `PropertiesCtx`, and the
+    footer is why: **Edit** routes to the table designer or the view editor, so the panel wants what
+    those two doors want on top of the four arguments `footer` already carries, which named one by
+    one is nine parameters — past clippy's seven, so the lint and *take the child bundle* agree and
+    the ctx is what they agree on. `open_for_table` stayed off it for `open_for_server`'s and
+    `open_import`'s reason a fourth time. **The one to carry forward is `properties::stats_body`,
+    which reads nothing at all**: it took a `&Ui` purely to hand down to `count_row`, whose two
+    actions are the only reads on that path, and it carries a `&PropertiesCtx` now — the same shape,
+    honestly labelled. A parameter that exists only to be passed on is still a dependency the
+    signature is claiming, and that one was claiming the whole bundle.
+    **`modals.rs` went 5 → 2 in the same tranche, and the two left are the end of that line.** The
+    three group predicates take the bundles they read — `ddl_modals_up(OverlayUi, ImportUi, DumpUi,
+    ScriptUi, DdlUi)`, `workspace_modals_up(OverlayUi, BlobUi, DdlUi)` and
+    `settings_modals_up(TermUi, AiUi, LayoutUi)` — each already a list of `Copy` flags read at the
+    top and never touched again. `modal_layer` reaches eighteen `Ui` fields and hands the bundle to
+    every modal constructor in the app, the widest thing in the crate after `center`, and
+    `modal_backdrop_up` calls all three predicates and adds seven terms of its own, so what it needs
+    is their union: eleven bundles, a parameter list longer than the function. Neither is a
+    candidate, which is what a floor looks like when it is the function's own reach rather than a
+    callee holding it there.
     **The live number is the sum of `BUDGET`, not the "roughly 140" above**, which describes the
-    state the gate found and by design never moves. That sum went **206 → 40** over this run:
+    state the gate found and by design never moves. That sum went **206 → 28** over this run:
     `table_designer.rs` 29 → 26 → 10 → 4 → **0**, `object_editor.rs` 14 → 5 → 4 → **0**,
     `routine_editor.rs` 12 → 6 → **0**, `event_editor.rs` 11 → 5 → **0**,
     `trigger_editor.rs` 11 → 8 → 7 → **0**, `view_editor.rs` 10 → 6 → **0**,
@@ -15405,14 +15469,16 @@ existing prose was left alone.
     `ddl_preview.rs` 6 → 4 → 2, `overlays.rs` 15 → 13 → 4, `account_editor.rs` 6 → **0**,
     `schema_tree.rs` 6 → 3 → 2, `users_view.rs` 9 → 8 → 5 → **0**, `import_view.rs` 9 → **0**,
     `dump_view.rs` 9 → **0**, `compare_view.rs` 8 → **0**, `script_view.rs` 6 → **0**,
-    `connection_import.rs` 6 → **0**, `lib.rs` 6 → 5.
+    `connection_import.rs` 6 → **0**, `properties.rs` 5 → **0**, `settings.rs` 4 → **0**,
+    `modals.rs` 5 → 2, `lib.rs` 6 → 5.
     Every step is recorded against its own entry with what it narrowed *to*,
     so read the list for where a file stands rather than inferring it from a paragraph — and a file
     that reaches zero leaves the list altogether, which is the one way an entry is ever removed and
-    the point at which it may not take a `Ui` again at all. **Fourteen files have left it** — the
+    the point at which it may not take a `Ui` again at all. **Sixteen files have left it** — the
     three DDL-object editors, then `trigger_editor.rs`, `account_editor.rs`, `users_view.rs`,
     `import_view.rs`, `dump_view.rs`, `compare_view.rs`, `script_view.rs`, `view_editor.rs`,
-    `database_editor.rs`, `table_designer.rs` and `connection_import.rs` — and each left a comment
+    `database_editor.rs`, `table_designer.rs`, `connection_import.rs`, `properties.rs` and
+    `settings.rs` — and each left a comment
     behind where it sat, because a name absent from `BUDGET` says nothing on its own about whether
     it was ever on it.
     It is a **budget, not a ban**, because narrowing 140 signatures is a campaign and a gate that
@@ -19914,6 +19980,12 @@ Re-introducing the anti-patterns these guard against is a regression:
   the answer: the three grouped predicates (`ddl`/`workspace`/`settings`) and the open signals the
   layer raises directly — five of the six there now are. A group added without joining it fails
   there instead of opening into a zero-sized box.
+  **It reads that closure's source, so a narrowing *above* it is invisible to the gate — which is
+  the point.** `whole_ui_gate`'s pass over `modals.rs` changed `modal_backdrop_up`'s signature and
+  the `let` lines binding those terms and nothing inside the closure, so the gate neither broke nor
+  went blind: what the predicate *takes* is free to change, how its answer is *written* is not. That
+  is the bargain `overlays.rs`'s two submenu call spellings keep with `menu_order_gate`, read from
+  the other end.
   **That gate's own list has to be kept current, and it goes stale exactly when a modal leaves a
   group**: the shared confirm became the layer's last entry and took its own term in
   `modal_backdrop_up`, and the array in the test was extended with it only afterwards. The grid

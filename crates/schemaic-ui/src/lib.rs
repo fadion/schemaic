@@ -8481,7 +8481,7 @@ fn center(ui: Ui) -> impl IntoView {
             )
             .is_some_and(|t| t.is_view);
             properties::open_for_table(
-                &ui,
+                ui.overlay,
                 conn_id,
                 &src.database,
                 src.schema.as_deref(),
@@ -14897,7 +14897,27 @@ mod whole_ui_gate {
         // it as `overlays.rs`'s `create_submenu` before the two editor doors
         // came down: a number held there by a callee, not by its own shape.
         ("lib.rs", 5),
-        ("modals.rs", 5),
+        // 5 → 2: the three **group predicates** take the bundles they read —
+        // `ddl_modals_up(OverlayUi, ImportUi, DumpUi, ScriptUi, DdlUi)`,
+        // `workspace_modals_up(OverlayUi, BlobUi, DdlUi)` and
+        // `settings_modals_up(TermUi, AiUi, LayoutUi)`. Each was already a list
+        // of `Copy` flags read at the top and never touched again; only the
+        // signature had not said so.
+        //
+        // **The two left are the layer and the union**, and neither is a
+        // candidate. `modal_layer` reaches eighteen `Ui` fields and hands the
+        // bundle to every modal constructor in the app — it is the widest thing
+        // in the crate after `center`. `modal_backdrop_up` calls all three
+        // predicates above *and* adds seven flags of its own, so what it needs
+        // is their union: eleven bundles. Narrowing it would be a parameter
+        // list longer than the function.
+        //
+        // `the_predicate_names_every_group_the_layer_raises` scans
+        // `modal_backdrop_up`'s **returned closure** for each term it must
+        // `||` in. The narrowing touched the signature and the `let` lines
+        // above that closure and nothing inside it, which is why the gate
+        // neither broke nor went blind.
+        ("modals.rs", 2),
         ("monitor_view.rs", 1),
         // `object_editor.rs` is **off the list** — see the note under
         // `routine_editor.rs`, which came off with it.
@@ -14935,7 +14955,25 @@ mod whole_ui_gate {
         // `view_editor.rs` records when that is the wrong answer.
         ("overlays.rs", 4),
         ("plan_view.rs", 1),
-        ("properties.rs", 5),
+        // `properties.rs` is **off the list** — 5 to zero, on a `PropertiesCtx`
+        // rather than named bundles, and the footer is why. The panel itself
+        // reads `overlay` and the loaded schema; its **Edit** routes to the
+        // table designer or the view editor, so it wants what those two doors
+        // want — `ConnUi`, `SchemaUi`, `DdlUi` and the `ViewAlgoFn` the view
+        // editor's door ends in — on top of the four arguments it already
+        // carries. Named one by one that is nine parameters, past clippy's
+        // seven: the lint and this gate's "take the child bundle" agree, and
+        // the ctx is what they agree on.
+        //
+        // `open_for_table` stayed off it, for `open_for_server`'s and
+        // `open_import`'s reason a fourth time: a door that only writes the
+        // modal's own signals has no business cloning four `Rc`s to do it, so
+        // it takes `OverlayUi`.
+        //
+        // `stats_body` is the one that shows why the ctx beats threading: it
+        // reads *nothing* itself and existed only to carry a `&Ui` down to
+        // `count_row`'s two actions. It carries a `&PropertiesCtx` now, which
+        // is the same shape honestly labelled.
         // `routine_editor.rs`, `event_editor.rs` and `object_editor.rs` are
         // **off the list** — 6, 5 and 4 to zero, and the three had to move
         // together because `object_editor`'s doors *are* the other two's.
@@ -15013,7 +15051,23 @@ mod whole_ui_gate {
         // about what the modal touches that nothing checks. The compiler caught
         // this one only because the field went unread — a field still read by
         // some other path would have stayed.
-        ("settings.rs", 4),
+        // `settings.rs` is **off the list** — 4 to zero, and like
+        // `connection_import.rs` it was narrow already and only had to say so:
+        // each of the four settings modals owns one domain and reads nothing
+        // else. `term_settings_overlay(TermUi, Rc<TermActions>)`,
+        // `ai_settings_overlay(AiUi, ConnUi, Rc<AiActions>)` — the `ConnUi` is
+        // the active connection's data-access level, which the AI pane reports
+        // — `theme_settings_overlay(LayoutUi, open_config_dir)` and
+        // `help_overlay(LayoutUi)`, which reads a single signal.
+        //
+        // The module names no `Ui` at all now — **not a first**, and the claim
+        // this comment used to make is worth leaving as a warning: twenty-three
+        // files in the crate contain no bare `Ui`, five of them already off
+        // this list (`connection_import.rs`, `view_editor.rs`,
+        // `database_editor.rs`, `routine_editor.rs`, `object_editor.rs`).
+        // Zero *parameters* is what this list tracks; zero *mentions* is a
+        // different measurement, and a file can be off the list while its
+        // prose still names the bundle — `users_view.rs` does, three times.
         ("snippet_edit.rs", 1),
         ("snippet_panel.rs", 1),
         // 33 → 32: `suggest_chevron` took `&Ui` for two `Copy` overlay signals

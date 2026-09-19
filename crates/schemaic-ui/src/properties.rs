@@ -39,7 +39,64 @@ use crate::widgets::{
     focus_root_with_ring, in_ring_button, loading_dots, modal_body_h, modal_footer_split,
     modal_pad_h, modal_title_owned, modal_w, panel_style,
 };
-use crate::{PropertiesState, PropertiesTarget, Ui, icons, theme};
+use crate::{
+    ConnUi, DdlUi, OverlayUi, PropertiesState, PropertiesTarget, SchemaUi, ViewAlgoFn, icons, theme,
+};
+
+/// Everything the properties modal reaches out of the root bundle.
+///
+/// **This one is nearly all driver, and the reason is its footer.** The panel
+/// itself only reads `overlay` and the loaded schema, but the footer offers
+/// **Edit**, which routes to the table designer or the view editor — so it
+/// wants what those two doors want (`ConnUi`, `SchemaUi`, `DdlUi` and the
+/// `ViewAlgoFn` the view editor's door ends in) on top of the four arguments
+/// it already carries. Named one by one that is nine parameters, past clippy's
+/// limit; the gate's own rule and the lint agree, so they are gathered here.
+///
+/// Holds no `Ui`, for `whole_ui_gate`'s reason: it is built by naming the
+/// reads at its one call site.
+#[derive(Clone)]
+pub(crate) struct PropertiesCtx {
+    /// The modal's own four signals — target, state, counting, count error.
+    overlay: OverlayUi,
+    /// The loaded schema, for the `TableInfo` the panel shows without a round
+    /// trip, and for the two editor doors below.
+    schema: SchemaUi,
+    /// The connection registry — `edit_ctx` at the footer's Edit.
+    conn: ConnUi,
+    /// The editors the footer opens into.
+    ddl: DdlUi,
+    /// Fetch this table's statistics into `overlay.properties_state`.
+    stats: Rc<dyn Fn(PropertiesTarget)>,
+    /// The `COUNT(*)` the user asks for, and the stop for it. Separate from
+    /// [`Self::stats`] because it is a full scan rather than part of opening.
+    count_rows: Rc<dyn Fn(PropertiesTarget)>,
+    count_cancel: Rc<dyn Fn()>,
+    /// The view editor's door ends in this — see `view_editor::open_for_view`.
+    view_algorithm: ViewAlgoFn,
+}
+
+impl PropertiesCtx {
+    /// Gather the modal's reads where the root bundle is in reach.
+    pub(crate) fn new(
+        overlay: OverlayUi,
+        schema: SchemaUi,
+        conn: ConnUi,
+        ddl: DdlUi,
+        actions: &crate::SchemaActions,
+    ) -> Self {
+        Self {
+            overlay,
+            schema,
+            conn,
+            ddl,
+            stats: actions.table_stats.clone(),
+            count_rows: actions.count_rows.clone(),
+            count_cancel: actions.count_cancel.clone(),
+            view_algorithm: actions.view_algorithm.clone(),
+        }
+    }
+}
 
 /// Modal width. Wide enough that the index list's three columns (name,
 /// cardinality, usage) sit on one line for an ordinary index name without the
@@ -80,18 +137,21 @@ fn index_fact_gap() -> f64 {
 /// results toolbar's entry describes a table on *that* server even while the
 /// switcher points at another one — and the fetch keys on this
 /// (`db_for(target.conn_id)`).
+/// Takes the bundle rather than [`PropertiesCtx`]: this door only writes the
+/// modal's own signals, so gathering four fetches for it would be four `Rc`
+/// clones spent on nothing — `users_view::open_for_server`'s case again.
 pub(crate) fn open_for_table(
-    ui: &Ui,
+    o: OverlayUi,
     conn_id: u64,
     database: &str,
     schema: Option<&str>,
     table: &str,
     is_view: bool,
 ) {
-    ui.overlay.properties_state.set(PropertiesState::Loading);
-    ui.overlay.properties_counting.set(false);
-    ui.overlay.properties_count_err.set(None);
-    ui.overlay.properties.set(Some(PropertiesTarget {
+    o.properties_state.set(PropertiesState::Loading);
+    o.properties_counting.set(false);
+    o.properties_count_err.set(None);
+    o.properties.set(Some(PropertiesTarget {
         conn_id,
         database: database.to_string(),
         schema: schema.map(str::to_string),
@@ -100,11 +160,11 @@ pub(crate) fn open_for_table(
     }));
 }
 
-pub(crate) fn properties_overlay(ui: Ui) -> impl IntoView {
-    let target = ui.overlay.properties;
-    let state = ui.overlay.properties_state;
-    let counting = ui.overlay.properties_counting;
-    let count_err = ui.overlay.properties_count_err;
+pub(crate) fn properties_overlay(ctx: PropertiesCtx) -> impl IntoView {
+    let target = ctx.overlay.properties;
+    let state = ctx.overlay.properties_state;
+    let counting = ctx.overlay.properties_counting;
+    let count_err = ctx.overlay.properties_count_err;
 
     dyn_container(
         move || target.get(),
@@ -112,7 +172,7 @@ pub(crate) fn properties_overlay(ui: Ui) -> impl IntoView {
             let Some(t) = open else {
                 return empty().into_any();
             };
-            let ui = ui.clone();
+            let ctx = ctx.clone();
             let close: Rc<dyn Fn()> = Rc::new(move || {
                 target.set(None);
                 state.set(PropertiesState::Loading);
@@ -124,7 +184,7 @@ pub(crate) fn properties_overlay(ui: Ui) -> impl IntoView {
             // Ask for the statistics. Runs once per opening: the closure reads no
             // signal, and a fresh target rebuilds this whole branch.
             {
-                let fetch = ui.schema_actions.table_stats.clone();
+                let fetch = ctx.stats.clone();
                 let t = t.clone();
                 create_effect(move |_| (fetch)(t.clone()));
             }
@@ -134,18 +194,18 @@ pub(crate) fn properties_overlay(ui: Ui) -> impl IntoView {
             // No round trip, and it is what gives a view something to show on an
             // engine that publishes no statistics for one.
             let info = crate::table_designer::loaded_table(
-                ui.schema,
+                ctx.schema,
                 &t.database,
                 t.schema.as_deref(),
                 &t.table,
             );
 
             let body = {
-                let (t, info, ui, ring) = (t.clone(), info.clone(), ui.clone(), ring.clone());
+                let (t, info, ctx, ring) = (t.clone(), info.clone(), ctx.clone(), ring.clone());
                 dyn_container(
                     move || (state.get(), counting.get(), count_err.get()),
                     move |(st, busy, err)| {
-                        stats_body(&t, info.as_ref(), st, busy, err, &ui, ring.clone())
+                        stats_body(&t, info.as_ref(), st, busy, err, &ctx, ring.clone())
                     },
                 )
                 .style(|s| s.width_full().flex_col())
@@ -156,7 +216,7 @@ pub(crate) fn properties_overlay(ui: Ui) -> impl IntoView {
                 ring.clone(),
             );
             let footer = footer(
-                ui.clone(),
+                &ctx,
                 t.clone(),
                 info.clone(),
                 state,
@@ -200,7 +260,7 @@ fn stats_body(
     state: PropertiesState,
     counting: bool,
     count_err: Option<String>,
-    ui: &Ui,
+    ctx: &PropertiesCtx,
     ring: FocusRing,
 ) -> AnyView {
     // **Collected as `Option`s and filtered, never as an `empty()` placeholder.**
@@ -233,7 +293,7 @@ fn stats_body(
             // it. It was also the only state in which `CountHint::Error` could
             // never appear, so a count error raised in another state and then
             // followed by a failed re-fetch was swallowed.
-            count_row(target, None, counting, count_err, ui, ring),
+            count_row(target, None, counting, count_err, ctx, ring),
         ]
         .into_iter()
         .flatten()
@@ -249,7 +309,7 @@ fn stats_body(
                     .to_string(),
             )),
             structure_section(target, info),
-            count_row(target, None, counting, count_err, ui, ring),
+            count_row(target, None, counting, count_err, ctx, ring),
         ]
         .into_iter()
         .flatten()
@@ -276,14 +336,14 @@ fn stats_body(
             // about the object. `options_section` has its own emptiness guard,
             // so on an engine that publishes nothing at all it adds nothing.
             options_section(&stats, info),
-            count_row(target, None, counting, count_err, ui, ring),
+            count_row(target, None, counting, count_err, ctx, ring),
         ]
         .into_iter()
         .flatten()
         .collect(),
         PropertiesState::Loaded(stats) => [
             Some(headline(&stats)),
-            count_row(target, Some(&stats), counting, count_err, ui, ring),
+            count_row(target, Some(&stats), counting, count_err, ctx, ring),
             storage_section(&stats),
             structure_section(target, info),
             options_section(&stats, info),
@@ -359,7 +419,7 @@ fn count_row(
     stats: Option<&TableStats>,
     counting: bool,
     count_err: Option<String>,
-    ui: &Ui,
+    ctx: &PropertiesCtx,
     ring: FocusRing,
 ) -> Option<AnyView> {
     let counted = stats.is_some_and(|s| s.exact_rows.is_some());
@@ -377,7 +437,7 @@ fn count_row(
         // connection, so "wait or close the panel" is not the only answer it should
         // have: Cancel stops it on the server. It takes `COUNT_TAB` because the two
         // are mutually exclusive — the ring holds whichever of them exists.
-        let stop = ui.schema_actions.count_cancel.clone();
+        let stop = ctx.count_cancel.clone();
         let press = stop.clone();
         let face = h_stack((
             loading_dots("Counting", theme::text_dim, font_label),
@@ -403,7 +463,7 @@ fn count_row(
             move || (press)(),
         ))
     } else {
-        let run = ui.schema_actions.count_rows.clone();
+        let run = ctx.count_rows.clone();
         // **Both halves, and they are not the same one.** `in_ring_button` binds
         // Space/Enter for the focus ring and nothing else — a face without its
         // own `on_click_stop` is a button the mouse cannot press, which is
@@ -727,7 +787,7 @@ fn note_line(icon: &'static str, color: fn() -> Color, message: String) -> AnyVi
 
 /// Copy on the left; the handoff to the editor and Close on the right.
 fn footer(
-    ui: Ui,
+    ctx: &PropertiesCtx,
     target: PropertiesTarget,
     info: Option<TableInfo>,
     state: RwSignal<PropertiesState>,
@@ -755,9 +815,9 @@ fn footer(
     // read-only from the status bar, and the button would stay live. What makes
     // it so in both directions is the refusal inside `open_for_table` /
     // `open_for_view`; this decides only what the button *says*.
-    let ctx = crate::table_designer::edit_ctx(ui.conn);
+    let conn_ctx = crate::table_designer::edit_ctx(ctx.conn);
     let editable_view = crate::view_editor::is_editable_view(info.as_ref());
-    let can_edit = !ctx.read_only
+    let can_edit = !conn_ctx.read_only
         && info.as_ref().is_some_and(|i| {
             if target.is_view {
                 editable_view
@@ -767,24 +827,24 @@ fn footer(
         });
     let is_view = target.is_view;
     let edit = {
-        let (ui, t, close) = (ui.clone(), target.clone(), close.clone());
+        let (ctx, t, close) = (ctx.clone(), target.clone(), close.clone());
         move || {
             (close)();
             if t.is_view {
                 crate::view_editor::open_for_view(
-                    ui.conn,
-                    ui.schema,
-                    ui.ddl,
-                    &ui.schema_actions.view_algorithm,
+                    ctx.conn,
+                    ctx.schema,
+                    ctx.ddl,
+                    &ctx.view_algorithm,
                     &t.database,
                     t.schema.as_deref(),
                     &t.table,
                 );
             } else {
                 crate::table_designer::open_for_table(
-                    ui.conn,
-                    ui.schema,
-                    ui.ddl,
+                    ctx.conn,
+                    ctx.schema,
+                    ctx.ddl,
                     &t.database,
                     t.schema.as_deref(),
                     &t.table,

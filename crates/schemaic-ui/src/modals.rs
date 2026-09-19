@@ -26,9 +26,9 @@ use crate::settings::{
     ai_settings_overlay, help_overlay, term_settings_overlay, theme_settings_overlay,
 };
 use crate::{
-    DdlUi, Ui, account_editor, database_editor, ddl_preview, event_editor, import_view,
-    object_editor, properties, routine_editor, table_designer, theme, trigger_editor, users_view,
-    view_editor,
+    AiUi, BlobUi, DdlUi, DumpUi, ImportUi, LayoutUi, OverlayUi, ScriptUi, TermUi, Ui,
+    account_editor, database_editor, ddl_preview, event_editor, import_view, object_editor,
+    properties, routine_editor, table_designer, theme, trigger_editor, users_view, view_editor,
 };
 
 /// **Every modal, in one layer that starts below the title bar.**
@@ -71,9 +71,9 @@ pub(crate) fn modal_layer(ui: Ui, modal_up: impl Fn() -> bool + Copy + 'static) 
     // Each group's wrapper asks its own question once, and gives its members
     // their box only while one of them is open — an always-full-window wrapper
     // would eat every click in the app beneath it.
-    let ddl_modals_up = ddl_modals_up(&ui);
-    let workspace_modals_up = workspace_modals_up(&ui);
-    let settings_modals_up = settings_modals_up(&ui);
+    let ddl_modals_up = ddl_modals_up(ui.overlay, ui.import, ui.dump, ui.script, ui.ddl);
+    let workspace_modals_up = workspace_modals_up(ui.overlay, ui.blob, ui.ddl);
+    let settings_modals_up = settings_modals_up(ui.term, ui.ai, ui.layout);
     let confirm_up = ui.overlay.confirm;
     stack((
         // First, so it keeps the place it had in the root stack: under every
@@ -232,7 +232,13 @@ pub(crate) fn modal_layer(ui: Ui, modal_up: impl Fn() -> bool + Copy + 'static) 
         stack((
             monitor_overlay(ui.clone()),
             erd_overlay(ui.clone()),
-            properties::properties_overlay(ui.clone()),
+            properties::properties_overlay(properties::PropertiesCtx::new(
+                ui.overlay,
+                ui.schema,
+                ui.conn,
+                ui.ddl,
+                &ui.schema_actions,
+            )),
             users_view::users_overlay(users_view::UsersCtx::new(
                 ui.conn,
                 ui.ddl,
@@ -270,10 +276,10 @@ pub(crate) fn modal_layer(ui: Ui, modal_up: impl Fn() -> bool + Copy + 'static) 
         // its own backdrop), and the wrapper fills only while one is open, or an
         // always-full-window box would eat every click in the app.
         stack((
-            term_settings_overlay(ui.clone()),
-            ai_settings_overlay(ui.clone()),
-            theme_settings_overlay(ui.clone()),
-            help_overlay(ui.clone()),
+            term_settings_overlay(ui.term, ui.term_actions.clone()),
+            ai_settings_overlay(ui.ai, ui.conn, ui.ai_actions.clone()),
+            theme_settings_overlay(ui.layout, ui.open_config_dir.clone()),
+            help_overlay(ui.layout),
         ))
         .style(move |s| {
             if settings_modals_up() {
@@ -381,13 +387,19 @@ pub(crate) fn modal_layer(ui: Ui, modal_up: impl Fn() -> bool + Copy + 'static) 
 /// thing the wrapper's box is for. The shared confirm is not: it is its own entry
 /// at the end of the layer, above every group, and so has its own term in
 /// [`modal_backdrop_up`] exactly as `find`, `manage` and `plan` do.
-fn ddl_modals_up(ui: &Ui) -> impl Fn() -> bool + Copy + 'static {
-    let tx_prompt = ui.overlay.tx_prompt;
-    let import_open = ui.import.target;
-    let dump_open = ui.dump.target;
-    let script_open = ui.script.target;
-    let snippet_edit = ui.overlay.snippet_edit;
-    let editors = ddl_editors_up(ui.ddl);
+fn ddl_modals_up(
+    overlay: OverlayUi,
+    import: ImportUi,
+    dump: DumpUi,
+    script: ScriptUi,
+    ddl: DdlUi,
+) -> impl Fn() -> bool + Copy + 'static {
+    let tx_prompt = overlay.tx_prompt;
+    let import_open = import.target;
+    let dump_open = dump.target;
+    let script_open = script.target;
+    let snippet_edit = overlay.snippet_edit;
+    let editors = ddl_editors_up(ddl);
     move || {
         // **The shared error modal is deliberately not here.** It is its own
         // entry near the end of the layer now, above every group, and so has its
@@ -455,21 +467,25 @@ pub(crate) fn ddl_editors_up(d: DdlUi) -> impl Fn() -> bool + Copy + 'static {
 /// and privileges browser, and schema compare. Both of those raise something
 /// painted in an earlier group and so stop counting while it is up. See the
 /// note in the body.
-fn workspace_modals_up(ui: &Ui) -> impl Fn() -> bool + Copy + 'static {
-    let mon_open = ui.overlay.monitor_open;
-    let erd_open = ui.overlay.erd;
-    let props_open = ui.overlay.properties;
-    let users_open = ui.overlay.users;
-    let blob_open = ui.blob.target;
-    let compare_open = ui.overlay.compare;
+fn workspace_modals_up(
+    overlay: OverlayUi,
+    blob: BlobUi,
+    ddl: DdlUi,
+) -> impl Fn() -> bool + Copy + 'static {
+    let mon_open = overlay.monitor_open;
+    let erd_open = overlay.erd;
+    let props_open = overlay.properties;
+    let users_open = overlay.users;
+    let blob_open = blob.target;
+    let compare_open = overlay.compare;
     // **The browser counts only while it is the thing on screen.** It renders
     // nothing while one of the account forms or the DDL preview is up — those
     // are raised from it and painted in an earlier group — and a wrapper that
     // still filled the layer would be a transparent full-window box sitting on
     // top of the form, swallowing every click meant for it.
-    let account_open = ui.ddl.account;
-    let grant_open = ui.ddl.grant;
-    let preview_open = ui.ddl.preview;
+    let account_open = ddl.account;
+    let grant_open = ddl.grant;
+    let preview_open = ddl.preview;
     move || {
         mon_open.get()
             || erd_open.get().is_some()
@@ -490,11 +506,15 @@ fn workspace_modals_up(ui: &Ui) -> impl Fn() -> bool + Copy + 'static {
 }
 
 /// The settings/help group's modals.
-fn settings_modals_up(ui: &Ui) -> impl Fn() -> bool + Copy + 'static {
-    let term_open = ui.term.settings_open;
-    let ai_open = ui.ai.settings_open;
-    let theme_open = ui.layout.theme_settings_open;
-    let help_open = ui.layout.help_open;
+fn settings_modals_up(
+    term: TermUi,
+    ai: AiUi,
+    layout: LayoutUi,
+) -> impl Fn() -> bool + Copy + 'static {
+    let term_open = term.settings_open;
+    let ai_open = ai.settings_open;
+    let theme_open = layout.theme_settings_open;
+    let help_open = layout.help_open;
     move || term_open.get() || ai_open.get() || theme_open.get() || help_open.get()
 }
 
@@ -542,9 +562,9 @@ pub(crate) fn modal_backdrop_up(ui: &Ui) -> impl Fn() -> bool + Copy + 'static {
     // consequence if this term were missing — the title bar live and undimmed
     // over an error nobody can dismiss.
     let error_modal_open = ui.overlay.error_modal_open;
-    let ddl = ddl_modals_up(ui);
-    let workspace = workspace_modals_up(ui);
-    let settings = settings_modals_up(ui);
+    let ddl = ddl_modals_up(ui.overlay, ui.import, ui.dump, ui.script, ui.ddl);
+    let workspace = workspace_modals_up(ui.overlay, ui.blob, ui.ddl);
+    let settings = settings_modals_up(ui.term, ui.ai, ui.layout);
     move || {
         find_open.get()
             || manage_open.get()

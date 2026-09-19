@@ -2160,7 +2160,7 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                         let (db, ns, tbl) = (database.clone(), schema.clone(), table.clone());
                         entries.push(MenuEntry::action("Properties", move || {
                             crate::properties::open_for_table(
-                                &ui,
+                                ui.overlay,
                                 active_conn.get_untracked(),
                                 &db,
                                 ns.as_deref(),

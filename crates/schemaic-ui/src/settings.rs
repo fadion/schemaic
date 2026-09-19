@@ -14,21 +14,24 @@ use crate::widgets::{
     ActionKind, MenuEntry, action_button, autohide, focus_root_with_ring, form_hint,
     form_label_style, modal_title, panel_style,
 };
-use crate::{AiEffort, FieldCfg, Harness, SchemaScope, TermCursor, Ui, edit_field, icons, theme};
+use crate::{
+    AiActions, AiEffort, AiUi, ConnUi, FieldCfg, Harness, LayoutUi, SchemaScope, TermActions,
+    TermCursor, TermUi, edit_field, icons, theme,
+};
 
 // ===== moved from lib.rs (settings modals) =====
 // The Terminal settings pane: shell + font size + cursor style dropdowns, and
 // copy-on-select / blink toggles. Every control binds straight to its persisted
 // signal — picking a shell respawns the terminal; the rest apply live.
-pub(crate) fn term_settings_overlay(ui: Ui) -> impl IntoView {
-    let open = ui.term.settings_open;
-    let shells = ui.term.shells;
-    let selected = ui.term.shell_selected;
-    let apply = ui.term_actions.apply_shell.clone();
-    let font_size = ui.term.font_size;
-    let copy_on_select = ui.term.copy_on_select;
-    let cursor_style = ui.term.cursor_style;
-    let cursor_blink = ui.term.cursor_blink;
+pub(crate) fn term_settings_overlay(term: TermUi, actions: Rc<TermActions>) -> impl IntoView {
+    let open = term.settings_open;
+    let shells = term.shells;
+    let selected = term.shell_selected;
+    let apply = actions.apply_shell.clone();
+    let font_size = term.font_size;
+    let copy_on_select = term.copy_on_select;
+    let cursor_style = term.cursor_style;
+    let cursor_blink = term.cursor_blink;
 
     dyn_container(
         move || open.get(),
@@ -768,19 +771,19 @@ pub(crate) fn in_ring_picker(
 // AI Assistant settings: harness + CLI path override + model + effort. Changes
 // commit when the modal closes (the `ai_apply` callback restarts the session and
 // persists).
-pub(crate) fn ai_settings_overlay(ui: Ui) -> impl IntoView {
-    let open = ui.ai.settings_open;
-    let harness = ui.ai.harness;
-    let cli_path = ui.ai.cli_path;
-    let model = ui.ai.model;
-    let effort = ui.ai.effort;
-    let instructions = ui.ai.instructions;
-    let scope = ui.ai.schema_scope;
-    let gutter = ui.ai.gutter;
+pub(crate) fn ai_settings_overlay(ai: AiUi, conn: ConnUi, actions: Rc<AiActions>) -> impl IntoView {
+    let open = ai.settings_open;
+    let harness = ai.harness;
+    let cli_path = ai.cli_path;
+    let model = ai.model;
+    let effort = ai.effort;
+    let instructions = ai.instructions;
+    let scope = ai.schema_scope;
+    let gutter = ai.gutter;
     // The active connection's data-access level, reactively — the modal reports
     // it, the connection form owns it.
-    let connections = ui.conn.connections;
-    let active_conn = ui.conn.active_conn;
+    let connections = conn.connections;
+    let active_conn = conn.active_conn;
     // **Named**, because it is the *active connection's* level and the grid a
     // step away obeys its own result's `conn_id`. Unnamed, the line could read
     // "Let it read data" over a grid whose attach actions are refused, and the
@@ -795,10 +798,10 @@ pub(crate) fn ai_settings_overlay(ui: Ui) -> impl IntoView {
             )
         })
     });
-    let apply = ui.ai_actions.apply.clone();
-    let detect_path = ui.ai_actions.detect_path.clone();
-    let constraint_notice = ui.ai_actions.constraint_notice.clone();
-    let cli_ok = ui.ai_actions.cli_ok.clone();
+    let apply = actions.apply.clone();
+    let detect_path = actions.detect_path.clone();
+    let constraint_notice = actions.constraint_notice.clone();
+    let cli_ok = actions.cli_ok.clone();
 
     dyn_container(
         move || open.get(),
@@ -1488,18 +1491,21 @@ fn settings_version_line() -> impl IntoView {
     })
 }
 
-pub(crate) fn theme_settings_overlay(ui: Ui) -> impl IntoView {
-    let open = ui.layout.theme_settings_open;
-    let ui_theme = ui.layout.ui_theme;
-    let editor_theme = ui.layout.editor_theme;
-    let ui_scale = ui.layout.ui_scale;
-    let editor_font = ui.layout.editor_font;
-    let row_limit = ui.layout.row_limit;
-    let statement_timeout = ui.layout.statement_timeout;
-    let confirm_writes = ui.layout.confirm_writes;
-    let live_validate = ui.layout.live_validate;
-    let restore_tabs = ui.layout.restore_tabs;
-    let open_config_dir = ui.open_config_dir.clone();
+pub(crate) fn theme_settings_overlay(
+    layout: LayoutUi,
+    open_config_dir: Rc<dyn Fn()>,
+) -> impl IntoView {
+    let open = layout.theme_settings_open;
+    let ui_theme = layout.ui_theme;
+    let editor_theme = layout.editor_theme;
+    let ui_scale = layout.ui_scale;
+    let editor_font = layout.editor_font;
+    let row_limit = layout.row_limit;
+    let statement_timeout = layout.statement_timeout;
+    let confirm_writes = layout.confirm_writes;
+    let live_validate = layout.live_validate;
+    let restore_tabs = layout.restore_tabs;
+    let open_config_dir = open_config_dir.clone();
 
     dyn_container(
         move || open.get(),
@@ -1703,8 +1709,8 @@ pub(crate) fn theme_settings_overlay(ui: Ui) -> impl IntoView {
 // one place the list lives and where the reasoning about what earns a row is
 // written down; a test there fails the build when a Ctrl/Alt+letter binding
 // exists with no row. This view owns only the layout.
-pub(crate) fn help_overlay(ui: Ui) -> impl IntoView {
-    let open = ui.layout.help_open;
+pub(crate) fn help_overlay(layout: LayoutUi) -> impl IntoView {
+    let open = layout.help_open;
 
     dyn_container(
         move || open.get(),
