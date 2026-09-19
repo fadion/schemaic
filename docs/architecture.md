@@ -13395,6 +13395,17 @@ existing prose was left alone.
     those two calls *take* costs nothing and re-wrapping how they are *written* blinds the gate.
   - `schema_tree.rs` — SCHEMA sidebar (`schema_panel` + db/table/column/key row builders + keyboard
     nav).
+    **`SchemaTreeCtx` names what the rows reach instead of carrying a `Ui`** — `conn`, `schema`,
+    `ddl`, `overlay`, `schema_actions` and `table_colors`, beside the row state it already held.
+    It was the last context struct in the crate holding the root bundle, and `whole_ui_gate`'s
+    rule for those is under `lib.rs`: a ctx carrying `Ui` relocates it rather than narrowing it.
+    The cost is not only bookkeeping — this struct is cloned once per row, and cloning `Ui` bumps
+    about seven `Rc`s where five `Copy` bundles and one `Rc` bump one. **Two comments were wrong
+    about that field before it came off**, in opposite directions: the struct's own said it was
+    "for the row actions that open a modal" (true of `object_row`, silent on the rest) and
+    `BUDGET`'s said it was carried "for `table_colors` alone" (true of half of `table_node`). It
+    was reached in three functions for six things, one of them an `active_conn` the struct already
+    had a field for. Nothing checks a comment; the field list is checked by the compiler.
     **The panel's title is the only place a long catalogue read can be reported.**
     `SchemaState::begin_refresh` deliberately leaves an already-loaded database's rows on screen
     through a refresh, and the per-database `Loading` row only ever appears for a *first* load — the
@@ -15176,9 +15187,12 @@ existing prose was left alone.
     action out of `schema_actions`, on top of `target`, `gate` and a `FocusRing` they already carry,
     so all four take a browser-local `UsersCtx` — the three `Copy` bundles (`ConnUi`, `DdlUi`,
     `OverlayUi`) and the two fetch closures (`principals`, `grants`) as `Rc`s — the way
-    `schema_tree`'s rows take a `SchemaTreeCtx`. That struct, though, carries a `ui: Ui` *field*,
-    which the counter sees because it scans lines rather than signatures, and which is one of the
-    three `schema_tree.rs` still declares; `UsersCtx` holds no root bundle at all, so it is built by
+    `schema_tree`'s rows take a `SchemaTreeCtx`. That struct, at the time, carried a `ui: Ui`
+    *field* — which the counter sees, because it scans lines rather than signatures, and which was
+    one of the three `schema_tree.rs` then declared. **It does not any more**, and the reason it
+    came off is this paragraph's own rule read back at it: the field turned out to be reached in
+    three functions for six things, while the comment on it named one, so it is six named fields
+    now and that file is at 2. `UsersCtx` holds no root bundle at all, so it is built by
     **naming the reads at the call site** — `UsersCtx::new(ui.conn, ui.ddl, ui.overlay,
     &ui.schema_actions)`, once, in `modals.rs` — rather than by a constructor that takes `&Ui` and
     can quietly grow. **A context struct is only a narrowing if it is narrower than what it
@@ -15341,13 +15355,13 @@ existing prose was left alone.
     question from the stuck end — **when an entry will not come down, look at what it calls before
     concluding the entry is the problem.**
     **The live number is the sum of `BUDGET`, not the "roughly 140" above**, which describes the
-    state the gate found and by design never moves. That sum went **206 → 48** over this run:
+    state the gate found and by design never moves. That sum went **206 → 47** over this run:
     `table_designer.rs` 29 → 26 → 10 → 4 → **0**, `object_editor.rs` 14 → 5 → 4 → **0**,
     `routine_editor.rs` 12 → 6 → **0**, `event_editor.rs` 11 → 5 → **0**,
     `trigger_editor.rs` 11 → 8 → 7 → **0**, `view_editor.rs` 10 → 6 → **0**,
     `database_editor.rs` 7 → 3 → **0**,
     `ddl_preview.rs` 6 → 4 → 2, `overlays.rs` 15 → 13 → 4, `account_editor.rs` 6 → **0**,
-    `schema_tree.rs` 6 → 3, `users_view.rs` 9 → 8 → 5 → **0**, `import_view.rs` 9 → **0**,
+    `schema_tree.rs` 6 → 3 → 2, `users_view.rs` 9 → 8 → 5 → **0**, `import_view.rs` 9 → **0**,
     `dump_view.rs` 9 → **0**, `compare_view.rs` 8 → **0**, `script_view.rs` 6 → **0**.
     Every step is recorded against its own entry with what it narrowed *to*,
     so read the list for where a file stands rather than inferring it from a paragraph — and a file

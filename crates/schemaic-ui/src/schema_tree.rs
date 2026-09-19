@@ -35,7 +35,8 @@ use crate::widgets::{
     shift_hscroll,
 };
 use crate::{
-    ConnNode, CtxKind, CtxMenu, FieldCfg, Ui, db_color_dot, edit_field, favorite_star, icons, theme,
+    ConnNode, ConnUi, CtxKind, CtxMenu, DdlUi, FieldCfg, OverlayUi, SchemaUi, TableColorRule, Ui,
+    db_color_dot, edit_field, favorite_star, icons, theme,
 };
 
 // ===== moved from lib.rs (schema tree) =====
@@ -1165,7 +1166,12 @@ pub(crate) fn schema_panel(ui: Ui) -> impl IntoView {
             db_node(
                 c,
                 SchemaTreeCtx {
-                    ui: tree_ui.clone(),
+                    conn: tree_ui.conn,
+                    schema: tree_ui.schema,
+                    ddl: tree_ui.ddl,
+                    overlay: tree_ui.overlay,
+                    schema_actions: tree_ui.schema_actions.clone(),
+                    table_colors: tree_ui.table_colors,
                     expanded,
                     filter,
                     on_toggle: on_toggle.clone(),
@@ -1673,9 +1679,28 @@ pub(crate) fn schema_panel(ui: Ui) -> impl IntoView {
 /// clone (signals are `Copy`, the two callbacks are `Rc`).
 #[derive(Clone)]
 struct SchemaTreeCtx {
-    /// The whole `Ui`, for the row actions that open a modal rather than a tab —
-    /// an object leaf's editor, which Enter and double-click both reach.
-    ui: Ui,
+    /// What the rows reach outside their own state, named rather than carried
+    /// as the root bundle.
+    ///
+    /// **This was `ui: Ui`, and the comment on it said "for the row actions
+    /// that open a modal".** That was true of `object_row` and left out the
+    /// other two thirds: `db_node` reaches `overlay` for the shared error
+    /// modal, and `table_node` reaches `schema`, `table_colors` and — through
+    /// `conn` — an `active_conn` this struct already carries as its own field.
+    /// A root bundle in a context struct is exactly the shape that lets a
+    /// field's stated purpose drift from its real one, because nothing checks
+    /// it; six named fields cannot.
+    ///
+    /// It is also cheaper per row, which is the part that is not bookkeeping:
+    /// this struct is cloned once per row and cloning [`Ui`] bumps about seven
+    /// `Rc`s (its `…Actions` bundles plus `persist_layout`), while five `Copy`
+    /// bundles and one `Rc` bump one.
+    conn: ConnUi,
+    schema: SchemaUi,
+    ddl: DdlUi,
+    overlay: OverlayUi,
+    schema_actions: Rc<crate::SchemaActions>,
+    table_colors: RwSignal<Vec<TableColorRule>>,
     expanded: RwSignal<HashSet<String>>,
     filter: RwSignal<String>,
     on_toggle: Rc<dyn Fn(String)>,
@@ -1719,7 +1744,8 @@ struct SchemaTreeCtx {
 }
 
 fn db_node(conn: ConnNode, ctx: SchemaTreeCtx) -> impl IntoView {
-    let node_ui = ctx.ui.clone();
+    let node_overlay = ctx.overlay;
+    let node_ctx = ctx.clone();
     let SchemaTreeCtx {
         expanded,
         filter,
@@ -1883,9 +1909,9 @@ fn db_node(conn: ConnNode, ctx: SchemaTreeCtx) -> impl IntoView {
     // The shared "View" error modal — the same one both error bars open. Lifted
     // out of the closure because `RwSignal` is `Copy`, so the failed-row arm
     // needs no clone of the whole `Ui`.
-    let err_open = node_ui.overlay.error_modal_open;
-    let err_text = node_ui.overlay.error_modal_text;
-    let err_fixable = node_ui.overlay.error_modal_fixable;
+    let err_open = node_overlay.error_modal_open;
+    let err_text = node_overlay.error_modal_text;
+    let err_fixable = node_overlay.error_modal_fixable;
     let children = dyn_container(
         // Through `dedup_key`, or every write to the app-wide `expanded` set
         // rebuilds this whole database's subtree — see it.
@@ -1932,7 +1958,12 @@ fn db_node(conn: ConnNode, ctx: SchemaTreeCtx) -> impl IntoView {
                 SchemaState::Loaded(schema) => {
                     let db = database.clone();
                     let child_ctx = |indent_levels: u32| SchemaTreeCtx {
-                        ui: node_ui.clone(),
+                        conn: node_ctx.conn,
+                        schema: node_ctx.schema,
+                        ddl: node_ctx.ddl,
+                        overlay: node_ctx.overlay,
+                        schema_actions: node_ctx.schema_actions.clone(),
+                        table_colors: node_ctx.table_colors,
                         expanded,
                         filter,
                         on_toggle: toggle_tables.clone(),
@@ -2405,14 +2436,18 @@ fn object_group_node(
 /// **Takes the row context rather than five hand-picked pieces of it.**
 /// `context_menu`, `dialect`, `nav` and `indent_levels` were all read off the
 /// same [`SchemaTreeCtx`] the caller was holding and passed one by one, and the
-/// fifth — `ui: Ui` — was a second clone of the `ctx.ui` beside them. `term` is
-/// the one argument that is genuinely not in the context: it is this render's
-/// filter text, not the tree's.
+/// fifth — `ui: Ui` — was a second clone of the context's own root bundle
+/// beside them. `term` is the one argument that is genuinely not in the
+/// context: it is this render's filter text, not the tree's.
 ///
-/// The context is cloned per row where a `Ui` was before, which is the same
-/// order of cost and is transient either way — it is destructured here and
-/// dropped. What the row *keeps* is what shrank: the double-click closure holds
-/// three `Copy` bundles and one `Rc` instead of a whole `Ui`.
+/// The context is cloned per row where a `Ui` was before, and it is transient
+/// either way — destructured here and dropped. What the row *keeps* is what
+/// shrank first: the double-click closure holds three `Copy` bundles and one
+/// `Rc` instead of a whole `Ui`. **The clone itself shrank later**, when
+/// [`SchemaTreeCtx`] stopped carrying a `Ui` at all and named the six things
+/// it reaches — so what this function destructures out of it now is
+/// `conn`/`schema`/`ddl`/`schema_actions` by name, not a bundle to pick them
+/// out of.
 fn object_row(
     ctx: SchemaTreeCtx,
     database: String,
@@ -2421,7 +2456,10 @@ fn object_row(
     term: Option<String>,
 ) -> impl IntoView {
     let SchemaTreeCtx {
-        ui,
+        conn,
+        schema: tree,
+        ddl,
+        schema_actions,
         context_menu,
         dialect,
         nav,
@@ -2495,8 +2533,7 @@ fn object_row(
     .on_double_click_stop({
         // The four child bundles the door names, not a `Ui` clone per row —
         // three of them are `Copy` and the fourth is one `Rc`.
-        let (conn, tree, ddl) = (ui.conn, ui.schema, ui.ddl);
-        let actions = ui.schema_actions.clone();
+        let actions = schema_actions.clone();
         let (db, obj) = (database.clone(), o.clone());
         move |_| {
             if crate::object_editor::is_editable_object(&obj) {
@@ -2628,11 +2665,14 @@ fn table_node(database: String, table: TableInfo, ctx: SchemaTreeCtx) -> impl In
     // `SchemaTreeCtx`: `db_nodes` is replaced wholesale on a connection switch,
     // which rebuilds this node anyway, so the handle captured here is always the
     // live one for the row on screen.
-    let table_sizes = ctx.ui.schema.table_sizes;
+    let table_sizes = ctx.schema.table_sizes;
     // Read before the destructure below moves `ctx`.
-    let table_colors = ctx.ui.table_colors;
-    let row_conn = ctx.ui.conn.active_conn;
-    let db_stats = ctx.ui.schema.db_nodes.with_untracked(|nodes| {
+    let table_colors = ctx.table_colors;
+    // `ctx.active_conn`, not `ctx.conn.active_conn`: this struct already
+    // carries the signal, and reading it twice through two names was how the
+    // root-bundle field earned its keep for longer than it should have.
+    let row_conn = ctx.active_conn;
+    let db_stats = ctx.schema.db_nodes.with_untracked(|nodes| {
         nodes
             .iter()
             .find(|n| n.database == database)

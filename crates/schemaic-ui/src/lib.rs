@@ -14918,24 +14918,35 @@ mod whole_ui_gate {
         // holding rather than a `Ui` plus four of that struct's own fields, and
         // `object_group_nodes`/`object_group_node` drop the `ui` parameter that
         // was a second clone of the `ctx.ui` passed beside it. The three left
-        // are `blank_space_menu` and `schema_panel` — and the
-        // `SchemaTreeCtx::ui` field itself, which the counter sees and which the
-        // table rows still read for `table_colors` and `table_sizes`.
+        // are `blank_space_menu` and `schema_panel`.
         //
-        // **This floor's stated reason has already lapsed once — read the
-        // replacement, not the original.** It used to say those two were
-        // "opening paths into `database_editor`, which still takes the root
-        // bundle"; that was true until `database_editor.rs` went to zero, and
-        // it is the exact failure the `trigger_editor.rs` note below warns
-        // about. The floor is still right, for a different reason: the two are
-        // wide on their own merits — `blank_space_menu` reaches six bundles and
-        // `schema_panel` nine — which is `overlays.rs`'s remaining four, not a
-        // callee holding them. The one thing here that *could* still come down
-        // is the `ui` field on `SchemaTreeCtx`: it is carried for `table_colors`
-        // alone, and a named field would take this entry to 2 — the case the
-        // `users_view.rs` note calls a ctx that relocates the root bundle
-        // rather than narrowing it.
-        ("schema_tree.rs", 3),
+        // **3 → 2: `SchemaTreeCtx` no longer carries a `Ui`.** It holds
+        // `conn`, `schema`, `ddl`, `overlay`, `schema_actions` and
+        // `table_colors` by name, which is the `users_view.rs` rule applied to
+        // the one ctx in the crate that had not had it — a context struct
+        // carrying the root bundle relocates it rather than narrowing it. The
+        // per-row cost went the same way: this struct is cloned once per row,
+        // and cloning `Ui` bumps about seven `Rc`s where five `Copy` bundles
+        // and one `Rc` bump one.
+        //
+        // **Two comments were wrong about that field and the compiler could
+        // not tell.** The struct's own said it was "for the row actions that
+        // open a modal", which was `object_row`'s use and two thirds of the
+        // story; this entry said it was carried "for `table_colors` alone",
+        // which was `table_node`'s half of the rest. It was reached in three
+        // functions for six things, one of them an `active_conn` the struct
+        // already had its own field for. That is the argument for naming
+        // fields rather than carrying a bundle, stated by two stale comments
+        // instead of by a rule.
+        //
+        // **This floor's stated reason has also lapsed once** — it used to say
+        // the two left were "opening paths into `database_editor`, which still
+        // takes the root bundle", true until `database_editor.rs` went to
+        // zero, and the exact failure the `trigger_editor.rs` note below warns
+        // about. The two are wide on their own merits: `blank_space_menu`
+        // reaches six bundles and `schema_panel` ten, which is
+        // `overlays.rs`'s remaining four, not a callee holding them.
+        ("schema_tree.rs", 2),
         // `script_view.rs` is **off the list** — 6 to zero, and it is the split
         // on a module that is nearly all driver: this modal is a file picker, a
         // probe and a run. `pick_file`, `run_script` and the overlay take
