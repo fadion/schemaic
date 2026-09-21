@@ -8,14 +8,23 @@
 //! against. `information_schema.SQL_FUNCTIONS` is the server's own answer, so
 //! it is the thing to ask.
 //!
-//! **MariaDB-only, and that is not a gap in the tier.** `SQL_FUNCTIONS` arrived
-//! in MariaDB 10.11 and MySQL has no equivalent — `mysql.func` holds loadable
-//! UDFs, not builtins — so there is no MySQL leg to write. That is also why this
-//! module sits outside `live_suite!`, for the same reason [`crate::pg_catalog`]
-//! does: the macro expands one function into a test per leg, and two of the
-//! three legs cannot answer the question. The consequence is worth stating
-//! plainly: a builtin **MySQL 8 added and MariaDB never got** is unguarded here,
-//! and [`MYSQL_ONLY`] is the list of the ones already known.
+//! **The two oracles below are MariaDB's, and for a long time this paragraph
+//! said that was not a gap.** `SQL_FUNCTIONS` arrived in MariaDB 10.11 and MySQL
+//! has no equivalent — `mysql.func` holds loadable UDFs, not builtins — so there
+//! is no MySQL leg *of that kind* to write. That is why this module sits outside
+//! `live_suite!`, for the same reason [`crate::pg_catalog`] does: the macro
+//! expands one function into a test per leg.
+//!
+//! What it does not excuse is the consequence, which was stated here as a known
+//! limitation and was in fact a live defect: `intel::FUNCTIONS` is a **two**-
+//! engine catalog measured against **one** engine, so every name MySQL 8 does
+//! not have was invisible and [`over_listing`] was green by construction over
+//! forty-nine of them — each one offered to a MySQL 8 tab that cannot call it.
+//!
+//! [`each_server_is_only_credited_with_the_builtins_it_really_has`] is the
+//! missing leg, and it is a different kind of oracle: **the parser**, which
+//! answers the question the editor actually asks — can this server call this
+//! name — and which both servers have. See its own doc.
 //!
 //! **Two oracles, not one and a hand-written excuse.** `SQL_FUNCTIONS` lists the
 //! names the parser resolves through its function-creator hash, which leaves out
@@ -23,9 +32,16 @@
 //! `CURRENT_DATE` and the rest. Those are exactly MariaDB's *reserved words*, so
 //! `information_schema.KEYWORDS` accounts for them without anybody writing them
 //! down: the union of the two views is what the server claims, and
-//! [`over_listing`] measures the catalog against that union. The partition is
-//! exact on 10.11.14 — 39 names covered by `KEYWORDS`, and the five left over
-//! are [`MYSQL_ONLY`] to a name.
+//! [`over_listing`] measures the catalog against that union.
+//!
+//! **The partition is computed in [`over_listing`], not stated here.** This
+//! paragraph used to read "39 names covered by `KEYWORDS`, and the five left
+//! over are [`MYSQL_ONLY`] to a name" — an arithmetic claim that does not add
+//! up, since 39 + 5 is not the 49 it was partitioning, and the real figure is
+//! 44. It was wrong when it was written and nothing computed it, which is the
+//! whole argument for not writing a number down: `over_listing` asserts the
+//! split adds up, so a release that moves it fails there instead of leaving a
+//! sentence that reads plausibly and is false.
 
 use std::collections::HashSet;
 
@@ -108,13 +124,17 @@ async fn over_listing() {
         endpoint::note_skipped(&MARIADB);
         return;
     }
-    let mut known = server_names(FUNCTION_ORACLE, 200).await;
-    known.extend(server_names(KEYWORD_ORACLE, 500).await);
+    let functions = server_names(FUNCTION_ORACLE, 200).await;
+    let keywords = server_names(KEYWORD_ORACLE, 500).await;
+    let mut known = functions.clone();
+    known.extend(keywords.iter().cloned());
 
-    let unexplained: Vec<String> = catalog_names()
-        .into_iter()
-        .filter(|n| !known.contains(n))
+    let ours = catalog_names();
+    let unexplained: Vec<String> = ours
+        .iter()
+        .filter(|n| !known.contains(*n))
         .filter(|n| !MYSQL_ONLY.contains(&n.as_str()))
+        .cloned()
         .collect();
 
     assert!(
@@ -125,6 +145,40 @@ async fn over_listing() {
          they are invented and would suppress a genuine typo warning: \
          {unexplained:?}",
         unexplained.len(),
+        MARIADB.endpoint()
+    );
+
+    // **The partition adds up, computed rather than written down.** The names
+    // `SQL_FUNCTIONS` misses are exactly those with their own grammar rule,
+    // and they are MariaDB's reserved words — so `KEYWORDS` has to account for
+    // every one of them, and `MYSQL_ONLY` for the rest. The module doc used to
+    // state this as "39 names covered by KEYWORDS, and the five left over",
+    // which does not add up to the set it partitions and was never computed by
+    // anything; the figure is 44.
+    let by_keyword: Vec<&String> = ours
+        .iter()
+        .filter(|n| !functions.contains(*n) && keywords.contains(*n))
+        .collect();
+    let by_mysql_only: Vec<&String> = ours
+        .iter()
+        .filter(|n| !known.contains(*n) && MYSQL_ONLY.contains(&n.as_str()))
+        .collect();
+    let not_in_functions = ours.iter().filter(|n| !functions.contains(*n)).count();
+    assert_eq!(
+        by_keyword.len() + by_mysql_only.len(),
+        not_in_functions,
+        "the two halves of the excuse do not add up to what `SQL_FUNCTIONS` \
+         leaves out on {}: {} by KEYWORDS + {} by MYSQL_ONLY against {} \
+         unreported",
+        MARIADB.endpoint(),
+        by_keyword.len(),
+        by_mysql_only.len(),
+        not_in_functions
+    );
+    assert!(
+        !by_keyword.is_empty() && !by_mysql_only.is_empty(),
+        "one half of the partition is empty on {}, so the sum above is not \
+         measuring a partition at all",
         MARIADB.endpoint()
     );
 }
@@ -231,4 +285,96 @@ fn catalog_names() -> HashSet<String> {
         .iter()
         .map(|f| f.name.to_ascii_lowercase())
         .collect()
+}
+
+/// **The MySQL leg this module said could not be written.**
+///
+/// `S6-L6-01`: the two oracles above measure a *two-engine* catalog against
+/// *one* engine. Every name MariaDB does not report is excused by
+/// [`MYSQL_ONLY`], and every name MySQL 8 does not have is invisible, because
+/// nothing here ever asked MySQL anything. So `over_listing` was green **by
+/// construction** over forty-nine names a MySQL 8 tab was being offered and
+/// cannot call — `NVL`, `TO_CHAR`, the eight `COLUMN_*`, the nine `*_ORACLE`,
+/// the three `WSREP_*` and the rest.
+///
+/// The module doc said "there is no MySQL leg to write" because MySQL ships no
+/// `SQL_FUNCTIONS` view. That is true of a *catalogue* oracle and it is not the
+/// only kind: **the parser is an oracle**, and it is the better one, because it
+/// answers the question the editor actually asks — can this server call this
+/// name. `SELECT <name>(1,2)` comes back `ERROR 1305` when the server has no
+/// such function, and with some other error (wrong arity, wrong types, a syntax
+/// error for a name with its own grammar rule) when it has one. Only 1305 is
+/// read as absence.
+///
+/// **Both directions, from one pass.** What MySQL 8 lacks must be exactly
+/// `intel`'s `MARIADB_ONLY`, and the same pass re-measures [`MYSQL_ONLY`] on
+/// MariaDB — so the two lists that decide what each tab is offered are checked
+/// against the two servers rather than against each other.
+///
+/// One pinned [`Session`] rather than 309 connections: this is the documented
+/// exception to one-connection-per-operation, and 309 `Db::fetch_query` calls
+/// would open 309 of them.
+#[tokio::test(flavor = "multi_thread")]
+async fn each_server_is_only_credited_with_the_builtins_it_really_has() {
+    use schemaic_db::session::Session;
+
+    for (target, expected) in [
+        (&crate::endpoint::MYSQL, schemaic_core::intel::MARIADB_ONLY),
+        (&MARIADB, schemaic_core::intel::MYSQL_ONLY),
+    ] {
+        if !target.enabled() {
+            endpoint::note_skipped(target);
+            continue;
+        }
+        // `mysql` as the scope: an unqualified unknown name is resolved as a
+        // stored function in the current database, and with none selected the
+        // server answers `1046 No database selected` instead of 1305 — which
+        // would report every name as present and pass this test vacuously.
+        let session = Session::open(&target.base_db(), Some("mysql"))
+            .await
+            .unwrap_or_else(|e| panic!("{}: could not pin a session: {e}", target.endpoint()));
+
+        let mut absent: Vec<&str> = Vec::new();
+        for f in FUNCTIONS {
+            let sql = format!("SELECT {}(1,2)", f.name);
+            if let Err(e) = session
+                .fetch_query(&sql, 1, CancellationToken::new())
+                .await
+                .result
+                && format!("{e}").contains("1305")
+            {
+                absent.push(f.name);
+            }
+        }
+        session.close().await;
+
+        let expected: HashSet<&str> = expected.iter().copied().collect();
+        let absent: HashSet<&str> = absent.into_iter().collect();
+
+        let unlisted: Vec<&&str> = absent.difference(&expected).collect();
+        assert!(
+            unlisted.is_empty(),
+            "{} has no such function, and nothing in `intel` withholds it — so \
+             a tab on this server is offered {} name(s) it cannot call: \
+             {unlisted:?}",
+            target.endpoint(),
+            unlisted.len()
+        );
+        let stale: Vec<&&str> = expected.difference(&absent).collect();
+        assert!(
+            stale.is_empty(),
+            "`intel` withholds {} name(s) from a tab on {} that this server \
+             does have, so the popup is short by them: {stale:?}",
+            stale.len(),
+            target.endpoint()
+        );
+        // The pass really ran — an empty `absent` on both legs would satisfy
+        // the first assertion having asked nothing.
+        assert!(
+            !absent.is_empty(),
+            "no name at all came back absent on {}, so this oracle is not \
+             answering",
+            target.endpoint()
+        );
+    }
 }

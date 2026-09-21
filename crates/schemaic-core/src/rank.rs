@@ -197,6 +197,21 @@ pub struct RankInput<'a> {
     /// engine to its catalog, so a fourth engine lands on `None` and is offered
     /// nothing rather than inheriting whichever list is nearest.
     pub dialect: crate::intel::SqlDialect,
+    /// **Which MySQL-family server, where the dialect cannot say.**
+    ///
+    /// `SqlDialect` has no MariaDB arm on purpose, and for parsing, quoting and
+    /// the *shape* of a completion that is right. It is wrong for one thing
+    /// only: which names exist. `FUNCTIONS` is one list transcribed from
+    /// MariaDB's manual, so a MySQL 8 tab was offered forty-nine functions it
+    /// cannot call — `NVL`, `TO_CHAR`, the eight `COLUMN_*`, the nine
+    /// `*_ORACLE`, the three `WSREP_*` — and a MariaDB tab five of MySQL's.
+    /// Measured on 8.4.11 and 10.11.14; see `intel::MARIADB_ONLY`.
+    ///
+    /// The caller reads it off the loaded `DbSchema` for the tab's active
+    /// database, which is where `collect_schema` stamps it. `Unknown` — a
+    /// PostgreSQL or SQLite tab, or one whose schema has not loaded yet —
+    /// offers everything, which is what this did before the split existed.
+    pub flavour: crate::schema::ServerFlavour,
 }
 
 /// Rank the candidates a caret position offers.
@@ -545,7 +560,7 @@ pub fn rank(schema: &SchemaIndex, input: &RankInput<'_>) -> Vec<Suggestion> {
             // the same 863 names every time. `offered_builtins` is that
             // filter's answer, held in `intel`'s `CatalogIndex` beside the
             // typo checker's own rearrangement of the same data.
-            for fun in crate::intel::offered_builtins(input.dialect).unwrap_or(&[]) {
+            for fun in crate::intel::offered_builtins(input.dialect, input.flavour).unwrap_or(&[]) {
                 add(
                     &mut cands,
                     &mut seen,
@@ -815,6 +830,7 @@ pub fn recency_bonus(text: &str, kind: SuggestKind, used: &HashSet<String>) -> i
 mod tests {
     use super::*;
     use crate::intel::SqlDialect;
+    use crate::schema::ServerFlavour;
 
     /// A two-table schema: `orders(id pk, customer_id fk, total)` and
     /// `customers(id pk, name, email)`, both in `shop`.
@@ -877,10 +893,24 @@ mod tests {
         ranked_on(schema, SqlDialect::MySql, ctx, scope, prefix)
     }
 
-    /// [`ranked`], on a named engine.
+    /// [`ranked`], on a named engine — with the flavour left `Unknown`, which
+    /// is what every engine but the MySQL family answers and what a MySQL tab
+    /// answers until its schema loads.
     fn ranked_on(
         schema: &SchemaIndex,
         dialect: SqlDialect,
+        ctx: ClauseCtx,
+        scope: &[TableRef],
+        prefix: &str,
+    ) -> Vec<String> {
+        ranked_on_flavour(schema, dialect, ServerFlavour::Unknown, ctx, scope, prefix)
+    }
+
+    /// [`ranked_on`], on a named MySQL-family server.
+    fn ranked_on_flavour(
+        schema: &SchemaIndex,
+        dialect: SqlDialect,
+        flavour: ServerFlavour,
         ctx: ClauseCtx,
         scope: &[TableRef],
         prefix: &str,
@@ -900,6 +930,7 @@ mod tests {
                 used: &used,
                 active_db: Some("shop"),
                 dialect,
+                flavour,
             },
         )
         .into_iter()
@@ -1081,6 +1112,7 @@ mod tests {
                 used: &used,
                 active_db: Some("shop"),
                 dialect: SqlDialect::MySql,
+                flavour: ServerFlavour::Unknown,
             },
         )
         .into_iter()
@@ -1119,6 +1151,7 @@ mod tests {
                     used: &used,
                     active_db: Some("shop"),
                     dialect: SqlDialect::MySql,
+                    flavour: ServerFlavour::Unknown,
                 },
             )
             .into_iter()
@@ -1178,6 +1211,7 @@ mod tests {
                     used: &used,
                     active_db: Some("shop"),
                     dialect: SqlDialect::MySql,
+                    flavour: ServerFlavour::Unknown,
                 },
             )
         };
@@ -1243,6 +1277,7 @@ mod tests {
                 used: &used,
                 active_db: Some("shop"),
                 dialect: SqlDialect::MySql,
+                flavour: ServerFlavour::Unknown,
             },
         );
         let email = out.iter().find(|s| s.text == "email").expect("offered");
@@ -1280,6 +1315,7 @@ mod tests {
                     used: &used,
                     active_db: Some("shop"),
                     dialect: SqlDialect::MySql,
+                    flavour: ServerFlavour::Unknown,
                 },
             )
         };
@@ -1322,6 +1358,7 @@ mod tests {
                 used: &used,
                 active_db: Some("shop"),
                 dialect: SqlDialect::MySql,
+                flavour: ServerFlavour::Unknown,
             },
         )
         .into_iter()
@@ -1365,6 +1402,7 @@ mod tests {
                 used: &used,
                 active_db: Some("shop"),
                 dialect: SqlDialect::MySql,
+                flavour: ServerFlavour::Unknown,
             },
         );
         let first = out.first().expect("something is offered");
@@ -1429,6 +1467,7 @@ mod tests {
                 used: &used,
                 active_db: Some("shop"),
                 dialect: SqlDialect::MySql,
+                flavour: ServerFlavour::Unknown,
             },
         );
         let first = out.first().expect("something is offered");

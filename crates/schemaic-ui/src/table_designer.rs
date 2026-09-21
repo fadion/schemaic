@@ -38,8 +38,8 @@ use crate::widgets::{
     modal_pad_h, modal_title_owned, modal_w, panel_style,
 };
 use crate::{
-    ConnUi, DdlPreview, DdlUi, DesignerTab, DesignerTarget, FieldCfg, OverlayUi, PopupAnchor,
-    SchemaUi, ddl_preview, edit_field, icons, object_location, theme,
+    ConnNode, ConnUi, DdlPreview, DdlUi, DesignerTab, DesignerTarget, FieldCfg, OverlayUi,
+    PopupAnchor, SchemaUi, ddl_preview, edit_field, icons, object_location, theme,
 };
 
 fn panel_w() -> f64 {
@@ -211,8 +211,15 @@ pub(crate) fn edit_ctx(ui: ConnUi) -> EditCtx {
 /// `SELECT VERSION()` was actually asked — see [`ServerFlavour`]. `Unknown`
 /// until the schema loads, which is the honest answer and the one that makes a
 /// per-flavour control hide rather than guess.
-pub(crate) fn db_flavour(ui: SchemaUi, database: &str) -> ServerFlavour {
-    ui.db_nodes.with_untracked(|nodes| {
+///
+/// **Takes the node list rather than a [`SchemaUi`]**, because the second
+/// caller has no `SchemaUi`: autocomplete asks the same question from
+/// `completion::recompute_completions`, where the bundle in hand is a
+/// `CompletionCtx`. One lookup, two surfaces — the alternative was a second
+/// spelling of the `db_nodes` walk in a file that would then have to be kept in
+/// step with this one.
+pub(crate) fn db_flavour(nodes: RwSignal<Vec<ConnNode>>, database: &str) -> ServerFlavour {
+    nodes.with_untracked(|nodes| {
         nodes
             .iter()
             .find(|n| n.database == database)
@@ -406,7 +413,7 @@ pub(crate) fn open_for_table(
         DesignerTarget {
             conn_id: ctx.conn_id,
             database: database.to_string(),
-            flavour: db_flavour(schema_ui, database),
+            flavour: db_flavour(schema_ui.db_nodes, database),
             schema: info.schema.clone(),
             dialect: ctx.dialect,
             current: Some(info),
@@ -462,7 +469,7 @@ pub(crate) fn preview_draft_edit(
     let cs = ddl::diff(
         &info,
         &draft,
-        ddl::Target::new(ctx.dialect, db_flavour(schema_ui, database)),
+        ddl::Target::new(ctx.dialect, db_flavour(schema_ui.db_nodes, database)),
     );
     if cs.is_empty() {
         return;
@@ -497,7 +504,7 @@ pub(crate) fn open_for_new(
         DesignerTarget {
             conn_id: ctx.conn_id,
             database: database.to_string(),
-            flavour: db_flavour(schema_ui, database),
+            flavour: db_flavour(schema_ui.db_nodes, database),
             schema: schema.map(str::to_string),
             dialect: ctx.dialect,
             current: None,

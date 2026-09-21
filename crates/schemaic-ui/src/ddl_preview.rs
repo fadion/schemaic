@@ -536,7 +536,7 @@ pub(crate) fn preview_proposal(
     // very same change.
     let target = schemaic_core::ddl::Target::new(
         ctx.dialect,
-        crate::table_designer::db_flavour(schema, database),
+        crate::table_designer::db_flavour(schema.db_nodes, database),
     );
     let cs = schemaic_core::ddl::diff(info, &draft, target);
     if cs.is_empty() {

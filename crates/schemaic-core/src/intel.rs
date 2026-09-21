@@ -19,6 +19,7 @@
 
 use sqlparser::dialect::{Dialect, MySqlDialect, PostgreSqlDialect, SQLiteDialect};
 
+use crate::schema::ServerFlavour;
 use crate::sql::skip_noncode;
 
 /// Which SQL dialect a connection speaks. MySQL, PostgreSQL and SQLite are wired;
@@ -1819,6 +1820,107 @@ pub const SQLITE_FUNCTIONS: &[SqlFunction] = &[
     ),
 ];
 
+/// Names in [`FUNCTIONS`] that **MariaDB 10.11 has and MySQL 8.4 has not**.
+///
+/// `FUNCTIONS` is one list for two servers, because they share a dialect as far
+/// as parsing, quoting and completion are concerned — see [`SqlDialect`], which
+/// deliberately has no MariaDB arm. That is right for everything except *which
+/// names exist*, and the difference is not small: a MySQL 8 tab was offered all
+/// forty-nine of these, none of which it can call.
+///
+/// **Measured, not remembered.** Every one of `FUNCTIONS`' 309 names was
+/// executed on both servers (`SELECT <name>(1,2)` with a database selected;
+/// `ERROR 1305` means the server has no such function, any other error means it
+/// has one and was called wrongly). MySQL 8.4.11 answered 1305 for exactly
+/// these forty-nine; MariaDB 10.11.14 answered it for the five in
+/// [`MYSQL_ONLY`].
+///
+/// **Two different reasons live in one list, and the list is right for both.**
+/// Most are MariaDB's own — the eight `COLUMN_*` dynamic-column functions, the
+/// nine `*_ORACLE` compatibility spellings, the three `WSREP_*` cluster
+/// functions, `NVL`/`NVL2`/`TO_CHAR`/`ADD_MONTHS`/`SYS_GUID` from its Oracle
+/// mode. A handful — `DES_ENCRYPT`, `DES_DECRYPT`, `ENCODE`, `ENCRYPT`,
+/// `OLD_PASSWORD` — are functions MySQL *removed* in 8.0 and MariaDB kept. The
+/// question this list answers is "can the server in front of me call it", and
+/// for MySQL 8.4 the answer is no either way.
+///
+/// Sorted, for the binary search and so a duplicate is visible;
+/// `every_flavoured_name_is_in_the_catalog` holds both.
+///
+/// **`pub` for one reader, and it is the one that matters**: the live tier's
+/// `each_server_is_only_credited_with_the_builtins_it_really_has` re-measures
+/// both lists against both servers by asking the parser. A list this file keeps
+/// to itself is a list nothing can check, and this one is a claim about two
+/// servers that nobody here can verify.
+pub const MARIADB_ONLY: &[&str] = &[
+    "ADD_MONTHS",
+    "BINLOG_GTID_POS",
+    "CHR",
+    "COLUMN_ADD",
+    "COLUMN_CHECK",
+    "COLUMN_CREATE",
+    "COLUMN_DELETE",
+    "COLUMN_EXISTS",
+    "COLUMN_GET",
+    "COLUMN_JSON",
+    "COLUMN_LIST",
+    "CONCAT_OPERATOR_ORACLE",
+    "CRC32C",
+    "DECODE",
+    "DECODE_HISTOGRAM",
+    "DECODE_ORACLE",
+    "DES_DECRYPT",
+    "DES_ENCRYPT",
+    "ENCODE",
+    "ENCRYPT",
+    "JSON_COMPACT",
+    "JSON_DETAILED",
+    "JSON_EQUALS",
+    "JSON_EXISTS",
+    "JSON_LOOSE",
+    "JSON_NORMALIZE",
+    "JSON_QUERY",
+    "LENGTHB",
+    "LPAD_ORACLE",
+    "LTRIM_ORACLE",
+    "MASTER_GTID_WAIT",
+    "MEDIAN",
+    "NATURAL_SORT_KEY",
+    "NVL",
+    "NVL2",
+    "OLD_PASSWORD",
+    "PERCENTILE_CONT",
+    "PERCENTILE_DISC",
+    "REPLACE_ORACLE",
+    "RPAD_ORACLE",
+    "RTRIM_ORACLE",
+    "SFORMAT",
+    "SUBSTR_ORACLE",
+    "SYS_GUID",
+    "TO_CHAR",
+    "TRIM_ORACLE",
+    "WSREP_LAST_SEEN_GTID",
+    "WSREP_LAST_WRITTEN_GTID",
+    "WSREP_SYNC_WAIT_UPTO_GTID",
+];
+
+/// Names in [`FUNCTIONS`] that **MySQL 8.4 has and MariaDB 10.11 has not** —
+/// [`MARIADB_ONLY`]'s other direction, measured the same way and in the same
+/// run.
+///
+/// Short because the catalog was transcribed from MariaDB's manual, which is
+/// also why the other list is not: the *asymmetry* is a property of how this
+/// file was written, not of the two servers.
+///
+/// `pub` for the live oracle, for [`MARIADB_ONLY`]'s reason.
+pub const MYSQL_ONLY: &[&str] = &[
+    "BIN_TO_UUID",
+    "IS_UUID",
+    "JSON_STORAGE_SIZE",
+    "REGEXP_LIKE",
+    "UUID_TO_BIN",
+];
+
 /// The builtin catalog `dialect`'s engine actually has, or `None` where this app
 /// does not carry one.
 ///
@@ -1947,7 +2049,15 @@ struct CatalogIndex {
     /// answer, precomputed. On PostgreSQL that predicate is
     /// `pg_builtins::is_suggested`, a binary search `rank` was running 2,706
     /// times per keystroke to filter a pool it then scored.
-    offered: Vec<&'static SqlFunction>,
+    ///
+    /// **One list per [`ServerFlavour`], because on the MySQL arm the answer
+    /// depends on which of the two servers is in front of the tab** — see
+    /// [`MARIADB_ONLY`]. Three short vectors of `&'static SqlFunction` rather
+    /// than a fourth `OnceLock` keyed on the pair: the flavour changes what is
+    /// *offered* and nothing else in this struct, so splitting the whole index
+    /// would rebuild the buckets and both sets three times to vary one field.
+    /// On the other two dialects all three are the same list.
+    offered: [Vec<&'static SqlFunction>; 3],
 }
 
 impl CatalogIndex {
@@ -1967,10 +2077,29 @@ impl CatalogIndex {
                 .collect(),
             by_len,
             upper,
-            offered: catalog
-                .iter()
-                .filter(|f| is_offered_builtin(dialect, f.name))
-                .collect(),
+            offered: [
+                ServerFlavour::Unknown,
+                ServerFlavour::MySql,
+                ServerFlavour::MariaDb,
+            ]
+            .map(|fl| {
+                catalog
+                    .iter()
+                    .filter(|f| is_offered_builtin(dialect, fl, f.name))
+                    .collect()
+            }),
+        }
+    }
+
+    /// Where a [`ServerFlavour`]'s offered list lives in [`Self::offered`].
+    ///
+    /// A `match` rather than `as usize`, so a fourth flavour is a compiler error
+    /// here rather than an index that silently reads somebody else's list.
+    fn slot(flavour: ServerFlavour) -> usize {
+        match flavour {
+            ServerFlavour::Unknown => 0,
+            ServerFlavour::MySql => 1,
+            ServerFlavour::MariaDb => 2,
         }
     }
 
@@ -2052,13 +2181,17 @@ fn catalog_index(dialect: SqlDialect) -> Option<&'static CatalogIndex> {
     Some(cell.get_or_init(|| CatalogIndex::build(dialect, catalog)))
 }
 
-/// The catalog entries autocomplete may offer on this engine.
+/// The catalog entries autocomplete may offer on this engine, on the server
+/// flavour in front of the tab.
 ///
 /// [`is_offered_builtin`] asked per candidate, precomputed — see
 /// [`CatalogIndex::offered`]. `None` where this app carries no catalog, which
 /// means *offer nothing* for the reason [`builtin_catalog`] gives.
-pub(crate) fn offered_builtins(dialect: SqlDialect) -> Option<&'static [&'static SqlFunction]> {
-    catalog_index(dialect).map(|i| i.offered.as_slice())
+pub(crate) fn offered_builtins(
+    dialect: SqlDialect,
+    flavour: ServerFlavour,
+) -> Option<&'static [&'static SqlFunction]> {
+    catalog_index(dialect).map(|i| i.offered[CatalogIndex::slot(flavour)].as_slice())
 }
 
 /// Whether autocomplete **offers** `name` on this engine, where
@@ -2080,10 +2213,32 @@ pub(crate) fn offered_builtins(dialect: SqlDialect) -> Option<&'static [&'static
 /// anything the engine does. A `dialect == Postgres` at the call site would be
 /// the failure; one named predicate, here, with the reason per arm, is how the
 /// question stays answerable.
-pub(crate) fn is_offered_builtin(dialect: SqlDialect, name: &str) -> bool {
+///
+/// **`flavour` is the second question, and it is only ever asked of the MySQL
+/// arm.** `SqlDialect` has no MariaDB arm on purpose — the two share a dialect
+/// for parsing, quoting and completion *shape* — but they do not share a list of
+/// names, and one `FUNCTIONS` covering both offered a MySQL 8 tab forty-nine
+/// functions it cannot call. See [`MARIADB_ONLY`] for the measurement.
+///
+/// `ServerFlavour::Unknown` offers everything, which is what this did before any
+/// of them were tagged. That is the deliberate choice and it is *not* the
+/// withhold-on-uncertainty rule `ServerFlavour::is_mariadb` follows: that rule
+/// is for writes, where guessing costs a table's constraints. Here the cost of
+/// guessing is one extra row in a popup, and the cost of withholding is 54 names
+/// missing from every tab whose schema has not finished loading. The flavour
+/// only ever *narrows* the list once it is known.
+pub(crate) fn is_offered_builtin(dialect: SqlDialect, flavour: ServerFlavour, name: &str) -> bool {
     match dialect {
-        SqlDialect::MySql | SqlDialect::Sqlite => true,
+        SqlDialect::Sqlite => true,
         SqlDialect::Postgres => crate::pg_builtins::is_suggested(name),
+        SqlDialect::MySql => {
+            let up = name.to_ascii_uppercase();
+            match flavour {
+                ServerFlavour::Unknown => true,
+                ServerFlavour::MySql => MARIADB_ONLY.binary_search(&up.as_str()).is_err(),
+                ServerFlavour::MariaDb => MYSQL_ONLY.binary_search(&up.as_str()).is_err(),
+            }
+        }
     }
 }
 
@@ -10000,6 +10155,131 @@ mod tests {
                 .map(|x| x.message)
                 .collect();
             assert!(msgs.is_empty(), "false positive: {sql} -> {msgs:?}");
+        }
+    }
+
+    #[test]
+    fn every_flavoured_name_is_in_the_catalog() {
+        use std::collections::HashSet;
+        let catalog: HashSet<&str> = FUNCTIONS.iter().map(|f| f.name).collect();
+        for (list, which) in [(MARIADB_ONLY, "MARIADB_ONLY"), (MYSQL_ONLY, "MYSQL_ONLY")] {
+            // **Sorted, because `is_offered_builtin` binary-searches them** —
+            // an unsorted list answers "not in it" for names that are, which is
+            // the failure that puts the offer back silently.
+            assert!(
+                list.windows(2).all(|w| w[0] < w[1]),
+                "{which} is not sorted ascending, so the binary search in \
+                 `is_offered_builtin` will miss names that are in it"
+            );
+            // And every name is one the catalog actually carries. A name that
+            // drifted out of `FUNCTIONS` — renamed, or removed — would sit here
+            // withholding nothing, and the list would look like it was doing
+            // its job.
+            for name in list {
+                assert!(
+                    catalog.contains(name),
+                    "{which} names {name}, which is not in `FUNCTIONS` — so it \
+                     withholds nothing and the list has drifted"
+                );
+            }
+        }
+        // The two cannot overlap: a name is not simultaneously absent from both
+        // servers, and one listed twice would be withheld from both flavours.
+        let maria: HashSet<&str> = MARIADB_ONLY.iter().copied().collect();
+        let both: Vec<&&str> = MYSQL_ONLY.iter().filter(|n| maria.contains(**n)).collect();
+        assert!(
+            both.is_empty(),
+            "a name is in both flavour lists, so it is offered to neither: {both:?}"
+        );
+    }
+
+    /// **A MySQL 8 tab is not offered MariaDB's functions, and the reverse.**
+    ///
+    /// `FUNCTIONS` is one list for two servers because `SqlDialect` has no
+    /// MariaDB arm — right for parsing and quoting, wrong for which names
+    /// exist. Measured by executing all 309 on both: MySQL 8.4.11 has none of
+    /// `MARIADB_ONLY`'s forty-nine, MariaDB 10.11.14 none of `MYSQL_ONLY`'s
+    /// five.
+    ///
+    /// Asserted through `rank` rather than over `is_offered_builtin`, because
+    /// the predicate reading correctly is not the property — the *popup* not
+    /// offering the name is, and the two are separated by `CatalogIndex`'s
+    /// precomputed per-flavour lists, which is exactly the kind of seam that
+    /// keeps a green predicate over a broken surface.
+    #[test]
+    fn a_tab_is_only_offered_the_builtins_its_own_server_has() {
+        let schema = crate::rank::SchemaIndex::default();
+        // **A proper prefix, not the whole name.** `rank`'s dedup drops a
+        // candidate equal to what is already typed (`tl == pl`), so asking with
+        // the full name comes back empty on every flavour and the test would
+        // pass for the wrong reason in one direction and fail in the other.
+        let offers = |flavour: ServerFlavour, name: &str| -> Vec<String> {
+            let prefix = &name[..name.len() - 1];
+            crate::rank::rank(
+                &schema,
+                &crate::rank::RankInput {
+                    ctx: &ClauseCtx::Column,
+                    cont: &Continuation::default(),
+                    scope: &[],
+                    prefix,
+                    snippets: &[],
+                    join_targets: &[],
+                    star: None,
+                    used: &std::collections::HashSet::new(),
+                    active_db: None,
+                    dialect: SqlDialect::MySql,
+                    flavour,
+                },
+            )
+            .into_iter()
+            .map(|s| s.text)
+            .collect()
+        };
+        let has = |rows: &[String], name: &str| rows.iter().any(|r| r.eq_ignore_ascii_case(name));
+
+        // MariaDB's own, on each server.
+        for name in ["NVL", "TO_CHAR", "COLUMN_GET", "SUBSTR_ORACLE"] {
+            let maria = offers(ServerFlavour::MariaDb, name);
+            assert!(has(&maria, name), "MariaDB is not offered its own {name}");
+            let mysql = offers(ServerFlavour::MySql, name);
+            assert!(
+                !has(&mysql, name),
+                "a MySQL 8 tab is offered {name}, which that server cannot call"
+            );
+        }
+        // …and MySQL's own, the other way.
+        for name in ["BIN_TO_UUID", "IS_UUID", "REGEXP_LIKE"] {
+            let mysql = offers(ServerFlavour::MySql, name);
+            assert!(has(&mysql, name), "MySQL is not offered its own {name}");
+            let maria = offers(ServerFlavour::MariaDb, name);
+            assert!(
+                !has(&maria, name),
+                "a MariaDB tab is offered {name}, which that server cannot call"
+            );
+        }
+        // A name both have is offered on both, so the split narrows rather than
+        // cuts.
+        for name in ["COUNT", "CONCAT", "NOW"] {
+            for flavour in [
+                ServerFlavour::MySql,
+                ServerFlavour::MariaDb,
+                ServerFlavour::Unknown,
+            ] {
+                assert!(
+                    has(&offers(flavour, name), name),
+                    "{flavour:?} lost {name}, which both servers have"
+                );
+            }
+        }
+        // **`Unknown` offers everything**, which is what this did before the
+        // split and is the deliberate choice for a tab whose schema has not
+        // loaded — see `is_offered_builtin`.
+        for name in ["NVL", "BIN_TO_UUID"] {
+            assert!(
+                has(&offers(ServerFlavour::Unknown, name), name),
+                "an unasked server withheld {name}, which costs every fresh tab \
+                 54 names to avoid one wrong row"
+            );
         }
     }
 

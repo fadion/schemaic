@@ -777,6 +777,18 @@ pub(crate) fn recompute_completions(
             used: &used,
             active_db,
             dialect,
+            // **Which MySQL-family server, read where `SELECT VERSION()` was
+            // actually asked** — the loaded `DbSchema` for the tab's active
+            // database. `SqlDialect` cannot say, and for one thing only it
+            // has to: a MySQL 8 tab was offered forty-nine names from
+            // MariaDB's manual that it cannot call. The same lookup the
+            // table designer makes for `ddl::Target`, so there is one of it.
+            //
+            // No active database means no schema to read it off, and
+            // `Unknown` offers everything — see `RankInput::flavour`.
+            flavour: active_db
+                .map(|db| crate::table_designer::db_flavour(db_nodes, db))
+                .unwrap_or_default(),
         },
     );
 
