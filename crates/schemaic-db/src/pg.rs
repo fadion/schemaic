@@ -2341,7 +2341,40 @@ ALTER TABLE {}.{} {clause} {};",
         // which are part of the object. Filling it would cost a
         // `current_database()` round trip to change no answer.
         database: None,
+        extension_routines: extension_routine_names(client).await?,
     })
+}
+
+/// The **names** of every function an extension owns — the complement of what
+/// [`routine_filter`] excludes, and nothing but the names.
+///
+/// One `SELECT proname`: no bodies, no arguments, no settings. This answers the
+/// typo checker's question ("is this a real callable name here") and not the
+/// tree's, which [`routines_on`] already answered the other way for the reasons
+/// its own doc gives. See `DbSchema::extension_routines` for the measurement —
+/// 19 of 196 extension-owned names came back squiggled as misspellings under
+/// correct SQL.
+///
+/// `DISTINCT`, because an overloaded name has a `pg_proc` row per overload and
+/// the checker only ever asks about the name. Scoped by [`routine_scope`], the
+/// same namespace filter the browse list stands on, so a function in a system
+/// namespace is no more visible here than it is there.
+async fn extension_routine_names(client: &Client) -> Result<Vec<String>, DbError> {
+    let sql = format!(
+        "SELECT DISTINCT p.proname::text \
+           FROM pg_proc p \
+           JOIN pg_namespace n ON n.oid = p.pronamespace \
+          WHERE {} AND EXISTS (SELECT 1 FROM pg_depend d \
+                               WHERE d.objid = p.oid \
+                                 AND d.classid = 'pg_proc'::regclass \
+                                 AND d.deptype = 'e')",
+        routine_scope()
+    );
+    let rows = client
+        .query(sql.as_str(), &[])
+        .await
+        .map_err(|e| db_err(&e))?;
+    Ok(rows.iter().map(|r| r.get::<_, String>(0)).collect())
 }
 
 /// The enum types and domains of every user namespace, plus each one's labels

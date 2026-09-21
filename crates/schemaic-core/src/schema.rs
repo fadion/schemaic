@@ -4272,6 +4272,32 @@ pub struct DbSchema {
     /// a hand-built schema. A side with no address is compared exactly as it
     /// arrived rather than guessed at.
     pub database: Option<String>,
+    /// **Names of functions an extension owns — and nothing else about them.**
+    /// PostgreSQL only; the other two engines have no such concept and leave it
+    /// empty.
+    ///
+    /// [`routines`](DbSchema::routines) deliberately excludes these, and that
+    /// decision is right where it stands: PostGIS alone installs ~1,000
+    /// functions into `public`, so the Functions folder on such a database would
+    /// be a wall of `st_*` with the user's own routines lost inside it, and
+    /// every schema refresh would carry their bodies. They are not the user's to
+    /// edit.
+    ///
+    /// **But the typo checker reads `routines` too, and it needed the opposite
+    /// answer.** `function_typo_checks` exempts anything in the catalog's
+    /// `known_idents`, which is built from what the tree lists — so an extension
+    /// function was not merely absent from the tree, it was *squiggled as a
+    /// misspelling* under correct SQL. Measured on PG 16.15 with `citext`,
+    /// `intarray`, `cube`, `earthdistance`, `tablefunc` and `hstore` installed:
+    /// **19 of the 196 extension-owned names** came back "looks like a
+    /// misspelled function" — `earth_distance`, `icount`, `sort`, `tconvert`
+    /// and fifteen `citext_*`.
+    ///
+    /// So this is names only. It is the cheapest thing that answers the
+    /// checker's question — "is this a real callable name here" — without
+    /// reopening the one the tree already settled, and without shipping a
+    /// thousand bodies over the wire to do it.
+    pub extension_routines: Vec<String>,
 }
 
 /// Which MySQL-family server a schema was introspected from. See

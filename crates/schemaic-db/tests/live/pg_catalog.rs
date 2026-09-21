@@ -294,3 +294,115 @@ fn catalog_names() -> HashSet<String> {
         .map(|f| f.name.to_ascii_lowercase())
         .collect()
 }
+
+/// **An extension's functions are callable names the tree deliberately omits,
+/// and the typo checker must still know them.**
+///
+/// `pg::routine_filter` excludes `deptype = 'e'` on purpose — PostGIS alone
+/// installs ~1,000 functions into `public`, and the Functions folder would be a
+/// wall of `st_*` with the user's own routines lost inside it. But
+/// `intel::function_typo_checks` exempts what the catalog's `known_idents`
+/// holds, and that set was built from what the tree lists — so an extension
+/// function was not merely absent from the tree, it was **squiggled as a
+/// misspelling under correct SQL**.
+///
+/// Measured on PG 16.15 before the fix, with the six extensions below
+/// installed: **19 of the 196 extension-owned names** came back "looks like a
+/// misspelled function" — `earth_distance`, `icount`, `sort`, `tconvert` and
+/// fifteen `citext_*`. `sort` and `icount` are `intarray`'s, and are exactly
+/// the short single-word shape `an_ordinary_user_function_survives_the_pg_
+/// catalog` had no sample of.
+///
+/// **A server is the only thing that can answer this**, which is why it is
+/// here rather than beside the unit test: the unit half asserts that a name in
+/// `DbSchema::extension_routines` is exempt, and what only a real PostgreSQL
+/// can say is that `fetch_schema` actually *puts* its extensions' names there.
+/// The extensions are created in the tier's own scratch database and go away
+/// with it.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_installed_extensions_functions_are_names_the_checker_knows() {
+    use schemaic_core::intel::{Catalog, Severity, diagnostics};
+
+    if !POSTGRES.enabled() {
+        endpoint::note_skipped(&POSTGRES);
+        return;
+    }
+    let scratch = crate::scratch::Scratch::create(&POSTGRES, "pgext").await;
+    // Six that ship with a stock PostgreSQL and between them cover the shapes
+    // that near-miss: `citext`'s comparison operators, `intarray`'s short
+    // `sort`/`icount`, `earthdistance`'s `earth_distance`, `tablefunc`'s
+    // `tconvert`.
+    for ext in [
+        "citext",
+        "intarray",
+        "cube",
+        "earthdistance",
+        "tablefunc",
+        "hstore",
+    ] {
+        scratch
+            .exec(&format!("CREATE EXTENSION IF NOT EXISTS \"{ext}\""))
+            .await;
+    }
+
+    let schema = scratch
+        .db
+        .fetch_schema(&scratch.database, CancellationToken::new())
+        .await
+        .unwrap_or_else(|e| panic!("fetch_schema on {}: {e}", POSTGRES.endpoint()));
+
+    // The premise: the read really found them. An empty list would make every
+    // assertion below pass having asserted nothing — the decoration this tier
+    // exists to avoid.
+    assert!(
+        schema.extension_routines.len() > 100,
+        "only {} extension function name(s) came back, so `fetch_schema` is \
+         not reading them and the rest of this test is vacuous",
+        schema.extension_routines.len()
+    );
+    // …and they are names only, not routines the tree would offer to edit.
+    for name in ["sort", "icount", "earth_distance"] {
+        assert!(
+            schema
+                .extension_routines
+                .iter()
+                .any(|n| n.eq_ignore_ascii_case(name)),
+            "{name} is installed on this server and is not in extension_routines"
+        );
+        assert!(
+            !schema
+                .routines
+                .iter()
+                .any(|r| r.name.eq_ignore_ascii_case(name)),
+            "{name} reached the browse list, which `routine_filter` exists to \
+             keep it out of"
+        );
+    }
+
+    // And not one of them is called a misspelling.
+    let cat = Catalog::build(
+        &[(scratch.database.as_str(), &schema)],
+        Some(&scratch.database),
+    );
+    let squiggled: Vec<&String> = schema
+        .extension_routines
+        .iter()
+        .filter(|n| {
+            let sql = format!("SELECT {n}(a) FROM t");
+            diagnostics(&sql, &cat, schemaic_core::intel::SqlDialect::Postgres)
+                .iter()
+                .any(|d| {
+                    d.severity == Severity::Warning && d.message.contains("misspelled function")
+                })
+        })
+        .collect();
+    assert!(
+        squiggled.is_empty(),
+        "{} of this server's {} extension function names are squiggled as \
+         misspellings under correct SQL: {squiggled:?}",
+        squiggled.len(),
+        schema.extension_routines.len()
+    );
+
+    scratch.teardown().await;
+}

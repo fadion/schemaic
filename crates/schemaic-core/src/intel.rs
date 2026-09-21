@@ -3382,6 +3382,16 @@ impl Catalog {
             for r in &schema.routines {
                 known_idents.insert(r.name.to_ascii_lowercase());
             }
+            // **And the ones the tree deliberately does not list.** An
+            // extension's functions are excluded from `routines` on purpose —
+            // they are not the user's to edit and PostGIS alone would bury the
+            // Functions folder — but they are perfectly callable SQL, and this
+            // set answers a different question: *is this a real name here*.
+            // Measured on PG 16.15, nineteen of them came back squiggled as
+            // misspellings under correct SQL. See `DbSchema::extension_routines`.
+            for name in &schema.extension_routines {
+                known_idents.insert(name.to_ascii_lowercase());
+            }
             for t in &schema.tables {
                 let cols: Vec<String> = t.columns.iter().map(|c| c.name.clone()).collect();
                 known_idents.insert(t.name.to_ascii_lowercase());
@@ -11141,12 +11151,86 @@ mod tests {
             "apply_discount",
             "customer_name",
             "trim_name",
+            // **Short, single-word names**, which the sample above has none of
+            // and which is where the cost actually bites: every one of these is
+            // 4–7 bytes, so the near-miss threshold is 1 and a 2,706-entry
+            // catalog is that many more things to be one edit from. Ten
+            // 9-to-14-byte compounds passed by construction and said nothing
+            // about the population that can fail.
+            "calc",
+            "tally",
+            "norm",
+            "audit",
+            "sync",
+            "purge",
+            "queue",
+            "notify",
+            "slug",
+            "score",
+            "refund",
+            "ledger",
+            "digest",
+            "expire",
+            "renew",
+            "lookup",
+            "verify",
+            "recalc",
+            "restock",
         ] {
             let sql = format!("SELECT {name}(id) FROM employees");
             let d = diag_d(&sql, SqlDialect::Postgres);
             assert!(
                 !d.iter().any(|x| x.message.contains("misspelled function")),
                 "{sql} on Postgres: {d:?}"
+            );
+        }
+    }
+
+    /// **An extension's functions are real names, and the checker has to know
+    /// them even though the tree deliberately does not list them.**
+    ///
+    /// `pg::routine_filter` excludes `deptype = 'e'` on purpose — PostGIS alone
+    /// would bury the Functions folder — so those names reached neither
+    /// `DbSchema::routines` nor the catalog's `known_idents`, and the ones that
+    /// happen to sit within an edit of a `pg_catalog` name came back squiggled
+    /// under correct SQL. Measured on PG 16.15 with `citext`, `intarray`,
+    /// `cube`, `earthdistance`, `tablefunc` and `hstore` installed: **19 of the
+    /// 196 extension-owned names**.
+    ///
+    /// The four below are the non-`citext_*` members of that measured set, so
+    /// this is the real population and not a constructed one. `sort` and
+    /// `icount` are `intarray`'s and are exactly the short single-word shape
+    /// the cost test above had none of.
+    #[test]
+    fn an_extension_function_is_a_known_name_even_though_the_tree_omits_it() {
+        let (schema, db) = sample_catalog();
+        let measured = ["earth_distance", "icount", "sort", "tconvert", "citext_ge"];
+
+        // The premise: these really are squiggled when nothing tells the
+        // checker about them, or the assertion below is about nothing.
+        let bare = Catalog::build(&[(db, &schema)], Some(db));
+        for name in measured {
+            let sql = format!("SELECT {name}(a) FROM employees");
+            assert!(
+                diagnostics(&sql, &bare, SqlDialect::Postgres)
+                    .iter()
+                    .any(|x| x.message.contains("misspelled function")),
+                "{name} no longer near-misses the catalog, so this test's \
+                 premise is gone and its population needs re-measuring"
+            );
+        }
+
+        // …and with the names carried, none of them is.
+        let mut with_ext = schema.clone();
+        with_ext.extension_routines = measured.iter().map(|s| s.to_string()).collect();
+        let cat = Catalog::build(&[(db, &with_ext)], Some(db));
+        for name in measured {
+            let sql = format!("SELECT {name}(a) FROM employees");
+            let d = diagnostics(&sql, &cat, SqlDialect::Postgres);
+            assert!(
+                !d.iter().any(|x| x.message.contains("misspelled function")),
+                "{sql}: an extension function the server really has is still \
+                 called a misspelling: {d:?}"
             );
         }
     }
