@@ -311,6 +311,149 @@ pub async fn a_manual_transaction_is_invisible_until_it_commits(target: &'static
     scratch.teardown().await;
 }
 
+/// **A Stop inside a manual transaction must not desynchronise the pinned
+/// connection**, and what the app reports about the commit afterwards must be
+/// what the database actually holds.
+///
+/// [`Session`] is the documented exception to one-connection-per-operation, so
+/// it is the one place a poisoned connection survives to be read from again —
+/// everywhere else a cancelled MySQL statement is followed by a disconnect. All
+/// four of this module's MySQL cancel arms raced the operation future against
+/// the token and **dropped** it, which leaves `mysql_async`'s result stream
+/// desynchronised: every reply after that belongs to the statement before it.
+///
+/// Measured on both servers before the fix, twice each, and the two reports are
+/// the same fault read through two servers' different replies:
+///
+/// - **MySQL 8.4.11** — the `COMMIT` returned `Ok(())`, the app said the
+///   transaction had committed, and a fresh connection saw **0 rows**. Silent
+///   data loss under a success report.
+/// - **MariaDB 10.11.14** — the `COMMIT` returned error 1317, the app said it
+///   had failed, and the row **was** committed. Rollback was then offered over
+///   durable data.
+///
+/// **So the assertion is the agreement, not the outcome.** Either answer is
+/// defensible on its own — a commit may legitimately fail — and a test that
+/// demanded one would be asserting a policy. What cannot be defended is the app
+/// telling the user one thing while the server holds another, which is exactly
+/// what a desynchronised connection produces and what a second, independent
+/// connection can settle.
+///
+/// PostgreSQL runs it too and has always passed: `Client` is a channel handle
+/// onto an independent connection task that drains to `request_complete`
+/// whatever the receiver does. Keeping the leg is what makes that a measured
+/// fact here rather than a claim.
+pub async fn a_stop_inside_a_manual_transaction_leaves_the_connection_usable(
+    target: &'static Target,
+) {
+    let scratch = Scratch::create(target, "manual_cancel").await;
+    seed_import_table(&scratch).await;
+
+    let session = OpenSession(Some(
+        Session::open(&scratch.db, Some(&scratch.database))
+            .await
+            .unwrap_or_else(|e| panic!("{}: could not pin a session: {e}", target.name)),
+    ));
+    session
+        .ensure_tx()
+        .await
+        .unwrap_or_else(|e| panic!("{}: could not begin: {e}", target.name));
+
+    // One real write, so there is something for the commit to be right or wrong
+    // about.
+    let insert = format!(
+        "INSERT INTO {} (id, name) VALUES (1, 'staged')",
+        scratch.qualified("imp")
+    );
+    session
+        .fetch_query(&insert, 10, CancellationToken::new())
+        .await
+        .result
+        .unwrap_or_else(|e| panic!("{}: the insert failed: {e}", target.name));
+
+    // Then a long statement, stopped part-way — the Stop button, on the same
+    // pinned connection.
+    let cancel = CancellationToken::new();
+    let armed = cancel.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        armed.cancel();
+    });
+    let started = Instant::now();
+    let stopped = session
+        .fetch_query(&target.sleep_sql(SESSION_CANCEL_MARKER), 10, cancel)
+        .await;
+    assert!(
+        matches!(stopped.result, Err(DbError::Cancelled)),
+        "{}: expected the cancellation, got {:?}",
+        target.name,
+        stopped
+            .result
+            .map(|rs| rs.row_count())
+            .map_err(|e| e.to_string())
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(SLEEP_SECS) - CANCEL_MARGIN,
+        "{}: the cancel took {:?}, so the statement ran to completion and this \
+         test never reached the state it is about",
+        target.name,
+        started.elapsed()
+    );
+
+    // **The commit, and then the database, on a different connection.**
+    let committed = session.commit().await;
+    let rows = count(&scratch).await;
+    drop(session);
+
+    if target.cancel_aborts_transaction {
+        // PostgreSQL: a cancelled statement aborts the block, so the row being
+        // gone is the engine's own rule and not a fault — see
+        // `Target::cancel_aborts_transaction`. What this leg is here for is the
+        // half that *is* about the connection: the statement was stopped and
+        // the session came back rather than hanging or dying.
+        assert_eq!(
+            rows, "0",
+            "{}: a cancelled statement is supposed to abort the transaction \
+             here, and the row survived it",
+            target.name
+        );
+        // **Not asserted here, and deliberately so:** `commit()` returns
+        // `Ok(())` on this leg for a `COMMIT` PostgreSQL turned into a
+        // `ROLLBACK` — measured, and a report that does not match the database.
+        // It is a different fault from the one this test was written for (that
+        // one is the pinned connection's result stream, and it is MySQL-family
+        // only), it is not in the ledger, and blessing it with an
+        // `assert_eq!(committed, Ok(()))` here would turn a finding into a
+        // fixture. Left stated rather than encoded.
+        let _ = &committed;
+    } else {
+        // MySQL and MariaDB: the transaction is still open and committable, so
+        // whichever way the commit goes its *report* has to agree with what the
+        // database holds. Either answer is defensible on its own — a commit may
+        // legitimately fail — and demanding one would assert a policy; what
+        // cannot be defended is the app saying one thing while the server holds
+        // another, which is exactly what a desynchronised result stream
+        // produces.
+        match &committed {
+            Ok(()) => assert_eq!(
+                rows, "1",
+                "{}: the app reported a successful COMMIT and the database \
+                 holds nothing — the reply it read belonged to the statement \
+                 before it",
+                target.name
+            ),
+            Err(e) => assert_eq!(
+                rows, "0",
+                "{}: the app reported the COMMIT as failed ({e}) and the row is \
+                 committed — Rollback is now offered over durable data",
+                target.name
+            ),
+        }
+    }
+
+    scratch.teardown().await;
+}
+
 /// A manual transaction that is rolled back leaves nothing behind.
 pub async fn a_rolled_back_manual_transaction_leaves_nothing(target: &'static Target) {
     let scratch = Scratch::create(target, "manual_rollback").await;
@@ -757,6 +900,9 @@ const ARM_FALLBACK: Duration = Duration::from_secs(SLEEP_SECS)
 const READ_CANCEL_MARKER: &str = "schemaicItCancelRead";
 /// See [`READ_CANCEL_MARKER`].
 const SCRIPT_CANCEL_MARKER: &str = "schemaicItCancelScript";
+/// See [`READ_CANCEL_MARKER`] — a third test cancelling a sleep on the same
+/// server needs a third marker, for the same reason.
+const SESSION_CANCEL_MARKER: &str = "schemaicItCancelSession";
 
 /// Feed `stmts` through the channel `run_script` reads, and report how it ended.
 ///

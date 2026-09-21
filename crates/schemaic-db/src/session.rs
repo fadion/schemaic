@@ -435,48 +435,59 @@ impl Session {
             Backend::MySql { conn, conn_id } => {
                 let conn_id = *conn_id;
                 let mut dest = crate::RowDest::Capped(row_cap);
-                tokio::select! {
-                    // `early_stop = false`: the connection outlives this
-                    // statement, so a truncated result must be drained fully to
-                    // leave it clean for the next one.
-                    r = collect_rows(conn, sql, &mut dest, false) => r,
-                    _ = cancel.cancelled() => {
-                        crate::mysql::kill_query(&self.db, conn_id).await;
-                        Err(DbError::Cancelled)
-                    }
-                }
+                // `early_stop = false`: the connection outlives this statement,
+                // so a truncated result must be drained fully to leave it clean
+                // for the next one — and `cancel_awaited` is that same rule for
+                // the *cancelled* case, which dropped the future instead. See
+                // its doc for the measurement.
+                crate::mysql::cancel_awaited(
+                    collect_rows(conn, sql, &mut dest, false),
+                    &self.db,
+                    conn_id,
+                    &cancel,
+                )
+                .await
             }
             Backend::Postgres { client } => {
-                let token = client.cancel_token();
                 let database = self.database.as_deref().unwrap_or("");
                 let mut dest = crate::RowDest::Capped(row_cap);
-                tokio::select! {
-                    // **`in_tx`, so the non-executing describe is fenced.** A
-                    // Manual-mode tab is inside a transaction from its first
-                    // statement (`ensure_tx`), and a failed `Parse` aborts one
-                    // exactly as a failed statement does — so a typo reported
-                    // "current transaction is aborted" instead of naming the
-                    // relation, and everything after it in the tab reported the
-                    // same. The flag is this session's own belief; PostgreSQL
-                    // refuses the savepoint if it is wrong, and that refusal is
-                    // what `run_statement` reads rather than the flag.
-                    r = pg::run_statement(
-                        &self.db,
-                        client,
-                        database,
-                        sql,
-                        &mut dest,
-                        &cancel,
-                        self.in_tx.load(Ordering::SeqCst),
-                    ) => r,
-                    // Over this session's own transport: a cancel that opened a
-                    // plaintext connection would be refused by the very servers
-                    // the TLS setting exists for, and the failure is discarded.
-                    _ = cancel.cancelled() => {
-                        pg::cancel_query(&self.db, &token).await;
-                        Err(DbError::Cancelled)
-                    }
-                }
+                // **No outer race here, because `run_statement` owns the
+                // token.** It cancels around `simple_query_raw` and again per
+                // message of the result stream, both times through
+                // `pg::cancel_query` on this connection's own transport — so an
+                // outer `tokio::select!` was redundant with it, and `select!`
+                // polls ready branches in random order, so which of the two
+                // answered a cancel was a coin flip.
+                //
+                // Its one *distinct* effect was the harmful one: winning the
+                // race during the **describe** phase drops the future between
+                // the `SAVEPOINT schemaic_describe` and its `RELEASE`, leaving
+                // the savepoint and an un-`CLOSE`d prepared statement in the
+                // user's transaction — measured on PG 16.15 as three stacked
+                // live savepoints after three cancels. The describe is one
+                // round trip and is not interruptible now; if it ever must be,
+                // the interruption belongs *inside* `run_statement`, between
+                // those two statements, where it can clean up after itself.
+                //
+                // **`in_tx`, so the non-executing describe is fenced.** A
+                // Manual-mode tab is inside a transaction from its first
+                // statement (`ensure_tx`), and a failed `Parse` aborts one
+                // exactly as a failed statement does — so a typo reported
+                // "current transaction is aborted" instead of naming the
+                // relation, and everything after it in the tab reported the
+                // same. The flag is this session's own belief; PostgreSQL
+                // refuses the savepoint if it is wrong, and that refusal is
+                // what `run_statement` reads rather than the flag.
+                pg::run_statement(
+                    &self.db,
+                    client,
+                    database,
+                    sql,
+                    &mut dest,
+                    &cancel,
+                    self.in_tx.load(Ordering::SeqCst),
+                )
+                .await
             }
         };
         // Same stamp `Db::fetch_query` applies, from this session's own scope —
@@ -652,17 +663,25 @@ impl Session {
         let result = match &mut *guard {
             Backend::MySql { conn, conn_id } => {
                 let conn_id = *conn_id;
-                // `None`: this path owns its own cancel, and the batch is a
-                // savepoint inside the user's transaction — `classify_isolated`
-                // below is what answers for what survived, not a `Rollback`
-                // verdict read off this connection. See `write_on`'s doc.
-                tokio::select! {
-                    r = write_on(conn, write, TxScope::Savepoint, None) => r,
-                    _ = cancel.cancelled() => {
-                        crate::mysql::kill_query(&self.db, conn_id).await;
-                        Err(DbError::Cancelled)
-                    }
-                }
+                // `None` to `write_on`: the batch is a savepoint inside the
+                // user's transaction, so `classify_isolated` below is what
+                // answers for what survived, not a `Rollback` verdict read off
+                // this connection. See `write_on`'s doc.
+                //
+                // **But the cancel still goes through `cancel_awaited`**, and
+                // the exemption sentence that used to stand here said otherwise.
+                // It answered a *transaction-state* question — who decides what
+                // survived — with a *protocol* one, and they are not the same:
+                // whatever answers for the batch, the killed statement has to be
+                // awaited or every reply after it on this pinned connection
+                // belongs to the statement before.
+                crate::mysql::cancel_awaited(
+                    write_on(conn, write, TxScope::Savepoint, None),
+                    &self.db,
+                    conn_id,
+                    &cancel,
+                )
+                .await
             }
             Backend::Postgres { client } => {
                 let token = client.cancel_token();
@@ -720,13 +739,7 @@ impl Session {
         let result = match &mut *guard {
             Backend::MySql { conn, conn_id } => {
                 let conn_id = *conn_id;
-                tokio::select! {
-                    res = blob_on(conn, r) => res,
-                    _ = cancel.cancelled() => {
-                        crate::mysql::kill_query(&self.db, conn_id).await;
-                        Err(DbError::Cancelled)
-                    }
-                }
+                crate::mysql::cancel_awaited(blob_on(conn, r), &self.db, conn_id, &cancel).await
             }
             Backend::Postgres { client } => {
                 let token = client.cancel_token();
@@ -777,13 +790,13 @@ impl Session {
         let result = match &mut *guard {
             Backend::MySql { conn, conn_id } => {
                 let conn_id = *conn_id;
-                tokio::select! {
-                    r = refetch_on(conn, template, rows) => r,
-                    _ = cancel.cancelled() => {
-                        crate::mysql::kill_query(&self.db, conn_id).await;
-                        Err(DbError::Cancelled)
-                    }
-                }
+                crate::mysql::cancel_awaited(
+                    refetch_on(conn, template, rows),
+                    &self.db,
+                    conn_id,
+                    &cancel,
+                )
+                .await
             }
             Backend::Postgres { client } => {
                 let token = client.cancel_token();
@@ -889,6 +902,63 @@ mod pg_cancel_gate {
              transport — a plaintext cancel is refused by exactly the servers TLS was set for, \
              and the refusal is discarded:\n{}",
             offenders.join("\n")
+        );
+    }
+
+    /// **The MySQL counterpart, and the one that was missing.** Every cancel on
+    /// this module's *pinned* connection goes through `mysql::cancel_awaited`,
+    /// which kills the statement and then **awaits** it.
+    ///
+    /// A `tokio::select!` that drops a `mysql_async` future leaves the result
+    /// stream desynchronised, and every reply after that belongs to the
+    /// statement before it. Everywhere else in this crate that is survivable,
+    /// because one connection per operation means the poisoned connection is
+    /// disconnected before anyone reads from it again — [`Session`] is the
+    /// documented exception, so it is the one place such a connection lives on.
+    /// It did: a Stop in a Manual-transaction tab made the next `COMMIT` read
+    /// the previous statement's reply, which MySQL 8.4.11 reported as success
+    /// over **0 committed rows** and MariaDB 10.11.14 as failure over a row that
+    /// *was* committed.
+    ///
+    /// Spelled as "`kill_query` is not called from here" rather than as "no
+    /// `select!`", because the PostgreSQL arms in this file race their futures
+    /// quite correctly — `Client` is a channel handle onto an independent
+    /// connection task that drains regardless of the receiver — so forbidding
+    /// the construct would forbid the wrong thing. A new MySQL arm that races
+    /// and drops has to kill the statement somehow, and this is where it shows.
+    #[test]
+    fn every_mysql_cancel_on_the_pinned_connection_awaits_the_statement_it_killed() {
+        let path = crate_src().join("session.rs");
+        let src = std::fs::read_to_string(&path).expect("this module's own source");
+        // Assembled, so this module is not its own first match.
+        let needle = format!("kill{}query(", '_');
+        let offenders: Vec<String> = src
+            .lines()
+            .enumerate()
+            .filter(|(_, l)| {
+                let code = l.split("//").next().unwrap_or("");
+                code.contains(&needle)
+            })
+            .map(|(i, l)| format!("session.rs:{}: {}", i + 1, l.trim()))
+            .collect();
+        assert!(
+            offenders.is_empty(),
+            "a cancel on the pinned MySQL connection kills the statement here \
+             rather than through `mysql::cancel_awaited`, which is the only \
+             shape that also *awaits* it — a dropped `mysql_async` future \
+             leaves the result stream desynchronised and the next reply on this \
+             connection belongs to the statement before:\n{}",
+            offenders.join("\n")
+        );
+        // …and the helper really is reached, so this gate cannot pass by the
+        // cancels having been deleted. One per MySQL arm: `fetch_query`,
+        // `commit_writes`, `fetch_blob`, `refetch_rows`.
+        let calls = src.matches("cancel_awaited(").count();
+        assert!(
+            calls >= 4,
+            "only {calls} call(s) to the awaiting cancel helper — a MySQL arm on \
+             the pinned connection has lost its cancel, or gained one that does \
+             not go through it"
         );
     }
 }

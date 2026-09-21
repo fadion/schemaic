@@ -543,6 +543,60 @@ pub(crate) async fn kill_query(db: &Db, conn_id: u32) {
     }
 }
 
+/// Race `fut` against `cancel`, and on a cancel **kill the statement at the
+/// server and then await the future** rather than dropping it.
+///
+/// **This is the one shape a cancel may take on a connection that outlives the
+/// statement**, and the rule is stated at length on [`write_on`] and
+/// [`crate::Db::import_rows`]: a `tokio::select!` that simply drops a
+/// `mysql_async` future leaves the connection's result stream desynchronised,
+/// and every reply after that belongs to the statement before it. Every other
+/// MySQL cancel arm in this crate is safe only because it *disconnects*
+/// immediately afterwards — one connection per operation, so a poisoned
+/// connection is thrown away before anyone reads from it again.
+///
+/// [`crate::session::Session`] is the documented exception to that invariant: it
+/// pins one connection for a whole Manual-transaction tab. So it is the one
+/// place a desynchronised connection survives, and it did. Measured on both
+/// servers, twice each — a tab that ran an `INSERT`, had a long `SELECT`
+/// cancelled, then pressed **Commit**:
+///
+/// - **MySQL 8.4.11**: the `COMMIT` returned `Ok(())`, the app reported success,
+///   and a fresh connection saw **0 rows**. Silent data loss under a success
+///   report.
+/// - **MariaDB 10.11.14**: the `COMMIT` returned error 1317, the app reported
+///   failure, and the row **was** committed — leaving Rollback offered over
+///   durable data.
+///
+/// The two reports are the same desynchronisation read through two servers'
+/// different replies, which is why neither looked like a protocol fault.
+///
+/// `let _ = fut.await` is not a wait for the statement to finish its work: the
+/// `KILL QUERY` above has already stopped it, so what is awaited is the error
+/// reply, and awaiting it is precisely what leaves the stream aligned. A body
+/// that runs several statements propagates that error with `?` and stops, which
+/// is why [`refetch_on`]'s loop needs nothing of its own.
+pub(crate) async fn cancel_awaited<T>(
+    fut: impl Future<Output = Result<T, DbError>>,
+    db: &Db,
+    conn_id: u32,
+    cancel: &CancellationToken,
+) -> Result<T, DbError> {
+    let mut fut = std::pin::pin!(fut);
+    let raced = tokio::select! {
+        r = fut.as_mut() => Some(r),
+        _ = cancel.cancelled() => None,
+    };
+    match raced {
+        Some(r) => r,
+        None => {
+            kill_query(db, conn_id).await;
+            let _ = fut.await;
+            Err(DbError::Cancelled)
+        }
+    }
+}
+
 /// Row and size estimates, and index statistics, for one database.
 pub(crate) async fn fetch_table_stats(db: &Db, database: &str) -> Result<SchemaStats, DbError> {
     let mut conn = db.open(None, false).await?;
@@ -5622,10 +5676,19 @@ async fn import_on(
 /// rollback goes out on an intact protocol and [`cancelled_write`] can be
 /// believed.
 ///
-/// `None` for a caller that does not cancel — or that owns the cancel itself,
-/// as [`crate::session::Session::commit_writes`] does, where the batch is a
-/// savepoint inside the user's transaction and `classify_isolated` is what
-/// answers for it.
+/// `None` for a caller that does not cancel, or one for which a `Rollback`
+/// verdict read off *this* connection is not the answer:
+/// [`crate::session::Session::commit_writes`] passes `None` because its batch is
+/// a savepoint inside the user's transaction and `classify_isolated` is what
+/// says what survived.
+///
+/// **That is a statement about who answers, not a licence to drop the future.**
+/// This sentence used to read as the latter, and `Session::commit_writes` raced
+/// `write_on` against its token and dropped it — a *transaction-state* argument
+/// used to settle a *protocol* question, which is how the pinned connection came
+/// to be left desynchronised. It goes through [`cancel_awaited`] now, which
+/// kills the statement and awaits it; `None` here still means only that the
+/// batch does not read its own rollback.
 pub(crate) async fn write_on(
     conn: &mut Conn,
     write: &GridWrite,
@@ -7073,11 +7136,26 @@ mod write_tests {
         );
         // …and the cancel still leaves through a rollback whose outcome is asked
         // for, which is now `write_on`'s job.
+        // **Measured to the end of the function, not to a fixed 3,000 bytes.**
+        // That is the same defect the first half of this gate was repaired for
+        // one commit earlier and this half kept: the window already stopped
+        // eleven lines short of `write_on`'s end, so a cancel path added below
+        // it was invisible, and a `write_on` that grew would have silently
+        // narrowed the gate further. `R2.2-L6-06`.
         let wo_sig = format!("pub(crate) async fn write{}on(", '_');
         let wo = src
             .find(&wo_sig)
             .expect("`write_on` is gone or was renamed");
-        let wob = &src[wo..wo + 3000];
+        let rest = &src[wo..];
+        let wob = match rest.find("\n}\n") {
+            Some(i) => &rest[..i],
+            None => rest,
+        };
+        assert!(
+            wob.len() > 3000,
+            "the `write_on` window is shorter than the fixed slice it replaced, \
+             so the end marker matched something inside the function"
+        );
         assert!(
             wob.contains("rollback(") && wob.contains("cancelled_write("),
             "the cancel path returns without asking what the rollback achieved, \

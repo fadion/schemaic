@@ -90,6 +90,22 @@ pub struct Target {
     /// table for good — which is why `DdlError::applied` exists and why the
     /// preview's failure message counts it.
     pub transactional_ddl: bool,
+    /// Does **cancelling a statement inside a transaction abort the whole
+    /// transaction** on this server?
+    ///
+    /// PostgreSQL treats a cancelled statement exactly as a failed one: the
+    /// block enters the aborted state, everything after it answers `25P02`, and
+    /// a `COMMIT` then behaves as a `ROLLBACK`. MySQL and MariaDB do not — a
+    /// killed statement leaves the transaction open and committable, which is
+    /// why `Session::fence_read` exists for the reads that must survive a
+    /// dismissed panel there.
+    ///
+    /// Data on the target rather than an `if engine == Postgres` in a test body,
+    /// for the reason at the top of [`crate::suite`] — and because it is the
+    /// difference that decides what
+    /// `a_stop_inside_a_manual_transaction_leaves_the_connection_usable` may
+    /// assert about the commit that follows.
+    pub cancel_aborts_transaction: bool,
     /// Does a grant list from this server cover **one database only**?
     ///
     /// PostgreSQL keeps schema, table and sequence privileges in the catalogue
@@ -256,6 +272,7 @@ pub static MARIADB: Target = Target {
     disable_index_sql: Some("ALTER TABLE {table} ALTER INDEX {index} IGNORED"),
     expression_index_sql: None,
     transactional_ddl: false,
+    cancel_aborts_transaction: false,
     grants_are_database_scoped: false,
     primary_key_include: None,
     error_names_the_value: false,
@@ -287,6 +304,7 @@ pub static MYSQL: Target = Target {
     disable_index_sql: Some("ALTER TABLE {table} ALTER INDEX {index} INVISIBLE"),
     expression_index_sql: Some("CREATE INDEX {index} ON {table} ((a + b))"),
     transactional_ddl: false,
+    cancel_aborts_transaction: false,
     grants_are_database_scoped: false,
     primary_key_include: None,
     error_names_the_value: false,
@@ -318,6 +336,7 @@ pub static POSTGRES: Target = Target {
     disable_index_sql: None,
     expression_index_sql: Some("CREATE INDEX {index} ON {table} ((a + b))"),
     transactional_ddl: true,
+    cancel_aborts_transaction: true,
     grants_are_database_scoped: true,
     primary_key_include: Some(" INCLUDE (payload)"),
     error_names_the_value: true,
