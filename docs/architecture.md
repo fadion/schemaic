@@ -462,14 +462,15 @@ existing prose was left alone.
     no caller outside this module and is the same "one place to forget an engine" one hop on.
     **`is_offered_builtin` is where those two surfaces part company again**, because trusting a name
     and offering it are not the same question: `builtin_catalog` is what the checker **trusts**,
-    whole, and `is_offered_builtin(dialect, name)` is what `rank`'s `ClauseCtx::Column` arm filters
-    it through before the popup sees it. They differ on exactly one engine. MySQL's and SQLite's
+    whole, and `is_offered_builtin(dialect, flavour, name)` is what `rank`'s `ClauseCtx::Column` arm
+    filters it through before the popup sees it. MySQL's and SQLite's
     catalogs were transcribed from their manuals and each already *is* the list a person would type,
-    so both arms are `true`; PostgreSQL's was read out of `pg_catalog`, so it carries the engine's
+    so SQLite's arm is `true` outright and MySQL's is `true` but for the flavour split below;
+    PostgreSQL's was read out of `pg_catalog`, so it carries the engine's
     own plumbing — `int4in`, `btint4cmp`, `texteq` — which the checker must keep knowing and the
     popup must not spend its forty rows on, and that arm asks `pg_builtins::is_suggested`.
-    **It is asked once per dialect rather than once per candidate**: the answer is
-    `CatalogIndex::offered`, and `offered_builtins(dialect)` is the slice `rank` iterates.
+    **It is asked once per dialect and flavour rather than once per candidate**: the answer is
+    `CatalogIndex::offered`, and `offered_builtins(dialect, flavour)` is the slice `rank` iterates.
     `is_suggested` is a binary search, and running it over all 2,706 entries to arrive at the same
     863 names every time was 2,706 binary searches per keystroke on a path with no debounce.
     **It is an exhaustive `match` on a dialect, and that is not the engine comparison the working
@@ -490,6 +491,31 @@ existing prose was left alone.
     `Option` outlives that**: all three engines answer `Some` today, and the `None` arm stays for the
     *fourth*, which has to land on it rather than inherit whichever list is nearest — the original
     bug, one engine further on.
+    **The checker's exemption set is the other half of "a name this engine really has", and an
+    extension's functions fell straight through it.** `function_typo_checks` passes anything in the
+    catalog's `known_idents` — databases, tables, columns, namespaces and the schema's stored
+    routines — and that set is built from what the tree lists. `pg::routine_filter`
+    deliberately keeps an extension's functions *out* of the tree (PostGIS alone installs ~1,000
+    `st_*` into `public`, and that decision stands), so an extension function was not merely absent
+    from the tree: it was **squiggled as a misspelling under correct SQL**, which is the exact
+    failure that switched this checker off for PostgreSQL in the first place. Measured on PG 16.15
+    with `citext`, `intarray`, `cube`, `earthdistance`, `tablefunc` and `hstore` installed, **19 of
+    the 196 extension-owned names** came back "looks like a misspelled function" —
+    `earth_distance`, `icount`, `sort`, `tconvert` and fifteen `citext_*`.
+    `DbSchema::extension_routines` is what closes it: **names and nothing else**, PostgreSQL only,
+    folded into `known_idents` beside `schema.routines` by `Catalog::build`. It answers the
+    checker's question — is this a real callable name here — without reopening the one the tree
+    settled the other way, and without shipping a thousand bodies over the wire to do it.
+    `an_extension_function_is_a_known_name_even_though_the_tree_omits_it` asserts its own **premise
+    first**, that those five names really do near-miss when nothing carries them, so it cannot come
+    to pass by the population having moved; the live half is `live::pg_catalog`'s
+    `an_installed_extensions_functions_are_names_the_checker_knows`, below.
+    **`an_ordinary_user_function_survives_the_pg_catalog` was sampling the wrong population**, and
+    that is how this sat unseen behind a test that stated the cost property: its ten names were
+    9-to-14-byte compounds, and at that length the near-miss threshold is 2 and a compound is far
+    from everything, so all ten passed by construction. Nineteen short single-word names were added
+    — 4–7 bytes, threshold 1 — and all nineteen pass too. The useful result is the one that is not
+    a fix: the failing population was never "short user names", it was extension names.
     **A catalog is data, so the engine checks it** — `schemaic-db/tests/sqlite_catalog.rs`, which
     lives over there rather than beside the catalog because only that crate links rusqlite, and needs
     no server, no file and no network (the in-memory-SQLite allowance).
@@ -530,15 +556,42 @@ existing prose was left alone.
     is why the server reports them and the checker must not squiggle them) and **Replication &
     cluster** (`MASTER_GTID_WAIT`, `BINLOG_GTID_POS`, the `WSREP_*` trio, `DECODE_HISTOGRAM`) — plus
     a small **XML** one (`EXTRACTVALUE`, `UPDATEXML`).
-    **`FUNCTIONS` is one catalog for two engines and feeds autocomplete as well as the checker**, so
-    the cost of that is paid in the popup: a MySQL 8 tab is now offered `NVL`, `SUBSTR_ORACLE` and
-    the rest of MariaDB's own names. `rank.rs` reaches this catalog through `builtin_catalog` now
-    rather than naming it, so the overhang stops at the two engines that share it instead of
-    reaching every tab — which it did, and which is the bug above. The shape is unchanged
-    and so is the open question — this made the list 57 names longer, not differently structured —
-    and the reverse allowance is deliberate for the same reason: the five names MySQL 8 has and
-    MariaDB never got stay listed rather than squiggling `UUID_TO_BIN` for the MySQL user who typed
-    it, which is what the test's `MYSQL_ONLY` is.
+    **`FUNCTIONS` is one catalog for two servers, and that was free until it reached the popup.**
+    `rank.rs` reaches this catalog through `builtin_catalog` rather than naming it, so the overhang
+    stops at the two engines that share it instead of reaching every tab — which it did, and which
+    is the bug above. But a name MariaDB has and MySQL 8 has not is still a row a MySQL tab cannot
+    call, and `SqlDialect` cannot say which of the two is in front of the tab: it has no MariaDB arm
+    on purpose, which is right for parsing, quoting and the *shape* of a completion and wrong for
+    one thing only — which names exist.
+    **Measured, not remembered.** All 309 of `FUNCTIONS`' names were executed on both servers
+    (`SELECT <name>(1,2)` with a database selected; `ERROR 1305` means the server has no such
+    function, any other error means it has one and was called wrongly). MySQL 8.4.11 answered 1305
+    for exactly **49** — the eight `COLUMN_*` dynamic-column functions, the nine `*_ORACLE`
+    spellings, the three `WSREP_*`, `NVL`/`NVL2`/`TO_CHAR`/`ADD_MONTHS`/`SYS_GUID` from Oracle mode
+    and the rest — and MariaDB 10.11.14 for exactly **5** (`BIN_TO_UUID`, `IS_UUID`,
+    `JSON_STORAGE_SIZE`, `REGEXP_LIKE`, `UUID_TO_BIN`). Those are `MARIADB_ONLY` and `MYSQL_ONLY`,
+    sorted for a binary search and `pub` for the live oracle alone. **Two different reasons live in
+    `MARIADB_ONLY` and the list is right for both**: most are MariaDB's own, but `DES_ENCRYPT`,
+    `DES_DECRYPT`, `ENCODE`, `ENCRYPT` and `OLD_PASSWORD` are functions MySQL *removed* in 8.0 and
+    MariaDB kept — the question the list answers is "can the server in front of me call it", and for
+    MySQL 8.4 the answer is no either way. `MYSQL_ONLY` is short *because* the catalog was
+    transcribed from MariaDB's manual: the asymmetry is a property of how this file was written, not
+    of the two servers.
+    **Only the offer narrows; the checker goes on trusting the catalog whole**, which is the
+    PostgreSQL split one engine along: squiggling `UUID_TO_BIN` for the MySQL user who typed it is
+    the false positive this area exists to prevent, so neither list is subtracted from what
+    `builtin_catalog` returns.
+    **`ServerFlavour::Unknown` offers everything, and that is deliberately *not* the
+    withhold-on-uncertainty rule `ServerFlavour::is_mariadb` follows.** That rule is for writes,
+    where guessing costs a table's constraints; here guessing costs one extra row in a popup while
+    withholding costs 54 names on every tab whose schema has not finished loading. The flavour only
+    ever *narrows* once it is known. `every_flavoured_name_is_in_the_catalog` holds both lists
+    sorted, really in `FUNCTIONS`, and not overlapping;
+    `a_tab_is_only_offered_the_builtins_its_own_server_has` asserts the consequence **through
+    `rank`** rather than over `is_offered_builtin`, because the predicate reading correctly is not
+    the property — the popup not offering the name is, and `CatalogIndex`'s precomputed per-flavour
+    lists sit between the two. It asks with a *proper prefix* of each name, since `rank`'s dedup
+    drops a candidate equal to what is already typed.
     **A builtin's name plus a `_` or a digit is a *derived* name, not a misspelling**, and
     `is_probable_function_typo` refuses those outright. Its own doc already claimed the design
     avoided flagging `format_x` as a typo of `FORMAT` — by not loosening the distance threshold —
@@ -563,7 +616,14 @@ existing prose was left alone.
     for the derived-name test and so asked from the *word's* side: for each `_`-or-digit byte in the
     word, is everything before it a name? That is one set lookup per separator byte instead of a
     walk of the catalog per word. `by_len` buckets the upper-cased names by byte length, each paired
-    with a character-presence mask, and `offered` is `is_offered_builtin`'s answer precomputed.
+    with a character-presence mask, and `offered` is `is_offered_builtin`'s answer precomputed —
+    **`[Vec<&'static SqlFunction>; 3]`, one list per `ServerFlavour`**, because on the MySQL arm
+    that answer depends on which of the two servers the tab is on. `CatalogIndex::slot(flavour)` is
+    a `match` rather than an `as usize`, so a fourth flavour is a compiler error instead of an index
+    quietly reading somebody else's list. Three short vectors rather than a fourth `OnceLock` keyed
+    on the (dialect, flavour) pair: the flavour changes what is *offered* and nothing else in the
+    struct, so splitting the whole index would rebuild the buckets and both hash sets three times
+    over to vary one field. On the other two dialects all three lists are the same.
     **Three `OnceLock`s, one per `SqlDialect` arm, rather than one map keyed by the dialect** — the
     set of engines is closed at compile time, so a fourth engine is a compiler error in the cache
     too rather than a silent miss at runtime, which is `builtin_catalog`'s own argument one layer on.
@@ -5719,6 +5779,15 @@ existing prose was left alone.
     round trip to change no answer. `None` also means "the reader did not record it", which is the honest
     answer for a hand-built schema, and a side with no address is compared exactly as it arrived
     rather than guessed at — see `compare.rs`'s `as_read_from`.
+    **`DbSchema::extension_routines` is the one field that carries names and nothing else**, and it
+    exists because two readers of `routines` wanted opposite answers. PostgreSQL only — the other
+    two engines have no such concept and leave it empty. The tree browses `routines`, which
+    `pg::routine_filter` deliberately strips of anything an extension owns; the typo checker reads
+    the same list, through the catalog's `known_idents`, and so squiggled every extension function
+    as a misspelling under correct SQL. Names alone is the cheapest thing that answers the checker
+    without reopening what the tree settled: no bodies, no arguments, no settings, nothing the
+    Functions folder would then have to hide again. See `intel.rs` above for the measurement, and
+    `db/pg.rs`'s `extension_routine_names` for the query.
     **`SchemaState::begin_refresh` is why a refresh doesn't blank the tree.** Re-introspection
     is whole-database on both engines and always will be — the cost is ~10 catalogue
     round-trips, not the rows, so scoping it to one table would optimise the term that doesn't
@@ -7152,8 +7221,8 @@ existing prose was left alone.
       `GROUP_CONCAT` — names that engine does not have — and never `btrim`, which it does, while a
       SQLite tab got MySQL's list just as silently. It is the typo checker's original PostgreSQL bug
       in the surface that *inserts* the word rather than the one that underlines it, so the arm asks
-      `intel::offered_builtins(input.dialect)` — the one engine→catalog map, read through
-      `intel::CatalogIndex` and `pub(crate)` for this caller — and reads its `None` as an empty
+      `intel::offered_builtins(input.dialect, input.flavour)` — the one engine→catalog map, read
+      through `intel::CatalogIndex` and `pub(crate)` for this caller — and reads its `None` as an empty
       slice, leaving a fourth engine offered nothing rather than inheriting whichever list is
       nearest. `each_dialect_is_offered_its_own_builtins` asserts
       that through `rank` and not over the catalogs, because the catalogs were already right and the
@@ -7171,6 +7240,14 @@ existing prose was left alone.
       **both** halves of that in one test, because either alone is satisfiable by a bug: a plumbing
       name is required to be *in* `PG_FUNCTIONS` and *absent* from the ranked list, and `coalesce`
       and `greatest` — grammar-only forms no `pg_proc` query can return — are required to survive.
+      **`RankInput::flavour` is the same question one level finer, and the dialect could not ask
+      it**: `SqlDialect` has no MariaDB arm, so `intel::FUNCTIONS` served both servers and a MySQL 8
+      tab was offered the forty-nine names MariaDB has and it has not — `NVL`, `TO_CHAR`, the eight
+      `COLUMN_*` — while a MariaDB tab got five of MySQL's. It is a `ServerFlavour`, not a fourth
+      dialect, because everything else about the two is the same dialect; `Unknown` offers
+      everything, which is what this did before the split and is the deliberate choice
+      `intel::is_offered_builtin` argues for. No new signal carries it: the caller reads it off the
+      loaded `DbSchema` for the tab's active database, where `collect_schema` stamped it.
       **`add` asks `worth_offering` before it builds anything, which is `add_col`'s shape adopted
       for `add_col`'s reason.** A PostgreSQL tab offers 863 builtins where MySQL offers 309, and
       every one of them was paying a `to_ascii_lowercase`, a `HashSet<String>` insert and an eagerly
@@ -8398,7 +8475,14 @@ existing prose was left alone.
   what the schema tree browses — that exclusion is applied here and not to the types beside it, and
   the difference is degree rather than principle: an extension installs a handful of types and
   hundreds of functions, and PostGIS alone would bury a database's own routines under ~1000 `st_*`
-  rows in whichever namespace it was created in. **`trigger_function_filter` does not add it**, and
+  rows in whichever namespace it was created in. **That exclusion had a second reader nobody had
+  asked**, which is what `extension_routine_names` is for: the typo checker exempts the names the
+  tree lists, so a name kept out of the browse list was squiggled as a misspelling under correct SQL
+  (19 of 196 on PG 16.15 — see `core/schema.rs`'s `extension_routines`). It is one
+  `SELECT DISTINCT p.proname` scoped by the same `routine_scope`, the exact complement of what
+  `routine_filter` excludes, `DISTINCT` because an overloaded name has a `pg_proc` row per overload
+  and the checker only ever asks about the name. No bodies, no arguments, no settings, so the browse
+  decision above is untouched. **`trigger_function_filter` does not add it**, and
   that is not an oversight: a trigger binds to whatever returns `trigger`, extension-owned or not
   — `moddatetime` is the standard "touch the modified column" function and arrives exactly that
   way — and the picker reading it is a dropdown with no free-text entry, so a function missing from
@@ -9025,6 +9109,15 @@ existing prose was left alone.
   generator against itself checks nothing. It carries a row-count floor (>500) on the same
   reasoning as the others, and it was watched fail — deleting `btrim` from the list produced
   ``pg at 127.0.0.1:5432 as schemaic offers 1 name(s) `PG_SUGGESTED` does not … ["btrim"]``.
+  **Its fifth is about the catalog the app reads off the *server*, not the one it ships.**
+  `an_installed_extensions_functions_are_names_the_checker_knows` creates `citext`, `intarray`,
+  `cube`, `earthdistance`, `tablefunc` and `hstore` in the tier's own scratch database and holds
+  `fetch_schema` to putting their names in `DbSchema::extension_routines` — the half only a real
+  server can answer, the unit half being that a name in that field is exempt. It asserts the
+  premise first (>100 names came back, or every assertion after it is vacuous), then that `sort`,
+  `icount` and `earth_distance` are there and **stayed out of `routines`**, so the fix cannot drift
+  into undoing what `routine_filter` exists for, and finally that not one of the server's extension
+  names is squiggled.
   The tier's rule still stands and this is not a hole in it: the subject of each is one engine's
   *data file* rather than a claim about how the DB layer behaves, and there is no version of "is
   PostgreSQL's builtin list complete" MariaDB could answer. Each carries its own `enabled()` check
@@ -9043,16 +9136,40 @@ existing prose was left alone.
   hand-written lists do remain, each held by a test of its own. `MYSQL_ONLY` is the five names MySQL
   8 has and MariaDB never got (`bin_to_uuid`, `is_uuid`, `json_storage_size`, `regexp_like`,
   `uuid_to_bin`), carried because `FUNCTIONS` serves both engines, and
-  `the_mysql_only_names_are_in_the_catalog` keeps the excuse from outliving what it excuses.
+  `the_mysql_only_names_are_in_the_catalog` keeps the excuse from outliving what it excuses. It is
+  this module's own lower-cased copy, and `intel::MYSQL_ONLY` now holds the same five for a
+  different job — the offer filter rather than the oracle's allowance — re-measured against both
+  servers by the parser test below.
   `NOT_CALLABLE` is one name, `schemas`, which `SQL_FUNCTIONS` reports and the parser will not accept
   as a call because it is the reserved word of `SHOW SCHEMAS` — a claim about the parser, so
   `the_uncallable_name_is_still_uncallable` *executes* `SELECT schemas()` and requires a syntax
   error, and requires the name absent from `FUNCTIONS` as well, so the completion popup cannot come
-  to offer something that will not parse. **MySQL is unguarded here, and that is stated rather than
-  left to be discovered**: MySQL has no `SQL_FUNCTIONS` (`mysql.func` holds loadable UDFs, not
-  builtins), so a builtin MySQL 8 added and MariaDB never got is held by nothing but those five known
-  names. Both oracles carry a row-count floor, for the reason the whole tier exists: an empty result
-  would pass the missing-name test having asserted nothing.
+  to offer something that will not parse. Both oracles carry a row-count floor, for the reason the
+  whole tier exists: an empty result would pass the missing-name test having asserted nothing.
+  **The partition behind `over_listing` is computed there now, where the module doc used to state
+  it as a number**: "39 names covered by `KEYWORDS`, and the five left over are
+  `MYSQL_ONLY` to a name" does not add up to the forty-nine it was partitioning — the real figure is
+  44 — and nothing computed it, which is the whole argument against writing one down. The test sums
+  the two halves against what `SQL_FUNCTIONS` leaves out and asserts neither half is empty, so a
+  release that moves the split fails there rather than leaving a sentence that reads plausibly and
+  is false.
+  **"MySQL is unguarded here" stood in this paragraph as a stated limitation and was a live defect.**
+  It is true that MySQL ships no `SQL_FUNCTIONS` (`mysql.func` holds loadable UDFs, not builtins), so
+  there is no *catalogue* oracle to write — and that is not the only kind.
+  `each_server_is_only_credited_with_the_builtins_it_really_has` is the missing leg and **the parser
+  is its oracle**, which is the better one because it answers the question the editor actually asks:
+  can this server call this name. It walks all 309 of `FUNCTIONS`' names on **both** servers, one
+  `SELECT <name>(1,2)` each, reading only `ERROR 1305` as absence, and asserts both directions — a
+  name the server lacks that nothing in `intel` withholds, and a name `intel` withholds that the
+  server does have — plus that the pass found something, so it cannot pass vacuously. Until it
+  landed, `over_listing` was green **by construction** over the forty-nine names a MySQL 8 tab was
+  being offered and cannot call. Two load-bearing details: it runs over **one pinned `Session`**,
+  the documented exception to one-connection-per-operation, because 309 `Db::fetch_query` calls
+  would open 309 connections; and it scopes that session to the `mysql` database, because an
+  unqualified unknown name with no database selected answers `1046 No database selected` instead of
+  1305 and would report every name as present. It runs in 0.2 s and was watched failing — deleting
+  `NVL` from `MARIADB_ONLY` gives ``mysql … has no such function, and nothing in `intel` withholds
+  it — so a tab on this server is offered 1 name(s) it cannot call: ["NVL"]``.
   **`endpoint.rs` is where a leg comes from**, and it is the whole environment contract: three
   `SCHEMAIC_IT_<ENGINE>_HOST`/`_PORT`/`_USER`/`_PASSWORD` groups with localhost defaults, plus
   `SCHEMAIC_IT_ENGINES` as the one way to run fewer than all three. An *unreachable* endpoint is a
@@ -14027,6 +14144,13 @@ existing prose was left alone.
     `snippet::by_abbrev` so the narrowest scope wins by the same rule everywhere; the row shows the
     abbrev and inserts the **body**, through the same `Suggestion::insert` override an FK-JOIN row
     uses.
+    **`recompute_completions` fills `RankInput::flavour`, and it needed no new signal to do it**:
+    the flavour is stamped on the loaded `DbSchema`, and this function already destructures
+    `active_db` and `db_nodes`. It asks through `table_designer::db_flavour`, which was narrowed to
+    take the node signal rather than a `SchemaUi` precisely so autocomplete and the table designer
+    share **one** lookup instead of two spellings of the same `db_nodes` walk. No active database
+    means no schema to read it off, and `ServerFlavour::Unknown` offers everything — the reasoning
+    is under `core/intel.rs`'s `is_offered_builtin`.
     **The `SchemaIndex` is memoised per UI thread beside the catalogue, and it was the half that
     never got it.** `index::build` walks every loaded database, every table and every column,
     allocating a fresh `ColMeta` per column plus three `HashMap`s, and `recompute_completions`
@@ -15476,10 +15600,15 @@ existing prose was left alone.
     `loaded_schema`, `default_schema`, `table_names` — are called from across the crate. Those six
     have now narrowed, and **the plan once written here was wrong about one of them**: the four
     that read only `db_nodes` (`db_flavour`, `loaded_table`, `loaded_schema`, `table_names`) take
-    `SchemaUi`, but `edit_ctx` reads `ui.conn.active_conn` and `ui.conn.connections` and touches the
-    schema tree not at all, so it takes `ConnUi`; `default_schema(conn: ConnUi, ui: SchemaUi,
-    database: &str)` takes both, because it asks `edit_ctx` for the dialect and then the tree
-    whether the database's namespaces loaded. What had held `edit_ctx` back was its **39 call
+    `SchemaUi` — `db_flavour` has since gone one step further, to the bare
+    `RwSignal<Vec<ConnNode>>`, because its second caller is `completion::recompute_completions`,
+    which holds a `CompletionCtx` and no `SchemaUi` at all, and one shared lookup beats a second
+    spelling of the same `db_nodes` walk in a file that would then have to be kept in step with
+    this one. `edit_ctx`, by contrast, reads `ui.conn.active_conn` and `ui.conn.connections` and
+    touches the schema tree not at all, so it takes `ConnUi`;
+    `default_schema(conn: ConnUi, ui: SchemaUi, database: &str)` takes both, because it asks
+    `edit_ctx` for the dialect and then the tree whether the database's namespaces loaded.
+    What had held `edit_ctx` back was its **39 call
     sites** — the count, not the shape.
     **The narrowing propagated, and that is the real lesson of that pass** — the lesson
     `ddl_preview::preview_container` had already taught below, now with numbers. A caller cannot be
@@ -18572,6 +18701,17 @@ Re-introducing the anti-patterns these guard against is a regression:
   the same shape for the same reason**: `intel::catalog_index` is three `OnceLock`s, one per
   `SqlDialect` arm, rather than one map keyed by the dialect, so a fourth engine is a compiler error
   there too rather than a cache nothing ever fills.
+  **`SqlDialect` was one level too coarse for one of those surfaces, and in the opposite direction
+  to the usual failure**: the usual one is a model that cannot say *unknown*, this one could not say
+  *which of two servers*. MySQL and MariaDB share a dialect — rightly, for parsing, quoting and the
+  shape of a completion — and differ on which builtin names exist, so the one `intel::FUNCTIONS`
+  offered a MySQL 8 tab forty-nine functions it cannot call. The answer is not a fourth
+  `SqlDialect` arm but the `ServerFlavour` the schema already carried, passed alongside:
+  `is_offered_builtin(dialect, flavour, name)`, with the flavour read only on the MySQL arm. It is
+  the first reader of that enum outside the DDL and comparison paths (`ddl::Target`,
+  `compare::occupied_names`), and its `Unknown` deliberately goes the *other* way from
+  `occupied_names`' — offering everything rather than withholding — because what an uncertain read
+  costs here is one row in a popup, not a table's constraints.
   **The rule has a gate now, and it is a ratchet rather than a ban.** `ui::engine_comparison_gate`
   scans both view crates' production source (`source_gate::crate_sources`, so `schemaic-app` is in
   it too) for `SqlDialect::` and holds each file to a **per-file budget with a written reason**,

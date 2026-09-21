@@ -202,8 +202,6 @@ pub(crate) fn edit_ctx(ui: ConnUi) -> EditCtx {
     }
 }
 
-/// The introspected table behind a schema-tree node, when its database's schema
-/// has loaded. `None` ⇒ nothing to design, and the menu entry is disabled.
 /// Which MySQL-family server `database` was introspected from, when its schema
 /// has loaded.
 ///

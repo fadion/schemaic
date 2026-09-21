@@ -233,6 +233,51 @@ mod tests {
             .1;
         let erasing = ["Saving", "::", "Erasing"].concat();
         let replacing = ["Saving", "::", "Replacing"].concat();
+        // **Each closure paired with the verb it must use.** Counting nine
+        // saves over one body holds just as well when two are *swapped* —
+        // `remove` writing `Replacing` and `create` writing `Erasing` leaves
+        // both totals intact, while a deleted snippet's body survives in
+        // `snippets.json.bak` under a modal saying it cannot be undone.
+        let regions = schemaic_ui::source_gate::let_regions(
+            body,
+            &[
+                "record_use",
+                "create",
+                "rename",
+                "set_abbrev",
+                "set_body",
+                "set_scope",
+                "duplicate_from",
+                "remove",
+                "clear_conn",
+            ],
+        )
+        .expect("every closure this gate names is still bound in `wire`");
+        for (name, region) in &regions {
+            let want_erasing = matches!(name.as_str(), "remove" | "clear_conn");
+            let (want, other, why) = if want_erasing {
+                (
+                    &erasing,
+                    &replacing,
+                    "removes snippets, so the `.bak` must go too",
+                )
+            } else {
+                (&replacing, &erasing, "is an ordinary save")
+            };
+            assert_eq!(
+                region.matches(want.as_str()).count(),
+                1,
+                "`{name}` {why} — it should save exactly once, with `{want}`"
+            );
+            assert_eq!(
+                region.matches(other.as_str()).count(),
+                0,
+                "`{name}` saves with `{other}`, which is the wrong policy for \
+                 it — swapping two verbs keeps every total in this gate intact"
+            );
+        }
+        // …and the totals stay, as a floor: they catch a closure *deleted*
+        // rather than mis-saved.
         assert_eq!(
             body.matches(&erasing).count(),
             2,

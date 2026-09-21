@@ -104,6 +104,53 @@ pub fn production_code(src: &str) -> String {
     kept
 }
 
+/// Cut a function body into the regions its `let <name>` bindings own — each
+/// one running from its own binding to the next.
+///
+/// **For the gates that must pair a fact with the closure it belongs to**, and
+/// it exists because counting was not enough. `history_store` and
+/// `snippet_store` each hold a `wire()` full of closures, and each has a gate
+/// asserting the erase policy: a `remove` must save `Erasing` so the deleted
+/// row does not survive in `<file>.json.bak`, an ordinary edit must save
+/// `Replacing`. Both gates counted *occurrences* over the whole body — three
+/// erasing, two replacing — which holds just as well when the verbs are
+/// **swapped**: `remove` writes `Replacing`, `record` writes `Erasing`, the
+/// totals are unchanged, and a deleted snippet's body survives in
+/// `snippets.json.bak` under a modal saying it cannot be undone.
+///
+/// So the caller names the bindings it expects and gets their text back, in
+/// source order, and can assert about each. The totals stay as a floor, which is
+/// what catches a closure *deleted* rather than mis-saved.
+///
+/// `bindings` are matched as `let <name>` at a line start (after indentation),
+/// so a mention inside another closure's body is not a region boundary.
+/// **Every name must be found**: a binding that was renamed returns `None`
+/// rather than silently yielding one region for the rest of the function, which
+/// is the failure mode a `split_once` has.
+pub fn let_regions<'a>(body: &'a str, bindings: &[&str]) -> Option<Vec<(String, &'a str)>> {
+    let mut found: Vec<(usize, String)> = Vec::new();
+    for name in bindings {
+        let needle = format!("let {name}");
+        let at = body.match_indices(&needle).find(|(i, _)| {
+            // A line start, and the next byte ends the identifier — so `let
+            // record` does not match `let record_use`.
+            let before_ok = body[..*i]
+                .rfind('\n')
+                .is_none_or(|n| body[n + 1..*i].bytes().all(|c| c == b' ' || c == b'\t'));
+            let after = body.as_bytes().get(i + needle.len());
+            before_ok && after.is_some_and(|c| !(c.is_ascii_alphanumeric() || *c == b'_'))
+        })?;
+        found.push((at.0, (*name).to_string()));
+    }
+    found.sort_by_key(|(at, _)| *at);
+    let mut out = Vec::with_capacity(found.len());
+    for (n, (at, name)) in found.iter().enumerate() {
+        let end = found.get(n + 1).map_or(body.len(), |(next, _)| *next);
+        out.push((name.clone(), &body[*at..end]));
+    }
+    Some(out)
+}
+
 /// The offset of the next `#[cfg(test)]` reached **as code**, from `from`.
 ///
 /// **The one scan in this module that was not comment-aware, and it was the one

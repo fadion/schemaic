@@ -74,15 +74,20 @@ const NOT_CALLABLE: &[&str] = &["schemas"];
 ///
 /// `FUNCTIONS` is one catalog for two engines, so carrying them is correct: the
 /// alternative is squiggling `UUID_TO_BIN` for the MySQL user who typed it.
-/// Verified absent by calling each on 10.11.14 and getting
-/// `FUNCTION … does not exist` rather than a wrong-argument error.
-const MYSQL_ONLY: &[&str] = &[
-    "bin_to_uuid",
-    "is_uuid",
-    "json_storage_size",
-    "regexp_like",
-    "uuid_to_bin",
-];
+///
+/// **`intel::MYSQL_ONLY` lower-cased, not a second list of the same names.**
+/// The two exist for different jobs — that one decides what a MariaDB tab is
+/// *offered*, this one excuses names from the server oracle below — and for a
+/// while they were two literals, which is one edit away from an excuse that no
+/// longer matches the filter it was written beside. Derived, so they cannot
+/// disagree; `each_server_is_only_credited_with_the_builtins_it_really_has`
+/// re-measures the shared list against both servers.
+fn mysql_only() -> Vec<String> {
+    schemaic_core::intel::MYSQL_ONLY
+        .iter()
+        .map(|n| n.to_ascii_lowercase())
+        .collect()
+}
 
 /// The server knows a name this catalog does not — a false positive waiting for
 /// whoever types it.
@@ -133,7 +138,7 @@ async fn over_listing() {
     let unexplained: Vec<String> = ours
         .iter()
         .filter(|n| !known.contains(*n))
-        .filter(|n| !MYSQL_ONLY.contains(&n.as_str()))
+        .filter(|n| !mysql_only().contains(n))
         .cloned()
         .collect();
 
@@ -161,7 +166,7 @@ async fn over_listing() {
         .collect();
     let by_mysql_only: Vec<&String> = ours
         .iter()
-        .filter(|n| !known.contains(*n) && MYSQL_ONLY.contains(&n.as_str()))
+        .filter(|n| !known.contains(*n) && mysql_only().contains(n))
         .collect();
     let not_in_functions = ours.iter().filter(|n| !functions.contains(*n)).count();
     assert_eq!(
@@ -195,7 +200,8 @@ async fn the_mysql_only_names_are_in_the_catalog() {
         return;
     }
     let ours = catalog_names();
-    let missing: Vec<&&str> = MYSQL_ONLY.iter().filter(|n| !ours.contains(**n)).collect();
+    let all = mysql_only();
+    let missing: Vec<&String> = all.iter().filter(|n| !ours.contains(*n)).collect();
     assert!(
         missing.is_empty(),
         "`over_listing` excuses these from the server's answer, and \

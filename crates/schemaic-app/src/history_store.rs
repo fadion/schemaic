@@ -340,9 +340,43 @@ mod tests {
             .1;
         let erasing = ["Saving", "::", "Erasing"].concat();
         let replacing = ["Saving", "::", "Replacing"].concat();
-        // The floor: three erasing calls (clear, remove, clear_conn) and two
-        // replacing ones (record, finish). A rename that made these zero would
-        // otherwise pass this test silently.
+        // **Each closure paired with the verb it must use, not five verbs
+        // counted over one body.** Counting holds just as well when the verbs
+        // are *swapped* — give `remove` the `Replacing` and `record` the
+        // `Erasing` and the totals are identical, while a deleted run survives
+        // in `history.json.bak`. `let_regions` cuts `wire` at its bindings so
+        // each assertion is about the closure it names.
+        let regions = schemaic_ui::source_gate::let_regions(
+            body,
+            &["record", "finish", "clear", "remove", "clear_conn"],
+        )
+        .expect("every closure this gate names is still bound in `wire`");
+        for (name, region) in &regions {
+            let want_erasing = matches!(name.as_str(), "clear" | "remove" | "clear_conn");
+            let (want, other, why) = if want_erasing {
+                (
+                    &erasing,
+                    &replacing,
+                    "removes rows, so the `.bak` must go too",
+                )
+            } else {
+                (&replacing, &erasing, "is an ordinary save")
+            };
+            assert_eq!(
+                region.matches(want.as_str()).count(),
+                1,
+                "`{name}` {why} — it should save exactly once, with \
+                 `{want}`"
+            );
+            assert_eq!(
+                region.matches(other.as_str()).count(),
+                0,
+                "`{name}` saves with `{other}`, which is the wrong policy for \
+                 it — swapping two verbs keeps every total in this gate intact"
+            );
+        }
+        // …and the totals stay, as a floor: they are what catches a closure
+        // *deleted* rather than mis-saved.
         assert_eq!(
             body.matches(&erasing).count(),
             3,
