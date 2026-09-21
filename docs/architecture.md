@@ -2500,7 +2500,14 @@ existing prose was left alone.
     no PostgreSQL grammar and `ON SCHEMA` has no MySQL one. Blind meant no INCOMPLETE header, a
     silent `apply` guard, and Apply enabled over a statement the server will refuse. Every other
     narrow arm in that function is shape-aware; this is the capability that already knew the answer,
-    consulted until now only by the form's own picker.
+    consulted until now only by the form's own picker. **A third narrowing followed, and it is about
+    the account rather than the engine**: `SetAccountPassword` asks `users::supports_password_reset`
+    with the whole `Principal` it carries, because on MySQL 8 the catalogue cannot tell a role from a
+    locked account and the change is otherwise `true` for a plan `set_password_sql` will decline to
+    write — exactly the degradation the paragraph above describes, no INCOMPLETE header and Apply
+    enabled over a plan that emits nothing at all. The browser withholds the button and
+    `account_editor::open_for_reset` refuses the door, so this is the *third* gate rather than the
+    only one, which is why it is here and not left to those two.
     `ChangeSet::account_statements` emits them at the **end** of the plan, called from `emit_mysql`
     and `emit_postgres` beside `container_drops` and filtered on `supports_change` like its
     neighbours — a privilege is stated *on* something, so it comes after whatever the plan creates.
@@ -4221,10 +4228,11 @@ existing prose was left alone.
     and its access control is the filesystem's — the database file's permissions, granted to an OS
     user by the OS — so there is no account to browse and no statement that would create one), and
     `supports_user_admin` is *computed* from it rather than spelling out a second `!= Sqlite`. A
-    `Principal` is `name`/`host`/`kind`/`system`/`attributes`, and the `Option` on `host` is the one
-    place the two engines disagree about what an account *is*: on MySQL/MariaDB it **is** the
-    `(user, host)` pair, where `'app'@'%'` and `'app'@'localhost'` are two accounts with different
-    passwords and different privileges, while a PostgreSQL role is not host-scoped at all — its host
+    `Principal` is `name`/`host`/`kind`/`system`/`attributes`/`role_ambiguous`, and the `Option`
+    on `host` is the one place the two engines disagree about what an account *is*: on MySQL/MariaDB
+    it **is** the `(user, host)` pair, where `'app'@'%'` and `'app'@'localhost'` are two accounts
+    with different passwords and different privileges, while a PostgreSQL role is not host-scoped
+    at all — its host
     rules live in `pg_hba.conf`, a file, and no catalogue publishes it. **A *role* carries no host on
     any engine here, and `from_mysql_rows` drops the one the catalogue stored rather than working
     around it in each statement builder.** MariaDB keeps `''` for a role and MySQL 8 keeps `'%'`, and
@@ -4263,7 +4271,37 @@ existing prose was left alone.
     flag or nothing**: MySQL 8 has no such column and implements `CREATE ROLE` as a locked,
     password-expired user, so reading that pair back as "role" would relabel every genuinely locked
     account as one — on MySQL every row is a `User` and the Locked attribute says the rest, which
-    `a_locked_mysql_account_is_not_guessed_to_be_a_role` pins. On PostgreSQL `rolcanlogin` is the
+    `a_locked_mysql_account_is_not_guessed_to_be_a_role` pins.
+    **What that label cannot carry, `Principal::role_ambiguous` does** — "could this row be a role
+    the server does not label as one?" — and it exists because the labelling decision above was made
+    for a *read* screen and a later release composed a **write** gate on top of it. On MySQL 8.4.11
+    the browser offered **Reset password** for a role and the server took the `ALTER USER … IDENTIFIED
+    BY` it emitted (`authentication_string` 0 → 70 bytes, `password_expired` `Y` → `N`, measured on
+    `127.0.0.1:3307`), while the identical statement on MariaDB 10.11.14 is `ERROR 1396` — one
+    `SqlDialect::MySql` covering two servers that answer oppositely, with nothing on screen saying
+    which. `kind` still reads `User` on such a row, because the display decision stands and a wrong
+    label on a privilege screen is worse than a missing one; the field is the *uncertainty* beside it.
+    `from_mysql_rows` sets it only where `is_role` is absent — MariaDB's flag settles both
+    directions, so a MariaDB row that happens to carry MySQL's fingerprint is not ambiguous — and it
+    is `false` on the PostgreSQL fold (`rolcanlogin` answers), on `AccountDraft::principal` and on
+    `GrantDraft::role_change`. The fingerprint is `my_role_fingerprint`: locked **and**
+    password-expired **and** a *published* empty credential, the three flags MySQL's own
+    `CREATE ROLE` leaves; its own doc carries the measured four-row table separating that row from a
+    locked user, a locked-and-expired user and an ordinary one. **All three have to be published
+    rather than merely not-`'Y'`**, which is `MyUserRow`'s own rule applied one level up: a server
+    answering none of the columns produces no ambiguity and keeps the reset it always had.
+    `has_credential` is that third flag, and it is a **presence and never the hash** — the query
+    answers `LENGTH(authentication_string) > 0` server-side, on `redact_secrets`' terms, so nothing
+    credential-equivalent crosses into the process to be read back. The residue is named rather than
+    papered over: a locked, expired, genuinely passwordless *user* matches the fingerprint too and
+    loses its reset, and a role someone has since `ACCOUNT UNLOCK`ed or already reset reads exactly
+    like a user — nothing in the catalogue recovers role-ness from that, which is why the guard sits
+    on the offer and not on the repair. The three tests assert over **the fold's output** rather than
+    a hand-built `Principal`, because either half reads correctly alone and the fault was only
+    visible where they met: `a_mysql_role_fingerprint_is_not_offered_a_password_reset`,
+    `a_locked_mysql_user_keeps_its_password_reset` (three rows that must keep it) and
+    `mariadb_answers_role_ness_from_its_flag_not_the_fingerprint`.
+    On PostgreSQL `rolcanlogin` is the
     user/role split, and it is the only split PostgreSQL makes; `from_pg_rows` lists only the
     attributes that are *set*, since a role with nine "No" rows is where `Superuser` stops standing
     out. `account_sql` is the account as **executed** SQL names it (`SHOW GRANTS FOR 'app'@'%'`),
@@ -4410,12 +4448,21 @@ existing prose was left alone.
     `CREATE`'s missing clause leaves one unset — a lock left open against a lock not yet fitted — so
     a caller who wants that has `DropAccount` or the engine's own client. An empty account name is
     refused on the same call, the backstop under the form's gate that `privilege_sql`'s empty list
-    is. `supports_password_reset(dialect, kind)` is the capability, *computed* as
-    `supports_users(dialect) && kind == PrincipalKind::User` rather than restated as a list of
+    is. `supports_password_reset(dialect, &Principal)` is the capability, *computed* as
+    `supports_users(dialect) && p.kind == PrincipalKind::User && !p.role_ambiguous` rather than
+    restated as a list of
     engines: an engine with accounts has an `ALTER` for them, so the dialect half is a question
     already answered and a fourth engine gets one answer instead of two, while the `kind` half is
     real and not about the engine at all — a role takes no password on either, the same rule
-    `account_draft_sql` applies to `CREATE`. `drop_account_sql` is the last, and like `DropDatabase` never
+    `account_draft_sql` applies to `CREATE`. **It takes the whole `Principal` and not its
+    `PrincipalKind`, because the kind cannot say "I don't know."** It asked only the kind for a
+    release, which is how the `role_ambiguous` finding above got in, and its own rustdoc asserted the
+    premise that made that look sound — that the engine *rejects* a password on a role outright,
+    which is true of MariaDB 10.11.14 and measurably false of MySQL 8.4.11. Both servers are named
+    there now, and the third term refuses where the catalogue cannot classify the row rather than
+    guessing at it, the way `intel`'s column resolution refuses an unresolved name. `set_password_sql`
+    asks the same predicate, so a plan built directly is refused on the terms the offer was.
+    `drop_account_sql` is the last, and like `DropDatabase` never
     `IF EXISTS`: the account came off the browser's list, so one that isn't there means the list is
     stale and a drop that dropped nothing is about to be reported as a success.
     `GrantDraft` is the grant form's state, held here so the view holds none of it — `subject`
@@ -7499,10 +7546,27 @@ existing prose was left alone.
   likely asking about — **and reaching it is news, so that rung is the one that sets
   `Principals::note`** (`users::my_own_account_only_note`). The three `if let Ok` rungs above it
   discard their errors deliberately, a denied read being the expected case, which is exactly why the
-  absence has to be carried out rather than inferred from a count of one. `my_user_rows` only slots
-  the fifth column into `is_role` or `account_locked`
-  by which query answered (`my_role_rows` is the third rung's three); everything else is
-  `users::from_mysql_rows`. `fetch_grants` runs
+  absence has to be carried out rather than inferred from a count of one.
+  **The two widest rungs no longer project the same shape, and that is the compiler holding them
+  apart rather than a comment asking.** `my_user_rows(rows, mariadb: bool)` slotted the fifth column
+  into `is_role` or `account_locked` by a pair of boolean literals twelve lines apart, and
+  transposing them makes every locked MySQL account a `Role`, drops its host, and leaves
+  `DROP USER "app"` resolving to a different account. It is `my_mariadb_rows` (five columns) and
+  `my_mysql_rows` (six) now, with a `MyUserTupleMysql` beside `MyUserTuple` rather than a sixth
+  `Option` on one shared tuple, because MySQL's rung asks for a column MariaDB's does not:
+  `IF(LENGTH(authentication_string) > 0, 'Y', 'N')`, the **presence** of a stored credential and
+  never the hash, compared on the server so nothing credential-equivalent crosses into the process.
+  It is the third of the three flags MySQL's own `CREATE ROLE` leaves and it is what withholds
+  **Reset password** from a row the catalogue cannot tell from a role — the fingerprint
+  `core::users` documents — while MariaDB's rung does not need it, `is_role` answering there
+  outright, and the `None` it leaves means *not published* rather than *no credential*. Three tests
+  hold that seam: `the_fifth_column_lands_in_the_field_this_servers_spelling_meant`,
+  `the_credential_flag_reaches_the_fold_only_on_the_rung_that_asks_for_it` — which runs the mapping
+  through `from_mysql_rows` to the `role_ambiguous` it decides, a dropped flag being invisible to
+  `core`'s own tests — and `the_credential_column_is_asked_as_a_presence_not_a_value`, which counts
+  the occurrences of `authentication_string` in the query so that "just select the column and
+  compare here" cannot be the next edit. `my_role_rows` is the third rung's three; everything else
+  is `users::from_mysql_rows`. `fetch_grants` runs
   `SHOW GRANTS FOR <account_sql>` and pipes **every row through `users::redact_secrets` at the
   boundary**, not in the view, so a second caller — the grant/revoke step beside it, a copy
   button — cannot forget to. `pg::fetch_principals` reads `pg_roles` on the **maintenance**
@@ -9204,17 +9268,23 @@ existing prose was left alone.
   on both catalogues; the note is present exactly where `grants_are_database_scoped` says and names
   the database it covers; and `no_password_material_survives_the_fetch`, which is the assertion that
   the redaction is on the fetch rather than on one view that happens to call it.
-  **The seven write tests go through the real emit-and-run path** — `ddl::account` →
+  **The write tests go through the real emit-and-run path** — `ddl::account` →
   `ChangeSet::emit` → `Db::run_ddl` — rather than asserting statement text, because a statement no
   engine accepts is exactly what only a server can tell you:
   `a_created_account_is_one_the_server_then_lists`,
+  `an_account_created_at_a_host_is_listed_and_dropped_at_it`,
   `a_created_account_can_log_in_with_the_password_it_was_given`,
+  `a_reset_password_replaces_the_one_the_account_had`,
+  `a_role_the_server_made_is_never_offered_a_password_reset`,
   `a_created_role_is_one_the_server_accepts`,
   `a_granted_privilege_comes_back_and_a_revoke_takes_it_off`,
   `a_granted_role_comes_back_and_a_revoke_takes_it_off`,
   `a_grant_at_every_level_reads_back_naming_that_object` and
-  `a_dropped_account_is_gone_from_the_list`, twenty-one in all across MariaDB 10.11, MySQL 8.4 and
-  PostgreSQL 16.
+  `a_dropped_account_is_gone_from_the_list` — every one of them fanned to MariaDB 10.11, MySQL 8.4
+  and PostgreSQL 16 by `live_suite!`. **The list is the count**, and deliberately so: the sentence
+  here used to say "the seven write tests … twenty-one in all" over an enumeration of seven that
+  had already left three of them out, which is the failure `AGENTS.md` names — a stated total is one
+  more thing to keep in step with the code, and the names are what a reader is actually looking for.
   **What none of them checked was the *host* an account is listed at.** `from_mysql_rows` folds
   `mysql.user.Host` into `Principal::host` and `users.rs`'s own doc calls that the one place the two
   catalogues genuinely disagree about what an account *is* — yet one site asked `host.is_some()`,
@@ -9258,7 +9328,26 @@ existing prose was left alone.
   test looks at. It reads the account back out of the catalogue before resetting
   (`listed_principal`) — the distinction `a_created_role_is_one_the_server_accepts` was written for,
   since MariaDB stores a host the draft does not and an `ALTER USER` naming the wrong one is an error
-  rather than a silent miss. Green on MariaDB, MySQL and PostgreSQL. The grant round trip reads its
+  rather than a silent miss. Green on MariaDB, MySQL and PostgreSQL.
+  **`a_role_the_server_made_is_never_offered_a_password_reset` is the one test in this file that
+  asserts an *offer* rather than a statement, and it is here because a pure test could not reach the
+  fault.** `a_role_cannot_have_its_password_reset` builds a `Principal` with `kind = Role` and asks
+  the predicate; both halves are correct and the defect sat between them, MySQL 8 publishing no
+  `is_role` for the fold to label a role with and a write gate then reading that label. So the
+  assertion is over `Db::fetch_principals`' own output — `listed_principal` for a role and for a
+  user the same run creates — and it was watched **red on the `mysql::` leg alone** before the fix
+  and green on all three after, MariaDB answering from `is_role` and PostgreSQL from `rolcanlogin`.
+  **Both directions**, because a gate that refused everything would pass the first half: the user
+  beside the role goes through the same statement path, the same fetch and the same predicate and
+  must still be offered a reset. It asserts the *plan* as well as the offer
+  (`users::set_password_sql` returns `None`), so neither gate is carrying the other.
+  **Its scratch-account suffix is its own, and that is load-bearing rather than tidy.** An account
+  name here is `{PREFIX}{pid}_{leg}_{suffix}` and the scratch *database* is not part of it, so
+  within one leg the suffix is the whole of an account's identity — this test and
+  `a_reset_password_replaces_the_one_the_account_had` both asked for `"r"` and raced for one name
+  whenever they overlapped, which is a duplicate-key `CREATE` or one test's teardown dropping the
+  other's account out from under it. The role test moved to `"crl"`; a new test in this file picks a
+  suffix nothing else uses. The grant round trip reads its
   privilege **off `users::privileges_for`** rather than naming one, and that is the tier earning its
   keep: naming `SELECT` was the first version and PostgreSQL refused the plan, a database being an
   *object* there that carries only `CONNECT`, `CREATE` and `TEMPORARY` rather than a shorthand for
@@ -12189,7 +12278,12 @@ existing prose was left alone.
     absent on a role rather than dimmed**, the call every per-engine and per-kind affordance in this
     crate makes: a role takes no password on either engine, so there is nothing there for a dimmed
     button to promise, and the question is asked as `users::supports_password_reset` rather than as a
-    `dialect ==` — that one capability folds "does this engine have accounts" into the same answer.
+    `dialect ==` — that one capability folds "does this engine have accounts" **and "can this
+    catalogue tell a role from a locked user"** into the same answer. The second half is why the
+    button hands it the whole `Principal`: asking the row's `PrincipalKind` put the offer on a MySQL
+    8 role, which publishes no `is_role` and is therefore labelled `User`, and 8.4.11 accepted the
+    `ALTER USER` behind it — see `core::users` for the measurement and the fingerprint that now
+    withholds it.
     The row sits in
     **the modal's own `FocusRing`, at 12, 13 and 14**: they built a `FocusRing::new()` of their own
     with no focus root stepping it, so clicking one focused it and Tab then cycled the pair forever
@@ -13184,7 +13278,11 @@ existing prose was left alone.
     read-only refusal is inside `open_for_new`/`open_for_reset`/`open_for_grant` rather than at the
     button, the same
     rule `database_editor::open_for_new` follows: a launch guards itself in the step that launches
-    it, and the browser's dimming is what *says* the action is unavailable.
+    it, and the browser's dimming is what *says* the action is unavailable. **`open_for_reset`
+    carries a second refusal of that shape** — `users::supports_password_reset` against the
+    `Principal` it was handed, not against its `PrincipalKind`, since a MySQL 8 row the catalogue
+    cannot tell from a role must not reach a form whose preview would come back empty; `core::ddl`'s
+    `SetAccountPassword` arm is the third ask of the same question.
     **A form's *address* comes from the browser that raised it, not from the connection switcher.**
     Both launchers take the browser's own `&UsersTarget` and stamp `conn_id` and `dialect` off it;
     they read `edit_ctx` instead, which resolves `ui.conn.active_conn` at the moment the button is
@@ -18703,6 +18801,23 @@ Re-introducing the anti-patterns these guard against is a regression:
   which is true of `GRANT … ON *.*` on PostgreSQL and of `ON SCHEMA` on MySQL, neither of which has
   a grammar there — so there was no INCOMPLETE header and Apply was enabled over a statement the
   server would refuse. It now asks `users::levels_for` for the two changes that carry a level.
+  **And a capability can be sound while the model under it cannot answer the question** — the same
+  rule one level finer than a `SqlDialect` can express, which is where it was missed.
+  `users::supports_password_reset` asked a `PrincipalKind`; `from_mysql_rows` labels every MySQL 8
+  row a `User` because that catalogue publishes no `is_role`, a decision made for the *read* screen
+  and documented as such. Each half read correctly on its own and the composition offered **Reset
+  password** for a role, which 8.4.11 accepted an `ALTER USER … IDENTIFIED BY` for
+  (`authentication_string` 0 → 70 bytes, `password_expired` `Y` → `N`, measured on
+  `127.0.0.1:3307`) while MariaDB 10.11.14 answers `ERROR 1396`: one dialect over two servers that
+  disagree, and the predicate's own rustdoc asserting they did not. The repair widens the **model**
+  rather than the gate — `Principal::role_ambiguous` carries the uncertainty a label cannot, the
+  gate reads it as a third term, and the offer is withheld where the catalogue cannot classify the
+  row. So the question to ask of a new capability is not only "is this about an engine" but "can the
+  thing I am asking represent *not known*"; where it cannot, the fix belongs where the model is
+  built. And it is pinned where the halves meet:
+  `a_role_the_server_made_is_never_offered_a_password_reset` asserts over `fetch_principals`' own
+  output on a real server, red on the `mysql::` leg alone, because the unit test that built a
+  `Principal` with `kind = Role` and asked the predicate was green throughout.
   Which gate to ask depends on the question: `supports_change` for a single change
   with no draft behind it, and for an editor the capability for *that object* —
   `supports_view_editing`, `supports_trigger_editing` or `supports_table_design`. All three answer

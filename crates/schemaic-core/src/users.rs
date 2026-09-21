@@ -107,6 +107,22 @@ pub struct Principal {
     /// `Option` fields would be mostly holes and every reader would have to know
     /// which engine filled which.
     pub attributes: Vec<(String, String)>,
+    /// **Could this row be a role that the server does not label as one?**
+    ///
+    /// `false` wherever the catalogue answers role-ness outright — MariaDB's
+    /// `is_role`, PostgreSQL's `rolcanlogin` — and `true` only on a MySQL 8 row
+    /// carrying the fingerprint `CREATE ROLE` leaves there: locked,
+    /// password-expired, and with no stored credential. MySQL 8 publishes no
+    /// column that separates that row from a locked, expired, passwordless
+    /// *user*, so the two are one row as far as this app can see.
+    ///
+    /// [`kind`](Principal::kind) stays `User` on such a row — the display
+    /// decision in [`from_mysql_rows`] stands, because a wrong label on a
+    /// privilege screen is worse than a missing one. This field is the
+    /// *uncertainty* that label cannot carry, and it exists because a **write**
+    /// gate was later composed on top of that label:
+    /// [`supports_password_reset`] refuses here rather than guessing.
+    pub role_ambiguous: bool,
 }
 
 impl Principal {
@@ -227,11 +243,62 @@ pub struct MyUserRow {
     pub is_role: Option<String>,
     /// `'Y'`/`'N'`, MySQL 8 only.
     pub account_locked: Option<String>,
+    /// `'Y'`/`'N'` — **does this row have a stored authentication string at
+    /// all?** The third of the three flags `CREATE ROLE` sets on MySQL 8, and
+    /// the one that separates a role from a locked, password-expired *user*.
+    ///
+    /// **A presence, never the credential.** `authentication_string` holds a
+    /// password hash, which for the older plugins is credential-equivalent and
+    /// has no business in this process — so the query answers
+    /// `LENGTH(authentication_string) > 0` and this field carries the yes/no,
+    /// on the same terms as [`redact_secrets`]. `None` means *this server does
+    /// not publish it*, which is what every rung of the query ladder below the
+    /// widest one leaves it as.
+    pub has_credential: Option<String>,
 }
 
 /// Is a `'Y'`/`'N'` column set? Absent is not `'N'` — see [`MyUserRow`].
 fn my_flag(v: &Option<String>) -> bool {
     v.as_deref().is_some_and(|s| s.eq_ignore_ascii_case("Y"))
+}
+
+/// **Does this row look like one `CREATE ROLE` would have left on MySQL 8?**
+///
+/// `CREATE ROLE r` there is implemented as an ordinary `mysql.user` row that is
+/// locked, password-expired and holds no authentication string. Measured on
+/// 8.4.11, those three flags separate it from every kind of user:
+///
+/// | row | `password_expired` | `account_locked` | credential |
+/// |---|---|---|---|
+/// | `CREATE ROLE r` | `Y` | `Y` | — |
+/// | `CREATE USER … ACCOUNT LOCK` | `N` | `Y` | yes |
+/// | `… ACCOUNT LOCK PASSWORD EXPIRE` | `Y` | `Y` | yes |
+/// | `CREATE USER …` | `N` | `N` | yes |
+///
+/// **This is a question about the row, not a second role detector.** It is
+/// consulted only where `is_role` is absent, and the answer it feeds is
+/// [`Principal::role_ambiguous`] — "the catalogue cannot tell these apart" —
+/// never [`PrincipalKind`]. A locked, expired, *passwordless* user matches it
+/// too, and that is the whole residue: such a row is genuinely
+/// indistinguishable from a role here, and the app refuses the write rather
+/// than picking a side.
+///
+/// It does not catch a role someone has since hand-modified — `ACCOUNT UNLOCK`
+/// or an `ALTER USER … IDENTIFIED BY` already applied by the defect this guards
+/// leaves a row that reads exactly like a user. Nothing in the catalogue can
+/// recover role-ness from those, which is why the guard is on the offer rather
+/// than on the repair.
+/// **All three flags have to be *published*, not merely not-`'Y'`.** `None` on a
+/// [`MyUserRow`] means the server does not answer that column — which is what
+/// every rung of the query ladder below the widest one leaves them as — and
+/// reading an unanswered column as `'N'` is the mistake [`MyUserRow`]'s own doc
+/// exists to forbid. A server that publishes none of the three therefore
+/// produces no ambiguity and keeps the reset it always had.
+fn my_role_fingerprint(r: &MyUserRow) -> bool {
+    my_flag(&r.account_locked)
+        && my_flag(&r.password_expired)
+        && r.has_credential.is_some()
+        && !my_flag(&r.has_credential)
 }
 
 /// Fold `mysql.user` rows into the list the browser shows.
@@ -243,6 +310,16 @@ fn my_flag(v: &Option<String>) -> bool {
 /// as one. So on MySQL every row is a [`PrincipalKind::User`] and the *locked*
 /// attribute says the rest; a wrong label on a privilege screen is worse than a
 /// missing one.
+///
+/// **What the label cannot carry, [`Principal::role_ambiguous`] does.** That
+/// decision was made for a *read* screen, and a later release composed a write
+/// gate on top of it — so on MySQL 8.4.11 the browser offered **Reset password**
+/// for a role and the server accepted the `ALTER USER`
+/// (`authentication_string` 0 → 70 bytes, `password_expired` `Y` → `N`, measured
+/// on `127.0.0.1:3307`; the identical statement is `ERROR 1396` on MariaDB
+/// 10.11.14). Where `is_role` is absent, [`my_role_fingerprint`] says whether
+/// this row is one MySQL's own `CREATE ROLE` would have produced, and the gate
+/// refuses on that rather than on the label.
 pub fn from_mysql_rows(rows: &[MyUserRow]) -> Vec<Principal> {
     let mut out: Vec<Principal> = rows
         .iter()
@@ -289,6 +366,10 @@ pub fn from_mysql_rows(rows: &[MyUserRow]) -> Vec<Principal> {
                 kind,
                 system: is_mysql_system_account(&r.user),
                 attributes,
+                // Only where the catalogue has no answer of its own: MariaDB's
+                // flag settles both directions, so a MariaDB row that happens
+                // to carry MySQL's fingerprint is still not ambiguous.
+                role_ambiguous: r.is_role.is_none() && my_role_fingerprint(r),
             }
         })
         .collect();
@@ -467,6 +548,10 @@ pub fn from_pg_rows(rows: &[PgRoleRow]) -> Vec<Principal> {
                 },
                 system: r.name.starts_with("pg_"),
                 attributes,
+                // PostgreSQL answers role-ness itself: `rolcanlogin` is the
+                // same column `kind` is folded from, so there is nothing left
+                // over to be uncertain about.
+                role_ambiguous: false,
             }
         })
         .collect();
@@ -1352,6 +1437,8 @@ impl GrantDraft {
                 kind: PrincipalKind::Role,
                 system: false,
                 attributes: Vec::new(),
+                // A role the user typed, not a row read back from a catalogue.
+                role_ambiguous: false,
             },
             member: account.clone(),
             with_admin_option: self.with_admin_option,
@@ -1445,6 +1532,8 @@ impl AccountDraft {
             kind: self.kind,
             system: false,
             attributes: Vec::new(),
+            // The draft says which of the two it is; nothing was inferred.
+            role_ambiguous: false,
         }
     }
 }
@@ -1510,7 +1599,7 @@ pub struct PasswordReset {
     pub password: String,
 }
 
-/// Can `dialect` change the password of an existing account of `kind`?
+/// Can `dialect` change the password of the existing account `p`?
 ///
 /// **Computed from [`supports_users`], not restated.** An engine with accounts
 /// has an `ALTER` for them — MySQL since 5.7.6, PostgreSQL since roles existed —
@@ -1518,12 +1607,23 @@ pub struct PasswordReset {
 /// fourth engine gets a consistent answer rather than whichever side a new
 /// constant left it on.
 ///
-/// The `kind` half is real and not about the engine: a role takes no password on
-/// either engine, which is the same rule [`account_draft_sql`] applies to
-/// `CREATE`. MySQL rejects one outright, and a PostgreSQL role with `LOGIN` off
+/// The account half is real and not about the engine: a role takes no password,
+/// which is the same rule [`account_draft_sql`] applies to `CREATE`. MariaDB
+/// refuses one outright (`ERROR 1396`) and a PostgreSQL role with `LOGIN` off
 /// has nothing to authenticate.
-pub fn supports_password_reset(dialect: SqlDialect, kind: PrincipalKind) -> bool {
-    supports_users(dialect) && kind == PrincipalKind::User
+///
+/// **It takes the whole [`Principal`], not its [`PrincipalKind`], because the
+/// kind cannot say "I don't know".** MySQL 8 does *not* refuse an `ALTER USER
+/// … IDENTIFIED BY` on a role — measured on 8.4.11, it is accepted — and it
+/// publishes no `is_role` for the offer to withhold on, so
+/// [`from_mysql_rows`] labels every row a `User`. An earlier release of this
+/// function asked only that label, and the two correct halves composed into a
+/// write the app's own docs called impossible. So the third term is
+/// [`Principal::role_ambiguous`]: the gate refuses where the catalogue cannot
+/// classify the row, the way [`crate::intel`]'s column resolution refuses an
+/// unresolved name rather than guessing at one.
+pub fn supports_password_reset(dialect: SqlDialect, p: &Principal) -> bool {
+    supports_users(dialect) && p.kind == PrincipalKind::User && !p.role_ambiguous
 }
 
 /// `ALTER USER … IDENTIFIED BY` / `ALTER ROLE … PASSWORD`, or `None` where the
@@ -1547,7 +1647,7 @@ pub fn supports_password_reset(dialect: SqlDialect, kind: PrincipalKind) -> bool
 /// already read `ROLE` throughout, so one word here keeps the preview internally
 /// consistent.
 pub fn set_password_sql(r: &PasswordReset, dialect: SqlDialect) -> Option<String> {
-    if !supports_password_reset(dialect, r.account.kind)
+    if !supports_password_reset(dialect, &r.account)
         || r.account.name.trim().is_empty()
         || r.password.is_empty()
     {
@@ -2968,6 +3068,22 @@ mod tests {
         }
     }
 
+    /// A `mysql.user` row shaped exactly as MySQL 8's `CREATE ROLE` leaves one:
+    /// no `is_role` column (the server does not have it), locked,
+    /// password-expired and holding no authentication string. Measured on
+    /// 8.4.11 — see [`super::my_role_fingerprint`] for the table.
+    fn role_shaped_row(name: &str) -> MyUserRow {
+        MyUserRow {
+            user: name.to_string(),
+            host: "%".to_string(),
+            plugin: Some("caching_sha2_password".to_string()),
+            password_expired: Some("Y".to_string()),
+            is_role: None,
+            account_locked: Some("Y".to_string()),
+            has_credential: Some("N".to_string()),
+        }
+    }
+
     #[test]
     fn a_reset_names_the_account_with_its_host_on_mysql() {
         assert_eq!(
@@ -3012,8 +3128,75 @@ mod tests {
         r.account.kind = PrincipalKind::Role;
         for d in [SqlDialect::MySql, SqlDialect::Postgres] {
             assert_eq!(set_password_sql(&r, d), None, "{d:?}");
-            assert!(!supports_password_reset(d, PrincipalKind::Role), "{d:?}");
+            assert!(!supports_password_reset(d, &r.account), "{d:?}");
         }
+    }
+
+    /// **The composition, not the predicate.** `from_mysql_rows` labels every
+    /// MySQL 8 row a `User` because the catalogue there publishes no `is_role`,
+    /// and the reset gate then reads that label — so a *role* is offered the
+    /// reset and MySQL 8.4.11 accepts the `ALTER USER` it emits (measured:
+    /// `authentication_string` 0 → 70 bytes, `password_expired` `Y` → `N`).
+    /// Asserted over the fold's own output rather than over a hand-built
+    /// `Principal`, because either half reads correctly on its own and the fault
+    /// is only visible where they meet.
+    #[test]
+    fn a_mysql_role_fingerprint_is_not_offered_a_password_reset() {
+        let p = from_mysql_rows(&[role_shaped_row("zz_role")])
+            .into_iter()
+            .next()
+            .unwrap();
+        let r = PasswordReset {
+            account: p.clone(),
+            password: "hunter2".to_string(),
+        };
+        assert!(
+            !supports_password_reset(SqlDialect::MySql, &p),
+            "the reset was offered for a row the catalogue cannot classify"
+        );
+        assert_eq!(
+            set_password_sql(&r, SqlDialect::MySql),
+            None,
+            "an ALTER USER was emitted for a row that may be a role"
+        );
+    }
+
+    /// The other side of the same rule: the narrowing must not reach an ordinary
+    /// account. A MySQL 8 user that is merely **locked** still has a stored
+    /// credential and an unexpired password, so it keeps its reset — measured on
+    /// 8.4.11 as `(password_expired N, account_locked Y, 70 bytes)`, which is
+    /// not the `(Y, Y, 0)` `CREATE ROLE` leaves.
+    #[test]
+    fn a_locked_mysql_user_keeps_its_password_reset() {
+        for (expired, credential, what) in [
+            ("N", "Y", "locked, with a password"),
+            ("Y", "Y", "locked and expired, with a password"),
+            ("N", "N", "locked, never given a password"),
+        ] {
+            let mut row = role_shaped_row("zz_user");
+            row.password_expired = Some(expired.to_string());
+            row.has_credential = Some(credential.to_string());
+            let p = from_mysql_rows(&[row]).into_iter().next().unwrap();
+            assert!(
+                supports_password_reset(SqlDialect::MySql, &p),
+                "a user {what} lost its reset"
+            );
+        }
+    }
+
+    /// MariaDB publishes `is_role`, so nothing there is ambiguous — including a
+    /// row that happens to carry MySQL's fingerprint. The flag answers, and the
+    /// fingerprint is never consulted.
+    #[test]
+    fn mariadb_answers_role_ness_from_its_flag_not_the_fingerprint() {
+        let mut row = role_shaped_row("zz_user");
+        row.is_role = Some("N".to_string());
+        let p = from_mysql_rows(&[row.clone()]).into_iter().next().unwrap();
+        assert!(supports_password_reset(SqlDialect::MySql, &p));
+        row.is_role = Some("Y".to_string());
+        let role = from_mysql_rows(&[row]).into_iter().next().unwrap();
+        assert_eq!(role.kind, PrincipalKind::Role);
+        assert!(!supports_password_reset(SqlDialect::MySql, &role));
     }
 
     /// The capability is computed from `supports_users`, so SQLite — which has
@@ -3022,7 +3205,7 @@ mod tests {
     fn password_reset_follows_whether_the_engine_has_accounts_at_all() {
         for d in [SqlDialect::MySql, SqlDialect::Postgres, SqlDialect::Sqlite] {
             assert_eq!(
-                supports_password_reset(d, PrincipalKind::User),
+                supports_password_reset(d, &my_account()),
                 supports_users(d),
                 "{d:?}"
             );

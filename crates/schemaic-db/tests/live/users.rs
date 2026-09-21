@@ -735,6 +735,81 @@ pub async fn a_reset_password_replaces_the_one_the_account_had(target: &'static 
     scratch.teardown().await;
 }
 
+/// **The offer, read off a real catalogue rather than off a drafted
+/// `Principal`.** A role the server itself made must not be offered a password
+/// reset on any leg, and the account beside it must keep one.
+///
+/// This is the composition `a_role_cannot_have_its_password_reset` cannot
+/// reach. That unit test builds a `Principal` with `kind = Role` and asks the
+/// predicate — both halves correct, and the fault sat between them: on **MySQL
+/// 8.4.11** `mysql.user` has no `is_role` column, so `from_mysql_rows` labels a
+/// role `User` by a documented and defensible decision, and a write gate
+/// composed on that label therefore offered **Reset password** for a role. The
+/// server accepted the `ALTER USER` (`authentication_string` 0 → 70 bytes,
+/// `password_expired` `Y` → `N`), while the identical statement on MariaDB
+/// 10.11.14 is `ERROR 1396` — one `SqlDialect::MySql` covering two servers that
+/// answer oppositely, with nothing on screen saying which.
+///
+/// So the assertion is over `fetch_principals`' own output, and it is red on the
+/// `mysql::` leg alone: MariaDB answers from `is_role`, PostgreSQL from
+/// `rolcanlogin`, and MySQL 8 from the fingerprint `CREATE ROLE` leaves.
+///
+/// **Both directions, because a gate that refuses everything would pass the
+/// first half.** The user created alongside is the same statement path, the
+/// same fetch and the same predicate, and it must still be offered — which is
+/// what keeps the narrowing off every ordinary account.
+pub async fn a_role_the_server_made_is_never_offered_a_password_reset(target: &'static Target) {
+    let scratch = Scratch::create(target, "roleoffer").await;
+    // **A suffix no other test in this file uses.** An account name is
+    // `{PREFIX}{pid}_{leg}_{suffix}` and the scratch database is *not* part of
+    // it, so within one leg the suffix is the whole of an account's identity and
+    // two tests sharing one collide the moment they overlap — `CREATE` fails
+    // with a duplicate key, or the first test's teardown drops the second's
+    // account out from under it.
+    let role = ScratchAccount::create(target, &scratch, "ofr", PrincipalKind::Role).await;
+    let user = ScratchAccount::create(target, &scratch, "ofu", PrincipalKind::User).await;
+
+    let listed_role = listed_principal(target, &role).await;
+    assert!(
+        !users::supports_password_reset(scratch.dialect(), &listed_role),
+        "{}: a role the server made is offered a password reset — listed as \
+         kind {:?}, role_ambiguous {}, attributes {:?}",
+        target.endpoint(),
+        listed_role.kind,
+        listed_role.role_ambiguous,
+        listed_role.attributes
+    );
+    // And the plan is empty as well as the button absent, so neither gate is
+    // carrying the other.
+    assert_eq!(
+        users::set_password_sql(
+            &PasswordReset {
+                account: listed_role.clone(),
+                password: "hunter2".to_string(),
+            },
+            scratch.dialect()
+        ),
+        None,
+        "{}: an ALTER was emitted for a role",
+        target.endpoint()
+    );
+
+    let listed_user = listed_principal(target, &user).await;
+    assert!(
+        users::supports_password_reset(scratch.dialect(), &listed_user),
+        "{}: an ordinary account lost its password reset — listed as kind {:?}, \
+         role_ambiguous {}, attributes {:?}",
+        target.endpoint(),
+        listed_user.kind,
+        listed_user.role_ambiguous,
+        listed_user.attributes
+    );
+
+    user.teardown().await;
+    role.drop_as(&listed_role).await;
+    scratch.teardown().await;
+}
+
 /// `CREATE ROLE` is a different statement with a different shape — no host, no
 /// password — and each engine has its own opinion about it. Only a server says
 /// whether ours is right.
@@ -749,7 +824,11 @@ pub async fn a_reset_password_replaces_the_one_the_account_had(target: &'static 
 /// browser's four role actions were broken on MariaDB while this test passed.
 pub async fn a_created_role_is_one_the_server_accepts(target: &'static Target) {
     let scratch = Scratch::create(target, "mkrole").await;
-    let role = ScratchAccount::create(target, &scratch, "r", PrincipalKind::Role).await;
+    // `crl`, not `r`: this test and `a_reset_password_replaces_the_one_the_
+    // account_had` both asked for `r`, and a suffix is the whole of an account's
+    // identity within a leg (see the note in the test above) — so the two raced
+    // for one account name whenever they overlapped.
+    let role = ScratchAccount::create(target, &scratch, "crl", PrincipalKind::Role).await;
 
     let listed = target
         .base_db()

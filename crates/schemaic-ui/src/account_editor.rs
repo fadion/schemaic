@@ -206,11 +206,12 @@ pub(crate) fn open_for_reset(
     if ctx.read_only {
         return;
     }
-    // A role has no password on either engine. The browser dims the button, and
-    // this is the same refusal one step in — `set_password_sql` would return
-    // `None` and the plan would be empty, which reads as a broken button rather
-    // than a refused one.
-    if !schemaic_core::users::supports_password_reset(from.dialect, account.kind) {
+    // A role has no password on either engine — nor has a MySQL 8 row the
+    // catalogue cannot tell from one. The browser withholds the button, and this
+    // is the same refusal one step in: `set_password_sql` would return `None`
+    // and the plan would be empty, which reads as a broken button rather than a
+    // refused one.
+    if !schemaic_core::users::supports_password_reset(from.dialect, account) {
         return;
     }
     d.session.update(|g| *g += 1);
@@ -1576,6 +1577,7 @@ mod account_change_tests {
             kind: PrincipalKind::User,
             system: false,
             attributes: Vec::new(),
+            role_ambiguous: false,
         }
     }
 

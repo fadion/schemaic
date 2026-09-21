@@ -9243,10 +9243,13 @@ pub fn supports_change(dialect: SqlDialect, change: &Change) -> bool {
             Change::GrantPrivileges(c) | Change::RevokePrivileges(c) => {
                 crate::users::levels_for(dialect).contains(&c.level.kind())
             }
-            // **And the kind, for the one change that is about a password.** A
-            // role has none on either engine, so a reset of one is not a thing
-            // this engine can be asked for — the same shape as the level above,
-            // one field along. Left to `set_password_sql` returning `None` it
+            // **And the account, for the one change that is about a password.**
+            // A role has none on either engine, so a reset of one is not a
+            // thing this engine can be asked for — the same shape as the level
+            // above, one field along. The whole `Principal` and not its `kind`,
+            // because on MySQL 8 the catalogue cannot tell a role from a
+            // locked account and `supports_password_reset` refuses on that
+            // uncertainty. Left to `set_password_sql` returning `None` it
             // degraded to exactly what the comment above describes: no
             // INCOMPLETE header, `apply`'s withheld guard silent, and Apply
             // enabled over a plan that then emitted nothing at all. The browser
@@ -9254,7 +9257,7 @@ pub fn supports_change(dialect: SqlDialect, change: &Change) -> bool {
             // third gate rather than the only one — which is why it is here and
             // not left to the two above it.
             Change::SetAccountPassword(r) => {
-                crate::users::supports_password_reset(dialect, r.account.kind)
+                crate::users::supports_password_reset(dialect, &r.account)
             }
             _ => true,
         };
@@ -11582,6 +11585,7 @@ mod tests {
                         kind: crate::users::PrincipalKind::User,
                         system: false,
                         attributes: Vec::new(),
+                        role_ambiguous: false,
                     },
                     level: crate::users::GrantLevel::Global,
                     privileges: vec!["SELECT".into()],

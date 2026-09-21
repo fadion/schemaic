@@ -125,9 +125,21 @@ const MY_USERS_MARIADB_SQL: &str = "SELECT CAST(User AS CHAR), CAST(Host AS CHAR
      FROM mysql.user ORDER BY User, Host";
 
 /// The same, MySQL 8's spelling — `account_locked` in place of `is_role`, which
-/// does not exist there.
+/// does not exist there, plus the **presence** of a stored credential.
+///
+/// **The sixth column is a `> 0`, never the hash.** `authentication_string`
+/// holds a password hash, which for the older plugins is credential-equivalent
+/// and has no business crossing into this process — so the comparison is done
+/// on the server and what comes back is a `'Y'`/`'N'`. It is here because it is
+/// the third of the three flags MySQL's own `CREATE ROLE` sets, and the one that
+/// separates a role from a locked, password-expired *user*; see
+/// `users::MyUserRow::has_credential` and the offer it withholds.
+///
+/// MariaDB's query does not need it — `is_role` answers there outright — so the
+/// column is asked for only on the rung that has no better answer.
 const MY_USERS_MYSQL_SQL: &str = "SELECT CAST(User AS CHAR), CAST(Host AS CHAR), \
-            CAST(plugin AS CHAR), CAST(password_expired AS CHAR), CAST(account_locked AS CHAR) \
+            CAST(plugin AS CHAR), CAST(password_expired AS CHAR), CAST(account_locked AS CHAR), \
+            IF(LENGTH(authentication_string) > 0, 'Y', 'N') \
      FROM mysql.user ORDER BY User, Host";
 
 /// **`is_role` on its own**, for a MariaDB that has roles but not password
@@ -159,7 +171,7 @@ const MY_USERS_PLAIN_SQL: &str =
 const MY_USERS_GRANTEE_SQL: &str =
     "SELECT DISTINCT GRANTEE FROM information_schema.USER_PRIVILEGES ORDER BY GRANTEE";
 
-/// One `mysql.user` row as the two wide queries project it.
+/// One `mysql.user` row as [`MY_USERS_MARIADB_SQL`] projects it.
 type MyUserTuple = (
     String,
     String,
@@ -168,7 +180,25 @@ type MyUserTuple = (
     Option<String>,
 );
 
-/// The MySQL/MariaDB half of [`Db::fetch_principals`]: four queries, of which
+/// One `mysql.user` row as [`MY_USERS_MYSQL_SQL`] projects it — the same five
+/// columns plus the credential-presence flag that rung alone asks for.
+///
+/// **A type of its own rather than a sixth `Option` on [`MyUserTuple`].** The
+/// two rungs no longer project the same shape, and a shared tuple with a
+/// trailing `None` would compile for either query while meaning something
+/// different in each — which is the mistake
+/// `the_fifth_column_lands_in_the_field_this_servers_spelling_meant` exists
+/// because of.
+type MyUserTupleMysql = (
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
+
+/// The MySQL/MariaDB half of [`Db::fetch_principals`]: five queries, of which
 /// exactly one runs to completion.
 ///
 /// **The fallbacks fire on an *error*, not on an empty result** — the same rule
@@ -186,12 +216,15 @@ async fn collect_my_users(conn: &mut Conn) -> Result<users::Principals, DbError>
         .await
     {
         return Ok(users::Principals::complete(users::from_mysql_rows(
-            &my_user_rows(rows, true),
+            &my_mariadb_rows(rows),
         )));
     }
-    if let Ok(rows) = conn.query_map(MY_USERS_MYSQL_SQL, |r: MyUserTuple| r).await {
+    if let Ok(rows) = conn
+        .query_map(MY_USERS_MYSQL_SQL, |r: MyUserTupleMysql| r)
+        .await
+    {
         return Ok(users::Principals::complete(users::from_mysql_rows(
-            &my_user_rows(rows, false),
+            &my_mysql_rows(rows),
         )));
     }
     if let Ok(rows) = conn
@@ -241,29 +274,56 @@ async fn collect_my_users(conn: &mut Conn) -> Result<users::Principals, DbError>
     })
 }
 
-/// Slot the fifth column into whichever field this server's spelling meant it
-/// for. The fold that reads it — `users::from_mysql_rows` — is where every
-/// decision about what a [`Principal`] *says* lives, and it needs the two
-/// columns kept apart rather than merged into a "flag" it would have to
-/// re-interpret.
-fn my_user_rows(rows: Vec<MyUserTuple>, mariadb: bool) -> Vec<MyUserRow> {
+/// [`MY_USERS_MARIADB_SQL`]'s five columns, as rows — the fifth being `is_role`.
+///
+/// **One function per rung rather than one with a `mariadb: bool`.** The fifth
+/// column means a different thing in each query, and a pair of boolean literals
+/// twelve lines apart deciding which was how transposing them could have made
+/// every locked MySQL account a `Role`, dropped its host, and left
+/// `DROP USER "app"` resolving to a different account. Now the two projections
+/// have different arities and the compiler holds them apart; the fold that reads
+/// them — `users::from_mysql_rows` — is still the one place that decides what a
+/// [`Principal`] *says*.
+fn my_mariadb_rows(rows: Vec<MyUserTuple>) -> Vec<MyUserRow> {
     rows.into_iter()
-        .map(|(user, host, plugin, expired, fifth)| MyUserRow {
+        .map(|(user, host, plugin, expired, is_role)| MyUserRow {
             user,
             host,
             plugin,
             password_expired: expired,
-            is_role: if mariadb { fifth.clone() } else { None },
-            account_locked: if mariadb { None } else { fifth },
+            is_role,
+            account_locked: None,
+            // MariaDB's rung does not ask for it, and `None` says so rather
+            // than claiming the row has no credential — see `MyUserRow`.
+            has_credential: None,
         })
+        .collect()
+}
+
+/// [`MY_USERS_MYSQL_SQL`]'s six columns, as rows — no `is_role` to be had, and
+/// the credential flag that stands in for the part of it MySQL withholds.
+fn my_mysql_rows(rows: Vec<MyUserTupleMysql>) -> Vec<MyUserRow> {
+    rows.into_iter()
+        .map(
+            |(user, host, plugin, expired, locked, credential)| MyUserRow {
+                user,
+                host,
+                plugin,
+                password_expired: expired,
+                is_role: None,
+                account_locked: locked,
+                has_credential: credential,
+            },
+        )
         .collect()
 }
 
 /// [`MY_USERS_ROLE_SQL`]'s three columns, as rows.
 ///
 /// A named function rather than a closure inside the ladder, for the reason
-/// [`my_user_rows`] is one: the mapping is the whole content of a rung, and a
-/// rung whose mapping is inline is a rung no test can reach.
+/// [`my_mariadb_rows`] and [`my_mysql_rows`] are: the mapping is the whole
+/// content of a rung, and a rung whose mapping is inline is a rung no test can
+/// reach.
 fn my_role_rows(rows: Vec<(String, String, Option<String>)>) -> Vec<MyUserRow> {
     rows.into_iter()
         .map(|(user, host, is_role)| MyUserRow {
@@ -277,30 +337,34 @@ fn my_role_rows(rows: Vec<(String, String, Option<String>)>) -> Vec<MyUserRow> {
 
 #[cfg(test)]
 mod my_user_tests {
-    use super::{MyUserRow, my_role_rows, my_user_rows};
+    use super::{MY_USERS_MYSQL_SQL, MyUserRow, my_mariadb_rows, my_mysql_rows, my_role_rows};
 
-    /// **Which column the fifth one is.** Two bare boolean literals twelve lines
-    /// apart decide it, and nothing in any tier asserted the result: transposing
-    /// them makes every locked MySQL account a `Role`, drops its host, and
-    /// `DROP USER "app"` then resolves to a *different* account. The live role
-    /// test finds its role by name and never asks what kind it is.
+    /// **Which column the fifth one is.** It used to be two bare boolean
+    /// literals twelve lines apart, with nothing in any tier asserting the
+    /// result: transposing them makes every locked MySQL account a `Role`, drops
+    /// its host, and `DROP USER "app"` then resolves to a *different* account.
+    /// The live role test finds its role by name and never asks what kind it is.
     #[test]
     fn the_fifth_column_lands_in_the_field_this_servers_spelling_meant() {
-        let row = |fifth: &str| {
-            vec![(
-                "app".to_string(),
-                "%".to_string(),
-                Some("plugin".to_string()),
-                Some("N".to_string()),
-                Some(fifth.to_string()),
-            )]
-        };
         // MariaDB's fifth column is `is_role`…
-        let maria = my_user_rows(row("Y"), true);
+        let maria = my_mariadb_rows(vec![(
+            "app".to_string(),
+            "%".to_string(),
+            Some("plugin".to_string()),
+            Some("N".to_string()),
+            Some("Y".to_string()),
+        )]);
         assert_eq!(maria[0].is_role.as_deref(), Some("Y"));
         assert_eq!(maria[0].account_locked, None);
         // …and MySQL 8's is `account_locked`, which does not make a role.
-        let mysql = my_user_rows(row("Y"), false);
+        let mysql = my_mysql_rows(vec![(
+            "app".to_string(),
+            "%".to_string(),
+            Some("plugin".to_string()),
+            Some("N".to_string()),
+            Some("Y".to_string()),
+            Some("Y".to_string()),
+        )]);
         assert_eq!(mysql[0].is_role, None);
         assert_eq!(mysql[0].account_locked.as_deref(), Some("Y"));
         // The other four columns are the same either way.
@@ -308,6 +372,58 @@ mod my_user_tests {
         assert_eq!(maria[0].host, mysql[0].host);
         assert_eq!(maria[0].plugin, mysql[0].plugin);
         assert_eq!(maria[0].password_expired, mysql[0].password_expired);
+    }
+
+    /// **The sixth column reaches `has_credential`, and only that rung has it.**
+    /// The flag is what withholds **Reset password** from a MySQL 8 row that may
+    /// be a role, so a mapping that dropped it would put the offer back with
+    /// `core`'s own tests still green — the fold cannot tell "not published"
+    /// from "no credential" if the projection never fills it in.
+    #[test]
+    fn the_credential_flag_reaches_the_fold_only_on_the_rung_that_asks_for_it() {
+        let row = |credential: &str| {
+            my_mysql_rows(vec![(
+                "zz".to_string(),
+                "%".to_string(),
+                None,
+                Some("Y".to_string()),
+                Some("Y".to_string()),
+                Some(credential.to_string()),
+            )])
+        };
+        assert_eq!(row("N")[0].has_credential.as_deref(), Some("N"));
+        assert_eq!(row("Y")[0].has_credential.as_deref(), Some("Y"));
+        // …and that is the difference between an offer and a refusal.
+        let role = schemaic_core::users::from_mysql_rows(&row("N"));
+        assert!(role[0].role_ambiguous);
+        let user = schemaic_core::users::from_mysql_rows(&row("Y"));
+        assert!(!user[0].role_ambiguous);
+
+        // The rungs that do not ask for it leave `None`, which the fold reads as
+        // "this server does not publish it" rather than as "no credential".
+        let maria = my_mariadb_rows(vec![(
+            "zz".to_string(),
+            "%".to_string(),
+            None,
+            Some("Y".to_string()),
+            None,
+        )]);
+        assert_eq!(maria[0].has_credential, None);
+    }
+
+    /// The hash itself never crosses the wire into this process: the sixth
+    /// column is a server-side `> 0`, and `authentication_string` appears in the
+    /// query only inside it. Pinned because "just select the column and compare
+    /// here" is the natural next edit and it would put a credential-equivalent
+    /// into a `MyUserRow`.
+    #[test]
+    fn the_credential_column_is_asked_as_a_presence_not_a_value() {
+        assert!(MY_USERS_MYSQL_SQL.contains("IF(LENGTH(authentication_string) > 0, 'Y', 'N')"));
+        assert_eq!(
+            MY_USERS_MYSQL_SQL.matches("authentication_string").count(),
+            1,
+            "authentication_string is projected somewhere other than the presence test"
+        );
     }
 
     /// The rung that exists so a MariaDB with roles but no password expiry still

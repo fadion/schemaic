@@ -963,11 +963,12 @@ fn actions_row(
     );
 
     // **Absent on a role rather than dimmed**, the call every per-engine and
-    // per-kind field in this crate makes: a role takes no password on either
+    // per-account field in this crate makes: a role takes no password on either
     // engine, so there is nothing here for a dimmed button to promise. Asked as
     // a capability — `supports_password_reset` folds "does this engine have
-    // accounts" into the same answer — rather than as a `dialect ==`.
-    let reset = schemaic_core::users::supports_password_reset(target.dialect, p.kind).then(|| {
+    // accounts" and "can this catalogue tell a role from a locked user" into the
+    // same answer — rather than as a `dialect ==`.
+    let reset = schemaic_core::users::supports_password_reset(target.dialect, p).then(|| {
         let (reset_conn, reset_ddl) = (conn, ddl);
         let reset_target = target.clone();
         let reset_who = p.clone();
