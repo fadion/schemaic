@@ -1833,14 +1833,22 @@ pub const SQLITE_FUNCTIONS: &[SqlFunction] = &[
 /// bug below, and `Option` is what keeps the fix from depending on somebody
 /// remembering to add an arm.
 ///
-/// **Two callers, and it took the second one a while to arrive.**
-/// [`crate::rank::rank`] asks it as well now, because the bug below had an exact
-/// twin in autocomplete: the checker was taught the question and the completion
-/// popup went on walking [`FUNCTIONS`] on every engine, offering a PostgreSQL
-/// tab `IFNULL` and never `btrim`. Suggesting a name the engine does not have is
-/// the same wrong as underlining one it does, so both surfaces route here rather
-/// than each keeping a map. `None` means *offer nothing*, on the same reasoning
-/// that makes it mean *say nothing*.
+/// **Every surface that names a builtin asks this, and they arrived one at a
+/// time — which is the whole history of the bug below.** The typo checker was
+/// taught the question first; then [`crate::rank::rank`], because the completion
+/// popup had gone on walking [`FUNCTIONS`] on every engine, offering a
+/// PostgreSQL tab `IFNULL` and never `btrim`; then [`signature_help`], which was
+/// still naming `FUNCTIONS` outright a release after this paragraph claimed
+/// there were two callers and that "both surfaces route here" — so a PostgreSQL
+/// tab got no help at all for `btrim(` and MySQL's `DATE_FORMAT(date, format)`
+/// for a function PostgreSQL has not got.
+///
+/// So the list is named rather than counted, and the reason they belong together
+/// is that they are one question: suggesting a name the engine does not have,
+/// underlining one it does, and describing the wrong engine's are the same wrong
+/// wearing three faces. `None` means *offer nothing* and *describe nothing*, on
+/// the same reasoning that makes it mean *say nothing*. A fourth surface asks
+/// here too, or it is the next instance.
 ///
 /// The checker used to spend its `dialect` on `skip_noncode` and `is_sql_keyword`
 /// and never on the catalog questions, so on PostgreSQL it failed to recognise
@@ -1864,6 +1872,193 @@ pub(crate) fn builtin_catalog(dialect: SqlDialect) -> Option<&'static [SqlFuncti
         SqlDialect::Sqlite => Some(SQLITE_FUNCTIONS),
         SqlDialect::Postgres => Some(crate::pg_builtins::PG_FUNCTIONS),
     }
+}
+
+/// One dialect's builtin catalog, arranged for the questions the editor asks of
+/// it on every keystroke rather than in the order it is written.
+///
+/// **Built once per dialect, because none of it depends on the schema or the
+/// statement.** Every field here is a *rearrangement* of
+/// [`builtin_catalog`]'s slice: nothing is added and nothing is filtered, so
+/// each answer below is the same answer the linear walk gave. What changes is
+/// the cost, and only on PostgreSQL does the difference matter — its catalog is
+/// 2,706 entries where MySQL's is 309.
+///
+/// **The cost it removes, measured in a release build over a 300-statement
+/// PostGIS-shaped buffer** — statements calling extension functions the catalog
+/// does not hold, which is the population that reaches the scan. Before → after,
+/// per debounce tick:
+///
+/// | | before | after |
+/// |---|---|---|
+/// | `function_typo_checks`, PostgreSQL | 424.6 ms | **4.3–4.5 ms** |
+/// | `function_typo_checks`, MySQL | 28.6 ms | **1.2 ms** |
+/// | the whole of [`diagnostics`], PostgreSQL | 393.0 ms | **21.5–22.6 ms** |
+/// | the whole of [`diagnostics`], MySQL | 48.0 ms | **18.1–22.9 ms** |
+///
+/// The debounce is 120 ms, so PostgreSQL went from three and a half times over
+/// its own tick budget to inside it with room to spare. **The two "before" rows
+/// do not decompose, and that is the finding rather than an error in them**:
+/// 424.6 ms of scan inside a 393.0 ms `diagnostics` is one number measured twice
+/// to within the run-to-run spread, because the catalog walk *was* substantially
+/// all of the cost — parsing 300 statements included. Afterwards the scan is
+/// 4.3 ms of a 21.5 ms whole, which decomposes as it should.
+///
+/// At `v0.25.0` the PostgreSQL column was **0 ms**, because `typo_checks`
+/// returned before reading a byte on that engine; turning the checker on is what
+/// put a 2,706-entry catalog on this path.
+///
+/// Four questions, four shapes:
+struct CatalogIndex {
+    /// **Is this word a name the catalog holds?** — `is_known_function`, asked
+    /// of every call-shaped word in the buffer. A set, because the walk it
+    /// replaces ran `eq_ignore_ascii_case` against all 2,706 entries to answer
+    /// "no", which is the answer for every user-defined function in the file.
+    ///
+    /// Lower-cased, which is what makes the probe allocation-free: the caller
+    /// has already lower-cased the word for its own `known_idents` lookup, and
+    /// the three catalogs are each single-case but not the *same* case
+    /// (`FUNCTIONS` is upper, `PG_FUNCTIONS` and `SQLITE_FUNCTIONS` lower).
+    lower: std::collections::HashSet<Box<str>>,
+    /// **Which names could be within `thresh` edits of this word?** —
+    /// `is_probable_function_typo`'s candidate set, cut down by two cheap
+    /// necessary conditions before the quadratic `edit_distance` runs.
+    ///
+    /// Indexed by byte length, so a 9-byte word visits buckets 7 through 11
+    /// rather than every entry, and each name is upper-cased once here so the
+    /// comparison allocates nothing. Length 0 is empty and exists only to make
+    /// the index the length itself.
+    ///
+    /// **Length alone is not enough on this data, which is why the mask is
+    /// here.** Bucketing by length was the whole of the first attempt and it
+    /// bought 1.6×, not the order of magnitude it looks like it should: MySQL's
+    /// names are spread over 2–21 bytes but PostgreSQL's 2,706 cluster hard in
+    /// 5–12, so a 9-byte word's five buckets are still most of the catalog.
+    /// Each entry therefore carries [`letter_mask`] as well, and the XOR
+    /// popcount test below rejects on one `u64` where the length test cannot.
+    by_len: Vec<Vec<(Box<str>, u64)>>,
+    /// **Is this word a catalog name plus a separator?** — the derived-name
+    /// test (`coalesce_x` is not a misspelling of `COALESCE`). Upper-cased, and
+    /// asked as a *prefix* lookup: for each `_`-or-digit byte in the word, is
+    /// everything before it a name? That is one lookup per separator rather
+    /// than a walk of the catalog per word.
+    upper: std::collections::HashSet<Box<str>>,
+    /// **Would autocomplete offer this name?** — [`is_offered_builtin`]'s
+    /// answer, precomputed. On PostgreSQL that predicate is
+    /// `pg_builtins::is_suggested`, a binary search `rank` was running 2,706
+    /// times per keystroke to filter a pool it then scored.
+    offered: Vec<&'static SqlFunction>,
+}
+
+impl CatalogIndex {
+    fn build(dialect: SqlDialect, catalog: &'static [SqlFunction]) -> CatalogIndex {
+        let longest = catalog.iter().map(|f| f.name.len()).max().unwrap_or(0);
+        let mut by_len: Vec<Vec<(Box<str>, u64)>> = vec![Vec::new(); longest + 1];
+        let mut upper = std::collections::HashSet::new();
+        for f in catalog {
+            let up: Box<str> = f.name.to_ascii_uppercase().into();
+            by_len[f.name.len()].push((up.clone(), letter_mask(up.as_bytes())));
+            upper.insert(up);
+        }
+        CatalogIndex {
+            lower: catalog
+                .iter()
+                .map(|f| f.name.to_ascii_lowercase().into())
+                .collect(),
+            by_len,
+            upper,
+            offered: catalog
+                .iter()
+                .filter(|f| is_offered_builtin(dialect, f.name))
+                .collect(),
+        }
+    }
+
+    /// The names that could be within `thresh` edits of a word of length `len`
+    /// and character-presence mask `mask` — every name that can match, and as
+    /// few others as two `O(1)` tests can manage.
+    ///
+    /// **Both conditions are *necessary*, which is what makes skipping the rest
+    /// sound.** Neither is sufficient, and neither is asked to be: what follows
+    /// is the same `edit_distance`/`is_adjacent_transposition` pair the linear
+    /// walk ran, on a smaller set.
+    ///
+    /// - **Length.** `edit_distance(a, b) >= |a.len() - b.len()|`, because every
+    ///   byte of length difference costs at least one insertion, and
+    ///   `is_adjacent_transposition` returns `false` outright on a length
+    ///   mismatch. This is the filter the linear walk already had, indexed
+    ///   instead of scanned.
+    /// - **Characters.** `(mask_a ^ mask_b).count_ones() <= 2 * thresh`. Each
+    ///   edit moves the *presence* set by at most two bits — a substitution can
+    ///   drop one character and add another, an insertion or deletion at most
+    ///   one — so `thresh` edits cannot separate two masks by more than
+    ///   `2 * thresh` bits. A transposition reorders and so changes no bit at
+    ///   all, which is why the same test covers that arm.
+    fn within(&self, len: usize, thresh: usize, mask: u64) -> impl Iterator<Item = &str> {
+        let lo = len.saturating_sub(thresh);
+        let hi = (len + thresh).min(self.by_len.len().saturating_sub(1));
+        let budget = 2 * thresh as u32;
+        (lo..=hi)
+            .filter(|&n| n < self.by_len.len())
+            .flat_map(move |n| {
+                self.by_len[n]
+                    .iter()
+                    .filter(move |(_, m)| (m ^ mask).count_ones() <= budget)
+                    .map(|(s, _)| &**s)
+            })
+    }
+}
+
+/// Which characters a name contains, as one bit each — the cheap half of
+/// [`CatalogIndex::within`]'s filter.
+///
+/// Case-insensitive (the catalogs are single-case and the comparison is not),
+/// with a bit per ASCII letter, a bit per digit, one for `_`, and **one shared
+/// bit for everything else**. Sharing that last bit is what keeps the test a
+/// necessary condition over non-ASCII input: two different multi-byte
+/// characters land on the same bit and so cannot make the popcount *larger*
+/// than the edits between them would allow, which is the only direction that
+/// could lose a match.
+fn letter_mask(bytes: &[u8]) -> u64 {
+    let mut m = 0u64;
+    for &b in bytes {
+        let bit = match b {
+            b'A'..=b'Z' => b - b'A',
+            b'a'..=b'z' => b - b'a',
+            b'0'..=b'9' => 26 + (b - b'0'),
+            b'_' => 36,
+            _ => 37,
+        };
+        m |= 1u64 << bit;
+    }
+    m
+}
+
+/// [`CatalogIndex`] for `dialect`, built on first use and kept for the process.
+///
+/// One `OnceLock` per dialect rather than a map keyed by it: the set of dialects
+/// is closed and known at compile time, so a fourth engine is a compiler error
+/// here rather than a silent miss at runtime.
+fn catalog_index(dialect: SqlDialect) -> Option<&'static CatalogIndex> {
+    static MYSQL: std::sync::OnceLock<CatalogIndex> = std::sync::OnceLock::new();
+    static SQLITE: std::sync::OnceLock<CatalogIndex> = std::sync::OnceLock::new();
+    static POSTGRES: std::sync::OnceLock<CatalogIndex> = std::sync::OnceLock::new();
+    let cell = match dialect {
+        SqlDialect::MySql => &MYSQL,
+        SqlDialect::Sqlite => &SQLITE,
+        SqlDialect::Postgres => &POSTGRES,
+    };
+    let catalog = builtin_catalog(dialect)?;
+    Some(cell.get_or_init(|| CatalogIndex::build(dialect, catalog)))
+}
+
+/// The catalog entries autocomplete may offer on this engine.
+///
+/// [`is_offered_builtin`] asked per candidate, precomputed — see
+/// [`CatalogIndex::offered`]. `None` where this app carries no catalog, which
+/// means *offer nothing* for the reason [`builtin_catalog`] gives.
+pub(crate) fn offered_builtins(dialect: SqlDialect) -> Option<&'static [&'static SqlFunction]> {
+    catalog_index(dialect).map(|i| i.offered.as_slice())
 }
 
 /// Whether autocomplete **offers** `name` on this engine, where
@@ -1897,24 +2092,62 @@ pub fn function_names() -> impl Iterator<Item = &'static str> {
     FUNCTIONS.iter().map(|f| f.name)
 }
 
-/// Every keyword and builtin function name this crate knows, lowercased —
-/// built **once per process**, because none of it depends on the schema, the
-/// dialect or the statement.
+/// Every keyword and builtin function name **this engine** has, lowercased —
+/// built once per dialect, because none of it depends on the schema or the
+/// statement.
 ///
-/// It used to be rebuilt inside `typo_checks`, which runs once per statement
-/// of the buffer on a 120 ms debounce while the user types. The catalog half
-/// of that set was worse still (see [`is_probable_typo`]), but the static half
-/// was pure waste on its own: ~700 `String` allocations per statement, per
-/// tick, for a value that cannot change.
-fn static_words() -> &'static std::collections::HashSet<String> {
-    static WORDS: std::sync::OnceLock<std::collections::HashSet<String>> =
+/// It used to be rebuilt inside `typo_checks`, which runs once per statement of
+/// the buffer on a 120 ms debounce while the user types. The catalog half of
+/// that set was worse still (see [`is_probable_typo`]), but the static half was
+/// pure waste on its own: ~700 `String` allocations per statement, per tick, for
+/// a value that cannot change.
+///
+/// **Per dialect, which it was not.** It chained [`function_names`] — that is
+/// `FUNCTIONS`, MySQL's catalog — on every engine, so the words a PostgreSQL tab
+/// was exempted for were MySQL's and PostgreSQL's own were not among them.
+/// Measured on PG 16.15: `SELECT x::int4` (also `::int8`, `::int2`, `::line`)
+/// and `json_object('a' VALUE 1)` are correct SQL and each came back squiggled
+/// "looks like a misspelled keyword" — the cast type names are one edit from
+/// `INT`/`INTO` and `LIKE`, `VALUE` one from `VALUES`. All four type names do
+/// have `pg_catalog` rows (PostgreSQL has an input-conversion function per
+/// type), so asking [`builtin_catalog`] clears them with no list of exceptions
+/// to maintain.
+///
+/// **And the keyword half is the engine's whole vocabulary, not the popup's.**
+/// It was `SQL_KEYWORDS` + `STMT_KEYWORDS` alone — the *completion* sets, forty
+/// rows curated for a popup — where the checker's question is "is this a legal
+/// keyword", which is a wider set. So [`reserved_words`] is folded in (a word
+/// the engine refuses as an identifier is certainly not a misspelling of one)
+/// together with [`CLAUSE_KEYWORDS`] and [`NON_RESERVED_KEYWORDS`], whose doc
+/// names the three words that were left over and how they were found. Widening
+/// an *exemption* set can only stop a legal word being underlined; `selct` is in
+/// none of these lists and is still caught on every engine.
+fn static_words(dialect: SqlDialect) -> &'static std::collections::HashSet<String> {
+    static MYSQL: std::sync::OnceLock<std::collections::HashSet<String>> =
         std::sync::OnceLock::new();
-    WORDS.get_or_init(|| {
+    static SQLITE: std::sync::OnceLock<std::collections::HashSet<String>> =
+        std::sync::OnceLock::new();
+    static POSTGRES: std::sync::OnceLock<std::collections::HashSet<String>> =
+        std::sync::OnceLock::new();
+    let cell = match dialect {
+        SqlDialect::MySql => &MYSQL,
+        SqlDialect::Sqlite => &SQLITE,
+        SqlDialect::Postgres => &POSTGRES,
+    };
+    cell.get_or_init(|| {
         SQL_KEYWORDS
             .iter()
             .chain(STMT_KEYWORDS.iter())
+            .chain(CLAUSE_KEYWORDS.iter())
+            .chain(NON_RESERVED_KEYWORDS.iter())
+            .chain(reserved_words(dialect).iter())
             .map(|k| k.to_ascii_lowercase())
-            .chain(function_names().map(|f| f.to_ascii_lowercase()))
+            .chain(
+                builtin_catalog(dialect)
+                    .unwrap_or(&[])
+                    .iter()
+                    .map(|f| f.name.to_ascii_lowercase()),
+            )
             .collect()
     })
 }
@@ -3490,7 +3723,7 @@ fn table_refs_with_pos(
 /// Is `word` a likely misspelled SQL keyword? Not a known word (keyword/function/
 /// schema ident) but a near-miss of a keyword. Conservative (short words + distant
 /// matches ignored) to avoid flagging legitimate identifiers.
-fn is_probable_typo(word: &str, catalog: &Catalog) -> bool {
+fn is_probable_typo(word: &str, catalog: &Catalog, dialect: SqlDialect) -> bool {
     if word.len() < 4 {
         return false;
     }
@@ -3505,7 +3738,7 @@ fn is_probable_typo(word: &str, catalog: &Catalog) -> bool {
     // editing one line paid it for every statement in the buffer. The
     // `Catalog` is memoized precisely because it is expensive to build; the
     // per-statement copy of its contents was not.
-    if catalog.known_idents.contains(&lw) || static_words().contains(lw.as_str()) {
+    if catalog.known_idents.contains(&lw) || static_words(dialect).contains(lw.as_str()) {
         return false;
     }
     let up = word.to_ascii_uppercase();
@@ -4051,13 +4284,45 @@ const SQLITE_RESERVED: &[&str] = &[
 /// [`SQLITE_RESERVED`].
 pub fn is_reserved_word(word: &str, dialect: SqlDialect) -> bool {
     let up = word.to_ascii_uppercase();
-    let list = match dialect {
+    reserved_words(dialect).contains(&up.as_str())
+}
+
+/// The reserved list [`is_reserved_word`] consults, as a slice.
+///
+/// Named so [`static_words`] can fold the same vocabulary into the typo
+/// checker's exemption set rather than spelling the three-arm `match` a second
+/// time — the shape `builtin_catalog` is for the catalogs.
+fn reserved_words(dialect: SqlDialect) -> &'static [&'static str] {
+    match dialect {
         SqlDialect::MySql => MYSQL_RESERVED,
         SqlDialect::Postgres => PG_RESERVED,
         SqlDialect::Sqlite => SQLITE_RESERVED,
-    };
-    list.contains(&up.as_str())
+    }
 }
+
+/// Keywords that are legal SQL on every engine here but are deliberately **not
+/// offered** as completions, so no other list in this module holds them.
+///
+/// **This exists because the typo checker's exemption set and the completion set
+/// are not the same question**, and it had been using the second to answer the
+/// first. `SQL_KEYWORDS` is curated for a popup — forty rows, the words somebody
+/// wants suggested — while the checker must not underline *any* legal keyword.
+/// The three below are the whole gap, found by running every non-reserved
+/// grammar keyword of all three engines through the checker rather than guessed
+/// at, and they are exactly the ones that sit one edit from a curated keyword:
+///
+/// - `VALUE` — PostgreSQL's SQL/JSON (`json_object('a' VALUE 1)`), and MySQL's
+///   own accepted synonym in `INSERT … VALUE (…)`. One edit from `VALUES`.
+/// - `GROUPS` — the window frame unit (`GROUPS BETWEEN 1 PRECEDING …`),
+///   PostgreSQL 11+ and SQLite 3.28+. One edit from `GROUP`.
+/// - `NULLS` — `ORDER BY x NULLS FIRST`, PostgreSQL and SQLite 3.30+. One edit
+///   from `NULL`.
+///
+/// Dialect-free, because each is legal on more than one of the three and the
+/// checker's job is not to say which engine has which — that is
+/// [`builtin_catalog`]'s half of the set. A fourth word belongs here the moment
+/// it is measured, not when it is remembered.
+const NON_RESERVED_KEYWORDS: &[&str] = &["VALUE", "GROUPS", "NULLS"];
 
 /// Words that can't be a bare **identifier** (a table or column name) but *can*
 /// be an alias, so [`is_reserved_word`] must not list them.
@@ -5393,7 +5658,7 @@ fn typo_checks(
                 j += 1;
             }
             let qualified = s > 0 && b[s - 1] == b'.';
-            if !qualified && is_probable_typo(&sql[s..j], catalog) {
+            if !qualified && is_probable_typo(&sql[s..j], catalog, dialect) {
                 out.push(Diagnostic {
                     range: (s, j),
                     severity: Severity::Warning,
@@ -5433,7 +5698,7 @@ fn function_typo_checks(
     // somebody that correct SQL is misspelled is worse than saying nothing.
     // PostgreSQL has its own catalog now; the early return is what a fourth
     // engine gets until it does too.
-    let Some(builtins) = builtin_catalog(dialect) else {
+    let Some(index) = catalog_index(dialect) else {
         return;
     };
     let b = sql.as_bytes();
@@ -5461,11 +5726,11 @@ fn function_typo_checks(
             let qualified = s > lo && b[s - 1] == b'.';
             if is_call
                 && !qualified
-                && !is_known_function(builtins, &lw)
+                && !is_known_function(index, &lw)
                 && !is_sql_keyword(word)
                 && !STMT_KEYWORDS.iter().any(|k| k.eq_ignore_ascii_case(word))
                 && !catalog.known_idents.contains(&lw)
-                && is_probable_function_typo(builtins, word)
+                && is_probable_function_typo(index, word)
             {
                 out.push(Diagnostic {
                     range: (s, j),
@@ -5480,12 +5745,14 @@ fn function_typo_checks(
     }
 }
 
-/// Case-insensitive membership in `builtins`, the catalog of the dialect being
-/// checked — never in whichever catalog happened to be in scope.
-fn is_known_function(builtins: &[SqlFunction], word_lower: &str) -> bool {
-    builtins
-        .iter()
-        .any(|f| f.name.eq_ignore_ascii_case(word_lower))
+/// Case-insensitive membership in the catalog of the dialect being checked —
+/// never in whichever catalog happened to be in scope.
+///
+/// `word_lower` is already lower-cased by the caller, and every catalog's names
+/// are single-case (`FUNCTIONS` upper, the other two lower), so the set is keyed
+/// on the catalog's own spelling and probed with both.
+fn is_known_function(index: &CatalogIndex, word_lower: &str) -> bool {
+    index.lower.contains(word_lower)
 }
 
 /// Is `word` a near-miss of a known builtin function name? A near-miss is a small
@@ -5494,7 +5761,7 @@ fn is_known_function(builtins: &[SqlFunction], word_lower: &str) -> bool {
 /// Levenshtein but by far the most common typo, so it's matched explicitly rather
 /// than by loosening the distance threshold (which would flag names like
 /// `format_x` as a typo of `FORMAT`).
-fn is_probable_function_typo(builtins: &[SqlFunction], word: &str) -> bool {
+fn is_probable_function_typo(index: &CatalogIndex, word: &str) -> bool {
     if word.len() < 4 {
         return false;
     }
@@ -5502,17 +5769,10 @@ fn is_probable_function_typo(builtins: &[SqlFunction], word: &str) -> bool {
     let ub = up.as_bytes();
     // Every catalog is compared upper-cased, so one written the way its own
     // engine writes it (SQLite's and PostgreSQL's are lower-case) measures the
-    // same distances.
+    // same distances. Both sides are upper-cased **once**, in
+    // [`CatalogIndex::build`]: the walk this replaced allocated a `String` per
+    // entry per word, twice over, on a 120 ms debounce while the user types.
     //
-    // **The upper-casing is deferred behind a length test rather than mapped
-    // over the catalog**, which it used to be. That allocated one `String` per
-    // entry per word, twice over, on a 120 ms debounce while the user types —
-    // affordable at MySQL's 250 entries and not at PostgreSQL's 2,682. Both
-    // filters below are length-first, and neither loses a match: the prefix test
-    // already required `up` to be the longer string, and
-    // [`is_adjacent_transposition`] returns `false` outright on a length
-    // mismatch, so a name further than `thresh` from `up` in length cannot
-    // satisfy either arm.
     // **A builtin's name plus a `_` or a digit is a *derived* name, not a
     // misspelling.** The doc above says the design avoids flagging `format_x`
     // as a typo of `FORMAT`; at length 8 the threshold is already 2, so it
@@ -5523,21 +5783,25 @@ fn is_probable_function_typo(builtins: &[SqlFunction], word: &str) -> bool {
     // The separator is what keeps this narrow: a *letter* continuation is how a
     // real typo looks (`SUBSTRIN` is `SUBSTR` plus `IN`, and is a dropped `G`
     // from `SUBSTRING`), so those still get flagged.
-    if builtins.iter().any(|f| {
-        let n = f.name.len();
-        ub.len() > n
-            && ub[..n].eq_ignore_ascii_case(f.name.as_bytes())
-            && matches!(ub[n], b'_' | b'0'..=b'9')
-    }) {
+    //
+    // **Asked from the word's side, not the catalog's.** The question is
+    // whether *some* prefix of this word is a name, so it is one set lookup per
+    // separator byte in the word — at most a handful — where the walk it
+    // replaces tested every entry against the word's prefix of that entry's
+    // length.
+    if ub
+        .iter()
+        .enumerate()
+        .skip(1)
+        .filter(|(_, c)| matches!(c, b'_' | b'0'..=b'9'))
+        .any(|(n, _)| index.upper.contains(&up[..n]))
+    {
         return false;
     }
     let thresh = if word.len() >= 7 { 2 } else { 1 };
-    builtins.iter().any(|f| {
-        if (f.name.len() as isize - up.len() as isize).unsigned_abs() > thresh {
-            return false;
-        }
-        let name = f.name.to_ascii_uppercase();
-        crate::sql::edit_distance(&up, &name) <= thresh
+    let mask = letter_mask(ub);
+    index.within(up.len(), thresh, mask).any(|name| {
+        crate::sql::edit_distance(&up, name) <= thresh
             || is_adjacent_transposition(ub, name.as_bytes())
     })
 }
@@ -6078,7 +6342,13 @@ pub fn signature_help(
     let TkKind::Word(name) = &toks[paren_idx - 1].kind else {
         return None;
     };
-    let func = FUNCTIONS
+    // **This engine's catalog, asked as the capability** — the third surface to
+    // do so, after the typo checker and `rank`. It named `FUNCTIONS` outright
+    // for a release while `builtin_catalog`'s own doc said there were two
+    // callers and "both surfaces route here rather than each keeping a map", so
+    // a PostgreSQL tab got nothing for `btrim(` and MySQL's
+    // `DATE_FORMAT(date, format)` for a function PostgreSQL has not got.
+    let func = builtin_catalog(dialect)?
         .iter()
         .find(|f| f.name.eq_ignore_ascii_case(name))?;
     Some(SignatureHelp {
@@ -8427,6 +8697,17 @@ mod tests {
         diagnostics(sql, &cat, dialect)
     }
 
+    /// Does `dialect`'s catalog hold `name`? Asked through the
+    /// [`CatalogIndex`] the checker itself reads, rather than of a slice a test
+    /// picked out — so a dialect wired to the wrong catalog, or an index built
+    /// from the wrong slice, fails these the same way.
+    fn catalog_knows(dialect: SqlDialect, name: &str) -> bool {
+        is_known_function(
+            catalog_index(dialect).expect("a catalog for this dialect"),
+            name,
+        )
+    }
+
     /// The standard PostgreSQL archive idiom. It is valid, it parses, it runs —
     /// and the editor drew error squiggles under both `RETURNING` and `gone`,
     /// telling the user a correct query was broken. Found when the user opened
@@ -9583,6 +9864,77 @@ mod tests {
         );
     }
 
+    /// **The *keyword* checker's exemption set is this engine's, not MySQL's.**
+    ///
+    /// `static_words` chained `function_names()` — `FUNCTIONS`, MySQL's catalog
+    /// — on every engine, so the words a PostgreSQL tab is exempted for were
+    /// MySQL's list and PostgreSQL's own were not in it. Every input below is
+    /// correct SQL, executed on PG 16.15, and each was squiggled "looks like a
+    /// misspelled keyword": the cast type names are one edit from `INT`/`INTO`
+    /// and `LIKE`, and `VALUE` is one from `VALUES`. All four type names *are*
+    /// in `PG_FUNCTIONS` (PostgreSQL has a function per type's input
+    /// conversion), so a per-dialect set clears them without a list of
+    /// exceptions.
+    ///
+    /// The MySQL half is asserted beside it, because the fix must not simply
+    /// widen the set for everyone: `curdate` is MySQL's and must stay exempt
+    /// there, and nothing about the engine that has it changes.
+    #[test]
+    fn the_keyword_checker_exempts_this_engines_own_words() {
+        let cat = Catalog::build(&[], None);
+        let flagged = |sql: &str, dialect: SqlDialect| -> Vec<String> {
+            diagnostics(sql, &cat, dialect)
+                .into_iter()
+                .filter(|d| d.message.contains("misspelled keyword"))
+                .map(|d| sql[d.range.0..d.range.1].to_string())
+                .collect()
+        };
+        for sql in [
+            "SELECT x::int4 FROM t",
+            "SELECT x::int8 FROM t",
+            "SELECT x::int2 FROM t",
+            "SELECT json_object('a' VALUE 1)",
+        ] {
+            assert!(
+                flagged(sql, SqlDialect::Postgres).is_empty(),
+                "correct PostgreSQL squiggled as a misspelled keyword: {sql} -> {:?}",
+                flagged(sql, SqlDialect::Postgres)
+            );
+        }
+        // MySQL keeps its own, and SQLite keeps SQLite's.
+        assert!(flagged("SELECT curdate() FROM t", SqlDialect::MySql).is_empty());
+        assert!(flagged("SELECT strftime(a, b) FROM t", SqlDialect::Sqlite).is_empty());
+        // **The three words no list held**, on every engine — the leftovers
+        // after the catalog half went per-dialect, and the reason
+        // `NON_RESERVED_KEYWORDS` exists. Each is one edit from a curated
+        // completion keyword, which is what was flagging it.
+        for dialect in [SqlDialect::MySql, SqlDialect::Postgres, SqlDialect::Sqlite] {
+            for word in NON_RESERVED_KEYWORDS {
+                let sql = format!("SELECT * FROM t WHERE {word} = 1");
+                assert!(
+                    flagged(&sql, dialect).is_empty(),
+                    "{dialect:?} squiggles the legal keyword {word}"
+                );
+            }
+            // …and a word the engine merely *reserves* is not a misspelling of
+            // one either, which is the wider vocabulary the exemption set now
+            // folds in.
+            assert!(
+                flagged("SELECT * FROM t WHERE grant = 1", dialect).is_empty(),
+                "{dialect:?} squiggles a reserved word"
+            );
+        }
+        // And the checker still works: a real keyword typo is still caught, on
+        // every engine, so the per-dialect set has not simply turned it off.
+        for dialect in [SqlDialect::MySql, SqlDialect::Postgres, SqlDialect::Sqlite] {
+            assert_eq!(
+                flagged("SELECT * FROM t WHERE selct = 1", dialect),
+                vec!["selct"],
+                "{dialect:?} stopped catching a keyword typo"
+            );
+        }
+    }
+
     #[test]
     fn diag_keyword_typo_is_a_warning() {
         let sql = "SELCT * FROM employees";
@@ -9647,7 +9999,7 @@ mod tests {
         // A builtin that used to be missing from the suggestion set is now present
         // and trusted by the typo checker.
         assert!(function_names().any(|f| f == "POWER"));
-        assert!(is_known_function(FUNCTIONS, "power"));
+        assert!(catalog_knows(SqlDialect::MySql, "power"));
         // A comprehensive catalog.
         assert!(FUNCTIONS.len() > 150, "only {} functions", FUNCTIONS.len());
         // Each entry is well-formed: unique upper-case name, signature leads with the
@@ -10488,13 +10840,13 @@ mod tests {
         // how that was settled — see `schemaic-db`'s `sqlite_catalog` tests.
         for name in ["curdate", "ucase", "lcase", "now", "sha2"] {
             assert!(
-                !is_known_function(SQLITE_FUNCTIONS, name),
+                !catalog_knows(SqlDialect::Sqlite, name),
                 "{name} is MySQL's, and SQLite's catalog claims it"
             );
         }
         for name in ["ifnull", "strftime", "randomblob", "json_extract", "typeof"] {
             assert!(
-                is_known_function(SQLITE_FUNCTIONS, name),
+                catalog_knows(SqlDialect::Sqlite, name),
                 "{name} is SQLite's own and its catalog is missing it"
             );
         }
@@ -10523,6 +10875,160 @@ mod tests {
         }
     }
 
+    /// **The bucketed index answers exactly what a full walk of the catalog
+    /// answers**, on every entry of all three catalogs and on a corpus of
+    /// near-misses around them.
+    ///
+    /// This is the test the `CatalogIndex` rewrite needed and the one its own
+    /// shape makes possible: the property is *"same answer, fewer entries
+    /// examined"*, so the reference below is the walk that was replaced,
+    /// transcribed, and the assertion is agreement. Nothing about wall-clock
+    /// time is asserted — a timing threshold is the kind of test that fails on
+    /// a loaded machine and passes over a regression.
+    ///
+    /// It fails on the mutation that matters. Narrow
+    /// [`CatalogIndex::within`]'s window by one at either end — `lo + 1`, or
+    /// `hi - 1` — and this goes red naming the word and the dialect, because
+    /// every single-insertion typo of a catalog name lives in exactly the
+    /// bucket the off-by-one drops. A linear filter cannot be got wrong that
+    /// way, which is the price of the speed and the reason this is here.
+    #[test]
+    fn the_bucketed_catalog_agrees_with_a_full_walk_of_it() {
+        /// How many names per length class the corpus is built from. Three
+        /// rather than one so a class is represented by more than whichever
+        /// entry the catalog happens to list first.
+        const SAMPLE_PER_LEN: usize = 3;
+
+        /// The walk `is_probable_function_typo` used to be: **every** entry,
+        /// with the same length filter and the same two comparisons.
+        ///
+        /// The per-comparison `to_ascii_uppercase()` is hoisted to the caller,
+        /// which is the one liberty taken with the transcription and it is
+        /// deliberate: the property under test is *which entries are
+        /// considered and how each is compared*, and the allocation is neither.
+        /// Leaving it in put this test at 36 seconds on PostgreSQL's catalog,
+        /// which is a suite nobody runs.
+        fn reference(upper: &[String], word: &str) -> bool {
+            if word.len() < 4 {
+                return false;
+            }
+            let up = word.to_ascii_uppercase();
+            let ub = up.as_bytes();
+            if upper.iter().any(|name| {
+                let n = name.len();
+                ub.len() > n
+                    && ub[..n].eq_ignore_ascii_case(name.as_bytes())
+                    && matches!(ub[n], b'_' | b'0'..=b'9')
+            }) {
+                return false;
+            }
+            let thresh = if word.len() >= 7 { 2 } else { 1 };
+            upper.iter().any(|name| {
+                if (name.len() as isize - up.len() as isize).unsigned_abs() > thresh {
+                    return false;
+                }
+                crate::sql::edit_distance(&up, name) <= thresh
+                    || is_adjacent_transposition(ub, name.as_bytes())
+            })
+        }
+
+        for dialect in [SqlDialect::MySql, SqlDialect::Sqlite, SqlDialect::Postgres] {
+            let builtins = builtin_catalog(dialect).expect("a catalog");
+            let index = catalog_index(dialect).expect("an index");
+            let upper: Vec<String> = builtins
+                .iter()
+                .map(|f| f.name.to_ascii_uppercase())
+                .collect();
+            // **Sampled per length bucket, not per entry, and that is what
+            // makes the sample principled rather than a shortcut.** The
+            // bucketing is indexed by name length, so a length class is
+            // precisely the unit a window error can lose — a corpus with a
+            // word from every occupied class exercises every bucket and every
+            // boundary between them, where walking all 2,706 PostgreSQL
+            // entries costs 34 seconds in a debug build to re-test the same
+            // classes over and over.
+            let mut per_len: std::collections::BTreeMap<usize, Vec<&str>> = Default::default();
+            for f in builtins {
+                let e = per_len.entry(f.name.len()).or_default();
+                if e.len() < SAMPLE_PER_LEN {
+                    e.push(f.name);
+                }
+            }
+            let occupied = index.by_len.iter().filter(|b| !b.is_empty()).count();
+            assert_eq!(
+                per_len.len(),
+                occupied,
+                "{dialect:?}: the sample misses a length the index has a bucket for"
+            );
+            let mut checked = 0usize;
+            for n in per_len.values().flatten() {
+                // The name itself, and the shapes a typo of it actually takes:
+                // a dropped byte, a doubled one, an adjacent transposition, a
+                // trailing letter (a real near-miss) and a trailing separator
+                // (a derived name, which must *not* be flagged).
+                let mut words = vec![
+                    n.to_string(),
+                    n.to_ascii_uppercase(),
+                    format!("{n}s"),
+                    format!("{n}_x"),
+                    format!("{n}2"),
+                ];
+                if n.len() > 4 {
+                    words.push(n[..n.len() - 1].to_string());
+                    words.push(format!("{}{}", &n[..1], &n[..n.len() - 1]));
+                    let mut swapped = n.as_bytes().to_vec();
+                    swapped.swap(1, 2);
+                    words.push(String::from_utf8(swapped).expect("ascii names"));
+                }
+                for w in words {
+                    assert_eq!(
+                        is_probable_function_typo(index, &w),
+                        reference(&upper, &w),
+                        "{dialect:?} disagrees about {w:?} (around {n})"
+                    );
+                    checked += 1;
+                }
+            }
+            // A floor on the corpus, because a sample is only worth what it
+            // covers: a bucket map that quietly came back with one entry would
+            // otherwise leave this test agreeing with itself over nothing.
+            assert!(
+                checked > occupied * 4,
+                "{dialect:?}: only {checked} words over {occupied} length classes"
+            );
+            // …and the membership set is the whole catalog, neither short nor
+            // holding something the slice does not.
+            assert_eq!(index.lower.len(), builtins.len());
+            for f in builtins {
+                assert!(
+                    is_known_function(index, &f.name.to_ascii_lowercase()),
+                    "{dialect:?} lost {}",
+                    f.name
+                );
+            }
+        }
+    }
+
+    /// **A multi-byte word does not panic the derived-name test.** It asks
+    /// `up[..n]` where the linear walk asked `ub[..n]` on bytes, and slicing a
+    /// `String` off a char boundary is a panic rather than a wrong answer.
+    ///
+    /// It is safe for a reason rather than by luck, and the reason is worth a
+    /// test: `n` is the index of an ASCII `_` or digit, and the byte before an
+    /// ASCII byte is always a char boundary. `is_word_byte` treats every byte
+    /// `>= 0x80` as a word byte, so these words genuinely reach the checker.
+    #[test]
+    fn a_multi_byte_function_name_is_answered_not_panicked_on() {
+        for dialect in [SqlDialect::MySql, SqlDialect::Sqlite, SqlDialect::Postgres] {
+            let index = catalog_index(dialect).expect("an index");
+            for word in ["calculé_x", "größe2", "日本語_1", "naïve", "ÅÄÖ_9"] {
+                let _ = is_probable_function_typo(index, word);
+            }
+        }
+        let d = diag_d("SELECT calculé_x(id) FROM employees", SqlDialect::Postgres);
+        assert!(!d.iter().any(|x| x.message.contains("misspelled function")));
+    }
+
     /// The catalogs answer per dialect, and no engine borrows another's.
     ///
     /// Stated as its own test because the whole design rests on it: an engine
@@ -10536,36 +11042,37 @@ mod tests {
         let mysql = builtin_catalog(SqlDialect::MySql).expect("MySQL's catalog");
         assert_eq!(mysql.len(), FUNCTIONS.len());
         assert!(
-            is_known_function(mysql, "curdate"),
+            catalog_knows(SqlDialect::MySql, "curdate"),
             "MySQL's own is missing"
         );
         assert!(
-            !is_known_function(mysql, "strftime"),
+            !catalog_knows(SqlDialect::MySql, "strftime"),
             "MySQL got SQLite's catalog"
         );
 
         let sqlite = builtin_catalog(SqlDialect::Sqlite).expect("SQLite's catalog");
         assert_eq!(sqlite.len(), SQLITE_FUNCTIONS.len());
         assert!(
-            is_known_function(sqlite, "strftime"),
+            catalog_knows(SqlDialect::Sqlite, "strftime"),
             "SQLite's own is missing"
         );
         assert!(
-            !is_known_function(sqlite, "curdate"),
+            !catalog_knows(SqlDialect::Sqlite, "curdate"),
             "SQLite got MySQL's catalog"
         );
         let postgres = builtin_catalog(SqlDialect::Postgres).expect("PostgreSQL's catalog");
         assert_eq!(postgres.len(), crate::pg_builtins::PG_FUNCTIONS.len());
         assert!(
-            is_known_function(postgres, "btrim"),
+            catalog_knows(SqlDialect::Postgres, "btrim"),
             "PostgreSQL's own is missing"
         );
         assert!(
-            !is_known_function(postgres, "curdate"),
+            !catalog_knows(SqlDialect::Postgres, "curdate"),
             "PostgreSQL got MySQL's catalog"
         );
         assert!(
-            !is_known_function(mysql, "btrim") && !is_known_function(sqlite, "btrim"),
+            !catalog_knows(SqlDialect::MySql, "btrim")
+                && !catalog_knows(SqlDialect::Sqlite, "btrim"),
             "PostgreSQL's catalog leaked into another engine's"
         );
     }
@@ -11075,6 +11582,45 @@ mod tests {
 
     fn sig(sql: &str) -> Option<SignatureHelp> {
         signature_help(sql, 0, sql.len(), sql.len(), SqlDialect::MySql)
+    }
+
+    fn sig_on(sql: &str, dialect: SqlDialect) -> Option<SignatureHelp> {
+        signature_help(sql, 0, sql.len(), sql.len(), dialect)
+    }
+
+    /// **The third surface asks the same capability as the other two.**
+    ///
+    /// `builtin_catalog`'s own doc says "two callers … both surfaces route here
+    /// rather than each keeping a map" — and `signature_help` is a third,
+    /// naming `FUNCTIONS` outright on every engine. So a PostgreSQL tab got no
+    /// help at all for `btrim(` and `jsonb_set(`, and got MySQL's
+    /// `DATE_FORMAT(date, format)` for a function PostgreSQL does not have.
+    /// The two halves that matter are asserted together, because "shows
+    /// nothing" and "shows the wrong engine's" are one defect with two faces.
+    #[test]
+    fn signature_help_answers_from_the_engines_own_catalog() {
+        // PostgreSQL's own, which it had none of.
+        for (sql, name) in [
+            ("SELECT btrim(name, ", "btrim"),
+            ("SELECT jsonb_set(doc, ", "jsonb_set"),
+        ] {
+            let h = sig_on(sql, SqlDialect::Postgres)
+                .unwrap_or_else(|| panic!("no signature help for {sql:?} on Postgres"));
+            assert_eq!(h.name, name);
+        }
+        // MySQL's own, which it must keep.
+        assert_eq!(sig("SELECT DATE_FORMAT(d, ").unwrap().name, "DATE_FORMAT");
+        // And MySQL's must not reach the other engines: `DATE_FORMAT` is not a
+        // PostgreSQL function, and `CURDATE` is not a SQLite one.
+        assert!(sig_on("SELECT DATE_FORMAT(d, ", SqlDialect::Postgres).is_none());
+        assert!(sig_on("SELECT CURDATE(", SqlDialect::Sqlite).is_none());
+        // SQLite's own, for the engine that had no help either.
+        assert_eq!(
+            sig_on("SELECT strftime(fmt, ", SqlDialect::Sqlite)
+                .unwrap()
+                .name,
+            "strftime"
+        );
     }
 
     #[test]

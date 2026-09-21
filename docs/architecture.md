@@ -434,7 +434,9 @@ existing prose was left alone.
     **The typo checker runs only where the app holds the engine's own catalog** — `builtin_catalog`
     answers that with one exhaustive `match` **returning the catalog itself**: `FUNCTIONS` for
     MySQL, `SQLITE_FUNCTIONS` for SQLite, `PG_FUNCTIONS` for PostgreSQL, and `is_known_function` and
-    `is_probable_function_typo` take it as a parameter. Reaching for the module-level `FUNCTIONS`
+    `is_probable_function_typo` take it as a parameter — as the `CatalogIndex` built from it rather
+    than as the slice itself, which is the same catalog reached one hop further on. Reaching for the
+    module-level `FUNCTIONS`
     inside those two was the defect under the original bug: the checker spent its `dialect` on
     `skip_noncode` and `is_sql_keyword` and never on the catalog questions, so on PostgreSQL it
     failed to recognise the engine's real functions *and* measured its edit distances against another
@@ -443,14 +445,21 @@ existing prose was left alone.
     correct SQL broken. A `builtin_functions_are_authoritative` bool stood beside the catalog and has
     been **deleted**: returning the catalog *is* answering whether this app's builtins are
     authoritative here, and asking one question at two sites is one more place to forget an engine.
-    **`rank::rank` is its second caller, and `builtin_catalog` is `pub(crate)` for it** — the
+    **`rank::rank` is a second caller, and the surfaces that ask are named rather than counted** — the
     completion popup went on walking `FUNCTIONS` on every engine for as long as the checker had been
     fixed, so a PostgreSQL tab was offered `IFNULL` and `GROUP_CONCAT`, names that engine does not
     have, and never `btrim`, which it does; SQLite was handed MySQL's list just as silently. That is
     the original bug in the surface that *inserts* the word rather than the one that underlines it,
-    and suggesting a name the engine lacks is the same wrong as squiggling one it has, so both
-    surfaces ask the one engine→catalog map rather than each keeping its own, and `None` means
-    *offer nothing* on the same reasoning that makes it mean *say nothing*.
+    and suggesting a name the engine lacks is the same wrong as squiggling one it has, so every such
+    surface asks the one engine→catalog map rather than each keeping its own, and `None` means
+    *offer nothing* on the same reasoning that makes it mean *say nothing*. **Counting them is what
+    went wrong**: this passage said there were two while `signature_help` still named `FUNCTIONS`
+    outright, so a PostgreSQL tab got no help at all for `btrim(` and got MySQL's
+    `DATE_FORMAT(date, format)` for a function that engine has not got —
+    `signature_help_answers_from_the_engines_own_catalog` asserts both halves, since "shows nothing"
+    and "shows the wrong engine's" are one defect with two faces. `rank` reaches the map through
+    `offered_builtins` now rather than calling `builtin_catalog` itself, which leaves the map with
+    no caller outside this module and is the same "one place to forget an engine" one hop on.
     **`is_offered_builtin` is where those two surfaces part company again**, because trusting a name
     and offering it are not the same question: `builtin_catalog` is what the checker **trusts**,
     whole, and `is_offered_builtin(dialect, name)` is what `rank`'s `ClauseCtx::Column` arm filters
@@ -459,6 +468,10 @@ existing prose was left alone.
     so both arms are `true`; PostgreSQL's was read out of `pg_catalog`, so it carries the engine's
     own plumbing — `int4in`, `btint4cmp`, `texteq` — which the checker must keep knowing and the
     popup must not spend its forty rows on, and that arm asks `pg_builtins::is_suggested`.
+    **It is asked once per dialect rather than once per candidate**: the answer is
+    `CatalogIndex::offered`, and `offered_builtins(dialect)` is the slice `rank` iterates.
+    `is_suggested` is a binary search, and running it over all 2,706 entries to arrive at the same
+    863 names every time was 2,706 binary searches per keystroke on a path with no debounce.
     **It is an exhaustive `match` on a dialect, and that is not the engine comparison the working
     rules warn against**: what it asks is a property of how *this app's* data file was made, not a
     server capability, so there is no yes/no behind it to compute from and a fourth engine's answer
@@ -536,14 +549,79 @@ existing prose was left alone.
     `G` from `SUBSTRING`, so those are still flagged. It is the same shape as the transposition case
     the function already carries — a named exception rather than a wider distance, because widening
     the distance is what produced this class in the first place.
-    **Both of its loops are length-first now, and that is a cost change PostgreSQL's catalog forced.**
-    It used to map the catalog to an upper-cased `String` per entry, twice over, per candidate word,
-    per statement, on the editor's 120 ms debounce — affordable against MySQL's few hundred entries
-    and not against `PG_FUNCTIONS`' 2,706. The derived-name loop compares the bytes case-insensitively
-    and allocates nothing; the distance loop tests `f.name.len()` against the word's and upper-cases
-    only the survivors. Neither loses a match: the derived-name test already required the word to be
-    the longer string, and `is_adjacent_transposition` returns `false` outright on a length mismatch,
-    so a name further than `thresh` from the word in length could satisfy neither arm.
+    **The catalog is read through a `CatalogIndex` now — one per dialect, built on first use — and
+    turning the PostgreSQL checker on is what forced it.** Both of the checker's loops used to walk
+    the slice, mapping it to an upper-cased `String` per entry, twice over, per candidate word, per
+    statement, on the editor's 120 ms debounce — affordable against MySQL's 309 entries and not
+    against `PG_FUNCTIONS`' 2,706 — while the completion path walked the same slice undebounced. The
+    index is a *rearrangement* of that slice and nothing else: nothing added, nothing filtered, so
+    every answer is the answer the walk gave and only the cost differs. `lower` is every name
+    lower-cased, which makes `is_known_function` an allocation-free `O(1)` probe with the word the
+    caller has already lower-cased for its own `known_idents` lookup — the walk it replaces ran
+    `eq_ignore_ascii_case` against all 2,706 entries to answer "no", which is the answer for every
+    user-defined function in a buffer. `upper` is the same names upper-cased, probed as a **prefix**
+    for the derived-name test and so asked from the *word's* side: for each `_`-or-digit byte in the
+    word, is everything before it a name? That is one set lookup per separator byte instead of a
+    walk of the catalog per word. `by_len` buckets the upper-cased names by byte length, each paired
+    with a character-presence mask, and `offered` is `is_offered_builtin`'s answer precomputed.
+    **Three `OnceLock`s, one per `SqlDialect` arm, rather than one map keyed by the dialect** — the
+    set of engines is closed at compile time, so a fourth engine is a compiler error in the cache
+    too rather than a silent miss at runtime, which is `builtin_catalog`'s own argument one layer on.
+    **`CatalogIndex::within(len, thresh, mask)` is the candidate set, and what makes skipping the
+    rest sound is that both of its conditions are *necessary*.** Neither is sufficient and neither is
+    asked to be: the same `edit_distance`/`is_adjacent_transposition` pair still decides, on a
+    smaller set. Length is the first — `edit_distance(a, b) >= |a.len() - b.len()|`, and
+    `is_adjacent_transposition` is `false` outright on a length mismatch — and it is the filter the
+    linear walk already had, indexed instead of scanned. Characters are the second:
+    `(mask_a ^ mask_b).count_ones() <= 2 * thresh`, because each edit moves the presence set by at
+    most two bits (a substitution can drop one character and add another, an insertion or deletion
+    at most one), so `thresh` edits cannot separate two masks by more than `2 * thresh` bits; a
+    transposition reorders and changes no bit at all, which is why one test covers both arms.
+    **The second condition is the one that did the work, and the obvious fix was the first alone.**
+    Bucketing by length reads like the whole answer — a 9-byte word visits buckets 7 through 11
+    rather than 2,706 entries — but the data does not cooperate: MySQL's names spread over 2–21
+    bytes while PostgreSQL's 2,706 cluster hard in 5–12, so those five buckets are still most of the
+    catalog. Length bucketing alone was measured at **1.6×**; the mask is what turned it into two
+    orders of magnitude.
+    **`letter_mask` gives everything that is not an ASCII letter, digit or `_` one *shared* bit, and
+    the sharing is load-bearing rather than lazy.** `sql::is_word_byte` treats every byte `>= 0x80`
+    as a word byte, so a word with multi-byte characters in it really does reach the checker, and two
+    different such characters landing on one bit cannot make the popcount *larger* than the edits
+    between them allow — which is the only direction that could lose a match. Spending a bit per
+    distinct byte instead would read as more precise and would break the necessary condition.
+    **Measured, release build, over a 300-statement PostGIS-shaped buffer** — statements calling
+    extension functions the catalog does not hold, which is the population that reaches the scan.
+    `function_typo_checks` went from 424.6 ms to 4.3–4.5 ms per tick on PostgreSQL and from 28.6 ms
+    to 1.2 ms on MySQL; the whole of `diagnostics` from 393.0 ms to 21.5–22.6 ms on PostgreSQL and
+    from 48.0 ms to 18.1–22.9 ms on MySQL. The debounce is 120 ms, so PostgreSQL went from three and
+    a half times over its own tick budget to inside it with room to spare. **The two "before"
+    figures do not decompose, and that is the finding rather than an error in them**: 424.6 ms of
+    scan inside a 393.0 ms `diagnostics` is one number measured twice to within the run-to-run
+    spread, because the catalog walk *was* substantially all of the cost — parsing 300 statements
+    included. Afterwards the scan is 4.3 ms of a 21.5 ms whole, which decomposes as it should.
+    **`the_bucketed_catalog_agrees_with_a_full_walk_of_it` is what holds all of that, and the
+    property dictates its shape**: "same answer, fewer entries examined" is only checkable against
+    the walk that was replaced, so the test carries a transcription of that walk and asserts
+    agreement across all three catalogs, asserting nothing about wall-clock time. The corpus is
+    sampled **three names per length class, not per entry** — a length class is precisely the unit a
+    window error can lose — and the test asserts that its sample covers every occupied bucket
+    (`per_len.len() == occupied`) plus a floor on the corpus size, so a bucket map that quietly came
+    back with one entry cannot leave it agreeing with itself over nothing. One liberty is taken with
+    the transcription and it is named there: the per-comparison `to_ascii_uppercase()` is hoisted to
+    the caller, because what is under test is which entries are considered and how each is compared
+    rather than the allocation, and leaving it in put the test at 36 seconds. It was watched
+    failing — `within`'s `lo` changed to `lo + 1` gives `MySql disagrees about "SUMs" (around SUM)`,
+    every single-insertion typo of a catalog name living in exactly the bucket an off-by-one drops —
+    and it runs in 0.68 s. **A linear filter cannot be got wrong that way**, which is the price of
+    the speed and the reason the test is there.
+    `a_multi_byte_function_name_is_answered_not_panicked_on` is the other half: the derived-name test
+    slices `up[..n]` on a `String` where the walk sliced bytes, and a slice off a char boundary is a
+    panic rather than a wrong answer. It is safe for a reason and not by luck — `n` is the index of
+    an ASCII `_` or digit, and the byte before an ASCII byte is always a char boundary — which is
+    exactly why the reason is worth pinning. And three existing tests moved from
+    `is_known_function(<slice>, name)` to a `catalog_knows(dialect, name)` helper that goes through
+    the index the checker itself reads, so a dialect wired to the wrong catalog *or* an index built
+    from the wrong slice fails them the same way.
     **`diagnostics` runs over the whole document on the UI thread 120 ms after a keystroke, with no
     size cap, and two things in it were redoing work the statement could not change.**
     `static_words` is every keyword and builtin name this crate knows, lowercased, behind a
@@ -808,6 +886,11 @@ existing prose was left alone.
     near-miss net is drawn around ten times as many names as MySQL's — and
     `intel::tests::an_ordinary_user_function_survives_the_pg_catalog` is what keeps it honest,
     holding ten ordinary application names (`calc_total`, `audit_log`, `trim_name`) to no squiggle.
+    **The other half of that cost is time, and it has a measured answer rather than an argument
+    now.** Ten times the names is ten times the walk on two per-keystroke paths, and putting 2,706
+    entries where 309 had been was 424.6 ms of `function_typo_checks` per 120 ms debounce tick on a
+    300-statement PostGIS-shaped buffer. It is the catalog's size that is paid, not its contents, so
+    the answer is a rearrangement of it and not a cut: `intel::CatalogIndex`, above.
     **The completion popup used to pay that cost too, and `PG_SUGGESTED` is what stopped it.** Once
     `rank` drew its function tier from `builtin_catalog`, a PostgreSQL tab was offered all 2,706:
     prefix filtering and `rank::MAX_ROWS`' cap of 40 meant the list was never dumped whole, but a
@@ -837,7 +920,10 @@ existing prose was left alone.
     **`is_suggested` is a binary search, so the sort is load-bearing in the quiet direction**: an
     unsorted list answers `false` for names that *are* in it, which shows up as a function missing
     from the popup and nowhere else, and `the_subset_is_sorted_and_has_no_duplicates` asserts strict
-    ascent rather than trusting the generator. In front of the search sits a `LONGEST_SUGGESTED`
+    ascent rather than trusting the generator. The popup does not reach the search per candidate any
+    more — `intel::offered_builtins` holds the 863 names it answers `true` for, built once per
+    dialect — so what the sort protects is that one build rather than every keystroke.
+    In front of the search sits a `LONGEST_SUGGESTED`
     (52) length fast-reject, a hand-written number that goes wrong silently in the same direction,
     so `the_length_shortcut_rejects_nothing_real` asserts it against the real longest name and then
     offers every name in the list back; case-folding is at the caller's end
@@ -7042,9 +7128,10 @@ existing prose was left alone.
       `GROUP_CONCAT` — names that engine does not have — and never `btrim`, which it does, while a
       SQLite tab got MySQL's list just as silently. It is the typo checker's original PostgreSQL bug
       in the surface that *inserts* the word rather than the one that underlines it, so the arm asks
-      `intel::builtin_catalog(input.dialect)` — the one engine→catalog map, `pub(crate)` for this
-      caller — and reads its `None` as an empty slice, leaving a fourth engine offered nothing rather
-      than inheriting whichever list is nearest. `each_dialect_is_offered_its_own_builtins` asserts
+      `intel::offered_builtins(input.dialect)` — the one engine→catalog map, read through
+      `intel::CatalogIndex` and `pub(crate)` for this caller — and reads its `None` as an empty
+      slice, leaving a fourth engine offered nothing rather than inheriting whichever list is
+      nearest. `each_dialect_is_offered_its_own_builtins` asserts
       that through `rank` and not over the catalogs, because the catalogs were already right and the
       composition was what was broken; `ranked_on` is the existing `ranked` helper with the engine
       named, and `ranked` itself still passes `SqlDialect::MySql`, so every older test means what it
@@ -7052,10 +7139,34 @@ existing prose was left alone.
       and the arm now filters through `intel::is_offered_builtin`** — `true` on MySQL and SQLite,
       whose catalogs are already the user-facing list, and `pg_builtins::PG_SUGGESTED` membership on
       PostgreSQL, so the tab is offered 863 names rather than 2,706 while the checker goes on
-      trusting all of them. `postgres_offers_the_subset_and_the_checker_still_sees_the_rest` asserts
+      trusting all of them. **That filter is precomputed now and the arm reads its answer**: it is a
+      binary search on PostgreSQL, asked per candidate, so it ran 2,706 times per keystroke to
+      arrive at the same 863 names every time. `offered_builtins` holds them, beside the typo
+      checker's own rearrangement of the same data.
+      `postgres_offers_the_subset_and_the_checker_still_sees_the_rest` asserts
       **both** halves of that in one test, because either alone is satisfiable by a bug: a plumbing
       name is required to be *in* `PG_FUNCTIONS` and *absent* from the ranked list, and `coalesce`
       and `greatest` — grammar-only forms no `pg_proc` query can return — are required to survive.
+      **`add` asks `worth_offering` before it builds anything, which is `add_col`'s shape adopted
+      for `add_col`'s reason.** A PostgreSQL tab offers 863 builtins where MySQL offers 309, and
+      every one of them was paying a `to_ascii_lowercase`, a `HashSet<String>` insert and an eagerly
+      allocated `String` for its signature before the ranking below could drop it — on a path that
+      is deliberately undebounced (`exec_after(Duration::ZERO)`, one tick per keystroke). `detail`
+      is a `&str` now, so that allocation happens after the guards rather than before them. **The
+      pre-filter sits above the dedup**, on the argument `add_col` sets out: `worth_offering`
+      depends on nothing but the candidate's own text and the prefix, so a candidate it refuses
+      cannot be blocking one it would admit — a later duplicate has the same text and fails the same
+      test. `the_pre_filter_admits_exactly_what_the_ranking_keeps` is what holds that, and it covers
+      this call site now as well as `add_col`'s.
+      Measured per keystroke in a release build, `ClauseCtx::Column` with one table in scope: a
+      PostgreSQL prefix of `"cu"` went from 511.2 µs to 40–45 µs and `"sub"` from 493.7 µs to
+      20–23 µs; MySQL's from 86.6 µs to 10–12 µs and from 72.6 µs to 6 µs. **An empty prefix is the
+      case this does not help, and the figures are reported rather than flattered**: nothing is
+      pre-filtered when every candidate matches, so that path gains only the offered subset and the
+      late allocation — PostgreSQL 590.1 µs to 318–407 µs, while MySQL's 146.7 µs against 171–226 µs
+      moved within build-to-build variation and is not attributable to this change, which was
+      checked by short-circuiting the pre-filter on an empty prefix and finding nothing changed.
+      What that path costs is scoring and sorting the whole pool, which this change does not touch.
       `SchemaIndex`/`ColMeta`/`Suggestion`/`SuggestKind`/`KeyKind` are the
       vocabulary; `worth_offering` and `database_suggestion_visible` are the leaf rules `rank`
       itself composes. **`statement_identifiers` and `snippet_abbrev_rows` are not** — they are the
@@ -18337,9 +18448,13 @@ Re-introducing the anti-patterns these guard against is a regression:
   (`Option<&'static [SqlFunction]>`) rather than sitting beside a bool, and the
   `builtin_functions_are_authoritative` that did sit beside it was deleted — "is this app's list
   authoritative here" and "which list" are one question, and answering it twice is two arms to keep
-  in step instead of one. The typo checker and `rank::rank` both ask it now, which is that argument
-  at the other end: two surfaces, one map, so a fourth engine is forgotten in one place rather than
-  two — and it was two, for as long as the popup named `FUNCTIONS` itself.
+  in step instead of one. The typo checker, `rank::rank` (through `intel::offered_builtins`) and
+  `signature_help` all ask it now, which is that argument at the other end: three surfaces, one map,
+  so a fourth engine is forgotten in one place rather than three — and it was three, for as long as
+  the popup and then the signature bar named `FUNCTIONS` themselves. **The cache in front of it is
+  the same shape for the same reason**: `intel::catalog_index` is three `OnceLock`s, one per
+  `SqlDialect` arm, rather than one map keyed by the dialect, so a fourth engine is a compiler error
+  there too rather than a cache nothing ever fills.
   **The rule has a gate now, and it is a ratchet rather than a ban.** `ui::engine_comparison_gate`
   scans both view crates' production source (`source_gate::crate_sources`, so `schemaic-app` is in
   it too) for `SqlDialect::` and holds each file to a **per-file budget with a written reason**,
