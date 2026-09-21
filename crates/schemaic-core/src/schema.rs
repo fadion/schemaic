@@ -1858,11 +1858,22 @@ impl TriggerInfo {
     /// group is its leader whatever it says.
     ///
     /// `exists` is the caller's, because only the caller knows what "yet"
-    /// means. [`TriggerInfo::create_set_sql`] is the one that asks it today:
-    /// whether the name comes earlier in the same set. A comparison between two
-    /// databases would ask whether the other one already holds it — the reason
-    /// the predicate is a parameter and not a field — but nothing does yet, and
-    /// this said `crate::compare::SchemaComparison` did.
+    /// means, and the two callers mean different things by it.
+    /// [`TriggerInfo::create_set_sql`] asks whether the name comes earlier in
+    /// the same set — the dump's question, where the set *is* the world.
+    /// `ChangeSet::trigger_statements` asks a two-term version: created earlier
+    /// in this plan, **or** surviving it, because a plan runs against a server
+    /// that already holds triggers it is not touching, and without the second
+    /// term an edit inside an existing group loses its position.
+    ///
+    /// **The apply path was the caller this had and should not have lacked.**
+    /// For a release the only caller was the dump, so the modal's own plan
+    /// emitted a group leader's `PRECEDES <successor>` naming a trigger it had
+    /// not created — refused on both MySQL-family servers after the drops had
+    /// committed, which destroys both triggers. A comparison between two
+    /// databases would ask a third question (does the *other* one hold it),
+    /// which is why the predicate is a parameter and not a field; nothing asks
+    /// that yet, and this doc once said `crate::compare::SchemaComparison` did.
     ///
     /// Borrows when there is nothing to take off, which is every trigger on the
     /// other two engines — neither has the clause.

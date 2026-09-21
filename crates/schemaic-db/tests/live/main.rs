@@ -189,6 +189,7 @@ live_suite!(
         a_renamed_trigger_still_fires,
         one_of_two_triggers_can_be_dropped_without_the_other,
         a_body_that_opens_like_an_ordering_clause_survives_the_round_trip,
+        an_ordered_pair_of_triggers_writes_back_without_naming_a_dropped_one,
     ],
     writeback: [
         a_spliced_row_is_the_row_a_fresh_select_would_show,

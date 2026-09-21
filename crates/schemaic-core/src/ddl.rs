@@ -4912,19 +4912,71 @@ impl ChangeSet {
         //
         // This is the order `diff_triggers` already documents for standalone
         // drops, and the one `GridWrite::plan` uses in `core::model`.
+        // **An ordering clause is resolved against the plan, not emitted
+        // blindly.** `FOLLOWS`/`PRECEDES` is a statement about the group as it
+        // stands when the statement runs, and both servers refuse one naming a
+        // trigger that is not there (`ERROR 3011` / `ERROR 4031`). The
+        // catalogue gives a group's **leader** `PRECEDES <successor>`, so
+        // recreating a whole group from nothing — a dump, a Copy DDL, or the
+        // write-back of the server's own reading — put that clause on the
+        // *first* create and it named a trigger this plan had not made yet.
+        // Measured live: MariaDB `ERROR 4031`, MySQL `ERROR 3011`, and with no
+        // transaction on MySQL DDL the drops above had already committed, so
+        // **both triggers were destroyed** and the modal has no control for
+        // `order` to repair them with.
+        //
+        // `TriggerInfo::with_resolvable_order` is the step that answers this and
+        // `dump.rs` was its only caller. What "exists" means here is *this
+        // plan's* answer, and it is two terms because the drops all run before
+        // the creates:
+        //
+        // - **created earlier in this plan** — the successor's own `FOLLOWS`
+        //   then rebuilds the chain, which is what makes stripping the leader's
+        //   clause sufficient rather than lossy;
+        // - **survives this plan** — a name this plan neither creates nor drops
+        //   is one the server holds throughout, so its clause resolves. That
+        //   term is what keeps an edit *inside* an existing group in its
+        //   position; without it the recreated trigger is appended last.
+        //
+        // A name this plan creates is deliberately not "surviving": it is gone
+        // until its own create runs. The residue is a draft whose `order` names
+        // a trigger that neither exists nor is touched — the server refuses
+        // that, as it did before, and no catalogue produces it.
+        let mut dropped: Vec<&str> = Vec::new();
+        let mut planned: Vec<&str> = Vec::new();
+        for c in &self.changes {
+            match c {
+                Change::CreateTrigger(draft) => planned.push(&draft.info.name),
+                Change::ReplaceTrigger { draft } => {
+                    dropped.push(draft.original.as_deref().unwrap_or(&draft.info.name));
+                    planned.push(&draft.info.name);
+                }
+                Change::DropTrigger { name } => dropped.push(name),
+                _ => {}
+            }
+        }
+        let same = |a: &str, b: &str| a.eq_ignore_ascii_case(b);
+        let survives =
+            |n: &str| !planned.iter().any(|p| same(p, n)) && !dropped.iter().any(|p| same(p, n));
+
         let mut drops = Vec::new();
         let mut creates = Vec::new();
-        let mut push_create = |t: &TriggerInfo| {
-            creates.extend(session_wrapped_create(t, d));
+        let mut made: Vec<String> = Vec::new();
+        let mut push_create = |t: &TriggerInfo, made: &mut Vec<String>| {
+            let resolved = t.with_resolvable_order(|named| {
+                survives(named) || made.iter().any(|m| same(m, named))
+            });
+            creates.extend(session_wrapped_create(&resolved, d));
+            made.push(t.name.clone());
         };
         for c in &self.changes {
             match c {
-                Change::CreateTrigger(draft) => push_create(&draft.info),
+                Change::CreateTrigger(draft) => push_create(&draft.info, &mut made),
                 Change::ReplaceTrigger { draft } => {
                     // The drop addresses the name the server knows; the create
                     // builds the draft's, which is how a rename comes for free.
                     drops.push(drop(draft.original.as_deref().unwrap_or(&draft.info.name)));
-                    push_create(&draft.info);
+                    push_create(&draft.info, &mut made);
                 }
                 Change::DropTrigger { name } => drops.push(drop(name)),
                 _ => {}
@@ -15649,6 +15701,81 @@ mod tests {
             d.triggers[0].info.action = TriggerAction::Body("SET NEW.x = 2".into());
             let sql = diff_triggers(&plain.triggers, &d, MySql).emit();
             assert!(!sql.iter().any(|s| s.contains("@@SESSION")), "{sql:?}");
+        }
+
+        /// **An ordered pair of triggers, which no fixture in this workspace
+        /// had** — and the reason `TriggerOrder` had never once been emitted by
+        /// a test. `S4-L6-01` is that gap; this is the fixture, and
+        /// `S4-L1-01` is what it found.
+        ///
+        /// MySQL and MariaDB give the **leader** of a `(table, timing, event)`
+        /// group `PRECEDES <successor>` and every other member
+        /// `FOLLOWS <predecessor>`. `trigger_statements` emitted every create's
+        /// `order` unconditionally, so recreating the whole group from nothing —
+        /// which is what a dump, a Copy DDL and any edit inside the group all
+        /// do — put `PRECEDES b` on the *first* statement, naming a trigger the
+        /// same plan had not created yet. Measured live: MariaDB 10.11.14
+        /// `ERROR 4031`, MySQL 8.4.11 `ERROR 3011`, and because MySQL DDL has no
+        /// transaction the drops above it had already committed — **both
+        /// triggers destroyed**, and unrepairable in-app, since the modal has no
+        /// control for `order` and every retry re-emits the clause.
+        ///
+        /// The resolution step existed (`TriggerInfo::with_resolvable_order`)
+        /// and had exactly one caller, in `dump.rs`. The apply path is the
+        /// second.
+        #[test]
+        fn a_recreated_group_does_not_name_a_trigger_it_has_not_created_yet() {
+            let mut a = my_trigger();
+            a.name = "t_a".into();
+            a.order = Some(crate::schema::TriggerOrder::Precedes("t_b".into()));
+            let mut b = my_trigger();
+            b.name = "t_b".into();
+            b.order = Some(crate::schema::TriggerOrder::Follows("t_a".into()));
+
+            // The whole group created from nothing — a dump, a Copy DDL, or the
+            // write-back of the server's own reading.
+            let table = table_with_triggers(vec![a.clone(), b.clone()]);
+            let sql = diff_triggers(&[], &TriggerSetDraft::from_table(&table), MySql).emit();
+            let creates: Vec<&String> = sql
+                .iter()
+                .filter(|s| s.contains("CREATE TRIGGER"))
+                .collect();
+            assert_eq!(creates.len(), 2, "{sql:?}");
+            assert!(
+                !creates[0].contains("PRECEDES"),
+                "the first CREATE names a trigger that does not exist yet: {:?}",
+                creates[0]
+            );
+            // …and the chain is still reconstructed, which is what makes
+            // stripping the leader's clause sufficient rather than lossy: the
+            // successor carries `FOLLOWS` and so lands after it.
+            assert!(
+                creates[1].contains("FOLLOWS") && creates[1].contains("t_a"),
+                "the group no longer rebuilds its own order: {:?}",
+                creates[1]
+            );
+
+            // **The other direction, which a conservative rule would break.**
+            // Editing one trigger inside a group that already exists must keep
+            // its clause: `t_a` is on the server and this plan does not drop it,
+            // so `FOLLOWS t_a` resolves — and without it `t_b` would be appended
+            // last in the group instead of back where it was.
+            let mut d = TriggerSetDraft::from_table(&table);
+            d.triggers[1].info.action = TriggerAction::Body("SET NEW.x = 2".into());
+            let sql = diff_triggers(&table.triggers, &d, MySql).emit();
+            let create = sql
+                .iter()
+                .find(|s| s.contains("CREATE TRIGGER"))
+                .expect("a create");
+            assert!(
+                create.contains("FOLLOWS") && create.contains("t_a"),
+                "editing one trigger in an existing group lost its position: {create:?}"
+            );
+            assert_eq!(
+                sql.iter().filter(|s| s.contains("CREATE TRIGGER")).count(),
+                1,
+                "only the edited trigger is recreated: {sql:?}"
+            );
         }
 
         /// Swapping two triggers' names must not destroy one of them.

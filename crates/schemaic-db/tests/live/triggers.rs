@@ -318,6 +318,101 @@ pub async fn a_renamed_trigger_still_fires(target: &'static Target) {
 
 /// The base table, and — on a server whose triggers call one — the function they
 /// call.
+/// **Two triggers in one `(table, timing, event)` group, which no fixture in
+/// this workspace had** — so `TriggerOrder` had never been emitted by any test,
+/// live or unit, and the fault below was invisible to a green suite.
+///
+/// The catalogue gives a group's **leader** `PRECEDES <successor>` and every
+/// other member `FOLLOWS <predecessor>`, and `ChangeSet::trigger_statements`
+/// emitted every create's clause unconditionally. So recreating the group —
+/// which is what a dump, a Copy DDL and any edit inside the group all do — put
+/// `PRECEDES b` on the *first* statement, naming a trigger the plan had not
+/// created yet. Both servers refuse that, and because MySQL-family DDL has no
+/// transaction the drops above it have already committed: **both triggers gone**,
+/// and unrepairable in-app since the modal has no control for `order`.
+///
+/// Measured before the fix, through this very test: MariaDB 10.11.14
+/// `ERROR 4031`, MySQL 8.4.11 `ERROR 3011`, on the first `CREATE TRIGGER` of the
+/// write-back.
+///
+/// **Both directions, and the second is why the fix is not just "strip it".**
+/// Editing one trigger inside a group that already exists must keep its clause,
+/// or the recreated trigger is appended last instead of landing back where it
+/// was — so the test edits `b` and asserts the group's order afterwards, by
+/// firing it.
+///
+/// MySQL-family only, and gated on `Target::trigger_body` rather than on an
+/// engine: PostgreSQL has no ordering clause in its `CREATE TRIGGER` grammar at
+/// all (it orders by name), and `pg::run_ddl` is transactional besides.
+pub async fn an_ordered_pair_of_triggers_writes_back_without_naming_a_dropped_one(
+    target: &'static Target,
+) {
+    let Some(_) = target.trigger_body else {
+        // PostgreSQL: no ordering clause to resolve.
+        return;
+    };
+    let scratch = Scratch::create(target, "trg_order").await;
+    seed(&scratch, target).await;
+
+    // Two BEFORE INSERT triggers on one table — the group the fixtures never
+    // built. Each appends a letter, so the *order* they ran in is readable off
+    // the row afterwards.
+    for (name, letter) in [("oa", "A"), ("ob", "B")] {
+        let table = table_of(&scratch).await;
+        let mut draft = TriggerSetDraft::from_table(&table);
+        let mut t = new_trigger(&scratch, target, name);
+        t.info.action = TriggerAction::Body(format!("SET NEW.name = CONCAT(NEW.name, '{letter}')"));
+        draft.triggers.push(t);
+        apply(&scratch, &table, &draft, target).await;
+    }
+    let table = table_of(&scratch).await;
+    assert_eq!(
+        table.triggers.len(),
+        2,
+        "{}: the group did not land",
+        target.name
+    );
+    // The premise: the server really did report an ordering clause, or the rest
+    // of this test is about nothing.
+    assert!(
+        table.triggers.iter().any(|t| t.order.is_some()),
+        "{}: no trigger in the group carries an ordering clause, so this test \
+         asserts nothing about resolving one: {:?}",
+        target.name,
+        table.triggers
+    );
+    assert_eq!(insert_and_read(&scratch, 1, "x").await, "xAB");
+
+    // The write-back of the server's own reading — the step that destroyed both.
+    assert_writes_back_unchanged(&scratch, target, "a group of two ordered triggers").await;
+    assert_eq!(
+        insert_and_read(&scratch, 2, "y").await,
+        "yAB",
+        "{}: the group came back in the wrong order",
+        target.name
+    );
+
+    // And an edit *inside* the group keeps the edited trigger's position, which
+    // is the half a conservative "always strip it" fix would lose.
+    let table = table_of(&scratch).await;
+    let mut draft = TriggerSetDraft::from_table(&table);
+    let second = draft
+        .triggers
+        .iter_mut()
+        .find(|t| t.info.name == "ob")
+        .expect("the second trigger is in the draft");
+    second.info.action = TriggerAction::Body("SET NEW.name = CONCAT(NEW.name, 'C')".to_string());
+    apply(&scratch, &table, &draft, target).await;
+    assert_eq!(
+        insert_and_read(&scratch, 3, "z").await,
+        "zAC",
+        "{}: editing the second trigger moved it out of position",
+        target.name
+    );
+
+    scratch.teardown().await;
+}
+
 /// **A body whose first token merely *starts* with an ordering keyword survives
 /// the round trip**, and the trigger it belongs to survives an unrelated edit.
 ///
