@@ -1092,9 +1092,16 @@ impl Db {
     ///
     /// **This is not an optimisation — it is the only correct source.** See
     /// [`TriggerSource`] for what `information_schema` does to the body instead.
-    /// `Ok(None)` on PostgreSQL (whose triggers have no body) and on MariaDB,
-    /// which returns a faithful `ACTION_STATEMENT` already and needs no second
-    /// round trip.
+    /// `Ok(None)` on PostgreSQL (whose triggers have no body) and on SQLite
+    /// (which stores the original `CREATE` text verbatim).
+    ///
+    /// **MariaDB reaches it too**, and this sentence used to say otherwise: the
+    /// gate below is `engine != Engine::MySql` and both flavours are
+    /// `Engine::MySql`, so "`Ok(None)` … on MariaDB" described no code. The
+    /// second round trip is *redundant* there — `ACTION_STATEMENT` is faithful
+    /// on MariaDB — rather than skipped, and a word-boundary defect in the
+    /// parser this reaches was measured on MariaDB 10.11.14 precisely because
+    /// it does run there.
     pub async fn trigger_source(
         &self,
         database: Option<&str>,

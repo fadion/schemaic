@@ -1642,8 +1642,23 @@ fn trigger_body_of(create_sql: &str) -> Option<String> {
     let rest = create_sql.get(after..)?.trim_start();
     // An ordering clause, if the server printed one: the keyword, then one
     // identifier (which may be backtick-quoted and hold anything).
+    //
+    // **A word boundary after the keyword, for the same reason the anchor above
+    // goes through `skip_noncode`.** A prefix match alone is not the question: a
+    // labelled compound statement is legal SQL and a label is any identifier, so
+    // a body opening `followsx: BEGIN … END followsx` matched `FOLLOWS`, lost
+    // one identifier's worth to the clause, and came back without its first
+    // token — into the editable draft *and* the diff baseline, where `validate`
+    // parses no body and says nothing, so an unrelated edit emitted
+    // `DROP TRIGGER` and then an invalid `CREATE`. Measured on MariaDB
+    // 10.11.14: `ERROR 1064`, trigger gone.
     for kw in ["FOLLOWS", "PRECEDES"] {
-        if rest.len() >= kw.len() && rest.as_bytes()[..kw.len()].eq_ignore_ascii_case(kw.as_bytes())
+        if rest.len() >= kw.len()
+            && rest.as_bytes()[..kw.len()].eq_ignore_ascii_case(kw.as_bytes())
+            && rest
+                .as_bytes()
+                .get(kw.len())
+                .is_none_or(|c| !sql::is_word_byte(*c))
         {
             let after_kw = rest[kw.len()..].trim_start();
             let nb = after_kw.as_bytes();
@@ -2844,9 +2859,15 @@ pub(crate) async fn event_source(
 
 /// A trigger's body **as written**, plus the session state it was written under.
 ///
-/// MariaDB returns a faithful `ACTION_STATEMENT` already and never reaches here
-/// — the dispatcher's engine check is not the whole gate, so see
-/// [`crate::Db::trigger_source`] for which servers ask.
+/// **Both MySQL-family servers reach here, and this doc used to say MariaDB did
+/// not.** `Db::trigger_source`'s only gate is `engine != Engine::MySql`, and
+/// both flavours are `Engine::MySql` — so the claim that MariaDB "never reaches
+/// here" was false of the code that dispatches to it, and the word-boundary
+/// defect below was measured on MariaDB 10.11.14 through exactly this path.
+/// MariaDB's `ACTION_STATEMENT` is indeed faithful, which is why the second
+/// round trip is redundant *there* rather than absent; skipping it is a
+/// behaviour change nobody has argued for, and `SHOW CREATE TRIGGER` is the
+/// more faithful source of the two either way.
 pub(crate) async fn trigger_source(
     db: &Db,
     database: Option<&str>,
@@ -3573,6 +3594,57 @@ mod schema_tests {
                 Some("SET NEW.x = 1"),
                 "{sql}"
             );
+        }
+    }
+
+    /// **`FOLLOWS`/`PRECEDES` need a word boundary after them**, the way the
+    /// `FOR EACH ROW` anchor twelve lines up needs one — and they were matched
+    /// as a bare byte prefix.
+    ///
+    /// A labelled compound statement is legal SQL and a label may be any
+    /// identifier, so a body opening `followsx: BEGIN … END followsx` starts
+    /// with the six bytes `FOLLOW` plus `S`. The prefix matched, one
+    /// identifier's worth was eaten as the ordering clause, and what came back
+    /// was a body missing its first token — into **both** the editable draft and
+    /// the diff baseline, where `TriggerDraft::validate` parses no body and so
+    /// says nothing. Applying any unrelated edit to that trigger then emits
+    /// `DROP TRIGGER` followed by an invalid `CREATE`, run in sequence with no
+    /// transaction: measured on MariaDB 10.11.14 as `ERROR 1064` with the
+    /// trigger gone and unrepairable in-app.
+    ///
+    /// The last two cases are the ones that must keep working, so the boundary
+    /// test cannot be satisfied by simply never matching.
+    #[test]
+    fn an_ordering_keyword_is_matched_on_a_word_boundary() {
+        for (sql, body) in [
+            // A label that merely starts with the keyword: the whole body,
+            // including the label.
+            (
+                "CREATE TRIGGER `b` BEFORE INSERT ON `t` FOR EACH ROW \
+                 followsx: BEGIN SET NEW.x = 1; END followsx",
+                "followsx: BEGIN SET NEW.x = 1; END followsx",
+            ),
+            (
+                "CREATE TRIGGER `b` BEFORE INSERT ON `t` FOR EACH ROW \
+                 precedes_it: BEGIN SET NEW.x = 1; END precedes_it",
+                "precedes_it: BEGIN SET NEW.x = 1; END precedes_it",
+            ),
+            // A bare statement that happens to start with the letters.
+            (
+                "CREATE TRIGGER `b` BEFORE INSERT ON `t` FOR EACH ROW SET NEW.followsme = 1",
+                "SET NEW.followsme = 1",
+            ),
+            // …and the real clause, which still has to be dropped.
+            (
+                "CREATE TRIGGER `b` BEFORE INSERT ON `t` FOR EACH ROW FOLLOWS `a` SET NEW.x = 1",
+                "SET NEW.x = 1",
+            ),
+            (
+                "CREATE TRIGGER `b` BEFORE INSERT ON `t` FOR EACH ROW PRECEDES `a` SET NEW.x = 1",
+                "SET NEW.x = 1",
+            ),
+        ] {
+            assert_eq!(trigger_body_of(sql).as_deref(), Some(body), "{sql}");
         }
     }
 

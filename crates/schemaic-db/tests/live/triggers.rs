@@ -318,6 +318,109 @@ pub async fn a_renamed_trigger_still_fires(target: &'static Target) {
 
 /// The base table, and — on a server whose triggers call one — the function they
 /// call.
+/// **A body whose first token merely *starts* with an ordering keyword survives
+/// the round trip**, and the trigger it belongs to survives an unrelated edit.
+///
+/// `mysql::trigger_body_of` matched `FOLLOWS`/`PRECEDES` as a bare byte prefix
+/// where the `FOR EACH ROW` anchor beside it goes through `sql::skip_noncode`
+/// for exactly that reason. A labelled compound statement is legal SQL and a
+/// label is any identifier, so `followsx: BEGIN … END followsx` matched, one
+/// identifier's worth was eaten as an ordering clause, and the body came back
+/// without its first token — into **both** the editable draft and the diff
+/// baseline. `TriggerDraft::validate` parses no body, so nothing objected;
+/// applying any unrelated edit then emitted `DROP TRIGGER` and an invalid
+/// `CREATE`, run in sequence with no transaction, and the measured outcome on
+/// MariaDB 10.11.14 was `ERROR 1064` with the trigger gone and unrepairable
+/// in-app.
+///
+/// **Two assertions, and the second is the one that matters.** That the body
+/// reads back whole is the unit property, and the unit test beside
+/// `trigger_body_of` already holds it. What only a server can say is that the
+/// *write-back* of that reading is a statement it accepts — which is the step
+/// that destroyed the trigger.
+///
+/// Gated on `Target::trigger_body`, not on an engine: a leg that carries its
+/// action on the trigger is a leg with a body to label, and PostgreSQL's action
+/// is a function call with no body and no ordering clause in its grammar at all.
+pub async fn a_body_that_opens_like_an_ordering_clause_survives_the_round_trip(
+    target: &'static Target,
+) {
+    let Some(_) = target.trigger_body else {
+        // PostgreSQL: no body on the trigger, so nothing here to label.
+        return;
+    };
+    let scratch = Scratch::create(target, "trg_label").await;
+    seed(&scratch, target).await;
+
+    // Both keywords, and a label that is the keyword plus one letter — the
+    // narrowest version of the bug.
+    //
+    // **Different events, deliberately.** Two triggers in one
+    // `(table, timing, event)` group is a *different* fault's fixture — the
+    // emitter writes an ordering clause naming a trigger the same plan has not
+    // created yet — and putting both here made this test fail on that instead
+    // (ERROR 4031 on MariaDB, 3011 on MySQL). One test, one property:
+    // `an_ordered_pair_of_triggers_writes_back_without_naming_a_dropped_one`
+    // owns the ordering.
+    for (name, label, event) in [
+        ("lf", "followsx", TriggerEvent::Insert),
+        ("lp", "precedes_it", TriggerEvent::Update),
+    ] {
+        let table = table_of(&scratch).await;
+        let mut draft = TriggerSetDraft::from_table(&table);
+        let mut t = new_trigger(&scratch, target, name);
+        t.info.events = vec![event];
+        t.info.action = TriggerAction::Body(format!(
+            "{label}: BEGIN SET NEW.name = UPPER(NEW.name); END {label}"
+        ));
+        draft.triggers.push(t);
+        apply(&scratch, &table, &draft, target).await;
+
+        // **Read through `Db::trigger_source`, which is the path that parses
+        // `SHOW CREATE TRIGGER`.** Introspection reads
+        // `information_schema.ACTION_STATEMENT` and so never reaches
+        // `trigger_body_of` at all — asserting over `table_of` here passed
+        // against the unfixed reader, which is how nearly it became a
+        // decoration. `trigger_source` is also what the trigger editor calls,
+        // so this is the reading the user actually gets.
+        let source = scratch
+            .db
+            .trigger_source(Some(&scratch.database), name)
+            .await
+            .unwrap_or_else(|e| panic!("{}: trigger_source({name}): {e}", target.name))
+            .unwrap_or_else(|| {
+                panic!(
+                    "{}: trigger_source returned nothing for {name}, so this \
+                     test is asserting over a path it does not reach",
+                    target.name
+                )
+            });
+        assert!(
+            source.body.trim_start().starts_with(label),
+            "{}: {name}'s body lost its opening token — the server printed a \
+             label the reader ate as an ordering clause: {:?}",
+            target.name,
+            source.body
+        );
+    }
+
+    // And the whole set written back through the emitter is a plan the server
+    // accepts and that changes nothing — the step where a damaged body becomes
+    // a dropped trigger.
+    assert_writes_back_unchanged(
+        &scratch,
+        target,
+        "a label that opens like an ordering clause",
+    )
+    .await;
+
+    // The triggers still fire, which is the property a catalogue row cannot
+    // report.
+    assert_eq!(insert_and_read(&scratch, 1, "abc").await, "ABC");
+
+    scratch.teardown().await;
+}
+
 async fn seed(scratch: &Scratch, target: &Target) {
     scratch
         .exec(&format!(
