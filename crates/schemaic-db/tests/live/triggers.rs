@@ -318,9 +318,15 @@ pub async fn a_renamed_trigger_still_fires(target: &'static Target) {
 
 /// The base table, and — on a server whose triggers call one — the function they
 /// call.
-/// **Two triggers in one `(table, timing, event)` group, which no fixture in
-/// this workspace had** — so `TriggerOrder` had never been emitted by any test,
-/// live or unit, and the fault below was invisible to a green suite.
+/// **Two triggers in one `(table, timing, event)` group, which no *live* leg
+/// had** — every fixture here varies the event, so `order` came back `None` on
+/// all three servers and the fault below was invisible to a green suite.
+///
+/// Narrower than it first reads, and the broad version is false: `core::dump`'s
+/// `a_dumped_trigger_group_names_nothing_the_file_has_not_created_yet` builds
+/// exactly this group in the unit tier. That is the shape of the gap rather
+/// than an exception to it — the resolution step was written for the dump and
+/// tested by the dump, and the apply path had neither.
 ///
 /// The catalogue gives a group's **leader** `PRECEDES <successor>` and every
 /// other member `FOLLOWS <predecessor>`, and `ChangeSet::trigger_statements`

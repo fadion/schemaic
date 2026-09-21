@@ -405,51 +405,46 @@ pub async fn a_stop_inside_a_manual_transaction_leaves_the_connection_usable(
     let rows = count(&scratch).await;
     drop(session);
 
-    if target.cancel_aborts_transaction {
-        // PostgreSQL: a cancelled statement aborts the block, so the row being
-        // gone is the engine's own rule and not a fault — see
-        // `Target::cancel_aborts_transaction`. What this leg is here for is the
-        // half that *is* about the connection: the statement was stopped and
-        // the session came back rather than hanging or dying.
-        assert_eq!(
-            rows, "0",
-            "{}: a cancelled statement is supposed to abort the transaction \
-             here, and the row survived it",
+    // **The agreement, on every engine.** Whichever way the commit goes, its
+    // *report* has to match what the database holds. Either answer is
+    // defensible on its own — a commit may legitimately fail, and on
+    // PostgreSQL a stopped statement means it must — so demanding one would
+    // assert a policy. What cannot be defended is the app saying one thing
+    // while the server holds another, and both engine families produced
+    // exactly that, by two unrelated routes: a desynchronised result stream on
+    // the MySQL family, and a `COMMIT` PostgreSQL turns into a `ROLLBACK`
+    // behind a reply `tokio_postgres` discards.
+    match &committed {
+        Ok(()) => assert_eq!(
+            rows, "1",
+            "{}: the app reported a successful COMMIT and the database holds \
+             nothing",
             target.name
-        );
-        // **Not asserted here, and deliberately so:** `commit()` returns
-        // `Ok(())` on this leg for a `COMMIT` PostgreSQL turned into a
-        // `ROLLBACK` — measured, and a report that does not match the database.
-        // It is a different fault from the one this test was written for (that
-        // one is the pinned connection's result stream, and it is MySQL-family
-        // only), it is not in the ledger, and blessing it with an
-        // `assert_eq!(committed, Ok(()))` here would turn a finding into a
-        // fixture. Left stated rather than encoded.
-        let _ = &committed;
-    } else {
-        // MySQL and MariaDB: the transaction is still open and committable, so
-        // whichever way the commit goes its *report* has to agree with what the
-        // database holds. Either answer is defensible on its own — a commit may
-        // legitimately fail — and demanding one would assert a policy; what
-        // cannot be defended is the app saying one thing while the server holds
-        // another, which is exactly what a desynchronised result stream
-        // produces.
-        match &committed {
-            Ok(()) => assert_eq!(
-                rows, "1",
-                "{}: the app reported a successful COMMIT and the database \
-                 holds nothing — the reply it read belonged to the statement \
-                 before it",
-                target.name
-            ),
-            Err(e) => assert_eq!(
-                rows, "0",
-                "{}: the app reported the COMMIT as failed ({e}) and the row is \
-                 committed — Rollback is now offered over durable data",
-                target.name
-            ),
-        }
+        ),
+        Err(e) => assert_eq!(
+            rows, "0",
+            "{}: the app reported the COMMIT as failed ({e}) and the row is \
+             committed — Rollback is now offered over durable data",
+            target.name
+        ),
     }
+
+    // …and *which* way it goes is the engine's rule, not a coin flip, so that
+    // is pinned too — otherwise a session that reported every commit as failed
+    // would satisfy the agreement above on every leg.
+    assert_eq!(
+        committed.is_err(),
+        target.cancel_aborts_transaction,
+        "{}: a stopped statement {} abort the transaction on this server, and \
+         the commit reported {:?}",
+        target.name,
+        if target.cancel_aborts_transaction {
+            "does"
+        } else {
+            "does not"
+        },
+        committed.map_err(|e| e.to_string())
+    );
 
     scratch.teardown().await;
 }

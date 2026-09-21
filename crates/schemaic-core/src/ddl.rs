@@ -15703,10 +15703,18 @@ mod tests {
             assert!(!sql.iter().any(|s| s.contains("@@SESSION")), "{sql:?}");
         }
 
-        /// **An ordered pair of triggers, which no fixture in this workspace
-        /// had** — and the reason `TriggerOrder` had never once been emitted by
-        /// a test. `S4-L6-01` is that gap; this is the fixture, and
+        /// **An ordered pair of triggers, which no fixture *this* path had** —
+        /// and the reason `TriggerOrder` had never once been emitted by a
+        /// `ChangeSet` test. `S4-L6-01` is that gap; this is the fixture, and
         /// `S4-L1-01` is what it found.
+        ///
+        /// Stated narrowly, because the broad version is false and worth not
+        /// repeating: `dump.rs`'s
+        /// `a_dumped_trigger_group_names_nothing_the_file_has_not_created_yet`
+        /// builds exactly this group, and has since the dump's own fix. That is
+        /// the shape of the gap rather than an exception to it — the resolution
+        /// step was written *for* the dump, tested *by* the dump, and the apply
+        /// path next door had neither.
         ///
         /// MySQL and MariaDB give the **leader** of a `(table, timing, event)`
         /// group `PRECEDES <successor>` and every other member

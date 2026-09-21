@@ -3363,13 +3363,34 @@ existing prose was left alone.
     together: adjacent pairs collide the moment two triggers swap names, and on MySQL
     statement 1 has already committed when statement 2 fails, so the first trigger is simply
     gone. Same rule, same reason as `GridWrite::plan` in `core::model`.
-    **It emits each trigger's own `create_sql` and *not* `TriggerInfo::create_set_sql`**, which is
-    safe by coupling rather than by construction: a designer plan replaces one trigger inside a group
-    that already exists, which is precisely the caller a `PRECEDES` anchor is right for, and the only
-    caller here that would replay a whole group into nothing is the comparison's migration plan —
-    where `compare::CompareEntry::needs_source` withholds every MySQL trigger anyway, MySQL being the
-    one engine with the clause. Take that withholding away and this emitter inherits the dump's bug;
-    `create_set_sql` is what it would have to switch to.
+    **It emits each trigger's own `create_sql` and *not* `TriggerInfo::create_set_sql`, and it
+    resolves the ordering clause against the plan before emitting it.** This passage used to say the
+    clause was safe here by coupling: a designer plan replaces one trigger inside a group that
+    already exists, which is precisely the caller a `PRECEDES` anchor is right for, and the only
+    caller that would replay a whole group into nothing was the comparison's migration plan, from
+    which `compare::CompareEntry::needs_source` withholds every MySQL trigger anyway. The premise was
+    false of the plan this emitter actually builds. Every trigger edit is a drop-and-create and all
+    the drops run first, so an edit *inside* a `(table, timing, event)` group recreates that group
+    from nothing — and the catalogue gives the group's **leader** `PRECEDES <successor>`, naming a
+    trigger the plan has not made yet. Both servers refuse it (measured: MariaDB `ERROR 4031`, MySQL
+    `ERROR 3011`), MySQL-family DDL has no transaction so the drops above have already committed, and
+    **both triggers are destroyed** — unrepairable in the app, the modal having no control for
+    `order` and every retry re-emitting the clause. Each create therefore goes through
+    `TriggerInfo::with_resolvable_order` with a **two-term** `exists`, the two terms being what "all
+    the drops, then all the creates" costs: *created earlier in this plan* — the successor's own
+    `FOLLOWS` then rebuilds the chain, which is what makes stripping the leader's clause sufficient
+    rather than lossy — **or** *survives this plan*, a name this plan neither creates nor drops being
+    one the server holds throughout, which is what keeps an edit inside an existing group in its
+    position instead of appending it last. A name this plan creates is deliberately **not**
+    surviving: it is gone until its own create runs. The residue is a draft whose `order` names a
+    trigger that neither exists nor is touched — the server refuses that, as it did before, and no
+    catalogue produces it.
+    `a_recreated_group_does_not_name_a_trigger_it_has_not_created_yet` pins both directions, so a
+    fix that stripped *every* clause fails it too. **Nothing on this path had ever emitted a
+    `TriggerOrder`**: the only fixtures in the workspace holding two triggers in one timing/event
+    group were `core::dump`'s own unit tests, written when `create_set_sql` was, so `order` was
+    `None` in every `ChangeSet` test and on every live leg. That is why the defect outlived a
+    release, and why the fix is a fixture as much as it is a predicate.
     `session_wrapped_with` is the MySQL half of that emitter, shared by triggers
     (`session_wrapped_create`) and routines (`session_wrapped`): neither `CREATE TRIGGER` nor
     `CREATE PROCEDURE` has a clause for the `sql_mode`/`character_set_client`/
@@ -5594,9 +5615,12 @@ existing prose was left alone.
     every non-leader carries `FOLLOWS <predecessor>`, so a group created in order rebuilds its own
     chain, and a trigger created alone into an empty group is its leader whatever it says. It
     borrows where there is nothing to take off, which is every trigger on the other two engines —
-    neither has the clause. `core::dump` is its one production caller; the migration plan is the
-    other whole-set emitter and does **not** use it, which `core::ddl`'s `trigger_statements`
-    explains.
+    neither has the clause. **`exists` is a parameter rather than a field because the two callers
+    mean different things by it.** `core::dump` asks through `create_set_sql`, where the set *is*
+    the world. The apply path is the second caller and the one this should never have lacked —
+    `core::ddl`'s `trigger_statements`, which asks a two-term version (created earlier in this plan,
+    **or** surviving it) and says there what each term is for. A comparison between two databases
+    would ask a third question, whether the *other* database holds the name; nothing asks it yet.
     `CheckInfo::validated`/`inherited` are PostgreSQL's `NOT VALID` / `NO INHERIT`, carried and
     restated: they are part of the clause, and `pg_get_constraintdef` prints them *after* the
     parens, which is why `ddl::check_predicate` must strip them before peeling. **An unnamed check
@@ -7524,7 +7548,9 @@ existing prose was left alone.
   **The last statement `lib.rs` sent itself is gone, and that is a property now rather than a
   claim.** `Db::kill_query` — a `query_drop` of `KILL QUERY <id>` — is
   `mysql::kill_query(db, conn_id)`, which is where every one of its callers already was: thirteen in
-  `mysql.rs` and four in `session.rs`, all four inside `Backend::MySql` arms.
+  `mysql.rs`, and four in `session.rs` inside `Backend::MySql` arms. Those four have since become
+  calls to `mysql::cancel_awaited`, which kills *and awaits*, so `session.rs` no longer names
+  `kill_query` at all — and a gate of its own now requires that (see the cancel rule below).
   `the_dispatcher_executes_nothing_itself` scans `lib.rs` for the driver's own verbs —
   `query_drop`/`query_iter`/`query_first` and the three `exec_` spellings, with `//` lines stripped
   first — and fails on any of them. It is named for the driver verbs rather than for SQL because a
@@ -8341,7 +8367,22 @@ existing prose was left alone.
   source and carries `sql_mode`/`character_set_client`/`collation_connection` in the same row;
   `trigger_body_of` is the pure positional reader beside `view_algorithm_of` (anchored on the
   first `FOR EACH ROW` at a *code* position, since a table can be named `` `x FOR EACH ROW y` ``).
-  Read **lazily, per trigger**, when the editor opens. MariaDB returns everything verbatim.
+  **The `FOLLOWS`/`PRECEDES` clause it then steps over is matched on a word boundary, for the same
+  reason that anchor is a code position.** A bare byte prefix is not the question a keyword asks: a
+  labelled compound statement is legal SQL and a label may be any identifier, so a body opening
+  `followsx: BEGIN … END followsx` matched `FOLLOWS`, lost one identifier's worth to the "ordering
+  clause" and came back **without its first token** — into the editable draft *and* into the diff
+  baseline, where `TriggerDraft::validate` parses no body and so objected to nothing. An unrelated
+  edit then emitted `DROP TRIGGER` followed by an invalid `CREATE`, with no transaction between
+  them: measured on MariaDB 10.11.14, `ERROR 1064`, trigger gone.
+  `an_ordering_keyword_is_matched_on_a_word_boundary` is the unit pin; the live one, and why it had
+  to be pointed at this call rather than at introspection, is under `tests/live/` below.
+  Read **lazily, per trigger**, when the editor opens. **MariaDB takes this round trip too**, and
+  the two functions' own rustdoc used to say it did not — `Ok(None)` "on MariaDB", "never reaches
+  here" — while the only gate is `engine != Engine::MySql` and both flavours are `Engine::MySql`.
+  MariaDB returns everything verbatim, so the second read is *redundant* there rather than skipped,
+  which is a weaker claim and the true one: the word-boundary defect above was measured on MariaDB
+  precisely because this parser does run on it.
   `mysql_triggers` also gives a group's *leading* trigger a `PRECEDES` anchor: MySQL appends a
   no-clause `CREATE TRIGGER` **last**, so replacing the leader silently reversed the firing order.
   On the PG side, both of `pg::fetch_schema`'s trigger queries filter `tgparentid = 0` inline (a
@@ -8922,6 +8963,42 @@ existing prose was left alone.
   `a_cancelled_import_rolls_back_and_says_so` and
   `a_cancelled_import_on_a_non_transactional_table_says_the_rows_remain` are the live pins — what
   each of them asserts, and why it takes two, is under `tests/live/` below.
+  **`mysql::cancel_awaited` is that rule as a function, and the pinned `Session` is why it had to
+  become one.** It races a future against the token and, on a cancel, kills the statement at the
+  server and then **awaits** the future instead of dropping it. `let _ = fut.await` is not a wait
+  for the work to finish — the `KILL QUERY` has already stopped it; what is awaited is the *error
+  reply*, and awaiting it is precisely what leaves the result stream aligned. A body that runs
+  several statements propagates that error with `?` and stops, which is why `refetch_on`'s loop
+  needs nothing of its own. All four of `Session`'s MySQL arms — `fetch_query`, `commit_writes`,
+  `fetch_blob`, `refetch_rows` — raced and **dropped**, and the pinned connection is the one place
+  in this crate where that is not survivable: everywhere else one connection per operation throws
+  the poisoned connection away before anyone reads from it again, and `Session` is the documented
+  exception to that invariant. Measured in opposite directions on a tab that ran an `INSERT`, had a
+  long `SELECT` cancelled, and then pressed **Commit**. MySQL 8.4.11 returned `Ok(())` from the
+  `COMMIT`, the app reported success, and a fresh connection saw **0 rows** — silent data loss under
+  a success report. MariaDB 10.11.14 returned `ERROR 1317` (*"Query execution was interrupted"*),
+  the app reported failure, and the row **was** committed — Rollback offered over durable data. One
+  desynchronisation read through two servers' different replies, which is why neither of them looked
+  like a protocol fault. The gate is `session::pg_cancel_gate`'s second test,
+  `every_mysql_cancel_on_the_pinned_connection_awaits_the_statement_it_killed`, spelled as
+  "`kill_query` is not called from `session.rs`" rather than as "no `select!`" — the PostgreSQL arms
+  in that file race quite correctly, `Client` being a handle onto a connection task that drains
+  regardless of the receiver, so forbidding the construct would forbid the wrong thing — and it
+  carries a floor of four calls, so it cannot pass by the cancels having been deleted instead.
+  `a_stop_inside_a_manual_transaction_leaves_the_connection_usable` is the live pin, under
+  `tests/live/` below.
+  **One `select!` in that file was deleted rather than converted.** `Session::fetch_query`'s
+  PostgreSQL branch had an outer race around `pg::run_statement`, which already cancels around
+  `simple_query_raw` and again per message of the result stream, both on this connection's own
+  transport — so the outer one was redundant, and since `select!` polls ready branches in random
+  order, which of the two answered a cancel was a coin flip. Its one *distinct* effect was the
+  harmful one: winning during the **describe** phase drops the future between `SAVEPOINT
+  schemaic_describe` and its `RELEASE`, leaving the savepoint and an un-`CLOSE`d prepared statement
+  in the user's transaction — measured on PG 16.15 as three stacked savepoints after three cancels.
+  The describe is one round trip and is **not interruptible** now; if it ever must be, the
+  interruption belongs *inside* `run_statement`, between those two statements, where it can clean up
+  after itself. That half is a deletion and no test can be made to fail on it, which is said here
+  and in the commit rather than left to look like coverage.
   **`tests/live/` is the DB layer against real servers**, and it exists because the pure suite can
   only reach the *decisions*: SQLite is testable directly (in-memory, shared-cache), so it is the
   one backend whose wire layer was covered at all, while MySQL, MariaDB and PostgreSQL — the
@@ -9203,7 +9280,10 @@ existing prose was left alone.
   families put them on opposite sides of the body), `Target::trigger_condition` and
   `trigger_update_columns` (a `WHEN` guard and an `UPDATE OF` column list, PostgreSQL's alone), and
   `Target::accounts_have_hosts`, which replaced an inline `engine == MySql` so the host assertions
-  and the host fixture cannot disagree about which legs have one.
+  and the host fixture cannot disagree about which legs have one. The newest is
+  `Target::cancel_aborts_transaction` — whether cancelling a statement takes the enclosing
+  transaction block down with it, true on PostgreSQL and on neither MySQL-family server — which
+  decides what a Stop test is allowed to assert about the commit that follows it.
   **`runtime.rs` covers the four paths that need a connection to *behave*** — `.sql` scripts, bulk
   imports, the pinned manual-transaction `Session`, and cancelling a statement already running — and
   every one of them is an exception to something, which is precisely what a pure test cannot check.
@@ -9211,6 +9291,25 @@ existing prose was left alone.
   table in one statement and reading it in the next: under a connection per statement the second
   fails, and so would a dump's opening `SET FOREIGN_KEY_CHECKS = 0`. That a `Session`'s transaction
   is real is asserted from a *second* connection, which must not see the uncommitted row.
+  **A Stop inside that transaction is where the last two of those paths meet**, and
+  `a_stop_inside_a_manual_transaction_leaves_the_connection_usable` asserts the **agreement** rather
+  than the outcome: stage a row, cancel a long statement on the same pinned connection, commit, and
+  require the app's report and a second connection's row count to say the same thing. Either answer
+  is defensible on its own — a commit may legitimately fail — so demanding one would be asserting a
+  policy; what cannot be defended is the app telling the user one thing while the server holds
+  another, which is exactly what a dropped `mysql_async` future produces (see `cancel_awaited`
+  above). PostgreSQL runs it and has always passed, `Client` being a channel handle onto a
+  connection task that drains whatever the receiver does, and keeping that leg is what makes that a
+  measured fact here rather than a claim.
+  **Its PostgreSQL branch also records a finding it deliberately does not assert.** A cancelled
+  statement aborts the enclosing transaction block there — the engine behaviour `Session::fence_read`
+  already exists for, carried here as `Target::cancel_aborts_transaction` — so the staged row is
+  gone by the engine's own rule, and that is all this leg requires. What was *measured* beside it is
+  that `Session::commit` returns `Ok(())` for a `COMMIT` PostgreSQL had turned into a `ROLLBACK`,
+  over `rows=0`: the same shape as the fault the test was written for, the app reporting a commit
+  that did not happen, and an entirely different cause. It is stated in a comment rather than
+  asserted, so that an open question does not become a fixture before anybody has decided what the
+  app should do about it.
   **Cancelling an import is two tests because the answer is two answers**, and they are what
   `Target::non_transactional` was recorded for:
   `a_cancelled_import_rolls_back_and_says_so` asserts `Err(Cancelled)` **and** that nothing is in the
@@ -9327,6 +9426,24 @@ existing prose was left alone.
   statement, and a diff that re-emitted the whole set would pass. The second trigger differs by
   **event** rather than timing, since MySQL refuses `SET NEW.x` in an `AFTER` trigger (ERROR 1362),
   which makes timing the wrong axis to vary.
+  **What that leaves is two triggers in two different *groups*, and the ordering clause needed two
+  in one.** Varying the event is what keeps MySQL's `SET NEW.x` legal, and it also puts the pair in
+  different `(table, timing, event)` groups — so no live leg ever carried a `FOLLOWS`/`PRECEDES`,
+  `TriggerInfo::order` was `None` on every one of them, and the apply path emitted its first
+  ordering clause in front of a user (see `core::ddl`'s `trigger_statements` for what that cost).
+  `an_ordered_pair_of_triggers_writes_back_without_naming_a_dropped_one` is the missing fixture:
+  it seeds an ordered pair, edits the group's **second** trigger, and reads the resulting firing
+  order off the row the triggers write — so a fix that simply stripped every clause fails it from
+  the other side. It is gated on `Target::trigger_body` rather than on an engine, PostgreSQL having
+  no ordering clause in its `CREATE TRIGGER` grammar at all, and that leg returns early rather than
+  asserting something the engine cannot express.
+  `a_body_that_opens_like_an_ordering_clause_survives_the_round_trip` is the other addition, and its
+  first draft is worth recording as a near-miss of this repository's standing test rule. Asserted
+  over `table_of`, it was **green against the unfixed tree**: introspection reads
+  `information_schema.ACTION_STATEMENT` and never reaches `mysql::trigger_body_of` at all. Pointed
+  at `Db::trigger_source` — the call the trigger editor actually makes — it fails on both MySQL legs
+  with the damaged body verbatim. The seam was the pure reader's composition with its caller, which
+  is where these keep being.
   **`streaming.rs` and `namespaces.rs`** close the last two. The export's assertions are about
   completeness and about how a failure reaches the *writer*: a channel that simply closes reads as
   "the table ended", so a half-written file would be reported as finished — both failure tests check
@@ -18525,6 +18642,17 @@ Re-introducing the anti-patterns these guard against is a regression:
   since no other connection can see uncommitted rows). Read-only side channels (schema
   introspection, live-validate `PREPARE`, EXPLAIN, Live Monitor, AI/MCP) stay on fresh connections so
   a long transaction can't block them. Don't add a second connection-caching path; extend `Session`.
+  **And a cancel on that connection may not be a bare `tokio::select!`.** Dropping a `mysql_async`
+  future leaves the connection's result stream desynchronised, and every reply after it belongs to
+  the statement before — survivable everywhere else in the DB layer precisely *because* of this
+  invariant, since the poisoned connection is disconnected on the way out, and not survivable here,
+  where it is pinned for the life of a transaction. So a cancel on a connection that outlives the
+  statement kills at the server and then **awaits** what it killed (`mysql::cancel_awaited`). All
+  four of `Session`'s MySQL arms raced and dropped instead: a Stop in a Manual tab made the next
+  `COMMIT` read the previous statement's reply, reported as success over **0 committed rows** on
+  MySQL 8.4.11 and as failure over a row that *was* committed on MariaDB 10.11.14.
+  `session::pg_cancel_gate` holds the shape for both engines — see `schemaic-db` for what each gate
+  can and cannot see.
   **The second exception is `Db::run_script`**, and it is a genuine one rather than a long call:
   the connection is pinned for the length of the whole file. A script's statements are not
   independent. A dump opens with `SET FOREIGN_KEY_CHECKS = 0` (`dump::fk_guard_sql`), may carry its
@@ -19052,7 +19180,11 @@ Re-introducing the anti-patterns these guard against is a regression:
   way `import_on` does — stopping between statements, or after *awaiting* a statement it killed — so
   the rollback goes out on an intact protocol and `cancelled_write` can be believed;
   `Session::commit_writes` passes `None`, its batch being a savepoint inside the user's transaction
-  that `classify_isolated` answers for. **Reproduced on the live tier**, which the review could not
+  that `classify_isolated` answers for. **`None` there means only that the batch does not read its
+  own rollback, and it used to be written as an exemption from the rule above** — which answered a
+  *transaction-state* question with a *protocol* one. Whoever answers for what survived, the killed
+  statement still has to be awaited, and on that pinned connection it now is
+  (`mysql::cancel_awaited`, under `schemaic-db`). **Reproduced on the live tier**, which the review could not
   reach: a 4,000-row commit into a `MyISAM` table, cancelled 300 ms in, returned `Err(Cancelled)` —
   the variant the modal renders as "nothing was written" — over 2,151 permanently-written rows on
   MariaDB and 159 on MySQL before the fix, and said "the rollback did NOT undo them" after it. The
@@ -19060,7 +19192,13 @@ Re-introducing the anti-patterns these guard against is a regression:
   rather than unfinished wiring, and *Data grid* says why; it is not latent at the DB layer. The
   gate carries both halves now: `commit_writes` holds no `tokio::select!`, and
   `write_on`'s cancel path kills the query, awaits the killed statement and asks `rollback` what it
-  achieved.
+  achieved. **Both halves are measured to the end of the function they name, and the second half was
+  not.** It read a fixed `&src[wo..wo + 3000]` window off `write_on` — which already stopped eleven
+  lines short of that function's end, so a cancel path added below the window was invisible to it
+  and any growth in `write_on` narrowed the gate further, silently. It runs to the function's
+  closing brace now, with a length floor so an end marker matching something *inside* the body fails
+  rather than shrinking the window to nothing. That is the same defect the first half had been
+  repaired for one commit earlier and this half kept.
   `one_row_verdict` states only what the guard saw — it runs *before* the rollback and can't
   know what it achieved, so **every** executor appends the clause once it does: SQLite's was the one
   that didn't, and a user reading *"UPDATE main.t affected 2 rows (expected exactly 1)"* with nothing

@@ -253,9 +253,70 @@ impl Session {
     /// transaction is harmless; skipping a needed one is not, so on doubt the
     /// flag errs toward "there is no transaction".
     pub async fn commit(&self) -> Result<(), DbError> {
-        let r = self.control("COMMIT").await;
+        let mut guard = self.inner.lock().await;
+        // **`COMMIT` is not always a commit, and on PostgreSQL it says so in a
+        // reply this client cannot read.** Once a statement in the block has
+        // failed or been cancelled, PostgreSQL puts the transaction in its
+        // *aborted* state, and a `COMMIT` there is documented to perform a
+        // `ROLLBACK` — it answers with the command tag `ROLLBACK`, and
+        // `tokio_postgres`' `SimpleQueryMessage::CommandComplete` carries a row
+        // count rather than that tag, so the one place the truth is written
+        // down is discarded before anything can read it. `batch_execute`
+        // returns `Ok(())` and the app reported a commit that discarded the
+        // user's work.
+        //
+        // Measured on PG 16.15: a tab that ran an `INSERT`, had a long `SELECT`
+        // stopped, and pressed **Commit** was told the transaction committed
+        // while a second connection saw **0 rows**. That is the same sentence
+        // the pinned-connection defect produced on MySQL
+        // (`mysql::cancel_awaited`) by a completely different route, and it is
+        // the report rather than the rollback that is wrong: discarding an
+        // aborted block *is* PostgreSQL's rule, and undoing that silently with
+        // a savepoint would be a product decision nobody has taken.
+        //
+        // **Asked rather than tracked.** A flag set when a statement fails
+        // would have to know that a cancelled *fenced* read does not abort
+        // anything (`classify_fenced` upgrades those to `…Isolated` precisely
+        // because the savepoint rollback cleared the state), and would drift
+        // the first time a path forgot to clear it. So the server is asked, on
+        // the same "confirmed, not assumed" terms as `undo_savepoint` — one
+        // round trip, on a button the user pressed.
+        let r = if Session::block_is_aborted(&mut guard).await {
+            // Leave the connection usable: the block has to end either way, and
+            // `ROLLBACK` is the only statement that ends an aborted one.
+            let _ = Session::control_on(&mut guard, "ROLLBACK").await;
+            Err(DbError::Query(
+                "the transaction was already aborted — a statement in it failed \
+                 or was stopped, so committing discards the work rather than \
+                 saving it. Nothing was committed."
+                    .to_string(),
+            ))
+        } else {
+            Session::control_on(&mut guard, "COMMIT").await
+        };
         self.in_tx.store(false, Ordering::SeqCst);
         r
+    }
+
+    /// Is this connection's transaction in a state where a `COMMIT` would
+    /// commit **nothing**?
+    ///
+    /// PostgreSQL only. A block there enters an *aborted* state the moment a
+    /// statement in it fails or is cancelled: every statement after that
+    /// answers `25P02`, and `COMMIT` performs a `ROLLBACK`. MySQL and MariaDB
+    /// have no such state — a failed statement inside a transaction leaves the
+    /// rest of it committable, which is why the whole `fence_read` apparatus
+    /// exists for PostgreSQL and is a no-op cost there.
+    ///
+    /// The probe is the cheapest statement that the aborted state refuses. A
+    /// dead connection fails it too, and answering "aborted" for one is right
+    /// for the only question being asked: nothing is going to be committed
+    /// either way.
+    async fn block_is_aborted(guard: &mut Backend) -> bool {
+        match guard {
+            Backend::MySql { .. } => false,
+            Backend::Postgres { client } => client.batch_execute("SELECT 1").await.is_err(),
+        }
     }
 
     /// Roll the transaction back. Also the way out of a PostgreSQL transaction
@@ -414,10 +475,19 @@ impl Session {
         // this connection for minutes, and a run queued behind it that the user
         // (or the statement timeout) cancels never reaches the server at all.
         //
-        // It is also what makes the outcome deterministic. Every arm below ends in
-        // a `tokio::select!` against `cancel.cancelled()`, and `select!` polls its
-        // ready branches in **random order** — the same coin flip `sqlite`'s
+        // It is also what makes the outcome deterministic. Both arms below race
+        // the statement against `cancel.cancelled()` — MySQL's inside
+        // `mysql::cancel_awaited`, PostgreSQL's inside `pg::run_statement` —
+        // and `select!` polls its ready branches in **random order**, so an
+        // already-cancelled token would otherwise be a coin flip between
+        // `Cancelled` and a statement that ran. The same one `sqlite`'s
         // `refuse_if_cancelled` documents from a real CI failure.
+        //
+        // **Where those races live is the part that moved.** This said "every
+        // arm below ends in a `tokio::select!`", which was true of the arms
+        // until the cancel handling was pushed down into the two functions
+        // named above — the conclusion still holds, the description of the arms
+        // did not.
         if cancel.is_cancelled() {
             return Outcome {
                 result: Err(DbError::Cancelled),
