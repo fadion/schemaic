@@ -79,6 +79,31 @@ pub(crate) fn run_id_seed(entries: &[HistoryEntry]) -> u64 {
     entries.iter().map(|e| e.run_id).max().unwrap_or(0)
 }
 
+/// Hand out `n` run ids from `next`, each one past everything issued before it.
+///
+/// **A function because a test could not otherwise reach it.** This was three
+/// lines inside `record`'s `map`, and `a_run_id_is_seeded_past_every_id_on_disk`
+/// asserted [`run_id_seed`] alone — so the name said "past every id on disk"
+/// while the `+ 1` that makes an allocated id *past* the seed was untested. Both
+/// mutations the seed's own doc names survived it: drop the `+ 1` and every run
+/// of a session reuses the maximum id already on disk, so the first run to land
+/// writes its timing and outcome onto a pre-existing entry — a row in the
+/// panel whose duration and row count belong to a query somebody ran last week.
+///
+/// The three properties [`run_id_seed`] documents are only true of the pair:
+/// the seed supplies "global" and "never zero", and this supplies "only ever
+/// counting up", which is the one that stops an id being reused while the run
+/// holding it is still in flight.
+pub(crate) fn allocate(next: &Cell<u64>, n: usize) -> Vec<u64> {
+    (0..n)
+        .map(|_| {
+            let id = next.get() + 1;
+            next.set(id);
+            id
+        })
+        .collect()
+}
+
 /// The store's file. A `const` rather than five string literals, so the gate
 /// below can say "named once" and mean it.
 const FILE: &str = "history.json";
@@ -159,7 +184,9 @@ pub(crate) fn wire(
                             .map(|c| SqlDialect::from_db_type(&c.db_type))
                     })
                     .unwrap_or_default();
-                let mut ids = Vec::with_capacity(stmts.len());
+                // The whole batch's ids up front, through `allocate` — see its
+                // doc for why the `+ 1` is not written inline here any more.
+                let ids = allocate(&run_ids, stmts.len());
                 // **One batch, not N pushes.** The per-connection cap applied on
                 // each push let a script longer than the cap evict the whole of
                 // the connection's real history — and its own dispatched
@@ -169,10 +196,8 @@ pub(crate) fn wire(
                 // known. See `history::push_batch`.
                 let batch: Vec<_> = stmts
                     .iter()
-                    .map(|sql| {
-                        let run_id = run_ids.get() + 1;
-                        run_ids.set(run_id);
-                        ids.push(run_id);
+                    .zip(ids.iter().copied())
+                    .map(|(sql, run_id)| {
                         HistoryEntry {
                             conn_id,
                             database: database.clone(),
@@ -284,8 +309,9 @@ pub(crate) fn wire(
 
 #[cfg(test)]
 mod tests {
-    use super::run_id_seed;
+    use super::{allocate, run_id_seed};
     use schemaic_core::history::{HistoryEntry, Outcome};
+    use std::cell::Cell;
 
     /// The whole of the run-id allocator's correctness argument, which was
     /// untested: deleting the `+ 1` at the call site or narrowing the seed to the
@@ -312,6 +338,38 @@ mod tests {
         // that entries written before run ids carry.
         assert_eq!(run_id_seed(&[]), 0);
         assert_eq!(run_id_seed(&[e(1, 0), e(1, 0)]), 0);
+
+        // **And "past", which is the word this test's name uses and which the
+        // seed alone cannot supply.** The `+ 1` lived inside `record`'s closure
+        // where nothing could reach it, so both mutations `run_id_seed`'s doc
+        // names survived this test: without it every run of a session reuses
+        // the maximum id on disk, and the first run to land writes its timing
+        // onto a pre-existing entry.
+        let on_disk = [e(1, 3), e(2, 9), e(1, 5)];
+        let next = Cell::new(run_id_seed(&on_disk));
+        let first = allocate(&next, 3);
+        assert_eq!(
+            first,
+            vec![10, 11, 12],
+            "the first ids of a session must be past every id on disk"
+        );
+        assert!(
+            first
+                .iter()
+                .all(|id| on_disk.iter().all(|e| e.run_id != *id)),
+            "an allocated id collides with one already in the history"
+        );
+        // A second batch continues rather than restarting, which is what stops
+        // an id being reused while the run holding it is still in flight.
+        assert_eq!(allocate(&next, 2), vec![13, 14]);
+        // Never zero, even from an empty history — a legacy entry carries 0 and
+        // `finish` matches by id.
+        let fresh = Cell::new(run_id_seed(&[]));
+        assert_eq!(allocate(&fresh, 1), vec![1]);
+        // A batch of nothing takes nothing, so a run that records no statement
+        // does not burn an id its outcome would then look for.
+        assert!(allocate(&fresh, 0).is_empty());
+        assert_eq!(fresh.get(), 1);
     }
 
     /// **The module's reason for existing, as a gate.** The three paths that

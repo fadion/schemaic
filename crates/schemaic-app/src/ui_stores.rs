@@ -17,6 +17,15 @@
 //! The rule those three stores actually need is enforced where it can be seen,
 //! by `schemaic_ui::persisted_store_gate`.
 //!
+//! **That sentence was true of two of the three.** `format.json`'s writer was
+//! exempted there on a premise that was false of the code — that `grid.rs`
+//! upserts "through `GridState::fmt_rules` rather than a `format::` mutator",
+//! where `grid.rs` calls `format::upsert` in exactly the shape the other
+//! needles match — so deleting that store's save left both gates green while
+//! this paragraph claimed all three were covered. The needle is in now. An
+//! exemption is a claim about the code, and the cost of not checking one is a
+//! sentence here that reads like a guarantee.
+//!
 //! **`db_colors` and `table_colors` are two signals over one file**, which is
 //! the only invariant left on this side: they share `db_colors.json`, so
 //! writing either half has to write both or the other is lost. [`saver`]'s

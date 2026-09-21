@@ -4575,11 +4575,19 @@ mod diagram_layout_gate {
 /// closure here takes — so the check is *"something was persisted"* rather than
 /// *"this exact name was called"*.
 ///
-/// `format.json`'s writer in `grid.rs` is deliberately **not** covered: it
-/// upserts through `GridState::fmt_rules` rather than a `format::` mutator, and
-/// giving this gate a second shape to recognise would weaken the one it has.
-/// That store's rule is unguarded and says so here rather than being quietly
-/// folded in.
+/// **`format.json`'s writer is covered, and this paragraph used to say it could
+/// not be.** It claimed `grid.rs` "upserts through `GridState::fmt_rules` rather
+/// than a `format::` mutator", so covering it would need a second shape and
+/// weaken the gate. That was false of the code: `grid.rs`'s one write is
+/// `format::upsert(rules, conn, &db, &table, &col, fmt)` — character for
+/// character the shape the three colour and favourite needles have — with its
+/// save three lines later. The needle was all that was missing, and in the
+/// meantime deleting that save left the suite green while `ui_stores.rs`
+/// claimed all three stores were guarded.
+///
+/// So the third store is in, and the lesson is worth more than the needle: an
+/// exemption is a claim about the code, and this one was never checked against
+/// it.
 #[cfg(test)]
 mod persisted_store_gate {
     /// The calls that change a persisted store, and how far after one a save has
@@ -4589,6 +4597,7 @@ mod persisted_store_gate {
         "db_color::upsert(",
         "db_color::table_upsert(",
         "favorite::toggle(",
+        "format::upsert(",
     ];
     const WINDOW: usize = 700;
     /// What a save looks like from here: every one of these stores' savers takes
@@ -4620,14 +4629,15 @@ mod persisted_store_gate {
             }
         }
         // The floor, and it is the whole reason this gate is not vacuous: four
-        // colour sites and one favourite. A rename in `schemaic-core` that made
-        // every needle stop matching would otherwise report success.
+        // colour sites, one favourite, one column format. A rename in
+        // `schemaic-core` that made every needle stop matching would otherwise
+        // report success.
         assert_eq!(
-            seen, 5,
-            "expected 5 persisted-store writes in this crate (4 colour, 1 \
-             favourite), found {seen} — if a site was added, add its save too \
-             and raise this number; if a mutator was renamed, fix the needle, \
-             because a gate that matches nothing passes"
+            seen, 6,
+            "expected 6 persisted-store writes in this crate (4 colour, 1 \
+             favourite, 1 column format), found {seen} — if a site was added, \
+             add its save too and raise this number; if a mutator was renamed, \
+             fix the needle, because a gate that matches nothing passes"
         );
         assert!(
             offenders.is_empty(),
