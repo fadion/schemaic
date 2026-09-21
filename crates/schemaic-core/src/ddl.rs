@@ -22348,11 +22348,28 @@ mod database_tests {
         assert!(!is_account_change(&Change::DropTable));
     }
 
-    /// **The list cannot quietly shrink.** `every_account_change()` is
-    /// hand-written so a new variant has to be added on purpose — but nothing
-    /// held it to the variants that exist, so a seventh could join `Change` and
-    /// three tests would keep passing over six. Counted against the discriminant
-    /// rather than a literal, so adding one fails here with a name.
+    /// **The list cannot quietly shrink, and `Change` cannot quietly grow past
+    /// it.** `every_account_change()` is hand-written so a new variant has to be
+    /// added on purpose, and three tests walk it — the credential-scrub gate
+    /// among them, which is why a variant missing from it can put a plaintext
+    /// password into an Export script.
+    ///
+    /// **It used to end at `assert_eq!(listed.len(), 7)`**, and a literal is
+    /// exactly what cannot hold this: `Change` is never enumerated by it, so an
+    /// eighth account variant added to [`is_account_change`] and not to the
+    /// fixture left the count at seven and every assertion passing. The
+    /// function's own doc claimed the opposite.
+    ///
+    /// So the number is derived from the enum in two steps, and both are
+    /// needed. [`account_variant_index`] is an exhaustive `match` **with no `_`
+    /// arm**, so a new `Change` variant does not compile until somebody says
+    /// which side it falls on — that is the compiler's half.
+    /// [`account_variant_count`] then reads how many arms are on the account
+    /// side off that function's own source, so classifying one as an account
+    /// change makes the expected index set grow whether or not the author
+    /// remembers the fixture. Neither half alone is enough: the first misses a
+    /// variant classified `Some` and forgotten, and the second would not fire
+    /// at all if the `match` had a `_` to hide behind.
     #[test]
     fn every_account_change_is_in_the_list_the_account_tests_walk() {
         use std::collections::HashSet;
@@ -22365,11 +22382,152 @@ mod database_tests {
             every_account_change().len(),
             "the list repeats a variant, so one is untested behind another"
         );
-        // The seven the module has. A new one lands in `is_account_change` (or
-        // it is not an account change at all), which is what makes this the
-        // right side to count from. It caught the seventh,
-        // `SetAccountPassword`, on the way in.
-        assert_eq!(listed.len(), 7);
+        // Every index the classification hands out is claimed by exactly one
+        // fixture value, and every fixture value claims one. Stated as a set
+        // equality against `0..ACCOUNT_VARIANTS` rather than as a length, so a
+        // fixture that covered one variant twice and another not at all — the
+        // shape a length cannot see — fails here too.
+        let claimed: HashSet<usize> = every_account_change()
+            .iter()
+            .map(|c| {
+                account_variant_index(c).unwrap_or_else(|| {
+                    panic!("{c:?} is in every_account_change() but is not an account variant")
+                })
+            })
+            .collect();
+        assert_eq!(
+            claimed,
+            (0..account_variant_count()).collect::<HashSet<usize>>(),
+            "the fixture does not hold one value per account variant of `Change`"
+        );
+        // And the two classifications agree, so the exhaustive `match` above
+        // cannot drift from the `matches!` the product actually asks.
+        for c in every_account_change() {
+            assert!(is_account_change(&c), "{c:?}");
+        }
+        assert_eq!(
+            account_variant_index(&Change::DropTable),
+            None,
+            "a table change is not an account change"
+        );
+    }
+
+    /// How many variants of `Change` are account changes, **read off
+    /// [`account_variant_index`]'s own source** rather than written down.
+    ///
+    /// A literal here would move the hole rather than close it, and that was
+    /// tried: with `const ACCOUNT_VARIANTS: usize = 7` the mutation this whole
+    /// gate exists for — classify an eighth variant as an account change, leave
+    /// the fixture alone — was **watched passing**, because the fixture still
+    /// claimed indices `0..7` and the literal still said seven. Nothing in the
+    /// chain noticed that the `match` had grown.
+    ///
+    /// So the count comes from the arms. Reading this crate's own source is the
+    /// one sanctioned filesystem access in the suite (`AGENTS.md`), and it is
+    /// the same device the `ui::source_gate` family uses; scoped to the one
+    /// function's body so **this** assertion's source cannot answer it — the
+    /// self-reference trap every source gate here has to dodge.
+    fn account_variant_count() -> usize {
+        let src = include_str!("ddl.rs");
+        // **Assembled, not written.** Spelled out, this needle's own source is
+        // the first hit in the file — `account_variant_count` is defined above
+        // the function it measures — so the slice became this function's body,
+        // the count came back 2 instead of 7, and the gate answered about
+        // itself. Watched happening, which is why it is written this way.
+        let needle = format!("fn {}(change: &Change)", "account_variant_index");
+        let at = src
+            .find(&needle)
+            .expect("the classification is in this file");
+        let body = &src[at..];
+        let end = body.find("\n    }\n").expect("the function ends");
+        let arm = format!("=> {}(", "Some");
+        let n = body[..end].matches(&arm).count();
+        assert!(
+            n > 0,
+            "no account arms found — the classification was rewritten and this \
+             gate is now measuring nothing"
+        );
+        n
+    }
+
+    /// Classify one `Change`: `Some(i)` for an account change, with a distinct
+    /// `i` per variant, and `None` for everything else.
+    ///
+    /// **The `match` is exhaustive and has no `_` arm, which is the whole
+    /// point.** Adding a variant to `Change` stops this compiling until
+    /// somebody says which side it falls on; putting it on the account side
+    /// adds an `=> Some(` arm, which [`account_variant_count`] reads, which
+    /// makes the fixture short and the test above red. That chain is what a
+    /// bare `assert_eq!(listed.len(), 7)` had none of.
+    ///
+    /// The indices are contiguous from zero on purpose — the test asserts the
+    /// claimed set *equals* `0..count`, so a duplicated or skipped index fails
+    /// it too, which a length could not see.
+    ///
+    /// The fifty-two names on the `None` side are not noise: they are the cost
+    /// of the guarantee, and the compiler maintains them.
+    fn account_variant_index(change: &Change) -> Option<usize> {
+        match change {
+            Change::CreateAccount(_) => Some(0),
+            Change::DropAccount(_) => Some(1),
+            Change::SetAccountPassword(_) => Some(2),
+            Change::GrantPrivileges(_) => Some(3),
+            Change::RevokePrivileges(_) => Some(4),
+            Change::GrantRole(_) => Some(5),
+            Change::RevokeRole(_) => Some(6),
+            Change::CreateTable(_)
+            | Change::RebuildTable(_)
+            | Change::DropTable
+            | Change::TruncateTable
+            | Change::RenameTable { .. }
+            | Change::AddColumn { .. }
+            | Change::DropColumn { .. }
+            | Change::AlterColumn { .. }
+            | Change::PrimaryKey { .. }
+            | Change::AddIndex(_)
+            | Change::DropIndex { .. }
+            | Change::KeepLossyIndex { .. }
+            | Change::AddForeignKey(_)
+            | Change::DropForeignKey { .. }
+            | Change::AddCheck(_)
+            | Change::DropCheck { .. }
+            | Change::TableOptions { .. }
+            | Change::CreateView(_)
+            | Change::ReplaceView { .. }
+            | Change::RenameView { .. }
+            | Change::DropView { .. }
+            | Change::RefreshView { .. }
+            | Change::CreateTrigger(_)
+            | Change::ReplaceTrigger { .. }
+            | Change::DropTrigger { .. }
+            | Change::CreateRoutine(_)
+            | Change::ReplaceRoutine { .. }
+            | Change::RenameRoutine { .. }
+            | Change::DropRoutine(_)
+            | Change::CreateEvent(_)
+            | Change::AlterEvent { .. }
+            | Change::DropEvent(_)
+            | Change::CreateEnum(_)
+            | Change::AddEnumValue { .. }
+            | Change::RenameEnumValue { .. }
+            | Change::RecreateEnum { .. }
+            | Change::CreateDomain(_)
+            | Change::SetDomainDefault { .. }
+            | Change::SetDomainNotNull { .. }
+            | Change::AddDomainCheck(_)
+            | Change::DropDomainCheck { .. }
+            | Change::RecreateDomain { .. }
+            | Change::CreateSequence(_)
+            | Change::AlterSequence { .. }
+            | Change::RestartSequence { .. }
+            | Change::RenameObject { .. }
+            | Change::DropObject { .. }
+            | Change::SetObjectComment { .. }
+            | Change::CreateDatabase(_)
+            | Change::DropDatabase { .. }
+            | Change::CreateSchema { .. }
+            | Change::DropSchema { .. } => None,
+        }
     }
 
     /// **And a password the engine has not got either.** A role takes none on
