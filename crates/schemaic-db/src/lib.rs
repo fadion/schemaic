@@ -260,12 +260,27 @@ fn writer_gone() -> DbError {
 /// `every_engine_module_answers_the_whole_interface` holds each module to it —
 /// **all three of them.** MySQL was absent from that check for as long as it had
 /// no module of its own, and joining the list was not a formality: it found
-/// `mysql.rs` answering ten of thirteen. `commit_writes`, `refetch_rows` and
-/// `fetch_blob` existed there only as `write_on`, `refetch_on` and `blob_on` —
-/// the bodies a pinned `session` connection calls directly — with the door
-/// itself still spelled out in the dispatcher. Both convention tests named all
-/// three the moment MySQL was added to them, which is exactly the omission they
-/// describe.
+/// `mysql.rs` answering three fewer names than the list held. `commit_writes`,
+/// `refetch_rows` and `fetch_blob` existed there only as `write_on`,
+/// `refetch_on` and `blob_on` — the bodies a pinned `session` connection calls
+/// directly — with the door itself still spelled out in the dispatcher. Both
+/// convention tests named all three the moment MySQL was added to them, which is
+/// exactly the omission they describe.
+///
+/// **And a list is only what somebody remembered to write in it.** Both those
+/// tests measure the modules and the dispatcher *against* this list, so a name
+/// that never reached it is a name neither of them asks about — and `run_batch`
+/// had not, for as long as there have been three modules. It is
+/// `pub(crate) async fn` in each and dispatched to each, and both gates were
+/// green over one fewer name than the interface has. Putting SQLite's
+/// `run_batch` back on the `fetch_query` loop that once cascade-emptied child
+/// tables passes them both.
+///
+/// `the_entry_point_list_is_what_the_dispatcher_actually_dispatches` derives the
+/// set the other way — every name called on all three modules is an entry point,
+/// whatever this list says — so the list cannot be the only thing that knows.
+/// **No count here on purpose**: this paragraph used to say "ten of thirteen"
+/// and "twelve of thirteen" about a list that was already fourteen long.
 ///
 /// Test-only: it is a statement *about* the code rather than something the code
 /// reads, which is the same reason `source_gate`'s machinery next door is.
@@ -282,6 +297,12 @@ pub(crate) const ENGINE_ENTRY_POINTS: &[&str] = &[
     "import_rows",
     "run_ddl",
     "run_script",
+    // Fourteenth, and it had been an entry point for as long as there have been
+    // three modules: `pub(crate) async fn` in each, dispatched to each, and
+    // named here by nobody — so both convention gates were green over thirteen
+    // of fourteen. `the_entry_point_list_is_what_the_dispatcher_actually_
+    // dispatches` is what found it and what stops a fifteenth doing the same.
+    "run_batch",
     "prepare_check",
     "ping",
 ];
@@ -2440,9 +2461,9 @@ mod tests {
         // **Three, at last.** `mysql.rs` was absent from this list for most of
         // the crate's life, not as an omission but because there was no such
         // module — MySQL's bodies were inline below, so the one test that
-        // notices a module answering twelve of thirteen could only ever check
-        // two engines out of three, and the engine that ships most was the one
-        // it could not check.
+        // notices a module answering one name short could only ever check two
+        // engines out of three, and the engine that ships most was the one it
+        // could not check.
         for (name, src) in [
             ("mysql.rs", include_str!("mysql.rs")),
             ("pg.rs", include_str!("pg.rs")),
@@ -2505,9 +2526,15 @@ mod tests {
 
     /// And the dispatcher reaches all three engines for each of them, so the
     /// convention is not a list of names nothing calls.
+    ///
+    /// **Over the code, not the raw file.** This scanned `include_str!` whole
+    /// while its three siblings stripped comments, and it is the one that most
+    /// needed to: a rustdoc link with parens — `[`sqlite::run_batch`]` — reads
+    /// exactly like a call, so a doc mention could stand in for a deleted arm
+    /// and this gate would say the dispatch was there (`S1-L6-04`).
     #[test]
     fn the_dispatcher_calls_every_engine_module_for_every_entry_point() {
-        let me = include_str!("lib.rs");
+        let me = dispatcher_code();
         for f in ENGINE_ENTRY_POINTS {
             for module in ["mysql", "pg", "sqlite"] {
                 assert!(
@@ -2518,6 +2545,92 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// **And the list is the dispatcher's, not a second opinion about it.**
+    ///
+    /// `ENGINE_ENTRY_POINTS` is thirteen hand-written strings, and the two
+    /// tests above measure the modules and the dispatcher *against the list* —
+    /// so a name that never reaches the list is a name neither of them is
+    /// asking about. One already had: **`run_batch`** is
+    /// `pub(crate) async fn` in all three engine modules and dispatched to all
+    /// three, and both convention gates were green over thirteen of fourteen.
+    /// Putting SQLite's `run_batch` back on the `fetch_query` loop that once
+    /// cascade-emptied child tables passes them.
+    ///
+    /// So this derives the set the other way — every name the dispatcher calls
+    /// on **all three** modules is an entry point, whatever the list says — and
+    /// asserts the two agree. A fourteenth arrives with its dispatch arms and
+    /// fails here by name until it is written down.
+    ///
+    /// Comments stripped, for `the_dispatcher_executes_nothing_itself`'s
+    /// reason: this file is one long argument about which statement lives
+    /// where, and a rustdoc link naming `sqlite::run_batch` would otherwise
+    /// count as an arm.
+    #[test]
+    fn the_entry_point_list_is_what_the_dispatcher_actually_dispatches() {
+        use std::collections::HashSet;
+        let me = dispatcher_code();
+        // Every `<module>::<name>(` the dispatcher calls, per module.
+        let called = |module: &str| -> HashSet<String> {
+            let needle = format!("{module}::");
+            let mut out = HashSet::new();
+            let mut rest = me.as_str();
+            while let Some(at) = rest.find(&needle) {
+                rest = &rest[at + needle.len()..];
+                let end = rest
+                    .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                    .unwrap_or(rest.len());
+                if rest.as_bytes().get(end) == Some(&b'(') {
+                    out.insert(rest[..end].to_string());
+                }
+            }
+            out
+        };
+        let mysql = called("mysql");
+        let dispatched: HashSet<String> = mysql
+            .intersection(&called("pg"))
+            .cloned()
+            .collect::<HashSet<String>>()
+            .intersection(&called("sqlite"))
+            .cloned()
+            .collect();
+        let listed: HashSet<String> = ENGINE_ENTRY_POINTS.iter().map(|s| s.to_string()).collect();
+
+        let unlisted: Vec<&String> = dispatched.difference(&listed).collect();
+        assert!(
+            unlisted.is_empty(),
+            "the dispatcher calls these on all three engine modules and \
+             `ENGINE_ENTRY_POINTS` does not name them, so both convention gates \
+             are silent about them: {unlisted:?}"
+        );
+        let phantom: Vec<&String> = listed.difference(&dispatched).collect();
+        assert!(
+            phantom.is_empty(),
+            "`ENGINE_ENTRY_POINTS` names these and the dispatcher does not call \
+             them on all three modules: {phantom:?}"
+        );
+        // The scan found something — an empty intersection would satisfy the
+        // first assertion having read nothing.
+        assert!(
+            dispatched.len() >= ENGINE_ENTRY_POINTS.len(),
+            "only {} name(s) came back from the dispatcher scan, so this gate \
+             is not reading it",
+            dispatched.len()
+        );
+    }
+
+    /// This file with comments stripped — the dispatcher's *code*.
+    ///
+    /// Shared by the three convention gates, because the one that did not strip
+    /// them was the odd one out: a rustdoc link with parens reads exactly like
+    /// a call, so a doc mention could stand in for a deleted arm.
+    fn dispatcher_code() -> String {
+        include_str!("lib.rs")
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     /// **A `Db` must not print its password**, in any formatting, ever.
