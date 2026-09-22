@@ -168,6 +168,41 @@ to read, and no amount of markup in this repository can add one. If you need a
 screen reader, this is not yet a tool you can use, and we would rather say so
 than let you find out after the download.
 
+### Command line
+
+Schemaic can run a query without its window, against a connection you have
+already saved:
+
+```
+schemaic list
+schemaic query "SELECT * FROM orders LIMIT 5" --connection=prod --format=json
+schemaic exec "UPDATE orders SET state = 'sent' WHERE id = 7" --connection=prod
+```
+
+**Nothing here takes a credential.** The connection comes from Schemaic's own
+saved list and its password from the OS keyring, which is the point: you can
+hand a script — or an AI agent — a connection name without handing it a
+password, including for a database whose credentials you only ever typed into
+Schemaic.
+
+A connection is reachable this way only once you turn on **CLI access** for it
+in its connection settings. That is off for every connection, including ones you
+saved before this existed, because the command line runs with nobody watching.
+`schemaic list --all` shows the ones that are not exposed and why.
+
+`query` runs reads and nothing else — not a flag away from a write, a different
+subcommand. `exec` is the one that writes, it refuses outright on a connection
+marked read-only, and it asks before running something the guard flags, such as
+a `DELETE` with no `WHERE`. Output is `table`, `json`, `jsonl` or `csv`; rows go
+to stdout and everything else to stderr, so a pipe gets only data. It exits `0`
+on success, `2` on a usage error, `3` when a guard refused and `4` when the
+server did.
+
+On Linux the `.deb` and `.rpm` put `schemaic` on your `PATH` already. Elsewhere
+it lives next to the app for now — on Windows as `schemaic.com` beside
+`schemaic.exe`, which is what lets typing `schemaic` reach the command line
+while shortcuts still open the app.
+
 ## Install
 
 Prebuilt binaries for every release are on the
