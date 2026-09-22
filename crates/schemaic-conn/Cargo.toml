@@ -1,0 +1,34 @@
+[package]
+name = "schemaic-conn"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+schemaic-core = { workspace = true }
+tracing = { workspace = true }
+
+# OS keyring for saved connection secrets (DB/SSH passwords + key passphrase), so
+# `connections.json` holds no plaintext. Backend is target-gated: Windows Credential
+# Manager on Windows, Secret Service (GNOME Keyring / KWallet, via zbus + pure-Rust
+# crypto — no libdbus/OpenSSL system dep) on Linux, Keychain on macOS. A machine
+# with no working backend degrades gracefully (see `secrets::sanitize_file`).
+#
+# These live here rather than in `schemaic-app` because the headless CLI needs the
+# same store without the GUI's dependency graph: this crate is the seam, and it
+# pulls no floem.
+[target.'cfg(windows)'.dependencies]
+keyring = { version = "3", default-features = false, features = ["windows-native"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# Pure-Rust Secret Service (zbus + RustCrypto), NOT `sync-secret-service` — that
+# one pulls `dbus-secret-service` → `libdbus-sys`, a C system lib that would break
+# the portable glibc-2.31 zigbuild / AppImage build. `async-io` runtime so keyring
+# blocks on its own executor (no nested-tokio-runtime hazard).
+keyring = { version = "3", default-features = false, features = ["async-secret-service", "async-io", "crypto-rust"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+keyring = { version = "3", default-features = false, features = ["apple-native"] }
+
+[lints]
+workspace = true

@@ -2887,6 +2887,7 @@ mod tests {
             color: None,
             prominent_color: false,
             read_only: false,
+            cli_access: false,
             environment: Default::default(),
             ai_data: None,
         };
@@ -2932,6 +2933,7 @@ mod tests {
                 color: None,
                 prominent_color: false,
                 read_only: false,
+                cli_access: false,
                 environment: Default::default(),
                 ai_data: None,
             };
@@ -2980,6 +2982,7 @@ mod tests {
             color: None,
             prominent_color: false,
             read_only: false,
+            cli_access: false,
             environment: Default::default(),
             ai_data: None,
         };

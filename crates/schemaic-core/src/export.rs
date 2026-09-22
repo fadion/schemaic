@@ -1189,6 +1189,44 @@ fn unique_column_keys(rs: &ResultSet) -> Vec<String> {
         .collect()
 }
 
+/// One JSON object per line — newline-delimited JSON, for a reader that takes a
+/// row at a time.
+///
+/// **The same row shape as [`export_json`], and that is the point of it living
+/// here.** [`RowObject`], [`unique_column_keys`] and the withheld-binary rule
+/// are shared, so a row does not read one way inside an array and another way
+/// on a line — a duplicate column name gets the same `_2` suffix in both, and a
+/// blob placeholder is `null` in both. Only the envelope differs: no brackets,
+/// no commas, compact rather than pretty, and a `\n` after every row, which is
+/// what lets a consumer parse the first row before the last has arrived.
+///
+/// An empty result is an empty string, not `[]` — there is no envelope to emit
+/// when there are no rows, and a reader looping over lines sees none.
+///
+/// It has no [`ExportFormat`] variant on purpose: this is the headless CLI's
+/// `--format=jsonl`, not a format offered in the export menu.
+pub fn export_jsonl(rs: &ResultSet, order: &[usize]) -> String {
+    to_string(|w| export_jsonl_to(w, rs, order))
+}
+
+/// [`export_jsonl`], streamed.
+pub fn export_jsonl_to<W: Write>(w: &mut W, rs: &ResultSet, order: &[usize]) -> io::Result<()> {
+    let keys = unique_column_keys(rs);
+    let dropped = dropped_binary_columns(rs, order);
+    let mask = binary_mask(rs, &dropped);
+    for &di in order.iter().filter(|&&di| di < rs.row_count()) {
+        let row = RowObject {
+            rs,
+            keys: &keys,
+            mask: &mask,
+            di,
+        };
+        serde_json::to_writer(&mut *w, &row).map_err(io::Error::other)?;
+        w.write_all(b"\n")?;
+    }
+    Ok(())
+}
+
 /// One column's values as a JSON array (for building arrays out of a column).
 pub fn export_column_json(rs: &ResultSet, order: &[usize], ci: usize) -> String {
     to_string(|w| export_column_json_to(w, rs, order, ci))
@@ -5478,6 +5516,65 @@ mod tests {
         let obj = v[0].as_object().expect("a row object");
         assert_eq!(obj.len(), 4, "{text}");
         assert_eq!(obj["a_4"], 2);
+    }
+
+    /// One object per row, each a complete JSON document on its own line — the
+    /// whole contract a line-at-a-time reader relies on.
+    #[test]
+    fn jsonl_is_one_parseable_object_per_line_in_display_order() {
+        let out = export_jsonl(&rs(), &[1, 0]);
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines.len(), 2, "one line per row");
+        let first: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+        let second: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
+        assert!(
+            first["id"].is_null(),
+            "display order [1, 0] puts the NULL first"
+        );
+        assert_eq!(second["id"], 1);
+    }
+
+    /// **The rows must be byte-identical to the array form's.** The reason
+    /// `export_jsonl` is in this module rather than in the CLI crate is that it
+    /// shares `RowObject` and `unique_column_keys`; if it ever stops agreeing
+    /// with `export_json` row for row, that sharing has been broken and a
+    /// duplicate column name or a withheld blob is about to read differently
+    /// depending on which flag the caller passed.
+    #[test]
+    fn a_jsonl_row_is_the_same_row_the_array_form_emits() {
+        let rs = rs();
+        let order = [0, 1];
+        let array: serde_json::Value = serde_json::from_str(&export_json(&rs, &order)).unwrap();
+        let lines: Vec<serde_json::Value> = export_jsonl(&rs, &order)
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(array.as_array().unwrap(), &lines);
+    }
+
+    /// No rows means no lines — not `[]`, which a line reader would hand back
+    /// as one bogus record.
+    #[test]
+    fn jsonl_of_an_empty_result_is_empty() {
+        let empty = ResultSet::from_rows(vec![col("id")], vec![]);
+        assert_eq!(export_jsonl(&empty, &[]), "");
+    }
+
+    /// A row carrying a newline must not become two records.
+    #[test]
+    fn a_value_with_a_newline_stays_on_one_jsonl_line() {
+        let rs = ResultSet::from_rows(
+            vec![col("id"), col("t")],
+            vec![vec![Value::Int(1), Value::Str("line\nbreak".to_string())]],
+        );
+        let out = export_jsonl(&rs, &[0]);
+        assert_eq!(
+            out.lines().count(),
+            1,
+            "the newline is escaped, not emitted"
+        );
+        let v: serde_json::Value = serde_json::from_str(out.trim_end()).unwrap();
+        assert_eq!(v["t"], "line\nbreak");
     }
 
     #[test]

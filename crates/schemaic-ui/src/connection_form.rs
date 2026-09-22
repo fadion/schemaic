@@ -1511,6 +1511,17 @@ fn conn_form(
         ring.clone(),
         30,
     );
+    // Whether `schemaic query` / `exec` may reach this connection at all. Off
+    // for every connection until the user turns it on here, including ones
+    // saved before the setting existed — the CLI runs with nobody watching, so
+    // exposure is granted one connection at a time and never inherited.
+    let cli_access_toggle = focusable_toggle_row(
+        "CLI access",
+        "Let the schemaic command line use this connection.",
+        draft.cli_access,
+        ring.clone(),
+        33,
+    );
 
     let type_field = v_stack((
         text("Type").style(form_label_style),
@@ -1584,6 +1595,7 @@ fn conn_form(
         name_color,
         prominent_toggle,
         read_only_toggle,
+        cli_access_toggle,
         ai_data_field,
         env_field,
         type_field,

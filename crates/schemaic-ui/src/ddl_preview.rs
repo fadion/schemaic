@@ -1350,6 +1350,7 @@ mod tests {
             color: None,
             prominent_color: false,
             read_only,
+            cli_access: false,
             environment: Default::default(),
             ai_data: None,
         }

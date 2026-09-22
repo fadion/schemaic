@@ -123,6 +123,48 @@ pub fn load_connections() -> ConnectionsFile {
     file
 }
 
+/// [`load_connections`] for a front end that **must not write the file**.
+///
+/// The app's load self-heals: a `connections.json` still carrying legacy
+/// plaintext is migrated into the keyring and the on-disk copy rewritten
+/// blanked. A headless front end must not do that. The app may be running and
+/// owns that file — a one-shot command rewriting it underneath a GUI that is
+/// about to save its own copy is how a connection list gets lost — and a
+/// migration is not something to perform as a side effect of `schemaic list`.
+///
+/// So this hydrates from the keyring and **reports instead of repairing**: the
+/// returned notices are what the caller puts on stderr. Everything still works
+/// against an unmigrated file, because the plaintext it carries hydrates the
+/// connection just as a keyring entry would; it simply stays plaintext until
+/// the app is next opened.
+///
+/// It deliberately does not touch `last_hydration` either — that exists to stop
+/// a later *save* deleting a secret it could not read, and there is no later
+/// save here.
+///
+/// **And it reads through [`persist::read_connections_unrecovered`], not
+/// [`persist::load_connections`]**, because the ordinary load is not read-only
+/// either: it sweeps the orphaned `.tmp` on every healthy read — which is what
+/// a save in flight looks like — and renames an unparseable primary to
+/// `.corrupt`. An unparseable file is returned as an `Err` here for the caller
+/// to report; repairing it is the app's job.
+pub fn load_connections_readonly() -> Result<(ConnectionsFile, Vec<String>), String> {
+    let mut file = persist::read_connections_unrecovered()?;
+    let hydration = secrets::hydrate_file(&mut file, &KeyringStore);
+    let mut notices = Vec::new();
+    if let Some(notice) = hydration.notice() {
+        notices.push(notice);
+    }
+    if hydration.needs_resave {
+        notices.push(
+            "some connection secrets are still stored as plaintext in connections.json; \
+             open Schemaic once to move them into the OS keyring"
+                .to_string(),
+        );
+    }
+    Ok((file, notices))
+}
+
 /// Persist saved connections with their secrets stored in the keyring; the JSON
 /// written to disk has every secret field blanked (unless the keyring was
 /// unavailable, in which case the plaintext is kept so the credential isn't

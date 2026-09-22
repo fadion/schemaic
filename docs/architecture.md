@@ -270,8 +270,8 @@ existing prose was left alone.
     where it is a name. The highlighter's own field doc promised the opposite — the `#` half worked
     and the `$tag$` half was exactly inverted. `None` exactly where `skip_noncode` answers `None`,
     which is what makes a `$` opening no valid tag ordinary punctuation on both sides.
-    **The AI read-only gate's allowed heads are a per-dialect list too** — `read_only_heads`, which
-    `read_only_reason` both tests against and builds its rejection message from:
+    **The unattended read-only gate's allowed heads are a per-dialect list too** — `read_only_heads`,
+    which `read_only_reason` both tests against and builds its rejection message from:
     `SELECT/SHOW/DESCRIBE/DESC/EXPLAIN/WITH` on MySQL, `SELECT/SHOW/EXPLAIN/WITH` on PostgreSQL
     (`SHOW search_path` is real SQL there, while `DESCRIBE` isn't — psql's `\d` is a client command
     rather than a statement), `SELECT/EXPLAIN/WITH` on SQLite. One shared list was wrong in both
@@ -284,6 +284,11 @@ existing prose was left alone.
     `the_rejection_lists_only_this_engines_heads`). Only the head list is per dialect: the
     single-statement check and the `DENY_KEYWORDS` scan — which is what refuses a write hidden
     behind a `WITH` head — apply the same everywhere.
+    **The gate has two front ends now, so its wording names neither.** It was the AI's alone and its
+    refusals said so; `schemaic query` runs the same function, and a person typing a `SLEEP()` at a
+    prompt being told it *"is not permitted in an AI query"* is being answered about somebody else's
+    session. The denied-keyword refusal says *read-only query* instead. The head-list refusal above
+    never named a front end, which is why only the one sentence changed.
     **A quoted name in front of a `(` is a function call, and the deny scan has to see it.**
     PostgreSQL resolves a double-quoted identifier against the stored lower-case `pg_proc.proname`,
     so `SELECT "pg_read_file"('/etc/passwd')` is the same call as the unquoted one — while
@@ -294,7 +299,8 @@ existing prose was left alone.
     separates the name from its `(` is asked through `sql::next_code_byte`, never
     `is_ascii_whitespace`.** The first spelling of the rule tested the first non-whitespace byte, and
     a comment is not whitespace, so `SELECT "pg_read_file"/*x*/('/etc/passwd')` put the name straight
-    back out of reach — on a predicate `app/mcp.rs`'s `run_query` is gated on alone. Every dialect
+    back out of reach — on a predicate that, at the time, `app/mcp.rs`'s `run_query` was gated on
+    alone, and that `schemaic query` is gated on too now. Every dialect
     steps over a comment between a name and its argument list exactly as it steps over a space;
     `next_code_byte` is built on `skip_noncode` and `noncode_kind`, so a comment is a gap while a
     string or a quoted identifier — code rather than a gap — stops the scan. The repair is inside
@@ -1951,6 +1957,14 @@ existing prose was left alone.
     every bare name is reserved before any key is handed out, which makes the answer independent of
     the order the columns arrive in, and only a *generated* suffix steps around the reservation: a
     column always keeps its own name.
+    **`export_jsonl`/`export_jsonl_to` are here rather than in the CLI that asked for them**, because
+    the row is the thing being shared and not the envelope: `RowObject`, `unique_column_keys` and the
+    withheld-binary rule are the same three, so a duplicate column name gets the same `_2` suffix and
+    a blob placeholder is `null` whether a row left through the export menu or down a pipe. Only the
+    envelope differs — no brackets, no commas, compact rather than pretty, a `\n` after every row, so
+    a consumer can parse the first row before the last has arrived — and an empty result is the empty
+    string rather than `[]`, there being no envelope to emit. It has **no `ExportFormat` variant** on
+    purpose: this is `schemaic query --format=jsonl`, not a format offered in the Download menu.
     And
     `all_rows_label(size, sorted, manual_tx, staged)` is the Download menu's `All rows` entry, four
     disclosures made at the point of choice in place of an untested `match` in the view (*Data grid*).
@@ -5162,8 +5176,11 @@ existing prose was left alone.
     integer arm alone. Nothing here understands what is *inside* the parens — that is
     `celledit::value_list`, which goes through `sql::skip_noncode` because a member may contain a
     quote, a comma or a `)`.
-  - `format.rs` — per-column display formatters (`ColumnFormat`/`apply`: epoch→datetime, bytes,
+  - `core/format.rs` — per-column display formatters (`ColumnFormat`/`apply`: epoch→datetime, bytes,
     bool). Display-only; edit/copy stay raw. Persisted to `format.json`.
+    **Named crate-qualified because the basename is no longer unique**: `schemaic-cli` has a
+    `format.rs` of its own (the `--format` surface), and `doc_coverage`'s bare-basename match would
+    let either entry answer for both files.
     **The Boolean one reads the word through `celledit::read_bool`, the workspace's one reader of
     it.** `bool_glyph` was a `matches!` over eight hand-listed spellings and PostgreSQL's text
     protocol hands `false` back as the single letter `f`, which was in none of them — so every
@@ -5390,6 +5407,16 @@ existing prose was left alone.
     the decision: a plan, a comparison or a preview that has lost its connection still has to name
     what it is about, and `connection 7` is a worse name than the one the user gave it and a far
     better one than a title reading *"Apply to  "*.
+    **`cli_access` is who may *reach* this connection, where `read_only` is what may be *done* over
+    it** — two fields rather than one setting, because a connection can be exposed to the headless
+    CLI and still refuse writes, and usually should be. It is `#[serde(default)]` and off, so every
+    connection already on disk reads as not exposed: the CLI runs with nobody at the keyboard, and an
+    upgrade that defaulted it on would hand an agent the production connection the user had already
+    saved, silently (`a_connection_saved_before_the_cli_existed_is_not_exposed_to_it`, with
+    `the_cli_access_flag_round_trips` for the direction that would break by never persisting). Only
+    the GUI writes it — the CLI reads `connections.json` and never writes it, since the app may be
+    running and owns that file — and `cli/select.rs`'s `select` is the one place a connection is
+    *refused* on it, its `listed` and `run`'s `list --all` column being the two that merely read it.
     `AiData` is the connection's **AI data-access level** — `SchemaOnly` / `OnRequest` (the
     default) / `Full` — and the single gate over every path that can carry this connection's rows
     off the machine: the `run_query` tool, `describe_table`'s sample rows, the grid's
@@ -6121,7 +6148,7 @@ existing prose was left alone.
     caller says whether a turn finished or a transcript was replaced with nothing; the snippet
     library's save says the same thing, now through `snippet_store`'s private `save(snippets,
     saving)` rather than the `save_snippets` closure `main.rs` used to hold; and
-    `persist::save_connections` takes one, with `app::secrets::save_connections` and `persist_conns`
+    `persist::save_connections` takes one, with `conn::secrets::save_connections` and `persist_conns`
     forwarding it. **Every connection save but the delete stays `Replacing`**, because
     `connections.json` is the one config file with no second copy anywhere and losing it loses every
     connection — but an ordinary save on the delete path copies the pre-delete generation aside, so
@@ -6192,7 +6219,7 @@ existing prose was left alone.
     **`queue_notice` is the shared startup-notice channel**, over the `RECOVERIES` list the
     config-recovery modal drains with `take_recoveries`. Everything loaded before the window is
     drawn has the same problem — there is no surface yet to say anything on — so one channel beats
-    each loader inventing its own, and `app/secrets.rs` is the second caller (a locked keyring is
+    each loader inventing its own, and `conn/secrets.rs` is the second caller (a locked keyring is
     *the* reason connections stop authenticating and used to reach neither a banner nor a log line).
     **The drain is no longer startup-only**, and believing it was is what made the contract false for
     `diagrams.json`. The app drained the queue exactly once, after the `Ui` literal, under the
@@ -6242,6 +6269,24 @@ existing prose was left alone.
     reason to take a backup. `load_json_strict` is the loader for *security* state rather than for
     configuration: an unreadable trust store is an `Err`, never an empty one, since the default
     value there is itself the insecure answer.
+    **`load_connections` is not a read-only operation, which is why a second process needs a second
+    door.** A healthy `read_bytes` sweeps the orphaned `.tmp` sibling on every read, and an
+    unparseable primary is renamed aside to `.corrupt` and read back off the `.bak` — both right for
+    the app, which owns these files and is the only thing that can repair them, and both wrong for
+    the headless CLI reading `connections.json` while the app runs. The `.tmp` that sweep removes is
+    exactly what a save in flight has just written and is about to rename into place, so a
+    `schemaic list` landing in that window would delete the generation the app was saving; and a
+    repair is not something a one-shot command was asked to perform.
+    `read_connections_unrecovered` parses the primary and stops — absent is the default value (what
+    every install looks like before its first connection is saved), unparseable is an `Err` for the
+    caller to report and nothing is moved — over `read_unrecovered`, the `FileStore`-taking half, so
+    all three outcomes are testable without a disk. The pin is
+    `the_recovering_read_sweeps_a_save_in_flight_and_the_unrecovered_one_does_not`, which runs the
+    two loads over the same staged `.tmp` **in one test**, because the claim is about the difference
+    between them and either half alone reads as a property of loading rather than a choice;
+    `an_unrecovered_read_leaves_every_file_where_it_found_it` is the wider half, asserted over the
+    fake store's op log rather than the final file set — the claim is not "it does not call `save`"
+    but "it renames nothing and removes nothing".
     **`write_file_atomic` is the other half of this module and is for a file that is *not* ours** —
     a `.sql` script the user opened, another vendor's settings file, the Antigravity claim marker.
     `fs::write` truncates before it writes, so a full disk, a dropped share or a crash between the
@@ -6274,7 +6319,7 @@ existing prose was left alone.
     passphrase, collected and stored by an earlier build for a feature that could never work —
     `TlsPlan` carried no passphrase, so an encrypted key always failed blaming the file — and
     removing the `SecretKind` arm alone would have stranded that entry in the keyring, unread and
-    undeletable through the app. The real keyring-backed store lives in `schemaic-app`'s
+    undeletable through the app. The real keyring-backed store lives in `schemaic-conn`'s
     `secrets` module (the heavy `keyring`/D-Bus dep stays out of core); pure + unit-tested via an
     in-memory fake.
     **Both directions of a store failure now come back as a sentence, because the machine where the
@@ -6300,14 +6345,14 @@ existing prose was left alone.
     beside the log), and *the next launch will fill this cleared field back in*. `forget` returns
     whether a deleted connection's entries are all definitely gone, which matters because ids are
     reused.
-    **`app/secrets.rs`'s two classifications are free functions so they can be tested**, which is
+    **`conn/secrets.rs`'s two classifications are free functions so they can be tested**, which is
     the whole reason they were pulled out of the trait impl. `classify_get` decides that `NoEntry`
     alone means *there is no secret here* and everything else — a locked keyring, a denied prompt, a
     platform failure — means *we could not read it*; `classify_delete` is the same rule the other
     way. Core pins both consequences, but only ever against a fake that reports errors correctly by
     construction, so collapsing the match at the real backend left every one of those tests green
     while credentials were destroyed — the seam at a trait impl rather than at a function call, and
-    that file was at zero coverage. On the app side `load_connections` puts `Hydration::notice` on
+    that file was at zero coverage. On the store side `load_connections` puts `Hydration::notice` on
     `persist::queue_notice` (the startup channel the config-recovery modal drains),
     `save_connections` returns `Option<String>` and `main.rs`'s `persist_conns` shows it in the
     error modal — once per session per distinct notice, because the alternative is a modal on every
@@ -7688,6 +7733,42 @@ existing prose was left alone.
         `index_facts`, `unused_note` and `shows_free` all exist to prevent. `TableStats::total_bytes`
         — the *table's* data plus indexes, which `storage_section` really does print — is a
         different function and is still here.
+- `schemaic-conn` — a saved connection and the OS keyring that holds its secrets, and nothing else.
+  Its whole dependency list is `schemaic-core`, `tracing` and the target-gated `keyring`: **no
+  floem**, which is the entire reason it exists. `secrets.rs` was `schemaic-app`'s, and
+  `schemaic-app` is bin-only and links floem and the whole wgpu stack, so nothing without a GUI
+  could reach `load_connections` to open a saved connection. This crate is that seam, and
+  `schemaic-cli` is what walks through it. It stays thin
+  on purpose — the pure transforms remain in `core::secrets` and the `connections.json` I/O in
+  `core::persist`; what moved is only the half that talks to the OS.
+  - `conn/secrets.rs` — the real, keyring-backed `SecretStore` behind `core::secrets`, plus the
+    `load_connections`/`save_connections`/`forget_connection` wrappers every connection save routes
+    through and the process-level `last_hydration` they share. It arrived here from `schemaic-app`
+    unchanged; what it decides — `classify_get`/`classify_delete` as free functions, why a refused
+    delete is reported only for a secret this load actually read a value out of — is written up
+    under `core/secrets.rs`, beside the pure half it serves.
+    **`load_connections_readonly` is that wrapper's headless twin, and the difference is that it
+    reports instead of repairing.** The app's load self-heals — a `connections.json` still carrying
+    legacy plaintext is migrated into the keyring and the on-disk copy rewritten blanked — which a
+    one-shot `schemaic query` must not do as a side effect while the GUI may be running and about to
+    save its own copy. So it reads through `persist::read_connections_unrecovered` (for that
+    function's own reasons), hydrates from the keyring, and hands back
+    `(ConnectionsFile, Vec<String>)`: the strings are what the caller puts on stderr, one of them
+    saying the file is still unmigrated and to open Schemaic once. It never touches
+    `last_hydration`, which exists to stop a later *save* deleting a secret it could not read, and
+    there is no later save here. An unmigrated file still works — the plaintext it carries hydrates
+    a connection exactly as a keyring entry would — it simply stays plaintext.
+    The target-gated `keyring` backends
+    came with it and are in this crate's manifest now: Windows Credential Manager, macOS Keychain,
+    and on Linux the **pure-Rust** `async-secret-service` (with `async-io`, so keyring blocks on its
+    own executor rather than nesting a tokio runtime) and not `sync-secret-service`, which pulls
+    `dbus-secret-service` → `libdbus-sys` and would put a C system library into the portable
+    glibc-2.31 zigbuild the tarball and the AppImage are built from. `schemaic-app`'s manifest keeps
+    a two-line pointer where those blocks used to be.
+    **The move also took this file out of the UI crate's source-gate census** —
+    `source_gate::workspace_sources()` names `ui`, `app`, `core` and `db` only, so the gates that
+    once reported `app/secrets.rs` no longer read it; `ui/source_gate.rs` has what that costs and
+    why adding a fifth directory is not a one-word change.
 - `schemaic-db` — MySQL/MariaDB (`mysql_async`) in `mysql.rs`, PostgreSQL in `pg.rs`,
   SQLite in `sqlite.rs`, SSH tunnels in `ssh.rs`, and
   the pinned manual-transaction connection in `session.rs`.
@@ -12121,6 +12202,16 @@ existing prose was left alone.
     That is also what stopped opening the form from rewriting a `MariaDB` label to `MySQL` — the
     write used to be unconditional, and the picker has one name per engine where `db_type` has
     several.
+    **The *CLI access* toggle is this form's whole write surface for `Connection::cli_access`**, and
+    it is the only one anywhere: nothing else in the app sets the flag. It sits at tabindex 33,
+    between Read-only (30) and AI data access (35), which is where it sits on screen — a Tab order
+    that disagrees with the eye makes the keyboard skip a control and come back to it, the reason
+    already written beside the AI picker. Its hint is *"Let the schemaic command line use this
+    connection."*, and the three guard-rails read as one group on purpose, being the same kind of
+    per-connection answer. `DraftSignals::cli_access` is threaded through create, load, reset and
+    `to_connection` exactly as `read_only` is, and that is the part worth pinning: a hardcoded
+    `false` at `to_connection` would have compiled and silently cleared the flag every time a user
+    edited an exposed connection for any other reason.
     **The mask is replayed from the editor's own delta, never diffed out of the buffer.** The
     document holds `MASK_CH` throughout, so comparing the text before and after an edit cannot tell
     a mask character the *user* typed from one that was already there — and the ambiguity was not
@@ -12571,7 +12662,7 @@ existing prose was left alone.
     they differed only in who saw them — `app/antigravity.rs`'s `blocked_reason` reached the AI
     panel's no-tools note verbatim, `core/ddl.rs`'s generated-column refusal shows in the DDL
     preview, `ui/blob_view.rs`'s is a cell-preview message, `core/schema.rs`'s is the sequence note
-    in a copied script, and `core/launch.rs`'s and `app/secrets.rs`'s are latent because their
+    in a copied script, and `core/launch.rs`'s and `conn/secrets.rs`'s are latent because their
     consumers collapse space runs, which is a copy of the mistake rather than a live one and exactly
     how a class survives being fixed at its noisy sites. It runs over `workspace_sources()` and
     applies **Rust's own continuation rule before looking**, or every correctly-written multi-line
@@ -12579,7 +12670,22 @@ existing prose was left alone.
     naive scan), reads production code only — a test's expected output lines its columns up on
     purpose, and so does a SQL fixture — leaves alone any literal spelling its own `\n` or `\t`, that
     being the mark of a block whose spacing is deliberate, and carries floors on both the file count
-    and the literal count.
+    and the literal count. **`secrets.rs` is in that list of six and was for a while no longer in
+    the census**: `workspace_sources()` named `ui`, `app`, `core` and `db`, the file moved to
+    `schemaic-conn`, and
+    every gate here stopped reading it — silently, as a side effect of the move. What kept it out
+    afterwards was the floor: `sources_of` took one flat count and asserted at least five source
+    files per directory, and that crate has two, so declaring it would have failed the suite and
+    leaving it out cost nothing visible. **The floor is per label now** — `sources_of` takes
+    `(label, floor)` pairs and `schemaic-conn` declares 2 — because forcing a genuinely small crate
+    out of the census is the exact failure the floor exists to catch, one directory short-changing
+    the corpus while the total still looks healthy. The floor still cannot catch a crate *deleted
+    from the label list*, which reads as a smaller-but-healthy corpus, so
+    `the_wider_scan_reaches_the_keyring_store` names `schemaic-conn/secrets.rs` outright — the way
+    `the_scan_reaches_both_crates_that_build_views` names `lib.rs` and `schemaic-app/main.rs` — and
+    says in its own prose that this file left the census once already. `schemaic-cli` is **not** in
+    either census: no gate here has a rule about it, and adding the label would be a claim that one
+    does.
   - `snippet_panel.rs` — the **Snippet Library** right-column panel (`RightPanel::Snippets`, the
     toolbar's bookmark toggle): the saved queries that apply to the active connection, under the
     scope bands `core::snippet::grouped` returns, over the History panel's chrome. It decides
@@ -16631,7 +16737,9 @@ existing prose was left alone.
     most of most sessions, and is clickable only while `is_actionable()` holds — "Updating… 40%" is a
     progress readout, and a click on it mid-download would have nothing to apply.
 - `schemaic-app` — `main.rs` wires signals + callbacks and builds the `Ui`; also the built-in MCP
-  server (`--mcp-serve`) the AI panel talks to. A query tab's identity is `(conn_id, database)`;
+  server (`--mcp-serve`) the AI panel talks to, and the argv branch into the headless CLI
+  (`schemaic-cli`, below). `main` returns a `std::process::ExitCode` so the one-shot front ends can
+  answer with one. A query tab's identity is `(conn_id, database)`;
   the app resolves `conn_id` → `Db` at run time (`db_for`), so a tab keeps its connection after a
   switch.
   **Getting past the row cap is a per-tab override, not a fetch mode.** The cap is read once per
@@ -17530,8 +17638,18 @@ existing prose was left alone.
   parse (`the_dialect_is_the_engines_own_for_every_engine`). The DDL paths escaped by luck alone:
   `TableInfo::create_ddl` hands back SQLite's own `create_sql` for a real table without consulting
   the dialect, and a **view** fell through to `ddl::view_ddl`'s MySQL shape, which was only cosmetic
-  because SQLite accepts backticks and its views carry no `view_options`. `app/secrets.rs` is the
+  because SQLite accepts backticks and its views carry no `view_options`. `conn/secrets.rs` is the
   keyring-backed `SecretStore` behind `core::secrets`.
+  **`run_query`'s body is `cli/query.rs`'s now, and that is a guard being kept single rather than a
+  tidy-up.** The normalisation, the read-only gate, the row cap and the cancel-and-wait timeout were
+  written out here first; the CLI needed all four, and writing them again would have left two copies
+  of a *gate* — the shape this codebase has already been bitten by, and one where only the front end
+  that got the next fix would have kept it. So this calls
+  `schemaic_cli::query::read_only_query` with `MCP_ROW_CAP` and `QUERY_TIMEOUT`, and
+  `normalize_stmt` and its tests left with the function. **The wording stays here**: `NoRows` is
+  matched arm by arm into this server's own sentences, because `NoRows::message` points a refused
+  write at `schemaic exec` and the assistant's route to a write is `propose_table_change`. Same
+  refusal, right advice for whoever is reading it.
   **The statement deadline is a property of the server, not of one tool.** `QUERY_TIMEOUT` (30 s)
   existed, its doc named the reason — "a backstop against `SLEEP()` / heavy scans holding the
   connection open" — and it was wired to exactly one of the **four** database reads this server
@@ -17577,7 +17695,14 @@ existing prose was left alone.
   seven. `no_database_read_is_awaited_without_a_deadline` states the property both were reaching for
   — **every awaited `db.…()` read in production code is lexically inside a deadline wrapper** — with
   no hand-maintained list, so a new read has to be wrapped rather than added to an array, and a floor
-  of seven because a needle that stops matching must not read as a clean file. It scans the whole
+  because a needle that stops matching must not read as a clean file. **That floor is six now, and
+  the seventh read was not deleted — it moved.** `run_query`'s `fetch_query` folded into
+  `schemaic_cli::query::read_only_query` so this server and the CLI share one read path, and lowering
+  a floor is exactly the edit this gate exists to make someone justify: the read is still wrapped,
+  by `schemaic_cli::deadline::with_deadline`, and `cli/deadline.rs` carries
+  `no_database_read_in_this_crate_is_awaited_without_a_deadline` — the same gate over there,
+  following the read into a crate nothing had been watching. Lower it again only for that reason,
+  and only after checking the read still has a gate wherever it went. It scans the whole
   call rather than one line: the wrapper is the call this read is an argument to, rustfmt breaks two
   of the wrapped reads across lines, and a line-oriented scan would report both as offenders and,
   worse, a broken *unwrapped* one as clean.
@@ -18739,6 +18864,164 @@ existing prose was left alone.
     Antigravity and OpenCode out of their own configuration with `--endpoint-file` beside it. So the
     ordering between them is free, and this way the protocol stream stays clean whichever of the
     four opened it.
+    **The headless-CLI branch sits between those two, and being *before* Velopack is the load-bearing
+    part.** `schemaic list`/`query`/`exec` return from `main` ahead of the hook, the file logger, the
+    fonts and Floem: none of that belongs in a one-shot command, and `auto_apply_on_startup` is free
+    to find a staged package and exit-and-relaunch the process — which is safe for a launch that has
+    read no session state and is not safe in the middle of a command whose output someone is piping.
+    What routes it is `schemaic_cli::args::wants_cli`, an allowlist of the **first** argument, which
+    is what keeps `--veloapp-*` and `--mcp-serve` out of clap's parser; see its entry for what
+    routing on "has arguments" would have broken. On Windows the branch is reachable only from a
+    debug build or from `schemaic.com`, a GUI-subsystem binary having no console to print to.
+    **`release.yml`'s Windows leg builds two binaries for that**, `cargo build --release -p
+    schemaic-app -p schemaic-cli`, and copies `target/release/schemaic-cli.exe` into the staged
+    directory as `dist/schemaic.com`. Linux and macOS build one and use the argv branch.
+- `schemaic-cli` — Schemaic without a window: `schemaic list` / `query` / `exec` / `help`, so a
+  person or an agent can run SQL against a saved connection with the app closed and without being
+  handed a credential. Its whole dependency list is `schemaic-core`, `schemaic-conn`, `schemaic-db`,
+  `clap`, `tokio` and `tokio-util` — **no floem**, which is what splitting `schemaic-conn` out of
+  `schemaic-app` was for. It is a **library** with two front ends, because the front ends differ per
+  platform. On Linux and macOS the `schemaic` binary takes an argv branch into `run::main` before it
+  builds a window, the shape `--mcp-serve` already had, so the CLI *is* the app's own executable —
+  deliberately so on macOS, where the keychain binds an item's ACL to the creating application and a
+  second binary would prompt for every password the GUI had stored. On Windows the app is
+  `windows_subsystem = "windows"` and therefore has no console to print to, so a second,
+  console-subsystem binary is built from this crate and shipped beside it as `schemaic.com`:
+  `PATHEXT` is `.COM;.EXE;…`, so a bare `schemaic` at a prompt resolves to the CLI while shortcuts,
+  the Start menu and Explorer keep launching the GUI. It is an ordinary PE — nothing about the DOS
+  `.com` format is involved — and the arrangement was checked on Windows 11 with the real binaries.
+  The command surface was verified end to end against a live MariaDB.
+  - `cli/args.rs` — the clap surface, kept separate from doing anything so that defaults, aliases
+    and which flag belongs to which subcommand are all testable without a database. `DEFAULT_LIMIT`
+    is **200, deliberately small**: the GUI's row cap is about what a grid can hold, this one is
+    about what a caller can sensibly receive down a pipe, and the caller is very often a language
+    model with a context window; a person who wants the whole table says so with `--limit`.
+    `--yes` exists on `exec` and **must not** exist on `query` — a read has nothing to consent to,
+    and accepting the flag there would teach the habit of passing it everywhere
+    (`query_has_no_yes_flag`). `--password-stdin` is for the headless case the keyring cannot serve:
+    Linux's Secret Service needs an unlocked desktop collection, which an SSH session or a container
+    does not have, and without it the CLI would simply be unusable there.
+    **`wants_cli` is the routing predicate, and it is an allowlist of the *first* argument rather
+    than "are there any arguments".** This binary is re-invoked with argv by things that are not the
+    CLI — the Velopack installer and updater (`--veloapp-install`, `--veloapp-updated`,
+    `--veloapp-obsolete`, `--veloapp-uninstall`, `--veloapp-firstrun`) and the AI panel
+    (`--mcp-serve`, `--endpoint-file`) — and handing any of those to clap gets them rejected and the
+    process exited, breaking an install, an update or the assistant, each in a way that looks nothing
+    like a CLI bug. So a new flag on the app is safe by default: it has to be added here to reach the
+    CLI (`the_apps_own_flags_are_not_cli_invocations` names all seven, and
+    `a_subcommand_further_along_does_not_route` holds the *first*-argument half, since
+    `schemaic --mcp-serve list` is the app being asked to serve).
+  - `cli/select.rs` — which saved connection an invocation means, and whether it may have it.
+    **One entry point, and it gates**: `select` resolves the id-or-name *and* applies
+    `Connection::cli_access`, rather than handing a connection back for a caller to remember to
+    check — the run guard's rule, for the run guard's reason, which is why there is no `find` here
+    that returns an ungated connection. Both spellings resolve, because a human types the name
+    (case-insensitively) and a script wants the id's stability. **Ambiguity is judged over every
+    saved connection, including the ones the CLI cannot use**, so that turning CLI access on for a
+    second connection later cannot silently repoint an existing script at it
+    (`ambiguity_counts_connections_the_cli_cannot_use`); two matches are refused rather than
+    tie-broken, the pair being as likely to be staging and production as duplicates. `NoConnection`
+    keeps `Unknown` and `NotExposed` apart because the two sentences send the reader to different
+    places — "you have not enabled this one" is an instruction, "no such connection" sends them
+    hunting for a typo they will not find — and `run.rs` gives them different exit codes for the
+    same reason. `listed` is what `list` prints; `list --all` is what shows the rest, with their
+    status, so a human can see *why* an expected connection is unreachable.
+  - `cli/query.rs` — **the one headless read path, and both non-GUI front ends are on it**:
+    `schemaic query` and the MCP server's `run_query`. Written twice they would have had every
+    reason to drift — same gate, same timeout, same normalisation, and only one of them getting the
+    next fix. The gate is
+    `core::sql::read_only_reason` and is strictly stronger than the editor's `run_verdict`: an
+    allowlist of read-only statement heads per dialect with no confirm arm to say yes to, which is
+    the right shape when there is nobody at the keyboard. It is asked in the **connection's own**
+    dialect, so a PostgreSQL `#` operator is not lexed as a comment on the way in. `normalize_stmt`
+    is pure and owns the trailing-`;` rule — a person types the semicolon out of habit and a
+    `SELECT 1;` answered "empty query" would be a baffling way to learn it was unwanted — and
+    `NoRows::is_refusal` separates the guard's answer from the server's, because a caller that
+    cannot tell "you asked for the wrong thing" from "the database is down" retries the one that
+    will never succeed. `DEFAULT_TIMEOUT` is 30 s — the CLI's default and the MCP server's fixed
+    value, moved by `schemaic query --timeout` — and the read itself goes through
+    `deadline::with_deadline`. The row cap bounds what is held and what is returned, and
+    `ResultSet::truncated` is the front end's to pass on — a caller silently told a capped result was
+    the whole answer has been given a wrong answer by a command that succeeded.
+  - `cli/exec.rs` — the write path, and the guard that is the only way into it. **A separate
+    subcommand, not a flag on `query`**: a flag would put the dangerous case one character from the
+    safe one, and it would give two paths one gate when they do not want the same gate — `query`
+    runs an allowlist with no override, while a write has to consult the connection's read-only
+    flag, the missing-`WHERE` warning and the user's own say-so. `ExecRequest::approved` is the
+    guard and the only constructor; the field is private and `run` takes one by value. Its
+    reasoning, the `--yes` asymmetry and why several statements are refused rather than half-run are
+    under *Architecture invariants* with the other two minted requests. The one thing stated here
+    rather than there is `confirm_writes: false`: typing `exec` is the caller saying this writes,
+    and asking again on every bounded `UPDATE … WHERE id = 1` would mean `--yes` on essentially
+    every invocation — a flag that is always passed has stopped carrying information, including for
+    the unbounded write it would then also wave through. A read through `exec` is allowed and merely
+    pointless, because refusing it would need `exec` to grow a second gate deciding what a read is.
+    `run` bounds the statement through `deadline::with_deadline`, the same wrapper `query` uses.
+  - `cli/deadline.rs` — one deadline, for every database read the headless front ends make.
+    `with_deadline(fut, token, timeout)` awaits `fut` for at most `timeout` and, on expiry, cancels
+    the token and **waits for the future to finish unwinding**. That last part is the whole reason
+    this is a function: the token goes down into the driver and the driver's cancel branch is what
+    issues the server-side `KILL`, so dropping the future at the deadline would return promptly and
+    leave the statement running on the server with nobody left to stop it. It was two
+    `tokio::select!` blocks, one in `query.rs` and one in `exec.rs`, and the second carried a comment
+    saying it made *"the same trade for the same reason"* as the first — a duplicated decision
+    admitting to being one, and a trade subtle enough that it should exist once. The token handed in
+    must be the one the future was given, or the cancel reaches nothing and the "deadline" returns
+    after the *query* rather than after `timeout`.
+    **It is deliberately not a merge with `app/mcp.rs`'s `with_deadline`**, which stays where it is:
+    that one wraps reads this crate never makes (`fetch_schema`, `fetch_databases`), and one of them
+    genuinely must abandon its future, which is why `with_deadline_abandoning` sits beside it.
+    **The gate that produced this module is the part worth keeping.** `mcp.rs`'s
+    `no_database_read_is_awaited_without_a_deadline` carries a floor on how many reads it finds, so
+    that a needle which stopped matching could not read as a clean file — and folding `run_query`
+    onto `query::read_only_query` moved one read out of that file, seven to six, into a crate no gate
+    was watching. So `no_database_read_in_this_crate_is_awaited_without_a_deadline` lives here and
+    asks the same thing of `query.rs`, `exec.rs` and `run.rs`, with its own floor of two. Both are
+    **lexical** in the same way: the read must be an argument to a `with_deadline` call with no
+    statement boundary in between, which is what lets a call rustfmt has wrapped across lines still
+    count. The two unit tests beside it run on tokio's paused clock, and the crate declares `tokio`
+    with `test-util` in its own dev-dependencies rather than inheriting it — `cargo test --workspace`
+    had been unifying that feature in from `schemaic-app`, so `cargo test -p schemaic-cli` alone did
+    not compile.
+  - `cli/format.rs` — how a result reaches stdout, and **every emitter in it is `core::export`'s**.
+    Nothing here formats a cell; it chooses which of core's emitters to call and what to say about
+    truncation, so a duplicate column name, an embedded newline or a withheld blob reads the same
+    whether a row left through the Download menu or down a pipe. `Format` is `table` / `json` /
+    `jsonl` / `csv`, parsed through `FromStr` so a bad name fails at parse time naming the real ones
+    instead of reaching a database and failing after the work is done; `table` is the default
+    whether or not stdout is a terminal, there being **no TTY auto-switch** to make a piped command
+    mean something different from the same command run by hand. **Only `table` reports truncation
+    in band**, as a footer: the machine formats stay pure data, because a JSON array with a metadata
+    object in it or a CSV with a comment row is worse for every consumer than a clean stream plus a
+    line on stderr, which is what `truncation_warning` is for
+    (`a_capped_result_is_reported_in_band_for_table_and_on_stderr_otherwise` pins that it is said in
+    exactly one place). `newline_terminated` is the one thing this module adds to core's output —
+    `export` writes for *files*, where a trailing newline is noise, and a terminal wants one or the
+    next shell prompt lands on the last line of the data — and an empty rendering stays empty, since
+    a lone newline is not nothing to a reader counting lines. `render_affected` is purpose-built
+    rather than a row renderer because a write has no rows for `export`'s emitters to describe.
+  - `cli/run.rs` — dispatch, and the module that owns the output contract. **stdout is data; stderr
+    is everything else** — no banners, no warnings, no progress — which is what makes `--format=json`
+    safe to parse and `--format=csv` safe to redirect. The other half is `Exit`, and it has **four**
+    outcomes rather than two: 0 ok, 2 usage (including a connection that is not there), 3 a guard
+    refusal, 4 a server or connection failure. A caller that can only tell success from failure
+    retries the refusal that will never succeed and gives up on the timeout that would have;
+    `the_exit_codes_are_the_documented_ones` pins the numbers, because scripts depend on them. The
+    tokio runtime is **current-thread and built here**, mirroring `--mcp-serve`: one statement on
+    one connection has no use for a pool and would pay its startup. `list` builds a `ResultSet` and
+    hands it to the same renderers a query's rows go through, so `--format=json` means the same
+    thing there as here and there is no second table-drawing path to keep in step; an empty list is
+    not an error but carries a hint, since "no connection has CLI access yet" is the correct answer
+    to *what may I use* and the baffling one without it. `open` hands back the `TunnelHandle`
+    alongside the `Db` because dropping it closes the tunnel, and it hands back a borrow of the
+    **saved** connection rather than the clone `--password-stdin` patched, so the guard's subject is
+    what the user configured. `database_for` is the flag, else the connection's own, else `None` —
+    an empty string there would read as a real database name to the guard's `no_database` arm.
+  - `cli/schemaic-cli.rs` — the console-subsystem binary, at `src/bin/`. Its body is one call to
+    `run::main`, deliberately: it is the same entry point the app's argv branch calls, two front
+    ends over one program. It is **built on every platform** even though only Windows packages it,
+    because a target that compiles on one platform only is a target that breaks on that platform
+    first.
 
 ## Architecture invariants (don't regress these)
 
@@ -18925,6 +19208,28 @@ Re-introducing the anti-patterns these guard against is a regression:
   `if let RunVerdict::Block(..)`, so a verdict of "ask first" ran the file anyway, and the three
   tests over `script_verdict` all passed because every one of them exercised the function alone —
   the defect living, as ever here, at its composition with the caller.
+  **The headless CLI is the fourth path, and it splits the question in two rather than adding a
+  gate.** `schemaic query` runs `cli/query.rs`'s `read_only_query`, whose gate is
+  `sql::read_only_reason` — an allowlist of read heads per dialect with **no `Confirm` arm to say
+  yes to**, which is the right shape when there is nobody at the keyboard, and stronger than the
+  verdict on the same axis `rerunnable_for_export` is. That function is the one headless read path:
+  the MCP server's `run_query` calls it too, rather than the CLI writing a second copy of the gate
+  beside the one `mcp.rs` already had.
+  **`schemaic exec` is the write half, and it is the third minted request.** `ExecRequest` has a
+  private field, `ExecRequest::approved` is its only constructor and `exec::run` takes one by value
+  — the same shape as `ScriptRequest::approved` and `RerunRequest::approved`, reached deliberately
+  rather than arrived at, since a front end with no window is exactly where a guard the launcher has
+  to remember would go unnoticed longest. What it mints against is `run_verdict` itself, not a
+  stronger refusal, because `exec` *does* have someone to ask: the caller is at a prompt, and
+  `--yes` is that answer. The asymmetry is the whole of it — `--yes` answers a `Confirm`, in
+  practice the missing-`WHERE` warning, and **cannot** answer a `Block`, so a read-only connection
+  has no override from a command line either
+  (`a_read_only_connection_blocks_a_write_and_yes_does_not_help` asserts it for both values of the
+  flag). Two refusals sit in front of the verdict rather than inside it: an empty statement, and
+  *several* statements, which `exec` will not half-run because a one-shot command has nowhere to
+  report "1 and 2 committed, 3 failed". The policy it assembles passes `confirm_writes: false`, and
+  `cli/exec.rs` carries the reason that is where the consent lives rather than a setting being
+  ignored.
   **One tested function is asked by everything that re-runs**, and that is the shape of the fix
   rather than a tidy-up. `filter::rerun_statement(base, &GridQuery, dialect)` composes *what* would
   run (`build_query`, or the base verbatim when there is no filter or sort) with *whether it may*
@@ -19381,18 +19686,18 @@ Re-introducing the anti-patterns these guard against is a regression:
   a set cloned with `ddl::PASSWORD_PLACEHOLDER` in each secret's place; the modal still *renders*
   the real statement, because a preview showing a blanked-out plan is not showing the plan.
 - **Connection secrets persist to the OS keyring, not `connections.json`.** DB/SSH passwords and the
-  SSH key passphrase go through `schemaic_core::secrets` (`SecretStore` seam) + `schemaic-app`'s
+  SSH key passphrase go through `schemaic_core::secrets` (`SecretStore` seam) + `schemaic-conn`'s
   keyring-backed store; the JSON on disk is blanked and hydrated on load. All connection saves route
-  through the app's `secrets::{load,save}_connections`/`forget_connection` (which wrap
-  `persist::{load,save}_connections`) — never call `persist::save_connections` directly from the app,
-  or you reintroduce plaintext. Plaintext in the JSON is a *fallback only* for a machine with no
+  through `conn::secrets::{load,save}_connections`/`forget_connection` (which wrap
+  `persist::{load,save}_connections`) — never call `persist::save_connections` directly from a front
+  end, or you reintroduce plaintext. Plaintext in the JSON is a *fallback only* for a machine with no
   working keyring — **and the app now says so when it happens**, rather than letting a stated
   invariant be quietly false on someone's machine: `Sanitized::notice` names the file the passwords
   landed in and the button that opens its folder, `Hydration::notice` names a keyring that would not
   answer and says the stored secrets were *not* deleted, and both reach the user (the startup ones
   through `persist::queue_notice`, a mid-session save's through `save_connections`' return value and
   `main.rs`'s `persist_conns`). A refused *delete* is the third case and is reported only for a
-  secret this session actually read a value out of. See `core/secrets.rs`.
+  secret this session actually read a value out of. See `core/secrets.rs` and `conn/secrets.rs`.
 - **Own per-entity signals in a child `Scope`; dispose it *deferred*.** A `Tab`/`ConnNode` creates
   its signals in `parent.create_child()`; removal disposes that scope via
   `exec_after(Duration::ZERO, …)` — one tick later, after the keyed `dyn_container` has unmounted

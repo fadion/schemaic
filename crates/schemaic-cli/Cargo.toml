@@ -1,0 +1,39 @@
+[package]
+name = "schemaic-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# The Windows console twin. On Linux and macOS the CLI is reached through
+# `schemaic`'s own argv branch and this binary is not shipped; on Windows the app
+# is GUI-subsystem and has no console to write to, so this one is packaged beside
+# it as `schemaic.com` — `PATHEXT` puts `.COM` ahead of `.EXE`, so typing
+# `schemaic` finds the CLI while shortcuts keep launching the GUI.
+#
+# It is built on every platform anyway: a target that only compiles on Windows is
+# one that breaks on Windows without anyone noticing first.
+[[bin]]
+name = "schemaic-cli"
+path = "src/bin/schemaic-cli.rs"
+
+[dependencies]
+schemaic-core = { workspace = true }
+schemaic-conn = { workspace = true }
+schemaic-db = { workspace = true }
+clap = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+
+# Test connections are built through serde rather than as struct literals, so a
+# new `Connection` field does not send anyone editing fixtures here.
+[dev-dependencies]
+serde_json = { workspace = true }
+# `test-util` for tokio's paused clock, so the deadline tests can let a
+# 30-second timeout expire without waiting half a minute. Declared here rather
+# than inherited: `cargo test --workspace` unified it in from `schemaic-app`'s
+# dev-dependencies and the tests compiled, while `cargo test -p schemaic-cli`
+# alone did not — a crate has to carry what it uses.
+tokio = { workspace = true, features = ["test-util", "macros"] }
+
+[lints]
+workspace = true

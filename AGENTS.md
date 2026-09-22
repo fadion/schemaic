@@ -3,8 +3,9 @@
 A native SQL editor (Rust + [Floem](https://github.com/lapce/floem) 0.2.0), MySQL/MariaDB-first,
 Zed-inspired, aiming to replace DataGrip. Workspace crates: `schemaic-core` (models + the pure,
 unit-tested SQL/edit/export/DDL logic), `schemaic-db` (MySQL/MariaDB + PostgreSQL + SQLite + SSH
-tunnels), `schemaic-ai`, `schemaic-term`, `schemaic-ui` (the Floem views), `schemaic-app` (signal
-wiring, the built-in MCP server).
+tunnels), `schemaic-conn` (saved connections hydrated from the OS keyring — the seam a non-GUI
+front end loads a connection through), `schemaic-ai`, `schemaic-term`, `schemaic-ui` (the Floem
+views), `schemaic-app` (signal wiring, the built-in MCP server).
 
 **Three engines, and they are not equal.** MySQL/MariaDB and PostgreSQL are full; SQLite reads,
 writes, imports and edits **tables** (through the twelve-step rebuild — `ddl::sqlite_rebuild_sql`),
@@ -65,16 +66,20 @@ substitute for the statement, and none of these is a style preference.
 
 - **The write guard lives on the run action**, not in a caller of it — every path executing user
   SQL goes through `TabsActions::run`/`run_all` and `sql::run_verdict`, or through a refusal
-  *strictly stronger* than it. There are **two** such refusals now:
-  `sql::rerunnable_for_export`, which has no `Confirm` arm, and `sql::script_verdict`, which treats
-  a whole `.sql` file as a write without reading it. Never a second, laxer gate — and **each is
-  reached only through a request its guard mints**: `ScriptRequest::approved` for the file,
-  `RerunRequest::approved` for `apply_view`, `open_table_filtered` and the grid's post-commit
-  re-fetch. That shape is the invariant, not a detail of it: the guard being a *step* the launcher
-  had to remember is how one `return` came to be all that stood between a read-only connection and
-  a file, and how three of the four re-run affordances came to rest on predicates that were not
-  about writes — the post-commit re-fetch was the last of them, and the census meant to catch it
-  could not see its call, which is spelled `(run)(sql)`.
+  *strictly stronger* than it. There are **three** such refusals now:
+  `sql::rerunnable_for_export`, which has no `Confirm` arm; `sql::script_verdict`, which treats
+  a whole `.sql` file as a write without reading it; and `sql::read_only_reason`, a per-dialect
+  allowlist of read-only statement heads with no confirm arm at all, which is the gate for both
+  paths that run SQL with nobody at the keyboard — the MCP server's `run_query` tool and
+  `schemaic query`. Never a second, laxer gate — and **each is reached only through a request its
+  guard mints**: `ScriptRequest::approved` for the file, `RerunRequest::approved` for `apply_view`,
+  `open_table_filtered` and the grid's post-commit re-fetch, and
+  `cli::exec::ExecRequest::approved` for `schemaic exec`, whose `--yes` answers a `Confirm` and
+  cannot answer a `Block`. That shape is the invariant, not a detail of it: the guard being a
+  *step* the launcher had to remember is how one `return` came to be all that stood between a
+  read-only connection and a file, and how three of the four re-run affordances came to rest on
+  predicates that were not about writes — the post-commit re-fetch was the last of them, and the
+  census meant to catch it could not see its call, which is spelled `(run)(sql)`.
 - **One SQL boundary lexer** — everything scanning SQL for string/comment/quote boundaries builds
   on `core::sql::skip_noncode`, and it is dialect-aware.
 - **Structure-aware SQL analysis goes through `core::intel`** (a real per-dialect AST), not a new

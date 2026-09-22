@@ -3443,6 +3443,8 @@ pub struct DraftSignals {
     pub prominent_color: RwSignal<bool>,
     /// Read-only guard-rail (off by default): disables cell edits + blocks writes.
     pub read_only: RwSignal<bool>,
+    /// Whether the headless CLI may use this connection (off by default).
+    pub cli_access: RwSignal<bool>,
     /// Environment this connection points at, shown as a top-bar badge. Defaults
     /// to `Environment::None` (no badge).
     pub environment: RwSignal<Environment>,
@@ -3479,6 +3481,7 @@ impl DraftSignals {
             color: cx.create_rw_signal(None),
             prominent_color: cx.create_rw_signal(false),
             read_only: cx.create_rw_signal(false),
+            cli_access: cx.create_rw_signal(false),
             environment: cx.create_rw_signal(Environment::None),
             ai_data: cx.create_rw_signal(AiData::default()),
         }
@@ -3511,6 +3514,7 @@ impl DraftSignals {
         self.color.set(c.color.clone());
         self.prominent_color.set(c.prominent_color);
         self.read_only.set(c.read_only);
+        self.cli_access.set(c.cli_access);
         self.environment.set(c.environment);
         // An unset level resolves to the default here, so the form shows the
         // level actually in force rather than a blank the user has to guess at.
@@ -3543,6 +3547,7 @@ impl DraftSignals {
         self.color.set(None);
         self.prominent_color.set(false);
         self.read_only.set(false);
+        self.cli_access.set(false);
         self.environment.set(Environment::None);
         self.ai_data.set(AiData::default());
     }
@@ -3599,6 +3604,7 @@ impl DraftSignals {
             color: self.color.get_untracked(),
             prominent_color: self.prominent_color.get_untracked(),
             read_only: self.read_only.get_untracked(),
+            cli_access: self.cli_access.get_untracked(),
             environment: self.environment.get_untracked(),
             ai_data: Some(self.ai_data.get_untracked()),
         }

@@ -839,6 +839,20 @@ pub struct Connection {
     /// any write/DDL statement in the editor is refused. Off by default.
     #[serde(default)]
     pub read_only: bool,
+    /// Whether the headless CLI may use this connection at all.
+    ///
+    /// **Off by default, and `#[serde(default)]` means off for every connection
+    /// saved before the flag existed** — the CLI runs with no human at the
+    /// keyboard, so exposure is something the user grants one connection at a
+    /// time rather than something an upgrade hands out. Orthogonal to
+    /// [`Connection::read_only`], which says what may be *done* over a
+    /// connection rather than who may reach it; a connection can be CLI-visible
+    /// and still refuse writes, and usually should be.
+    ///
+    /// Written only by the GUI. The CLI reads `connections.json` and never
+    /// writes it, since the app may be running and owns that file.
+    #[serde(default)]
+    pub cli_access: bool,
     /// Which environment this connection points at (Development / Testing /
     /// Production / …), shown as a badge in the top bar. Defaults to none.
     #[serde(default)]
@@ -1575,6 +1589,35 @@ mod tests {
         assert_eq!(c.ai_data, None);
     }
 
+    /// **Opt-in, and opt-in has to mean every connection already on disk is
+    /// off.** The headless CLI reaches a saved connection with no human at the
+    /// keyboard, so a file written before the flag existed must read as *not
+    /// exposed* — an upgrade that defaulted this to `true` would hand an agent
+    /// the production connection the user had already saved, silently.
+    #[test]
+    fn a_connection_saved_before_the_cli_existed_is_not_exposed_to_it() {
+        let c: Connection = serde_json::from_str(
+            r#"{"id":1,"name":"n","host":"h","port":3306,"user":"u","password":""}"#,
+        )
+        .unwrap();
+        assert!(
+            !c.cli_access,
+            "a connection saved before the flag must stay dark until it is toggled"
+        );
+    }
+
+    /// And the flag has to survive a save, or the toggle would not stick past
+    /// the next launch.
+    #[test]
+    fn the_cli_access_flag_round_trips() {
+        let c = Connection {
+            cli_access: true,
+            ..conn()
+        };
+        let back: Connection = serde_json::from_str(&serde_json::to_string(&c).unwrap()).unwrap();
+        assert!(back.cli_access);
+    }
+
     /// The upgrade must not change what the assistant can reach: someone who had
     /// `run_query` keeps it, someone who had turned it off does not get it back.
     /// The saved id wins while it names something; a stale one falls back to the
@@ -1706,6 +1749,7 @@ mod tests {
             color: None,
             prominent_color: false,
             read_only: false,
+            cli_access: false,
             environment: Environment::None,
             ai_data: None,
         };
@@ -1802,6 +1846,7 @@ mod tests {
             color: None,
             prominent_color: false,
             read_only: false,
+            cli_access: false,
             environment: Environment::None,
             ai_data: None,
         }
@@ -2693,6 +2738,7 @@ mod tls_tests {
             color: None,
             prominent_color: false,
             read_only: false,
+            cli_access: false,
             environment: Environment::None,
             ai_data: None,
         }

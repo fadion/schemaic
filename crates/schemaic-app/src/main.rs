@@ -23,7 +23,6 @@ mod logging;
 mod mcp;
 mod opencode;
 mod script;
-mod secrets;
 mod snippet_store;
 mod ui_stores;
 mod update;
@@ -40,6 +39,10 @@ use ai::{
     active_tab_database, ai_context, apply_turn_delta, extract_sql, inline_system_prompt,
     mcp_endpoint_from_env, needs_respawn, render_recap, start_ai_session, turn_context,
 };
+// Imported under its bare module name because it *was* `mod secrets;` here until
+// the headless CLI needed the same keyring store without floem behind it; the
+// call sites below are unchanged by the move.
+use schemaic_conn::secrets;
 use schemaic_core::tabsel::scoped_database;
 
 use std::cell::{Cell, RefCell};
@@ -145,7 +148,7 @@ use schemaic_ui::{
 };
 use tokio_util::sync::CancellationToken;
 
-fn main() {
+fn main() -> std::process::ExitCode {
     // MCP stdio server mode (launched by whichever agent CLI drives the AI
     // panel). Runs the JSON-RPC loop and exits — no GUI.
     //
@@ -178,7 +181,25 @@ fn main() {
             .build()
             .expect("build tokio runtime");
         rt.block_on(mcp::serve(endpoint));
-        return;
+        return std::process::ExitCode::SUCCESS;
+    }
+
+    // Headless CLI mode — `schemaic list` / `query` / `exec` / `help`. Like
+    // `--mcp-serve` above it returns before Velopack, the file logger, the
+    // fonts and Floem: none of that belongs in a one-shot command, and the
+    // updater's auto-apply-on-startup would be free to exit and relaunch the
+    // process in the middle of one.
+    //
+    // **The predicate is an allowlist of the first argument**, which is what
+    // keeps the `--veloapp-*` re-invocations and `--mcp-serve` out of the
+    // argument parser; see `schemaic_cli::args::wants_cli`.
+    //
+    // On Windows this branch is only reachable from a debug build or from
+    // `schemaic.com`, the console-subsystem twin shipped beside the GUI exe —
+    // a `windows_subsystem = "windows"` binary has no console to print to.
+    let argv: Vec<String> = std::env::args().collect();
+    if schemaic_cli::args::wants_cli(&argv) {
+        return schemaic_cli::run::main(argv);
     }
 
     // Velopack's startup hook, and it has to run before *everything* below —
@@ -260,6 +281,7 @@ fn main() {
         .run();
 
     drop(rt);
+    std::process::ExitCode::SUCCESS
 }
 
 /// Decode the bundled PNG into a window icon (title bar / taskbar, both OSes).
@@ -14558,6 +14580,7 @@ mod app_tests {
             color: None,
             prominent_color: false,
             read_only: false,
+            cli_access: false,
             environment: Default::default(),
             ai_data: None,
         }

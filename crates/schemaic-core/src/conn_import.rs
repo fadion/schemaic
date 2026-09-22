@@ -2125,6 +2125,7 @@ fn blank(db_type: &str) -> Connection {
         color: None,
         prominent_color: false,
         read_only: false,
+        cli_access: false,
         environment: Environment::default(),
         ai_data: None,
     }

@@ -1619,6 +1619,45 @@ pub fn load_connections() -> ConnectionsFile {
     read_json(connections_path())
 }
 
+/// [`load_connections`] for a reader that **must not touch the directory**.
+///
+/// `load_connections` is a *recovering* load, and recovery means writes:
+/// [`read_bytes`] sweeps the orphaned `.tmp` on every healthy read, and on a
+/// bad parse it renames the primary aside to `.corrupt` and falls back to a
+/// sibling. Both are right for the app, which owns this file and is the only
+/// thing that can repair it.
+///
+/// Both are wrong for a **second process** reading it while the app runs. The
+/// `.tmp` that sweep removes is exactly what a save in flight has just written
+/// and is about to rename into place, so a one-shot command that happened to
+/// land in that window would delete the generation the app was saving. And a
+/// repair is not something `schemaic list` was asked to perform.
+///
+/// So this parses the primary and stops. A missing file is an empty list — the
+/// same answer a first run gets — and an unparseable one is an error for the
+/// caller to report, not a file to move.
+pub fn read_connections_unrecovered() -> Result<ConnectionsFile, String> {
+    let Some(path) = connections_path() else {
+        return Ok(ConnectionsFile::default());
+    };
+    read_unrecovered(&Fs, &path)
+}
+
+/// [`read_connections_unrecovered`] over any [`FileStore`], so the three
+/// outcomes are testable without a filesystem.
+pub(crate) fn read_unrecovered<T: Default + for<'de> Deserialize<'de>>(
+    store: &dyn FileStore,
+    path: &Path,
+) -> Result<T, String> {
+    match classify::<T>(store.read(path).ok().as_deref()) {
+        Load::Ok(v) => Ok(v),
+        // Absent is not a failure: it is what every install looks like before
+        // the first connection is saved.
+        Load::Absent => Ok(T::default()),
+        Load::Corrupt(e) => Err(e),
+    }
+}
+
 /// Persist saved connections (best effort).
 ///
 /// **The one store whose `.bak` is a credential file.** Pass
@@ -1662,7 +1701,7 @@ mod tests {
     use super::{
         ConnectionsFile, FileStore, Load, RECOVERIES, Recovered, RightPanelState, Saving, UiState,
         ai_harness_to_persist, classify, legacy_ai_run_queries_in, migrate_legacy_once,
-        missing_notice, private_dir_in, read_bytes, recover, recovery_notice,
+        missing_notice, private_dir_in, read_bytes, read_unrecovered, recover, recovery_notice,
         remove_secret_siblings, sibling, statement_timeout, statement_timeout_label,
         take_recoveries, usable_base, write_bytes, write_secret_store,
     };
@@ -2168,6 +2207,96 @@ mod tests {
     /// this module's own prose calls "the only config file with no second copy
     /// anywhere", deleting one connection could lose all of them.
     ///
+    /// **The whole point of the unrecovered read: it writes nothing.**
+    ///
+    /// Not "it does not call `save`" — it must not rename, must not remove, and
+    /// must leave the sibling files exactly as it found them, because a second
+    /// process reading this file has no standing to repair it.
+    #[test]
+    fn an_unrecovered_read_leaves_every_file_where_it_found_it() {
+        let fs = FakeFs::default();
+        fs.put(CFG, r#""A""#);
+        fs.put(&format!("{CFG}.tmp"), r#""B""#);
+        fs.put(&format!("{CFG}.bak"), r#""C""#);
+        fs.ops.borrow_mut().clear();
+
+        let got: String = read_unrecovered(&fs, Path::new(CFG)).expect("it parses");
+
+        assert_eq!(got, "A");
+        assert!(
+            fs.ops.borrow().is_empty(),
+            "it touched the directory: {:?}",
+            fs.ops.borrow()
+        );
+        assert!(
+            fs.get(&format!("{CFG}.tmp")).is_some(),
+            "the .tmp must survive"
+        );
+        assert!(
+            fs.get(&format!("{CFG}.bak")).is_some(),
+            "the .bak must survive"
+        );
+        assert!(fs.get(CFG).is_some(), "the primary must survive");
+    }
+
+    /// **The race this exists to close.** A save in flight has written `.tmp`
+    /// and not yet renamed it into place; the recovering load sweeps that
+    /// orphan on every healthy read, so a CLI invocation landing in that window
+    /// would delete the generation the app was in the middle of saving. The two
+    /// loads are contrasted directly, because the claim is about the
+    /// difference between them.
+    #[test]
+    fn the_recovering_read_sweeps_a_save_in_flight_and_the_unrecovered_one_does_not() {
+        let in_flight = format!("{CFG}.tmp");
+
+        let recovering = FakeFs::default();
+        recovering.put(CFG, r#""A""#);
+        recovering.put(&in_flight, r#""the save in flight""#);
+        let _: String = read_bytes(&recovering, Path::new(CFG));
+        assert!(
+            recovering.get(&in_flight).is_none(),
+            "the premise: the recovering load removes it"
+        );
+
+        let unrecovered = FakeFs::default();
+        unrecovered.put(CFG, r#""A""#);
+        unrecovered.put(&in_flight, r#""the save in flight""#);
+        let _: String = read_unrecovered(&unrecovered, Path::new(CFG)).expect("it parses");
+        assert!(
+            unrecovered.get(&in_flight).is_some(),
+            "the unrecovered load must leave the save in flight alone"
+        );
+    }
+
+    /// An unparseable file is **reported, not quarantined**. The recovering
+    /// load renames it to `.corrupt`; a reader must hand the problem back to
+    /// the caller with the parser's own words and change nothing.
+    #[test]
+    fn an_unrecovered_read_reports_a_bad_parse_instead_of_moving_the_file() {
+        let fs = FakeFs::default();
+        fs.put(CFG, "{not json");
+
+        let err = read_unrecovered::<String>(&fs, Path::new(CFG)).expect_err("it must not parse");
+
+        assert!(!err.is_empty(), "the parser's reason has to survive");
+        assert!(fs.get(CFG).is_some(), "the primary must still be there");
+        assert!(
+            fs.get(&format!("{CFG}.corrupt")).is_none(),
+            "nothing may be quarantined by a reader"
+        );
+    }
+
+    /// A missing file is the answer every install gives before its first save,
+    /// so it is an empty value and not an error.
+    #[test]
+    fn an_unrecovered_read_of_a_missing_file_is_the_default() {
+        let fs = FakeFs::default();
+        assert_eq!(
+            read_unrecovered::<String>(&fs, Path::new(CFG)),
+            Ok(String::new())
+        );
+    }
+
     /// Asserted as an **order**, because both orderings end with the same set
     /// of files and a store that recorded only the outcome could not tell them
     /// apart.
@@ -2723,6 +2852,7 @@ mod tests {
             color: None,
             prominent_color: false,
             read_only: false,
+            cli_access: false,
             environment: Environment::Production,
             ai_data: None,
         };

@@ -2,6 +2,8 @@
 resolver = "2"
 members = [
     "crates/schemaic-core",
+    "crates/schemaic-conn",
+    "crates/schemaic-cli",
     "crates/schemaic-db",
     "crates/schemaic-ai",
     "crates/schemaic-term",
@@ -27,6 +29,8 @@ authors = ["Schemaic contributors"]
 [workspace.dependencies]
 # Internal crates
 schemaic-core = { path = "crates/schemaic-core" }
+schemaic-conn = { path = "crates/schemaic-conn" }
+schemaic-cli = { path = "crates/schemaic-cli" }
 schemaic-db = { path = "crates/schemaic-db" }
 schemaic-ai = { path = "crates/schemaic-ai" }
 schemaic-term = { path = "crates/schemaic-term" }
@@ -178,6 +182,23 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 # byte positions + mid-edit fallback (sqlparser isn't error-tolerant). The `visitor`
 # feature powers the unqualified-column diagnostic (walking the AST for column refs).
 sqlparser = { version = "0.62", features = ["visitor"] }
+
+# Argument parsing, for `schemaic-cli` and nowhere else. The GUI's handful of
+# flags (`--mcp-serve`, `--endpoint-file`, Velopack's `--veloapp-*`) stay hand-
+# matched in `app/main.rs`: they are read before the CLI branch and a parser
+# that rejected an unknown flag there would break the installer's re-invocations.
+# `default-features = false` + `std`/`help`/`usage`/`error-context`/`derive` —
+# no `color`, no `suggestions`, so no `anstream`/`strsim` in the graph.
+clap = { version = "4", default-features = false, features = [
+    "std",
+    "help",
+    "usage",
+    "error-context",
+    "derive",
+    # `SCHEMAIC_CONNECTION`, so an agent's shell can be pointed at one
+    # connection once instead of repeating `-c` on every invocation.
+    "env",
+] }
 
 # Errors / logging / serde
 thiserror = "2"

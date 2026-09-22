@@ -414,7 +414,7 @@ fn find_bytes(hay: &[u8], needle: &[u8]) -> Option<usize> {
 /// passed the whole suite.
 #[cfg(test)]
 pub(crate) fn crate_sources() -> Vec<(String, String)> {
-    sources_of(&["", "schemaic-app/"])
+    sources_of(&[("", 5), ("schemaic-app/", 5)])
 }
 
 /// [`crate_sources`] plus `schemaic-core` and `schemaic-db`.
@@ -435,42 +435,59 @@ pub(crate) fn crate_sources() -> Vec<(String, String)> {
 /// judgement for.
 #[cfg(test)]
 pub(crate) fn workspace_sources() -> Vec<(String, String)> {
-    sources_of(&["", "schemaic-app/", "schemaic-core/", "schemaic-db/"])
+    sources_of(&[
+        ("", 5),
+        ("schemaic-app/", 5),
+        ("schemaic-core/", 5),
+        ("schemaic-db/", 5),
+        // **Two files, and the floor is 2 rather than the crate being left
+        // out.** `conn/secrets.rs` was `app/secrets.rs` and was in this census
+        // until it moved; dropping it would have taken it out of every gate
+        // here silently, which is the exact failure the per-directory floor
+        // exists to catch — one directory short-changing the corpus while the
+        // total still looks healthy.
+        ("schemaic-conn/", 2),
+    ])
 }
 
 /// The `.rs` files of the named crates, as `(display name, production code)`.
 /// `""` is this crate; every other label is a sibling directory name with its
 /// trailing slash, which is also the prefix each file is reported under.
+///
+/// Each label carries **its own floor** — the fewest files that directory may
+/// contribute before the scan is presumed broken. A single shared floor was
+/// fine while every crate here was large, but it forces a genuinely small crate
+/// to be left out of the census rather than declared, and a crate left out is
+/// one every gate stops reading with nothing red. Declare the real count.
 #[cfg(test)]
-fn sources_of(labels: &[&str]) -> Vec<(String, String)> {
+fn sources_of(labels: &[(&str, usize)]) -> Vec<(String, String)> {
     let ui = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
     let crates = ui
         .parent()
         .and_then(|p| p.parent())
         .expect("the workspace's crates dir")
         .to_path_buf();
-    let dirs: Vec<(&str, std::path::PathBuf)> = labels
+    let dirs: Vec<(&str, usize, std::path::PathBuf)> = labels
         .iter()
-        .map(|label| {
+        .map(|(label, floor)| {
             let dir = if label.is_empty() {
                 ui.clone()
             } else {
                 crates.join(label.trim_end_matches('/')).join("src")
             };
-            (*label, dir)
+            (*label, *floor, dir)
         })
         .collect();
     let mut out = Vec::new();
-    for (label, dir) in dirs {
+    for (label, floor, dir) in dirs {
         let before = out.len();
         collect_rs(&dir, label, "", &mut out);
         // **Per directory, not only in total.** A total floor is satisfied by
         // the largest crate alone, so a `src` that moved under any of the others
-        // would leave every gate over it green by finding nothing. The smallest
-        // crate here has six files.
+        // would leave every gate over it green by finding nothing.
         assert!(
-            out.len() - before >= 5,
-            "only {} source files scanned in {}",
+            out.len() - before >= floor,
+            "only {} source files scanned in {} (floor {floor})",
             out.len() - before,
             dir.display()
         );
@@ -860,6 +877,23 @@ mod tests {
         assert!(
             files.iter().any(|(n, _)| n == "schemaic-app/main.rs"),
             "schemaic-app builds views too, and the invariants are stated app-wide"
+        );
+    }
+
+    /// **The wider census reaches the small crates too, by name.**
+    ///
+    /// The per-directory floor in [`sources_of`] catches a `src` that moved; it
+    /// cannot catch a crate deleted from the label list, which reads as a
+    /// smaller-but-healthy corpus. `secrets.rs` left this census once already —
+    /// silently, as the side effect of moving from `schemaic-app` to
+    /// `schemaic-conn` — and every gate here stopped reading the file that
+    /// decides whether an unreadable credential is deleted. Name it.
+    #[test]
+    fn the_wider_scan_reaches_the_keyring_store() {
+        let files = workspace_sources();
+        assert!(
+            files.iter().any(|(n, _)| n == "schemaic-conn/secrets.rs"),
+            "schemaic-conn is not being read; the gates over the keyring store are blind"
         );
     }
 

@@ -1939,8 +1939,13 @@ pub fn read_only_heads(dialect: SqlDialect) -> &'static [&'static str] {
     }
 }
 
-/// Is `sql` a single read-only statement we're willing to run on the AI's
-/// behalf? Returns the rejection reason on failure.
+/// Is `sql` a single read-only statement we're willing to run unattended?
+/// Returns the rejection reason on failure.
+///
+/// **Two front ends now, so the wording names neither.** This was the AI's gate
+/// alone and its refusals said so; `schemaic query` shares it, and a person
+/// typing a `SLEEP()` at a prompt being told it "is not permitted in an AI
+/// query" is being answered about somebody else's session.
 pub fn read_only_reason(sql: &str, dialect: SqlDialect) -> Result<(), String> {
     let (words, multi) = word_tokens(sql, dialect);
     if multi {
@@ -1957,7 +1962,7 @@ pub fn read_only_reason(sql: &str, dialect: SqlDialect) -> Result<(), String> {
         ));
     }
     if let Some(bad) = words.iter().find(|w| is_denied(w, dialect)) {
-        return Err(format!("`{bad}` is not permitted in an AI query"));
+        return Err(format!("`{bad}` is not permitted in a read-only query"));
     }
     Ok(())
 }
@@ -2241,6 +2246,7 @@ mod tests {
                 color: None,
                 prominent_color: false,
                 read_only: false,
+                cli_access: false,
                 environment: crate::connection::Environment::None,
                 ai_data: None,
             };
@@ -2286,6 +2292,7 @@ mod tests {
             color: None,
             prominent_color: false,
             read_only: true,
+            cli_access: false,
             environment: crate::connection::Environment::None,
             ai_data: None,
         };

@@ -557,6 +557,7 @@ mod tests {
             color: None,
             prominent_color: false,
             read_only: false,
+            cli_access: false,
             environment: crate::connection::Environment::None,
             ai_data: None,
         }

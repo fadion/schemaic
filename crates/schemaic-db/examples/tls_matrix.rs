@@ -154,6 +154,7 @@ fn connection(db_type: &str, host: &str, port: u16, tls: Tls) -> Connection {
         color: None,
         prominent_color: false,
         read_only: false,
+        cli_access: false,
         environment: Environment::None,
         ai_data: None,
     }

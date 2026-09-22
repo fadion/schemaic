@@ -549,35 +549,31 @@ where
     tokio::time::timeout(QUERY_TIMEOUT, fut).await.ok()
 }
 
+/// **One headless read path, shared with the CLI.**
+///
+/// The normalisation, the read-only gate, the row cap and the cancel-and-wait
+/// timeout all live in [`schemaic_cli::query::read_only_query`] now. They were
+/// duplicated here, which is two copies of a *guard* — the shape this codebase
+/// has already been bitten by, and one only the front end that got the fix
+/// would have kept.
+///
+/// **The wording stays here** rather than coming from `NoRows::message`, which
+/// is the CLI's: that one points a refused write at `schemaic exec`, and the
+/// assistant's route to a write is `propose_table_change`. Same refusal, right
+/// advice for whoever is reading it.
 async fn run_query(db: &Db, database: Option<&str>, sql: &str) -> (String, bool) {
-    let Some(stmt) = normalize_stmt(sql) else {
-        return ("Empty query.".to_string(), true);
-    };
-    // Read-only gate (comment/string/identifier-aware) lives in schemaic-core,
-    // where it's unit-tested alongside the other SQL analysis. Gate in the
-    // connection's dialect so PG `#`-operators aren't mistaken for comments.
-    if let Err(reason) = schemaic_core::sql::read_only_reason(stmt, dialect_of(db)) {
-        return (format!("Rejected: {reason}."), true);
-    }
-    let token = CancellationToken::new();
-    match with_deadline(
-        db.fetch_query(database, stmt, MCP_ROW_CAP, token.clone()),
-        token,
-    )
-    .await
+    use schemaic_cli::query::NoRows;
+    match schemaic_cli::query::read_only_query(db, database, sql, MCP_ROW_CAP, QUERY_TIMEOUT).await
     {
-        Some(Ok(rs)) => (format_table(&rs), false),
-        Some(Err(e)) => (format!("Query error: {e}"), true),
-        None => ("Query timed out (30s) and was cancelled.".to_string(), true),
+        Ok(rs) => (format_table(&rs), false),
+        Err(NoRows::Empty) => ("Empty query.".to_string(), true),
+        Err(NoRows::NotARead(reason)) => (format!("Rejected: {reason}."), true),
+        Err(NoRows::Failed(e)) => (format!("Query error: {e}"), true),
+        Err(NoRows::TimedOut(d)) => (
+            format!("Query timed out ({}s) and was cancelled.", d.as_secs()),
+            true,
+        ),
     }
-}
-
-/// Trim surrounding whitespace and a single trailing `;` from an AI-issued
-/// statement, returning `None` if nothing is left. Pure so the empty/`;`-only
-/// cases are unit-tested.
-fn normalize_stmt(sql: &str) -> Option<&str> {
-    let stmt = sql.trim().trim_end_matches(';').trim();
-    (!stmt.is_empty()).then_some(stmt)
 }
 
 /// Render a result set as a pipe table (capped), for the assistant to read.
@@ -1072,8 +1068,8 @@ mod tests {
     use super::{
         HashSet, McpTool, NO_DATA_ACCESS, SUPPORTED_PROTOCOLS, dialect_of, find_described,
         format_database_list, format_database_schema, format_table, format_table_detail,
-        format_table_heading, listed_databases, negotiate_protocol, normalize_stmt,
-        proposal_from_args, refusal_for,
+        format_table_heading, listed_databases, negotiate_protocol, proposal_from_args,
+        refusal_for,
     };
 
     /// **A read that finishes in time comes back whole**, and the clock is not
@@ -1302,10 +1298,20 @@ mod tests {
                 offenders.push(format!("{line}: {}", text.trim()));
             }
         }
+        // **Six, down from seven, and the seventh was not deleted — it moved.**
+        // `run_query`'s `fetch_query` folded into
+        // `schemaic_cli::query::read_only_query` so the CLI and this server
+        // share one read path. Lowering a floor is exactly the edit this gate
+        // exists to make someone justify, so: the read is still wrapped, by
+        // `schemaic_cli::deadline::with_deadline`, and
+        // `no_database_read_in_this_crate_is_awaited_without_a_deadline` is the
+        // same gate over there, following it. Lower this again only for the
+        // same reason, and only after checking the read still has a gate
+        // wherever it went.
         assert!(
-            checked >= 7,
+            checked >= 6,
             "the needle stopped matching: {checked} database reads found, and this \
-             module has at least seven — a gate that scans nothing reports success"
+             module has at least six — a gate that scans nothing reports success"
         );
         assert!(
             offenders.is_empty(),
@@ -1926,14 +1932,8 @@ mod tests {
         assert!(!out.contains("Foreign keys:"));
     }
 
-    #[test]
-    fn normalize_stmt_trims_and_rejects_empty() {
-        assert_eq!(normalize_stmt("  SELECT 1 ;  "), Some("SELECT 1"));
-        assert_eq!(normalize_stmt("SELECT 1"), Some("SELECT 1"));
-        assert_eq!(normalize_stmt("   "), None);
-        assert_eq!(normalize_stmt(";"), None);
-        assert_eq!(normalize_stmt(""), None);
-    }
+    // `normalize_stmt`'s tests went with the function, to
+    // `schemaic_cli::query`, which owns the one copy both front ends now call.
 
     fn col(name: &str) -> Column {
         Column {
