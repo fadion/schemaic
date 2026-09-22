@@ -2015,6 +2015,89 @@ pub const FUNCTIONS: &[SqlFunction] = &[
     ),
     f("X", "X(p [, new_x_val])", "Synonym for ST_X()"),
     f("Y", "Y(p [, new_y_val])", "Synonym for ST_Y()"),
+    // ── MariaDB 11 ───────────────────────────────────────────────────────────
+    //
+    // **The catalog spans MariaDB versions, and this is the block that says
+    // so.** These fifteen are in 11.8's `SQL_FUNCTIONS` and not in 10.11's, so
+    // a user on the newer server was getting fifteen squiggles under correct
+    // SQL — the same defect as the spatial block above, along the *version*
+    // axis rather than the flavour one. `live::mariadb_catalog`'s
+    // `NEWER_THAN_BASELINE` carries the same names and is what keeps the two
+    // server legs from contradicting each other.
+    //
+    // Six carry their own `mysql.help_topic` syntax line on 11.8 and were taken
+    // from it. The other nine are undocumented there, so their **arity was
+    // measured** — `SELECT <name>(…)` at 0–4 arguments, keeping the arity that
+    // is not `ERROR 1582` — and their behaviour confirmed by executing them:
+    // `FORMAT_BYTES(123456789)` is `117.74 MiB`,
+    // `VEC_DISTANCE_EUCLIDEAN([0,0], [3,4])` is `5`,
+    // `VEC_ToText(VEC_FromText('[1,2,3]'))` round-trips.
+    f(
+        "FORMAT_BYTES",
+        "FORMAT_BYTES(size)",
+        "Human-readable size from a byte count",
+    ),
+    f(
+        "FORMAT_PICO_TIME",
+        "FORMAT_PICO_TIME(time_val)",
+        "Human-readable time from a value in picoseconds",
+    ),
+    f(
+        "JSON_ARRAY_INTERSECT",
+        "JSON_ARRAY_INTERSECT(arr1, arr2)",
+        "Intersection of two JSON arrays",
+    ),
+    // Arity measured; its semantics are **not** pinned here — every shape tried
+    // on 11.8.9 answered `NULL` with no warning, so nothing more is claimed
+    // than that the name exists and takes two arguments.
+    f(
+        "JSON_KEY_VALUE",
+        "JSON_KEY_VALUE(json, key)",
+        "Key/value accessor for a JSON document",
+    ),
+    f(
+        "JSON_OBJECT_FILTER_KEYS",
+        "JSON_OBJECT_FILTER_KEYS(obj, array_keys)",
+        "The object's members whose keys appear in the given array",
+    ),
+    f(
+        "JSON_OBJECT_TO_ARRAY",
+        "JSON_OBJECT_TO_ARRAY(obj)",
+        "A JSON object as an array of [key, value] pairs",
+    ),
+    f(
+        "JSON_SCHEMA_VALID",
+        "JSON_SCHEMA_VALID(schema, json)",
+        "Whether a JSON document validates against a JSON Schema",
+    ),
+    f(
+        "KDF",
+        "KDF(key_str, salt [, {info | iterations} [, kdf_name [, width ]]])",
+        "Derive a key from a passphrase and a salt",
+    ),
+    f("UUID_V4", "UUID_V4()", "A version 4 (random) UUID"),
+    f("UUID_V7", "UUID_V7()", "A version 7 (time-ordered) UUID"),
+    f(
+        "VEC_DISTANCE",
+        "VEC_DISTANCE(v1, v2)",
+        "Distance between two vectors, in the metric the index was built with",
+    ),
+    f(
+        "VEC_DISTANCE_COSINE",
+        "VEC_DISTANCE_COSINE(v1, v2)",
+        "Cosine distance between two vectors",
+    ),
+    f(
+        "VEC_DISTANCE_EUCLIDEAN",
+        "VEC_DISTANCE_EUCLIDEAN(v1, v2)",
+        "Euclidean distance between two vectors",
+    ),
+    f(
+        "VEC_FROMTEXT",
+        "VEC_FROMTEXT(json_array)",
+        "A vector from its JSON-array text form",
+    ),
+    f("VEC_TOTEXT", "VEC_TOTEXT(vec)", "A vector as a JSON array"),
 ];
 
 /// The authoritative catalog of **SQLite** built-in functions, trusted by the
@@ -2635,13 +2718,18 @@ pub const MARIADB_ONLY: &[&str] = &[
     "ISEMPTY",
     "ISRING",
     "ISSIMPLE",
+    "JSON_ARRAY_INTERSECT",
     "JSON_COMPACT",
     "JSON_DETAILED",
     "JSON_EQUALS",
     "JSON_EXISTS",
+    "JSON_KEY_VALUE",
     "JSON_LOOSE",
     "JSON_NORMALIZE",
+    "JSON_OBJECT_FILTER_KEYS",
+    "JSON_OBJECT_TO_ARRAY",
     "JSON_QUERY",
+    "KDF",
     "LENGTHB",
     "LINEFROMTEXT",
     "LINEFROMWKB",
@@ -2697,6 +2785,13 @@ pub const MARIADB_ONLY: &[&str] = &[
     "TOUCHES",
     "TO_CHAR",
     "TRIM_ORACLE",
+    "UUID_V4",
+    "UUID_V7",
+    "VEC_DISTANCE",
+    "VEC_DISTANCE_COSINE",
+    "VEC_DISTANCE_EUCLIDEAN",
+    "VEC_FROMTEXT",
+    "VEC_TOTEXT",
     "WITHIN",
     "WSREP_LAST_SEEN_GTID",
     "WSREP_LAST_WRITTEN_GTID",

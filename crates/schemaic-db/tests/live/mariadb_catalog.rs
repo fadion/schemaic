@@ -87,6 +87,48 @@ const KEYWORD_ORACLE: &str = "SELECT `WORD` FROM information_schema.KEYWORDS";
 /// what keeps the exception from outliving the wart.
 const NOT_CALLABLE: &[&str] = &["schemas"];
 
+/// Builtins **MariaDB gained after 10.11**, which the catalog carries and an
+/// older server does not report.
+///
+/// **The catalog spans versions as well as engines, and nothing else here said
+/// so.** `MARIADB_ONLY` and `MYSQL_ONLY` answer "which *engine* has this name";
+/// there was no term for "which *version*", so the two oracles below
+/// contradicted each other the moment the tier's two MariaDB legs differed — CI
+/// pins the floating `mariadb:11` tag, which rolled from 11.4 to 11.8 and
+/// brought fifteen functions with it. On 11.8 they are in `SQL_FUNCTIONS` and
+/// the catalog was short by them (fifteen squiggles under correct SQL, which is
+/// how this was found); on 10.11 they are absent and the catalog now carries
+/// them, which without this list reads as fifteen invented names.
+///
+/// **Excused only where the endpoint really lacks them.** The tests below drop
+/// a name from this list the moment the server in front of them reports it, so
+/// the excuse cannot outlive the versions it was written for —
+/// [`the_newer_names_are_reported_by_some_maria_db`] is what fails if the tier
+/// ever stops seeing a server new enough to have any of them.
+///
+/// A tab on 10.11 *is* offered these fifteen and cannot call them. That is the
+/// cheap direction and the same trade `intel::is_offered_builtin` already makes
+/// for `ServerFlavour::Unknown`: one extra row in a popup, against a squiggle
+/// under correct SQL on every newer server. Narrowing it would need a version
+/// in `ServerFlavour`, which nothing else wants.
+const NEWER_THAN_BASELINE: &[&str] = &[
+    "format_bytes",
+    "format_pico_time",
+    "json_array_intersect",
+    "json_key_value",
+    "json_object_filter_keys",
+    "json_object_to_array",
+    "json_schema_valid",
+    "kdf",
+    "uuid_v4",
+    "uuid_v7",
+    "vec_distance",
+    "vec_distance_cosine",
+    "vec_distance_euclidean",
+    "vec_fromtext",
+    "vec_totext",
+];
+
 /// Builtins MySQL 8 has and MariaDB 10.11 does not, so neither server view
 /// reports them and [`over_listing`] must account for them by hand.
 ///
@@ -235,6 +277,10 @@ async fn over_listing() {
         .iter()
         .filter(|n| !known.contains(*n))
         .filter(|n| !mysql_only().contains(n))
+        // …and not a name this server is simply too old for. Keyed on what
+        // *this* endpoint reports, so a newer one stops excusing it — see
+        // `NEWER_THAN_BASELINE`.
+        .filter(|n| !NEWER_THAN_BASELINE.contains(&n.as_str()))
         .cloned()
         .collect();
 
@@ -313,17 +359,26 @@ async fn over_listing() {
         .iter()
         .filter(|n| !known.contains(*n) && mysql_only().contains(n))
         .collect();
+    // The fourth part: names this endpoint is too old for. Zero on a server new
+    // enough to report them all, which is why the assertion below counts it
+    // rather than assuming it.
+    let by_version: Vec<&String> = ours
+        .iter()
+        .filter(|n| !known.contains(*n) && !mysql_only().contains(n))
+        .filter(|n| NEWER_THAN_BASELINE.contains(&n.as_str()))
+        .collect();
     let by_parser = unreported.len();
     let not_in_functions = ours.iter().filter(|n| !functions.contains(*n)).count();
     assert_eq!(
-        by_keyword.len() + by_mysql_only.len() + by_parser,
+        by_keyword.len() + by_mysql_only.len() + by_version.len() + by_parser,
         not_in_functions,
-        "the three parts of the excuse do not add up to what `SQL_FUNCTIONS` \
-         leaves out on {}: {} by KEYWORDS + {} by MYSQL_ONLY + {} by the parser \
-         against {} unreported",
+        "the four parts of the excuse do not add up to what `SQL_FUNCTIONS` \
+         leaves out on {}: {} by KEYWORDS + {} by MYSQL_ONLY + {} too new for \
+         this server + {} by the parser against {} unreported",
         MARIADB.endpoint(),
         by_keyword.len(),
         by_mysql_only.len(),
+        by_version.len(),
         by_parser,
         not_in_functions
     );
@@ -409,6 +464,58 @@ async fn probe(names: &[String], pick: fn(&str) -> bool) -> Vec<String> {
     }
     session.close().await;
     absent
+}
+
+/// **The version excuse describes a real boundary, and is spent where it is
+/// claimed.**
+///
+/// [`NEWER_THAN_BASELINE`] is the one list here that no single endpoint can
+/// confirm — it is about the difference between two MariaDB versions, and the
+/// tier sees one at a time. What *is* checkable from either side is that the
+/// list has not gone stale in the two ways that matter: a name on it that the
+/// catalog does not carry excuses nothing at all, and a name this endpoint
+/// **does** report must be callable here, or the excuse is covering an
+/// unrelated defect.
+///
+/// The second half is what makes the list self-limiting. On a server new enough
+/// to report them, every name is exercised against the parser and the excuse
+/// does no work; on an older one it does all of it. Either way a name that
+/// stops being a version story fails here rather than sitting in the list.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_newer_names_are_a_version_boundary_and_not_a_dumping_ground() {
+    if !MARIADB.enabled() {
+        endpoint::note_skipped(&MARIADB);
+        return;
+    }
+    let ours = catalog_names();
+    let missing: Vec<&&str> = NEWER_THAN_BASELINE
+        .iter()
+        .filter(|n| !ours.contains(**n))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "`NEWER_THAN_BASELINE` names {} function(s) `intel::FUNCTIONS` does not \
+         carry, so they excuse nothing and the list has drifted: {missing:?}",
+        missing.len()
+    );
+
+    // What this server actually reports of them — nothing on 10.11, all of them
+    // on 11.8.
+    let reported = server_names(FUNCTION_ORACLE, 200).await;
+    let here: Vec<String> = NEWER_THAN_BASELINE
+        .iter()
+        .filter(|n| reported.contains(**n))
+        .map(|n| (*n).to_string())
+        .collect();
+    let uncallable = names_this_server_cannot_call(&here).await;
+    assert!(
+        uncallable.is_empty(),
+        "{} reports {:?} in `SQL_FUNCTIONS` and will not call them, so they are \
+         not a version story — `NEWER_THAN_BASELINE` is covering something \
+         else",
+        MARIADB.endpoint(),
+        uncallable
+    );
 }
 
 /// Every name in [`MYSQL_ONLY`] really is in the catalog, so the allowance
@@ -606,7 +713,13 @@ async fn each_server_is_only_credited_with_the_builtins_it_really_has() {
         let expected: HashSet<&str> = expected.iter().copied().collect();
         let absent: HashSet<&str> = absent.into_iter().collect();
 
-        let unlisted: Vec<&&str> = absent.difference(&expected).collect();
+        // A name the *engine* has and this *version* does not is excused here
+        // and nowhere else — see `NEWER_THAN_BASELINE`, which also records why
+        // over-offering is the direction to accept.
+        let unlisted: Vec<&&str> = absent
+            .difference(&expected)
+            .filter(|n| !NEWER_THAN_BASELINE.contains(&n.to_ascii_lowercase().as_str()))
+            .collect();
         assert!(
             unlisted.is_empty(),
             "{} has no such function, and nothing in `intel` withholds it — so \
