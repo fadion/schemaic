@@ -49,9 +49,15 @@ use crate::{
 /// itself only reads `overlay` and the loaded schema, but the footer offers
 /// **Edit**, which routes to the table designer or the view editor — so it
 /// wants what those two doors want (`ConnUi`, `SchemaUi`, `DdlUi` and the
-/// `ViewAlgoFn` the view editor's door ends in) on top of the four arguments
-/// it already carries. Named one by one that is nine parameters, past clippy's
-/// limit; the gate's own rule and the lint agree, so they are gathered here.
+/// `ViewAlgoFn` the view editor's door ends in) on top of the `overlay` and the
+/// three count closures it already carries. Named one by one that is **eight**
+/// parameters, past clippy's limit of seven; the gate's own rule and the lint
+/// agree, so they are gathered here.
+///
+/// It said nine, in both copies of this paragraph, by counting `SchemaUi` in
+/// each half of the sum — the panel's "loaded schema" and the doors' list are
+/// the same field. The conclusion survives the arithmetic, which is exactly why
+/// nothing caught it.
 ///
 /// Holds no `Ui`, for `whole_ui_gate`'s reason: it is built by naming the
 /// reads at its one call site.

@@ -8211,6 +8211,19 @@ fn body(
             right_content.set(p);
         }
     });
+    // Built once for the whole builder rather than per arm, the way
+    // `overlays.rs`'s `dump_ctx` and `schema_tree.rs`'s are: the three panels
+    // that take one were each constructing a character-identical `MenuFlags`
+    // from the same `ui_right`, 34 lines apart, inside one `dyn_container`
+    // builder. `MenuFlags` is `Copy`, so each arm takes it by value and nothing
+    // about the rebuild changes.
+    let right_menus = crate::widgets::MenuFlags::of(
+        ui_right.overlay,
+        ui_right.schema,
+        ui_right.conn,
+        ui_right.tabs_ui,
+        ui_right.activity,
+    );
     let right_inner = dyn_container(
         move || right_content.get(),
         move |panel| match panel {
@@ -8227,13 +8240,7 @@ fn body(
                 ui_right.overlay,
                 ui_right.db_colors,
                 ui_right.history_actions.clone(),
-                crate::widgets::MenuFlags::of(
-                    ui_right.overlay,
-                    ui_right.schema,
-                    ui_right.conn,
-                    ui_right.tabs_ui,
-                    ui_right.activity,
-                ),
+                right_menus,
             )
             .into_any(),
             RightPanel::Snippets => crate::snippet_panel::snippet_panel(
@@ -8241,13 +8248,7 @@ fn body(
                 ui_right.conn,
                 ui_right.overlay,
                 ui_right.snippet_actions.clone(),
-                crate::widgets::MenuFlags::of(
-                    ui_right.overlay,
-                    ui_right.schema,
-                    ui_right.conn,
-                    ui_right.tabs_ui,
-                    ui_right.activity,
-                ),
+                right_menus,
             )
             .into_any(),
             RightPanel::Activity => activity_panel(
@@ -8255,13 +8256,7 @@ fn body(
                 ui_right.conn,
                 ui_right.overlay,
                 ui_right.activity_actions.clone(),
-                crate::widgets::MenuFlags::of(
-                    ui_right.overlay,
-                    ui_right.schema,
-                    ui_right.conn,
-                    ui_right.tabs_ui,
-                    ui_right.activity,
-                ),
+                right_menus,
             )
             .into_any(),
             _ => ai_panel(ui_right.clone()).into_any(),
@@ -10619,6 +10614,40 @@ pub(crate) fn tab_action(on_tab: bool, tab_indents: bool, in_ring: bool, shift: 
     }
 }
 
+/// What a field's signal should be set to after a document edit, or `None` to
+/// leave it alone.
+///
+/// **The `Some` on an *unchanged* value is the whole of this function.** A
+/// single-line field strips line breaks on the way from the document to the
+/// signal, and the only thing that can put the stripped text back *into the
+/// document* is the signal→document reconcile, which is an effect on the
+/// signal. So when the pasted text is only line breaks — a clipboard holding
+/// exactly `"\n"`, which is what copying a blank line gives you — the stripped
+/// value equals what the signal already holds, the set is skipped, the reconcile
+/// never runs, and the document keeps a newline the signal does not have.
+///
+/// That desync is silent until the *next* edit, and on a masked password field
+/// it eats it: `connection_form::splice_real` refuses a delta whose `prev_len`
+/// does not match the real value's length, and the `None` arm restores the mask
+/// from `mirror_real` — so selecting all and typing a new password flashes once,
+/// snaps back, and **Save writes the old secret**. It heals after exactly one
+/// refusal, which is what makes the first loss easy to miss.
+///
+/// Returning `Some` with an equal value is not a no-op here, and that is the
+/// mechanism: a floem signal never dedups, so the set still notifies, the
+/// reconcile runs, finds `want != have`, and rewrites the document.
+fn single_line_sync(current: &str, doc: &str, multiline: bool) -> Option<String> {
+    let stripped = !multiline && (doc.contains('\n') || doc.contains('\r'));
+    let t = if stripped {
+        doc.replace(['\n', '\r'], "")
+    } else {
+        doc.to_string()
+    };
+    // `stripped` first and on its own: the document needs rewriting whether or
+    // not the signal's value moved.
+    (stripped || current != t).then_some(t)
+}
+
 /// The one text-input component used across the app (except the specialised
 /// Ctrl+K overlay and the `*`-masked password fields): Floem's editor engine —
 /// the same one that powers the SQL editor — configured as a plain field inside
@@ -10991,11 +11020,8 @@ pub(crate) fn edit_field(text_sig: RwSignal<String>, cfg: FieldCfg) -> impl Into
                 .scroll_beyond_last_line(false)
         })
         .update(move |upd| {
-            let mut t = ed_upd.doc().text().to_string();
-            if !multiline && (t.contains('\n') || t.contains('\r')) {
-                t = t.replace(['\n', '\r'], "");
-            }
-            if text_sig.get_untracked() != t {
+            let doc = ed_upd.doc().text().to_string();
+            if let Some(t) = single_line_sync(&text_sig.get_untracked(), &doc, multiline) {
                 text_sig.set(t);
             }
             // Report the edit to a masked field — but not the re-mask it makes
@@ -12542,6 +12568,62 @@ pub(crate) fn search_box(
         },
     )
     .style(|s| s.width_full())
+}
+
+#[cfg(test)]
+mod single_line_sync_tests {
+    use super::single_line_sync;
+
+    /// The ordinary keystroke: the document moved, so the signal follows.
+    #[test]
+    fn a_changed_document_sets_the_signal() {
+        assert_eq!(single_line_sync("ab", "abc", false), Some("abc".into()));
+    }
+
+    /// …and an unchanged one does not, which is what keeps this off the
+    /// reconcile path on every keystroke of a masked field.
+    #[test]
+    fn an_unchanged_document_sets_nothing() {
+        assert_eq!(single_line_sync("abc", "abc", false), None);
+        assert_eq!(single_line_sync("", "", false), None);
+    }
+
+    /// **The defect, and the reason the answer is `Some` over an equal value.**
+    ///
+    /// Paste a clipboard holding exactly `"\n"` — what copying a blank line
+    /// gives you — into a single-line field showing `ab`. The document is now
+    /// `"ab\n"`, the stripped value is `"ab"`, and the signal already holds
+    /// `"ab"`. The old rule compared only those last two, skipped the set, and
+    /// left the document a character longer than the signal for good.
+    #[test]
+    fn a_line_break_only_paste_still_forces_the_reconcile() {
+        assert_eq!(single_line_sync("ab", "ab\n", false), Some("ab".into()));
+        assert_eq!(single_line_sync("ab", "ab\r\n", false), Some("ab".into()));
+        assert_eq!(single_line_sync("ab", "\nab", false), Some("ab".into()));
+        // The empty field is the same case and the one that reads as "nothing
+        // happened": a lone newline into an empty password box.
+        assert_eq!(single_line_sync("", "\n", false), Some(String::new()));
+        assert_eq!(single_line_sync("", "\r\n", false), Some(String::new()));
+    }
+
+    /// A break that arrives *with* text takes the same path, and always did —
+    /// the value moves, so the old rule found it too. Pinned so a fix to the
+    /// case above cannot lose this one.
+    #[test]
+    fn a_paste_carrying_both_text_and_a_break_is_stripped() {
+        assert_eq!(
+            single_line_sync("ab", "ab\nhunter2", false),
+            Some("abhunter2".into())
+        );
+    }
+
+    /// A multiline field keeps its line breaks — this is only ever about a box
+    /// that cannot have them.
+    #[test]
+    fn a_multiline_field_keeps_its_breaks() {
+        assert_eq!(single_line_sync("a", "a\nb", true), Some("a\nb".into()));
+        assert_eq!(single_line_sync("a\nb", "a\nb", true), None);
+    }
 }
 
 #[cfg(test)]
@@ -15196,10 +15278,13 @@ mod whole_ui_gate {
         // reads `overlay` and the loaded schema; its **Edit** routes to the
         // table designer or the view editor, so it wants what those two doors
         // want — `ConnUi`, `SchemaUi`, `DdlUi` and the `ViewAlgoFn` the view
-        // editor's door ends in — on top of the four arguments it already
-        // carries. Named one by one that is nine parameters, past clippy's
-        // seven: the lint and this gate's "take the child bundle" agree, and
-        // the ctx is what they agree on.
+        // editor's door ends in — on top of the `overlay` and three count
+        // closures it already carries. Named one by one that is **eight**
+        // parameters, past clippy's seven: the lint and this gate's "take the
+        // child bundle" agree, and the ctx is what they agree on. (Both copies
+        // of this paragraph said nine, by counting `SchemaUi` in each half of
+        // the sum. The conclusion survives, which is why nothing caught it —
+        // see `PropertiesCtx`'s own doc.)
         //
         // `open_for_table` stayed off it, for `open_for_server`'s and
         // `open_import`'s reason a fourth time: a door that only writes the
