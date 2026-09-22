@@ -1294,6 +1294,727 @@ pub const FUNCTIONS: &[SqlFunction] = &[
         "DECODE_HISTOGRAM(type, histogram)",
         "Readable form of a stored statistics histogram (MariaDB)",
     ),
+    // ── Spatial (OGC) ────────────────────────────────────────────────────────
+    //
+    // **Measured, not written from the documentation.** Every name here was
+    // shown callable on *both* MySQL 8.4.11 and MariaDB 10.11.14 by asking the
+    // parser (`SELECT <name>(1,2)`, anything but `ERROR 1305`), and each
+    // signature and summary is that server's own `mysql.help_topic` first line
+    // and first sentence. Nothing here was invented, which is the property
+    // `live::mariadb_catalog` exists to keep.
+    //
+    // They were missing because `information_schema.SQL_FUNCTIONS` — the oracle
+    // that checks this list — does not report them: a builtin registered
+    // natively but resolved by its own path is in neither server view, so the
+    // completeness half was green over the whole family. `ST_LENGTH` was the
+    // one already squiggling under correct SQL; the other eighty were silent
+    // only because no catalogued name sat within a near-miss of them.
+    f(
+        "GEOMETRYCOLLECTION",
+        "GEOMETRYCOLLECTION(g [, g] ...)",
+        "Constructs a GeomCollection value from the geometry arguments",
+    ),
+    f(
+        "LINESTRING",
+        "LINESTRING(pt [, pt] ...)",
+        "Constructs a LineString value from a number of Point or WKB Point arguments",
+    ),
+    f(
+        "MBRCONTAINS",
+        "MBRCONTAINS(g1, g2)",
+        "Returns 1 or 0 to indicate whether the minimum bounding rectangle of g1 contains the…",
+    ),
+    f(
+        "MBRDISJOINT",
+        "MBRDISJOINT(g1, g2)",
+        "Returns 1 or 0 to indicate whether the minimum bounding rectangles of the two…",
+    ),
+    f(
+        "MBREQUALS",
+        "MBREQUALS(g1, g2)",
+        "Returns 1 or 0 to indicate whether the minimum bounding rectangles of the two…",
+    ),
+    f(
+        "MBRINTERSECTS",
+        "MBRINTERSECTS(g1, g2)",
+        "Returns 1 or 0 to indicate whether the minimum bounding rectangles of the two…",
+    ),
+    f(
+        "MBROVERLAPS",
+        "MBROVERLAPS(g1, g2)",
+        "Two geometries spatially overlap if they intersect and their intersection results in a…",
+    ),
+    f(
+        "MBRTOUCHES",
+        "MBRTOUCHES(g1, g2)",
+        "Two geometries spatially touch if their interiors do not intersect, but the boundary…",
+    ),
+    f(
+        "MBRWITHIN",
+        "MBRWITHIN(g1, g2)",
+        "Returns 1 or 0 to indicate whether the minimum bounding rectangle of g1 is within the…",
+    ),
+    f(
+        "MULTILINESTRING",
+        "MULTILINESTRING(ls [, ls] ...)",
+        "Constructs a MultiLineString value using LineString or WKB LineString arguments",
+    ),
+    f(
+        "MULTIPOINT",
+        "MULTIPOINT(pt [, pt2] ...)",
+        "Constructs a MultiPoint value using Point or WKB Point arguments",
+    ),
+    f(
+        "MULTIPOLYGON",
+        "MULTIPOLYGON(poly [, poly] ...)",
+        "Constructs a MultiPolygon value from a set of Polygon or WKB Polygon arguments",
+    ),
+    f(
+        "POINT",
+        "POINT(x, y)",
+        "Constructs a Point using its coordinates",
+    ),
+    f(
+        "POLYGON",
+        "POLYGON(ls [, ls] ...)",
+        "Constructs a Polygon value from a number of LineString or WKB LineString arguments",
+    ),
+    f(
+        "ST_AREA",
+        "ST_AREA({poly|mpoly})",
+        "Returns a double-precision number indicating the area of the Polygon or MultiPolygon…",
+    ),
+    f(
+        "ST_ASBINARY",
+        "ST_ASBINARY(g [, options])",
+        "Converts a value in internal geometry format to its WKB representation and returns the…",
+    ),
+    f(
+        "ST_ASGEOJSON",
+        "ST_ASGEOJSON(g [, max_dec_digits [, options]])",
+        "Generates a GeoJSON object from the geometry g",
+    ),
+    f(
+        "ST_ASTEXT",
+        "ST_ASTEXT(g [, options])",
+        "Converts a value in internal geometry format to its WKT representation and returns the…",
+    ),
+    f(
+        "ST_ASWKB",
+        "ST_ASWKB(g [, options])",
+        "Synonym for ST_ASBINARY()",
+    ),
+    f(
+        "ST_ASWKT",
+        "ST_ASWKT(g [, options])",
+        "Synonym for ST_ASTEXT()",
+    ),
+    f(
+        "ST_BUFFER",
+        "ST_BUFFER(g, d [, strategy1 [, strategy2 [, strategy3]]])",
+        "Returns a geometry that represents all points whose distance from the geometry value g…",
+    ),
+    f(
+        "ST_CENTROID",
+        "ST_CENTROID({poly|mpoly})",
+        "Returns the mathematical centroid for the Polygon or MultiPolygon argument as a Point",
+    ),
+    f(
+        "ST_CONTAINS",
+        "ST_CONTAINS(g1, g2)",
+        "Returns 1 or 0 to indicate whether g1 completely contains g2",
+    ),
+    f(
+        "ST_CONVEXHULL",
+        "ST_CONVEXHULL(g)",
+        "Returns a geometry that represents the convex hull of the geometry value g",
+    ),
+    f(
+        "ST_CROSSES",
+        "ST_CROSSES(g1, g2)",
+        "Two geometries spatially cross if their spatial relation has the following properties…",
+    ),
+    f(
+        "ST_DIFFERENCE",
+        "ST_DIFFERENCE(g1, g2)",
+        "Returns a geometry that represents the point set difference of the geometry values g1…",
+    ),
+    f(
+        "ST_DIMENSION",
+        "ST_DIMENSION(g)",
+        "Returns the inherent dimension of the geometry value g",
+    ),
+    f(
+        "ST_DISJOINT",
+        "ST_DISJOINT(g1, g2)",
+        "Returns 1 or 0 to indicate whether g1 is spatially disjoint from (does not intersect) g2",
+    ),
+    f(
+        "ST_DISTANCE",
+        "ST_DISTANCE(g1, g2 [, unit])",
+        "Returns the distance between g1 and g2, measured in the length unit of the spatial…",
+    ),
+    f(
+        "ST_DISTANCE_SPHERE",
+        "ST_DISTANCE_SPHERE(g1, g2 [, radius])",
+        "Returns the minimum spherical distance between Point or MultiPoint arguments on a…",
+    ),
+    f(
+        "ST_ENDPOINT",
+        "ST_ENDPOINT(ls)",
+        "Returns the Point that is the endpoint of the LineString value ls",
+    ),
+    f(
+        "ST_ENVELOPE",
+        "ST_ENVELOPE(g)",
+        "Returns the minimum bounding rectangle (MBR) for the geometry value g",
+    ),
+    f(
+        "ST_EQUALS",
+        "ST_EQUALS(g1, g2)",
+        "Returns 1 or 0 to indicate whether g1 is spatially equal to g2",
+    ),
+    f(
+        "ST_EXTERIORRING",
+        "ST_EXTERIORRING(poly)",
+        "Returns the exterior ring of the Polygon value poly as a LineString",
+    ),
+    f(
+        "ST_GEOMCOLLFROMTEXT",
+        "ST_GEOMCOLLFROMTEXT(wkt [, srid [, options]])",
+        "Constructs a GeometryCollection value using its WKT representation and SRID",
+    ),
+    f(
+        "ST_GEOMCOLLFROMWKB",
+        "ST_GEOMCOLLFROMWKB(wkb [, srid [, options]])",
+        "Constructs a GeometryCollection value using its WKB representation and SRID",
+    ),
+    f(
+        "ST_GEOMETRYCOLLECTIONFROMTEXT",
+        "ST_GEOMETRYCOLLECTIONFROMTEXT(wkt [, srid [, options]])",
+        "Synonym for ST_GEOMCOLLFROMTEXT()",
+    ),
+    f(
+        "ST_GEOMETRYCOLLECTIONFROMWKB",
+        "ST_GEOMETRYCOLLECTIONFROMWKB(wkb [, srid [, options]])",
+        "Synonym for ST_GEOMCOLLFROMWKB()",
+    ),
+    f(
+        "ST_GEOMETRYFROMTEXT",
+        "ST_GEOMETRYFROMTEXT(wkt [, srid [, options]])",
+        "Synonym for ST_GEOMFROMTEXT()",
+    ),
+    f(
+        "ST_GEOMETRYFROMWKB",
+        "ST_GEOMETRYFROMWKB(wkb [, srid [, options]])",
+        "Synonym for ST_GEOMFROMWKB()",
+    ),
+    f(
+        "ST_GEOMETRYN",
+        "ST_GEOMETRYN(gc, N)",
+        "Returns the N-th geometry in the GeometryCollection value gc",
+    ),
+    f(
+        "ST_GEOMETRYTYPE",
+        "ST_GEOMETRYTYPE(g)",
+        "Returns a binary string indicating the name of the geometry type of which the geometry…",
+    ),
+    f(
+        "ST_GEOMFROMGEOJSON",
+        "ST_GEOMFROMGEOJSON(str [, options [, srid]])",
+        "Parses a string str representing a GeoJSON object and returns a geometry",
+    ),
+    f(
+        "ST_GEOMFROMTEXT",
+        "ST_GEOMFROMTEXT(wkt [, srid [, options]])",
+        "Constructs a geometry value of any type using its WKT representation and SRID",
+    ),
+    f(
+        "ST_GEOMFROMWKB",
+        "ST_GEOMFROMWKB(wkb [, srid [, options]])",
+        "Constructs a geometry value of any type using its WKB representation and SRID",
+    ),
+    f(
+        "ST_INTERIORRINGN",
+        "ST_INTERIORRINGN(poly, N)",
+        "Returns the N-th interior ring for the Polygon value poly as a LineString",
+    ),
+    f(
+        "ST_INTERSECTION",
+        "ST_INTERSECTION(g1, g2)",
+        "Returns a geometry that represents the point set intersection of the geometry values…",
+    ),
+    f(
+        "ST_INTERSECTS",
+        "ST_INTERSECTS(g1, g2)",
+        "Returns 1 or 0 to indicate whether g1 spatially intersects g2",
+    ),
+    f(
+        "ST_ISCLOSED",
+        "ST_ISCLOSED(ls)",
+        "Returns 1 if the LineString or MultiLineString value is closed, 0 otherwise",
+    ),
+    f(
+        "ST_ISEMPTY",
+        "ST_ISEMPTY(g)",
+        "This function is a placeholder that returns 1 for an empty geometry collection value…",
+    ),
+    f(
+        "ST_ISSIMPLE",
+        "ST_ISSIMPLE(g)",
+        "Returns 1 if the geometry value g is simple according to the ISO SQL/MM Part 3…",
+    ),
+    f(
+        "ST_LENGTH",
+        "ST_LENGTH(ls [, unit])",
+        "Returns a double-precision number indicating the length of the LineString or…",
+    ),
+    f(
+        "ST_LINEFROMTEXT",
+        "ST_LINEFROMTEXT(wkt [, srid [, options]])",
+        "Constructs a LineString value using its WKT representation and SRID",
+    ),
+    f(
+        "ST_LINEFROMWKB",
+        "ST_LINEFROMWKB(wkb [, srid [, options]])",
+        "Constructs a LineString value using its WKB representation and SRID",
+    ),
+    f(
+        "ST_LINESTRINGFROMTEXT",
+        "ST_LINESTRINGFROMTEXT(wkt [, srid [, options]])",
+        "Synonym for ST_LINEFROMTEXT()",
+    ),
+    f(
+        "ST_LINESTRINGFROMWKB",
+        "ST_LINESTRINGFROMWKB(wkb [, srid [, options]])",
+        "Synonym for ST_LINEFROMWKB()",
+    ),
+    f(
+        "ST_MLINEFROMTEXT",
+        "ST_MLINEFROMTEXT(wkt [, srid [, options]])",
+        "Constructs a MultiLineString value using its WKT representation and SRID",
+    ),
+    f(
+        "ST_MLINEFROMWKB",
+        "ST_MLINEFROMWKB(wkb [, srid [, options]])",
+        "Constructs a MultiLineString value using its WKB representation and SRID",
+    ),
+    f(
+        "ST_MPOINTFROMTEXT",
+        "ST_MPOINTFROMTEXT(wkt [, srid [, options]])",
+        "Constructs a MultiPoint value using its WKT representation and SRID",
+    ),
+    f(
+        "ST_MPOINTFROMWKB",
+        "ST_MPOINTFROMWKB(wkb [, srid [, options]])",
+        "Constructs a MultiPoint value using its WKB representation and SRID",
+    ),
+    f(
+        "ST_MPOLYFROMTEXT",
+        "ST_MPOLYFROMTEXT(wkt [, srid [, options]])",
+        "Constructs a MultiPolygon value using its WKT representation and SRID",
+    ),
+    f(
+        "ST_MPOLYFROMWKB",
+        "ST_MPOLYFROMWKB(wkb [, srid [, options]])",
+        "Constructs a MultiPolygon value using its WKB representation and SRID",
+    ),
+    f(
+        "ST_NUMGEOMETRIES",
+        "ST_NUMGEOMETRIES(gc)",
+        "Returns the number of geometries in the GeometryCollection value gc",
+    ),
+    f(
+        "ST_NUMINTERIORRINGS",
+        "ST_NUMINTERIORRINGS(poly)",
+        "Returns the number of interior rings in the Polygon value poly",
+    ),
+    f(
+        "ST_NUMPOINTS",
+        "ST_NUMPOINTS(ls)",
+        "Returns the number of Point objects in the LineString value ls",
+    ),
+    f(
+        "ST_OVERLAPS",
+        "ST_OVERLAPS(g1, g2)",
+        "Two geometries spatially overlap if they intersect and their intersection results in a…",
+    ),
+    f(
+        "ST_POINTFROMTEXT",
+        "ST_POINTFROMTEXT(wkt [, srid [, options]])",
+        "Constructs a Point value using its WKT representation and SRID",
+    ),
+    f(
+        "ST_POINTFROMWKB",
+        "ST_POINTFROMWKB(wkb [, srid [, options]])",
+        "Constructs a Point value using its WKB representation and SRID",
+    ),
+    f(
+        "ST_POINTN",
+        "ST_POINTN(ls, N)",
+        "Returns the N-th Point in the Linestring value ls",
+    ),
+    f(
+        "ST_POLYFROMTEXT",
+        "ST_POLYFROMTEXT(wkt [, srid [, options]])",
+        "Constructs a Polygon value using its WKT representation and SRID",
+    ),
+    f(
+        "ST_POLYFROMWKB",
+        "ST_POLYFROMWKB(wkb [, srid [, options]])",
+        "Constructs a Polygon value using its WKB representation and SRID",
+    ),
+    f(
+        "ST_POLYGONFROMTEXT",
+        "ST_POLYGONFROMTEXT(wkt [, srid [, options]])",
+        "Synonym for ST_POLYFROMTEXT()",
+    ),
+    f(
+        "ST_POLYGONFROMWKB",
+        "ST_POLYGONFROMWKB(wkb [, srid [, options]])",
+        "Synonym for ST_POLYFROMWKB()",
+    ),
+    f(
+        "ST_SRID",
+        "ST_SRID(g [, srid])",
+        "Returns the spatial reference system ID of the geometry value g, or sets it",
+    ),
+    f(
+        "ST_STARTPOINT",
+        "ST_STARTPOINT(ls)",
+        "Returns the Point that is the start point of the LineString value ls",
+    ),
+    f(
+        "ST_SYMDIFFERENCE",
+        "ST_SYMDIFFERENCE(g1, g2)",
+        "Returns a geometry that represents the point set symmetric difference of the geometry…",
+    ),
+    f(
+        "ST_TOUCHES",
+        "ST_TOUCHES(g1, g2)",
+        "Two geometries spatially touch if their interiors do not intersect, but the boundary…",
+    ),
+    f(
+        "ST_UNION",
+        "ST_UNION(g1, g2)",
+        "Returns a geometry that represents the point set union of the geometry values g1 and g2",
+    ),
+    f(
+        "ST_WITHIN",
+        "ST_WITHIN(g1, g2)",
+        "Returns 1 or 0 to indicate whether g1 is spatially within g2",
+    ),
+    f(
+        "ST_X",
+        "ST_X(p [, new_x_val])",
+        "Returns the X coordinate of the Point value p, or sets it",
+    ),
+    f(
+        "ST_Y",
+        "ST_Y(p [, new_y_val])",
+        "Returns the Y coordinate of the Point value p, or sets it",
+    ),
+    // ── Spatial, MariaDB's OGC-v1 spellings ──────────────────────────────────
+    //
+    // MariaDB keeps the unprefixed names the first OGC standard used, and MySQL
+    // 8 removed them — so these are [`MARIADB_ONLY`], measured the same way as
+    // the block above. They are **trusted but never offered**
+    // ([`DEPRECATED_ALIASES`]): the typo checker must know `GLENGTH` so it does
+    // not squiggle it, and the completion popup must not suggest `X(`, `Y(`,
+    // `CONTAINS(` or `EQUALS(` to somebody typing an ordinary column name.
+    f("AREA", "AREA({poly|mpoly})", "Synonym for ST_AREA()"),
+    f(
+        "ASBINARY",
+        "ASBINARY(g [, options])",
+        "Synonym for ST_ASBINARY()",
+    ),
+    f("ASTEXT", "ASTEXT(g [, options])", "Synonym for ST_ASTEXT()"),
+    f("ASWKB", "ASWKB(g [, options])", "Synonym for ST_ASBINARY()"),
+    f("ASWKT", "ASWKT(g [, options])", "Synonym for ST_ASTEXT()"),
+    f("BOUNDARY", "BOUNDARY(g)", "Synonym for ST_BOUNDARY()"),
+    f(
+        "BUFFER",
+        "BUFFER(g, d [, strategy1 [, strategy2 [, strategy3]]])",
+        "Synonym for ST_BUFFER()",
+    ),
+    f(
+        "CENTROID",
+        "CENTROID({poly|mpoly})",
+        "Synonym for ST_CENTROID()",
+    ),
+    f(
+        "CONTAINS",
+        "CONTAINS(g1,g2)",
+        "Returns 1 or 0 to indicate whether a geometry g1 completely contains geometry g2",
+    ),
+    f("CONVEXHULL", "CONVEXHULL(g)", "Synonym for ST_CONVEXHULL()"),
+    f(
+        "CROSSES",
+        "CROSSES(g1,g2)",
+        "Returns 1 if g1 spatially crosses g2",
+    ),
+    f("DIMENSION", "DIMENSION(g)", "Synonym for ST_DIMENSION()"),
+    f(
+        "DISJOINT",
+        "DISJOINT(g1,g2)",
+        "Returns 1 or 0 to indicate whether g1 is spatially disjoint from (does not intersect) g2",
+    ),
+    f("ENDPOINT", "ENDPOINT(ls)", "Synonym for ST_ENDPOINT()"),
+    f("ENVELOPE", "ENVELOPE(g)", "Synonym for ST_ENVELOPE()"),
+    f(
+        "EQUALS",
+        "EQUALS(g1,g2)",
+        "Returns 1 or 0 to indicate whether g1 is spatially equal to g2",
+    ),
+    f(
+        "EXTERIORRING",
+        "EXTERIORRING(poly)",
+        "Synonym for ST_EXTERIORRING()",
+    ),
+    f(
+        "GEOMCOLLFROMTEXT",
+        "GEOMCOLLFROMTEXT(wkt [, srid [, options]])",
+        "Synonym for ST_GEOMCOLLFROMTEXT()",
+    ),
+    f(
+        "GEOMCOLLFROMWKB",
+        "GEOMCOLLFROMWKB(wkb [, srid [, options]])",
+        "Synonym for ST_GEOMCOLLFROMWKB()",
+    ),
+    f(
+        "GEOMETRYCOLLECTIONFROMTEXT",
+        "GEOMETRYCOLLECTIONFROMTEXT(wkt [, srid [, options]])",
+        "Synonym for ST_GEOMCOLLFROMTEXT()",
+    ),
+    f(
+        "GEOMETRYCOLLECTIONFROMWKB",
+        "GEOMETRYCOLLECTIONFROMWKB(wkb [, srid [, options]])",
+        "Synonym for ST_GEOMCOLLFROMWKB()",
+    ),
+    f(
+        "GEOMETRYFROMTEXT",
+        "GEOMETRYFROMTEXT(wkt [, srid [, options]])",
+        "Synonym for ST_GEOMFROMTEXT()",
+    ),
+    f(
+        "GEOMETRYFROMWKB",
+        "GEOMETRYFROMWKB(wkb [, srid [, options]])",
+        "Synonym for ST_GEOMFROMWKB()",
+    ),
+    f(
+        "GEOMETRYN",
+        "GEOMETRYN(gc, N)",
+        "Synonym for ST_GEOMETRYN()",
+    ),
+    f(
+        "GEOMETRYTYPE",
+        "GEOMETRYTYPE(g)",
+        "Synonym for ST_GEOMETRYTYPE()",
+    ),
+    f(
+        "GEOMFROMTEXT",
+        "GEOMFROMTEXT(wkt [, srid [, options]])",
+        "Synonym for ST_GEOMFROMTEXT()",
+    ),
+    f(
+        "GEOMFROMWKB",
+        "GEOMFROMWKB(wkb [, srid [, options]])",
+        "Synonym for ST_GEOMFROMWKB()",
+    ),
+    f(
+        "GLENGTH",
+        "GLENGTH(ls)",
+        "Returns as a double-precision number the length of the LineString value ls in its…",
+    ),
+    f(
+        "INTERIORRINGN",
+        "INTERIORRINGN(poly, N)",
+        "Synonym for ST_INTERIORRINGN()",
+    ),
+    f(
+        "INTERSECTS",
+        "INTERSECTS(g1,g2)",
+        "Returns 1 or 0 to indicate whether geometry g1 spatially intersects geometry g2",
+    ),
+    f("ISCLOSED", "ISCLOSED(ls)", "Synonym for ST_ISCLOSED()"),
+    f("ISEMPTY", "ISEMPTY(g)", "Synonym for ST_ISEMPTY()"),
+    f("ISRING", "ISRING(g)", "Synonym for ST_ISRING()"),
+    f("ISSIMPLE", "ISSIMPLE(g)", "Synonym for ST_ISSIMPLE()"),
+    f(
+        "LINEFROMTEXT",
+        "LINEFROMTEXT(wkt [, srid [, options]])",
+        "Synonym for ST_LINEFROMTEXT()",
+    ),
+    f(
+        "LINEFROMWKB",
+        "LINEFROMWKB(wkb [, srid [, options]])",
+        "Synonym for ST_LINEFROMWKB()",
+    ),
+    f(
+        "LINESTRINGFROMTEXT",
+        "LINESTRINGFROMTEXT(wkt [, srid [, options]])",
+        "Synonym for ST_LINEFROMTEXT()",
+    ),
+    f(
+        "LINESTRINGFROMWKB",
+        "LINESTRINGFROMWKB(wkb [, srid [, options]])",
+        "Synonym for ST_LINEFROMWKB()",
+    ),
+    f(
+        "MBREQUAL",
+        "MBREQUAL(g1,g2)",
+        "Returns 1 or 0 to indicate whether the Minimum Bounding Rectangles of the two…",
+    ),
+    f(
+        "MLINEFROMTEXT",
+        "MLINEFROMTEXT(wkt[,srid])",
+        "Constructs a MULTILINESTRING value using its WKT representation and SRID",
+    ),
+    f(
+        "MLINEFROMWKB",
+        "MLINEFROMWKB(wkb[,srid])",
+        "Constructs a MULTILINESTRING value using its WKB representation and SRID",
+    ),
+    f(
+        "MPOINTFROMTEXT",
+        "MPOINTFROMTEXT(wkt[,srid])",
+        "Constructs a MULTIPOINT value using its WKT representation and SRID",
+    ),
+    f(
+        "MPOINTFROMWKB",
+        "MPOINTFROMWKB(wkb[,srid])",
+        "Constructs a MULTIPOINT value using its WKB representation and SRID",
+    ),
+    f(
+        "MPOLYFROMTEXT",
+        "MPOLYFROMTEXT(wkt[,srid])",
+        "Constructs a MULTIPOLYGON value using its WKT representation and SRID",
+    ),
+    f(
+        "MPOLYFROMWKB",
+        "MPOLYFROMWKB(wkb[,srid])",
+        "Constructs a MULTIPOLYGON value using its WKB representation and SRID",
+    ),
+    f(
+        "MULTILINESTRINGFROMTEXT",
+        "MULTILINESTRINGFROMTEXT(wkt[,srid])",
+        "Synonym for MLINEFROMTEXT()",
+    ),
+    f(
+        "MULTILINESTRINGFROMWKB",
+        "MULTILINESTRINGFROMWKB(wkb[,srid])",
+        "Synonym for MLINEFROMWKB()",
+    ),
+    f(
+        "MULTIPOINTFROMTEXT",
+        "MULTIPOINTFROMTEXT(wkt[,srid])",
+        "Synonym for MPOINTFROMTEXT()",
+    ),
+    f(
+        "MULTIPOINTFROMWKB",
+        "MULTIPOINTFROMWKB(wkb[,srid])",
+        "Synonym for MPOINTFROMWKB()",
+    ),
+    f(
+        "MULTIPOLYGONFROMTEXT",
+        "MULTIPOLYGONFROMTEXT(wkt[,srid])",
+        "Synonym for MPOLYFROMTEXT()",
+    ),
+    f(
+        "MULTIPOLYGONFROMWKB",
+        "MULTIPOLYGONFROMWKB(wkb[,srid])",
+        "Synonym for MPOLYFROMWKB()",
+    ),
+    f(
+        "NUMGEOMETRIES",
+        "NUMGEOMETRIES(gc)",
+        "Synonym for ST_NUMGEOMETRIES()",
+    ),
+    f(
+        "NUMINTERIORRINGS",
+        "NUMINTERIORRINGS(poly)",
+        "Synonym for ST_NUMINTERIORRINGS()",
+    ),
+    f("NUMPOINTS", "NUMPOINTS(ls)", "Synonym for ST_NUMPOINTS()"),
+    f(
+        "OVERLAPS",
+        "OVERLAPS(g1,g2)",
+        "Returns 1 or 0 to indicate whether g1 spatially overlaps g2",
+    ),
+    f(
+        "POINTFROMTEXT",
+        "POINTFROMTEXT(wkt [, srid [, options]])",
+        "Synonym for ST_POINTFROMTEXT()",
+    ),
+    f(
+        "POINTFROMWKB",
+        "POINTFROMWKB(wkb [, srid [, options]])",
+        "Synonym for ST_POINTFROMWKB()",
+    ),
+    f("POINTN", "POINTN(ls, N)", "Synonym for ST_POINTN()"),
+    f(
+        "POINTONSURFACE",
+        "POINTONSURFACE(g)",
+        "Synonym for ST_POINTONSURFACE()",
+    ),
+    f(
+        "POLYFROMTEXT",
+        "POLYFROMTEXT(wkt [, srid [, options]])",
+        "Synonym for ST_POLYFROMTEXT()",
+    ),
+    f(
+        "POLYFROMWKB",
+        "POLYFROMWKB(wkb [, srid [, options]])",
+        "Synonym for ST_POLYFROMWKB()",
+    ),
+    f(
+        "POLYGONFROMTEXT",
+        "POLYGONFROMTEXT(wkt [, srid [, options]])",
+        "Synonym for ST_POLYFROMTEXT()",
+    ),
+    f(
+        "POLYGONFROMWKB",
+        "POLYGONFROMWKB(wkb [, srid [, options]])",
+        "Synonym for ST_POLYFROMWKB()",
+    ),
+    f("SRID", "SRID(g [, srid])", "Synonym for ST_SRID()"),
+    f(
+        "ST_BOUNDARY",
+        "ST_BOUNDARY(g)",
+        "Returns a geometry that is the closure of the combinatorial boundary of the geometry…",
+    ),
+    f(
+        "ST_ISRING",
+        "ST_ISRING(g)",
+        "Returns true if a given LINESTRING is a ring, that is, both ST_IsClosed and ST_IsSimple",
+    ),
+    f(
+        "ST_POINTONSURFACE",
+        "ST_POINTONSURFACE(g)",
+        "Returns a Point guaranteed to lie on the surface of the geometry value g",
+    ),
+    f(
+        "ST_RELATE",
+        "ST_RELATE(g1, g2, i)",
+        "Returns true if g1 is spatially related to g2, tested against the intersection matrix i",
+    ),
+    f(
+        "STARTPOINT",
+        "STARTPOINT(ls)",
+        "Synonym for ST_STARTPOINT()",
+    ),
+    f(
+        "TOUCHES",
+        "TOUCHES(g1,g2)",
+        "Returns 1 or 0 to indicate whether g1 spatially touches g2",
+    ),
+    f(
+        "WITHIN",
+        "WITHIN(g1,g2)",
+        "Returns 1 or 0 to indicate whether g1 is spatially within g2",
+    ),
+    f("X", "X(p [, new_x_val])", "Synonym for ST_X()"),
+    f("Y", "Y(p [, new_y_val])", "Synonym for ST_Y()"),
 ];
 
 /// The authoritative catalog of **SQLite** built-in functions, trusted by the
@@ -1854,7 +2575,15 @@ pub const SQLITE_FUNCTIONS: &[SqlFunction] = &[
 /// servers that nobody here can verify.
 pub const MARIADB_ONLY: &[&str] = &[
     "ADD_MONTHS",
+    "AREA",
+    "ASBINARY",
+    "ASTEXT",
+    "ASWKB",
+    "ASWKT",
     "BINLOG_GTID_POS",
+    "BOUNDARY",
+    "BUFFER",
+    "CENTROID",
     "CHR",
     "COLUMN_ADD",
     "COLUMN_CHECK",
@@ -1865,14 +2594,40 @@ pub const MARIADB_ONLY: &[&str] = &[
     "COLUMN_JSON",
     "COLUMN_LIST",
     "CONCAT_OPERATOR_ORACLE",
+    "CONTAINS",
+    "CONVEXHULL",
     "CRC32C",
+    "CROSSES",
     "DECODE",
     "DECODE_HISTOGRAM",
     "DECODE_ORACLE",
     "DES_DECRYPT",
     "DES_ENCRYPT",
+    "DIMENSION",
+    "DISJOINT",
     "ENCODE",
     "ENCRYPT",
+    "ENDPOINT",
+    "ENVELOPE",
+    "EQUALS",
+    "EXTERIORRING",
+    "GEOMCOLLFROMTEXT",
+    "GEOMCOLLFROMWKB",
+    "GEOMETRYCOLLECTIONFROMTEXT",
+    "GEOMETRYCOLLECTIONFROMWKB",
+    "GEOMETRYFROMTEXT",
+    "GEOMETRYFROMWKB",
+    "GEOMETRYN",
+    "GEOMETRYTYPE",
+    "GEOMFROMTEXT",
+    "GEOMFROMWKB",
+    "GLENGTH",
+    "INTERIORRINGN",
+    "INTERSECTS",
+    "ISCLOSED",
+    "ISEMPTY",
+    "ISRING",
+    "ISSIMPLE",
     "JSON_COMPACT",
     "JSON_DETAILED",
     "JSON_EQUALS",
@@ -1881,27 +2636,66 @@ pub const MARIADB_ONLY: &[&str] = &[
     "JSON_NORMALIZE",
     "JSON_QUERY",
     "LENGTHB",
+    "LINEFROMTEXT",
+    "LINEFROMWKB",
+    "LINESTRINGFROMTEXT",
+    "LINESTRINGFROMWKB",
     "LPAD_ORACLE",
     "LTRIM_ORACLE",
     "MASTER_GTID_WAIT",
+    "MBREQUAL",
     "MEDIAN",
+    "MLINEFROMTEXT",
+    "MLINEFROMWKB",
+    "MPOINTFROMTEXT",
+    "MPOINTFROMWKB",
+    "MPOLYFROMTEXT",
+    "MPOLYFROMWKB",
+    "MULTILINESTRINGFROMTEXT",
+    "MULTILINESTRINGFROMWKB",
+    "MULTIPOINTFROMTEXT",
+    "MULTIPOINTFROMWKB",
+    "MULTIPOLYGONFROMTEXT",
+    "MULTIPOLYGONFROMWKB",
     "NATURAL_SORT_KEY",
+    "NUMGEOMETRIES",
+    "NUMINTERIORRINGS",
+    "NUMPOINTS",
     "NVL",
     "NVL2",
     "OLD_PASSWORD",
+    "OVERLAPS",
     "PERCENTILE_CONT",
     "PERCENTILE_DISC",
+    "POINTFROMTEXT",
+    "POINTFROMWKB",
+    "POINTN",
+    "POINTONSURFACE",
+    "POLYFROMTEXT",
+    "POLYFROMWKB",
+    "POLYGONFROMTEXT",
+    "POLYGONFROMWKB",
     "REPLACE_ORACLE",
     "RPAD_ORACLE",
     "RTRIM_ORACLE",
     "SFORMAT",
+    "SRID",
+    "STARTPOINT",
+    "ST_BOUNDARY",
+    "ST_ISRING",
+    "ST_POINTONSURFACE",
+    "ST_RELATE",
     "SUBSTR_ORACLE",
     "SYS_GUID",
+    "TOUCHES",
     "TO_CHAR",
     "TRIM_ORACLE",
+    "WITHIN",
     "WSREP_LAST_SEEN_GTID",
     "WSREP_LAST_WRITTEN_GTID",
     "WSREP_SYNC_WAIT_UPTO_GTID",
+    "X",
+    "Y",
 ];
 
 /// Names in [`FUNCTIONS`] that **MySQL 8.4 has and MariaDB 10.11 has not** —
@@ -1919,6 +2713,104 @@ pub const MYSQL_ONLY: &[&str] = &[
     "JSON_STORAGE_SIZE",
     "REGEXP_LIKE",
     "UUID_TO_BIN",
+];
+
+/// Names in [`FUNCTIONS`] the checker must **trust** and the popup must never
+/// **offer** — the MySQL family's answer to PostgreSQL's
+/// [`crate::pg_builtins::is_suggested`].
+///
+/// **The two questions are not the same one, and this file only had the second
+/// list.** `MARIADB_ONLY` and `MYSQL_ONLY` decide which *server* has a name;
+/// nothing decided whether a name the server has is worth *suggesting*. For 309
+/// entries that distinction never came up, because every one of them was a name
+/// somebody would type on purpose.
+///
+/// MariaDB's OGC-v1 spatial aliases are the case that needs it. They are real,
+/// callable functions — so squiggling `GLENGTH` under correct SQL is the false
+/// positive [`crate::intel`]'s whole typo-checking half exists to avoid, and
+/// the catalog has to carry them. But their spellings are `X`, `Y`, `AREA`,
+/// `CONTAINS`, `EQUALS`, `OVERLAPS`, `WITHIN`, `BUFFER` — the most ordinary
+/// column names there are — and MariaDB itself documents every one as a synonym
+/// for the `ST_`-prefixed name. Offering them would put `X(` in the popup of
+/// everyone who typed `x`.
+///
+/// So: in the catalog, out of the suggestions. That is exactly what
+/// `is_suggested` does for PostgreSQL's internal plumbing (`int4in`, `texteq`),
+/// and it is the same trade — trust everything the server has, suggest only
+/// what someone would mean.
+///
+/// Sorted, for the binary search; `every_deprecated_alias_is_in_the_catalog`
+/// holds that and the membership both.
+pub const DEPRECATED_ALIASES: &[&str] = &[
+    "AREA",
+    "ASBINARY",
+    "ASTEXT",
+    "ASWKB",
+    "ASWKT",
+    "BOUNDARY",
+    "BUFFER",
+    "CENTROID",
+    "CONTAINS",
+    "CONVEXHULL",
+    "CROSSES",
+    "DIMENSION",
+    "DISJOINT",
+    "ENDPOINT",
+    "ENVELOPE",
+    "EQUALS",
+    "EXTERIORRING",
+    "GEOMCOLLFROMTEXT",
+    "GEOMCOLLFROMWKB",
+    "GEOMETRYCOLLECTIONFROMTEXT",
+    "GEOMETRYCOLLECTIONFROMWKB",
+    "GEOMETRYFROMTEXT",
+    "GEOMETRYFROMWKB",
+    "GEOMETRYN",
+    "GEOMETRYTYPE",
+    "GEOMFROMTEXT",
+    "GEOMFROMWKB",
+    "GLENGTH",
+    "INTERIORRINGN",
+    "INTERSECTS",
+    "ISCLOSED",
+    "ISEMPTY",
+    "ISRING",
+    "ISSIMPLE",
+    "LINEFROMTEXT",
+    "LINEFROMWKB",
+    "LINESTRINGFROMTEXT",
+    "LINESTRINGFROMWKB",
+    "MBREQUAL",
+    "MLINEFROMTEXT",
+    "MLINEFROMWKB",
+    "MPOINTFROMTEXT",
+    "MPOINTFROMWKB",
+    "MPOLYFROMTEXT",
+    "MPOLYFROMWKB",
+    "MULTILINESTRINGFROMTEXT",
+    "MULTILINESTRINGFROMWKB",
+    "MULTIPOINTFROMTEXT",
+    "MULTIPOINTFROMWKB",
+    "MULTIPOLYGONFROMTEXT",
+    "MULTIPOLYGONFROMWKB",
+    "NUMGEOMETRIES",
+    "NUMINTERIORRINGS",
+    "NUMPOINTS",
+    "OVERLAPS",
+    "POINTFROMTEXT",
+    "POINTFROMWKB",
+    "POINTN",
+    "POINTONSURFACE",
+    "POLYFROMTEXT",
+    "POLYFROMWKB",
+    "POLYGONFROMTEXT",
+    "POLYGONFROMWKB",
+    "SRID",
+    "STARTPOINT",
+    "TOUCHES",
+    "WITHIN",
+    "X",
+    "Y",
 ];
 
 /// The builtin catalog `dialect`'s engine actually has, or `None` where this app
@@ -2233,6 +3125,14 @@ pub(crate) fn is_offered_builtin(dialect: SqlDialect, flavour: ServerFlavour, na
         SqlDialect::Postgres => crate::pg_builtins::is_suggested(name),
         SqlDialect::MySql => {
             let up = name.to_ascii_uppercase();
+            // **Two questions, asked in order.** Does the server in front of me
+            // have it, and — if it does — is it a name anybody would mean? See
+            // [`DEPRECATED_ALIASES`]; the second question is asked whatever the
+            // flavour, because a name nobody means is not worth offering on the
+            // one server that still has it either.
+            if DEPRECATED_ALIASES.binary_search(&up.as_str()).is_ok() {
+                return false;
+            }
             match flavour {
                 ServerFlavour::Unknown => true,
                 ServerFlavour::MySql => MARIADB_ONLY.binary_search(&up.as_str()).is_err(),
@@ -10191,6 +11091,62 @@ mod tests {
             both.is_empty(),
             "a name is in both flavour lists, so it is offered to neither: {both:?}"
         );
+    }
+
+    /// **The trusted-but-not-offered list is both**, and the two halves are
+    /// separate failures.
+    ///
+    /// A name that drifted out of `FUNCTIONS` would sit in `DEPRECATED_ALIASES`
+    /// withholding nothing *and* would start being squiggled again — which is
+    /// the false positive the entries were added for, arriving back through the
+    /// list meant to describe them. An unsorted list answers "not in it" for
+    /// names that are, which puts `X(` and `Y(` back in the popup.
+    #[test]
+    fn every_deprecated_alias_is_in_the_catalog_and_none_is_offered() {
+        use std::collections::HashSet;
+        let catalog: HashSet<&str> = FUNCTIONS.iter().map(|f| f.name).collect();
+        assert!(
+            DEPRECATED_ALIASES.windows(2).all(|w| w[0] < w[1]),
+            "DEPRECATED_ALIASES is not sorted ascending, so the binary search \
+             in `is_offered_builtin` will miss names that are in it"
+        );
+        for name in DEPRECATED_ALIASES {
+            assert!(
+                catalog.contains(name),
+                "DEPRECATED_ALIASES names {name}, which is not in `FUNCTIONS` — \
+                 so it withholds nothing, and the typo checker has stopped \
+                 trusting a name the server really has"
+            );
+            // Trusted: the checker must not squiggle it, on either flavour.
+            assert!(
+                catalog_knows(SqlDialect::MySql, &name.to_ascii_lowercase()),
+                "the catalog does not know {name}, so correct SQL calling it is \
+                 squiggled as a misspelling"
+            );
+            // …and not offered, on either flavour — the whole point of the
+            // split. `Unknown` too: before a server says which it is, `X(` must
+            // not be in the popup.
+            for flavour in [
+                ServerFlavour::Unknown,
+                ServerFlavour::MySql,
+                ServerFlavour::MariaDb,
+            ] {
+                assert!(
+                    !is_offered_builtin(SqlDialect::MySql, flavour, name),
+                    "{name} is offered to a {flavour:?} tab — these are \
+                     MariaDB's OGC-v1 synonyms, and their spellings are the \
+                     most ordinary column names there are"
+                );
+            }
+        }
+        // The list is not vacuous, and the names that motivated it are on it.
+        assert!(DEPRECATED_ALIASES.len() > 50);
+        for name in ["GLENGTH", "MBREQUAL", "POINTN", "X", "Y"] {
+            assert!(
+                DEPRECATED_ALIASES.binary_search(&name).is_ok(),
+                "{name} left the list"
+            );
+        }
     }
 
     /// **A MySQL 8 tab is not offered MariaDB's functions, and the reverse.**
