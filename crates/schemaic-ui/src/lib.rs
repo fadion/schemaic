@@ -4427,10 +4427,30 @@ mod read_only_door_gate {
          enclosing item is the menu builder — there is no door here to guard.",
     )];
 
-    /// What makes a function a door.
-    const STAMP: &str = "read_only: ctx.read_only,";
-    /// What it must say first.
-    const REFUSAL: &str = "if ctx.read_only {";
+    /// What makes a function a door, and what it must say first — **one pair
+    /// per subject the flag can be about.**
+    ///
+    /// It was one pair, `read_only: ctx.read_only,` / `if ctx.read_only {`, and
+    /// that spelling was not neutral: it made "the door asks the *switcher*"
+    /// part of the definition of a door. For the fifteen schema editors that is
+    /// right — the active connection *is* the target — but the Users browser's
+    /// three doors are launched from a captured `UsersTarget` that can be a
+    /// different connection entirely, and asking `ctx` there returned having set
+    /// nothing while the button stayed lit. A door written to ask the target
+    /// would have *failed this gate*, which is how the tests came to enforce the
+    /// divergence rather than catch it.
+    ///
+    /// So the subject is a pair, not a constant. Adding a third spelling is a
+    /// line here; what neither spelling may do is stamp the flag without
+    /// refusing on the same value first, which is what the gate actually
+    /// asserts.
+    const SUBJECTS: &[(&str, &str)] = &[
+        // The fifteen schema editors: the switcher is the target.
+        ("read_only: ctx.read_only,", "if ctx.read_only {"),
+        // The Users browser's three: the target is captured and may not be the
+        // connection the tree is on. See `account_editor::door_read_only`.
+        ("read_only: door_read_only,", "if door_read_only {"),
+    ];
 
     /// The `(offset, name)` of the top-level `fn` header nearest above `at`.
     fn enclosing_fn(code: &str, at: usize) -> (usize, &str) {
@@ -4457,29 +4477,47 @@ mod read_only_door_gate {
         let mut offenders: Vec<String> = Vec::new();
         let mut doors = 0usize;
         let mut exempt_seen: Vec<&str> = Vec::new();
+        let mut per_subject = vec![0usize; SUBJECTS.len()];
         for (file, code) in crate::source_gate::crate_sources() {
-            if !code.contains(STAMP) {
+            if !SUBJECTS.iter().any(|(stamp, _)| code.contains(stamp)) {
                 continue;
             }
             if let Some((name, _)) = EXEMPT.iter().find(|(f, _)| *f == file) {
                 exempt_seen.push(name);
                 continue;
             }
-            for (at, _) in code.match_indices(STAMP) {
-                doors += 1;
-                let (start, name) = enclosing_fn(&code, at);
-                if !code[start..at].contains(REFUSAL) {
-                    offenders.push(format!("{file}::{name}"));
+            for (n, (stamp, refusal)) in SUBJECTS.iter().enumerate() {
+                for (at, _) in code.match_indices(stamp) {
+                    doors += 1;
+                    per_subject[n] += 1;
+                    let (start, name) = enclosing_fn(&code, at);
+                    if !code[start..at].contains(refusal) {
+                        offenders.push(format!("{file}::{name}"));
+                    }
                 }
             }
         }
         // A renamed field or a moved `src` would otherwise make this pass by
         // finding nothing at all — the failure mode `crate_sources` guards
         // against for the whole family.
+        // Sixteen, unchanged: splitting the spelling in two moved three of them
+        // from one subject to the other rather than adding any.
         assert!(
             doors >= 16,
-            "only {doors} editor doors found — is `{STAMP}` still the spelling?"
+            "only {doors} editor doors found — are the `SUBJECTS` spellings \
+             still right?"
         );
+        // **And each subject is still used**, so a spelling that stopped
+        // matching cannot hide behind the other's count. The Users browser's
+        // three are the smaller half and the ones most recently moved.
+        for (n, (stamp, _)) in SUBJECTS.iter().enumerate() {
+            assert!(
+                per_subject[n] > 0,
+                "no door stamps `{stamp}` any more — either it was renamed, or \
+                 the doors that used it now guard on something this gate cannot \
+                 see"
+            );
+        }
         for (file, why) in EXEMPT {
             assert!(
                 exempt_seen.contains(file),
@@ -4490,10 +4528,13 @@ mod read_only_door_gate {
             offenders.is_empty(),
             "these open a schema editor without refusing a read-only connection \
              first:\n    {}\n\nA launch guards itself in the same step that \
-             launches it (CLAUDE.md). Put `if ctx.read_only {{ return; }}` above \
-             the target, as `database_editor::open_for_new` does — the dimmed \
-             menu entry stays, because that is what *says* the action is \
-             unavailable; this is what makes it so.",
+             launches it (CLAUDE.md). Refuse on the *same value* the target \
+             stamps, above the target — `if ctx.read_only {{ return; }}` where \
+             the switcher is the target, as `database_editor::open_for_new` \
+             does, or `if door_read_only {{ return; }}` where it is captured, as \
+             `account_editor::open_for_new` does. The dimmed menu entry stays, \
+             because that is what *says* the action is unavailable; this is what \
+             makes it so.",
             offenders.join("\n    ")
         );
     }

@@ -51,7 +51,7 @@ use schemaic_core::users::{
     self, AccountDraft, GrantDraft, GrantLevelKind, GrantSubject, Principal, PrincipalKind,
 };
 
-use crate::table_designer::{edit_ctx, suggest_chevron};
+use crate::table_designer::suggest_chevron;
 use crate::widgets::{
     ACTION_TAB, ActionKind, FocusRing, action_button, action_gap, autohide, dismiss_layer,
     focus_root_with_ring, form_gap, form_section, form_setting, modal_footer_split, modal_h,
@@ -135,6 +135,33 @@ fn field_w() -> f64 {
 /// One function rather than the sequence written out twice, so a third form
 /// cannot get the order wrong — `a_freshly_opened_form_keeps_the_draft_it_was_
 /// seeded_with` is what holds it.
+/// Is the connection this door is **for** read-only?
+///
+/// **Not `edit_ctx`'s, which is the switcher's.** The three doors below asked
+/// `ctx.read_only` while the buttons that launch them were lit from the
+/// *target's* flag (`users_view::write_gate` → `target_read_only`), and nothing
+/// closes the Users browser when the schema tree switches connection. So: open
+/// the browser on a writable connection A, switch the tree to a read-only B,
+/// and **+ New account**, **Privileges** and **Reset password** stayed lit —
+/// lit from A — while all three returned having set nothing, because `edit_ctx`
+/// answered about B. A lit control that does nothing, with no modal, no message
+/// and no dimming, on the three writes the browser offers.
+///
+/// The same row gets it right one button along: **Drop** asks
+/// `launch_read_only(conn.connections, plan_conn_id)`, whose doc says it is
+/// "about the connection the plan is for, which is the one the account lives
+/// on". Three doors and one button, same click, two answers — this is the
+/// button's answer, given to the doors.
+///
+/// `open_for_grant`'s note used to justify the divergence: *"`read_only` stays
+/// live, and deliberately: it is the refusal, not the address, and `WriteGate`
+/// reads it the same way."* The second clause was false — `WriteGate` reads
+/// `target.conn_id` — so the premise the decision rested on was contradicted by
+/// the function it cited.
+fn door_read_only(conn: ConnUi, from: &UsersTarget) -> bool {
+    crate::users_view::launch_read_only(conn.connections, from.conn_id)
+}
+
 fn reset_then_seed<T: 'static>(d: crate::DdlUi, draft: floem::reactive::RwSignal<T>, seed: T) {
     d.error.set(None);
     d.preview.set(None);
@@ -157,8 +184,12 @@ fn reset_then_seed<T: 'static>(d: crate::DdlUi, draft: floem::reactive::RwSignal
 /// reasoning is written out once, over `open_for_grant`'s copy of the same four
 /// lines, and `anchor_gate` is what holds both to it.
 pub(crate) fn open_for_new(conn: ConnUi, d: DdlUi, from: &UsersTarget, database: &str) {
-    let ctx = edit_ctx(conn);
-    if ctx.read_only {
+    // **No `edit_ctx` here at all.** These three read nothing else from it, and
+    // what they did read was the switcher's flag — see `door_read_only`. A live
+    // read of the active connection in a door launched from a captured target
+    // is the fault, not just the answer it gave.
+    let door_read_only = door_read_only(conn, from);
+    if door_read_only {
         return;
     }
     // A new editing session — see `DdlUi::session`.
@@ -173,7 +204,7 @@ pub(crate) fn open_for_new(conn: ConnUi, d: DdlUi, from: &UsersTarget, database:
         conn_id: from.conn_id,
         database: database.to_string(),
         dialect: from.dialect,
-        read_only: ctx.read_only,
+        read_only: door_read_only,
         resetting: None,
     }));
 }
@@ -202,8 +233,12 @@ pub(crate) fn open_for_reset(
     database: &str,
     account: &Principal,
 ) {
-    let ctx = edit_ctx(conn);
-    if ctx.read_only {
+    // **No `edit_ctx` here at all.** These three read nothing else from it, and
+    // what they did read was the switcher's flag — see `door_read_only`. A live
+    // read of the active connection in a door launched from a captured target
+    // is the fault, not just the answer it gave.
+    let door_read_only = door_read_only(conn, from);
+    if door_read_only {
         return;
     }
     // A role has no password on either engine — nor has a MySQL 8 row the
@@ -229,7 +264,7 @@ pub(crate) fn open_for_reset(
         conn_id: from.conn_id,
         database: database.to_string(),
         dialect: from.dialect,
-        read_only: ctx.read_only,
+        read_only: door_read_only,
         resetting: Some(account.clone()),
     }));
 }
@@ -244,8 +279,12 @@ pub(crate) fn open_for_grant(
     database: &str,
     account: &Principal,
 ) {
-    let ctx = edit_ctx(conn);
-    if ctx.read_only {
+    // **No `edit_ctx` here at all.** These three read nothing else from it, and
+    // what they did read was the switcher's flag — see `door_read_only`. A live
+    // read of the active connection in a door launched from a captured target
+    // is the fault, not just the answer it gave.
+    let door_read_only = door_read_only(conn, from);
+    if door_read_only {
         return;
     }
     d.session.update(|g| *g += 1);
@@ -277,7 +316,7 @@ pub(crate) fn open_for_grant(
         database: database.to_string(),
         account: account.clone(),
         dialect: from.dialect,
-        read_only: ctx.read_only,
+        read_only: door_read_only,
     }));
 }
 
@@ -1654,8 +1693,18 @@ mod account_change_tests {
 
 #[cfg(test)]
 mod anchor_gate {
-    /// What must not appear: the switcher, used as an address.
-    const FORBIDDEN: &[&str] = &["ctx.conn_id", "ctx.dialect"];
+    /// What must not appear: the switcher, used for **anything** these doors
+    /// decide.
+    ///
+    /// `ctx.read_only` joined the list, and that is the whole of `R1-L2-01`.
+    /// This gate's own message used to end *"`read_only` is the one field that
+    /// stays live — it is the refusal, not the address"*, which read as a
+    /// distinction and was a hole: the browser's buttons are lit from the
+    /// *target's* flag and nothing closes the browser when the tree switches
+    /// connection, so a live refusal answered about a different connection than
+    /// the one that lit the button. Address or refusal, a door launched from a
+    /// captured target asks that target.
+    const FORBIDDEN: &[&str] = &["ctx.conn_id", "ctx.dialect", "ctx.read_only"];
     /// What must appear instead, once per door.
     const REQUIRED: &[&str] = &["conn_id: from.conn_id,", "dialect: from.dialect,"];
     /// **The doors this file has**, as a number the gates below count against.
@@ -1680,12 +1729,14 @@ mod anchor_gate {
         // The floor, which is the failure mode a source gate is most prone to:
         // a rename would leave nothing to look for and pass silently.
         assert!(
-            // Argument-agnostic: `edit_ctx` took `&Ui` when this gate was
-            // written and takes `ConnUi` now, and the floor is that the
-            // launchers still *call* it — not how they spell the bundle.
-            body.contains("edit_ctx("),
-            "the launchers no longer call `edit_ctx` — rewrite this gate rather \
-             than deleting it: `read_only` is still supposed to come from there"
+            // The floor moved with the fix: these doors called `edit_ctx` for
+            // `read_only` alone, and that was the defect, so they call it for
+            // nothing now. What must still be *here* is the question asked in
+            // its place.
+            body.contains("door_read_only("),
+            "the launchers no longer ask `door_read_only` — rewrite this gate \
+             rather than deleting it: the refusal still has to be about the \
+             connection the browser is showing, not the one the tree is on"
         );
         for want in REQUIRED {
             assert_eq!(
@@ -1701,8 +1752,8 @@ mod anchor_gate {
                 "`{bad}` is back in account_editor.rs: a form's address must come \
                  from the browser's captured `UsersTarget`, not from whichever \
                  connection the switcher points at when the button is pressed. \
-                 `read_only` is the one field that stays live — it is the \
-                 refusal, not the address."
+                 That is true of the refusal as well as the address: see \
+                 `door_read_only`."
             );
         }
     }
@@ -1720,7 +1771,15 @@ mod anchor_gate {
         )
         .expect("account_editor.rs");
         let body = crate::source_gate::production_code(&src);
-        assert_eq!(body.matches("if ctx.read_only {").count(), DOORS);
-        assert_eq!(body.matches("read_only: ctx.read_only,").count(), DOORS);
+        // The pair `read_only_door_gate` finds a door by, in this file's
+        // spelling — see its `SUBJECTS`. Both terms are the *target's* answer
+        // now, so a door cannot refuse on one connection and stamp another's
+        // flag into the modal it opens.
+        assert_eq!(body.matches("if door_read_only {").count(), DOORS);
+        assert_eq!(body.matches("read_only: door_read_only,").count(), DOORS);
+        // And the switcher's spelling is gone from both positions, which is
+        // what `FORBIDDEN` asserts from the other side.
+        assert_eq!(body.matches("if ctx.read_only {").count(), 0);
+        assert_eq!(body.matches("read_only: ctx.read_only,").count(), 0);
     }
 }

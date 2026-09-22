@@ -822,7 +822,12 @@ fn target_read_only(conns: RwSignal<Vec<Connection>>, target: &UsersTarget) -> b
 /// The same question at a **launch**, where the read is untracked because it is
 /// a click rather than a container key — and about the connection the plan is
 /// for, which is the one the account lives on.
-fn launch_read_only(conns: RwSignal<Vec<Connection>>, conn_id: u64) -> bool {
+///
+/// **`pub(crate)` for the three doors in `account_editor`**, which asked
+/// `edit_ctx`'s live `read_only` — the *switcher's* — while the buttons that
+/// launch them were lit from the target's. One answer to one question, rather
+/// than a fourth spelling of it next door.
+pub(crate) fn launch_read_only(conns: RwSignal<Vec<Connection>>, conn_id: u64) -> bool {
     conns.with_untracked(|cs| schemaic_core::connection::read_only_of(cs, conn_id))
 }
 
