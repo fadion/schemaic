@@ -9308,9 +9308,17 @@ pub fn supports_change(dialect: SqlDialect, change: &Change) -> bool {
             // never offers it and `open_for_reset` refuses it, so this is the
             // third gate rather than the only one — which is why it is here and
             // not left to the two above it.
-            Change::SetAccountPassword(r) => {
-                crate::users::supports_password_reset(dialect, &r.account)
-            }
+            //
+            // **Asked of the emitter, not of the capability beside it.** The
+            // arm read `supports_password_reset`, which is about the *account*,
+            // and `set_password_sql` refuses on two further grounds — an empty
+            // name and an empty password. So a blank-password reset passed here
+            // as "supported" and then emitted nothing: the same empty plan with
+            // no INCOMPLETE header this arm was written to stop, one field
+            // along. Deriving it means the predicate and the emitter cannot
+            // disagree about what is emittable, which is the only version of
+            // this that stays true as `set_password_sql` grows a fourth reason.
+            Change::SetAccountPassword(r) => crate::users::set_password_sql(r, dialect).is_some(),
             _ => true,
         };
     }
@@ -22700,6 +22708,58 @@ mod database_tests {
         }));
         assert!(supports_change(MySql, &user));
         assert_eq!(cs_len(MySql, user), 1);
+    }
+
+    /// **The same degraded shape, one field along again.**
+    ///
+    /// The arm above asks `supports_password_reset`, which is about the
+    /// *account* — so a reset carrying a **blank password** passed it as
+    /// "supported" while `set_password_sql` refused to emit one, which is
+    /// exactly the empty-plan-with-no-INCOMPLETE-header that the role arm
+    /// exists to stop. Unreachable from the UI today (`set_password_sql`
+    /// returning `None` disables Preview SQL, and a disabled `action_button` is
+    /// genuinely inert), so this is a latent hole rather than a live one — and
+    /// it is closed by construction: the predicate now asks the emitter, so
+    /// the two cannot disagree about what is emittable.
+    #[test]
+    fn a_reset_with_no_password_is_withheld_rather_than_emitting_nothing() {
+        let reset = |password: &str| {
+            Change::SetAccountPassword(Box::new(crate::users::PasswordReset {
+                account: an_account(),
+                password: password.into(),
+            }))
+        };
+        // The property, over every shape: whatever `supports_change` calls
+        // supported has to be something the emitter will emit. A disagreement
+        // in either direction is a plan with Apply enabled over nothing, or a
+        // statement withheld from a plan that could carry it.
+        //
+        // `" "` is deliberately in this list and is *not* an empty password —
+        // it is a bad one, which is the user's business. `set_password_sql`
+        // refuses `""` because clearing a password that exists is a lock left
+        // open; it has nothing to say about a weak one.
+        for password in ["", " ", "hunter2"] {
+            for d in [MySql, Postgres] {
+                let change = reset(password);
+                let cs = account("app", d, change.clone());
+                assert_eq!(
+                    supports_change(d, &change),
+                    !cs.emit().is_empty(),
+                    "{d:?}: `supports_change` and the emitter disagree about a \
+                     {password:?} password"
+                );
+            }
+        }
+        // …and the empty one specifically is withheld *visibly*, which is what
+        // puts the INCOMPLETE header on the preview.
+        for d in [MySql, Postgres] {
+            let cs = account("app", d, reset(""));
+            assert!(
+                !cs.unsupported().is_empty(),
+                "{d:?}: an empty password is withheld silently — no INCOMPLETE \
+                 header, and Apply stands over an empty plan"
+            );
+        }
     }
 
     fn cs_len(d: SqlDialect, change: Change) -> usize {

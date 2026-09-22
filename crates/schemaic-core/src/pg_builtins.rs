@@ -21,8 +21,45 @@
 //!   FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
 //!  WHERE n.nspname = 'pg_catalog'
 //!    AND p.prokind IN ('f', 'a', 'w')
+//!    AND p.proname ~ '^[a-z][a-z0-9_]*$'
 //!  ORDER BY p.proname, p.pronargs, p.oid;
 //! ```
+//!
+//! **The query is not the whole recipe, and for a while this was the only thing
+//! written down.** Following it literally does *not* reproduce this file: it was
+//! missing the `proname` filter above (the live oracle carried it, the doc did
+//! not), so it returned 2,694 rows including twelve mixed-case ones
+//! (`RI_FKey_cascade_del` and friends); and `pg_get_function_identity_arguments`
+//! **includes `OUT` parameters** on PostgreSQL 16, so a literal regeneration
+//! would rewrite `json_each(from_json json)` to
+//! `json_each(from_json json, OUT key text, OUT value json)` and lose every
+//! `name(…)` entry. That is 156 signature cells silently rewritten and twelve
+//! rows added, with the whole workspace green — because until now nothing
+//! checked a `signature` or a `summary` at all. So the three rules the data
+//! actually follows, stated rather than remembered:
+//!
+//! 1. **Signature** is `proname` + `(` + the identity arguments **with every
+//!    `OUT ` parameter dropped** + `)`.
+//! 2. …**unless that exceeds 72 bytes**, in which case it is `proname(…)`. 77
+//!    of the 2,682 generated entries are that shape, and the longest
+//!    non-ellipsis signature is exactly 72.
+//! 3. **Summary** is `obj_description` with its first character upper-cased, or
+//!    the literal ``No description in `pg_proc` `` where the description is
+//!    null.
+//!
+//! `live::pg_catalog::every_generated_cell_is_what_the_recipe_produces` rebuilds
+//! all three from the server and compares, so the instruction above is now safe
+//! to follow: measured at PostgreSQL 16.15, **0 deviations across all 2,682
+//! generated entries in either direction**.
+//!
+//! **The snapshot is one version's, and nothing here notices a newer server.**
+//! These are 16.15's rows, used for whatever server is connected, so a function
+//! added later is a name this catalog lacks and the checker squiggles —
+//! `array_sort` (PostgreSQL 18) is the known case. Narrow rather than
+//! theoretical-only: fifteen other post-16 additions were checked and are clean,
+//! because the near-miss net only fires on a name close to one already held. The
+//! repair is to regenerate against the newest server the project tests on, which
+//! is what the rules above are written down for.
 //!
 //! **`pg_catalog` is not the whole answer, and the corpus test is how that was
 //! found.** `TRIM(BOTH ' ' FROM name)` is ordinary PostgreSQL and `trim` is not
@@ -59,9 +96,11 @@
 //!
 //! **The signature is one overload, not all of them.** `abs` alone has six and
 //! the completion popup has one line to show, so the representative is the
-//! fewest-argument overload, with types rather than parameter names because that
-//! is what PostgreSQL's own documentation prints for an overload set. Summaries
-//! are the server's `obj_description`, verbatim but for the leading capital.
+//! fewest-argument overload — that is what `DISTINCT ON (p.proname)` plus the
+//! `ORDER BY p.pronargs, p.oid` above selects — with types rather than parameter
+//! names because that is what PostgreSQL's own documentation prints for an
+//! overload set. Summaries are the server's `obj_description`, verbatim but for
+//! the leading capital.
 
 use crate::intel::SqlFunction;
 use crate::intel::f;

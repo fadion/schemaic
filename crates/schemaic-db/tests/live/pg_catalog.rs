@@ -137,8 +137,10 @@ async fn every_function_the_server_reports_is_in_the_catalog() {
         missing.is_empty(),
         "{} reports {} function(s) `PG_FUNCTIONS` does not carry, so each would \
          be squiggled as a misspelling of whatever it happens to resemble. \
-         Re-run the query in `pg_builtins`' module docs and regenerate the \
-         file: {missing:?}",
+         Re-run the query in `pg_builtins`' module docs and regenerate the file \
+         — the three rules for turning a row into an entry are written out \
+         beside it, and `every_generated_cell_is_what_the_recipe_produces` says \
+         whether you followed them: {missing:?}",
         POSTGRES.endpoint(),
         missing.len()
     );
@@ -257,6 +259,159 @@ async fn the_offered_subset_is_still_what_the_filter_answers() {
         "`PG_SUGGESTED` carries {} name(s) the filter no longer keeps, so the \
          popup is offering this server's plumbing: {extra:?}",
         extra.len()
+    );
+}
+
+/// The full generated row — name, identity arguments, description — which is
+/// what [`every_generated_cell_is_what_the_recipe_produces`] rebuilds from.
+///
+/// [`ORACLE`]'s three columns rather than its one, spelled separately for
+/// [`ORACLE`]'s own reason: a shared constant would let one edit move both the
+/// catalog and the check on it.
+const CELL_ORACLE: &str = "SELECT DISTINCT ON (p.proname) \
+                                  p.proname, \
+                                  pg_get_function_identity_arguments(p.oid), \
+                                  coalesce(obj_description(p.oid, 'pg_proc'), '') \
+                             FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace \
+                            WHERE n.nspname = 'pg_catalog' \
+                              AND p.prokind IN ('f', 'a', 'w') \
+                              AND p.proname ~ '^[a-z][a-z0-9_]*$' \
+                            ORDER BY p.proname, p.pronargs, p.oid";
+
+/// **The 5,412 cells that had no oracle at all.**
+///
+/// Both live tests and both pure tests compared *names*; `signature` and
+/// `summary` are what the completion popup renders and what `rank` puts in a
+/// suggestion's detail, and nothing anywhere checked their content. Meanwhile
+/// this file told the next maintainer to "re-run the query in `pg_builtins`'
+/// module docs and regenerate the file" — and doing that literally would have
+/// rewritten 156 signatures and added twelve rows, green the whole way, because
+/// the query as recorded was missing the `proname` filter and
+/// `pg_get_function_identity_arguments` includes `OUT` parameters on PG 16.
+///
+/// The data was never drifted; the *documentation of how to make it* was. So
+/// this pins the rule the data actually follows — see `pg_builtins`' module doc,
+/// where all three parts are now written out — by rebuilding every cell from the
+/// server and comparing. Measured at 16.15: 0 deviations in either direction.
+///
+/// The hand-written grammar forms (`cast`, `coalesce`, the `xml*` constructors)
+/// are not reached, and correctly: they have no `pg_proc` row, so the server
+/// returns nothing to rebuild them from. `every_function_the_server_reports_is_
+/// in_the_catalog` is what covers the other direction.
+#[tokio::test(flavor = "multi_thread")]
+async fn every_generated_cell_is_what_the_recipe_produces() {
+    if !POSTGRES.enabled() {
+        endpoint::note_skipped(&POSTGRES);
+        return;
+    }
+    /// Rule 1: identity arguments with every `OUT ` parameter dropped.
+    fn without_out_params(args: &str) -> String {
+        let mut kept: Vec<&str> = Vec::new();
+        let (mut depth, mut start) = (0i32, 0usize);
+        for (i, ch) in args.char_indices() {
+            match ch {
+                '(' | '[' => depth += 1,
+                ')' | ']' => depth -= 1,
+                ',' if depth == 0 => {
+                    kept.push(&args[start..i]);
+                    start = i + 1;
+                }
+                _ => {}
+            }
+        }
+        if !args[start..].trim().is_empty() {
+            kept.push(&args[start..]);
+        }
+        kept.iter()
+            .map(|a| a.trim())
+            .filter(|a| !a.starts_with("OUT "))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
+    /// Rules 1 and 2 together.
+    fn signature(name: &str, args: &str) -> String {
+        let full = format!("{name}({})", without_out_params(args));
+        if full.len() > 72 {
+            format!("{name}(…)")
+        } else {
+            full
+        }
+    }
+
+    /// Rule 3.
+    fn summary(desc: &str) -> String {
+        let d = desc.trim();
+        let mut cs = d.chars();
+        match cs.next() {
+            Some(c) => c.to_uppercase().collect::<String>() + cs.as_str(),
+            None => "No description in `pg_proc`".to_string(),
+        }
+    }
+
+    let rs = POSTGRES
+        .base_db()
+        .fetch_query(None, CELL_ORACLE, 10_000, CancellationToken::new())
+        .await
+        .unwrap_or_else(|e| {
+            panic!(
+                "live tier could not read pg_catalog on {}: {e}\nstatement: {CELL_ORACLE}",
+                POSTGRES.endpoint()
+            )
+        });
+
+    let ours: std::collections::HashMap<&str, &schemaic_core::intel::SqlFunction> =
+        PG_FUNCTIONS.iter().map(|f| (f.name, f)).collect();
+
+    let mut wrong: Vec<String> = Vec::new();
+    let mut checked = 0usize;
+    for r in 0..rs.row_count() {
+        let cell = |c: usize| {
+            rs.cell(r, c)
+                .map(|v| v.text().to_string())
+                .unwrap_or_default()
+        };
+        let (name, args, desc) = (cell(0), cell(1), cell(2));
+        let Some(entry) = ours.get(name.as_str()) else {
+            // Absence is `every_function_the_server_reports_is_in_the_catalog`'s
+            // to report, with its own message.
+            continue;
+        };
+        checked += 1;
+        let want = signature(&name, &args);
+        if entry.signature != want {
+            wrong.push(format!(
+                "{name}: signature {:?} != {want:?}",
+                entry.signature
+            ));
+        }
+        let want = summary(&desc);
+        if entry.summary != want {
+            wrong.push(format!("{name}: summary {:?} != {want:?}", entry.summary));
+        }
+    }
+
+    assert!(
+        wrong.is_empty(),
+        "{} generated cell(s) on {} are not what the recipe in `pg_builtins`' \
+         module doc produces, so regenerating the file the way that doc says \
+         would change them. Either the file was hand-edited or the rules have \
+         moved — fix whichever is wrong, and keep the doc and the data \
+         together:\n  {}",
+        wrong.len(),
+        POSTGRES.endpoint(),
+        wrong
+            .iter()
+            .take(20)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("\n  ")
+    );
+    assert!(
+        checked > 2_000,
+        "only {checked} generated entr(ies) were compared on {}, so this oracle \
+         is not answering",
+        POSTGRES.endpoint()
     );
 }
 

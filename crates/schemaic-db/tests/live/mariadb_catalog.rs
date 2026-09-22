@@ -246,7 +246,7 @@ async fn over_listing() {
     // union of the two views "is what the server claims"; it is not, and the
     // whole OGC spatial family sat in that gap. So a name the two views miss is
     // put to the parser, which is the question the editor actually asks — can
-    // this server call this name — and only `1305` is read as absence.
+    // this server call this name.
     let unexplained = names_this_server_cannot_call(&unreported).await;
 
     assert!(
@@ -257,6 +257,43 @@ async fn over_listing() {
          MYSQL_ONLY, or they are invented and would suppress a genuine typo \
          warning: {unexplained:?}",
         unexplained.len(),
+        MARIADB.endpoint()
+    );
+
+    // **And the `KEYWORDS` excuse is put to the parser too** (`S6-L6-04`).
+    // Reserved-word-ness does not imply callability, which is the converse of
+    // the sentence `NOT_CALLABLE`'s own doc argues — and this half was using it
+    // as if it were sound: 696 keywords, of which 681 are not in
+    // `SQL_FUNCTIONS`, standing as a blanket excuse for the 44 catalog names
+    // that need one. Add `f("TABLESPACE", …)` to `intel::FUNCTIONS` and the
+    // assertion above never sees it, while the popup offers a name that
+    // completes to a syntax error and the checker stops squiggling
+    // `tablespace(` for whoever meant something else.
+    //
+    // A name with its own grammar rule answers `1064` to `NAME(1,2)` because
+    // `(1,2)` is not its syntax — measured: `CAST`, `COUNT`, `IF`, `PARTITION`
+    // and `SAVEPOINT` all do. An invented one answers `1630`: measured, that is
+    // exactly what `TABLESPACE` gives. So the two *are* distinguishable here,
+    // which is what makes this checkable at all.
+    let by_keyword_only: Vec<String> = ours
+        .iter()
+        .filter(|n| !functions.contains(*n) && keywords.contains(*n))
+        .cloned()
+        .collect();
+    let invented = names_the_server_has_never_heard_of(&by_keyword_only).await;
+    assert!(
+        invented.is_empty(),
+        "{} of `intel::FUNCTIONS`' names are excused only by being reserved \
+         words on {}, and its parser says it has no such function — so they are \
+         invented, and each one silently suppresses a genuine typo warning \
+         while completing to a syntax error: {invented:?}",
+        invented.len(),
+        MARIADB.endpoint()
+    );
+    assert!(
+        !by_keyword_only.is_empty(),
+        "no catalog name is excused by `KEYWORDS` on {}, so the check above \
+         asked nothing",
         MARIADB.endpoint()
     );
 
@@ -327,12 +364,29 @@ fn is_not_callable(err: &str) -> bool {
 /// [`each_server_is_only_credited_with_the_builtins_it_really_has`] gives: it
 /// answers the question the editor actually asks. [`is_not_callable`] is the
 /// rule.
+async fn names_this_server_cannot_call(names: &[String]) -> Vec<String> {
+    probe(names, is_not_callable).await
+}
+
+/// Which of `names` this server says it has **no such function** for — `1305`
+/// or `1630`, and deliberately *not* `1064`.
+///
+/// The narrower question, for the names [`over_listing`] excuses by their being
+/// reserved words. A builtin with its own grammar rule answers `1064` to
+/// `NAME(1,2)` because that is not its syntax, so reading `1064` as absence
+/// would condemn `CAST`, `COUNT` and `IF`. An *invented* name answers `1630`.
+async fn names_the_server_has_never_heard_of(names: &[String]) -> Vec<String> {
+    probe(names, |e| e.contains("1305") || e.contains("1630")).await
+}
+
+/// Run `SELECT <name>(1,2)` for each name and keep those whose error `pick`
+/// accepts.
 ///
 /// One pinned [`Session`] rather than a connection per name, scoped to `mysql`
 /// so an unqualified unknown name is resolved as a stored function there rather
 /// than answered with `1046 No database selected`, which would report every
 /// name as present.
-async fn names_this_server_cannot_call(names: &[String]) -> Vec<String> {
+async fn probe(names: &[String], pick: fn(&str) -> bool) -> Vec<String> {
     use schemaic_db::session::Session;
 
     if names.is_empty() {
@@ -348,7 +402,7 @@ async fn names_this_server_cannot_call(names: &[String]) -> Vec<String> {
             .fetch_query(&sql, 1, CancellationToken::new())
             .await
             .result
-            && is_not_callable(&format!("{e}"))
+            && pick(&format!("{e}"))
         {
             absent.push(name.clone());
         }

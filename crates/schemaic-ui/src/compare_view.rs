@@ -54,8 +54,8 @@ use crate::{
 /// Everything the comparison modal reaches out of the root bundle.
 ///
 /// **The drivers take this; the renderers take [`OverlayUi`].** The tree, the
-/// filter bar and the state switch above them read and write nothing but the
-/// eight `compare_*` signals, and say so. What is gathered here is the half that
+/// filter bar and the state switch above them read and write nothing but this
+/// modal's own signals, and say so. What is gathered here is the half that
 /// *acts*: a fetch, the connection registry the two side labels read, and the
 /// DDL preview the plan is handed to.
 ///
@@ -64,9 +64,15 @@ use crate::{
 /// call site.
 #[derive(Clone)]
 pub(crate) struct CompareCtx {
-    /// The modal's own eight signals — target, state, selection, expansion,
-    /// focus, query, the identical-objects toggle, and the picker's database
-    /// list and its error.
+    /// The modal's own signals — the target, plus the eight [`reset`] returns
+    /// to their opening values: state, selection, expansion, focus, query, the
+    /// identical-objects toggle, and the picker's database list and its error.
+    ///
+    /// The target is outside that eight deliberately, not by omission: it is
+    /// the open/closed key, so `reset` clearing it would close the modal it is
+    /// preparing. Counted here as "the eight and the target" rather than as a
+    /// ninth, because the two sentences that said "eight" over a list of nine
+    /// were reached by adding the target to `reset`'s correct count.
     overlay: OverlayUi,
     /// The connection registry, for the two side labels and for the read-only
     /// flag the plan hand-off carries into the preview.
