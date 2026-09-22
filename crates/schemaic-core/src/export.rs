@@ -3254,10 +3254,12 @@ mod tests {
         assert_eq!(literal_mode_sql(Sqlite), None);
         // The pin this arm's `None` rests on. Assembled, so this assertion's
         // own text is not what it finds — and read over **code only**, because
-        // the twelve-line comment above that option explains it by name and
+        // the comment block above that option explains the setting by name and
         // would keep this green after the line itself was deleted. (Watched
-        // doing exactly that: replacing the option with an
-        // `application_name` left the raw-text version passing.)
+        // doing exactly that: replacing the option with an `application_name`
+        // left the raw-text version passing.) No length here — the first
+        // version of this sentence guessed "twelve-line" at a block of
+        // twenty-three, in a gate whose whole point is not trusting a comment.
         let pin = format!("-c standard{}conforming{}strings=on", '_', '_');
         let src = include_str!("../../schemaic-db/src/pg.rs");
         let code: String = src

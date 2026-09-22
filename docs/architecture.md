@@ -1776,8 +1776,32 @@ existing prose was left alone.
     about what the literals mean, not about what the statements around them may do. The flag has to
     be named to be on (`ANSI` does not imply it, checked on MariaDB 10.11.14), which is what makes
     the comma-wrapped `REPLACE` + `TRIM` surgery exact rather than a guess. PostgreSQL and SQLite
-    answer `None` — standard literals since 9.1's `standard_conforming_strings` default, and no
-    backslash escape at all, which is the same split `sql_literal`'s own arms take. Two kinds of
+    answer `None`, which is the same split `sql_literal`'s own arms take — but for two different
+    reasons, and **PostgreSQL's is a claim about the *connection*, not about the engine.** The
+    reason this doc used to give was wrong: it said PostgreSQL announces the other setting with a
+    `WARNING` at every occurrence rather than silently, which is true of the server and false of
+    this app, since `tokio_postgres` delivers `NoticeResponse` only on the connection's
+    `AsyncMessage` stream and `AsyncMessage`, `poll_message` and `Notice` appear nowhere in
+    `schemaic-db` — the announcement is discarded before anything could show it, and a `WARNING` is
+    not an error anyway. Had the app rested on that argument, a cluster with
+    `standard_conforming_strings = off` would have stored a password containing a `\` as a
+    *different* password than the preview showed, silently, and that GUC is settable per role, per
+    database and in `postgresql.conf` with every new connection inheriting it (measured on PG 16.15
+    through `psql`: `ALTER ROLE zz PASSWORD 'p\ass''q'` stores `pass'q`, the typed value is then
+    refused and the mangled one accepted). It rests on the startup pin instead:
+    `pg::connect_probe` sends `-c standard_conforming_strings=on` on the **startup packet**, so
+    every connection this app opens parses literals the way `sql_literal` wrote them — in force
+    before the first statement and not undoable by anything the app runs, which is why there is no
+    statement to return and why `pg::run_ddl` issues nothing where `mysql::run_ddl` issues
+    `MYSQL_LITERAL_MODE_SQL`. SQLite's `None` is a third reason rather than either: no backslash
+    escape at all, and no setting that would give it one. **The pin was one line of connection
+    config with nothing testing it**, which is the shape that gets deleted as dead configuration, so
+    two tests hold it now, both watched failing with the option replaced by an `application_name`:
+    `only_mysql_needs_a_statement_to_settle_what_a_literal_means` reads the option out of `pg.rs`
+    over **code only** — the comment block above that option explains the setting by name, and the
+    first version of this gate stayed green over the deletion because of it — and the live tier's
+    `a_password_with_a_backslash_is_stored_as_it_was_typed` turns the GUC off on the role the tier
+    connects as and checks that a plan's connection reports `on` anyway. Two kinds of
     caller: a **file**, where `dump::literal_mode_guard_sql` wraps it in a save/restore pair, and a
     **live plan**, where `Db::run_ddl` and `Db::run_server_ddl` run the bare statement best-effort
     beside `lock_wait_sql` — scoped to the plan, never pinned at connect time, because a user who
@@ -2319,7 +2343,14 @@ existing prose was left alone.
     TABLE`s in front of the transaction carry literals too, a column comment or a quoted default.
     And it is emitted **unconditionally** — `disable_fk_checks` and `wrap_transaction` choose how the
     load behaves, while this one is the file saying what it says. `mysqldump` pins the mode at the
-    head of every file for the same reason. **`target_database_sql` emits `USE` on MySQL only, and it is load-bearing.**
+    head of every file for the same reason. **The `@SCHEMAIC_OLD_SQL_MODE` wrapper is MySQL's
+    session-variable syntax**, so this leans on `literal_mode_sql` answering for MySQL alone and
+    carries a `debug_assert` saying so: a second dialect needing a statement there has to grow an
+    arm here, not have its statement wrapped in these two. Whether a PostgreSQL *dump* should pin
+    `standard_conforming_strings` the way `pg_dump` does is a separate question and an open one —
+    the live path has no need of it, `pg::connect_probe` pinning the GUC on the startup packet, but
+    a file is replayed in somebody else's client.
+    **`target_database_sql` emits `USE` on MySQL only, and it is load-bearing.**
     `create_ddl` names a MySQL table bare — a database is not a namespace there, so there is nothing
     to qualify with — while the `INSERT`s come from the export renderer, which addresses a table
     through `qualified_table` and *does* name the database; without that line the file would create
@@ -4732,7 +4763,7 @@ existing prose was left alone.
     the pack above a user snippet moved to "All connections" — a snippet they wrote, losing its
     abbrev to one they cannot delete or re-spell.
     `clear_conn`/`count_conn` drop a deleted connection's `Scope::Conn` snippets, for the two
-    reasons `delete_conn_now` states about its eleven siblings: a deleted connection should not be
+    reasons `delete_conn_now` states about its twelve siblings: a deleted connection should not be
     reconstructable from what is left on disk, and connection ids are **recycled**, so a snippet
     left behind is inherited by the next connection to take the freed id, under a heading reading
     "THIS CONNECTION".
@@ -5929,6 +5960,28 @@ existing prose was left alone.
     exactly that reason) and the Settings modal's **Log file** row is an explicit invitation to open
     that folder and share it. An erasing save takes no `.bak` and removes the one it found **after**
     the new file lands.
+    **And it syncs before it removes it, which is the one place this module pays for an fsync.** The
+    rename publishes the *name*: on XFS, btrfs, ZFS, an SMB/NFS share and NTFS that metadata can
+    reach stable storage while the contents have not, so a crash in the window leaves a zero-length
+    primary — which `serde_json::from_slice` refuses, `read_bytes` reports as `Load::Corrupt`, and
+    recovers from the backup, the file that branch had just deleted. **The asymmetry is the design
+    and is why the fix is narrow**: `Saving::Replacing` keeps the previous generation, so the same
+    window is already covered and the ordinary path pays for nothing — one fsync per
+    keystroke-driven save is a cost this store does not need. `Saving::Erasing` is the one save with
+    no second copy, because removing it is the point, so it closes the window itself: one fsync per
+    *deletion*, a connection removed or a history row deleted. Without it the worst case is deleting
+    one connection losing all of them, on `connections.json` — the file this entry's own prose calls
+    the only config file with no second copy anywhere. `FileStore::sync(path)` is the fifth method
+    of the seam, and the real `Fs` opens the file and `sync_data`s **best effort**, on the same
+    terms as every other sweep here — a file that cannot be opened has nothing to flush, and
+    failing the save over it would discard a write the user has already been told about. It is
+    asserted as an **order rather than an outcome**, which is why the fake store grew an op log:
+    both orderings end with the same set of files, so a store recording only the final state cannot
+    tell them apart.
+    `an_erasing_save_syncs_before_it_removes_the_backup` covers three things — the erasing path
+    syncs first, the replacing path still does not sync at all, and the credential store's extra
+    `.corrupt` sweep is after the sync too, which `write_secret_store`'s own doc already said it
+    owed.
     **The sibling an erasing save removes is the `.bak`, and only the `.bak`** — the other one is a
     different kind of file, and the difference is the whole of the rule. The `.bak` is the previous
     generation of the store being written, so everything in it except the erased row is already in
@@ -5940,8 +5993,8 @@ existing prose was left alone.
     the `.bak`, which is a silent copy and the whole reason `Saving::Erasing` exists, that file was
     announced in a modal, so the privacy argument that justifies scrubbing the `.bak` does not carry
     across. For a while every erasing save removed both, and **every erasing call site is a *per-row*
-    erasure** — one snippet, one chat, one history row, a deleted connection's cascade across twelve
-    stores — never an erasure of the whole store, so deleting one snippet destroyed
+    erasure** — one snippet, one chat, one history row, a deleted connection's cascade across
+    thirteen stores — never an erasure of the whole store, so deleting one snippet destroyed
     `snippets.json.corrupt` and with it the snippets that existed only there, with no message, as the
     side effect of deleting a *different* row
     (`an_erasing_save_keeps_a_corrupt_sibling_it_did_not_write`, and the composition in
@@ -6005,9 +6058,15 @@ existing prose was left alone.
     `saver(file, build)`, which passes the argument straight through to `write_json_store` and so
     keeps no policy of its own. `Ui::save_formats`, `save_db_colors`,
     `save_db_favorites` and the app's `save_ui` take one, and the delete closure's own gate asserts a
-    floor of nine erasing saves in it — **two of the nine now delegated**, since the history store's
+    floor of ten erasing saves in it — **two of the ten delegated**, since the history store's
     prune moved to `app/history_store.rs` and the snippet store's to `app/snippet_store.rs`, the
     closure holding only the call to each, whose erase is gated in the module it moved to.
+    **The tenth is the Find-Anywhere search history, and it was pruned in that closure while being
+    saved nowhere in it** — its persistence was a `create_effect` at the top of `main` calling
+    `persist::save_json`, so the prune notified the effect, the effect saved `Replacing`, and the
+    *pre-prune* file went to `search_history.json.bak` whole. It has an explicit
+    `Rc<dyn Fn(persist::Saving)>` saver now, on `save_db_favorites`' shape, with the effect keeping
+    `Replacing` for an ordinary activation, which is the right recovery for adding a row.
     `persist_chat` takes a `Saving`, so the
     caller says whether a turn finished or a transcript was replaced with nothing; the snippet
     library's save says the same thing, now through `snippet_store`'s private `save(snippets,
@@ -7113,6 +7172,13 @@ existing prose was left alone.
       `a_hidden_databases_entries_do_not_spend_the_per_connection_window` is that half, and
       `a_hidden_databases_history_row_is_not_offered` the other. `recent` stays as it is — the
       unfiltered question is still the right one for a caller that has no hidden set to apply.
+      **`clear_conn` is the deleted connection's half, and the prune was not the part that was
+      missing** — this store's persistence is an effect, which can only save `Replacing`, so the
+      prune's own save copied the *pre-prune* file to `search_history.json.bak` and left the
+      deleted connection's table names, column names and searched text in the directory the
+      Settings modal invites the user to open. `main.rs` holds an explicit `Saving`-taking saver
+      beside that effect now; see the `create_effect` entry under *Floem 0.2 gotchas* for why the
+      effect stays for an ordinary activation.
     - `favorite.rs` — the `(conn_id, database)` star list. `toggle` appends newest-**last** on
       purpose: `rank` (0 = that connection's oldest) is what the schema tree sorts by, so order in
       the `Vec` *is* the sort key.
@@ -8139,6 +8205,21 @@ existing prose was left alone.
   the app runs. It is the belt and not the fix — the values still reach the server inside statement
   text, and binding them is open work — but it removes a dependency this module already refuses to
   take twice, in `roles`' prefix comparison and in `pg_cell_lit`'s argument for `decode`.
+  **It is also why `run_ddl` here issues nothing where `mysql::run_ddl` issues
+  `MYSQL_LITERAL_MODE_SQL`**, which is a gap a reader comparing the two will otherwise read as an
+  omission — it was raised as one. The counterpart would be `SET standard_conforming_strings = on`
+  after connecting, which is a second mechanism for one guarantee and the weaker of the two: it
+  leaves the window between connect and the `SET` that a startup option does not have. Every
+  literal in a plan was written by `export::sql_literal` for exactly the meaning the startup packet
+  already settled. **One line of connection config with nothing testing it is the shape that gets
+  deleted as dead configuration**, so two tests hold it, both watched failing with the option
+  replaced by an `application_name`: `export`'s
+  `only_mysql_needs_a_statement_to_settle_what_a_literal_means` reads the option out of this file
+  over code only — the comment above it names the setting, and the first version of that gate
+  stayed green over the deletion by matching the comment — and the live tier's
+  `a_password_with_a_backslash_is_stored_as_it_was_typed` sets the GUC **off** on the role the tier
+  connects as, checks a plan's connection reports `on` regardless, resets a password to `p\ass'q`
+  through `Db::run_ddl` and logs in with the typed value while the mangled one is refused.
   The live tier's `staged_bytes_reach_the_column_as_bytes` runs the whole chain — stage, commit,
   re-read — on all three servers, and it is what proves the MySQL binding; it does **not** pin the
   PostgreSQL choice, because a server with the default setting takes both forms, which is precisely
@@ -9697,6 +9778,23 @@ existing prose was left alone.
   (`listed_principal`) — the distinction `a_created_role_is_one_the_server_accepts` was written for,
   since MariaDB stores a host the draft does not and an `ALTER USER` naming the wrong one is an error
   rather than a silent miss. Green on MariaDB, MySQL and PostgreSQL.
+  **`a_password_with_a_backslash_is_stored_as_it_was_typed` is the leg-gated one beside it, and
+  what it pins is a *connection option* rather than anything this file emits.** PostgreSQL only —
+  MySQL's mirror hazard is `NO_BACKSLASH_ESCAPES` and `mysql::run_ddl` already sends
+  `MYSQL_LITERAL_MODE_SQL` for it, SQLite has no backslash escape to get wrong, and the gate is
+  `Target::accounts_have_hosts` being false rather than an engine comparison. It turns
+  `standard_conforming_strings` **off on the role the tier connects as**, asserts that a plan's
+  connection reports `on` anyway — because `pg::connect_probe` pins it on the startup packet — then
+  resets the account's password to `p\ass'q` through `Db::run_ddl` and logs in with the typed value
+  while the mangled `pass'q` is refused. **Everything that needs the GUC off sits between the set
+  and the `RESET`, with no assertion inside**: a panic there would leave the tier's own role
+  parsing literals the old way for every test after it, the setting being cluster-wide and
+  outliving the scratch database — so the observations are captured, the role is put back, and the
+  assertions come after. It is `RESET` and not `SET … = on` for the tier's standing rule that it
+  touches nothing it did not create: setting it explicitly would leave a `pg_db_role_setting` row
+  on a cluster that had none. The finding it was written for turned out not to hold, and this test
+  is what settled it — the first version's *premise* assertion, that a plan's connection inherits
+  the role setting, is the one that failed.
   **`a_role_the_server_made_is_never_offered_a_password_reset` is the one test in this file that
   asserts an *offer* rather than a statement, and it is here because a pure test could not reach the
   fault.** `a_role_cannot_have_its_password_reset` builds a `Principal` with `kind = Role` and asks
@@ -17968,7 +18066,7 @@ existing prose was left alone.
     tab-id allocator and the placement closure and never touches this store; it is put into
     `HistoryActions` beside `clear` and `remove` at the `Ui` literal. And the connection-deletion
     prune became a one-line `(history_clear_conn)(id)` call rather than moving, because the block it
-    sits in erases twelve stores in a row under an invariant of its own, and each store being one
+    sits in erases thirteen stores in a row under an invariant of its own, and each store being one
     line is what keeps that readable.
     `the_removal_paths_erase` is the module's reason for existing, as a gate: exactly three erasing
     and two replacing saves inside `wire`, and `history.json` named once, as `FILE`. It scans its own
@@ -17988,6 +18086,16 @@ existing prose was left alone.
     it also counts a listed `delegated` needle (`"(history_clear_conn)("`, joined by
     `"(snippet_clear_conn)("` when the snippet store followed), and its comment says to
     add a line there *and* a gate in the store's own module, never only the line.
+    **A store it could not see at all is the sharper version of the same failure**, and it is the
+    limit of every census of this shape: the gate counts `Saving::Erasing`/`save_json_erasing(` inside the
+    closure's text and bans `Saving::Replacing` there, so a store pruned in the closure and saved
+    somewhere else entirely is neither counted nor banned. The Find-Anywhere search history was
+    exactly that — pruned in the delete closure, persisted by a `create_effect` ~8,300 lines away
+    calling `persist::save_json` — so the gate was green over a block whose own comment reads
+    *"every save below is erasing"* while that store's save was `Replacing`, copying the pre-prune
+    file to `search_history.json.bak` under a confirm reading *"It can't be undone"*. It has an
+    explicit saver now and the closure calls it with `Saving::Erasing` right after the prune, the
+    floor going 9 → 10 and watched failing at the old state.
   - `snippet_store.rs` — the snippet library's store: the persisted **user** list and the nine
     closures that write it. **The matched pair to `history_store.rs`, and the pairing is the
     point** — two modules of the same shape rather than one "stores" grab-bag, because what
@@ -21046,7 +21154,7 @@ Re-introducing the anti-patterns these guard against is a regression:
   was already written.
 - **`create_effect` runs its body once immediately, so an effect that *saves* what it watches saves
   what it has just loaded.** The Find-Anywhere search history is the one store the app persists
-  through an effect rather than through an explicit saver, and that first run wrote
+  through an effect at all, and that first run wrote
   `search_history.json` back before the window was drawn — so its `.bak` was always exactly one
   launch old even in normal operation, and on a launch that loaded defaults (a read failure, a
   removed file) the write put an empty primary on disk and the launch after that rotated the empty
@@ -21055,6 +21163,16 @@ Re-introducing the anti-patterns these guard against is a regression:
   mistaken for an edit, and the resize hint's poke uses so no bar flashes on mount. A signal that is
   *loaded* and then *watched* is the general case — the first run establishes tracking and has
   nothing to report.
+  **The second thing an effect cannot say is *which kind* of save this is**, which is why that
+  store now has an explicit `Rc<dyn Fn(persist::Saving)>` saver beside the effect rather than
+  instead of it. An effect sees a changed signal and nothing else, so it saves `Replacing` — right
+  for an ordinary Find-Anywhere activation, where the previous generation as `.bak` is the recovery
+  wanted, and wrong for the connection delete, where it copied the pre-prune file whole to
+  `search_history.json.bak`. `delete_conn_now` calls the saver with `Saving::Erasing` straight
+  after the prune, and the ordering is safe either way floem schedules the effect: if the effect
+  runs inside `update` it writes a `.bak` holding the pre-prune file and the erasing save then
+  removes it, and if it runs after, it copies the already-pruned primary. What matters is only that
+  the explicit save is *after* the prune.
 - **An effect that writes the signals it reads must read them untracked — and an outside write to
   them is then invisible, so it needs a generation counter.** The schema tree's size-column effect
   scans every `ConnNode::stats` slot for `Idle` and writes `Loading` into each one it fetches;

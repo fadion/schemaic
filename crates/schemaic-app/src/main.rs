@@ -12673,8 +12673,11 @@ mod app_tests {
     ///
     /// It is a decision inside a view closure, so no unit test reaches it; this
     /// reads the closure's own text. **Both directions, and a floor:** no
-    /// `Replacing` may appear in that region, at least nine saves must be
-    /// erasing, and the region must actually have been found — a needle that
+    /// `Replacing` may appear in that region, every store keyed to the
+    /// connection must be erased there (the floor is asserted below, beside the
+    /// count it is about, rather than restated here where it would drift from
+    /// it — it already had, at nine against an assert of ten), and the region
+    /// must actually have been found — a needle that
     /// stops matching otherwise reports an empty region with no `Replacing` in
     /// it and passes, which is how the gate would become the bug.
     #[test]
@@ -12711,8 +12714,9 @@ mod app_tests {
         // **Delegated erases count, and are named one by one.** A store whose
         // pruning has moved into its own module still has to be erased here, but
         // this gate cannot see the save any more — so the closure's call is what
-        // it counts, and the erase itself is gated where it now lives. The floor
-        // stays at 9: moving a store out must not be a way to lose one.
+        // it counts, and the erase itself is gated where it now lives. Moving a
+        // store out must not be a way to lose one, so a delegated call counts
+        // toward the same floor as an inline save.
         //
         // Each entry below has its other half in the module it delegates to —
         // `history_store::the_removal_paths_erase` and
