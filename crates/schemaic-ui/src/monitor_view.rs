@@ -94,6 +94,13 @@ fn row_pad_h() -> f64 {
 /// `conn_import`'s `ROW_VIEW_CAP` chose a cap over a virtual stack precisely
 /// because *its* rows are two lines or three; a change row is always one, which
 /// is what makes `Fixed` honest here.
+///
+/// **"Always one" is enforced, not observed.** The values in a change row are
+/// whatever the engine stored, and a `TEXT` column holding a newline shapes to
+/// two lines — so [`cell`] flattens line breaks on the way to `text()`, and
+/// [`entry_row`]'s empty slot is given this height rather than hidden. Both are
+/// this contract, not tidiness: `Fixed` is a promise about the child's height
+/// that nothing in floem checks.
 fn mon_row_h() -> f64 {
     theme::scaled(29.0)
 }
@@ -578,9 +585,22 @@ pub(crate) fn monitor_overlay(o: OverlayUi, tab_actions: Rc<TabsActions>) -> imp
                     .style(move |s| {
                         s.flex_col()
                             .padding_horiz(row_pad_h())
-                            .padding_vert(theme::scaled(8.0))
                             .min_width(widest.get() + row_pad_h() * 2.0)
                     });
+                    // **The 8px band is a wrapper's, not the stack's.**
+                    // `virtual_stack` derives its window straight from
+                    // `viewport.y0 / item_size` and knows nothing about the
+                    // container's padding, while `compute_view_layout` hands it
+                    // a viewport in its own border-box space — so padding on the
+                    // stack itself makes the window short by `padding_top` and
+                    // the first row visible at the top edge is never built. It
+                    // also forces `height(content_size)` against taffy's
+                    // border-box `size`, which would eat the 16px back out of
+                    // the rows. Padding a parent leaves both exact: the
+                    // viewport the stack is given is already translated into
+                    // its own space.
+                    let list = container(list)
+                        .style(move |s| s.flex_col().padding_vert(theme::scaled(8.0)));
                     let (list_scroll, by_user) = with_scroll_gesture(shift_hscroll(
                         list.on_resize(move |r| content_h.set(r.height())),
                     ));
@@ -706,8 +726,15 @@ fn header_row() -> impl IntoView {
 /// above can iterate 8 KiB of `u64` instead of deep-copying every entry's cells
 /// twice per landing poll. The log is appended in ascending `seq` and never
 /// reordered, so the lookup is a binary search; a `seq` the log no longer holds
-/// (the window slid while this was being built) renders nothing, which is what
+/// (the window slid while this was being built) renders blank — which is what
 /// the row would have shown anyway.
+///
+/// **Blank at full height, not `widgets::nothing()`.** `nothing()` is
+/// `display: none`, so it occupies zero rows; under a
+/// `VirtualItemSize::Fixed` stack, which places child `i` at `i * item_size`
+/// regardless, that puts every later row in the window 29 px above where the
+/// stack has reserved space for it. Whatever this slot is, it is one row tall —
+/// see [`mon_row_h`].
 fn entry_row(
     log: RwSignal<Vec<MonitorEntry>>,
     seq: u64,
@@ -718,7 +745,7 @@ fn entry_row(
             .ok()
             .map(|i| l[i].clone())
     }) else {
-        return crate::widgets::nothing();
+        return empty().style(|s| s.height(mon_row_h())).into_any();
     };
     // **The entry's own list, not the modal's current one.** A baseline restart
     // answering an `ALTER` rewrites `monitor_cols` mid-session while the log
@@ -1050,9 +1077,50 @@ fn interval_label(secs: u64) -> &'static str {
     }
 }
 
-/// Render one cell value: `NULL` for a missing value, the text otherwise.
+/// The characters a shaper starts a new line on, as one definition.
+///
+/// Unicode's mandatory breaks (UAX #14 BK/CR/LF/NL), which is the set
+/// [`cell`] has to flatten and the set its test asserts over — written once so
+/// the two cannot disagree about what "one line" means.
+fn is_line_break(c: char) -> bool {
+    matches!(
+        c,
+        '\n' | '\r' | '\u{0b}' | '\u{0c}' | '\u{85}' | '\u{2028}' | '\u{2029}'
+    )
+}
+
+/// Render one cell value: `NULL` for a missing value, the text otherwise,
+/// flattened to a single line.
+///
+/// **The flattening is what keeps [`mon_row_h`] honest.** The log is a virtual
+/// stack over `VirtualItemSize::Fixed`, which places child `i` at
+/// `i * item_size`; the row is given that exact height, so a value that shapes
+/// to two lines is laid out past its own box and paints across the row below
+/// it. A watched `TEXT`/`VARCHAR` column holding an address, a note or
+/// pretty-printed JSON is the ordinary way that happens.
+///
+/// A single-line, horizontally-scrolled column is what this display means
+/// anyway. The export path ([`log_result_set`]) is deliberately not routed
+/// through here and keeps the engine's value verbatim.
 fn cell(c: &Option<String>) -> String {
     match c {
+        Some(s) if s.chars().any(is_line_break) => {
+            // A CRLF is one line ending, not two: collapse the pair before the
+            // singletons so the value does not gain a column.
+            let mut out = String::with_capacity(s.len());
+            let mut chars = s.chars().peekable();
+            while let Some(ch) = chars.next() {
+                if is_line_break(ch) {
+                    if ch == '\r' && chars.peek() == Some(&'\n') {
+                        chars.next();
+                    }
+                    out.push(' ');
+                } else {
+                    out.push(ch);
+                }
+            }
+            out
+        }
         Some(s) => s.clone(),
         None => "NULL".to_string(),
     }
@@ -1061,6 +1129,52 @@ fn cell(c: &Option<String>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **[`mon_row_h`]'s premise, asserted where it is actually decided.**
+    ///
+    /// `VirtualItemSize::Fixed` places child `i` at `i * item_size`, so a row
+    /// that shapes to two lines is laid out past its own box and paints across
+    /// the row below it. The premise "a change row is always one line" is not a
+    /// property of the row — it is a property of what `cell` hands to `text()`,
+    /// and until this test it was stated in three places and checked in none.
+    /// A `TEXT` column holding an address, a note or pretty-printed JSON is the
+    /// ordinary case, not a contrived one.
+    #[test]
+    fn a_cell_holding_a_newline_is_flattened_to_one_line() {
+        for raw in [
+            "a\nb",
+            "a\r\nb",
+            "a\rb",
+            "line1\nline2\nline3",
+            "\n",
+            "a\u{2028}b",
+        ] {
+            let out = cell(&Some(raw.to_string()));
+            assert!(
+                !out.chars().any(is_line_break),
+                "{raw:?} kept a line break as {out:?}"
+            );
+        }
+    }
+
+    /// The flattening is a display concern and must not eat anything else: a
+    /// value with no line break is handed through byte for byte, and `NULL`
+    /// still reads as `NULL` rather than as an empty cell.
+    #[test]
+    fn a_cell_without_a_newline_is_unchanged() {
+        for raw in ["", "plain", "a\tb", "  spaced  ", "ünïcode", "NULL"] {
+            assert_eq!(cell(&Some(raw.to_string())), raw);
+        }
+        assert_eq!(cell(&None), "NULL");
+    }
+
+    /// One space per break, not one per byte — a CRLF is a single line ending
+    /// and must not widen the value by two columns.
+    #[test]
+    fn a_crlf_costs_exactly_one_space() {
+        assert_eq!(cell(&Some("a\r\nb".to_string())), "a b");
+        assert_eq!(cell(&Some("a\nb".to_string())), "a b");
+    }
 
     /// **The virtual stack may ask for rows the log no longer has.**
     ///
