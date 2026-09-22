@@ -300,7 +300,12 @@ pub(crate) fn modal_layer(ui: Ui, modal_up: impl Fn() -> bool + Copy + 'static) 
         stack((
             term_settings_overlay(ui.term, ui.term_actions.clone()),
             ai_settings_overlay(ui.ai, ui.conn, ui.ai_actions.clone()),
-            theme_settings_overlay(ui.layout, ui.open_config_dir.clone()),
+            theme_settings_overlay(
+                ui.layout,
+                ui.open_config_dir.clone(),
+                ui.install_cli.clone(),
+                ui.cli_install,
+            ),
             help_overlay(ui.layout),
         ))
         .style(move |s| {

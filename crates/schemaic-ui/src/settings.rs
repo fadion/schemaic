@@ -11,13 +11,14 @@ use floem::prelude::*;
 
 use crate::consts::{TERM_FONT_SIZES, chat_pad_h};
 use crate::widgets::{
-    ActionKind, MenuEntry, action_button, autohide, focus_root_with_ring, form_hint,
-    form_label_style, modal_title, panel_style,
+    ActionKind, MenuEntry, action_button, action_button_dyn, autohide, focus_root_with_ring,
+    footer_error, form_hint, form_label_style, modal_title, nothing, panel_style,
 };
 use crate::{
     AiActions, AiEffort, AiUi, ConnUi, FieldCfg, Harness, LayoutUi, SchemaScope, TermActions,
     TermCursor, TermUi, edit_field, icons, theme,
 };
+use schemaic_core::cli_install::{self, InstallState};
 
 // ===== moved from lib.rs (settings modals) =====
 // The Terminal settings pane: shell + font size + cursor style dropdowns, and
@@ -1461,6 +1462,68 @@ fn log_row(open: Rc<dyn Fn()>, ring: crate::widgets::FocusRing, tabindex: u32) -
     .style(|s| s.items_center().width_full().gap(theme::scaled(10.0)))
 }
 
+/// The Settings row that puts the `schemaic` command on `PATH`.
+///
+/// Only ever on a click — never at install time — and the outcome stays under
+/// the row for the rest of the session, naming the path it resolved. The
+/// guard against a second click while one is running is the app's, beside the
+/// launch; the label only says so.
+fn cli_row(
+    install: Rc<dyn Fn()>,
+    state: RwSignal<InstallState>,
+    ring: crate::widgets::FocusRing,
+    tabindex: u32,
+) -> impl IntoView {
+    let outcome = dyn_container(
+        move || state.get(),
+        |st| match st {
+            InstallState::Done(msg) => text(msg)
+                .style(|s| {
+                    s.color(theme::text_dim())
+                        .font_size(theme::font_label())
+                        .max_width(theme::scaled(460.0))
+                })
+                .into_any(),
+            InstallState::Failed(msg) => footer_error(msg),
+            InstallState::Idle | InstallState::Running => nothing(),
+        },
+    )
+    // Hidden rather than empty with nothing to say, or it takes the column's
+    // gap and this row sits taller than Log file above it — the same fix as the
+    // AI modal's harness notice.
+    .style(move |s| {
+        match state.with(|st| matches!(st, InstallState::Done(_) | InstallState::Failed(_))) {
+            true => s,
+            false => s.display(floem::style::Display::None),
+        }
+    });
+    h_stack((
+        v_stack((
+            text("Command line").style(|s| s.color(theme::text()).font_size(theme::font_label())),
+            form_hint(cli_install::hint(cli_install::Os::current())),
+            outcome,
+        ))
+        .style(|s| {
+            s.flex_col()
+                .gap(theme::scaled(2.0))
+                .flex_grow(1.0_f32)
+                .min_width(0.0)
+        }),
+        action_button_dyn(
+            move || match state.get() {
+                InstallState::Running => "Installing".to_string(),
+                _ => "Install".to_string(),
+            },
+            ActionKind::Quiet,
+            true,
+            ring,
+            tabindex,
+            move || install(),
+        ),
+    ))
+    .style(|s| s.items_center().width_full().gap(theme::scaled(10.0)))
+}
+
 fn settings_section_header(t: &'static str) -> impl IntoView {
     text(t).style(|s| {
         s.font_size(theme::font_body())
@@ -1494,6 +1557,8 @@ fn settings_version_line() -> impl IntoView {
 pub(crate) fn theme_settings_overlay(
     layout: LayoutUi,
     open_config_dir: Rc<dyn Fn()>,
+    install_cli: Rc<dyn Fn()>,
+    cli_install: RwSignal<InstallState>,
 ) -> impl IntoView {
     let open = layout.theme_settings_open;
     let ui_theme = layout.ui_theme;
@@ -1540,6 +1605,7 @@ pub(crate) fn theme_settings_overlay(
                 settings_section_header("General"),
                 restore_row,
                 log_row(open_config_dir.clone(), ring.clone(), 20),
+                cli_row(install_cli.clone(), cli_install, ring.clone(), 30),
             ))
             .style(|s| s.flex_col().gap(theme::scaled(16.0)));
 

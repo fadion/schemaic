@@ -33,6 +33,20 @@ image = { version = "0.25", default-features = false, features = ["png"] }
 # can reach a saved connection without linking floem. The backend notes that used
 # to sit here are in that crate's manifest.
 
+# Settings → Install writes the user PATH (`HKCU\Environment`) and broadcasts
+# `WM_SETTINGCHANGE` so Explorer hands the new value to the next terminal. The
+# version is the one already in the tree through tokio and friends.
+# `Win32_Security` is not optional: `RegCreateKeyExW` takes a
+# `SECURITY_ATTRIBUTES` pointer and is compiled out without it. The workspace
+# builds either way only because another crate enables it for us.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_Registry",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
 # `test-util` for tokio's paused clock, so the statement-timeout tests can let a
 # 60-second timeout expire without waiting a minute. Dev-only on purpose: it is
 # not a feature a shipped binary should carry.

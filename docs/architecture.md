@@ -7247,6 +7247,49 @@ existing prose was left alone.
     loopback address *is* the address and nothing is compared. A refusal rather than a silent drop to
     `require`, which would open a session that says TLS and checks nothing on a connection whose
     whole point is that it checks — the direction `SslMode::STRICTEST` already sends a guess.
+  - `cli_install.rs` — **putting the `schemaic` command on `PATH`**: the decision half of Settings →
+    General → Command line → Install, with the registry write, the symlink and the broadcast left to
+    `schemaic-app`'s `install_cli.rs`. The CLI itself needs nothing installed — it is the app's own
+    argv branch, plus `schemaic.com` on Windows — but it shipped reachable only by its full path on
+    Windows and macOS, and getting it onto `PATH` is a write to the user's own environment, so it
+    happens only on a click, never at install time, and every outcome names the path it resolved.
+    `plan(&Probe) -> Result<Plan, String>` is the whole decision: `Plan::Already { dir }`,
+    `AddUserPath { dir }` (Windows) or `Link { link, target }` (macOS and Linux). On Windows the
+    directory is the one holding `schemaic.com`, and **a copy with no shim beside it is refused**
+    rather than planned — a development build has `schemaic-cli.exe` there instead, so putting that
+    directory on `PATH` would hand a terminal the GUI
+    (`windows_without_the_shim_is_refused_and_says_why`). macOS and a loose Linux binary get
+    `~/.local/bin/schemaic` → the running executable. **Under an AppImage the target is `$APPIMAGE`,
+    never `current_exe`**: the running executable sits inside the image's mount, which is gone the
+    moment the app exits, so a link to it — or an "already on `PATH`" answered because of it — would
+    be false by the next terminal (`an_appimage_links_the_image_not_its_mount`,
+    `an_appimage_mount_on_path_is_not_already_installed`). A `.deb`/`.rpm` install is
+    `/usr/bin/schemaic` with `/usr/bin` on `PATH`, so the planner answers `Already` and nothing is
+    written; that needs the target to be *named* `schemaic`, since a `schemaic-nightly` in a `PATH`
+    directory does not make the command resolve
+    (`a_binary_on_path_under_another_name_still_gets_a_link`).
+    `path_has_dir` is string work rather than `Path`, per OS — `;`, case-folding, `/` read as `\`,
+    quotes and trailing separators dropped on Windows; `:` and exact bytes elsewhere — so the Windows
+    arms answer the same when the tests run on Linux CI, where a backslash is an ordinary file-name
+    byte. An empty entry never matches, because on Unix it means the current directory.
+    **`user_path_update` appends to the *raw* user `PATH`, and that is the point of it.** The
+    classic `setx PATH "%PATH%;…"` writes the *expanded, merged* system-plus-user value back into
+    the user key; this keeps every entry as written — an unexpanded `%USERPROFILE%\…` stays
+    unexpanded — and returns `None` when the directory is already there once `expand_env` has been
+    applied (`%NAME%` the way `ExpandEnvironmentStringsW` does it, an unknown name and a lone `%`
+    left as written — `user_path_update_sees_an_unexpanded_entry_as_present`).
+    `link_step` decides what to do about whatever already sits at the link: `Create` where nothing
+    is, `Keep` a link already resolving to the target (a relative one resolved lexically against its
+    own directory), `Replace` a *dangling* one — an AppImage that was moved or deleted — and
+    `Refuse`, naming it, anything live pointing elsewhere or any regular file, because something
+    that isn't Install's is left alone. The report strings (`report_already`, `report_added`,
+    `report_linked`) live here so the "names the path it resolved" promise is tested
+    (`reports_name_the_path_they_resolved`); `report_linked` **always** adds a "put it on your
+    `PATH`" hint on macOS, since an app started from Finder gets launchd's minimal `PATH` and cannot
+    tell whether the user's shell has `~/.local/bin` (`report_linked_always_hints_on_macos`), and on
+    Linux only when the process's own `PATH` lacks it. `InstallState` (`Idle`, `Running`,
+    `Done(String)`, `Failed(String)`) is the Settings row's lifecycle — transient, never persisted.
+    **Nothing removes the entry or the link on uninstall**; that half is not built.
   - **Small persisted / UI-state models**, each a flat `Vec` keyed by `conn_id` and each pure +
     tested (they share `history.rs`'s shape; a new one belongs here, not in the UI):
     - `search_history.rs` — recent Find-Anywhere targets (`MAX_PER_CONN`, newest-first, deduped).
@@ -11878,7 +11921,8 @@ existing prose was left alone.
     `term_settings_overlay(TermUi, Rc<TermActions>)`,
     `ai_settings_overlay(AiUi, ConnUi, Rc<AiActions>)` — the `ConnUi` is the active connection's
     data-access level, which the AI pane reports — `theme_settings_overlay(LayoutUi,
-    open_config_dir: Rc<dyn Fn()>)`, and `help_overlay(LayoutUi)`, which reads a single signal. The
+    open_config_dir, install_cli, cli_install)`, the last three General's two trips outside the app —
+    and `help_overlay(LayoutUi)`, which reads a single signal. The
     module names no `Ui` anywhere now, prose included.
     **The body opens with a version caption, and the string it shows is composed in `schemaic-core`.**
     `settings_version_line` renders `core::app_version_label()` — `Schemaic v0.24.0`, built from
@@ -11910,6 +11954,14 @@ existing prose was left alone.
     Spawning a file manager is a process launch, so it is the app boundary's `open_config_dir` and
     not a `Command` in a view; a machine with no config directory gets the path-less hint and a
     disabled button rather than a control that silently does nothing.
+    `cli_row` sits under it and is General's other trip outside the app: **Command line**, the
+    per-OS hint from `core::cli_install::hint`, an **Install** button that reads **Installing**
+    while one runs, and the outcome under the hint — dim text on success, `footer_error` on
+    failure — which stays there for the rest of the session, naming the path Install resolved. The
+    action is `Ui::install_cli` and the state `Ui::cli_install`, an `RwSignal<InstallState>` the app
+    owns: a registry write or a symlink is the app boundary's job for `open_config_dir`'s reason.
+    **The button stays enabled while an install runs**, and the guard against a second click is
+    `main.rs`'s, beside the launch — the label only says so.
     **The AI modal is where the harness is chosen, and half its controls follow that choice.** The
     *Agent CLI* dropdown is `focusable_dropdown(harness, Harness::ALL, Harness::label, …)` over the
     workspace's **one** `Harness` — `schemaic-ui` depends on `schemaic-ai` for it, deliberately, and
@@ -16406,7 +16458,8 @@ existing prose was left alone.
     already and only having to say so, each of its four modals owning one domain and reading nothing
     else: `term_settings_overlay(TermUi, Rc<TermActions>)`, `ai_settings_overlay(AiUi, ConnUi,
     Rc<AiActions>)` — the `ConnUi` being the data-access level the AI pane reports —
-    `theme_settings_overlay(LayoutUi, open_config_dir)` and `help_overlay(LayoutUi)`, which reads a
+    `theme_settings_overlay(LayoutUi, open_config_dir, install_cli, cli_install)` and
+    `help_overlay(LayoutUi)`, which reads a
     single signal. `properties.rs` went 5 to zero the other way, on a `PropertiesCtx`, and the
     footer is why: **Edit** routes to the table designer or the view editor, so the panel wants what
     those two doors want on top of the four arguments `footer` already carries, which named one by
@@ -18876,6 +18929,34 @@ existing prose was left alone.
     **`release.yml`'s Windows leg builds two binaries for that**, `cargo build --release -p
     schemaic-app -p schemaic-cli`, and copies `target/release/schemaic-cli.exe` into the staged
     directory as `dist/schemaic.com`. Linux and macOS build one and use the argv branch.
+  - `install_cli.rs` — the side-effect half of `core::cli_install`, which owns every decision and
+    every test: this gathers the `Probe` (`current_exe`, `APPIMAGE`, `HOME`, `PATH`, whether
+    `schemaic.com` sits beside the exe) and performs the `Plan`. **On Windows it is a
+    read-modify-write of `HKCU\Environment\Path` in the value's own registry type**, through
+    `RegCreateKeyExW`/`RegQueryValueExW`/`RegSetValueExW`: a `REG_EXPAND_SZ` must stay one or every
+    `%USERPROFILE%\…` entry in it stops resolving, and a missing value is created as
+    `REG_EXPAND_SZ`. A value of any other type, or one that is not valid UTF-16, is **refused rather
+    than written back lossily**. A directory already in the registry but not in this process's
+    `PATH` — written after the app started — reports as added without a second write. After a
+    write, `SendMessageTimeoutW(HWND_BROADCAST, WM_SETTINGCHANGE, "Environment", SMTO_ABORTIFHUNG,
+    5 s)` tells Explorer, so a terminal it starts next gets the new value; that is best-effort, the
+    value being written either way, and a terminal already open keeps the old `PATH`, which
+    `report_added` says. **The whole install runs on a `std::thread`, not the UI thread**, because
+    the broadcast waits on every top-level window and a slow one should stall a thread nobody is
+    looking at. This is `schemaic-app`'s first *direct* `windows-sys` dependency — 0.61,
+    `cfg(windows)`, features `Win32_Foundation`, `Win32_Security`, `Win32_System_Registry` and
+    `Win32_UI_WindowsAndMessaging` — at the version already in the tree transitively, so no new crate
+    version enters the lock file. **`Win32_Security` looks unused and is not**: `RegCreateKeyExW`
+    takes a `SECURITY_ATTRIBUTES` pointer and windows-sys compiles it out without that feature. The
+    workspace builds without it anyway, because another crate enables it for the shared
+    `windows-sys` — so the omission built green, and only compiling this module on its own showed
+    it. On macOS and Linux it reads what is at the link
+    (`symlink_metadata`, `read_link`, and `exists` to follow it for liveness), asks `link_step`, then
+    `create_dir_all`s `~/.local/bin`, removes a dangling link it is replacing and
+    `std::os::unix::fs::symlink`s. The closure the Settings row calls is built in `main.rs` next to
+    `update::start`: it owns the **double-click guard** — a click while the state is `Running` is
+    ignored, the button itself staying enabled — and posts the result back with
+    `create_ext_action`.
 - `schemaic-cli` — Schemaic without a window: `schemaic list` / `query` / `exec` / `help`, so a
   person or an agent can run SQL against a saved connection with the app closed and without being
   handed a credential. Its whole dependency list is `schemaic-core`, `schemaic-conn`, `schemaic-db`,
@@ -18890,6 +18971,11 @@ existing prose was left alone.
   `PATHEXT` is `.COM;.EXE;…`, so a bare `schemaic` at a prompt resolves to the CLI while shortcuts,
   the Start menu and Explorer keep launching the GUI. It is an ordinary PE — nothing about the DOS
   `.com` format is involved — and the arrangement was checked on Windows 11 with the real binaries.
+  **A bare `schemaic` resolves only once its directory is on `PATH`, though, and of the installs
+  only the `.deb`/`.rpm` (in `/usr/bin`) puts it there** — so on Windows and macOS the CLI shipped
+  reachable only by its full path. Settings → General → Command line → **Install** closes that, on a
+  click and never at install time: `core::cli_install` decides (the user `PATH` on Windows, a
+  `~/.local/bin` link elsewhere) and `app/install_cli.rs` writes.
   The command surface was verified end to end against a live MariaDB.
   - `cli/args.rs` — the clap surface, kept separate from doing anything so that defaults, aliases
     and which flag belongs to which subcommand are all testable without a database. `DEFAULT_LIMIT`

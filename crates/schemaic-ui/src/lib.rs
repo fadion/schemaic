@@ -6320,6 +6320,13 @@ pub struct Ui {
     /// process launch, which is the app boundary's job and not a view's — hence
     /// a callback rather than a `Command` in `settings.rs`.
     pub open_config_dir: Rc<dyn Fn()>,
+    /// Put the `schemaic` command on `PATH` (Settings → General → Command
+    /// line). A registry write or a symlink, so it is the app boundary's job for
+    /// the same reason as [`Self::open_config_dir`]; it runs off-thread and
+    /// reports through [`Self::cli_install`].
+    pub install_cli: Rc<dyn Fn()>,
+    /// Where the last Install got to, and what it said. Transient.
+    pub cli_install: RwSignal<schemaic_core::cli_install::InstallState>,
 }
 
 /// Which panel occupies the right column. AI and Terminal are mutually
@@ -15384,7 +15391,8 @@ mod whole_ui_gate {
         // else. `term_settings_overlay(TermUi, Rc<TermActions>)`,
         // `ai_settings_overlay(AiUi, ConnUi, Rc<AiActions>)` — the `ConnUi` is
         // the active connection's data-access level, which the AI pane reports
-        // — `theme_settings_overlay(LayoutUi, open_config_dir)` and
+        // — `theme_settings_overlay(LayoutUi, open_config_dir, install_cli,
+        // cli_install)`, the last three General's two trips outside the app — and
         // `help_overlay(LayoutUi)`, which reads a single signal.
         //
         // The module names no `Ui` at all now — **not a first**, and the claim

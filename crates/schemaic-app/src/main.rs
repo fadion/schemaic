@@ -18,6 +18,7 @@ mod conn_sources;
 mod dump;
 mod heap;
 mod history_store;
+mod install_cli;
 mod liveness;
 mod logging;
 mod mcp;
@@ -11552,6 +11553,25 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
     let update_state = RwSignal::new(schemaic_core::update::UpdateState::default());
     let apply_update = update::start(cx, &handle, window, update_state);
 
+    // Settings → General → Command line → Install. Off-thread because the
+    // Windows arm waits on a broadcast to every top-level window; the guard
+    // against a second click while one runs sits here, beside the launch.
+    let cli_install = RwSignal::new(schemaic_core::cli_install::InstallState::default());
+    let install_cli: Rc<dyn Fn()> = Rc::new(move || {
+        use schemaic_core::cli_install::InstallState;
+        if cli_install.get_untracked() == InstallState::Running {
+            return;
+        }
+        cli_install.set(InstallState::Running);
+        let report = create_ext_action(cx, move |res: Result<String, String>| {
+            cli_install.set(match res {
+                Ok(msg) => InstallState::Done(msg),
+                Err(msg) => InstallState::Failed(msg),
+            });
+        });
+        std::thread::spawn(move || report(install_cli::install()));
+    });
+
     let ui = Ui {
         tabs_ui: TabsUi {
             tabs,
@@ -12040,6 +12060,8 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
         update_state,
         apply_update,
         open_config_dir: Rc::new(open_config_dir),
+        install_cli,
+        cli_install,
     };
     // Every config file loaded *during this build* has been loaded by now. If any
     // of them was unreadable it was preserved as `.corrupt` and recovered from
