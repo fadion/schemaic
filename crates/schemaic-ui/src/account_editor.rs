@@ -135,6 +135,13 @@ fn field_w() -> f64 {
 /// One function rather than the sequence written out twice, so a third form
 /// cannot get the order wrong — `a_freshly_opened_form_keeps_the_draft_it_was_
 /// seeded_with` is what holds it.
+fn reset_then_seed<T: 'static>(d: crate::DdlUi, draft: floem::reactive::RwSignal<T>, seed: T) {
+    d.error.set(None);
+    d.preview.set(None);
+    ddl_preview::close_peers(d, false);
+    draft.set(seed);
+}
+
 /// Is the connection this door is **for** read-only?
 ///
 /// **Not `edit_ctx`'s, which is the switcher's.** The three doors below asked
@@ -160,13 +167,6 @@ fn field_w() -> f64 {
 /// the function it cited.
 fn door_read_only(conn: ConnUi, from: &UsersTarget) -> bool {
     crate::users_view::launch_read_only(conn.connections, from.conn_id)
-}
-
-fn reset_then_seed<T: 'static>(d: crate::DdlUi, draft: floem::reactive::RwSignal<T>, seed: T) {
-    d.error.set(None);
-    d.preview.set(None);
-    ddl_preview::close_peers(d, false);
-    draft.set(seed);
 }
 
 /// Open the account form on a blank draft.

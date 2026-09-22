@@ -11,7 +11,7 @@
 //!
 //! *Not* "no arm builds SQL". SQLite's arm of [`Db::fetch_table`] still assembles
 //! its `SELECT … LIMIT` inline and re-enters [`Db::fetch_query`]; `fetch_table`
-//! is not one of `ENGINE_ENTRY_POINTS`' thirteen, so the census below never looks
+//! is not one of `ENGINE_ENTRY_POINTS`' names, so the census below never looks
 //! at it.
 //!
 //! *Not* "no statement text is left". `lock_wait_sql` writes MySQL's
@@ -2491,14 +2491,11 @@ mod tests {
     /// are the only ways a `mysql_async` connection is made to do anything.
     #[test]
     fn the_dispatcher_executes_nothing_itself() {
-        let me = include_str!("lib.rs");
-        let body = me
-            .lines()
-            // Doc comments and ordinary comments talk about these by name, and
-            // this file is one long argument about which statement lives where.
-            .filter(|l| !l.trim_start().starts_with("//"))
-            .collect::<Vec<_>>()
-            .join("\n");
+        // Comments stripped — doc comments and ordinary ones talk about these
+        // by name, and this file is one long argument about which statement
+        // lives where. Through the shared helper rather than a fourth copy of
+        // the same filter, which is what the other two do.
+        let body = dispatcher_code();
         // **Assembled, not written out**, the way the timeout census next door
         // assembles its `stop` marker: a test that names the thing it forbids
         // trips on its own source, and the first spelling of this one did.
@@ -2613,9 +2610,14 @@ mod tests {
 
     /// This file with comments stripped — the dispatcher's *code*.
     ///
-    /// Shared by the three convention gates, because the one that did not strip
-    /// them was the odd one out: a rustdoc link with parens reads exactly like
-    /// a call, so a doc mention could stand in for a deleted arm.
+    /// Shared by every gate that reads the dispatcher — the three that scan
+    /// this file — because the one that did *not* strip comments was the odd
+    /// one out: a rustdoc link with parens reads exactly like a call, so a doc
+    /// mention could stand in for a deleted arm.
+    ///
+    /// (`every_engine_module_answers_the_whole_interface` is the fourth
+    /// convention gate and reads the three engine modules instead, so it has no
+    /// use for this.)
     fn dispatcher_code() -> String {
         include_str!("lib.rs")
             .lines()

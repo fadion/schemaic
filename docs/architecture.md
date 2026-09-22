@@ -7576,7 +7576,7 @@ existing prose was left alone.
   the convention flip — taking `lib.rs` from 9,590 lines to about 3,100 beside `mysql.rs`'s 7,055, and
   leaving no `Engine::MySql` arm in `lib.rs` that is not a call into `mysql::`. (The one dispatch
   arm in the file that still builds SQL is SQLite's inside `fetch_table`, which is not one of
-  `ENGINE_ENTRY_POINTS`' thirteen and so is outside the census below.) Both convention tests read
+  `ENGINE_ENTRY_POINTS` and so is outside the census below.) Both convention tests read
   three engines now, and the second is renamed for it:
   `every_engine_module_answers_the_whole_interface` and
   `the_dispatcher_calls_every_engine_module_for_every_entry_point`.
@@ -7585,7 +7585,25 @@ existing prose was left alone.
   bodies `session.rs` calls directly — while the dispatcher's arm was still inline, so the interface
   had three names MySQL answered only from the inside. Both tests named all three, which is the
   census doing what the compiler cannot: a fourth engine *variant* is a compile error at every
-  dispatch site, a module answering twelve of thirteen is not.
+  dispatch site, a module answering all but one of the names is not.
+  **But both of those measure the modules and the dispatcher *against* the list, so a name that
+  never reached the list is a name neither of them asks about.** One never had: `run_batch` is
+  `pub(crate) async fn` in all three engine modules and dispatched to all three, and was written
+  down nowhere — both gates were green over thirteen of fourteen, and putting SQLite's `run_batch`
+  back on the `fetch_query` loop that once cascade-emptied child tables passes them.
+  `the_entry_point_list_is_what_the_dispatcher_actually_dispatches` derives the set the other way:
+  every name the dispatcher calls on **all three** modules is an entry point whatever the list says,
+  asserted in both directions, with a floor so that an empty intersection cannot satisfy the first
+  half having read nothing. `run_batch` is on the list and the list is fourteen; the const's doc
+  carries no count at all now, having said "ten of thirteen" and "twelve of thirteen" about a list
+  that was already fourteen long.
+  **And the gate that most needed comments stripped was the one not stripping them.**
+  `the_dispatcher_calls_every_engine_module_for_every_entry_point` scanned `include_str!("lib.rs")`
+  whole while its siblings filtered `//` lines first, and a rustdoc link with parens reads exactly
+  like a call — so a doc comment naming `sqlite::run_script` could stand in for the dispatch arm
+  somebody deleted, in the file that is largely doc comments about which statement lives where. It
+  and `the_entry_point_list_is_what_the_dispatcher_actually_dispatches` share a `dispatcher_code()`
+  helper now.
   **The census also caught a mistake byte-identity could not.** One step moved a *line range*
   rather than an item list and swept three public `impl Db` methods — `commit_writes`,
   `refetch_rows`, `fetch_blob` — into `mysql.rs` with it, where they compiled perfectly, an
@@ -7615,7 +7633,12 @@ existing prose was left alone.
   next to MySQL's own `ident` and belonging to neither. The rule covers the tests as well, which is
   the half that was got wrong: the `assemble_schema_*` tests travelled to `mysql.rs` with one step
   and had to come back, a test for a function two engines share not belonging in one engine's
-  module.
+  module. **The other direction is the one the rule is easiest to lose in**: `err_clone` — which
+  rebuilds a `DbError` for the "connect failed" fan-out, `DbError` not being `Clone` — stayed in
+  `lib.rs` when its only caller moved to `mysql.rs`, and was *widened* to `pub(crate)` so the call
+  would still reach it. Widening to survive an extraction is exactly the shape the rule refuses: it
+  is read by one engine, so it lives beside that engine and is private again, which the compiler
+  then proves is the whole of its audience.
   **`mysql::run_batch` takes two arguments `pg::run_batch` does not** — the `USE` scope and the
   dialect — because `USE` is MySQL's alone, so only that arm can move the batch's current database
   mid-run and only it has to make a later statement's result label follow. That is the concrete
@@ -12110,9 +12133,14 @@ existing prose was left alone.
     below). The captured-`Color` member is `theme::color_arg_gate`, and it holds only the
     *parameter* half of its invariant — see that rule for why the rest is not greppable at all.
     **One of the family fails on a spelling that is *missing* rather than present**, and it reads
-    differently for that reason: `lib.rs`'s `read_only_door_gate` finds every schema-editor door by
-    the stamp it writes (`read_only: ctx.read_only,`) and asserts the refusal appears *above* it in
-    the same `fn`, so what it holds is an ordering rather than an absence. It needs the same two
+    differently for that reason: `lib.rs`'s `read_only_door_gate` finds every editor door by
+    the stamp it writes and asserts the refusal appears *above* it in
+    the same `fn`, so what it holds is an ordering rather than an absence. The stamp is a
+    `SUBJECTS` list of `(stamp, refusal)` pairs — one per subject the flag can be about — rather
+    than the single literal it started as, since that literal made "the door asks the switcher" part
+    of the definition of a door and so **failed** a door written to ask its target; each subject
+    must still have at least one user, so a spelling that stopped matching cannot hide behind the
+    other's count. It needs the same two
     halves regardless — the whole file scanned, and both view crates enumerated — and it carries the
     other pattern this module made possible, an exemption list holding its reason as data
     (`overlays.rs`, whose stamps are `PlanTarget`s) with an assertion that the exemption is still
@@ -12141,14 +12169,21 @@ existing prose was left alone.
     save_db_colors.clone();`, then `(save)(…)`), so a needle naming the `Ui` field would match
     nothing and pass vacuously; the window only has to contain *a* `persist::Saving::`, making the
     check "something was persisted" rather than "this exact name was called". The count is asserted
-    at exactly **5** — four colour sites, one favourite — and that floor is the whole reason it is
+    at exactly **6** — four colour sites, one favourite, one column format — and that floor is the
+    whole reason it is
     not vacuous, since a rename in `schemaic-core` that made every needle stop matching would
-    otherwise report success; one needle pointed at a name that does not exist failed it at 3 ≠ 5,
-    and removing the save from one colour site failed it with `overlays.rs: db_color::upsert( with
-    no save after it`. **`format.json`'s writer in `grid.rs` is deliberately outside it** — that one
-    upserts through `GridState::fmt_rules` rather than a `format::` mutator, and giving the gate a
-    second shape to recognise would weaken the one it has, so that store's rule is unguarded and the
-    gate's doc says so instead of quietly folding it in.
+    otherwise report success; one needle pointed at a name that does not exist failed it at 3 ≠ 5
+    while the number was five, and removing the save from one colour site failed it with
+    `overlays.rs: db_color::upsert( with
+    no save after it`. **`format.json`'s writer in `grid.rs` was exempted from it on a reason that
+    was false of the code.** The doc said that one "upserts through `GridState::fmt_rules` rather
+    than a `format::` mutator", so covering it would need a second shape and weaken the one the gate
+    has; `grid.rs`'s single write is `format::upsert(rules, conn, &db, &table, &col, fmt)` —
+    character for character the shape the other three needles match — with its save three lines
+    later. Only the needle was missing, and while it was, deleting that save left the suite green
+    with `ui_stores.rs` claiming all three of its stores were guarded. `format::upsert(` is a
+    fourth needle now, and the floor went 5 → 6 with it. The lesson outlives the needle: an
+    exemption is a claim about the code, and this one had never been checked against it.
     **`lib.rs`'s `diagram_layout_gate::diagram_layouts_are_loaded_through_the_one_reporting_door` is
     the fifth**, and it is what a rule that could only be *counted* looks like once the code has been
     reshaped to make it greppable. Its subject is under `core/persist.rs`: every lazy `diagrams.json`
@@ -12163,6 +12198,21 @@ existing prose was left alone.
     `production_code` blanks every
     `#[cfg(test)]` **item** — brace-aware, skipping braces inside strings, chars and comments — and
     every `//` line; `crate_sources` enumerates the files to scan.
+    **`let_regions(body, bindings)` is the module's second public function, and it exists because
+    counting was not enough.** `app/history_store.rs` and `app/snippet_store.rs` each hold a `wire()`
+    full of closures with a gate asserting the erase policy — a `remove` saves `Erasing` so the
+    deleted row does not survive in `<file>.json.bak`, an ordinary edit saves `Replacing` — and both
+    gates counted *occurrences* over the whole body. A count holds just as well when two verbs are
+    **swapped**: give `remove` the `Replacing` and `record` the `Erasing` and every total is
+    identical, while a deleted run survives in `history.json.bak` and a deleted snippet's body in
+    `snippets.json.bak`, under a modal saying it cannot be undone. So the caller names the bindings
+    it expects and gets each one's text back in source order, cut at the next binding, and asserts
+    about the closure rather than about the file. A binding is matched as `let <name>` at a line
+    start with the identifier ending there, so `let record` is not `let record_use` and a mention
+    inside another closure's body is not a boundary; and **every name must be found**, the function
+    returning `None` rather than yielding one region for the rest of the function, which is the
+    failure mode a `split_once` has and the way a rename would otherwise make the gate weaker
+    without making it red.
     **The cut is compiled into the library, and it has to be.** A `#[cfg(test)] mod` is invisible to
     a *different* crate's tests, which is how `schemaic-app` came to carry a twelfth private copy
     holding both defects this one exists to remove — so `production_code` and the byte scanners under
@@ -12515,7 +12565,12 @@ existing prose was left alone.
     `table_designer::edit_ctx`'s untracked one: `get_untracked` is the right reading at a click and
     the wrong one as a container key, since a browser keyed on it has to rebuild when the answer
     changes — which is the whole point of the question. Both readings are wanted here, so there are
-    two.
+    two: `target_read_only` for the key and `launch_read_only(conns, conn_id)` for a click. The
+    second is `pub(crate)`, because `account_editor`'s three doors asked `edit_ctx`'s `read_only` —
+    the *switcher's* — while the buttons that launch them were lit from the target's, and the
+    repair for that is this browser's own answer given to the doors rather than a fourth spelling of
+    it next door. Drop was already asking it; see `account_editor.rs`'s entry for what the other
+    three did instead.
     **That third term is load-bearing in a way the function's own doc obscures, so a test pins it.**
     `write_gate` calls `target_read_only` again *inside* the builder, and that function's doc says it
     reads tracked — true of the function, which uses `.with` rather than `.with_untracked`, and not
@@ -13636,24 +13691,44 @@ existing prose was left alone.
     on B for an account that lives on A. `UsersTarget`'s own doc had already stated the rule in the
     imperative ("the browser describes the server it was opened on, even if the switcher has since
     moved", and that its two sibling targets carry one for the same reason), and the module's *third*
-    write action, Drop, was already spelled this way eight lines below. **`read_only` deliberately
-    stays live**: it is the refusal, not the address — a connection marked read-only while the
-    browser is open must stop the write it is about to authorise — and it is also the stamp
-    `read_only_door_gate` finds this file's doors by. `account_editor::anchor_gate` holds both
+    write action, Drop, was already spelled this way eight lines below. **`read_only` was left live
+    on the argument that it is the refusal rather than the address, and that argument was wrong.**
+    The browser's three buttons are lit from the *target's* flag (`users_view::write_gate` →
+    `target_read_only` → `read_only_tracked(conns, target.conn_id)`) and nothing closes the browser
+    when the schema tree switches connection, so opening Users on a writable A and switching the
+    tree to a read-only B left **+ New account**, **Privileges** and **Reset password** lit from A
+    while all three returned having set nothing about B: a lit control that does nothing, with no
+    modal, no message and no dimming, on the three writes the browser offers. The same row gets it
+    right one button along — **Drop** asks `users_view::launch_read_only(conn.connections,
+    plan_conn_id)`, "about the connection the plan is for, which is the one the account lives on" —
+    so that button's answer is now the doors' answer too, through `account_editor::door_read_only`,
+    which is a one-line call into `launch_read_only` rather than a fourth spelling of the question.
+    **Both terms moved, not only the refusal**: the doors also stamped `read_only: ctx.read_only`
+    into the target they open, so refusing on the target while stamping the switcher's flag would
+    have swapped one wrong outcome for another — the connection is read once, bound once, and used
+    for both. `edit_ctx` is gone from all three doors, `read_only` having been the last thing they
+    took from it. `read_only_door_gate` therefore finds this file's doors by a second
+    `(stamp, refusal)` pair, `read_only: door_read_only,` / `if door_read_only {`.
+    `account_editor::anchor_gate` holds both
     halves,
     and it is a **source** gate because the decision is struct literals inside `fn`s that write a
     reactive bundle. When it was written those `fn`s took the whole `Ui` — 36 fields and 91 more
     transitively to build in a test; the doors take `(ConnUi, DdlUi, …)` since this file came off
     `whole_ui_gate`'s list, which is smaller and still a `DdlUi`'s 40 fields inside a Floem scope. What it can see
-    mechanically is the spelling — `ctx.conn_id`/`ctx.dialect` must not appear in this file's
+    mechanically is the spelling — `ctx.conn_id`, `ctx.dialect` and now `ctx.read_only` must not
+    appear in this file's
     production code, `conn_id: from.conn_id,` and `dialect: from.dialect,` must appear once per door,
-    and `edit_ctx` must still be called at all, which is the floor that stops a rename leaving
-    nothing to look for. **That floor was itself keyed on a call *spelling*, and the spelling
-    moved**: it asserted `edit_ctx(ui)` until `edit_ctx` narrowed from `&Ui` to `ConnUi` under
+    and the file must still ask a question in `edit_ctx`'s place, which is the floor that stops a
+    rename leaving nothing to look for. **That floor has moved twice, and both moves are the same
+    hazard.** It asserted `edit_ctx(ui)` until `edit_ctx` narrowed from `&Ui` to `ConnUi` under
     `whole_ui_gate`, at which point the gate failed on a signature change that touched nothing it
-    guards. It asks for `edit_ctx(` now, argument-agnostic — the general hazard being that a source
+    guards, and it was made argument-agnostic (`edit_ctx(`) for that; then the doors stopped calling
+    `edit_ctx` at all, so the floor is
+    `door_read_only(` — the question asked in its place. A source
     gate written against how a call is spelled is coupled to every refactor of the callee, not only
-    to the behaviour it exists to protect. **The door count is a `DOORS` constant, not a literal in
+    to the behaviour it exists to protect. The gate's message used to end "`read_only` is the one
+    field that stays live — it is the refusal, not the address", which read as a distinction and was
+    the hole itself. **The door count is a `DOORS` constant, not a literal in
     each assertion**: it went 2 → 3 when `open_for_reset` landed, both halves of the gate caught the
     new door, and a fourth `open_for_*` raises the number in one place. **That third door was paid for rather than
     added**: another `ui: &Ui` would have raised this file's `whole_ui_gate` budget, and the
@@ -15683,7 +15758,8 @@ existing prose was left alone.
     the nested routine editor closes back to it, because a function just created has to appear in the
     dropdown — so the action cannot be left at the door.
     **`account_editor.rs` came off in the same pass, 6 to zero, and needed no such argument.** Its
-    three doors (`open_for_new`, `open_for_reset`, `open_for_grant`) read `edit_ctx` and write the
+    three doors (`open_for_new`, `open_for_reset`, `open_for_grant`) read the connection registry —
+    `edit_ctx` then, `door_read_only` since — and write the
     draft and nothing else, so each takes `(ConnUi, DdlUi, …)`; `grant_form` took `&Ui` for
     `ui.overlay` alone and takes `OverlayUi` beside the `DdlUi` it already had; and the two overlays
     fall out of those — `account_editor_overlay(DdlUi)` and `grant_editor_overlay(DdlUi, OverlayUi)`.
@@ -17874,6 +17950,17 @@ existing prose was left alone.
     `wire(connections, active_conn)` loads the file and hands back the `HistoryStore` — `entries`,
     `record`, `finish`, `clear`, `remove`, `clear_conn` — with `RecordHistoryFn`, `FinishHistoryFn`
     and `run_id_seed` (and its test) moved across from `main.rs`.
+    **The allocator is two functions, and the second one is a function so that a test can reach
+    it.** `run_id_seed` answers "the highest id on disk"; `allocate(next, n)` hands out the batch's
+    ids from the `Cell` seeded with it, each one past everything issued before. The `+ 1` that makes
+    an allocated id *past* the seed lived inside `record`'s `map`, where nothing could call it, so
+    `a_run_id_is_seeded_past_every_id_on_disk` asserted the seed alone while the word its own name
+    turns on went untested — and both mutations `run_id_seed`'s doc names survived it. Drop the
+    `+ 1` and every run of a session reuses the maximum id already on disk, so the first run to
+    land writes its timing and outcome onto a pre-existing entry: a row in the panel whose duration
+    and row count belong to a query somebody ran last week. `record` now takes the batch's ids up
+    front and zips them, and the test covers what its name says, including that a batch of nothing
+    burns no id its outcome would then look for.
     **`record` and `finish` are deliberately not in `HistoryActions`**: they go to the run paths,
     being how a query run reports itself rather than something the panel offers, so the store hands
     them out separately. **`open_history` deliberately stayed in `app_view`** — it is the history
@@ -17887,7 +17974,13 @@ existing prose was left alone.
     and two replacing saves inside `wire`, and `history.json` named once, as `FILE`. It scans its own
     file through `source_gate::production_code` and carries that family's hazard — a gate in the same
     file as its subject is its own first match — so its needles are assembled from fragments and its
-    counts are exact rather than floors. **The other half of it is in `main.rs`, and the move is what
+    counts are exact rather than floors. **Those totals are a floor now rather than the whole
+    check**, because a total holds just as well when two verbs are *swapped*: give `remove` the
+    `Replacing` and `record` the `Erasing` and every count is identical, while the deleted run
+    survives in `history.json.bak` under a modal saying it cannot be undone. The gate cuts `wire` at
+    its five `let` bindings with `source_gate::let_regions` and asserts per closure that the right
+    verb appears exactly once and the wrong one not at all; the totals stay, since what *they* catch
+    is a closure deleted rather than mis-saved. It was watched failing on exactly that swap. **The other half of it is in `main.rs`, and the move is what
     found it**: `app_tests::deleting_a_connection_erases_every_store_it_was_keyed_into` counts
     erasing saves in the delete closure with a floor of nine, the move took one of them out of that
     file, and it read eight and failed. The repair was not to lower the floor — that is what stops a
@@ -17934,7 +18027,13 @@ existing prose was left alone.
     hazard — a gate in the same file as its subject is its own first match — so its needles are
     assembled from fragments and its counts are **exact rather than floors**, which is not pedantry:
     deleting `rename`'s save failed it at 6 ≠ 7, and what that spells is a writer silently no longer
-    persisting, which a floor would have passed. The other half is in `main.rs`, where
+    persisting, which a floor would have passed. **What a total cannot catch is a *swap*** — give
+    `remove` the `Replacing` and one edit the `Erasing` and every count is unchanged, while a
+    deleted snippet's body survives in `snippets.json.bak` for as long as the library is never
+    edited again — so the twin pairing holds here too: `source_gate::let_regions` cuts `wire` at its
+    nine `let` bindings and each closure is asserted against the one verb it may use, with the
+    totals left standing underneath to catch a closure deleted rather than mis-saved.
+    The other half is in `main.rs`, where
     `deleting_a_connection_erases_every_store_it_was_keyed_into` gained its **second** delegated
     needle (`"(snippet_clear_conn)("` beside `"(history_clear_conn)("`), exactly as its own comment
     instructs. `clear_conn` is the prune that block's prose calls *the twelfth store, and the one
@@ -17955,7 +18054,10 @@ existing prose was left alone.
     and its doc comment says so in terms: the rule those stores actually need is
     `schemaic_ui::persisted_store_gate`, and **if that gate is ever deleted, this one is not a
     substitute for it.** A reader arriving from `history_store.rs` will otherwise assume this module
-    guarantees what those two do.
+    guarantees what those two do. **All three are inside that gate now**, which this entry could not
+    have said before: `format.json`'s writer was exempted from it on a stated reason that turned out
+    to be false of `grid.rs`, so for as long as that stood, deleting the formatter's save left the
+    suite green while this module's prose pointed at a gate covering two of its three stores.
     **The one invariant left on this side is that `db_colors` and `table_colors` are two signals
     over one file**, so writing either half has to write both or the other is lost; `saver`'s closure
     builds the whole `DbColorsFile` on every save, and the struct literal is what makes that
@@ -19500,23 +19602,43 @@ Re-introducing the anti-patterns these guard against is a regression:
   and the first thing that said no was Apply. That is the same defect as the disabled button: the
   refusal arrived a step late, and it arrived after the user had done the work. It was filed three
   times as three findings, one editor at a time, because each door is written where its own modal is
-  and nothing looked at the fifteen together. Each now answers `if ctx.read_only { return; }` before
-  writing any signal — which is also the order that keeps a half-opened modal off the screen — and
-  `ui::read_only_door_gate` holds it. The gate is spelled over the **stamp** (`read_only:
-  ctx.read_only,`) rather than over a list of function names, so a new editor is caught the
+  and nothing looked at the fifteen together. Each now refuses before
+  writing any signal, fifteen of them spelled `if ctx.read_only { return; }` — which is also the
+  order that keeps a half-opened modal off the screen — and
+  `ui::read_only_door_gate` holds it. The gate is spelled over the **stamp** rather than over a
+  list of function names, so a new editor is caught the
   moment it is written instead of when someone remembers to add it; it asserts it still found all
-  fifteen, since a renamed field would otherwise pass it by finding none, and it holds its
+  sixteen, since a renamed field would otherwise pass it by finding none, and it holds its
   one exemption as *data* with the reason attached — `overlays.rs` stamps the flag into two
   `ddl_preview::PlanTarget`s, which capture the context a Drop-container menu fired in so the
   confirmation cannot be answered against a connection the user switched to meanwhile; the refusal
   on that stamp is `preview_container`'s and there is no door there to guard.
-  **`account_editor`'s doors keep `read_only: ctx.read_only,` even though their `conn_id` and
-  `dialect` no longer come from `ctx`** — the flag is the refusal, not the address, and it has to
-  follow a connection marked read-only while the browser is open. `anchor_gate` asserts the same two
-  lines from the other side, counting them against its own `DOORS`, because the fix that moved their
-  address moved the lines this gate finds them by. There are three of them now: `open_for_reset` is
-  the sixteenth door in the crate and arrived with the refusal already written, which is the shape
-  the campaign above exists to make ordinary.
+  **A guard that is present and synchronous is still not the whole rule: its *subject* has to be the
+  connection the action is for.** `account_editor`'s three doors are launched from the Users
+  browser's captured `UsersTarget`, which can be a different connection from the one the schema tree
+  is on — nothing closes the browser when the tree switches — and they asked `edit_ctx`'s live
+  `read_only`, the switcher's. So the buttons stayed lit from the connection the browser is showing
+  while all three refusals answered about the connection the tree had moved to: a lit control that
+  does nothing, with no modal, no message and no dimming. They ask
+  `account_editor::door_read_only` now, which is `users_view::launch_read_only` — the question
+  **Drop**, one button along in the same row, had been asking all along — and the flag they *stamp*
+  moved with the refusal, since refusing on the target while stamping the switcher's value is a
+  different wrong outcome rather than none.
+  **The gate enforced that divergence rather than catching it**, which is the part worth
+  remembering: it recognised a door by the literal `read_only: ctx.read_only,` and demanded `if
+  ctx.read_only {` above it, so a door written to ask its target would have *failed* it. Its subject
+  is a `SUBJECTS` list of `(stamp, refusal)` pairs now — one per subject the flag can be about, with
+  an assertion that each still has at least one user so a spelling that stopped matching cannot hide
+  behind the other's count. Sixteen doors, unchanged: splitting the spelling moved three between
+  subjects and added none. `anchor_gate` asserts the same two lines from the other side, counting
+  them against its own `DOORS`; it was the fix that moved their *address* off `ctx` that moved the
+  lines this gate finds them by, and the one that moved their flag that finished it. There are three
+  of them: `open_for_reset` is the sixteenth door in the crate and arrived with the refusal already
+  written, which is the shape the campaign above exists to make ordinary. **None of this is
+  reachable as a test** — the fault is which connection a signal read resolves against at click
+  time, and there is no view harness in the repository — so the two source gates hold the spelling
+  and the commit carries the hand check: open Users on a writable A, switch the tree to a read-only
+  B, and all three buttons must still open their form.
 - **No floem `Dropdown` — every `<select>` in the app drops the app's own menu.** A control that
   offers a fixed list is built with `settings::in_ring_picker` (or one of its two thin wrappers,
   `focusable_dropdown` and `table_designer::focusable_owned_dropdown`); nothing constructs a
