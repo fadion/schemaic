@@ -5162,8 +5162,39 @@ pub const READ_NOTICE_DELAY: std::time::Duration = std::time::Duration::from_mil
 /// Both terms matter: a read that has finished says nothing however long it
 /// ran, and a read still running says nothing until it has outlasted
 /// [`READ_NOTICE_DELAY`].
+///
+/// The panel reaches this through [`report_read_since`] rather than directly,
+/// and that is deliberate: the call site has a timer, not a duration, and when
+/// it passed the constant here the duration term degenerated to a constant
+/// `true` — leaving three of this function's four tests asserting over values
+/// the composition could never produce. Compute the duration there, from the
+/// period on screen, and pass it in.
 pub fn report_read(reading: bool, for_how_long: std::time::Duration) -> bool {
     reading && for_how_long >= READ_NOTICE_DELAY
+}
+
+/// Should a notice timer armed at the rising edge of one catalogue read still
+/// announce anything by the time it fires?
+///
+/// Nothing cancels the timer when the read it was armed for lands, so the busy
+/// period it finds on screen need not be the one it was armed for: expand one
+/// database, let it land at 150 ms, expand a second at 300 ms, and the first
+/// timer fires at 400 ms over a read that is 100 ms old. `began` is when the
+/// period **currently** on screen started, so this asks that period's own age
+/// rather than how long the timer slept — which is the question
+/// [`report_read`]'s duration argument was written for, and the reason a
+/// superseded timer now returns without writing.
+pub fn report_read_since(
+    reading: bool,
+    began: Option<std::time::Instant>,
+    now: std::time::Instant,
+) -> bool {
+    match began {
+        Some(t) => report_read(reading, now.saturating_duration_since(t)),
+        // Nothing in flight to date the notice from, so there is nothing to
+        // announce however long the timer slept.
+        None => false,
+    }
 }
 
 #[cfg(test)]
@@ -5960,7 +5991,7 @@ mod sqlite_affinity_tests {
 #[cfg(test)]
 mod read_notice_tests {
     use super::*;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     /// The ordinary local refresh, which is what the delay exists to stay out
     /// of: `begin_refresh` measures 48 ms on MySQL and 134 ms on PostgreSQL,
@@ -6007,6 +6038,56 @@ mod read_notice_tests {
                 "a {measured:?} refresh would flicker"
             );
         }
+    }
+
+    /// The sequence the panel actually produces, and the one the three tests
+    /// above could not see because the call site passed the constant: the timer
+    /// armed for a read that has since landed fires over a *different*, younger
+    /// read. Announcing it puts the dots on screen for the 50 ms until the
+    /// second read lands — the flicker `READ_NOTICE_DELAY` exists to prevent,
+    /// arriving through the timer meant to enforce it.
+    #[test]
+    fn a_superseded_timer_does_not_announce_the_read_that_replaced_it() {
+        let now = Instant::now();
+        // Read A rose at t = 0 and landed at t = 150; read B rose at t = 300
+        // and is what the 400 ms timer finds in flight.
+        let b_began = now - Duration::from_millis(100);
+        assert!(!report_read_since(true, Some(b_began), now));
+    }
+
+    /// The case the notice exists for, through the same door: one read, still
+    /// in flight, whose own period has outlasted the delay.
+    #[test]
+    fn a_single_read_past_the_delay_is_still_announced() {
+        let now = Instant::now();
+        for age in [400, 401, 3_000] {
+            let began = now - Duration::from_millis(age);
+            assert!(
+                report_read_since(true, Some(began), now),
+                "a {age} ms read was not announced"
+            );
+        }
+    }
+
+    /// Both of the other terms, at the composition rather than in isolation: a
+    /// period that has ended says nothing however old it is, and a timer that
+    /// finds no period at all has nothing to date from.
+    #[test]
+    fn a_timer_with_nothing_in_flight_announces_nothing() {
+        let now = Instant::now();
+        let old = now - Duration::from_secs(30);
+        assert!(!report_read_since(false, Some(old), now));
+        assert!(!report_read_since(true, None, now));
+        assert!(!report_read_since(false, None, now));
+    }
+
+    /// `now` is read after `began` is stamped, but a clock that hands back the
+    /// same instant twice must not be a panic — `Instant` subtraction is the
+    /// one arithmetic here that can.
+    #[test]
+    fn a_period_that_began_this_instant_is_not_announced() {
+        let now = Instant::now();
+        assert!(!report_read_since(true, Some(now), now));
     }
 }
 

@@ -1598,26 +1598,40 @@ pub(crate) fn schema_panel(ui: Ui) -> impl IntoView {
     // a local refresh lands in 48–134 ms and every applied DDL causes one, so
     // an instant indicator would strobe after every schema edit.
     let reading = RwSignal::new(false);
+    // When the busy period **currently** on screen began. Nothing cancels a
+    // timer when the read it was armed for lands, so a timer can fire over a
+    // later, younger read; `report_read_since` dates the notice from this
+    // rather than from how long the timer slept.
+    let began = RwSignal::new(None::<std::time::Instant>);
     create_effect(move |was: Option<bool>| {
         let busy = db_nodes.with(|ns| ns.iter().any(|n| n.refreshing.get()));
         if !busy {
             reading.set(false);
+            began.set(None);
         } else if was != Some(true) {
-            // The rising edge only. A second database starting while the first
-            // is still out must not queue a second timer for the same notice.
+            // The rising edge only, for both: a second database starting while
+            // the first is still out must not queue a second timer, and must
+            // not restamp the period the first one is being timed against.
+            began.set(Some(std::time::Instant::now()));
             exec_after(schemaic_core::schema::READ_NOTICE_DELAY, move |_| {
                 let still = db_nodes.with_untracked(|ns| {
                     ns.iter()
                         .any(|n| n.refreshing.try_get_untracked().unwrap_or(false))
                 });
-                // `try_update`: switching connections disposes the scope this
-                // timer was armed in, and the read it is reporting with it.
-                let _ = reading.try_update(|v| {
-                    *v = schemaic_core::schema::report_read(
-                        still,
-                        schemaic_core::schema::READ_NOTICE_DELAY,
-                    )
-                });
+                let next = schemaic_core::schema::report_read_since(
+                    still,
+                    began.try_get_untracked().flatten(),
+                    std::time::Instant::now(),
+                );
+                // Read before writing: a floem signal never dedups, so a second
+                // timer landing on the same `true` would tear the title down
+                // and restart `loading_dots` from plain `SCHEMA` mid-animation.
+                //
+                // `try_*`: switching connections disposes the scope this timer
+                // was armed in, and the read it is reporting with it.
+                if reading.try_get_untracked() != Some(next) {
+                    let _ = reading.try_update(|v| *v = next);
+                }
             });
         }
         busy
