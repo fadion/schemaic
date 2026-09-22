@@ -8844,10 +8844,22 @@ existing prose was left alone.
   single-table read that no parse of the statement can see into
   (`a_view_over_a_set_operation_stays_unattributed`). That check covers **every** relation the
   statement reads rather than a single source, so a view anywhere in a join refuses the whole result
-  (`a_view_anywhere_in_a_join_refuses_the_whole_result`). The third refusal is **gone**: an
-  **`ATTACH`ed database** is attributed like any other now, and the limit was never provenance's —
-  provenance named the database per column all along, and what could not answer was this crate,
-  whose schema lookups addressed `main`. Ten of them take a `db: &str` and pass it down —
+  (`a_view_anywhere_in_a_join_refuses_the_whole_result`). The third refusal — an **`ATTACH`ed or
+  `temp` relation** — was briefly gone and is **back, deliberately**, which this paragraph did not
+  say for a week: `b48cab80` lifted it on the ground that provenance named the database per column
+  all along and only this crate's schema lookups could not follow, and then `b4637c58` put it back
+  as one of three Critical fixes, because attribution is an offer to *write* and the write runs on
+  a **different connection** — `commit_writes` opens a fresh one, on which no `ATTACH` has run and
+  no `temp` table exists. `attach_origins`' own doc states it ("that database must be `main`,
+  because the write connection has nothing else. An `ATTACH`ed or `temp` relation reads fine and
+  comes back read-only") and `nothing_outside_main_is_attributed` pins it. A doc claiming a write
+  is offered where the code refuses it is the damaging direction, so read the refusal as current
+  and the per-database work below as what makes the *resolution* honest rather than as what makes
+  an attached table editable.
+
+  The per-database plumbing is real and is still needed, because `resolve_relation` has to name the
+  database a relation is in before anything can decide whether it is `main`. Ten lookups take a
+  `db: &str` and pass it down —
   `table_columns`, `has_rowid`, `table_declares_autoincrement`, `collations_of`, `generated_expr`,
   `index_sql`, `index_columns`, `table_indexes`, `single_column_unique_indexes` and
   `resolve_relation`. The pragma table-valued functions take the schema as a second bound argument
@@ -8880,8 +8892,9 @@ existing prose was left alone.
   view or isn't found, keys its per-table pragma cache on the pair, and attributes a column only to
   a pair in that list — matched on the database as well as the name. `ColumnOrigin::database`
   carries the real database instead of the constant `MAIN`, which is what `edit::analyze_edit`
-  already groups on, so two attached files each holding a `note` are two editable tables rather
-  than one.
+  already groups on, so two files each holding a `note` are two *distinct* tables rather than one —
+  and then only `main`'s is attributed, per the refusal above. Distinguishing them is what stops a
+  write meant for one landing on the other; it is not a licence to write to both.
   **The fixture is the guard, and this passage used to name four tests of which three have never
   existed.** It also quoted a mutation result — forcing `attach_origins`' schema reads back to
   `MAIN` fails "the second of those and nothing else" — against a test that is not there, so the
