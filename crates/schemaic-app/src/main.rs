@@ -1649,6 +1649,40 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             );
         }
     });
+    /// The file, written once so the saver below and the effect above cannot
+    /// drift onto two names.
+    const SEARCH_HISTORY_FILE: &str = "search_history.json";
+    // **And an explicit saver, for the one caller that is a *deletion*.**
+    //
+    // The effect above is right for an ordinary activation: Find-Anywhere adds
+    // a row, the previous generation becomes `.bak`, and that is the recovery
+    // this store wants. It is wrong for connection deletion, and that is the
+    // one save in `delete_conn_now` that was not in the block — so the prune
+    // there notified this effect, which saved `Replacing`, which copied the
+    // **pre-prune** file whole to `search_history.json.bak`. The deleted
+    // connection's object names — table names, column names, the text that was
+    // searched — stayed on disk, in the directory the Settings modal invites
+    // the user to open, under a confirm reading "It can't be undone", until
+    // some later activation happened to rewrite the store. The block's own
+    // comment says "every save below is erasing"; this was the thirteenth
+    // store and the exception.
+    //
+    // Ordering is safe either way floem schedules the effect. If the effect
+    // runs inside `update`, it writes a `.bak` holding the pre-prune file and
+    // this erasing save then removes it; if it runs after, it copies the
+    // already-pruned primary. Neither leaves the deleted connection anywhere —
+    // what matters is only that this is called *after* the prune.
+    let save_search_history: Rc<dyn Fn(persist::Saving)> = Rc::new(move |saving| {
+        let file = schemaic_core::search_history::SearchHistoryFile {
+            entries: search_history.get_untracked(),
+        };
+        match saving {
+            persist::Saving::Erasing => {
+                persist::save_json_erasing(SEARCH_HISTORY_FILE, &file);
+            }
+            persist::Saving::Replacing => persist::save_json(SEARCH_HISTORY_FILE, &file),
+        }
+    });
 
     // Formatters, identity colours and favourites: the three stores the **UI**
     // owns and this side only loads and persists. `ui_stores`' doc carries why
@@ -9729,6 +9763,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
         let open_tab_on = open_tab_on.clone();
         let save_db_colors = save_db_colors.clone();
         let save_db_favorites = save_db_favorites.clone();
+        let save_search_history = save_search_history.clone();
         let save_formats = save_formats.clone();
         let save_ui = save_ui.clone();
         let reset_activity = reset_activity.clone();
@@ -9976,9 +10011,17 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             // whose save takes a `Saving`; the five that were wrong were the
             // five written by a shared `Fn()` closure with nowhere to say it.
             // They take one now.
+            //
+            // **And there were thirteen, not twelve.** `search_history` was
+            // pruned here and saved *nowhere here* — its persistence was an
+            // effect at the top of this function calling `persist::save_json`,
+            // which is `Replacing` — so the sentence above was false of one
+            // store and the census gate below could not see it either: there
+            // was no save in this region to count or to ban. It has an explicit
+            // saver now, like the others, and the count is ten.
             (history_clear_conn)(id);
-            // Persisted by an effect on change.
             search_history.update(|v| schemaic_core::search_history::clear_conn(v, id));
+            (save_search_history)(persist::Saving::Erasing);
             db_colors.update(|v| schemaic_core::db_color::clear_conn(v, id));
             table_colors.update(|v| schemaic_core::db_color::table_clear_conn(v, id));
             // One save, both stores — see where `save_db_colors` is built.
@@ -12683,8 +12726,18 @@ mod app_tests {
                 .iter()
                 .map(|needle| region.matches(needle).count())
                 .sum::<usize>();
+        // **Ten, and the tenth is the one this gate could not see at all.**
+        // `search_history` was pruned in this closure and saved nowhere in it —
+        // its persistence was an effect ~8,300 lines away calling
+        // `persist::save_json`, i.e. `Replacing` — so it was neither counted
+        // here nor caught by the `Replacing` ban above, and the closure's own
+        // comment that "every save below is erasing" was false of the
+        // thirteenth store. A `Replacing` save there copies the *pre-prune*
+        // file whole to `search_history.json.bak`, leaving the deleted
+        // connection's table names, column names and searched text on disk
+        // under a confirm saying it cannot be undone.
         assert!(
-            erasing >= 9,
+            erasing >= 10,
             "only {erasing} erasing saves in the delete closure; every store keyed \
              to the connection has to be one"
         );
