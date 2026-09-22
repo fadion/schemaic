@@ -778,12 +778,18 @@ pub async fn a_password_with_a_backslash_is_stored_as_it_was_typed(target: &'sta
 
     // Make every new connection — including the one the plan opens — parse
     // literals the old way. Per *role*, so it is inherited at connect time.
-    let guc = |on: bool| {
-        format!(
-            "ALTER ROLE {} SET standard_conforming_strings = {}",
-            schemaic_core::export::ident_sql(&target.user(), SqlDialect::Postgres),
-            if on { "on" } else { "off" }
-        )
+    // **`RESET`, not `SET … = on`, to put it back.** Setting it explicitly
+    // would leave a `pg_db_role_setting` row on a server that had none — the
+    // same value, and still a change this test made to somebody's cluster that
+    // outlives it. The tier's rule is that it touches nothing it did not
+    // create.
+    let guc = |off: bool| {
+        let who = schemaic_core::export::ident_sql(&target.user(), SqlDialect::Postgres);
+        if off {
+            format!("ALTER ROLE {who} SET standard_conforming_strings = off")
+        } else {
+            format!("ALTER ROLE {who} RESET standard_conforming_strings")
+        }
     };
     // **Everything that needs the GUC off happens between these two lines, and
     // nothing asserts inside them.** A panic with the role still set would
@@ -791,7 +797,7 @@ pub async fn a_password_with_a_backslash_is_stored_as_it_was_typed(target: &'sta
     // setting is cluster-wide and outlives the scratch database that made it.
     // So the two observations are captured, the role is put back, and the
     // assertions come after.
-    scratch.exec(&guc(false)).await;
+    scratch.exec(&guc(true)).await;
 
     let inherited = scratch
         .exec("SELECT current_setting('standard_conforming_strings')")
@@ -806,7 +812,7 @@ pub async fn a_password_with_a_backslash_is_stored_as_it_was_typed(target: &'sta
         })))
         .await;
 
-    scratch.exec(&guc(true)).await;
+    scratch.exec(&guc(false)).await;
 
     // **The pin, asserted directly**: the role says `off` and this app's own
     // connection says `on`, because the startup packet said so first.
