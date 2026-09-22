@@ -5698,27 +5698,37 @@ mod cmdk_preview_gate {
         // The shared walk, not a cut at the first `#[cfg(test)]` — which is
         // positional and not comment-aware. See `source_gate::production_code`.
         let body = crate::source_gate::production_code(&src);
-        let lines: Vec<&str> = body.lines().collect();
         let mut checked = 0;
-        for (i, l) in lines.iter().enumerate() {
-            // Passing the signal on (`inline_band_runs(&ed, cmdk.preview)`) is
-            // not a read; only `.get()`/`.with()` here subscribe.
-            if !l.contains("cmdk.preview.get()") && !l.contains("cmdk.preview.with(") {
+        // **On the signal, not on one accessor.** Selecting `.get()`/`.with()`
+        // meant the read that *does not* subscribe — `get_untracked()`, which
+        // is the other spelling of the very bug this was written for — matched
+        // no needle, was skipped, and left the gate to fail on its own stale
+        // count with a message that reads as a maintenance nudge. Passing the
+        // signal on (`inline_band_runs(&ed, cmdk.preview)`) is still not a
+        // read: there is no accessor after the dot.
+        const SIGNAL: &str = "cmdk.preview.";
+        for (at, _) in body.match_indices(SIGNAL) {
+            let rest = &body[at + SIGNAL.len()..];
+            if !["get()", "with(", "get_untracked()", "with_untracked("]
+                .iter()
+                .any(|a| rest.starts_with(a))
+            {
                 continue;
             }
             checked += 1;
-            // Three lines back, which reaches the `label(move ||` / `.style(move
-            // |s|` / key closure a rustfmt-broken call puts the read under, and
-            // does not reach the `let discard_b` / `let accept_b` bindings the
-            // frozen version sat below.
-            let window = lines[i.saturating_sub(3)..=i].join("\n");
+            let line = body[..at].matches('\n').count() + 1;
             assert!(
-                window.contains("move |"),
-                "the `cmdk.preview` read at line {} is not inside a closure, so \
-                 it subscribes to nothing: the verdict container's key reads \
+                !rest.starts_with("get_untracked()") && !rest.starts_with("with_untracked("),
+                "the `cmdk.preview` read at line {line} is untracked, so it \
+                 subscribes to nothing however well placed it is — which is the \
+                 frozen summary this gate exists for, one spelling along"
+            );
+            assert!(
+                crate::source_gate::inside_a_closure(&body, at),
+                "the `cmdk.preview` read at line {line} is not inside a closure, \
+                 so it subscribes to nothing: the verdict container's key reads \
                  only `cmdk.open` and whether `inline_ai` is `Ready`, and the \
-                 builder is not a tracking scope in floem 0.2",
-                i + 1
+                 builder is not a tracking scope in floem 0.2"
             );
         }
         assert_eq!(checked, 1, "this gate is stale — it found {checked}");

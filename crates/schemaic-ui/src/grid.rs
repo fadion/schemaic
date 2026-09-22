@@ -11448,21 +11448,23 @@ mod header_sort_tests {
         // The shared walk, not a cut at the first `#[cfg(test)]` — which is
         // positional and not comment-aware. See `source_gate::production_code`.
         let body = crate::source_gate::production_code(&src);
-        let lines: Vec<&str> = body.lines().collect();
         let mut checked = 0;
-        for (i, l) in lines.iter().enumerate() {
-            if !l.contains("server_sort_dir(") || l.contains("fn server_sort_dir") {
+        // Containment rather than a three-line window — see
+        // `source_gate::inside_a_closure`. There is no `_untracked` escape on
+        // this one: `server_sort_dir` is a `GridState` method, not a signal
+        // accessor. The shape is otherwise the sibling gate's, copied.
+        for (at, _) in body.match_indices("server_sort_dir(") {
+            if body[..at].ends_with("fn ") {
                 continue;
             }
             checked += 1;
-            let window = lines[i.saturating_sub(3)..=i].join("\n");
+            let line = body[..at].matches('\n').count() + 1;
             assert!(
-                window.contains("move |"),
-                "the `server_sort_dir` call at line {} is not inside a closure, \
-                 so it subscribes to nothing: `header_cell` runs in a \
+                crate::source_gate::inside_a_closure(&body, at),
+                "the `server_sort_dir` call at line {line} is not inside a \
+                 closure, so it subscribes to nothing: `header_cell` runs in a \
                  `dyn_container` builder, which floem 0.2 does not track, and \
-                 neither container's key reads `grid_query`",
-                i + 1
+                 neither container's key reads `grid_query`"
             );
         }
         assert_eq!(checked, 1, "this gate is stale — it found {checked}");

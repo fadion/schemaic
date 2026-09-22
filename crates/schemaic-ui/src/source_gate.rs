@@ -151,6 +151,62 @@ pub fn let_regions<'a>(body: &'a str, bindings: &[&str]) -> Option<Vec<(String, 
     Some(out)
 }
 
+/// Is the byte at `at` **inside** a `move |…|` closure body?
+///
+/// **Containment, not proximity.** The two "this read sits in a tracking scope"
+/// gates asked whether `move |` appeared anywhere in the three lines up to the
+/// read — and the single commonest three-line neighbour in either file is an
+/// unrelated `.style(move |s| …)`, which satisfies that check without the read
+/// being inside anything. The window was a heuristic standing in for the
+/// question; both gates' messages stated the question.
+///
+/// So: find the nearest `move |` above, step past its parameter list, and walk
+/// the brackets forward. A closure that has already closed takes the depth
+/// below zero before `at` is reached, which is the answer. A closure whose body
+/// is a bare expression ending at a `,` rather than a bracket is not detected as
+/// closed — narrower than the truth in that one direction, and still strictly
+/// stronger than counting lines.
+///
+/// Callers pass [`production_code`], so comments are already gone; a bracket
+/// inside a string literal would still be counted, and none of the regions
+/// these gates read holds one.
+///
+/// Test-only, like the corpus walkers below and unlike [`production_code`]:
+/// both callers are gates in this crate, so nothing outside `cargo test` needs
+/// it and an unconditional one is a dead-code warning under CI's `-D warnings`.
+#[cfg(test)]
+pub(crate) fn inside_a_closure(code: &str, at: usize) -> bool {
+    const OPEN: &str = "move |";
+    let Some(open) = code[..at].rfind(OPEN) else {
+        return false;
+    };
+    // Past the parameter list's closing `|`, so a `|` in the params is not
+    // mistaken for the body's first byte.
+    let after_params = open + OPEN.len();
+    let Some(body_at) = code[after_params..at]
+        .find('|')
+        .map(|i| after_params + i + 1)
+    else {
+        return false;
+    };
+    let mut depth = 0i32;
+    for c in code[body_at..at].bytes() {
+        match c {
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => {
+                depth -= 1;
+                if depth < 0 {
+                    // The closure closed before `at`; whatever encloses the
+                    // read, it is not that one.
+                    return false;
+                }
+            }
+            _ => {}
+        }
+    }
+    true
+}
+
 /// The offset of the next `#[cfg(test)]` reached **as code**, from `from`.
 ///
 /// **The one scan in this module that was not comment-aware, and it was the one
