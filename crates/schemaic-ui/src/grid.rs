@@ -9266,9 +9266,6 @@ fn format_submenu(gs: GridState, ci: usize) -> Vec<MenuEntry> {
         .collect()
 }
 
-/// Clickable, two-line header cell (name + SQL type). Sorts on click, shows a
-/// chevron for the active sort, a key icon for PK/index/FK columns, a selected-
-/// column background, and carries a right-edge resize divider.
 /// Whether display column `ci`'s header draws a chevron, and which way it
 /// points: `(sorted, ascending)`.
 ///
@@ -9287,6 +9284,9 @@ fn header_sort_indicator(server_dir: Option<bool>, client: SortState, ci: usize)
     (sorted, asc)
 }
 
+/// Clickable, two-line header cell (name + SQL type). Sorts on click, shows a
+/// chevron for the active sort, a key icon for PK/index/FK columns, a selected-
+/// column background, and carries a right-edge resize divider.
 fn header_cell(
     gs: GridState,
     ci: usize,

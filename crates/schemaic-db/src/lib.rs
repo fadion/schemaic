@@ -981,31 +981,6 @@ impl Db {
         }
     }
 
-    /// Validate `sql` against the server **without executing it**: prepare it via
-    /// the binary protocol (`PREPARE`), then deallocate. The server checks syntax,
-    /// object names, and types but runs nothing — safe even for `UPDATE`/`DELETE`.
-    /// Returns the server's error text on failure, `Ok(())` on a clean prepare.
-    ///
-    /// Statements the prepared-statement protocol doesn't support (server error
-    /// 1295 — e.g. some `SHOW`/admin forms) can't be validated this way, so they're
-    /// treated as `Ok` rather than surfacing a spurious error. A trailing `;` is
-    /// trimmed (the protocol prepares a single statement).
-    /// A MySQL view's `ALGORITHM`, which lives nowhere a bulk query can reach it.
-    ///
-    /// MariaDB reports it in `information_schema.VIEWS` and the schema fetch
-    /// already carries it. **MySQL 8 has the column nowhere but `SHOW CREATE
-    /// VIEW`**, one statement per view — too many round-trips to fold into a
-    /// schema fetch, so this is called lazily, for the single view about to be
-    /// edited.
-    ///
-    /// It matters because `CREATE OR REPLACE VIEW` replaces the whole view: a
-    /// `MERGE` view redefined without the clause comes back `UNDEFINED`, letting
-    /// the server pick a materialization the author had ruled out. The same class
-    /// of silent loss as the `SQL SECURITY` bug, which is why it isn't left to
-    /// the default.
-    ///
-    /// `Ok(None)` means the server didn't state one (`UNDEFINED`), which is also
-    /// what PostgreSQL — with no such concept — returns without asking.
     /// Every trigger function in `database` — PostgreSQL only, and re-read on
     /// its own when the trigger or routine editor asks.
     ///
@@ -1138,6 +1113,22 @@ impl Db {
         mysql::trigger_source(self, database, trigger).await
     }
 
+    /// A MySQL view's `ALGORITHM`, which lives nowhere a bulk query can reach it.
+    ///
+    /// MariaDB reports it in `information_schema.VIEWS` and the schema fetch
+    /// already carries it. **MySQL 8 has the column nowhere but `SHOW CREATE
+    /// VIEW`**, one statement per view — too many round-trips to fold into a
+    /// schema fetch, so this is called lazily, for the single view about to be
+    /// edited.
+    ///
+    /// It matters because `CREATE OR REPLACE VIEW` replaces the whole view: a
+    /// `MERGE` view redefined without the clause comes back `UNDEFINED`, letting
+    /// the server pick a materialization the author had ruled out. The same class
+    /// of silent loss as the `SQL SECURITY` bug, which is why it isn't left to
+    /// the default.
+    ///
+    /// `Ok(None)` means the server didn't state one (`UNDEFINED`), which is also
+    /// what PostgreSQL — with no such concept — returns without asking.
     pub async fn view_algorithm(
         &self,
         database: Option<&str>,
@@ -1151,6 +1142,15 @@ impl Db {
         mysql::view_algorithm(self, database, view).await
     }
 
+    /// Validate `sql` against the server **without executing it**: prepare it via
+    /// the binary protocol (`PREPARE`), then deallocate. The server checks syntax,
+    /// object names, and types but runs nothing — safe even for `UPDATE`/`DELETE`.
+    /// Returns the server's error text on failure, `Ok(())` on a clean prepare.
+    ///
+    /// Statements the prepared-statement protocol doesn't support (server error
+    /// 1295 — e.g. some `SHOW`/admin forms) can't be validated this way, so they're
+    /// treated as `Ok` rather than surfacing a spurious error. A trailing `;` is
+    /// trimmed (the protocol prepares a single statement).
     pub async fn prepare_check(&self, database: Option<&str>, sql: &str) -> Result<(), DbError> {
         let stmt = sql.trim().trim_end_matches(';').trim_end();
         if stmt.is_empty() {
@@ -1244,15 +1244,6 @@ impl Db {
                 .await;
             }
         }
-    }
-}
-
-/// `DbError` isn't `Clone`; this reproduces one for the "connect failed" fan-out.
-pub(crate) fn err_clone(e: &DbError) -> DbError {
-    match e {
-        DbError::Connect(s) => DbError::Connect(s.clone()),
-        DbError::Query(s) => DbError::Query(s.clone()),
-        DbError::Cancelled => DbError::Cancelled,
     }
 }
 

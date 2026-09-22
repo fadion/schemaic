@@ -61,8 +61,8 @@ use mysql_async::Params;
 
 use crate::{
     ColRow, Db, DbError, DdlError, EXPLAIN_ROW_CAP, FkColRow, IdxRow, ImportTarget, NumKind,
-    RowDest, RowSource, TxScope, assemble_schema, err_clone, lock_wait_sql,
-    next_batch_off_executor, num_kind, order_by_clause, parse_as, parse_typed, pg,
+    RowDest, RowSource, TxScope, assemble_schema, lock_wait_sql, next_batch_off_executor, num_kind,
+    order_by_clause, parse_as, parse_typed, pg,
 };
 
 /// The binary collation id (`binary`) — a column with this charset holds raw
@@ -5056,6 +5056,22 @@ pub(crate) async fn fetch_query(
 
     let _ = conn.disconnect().await;
     outcome
+}
+
+/// `DbError` isn't `Clone`; this reproduces one for the "connect failed"
+/// fan-out below.
+///
+/// **Here rather than in the dispatcher**, where it sat until its only caller
+/// moved: `lib.rs`'s own rule is that what stays there is what more than one
+/// engine reads, and this is read by one. It was widened to `pub(crate)` to
+/// survive the extraction instead, which is the shape that rule exists to
+/// refuse. Private again, and the compiler proves that is complete.
+fn err_clone(e: &DbError) -> DbError {
+    match e {
+        DbError::Connect(s) => DbError::Connect(s.clone()),
+        DbError::Query(s) => DbError::Query(s.clone()),
+        DbError::Cancelled => DbError::Cancelled,
+    }
 }
 
 /// Run `stmts` in order on **one** connection, reporting each result as it lands.

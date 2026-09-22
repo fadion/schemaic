@@ -308,16 +308,26 @@ pub async fn a_renamed_trigger_still_fires(target: &'static Target) {
         target.name
     );
 
-    // And the renamed trigger survives a trip back through the emitter — the
-    // case where the draft's `original` and its `name` differ, which the
-    // identity test's fresh fixture never has.
+    // And the trigger the rename produced survives a trip back through the
+    // emitter.
+    //
+    // **What this does *not* cover, said here because the comment used to claim
+    // it did**: "the case where the draft's `original` and its `name` differ".
+    // `assert_writes_back_unchanged` builds its draft with
+    // `TriggerSetDraft::from_table`, where `original == name` always — the
+    // rename has already landed and the server reports the new name — so this
+    // call is a strictly weaker duplicate of the identity test's, over a
+    // differently-named trigger. Non-vacuous, and worth keeping for that; just
+    // not about the rename.
+    //
+    // The `original != name` case is covered by the `apply` above, which is the
+    // rename itself: `diff_triggers` sees a draft whose `original` names the old
+    // trigger and emits the drop for that name and the create for the new one.
     assert_writes_back_unchanged(&scratch, target, "the rename").await;
 
     scratch.teardown().await;
 }
 
-/// The base table, and — on a server whose triggers call one — the function they
-/// call.
 /// **Two triggers in one `(table, timing, event)` group, which no *live* leg
 /// had** — every fixture here varies the event, so `order` came back `None` on
 /// all three servers and the fault below was invisible to a green suite.
@@ -522,6 +532,8 @@ pub async fn a_body_that_opens_like_an_ordering_clause_survives_the_round_trip(
     scratch.teardown().await;
 }
 
+/// The base table, and — on a server whose triggers call one — the function they
+/// call.
 async fn seed(scratch: &Scratch, target: &Target) {
     scratch
         .exec(&format!(

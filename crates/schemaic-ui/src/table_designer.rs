@@ -2199,8 +2199,6 @@ fn unique_name(taken: &[String], base: &str) -> String {
         .unwrap_or_else(|| base.to_string())
 }
 
-/// The type a new column starts as — a sane, obviously-editable default per
-/// engine rather than an empty field that fails validation on sight.
 /// Keep the selection on a real row after a removal.
 ///
 /// Takes the `ddl` bundle rather than `&Ui`, which is `whole_ui_gate`'s rule —
