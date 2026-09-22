@@ -314,8 +314,22 @@ pub fn fk_guard_sql(dialect: SqlDialect) -> Option<(&'static str, &'static str)>
 /// user may go on using — `Db::run_script` holds one connection for the whole
 /// file, and the psql/mysql client a user replays it in holds one for the
 /// evening.
+/// **The `@SCHEMAIC_OLD_SQL_MODE` wrapper is MySQL's syntax**, so this leans on
+/// [`crate::export::literal_mode_sql`] answering for MySQL alone. If a second
+/// dialect ever needs a statement there, this has to grow an arm rather than
+/// wrap that dialect's statement in these two.
+///
+/// Whether a PostgreSQL dump should pin `standard_conforming_strings` the way
+/// `pg_dump` does is a separate question and an open one — the *live* path has
+/// no need of it, because `pg::connect_probe` pins the GUC on the startup
+/// packet, but a `.sql` file is replayed in somebody else's client.
 pub fn literal_mode_guard_sql(dialect: SqlDialect) -> Option<(String, &'static str)> {
     let set = crate::export::literal_mode_sql(dialect)?;
+    debug_assert_eq!(
+        dialect,
+        SqlDialect::MySql,
+        "the guard below is MySQL's session-variable syntax"
+    );
     Some((
         format!("SET @SCHEMAIC_OLD_SQL_MODE = @@SESSION.sql_mode;\n{set};"),
         "SET SESSION sql_mode = @SCHEMAIC_OLD_SQL_MODE;",

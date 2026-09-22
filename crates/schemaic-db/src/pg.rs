@@ -713,6 +713,21 @@ pub(crate) async fn run_ddl(
     let _ = client
         .batch_execute(&crate::lock_wait_sql(crate::Engine::Postgres))
         .await;
+    // **No literal-mode statement here, and it is not the gap it looks like.**
+    // MySQL's `run_ddl` issues `MYSQL_LITERAL_MODE_SQL` at this point because a
+    // session can carry `NO_BACKSLASH_ESCAPES`. The PostgreSQL counterpart
+    // would be `SET standard_conforming_strings = on` — and `connect_probe`
+    // has already sent `-c standard_conforming_strings=on` on the **startup
+    // packet**, in force before the first statement and not undoable by
+    // anything the app runs. Every literal in `stmts` was written by
+    // `export::sql_literal` for exactly that meaning.
+    //
+    // A `SET` here would be a second mechanism for one guarantee, and the
+    // weaker of the two: it leaves the window between connect and the `SET`,
+    // which a startup option does not have. `a_password_with_a_backslash_is_
+    // stored_as_it_was_typed` in the live tier is what holds the pin — it sets
+    // the GUC *off* on the role and checks that this connection still parses
+    // as `on`.
     for (i, sql) in stmts.iter().enumerate() {
         let step = tokio::select! {
             r = client.batch_execute(sql) => r.map_err(|e| db_text(&e)),

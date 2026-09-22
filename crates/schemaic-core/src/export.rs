@@ -862,13 +862,34 @@ pub fn ident_sql(name: &str, dialect: SqlDialect) -> String {
 pub const MYSQL_LITERAL_MODE_SQL: &str = "SET SESSION sql_mode = TRIM(BOTH ',' FROM REPLACE(\
      CONCAT(',', @@SESSION.sql_mode, ','), ',NO_BACKSLASH_ESCAPES,', ','))";
 
-/// [`MYSQL_LITERAL_MODE_SQL`] where the dialect needs it, `None` where its
-/// literals already mean one thing.
+/// [`MYSQL_LITERAL_MODE_SQL`] where the dialect needs a *statement* to settle
+/// what its literals mean, `None` where nothing here has to send one.
 ///
-/// PostgreSQL has written standard literals since `standard_conforming_strings`
-/// became the 9.1 default, and announces the other setting with a `WARNING` at
-/// every occurrence rather than silently; SQLite has no backslash escape at all,
-/// which is why [`sql_literal`]'s arm splits the way it does.
+/// **PostgreSQL is `None` for a stronger reason than the one this doc used to
+/// give, and the old reason was wrong.** It said PostgreSQL "announces the
+/// other setting with a `WARNING` at every occurrence rather than silently" —
+/// true of the server and false of this app: `tokio_postgres` delivers
+/// `NoticeResponse` only on the connection's `AsyncMessage` stream, and
+/// `AsyncMessage`, `poll_message` and `Notice` appear nowhere in
+/// `schemaic-db`. The announcement is discarded before anything can show it,
+/// and a `WARNING` is not an error. Had the app depended on that argument, a
+/// cluster with `standard_conforming_strings = off` would have stored a
+/// password with a backslash in it as a *different* password than the preview
+/// showed, silently — measured on PG 16.15, where the typed value is then
+/// refused and the mangled one accepted.
+///
+/// It does not depend on it. `pg::connect_probe` sends
+/// `-c standard_conforming_strings=on` on the **startup packet**, so every
+/// connection this app opens parses literals the way [`sql_literal`] wrote them
+/// — in force before the first statement, and not undoable by anything the app
+/// runs. That is strictly better than a `SET` after connecting, which would
+/// leave the window in between, and it is why there is no statement to return
+/// here. The live tier's `a_password_with_a_backslash_is_stored_as_it_was_typed`
+/// sets the GUC *off* on the role and checks that a plan's connection still
+/// parses as `on`, so the pin cannot be removed quietly.
+///
+/// SQLite is `None` for a third reason rather than either of those: it has no
+/// backslash escape at all, and no setting that would give it one.
 pub fn literal_mode_sql(dialect: SqlDialect) -> Option<&'static str> {
     match dialect {
         SqlDialect::MySql => Some(MYSQL_LITERAL_MODE_SQL),
@@ -3213,6 +3234,43 @@ mod tests {
         assert_eq!(
             sql_literal(&Value::Str("O'Hara".to_string()), Sqlite),
             "'O''Hara'"
+        );
+    }
+
+    /// **`None` is a claim about the connection, not about the engine**, and
+    /// this pins the claim rather than the value.
+    ///
+    /// `sql_literal` escapes only `'` for `Postgres | Sqlite`, which is right
+    /// **only** under `standard_conforming_strings = on`. PostgreSQL returns no
+    /// statement here — correctly — because `pg::connect_probe` pins that GUC on
+    /// the startup packet. The reason matters more than the answer: if the pin
+    /// ever goes, this arm has to start returning one, and `None` alone would
+    /// not say so. The live tier holds the other half, by turning the GUC off
+    /// on the role and watching a connection parse as `on` anyway.
+    #[test]
+    fn only_mysql_needs_a_statement_to_settle_what_a_literal_means() {
+        assert_eq!(literal_mode_sql(MySql), Some(MYSQL_LITERAL_MODE_SQL));
+        assert_eq!(literal_mode_sql(Postgres), None);
+        assert_eq!(literal_mode_sql(Sqlite), None);
+        // The pin this arm's `None` rests on. Assembled, so this assertion's
+        // own text is not what it finds — and read over **code only**, because
+        // the twelve-line comment above that option explains it by name and
+        // would keep this green after the line itself was deleted. (Watched
+        // doing exactly that: replacing the option with an
+        // `application_name` left the raw-text version passing.)
+        let pin = format!("-c standard{}conforming{}strings=on", '_', '_');
+        let src = include_str!("../../schemaic-db/src/pg.rs");
+        let code: String = src
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            code.contains(&pin),
+            "`pg` no longer pins `standard_conforming_strings` on the startup \
+             packet, so a cluster with it off would store a different password \
+             than the preview showed — `literal_mode_sql(Postgres)` has to \
+             return a `SET` now, and `pg::run_ddl` has to issue it"
         );
     }
 

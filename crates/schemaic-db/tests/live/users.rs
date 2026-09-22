@@ -735,6 +735,119 @@ pub async fn a_reset_password_replaces_the_one_the_account_had(target: &'static 
     scratch.teardown().await;
 }
 
+/// **A password containing a backslash is stored as it was typed, even on a
+/// cluster configured to read literals the other way.**
+///
+/// `export::sql_literal` escapes only `'` for PostgreSQL, which is correct
+/// **only** under `standard_conforming_strings = on`. That GUC is settable per
+/// role, per database and in `postgresql.conf`, and every *new* connection
+/// inherits it — so on a cluster with it off, `ALTER ROLE "u" PASSWORD
+/// 'p\ass''q'` stores `pass'q`: the typed value is refused (`FATAL: password
+/// authentication failed`) and the mangled one accepted, with the user told the
+/// reset succeeded. Measured on PG 16.15 through `psql`, which inherits the
+/// role setting.
+///
+/// **This app does not inherit it**, and that is what this test pins.
+/// `pg::connect_probe` sends `-c standard_conforming_strings=on` on the startup
+/// packet — in force before the first statement, and not undoable by anything
+/// the app runs — so the hazard above cannot reach a plan. The pin is one line
+/// with no test on it, spelled as a connection option rather than a `SET`,
+/// which is exactly the shape that gets deleted as dead configuration. So the
+/// GUC is turned **off** on the role the tier connects as, and the assertion is
+/// that a plan's connection parses as `on` anyway.
+///
+/// A `SET` in the same statement batch would not reproduce it: the batch is
+/// parsed before the `SET` takes effect, which is why the first attempt at this
+/// measurement showed nothing.
+///
+/// PostgreSQL only — MySQL's mirror hazard (`NO_BACKSLASH_ESCAPES`) is guarded
+/// by `MYSQL_LITERAL_MODE_SQL` inside `mysql::run_ddl`, and SQLite has no
+/// backslash escape to get wrong. Gated on `Target::accounts_have_hosts` being
+/// false, a property of the target rather than an engine comparison.
+pub async fn a_password_with_a_backslash_is_stored_as_it_was_typed(target: &'static Target) {
+    if target.accounts_have_hosts() {
+        // MySQL family: guarded by `MYSQL_LITERAL_MODE_SQL` already, and it has
+        // no such GUC to turn off.
+        return;
+    }
+    let scratch = Scratch::create(target, "pgbslash").await;
+    let secret = r"p\ass'q";
+    let account =
+        ScratchAccount::create_with_password(target, &scratch, "bs", PrincipalKind::User, "", "")
+            .await;
+
+    // Make every new connection — including the one the plan opens — parse
+    // literals the old way. Per *role*, so it is inherited at connect time.
+    let guc = |on: bool| {
+        format!(
+            "ALTER ROLE {} SET standard_conforming_strings = {}",
+            schemaic_core::export::ident_sql(&target.user(), SqlDialect::Postgres),
+            if on { "on" } else { "off" }
+        )
+    };
+    // **Everything that needs the GUC off happens between these two lines, and
+    // nothing asserts inside them.** A panic with the role still set would
+    // leave every later test in the tier parsing literals the old way — the
+    // setting is cluster-wide and outlives the scratch database that made it.
+    // So the two observations are captured, the role is put back, and the
+    // assertions come after.
+    scratch.exec(&guc(false)).await;
+
+    let inherited = scratch
+        .exec("SELECT current_setting('standard_conforming_strings')")
+        .await;
+    let inherited = inherited.cell(0, 0).map(|c| c.text().to_string());
+
+    let listed = listed_principal(target, &account).await;
+    account
+        .run(ddl::Change::SetAccountPassword(Box::new(PasswordReset {
+            account: listed,
+            password: secret.to_string(),
+        })))
+        .await;
+
+    scratch.exec(&guc(true)).await;
+
+    // **The pin, asserted directly**: the role says `off` and this app's own
+    // connection says `on`, because the startup packet said so first.
+    assert_eq!(
+        inherited.as_deref(),
+        Some("on"),
+        "{}: a plan's connection inherited `standard_conforming_strings = off` \
+         from the role — `pg::connect_probe`'s `-c standard_conforming_strings\
+         =on` is gone, and every backslash in generated DDL is now stored as \
+         something else",
+        target.endpoint()
+    );
+
+    target
+        .db_as(&account.principal.name, secret)
+        .ping(std::time::Duration::from_secs(10))
+        .await
+        .unwrap_or_else(|e| {
+            panic!(
+                "{}: the password the user typed does not work — the literal was \
+                 read under `standard_conforming_strings = off` and a different \
+                 value was stored: {e}",
+                target.endpoint()
+            )
+        });
+    // And the mangled value specifically does not, which is what says the
+    // backslash survived rather than that some password happens to work.
+    assert!(
+        target
+            .db_as(&account.principal.name, "pass'q")
+            .ping(std::time::Duration::from_secs(10))
+            .await
+            .is_err(),
+        "{}: the backslash was eaten — the stored password is the mangled one",
+        target.endpoint()
+    );
+
+    account.teardown().await;
+    scratch.teardown().await;
+}
+
 /// **The offer, read off a real catalogue rather than off a drafted
 /// `Principal`.** A role the server itself made must not be offered a password
 /// reset on any leg, and the account beside it must keep one.
