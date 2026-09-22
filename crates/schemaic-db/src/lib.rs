@@ -2350,7 +2350,7 @@ impl TxScope {
 
 /// Double-quote an identifier for SQLite, doubling any embedded double-quote.
 ///
-/// The same thin delegation as [`ident`], pinned to the other engine this file
+/// The same thin delegation as [`crate::mysql::ident`], pinned to the other engine this file
 /// builds statements for. SQLite would also accept backticks or brackets, but
 /// what it *emits* is the standard form for the reason
 /// [`schemaic_core::export::ident_sql`] gives: `"` is the only one of the three

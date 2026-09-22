@@ -16,7 +16,7 @@
 //! **Everything the panel decides lives in [`schemaic_core::activity`]** — the
 //! ordering, the counts, which wait is worth a banner, what a kill will do. This
 //! file paints it. The polling timer and the fetch are the app's
-//! ([`ActivityActions`](crate::ActivityActions)).
+//! ([`crate::ActivityActions`]).
 
 use std::rc::Rc;
 use std::time::Duration;

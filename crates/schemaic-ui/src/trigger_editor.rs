@@ -161,7 +161,8 @@ fn open_editor(d: DdlUi, actions: &SchemaActions, target: TriggerTarget, draft: 
 /// user who typed one character inside the fetch window kept the mangled body
 /// on the side that Apply emits — `DROP TRIGGER` and then a `CREATE` carrying
 /// `'it's'`, refused 1064 on both engines, after the drop has committed and
-/// with no transaction. [`TriggerSource::may_overwrite_edit`] is the rule, and
+/// with no transaction.
+/// [`schemaic_core::schema::TriggerSource::may_overwrite_edit`] is the rule, and
 /// it keeps the skip for the case the skip was written for: where the fetch
 /// agrees with what the editor opened, there is nothing to correct and the
 /// keystrokes stand.
