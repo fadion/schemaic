@@ -309,8 +309,9 @@ pub(crate) const ENGINE_ENTRY_POINTS: &[&str] = &[
 
 /// Which database engine a [`Db`] speaks. Selected from the saved connection's
 /// `db_type` at [`Db::connect`] time; each public method dispatches to the
-/// engine-specific backend (MySQL bodies inline here, Postgres in [`pg`],
-/// SQLite in [`sqlite`]).
+/// engine-specific backend — one module each now, MySQL in [`mysql`], Postgres
+/// in [`pg`], SQLite in [`sqlite`]; MySQL's bodies were inline here until the
+/// extraction, which is what this line used to say.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum Engine {
     #[default]

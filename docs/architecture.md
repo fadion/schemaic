@@ -563,12 +563,13 @@ existing prose was left alone.
     call, and `SqlDialect` cannot say which of the two is in front of the tab: it has no MariaDB arm
     on purpose, which is right for parsing, quoting and the *shape* of a completion and wrong for
     one thing only — which names exist.
-    **Measured, not remembered.** All 309 of `FUNCTIONS`' names were executed on both servers
+    **Measured, not remembered.** Every name in `FUNCTIONS` was executed on both servers
     (`SELECT <name>(1,2)` with a database selected; `ERROR 1305` means the server has no such
     function, any other error means it has one and was called wrongly). MySQL 8.4.11 answered 1305
-    for exactly **49** — the eight `COLUMN_*` dynamic-column functions, the nine `*_ORACLE`
+    for the eight `COLUMN_*` dynamic-column functions, the nine `*_ORACLE`
     spellings, the three `WSREP_*`, `NVL`/`NVL2`/`TO_CHAR`/`ADD_MONTHS`/`SYS_GUID` from Oracle mode
-    and the rest — and MariaDB 10.11.14 for exactly **5** (`BIN_TO_UUID`, `IS_UUID`,
+    and the rest — forty-nine at that pass, **122** since the spatial families landed — and MariaDB
+    10.11.14 for exactly **5** (`BIN_TO_UUID`, `IS_UUID`,
     `JSON_STORAGE_SIZE`, `REGEXP_LIKE`, `UUID_TO_BIN`). Those are `MARIADB_ONLY` and `MYSQL_ONLY`,
     sorted for a binary search and `pub` for the live oracle alone. **Two different reasons live in
     `MARIADB_ONLY` and the list is right for both**: most are MariaDB's own, but `DES_ENCRYPT`,
@@ -592,6 +593,36 @@ existing prose was left alone.
     the property — the popup not offering the name is, and `CatalogIndex`'s precomputed per-flavour
     lists sit between the two. It asks with a *proper prefix* of each name, since `rank`'s dedup
     drops a candidate equal to what is already typed.
+    **The spatial families are the largest thing this catalog has been missing, and the reason
+    nobody saw them is a claim about `SQL_FUNCTIONS` that was false.** `FUNCTIONS` holds **463**
+    entries now: 83 `ST_*` names callable on MySQL 8.4 and MariaDB 10.11 alike, and 73 MariaDB-only
+    spellings — the 69 unprefixed OGC-v1 synonyms MariaDB kept and MySQL 8 removed, plus
+    `ST_BOUNDARY`, `ST_ISRING`, `ST_POINTONSURFACE` and `ST_RELATE`. Until they landed `ST_Length`
+    squiggled under correct SQL on the engine this app was built for first.
+    `information_schema.SQL_FUNCTIONS` is **not** "every builtin the parser registers by name": a
+    builtin registered natively and resolved by its own path is in neither that view nor
+    `KEYWORDS` — MariaDB answers `SELECT st_area()` with *"incorrect parameter count in the call to
+    native function 'st_area'"* while the view does not list it — so the whole OGC family sat in
+    that gap with every test in `live::mariadb_catalog` green. Anywhere the union of the two server
+    views is described as what the server has, that is the false claim; the third oracle is the
+    parser.
+    **`DEPRECATED_ALIASES` is the MySQL family's answer to `pg_builtins::is_suggested`, and it is
+    the question `MARIADB_ONLY` could not be asked.** Those two lists say which *server* has a name;
+    nothing said whether a name the server has is worth *suggesting*, and across 309 entries the
+    distinction never arose because every one of them was a name somebody types on purpose. The
+    OGC-v1 synonyms are not. They are real, callable functions — squiggling `GLENGTH` under correct
+    SQL is the false positive this whole half exists to avoid, so the catalog has to carry them —
+    but they are spelled `X`, `Y`, `AREA`, `CONTAINS`, `EQUALS`, `OVERLAPS`, `WITHIN`, `BUFFER`, the
+    most ordinary column names there are, and MariaDB documents every one as a synonym for the
+    `ST_`-prefixed name. Offering them puts `X(` in the popup of everyone who typed `x`. So: in the
+    catalog, out of the suggestions — **69** names, sorted for a binary search, consulted by
+    `is_offered_builtin`'s MySQL arm *before* the flavour and for every flavour **including
+    `Unknown`**, because a name nobody means is not worth offering on the one server that still has
+    it either. `every_deprecated_alias_is_in_the_catalog_and_none_is_offered` holds both halves at
+    once: a name that drifted out of `FUNCTIONS` would withhold nothing *and* start being squiggled
+    again — the false positive arriving back through the list written to describe it — and an
+    unsorted list answers "not in it" for names that are in it, which puts `X(` and `Y(` back in the
+    popup.
     **A builtin's name plus a `_` or a digit is a *derived* name, not a misspelling**, and
     `is_probable_function_typo` refuses those outright. Its own doc already claimed the design
     avoided flagging `format_x` as a typo of `FORMAT` — by not loosening the distance threshold —
@@ -605,7 +636,8 @@ existing prose was left alone.
     **The catalog is read through a `CatalogIndex` now — one per dialect, built on first use — and
     turning the PostgreSQL checker on is what forced it.** Both of the checker's loops used to walk
     the slice, mapping it to an upper-cased `String` per entry, twice over, per candidate word, per
-    statement, on the editor's 120 ms debounce — affordable against MySQL's 309 entries and not
+    statement, on the editor's 120 ms debounce — affordable against MySQL's catalog (309 entries
+    then, 463 now) and not
     against `PG_FUNCTIONS`' 2,706 — while the completion path walked the same slice undebounced. The
     index is a *rearrangement* of that slice and nothing else: nothing added, nothing filtered, so
     every answer is the answer the walk gave and only the cost differs. `lower` is every name
@@ -5684,7 +5716,14 @@ existing prose was left alone.
     `ENABLE ALWAYS`/`ENABLE REPLICA` folded into a bool get recreated as plain `O` and change
     what fires during replication apply; `old_table`/`new_table` are `REFERENCING OLD/NEW
     TABLE`, whose loss breaks *every write to the table* rather than failing the plan.
-    `TriggerSource` is the MySQL body + session state, fetched lazily — see `schemaic-db`.
+    `TriggerSource` is the MySQL body + session state, fetched lazily — see `schemaic-db`. Its
+    `apply_to` copies both onto a `TriggerInfo`, one method because both sides of the diff have to
+    be patched with it, and `may_overwrite_edit(opened, draft)` decides whether a draft row the user
+    has *already edited* takes the correction anyway: it does when the body the keystrokes were
+    typed on top of is not what the server holds, because what the skip preserves there is not the
+    user's work but a few characters riding a `'it's'` that Apply would `DROP` the trigger to emit.
+    `None` for `opened` means no record of what the row opened with, so nothing can be said and the
+    row is left alone. The failure and the call site are under `ui/trigger_editor.rs`.
     `TriggerInfo::create_sql` is the one trigger emitter and has **three** arms, not two: SQLite's
     shape is neither of the others' — PostgreSQL's `UPDATE OF` and `WHEN` with MySQL's inline
     body, no definer, no ordering clause, no session state and always `FOR EACH ROW` — so it is
@@ -5842,6 +5881,17 @@ existing prose was left alone.
     notice cannot outlive the work. `read_notice_tests::the_delay_clears_every_measured_local_refresh`
     asserts the constant exceeds both 48 ms and 134 ms, so lowering it has to argue with the
     measurement rather than quietly reintroducing the flicker.
+    **`report_read_since` is how the panel reaches it, and handing the constant straight across is
+    what it prevents.** Nothing cancels the notice timer when the read it was armed for lands, so the
+    busy period the timer finds on screen need not be the one it was armed for: expand one database,
+    let it land at 150 ms, expand a second at 300 ms, and the first timer fires at 400 ms over a read
+    that is 100 ms old and announces it. `report_read_since(reading, began, now)` asks that period's
+    own age — `began` is when the period **currently** on screen started — and answers `false` for
+    `began: None`, there being nothing in flight to date a notice from. The call site has a *timer*
+    rather than a duration, and passing `READ_NOTICE_DELAY` itself degenerated `report_read`'s
+    duration term to a constant `true`, leaving three of that function's four tests asserting over
+    values the composition could never produce: the pure-function-composed-with-its-caller seam the
+    working rules name. `report_read` is reached only through `report_read_since` now.
     **There are two refresh paths and both go through it**, via the app's one
     `start_fetch` (`FetchSchemaFn`): the per-database one
     (`refresh_db`) and the connection-wide one (`load_schema`, the SCHEMA header's Refresh),
@@ -6175,6 +6225,13 @@ existing prose was left alone.
     `source_gate::workspace_sources()` and asserts the site list is exactly `["lib.rs"]`, so a
     failure **names the offending file** where the count could only report a number one too low —
     restoring the app-side direct load failed it with `left: ["lib.rs", "schemaic-app/main.rs"]`.
+    **Only the counting half was rewritten, though, and "one door" does not make the reporting true
+    by construction**: delete `report_recoveries` from the door and the site list is still exactly
+    one, so the whole failure the gate exists for comes back under a green suite. Its second test,
+    `the_one_door_reports_before_it_returns`, reads the door's own body and requires the load, then
+    the report, then the return. The *order* is not tidiness — if the `.bak` was unreadable too the
+    caller's `save_json` writes the defaulted empty file over the recovered nothing, so the notice
+    has to be queued before the caller can get that far.
     The lesson generalises: a rule that cannot be checked positionally can sometimes be made
     *structural* instead, by reshaping the code until there is one site, and then it can.
     `recovery_notice` is the corrupt-file sentence — plus, for the one store whose `.corrupt` a later
@@ -7315,7 +7372,8 @@ existing prose was left alone.
       `intel::is_offered_builtin` argues for. No new signal carries it: the caller reads it off the
       loaded `DbSchema` for the tab's active database, where `collect_schema` stamped it.
       **`add` asks `worth_offering` before it builds anything, which is `add_col`'s shape adopted
-      for `add_col`'s reason.** A PostgreSQL tab offers 863 builtins where MySQL offers 309, and
+      for `add_col`'s reason.** A PostgreSQL tab offers 863 builtins where a MySQL 8 one offers 341
+      (`FUNCTIONS`' 463 less `MARIADB_ONLY`, which contains every `DEPRECATED_ALIASES` name), and
       every one of them was paying a `to_ascii_lowercase`, a `HashSet<String>` insert and an eagerly
       allocated `String` for its signature before the ranking below could drop it — on a path that
       is deliberately undebounced (`exec_after(Duration::ZERO)`, one tick per keystroke). `detail`
@@ -7717,9 +7775,19 @@ existing prose was left alone.
   `mysql.rs`, and four in `session.rs` inside `Backend::MySql` arms. Those four have since become
   calls to `mysql::cancel_awaited`, which kills *and awaits*, so `session.rs` no longer names
   `kill_query` at all — and a gate of its own now requires that (see the cancel rule below).
-  `the_dispatcher_executes_nothing_itself` scans `lib.rs` for the driver's own verbs —
-  `query_drop`/`query_iter`/`query_first` and the three `exec_` spellings, with `//` lines stripped
-  first — and fails on any of them. It is named for the driver verbs rather than for SQL because a
+  `the_dispatcher_executes_nothing_itself` scans `lib.rs` for the driver's own verbs, with `//`
+  lines stripped first, and fails on any of them. **Thirteen verbs in two shapes, and the list's own
+  length is pinned.** A suffixed verb (`query_drop`, `query_iter`, `query_first`, `query_map` and
+  the four `exec_` spellings, plus `query_internal`) can only be the driver's, so the name alone is
+  the needle; a short one (`query`, `exec`, `prep`, `batch`) is a word this file uses in other
+  senses all day — `fetch_query`, `run_batch`, `ENGINE_ENTRY_POINTS` — so it is matched with the
+  method dot that makes it a call rather than a name. `_map` is the pair the gate was written
+  without and the pair the extraction actually carried out of the file: `Db::fetch_grants` and
+  `Db::fetch_table_list` were `query_map` at `v0.25.0` and both still are, in `mysql.rs`, so putting
+  either back here left the gate green. Nothing can make this gate fail without putting a call back,
+  so `assert_eq!(verbs.len(), 13)` is the only thing that says a verb has been dropped from the
+  list — which is exactly how `_map` went missing. It is named for the driver verbs rather than for
+  SQL because a
   scan for keywords cannot tell a statement from a doc comment about one, and this file is largely
   doc comments about which statement lives where; the verbs are **assembled** from two arrays for
   the reason the timeout census next door assembles its `stop` marker, the first spelling of the
@@ -8814,18 +8882,22 @@ existing prose was left alone.
   carries the real database instead of the constant `MAIN`, which is what `edit::analyze_edit`
   already groups on, so two attached files each holding a `note` are two editable tables rather
   than one.
-  **The test that guards the qualifier is the same-name one, and only that one.** All four run on
-  an `attached()` fixture where `main` and `side` hold a `note` of the same name and different
-  shape: `an_attached_databases_columns_carry_its_own_name`,
-  `two_databases_holding_the_same_table_name_do_not_borrow_each_others_schema` — which asserts
-  `main.note.body` is NOT NULL and `side.note.body` is not, so a flag read from the wrong database
-  is visible — `a_view_in_an_attached_database_is_still_refused`, and
-  `an_attached_table_is_editable_and_joins_across_databases`, which walks `analyze_edit` to two
-  keyed tables across two databases. Forcing the two schema reads in `attach_origins` back to
-  `MAIN` fails the second of those and **nothing else**, measured by mutation rather than assumed:
-  the first still passes under it, because both `note` tables declare `id` the same way, so it pins
-  the `database` field and not the reads. Widen that fixture rather than adding a fifth test beside
-  it when another lookup learns the qualifier. The helper those tests describe a table through is
+  **The fixture is the guard, and this passage used to name four tests of which three have never
+  existed.** It also quoted a mutation result — forcing `attach_origins`' schema reads back to
+  `MAIN` fails "the second of those and nothing else" — against a test that is not there, so the
+  one sentence claiming a measurement pointed at nothing. The real list is `sqlite.rs`'s five users
+  of the `attached()` fixture, where `main` and `side` each hold a `note` of the same name and a
+  deliberately different shape (`body` is NOT NULL in `main` and nullable in `side`; `slug` is
+  generated by `lower` in one and `upper` in the other, so a read from the wrong database is a
+  visibly wrong answer rather than an absent one):
+  `an_unqualified_name_resolves_the_way_sqlite_resolves_it`, which pins the `temp` → `main` →
+  attached resolution order against `pragma_table_list`'s own `main` → `temp` → attached row order;
+  `a_view_in_an_attached_database_is_still_refused`;
+  `a_generated_columns_expression_is_read_from_its_own_database`, the lookup that has no pragma
+  behind it and so is the easiest to leave unqualified; `nothing_outside_main_is_attributed`; and
+  `every_attributed_column_is_one_the_bare_write_statement_reaches`, which is the composition the
+  others stop one call short of. Widen that fixture rather than adding a sixth test beside it when
+  another lookup learns the qualifier. The helper those tests describe a table through is
   `table_info_in(conn, db, name)`, with `table_info_of` delegating to it, and it mirrors the UI's
   `schema_for` closure in being keyed on the origin's `database` — so a table of the same name in
   `main` can never stand in for an attached one. In the running app that closure answers **`None`**
@@ -9056,7 +9128,15 @@ existing prose was left alone.
   exactly the servers this setting exists for, with the failure discarded. That is a property of a
   **set of call sites**, not of the function — the function was right the whole time two of the ten
   sites bypassed it — so the gate is `session::pg_cancel_gate`, which scans the crate for a
-  `cancel_query` outside the module that defines the helper. Both cancels are bounded by
+  `cancel_query` outside the module that defines the helper. **Its needle stops before the paren**,
+  because `tokio_postgres::CancelToken` has two of them: `cancel_query(tls)` and
+  `cancel_query_raw(stream, tls)`, the second being what a cancel riding an already-open socket
+  would reach for — so a needle ending in `(` sees the first and walks past the second, which
+  commits the identical failure. `CancelToken::cancel_query` is listed beside it for the UFCS
+  spelling, and both are assembled from pieces so the gate does not find itself: it lives in a file
+  it reads. It also asserts it scanned at least five files, this being the one gate of the family
+  that reads a *directory* rather than a named source, so a moved or renamed `src` would otherwise
+  make it pass by reading nothing. Both cancels are bounded by
   `CANCEL_TIMEOUT`: best-effort and unbounded are not the same word, and a Stop against a host that
   has gone away hangs inside a modal whose every exit maps to that same Stop.
   **Two things the ladder cannot deliver, said out loud rather than left to a connect.**
@@ -9228,13 +9308,21 @@ existing prose was left alone.
   for its own target, which is what the macro would otherwise have given it.
   **`mariadb_catalog.rs` is that rule's second instance, for `intel::FUNCTIONS`** — the catalog the
   checker trusts on MySQL and MariaDB, and the one that had no oracle of any kind until this module.
-  Its design point is **two server oracles rather than one plus a hand-written excuse**:
+  Its design point is **three oracles rather than one plus a hand-written excuse**:
   `information_schema.SQL_FUNCTIONS` (MariaDB 10.11+, 261 rows on 10.11.14) lists only the builtins
   the parser resolves through its function-creator hash, so every builtin spelled as its own grammar
   rule — `LEFT`, `IF`, `AVG`, `CURRENT_DATE`, the `COLUMN_*` dynamic-column forms — is absent from
   it. Those turn out to be exactly MariaDB's *reserved words*, so `information_schema.KEYWORDS` (696
-  rows) accounts for them without anybody writing a list, and `over_listing` measures the catalog
-  against the **union** of the two views. That is the deliberate contrast with `pg_catalog`, whose
+  rows) accounts for them without anybody writing a list. **This paragraph then said the union of
+  the two views is what the server claims, and it is not.** A builtin registered natively and
+  resolved by its own path is in *neither*: `ST_Area` is absent from `SQL_FUNCTIONS` while the same
+  server answers `SELECT st_area()` with *"incorrect parameter count in the call to **native
+  function** 'st_area'"*, the server's own words for a builtin. The entire OGC spatial family sat in
+  that gap, so `ST_Length` was squiggling under correct SQL on the default engine while every test
+  in this file was green. The third oracle is therefore the **parser**, which both servers have and
+  which answers the question the editor actually asks — can this server call this name — and
+  `over_listing` measures the catalog against all three. That is the deliberate contrast with
+  `pg_catalog`, whose
   over-listing direction needs the hand-written `GRAMMAR_ONLY` and its 24 names: a list in a test
   file is a second thing that has to be kept true, and here the server keeps it. Two small
   hand-written lists do remain, each held by a test of its own. `MYSQL_ONLY` is the five names MySQL
@@ -9253,27 +9341,67 @@ existing prose was left alone.
   **The partition behind `over_listing` is computed there now, where the module doc used to state
   it as a number**: "39 names covered by `KEYWORDS`, and the five left over are
   `MYSQL_ONLY` to a name" does not add up to the forty-nine it was partitioning — the real figure is
-  44 — and nothing computed it, which is the whole argument against writing one down. The test sums
-  the two halves against what `SQL_FUNCTIONS` leaves out and asserts neither half is empty, so a
+  44 — and nothing computed it, which is the whole argument against writing one down. It was also a
+  *two*-way split of a **three**-way set: the names `SQL_FUNCTIONS` misses are those with their own
+  grammar rule (MariaDB's reserved words, so in `KEYWORDS`), MySQL 8's (`MYSQL_ONLY`), and the
+  natively-registered ones neither view reports, which only the parser can vouch for. The test sums
+  all three against what `SQL_FUNCTIONS` leaves out and asserts none of them is empty, so a
   release that moves the split fails there rather than leaving a sentence that reads plausibly and
-  is false.
+  is false. **The `KEYWORDS` excuse is put to the parser as well**, because reserved-word-ness does
+  not imply callability and this half was using it as if it did: 696 keywords, 681 of them not in
+  `SQL_FUNCTIONS`, standing as a blanket excuse for the 44 catalog names that need one. Add
+  `f("TABLESPACE", …)` to `intel::FUNCTIONS` and the first assertion never sees it while the popup
+  offers a name that completes to a syntax error. The two are distinguishable: a name with its own
+  grammar rule answers `1064` to `NAME(1,2)` because `(1,2)` is not its syntax — measured, `CAST`,
+  `COUNT`, `IF`, `PARTITION` and `SAVEPOINT` all do — while an invented one answers `1630`, which is
+  measured to be exactly what `TABLESPACE` gives.
+  **What counts as "no such function" is one rule now, `is_not_callable`, because two tests were
+  asking it and only one had it right.** `1305` *and* `1630` are both absence — MariaDB uses the
+  second for a name whose shape reaches builtin resolution and finds nothing (`AUTO_INCREMENT`,
+  `GOTO`, `JSON_TABLE`, `MERGE`, `RESTART` all answer it), and reading only `1305` credits the
+  server with five functions it has not got. `1064` is the third answer and separates a builtin from
+  a *type* or a reserved word: `mysql.help_topic` indexes `DATETIME`, `BEGIN` and `CALL` beside the
+  functions, and MySQL 8.4 answers 1064 for `SRID` and `CONTAINS`, which it keeps as reserved words
+  after removing the functions. A name that cannot be typed as a call cannot be squiggled as one
+  either — and must not be offered.
   **"MySQL is unguarded here" stood in this paragraph as a stated limitation and was a live defect.**
   It is true that MySQL ships no `SQL_FUNCTIONS` (`mysql.func` holds loadable UDFs, not builtins), so
   there is no *catalogue* oracle to write — and that is not the only kind.
   `each_server_is_only_credited_with_the_builtins_it_really_has` is the missing leg and **the parser
   is its oracle**, which is the better one because it answers the question the editor actually asks:
-  can this server call this name. It walks all 309 of `FUNCTIONS`' names on **both** servers, one
-  `SELECT <name>(1,2)` each, reading only `ERROR 1305` as absence, and asserts both directions — a
+  can this server call this name. It walks every name in `FUNCTIONS` on **both** servers, one
+  `SELECT <name>(1,2)` each, and asserts both directions — a
   name the server lacks that nothing in `intel` withholds, and a name `intel` withholds that the
   server does have — plus that the pass found something, so it cannot pass vacuously. Until it
   landed, `over_listing` was green **by construction** over the forty-nine names a MySQL 8 tab was
-  being offered and cannot call. Two load-bearing details: it runs over **one pinned `Session`**,
-  the documented exception to one-connection-per-operation, because 309 `Db::fetch_query` calls
-  would open 309 connections; and it scopes that session to the `mysql` database, because an
+  being offered and cannot call. **It reads three outcomes, not two**, and the third is why: `1305`
+  or `1630` is absence, anything else is "has it, called wrongly", *except* `1064`, which this probe
+  cannot read either way. `COUNT(1,2)`, `CAST(1,2)`, `EXTRACT(1,2)` and the whole grammar-rule
+  family answer it because `(1,2)` is not their syntax, and so do `SRID(…)` and `CONTAINS(…)` on
+  MySQL 8.4, which removed the functions and kept the words reserved — measured, `SRID(1)`,
+  `SRID(ST_GeomFromText(…))` and `CONTAINS(1)` are all 1064 there while `COUNT(1)` is not, so no
+  arity makes them parse. Calling 1064 "present" made the test demand MySQL be offered two names it
+  cannot type; calling it "absent" made it demand MariaDB's `COUNT` be withheld; so it is neither,
+  and the withheld-but-present assertion skips it. Two load-bearing details: it runs over **one
+  pinned `Session`**, the documented exception to one-connection-per-operation, because a
+  `Db::fetch_query` per name would open a connection per name; and it scopes that session to the
+  `mysql` database, because an
   unqualified unknown name with no database selected answers `1046 No database selected` instead of
   1305 and would report every name as present. It runs in 0.2 s and was watched failing — deleting
   `NVL` from `MARIADB_ONLY` gives ``mysql … has no such function, and nothing in `intel` withholds
   it — so a tab on this server is offered 1 name(s) it cannot call: ["NVL"]``.
+  **`no_name_this_server_can_call_is_squiggled_under_correct_sql` is the completeness direction
+  asked of the thing that actually goes wrong**, and it is the leg the spatial families needed.
+  `every_function_the_server_reports_is_in_the_catalog` asks `SQL_FUNCTIONS`, whose own constant doc
+  called it "every builtin the parser registers by name" and which is nothing of the sort; the OGC
+  family sat in that gap and `ST_Length` squiggled under correct SQL while this file was green, the
+  other eighty being silent only because no catalogued name happened to sit within a near-miss of
+  them, which is luck rather than a guard. So this one asks the **name source the server ships** —
+  `mysql.help_topic`, which both engines have — filters it through the parser, and drives each
+  survivor through `intel::diagnostics`. That last step is the point, and it is the only test
+  anywhere that composes the catalog with the checker that reads it: a name absent from `FUNCTIONS`
+  is a *defect* only when it produces a warning under correct SQL, and adding an unrelated entry
+  that brings a real builtin within edit distance fails here where no membership test can see it.
   **`endpoint.rs` is where a leg comes from**, and it is the whole environment contract: three
   `SCHEMAIC_IT_<ENGINE>_HOST`/`_PORT`/`_USER`/`_PASSWORD` groups with localhost defaults, plus
   `SCHEMAIC_IT_ENGINES` as the one way to run fewer than all three. An *unreachable* endpoint is a
@@ -11584,10 +11712,12 @@ existing prose was left alone.
     DdlUi)`, `workspace_modals_up(OverlayUi, BlobUi, DdlUi)` and `settings_modals_up(TermUi, AiUi,
     LayoutUi)` — each having already been a list of `Copy` flags read at the top and never touched
     again, with only the signature not saying so. Neither of the other two is a candidate:
-    `modal_layer` reaches eighteen `Ui` fields and hands the bundle to every modal constructor in
-    the app, the widest thing in the crate after `center`, and `modal_backdrop_up` calls all three
-    predicates above and adds seven terms of its own, so what it needs is their union — eleven
-    bundles, a parameter list longer than the function.
+    `modal_layer` reaches **twenty-one** `Ui` fields and hands the bundle to every modal constructor
+    in the app, which makes it the widest of everything this gate's entries name — `center`'s
+    eighteen included, where this sentence used to put the two the other way round on a stale
+    count — and `modal_backdrop_up` calls
+    all three predicates above and adds seven terms of its own, so what it needs is their union —
+    eleven bundles, a parameter list longer than the function.
   - `markdown.rs` — AI-chat `render_markdown`/`CodeActions`/`code_block` (pulldown-cmark). Its
     prose colour and its font size are both **baked into a text `AttrsList`** rather than read in a
     style closure, which an `AttrsList` is not — so this module's correctness depends on
@@ -12241,8 +12371,12 @@ existing prose was left alone.
     other's count. It needs the same two
     halves regardless — the whole file scanned, and both view crates enumerated — and it carries the
     other pattern this module made possible, an exemption list holding its reason as data
-    (`overlays.rs`, whose stamps are `PlanTarget`s) with an assertion that the exemption is still
-    *needed*, so a stale entry fails rather than accumulating.
+    (`ddl_preview::PlanTarget`, the one literal that carries the flag without being an editor
+    target) with an assertion that the exemption is still *needed*, so a stale entry fails rather
+    than accumulating. **That list is keyed on the struct literal and used to be keyed on the
+    file** — and the file was `overlays.rs`, the launch point for every editor door in the app, so
+    the skip covered far more than the two `PlanTarget`s it was written for and made this gate's own
+    claim (a new editor caught the moment it is written) false exactly where it mattered.
     **`widgets::focus_root_gate::every_modal_root_publishes_a_ring` is the second of that shape**:
     it finds every bare `focus_root(` across both view crates and fails unless the site is a
     `focus_root_with_ring`, naming the offender by its enclosing `fn` — a modal root with no ring is
@@ -12292,7 +12426,12 @@ existing prose was left alone.
     failure names the file that added a second reader instead of reporting a number that is one too
     low. It moved into this crate because that is where the door is, and its needle is assembled from
     fragments (`["load_json", "(\"diagrams", ".json\")"].concat()`) for this family's standing
-    reason: a gate in the same file as its subject is otherwise its own first match.
+    reason: a gate in the same file as its subject is otherwise its own first match. **It is two
+    tests, because one door does not make the reporting true by construction**:
+    `the_one_door_reports_before_it_returns` reads `load_diagram_layouts`' own body and requires the
+    load, then `report_recoveries`, then the return. The old gate asserted both `loads >= 3` and
+    `reports > loads`; only the counting half was carried across, and deleting the report from the
+    door leaves the site list exactly `["lib.rs"]` with the whole failure back.
     `production_code` blanks every
     `#[cfg(test)]` **item** — brace-aware, skipping braces inside strings, chars and comments — and
     every `//` line; `crate_sources` enumerates the files to scan.
@@ -12311,6 +12450,21 @@ existing prose was left alone.
     returning `None` rather than yielding one region for the rest of the function, which is the
     failure mode a `split_once` has and the way a rename would otherwise make the gate weaker
     without making it red.
+    **`inside_a_closure(code, at)` is the third shared helper, and it replaced a heuristic that was
+    standing in for the question.** The two "this read sits in a tracking scope" gates —
+    `grid`'s server-sort one and `editor_pane`'s cmdk-preview one, both written up under *Floem 0.2
+    gotchas* — asked whether `move |` appeared anywhere in the three lines above the read, and the
+    single commonest three-line neighbour in either file is an unrelated `.style(move |s| …)`, which
+    satisfies that while the read sits inside nothing. Both gates' failure *messages* had stated the
+    real question all along. This answers it: find the nearest `move |` above, step past the
+    parameter list and walk the brackets forward, so a closure that has already closed takes the
+    depth below zero before the read is reached. A closure whose body is a bare expression ending at
+    a `,` rather than a bracket is not detected as closed — narrower than the truth in that one
+    direction, and still strictly stronger than counting lines. Callers hand it `production_code`,
+    so comments are already gone; a bracket inside a string literal would still be counted, and
+    neither region holds one. It is `#[cfg(test)]`, unlike `production_code` and beside the corpus
+    walkers, because both callers are gates in this crate and an unconditional one is a dead-code
+    warning under CI's `-D warnings`.
     **The cut is compiled into the library, and it has to be.** A `#[cfg(test)] mod` is invisible to
     a *different* crate's tests, which is how `schemaic-app` came to carry a twelfth private copy
     holding both defects this one exists to remove — so `production_code` and the byte scanners under
@@ -13527,7 +13681,23 @@ existing prose was left alone.
     MySQL-only `fetch_sources` (`SHOW CREATE TRIGGER`) is gated `== MySql` — whose reply is also why
     **this overlay's `dyn_container` key is deliberately not the memo the routine and view editors
     took** (*Floem 0.2 gotchas*): `form` is built once per `(selected, rev)` and its Body seeds at
-    build, so the rebuild that key causes is the only delivery of the escape-corrected body;
+    build, so the rebuild that key causes is the only delivery of the escape-corrected body.
+    **That fetch is a correction, not an enhancement, and the skip that protected the user's typing
+    was preserving the corruption instead.** The editor opens on
+    `information_schema.ACTION_STATEMENT`, whose escapes MySQL 8 has already resolved — a trigger
+    written `'it''s'` reads back as `'it's'` — so both sides of the diff are patched, the rule
+    `view_editor::fetch_algorithm` established. A draft row the user had already edited was left
+    alone on the reasonable ground that a round trip landing in milliseconds is no reason to
+    overwrite somebody's keystrokes; but `current` was patched unconditionally, so a user typing one
+    character inside the fetch window kept the mangled body on the side Apply emits, and Apply is
+    `DROP TRIGGER` followed by a `CREATE` carrying `'it's'` — 1064 on both engines, after the drop
+    has committed, with no transaction around it. `schema::TriggerSource::may_overwrite_edit(opened,
+    draft)` is the rule now, asked of the *opened* body rather than of the edit: an untouched row
+    always takes the correction, and a touched one takes it only where the fetch disagrees with what
+    the editor opened. The common case — a body with no escapes to resolve — leaves the keystrokes
+    alone, because there is nothing to rescue them from. The bodies the editor opened with are read
+    out of `current` **before** `current` is corrected, since they are what says whether the row was
+    touched at all;
     **the function list is re-fetched on its own** (`Db::trigger_functions`
     via `TriggerFnFn`) and arrives a round trip late, so the
     picker keeps whatever the draft already names instead of selecting the first entry and silently
@@ -13557,10 +13727,21 @@ existing prose was left alone.
     against the already-displayed string, and those two agree only while `display_of` has
     *succeeded* — the moment it falls back to showing the stored SQL verbatim, Edit's comparison is
     silently `None`, which is why Edit stayed grey on a stock `public` function long after the
-    qualified case was fixed. Both call sites go through `matching` now, so the seam is closed by
-    construction rather than by a test. `a_stored_name_matches_its_function_in_either_quoting` pins
+    qualified case was fixed. Both call sites go through `matching` now.
+    `a_stored_name_matches_its_function_in_either_quoting` pins
     the qualified half and `a_bare_stored_name_resolves_when_only_one_function_can_be_meant` the
-    bare one, including the ambiguous pair it must refuse. Resolving a display never fabricates an
+    bare one, including the ambiguous pair it must refuse — but both drive `matching` in isolation,
+    and `matching` was never the broken half, which is why that seam is held by
+    `one_answer_gate::both_doors_ask_which_function_through_the_one_helper` rather than by
+    construction. It is a source gate because the decision is which helper a `dyn_container` builder
+    calls and there is no value to assert on. Two halves: `fn_names` must appear exactly twice in
+    this file's production code — its own definition and the one call inside `matching` — so a
+    caller reaching past `matching` to it loses the bare-name arm and answers `None` for the
+    commonest trigger on a stock server; and the Edit button's own `let` region inside `pg_action`
+    must name `matching(` and must not name `fn_display(`. The second is scoped to that binding
+    rather than counted over the file because counting cannot separate the Edit button's question
+    from the picker's *inverse* mapping at `on_select`, where `fn_display(f) == v` is right by
+    construction because `v` came out of the options list. Resolving a display never fabricates an
     edit: `display_of` feeds the `sel` display signal and never the draft.
     **`TriggerTarget::sibling_triggers` is read at the door, because the modal cannot see far
     enough.** On MySQL, MariaDB and SQLite a trigger name is unique across the whole *schema*
@@ -14092,10 +14273,18 @@ existing prose was left alone.
     thing to lay out in a panel whose width the user sets. **It is delayed, not immediate** — the
     effect arms `exec_after(schema::READ_NOTICE_DELAY, …)`, and the 400 ms is the same reasoning
     `begin_refresh` gives for the rows showing nothing, applied to the header (*core::schema*, where
-    the constant and `report_read` live and are tested). The effect watches
+    the constant and `report_read`/`report_read_since` live and are tested). The effect watches
     `db_nodes`' `refreshing` signals and arms on the **rising edge only**, off its own previous
     value: a second database starting while the first is still out must not queue a second timer for
-    the same notice. Any fall clears the notice immediately, without waiting for a timer. The
+    the same notice. Any fall clears the notice immediately, without waiting for a timer.
+    **Nothing cancels a timer whose read has landed, so the notice is dated from the period on
+    screen rather than from how long the timer slept.** That same rising edge stamps an `Instant`
+    into a `began` signal, and the timer asks `schema::report_read_since(still, began, now)` — one
+    database landing at 150 ms and a second starting at 300 ms otherwise has the first timer fire at
+    400 ms over a read 100 ms old and announce it. A fall clears `began` beside `reading`, so a timer
+    that outlives its period has nothing to date from and says nothing. **And the timer reads before
+    it writes**: a floem signal never dedups, so a second one landing on the same `true` tore the
+    title down and restarted `loading_dots` from a plain `SCHEMA` mid-animation. The
     timer's write is `try_update` because switching connections disposes the scope it was armed in,
     and the read it was going to report with it. The busy branch restates `section_title`'s bold
     face and padding on its own container rather than sharing a helper — `section_title` styles the
@@ -15164,6 +15353,25 @@ existing prose was left alone.
     at `i * item_size`, so a height computed one way for layout and another for the stack drifts
     further out of place the further you scroll — see the Floem gotcha, which is also where the
     contrast with `conn_import::ROW_VIEW_CAP` lives.
+    **The 8px vertical band is a wrapping `container`'s, not the stack's**, and that is arithmetic
+    rather than taste: `virtual_stack` derives start, end and `before_size` straight from
+    `viewport.y0 / item_size` and knows nothing about its own padding, while `compute_view_layout`
+    hands it a viewport in its own border-box space — so `padding_vert(8)` on the stack made the
+    window short by the top inset and the first row at the top edge was never built. It also forces
+    `height(content_size)`, which taffy reads as a border box, so the 16px would have come back out
+    of the rows. Padding the parent leaves both exact.
+    **Two further things keep `Fixed`'s promise, and neither is the row's own style.** `entry_row`'s
+    missing-`seq` slot is `empty().style(|s| s.height(mon_row_h()))` rather than `widgets::nothing()`
+    — `nothing()` is `display: none`, so it occupies zero rows under a stack that has already
+    reserved 29px for it and puts every later row in the window that far above its place. And `cell`
+    flattens Unicode's mandatory line breaks to a space (UAX #14 BK/CR/LF/NL, through
+    `is_line_break`, with a CRLF collapsed as one break so the value does not gain a column), because
+    "a change row is always one line" is a property of what `cell` hands `text()` and not of the row:
+    a watched `TEXT`/`VARCHAR` column holding an address, a note or pretty-printed JSON is the
+    ordinary case, and it shaped to two lines, laid out past its own box and painted across the row
+    below. `a_cell_holding_a_newline_is_flattened_to_one_line` asserts it where it is decided — the
+    premise was stated in three places and checked in none. The export path (`log_result_set`) is
+    deliberately not routed through `cell` and keeps the engine's value verbatim.
     **The width objection the old paragraph raised is answered rather than withdrawn.** The rows are
     content-sized so a long change list scrolls horizontally instead of wrapping, and the table
     header mirrors the body's `hscroll`; with only the visible rows mounted, the widest row in the
@@ -15849,12 +16057,17 @@ existing prose was left alone.
     `open_editor(DdlUi, &SchemaActions, …)` and `open_for_table(ConnUi, SchemaUi, DdlUi,
     &SchemaActions, …)`, the two `&SchemaActions` for `object_editor`'s reason — the dialect decides
     *inside* `open_editor` whether `trigger_source` or `trigger_functions` runs.
-    **`trigger_editor_overlay` is the one overlay in the crate that genuinely needs an action**, and
+    **`trigger_editor_overlay` is the one overlay in the crate that genuinely needs a fetch**, and
     it is the real exception to *the overlays needed no fetch at all* two paragraphs up rather than a
-    miss: it takes `(ConnUi, DdlUi, Rc<SchemaActions>)`. Every sibling's fetch runs from an `open`,
+    miss. Every sibling's fetch runs from an `open`,
     so the door can absorb it; this one has a *second, later* trigger — `refetch_functions_on_return` re-reads the function list when
     the nested routine editor closes back to it, because a function just created has to appear in the
-    dropdown — so the action cannot be left at the door.
+    dropdown — so the fetch cannot be left at the door. **It takes the two it needs by name**,
+    `(ConnUi, DdlUi, TriggerFnFn, RoutineSrcFn)`, where it *stored* an `Rc<SchemaActions>` — the
+    campaign's one site that held the bundle rather than forwarding it, keeping 31 closures alive for
+    exactly two fetches. Naming them costs one parameter, four in all, three under the limit the rest
+    of the campaign cites as its reason for bundling; `whole_ui_gate` counts only `ui: Ui`, so
+    nothing measured this one.
     **`account_editor.rs` came off in the same pass, 6 to zero, and needed no such argument.** Its
     three doors (`open_for_new`, `open_for_reset`, `open_for_grant`) read the connection registry —
     `edit_ctx` then, `door_read_only` since — and write the
@@ -16060,8 +16273,8 @@ existing prose was left alone.
     its own domain, while `TermActions` goes in whole because the panel reads twelve closures off it
     and naming twelve is the `schema_settings_overlay` case several times over; the `ConnUi` is
     there for a read-only memo. **Four of the five are wide by nature** — `workspace` reaches eleven
-    `Ui` fields, `center` **sixteen** and is the widest function in the crate, `footer` seven,
-    `header` six — so naming any of them lands at or past clippy's seven-argument limit, which is
+    `Ui` fields, `center` **eighteen** and is the widest function in this file, `footer` seven,
+    `header` **nine** — so naming any of them lands at or past clippy's seven-argument limit, which is
     the lint agreeing with the gate, except that here there is no single child bundle to take
     instead, because what they span *is* the app. **The fifth, `body`, is a pass-through blocked by
     its children**: its own reads are two (`layout`, `persist_layout`), but it clones the root
@@ -16089,12 +16302,22 @@ existing prose was left alone.
     three group predicates take the bundles they read — `ddl_modals_up(OverlayUi, ImportUi, DumpUi,
     ScriptUi, DdlUi)`, `workspace_modals_up(OverlayUi, BlobUi, DdlUi)` and
     `settings_modals_up(TermUi, AiUi, LayoutUi)` — each already a list of `Copy` flags read at the
-    top and never touched again. `modal_layer` reaches eighteen `Ui` fields and hands the bundle to
-    every modal constructor in the app, the widest thing in the crate after `center`, and
+    top and never touched again. `modal_layer` reaches **twenty-one** `Ui` fields and hands the
+    bundle to every modal constructor in the app — the widest of everything this gate's entries
+    name, ahead of `center`'s eighteen and `overlays::context_menu_overlay`'s seventeen — and
     `modal_backdrop_up` calls all three predicates and adds seven terms of its own, so what it needs
     is their union: eleven bundles, a parameter list longer than the function. Neither is a
     candidate, which is what a floor looks like when it is the function's own reach rather than a
     callee holding it there.
+    **Every one of those field counts is a hand count that nothing computes, and three of them had
+    drifted** — `center` was written as sixteen against eighteen, `header` as six against nine and
+    `modal_layer` as eighteen against twenty-one, which put `modal_layer` and `center` in the wrong
+    order in two places. The gate itself only counts `ui: Ui` **parameters** per file, so it can
+    never catch a wrong reach count; re-measure before leaning on one, the way the lapsed
+    justifications under `trigger_editor.rs` and `schema_tree.rs` have to be re-read before being
+    trusted. `workspace` (eleven), `footer` (seven), `modal_backdrop_up` (eleven),
+    `context_menu_overlay` (seventeen), `palette_commands` (nine), `find_overlay` (eight) and
+    `error_modal_overlay` (five) were all still right at the same measurement.
     **Then the whole tail came off in one pass — twelve files — and the lesson is about the ratchet
     rather than about any of them: the tail was never hard.** `tabs.rs` (2), `ddl_preview.rs` (2),
     `widgets.rs` (1), and `snippet_panel.rs`, `snippet_edit.rs`, `plan_view.rs`, `monitor_view.rs`,
@@ -18519,8 +18742,12 @@ Re-introducing the anti-patterns these guard against is a regression:
   **The policy it judges against is assembled in core as well, by `sql::GuardPolicy::of`.** The
   verdict was pure and tested; its three inputs — read-only off the connection, the dialect off its
   `db_type`, and whether the tab has a database — were assembled by a closure called `guard_policy`
-  *inside* `app_view`, a 9,600-line function where nothing is nameable, callable or testable, so the
-  half of the guard that reads the world had no test and no name. The window's closure now gathers
+  *inside* `app_view`, a function long enough that nothing in it is nameable, callable or testable,
+  so the half of the guard that reads the world had no test and no name. **No line count here on
+  purpose**: this sentence carried 9,600 and the function was over 900 lines longer than that when
+  anyone counted. Nothing computes the figure, so it goes stale with every edit to `main.rs` while
+  the argument it was decorating does not depend on its value — the same rule the working notes
+  apply to their own. The window's closure now gathers
   signals and decides nothing. `script_view` assembles the same policy, which is the other half of
   why this is a constructor and not a struct literal at each site: two independent assemblies that
   happen to agree are not one policy, they are two policies nobody is comparing. It restates one
@@ -19721,6 +19948,16 @@ Re-introducing the anti-patterns these guard against is a regression:
   `ddl_preview::PlanTarget`s, which capture the context a Drop-container menu fired in so the
   confirmation cannot be answered against a connection the user switched to meanwhile; the refusal
   on that stamp is `preview_container`'s and there is no door there to guard.
+  **That exemption is keyed on the struct literal, and it was keyed on the *file*.** `overlays.rs`
+  is the launch point for every editor door in the app, so skipping the file skipped the doors with
+  the `PlanTarget`s and made the sentence above — a sixteenth editor caught the moment it is
+  written — false for the one file where it mattered most. `stamped_into` names the literal a stamp
+  sits inside by reading back to the nearest `{` (a target's fields are plain `name: expr,` lines
+  with no braces of their own, so nothing can sit between the opener and the `read_only` field) and
+  drops path segments, so `crate::ddl_preview::PlanTarget {` and `PlanTarget {` answer alike. Every
+  editor target is a `*Target` too, so `EXEMPT` is a name list of one rather than a suffix rule, and
+  the gate fails if the exempted literal stops stamping the flag at all — an excuse that has
+  outlived what it excused is the other way this list goes wrong.
   **A guard that is present and synchronous is still not the whole rule: its *subject* has to be the
   connection the action is for.** `account_editor`'s three doors are launched from the Users
   browser's captured `UsersTarget`, which can be a different connection from the one the schema tree
@@ -20787,11 +21024,17 @@ Re-introducing the anti-patterns these guard against is a regression:
   that array — so that term is now the one thing here nothing pins. The list only guards what it
   names. **The event editor shipped absent from the
   predicate** and painted nothing at all, so the schema-editing half of that list is now
-  `ddl_editors_up(DdlUi)`, split out of `ddl_modals_up(&Ui)` for the one reason that matters here:
-  it can be tested. `ddl_preview::tests::every_editor_raises_the_group_that_gives_it_a_box` raises
-  each editor target **alone** and asserts the group sees it, over the same `DdlUi` fixture
-  `close_editors_clears_every_editor` already builds. The two tests are one invariant read from
-  opposite ends — every editor must be in this list, and every editor must be cleared by that one.
+  `ddl_editors_up(DdlUi)`, split out of `ddl_modals_up(OverlayUi, ImportUi, DumpUi, ScriptUi,
+  DdlUi)` for the one reason that matters here:
+  it can be tested — `DdlUi` is a fixture `ddl_preview`'s tests already build, where the aggregate
+  wants five bundles.
+  `ddl_preview::tests::every_editor_reaches_the_three_lists_that_must_know_about_it`
+  raises each of the nine editor targets **alone** and asserts all three lists see it:
+  `ddl_editors_up`, which gives the group its box; `close_editors`, which must clear it; and
+  `has_editor_behind`, which decides whether the preview's exit says **Back** or **Cancel**. One
+  invariant read from three ends — the event editor shipped absent from the first and the exit label
+  shipped naming two of the nine, which is why it sits beside `close_editors_clears_every_editor`
+  rather than being folded into it.
 - **And nothing bounds them.** An absolute child is out of flow, so text in one that is longer than
   the box lays out at its natural width and **paints across the border** into whatever sits beside
   it — not clipped, not ellipsized. `edit_field`'s placeholder did this for every field in the app
@@ -21130,8 +21373,24 @@ Re-introducing the anti-patterns these guard against is a regression:
   closure, and each leaves a `source_gate`-family scan of its own file behind it —
   `grid::header_sort_tests::a_server_sort_read_sits_in_a_tracking_scope` and
   `editor_pane::cmdk_preview_gate::a_preview_read_sits_in_a_tracking_scope`, each asserting that
-  every read of that one signal in that one file sits within three lines of a `move |`. Both were
-  watched failing against the unfixed tree, naming `grid.rs:9305` and `editor_pane.rs:661`. They are
+  every read of that one signal in that one file sits **inside** a `move |…|` closure. Both were
+  watched failing against the unfixed tree, naming `grid.rs:9305` and `editor_pane.rs:661`.
+  **Both asked proximity first, and proximity is not the property**: the test was "does `move |`
+  appear anywhere in the three lines above the read", and the single commonest three-line neighbour
+  in either file is an unrelated `.style(move |s| …)`, which satisfies that without the read being
+  inside anything. Each gate's *message* stated the real question the whole time.
+  `source_gate::inside_a_closure(code, at)` is the question itself, shared by the two: find the
+  nearest `move |` above, step past the parameter list, and walk the brackets forward — a closure
+  that has already closed takes the depth below zero before the read is reached. It is narrower than
+  the truth in exactly one direction, a closure whose body is a bare expression ending at a `,`
+  rather than a bracket not being detected as closed, and still strictly stronger than counting
+  lines. It is `#[cfg(test)]` like the corpus walkers beside it, both callers being gates.
+  The cmdk half also **selects on the signal rather than on one accessor**: keying on
+  `.get()`/`.with()` meant `cmdk.preview.get_untracked()` — the same bug one spelling along —
+  matched no needle, was skipped, and left the gate to fail on its own stale count with a message
+  reading as a maintenance nudge. It now matches all four accessors and refuses the two untracked
+  ones by name. (Passing the signal on, `inline_band_runs(&ed, cmdk.preview)`, is still not a read:
+  there is no accessor after the dot.) They are
   per-file and per-signal on purpose: the general gate is still the one the paragraph above says
   cannot be written, and this is what a hand walk can leave behind so a swept file does not quietly
   reacquire the bug.
@@ -21444,13 +21703,30 @@ Re-introducing the anti-patterns these guard against is a regression:
   at all — `Fixed` is honest only for a row that is always one line, which is why
   `conn_import::ROW_VIEW_CAP` took a cap instead: its rows are two lines or three, so virtualising
   them means a `VirtualItemSize::Fn` restating the layout, with no screenshot harness to catch it
-  being wrong. **And a vertically-virtualised list of content-sized rows has a horizontal problem
+  being wrong. **"Always one line" is a promise about the row's *content*, so something has to keep
+  it**: `monitor_view::cell` flattens Unicode's mandatory line breaks before the text reaches
+  `text()`, because a watched `TEXT` column holding an address or pretty-printed JSON shapes to two
+  lines, lays out past its own box and paints across the row below — the premise was stated in three
+  places and checked in none until `a_cell_holding_a_newline_is_flattened_to_one_line`. **And a slot
+  that renders nothing still owes its height**: `widgets::nothing()` is `display: none`, so
+  `entry_row`'s missing-`seq` branch is an `empty()` given `mon_row_h()`; hiding it puts every later
+  row in the window 29px above the space the stack reserved for it. **And a vertically-virtualised
+  list of content-sized rows has a horizontal problem
   too**: only the mounted rows contribute to the content width, so it moves as you scroll, and
   anything mirroring the scroll offset — the monitor's table header — is dragged sideways by a
   purely vertical gesture. The answer there is a monotone `min_width`: the widest row *seen*, never
   shrinking, and owned by whatever scope the list's own emptiness disposes, so that clearing the
   list is what resets it rather than an effect watching for it (reasoned from the layout rather than
   observed — see `monitor_view`'s entry).
+- **Padding on a virtual stack is an arithmetic error — put it on a parent.** `virtual_stack`
+  derives start, end and `before_size` from `viewport.y0 / item_size` with no knowledge of any
+  padding of its own, and `view_style` forces `height(content_size)`, which taffy reads as a border
+  box. So a `padding_vert(8)` on the stack makes the window short by the top inset — the first row
+  at the top edge is never built — *and* takes the 16px back out of the rows it does build. A
+  wrapping `container` carrying the band leaves both exact, because the viewport the stack is handed
+  is already translated into its own space. `monitor_view`'s change log is where this was found and
+  where the wrapper now is; nothing in floem objects to the padded spelling, and nothing on screen
+  says which of the two you have except a first row that never appears.
 - **`s.hide()`/`s.flex()` (display none/flex) beat height/scale for a reactive show-hide** — adds/
   removes the element from layout cleanly (no clip/overflow/leftover space). Prefer it to animating
   height when you don't need the animation.

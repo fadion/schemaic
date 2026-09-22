@@ -14920,10 +14920,17 @@ mod uncollapse_tests {
 
 /// **A ratchet on how far the root `Ui` bundle travels.**
 ///
-/// `Ui` has 36 fields and transitively pulls `OverlayUi`'s 51 and `DdlUi`'s 40,
-/// and it is passed *unnarrowed* into roughly 140 function signatures across this
-/// crate — while the per-domain child bundles that exist for exactly this purpose
-/// narrow a call at **two** sites in the whole crate. Two costs, both concrete:
+/// `Ui` has 36 fields and transitively pulls `OverlayUi`'s 51 and `DdlUi`'s 40.
+///
+/// **What follows describes the tree this gate was written against, and the
+/// campaign it drove has since made most of it false** — deliberately left in
+/// the past tense rather than deleted, because the two costs below are why the
+/// budget exists and a reader who meets the gate at 14 needs to know what 140
+/// looked like. At the time: `Ui` went *unnarrowed* into roughly 140 signatures
+/// across this crate, while the per-domain child bundles that exist for exactly
+/// this purpose narrowed a call at **two** sites. It is now 14 signatures in
+/// five files, and the child bundles are how the rest of the crate is written.
+/// Two costs, both concrete, both from that tree:
 ///
 /// * **No such function can be unit-tested.** `ddl_preview::connection_label`
 ///   touched 1 of the 36 and encoded a real decision — the `connection N`
@@ -14933,10 +14940,12 @@ mod uncollapse_tests {
 ///   `compare_view::left_db_type`/`side_label` and `event_editor::taken_names`
 ///   were the same shape and went the same way.
 /// * **A signature stops saying what it depends on.** `schema_tree::object_row`
-///   takes `ui: Ui` and dereferences it *zero* times — the only use is a clone
-///   forwarded into `object_editor::open_for_object` — so it holds live handles
-///   to ~127 signals it never reads, and a change to `OverlayUi` has no readable
-///   blast radius.
+///   took `ui: Ui` and dereferenced it *zero* times — the only use was a clone
+///   forwarded into `object_editor::open_for_object` — so it held live handles
+///   to ~127 signals it never read, and a change to `OverlayUi` had no readable
+///   blast radius. That function takes `SchemaTreeCtx` now, which is what this
+///   example reads as once you know the campaign happened; it was written when
+///   it was still true.
 ///
 /// **This is a budget, not a ban**, because narrowing 140 signatures is a
 /// campaign and a gate that fails today teaches nothing. Every number below is
@@ -15071,17 +15080,25 @@ mod whole_ui_gate {
         // reaches outside its own domain.
         //
         // **The five left are the app shell, and four are wide by nature**:
-        // `workspace` reaches eleven `Ui` fields, `center` **sixteen**,
-        // `footer` seven and `header` six. Naming any of those is past
+        // `workspace` reaches eleven `Ui` fields, `center` **eighteen**,
+        // `header` nine and `footer` seven. Naming any of those is past
         // clippy's seven-argument limit or at it, which is the lint agreeing
         // with the gate's "take the child bundle" — except there is no single
         // child bundle to take, because what they span *is* the app.
+        //
+        // **Those four numbers are hand counts and nothing recomputes them**,
+        // which is the whole reason they are worth distrusting: two of them
+        // were written as "sixteen" and "six" and stayed there through the
+        // campaign that moved them. What the gate *does* compute is the
+        // signature count per file, and that is what `BUDGET` asserts — the
+        // figures here only justify why these four are not candidates, so read
+        // them as an order of magnitude and re-measure before quoting one.
         //
         // **The fifth, `body`, is a pass-through and is blocked by its
         // children.** Its own reads are two — `layout` and `persist_layout` —
         // but it clones the root bundle three times to hand to `schema_panel`,
         // `center` and the right panel, so it cannot be narrower than the
-        // widest of them, and `center` is the widest thing in the crate. Read
+        // widest of them, and `center` is the widest thing it hands to. Read
         // it as `overlays.rs`'s `create_submenu` before the two editor doors
         // came down: a number held there by a callee, not by its own shape.
         // **Twelve files left the list in one pass — the whole tail — and
@@ -15123,9 +15140,12 @@ mod whole_ui_gate {
         // signature had not said so.
         //
         // **The two left are the layer and the union**, and neither is a
-        // candidate. `modal_layer` reaches eighteen `Ui` fields and hands the
+        // candidate. `modal_layer` reaches twenty-one `Ui` fields and hands the
         // bundle to every modal constructor in the app — it is the widest thing
-        // in the crate after `center`. `modal_backdrop_up` calls all three
+        // in the crate, `center`'s eighteen next. (Both counts were wrong here
+        // and said the opposite about the order; see the note beside `center`
+        // for why a number in this comment is not to be trusted without
+        // re-measuring.) `modal_backdrop_up` calls all three
         // predicates above *and* adds seven flags of its own, so what it needs
         // is their union: eleven bundles. Narrowing it would be a parameter
         // list longer than the function.
@@ -15277,10 +15297,16 @@ mod whole_ui_gate {
         // `help_overlay(LayoutUi)`, which reads a single signal.
         //
         // The module names no `Ui` at all now — **not a first**, and the claim
-        // this comment used to make is worth leaving as a warning: twenty-three
-        // files in the crate contain no bare `Ui`, five of them already off
-        // this list (`connection_import.rs`, `view_editor.rs`,
-        // `database_editor.rs`, `routine_editor.rs`, `object_editor.rs`).
+        // this comment used to make is worth leaving as a warning. It read
+        // "twenty-three files in the crate contain no bare `Ui`, five of them
+        // already off this list": exact when written, and falsified by this
+        // campaign's own later commits. Measured with the gate's own
+        // `whole_ui_params`, it is **46 of the crate's 51 files**, and the
+        // remainder is not "five already off the list" but the five *survivors*
+        // this `BUDGET` names — `lib.rs` 5 signatures, `overlays.rs` 4,
+        // `modals.rs` 2, `schema_tree.rs` 2, `ai_panel.rs` 1, which is the 14
+        // the equality below asserts.
+        //
         // Zero *parameters* is what this list tracks; zero *mentions* is a
         // different measurement, and a file can be off the list while its
         // prose still names the bundle — `users_view.rs` does, three times.

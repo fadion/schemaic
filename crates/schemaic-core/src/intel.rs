@@ -2546,15 +2546,22 @@ pub const SQLITE_FUNCTIONS: &[SqlFunction] = &[
 /// `FUNCTIONS` is one list for two servers, because they share a dialect as far
 /// as parsing, quoting and completion are concerned — see [`SqlDialect`], which
 /// deliberately has no MariaDB arm. That is right for everything except *which
-/// names exist*, and the difference is not small: a MySQL 8 tab was offered all
-/// forty-nine of these, none of which it can call.
+/// names exist*, and the difference is not small: a MySQL 8 tab was offered
+/// every one of these, and can call none of them.
 ///
-/// **Measured, not remembered.** Every one of `FUNCTIONS`' 309 names was
-/// executed on both servers (`SELECT <name>(1,2)` with a database selected;
-/// `ERROR 1305` means the server has no such function, any other error means it
-/// has one and was called wrongly). MySQL 8.4.11 answered 1305 for exactly
-/// these forty-nine; MariaDB 10.11.14 answered it for the five in
-/// [`MYSQL_ONLY`].
+/// **Measured, not remembered.** Every name in `FUNCTIONS` was executed on both
+/// servers (`SELECT <name>(1,2)` with a database selected; `ERROR 1305` or
+/// `1630` means the server has no such function, `1064` cannot say either way —
+/// see the live tier's `is_not_callable` — and any other error means it has one
+/// and was called wrongly). The first pass over the pre-spatial catalog found
+/// forty-nine here and the five in [`MYSQL_ONLY`]; the OGC-v1 spellings MariaDB
+/// kept and MySQL removed were measured the same way and are the rest.
+///
+/// **No count here on purpose.** The figure was written down three times in
+/// this doc as "forty-nine" and outlived two changes to the list.
+/// `live::mariadb_catalog::each_server_is_only_credited_with_the_builtins_it_
+/// really_has` re-measures both lists against both servers, which is the only
+/// thing that can be right about the number.
 ///
 /// **Two different reasons live in one list, and the list is right for both.**
 /// Most are MariaDB's own — the eight `COLUMN_*` dynamic-column functions, the
@@ -2876,7 +2883,7 @@ pub(crate) fn builtin_catalog(dialect: SqlDialect) -> Option<&'static [SqlFuncti
 /// [`builtin_catalog`]'s slice: nothing is added and nothing is filtered, so
 /// each answer below is the same answer the linear walk gave. What changes is
 /// the cost, and only on PostgreSQL does the difference matter — its catalog is
-/// 2,706 entries where MySQL's is 309.
+/// 2,706 entries where MySQL's is a few hundred.
 ///
 /// **The cost it removes, measured in a release build over a 300-statement
 /// PostGIS-shaped buffer** — statements calling extension functions the catalog
@@ -3109,16 +3116,17 @@ pub(crate) fn offered_builtins(
 /// **`flavour` is the second question, and it is only ever asked of the MySQL
 /// arm.** `SqlDialect` has no MariaDB arm on purpose — the two share a dialect
 /// for parsing, quoting and completion *shape* — but they do not share a list of
-/// names, and one `FUNCTIONS` covering both offered a MySQL 8 tab forty-nine
-/// functions it cannot call. See [`MARIADB_ONLY`] for the measurement.
+/// names, and one `FUNCTIONS` covering both offered a MySQL 8 tab a long list of
+/// functions it cannot call. See [`MARIADB_ONLY`] for the measurement, and for
+/// why the count is not written down here.
 ///
 /// `ServerFlavour::Unknown` offers everything, which is what this did before any
 /// of them were tagged. That is the deliberate choice and it is *not* the
 /// withhold-on-uncertainty rule `ServerFlavour::is_mariadb` follows: that rule
 /// is for writes, where guessing costs a table's constraints. Here the cost of
-/// guessing is one extra row in a popup, and the cost of withholding is 54 names
-/// missing from every tab whose schema has not finished loading. The flavour
-/// only ever *narrows* the list once it is known.
+/// guessing is one extra row in a popup, and the cost of withholding is every
+/// flavoured name missing from every tab whose schema has not finished loading.
+/// The flavour only ever *narrows* the list once it is known.
 pub(crate) fn is_offered_builtin(dialect: SqlDialect, flavour: ServerFlavour, name: &str) -> bool {
     match dialect {
         SqlDialect::Sqlite => true,
@@ -11153,9 +11161,10 @@ mod tests {
     ///
     /// `FUNCTIONS` is one list for two servers because `SqlDialect` has no
     /// MariaDB arm — right for parsing and quoting, wrong for which names
-    /// exist. Measured by executing all 309 on both: MySQL 8.4.11 has none of
-    /// `MARIADB_ONLY`'s forty-nine, MariaDB 10.11.14 none of `MYSQL_ONLY`'s
-    /// five.
+    /// exist. Measured by executing every one of them on both: MySQL 8.4.11 has
+    /// none of `MARIADB_ONLY`'s, MariaDB 10.11.14 none of `MYSQL_ONLY`'s five.
+    /// No count for the first list — see [`MARIADB_ONLY`]'s own doc for why it
+    /// no longer carries one.
     ///
     /// Asserted through `rank` rather than over `is_offered_builtin`, because
     /// the predicate reading correctly is not the property — the *popup* not
@@ -11234,7 +11243,7 @@ mod tests {
             assert!(
                 has(&offers(ServerFlavour::Unknown, name), name),
                 "an unasked server withheld {name}, which costs every fresh tab \
-                 54 names to avoid one wrong row"
+                 every flavoured name to avoid one wrong row"
             );
         }
     }

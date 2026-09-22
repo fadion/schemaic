@@ -530,19 +530,27 @@ fn catalog_names() -> HashSet<String> {
 /// `SQL_FUNCTIONS` view. That is true of a *catalogue* oracle and it is not the
 /// only kind: **the parser is an oracle**, and it is the better one, because it
 /// answers the question the editor actually asks — can this server call this
-/// name. `SELECT <name>(1,2)` comes back `ERROR 1305` when the server has no
-/// such function, and with some other error (wrong arity, wrong types, a syntax
-/// error for a name with its own grammar rule) when it has one. Only 1305 is
-/// read as absence.
+/// name. `SELECT <name>(1,2)` comes back `ERROR 1305` or `1630` when the server
+/// has no such function, and with some other error (wrong arity, wrong types)
+/// when it has one.
+///
+/// **`1064` is the third answer, and reading it as either of the other two is
+/// wrong.** A builtin with its own grammar rule answers it because `(1,2)` is
+/// not its syntax — `CAST`, `COUNT`, `IF` — and so does a name the server
+/// removed but kept reserved: MySQL 8.4 does that with `SRID` and `CONTAINS`,
+/// and no arity makes either parse while `COUNT(1)` does. Calling it "present"
+/// made this test demand MySQL be offered two names it cannot type; calling it
+/// "absent" would make it demand MariaDB's `COUNT` be withheld. So the walk
+/// below has three outcomes and the `stale` half skips the inconclusive ones.
 ///
 /// **Both directions, from one pass.** What MySQL 8 lacks must be exactly
 /// `intel`'s `MARIADB_ONLY`, and the same pass re-measures [`MYSQL_ONLY`] on
 /// MariaDB — so the two lists that decide what each tab is offered are checked
 /// against the two servers rather than against each other.
 ///
-/// One pinned [`Session`] rather than 309 connections: this is the documented
-/// exception to one-connection-per-operation, and 309 `Db::fetch_query` calls
-/// would open 309 of them.
+/// One pinned [`Session`] rather than a connection per name: this is the
+/// documented exception to one-connection-per-operation, and a `Db::fetch_query`
+/// per catalog entry would open one apiece.
 #[tokio::test(flavor = "multi_thread")]
 async fn each_server_is_only_credited_with_the_builtins_it_really_has() {
     use schemaic_db::session::Session;
