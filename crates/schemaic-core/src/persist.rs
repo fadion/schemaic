@@ -1111,6 +1111,21 @@ pub(crate) trait FileStore {
     fn remove(&self, path: &Path);
     /// Create the file's directory, owner-only where the platform has modes.
     fn ensure_parent(&self, path: &Path);
+    /// Push `path`'s contents to stable storage, best effort.
+    ///
+    /// **Only the erasing path pays for this**, and it is not an oversight that
+    /// the ordinary one does not: a `Saving::Replacing` save keeps the previous
+    /// generation as `.bak`, so a crash between the rename and the flush leaves
+    /// a zero-length primary that fails `serde_json::from_slice`, comes back
+    /// [`Load::Corrupt`], and is recovered from the backup. That is the whole
+    /// design, and it is why [`write_bytes`] does not sync in the common case.
+    ///
+    /// `Saving::Erasing` is the one save with **no** second copy — removing the
+    /// `.bak` is the point of it — so the window the backup covers is one it
+    /// has nothing to cover with. One fsync per *deletion*, which is a
+    /// connection or a history row being removed, is not a cost anybody
+    /// notices.
+    fn sync(&self, path: &Path);
 }
 
 /// The real filesystem.
@@ -1133,6 +1148,14 @@ impl FileStore for Fs {
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
             make_dir_private(parent);
+        }
+    }
+    fn sync(&self, path: &Path) {
+        // Best effort, like every other sweep here: a file that cannot be
+        // opened has nothing to flush, and failing the save over it would
+        // discard a write the user has already been told about.
+        if let Ok(f) = std::fs::File::open(path) {
+            let _ = f.sync_data();
         }
     }
 }
@@ -1223,6 +1246,18 @@ pub(crate) fn write_bytes(store: &dyn FileStore, path: &Path, json: &[u8], savin
         store.remove(&tmp);
     }
     if saving == Saving::Erasing && landed {
+        // **Synced before the backup goes, because this is the save with no
+        // second copy.** The rename above publishes the name; on a crash before
+        // the contents reach stable storage the primary can come back
+        // zero-length, which `from_slice` refuses and `read_bytes` recovers
+        // from the `.bak` — and that is exactly the file this branch is about to
+        // delete. So the window the backup covers is closed first.
+        //
+        // One fsync per *deletion* — a connection removed, a history row
+        // deleted — and not one per save: `Saving::Replacing` keeps its `.bak`
+        // and needs none, which is the asymmetry `FileStore::sync`'s doc sets
+        // out.
+        store.sync(path);
         store.remove(&sibling(path, ".bak"));
     }
     landed
@@ -1903,6 +1938,14 @@ mod tests {
         /// Paths whose `write` fails, and whether `rename` fails at all.
         unwritable: RefCell<Vec<PathBuf>>,
         rename_fails: RefCell<bool>,
+        /// Every `remove` and `sync`, in order.
+        ///
+        /// **The order is the property** for an erasing save: whether the
+        /// backup is deleted *before* the new content has reached stable
+        /// storage. A store that only records the final file set cannot see it
+        /// — both orderings end with the same files — which is why this is a
+        /// log and not a flag.
+        ops: RefCell<Vec<String>>,
     }
 
     impl FakeFs {
@@ -1947,9 +1990,17 @@ mod tests {
             Ok(())
         }
         fn remove(&self, path: &Path) {
+            self.ops
+                .borrow_mut()
+                .push(format!("remove {}", path.display()));
             self.files.borrow_mut().remove(path);
         }
         fn ensure_parent(&self, _path: &Path) {}
+        fn sync(&self, path: &Path) {
+            self.ops
+                .borrow_mut()
+                .push(format!("sync {}", path.display()));
+        }
     }
 
     const CFG: &str = "/cfg/ui.json";
@@ -1966,6 +2017,89 @@ mod tests {
     fn recovery_lock() -> std::sync::MutexGuard<'static, ()> {
         static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
         LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// **The erasing save is the one with no recovery copy, so it is the one
+    /// that has to sync before it removes the old one.**
+    ///
+    /// `Saving::Replacing` keeps the previous generation as `.bak`, so the
+    /// window between a rename and the contents reaching stable storage is
+    /// covered: a crash there leaves a zero-length primary, which fails
+    /// `from_slice`, comes back `Load::Corrupt`, and is read from the backup.
+    /// That is why the ordinary path does not pay for a sync.
+    ///
+    /// `Saving::Erasing` removes the `.bak` — that is the point of it — so the
+    /// same window has nothing to cover it with. On `connections.json`, which
+    /// this module's own prose calls "the only config file with no second copy
+    /// anywhere", deleting one connection could lose all of them.
+    ///
+    /// Asserted as an **order**, because both orderings end with the same set
+    /// of files and a store that recorded only the outcome could not tell them
+    /// apart.
+    #[test]
+    fn an_erasing_save_syncs_before_it_removes_the_backup() {
+        let fs = FakeFs::default();
+        write_bytes(&fs, Path::new(CFG), br#""A""#, Saving::Replacing);
+        write_bytes(&fs, Path::new(CFG), br#""B""#, Saving::Replacing);
+        assert!(fs.get("/cfg/ui.json.bak").is_some(), "the premise");
+
+        fs.ops.borrow_mut().clear();
+        write_bytes(&fs, Path::new(CFG), br#""C""#, Saving::Erasing);
+        let ops = fs.ops.borrow().clone();
+
+        let sync = ops
+            .iter()
+            .position(|o| o == "sync /cfg/ui.json")
+            .unwrap_or_else(|| panic!("the erasing save never synced: {ops:?}"));
+        let removed = ops
+            .iter()
+            .position(|o| o == "remove /cfg/ui.json.bak")
+            .unwrap_or_else(|| panic!("the erasing save kept the backup: {ops:?}"));
+        assert!(
+            sync < removed,
+            "the backup was removed before the new content was synced, so a \
+             crash in between leaves a zero-length primary and nothing to \
+             recover from: {ops:?}"
+        );
+        // …and an ordinary save still does not pay for it: the `.bak` it leaves
+        // behind is the recovery, and one fsync per keystroke-driven save is a
+        // cost this store does not need to carry.
+        fs.ops.borrow_mut().clear();
+        write_bytes(&fs, Path::new(CFG), br#""D""#, Saving::Replacing);
+        assert!(
+            !fs.ops.borrow().iter().any(|o| o.starts_with("sync")),
+            "a replacing save synced — it has a `.bak` for exactly that window: {:?}",
+            fs.ops.borrow()
+        );
+
+        // **And the credential store, which sweeps one sibling more.**
+        // `write_secret_store` removes the `.corrupt` as well as the `.bak`,
+        // and its own doc says it "owes the sweep the same ordering
+        // `write_bytes` gives its own" — so both of its removals must also be
+        // after the sync. `connections.json` is the file this module calls "the
+        // only config file with no second copy anywhere".
+        let fs = FakeFs::default();
+        write_secret_store(&fs, Path::new(CREDS), &vec!["a"], Saving::Replacing);
+        write_secret_store(&fs, Path::new(CREDS), &vec!["a", "b"], Saving::Replacing);
+        fs.ops.borrow_mut().clear();
+        write_secret_store(&fs, Path::new(CREDS), &vec!["a"], Saving::Erasing);
+        let ops = fs.ops.borrow().clone();
+        let sync = ops
+            .iter()
+            .position(|o| o == "sync /cfg/connections.json")
+            .unwrap_or_else(|| panic!("the credential store's erase never synced: {ops:?}"));
+        for sibling in [".bak", ".corrupt"] {
+            let want = format!("remove /cfg/connections.json{sibling}");
+            let at = ops
+                .iter()
+                .position(|o| *o == want)
+                .unwrap_or_else(|| panic!("{sibling} was not swept: {ops:?}"));
+            assert!(
+                sync < at,
+                "the credential store removed its {sibling} before the new \
+                 content was synced: {ops:?}"
+            );
+        }
     }
 
     #[test]
