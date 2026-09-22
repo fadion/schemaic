@@ -330,6 +330,29 @@ pub struct UiState {
     /// [`statement_timeout`] is the one place the `0` is read as "off".
     #[serde(default)]
     pub statement_timeout_secs: u64,
+    /// **Every key this build does not recognise, carried through a save.**
+    ///
+    /// The struct-field half of a policy this module states four times for
+    /// *values* — `RightPanelState`'s `#[serde(other)]`, `history::OutcomeRaw`,
+    /// `snippet::Scope::Unknown`, `search_history::ObjectTag::Unknown`, whose
+    /// doc says in terms that "merely running this build once would have
+    /// rewritten a newer build's entry". `expanded` and `hidden_dbs` above are
+    /// kept solely so an upgrade does not lose a setting. Without this, a
+    /// *downgrade* loses one: serde drops an unknown key and
+    /// [`save_ui_state`] writes the struct.
+    ///
+    /// It needs no user action. `save_ui` is driven by three `create_effect`s
+    /// that floem runs once at creation, so the first save of a rolled-back
+    /// build happens before the window is drawn — and it is `Saving::Replacing`,
+    /// so the newer generation survives only as `ui_state.json.bak` until the
+    /// next save rotates it, on that same launch. Rolling back over the
+    /// `stable` channel is a supported motion; both builds share one
+    /// `%APPDATA%\Roaming\schemaic`.
+    ///
+    /// `skip_serializing_if`, so a file that never met a newer build does not
+    /// grow an `"extra": {}` — this is a JSON file a human may edit.
+    #[serde(flatten, default, skip_serializing_if = "serde_json::Map::is_empty")]
+    pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
 /// The configured statement timeout as a duration, or `None` when there is
@@ -398,6 +421,8 @@ impl Default for UiState {
             restore_tabs: true,
             live_validate: false,
             statement_timeout_secs: 0,
+            // Nothing unrecognised until a file says otherwise.
+            extra: serde_json::Map::new(),
         }
     }
 }
@@ -1643,6 +1668,116 @@ mod tests {
     };
     use std::cell::RefCell;
     use std::collections::HashMap;
+
+    /// **A setting a newer build wrote survives an older build's save.**
+    ///
+    /// This module states the policy for the *value* half four times over, each
+    /// with the reasoning written out — `RightPanelState`'s `#[serde(other)]`,
+    /// `history::OutcomeRaw`, `snippet::Scope::Unknown`,
+    /// `search_history::ObjectTag::Unknown` — and the last of those says in
+    /// terms that "merely running this build once would have rewritten a newer
+    /// build's entry". [`UiState`] itself keeps `expanded` and `hidden_dbs`
+    /// solely so an upgrade does not lose a setting. The *field* case was the
+    /// one instance with no mechanism: serde drops an unknown key, and
+    /// `save_ui_state` writes the struct.
+    ///
+    /// It needs no user action to bite. `save_ui` is driven by three
+    /// `create_effect`s that floem runs once at creation, so an older build's
+    /// first save happens before the window is drawn — and it is `Replacing`,
+    /// so the pre-downgrade generation survives only as `ui_state.json.bak`
+    /// until the next save rotates it, on that same launch.
+    #[test]
+    fn a_field_a_newer_build_wrote_survives_a_round_trip_through_this_one() {
+        let json = r#"{
+            "schema_visible": false,
+            "grid_row_height": 22.5,
+            "some_future_map": {"a": [1, 2, 3]},
+            "statement_timeout_secs": 30
+        }"#;
+        let state: UiState = serde_json::from_str(json).expect("an unknown key is not an error");
+        // The known fields still land where they belong — `flatten` must not
+        // swallow them into the carrier.
+        assert!(!state.schema_visible);
+        assert_eq!(state.statement_timeout_secs, 30);
+
+        let out = serde_json::to_string(&state).expect("serialises");
+        let back: serde_json::Value = serde_json::from_str(&out).expect("valid json");
+        assert_eq!(
+            back.get("grid_row_height").and_then(|v| v.as_f64()),
+            Some(22.5),
+            "a scalar a newer build wrote was dropped by this build's save: {out}"
+        );
+        assert_eq!(
+            back.pointer("/some_future_map/a/2")
+                .and_then(|v| v.as_i64()),
+            Some(3),
+            "a structured value a newer build wrote was dropped: {out}"
+        );
+        // …and the carrier is not itself written out as a key.
+        assert!(
+            back.get("extra").is_none(),
+            "the carrier leaked into the file as a field of its own: {out}"
+        );
+    }
+
+    /// The ordinary file gains nothing: a state with no unknown keys round-trips
+    /// to the same set of keys it started with, so the carrier costs nobody a
+    /// stray `"extra": {}` in a file they may hand-edit.
+    #[test]
+    fn a_file_with_no_unknown_keys_gains_none() {
+        let state: UiState = serde_json::from_str("{}").expect("an empty object is a default");
+        let out = serde_json::to_string(&state).expect("serialises");
+        let back: serde_json::Value = serde_json::from_str(&out).expect("valid json");
+        let keys: Vec<&String> = back.as_object().expect("an object").keys().collect();
+        assert!(
+            !keys.iter().any(|k| k.as_str() == "extra"),
+            "the carrier is written out even when empty: {keys:?}"
+        );
+    }
+
+    /// **`#[serde(flatten)]` changes the deserializer's shape for the whole
+    /// struct**, which is the cost of the carrier above and the reason this is
+    /// here: flattening routes every field through serde's buffered
+    /// self-describing path instead of the struct visitor, and the types that
+    /// notice are the numeric and enum ones. So a full non-default state goes
+    /// out and comes back, field for field.
+    #[test]
+    fn every_field_survives_the_flattened_round_trip() {
+        // One of each shape the struct holds: bool both ways, f64, usize, u64,
+        // String, enum, and a keyed Vec.
+        let mut state = UiState {
+            schema_visible: false,
+            live_validate: true,
+            schema_w: 412.5,
+            editor_font_size: 17.0,
+            row_limit: 1_234,
+            tab_width: 8,
+            statement_timeout_secs: 90,
+            ui_theme: "light".to_string(),
+            right_panel: RightPanelState::Ai,
+            hidden_dbs: vec!["mysql".into(), "sys".into()],
+            ..UiState::default()
+        };
+        state.extra.insert("from_v26".into(), 7.into());
+
+        let out = serde_json::to_string(&state).expect("serialises");
+        let back: UiState = serde_json::from_str(&out).expect("round-trips");
+
+        assert!(!back.schema_visible);
+        assert!(back.live_validate);
+        assert_eq!(back.schema_w, 412.5);
+        assert_eq!(back.editor_font_size, 17.0);
+        assert_eq!(back.row_limit, 1_234);
+        assert_eq!(back.tab_width, 8);
+        assert_eq!(back.statement_timeout_secs, 90);
+        assert_eq!(back.ui_theme, "light");
+        assert_eq!(back.right_panel, RightPanelState::Ai);
+        assert_eq!(
+            back.hidden_dbs,
+            vec!["mysql".to_string(), "sys".to_string()]
+        );
+        assert_eq!(back.extra.get("from_v26").and_then(|v| v.as_i64()), Some(7));
+    }
 
     /// **The bargain `migrate_legacy_once` exists for, and the half neither
     /// `expanded::migrate_flat` nor `db_hidden::migrate_flat` could test.**

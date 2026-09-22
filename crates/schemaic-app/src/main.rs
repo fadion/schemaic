@@ -1534,6 +1534,13 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
     // reads the *old* global AI flag out of it; tab restore further down needs it
     // too (`restore_tabs`).
     let ui_state = persist::load_ui_state();
+    // **Every key this build does not recognise, held for the save.** Captured
+    // here rather than read off `ui_state` at the save, because the struct is
+    // consumed field by field on the way down — the same reason
+    // `pending_legacy_expanded` is an `Rc`. See `UiState::extra`: without this
+    // the first save of a rolled-back build drops a setting the newer one
+    // wrote, before the window is even drawn.
+    let carried_unknown = Rc::new(ui_state.extra.clone());
 
     // Load saved connections. Secrets are hydrated from the OS keyring (and any
     // legacy plaintext migrated into it) by `secrets::load_connections`.
@@ -7028,6 +7035,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
     // all keyed by connection. See `persist::save_ui_state`.
     let save_ui: Rc<dyn Fn(persist::Saving)> = Rc::new({
         let pending_legacy_hidden = pending_legacy_hidden.clone();
+        let carried_unknown = carried_unknown.clone();
         move |saving| {
             persist::save_ui_state(
                 &UiState {
@@ -7080,6 +7088,10 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                     restore_tabs: restore_tabs.get_untracked(),
                     live_validate: live_validate.get_untracked(),
                     show_table_sizes: table_sizes.get_untracked(),
+                    // Carried straight back out — see `UiState::extra`. This
+                    // build cannot say anything about these keys except that
+                    // some build could.
+                    extra: (*carried_unknown).clone(),
                 },
                 saving,
             );
