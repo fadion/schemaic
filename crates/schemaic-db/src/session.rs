@@ -944,6 +944,7 @@ mod pg_cancel_gate {
     #[test]
     fn every_postgres_cancel_goes_through_the_helper_that_knows_the_transport() {
         let mut offenders = Vec::new();
+        let mut scanned = 0_usize;
         for entry in std::fs::read_dir(crate_src()).expect("the crate's src") {
             let path = entry.expect("a dir entry").path();
             if path.extension().is_none_or(|e| e != "rs") {
@@ -956,12 +957,26 @@ mod pg_cancel_gate {
                 continue;
             }
             let src = std::fs::read_to_string(&path).expect("a source file");
-            // Spelled in two pieces so the scanner does not find *itself* —
-            // this module lives in the file it reads.
-            let needle = format!(".cancel{}(", "_query");
+            scanned += 1;
+            // **No trailing `(`, because the token has two methods.**
+            // `tokio_postgres::CancelToken` offers `cancel_query(tls)` and
+            // `cancel_query_raw(stream, tls)`; the second is the one to reach
+            // for when the cancel has to ride an already-open socket, which is
+            // exactly what the tunnel would want. A needle ending in `(` sees
+            // the first and walks past the second, which commits the identical
+            // failure. Stopping before the paren catches both, and the UFCS
+            // form is listed beside it.
+            //
+            // Spelled in pieces so the scanner does not find *itself* — this
+            // module lives in the file it reads. `pg::cancel_query(…)` is a
+            // path, not a method call, so it does not match either needle.
+            let needles = [
+                format!(".cancel{}", "_query"),
+                format!("CancelToken::cancel{}", "_query"),
+            ];
             for (i, line) in src.lines().enumerate() {
                 let code = line.split("//").next().unwrap_or("");
-                if code.contains(&needle) {
+                if needles.iter().any(|n| code.contains(n.as_str())) {
                     offenders.push(format!("{name}:{}: {}", i + 1, line.trim()));
                 }
             }
@@ -972,6 +987,13 @@ mod pg_cancel_gate {
              transport — a plaintext cancel is refused by exactly the servers TLS was set for, \
              and the refusal is discarded:\n{}",
             offenders.join("\n")
+        );
+        // The floor every source gate in this workspace carries: a moved or
+        // renamed `src` would otherwise make this pass by reading nothing, and
+        // this is the gate that reads a directory rather than a named file.
+        assert!(
+            scanned >= 5,
+            "only {scanned} source file(s) scanned — has `src` moved?"
         );
     }
 

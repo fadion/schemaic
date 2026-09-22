@@ -2499,16 +2499,46 @@ mod tests {
         // **Assembled, not written out**, the way the timeout census next door
         // assembles its `stop` marker: a test that names the thing it forbids
         // trips on its own source, and the first spelling of this one did.
+        //
+        // **Two shapes, because the verbs are two shapes.** A suffixed verb
+        // (`query_drop`, `exec_map`) can only be the driver's, so the name
+        // alone is the needle. A short one (`query`, `exec`, `prep`, `batch`)
+        // is a word this file uses in other senses all day — `fetch_query`,
+        // `run_batch`, `ENGINE_ENTRY_POINTS` — so it is matched with the method
+        // dot that makes it a call rather than a name.
+        //
+        // `_map` is here because it is the pair this gate was written without
+        // and the pair the extraction actually carried out of the file:
+        // `Db::fetch_grants` and `Db::fetch_table_list` were `query_map` at
+        // `v0.25.0`, and both still are, in `mysql.rs`. Putting either back
+        // here left the gate green.
+        let mut verbs = Vec::new();
         for kind in ["query", "exec"] {
-            for tail in ["_drop(", "_iter(", "_first("] {
-                let verb = format!("{kind}{tail}");
-                assert!(
-                    !body.contains(&verb),
-                    "`lib.rs` calls `{verb}` — it is the dispatcher, and a \
-                     statement it runs itself is one no engine module owns. \
-                     Put it in `mysql.rs` beside the others"
-                );
+            for tail in ["_drop(", "_iter(", "_first(", "_map("] {
+                verbs.push(format!("{kind}{tail}"));
             }
+        }
+        verbs.push(format!("query{}internal(", '_'));
+        for kind in ["query", "exec", "prep", "batch"] {
+            verbs.push(format!(".{kind}("));
+        }
+        // **Pinned, because this gate cannot be made to fail without putting a
+        // call back.** The list is the whole of what it checks, so its length
+        // is the only thing that says a verb was dropped from it — which is
+        // exactly how `_map` went missing.
+        assert_eq!(
+            verbs.len(),
+            13,
+            "the driver-verb list changed size — every way to make a \
+             `mysql_async` connection do something belongs in it"
+        );
+        for verb in &verbs {
+            assert!(
+                !body.contains(verb),
+                "`lib.rs` calls `{verb}` — it is the dispatcher, and a \
+                 statement it runs itself is one no engine module owns. \
+                 Put it in `mysql.rs` beside the others"
+            );
         }
     }
 

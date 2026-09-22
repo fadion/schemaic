@@ -4415,11 +4415,33 @@ mod engine_comparison_gate {
 /// rather than when someone remembers to add it here. The refusal has to come *before*
 /// the stamp, which is also the order that keeps a half-opened modal off the
 /// screen.
+///
+/// **The exemption is per *stamp*, not per file, and that is what lets the
+/// sentence above stand.** It was a whole-file skip keyed on `overlays.rs` —
+/// which is the schema tree's entire right-click surface and the launch point
+/// for every editor door in the app, so a sixteenth door written *there* was
+/// exactly the one the gate could not see. `modal_backdrop_gate` documents that
+/// price for itself and pays it; this one claimed the opposite. Keying on the
+/// struct literal the flag is stamped into costs nothing and is strictly
+/// stronger: an editor target in `overlays.rs` is now checked, and a
+/// `PlanTarget` is skipped wherever it is written rather than only there.
+///
+/// **What it still cannot see** — said plainly, because the sentence above is
+/// the kind that rots: `enclosing_fn` finds the nearest *top-level* `fn` and
+/// asks only whether the refusal appears somewhere above the stamp in it, so in
+/// a long function one refusal on one branch satisfies every stamp below it on
+/// any branch. No such shape exists today; every door is short and refuses on
+/// its first line.
 #[cfg(test)]
 mod read_only_door_gate {
-    /// Files that stamp the flag and are **not** editor doors, with the reason.
+    /// Struct literals that carry the flag and are **not** editor targets, with
+    /// the reason.
+    ///
+    /// Keyed on the literal rather than on the file it appears in — see the
+    /// module doc. Every editor target is a `*Target` too, so this is a name
+    /// list of one, not a suffix rule.
     const EXEMPT: &[(&str, &str)] = &[(
-        "overlays.rs",
+        "PlanTarget",
         "`ddl_preview::PlanTarget`, not an editor target: the two Drop-container \
          entries capture the context where the menu fired so the confirmation \
          cannot be answered against a connection the user switched to \
@@ -4472,6 +4494,25 @@ mod read_only_door_gate {
         (start, name)
     }
 
+    /// The name of the struct literal a stamp sits inside.
+    ///
+    /// The nearest `{` above the stamp opens it: a target's fields are plain
+    /// `name: expr,` lines with no braces of their own, so nothing can sit
+    /// between the literal's opener and its `read_only` field. The name is the
+    /// identifier immediately before that brace, path segments dropped —
+    /// `crate::ddl_preview::PlanTarget {` and `PlanTarget {` answer alike.
+    fn stamped_into(code: &str, at: usize) -> &str {
+        let Some(open) = code[..at].rfind('{') else {
+            return "<none>";
+        };
+        code[..open]
+            .trim_end()
+            .rsplit(|c: char| !(c.is_alphanumeric() || c == '_'))
+            .next()
+            .filter(|s| !s.is_empty())
+            .unwrap_or("<none>")
+    }
+
     #[test]
     fn every_editor_door_refuses_a_read_only_connection() {
         let mut offenders: Vec<String> = Vec::new();
@@ -4482,12 +4523,16 @@ mod read_only_door_gate {
             if !SUBJECTS.iter().any(|(stamp, _)| code.contains(stamp)) {
                 continue;
             }
-            if let Some((name, _)) = EXEMPT.iter().find(|(f, _)| *f == file) {
-                exempt_seen.push(name);
-                continue;
-            }
             for (n, (stamp, refusal)) in SUBJECTS.iter().enumerate() {
                 for (at, _) in code.match_indices(stamp) {
+                    // Per stamp, not per file: the exempted literal may share a
+                    // file with a real door, and the file it shares is the one
+                    // every door is launched from.
+                    let into = stamped_into(&code, at);
+                    if let Some((name, _)) = EXEMPT.iter().find(|(t, _)| *t == into) {
+                        exempt_seen.push(name);
+                        continue;
+                    }
                     doors += 1;
                     per_subject[n] += 1;
                     let (start, name) = enclosing_fn(&code, at);
@@ -4497,6 +4542,7 @@ mod read_only_door_gate {
                 }
             }
         }
+        exempt_seen.dedup();
         // A renamed field or a moved `src` would otherwise make this pass by
         // finding nothing at all — the failure mode `crate_sources` guards
         // against for the whole family.
@@ -4518,10 +4564,11 @@ mod read_only_door_gate {
                  see"
             );
         }
-        for (file, why) in EXEMPT {
+        for (literal, why) in EXEMPT {
             assert!(
-                exempt_seen.contains(file),
-                "{file} is exempted ({why}) but no longer stamps the flag — drop it from EXEMPT"
+                exempt_seen.contains(literal),
+                "`{literal}` is exempted ({why}) but no longer stamps the flag — \
+                 drop it from EXEMPT"
             );
         }
         assert!(
@@ -4585,6 +4632,53 @@ mod diagram_layout_gate {
              that renames a `.corrupt` file and tells the user nothing — and on \
              a save path, writes the defaulted empty file over the recovered \
              nothing. Found it in: {sites:?}"
+        );
+    }
+
+    /// **And the one door reports — before it hands the layouts back.**
+    ///
+    /// The half that did not come across. The gate this replaced asserted two
+    /// things, `loads >= 3` *and* `reports > loads`; only the counting half was
+    /// rewritten, and "one door" was taken to make the reporting true by
+    /// construction. It does not: delete `report_recoveries` from the door and
+    /// the assertion above still passes, because the file is still read in
+    /// exactly one place — and the whole failure the gate exists for is back.
+    ///
+    /// The *order* is asserted too, and it is not tidiness. The door's own
+    /// comment says why: if the `.bak` was unreadable as well, the caller's
+    /// `save_json` writes the defaulted empty file over the recovered nothing,
+    /// so the notice has to be queued before the caller can get that far.
+    #[test]
+    fn the_one_door_reports_before_it_returns() {
+        let src = crate::source_gate::production_code(include_str!("lib.rs"));
+        let at = src
+            .find("pub fn load_diagram_layouts(")
+            .expect("the one door");
+        let end = crate::source_gate::item_end(&src, at).expect("no end to the door");
+        let body = &src[at..end];
+
+        let reports = body.find(&["report", "_recoveries("].concat()).expect(
+            "`load_diagram_layouts` does not report what the read recovered — \
+                 a truncated `diagrams.json` is renamed to `.corrupt` and the \
+                 user is told nothing at all",
+        );
+        let loads = body
+            .find(&["load", "_json("].concat())
+            .expect("`load_diagram_layouts` no longer reads the file");
+        assert!(
+            loads < reports,
+            "the door must read first and report second — there is nothing to \
+             report before the read"
+        );
+        // The value is bound, then reported, then returned. Anything after the
+        // report is work the notice has already been queued ahead of, which is
+        // the property the save side depends on.
+        let returns = body.rfind("layouts").expect("the door returns the layouts");
+        assert!(
+            reports < returns,
+            "`report_recoveries` must be queued before the layouts are handed \
+             back: a caller's `save_json` would otherwise write the defaulted \
+             empty file over the recovered nothing, and the notice with it"
         );
     }
 }
