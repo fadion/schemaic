@@ -333,13 +333,15 @@ fn wsl_distros() -> Vec<String> {
 
 /// Decode `wsl.exe -l -q`'s UTF-16LE output into distro names: one per line,
 /// each trimmed of NULs/whitespace, blanks dropped. Pure so it's unit-testable
-/// without spawning `wsl.exe`. A trailing odd byte (incomplete code unit) is
-/// ignored by `chunks_exact`.
+/// without spawning `wsl.exe`. A trailing odd byte (incomplete code unit) lands
+/// in `as_chunks`' remainder and is dropped.
 #[cfg(windows)]
 fn parse_wsl_list(stdout: &[u8]) -> Vec<String> {
     let u16s: Vec<u16> = stdout
-        .chunks_exact(2)
-        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|c| u16::from_le_bytes(*c))
         .collect();
     String::from_utf16_lossy(&u16s)
         .lines()
