@@ -167,7 +167,8 @@ pub(crate) fn modal_layer(ui: Ui, modal_up: impl Fn() -> bool + Copy + 'static) 
                     trigger_editor::trigger_editor_overlay(
                         ui.conn,
                         ui.ddl,
-                        ui.schema_actions.clone(),
+                        ui.schema_actions.trigger_functions.clone(),
+                        ui.schema_actions.routine_source.clone(),
                     ),
                     routine_editor::routine_editor_overlay(ui.ddl, ui.schema),
                     event_editor::event_editor_overlay(ui.ddl, ui.schema),

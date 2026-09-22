@@ -155,6 +155,16 @@ fn open_editor(d: DdlUi, actions: &SchemaActions, target: TriggerTarget, draft: 
 /// leave the draft emitting it. A draft the user has already edited is left
 /// alone — the round trip lands in milliseconds, but "unlikely" is not a reason
 /// to overwrite what somebody typed.
+///
+/// **Except where the thing being preserved is the corruption itself.** That
+/// skip patched `current` unconditionally and the draft conditionally, so a
+/// user who typed one character inside the fetch window kept the mangled body
+/// on the side that Apply emits — `DROP TRIGGER` and then a `CREATE` carrying
+/// `'it's'`, refused 1064 on both engines, after the drop has committed and
+/// with no transaction. [`TriggerSource::may_overwrite_edit`] is the rule, and
+/// it keeps the skip for the case the skip was written for: where the fetch
+/// agrees with what the editor opened, there is nothing to correct and the
+/// keystrokes stand.
 fn fetch_sources(d: DdlUi, source: &TriggerSrcFn) {
     let Some((conn_id, database, names)) = d.trigger.with_untracked(|t| {
         t.as_ref().map(|t| {
@@ -234,16 +244,20 @@ fn fetch_sources(d: DdlUi, source: &TriggerSrcFn) {
                     }
                 }
             });
-            // …and the draft, row by row, skipping any the user has already
-            // edited: the round trip lands in milliseconds, but that is not a
-            // reason to overwrite what somebody typed.
+            // …and the draft, row by row. A row the user has already edited is
+            // normally left alone — the round trip lands in milliseconds, but
+            // that is not a reason to overwrite what somebody typed — *unless*
+            // the body the edit was typed on top of is the corrupt one, in
+            // which case the keystrokes are riding a syntax error that Apply
+            // would `DROP` the trigger to emit. `may_overwrite_edit` is where
+            // that is decided, and why.
             d.trigger_draft.update(|dr| {
                 for ((name, src), opened) in replies.iter().zip(&opened_with) {
                     if let Some(row) = dr
                         .triggers
                         .iter_mut()
                         .find(|r| r.original.as_deref() == Some(name.as_str()))
-                        .filter(|r| opened.as_ref() == Some(&r.info.action))
+                        .filter(|r| src.may_overwrite_edit(opened.as_ref(), &r.info.action))
                     {
                         src.apply_to(&mut row.info);
                     }
@@ -1063,7 +1077,6 @@ fn matching<'a>(list: &'a [RoutineInfo], sql: &str) -> Option<&'a RoutineInfo> {
 /// which is an opening path — stopped being one when that editor's doors took
 /// `(ConnUi, DdlUi, &RoutineSrcFn)` themselves: this is the union of what those
 /// two buttons hand on, and nothing else here reads the bundle at all.
-#[allow(clippy::too_many_arguments)]
 fn pg_action(
     conn: ConnUi,
     ui: DdlUi,
@@ -1380,12 +1393,20 @@ fn preview_from(target: &TriggerTarget, cs: &ddl::ChangeSet) -> DdlPreview {
 /// **The one overlay in the crate that still needs an action.** Its siblings'
 /// fetches all run from an `open`; this one has a second, later trigger — the
 /// function list is re-read when the nested routine editor closes back to here
-/// — so `&SchemaActions` comes in beside the two bundles, and `PostgreSQL`'s
-/// function picker hands its own `routine_source` on to the editor it opens.
+/// — and `PostgreSQL`'s function picker hands a routine source on to the editor
+/// it opens.
+///
+/// **The two it needs, named, rather than the bundle they live on.** This was
+/// the campaign's one site that *stored* an `Rc<SchemaActions>` instead of
+/// forwarding it — 31 closures kept alive for exactly two fetches — and naming
+/// them costs one parameter: four, three under the limit the rest of the
+/// campaign cites as its reason for bundling. `whole_ui_gate` counts only
+/// `ui: Ui`, so nothing measured it.
 pub(crate) fn trigger_editor_overlay(
     conn: ConnUi,
     d: DdlUi,
-    schema_actions: Rc<SchemaActions>,
+    trigger_functions: TriggerFnFn,
+    routine_source: RoutineSrcFn,
 ) -> impl IntoView {
     let close = move || d.trigger.set(None);
 
@@ -1394,7 +1415,7 @@ pub(crate) fn trigger_editor_overlay(
     // put it there before the next schema reload. Created once, outside the
     // `dyn_container`, so it survives the panel being rebuilt.
     {
-        let fns_of = schema_actions.trigger_functions.clone();
+        let fns_of = trigger_functions.clone();
         create_effect(move |prev: Option<bool>| {
             let fn_open = d.routine.get().is_some();
             if refetch_functions_on_return(prev, fn_open, d.trigger.get_untracked().is_some()) {
@@ -1456,7 +1477,7 @@ pub(crate) fn trigger_editor_overlay(
             let ring = FocusRing::new();
             let root_ring = ring.clone();
 
-            let form_source = schema_actions.routine_source.clone();
+            let form_source = routine_source.clone();
             let form_target = target.clone();
             let form_ring = ring.clone();
             let (selected, rev) = (d.selected, d.rev);
@@ -1591,6 +1612,81 @@ pub(crate) fn trigger_editor_overlay(
             s
         }
     })
+}
+
+/// **"Which function is this trigger bound to" is asked in one place.**
+///
+/// The picker asked [`fn_names`]; the Edit button compared [`fn_display`] to the
+/// already-displayed string. The two agreed only while the first had *succeeded*
+/// and disagreed silently whenever it had fallen back to the stored SQL — so on
+/// a stock server, where `tgfoid::regproc::text` drops the schema for a `public`
+/// function, the picker listed the function twice and **Edit was permanently
+/// disabled**. Both go through [`matching`] now.
+///
+/// That seam was closed by construction and nothing failed when it reopened,
+/// which is the shape `AGENTS.md`'s testing section names: the existing test
+/// drives `matching` in isolation, and `matching` was never the broken half.
+/// `a_stored_name_matches_its_function_in_either_quoting` was green against the
+/// `public` case for as long as it existed.
+///
+/// A source gate rather than a unit test for `one_funnel_gate`'s reason: the
+/// decision is which helper a `dyn_container` builder calls, and there is no
+/// value to assert on. What it can check is that the second spelling has not
+/// come back — which is what actually regressed.
+#[cfg(test)]
+mod one_answer_gate {
+    #[test]
+    fn both_doors_ask_which_function_through_the_one_helper() {
+        let src = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("src")
+                .join("trigger_editor.rs"),
+        )
+        .expect("trigger_editor.rs");
+        let body = crate::source_gate::production_code(&src);
+
+        // `fn_names` is `matching`'s own first arm and nothing else's. A second
+        // occurrence is the picker asking directly again.
+        let calls = body.matches(&["fn", "_names("].concat()).count();
+        assert_eq!(
+            calls,
+            2,
+            "`fn_names` is called {} time(s) outside its own definition — it is \
+             `matching`'s first arm, and a caller reaching past `matching` to it \
+             loses the bare-name arm: a trigger on a stock server's `public` \
+             function stores the unqualified name, so that caller answers `None` \
+             for the commonest trigger there is",
+            calls.saturating_sub(1)
+        );
+
+        // **Paired with the door, not counted over the file.** Counting cannot
+        // separate the Edit button's question — "which function is this stored
+        // SQL bound to" — from the picker's *inverse* mapping at `on_select`,
+        // where `fn_display(f) == v` is right by construction because `v` came
+        // out of the options list. That third use is legitimate and must stay
+        // legible, so the assertion is scoped to the binding that regressed.
+        let at = body
+            .find("fn pg_action(")
+            .expect("`pg_action` is gone — rewrite this gate, don't delete it");
+        let end = crate::source_gate::item_end(&body, at).expect("no end to `pg_action`");
+        let regions = crate::source_gate::let_regions(&body[at..end], &["edit_btn"])
+            .expect("`edit_btn` is gone — rewrite this gate, don't delete it");
+        let (_, edit_btn) = &regions[0];
+
+        assert!(
+            edit_btn.contains("matching("),
+            "the Edit button no longer asks `matching`. Reverting it to \
+             `fn_display(f) == named` agrees with `display_of` only while \
+             `display_of` has succeeded, and is silently `None` whenever it \
+             fell back to the stored SQL — which is how Edit came to be \
+             permanently disabled on a stock `public` trigger function."
+        );
+        assert!(
+            !edit_btn.contains(&["fn", "_display("].concat()),
+            "the Edit button is comparing display names again — see above. The \
+             stored SQL is qualified only sometimes; `fn_display` always is."
+        );
+    }
 }
 
 #[cfg(test)]

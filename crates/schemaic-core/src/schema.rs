@@ -1757,6 +1757,49 @@ impl TriggerSource {
         t.charset_client = self.charset_client.clone();
         t.collation_connection = self.collation_connection.clone();
     }
+
+    /// May this correction overwrite a draft row the user has **already
+    /// edited**?
+    ///
+    /// The editor opens on `information_schema.ACTION_STATEMENT`, which on
+    /// MySQL has had its escapes resolved — a trigger written `'it''s'` reads
+    /// back as `'it's'` — and the real source is fetched behind it. The fetch
+    /// leaves an edited row alone, on the reasonable ground that a round trip
+    /// landing in milliseconds is no reason to overwrite what somebody typed.
+    ///
+    /// **But that is only reasonable when there was nothing to correct.** If
+    /// the body the edit was made on top of was the corrupt one, keeping it
+    /// keeps the corruption: `current` is patched either way, so the footer
+    /// reports a change, `TriggerDraft::validate` never parses a body, and Apply
+    /// emits `DROP TRIGGER` followed by a `CREATE` carrying `'it's'` — 1064 on
+    /// both engines, after the `DROP` has committed, with no transaction around
+    /// it. What the skip preserves there is not the user's work but a few
+    /// keystrokes on top of a body the server says is wrong.
+    ///
+    /// So the question is asked of the *opened* body rather than of the edit:
+    /// an untouched row always takes the correction, and a touched one takes it
+    /// only when the correction actually changes something. The common case —
+    /// a body with no escapes to resolve, where the fetch agrees with what was
+    /// opened — leaves the keystrokes alone, because there is nothing to
+    /// rescue them from.
+    pub fn may_overwrite_edit(
+        &self,
+        opened: Option<&TriggerAction>,
+        draft: &TriggerAction,
+    ) -> bool {
+        let Some(opened) = opened else {
+            // No record of what this row opened with, so nothing can be said
+            // about whether it was corrupt. Leave it.
+            return false;
+        };
+        // Untouched: the ordinary path, and the one the diff needs.
+        if opened == draft {
+            return true;
+        }
+        // Touched. Only worth overriding if what it was typed on top of is not
+        // what the server actually holds.
+        *opened != TriggerAction::Body(self.body.clone())
+    }
 }
 
 /// Which sessions a PostgreSQL trigger fires in — `pg_trigger.tgenabled`.
@@ -5235,6 +5278,83 @@ mod trigger_tests {
         // The opposite default would append a DISABLE TRIGGER to every create.
         assert_eq!(TriggerInfo::default().enabled, TriggerEnabled::Origin);
         assert!(TriggerInfo::default().enabled.fires_normally());
+    }
+
+    // ── the body correction vs. an edit in flight ────────────────────────────
+
+    fn body(s: &str) -> TriggerAction {
+        TriggerAction::Body(s.into())
+    }
+
+    fn source(s: &str) -> TriggerSource {
+        TriggerSource {
+            body: s.into(),
+            sql_mode: None,
+            charset_client: None,
+            collation_connection: None,
+        }
+    }
+
+    /// The ordinary case: nobody touched the row, so the correction lands. This
+    /// is what both sides of the diff need — patching `current` alone would
+    /// leave the draft emitting the corrupt body.
+    #[test]
+    fn an_untouched_row_always_takes_the_correction() {
+        let opened = body("SET NEW.n = 'it's'");
+        let src = source("SET NEW.n = 'it''s'");
+        assert!(src.may_overwrite_edit(Some(&opened), &opened));
+    }
+
+    /// **The destructive case.** The user typed into Body before the round trip
+    /// landed, on top of the escape-mangled body — so what the skip would
+    /// preserve is a syntax error. `current` is corrected either way, the
+    /// footer reports a change, and Apply emits `DROP TRIGGER` followed by a
+    /// `CREATE` the engine refuses, with no transaction and no second copy.
+    #[test]
+    fn a_row_edited_on_top_of_a_corrupt_body_still_takes_the_correction() {
+        let opened = body("SET NEW.n = 'it's'");
+        let edited = body("SET NEW.n = 'it's'; SET NEW.m = 1");
+        let src = source("SET NEW.n = 'it''s'");
+        assert!(src.may_overwrite_edit(Some(&opened), &edited));
+    }
+
+    /// …and the reason the skip exists, kept: where `information_schema` had
+    /// nothing to resolve, the fetch agrees with what was opened and there is
+    /// nothing to rescue the keystrokes from. This is every trigger whose body
+    /// contains no escape, which is most of them.
+    #[test]
+    fn an_edit_on_top_of_a_correct_body_is_left_alone() {
+        let opened = body("SET NEW.created = NOW()");
+        let edited = body("SET NEW.created = NOW(); SET NEW.n = 1");
+        let src = source("SET NEW.created = NOW()");
+        assert!(!src.may_overwrite_edit(Some(&opened), &edited));
+    }
+
+    /// A reply for a row the draft no longer has an opened body for says
+    /// nothing about whether that body was corrupt, so it decides nothing.
+    #[test]
+    fn a_reply_with_no_opened_body_overwrites_nothing() {
+        let edited = body("SET NEW.n = 1");
+        assert!(!source("SET NEW.n = 2").may_overwrite_edit(None, &edited));
+    }
+
+    /// A PostgreSQL row's action is a function reference, never a body, so the
+    /// correction — which only ever produces a `Body` — always differs from
+    /// what was opened. It is MySQL-only in practice (`fetch_sources` is not
+    /// called elsewhere), and this pins that an untouched row is still the
+    /// unconditional case.
+    #[test]
+    fn a_function_action_is_not_mistaken_for_an_edited_body() {
+        let opened = TriggerAction::Function {
+            name: "audit_fn".into(),
+            args: vec![],
+        };
+        let src = source("SET NEW.n = 1");
+        // Untouched: the first arm, unchanged.
+        assert!(src.may_overwrite_edit(Some(&opened), &opened));
+        // Touched: the opened action is not the fetched body, so the
+        // correction stands — the same answer the corrupt-body case gives.
+        assert!(src.may_overwrite_edit(Some(&opened), &body("SET NEW.n = 2")));
     }
 
     #[test]
