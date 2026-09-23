@@ -22,6 +22,10 @@ floem = { workspace = true }
 # The `Renderer` trait (stroke/fill in a custom view's `paint`) isn't re-exported
 # by `floem`; pull it directly. Already in the tree via floem — same version.
 floem_renderer = "0.2.0"
+# The salt a PostgreSQL role password is hashed under (`account_editor`'s
+# `fresh_salt`). The OS's randomness and nothing else; already in the tree at
+# this version.
+getrandom = "0.3"
 serde_json = { workspace = true }
 # Rasterise the ER diagram's exported SVG to PNG. Already in the tree via floem
 # (its `svg` view), same version — no extra compile. `default-features = false`

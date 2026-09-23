@@ -50,6 +50,7 @@ pub mod resource;
 pub mod resultsel;
 pub mod rowjson;
 pub mod schema;
+pub mod scram;
 pub mod script;
 pub mod search_history;
 pub mod secrets;

@@ -33,10 +33,13 @@
 //! kind that ships backwards.
 //!
 //! **The account form holds a password**, which nothing else in this crate does.
-//! It is cleared on open and on Cancel, it is never persisted, and it becomes
-//! visible in exactly one place: the preview's SQL. That is deliberate — the
-//! preview is the app's one gate between a plan and a server, and a statement it
-//! showed with a field blanked would not be the statement it ran.
+//! It is cleared on open and on Cancel, it is never persisted, and the one place
+//! it can become visible is the preview's SQL. That is deliberate — the preview
+//! is the app's one gate between a plan and a server, and a statement it showed
+//! with a field blanked would not be the statement it ran. On PostgreSQL even
+//! that shows a SCRAM verifier rather than the password, for any password in
+//! printable ASCII: Preview SQL stamps a fresh salt (`fresh_salt`), and
+//! `users::password_hint` under the field says which the preview will hold.
 
 use std::rc::Rc;
 
@@ -258,6 +261,8 @@ pub(crate) fn open_for_reset(
             host: account.host.clone().unwrap_or_default(),
             kind: account.kind,
             password: String::new(),
+            // Stamped when the plan is built (`account_change`), not here.
+            scram_salt: None,
         },
     );
     d.account.set(Some(AccountTarget {
@@ -508,10 +513,26 @@ pub(crate) fn grant_form_shape(d: &GrantDraft) -> (GrantSubject, bool, Option<Gr
 
 // ── the account form ─────────────────────────────────────────────────────────
 
+/// A salt for one plan's password, from the OS's randomness. `None` if that is
+/// unavailable, and then the password is sent as typed — the behaviour before
+/// verifiers, never a lockout (see `AccountDraft::scram_salt`).
+pub(crate) fn fresh_salt() -> Option<schemaic_core::scram::Salt> {
+    let mut salt = schemaic_core::scram::Salt::default();
+    getrandom::fill(&mut salt).ok().map(|()| salt)
+}
+
 /// What this form is asking for. Pure, and out of the render for the reason the
 /// database editor's `change_of` is: which of the two statements a draft becomes
 /// is not visible in a rendered form.
-pub(crate) fn account_change(draft: &AccountDraft, resetting: Option<&Principal>) -> ddl::Change {
+///
+/// `salt` is stamped onto whichever change it builds — handed in rather than
+/// drawn here so this stays pure — and it is what a PostgreSQL password is
+/// hashed under (`users::supports_password_verifier`).
+pub(crate) fn account_change(
+    draft: &AccountDraft,
+    resetting: Option<&Principal>,
+    salt: Option<schemaic_core::scram::Salt>,
+) -> ddl::Change {
     // **The subject comes from `resetting`, never from the draft.** The form
     // seeds the draft's name and host so it can say whose password this is, and
     // reading them back here would let a reset rename or re-host the very
@@ -522,11 +543,13 @@ pub(crate) fn account_change(draft: &AccountDraft, resetting: Option<&Principal>
         return ddl::Change::SetAccountPassword(Box::new(schemaic_core::users::PasswordReset {
             account: account.clone(),
             password: draft.password.clone(),
+            scram_salt: salt,
         }));
     }
     let mut d = draft.clone();
     d.name = d.name.trim().to_string();
     d.host = d.host.trim().to_string();
+    d.scram_salt = salt;
     ddl::Change::CreateAccount(Box::new(d))
 }
 
@@ -555,7 +578,7 @@ fn account_form(
             )
             .into_any(),
         );
-        rows.push(password_row(d, ring));
+        rows.push(password_row(d, ring, target.dialect));
         return v_stack_from_iter(rows)
             .style(|s| s.width_full().flex_col().gap(theme::scaled(10.0)))
             .into_any();
@@ -626,7 +649,7 @@ fn account_form(
     }
 
     if kind == PrincipalKind::User {
-        rows.push(password_row(d, ring));
+        rows.push(password_row(d, ring, target.dialect));
     }
 
     v_stack_from_iter(rows)
@@ -652,7 +675,7 @@ fn account_form(
 /// It seeds from the draft *untracked*: the seed is the value this row starts
 /// from, and reading it tracked would rebuild the field on every keystroke it
 /// itself caused.
-fn password_row(d: crate::DdlUi, ring: FocusRing) -> AnyView {
+fn password_row(d: crate::DdlUi, ring: FocusRing, dialect: SqlDialect) -> AnyView {
     let draft = d.account_draft;
     let pw = floem::reactive::create_rw_signal(draft.with_untracked(|a| a.password.clone()));
     create_effect(move |prev: Option<String>| {
@@ -669,15 +692,14 @@ fn password_row(d: crate::DdlUi, ring: FocusRing) -> AnyView {
                 .style(|s| s.width(field_w()))
                 .into_any(),
         ),
-        // The one field in the app whose value reaches a screenshot, so it says
-        // so where it is typed rather than only in the module comment.
-        text("The password appears in the previewed SQL, which is the statement that runs.").style(
-            |s| {
-                s.font_size(theme::font_hint())
-                    .color(theme::text_faint())
-                    .width_full()
-            },
-        ),
+        // The one field in the app whose value can reach a screenshot, so it
+        // says so where it is typed — and per engine, since on PostgreSQL the
+        // preview shows a hash instead (`users::password_hint`).
+        text(schemaic_core::users::password_hint(dialect)).style(|s| {
+            s.font_size(theme::font_hint())
+                .color(theme::text_faint())
+                .width_full()
+        }),
     ))
     .style(|s| s.flex_col().gap(form_gap()).width_full())
     .into_any()
@@ -835,7 +857,7 @@ pub(crate) fn account_editor_overlay(d: DdlUi) -> impl IntoView {
                                     d,
                                     (&target).into(),
                                     &subject,
-                                    account_change(&draft, target.resetting.as_ref()),
+                                    account_change(&draft, target.resetting.as_ref(), fresh_salt()),
                                 );
                             },
                         ),
@@ -1628,8 +1650,9 @@ mod account_change_tests {
             host: "  %  ".into(),
             kind: PrincipalKind::User,
             password: "hunter2".into(),
+            scram_salt: None,
         };
-        match account_change(&d, None) {
+        match account_change(&d, None, None) {
             ddl::Change::CreateAccount(a) => {
                 // Trimmed on the way out, which is the other thing this function
                 // does and the reason it is not a bare constructor call.
@@ -1658,8 +1681,9 @@ mod account_change_tests {
             host: "%".into(),
             kind: PrincipalKind::User,
             password: "hunter2".into(),
+            scram_salt: None,
         };
-        match account_change(&d, Some(&an_account())) {
+        match account_change(&d, Some(&an_account()), None) {
             ddl::Change::SetAccountPassword(r) => {
                 assert_eq!(r.account, an_account());
                 assert_eq!(r.password, "hunter2");
@@ -1677,8 +1701,9 @@ mod account_change_tests {
             host: "ignored".into(),
             kind: PrincipalKind::User,
             password: "hunter2".into(),
+            scram_salt: None,
         };
-        let change = account_change(&d, Some(&an_account()));
+        let change = account_change(&d, Some(&an_account()), None);
         let cs = ddl::account("app", SqlDialect::MySql, change);
         assert_eq!(
             cs.emit(),
@@ -1688,6 +1713,48 @@ mod account_change_tests {
         let (clean, redacted) = cs.without_secrets();
         assert!(redacted);
         assert!(!clean.emit().iter().any(|s| s.contains("hunter2")));
+    }
+
+    /// **The salt the form is handed is the one the statement is hashed
+    /// under**, on both of the form's two changes. The composition again: the
+    /// emitter's own tests prove a salted draft becomes a verifier, and this
+    /// proves the form's draft is a salted one — a stamp lost between the two
+    /// would put the password back in PostgreSQL's logs with every test green.
+    #[test]
+    fn the_form_hashes_a_postgres_password_under_the_salt_it_was_given() {
+        let salt = [3u8; 16];
+        let v = schemaic_core::scram::verifier("hunter2", &salt).unwrap();
+        let d = AccountDraft {
+            name: "app".into(),
+            kind: PrincipalKind::User,
+            password: "hunter2".into(),
+            ..Default::default()
+        };
+        let mut pg_account = an_account();
+        pg_account.host = None;
+        for (change, verb) in [
+            (account_change(&d, None, Some(salt)), "CREATE USER"),
+            (
+                account_change(&d, Some(&pg_account), Some(salt)),
+                "ALTER ROLE",
+            ),
+        ] {
+            let emitted = ddl::account("app", SqlDialect::Postgres, change).emit();
+            assert_eq!(emitted.len(), 1, "{emitted:?}");
+            assert!(emitted[0].starts_with(verb), "{emitted:?}");
+            assert!(emitted[0].contains(&v), "{emitted:?}");
+            assert!(!emitted[0].contains("hunter2"), "{emitted:?}");
+        }
+    }
+
+    /// A fresh salt per plan: two previews of the same password must not share
+    /// one, or the salt stops doing its job.
+    #[test]
+    fn every_plan_gets_its_own_salt() {
+        let a = fresh_salt();
+        let b = fresh_salt();
+        assert!(a.is_some() && b.is_some());
+        assert_ne!(a, b);
     }
 }
 

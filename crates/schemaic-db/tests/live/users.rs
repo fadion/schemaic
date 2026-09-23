@@ -308,6 +308,21 @@ impl ScratchAccount {
         password: &str,
         host: &str,
     ) -> ScratchAccount {
+        Self::create_salted(target, scratch, suffix, kind, password, host, None).await
+    }
+
+    /// [`Self::create_with_password`] with a SCRAM salt stamped on the draft,
+    /// as the account form stamps one — so on PostgreSQL the statement carries
+    /// a verifier, and on MySQL the salt is ignored.
+    async fn create_salted(
+        target: &'static Target,
+        scratch: &Scratch,
+        suffix: &str,
+        kind: PrincipalKind,
+        password: &str,
+        host: &str,
+        scram_salt: Option<schemaic_core::scram::Salt>,
+    ) -> ScratchAccount {
         let name = format!("{PREFIX}{}_{}_{suffix}", std::process::id(), target.name);
         assert_scratch_name(&name);
         assert!(
@@ -321,6 +336,7 @@ impl ScratchAccount {
             host: host.to_string(),
             kind,
             password: password.to_string(),
+            scram_salt,
         };
         let principal = draft.principal(dialect);
         let me = ScratchAccount {
@@ -706,6 +722,7 @@ pub async fn a_reset_password_replaces_the_one_the_account_had(target: &'static 
         .run(ddl::Change::SetAccountPassword(Box::new(PasswordReset {
             account: listed,
             password: now.to_string(),
+            scram_salt: None,
         })))
         .await;
 
@@ -728,6 +745,77 @@ pub async fn a_reset_password_replaces_the_one_the_account_had(target: &'static 
             .await
             .is_err(),
         "{}: the old password still works, so the reset changed nothing",
+        target.endpoint()
+    );
+
+    account.teardown().await;
+    scratch.teardown().await;
+}
+
+/// **A salted create and a salted reset both log in — which is what the
+/// account form now sends.**
+///
+/// On PostgreSQL the salt turns the password clause into a SCRAM-SHA-256
+/// verifier (`users::supports_password_verifier`), so no statement carries the
+/// password for `log_statement` or `pg_stat_activity` to keep. A verifier
+/// computed wrong is the silent failure: the server stores it verbatim, the
+/// statement succeeds, and the account takes no password anyone holds. So the
+/// assertion is a login with the *typed* password after each — which also
+/// proves the server stored the verifier rather than hashing its text as a
+/// password, since then this login would be refused — and a refusal of the
+/// password it replaced.
+///
+/// On MySQL and MariaDB the salt is ignored, and this is the unsalted tests
+/// again: it pins that a salt changes nothing there.
+pub async fn a_salted_password_logs_in_on_create_and_on_reset(target: &'static Target) {
+    let scratch = Scratch::create(target, "pwscram").await;
+    let first = r"s'c\r***m";
+    let second = r"v3r'i\f***y";
+    let account = ScratchAccount::create_salted(
+        target,
+        &scratch,
+        "s",
+        PrincipalKind::User,
+        first,
+        "",
+        Some([0x5a; 16]),
+    )
+    .await;
+
+    let login = |pw: &'static str| {
+        let db = target.db_as(&account.principal.name, pw);
+        async move { db.ping(std::time::Duration::from_secs(10)).await }
+    };
+    login(first).await.unwrap_or_else(|e| {
+        panic!(
+            "{}: a salted create will not take the password it was given: {e}",
+            target.endpoint()
+        )
+    });
+    assert!(
+        login("not-the-password").await.is_err(),
+        "{}: the server accepted a password this account was never given",
+        target.endpoint()
+    );
+
+    let listed = listed_principal(target, &account).await;
+    account
+        .run(ddl::Change::SetAccountPassword(Box::new(PasswordReset {
+            account: listed,
+            password: second.to_string(),
+            scram_salt: Some([0xa5; 16]),
+        })))
+        .await;
+    login(second).await.unwrap_or_else(|e| {
+        panic!(
+            "{}: a salted reset was accepted but the account will not take the \
+             new password: {e}",
+            target.endpoint()
+        )
+    });
+    assert!(
+        login(first).await.is_err(),
+        "{}: the old password still works, so the salted reset changed nothing",
         target.endpoint()
     );
 
@@ -809,6 +897,9 @@ pub async fn a_password_with_a_backslash_is_stored_as_it_was_typed(target: &'sta
         .run(ddl::Change::SetAccountPassword(Box::new(PasswordReset {
             account: listed,
             password: secret.to_string(),
+            // Unsalted on purpose: this test is about how the *literal* is
+            // parsed, and a verifier would take the backslash out of it.
+            scram_salt: None,
         })))
         .await;
 
@@ -905,6 +996,7 @@ pub async fn a_role_the_server_made_is_never_offered_a_password_reset(target: &'
             &PasswordReset {
                 account: listed_role.clone(),
                 password: "hunter2".to_string(),
+                scram_salt: None,
             },
             scratch.dialect()
         ),

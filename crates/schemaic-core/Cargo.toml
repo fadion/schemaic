@@ -19,6 +19,13 @@ tracing = { workspace = true }
 # central directory here, before calamine inflates anything. Already in the graph
 # under calamine; this is the same crate, asked one question earlier.
 zip = { workspace = true }
+# `scram` computes PostgreSQL's SCRAM-SHA-256 password verifier, so a role's
+# password reaches the server as a verifier and never as text its logs can keep.
+# The same three crates and versions `postgres-protocol` (under tokio-postgres)
+# already puts in the graph; nothing new enters the lock file.
+sha2 = "0.11"
+hmac = "0.13"
+base64 = "0.22"
 
 [lints]
 workspace = true

@@ -4213,16 +4213,21 @@ impl ChangeSet {
         let mut out = self.clone();
         let mut redacted = false;
         for c in &mut out.changes {
+            // **The salt goes with the password.** Left on the clone, it would
+            // hash the placeholder into a verifier: a script with nothing to
+            // type back, setting the password to the placeholder's own text.
             if let Change::CreateAccount(d) = c
                 && !d.password.is_empty()
             {
                 d.password = PASSWORD_PLACEHOLDER.to_string();
+                d.scram_salt = None;
                 redacted = true;
             }
             if let Change::SetAccountPassword(r) = c
                 && !r.password.is_empty()
             {
                 r.password = PASSWORD_PLACEHOLDER.to_string();
+                r.scram_salt = None;
                 redacted = true;
             }
         }
@@ -22463,6 +22468,7 @@ mod database_tests {
             Change::SetAccountPassword(Box::new(crate::users::PasswordReset {
                 account: an_account(),
                 password: "s3cret".into(),
+                scram_salt: None,
             })),
             Change::GrantPrivileges(a_privilege_change(&["SELECT"])),
             Change::RevokePrivileges(a_privilege_change(&["SELECT"])),
@@ -22687,6 +22693,7 @@ mod database_tests {
         let change = Change::SetAccountPassword(Box::new(crate::users::PasswordReset {
             account: role,
             password: "hunter2".into(),
+            scram_salt: None,
         }));
         for d in [MySql, Postgres] {
             assert!(
@@ -22705,6 +22712,7 @@ mod database_tests {
         let user = Change::SetAccountPassword(Box::new(crate::users::PasswordReset {
             account: an_account(),
             password: "hunter2".into(),
+            scram_salt: None,
         }));
         assert!(supports_change(MySql, &user));
         assert_eq!(cs_len(MySql, user), 1);
@@ -22727,6 +22735,7 @@ mod database_tests {
             Change::SetAccountPassword(Box::new(crate::users::PasswordReset {
                 account: an_account(),
                 password: password.into(),
+                scram_salt: None,
             }))
         };
         // The property, over every shape: whatever `supports_change` calls
@@ -22922,6 +22931,55 @@ mod database_tests {
                 "{:?}",
                 clean.emit()
             );
+        }
+    }
+
+    /// **A verifier is scrubbed like a password**, and the salt goes with it.
+    ///
+    /// The scrub swaps the password for [`PASSWORD_PLACEHOLDER`] and re-emits, so
+    /// a salt left on the clone would hash the *placeholder* into a verifier: the
+    /// exported script would carry no placeholder to replace, and running it
+    /// would set the password to the literal text `PUT-THE-PASSWORD-HERE`. And a
+    /// verifier is itself not for a clipboard — it is enough to brute-force the
+    /// password offline. So the salted set has to export as the unsalted one
+    /// does: the placeholder, typed back by hand.
+    #[test]
+    fn a_salted_password_exports_the_placeholder_and_no_verifier() {
+        let salt = Some([5u8; 16]);
+        for c in every_account_change() {
+            let mut c = c;
+            let carries = match &mut c {
+                Change::CreateAccount(d) => {
+                    d.password = "hunter2".into();
+                    d.scram_salt = salt;
+                    d.kind == crate::users::PrincipalKind::User
+                }
+                Change::SetAccountPassword(r) => {
+                    r.password = "hunter2".into();
+                    r.scram_salt = salt;
+                    true
+                }
+                _ => false,
+            };
+            let cs = account("app", Postgres, c);
+            if carries {
+                // The live statement really is the verifier…
+                assert!(
+                    cs.emit().iter().any(|s| s.contains("SCRAM-SHA-256$")),
+                    "{:?}",
+                    cs.emit()
+                );
+            }
+            let out = cs.export_script();
+            assert!(!out.contains("SCRAM-SHA-256$"), "{out}");
+            assert!(!out.contains("hunter2"), "{out}");
+            if carries {
+                // …and the copy carries the word to type back, not a hash of it.
+                assert!(
+                    out.contains(&format!("PASSWORD '{PASSWORD_PLACEHOLDER}'")),
+                    "{out}"
+                );
+            }
         }
     }
 

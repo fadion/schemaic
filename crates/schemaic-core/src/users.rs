@@ -1511,6 +1511,13 @@ pub struct AccountDraft {
     /// draft is dropped as soon as the plan is built. See
     /// [`account_draft_sql`]'s note on the preview.
     pub password: String,
+    /// The salt the password is hashed under on an engine that takes a
+    /// verifier ([`supports_password_verifier`]). **Stamped by the form, never
+    /// made at emit**: preview and Apply must run one identical statement, and
+    /// the emitter has to stay a pure function. `None` sends the password as
+    /// typed, which is what the app did before verifiers — so a caller that
+    /// forgets to stamp one gets the old behaviour, never a locked-out account.
+    pub scram_salt: Option<crate::scram::Salt>,
 }
 
 impl AccountDraft {
@@ -1540,13 +1547,16 @@ impl AccountDraft {
 
 /// `CREATE USER` / `CREATE ROLE`, or `None` for a draft with no name.
 ///
-/// **The password is in the statement, and the statement is shown in the
-/// preview.** That is deliberate and it is the only honest option: the preview
-/// is the app's one gate between a plan and a server, and a statement it showed
-/// with the password blanked would not be the statement it ran. What follows
-/// from it is that the *preview* is where a password is briefly visible, and
-/// nowhere else — [`redact_secrets`] keeps it out of everything read back from
-/// the server, and the draft is dropped once the plan is built.
+/// **The password clause is in the statement, and the statement is shown in
+/// the preview.** That is deliberate and it is the only honest option: the
+/// preview is the app's one gate between a plan and a server, and a statement
+/// it showed with the clause blanked would not be the statement it ran. On an
+/// engine that takes a verifier ([`supports_password_verifier`]) and a draft
+/// carrying a salt, the clause is a SCRAM verifier and the password appears
+/// nowhere; otherwise it is the password, and the *preview* is where it is
+/// briefly visible, and nowhere else — [`redact_secrets`] keeps it out of
+/// everything read back from the server, and the draft is dropped once the plan
+/// is built.
 ///
 /// An empty password emits no `IDENTIFIED BY` clause at all, which is a real and
 /// useful account on both engines: PostgreSQL's is one that must authenticate
@@ -1574,7 +1584,7 @@ pub fn account_draft_sql(d: &AccountDraft, dialect: SqlDialect) -> Option<String
                     SqlDialect::Postgres | SqlDialect::Sqlite => "PASSWORD",
                     SqlDialect::MySql => "IDENTIFIED BY",
                 },
-                crate::schema::ddl_string(&d.password, dialect)
+                password_literal(&d.password, d.scram_salt.as_ref(), dialect)
             ));
         }
     }
@@ -1597,6 +1607,52 @@ pub struct PasswordReset {
     /// and scrubbed by `ChangeSet::without_secrets` on the way to anything but
     /// the preview.
     pub password: String,
+    /// See [`AccountDraft::scram_salt`] — the same stamp, on the same terms.
+    pub scram_salt: Option<crate::scram::Salt>,
+}
+
+/// Does `dialect` take a precomputed password **verifier** in its password
+/// clause, so the password itself need not be in the statement?
+///
+/// PostgreSQL does: since 10 it stores a password that is already a
+/// SCRAM-SHA-256 verifier exactly as given, and without one the statement text
+/// — password and all — is what `log_statement`, pgaudit and
+/// `pg_stat_activity` keep. MySQL/MariaDB need none: the server rewrites
+/// `IDENTIFIED BY` out of its own logs. SQLite has no accounts.
+///
+/// An exhaustive match, not a comparison: a fourth engine has to answer.
+pub fn supports_password_verifier(dialect: SqlDialect) -> bool {
+    match dialect {
+        SqlDialect::Postgres => true,
+        SqlDialect::MySql | SqlDialect::Sqlite => false,
+    }
+}
+
+/// The line under the account form's password field: what of the password the
+/// previewed SQL — the statement that runs — will show. The one field in the
+/// app whose value can reach a screenshot, so it says so where it is typed.
+pub fn password_hint(dialect: SqlDialect) -> &'static str {
+    if supports_password_verifier(dialect) {
+        "The previewed SQL, which is the statement that runs, carries a hash of the \
+         password and not the password itself — unless it has characters outside \
+         printable ASCII, which are sent as typed."
+    } else {
+        "The password appears in the previewed SQL, which is the statement that runs."
+    }
+}
+
+/// The password clause's literal: a verifier where the engine takes one and
+/// the draft carries a salt, the password as typed otherwise — including a
+/// password [`crate::scram::verifier`] declines, one outside printable ASCII.
+fn password_literal(
+    password: &str,
+    salt: Option<&crate::scram::Salt>,
+    dialect: SqlDialect,
+) -> String {
+    let verifier = salt
+        .filter(|_| supports_password_verifier(dialect))
+        .and_then(|salt| crate::scram::verifier(password, salt));
+    crate::schema::ddl_string(verifier.as_deref().unwrap_or(password), dialect)
 }
 
 /// Can `dialect` change the password of the existing account `p`?
@@ -1629,10 +1685,10 @@ pub fn supports_password_reset(dialect: SqlDialect, p: &Principal) -> bool {
 /// `ALTER USER … IDENTIFIED BY` / `ALTER ROLE … PASSWORD`, or `None` where the
 /// account cannot have a password reset at all.
 ///
-/// **The password is in the statement, and the statement is in the preview**, on
-/// exactly the terms [`account_draft_sql`] sets out: the preview is the app's one
-/// gate between a plan and a server, and a statement shown with the password
-/// blanked would not be the statement it ran.
+/// **The password clause is in the statement, and the statement is in the
+/// preview**, on exactly the terms [`account_draft_sql`] sets out — a verifier
+/// where the engine takes one and the reset carries a salt, the password
+/// otherwise.
 ///
 /// **An empty password is refused rather than emitted.** `ALTER USER … IDENTIFIED
 /// BY ''` is a legal statement on MySQL and it sets a *blank* password, which is
@@ -1660,7 +1716,7 @@ pub fn set_password_sql(r: &PasswordReset, dialect: SqlDialect) -> Option<String
     };
     Some(format!(
         "{verb} {who} {clause} {}",
-        crate::schema::ddl_string(&r.password, dialect)
+        password_literal(&r.password, r.scram_salt.as_ref(), dialect)
     ))
 }
 
@@ -3065,6 +3121,7 @@ mod tests {
         PasswordReset {
             account: my_account(),
             password: pw.to_string(),
+            scram_salt: None,
         }
     }
 
@@ -3089,6 +3146,136 @@ mod tests {
         assert_eq!(
             set_password_sql(&reset("hunter2"), SqlDialect::MySql).unwrap(),
             "ALTER USER 'app'@'%' IDENTIFIED BY 'hunter2'"
+        );
+    }
+
+    // ── Password verifiers ─────────────────────────────────────────────────
+
+    const SALT: crate::scram::Salt = [9; 16];
+
+    fn salted(pw: &str) -> AccountDraft {
+        AccountDraft {
+            password: pw.into(),
+            scram_salt: Some(SALT),
+            ..draft("app", PrincipalKind::User)
+        }
+    }
+
+    fn salted_reset(pw: &str) -> PasswordReset {
+        let mut r = reset(pw);
+        r.account.host = None;
+        r.scram_salt = Some(SALT);
+        r
+    }
+
+    #[test]
+    fn only_postgresql_takes_a_password_verifier() {
+        assert!(supports_password_verifier(SqlDialect::Postgres));
+        assert!(!supports_password_verifier(SqlDialect::MySql));
+        assert!(!supports_password_verifier(SqlDialect::Sqlite));
+    }
+
+    /// The point of the whole change: with a salt stamped, the statement
+    /// PostgreSQL logs carries the verifier `scram` builds for exactly this
+    /// password and salt, and the password appears nowhere in it.
+    #[test]
+    fn a_salted_postgres_create_sends_the_verifier_and_not_the_password() {
+        let sql = account_draft_sql(&salted("hunter2"), SqlDialect::Postgres).unwrap();
+        let v = crate::scram::verifier("hunter2", &SALT).unwrap();
+        assert_eq!(sql, format!("CREATE USER \"app\" PASSWORD '{v}'"));
+        assert!(!sql.contains("hunter2"), "{sql}");
+    }
+
+    #[test]
+    fn a_salted_postgres_reset_sends_the_verifier_and_not_the_password() {
+        let sql = set_password_sql(&salted_reset("hunter2"), SqlDialect::Postgres).unwrap();
+        let v = crate::scram::verifier("hunter2", &SALT).unwrap();
+        assert_eq!(sql, format!("ALTER ROLE \"app\" PASSWORD '{v}'"));
+        assert!(!sql.contains("hunter2"), "{sql}");
+    }
+
+    /// MySQL rewrites `IDENTIFIED BY` out of its own logs, so a salt changes
+    /// nothing there — the statement is the one it always was.
+    #[test]
+    fn a_salt_changes_nothing_on_mysql() {
+        assert_eq!(
+            account_draft_sql(&salted("hunter2"), SqlDialect::MySql).unwrap(),
+            "CREATE USER 'app'@'%' IDENTIFIED BY 'hunter2'"
+        );
+        let mut r = reset("hunter2");
+        r.scram_salt = Some(SALT);
+        assert_eq!(
+            set_password_sql(&r, SqlDialect::MySql).unwrap(),
+            "ALTER USER 'app'@'%' IDENTIFIED BY 'hunter2'"
+        );
+    }
+
+    /// A password `scram` declines — outside printable ASCII, where SASLprep
+    /// would rewrite it at login — is sent as typed rather than hashed into a
+    /// credential nobody could use.
+    #[test]
+    fn a_non_ascii_password_is_sent_as_typed_even_when_salted() {
+        assert_eq!(
+            account_draft_sql(&salted("pässword"), SqlDialect::Postgres).unwrap(),
+            "CREATE USER \"app\" PASSWORD 'pässword'"
+        );
+        assert_eq!(
+            set_password_sql(&salted_reset("pässword"), SqlDialect::Postgres).unwrap(),
+            "ALTER ROLE \"app\" PASSWORD 'pässword'"
+        );
+    }
+
+    /// No salt is the behaviour before verifiers existed, so a caller that
+    /// forgot to stamp one sets the password it was given — never a lockout.
+    #[test]
+    fn an_unsalted_postgres_password_is_sent_as_typed() {
+        let d = AccountDraft {
+            password: "hunter2".into(),
+            ..draft("app", PrincipalKind::User)
+        };
+        assert_eq!(
+            account_draft_sql(&d, SqlDialect::Postgres).unwrap(),
+            "CREATE USER \"app\" PASSWORD 'hunter2'"
+        );
+    }
+
+    #[test]
+    fn a_salted_role_still_takes_no_password_clause() {
+        let d = AccountDraft {
+            password: "hunter2".into(),
+            scram_salt: Some(SALT),
+            ..draft("readers", PrincipalKind::Role)
+        };
+        assert_eq!(
+            account_draft_sql(&d, SqlDialect::Postgres).unwrap(),
+            "CREATE ROLE \"readers\""
+        );
+    }
+
+    /// The hint has to tell the truth per engine: on PostgreSQL the preview now
+    /// shows a hash, and saying the password appears there would be as wrong
+    /// as saying it does not on MySQL.
+    #[test]
+    fn the_password_hint_says_what_the_preview_shows() {
+        let pg = password_hint(SqlDialect::Postgres);
+        assert!(
+            pg.contains("hash") && pg.contains("not the password"),
+            "{pg}"
+        );
+        // And names the one case that is still sent as typed.
+        assert!(pg.contains("ASCII"), "{pg}");
+        let my = password_hint(SqlDialect::MySql);
+        assert!(my.contains("password appears"), "{my}");
+        for d in [SqlDialect::Postgres, SqlDialect::MySql, SqlDialect::Sqlite] {
+            assert!(password_hint(d).contains("previewed SQL"), "{d:?}");
+        }
+    }
+
+    #[test]
+    fn a_salted_blank_reset_still_has_no_statement() {
+        assert_eq!(
+            set_password_sql(&salted_reset(""), SqlDialect::Postgres),
+            None
         );
     }
 
@@ -3149,6 +3336,7 @@ mod tests {
         let r = PasswordReset {
             account: p.clone(),
             password: "hunter2".to_string(),
+            scram_salt: None,
         };
         assert!(
             !supports_password_reset(SqlDialect::MySql, &p),

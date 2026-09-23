@@ -2764,8 +2764,9 @@ existing prose was left alone.
     this module emits**, which is the call `DropCheck`'s "rows the constraint refused are accepted
     from now on" already makes: a blank password on MySQL is an account anyone who can reach the
     server can log in as, with no `IDENTIFIED BY` for `validate_password` to fire on, and a blank
-    host means `%` — every machine on the network. The form discloses the host default and that the
-    password shows in the preview; nothing said what leaving it *blank* produces.
+    host means `%` — every machine on the network. The form discloses the host default and what of
+    the password the preview shows (`users::password_hint`); nothing said what leaving it *blank*
+    produces.
     **One grant carries a consequence too, where no grant carried one at all.** Every arm above
     describes what a plan takes away or rewrites; a `GrantPrivileges` whose level is
     `GrantLevel::Global` is the case where what it *gives* is the risk. `GRANT DROP ON *.*` reaches
@@ -2806,8 +2807,14 @@ existing prose was left alone.
     (`every_account_change_that_carries_a_password_is_scrubbed`), which a seventh such change has to
     extend — **and the seventh has since arrived and been caught by it**: `SetAccountPassword` went
     in with its emitter and its fixture and without its arm here, and that test named the leaking
-    statement. The preview itself still renders `statements`, which is the statement that runs: a
-    modal showing a blanked-out plan would not be showing the plan.
+    statement. **The salt goes with the password**: the scrub clears `scram_salt` as well, because
+    the clone is re-emitted and a salt left on it hashed the *placeholder* into a verifier — the
+    script said "Replace PUT-THE-PASSWORD-HERE below" over a statement with nothing to replace, and
+    running it would have set the password to that text. A verifier is not for a clipboard in any
+    case, being enough to brute-force the password offline.
+    `a_salted_password_exports_the_placeholder_and_no_verifier` was seen failing with exactly that
+    output before the fix. The preview itself still renders `statements`, which is the statement
+    that runs: a modal showing a blanked-out plan would not be showing the plan.
     `grant_change(draft, account)` is the last piece: the mapping from the grant form's Action and
     Subject dropdowns (two toggles when the test was named) to those four statements, out of the
     view because a mapping invisible in a rendered form is the
@@ -4706,6 +4713,23 @@ existing prose was left alone.
     there now, and the third term refuses where the catalogue cannot classify the row rather than
     guessing at it, the way `intel`'s column resolution refuses an unresolved name. `set_password_sql`
     asks the same predicate, so a plan built directly is refused on the terms the offer was.
+    **Both builders write the password through one private `password_literal`, and on PostgreSQL
+    that literal is a verifier rather than the password.** `AccountDraft` and `PasswordReset` each
+    carry `scram_salt: Option<scram::Salt>`; where `supports_password_verifier(dialect)` says yes
+    and a salt is stamped, the clause is `PASSWORD '<scram::verifier>'` and the statement PostgreSQL
+    logs and shows in `pg_stat_activity` carries no password (`core::scram` has the why). MySQL and
+    MariaDB answer no, because the server rewrites `IDENTIFIED BY` out of its own logs, and the
+    predicate is an exhaustive `match` so a fourth engine has to answer it. **The salt is stamped by
+    the form, never generated at emit**, so preview and Apply run one statement and the emitter stays
+    pure — and `None` is the old behaviour, the password as typed, so a caller that forgets to stamp
+    one sends a password the logs keep rather than locking the account out. A password
+    `scram::verifier` declines, one outside printable ASCII, falls back to typed on the same terms.
+    `password_hint(dialect)` is the line under the form's password field and says which of the two
+    the preview will show: on a verifier engine a hash and not the password, unless it has characters
+    outside printable ASCII; elsewhere the password itself. The salted tests pin the PostgreSQL
+    create and reset to exactly `scram::verifier`'s output with the password nowhere in it, and that
+    a salt changes nothing on MySQL, a salted role still takes no clause and a salted blank reset
+    still has no statement.
     `drop_account_sql` is the last, and like `DropDatabase` never
     `IF EXISTS`: the account came off the browser's list, so one that isn't there means the list is
     stale and a drop that dropped nothing is about to be reported as a success.
@@ -4750,6 +4774,34 @@ existing prose was left alone.
     `matches` twice per keystroke — once to build the rows and once for the footer's count — each
     call re-`format!`ing every account's `display()`, which at the ~1,000 accounts a shared server
     has was measured at ≥13 ms of a 16.7 ms frame, behind a query with no `LIMIT`.
+  - `scram.rs` — PostgreSQL's **SCRAM-SHA-256 password verifier**, computed here so a role's
+    password never reaches the server as text. `ALTER ROLE "x" PASSWORD 'hunter2'` is logged
+    verbatim under `log_statement = 'ddl'`, pgaudit or any `log_min_duration_statement` the
+    statement exceeds, and sits in `pg_stat_activity.query` while it runs — so the account form's
+    create and reset were writing the password into the server's own logs. PostgreSQL 10 and later
+    store a password that is *already* a verifier exactly as given (what `psql`'s `\password` relies
+    on), so `PASSWORD 'SCRAM-SHA-256$4096:…'` sets the same password with nothing recoverable in the
+    statement. `verifier(password, &Salt)` builds the server's own format,
+    `SCRAM-SHA-256$<iterations>:<salt>$<StoredKey>:<ServerKey>` in standard base64, at `ITERATIONS`
+    (4096, PostgreSQL's default `scram_iterations`) over a 16-byte `Salt`, through a hand-written
+    PBKDF2-HMAC-SHA-256 of **one block** — SCRAM's output is exactly one HMAC wide. The `sha2`,
+    `hmac` and `base64` it calls are the versions `postgres-protocol` already put in the lock, so
+    making them direct dependencies of core added no new version.
+    **Only printable ASCII is hashed; anything else, and an empty password, is `None`.** The client
+    SASLpreps the password it types at login before deriving anything, and SASLprep is the identity
+    on 0x20–0x7E and not in general, so a verifier over any other password would store a credential
+    nobody can log in with. The caller sends those as typed, which is what the app did before this
+    module existed. **The salt is always an argument, never drawn here**: the form stamps it into
+    the draft once (`users::AccountDraft::scram_salt`), so the preview and the Apply run one
+    identical statement and `ChangeSet::emit` stays a pure function. Two of the tests are oracles
+    rather than round trips, because a verifier computed wrong is the silent failure — the server
+    stores it verbatim, the statement succeeds, and the account takes no password anyone holds.
+    `matches_a_verifier_postgresql_built` reproduces byte-for-byte a verifier PostgreSQL 16.14 itself
+    built for `correct horse ~ battery!`, read back from `pg_authid` under the same salt — the space,
+    `~` and `!` sit on the edges of the accepted range — and `logs_in_to_the_rfc_7677_exchange`
+    validates RFC 7677 §3's exchange from the verifier's own `StoredKey`/`ServerKey`, which is what
+    a server does at login. The live tier's `a_salted_password_logs_in_on_create_and_on_reset` is
+    the third check, against a real server.
   - `diff.rs` — the line-level diff behind the inline-AI (Ctrl+K) preview. `line_diff` is the LCS
     pass, one tagged row per displayed line (context / removed / added); `inline_plan` re-addresses
     those rows as **document line numbers**, which is what lets the UI draw the suggestion in the
@@ -10031,6 +10083,7 @@ existing prose was left alone.
   `an_account_created_at_a_host_is_listed_and_dropped_at_it`,
   `a_created_account_can_log_in_with_the_password_it_was_given`,
   `a_reset_password_replaces_the_one_the_account_had`,
+  `a_salted_password_logs_in_on_create_and_on_reset`,
   `a_role_the_server_made_is_never_offered_a_password_reset`,
   `a_created_role_is_one_the_server_accepts`,
   `a_granted_privilege_comes_back_and_a_revoke_takes_it_off`,
@@ -10085,6 +10138,21 @@ existing prose was left alone.
   (`listed_principal`) — the distinction `a_created_role_is_one_the_server_accepts` was written for,
   since MariaDB stores a host the draft does not and an `ALTER USER` naming the wrong one is an error
   rather than a silent miss. Green on MariaDB, MySQL and PostgreSQL.
+  **`a_salted_password_logs_in_on_create_and_on_reset` is the same pair of logins over what the
+  account form now sends** — a `scram_salt` stamped on the create (`ScratchAccount::create_salted`,
+  which `create_with_password` delegates to with `None`) and on the reset. On PostgreSQL that makes
+  the clause a `core::scram` verifier, and a verifier computed wrong is stored verbatim by a server
+  that reports success, so only a login with the *typed* password can tell — after the create,
+  with a wrong one refused beside it, and after the reset, with the replaced one refused. That login
+  also proves the server stored the verifier rather than hashing its text as a password, which would
+  refuse it. On MySQL and MariaDB the salt is ignored, and the test pins that it changes nothing
+  there. The unsalted tests keep `scram_salt: None` on purpose — the backslash test below above all,
+  being about how the literal is parsed, and a base64 verifier carries no backslash to parse. Green
+  on MariaDB 10.11, MySQL 8.4 and PostgreSQL 16 under a `scram-sha-256` `pg_hba`; and run once more
+  by hand on PostgreSQL with a temporary `pg_hba` rule sending `/^schemaic_it_` roles through `md5`
+  — shown to be in force by a control, an md5-stored role that logged in under that prefix and was
+  refused outside it — where it still passed, PostgreSQL switching to SCRAM for a SCRAM-stored
+  verifier. The rule was removed afterwards; nothing in the tier reproduces that run.
   **`a_password_with_a_backslash_is_stored_as_it_was_typed` is the leg-gated one beside it, and
   what it pins is a *connection option* rather than anything this file emits.** PostgreSQL only —
   MySQL's mirror hazard is `NO_BACKSLASH_ESCAPES` and `mysql::run_ddl` already sends
@@ -13675,7 +13743,8 @@ existing prose was left alone.
     clear is load-bearing rather than defence in depth**, and it changed sides without the helper
     changing: it was the weaker thing while the box showed `ChangeSet::export_script`'s *redacted*
     copy, and it now holds `ChangeSet::emit`'s statements, which for an account plan carry the real
-    password — see `open_preview` for why the box shows those. So it is the same rule as
+    password — or, on PostgreSQL, a SCRAM verifier of it, which is still enough to brute-force the
+    password offline — see `open_preview` for why the box shows those. So it is the same rule as
     `account_draft` and `grant_draft` above rather than a tidy-up beside them.
     **`has_editor_behind` is the other reader of that same list, and the word on the preview's exit
     button is what depends on it.** The label was a hand-spelled two-name test —
@@ -14290,7 +14359,7 @@ existing prose was left alone.
     in the browser, and neither engine offers a
     rename that is safe to perform. **Which of the two it means rides on `AccountTarget::resetting`**
     (`Option<Principal>`), not on whether some field happens to be filled: `account_change(draft,
-    resetting)` reads the statement's *subject* from there, so a reset cannot rename or re-host the
+    resetting, salt)` reads the statement's *subject* from there, so a reset cannot rename or re-host the
     account it is resetting even though the form seeds the draft's name and host in order to say
     whose password it is — reading them back would do it silently, `ALTER USER 'b'@'%'` on an account
     that does not exist being an error the preview would blame on the server. That mapping is
@@ -14316,7 +14385,20 @@ existing prose was left alone.
     exactly one place: the preview's SQL. That is deliberate. The preview is the app's one gate
     between a plan and a server, and a statement shown there with a field blanked out would not be
     the statement it ran — but nothing *leaves* the preview carrying it, which is
-    `ChangeSet::export_script`'s job. **The field itself is
+    `ChangeSet::export_script`'s job. **On PostgreSQL the preview does not show it either**, for any
+    password in printable ASCII: Preview SQL calls `account_change` with `fresh_salt()` — 16 bytes
+    from `getrandom::fill` — and the salt stamped on either change makes the statement carry
+    `core::scram`'s verifier instead, so what the preview shows is what the server logs and neither
+    is the password. The salt is handed in rather than drawn inside `account_change` so the mapping
+    stays pure, and it is fresh per press because two previews of one password sharing a salt is
+    the salt no longer doing its job (`every_plan_gets_its_own_salt`). An OS with no randomness gives
+    `None`, which is the password as typed and never a lockout. `password_row` takes the dialect and
+    renders `users::password_hint` beneath the field, so the line says which of the two the preview
+    will hold. `the_form_hashes_a_postgres_password_under_the_salt_it_was_given` is the composition
+    test: the emitter's own tests prove a salted change becomes a verifier and this proves the form
+    builds a salted one, for create and reset alike — a stamp lost between the two puts the password
+    back in PostgreSQL's logs with every other test green, and an `account_change` that dropped the
+    salt was seen failing it. **The field itself is
     `connection_form::masked_edit_field`**, the same one the three saved-connection secrets wear:
     this was the app's only *unmasked* secret field, so its real characters were on screen and a
     Ctrl+A/Ctrl+C from the clipboard. That helper is `pub(crate)` precisely so there is one of them
@@ -19959,7 +20041,9 @@ Re-introducing the anti-patterns these guard against is a regression:
   both while three doc sites said it was
   "never persisted, never logged". What goes out is `ChangeSet::export_script`, which re-emits from
   a set cloned with `ddl::PASSWORD_PLACEHOLDER` in each secret's place; the modal still *renders*
-  the real statement, because a preview showing a blanked-out plan is not showing the plan.
+  the real statement, because a preview showing a blanked-out plan is not showing the plan. The
+  clone drops a PostgreSQL plan's `scram_salt` along with its password, or it re-emits a verifier
+  *of the placeholder* and the copy has nothing left to replace (`ddl.rs` has the whole of it).
 - **Connection secrets persist to the OS keyring, not `connections.json`.** DB/SSH passwords and the
   SSH key passphrase go through `schemaic_core::secrets` (`SecretStore` seam) + `schemaic-conn`'s
   keyring-backed store; the JSON on disk is blanked and hydrated on load. All connection saves route

@@ -5020,12 +5020,15 @@ dependencies = [
 name = "schemaic-core"
 version = "0.26.0"
 dependencies = [
+ "base64 0.22.1",
  "calamine",
  "chrono",
  "csv",
+ "hmac 0.13.0",
  "rust_xlsxwriter",
  "serde",
  "serde_json",
+ "sha2 0.11.0",
  "sqlparser",
  "thiserror 2.0.20",
  "tracing",
@@ -5072,6 +5075,7 @@ version = "0.26.0"
 dependencies = [
  "floem",
  "floem_renderer",
+ "getrandom 0.3.4",
  "image",
  "pulldown-cmark",
  "resvg",
