@@ -1369,7 +1369,15 @@ existing prose was left alone.
     that. Unformatted, like `tsv`: a formatter is how a value is shown and an export writes the
     value, so `formats` is the one field of this struct the method does not consult. Cheap on a
     clean grid, since the columns are refcounted and `splice_cells` rebuilds only a column whose
-    listed cell really differs. One rule,
+    listed cell really differs. `exported_rows_at(selection, pos)` is that resolution narrowed to
+    the rows a gutter gesture at **display** row `pos` means — the highlighted rows when the click
+    is inside them, else that row alone, the reading `selected_data_rows` gives — for the row
+    menu's *Copy as*. It slices the *exported* order by display position rather than reading the
+    selection as data indices, which on a sorted grid are different numbers and would copy the wrong
+    rows; slicing the resolved order is what carries the sort, the staged values and the pending
+    rows at once. Unlike the delete it keeps the pending rows, since a copy has nothing to refuse
+    them for, and a range past the last row is clamped rather than a panic
+    (`exported_rows_at_clamps_to_the_rows_that_exist`). One rule,
     because this resolution kept going out one source short where nothing could test it:
     `attached_rows` first read `rs.cell` and never `dirty`, so a green uncommitted edit was on
     screen while the pre-edit value went to the model, and the fix for *that* left the rule in
@@ -23952,9 +23960,14 @@ this bundle's.
   reporting a clean row count and no caveat. `save_export` takes that resolved snapshot **before**
   the save dialog opens, for the reason the statement beside it is snapshotted: the dialog is modal
   and slow, and an edit typed while it stands open must not change what was asked for. The gate is
-  `no_export_path_renders_the_unresolved_result`, which holds all four to calling `exported_rows`
-  and holds `exported_rows` to `grid_cells` — fixing one of four is exactly how this class comes
-  back.
+  `no_export_path_renders_the_unresolved_result`, which lists every export path — those four,
+  `export_menu` (whose `Fetched rows (N)` label counts what the file will hold) and the gutter
+  menu's *Copy as* — holds each to one of three resolvers, and holds every resolver to
+  `grid_cells`; fixing one of four is exactly how this class came back. The resolvers are
+  `exported_rows`, its count-only half `exported_row_count` (what `export_menu` needs, with
+  nothing built), and `exported_rows_at`, its row-narrowed sibling for *Copy as*
+  (`render_rows_at`), which reads the raw pair plus the selection. It shares `render_order`
+  with `render_export`, so a row copy and the whole-result copy cannot render a format differently.
   The reason is under `core::edit`: the rule went out one source
   short twice in the view, most recently without `format::apply`, so a `Timestamp` column attached
   the epoch integer the cell does not show. The **painter** is the exception and stays one:
@@ -24008,8 +24021,14 @@ this bundle's.
   `new_rows_gen` exists for, and the guard had been written into `ai_seed_rows` and not into the
   sibling reaching the same `stage_new`. So the enum carries a committed row by its **data** index,
   stable under a sort, and a pending row by index *and* the generation it belongs to.
-- **Right-click menus** (generic `menu_panel` / `ui.popup_menu`): a header offers `Copy › CSV / JSON`
-  of that column's values (`export_column_csv`/`_json`); a data cell offers `View`, `Edit` (editable
+- **Right-click menus** (generic `menu_panel` / `ui.popup_menu`): a header offers flat `Copy name`
+  (the name the header shows — the alias where the query gave one) and `Copy qualified name`
+  (`database.<display_name(schema, table)>.column`, the schema tree column entry's shape, offered
+  only when the column has a `model::ColumnOrigin`), then `Copy values › CSV / JSON` of that
+  column's values (`export_column_csv`/`_json`). The two names differ on an aliased base column:
+  the origin survives an alias, so the qualified entry is offered there and copies the base
+  column's real name (`ColumnOrigin::column`), not the alias. A data cell offers `View`,
+  `Edit` (editable
   cells only), a Copy entry whose scope and wording come from `edit::copy_scope` (**Copy** for the
   whole block when the right-click was inside a multi-cell selection, **Copy value** for one cell —
   the same word for three different amounts was the bug), `Set to NULL` (editable **and** nullable —
@@ -24069,10 +24088,15 @@ this bundle's.
   The fetch carries `conn_at_load` rather than the tab's current connection, on the argument the
   export already makes — a blob re-read over a different connection is a different database's row
   with the same key. The
-  **gutter** has its own menu (`gutter_menu`) rather than the cell one — `Copy`, the row actions,
-  and the attach entry — because a row-number click has picked out no cell, and offering
+  **gutter** has its own menu (`gutter_menu`) rather than the cell one — `Copy`, a `Copy as`
+  submenu, the row actions, and the attach entry — because a row-number click has picked out no
+  cell, and offering
   Edit field / Filter by this value there would answer a gesture about rows with actions about a
-  column. Its row actions take **every selected row** (`selected_data_rows` → `set_rows_deleted` /
+  column. `Copy as` is the toolbar's Copy menu for just these rows: the same
+  `ExportFormat::clipboard_formats()` list (text formats only, for the reason `export.rs`'s entry
+  gives), each rendered through `render_rows_at` → `edit::GridCells::exported_rows_at`, so it
+  copies the rows on screen in screen order, staged values and pending rows included. Its row
+  actions take **every selected row** (`selected_data_rows` → `set_rows_deleted` /
   `clone_rows`) and count them in the label: the same menu naming five rows in one entry and acting
   on one in the next is how four deletions go missing unnoticed. **`set_rows_deleted` batches, and
   it was the one row action in that pair that did not** — the Del key's handler and

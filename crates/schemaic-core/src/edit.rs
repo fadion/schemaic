@@ -1384,6 +1384,34 @@ impl GridCells<'_> {
         (out, order)
     }
 
+    /// [`GridCells::exported`], narrowed to the rows a gutter gesture at
+    /// **display** row `pos` means: the highlighted display rows when the click
+    /// is inside them, else that row alone — the reading
+    /// [`selected_data_rows`] gives every other gutter action.
+    ///
+    /// For the row menu's *Copy as*, which renders through `core::export` like
+    /// the whole-result export does. Display rows, not data rows, and resolved
+    /// first: the exported order already carries the sort, the staged values and
+    /// the pending rows past the real ones, so slicing it by display position is
+    /// the one reading that copies what is on screen. Pending rows are copied
+    /// too — unlike a delete, a copy has nothing to refuse them for.
+    pub fn exported_rows_at(
+        &self,
+        selection: Option<(usize, usize)>,
+        pos: usize,
+    ) -> (ResultSet, Vec<usize>) {
+        let (out, order) = self.exported();
+        let (r0, r1) = match selection {
+            Some((r0, r1)) if pos >= r0 && pos <= r1 => (r0, r1),
+            _ => (pos, pos),
+        };
+        let picked = order
+            .get(r0..order.len().min(r1 + 1))
+            .unwrap_or_default()
+            .to_vec();
+        (out, picked)
+    }
+
     /// How many rows [`GridCells::exported`] would hand back, **without
     /// building them.**
     ///
@@ -4114,6 +4142,81 @@ mod tests {
             )
         };
         assert_eq!(one(&out), one(&rs), "a clean grid exported differently");
+    }
+
+    /// Three stored rows `a b c`, shown sorted as `c a b`, plus one pending row
+    /// `new` drawn past them — display rows 0..=3 read `c a b new`.
+    fn sorted_with_pending() -> (ResultSet, Vec<usize>, Vec<HashMap<usize, CellEdit>>) {
+        let rs = ResultSet::from_rows(
+            vec![col("name", "VARCHAR", "t", false, false)],
+            vec![
+                vec![Value::Str("a".into())],
+                vec![Value::Str("b".into())],
+                vec![Value::Str("c".into())],
+            ],
+        );
+        let mut pending = HashMap::new();
+        pending.insert(0, CellEdit::Text("new".into()));
+        (rs, vec![2, 0, 1], vec![pending])
+    }
+
+    /// The rows a `(ResultSet, order)` pair renders, one CSV value per row.
+    fn csv_rows(out: &ResultSet, ord: &[usize]) -> Vec<String> {
+        crate::export::ExportFormat::Csv
+            .render(out, ord, None, crate::intel::SqlDialect::MySql)
+            .lines()
+            .skip(1)
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// **Copy rows as — the rows on screen, in the order on screen.** On a
+    /// sorted grid the display row and the data row are different numbers, so
+    /// reading the selection as data indices would copy the wrong rows.
+    #[test]
+    fn exported_rows_at_takes_the_highlighted_display_rows_in_display_order() {
+        let (rs, order, new_rows) = sorted_with_pending();
+        let formats = vec![crate::format::ColumnFormat::None];
+        let dirty = HashMap::new();
+        let c = cells(&rs, &order, &formats, &dirty, &new_rows);
+        let (out, ord) = c.exported_rows_at(Some((0, 1)), 1);
+        assert_eq!(csv_rows(&out, &ord), ["c", "a"]);
+    }
+
+    /// A right-click outside the highlight means the row clicked, as every
+    /// other gutter action reads it.
+    #[test]
+    fn exported_rows_at_a_click_outside_the_selection_is_that_row_alone() {
+        let (rs, order, new_rows) = sorted_with_pending();
+        let formats = vec![crate::format::ColumnFormat::None];
+        let dirty = HashMap::new();
+        let c = cells(&rs, &order, &formats, &dirty, &new_rows);
+        let (out, ord) = c.exported_rows_at(Some((0, 1)), 2);
+        assert_eq!(csv_rows(&out, &ord), ["b"]);
+    }
+
+    /// Staged values and pending rows are what the grid shows, so they are what
+    /// is copied — the same resolution the whole-result export goes through.
+    #[test]
+    fn exported_rows_at_carries_staged_edits_and_pending_rows() {
+        let (rs, order, new_rows) = sorted_with_pending();
+        let formats = vec![crate::format::ColumnFormat::None];
+        let mut dirty = HashMap::new();
+        dirty.insert((0, 0), CellEdit::Text("A".into()));
+        let c = cells(&rs, &order, &formats, &dirty, &new_rows);
+        let (out, ord) = c.exported_rows_at(Some((1, 3)), 3);
+        assert_eq!(csv_rows(&out, &ord), ["A", "b", "new"]);
+    }
+
+    /// A selection running past the last row is clamped, not a panic.
+    #[test]
+    fn exported_rows_at_clamps_to_the_rows_that_exist() {
+        let (rs, order, new_rows) = sorted_with_pending();
+        let formats = vec![crate::format::ColumnFormat::None];
+        let dirty = HashMap::new();
+        let c = cells(&rs, &order, &formats, &dirty, &new_rows);
+        let (out, ord) = c.exported_rows_at(Some((2, 9)), 2);
+        assert_eq!(csv_rows(&out, &ord), ["b", "new"]);
     }
 
     /// A staged NULL is a null in the file, not the word — the mapping

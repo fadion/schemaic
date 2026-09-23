@@ -2515,14 +2515,36 @@ fn exported_row_count(gs: GridState) -> usize {
     grid_cells(&rs, &order, &formats, &dirty, &new_rows).exported_row_count()
 }
 
+/// [`exported_rows`], narrowed to the rows a gutter gesture at display row
+/// `pos` means — see [`schemaic_core::edit::GridCells::exported_rows_at`].
+fn exported_rows_at(gs: GridState, pos: usize) -> (ResultSet, Vec<usize>) {
+    let (rs, order) = (gs.rs.get_untracked(), gs.order.get_untracked());
+    let (dirty, new_rows) = (gs.dirty.get_untracked(), gs.new_rows.get_untracked());
+    let formats = gs.formats.get_untracked();
+    let selection = gs.bounds_untracked().map(|(r0, _, r1, _)| (r0, r1));
+    grid_cells(&rs, &order, &formats, &dirty, &new_rows).exported_rows_at(selection, pos)
+}
+
 /// Render the whole result in `format`. The single dispatch point for both the
 /// copy menu and the save-to-file menu, so the two can't drift.
 fn render_export(gs: GridState, format: ExportFormat) -> String {
     let (rs, order) = exported_rows(gs);
+    render_order(gs, &rs, &order, format)
+}
+
+/// Render the rows the gutter menu was opened on in `format` — the row menu's
+/// *Copy as*, through the same renderer as the whole-result copy.
+fn render_rows_at(gs: GridState, pos: usize, format: ExportFormat) -> String {
+    let (rs, order) = exported_rows_at(gs, pos);
+    render_order(gs, &rs, &order, format)
+}
+
+/// `format`'s rendering of `order` over an already-resolved `rs`.
+fn render_order(gs: GridState, rs: &ResultSet, order: &[usize], format: ExportFormat) -> String {
     let source = gs.source.get_untracked();
     format.render(
-        &rs,
-        order.as_slice(),
+        rs,
+        order,
         source
             .as_ref()
             .map(|s| (s.database.as_str(), s.schema.as_deref(), s.table.as_str())),
@@ -9071,7 +9093,22 @@ fn blob_launch(
 /// picked out, and offering them would answer a gesture about rows with actions
 /// about a column.
 fn gutter_menu(gs: GridState, pos: usize, pending: Option<usize>) -> Vec<MenuEntry> {
-    let mut entries = vec![MenuEntry::action("Copy", move || copy_selection(gs))];
+    let mut entries = vec![
+        MenuEntry::action("Copy", move || copy_selection(gs)),
+        // The rows as the toolbar's Copy renders the whole result — an
+        // `INSERT`, a JSON array, a Markdown table — for just these rows. Text
+        // formats only, for the reason that menu gives.
+        MenuEntry::sub(
+            "Copy as",
+            ExportFormat::clipboard_formats()
+                .map(|f| {
+                    MenuEntry::action(f.label(), move || {
+                        let _ = floem::Clipboard::set_contents(render_rows_at(gs, pos, f));
+                    })
+                })
+                .collect(),
+        ),
+    ];
     // Row actions, on the same terms the cell menu offers them: real (already
     // committed) rows of a single writable table.
     let model = gs.edit_model.get_untracked();
@@ -9411,7 +9448,7 @@ fn header_cell(
                 cycle_sort(sort, ci);
             }
         })
-        // Right-click → Freeze this column (pin left) · Copy its values.
+        // Right-click → Freeze this column (pin left) · Copy its name or values.
         .on_secondary_click_stop(move |_| {
             gs.dismiss_overlays();
             let freeze_item = if gs.frozen.get_untracked() == Some(ci) {
@@ -9436,23 +9473,47 @@ fn header_cell(
                 &type_name,
                 &summary::sample_column(&rs, ci, summary::COLUMN_SAMPLE),
             );
+            // `database.schema.table.column` — the shape the schema tree's
+            // column entry copies — for a column read from a real table. An
+            // expression has no such name, so it gets none; an aliased column
+            // keeps its origin, and copies the base column's real name, which
+            // is what a qualified reference to it is.
+            let qualified = rs.columns.get(ci).and_then(|c| c.origin.as_ref()).map(|o| {
+                format!(
+                    "{}.{}.{}",
+                    o.database,
+                    schemaic_core::schema::display_name(o.schema.as_deref(), &o.table),
+                    o.column
+                )
+            });
             gs.popup_anchor.set(None); // right-click → open at the cursor
+            let name = column.clone();
             let mut entries = vec![
                 freeze_item,
                 MenuEntry::sub("Format as", format_submenu(gs, ci)),
                 MenuEntry::Separator,
-                MenuEntry::sub(
-                    "Copy",
-                    vec![
-                        MenuEntry::action("CSV", move || {
-                            let _ = floem::Clipboard::set_contents(export_column_csv(gs, ci));
-                        }),
-                        MenuEntry::action("JSON", move || {
-                            let _ = floem::Clipboard::set_contents(export_column_json(gs, ci));
-                        }),
-                    ],
-                ),
+                // The name as the header shows it — an alias where the query
+                // gave one, since that is what the next query will refer to.
+                MenuEntry::action("Copy name", move || {
+                    let _ = floem::Clipboard::set_contents(name.clone());
+                }),
             ];
+            if let Some(q) = qualified {
+                entries.push(MenuEntry::action("Copy qualified name", move || {
+                    let _ = floem::Clipboard::set_contents(q.clone());
+                }));
+            }
+            entries.push(MenuEntry::sub(
+                "Copy values",
+                vec![
+                    MenuEntry::action("CSV", move || {
+                        let _ = floem::Clipboard::set_contents(export_column_csv(gs, ci));
+                    }),
+                    MenuEntry::action("JSON", move || {
+                        let _ = floem::Clipboard::set_contents(export_column_json(gs, ci));
+                    }),
+                ],
+            ));
             // The column summary's prompt carries a sample of the values, so it
             // is a data path like the cell one and is absent on a schema-only
             // connection. (Copy is not: the clipboard is the user's own machine.)
@@ -10979,6 +11040,7 @@ mod cell_preview_tests {
         // figures for one file. Same rule, same needle: read the resolved pair.
         for name in [
             "fn render_export(",
+            "fn render_rows_at(",
             "fn export_column_json(",
             "fn export_column_csv(",
             "fn save_export(",
@@ -10999,7 +11061,9 @@ mod cell_preview_tests {
             // the UI thread, per click. Listed here rather than exempting the
             // function, so a path that stops resolving at all is still caught.
             assert!(
-                f.contains("exported_rows(") || f.contains("exported_row_count("),
+                f.contains("exported_rows(")
+                    || f.contains("exported_rows_at(")
+                    || f.contains("exported_row_count("),
                 "`{name}` does not resolve the grid's staged edits before \
                  rendering, so it disagrees with Ctrl+C:\n{f}"
             );
@@ -11011,7 +11075,11 @@ mod cell_preview_tests {
         // And both resolvers go through `GridCells`, rather than reaching for
         // the overlay a second time — which is how the menu and the file came to
         // disagree about a row count in the first place.
-        for name in ["fn exported_rows(", "fn exported_row_count("] {
+        for name in [
+            "fn exported_rows(",
+            "fn exported_rows_at(",
+            "fn exported_row_count(",
+        ] {
             let at = body
                 .find(name)
                 .unwrap_or_else(|| panic!("`{name}` is gone — this gate is stale"));
