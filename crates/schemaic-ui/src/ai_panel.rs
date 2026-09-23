@@ -370,7 +370,7 @@ pub(crate) fn ai_panel(ui: Ui) -> impl IntoView {
                     move || (available.get(), panel_harness.get()),
                     move |(ok, h)| {
                         let msg = match ok {
-                            true => "Ask about your SQL...".to_string(),
+                            true => "Ask about your SQL…".to_string(),
                             false => format!("{} not connected.", h.label()),
                         };
                         text(msg)

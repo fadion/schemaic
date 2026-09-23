@@ -7402,6 +7402,10 @@ fn header(ui: Ui, chrome: window_chrome::WindowChrome) -> impl IntoView {
 
     // Find-anywhere trigger: a plain Lucide search glyph, 24px, 20px from the
     // header's right edge (brightens on hover like the schema-panel icons).
+    //
+    // All three glyphs are icon-only, so each carries a tooltip like every other
+    // icon button in the app; the tooltip goes last because `.tooltip()` wraps
+    // the view rather than decorating it (see the result chips' note).
     let search = icons::icon(icons::SEARCH, 20.0)
         .on_click_stop(move |_| find_open.set(true))
         .style(|s| {
@@ -7409,6 +7413,13 @@ fn header(ui: Ui, chrome: window_chrome::WindowChrome) -> impl IntoView {
                 .margin_right(theme::scaled(16.0))
                 .color(theme::text_muted())
                 .hover(|s| s.color(theme::text()))
+        })
+        .tooltip(|| {
+            text(format!(
+                "Find Anywhere ({})",
+                crate::shortcuts::keys_label("Ctrl+P")
+            ))
+            .style(widgets::tooltip_style)
         });
 
     // Keyboard-shortcuts help, 20px, just left of the settings gear — same look
@@ -7420,7 +7431,8 @@ fn header(ui: Ui, chrome: window_chrome::WindowChrome) -> impl IntoView {
                 .margin_right(theme::scaled(16.0))
                 .color(theme::text_muted())
                 .hover(|s| s.color(theme::text()))
-        });
+        })
+        .tooltip(|| text("Keyboard shortcuts").style(widgets::tooltip_style));
 
     // App settings (theme picker), 20px, sitting just right of the search glyph.
     let settings = icons::icon(icons::SETTINGS, 20.0)
@@ -7430,7 +7442,8 @@ fn header(ui: Ui, chrome: window_chrome::WindowChrome) -> impl IntoView {
                 .margin_right(theme::scaled(20.0))
                 .color(theme::text_muted())
                 .hover(|s| s.color(theme::text()))
-        });
+        })
+        .tooltip(|| text("Settings").style(widgets::tooltip_style));
     // The glyph cluster, then the window's caption buttons hard against the right
     // edge — the header *is* the title bar now. `settings` keeps its 20px right
     // margin, which becomes the gap between the app's glyphs and the OS-ish
