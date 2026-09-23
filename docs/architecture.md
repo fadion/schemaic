@@ -8267,7 +8267,10 @@ existing prose was left alone.
   (which hands back an empty definition to a non-owner and omits materialized views entirely)
   plus `reloptions` for the storage params a replace would reset (`pg_view_options`) — all
   folded on *after* the shared `assemble_schema` (which both engines share and neither's
-  extras belong in).
+  extras belong in). **That fold looks each table up rather than filtering for it**: the checks,
+  triggers, FK rules and the per-namespace row sets are bucketed once by `group_by`, where a
+  `.filter` per table (and per namespace) made the load O(tables × rows) — measured 1.25 s against
+  0.24 s on a 2400-table database with one CHECK, trigger and FK each.
   **`table_list_sql` returns four columns, and the fourth is the table comment.** It is the one
   table option PostgreSQL has and nothing was reading it: the designer emits `COMMENT ON TABLE`
   correctly and this query never selected `obj_description`, so a comment set through the app was
