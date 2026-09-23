@@ -11,8 +11,9 @@ use floem::prelude::*;
 
 use crate::consts::{TERM_FONT_SIZES, chat_pad_h};
 use crate::widgets::{
-    ActionKind, MenuEntry, action_button, action_button_dyn, autohide, focus_root_with_ring,
-    footer_error, form_hint, form_label_style, modal_title, nothing, panel_style,
+    ActionKind, MenuEntry, action_button, action_button_dyn, action_gap, autohide,
+    focus_root_with_ring, footer_error, form_hint, form_label_style, modal_title, nothing,
+    panel_style,
 };
 use crate::{
     AiActions, AiEffort, AiUi, ConnUi, FieldCfg, Harness, LayoutUi, SchemaScope, TermActions,
@@ -1462,18 +1463,25 @@ fn log_row(open: Rc<dyn Fn()>, ring: crate::widgets::FocusRing, tabindex: u32) -
     .style(|s| s.items_center().width_full().gap(theme::scaled(10.0)))
 }
 
-/// The Settings row that puts the `schemaic` command on `PATH`.
+/// The Settings row that puts the `schemaic` command on `PATH`, or takes it
+/// off again.
 ///
 /// Only ever on a click — never at install time — and the outcome stays under
-/// the row for the rest of the session, naming the path it resolved. The
-/// guard against a second click while one is running is the app's, beside the
-/// launch; the label only says so.
+/// the row for the rest of the session, naming the path it resolved. Remove is
+/// the only undo macOS and AppImage users get: nothing of ours runs when those
+/// are thrown away (Windows also has the uninstall hook). The guard against a
+/// second click while either is running is the app's, beside the launch; the
+/// labels only say so. `tabindex` is Install's; Remove follows it.
 fn cli_row(
-    install: Rc<dyn Fn()>,
-    state: RwSignal<InstallState>,
+    cmd: crate::CliCommand,
     ring: crate::widgets::FocusRing,
     tabindex: u32,
 ) -> impl IntoView {
+    let crate::CliCommand {
+        install,
+        remove,
+        state,
+    } = cmd;
     let outcome = dyn_container(
         move || state.get(),
         |st| match st {
@@ -1485,7 +1493,7 @@ fn cli_row(
                 })
                 .into_any(),
             InstallState::Failed(msg) => footer_error(msg),
-            InstallState::Idle | InstallState::Running => nothing(),
+            InstallState::Idle | InstallState::Running | InstallState::Removing => nothing(),
         },
     )
     // Hidden rather than empty with nothing to say, or it takes the column's
@@ -1509,17 +1517,31 @@ fn cli_row(
                 .flex_grow(1.0_f32)
                 .min_width(0.0)
         }),
-        action_button_dyn(
-            move || match state.get() {
-                InstallState::Running => "Installing".to_string(),
-                _ => "Install".to_string(),
-            },
-            ActionKind::Quiet,
-            true,
-            ring,
-            tabindex,
-            move || install(),
-        ),
+        h_stack((
+            action_button_dyn(
+                move || match state.get() {
+                    InstallState::Running => "Installing".to_string(),
+                    _ => "Install".to_string(),
+                },
+                ActionKind::Quiet,
+                true,
+                ring.clone(),
+                tabindex,
+                move || install(),
+            ),
+            action_button_dyn(
+                move || match state.get() {
+                    InstallState::Removing => "Removing".to_string(),
+                    _ => "Remove".to_string(),
+                },
+                ActionKind::Quiet,
+                true,
+                ring,
+                tabindex + 5,
+                move || remove(),
+            ),
+        ))
+        .style(|s| s.flex_row().items_center().gap(action_gap())),
     ))
     .style(|s| s.items_center().width_full().gap(theme::scaled(10.0)))
 }
@@ -1557,8 +1579,7 @@ fn settings_version_line() -> impl IntoView {
 pub(crate) fn theme_settings_overlay(
     layout: LayoutUi,
     open_config_dir: Rc<dyn Fn()>,
-    install_cli: Rc<dyn Fn()>,
-    cli_install: RwSignal<InstallState>,
+    cli_command: crate::CliCommand,
 ) -> impl IntoView {
     let open = layout.theme_settings_open;
     let ui_theme = layout.ui_theme;
@@ -1605,7 +1626,7 @@ pub(crate) fn theme_settings_overlay(
                 settings_section_header("General"),
                 restore_row,
                 log_row(open_config_dir.clone(), ring.clone(), 20),
-                cli_row(install_cli.clone(), cli_install, ring.clone(), 30),
+                cli_row(cli_command.clone(), ring.clone(), 30),
             ))
             .style(|s| s.flex_col().gap(theme::scaled(16.0)));
 

@@ -303,8 +303,7 @@ pub(crate) fn modal_layer(ui: Ui, modal_up: impl Fn() -> bool + Copy + 'static) 
             theme_settings_overlay(
                 ui.layout,
                 ui.open_config_dir.clone(),
-                ui.install_cli.clone(),
-                ui.cli_install,
+                ui.cli_command.clone(),
             ),
             help_overlay(ui.layout),
         ))

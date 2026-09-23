@@ -230,6 +230,23 @@ fn main() -> std::process::ExitCode {
     // written yet, so there is nothing to lose. Placed after the tab restore it
     // would be a data-loss bug. Turn it off with `.set_auto_apply_on_startup(false)`
     // if the surprise restart ever proves more annoying than the updates are worth.
+    //
+    // **One hook is ours: uninstall takes the CLI's folder back off the user
+    // `PATH`** (Settings → General → Command line put it there), before the
+    // uninstaller deletes that folder and leaves a dead entry behind. Windows
+    // only, as Velopack's fast callbacks are — it has no uninstaller elsewhere.
+    // The logger is started inside the hook, the one place ahead of
+    // `logging::init()` below that needs it: the hook has no UI, so the log is
+    // the only record of what it did, and it lives in the config directory,
+    // which the uninstall leaves behind.
+    #[cfg(windows)]
+    velopack::VelopackApp::build()
+        .on_before_uninstall_fast_callback(|_version| {
+            logging::init();
+            install_cli::on_uninstall();
+        })
+        .run();
+    #[cfg(not(windows))]
     velopack::VelopackApp::build().run();
 
     logging::init();
@@ -11553,24 +11570,33 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
     let update_state = RwSignal::new(schemaic_core::update::UpdateState::default());
     let apply_update = update::start(cx, &handle, window, update_state);
 
-    // Settings → General → Command line → Install. Off-thread because the
-    // Windows arm waits on a broadcast to every top-level window; the guard
-    // against a second click while one runs sits here, beside the launch.
-    let cli_install = RwSignal::new(schemaic_core::cli_install::InstallState::default());
-    let install_cli: Rc<dyn Fn()> = Rc::new(move || {
+    // Settings → General → Command line → Install / Remove. Off-thread because
+    // the Windows arm waits on a broadcast to every top-level window; the guard
+    // against a click while either runs sits here, beside the launch.
+    let cli_command = {
         use schemaic_core::cli_install::InstallState;
-        if cli_install.get_untracked() == InstallState::Running {
-            return;
+        let state = RwSignal::new(InstallState::default());
+        let action = move |running: InstallState, work: fn() -> Result<String, String>| {
+            Rc::new(move || {
+                if state.get_untracked().busy() {
+                    return;
+                }
+                state.set(running.clone());
+                let report = create_ext_action(cx, move |res: Result<String, String>| {
+                    state.set(match res {
+                        Ok(msg) => InstallState::Done(msg),
+                        Err(msg) => InstallState::Failed(msg),
+                    });
+                });
+                std::thread::spawn(move || report(work()));
+            }) as Rc<dyn Fn()>
+        };
+        schemaic_ui::CliCommand {
+            install: action(InstallState::Running, install_cli::install),
+            remove: action(InstallState::Removing, install_cli::remove),
+            state,
         }
-        cli_install.set(InstallState::Running);
-        let report = create_ext_action(cx, move |res: Result<String, String>| {
-            cli_install.set(match res {
-                Ok(msg) => InstallState::Done(msg),
-                Err(msg) => InstallState::Failed(msg),
-            });
-        });
-        std::thread::spawn(move || report(install_cli::install()));
-    });
+    };
 
     let ui = Ui {
         tabs_ui: TabsUi {
@@ -12060,8 +12086,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
         update_state,
         apply_update,
         open_config_dir: Rc::new(open_config_dir),
-        install_cli,
-        cli_install,
+        cli_command,
     };
     // Every config file loaded *during this build* has been loaded by now. If any
     // of them was unreadable it was preserved as `.corrupt` and recovered from

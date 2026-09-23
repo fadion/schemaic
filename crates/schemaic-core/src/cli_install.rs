@@ -1,5 +1,6 @@
-//! Putting the `schemaic` command on `PATH` — the decision half of Settings →
-//! General → Command line → Install.
+//! Putting the `schemaic` command on `PATH`, and taking it off again — the
+//! decision half of Settings → General → Command line → Install / Remove, and
+//! of the Windows uninstall hook.
 //!
 //! The CLI itself needs nothing installed: it is an argv branch of the app's own
 //! binary (plus the `schemaic.com` console shim on Windows). What it lacks is a
@@ -17,6 +18,12 @@
 //!   a mount that disappears at exit, so the link targets `$APPIMAGE` instead.
 //! - **deb/rpm** already install `/usr/bin/schemaic`: the planner finds that
 //!   directory on `PATH` and there is nothing to do.
+//!
+//! [`removal`] is the inverse, and only ever undoes what Install could have
+//! written: this copy's folder out of the user `PATH`, or a link that points at
+//! this copy (or at nothing). On Windows Velopack's uninstall hook runs it too;
+//! nothing of ours runs when a macOS app or an AppImage is thrown away, so
+//! there the Remove button is the only undo.
 //!
 //! Everything here is pure; the registry, the symlink and the broadcast live at
 //! the app boundary (`schemaic-app`'s `install_cli`).
@@ -99,35 +106,61 @@ pub fn plan(p: &Probe) -> Result<Plan, String> {
             })
         }
         Os::MacOs | Os::Linux => {
-            // Under an AppImage `exe` is inside the image's mount, which is gone
-            // the moment the app exits — a link to it, or "already on PATH"
-            // because of it, would be false by the next terminal.
-            let target = match (&p.appimage, p.os) {
-                (Some(image), Os::Linux) => image.clone(),
-                _ => p.exe.clone(),
-            };
-            let t = target.to_string_lossy();
-            if file_name(&t, p.os) == COMMAND
-                && let Some(dir) = parent_of(&t, p.os)
-                && path_has_dir(&p.path_var, Path::new(dir), p.os)
-            {
-                return Ok(Plan::Already {
-                    dir: PathBuf::from(dir),
-                });
+            let target = link_target(p);
+            if let Some(dir) = on_path_as_command(p, &target) {
+                return Ok(Plan::Already { dir });
             }
-            let home = p.home.as_ref().ok_or_else(|| {
-                "There is no home directory to put the link under, so Install has nowhere \
-                 to write."
-                    .to_string()
-            })?;
-            let home = home.to_string_lossy();
-            let link = format!("{}/.local/bin/{COMMAND}", home.trim_end_matches('/'));
             Ok(Plan::Link {
-                link: PathBuf::from(link),
+                link: link_path(p)?,
                 target,
             })
         }
     }
+}
+
+/// What a link should point at. Under an AppImage `exe` is inside the image's
+/// mount, which is gone the moment the app exits — a link to it, or "already
+/// on PATH" because of it, would be false by the next terminal.
+fn link_target(p: &Probe) -> PathBuf {
+    match (&p.appimage, p.os) {
+        (Some(image), Os::Linux) => image.clone(),
+        _ => p.exe.clone(),
+    }
+}
+
+/// The directory `target` already resolves from by name, if it does — a
+/// deb/rpm's `/usr/bin/schemaic`.
+fn on_path_as_command(p: &Probe, target: &Path) -> Option<PathBuf> {
+    let t = target.to_string_lossy();
+    let dir = parent_of(&t, p.os)?;
+    (file_name(&t, p.os) == COMMAND && path_has_dir(&p.path_var, Path::new(dir), p.os))
+        .then(|| PathBuf::from(dir))
+}
+
+/// `~/.local/bin/schemaic` — the one link Install writes and Remove removes.
+fn link_path(p: &Probe) -> Result<PathBuf, String> {
+    let home = p.home.as_ref().ok_or_else(|| {
+        "There is no home directory to hold the link, so there is nowhere to look.".to_string()
+    })?;
+    let home = home.to_string_lossy();
+    Ok(PathBuf::from(format!(
+        "{}/.local/bin/{COMMAND}",
+        home.trim_end_matches('/')
+    )))
+}
+
+/// Does the symlink at `link`, whose `read_link` is `to`, point at `target`? A
+/// relative `to` is resolved lexically against the link's own directory.
+fn link_points_at(link: &Path, to: &Path, target: &Path) -> bool {
+    let to_s = to.to_string_lossy();
+    let resolved = if to_s.starts_with('/') {
+        lexical(&to_s)
+    } else {
+        let link_s = link.to_string_lossy();
+        let base = parent_of(&link_s, Os::Linux).unwrap_or("");
+        lexical(&format!("{base}/{to_s}"))
+    };
+    resolved == lexical(&target.to_string_lossy())
 }
 
 /// The separators of `os`'s paths. String work rather than `Path`, so the
@@ -271,21 +304,15 @@ pub fn link_step(existing: &Existing, link: &Path, target: &Path) -> LinkStep {
              aside and try again."
         )),
         Existing::Link { to, live } => {
-            let to_s = to.to_string_lossy();
-            let resolved = if to_s.starts_with('/') {
-                lexical(&to_s)
-            } else {
-                let base = parent_of(&link_s, Os::Linux).unwrap_or("");
-                lexical(&format!("{base}/{to_s}"))
-            };
-            if resolved == lexical(&target.to_string_lossy()) {
+            if link_points_at(link, to, target) {
                 LinkStep::Keep
             } else if !live {
                 LinkStep::Replace
             } else {
                 LinkStep::Refuse(format!(
-                    "{link_s} already points at {to_s}. Remove it if that's an old copy of \
-                     Schemaic, then try again."
+                    "{link_s} already points at {}. Remove it if that's an old copy of \
+                     Schemaic, then try again.",
+                    to.display()
                 ))
             }
         }
@@ -310,6 +337,138 @@ fn lexical(path: &str) -> String {
     } else {
         joined
     }
+}
+
+/// What Remove will do — the inverse of [`Plan`], and deliberately narrower:
+/// it only ever undoes what Install could have written.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Removal {
+    /// Windows: take `dir` out of the user `PATH`.
+    UserPath { dir: PathBuf },
+    /// macOS/Linux: remove `link` if it is ours — pointing at `target`, or at
+    /// nothing.
+    Unlink { link: PathBuf, target: PathBuf },
+    /// The command resolves from `dir` because a package put it there, not
+    /// Install; removing it is the package manager's job.
+    Package { dir: PathBuf },
+}
+
+/// Decide what Remove does on this machine, or why it can't.
+///
+/// Unlike [`plan`] this does not ask for the Windows shim: the entry to remove
+/// is this copy's folder whether or not `schemaic.com` survived, and the
+/// uninstall hook in particular must clean up without it.
+pub fn removal(p: &Probe) -> Result<Removal, String> {
+    match p.os {
+        Os::Windows => {
+            let exe = p.exe.to_string_lossy();
+            let dir = parent_of(&exe, Os::Windows)
+                .ok_or_else(|| format!("Can't tell which folder {exe} is in."))?;
+            Ok(Removal::UserPath {
+                dir: PathBuf::from(dir),
+            })
+        }
+        Os::MacOs | Os::Linux => {
+            let target = link_target(p);
+            if let Some(dir) = on_path_as_command(p, &target) {
+                return Ok(Removal::Package { dir });
+            }
+            Ok(Removal::Unlink {
+                link: link_path(p)?,
+                target,
+            })
+        }
+    }
+}
+
+/// The new *raw* user `PATH` with every entry naming `dir` taken out — after
+/// `%NAME%` expansion through `lookup`, so an entry written unexpanded goes
+/// too — or `None` when there was none. Every other entry, empty ones and a
+/// trailing `;` included, is kept exactly as written.
+pub fn user_path_remove(
+    raw: &str,
+    dir: &Path,
+    lookup: impl Fn(&str) -> Option<String>,
+) -> Option<String> {
+    let mut removed = false;
+    let kept: Vec<&str> = raw
+        .split(';')
+        .filter(|entry| {
+            let ours = path_has_dir(&expand_env(entry, &lookup), dir, Os::Windows);
+            removed |= ours;
+            !ours
+        })
+        .collect();
+    removed.then(|| kept.join(";"))
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum UnlinkStep {
+    /// The link is ours: it points at the target, or at nothing.
+    Remove,
+    /// Nothing there — nothing to do.
+    Absent,
+    /// Something that isn't ours is left alone, and this says what.
+    Refuse(String),
+}
+
+/// Whether Remove may delete `link`, given what is there. A dangling link goes
+/// too: it is what a moved or deleted copy leaves behind, and it points at
+/// nothing anyone could be relying on.
+pub fn unlink_step(existing: &Existing, link: &Path, target: &Path) -> UnlinkStep {
+    match existing {
+        Existing::Nothing => UnlinkStep::Absent,
+        Existing::Link { to, live } if !live || link_points_at(link, to, target) => {
+            UnlinkStep::Remove
+        }
+        Existing::Link { to, .. } => UnlinkStep::Refuse(format!(
+            "{} points at {}, not at this copy of Schemaic, so Remove left it alone.",
+            link.display(),
+            to.display()
+        )),
+        Existing::Other => UnlinkStep::Refuse(format!(
+            "{} isn't a link Schemaic made, so Remove left it alone.",
+            link.display()
+        )),
+    }
+}
+
+/// The report once `dir` has left the user `PATH`.
+pub fn report_removed(dir: &Path) -> String {
+    format!(
+        "Removed {} from your user PATH. A terminal that is already open keeps the old PATH.",
+        dir.display()
+    )
+}
+
+/// The report when `dir` was not on the user `PATH` to begin with.
+pub fn report_path_absent(dir: &Path) -> String {
+    format!(
+        "{} isn't on your user PATH, so there was nothing to remove.",
+        dir.display()
+    )
+}
+
+/// The report once `link` is gone.
+pub fn report_unlinked(link: &Path) -> String {
+    format!("Removed {}.", link.display())
+}
+
+/// The report when there was no link to remove.
+pub fn report_link_absent(link: &Path) -> String {
+    format!(
+        "There is no {}, so there was nothing to remove.",
+        link.display()
+    )
+}
+
+/// The report for [`Removal::Package`].
+pub fn report_package(dir: &Path) -> String {
+    format!(
+        "The schemaic command in {} came with the installed package, not from Install — \
+         remove the package to remove it.",
+        dir.display()
+    )
 }
 
 /// The report for [`Plan::Already`].
@@ -367,9 +526,20 @@ pub enum InstallState {
     #[default]
     Idle,
     Running,
+    Removing,
     /// Installed (or already was), and the report saying where.
     Done(String),
     Failed(String),
+}
+
+impl InstallState {
+    /// Is an Install or a Remove in flight? Either one blocks both buttons:
+    /// a Remove racing an Install over the same registry value or link would
+    /// leave whichever finished second as the answer, and the row would show
+    /// the other.
+    pub fn busy(&self) -> bool {
+        matches!(self, InstallState::Running | InstallState::Removing)
+    }
 }
 
 #[cfg(test)]
@@ -757,6 +927,202 @@ mod tests {
         let path = "/home/me/.local/bin:/usr/bin";
         let r = report_linked(Path::new(LINK), Path::new(TARGET), Os::MacOs, path);
         assert!(r.contains("PATH"), "{r}");
+    }
+
+    // ---- removal ----
+
+    #[test]
+    fn windows_removal_names_this_copys_folder() {
+        assert_eq!(
+            removal(&win(VELOPACK_EXE, "", true)),
+            Ok(Removal::UserPath {
+                dir: PathBuf::from(VELOPACK_DIR)
+            })
+        );
+    }
+
+    #[test]
+    fn windows_removal_does_not_need_the_shim() {
+        // The uninstall hook must clean up even if schemaic.com is already gone.
+        assert_eq!(
+            removal(&win(VELOPACK_EXE, "", false)),
+            Ok(Removal::UserPath {
+                dir: PathBuf::from(VELOPACK_DIR)
+            })
+        );
+    }
+
+    #[test]
+    fn windows_removal_ignores_the_process_path() {
+        // What this process inherited says nothing about the registry, which is
+        // what Remove edits.
+        let p = win(VELOPACK_EXE, VELOPACK_DIR, true);
+        assert!(matches!(removal(&p), Ok(Removal::UserPath { .. })));
+    }
+
+    #[test]
+    fn a_package_install_is_not_removed_by_the_app() {
+        let p = unix(Os::Linux, "/usr/bin/schemaic", "/usr/bin:/bin");
+        assert_eq!(
+            removal(&p),
+            Ok(Removal::Package {
+                dir: PathBuf::from("/usr/bin")
+            })
+        );
+    }
+
+    #[test]
+    fn unix_removal_targets_the_same_link_install_writes() {
+        let mut p = unix(Os::Linux, "/tmp/.mount_X/usr/bin/schemaic", "/usr/bin");
+        p.appimage = Some(PathBuf::from(TARGET));
+        let Ok(Plan::Link { link, target }) = plan(&p) else {
+            panic!("expected a link plan");
+        };
+        assert_eq!(removal(&p), Ok(Removal::Unlink { link, target }));
+    }
+
+    #[test]
+    fn macos_removal_unlinks() {
+        let exe = "/Applications/Schemaic.app/Contents/MacOS/schemaic";
+        assert_eq!(
+            removal(&unix(Os::MacOs, exe, "")),
+            Ok(Removal::Unlink {
+                link: PathBuf::from("/home/me/.local/bin/schemaic"),
+                target: PathBuf::from(exe),
+            })
+        );
+    }
+
+    #[test]
+    fn unix_removal_without_home_is_refused() {
+        let mut p = unix(Os::MacOs, "/Applications/S.app/Contents/MacOS/schemaic", "");
+        p.home = None;
+        assert!(removal(&p).unwrap_err().contains("home"));
+    }
+
+    // ---- user_path_remove ----
+
+    #[test]
+    fn user_path_remove_takes_out_the_entry_and_keeps_the_rest_raw() {
+        let raw = format!(r"%USERPROFILE%\bin;{VELOPACK_DIR};C:\z");
+        assert_eq!(
+            user_path_remove(&raw, Path::new(VELOPACK_DIR), env),
+            Some(r"%USERPROFILE%\bin;C:\z".to_string())
+        );
+    }
+
+    #[test]
+    fn user_path_remove_undoes_user_path_update_exactly() {
+        for raw in ["", r"C:\a", r"C:\a;", r"%USERPROFILE%\bin;C:\b"] {
+            let dir = Path::new(VELOPACK_DIR);
+            let added = user_path_update(raw, dir, env).unwrap();
+            let back = user_path_remove(&added, dir, env).unwrap();
+            // Every entry the user wrote comes back verbatim; only a trailing
+            // `;` — the separator the entry was appended after — may not.
+            assert_eq!(
+                back.trim_end_matches(';'),
+                raw.trim_end_matches(';'),
+                "{raw:?} -> {added:?} -> {back:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn user_path_remove_matches_case_slashes_and_expansion() {
+        let raw =
+            r"C:\a;%LOCALAPPDATA%\schemaic\CURRENT\;c:/users/me/appdata/local/schemaic/current";
+        assert_eq!(
+            user_path_remove(raw, Path::new(VELOPACK_DIR), env),
+            Some(r"C:\a".to_string())
+        );
+    }
+
+    #[test]
+    fn user_path_remove_keeps_empty_entries_and_a_trailing_separator() {
+        let raw = format!(r"C:\a;;{VELOPACK_DIR};");
+        assert_eq!(
+            user_path_remove(&raw, Path::new(VELOPACK_DIR), env),
+            Some(r"C:\a;;".to_string())
+        );
+    }
+
+    #[test]
+    fn user_path_remove_is_none_when_absent() {
+        assert_eq!(user_path_remove("", Path::new(VELOPACK_DIR), env), None);
+        let raw = r"C:\a;C:\Users\me\AppData\Local\Schemaic\current-old";
+        assert_eq!(user_path_remove(raw, Path::new(VELOPACK_DIR), env), None);
+    }
+
+    // ---- unlink_step ----
+
+    fn unstep(existing: Existing) -> UnlinkStep {
+        unlink_step(&existing, Path::new(LINK), Path::new(TARGET))
+    }
+
+    #[test]
+    fn unlink_step_removes_a_link_to_the_target() {
+        let to = PathBuf::from(TARGET);
+        assert_eq!(
+            unstep(Existing::Link { to, live: true }),
+            UnlinkStep::Remove
+        );
+        let to = PathBuf::from("../../Apps/Schemaic.AppImage");
+        assert_eq!(
+            unstep(Existing::Link { to, live: true }),
+            UnlinkStep::Remove
+        );
+    }
+
+    #[test]
+    fn unlink_step_removes_a_dangling_link() {
+        let to = PathBuf::from("/gone/Schemaic.AppImage");
+        assert_eq!(
+            unstep(Existing::Link { to, live: false }),
+            UnlinkStep::Remove
+        );
+    }
+
+    #[test]
+    fn unlink_step_is_absent_where_nothing_is() {
+        assert_eq!(unstep(Existing::Nothing), UnlinkStep::Absent);
+    }
+
+    #[test]
+    fn unlink_step_refuses_a_live_link_elsewhere_and_names_it() {
+        let to = PathBuf::from("/opt/other/schemaic");
+        let UnlinkStep::Refuse(why) = unstep(Existing::Link { to, live: true }) else {
+            panic!("expected a refusal");
+        };
+        assert!(
+            why.contains(LINK) && why.contains("/opt/other/schemaic"),
+            "{why}"
+        );
+    }
+
+    #[test]
+    fn unlink_step_refuses_a_regular_file() {
+        let UnlinkStep::Refuse(why) = unstep(Existing::Other) else {
+            panic!("expected a refusal");
+        };
+        assert!(why.contains(LINK), "{why}");
+    }
+
+    #[test]
+    fn busy_covers_install_and_remove_and_nothing_else() {
+        assert!(InstallState::Running.busy());
+        assert!(InstallState::Removing.busy());
+        assert!(!InstallState::Idle.busy());
+        assert!(!InstallState::Done("x".into()).busy());
+        assert!(!InstallState::Failed("x".into()).busy());
+    }
+
+    #[test]
+    fn removal_reports_name_the_path() {
+        assert!(report_removed(Path::new(VELOPACK_DIR)).contains(VELOPACK_DIR));
+        assert!(report_path_absent(Path::new(VELOPACK_DIR)).contains(VELOPACK_DIR));
+        assert!(report_unlinked(Path::new(LINK)).contains(LINK));
+        assert!(report_link_absent(Path::new(LINK)).contains(LINK));
+        assert!(report_package(Path::new("/usr/bin")).contains("/usr/bin"));
     }
 
     #[test]

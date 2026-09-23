@@ -7247,8 +7247,9 @@ existing prose was left alone.
     loopback address *is* the address and nothing is compared. A refusal rather than a silent drop to
     `require`, which would open a session that says TLS and checks nothing on a connection whose
     whole point is that it checks — the direction `SslMode::STRICTEST` already sends a guess.
-  - `cli_install.rs` — **putting the `schemaic` command on `PATH`**: the decision half of Settings →
-    General → Command line → Install, with the registry write, the symlink and the broadcast left to
+  - `cli_install.rs` — **putting the `schemaic` command on `PATH`, and taking it off again**: the
+    decision half of Settings → General → Command line → Install / Remove and of the Windows
+    uninstall hook, with the registry write, the symlink and the broadcast left to
     `schemaic-app`'s `install_cli.rs`. The CLI itself needs nothing installed — it is the app's own
     argv branch, plus `schemaic.com` on Windows — but it shipped reachable only by its full path on
     Windows and macOS, and getting it onto `PATH` is a write to the user's own environment, so it
@@ -7288,8 +7289,35 @@ existing prose was left alone.
     `PATH`" hint on macOS, since an app started from Finder gets launchd's minimal `PATH` and cannot
     tell whether the user's shell has `~/.local/bin` (`report_linked_always_hints_on_macos`), and on
     Linux only when the process's own `PATH` lacks it. `InstallState` (`Idle`, `Running`,
-    `Done(String)`, `Failed(String)`) is the Settings row's lifecycle — transient, never persisted.
-    **Nothing removes the entry or the link on uninstall**; that half is not built.
+    `Removing`, `Done(String)`, `Failed(String)`) is the Settings row's lifecycle — transient, never
+    persisted — and `busy()` is `Running | Removing`, because **either operation blocks both
+    buttons**: a Remove racing an Install over the same registry value or link would leave
+    whichever finished second as the answer while the row showed the other
+    (`busy_covers_install_and_remove_and_nothing_else`).
+    **`removal(&Probe) -> Result<Removal, String>` is the inverse, and deliberately narrower: it only
+    ever undoes what Install could have written.** `Removal::UserPath { dir }` (Windows) is this
+    copy's folder, and unlike `plan` it neither asks for `schemaic.com` nor reads the process
+    `PATH` — the uninstall hook must clean up whether or not the shim survived
+    (`windows_removal_does_not_need_the_shim`), and what this process inherited says nothing about
+    the registry, which is what Remove edits (`windows_removal_ignores_the_process_path`).
+    `Unlink { link, target }` is the pair Install computes, because `plan` and `removal` both go
+    through `link_target`, `on_path_as_command` and `link_path` — so under an AppImage Remove looks
+    for a link to `$APPIMAGE` too (`unix_removal_targets_the_same_link_install_writes`).
+    `Package { dir }` is a deb/rpm's `/usr/bin`: the command came with the package, so removing it
+    is the package manager's job, and `report_package` says so instead of touching it.
+    `user_path_remove` takes out every entry naming the directory once `expand_env` has been applied
+    — so an entry written unexpanded goes too — keeps every other entry verbatim, empty ones
+    included, and returns `None` when there was none. **The round-trip is pinned**:
+    `user_path_remove_undoes_user_path_update_exactly` gives back every entry the user wrote, and
+    the one difference it allows is a trailing `;`, the separator the entry was appended after.
+    `unlink_step` mirrors `link_step` over the same `link_points_at` resolution: `Remove` a link to
+    this copy *or a dangling one* — what a moved or deleted copy leaves behind, pointing at nothing
+    anyone could rely on — `Absent` where nothing is, and `Refuse`, naming it, a live link elsewhere
+    or a regular file, for Install's reason. `report_removed`, `report_path_absent`,
+    `report_unlinked`, `report_link_absent` and `report_package` carry the names-the-path promise
+    over to this half (`removal_reports_name_the_path`). **On Windows Velopack's uninstall hook runs
+    `removal` as well; nothing of ours runs when a macOS app or an AppImage is thrown away**, so
+    there the Remove button is the only undo.
   - **Small persisted / UI-state models**, each a flat `Vec` keyed by `conn_id` and each pure +
     tested (they share `history.rs`'s shape; a new one belongs here, not in the UI):
     - `search_history.rs` — recent Find-Anywhere targets (`MAX_PER_CONN`, newest-first, deduped).
@@ -11921,7 +11949,7 @@ existing prose was left alone.
     `term_settings_overlay(TermUi, Rc<TermActions>)`,
     `ai_settings_overlay(AiUi, ConnUi, Rc<AiActions>)` — the `ConnUi` is the active connection's
     data-access level, which the AI pane reports — `theme_settings_overlay(LayoutUi,
-    open_config_dir, install_cli, cli_install)`, the last three General's two trips outside the app —
+    open_config_dir, CliCommand)`, the last two General's two trips outside the app —
     and `help_overlay(LayoutUi)`, which reads a single signal. The
     module names no `Ui` anywhere now, prose included.
     **The body opens with a version caption, and the string it shows is composed in `schemaic-core`.**
@@ -11955,13 +11983,16 @@ existing prose was left alone.
     not a `Command` in a view; a machine with no config directory gets the path-less hint and a
     disabled button rather than a control that silently does nothing.
     `cli_row` sits under it and is General's other trip outside the app: **Command line**, the
-    per-OS hint from `core::cli_install::hint`, an **Install** button that reads **Installing**
-    while one runs, and the outcome under the hint — dim text on success, `footer_error` on
-    failure — which stays there for the rest of the session, naming the path Install resolved. The
-    action is `Ui::install_cli` and the state `Ui::cli_install`, an `RwSignal<InstallState>` the app
-    owns: a registry write or a symlink is the app boundary's job for `open_config_dir`'s reason.
-    **The button stays enabled while an install runs**, and the guard against a second click is
-    `main.rs`'s, beside the launch — the label only says so.
+    per-OS hint from `core::cli_install::hint`, **Install** and **Remove** side by side at
+    `action_gap()` (tabindex 30 and 35), reading **Installing** / **Removing** while one runs, and
+    the outcome under the hint — dim text on success, `footer_error` on failure — which stays there
+    for the rest of the session, naming the path the operation resolved. Remove is on the row
+    because it is the only undo on macOS and under an AppImage, where nothing of ours runs when the
+    app is thrown away. Both arrive as one `Ui::cli_command: CliCommand { install, remove, state }`
+    — two actions and the one `RwSignal<InstallState>` they share, which the app owns: a registry
+    write or a symlink is the app boundary's job for `open_config_dir`'s reason. **Both buttons
+    stay enabled while either runs**, and the guard against a click on either is `main.rs`'s,
+    beside the launch — the labels only say so.
     **The AI modal is where the harness is chosen, and half its controls follow that choice.** The
     *Agent CLI* dropdown is `focusable_dropdown(harness, Harness::ALL, Harness::label, …)` over the
     workspace's **one** `Harness` — `schemaic-ui` depends on `schemaic-ai` for it, deliberately, and
@@ -16458,7 +16489,7 @@ existing prose was left alone.
     already and only having to say so, each of its four modals owning one domain and reading nothing
     else: `term_settings_overlay(TermUi, Rc<TermActions>)`, `ai_settings_overlay(AiUi, ConnUi,
     Rc<AiActions>)` — the `ConnUi` being the data-access level the AI pane reports —
-    `theme_settings_overlay(LayoutUi, open_config_dir, install_cli, cli_install)` and
+    `theme_settings_overlay(LayoutUi, open_config_dir, CliCommand)` and
     `help_overlay(LayoutUi)`, which reads a
     single signal. `properties.rs` went 5 to zero the other way, on a `PropertiesCtx`, and the
     footer is why: **Edit** routes to the table designer or the view editor, so the panel wants what
@@ -18929,19 +18960,38 @@ existing prose was left alone.
     **`release.yml`'s Windows leg builds two binaries for that**, `cargo build --release -p
     schemaic-app -p schemaic-cli`, and copies `target/release/schemaic-cli.exe` into the staged
     directory as `dist/schemaic.com`. Linux and macOS build one and use the argv branch.
+    **One Velopack hook is ours, and only on Windows**: there the builder carries
+    `.on_before_uninstall_fast_callback(|_| { logging::init(); install_cli::on_uninstall(); })`
+    before `.run()`, and every other platform keeps the plain `.run()`. Velopack runs
+    `schemaic.exe --veloapp-uninstall <ver>` before it deletes the install folder, calls the hook,
+    then exits — no UI, a 30-second budget — so the folder Install put on the user `PATH` comes back
+    off instead of surviving as a dead entry. **`logging::init()` is inside the hook on purpose**,
+    the one place ahead of the normal `init` that needs it: with no UI the log is the only record
+    of what the hook did, and it lives in the config directory, which the uninstall leaves behind.
+    Velopack has no uninstaller on macOS or for an AppImage, so nothing of ours runs there at all.
   - `install_cli.rs` — the side-effect half of `core::cli_install`, which owns every decision and
     every test: this gathers the `Probe` (`current_exe`, `APPIMAGE`, `HOME`, `PATH`, whether
-    `schemaic.com` sits beside the exe) and performs the `Plan`. **On Windows it is a
-    read-modify-write of `HKCU\Environment\Path` in the value's own registry type**, through
-    `RegCreateKeyExW`/`RegQueryValueExW`/`RegSetValueExW`: a `REG_EXPAND_SZ` must stay one or every
-    `%USERPROFILE%\…` entry in it stops resolving, and a missing value is created as
-    `REG_EXPAND_SZ`. A value of any other type, or one that is not valid UTF-16, is **refused rather
-    than written back lossily**. A directory already in the registry but not in this process's
-    `PATH` — written after the app started — reports as added without a second write. After a
-    write, `SendMessageTimeoutW(HWND_BROADCAST, WM_SETTINGCHANGE, "Environment", SMTO_ABORTIFHUNG,
-    5 s)` tells Explorer, so a terminal it starts next gets the new value; that is best-effort, the
-    value being written either way, and a terminal already open keeps the old `PATH`, which
-    `report_added` says. **The whole install runs on a `std::thread`, not the UI thread**, because
+    `schemaic.com` sits beside the exe) and performs the `Plan` (`install`) or the `Removal`
+    (`remove`); `on_uninstall`, Windows-only, is `remove` for the Velopack hook with the outcome
+    logged rather than shown — a copy that never ran Install finds nothing and changes nothing.
+    **On Windows it is a read-modify-write of `HKCU\Environment\Path` in the value's own registry
+    type**, through `RegCreateKeyExW`/`RegQueryValueExW`/`RegSetValueExW`: a `REG_EXPAND_SZ` must
+    stay one or every `%USERPROFILE%\…` entry in it stops resolving, and a missing value is created
+    as `REG_EXPAND_SZ`. A value of any other type, or one that is not valid UTF-16, is **refused
+    rather than written back lossily**. Both directions share that through a `win` module:
+    `UserPath { key, ty, raw }`, whose `open` reads the raw value in its own type (or refuses it),
+    whose `write` puts a value back in the type it was read in, and whose `Drop` closes the key, so
+    every early return between the open and the write closes it too; and
+    `broadcast_environment_change`, below. A directory already in the registry but not in this
+    process's `PATH` — written after the app started — reports as added without a second write, and
+    one Remove finds absent reports `report_path_absent` and writes nothing. After a write,
+    `SendMessageTimeoutW(HWND_BROADCAST, WM_SETTINGCHANGE, "Environment", SMTO_ABORTIFHUNG, 5 s)`
+    tells Explorer, so a terminal it starts next gets the new value; that is best-effort, the value
+    being written either way, and a terminal already open keeps the old `PATH`, which
+    `report_added` and `report_removed` say. `env_lookup`, the `%NAME%` resolver both directions
+    hand to core, is `cfg(windows)`: nothing else reads it, and left unconditional it is dead code on
+    Linux, which CI's clippy `-D warnings` fails. **The whole operation runs on a `std::thread`, not
+    the UI thread**, because
     the broadcast waits on every top-level window and a slow one should stall a thread nobody is
     looking at. This is `schemaic-app`'s first *direct* `windows-sys` dependency — 0.61,
     `cfg(windows)`, features `Win32_Foundation`, `Win32_Security`, `Win32_System_Registry` and
@@ -18950,13 +19000,22 @@ existing prose was left alone.
     takes a `SECURITY_ATTRIBUTES` pointer and windows-sys compiles it out without that feature. The
     workspace builds without it anyway, because another crate enables it for the shared
     `windows-sys` — so the omission built green, and only compiling this module on its own showed
-    it. On macOS and Linux it reads what is at the link
-    (`symlink_metadata`, `read_link`, and `exists` to follow it for liveness), asks `link_step`, then
-    `create_dir_all`s `~/.local/bin`, removes a dangling link it is replacing and
-    `std::os::unix::fs::symlink`s. The closure the Settings row calls is built in `main.rs` next to
-    `update::start`: it owns the **double-click guard** — a click while the state is `Running` is
-    ignored, the button itself staying enabled — and posts the result back with
-    `create_ext_action`.
+    it. On macOS and Linux `existing_at` reads what is at the link
+    (`symlink_metadata`, `read_link`, and `exists` to follow it for liveness) for both directions.
+    `link_command` asks `link_step`, then `create_dir_all`s `~/.local/bin`, removes a dangling link
+    it is replacing and `std::os::unix::fs::symlink`s; `unlink_command` asks `unlink_step` and
+    `remove_file`s the link — which on a symlink removes the link, never what it points at, so an
+    AppImage outlives its link. The closures the Settings row calls are built in `main.rs` next to
+    `update::start`, one factory making both: it owns the **double-click guard** — a click on
+    either button while `state.busy()` is ignored, so an Install blocks a Remove and the reverse,
+    the buttons themselves staying enabled — and posts the result back with `create_ext_action`.
+    **Verified by hand on both platforms.** Linux, under WSL: Remove with nothing there, Install
+    then Remove, a dangling link removed, a live link elsewhere and a regular file both refused, an
+    AppImage's target file surviving the removal, and the package case. Windows: an Install → Remove
+    round-trip left the real user `PATH` byte-identical and still `REG_EXPAND_SZ`, and a second
+    Remove reported it absent; and the real debug `schemaic.exe --veloapp-uninstall 0.26.0`, with
+    `APPDATA` redirected to a scratch profile, removed a seeded entry, exited 0, left `PATH`
+    byte-identical to the backup and logged the removal.
 - `schemaic-cli` — Schemaic without a window: `schemaic list` / `query` / `exec` / `help`, so a
   person or an agent can run SQL against a saved connection with the app closed and without being
   handed a credential. Its whole dependency list is `schemaic-core`, `schemaic-conn`, `schemaic-db`,
@@ -18975,7 +19034,8 @@ existing prose was left alone.
   only the `.deb`/`.rpm` (in `/usr/bin`) puts it there** — so on Windows and macOS the CLI shipped
   reachable only by its full path. Settings → General → Command line → **Install** closes that, on a
   click and never at install time: `core::cli_install` decides (the user `PATH` on Windows, a
-  `~/.local/bin` link elsewhere) and `app/install_cli.rs` writes.
+  `~/.local/bin` link elsewhere) and `app/install_cli.rs` writes. **Remove** beside it undoes that,
+  and on Windows so does the Velopack uninstall hook.
   The command surface was verified end to end against a live MariaDB.
   - `cli/args.rs` — the clap surface, kept separate from doing anything so that defaults, aliases
     and which flag belongs to which subcommand are all testable without a database. `DEFAULT_LIMIT`
