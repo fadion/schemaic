@@ -248,10 +248,6 @@ type FollowFn = Rc<dyn Fn(TableSource, crate::RerunRequest)>;
 /// server-side filter/sort callback (`TabsActions::apply_view`).
 type ApplyViewFn = Rc<dyn Fn(crate::RerunRequest)>;
 
-/// Persist the app-wide formatter rules — see [`crate::Ui::save_formats`], whose
-/// doc says why the save takes its own [`schemaic_core::persist::Saving`].
-type SaveFormats = Rc<dyn Fn(schemaic_core::persist::Saving)>;
-
 /// Per-result interactive grid state. `Copy` (every field is an `RwSignal`, which
 /// is `Copy`) so it threads freely into the many cell/handler closures. Created
 /// once per result set and shared across sort rebuilds. Selection is tracked in
@@ -432,10 +428,9 @@ struct GridState {
     /// [`crate::Tab::view_busy`]. Read by the capped notice's read-more offer,
     /// which is the affordance most able to start a second one by accident.
     view_busy: RwSignal<bool>,
-    /// App-wide formatter-rule store (upserted + persisted on a menu choice).
-    fmt_rules: RwSignal<Vec<ColumnFormatRule>>,
-    /// Persist the formatter rules (wrapped so `GridState` stays `Copy`).
-    save_formats: RwSignal<Option<SaveFormats>>,
+    /// App-wide formatter-rule store — upserted on a menu choice, which saves it
+    /// (`Stored::update`). `Copy`, so `GridState` stays `Copy` with no wrapper.
+    fmt_rules: crate::stored::Stored<Vec<ColumnFormatRule>>,
     /// In-grid find (Ctrl+F): the bar's open state and its query. Match counts
     /// live in `GridCtx` (written by `grid_view`, read by the panel-level bar).
     find_open: RwSignal<bool>,
@@ -747,7 +742,6 @@ impl GridState {
             view_err: gctx.view_err,
             view_busy: gctx.view_busy,
             fmt_rules: gctx.formats,
-            save_formats: RwSignal::new(Some(gctx.save_formats.clone())),
             // Shared with the find bar (rendered up at the RESULTS-panel level).
             find_open: gctx.find_open,
             find_query: gctx.find_query,
@@ -3344,10 +3338,8 @@ pub(crate) struct GridCtx {
     /// the source `(database, table)`.
     pub(crate) conn_id: RwSignal<u64>,
     /// App-wide per-column display-formatter rules (persisted). The grid reads it
-    /// to seed each column's format and upserts on a menu choice.
-    pub(crate) formats: RwSignal<Vec<ColumnFormatRule>>,
-    /// Persist the formatter rules to disk (called after an upsert).
-    pub(crate) save_formats: SaveFormats,
+    /// to seed each column's format and upserts on a menu choice, which saves.
+    pub(crate) formats: crate::stored::Stored<Vec<ColumnFormatRule>>,
     /// In-grid find (Ctrl+F). State lives here (at the RESULTS-panel level) so the
     /// find bar can render at the panel's top edge — above the grid — while the
     /// search runs in `grid_view` (which has the row data). `find_step` is a
@@ -9237,12 +9229,10 @@ fn set_format(gs: GridState, ci: usize, fmt: ColumnFormat) {
     if let Some((conn, db, table, col)) =
         format::rule_key(gs.conn_at_load, &gs.rs.get_untracked(), ci)
     {
+        // An upsert, not a deletion: `update` saves keeping the previous
+        // generation as `.bak`.
         gs.fmt_rules
             .update(|rules| format::upsert(rules, conn, &db, &table, &col, fmt));
-        if let Some(save) = gs.save_formats.get_untracked() {
-            // An upsert, not a deletion: the previous generation stays as `.bak`.
-            (save)(schemaic_core::persist::Saving::Replacing);
-        }
     }
 }
 

@@ -8,23 +8,20 @@
 //! siblings and guarantees nothing.
 //!
 //! Those two own their mutators, so each can hold the rule *every mutation is
-//! followed by the right kind of save* and gate it. These three cannot: their
-//! signals go raw into the `Ui` bundle and every mutation happens in
+//! followed by the right kind of save* and gate it. These three are mutated in
 //! `schemaic-ui` — the grid's "Format as" menu, the schema tree's Colour and
-//! Favorite entries. **The whole app-side surface is a load and a save**, so
-//! what this module can own is exactly that much: the three file names, once
-//! each, and one [`saver`] so a fourth store cannot arrive with a fourth shape.
-//! The rule those three stores actually need is enforced where it can be seen,
-//! by `schemaic_ui::persisted_store_gate`.
+//! Favorite entries — so the rule lives in the type they are handed as:
+//! [`Stored`], whose only writers save. **This module is the one place a
+//! writable signal for them exists**, and only for as long as it takes to build
+//! the savers that read it; what leaves [`wire`] is `Stored` and nothing else.
+//! What the module owns beyond that is the three file names, once each, and one
+//! [`saver`] so a fourth store cannot arrive with a fourth shape.
 //!
-//! **That sentence was true of two of the three.** `format.json`'s writer was
-//! exempted there on a premise that was false of the code — that `grid.rs`
-//! upserts "through `GridState::fmt_rules` rather than a `format::` mutator",
-//! where `grid.rs` calls `format::upsert` in exactly the shape the other
-//! needles match — so deleting that store's save left both gates green while
-//! this paragraph claimed all three were covered. The needle is in now. An
-//! exemption is a claim about the code, and the cost of not checking one is a
-//! sentence here that reads like a guarantee.
+//! That replaced a source gate in `schemaic-ui` which matched a
+//! `persist::Saving::` within 700 bytes of each core mutator. It worked, but it
+//! was a needle: `format.json`'s writer was once exempted from it on a premise
+//! that was false of the code, and deleting that save left the suite green.
+//! With the signal behind `Stored` there is no save to forget.
 //!
 //! **`db_colors` and `table_colors` are two signals over one file**, which is
 //! the only invariant left on this side: they share `db_colors.json`, so
@@ -34,10 +31,11 @@
 //!
 //! Each save takes its [`persist::Saving`] rather than assuming `Replacing`,
 //! because each has a caller that is a **deletion**: connection deletion prunes
-//! all three and must erase, or the deleted connection's databases, tables and
-//! columns stay readable in `<store>.json.bak` under a confirm saying they
-//! cannot be recovered. That dispatch is `persist::write_json_store`'s, which is
-//! why — unlike the two stores above — this module holds no `match` of its own.
+//! all three with `Stored::erase`, or the deleted connection's databases, tables
+//! and columns would stay readable in `<store>.json.bak` under a confirm saying
+//! they cannot be recovered. That dispatch is `persist::write_json_store`'s,
+//! which is why — unlike the two stores above — this module holds no `match` of
+//! its own.
 
 use std::rc::Rc;
 
@@ -47,6 +45,7 @@ use serde::Serialize;
 use schemaic_core::db_color::{DbColorRule, DbColorsFile, TableColorRule};
 use schemaic_core::favorite::{FavoriteRule, FavoritesFile};
 use schemaic_core::format::{ColumnFormatRule, FormatsFile};
+use schemaic_ui::stored::Stored;
 
 use crate::persist;
 
@@ -70,22 +69,18 @@ fn saver<F: Serialize + 'static>(
 pub(crate) struct UiStores {
     /// Per-column display formatters, keyed by connection+table+column; read and
     /// upserted by the results grid's "Format as" menu.
-    pub(crate) formats: RwSignal<Vec<ColumnFormatRule>>,
-    pub(crate) save_formats: Rc<dyn Fn(persist::Saving)>,
+    pub(crate) formats: Stored<Vec<ColumnFormatRule>>,
     /// Identity colour per database — keyed by connection+database, shown as a
     /// dot on the DB node, the active-DB selector and that database's query
     /// tabs.
-    pub(crate) db_colors: RwSignal<Vec<DbColorRule>>,
+    pub(crate) db_colors: Stored<Vec<DbColorRule>>,
     /// Identity colour per table — keyed by connection+database+display name,
     /// shown as a dot on the table row and as a tint on the table's ER-diagram
-    /// card header.
-    pub(crate) table_colors: RwSignal<Vec<TableColorRule>>,
-    /// **One save for the pair.** See the module doc.
-    pub(crate) save_db_colors: Rc<dyn Fn(persist::Saving)>,
+    /// card header. **Shares its saver with `db_colors`** — see the module doc.
+    pub(crate) table_colors: Stored<Vec<TableColorRule>>,
     /// Favourited (bookmarked) databases — a gold star, sorted to the top of the
     /// tree.
-    pub(crate) db_favorites: RwSignal<Vec<FavoriteRule>>,
-    pub(crate) save_db_favorites: Rc<dyn Fn(persist::Saving)>,
+    pub(crate) db_favorites: Stored<Vec<FavoriteRule>>,
 }
 
 /// Load all three and build their savers.
@@ -109,14 +104,13 @@ pub(crate) fn wire() -> UiStores {
         rules: db_favorites.get_untracked(),
     });
 
+    // The writable signals end here: from this line on, the only way to change
+    // any of them is a `Stored` writer, and each of those saves.
     UiStores {
-        formats,
-        save_formats,
-        db_colors,
-        table_colors,
-        save_db_colors,
-        db_favorites,
-        save_db_favorites,
+        formats: Stored::new(formats, save_formats),
+        db_colors: Stored::new(db_colors, save_db_colors.clone()),
+        table_colors: Stored::new(table_colors, save_db_colors),
+        db_favorites: Stored::new(db_favorites, save_db_favorites),
     }
 }
 
@@ -128,12 +122,10 @@ const FAVORITES_FILE: &str = "favorites.json";
 mod tests {
     /// Each file is named **once**, by its const.
     ///
-    /// Weaker than its siblings' gates on purpose, and the doc comment above
-    /// says why: with every mutation in `schemaic-ui`, the only thing this side
-    /// can promise is that a store has one name and one saver. The rule that
-    /// matters — a mutation followed by a save — is asserted in the crate where
-    /// the mutations are, by `schemaic_ui::persisted_store_gate`. **If that gate
-    /// is ever deleted, this one is not a substitute for it.**
+    /// All this side can promise is that a store has one name and one saver. The
+    /// rule that matters — a mutation followed by a save — is not a test at all
+    /// now: it is `schemaic_ui::stored::Stored`, whose only writers save, and
+    /// whose own tests pin that.
     #[test]
     fn each_store_is_named_once() {
         let raw = include_str!("ui_stores.rs");

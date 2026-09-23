@@ -6133,11 +6133,13 @@ existing prose was left alone.
     the five written by a shared `Fn()` with nowhere to say it. Three of those five — the colour,
     favourite and formatter savers — are built in one place now, `app/ui_stores.rs`'s
     `saver(file, build)`, which passes the argument straight through to `write_json_store` and so
-    keeps no policy of its own. `Ui::save_formats`, `save_db_colors`,
-    `save_db_favorites` and the app's `save_ui` take one, and the delete closure's own gate asserts a
+    keeps no policy of its own. They are no longer on `Ui` at all: each is sealed with its signal
+    inside a `ui/stored.rs` `Stored`, whose `update` passes `Replacing` and whose `erase` passes
+    `Erasing`; the app's `save_ui` takes one directly. The delete closure's own gate asserts a
     floor of ten erasing saves in it — **two of the ten delegated**, since the history store's
     prune moved to `app/history_store.rs` and the snippet store's to `app/snippet_store.rs`, the
-    closure holding only the call to each, whose erase is gated in the module it moved to.
+    closure holding only the call to each, whose erase is gated in the module it moved to — and
+    counts the four `Stored` stores' `.erase(` calls toward the same floor.
     **The tenth is the Find-Anywhere search history, and it was pruned in that closure while being
     saved nowhere in it** — its persistence was a `create_effect` at the top of `main` calling
     `persist::save_json`, so the prune notified the effect, the effect saved `Replacing`, and the
@@ -7439,7 +7441,8 @@ existing prose was left alone.
       rules out of a table lookup, and a database named `app` cannot lend its colour to a table
       named `app` — which is what `database_and_table_colours_are_separate_stores` pins. `tables`
       is `#[serde(default)]`, so a file written before table colours existed still loads. Sharing
-      the file is why the app builds **one** `save_db_colors` for the pair (in `app/ui_stores.rs`),
+      the file is why the app builds **one** `save_db_colors` for the pair (in `app/ui_stores.rs`,
+      handed to both halves' `Stored`),
       since writing either half alone would drop the other, and why deleting a connection runs both
       `clear_conn` and
       `table_clear_conn`. A table's key is its **display name** (`schema::TableSource::display` —
@@ -12605,33 +12608,22 @@ existing prose was left alone.
     focuses *without* one — the SQL editor, `edit_field`'s editor and the grid's inline `text_input`
     carry no such call for a needle to match, so those three are a census kept by hand in
     `takes_pointer_focus`'s doc and the test says so rather than reading as broader than it is.
-    **`lib.rs`'s `persisted_store_gate::every_persisted_store_write_is_followed_by_its_save` is the
-    fourth**, and what it adds is a floor. It holds every `db_color::upsert(`,
-    `db_color::table_upsert(` and `favorite::toggle(` to a `persist::Saving::` somewhere in the
-    following 700 bytes — the three stores `app/ui_stores.rs` loads and saves are mutated only in
-    this crate, so this is the one place the rule *a mutation is followed by its save* can be checked
-    at all, and forgetting the save is invisible until a restart: the signal updates, the dot appears
-    on the node, the star turns gold, and the colour is simply gone the next launch, with no error,
-    no failed write and nothing in the log. It is anchored on the **core mutator** rather than on the
-    save because every site reaches its save through a local alias (`let save =
-    save_db_colors.clone();`, then `(save)(…)`), so a needle naming the `Ui` field would match
-    nothing and pass vacuously; the window only has to contain *a* `persist::Saving::`, making the
-    check "something was persisted" rather than "this exact name was called". The count is asserted
-    at exactly **6** — four colour sites, one favourite, one column format — and that floor is the
-    whole reason it is
-    not vacuous, since a rename in `schemaic-core` that made every needle stop matching would
-    otherwise report success; one needle pointed at a name that does not exist failed it at 3 ≠ 5
-    while the number was five, and removing the save from one colour site failed it with
-    `overlays.rs: db_color::upsert( with
-    no save after it`. **`format.json`'s writer in `grid.rs` was exempted from it on a reason that
-    was false of the code.** The doc said that one "upserts through `GridState::fmt_rules` rather
-    than a `format::` mutator", so covering it would need a second shape and weaken the one the gate
-    has; `grid.rs`'s single write is `format::upsert(rules, conn, &db, &table, &col, fmt)` —
-    character for character the shape the other three needles match — with its save three lines
-    later. Only the needle was missing, and while it was, deleting that save left the suite green
-    with `ui_stores.rs` claiming all three of its stores were guarded. `format::upsert(` is a
-    fourth needle now, and the floor went 5 → 6 with it. The lesson outlives the needle: an
-    exemption is a claim about the code, and this one had never been checked against it.
+    **`lib.rs`'s `persisted_store_gate` was the fourth, and it is deleted — a type made it
+    unnecessary.** It held each of four core mutators (`db_color::upsert(`,
+    `db_color::table_upsert(`, `favorite::toggle(`, `format::upsert(`) to a `persist::Saving::`
+    somewhere in the following 700 bytes, with a count of six sites to keep a renamed needle from
+    passing vacuously, because the stores `app/ui_stores.rs` loads are mutated only in this crate and
+    forgetting the save is invisible until a restart: the signal updates, the dot appears on the
+    node, the star turns gold, and the colour is simply gone the next launch, with no error, no
+    failed write and nothing in the log. Those stores are `stored::Stored` now, whose only writers
+    save, so there is no save left to forget and nothing for a needle to find — `stored.rs` below
+    has the rest. **Its one lesson outlives it**: `format.json`'s writer in `grid.rs` was exempted
+    from it on a reason that was false of the code — the doc said that write went "through
+    `GridState::fmt_rules` rather than a `format::` mutator", while the code called
+    `format::upsert(` character for character like the other needles, its save three lines later —
+    and while the exemption stood, deleting that save left the suite green with `ui_stores.rs`
+    claiming all three of its stores were guarded. An exemption is a claim about the code, and this
+    one had never been checked against it.
     **`lib.rs`'s `diagram_layout_gate::diagram_layouts_are_loaded_through_the_one_reporting_door` is
     the fifth**, and it is what a rule that could only be *counted* looks like once the code has been
     reshaped to make it greppable. Its subject is under `core/persist.rs`: every lazy `diagrams.json`
@@ -12798,6 +12790,40 @@ existing prose was left alone.
     says in its own prose that this file left the census once already. `schemaic-cli` is **not** in
     either census: no gate here has a rule about it, and adding the label would be a claim that one
     does.
+  - `stored.rs` — `Stored<T>`, **a persisted store the UI can read freely and write only by
+    saving**. `formats`, `db_colors`, `table_colors` and `db_favorites` used to sit on `Ui` as public
+    `RwSignal`s beside three public save closures (`save_formats`, `save_db_colors`,
+    `save_db_favorites`), so writing a signal and forgetting the save compiled — and looked right
+    until a restart: the swatch painted, the star turned gold, and the choice was gone the next
+    launch. The only thing between that and a shipped bug was `persisted_store_gate`, a needle (see
+    `source_gate.rs` above). `Stored` makes the pairing unspellable instead: its signal and its
+    saver are private, and the only writers are `update`, which saves `Saving::Replacing`, and
+    `erase`, which saves `Saving::Erasing`. *Which* save is still the caller's to say — an upsert
+    keeps the previous file as `.bak`, a deletion must not — but *whether* to save no longer is.
+    Both mutate first and save second, and the saver's `Rc` is cloned out of its signal before it
+    is called rather than invoked inside that borrow, because a saver reads the store's own signal
+    (and, for the colour pair, its sibling's) and nothing should be held while it runs. The readers
+    are `get`, `get_untracked`, `with`, `with_untracked` and `read_only() -> ReadSignal<T>`, and the
+    last is what every consumer that only reads now takes — `db_color_dot`, `table_color_dot`,
+    `favorite_star`, the ER overlay, the history panel, the tab strip, `visible_nav_rows` and the
+    schema tree's node-context structs — so the writable handle reaches only the two places that
+    write: the schema tree's right-click menu in `overlays.rs` (four colour entries and one
+    favourite) and the grid's `set_format`, through `GridState::fmt_rules`.
+    **The saver sits in a signal of its own (`RwSignal<Rc<dyn Fn(Saving)>>`) so that `Stored` is
+    `Copy`**, like the `RwSignal` it replaced: `GridState` stays `Copy` and every closure that
+    captured the old field keeps its shape, and the grid's `RwSignal<Option<SaveFormats>>` wrapper
+    around the old save closure is gone with the `SaveFormats` alias. **`Stored::new` takes the
+    signal, not a value**, because two stores share one file — `db_colors` and `table_colors` are
+    both `db_colors.json` — and the shared saver has to read both signals before either store
+    exists. The trade is that whoever builds a `Stored` *could* keep the `RwSignal` and write around
+    it; the one place that does is `app/ui_stores.rs`'s `wire`, and only for as long as it takes to
+    build the savers. Seven tests pin the type, the load-bearing one being
+    `the_save_runs_after_the_change_not_before` — a saver that ran first would write the previous
+    generation and lose the choice just made — beside one save per write and of its own kind, reads
+    saving nothing, a copy being the same store, and two stores sharing a saver each writing the
+    whole file. **What it cannot cover is which writer a caller picks**: `update` in the
+    connection-delete prune compiles and saves `Replacing` with no `Saving::Replacing` in the text,
+    so `app/main.rs`'s census bans `<store>.update(` there by name (under `history_store.rs`).
   - `snippet_panel.rs` — the **Snippet Library** right-column panel (`RightPanel::Snippets`, the
     toolbar's bookmark toggle): the saved queries that apply to the active connection, under the
     scope bands `core::snippet::grouped` returns, over the History panel's chrome. It decides
@@ -18616,6 +18642,13 @@ existing prose was left alone.
     file to `search_history.json.bak` under a confirm reading *"It can't be undone"*. It has an
     explicit saver now and the closure calls it with `Saving::Erasing` right after the prune, the
     floor going 9 → 10 and watched failing at the old state.
+    **`ui/stored.rs`'s `Stored` is the same blind spot reached from the other side.** The four
+    stores it wraps save inside their own writers, so there is no `Saving::` text in the closure for
+    either half of the gate to see — and `Stored::update` saves `Replacing` just as invisibly as
+    `erase` saves `Erasing`. So the gate counts `<store>.erase(` for `db_colors`, `table_colors`,
+    `db_favorites` and `formats` toward the same floor, and **bans `<store>.update(` for them in the
+    closure by name**, since the text ban on `Saving::Replacing` cannot. That ban was watched
+    failing against a `db_colors.update(` prune before the prune was switched to `erase`.
   - `snippet_store.rs` — the snippet library's store: the persisted **user** list and the nine
     closures that write it. **The matched pair to `history_store.rs`, and the pairing is the
     point** — two modules of the same shape rather than one "stores" grab-bag, because what
@@ -18671,20 +18704,25 @@ existing prose was left alone.
     and favourited databases (`favorites.json`). **The third cut of the `app_view` split, and
     deliberately *not* the sibling of the two above — the difference is what this entry is for.**
     Those two own their mutators, so each can hold the rule *every mutation is followed by the right
-    kind of save* and gate it exactly. These three cannot: their signals go raw into the `Ui` bundle
-    and every mutation is in `schemaic-ui` — the grid's "Format as" menu, the schema tree's Colour
-    swatches and Favorite/Unfavorite — so the whole app-side surface is a load and a save. What the
-    module owns is exactly that much: the three file names, once each as consts, and one
-    `saver(file, build)` helper so a fourth store cannot arrive with a fifth shape. `build` is re-run
+    kind of save* and gate it exactly. These three cannot: every mutation is in `schemaic-ui` — the
+    grid's "Format as" menu, the schema tree's Colour swatches and Favorite/Unfavorite — so the rule
+    lives in the type they are handed as instead, `ui/stored.rs`'s `Stored`, whose only writers
+    save. **This module is the one place a writable signal for them exists**, and only for as long
+    as it takes to build the savers that read it: `wire()` makes each `RwSignal` and its saver and
+    returns `Stored::new(signal, saver)` for each — four handles over three files, the colour pair
+    sharing `save_db_colors` — and `UiStores` holds those four and nothing else. What the module
+    owns beyond that is the three file names, once each as consts, and one `saver(file, build)`
+    helper so a fourth store cannot arrive with a fifth shape. `build` is re-run
     on every save rather than captured once, because the UI writes these signals between saves and a
     captured value would persist whatever the store held when `wire` ran. Its own gate,
-    `each_store_is_named_once`, is correspondingly weak — one name and one `saver` call per store —
-    and its doc comment says so in terms: the rule those stores actually need is
-    `schemaic_ui::persisted_store_gate`, and **if that gate is ever deleted, this one is not a
-    substitute for it.** A reader arriving from `history_store.rs` will otherwise assume this module
-    guarantees what those two do. **All three are inside that gate now**, which this entry could not
-    have said before: `format.json`'s writer was exempted from it on a stated reason that turned out
-    to be false of `grid.rs`, so for as long as that stood, deleting the formatter's save left the
+    `each_store_is_named_once`, is correspondingly narrow — one name and one `saver` call per store —
+    and its doc comment says why that is enough now: the rule those stores actually need is not a
+    test here at all but `Stored`, whose own tests pin it. A reader arriving from `history_store.rs`
+    will otherwise look for the gate those two have. **Until `Stored`, the signals went raw into
+    the `Ui` bundle beside three public `save_*` closures, and the whole guarantee was
+    `persisted_store_gate`**, a needle in `schemaic-ui` (under `source_gate.rs`, where its deletion
+    is recorded): `format.json`'s writer was exempted from it on a stated reason that turned out to
+    be false of `grid.rs`, so for as long as that stood, deleting the formatter's save left the
     suite green while this module's prose pointed at a gate covering two of its three stores.
     **The one invariant left on this side is that `db_colors` and `table_colors` are two signals
     over one file**, so writing either half has to write both or the other is lost; `saver`'s closure
@@ -18692,7 +18730,9 @@ existing prose was left alone.
     unforgettable — a save that wrote one half would not compile. Each save still takes its
     `persist::Saving`, because each has a caller that is a **deletion**: the connection-deletion
     prune must erase, or the deleted connection's databases, tables and columns stay readable in
-    `<store>.json.bak` under a confirm saying they cannot be recovered. That dispatch is
+    `<store>.json.bak` under a confirm saying they cannot be recovered. It does so with
+    `Stored::erase` on all four, so the colour pair's file is written twice — the second write the
+    one with both halves pruned, and neither leaving a `.bak`. That dispatch is
     `persist::write_json_store`'s, which is why — unlike the other two stores — this module holds no
     `match` of its own. It made `serde` a direct dependency of `schemaic-app`, which it already was
     transitively through `serde_json`: one line in `Cargo.toml` and nothing new to compile.
@@ -20992,8 +21032,10 @@ Re-introducing the anti-patterns these guard against is a regression:
   the tell is where the mutators live.** It looks like the third and fourth (another set of small
   persisted stores lifted out of `app_view`) and is not one: every mutation of those three stores is
   in `schemaic-ui`, so what came out could own the file names and one `saver` but *not* the
-  invariant, and the gate that matters had to be written in the view crate instead
-  (`persisted_store_gate`, under `source_gate.rs`). Read the call sites before assuming a cut takes
+  invariant, and it had to be held in the view crate instead — first by a source gate
+  (`persisted_store_gate`, under `source_gate.rs`), and later by a type, `ui/stored.rs`'s `Stored`,
+  which the module now hands out in place of the raw signals. Read the call sites before assuming
+  a cut takes
   its invariant with it, and where it doesn't, say so in the module that doesn't have it — the risk
   is a module that reads as its siblings' peer and guarantees less than a reader will assume.
   **`ui_state` is the sixth, and it is the one that did not move: some candidates are not liftable,

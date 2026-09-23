@@ -1922,7 +1922,7 @@ fn zoom_unit(zoom: RwSignal<f64>, zoom_out: Rc<dyn Fn()>, zoom_in: Rc<dyn Fn()>)
 pub(crate) fn erd_overlay(
     o: OverlayUi,
     schema: SchemaUi,
-    table_colors: RwSignal<Vec<TableColorRule>>,
+    table_colors: floem::reactive::ReadSignal<Vec<TableColorRule>>,
     tab_actions: Rc<TabsActions>,
 ) -> impl IntoView {
     let erd_sig = o.erd;

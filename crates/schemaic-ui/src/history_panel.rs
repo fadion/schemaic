@@ -39,7 +39,7 @@ pub(crate) fn history_panel(
     history: HistoryUi,
     conn: ConnUi,
     overlay: OverlayUi,
-    db_colors: RwSignal<Vec<DbColorRule>>,
+    db_colors: floem::reactive::ReadSignal<Vec<DbColorRule>>,
     actions: Rc<HistoryActions>,
     menus: crate::widgets::MenuFlags,
 ) -> impl IntoView {
@@ -279,7 +279,7 @@ fn history_row(
     now: u64,
     open_history: Rc<dyn Fn(HistoryEntry)>,
     open_menu: Rc<dyn Fn(HistoryEntry)>,
-    db_colors: RwSignal<Vec<DbColorRule>>,
+    db_colors: floem::reactive::ReadSignal<Vec<DbColorRule>>,
     term: Option<String>,
     dialect: SqlDialect,
 ) -> impl IntoView {

@@ -16,7 +16,7 @@ use floem::event::{Event, EventListener, EventPropagation};
 use floem::keyboard::{Key, NamedKey};
 use floem::kurbo::Point;
 use floem::prelude::*;
-use floem::reactive::{Memo, create_effect};
+use floem::reactive::{Memo, ReadSignal, create_effect};
 
 use schemaic_core::db_color::DbColorRule;
 use schemaic_core::ddl::ObjectKind;
@@ -580,7 +580,7 @@ fn visible_nav_rows(
     expanded: RwSignal<HashSet<String>>,
     hidden_dbs: Memo<HashSet<String>>,
     filter: RwSignal<String>,
-    db_favorites: RwSignal<Vec<FavoriteRule>>,
+    db_favorites: ReadSignal<Vec<FavoriteRule>>,
     active_conn: RwSignal<u64>,
 ) -> Vec<NavRow> {
     let mut dbs: Vec<NavDb> = db_nodes.with_untracked(|nodes| {
@@ -1071,8 +1071,10 @@ pub(crate) fn schema_panel(ui: Ui) -> impl IntoView {
     let active_db = ui.tabs_ui.active_db;
     let active_conn = ui.conn.active_conn;
     let connections = ui.conn.connections;
-    let db_colors = ui.db_colors;
-    let db_favorites = ui.db_favorites;
+    // Read-only here: the tree shows the stores; the right-click menu that
+    // changes them writes through `Ui`'s `Stored` handles in `overlays.rs`.
+    let db_colors = ui.db_colors.read_only();
+    let db_favorites = ui.db_favorites.read_only();
     let hidden_dbs = ui.schema.hidden_dbs;
     let db_menu_open = ui.schema.db_menu_open;
     let schema_menu_open = ui.schema.schema_menu_open;
@@ -1172,7 +1174,7 @@ pub(crate) fn schema_panel(ui: Ui) -> impl IntoView {
                     ddl: tree_ui.ddl,
                     overlay: tree_ui.overlay,
                     schema_actions: tree_ui.schema_actions.clone(),
-                    table_colors: tree_ui.table_colors,
+                    table_colors: tree_ui.table_colors.read_only(),
                     expanded,
                     filter,
                     on_toggle: on_toggle.clone(),
@@ -1715,7 +1717,7 @@ struct SchemaTreeCtx {
     ddl: DdlUi,
     overlay: OverlayUi,
     schema_actions: Rc<crate::SchemaActions>,
-    table_colors: RwSignal<Vec<TableColorRule>>,
+    table_colors: ReadSignal<Vec<TableColorRule>>,
     expanded: RwSignal<HashSet<String>>,
     filter: RwSignal<String>,
     on_toggle: Rc<dyn Fn(String)>,
@@ -1750,8 +1752,8 @@ struct SchemaTreeCtx {
     /// The active connection id + the app-wide DB-colour store, for the identity
     /// dot on database rows. (Schema-tree nodes all belong to the active connection.)
     active_conn: RwSignal<u64>,
-    db_colors: RwSignal<Vec<DbColorRule>>,
-    db_favorites: RwSignal<Vec<FavoriteRule>>,
+    db_colors: ReadSignal<Vec<DbColorRule>>,
+    db_favorites: ReadSignal<Vec<FavoriteRule>>,
     /// The active connection's SQL dialect — for engine-correct `create_ddl`
     /// (Copy/Generate DDL). All tree nodes belong to the active connection.
     dialect: SqlDialect,

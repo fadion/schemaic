@@ -1735,15 +1735,13 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
     // owns and this side only loads and persists. `ui_stores`' doc carries why
     // they are one module and why it is shaped unlike `history_store` and
     // `snippet_store` — their mutations are all in `schemaic-ui`, so the rule
-    // that every one of them saves is gated there, not here.
+    // that every one of them saves is the type they arrive as (`Stored`), whose
+    // only writers save.
     let ui_stores::UiStores {
         formats,
-        save_formats,
         db_colors,
         table_colors,
-        save_db_colors,
         db_favorites,
-        save_db_favorites,
     } = ui_stores::wire();
 
     // Tab state. When "restore tabs on startup" is on and the last session saved
@@ -9813,10 +9811,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
         let recently_closed = recently_closed.clone();
         let last_tab = last_tab.clone();
         let open_tab_on = open_tab_on.clone();
-        let save_db_colors = save_db_colors.clone();
-        let save_db_favorites = save_db_favorites.clone();
         let save_search_history = save_search_history.clone();
-        let save_formats = save_formats.clone();
         let save_ui = save_ui.clone();
         let reset_activity = reset_activity.clone();
         let ai_session = ai_session.clone();
@@ -10074,12 +10069,12 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             (history_clear_conn)(id);
             search_history.update(|v| schemaic_core::search_history::clear_conn(v, id));
             (save_search_history)(persist::Saving::Erasing);
-            db_colors.update(|v| schemaic_core::db_color::clear_conn(v, id));
-            table_colors.update(|v| schemaic_core::db_color::table_clear_conn(v, id));
-            // One save, both stores — see where `save_db_colors` is built.
-            (save_db_colors)(persist::Saving::Erasing);
-            db_favorites.update(|v| schemaic_core::favorite::clear_conn(v, id));
-            (save_db_favorites)(persist::Saving::Erasing);
+            // `erase`, which saves `Erasing` by construction. The colour pair
+            // shares one file, so it is written twice here; the second write is
+            // the one with both halves pruned, and neither leaves a `.bak`.
+            db_colors.erase(|v| schemaic_core::db_color::clear_conn(v, id));
+            table_colors.erase(|v| schemaic_core::db_color::table_clear_conn(v, id));
+            db_favorites.erase(|v| schemaic_core::favorite::clear_conn(v, id));
             // Its poll interval too. Not because the id could come back —
             // `next_id_after` sees to that — but because a rule keyed to a
             // connection that is gone is a row nothing will ever read, in a file
@@ -10096,8 +10091,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             // created later.
             expanded_rules.update(|v| schemaic_core::expanded::clear_conn(v, id));
             (save_ui)(persist::Saving::Erasing);
-            formats.update(|v| schemaic_core::format::clear_conn(v, id));
-            (save_formats)(persist::Saving::Erasing);
+            formats.erase(|v| schemaic_core::format::clear_conn(v, id));
             // The twelfth store, and it was the one missed — why, and why the
             // id-recycling reason applies to it with force, is on
             // `SnippetStore::clear_conn` where the prune now lives.
@@ -12088,12 +12082,9 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             Rc::new(move || save_ui(persist::Saving::Replacing))
         },
         formats,
-        save_formats,
         db_colors,
         table_colors,
-        save_db_colors,
         db_favorites,
-        save_db_favorites,
         resources,
         update_state,
         apply_update,
@@ -12816,12 +12807,34 @@ mod app_tests {
         // `snippet_store::the_remove_path_erases`, which are what prove the
         // erase this gate can no longer see. Add a needle here *and* a gate
         // there, never only the needle.
+        //
+        // **The four `Stored` stores count by their writer, and only one of
+        // their two writers may appear.** `Stored::erase` saves `Erasing` by
+        // construction (`schemaic_ui::stored`'s tests pin it), so its call is the
+        // erase this gate counts. `Stored::update` saves `Replacing` just as
+        // invisibly — no `Saving::Replacing` in the text for the ban above to
+        // find — so for these stores `update` is banned by name: pruning one
+        // with it would keep the deleted connection's rules in `<store>.bak`.
+        let stored = ["db_colors", "table_colors", "db_favorites", "formats"];
+        for store in stored {
+            let update = format!("{store}.update(");
+            assert!(
+                !region.contains(&update),
+                "`{update}` in the delete closure saves `Replacing` — prune a \
+                 `Stored` store with `erase`, or its pre-deletion generation stays \
+                 in `<store>.bak`"
+            );
+        }
         let delegated = ["(history_clear_conn)(", "(snippet_clear_conn)("];
         let erasing = region.matches("Saving::Erasing").count()
             + region.matches("save_json_erasing(").count()
             + delegated
                 .iter()
                 .map(|needle| region.matches(needle).count())
+                .sum::<usize>()
+            + stored
+                .iter()
+                .map(|store| region.matches(&format!("{store}.erase(")).count())
                 .sum::<usize>();
         // **Ten, and the tenth is the one this gate could not see at all.**
         // `search_history` was pruned in this closure and saved nowhere in it —

@@ -251,7 +251,7 @@ pub(crate) fn modal_layer(ui: Ui, modal_up: impl Fn() -> bool + Copy + 'static) 
             erd_overlay(
                 ui.overlay,
                 ui.schema,
-                ui.table_colors,
+                ui.table_colors.read_only(),
                 ui.tab_actions.clone(),
             ),
             properties::properties_overlay(properties::PropertiesCtx::new(

@@ -25,7 +25,7 @@ pub(crate) fn tab_bar(
     tabs_ui: TabsUi,
     conn: ConnUi,
     o: OverlayUi,
-    db_colors: RwSignal<Vec<DbColorRule>>,
+    db_colors: floem::reactive::ReadSignal<Vec<DbColorRule>>,
     tab_actions: Rc<TabsActions>,
 ) -> impl IntoView {
     let tabs = tabs_ui.tabs;
@@ -126,7 +126,7 @@ fn tab_chip(
     tab: Tab,
     tabs_ui: TabsUi,
     o: OverlayUi,
-    db_colors: RwSignal<Vec<DbColorRule>>,
+    db_colors: floem::reactive::ReadSignal<Vec<DbColorRule>>,
     tab_actions: Rc<TabsActions>,
 ) -> impl IntoView {
     let active = tabs_ui.active;

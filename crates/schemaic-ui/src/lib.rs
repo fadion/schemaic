@@ -65,6 +65,7 @@ mod snippet_panel;
 /// at runtime.
 pub mod source_gate;
 pub mod sql_highlight;
+pub mod stored;
 mod table_designer;
 mod tabs;
 pub mod theme;
@@ -114,7 +115,7 @@ use floem::event::{Event, EventListener, EventPropagation};
 use floem::keyboard::{Key, NamedKey};
 use floem::kurbo::Point;
 use floem::prelude::*;
-use floem::reactive::{Memo, Scope, batch, create_effect, create_memo, untrack};
+use floem::reactive::{Memo, ReadSignal, Scope, batch, create_effect, create_memo, untrack};
 use floem::style::{CursorStyle, Transition, Width};
 use floem::text::FamilyOwned;
 use floem::unit::Px;
@@ -4689,108 +4690,6 @@ mod diagram_layout_gate {
     }
 }
 
-/// **A persisted store written here is saved here, in the same closure.**
-///
-/// Three small stores — identity colours, favourited databases, per-column
-/// formatters — live as `RwSignal`s on the [`Ui`] bundle with their save handed
-/// alongside, and every one of their mutations is in *this* crate: a Colour
-/// swatch, Favorite/Unfavorite, the grid's "Format as". The app side only loads
-/// and persists them, which is exactly what `app/ui_stores.rs` says it owns and
-/// why that module's own gate is the weak one — **this is the rule, and it can
-/// only be checked here.**
-///
-/// Forgetting the save is invisible in every way that matters until a restart:
-/// the signal updates, the dot appears on the node, the star turns gold, and the
-/// colour is gone the next time the app opens. There is no error, no failed
-/// write, nothing in the log — the user simply does not get to keep it. That is
-/// the class this gate exists for, and a fifth swatch entry copied from the four
-/// correct ones is how it would arrive.
-///
-/// **Anchored on the core mutator, not on the save.** The save is reached
-/// through a local alias at every site (`let save = save_db_colors.clone();`
-/// then `(save)(…)`), so a needle naming the bundle field would find nothing and
-/// pass vacuously. `db_color::upsert`, `db_color::table_upsert` and
-/// `favorite::toggle` are core API, are what a new site must call to change
-/// anything, and are stable in a way a local binding is not. What the window
-/// after them must contain is a `persist::Saving::`, which is what every save
-/// closure here takes — so the check is *"something was persisted"* rather than
-/// *"this exact name was called"*.
-///
-/// **`format.json`'s writer is covered, and this paragraph used to say it could
-/// not be.** It claimed `grid.rs` "upserts through `GridState::fmt_rules` rather
-/// than a `format::` mutator", so covering it would need a second shape and
-/// weaken the gate. That was false of the code: `grid.rs`'s one write is
-/// `format::upsert(rules, conn, &db, &table, &col, fmt)` — character for
-/// character the shape the three colour and favourite needles have — with its
-/// save three lines later. The needle was all that was missing, and in the
-/// meantime deleting that save left the suite green while `ui_stores.rs`
-/// claimed all three stores were guarded.
-///
-/// So the third store is in, and the lesson is worth more than the needle: an
-/// exemption is a claim about the code, and this one was never checked against
-/// it.
-#[cfg(test)]
-mod persisted_store_gate {
-    /// The calls that change a persisted store, and how far after one a save has
-    /// to appear. The window is generous — these sites are short closures, and a
-    /// tight bound would fail on rustfmt reflowing an argument list.
-    const MUTATORS: &[&str] = &[
-        "db_color::upsert(",
-        "db_color::table_upsert(",
-        "favorite::toggle(",
-        "format::upsert(",
-    ];
-    const WINDOW: usize = 700;
-    /// What a save looks like from here: every one of these stores' savers takes
-    /// a `Saving`.
-    const SAVED: &str = "persist::Saving::";
-
-    #[test]
-    fn every_persisted_store_write_is_followed_by_its_save() {
-        let mut offenders: Vec<String> = Vec::new();
-        let mut seen = 0usize;
-        for (file, code) in crate::source_gate::crate_sources() {
-            for needle in MUTATORS {
-                let mut from = 0usize;
-                while let Some(rel) = code[from..].find(needle) {
-                    let at = from + rel;
-                    from = at + needle.len();
-                    seen += 1;
-                    let end = (at + WINDOW).min(code.len());
-                    // Char boundaries: this crate's sources carry non-ASCII in
-                    // strings, and slicing mid-character panics.
-                    let end = (at..=end)
-                        .rev()
-                        .find(|i| code.is_char_boundary(*i))
-                        .unwrap_or(at);
-                    if !code[at..end].contains(SAVED) {
-                        offenders.push(format!("{file}: {needle} with no save after it"));
-                    }
-                }
-            }
-        }
-        // The floor, and it is the whole reason this gate is not vacuous: four
-        // colour sites, one favourite, one column format. A rename in
-        // `schemaic-core` that made every needle stop matching would otherwise
-        // report success.
-        assert_eq!(
-            seen, 6,
-            "expected 6 persisted-store writes in this crate (4 colour, 1 \
-             favourite, 1 column format), found {seen} — if a site was added, \
-             add its save too and raise this number; if a mutator was renamed, \
-             fix the needle, because a gate that matches nothing passes"
-        );
-        assert!(
-            offenders.is_empty(),
-            "these change a persisted store without saving it, so the change is \
-             lost on restart with no error anywhere:\n    {}\n\nCall the \
-             store's save — `(save)(persist::Saving::Replacing)` — in the same \
-             closure, as the four sites in `overlays.rs` do.",
-            offenders.join("\n    ")
-        );
-    }
-}
-
 /// **A text box's width moves with the interface scale, or the text outgrows
 /// it.**
 ///
@@ -6267,37 +6166,27 @@ pub struct Ui {
     pub persist_layout: Rc<dyn Fn()>,
     /// App-wide per-column display-formatter rules (persisted to `format.json`),
     /// read + upserted by the results grid's "Format as" menu.
-    pub formats: RwSignal<Vec<ColumnFormatRule>>,
-    /// Persist the formatter rules to disk (after the grid upserts one).
     ///
-    /// **Takes its [`schemaic_core::persist::Saving`]**, like the snippet store's
-    /// save, because one of its callers is a *deletion*. Deleting a connection
-    /// prunes this store of everything keyed to it and then saves — and an
-    /// ordinary save copies the pre-prune generation to `format.json.bak`, so
-    /// every column the deleted connection had was still on disk under a confirm
-    /// saying it could not be. `Saving`'s own doc names this store, along with
-    /// `db_colors.json`, `favorites.json` and `diagrams.json`, as having that
-    /// property; the argument is how a shared closure can honour it.
-    pub save_formats: Rc<dyn Fn(schemaic_core::persist::Saving)>,
+    /// This and the three stores below are [`stored::Stored`]: readable like the
+    /// signals they were, writable only through `update` / `erase`, both of which
+    /// save — see that module for the bug the old signal-plus-saver pair allowed.
+    /// Each has a **deletion** caller: deleting a connection prunes all four and
+    /// must `erase`, or the deleted connection's rules stay readable in
+    /// `<store>.json.bak` under a confirm saying they cannot be recovered.
+    pub formats: stored::Stored<Vec<ColumnFormatRule>>,
     /// Per-database identity colours (persisted to `db_colors.json`), keyed by
     /// `(conn_id, database)`; set from the schema tree, shown as a dot on the DB
     /// node, the active-DB selector, and the database's query tabs.
-    pub db_colors: RwSignal<Vec<DbColorRule>>,
+    pub db_colors: stored::Stored<Vec<DbColorRule>>,
     /// Per-table identity colours (persisted to the same `db_colors.json`), keyed
     /// by `(conn_id, database, display name)`; set from the schema tree, shown as
     /// a dot on the table row and as a tint on the table's ER-diagram card header.
-    pub table_colors: RwSignal<Vec<TableColorRule>>,
-    /// Persist both colour stores to disk (after a menu upsert). One closure for
-    /// the pair, because they share one file. Takes its
-    /// [`schemaic_core::persist::Saving`] for [`Ui::save_formats`]' reason.
-    pub save_db_colors: Rc<dyn Fn(schemaic_core::persist::Saving)>,
+    /// It shares a saver with [`Ui::db_colors`], which writes both halves.
+    pub table_colors: stored::Stored<Vec<TableColorRule>>,
     /// Favorited (bookmarked) databases (persisted to `favorites.json`), keyed by
     /// `(conn_id, database)` in favorite order (oldest first); set from the schema
     /// tree's right-click menu, shown as a gold star and sorted to the top.
-    pub db_favorites: RwSignal<Vec<FavoriteRule>>,
-    /// Persist the favorites to disk (after a menu toggle). Takes its
-    /// [`schemaic_core::persist::Saving`] for [`Ui::save_formats`]' reason.
-    pub save_db_favorites: Rc<dyn Fn(schemaic_core::persist::Saving)>,
+    pub db_favorites: stored::Stored<Vec<FavoriteRule>>,
     /// The app process's own CPU/RAM usage, sampled on a timer at the app
     /// boundary and shown in the status bar. Transient (never persisted).
     pub resources: RwSignal<ResourceSample>,
@@ -7806,7 +7695,7 @@ pub(crate) fn color_dot(
 
 /// [`color_dot`] for a database: `key` yields the `(conn_id, database)` to look up.
 pub(crate) fn db_color_dot(
-    db_colors: RwSignal<Vec<DbColorRule>>,
+    db_colors: ReadSignal<Vec<DbColorRule>>,
     key: impl Fn() -> Option<(u64, String)> + 'static,
     ml: f64,
     mr: f64,
@@ -7828,7 +7717,7 @@ pub(crate) fn db_color_dot(
 /// to look up. The third part is [`schemaic_core::schema::TableSource::display`],
 /// which is what [`TableColorRule`] is keyed by.
 pub(crate) fn table_color_dot(
-    table_colors: RwSignal<Vec<TableColorRule>>,
+    table_colors: ReadSignal<Vec<TableColorRule>>,
     key: impl Fn() -> Option<(u64, String, String)> + 'static,
     ml: f64,
     mr: f64,
@@ -7853,7 +7742,7 @@ pub(crate) fn table_color_dot(
 /// right margins (applied only when drawn). Rebuilds when the favorite state or
 /// key changes. The star colour is themable, so it's read inside the style closure.
 pub(crate) fn favorite_star(
-    db_favorites: RwSignal<Vec<FavoriteRule>>,
+    db_favorites: ReadSignal<Vec<FavoriteRule>>,
     key: impl Fn() -> Option<(u64, String)> + 'static,
     size: f32,
     ml: f64,
@@ -8265,7 +8154,7 @@ fn body(
                 ui_right.history,
                 ui_right.conn,
                 ui_right.overlay,
-                ui_right.db_colors,
+                ui_right.db_colors.read_only(),
                 ui_right.history_actions.clone(),
                 right_menus,
             )
@@ -8702,7 +8591,6 @@ fn center(ui: Ui) -> impl IntoView {
     let active_db_menu_open = ui.tabs_ui.active_db_menu_open;
     let active_db_anchor = ui.tabs_ui.active_db_anchor;
     let formats = ui.formats;
-    let save_formats = ui.save_formats.clone();
     // Global nav keys, so the editor can handle Ctrl+P/T/W/Tab/1-9 (it stops
     // KeyDown propagation, so the workspace-root handler can't see them).
     let navkeys = NavKeys {
@@ -8894,7 +8782,6 @@ fn center(ui: Ui) -> impl IntoView {
                     tx_mode: tab.tx_mode,
                     conn_id: tab.conn_id,
                     formats,
-                    save_formats: save_formats.clone(),
                     // Find state (Ctrl+F), created per active-tab render.
                     find_open: RwSignal::new(false),
                     find_query: RwSignal::new(String::new()),
@@ -8997,7 +8884,7 @@ fn center(ui: Ui) -> impl IntoView {
             ui.tabs_ui,
             ui.conn,
             ui.overlay,
-            ui.db_colors,
+            ui.db_colors.read_only(),
             ui.tab_actions.clone(),
         ),
         conn_edge_border(connections, active_conn, false),

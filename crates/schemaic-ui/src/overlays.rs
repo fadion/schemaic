@@ -1485,11 +1485,10 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
     let collapse_db = ui.schema_actions.collapse_db.clone();
     let ai_send = ui.ai_actions.send.clone();
     let right_panel = ui.layout.right_panel;
+    // `Stored` handles: every `update` below saves by construction.
     let db_colors = ui.db_colors;
     let table_colors = ui.table_colors;
-    let save_db_colors = ui.save_db_colors.clone();
     let db_favorites = ui.db_favorites;
-    let save_db_favorites = ui.save_db_favorites.clone();
     let db_nodes = ui.schema.db_nodes;
     let connections = ui.conn.connections;
     let import_ui = ui.clone();
@@ -1613,7 +1612,6 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                         .iter()
                         .map(|(name, hex, cfn)| {
                             let dbc = db_colors;
-                            let save = save_db_colors.clone();
                             let db = db_name.clone();
                             let hex = hex.to_string();
                             MenuEntry::action_icon(*name, (icons::DOT, *cfn), move || {
@@ -1621,19 +1619,16 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                                 dbc.update(|r| {
                                     schemaic_core::db_color::upsert(r, cid, &db, Some(hex.clone()))
                                 });
-                                (save)(schemaic_core::persist::Saving::Replacing);
                             })
                         })
                         .collect();
                     swatches.push(MenuEntry::Separator);
                     {
                         let dbc = db_colors;
-                        let save = save_db_colors.clone();
                         let db = db_name.clone();
                         swatches.push(MenuEntry::action("None", move || {
                             let cid = active_conn.get_untracked();
                             dbc.update(|r| schemaic_core::db_color::upsert(r, cid, &db, None));
-                            (save)(schemaic_core::persist::Saving::Replacing);
                         }));
                     }
                     // Favorite / unfavorite: a favorited database gets a gold star
@@ -1653,7 +1648,6 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                     });
                     {
                         let dbf = db_favorites;
-                        let save = save_db_favorites.clone();
                         let db = menu.name.clone();
                         let label = if fav_now { "Unfavorite" } else { "Favorite" };
                         entries.push(MenuEntry::action(label, move || {
@@ -1661,7 +1655,6 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                             dbf.update(|r| {
                                 schemaic_core::favorite::toggle(r, cid, &db);
                             });
-                            (save)(schemaic_core::persist::Saving::Replacing);
                         }));
                     }
                     entries.push(MenuEntry::sub("Colour", swatches));
@@ -2284,7 +2277,6 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                             .iter()
                             .map(|(name, hex, cfn)| {
                                 let tc = table_colors;
-                                let save = save_db_colors.clone();
                                 let db = database.clone();
                                 let tbl = key.clone();
                                 let hex = hex.to_string();
@@ -2299,14 +2291,12 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                                             Some(hex.clone()),
                                         )
                                     });
-                                    (save)(schemaic_core::persist::Saving::Replacing);
                                 })
                             })
                             .collect();
                         swatches.push(MenuEntry::Separator);
                         {
                             let tc = table_colors;
-                            let save = save_db_colors.clone();
                             let db = database.clone();
                             let tbl = key.clone();
                             swatches.push(MenuEntry::action("None", move || {
@@ -2314,7 +2304,6 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                                 tc.update(|r| {
                                     schemaic_core::db_color::table_upsert(r, cid, &db, &tbl, None)
                                 });
-                                (save)(schemaic_core::persist::Saving::Replacing);
                             }));
                         }
                         entries.push(MenuEntry::sub("Colour", swatches));
