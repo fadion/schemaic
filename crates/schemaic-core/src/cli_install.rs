@@ -69,6 +69,10 @@ pub struct Probe {
     pub home: Option<PathBuf>,
     /// The process's own `PATH`, lossily decoded.
     pub path_var: String,
+    /// Windows only: the user `PATH` in the registry **as it is now**, with
+    /// `%NAME%` entries expanded — `None` when it couldn't be read, and always
+    /// `None` elsewhere.
+    pub user_path: Option<String>,
     /// Windows only: whether [`WINDOWS_SHIM`] sits beside `exe`.
     pub console_shim: bool,
 }
@@ -99,7 +103,13 @@ pub fn plan(p: &Probe) -> Result<Plan, String> {
                 ));
             }
             let dir = PathBuf::from(dir);
-            Ok(if path_has_dir(&p.path_var, &dir, Os::Windows) {
+            // The registry's user PATH when it can be read, because that is
+            // what the next terminal gets; this process's PATH was fixed at
+            // launch and still names a folder Remove has since taken out. A
+            // copy on the *machine* PATH alone then gets a redundant user entry
+            // — harmless, and not somewhere a per-user install lives.
+            let on_path = p.user_path.as_deref().unwrap_or(&p.path_var);
+            Ok(if path_has_dir(on_path, &dir, Os::Windows) {
                 Plan::Already { dir }
             } else {
                 Plan::AddUserPath { dir }
@@ -584,6 +594,7 @@ mod tests {
             appimage: None,
             home: Some(PathBuf::from(r"C:\Users\me")),
             path_var: path_var.to_string(),
+            user_path: None,
             console_shim: shim,
         }
     }
@@ -595,6 +606,7 @@ mod tests {
             appimage: None,
             home: Some(PathBuf::from("/home/me")),
             path_var: path_var.to_string(),
+            user_path: None,
             console_shim: false,
         }
     }
@@ -620,6 +632,49 @@ mod tests {
         let path = format!(r"C:\Windows;{}\", VELOPACK_DIR.to_lowercase());
         assert_eq!(
             plan(&win(VELOPACK_EXE, &path, true)),
+            Ok(Plan::Already {
+                dir: PathBuf::from(VELOPACK_DIR)
+            })
+        );
+    }
+
+    /// **The registry is what a new terminal reads, not this process's PATH.**
+    /// Install, restart the app (its PATH now has the folder), Remove — the
+    /// registry entry goes, but the running process's PATH still holds it. Read
+    /// off that, Install answered "already on your PATH" and wrote nothing, and
+    /// no new terminal could find the command until the app was restarted.
+    #[test]
+    fn windows_decides_from_the_user_path_in_the_registry_when_it_can_read_it() {
+        let stale = format!(r"C:\Windows;{VELOPACK_DIR}");
+        let mut p = win(VELOPACK_EXE, &stale, true);
+
+        p.user_path = Some(r"C:\Users\me\bin".to_string());
+        assert_eq!(
+            plan(&p),
+            Ok(Plan::AddUserPath {
+                dir: PathBuf::from(VELOPACK_DIR)
+            }),
+            "removed from the registry since launch: install it again"
+        );
+
+        p.user_path = Some(format!(r"C:\Users\me\bin;{VELOPACK_DIR}"));
+        assert_eq!(
+            plan(&p),
+            Ok(Plan::Already {
+                dir: PathBuf::from(VELOPACK_DIR)
+            })
+        );
+    }
+
+    /// An unreadable registry falls back to the process's PATH rather than
+    /// refusing: the answer is stale at worst, and Install still works.
+    #[test]
+    fn windows_without_a_readable_user_path_falls_back_to_the_process_path() {
+        let path = format!(r"C:\Windows;{VELOPACK_DIR}");
+        let mut p = win(VELOPACK_EXE, &path, true);
+        p.user_path = None;
+        assert_eq!(
+            plan(&p),
             Ok(Plan::Already {
                 dir: PathBuf::from(VELOPACK_DIR)
             })

@@ -109,9 +109,22 @@ fn probe() -> Result<Probe, String> {
         path_var: std::env::var_os("PATH")
             .map(|v| v.to_string_lossy().into_owned())
             .unwrap_or_default(),
+        user_path: user_path_now(),
         console_shim,
         exe,
     })
+}
+
+/// The registry's user `PATH` as it stands now, expanded — what the planner
+/// prefers over this process's own `PATH`, which was fixed at launch.
+#[cfg(windows)]
+fn user_path_now() -> Option<String> {
+    read_user_path().map(|raw| cli_install::expand_env(&raw, env_lookup))
+}
+
+#[cfg(not(windows))]
+fn user_path_now() -> Option<String> {
+    None
 }
 
 #[cfg(windows)]
@@ -134,8 +147,9 @@ fn remove_user_path(_dir: &Path) -> Result<String, String> {
 fn add_user_path(dir: &Path) -> Result<String, String> {
     let path = win::UserPath::open(win::Access::Write)?;
     let Some(updated) = cli_install::user_path_update(&path.raw, dir, env_lookup) else {
-        // Already in the registry — written after this process started, which
-        // is why the planner's look at our own PATH missed it.
+        // Already in the registry — written between the planner's read and
+        // this one, or the planner could not read it and fell back to our own
+        // PATH.
         return Ok(cli_install::report_added(dir));
     };
     path.write(&updated)?;

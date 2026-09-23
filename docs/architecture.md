@@ -7313,7 +7313,13 @@ existing prose was left alone.
     directory is the one holding `schemaic.com`, and **a copy with no shim beside it is refused**
     rather than planned — a development build has `schemaic-cli.exe` there instead, so putting that
     directory on `PATH` would hand a terminal the GUI
-    (`windows_without_the_shim_is_refused_and_says_why`). macOS and a loose Linux binary get
+    (`windows_without_the_shim_is_refused_and_says_why`). **`Already` is read off
+    `Probe::user_path`** — the registry's user `PATH` at probe time, `%NAME%`-expanded — and off
+    the process `PATH` only when that can't be read, because the process `PATH` was fixed at
+    launch: after Install → restart → Remove it still held the folder, so Install answered
+    "already on your `PATH`" and wrote nothing
+    (`windows_decides_from_the_user_path_in_the_registry_when_it_can_read_it`). A copy only on
+    the machine `PATH` gets a redundant user entry, harmless. macOS and a loose Linux binary get
     `~/.local/bin/schemaic` → the running executable. **Under an AppImage the target is `$APPIMAGE`,
     never `current_exe`**: the running executable sits inside the image's mount, which is gone the
     moment the app exits, so a link to it — or an "already on `PATH`" answered because of it — would
@@ -19171,7 +19177,8 @@ existing prose was left alone.
     Velopack has no uninstaller on macOS or for an AppImage, so nothing of ours runs there at all.
   - `install_cli.rs` — the side-effect half of `core::cli_install`, which owns every decision and
     every test: this gathers the `Probe` (`current_exe`, `APPIMAGE`, `HOME`, `PATH`, whether
-    `schemaic.com` sits beside the exe) and performs the `Plan` (`install`) or the `Removal`
+    `schemaic.com` sits beside the exe, and on Windows `user_path_now` — the registry value read
+    and expanded) and performs the `Plan` (`install`) or the `Removal`
     (`remove`); `on_uninstall`, Windows-only, is `remove` for the Velopack hook with the outcome
     logged rather than shown — a copy that never ran Install finds nothing and changes nothing.
     **On Windows it is a read-modify-write of `HKCU\Environment\Path` in the value's own registry
@@ -19182,8 +19189,9 @@ existing prose was left alone.
     `UserPath { key, ty, raw }`, whose `open` reads the raw value in its own type (or refuses it),
     whose `write` puts a value back in the type it was read in, and whose `Drop` closes the key, so
     every early return between the open and the write closes it too; and
-    `broadcast_environment_change`, below. A directory already in the registry but not in this
-    process's `PATH` — written after the app started — reports as added without a second write, and
+    `broadcast_environment_change`, below. A directory the write finds already in the registry —
+    added between the planner's read and this one, or missed because the planner could not read the
+    registry and fell back to the process `PATH` — reports as added without a second write, and
     one Remove finds absent reports `report_path_absent` and writes nothing. After a write,
     `SendMessageTimeoutW(HWND_BROADCAST, WM_SETTINGCHANGE, "Environment", SMTO_ABORTIFHUNG, 5 s)`
     tells Explorer, so a terminal it starts next gets the new value; that is best-effort, the value
