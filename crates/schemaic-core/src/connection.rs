@@ -679,7 +679,7 @@ pub struct Tls {
 // crypto dependency, and one that cannot be verified without a live mutual-TLS
 // server. Shipping a form row that guarantees failure is the worse of the two,
 // so the row is gone and `db::tls::preflight` now refuses an encrypted key by
-// name, telling the user how to decrypt it. `TODO.md` carries the feature.
+// name, telling the user how to decrypt it.
 //
 // Older `connections.json` files may still hold the key; serde ignores it. A
 // keyring entry an older build wrote is swept by

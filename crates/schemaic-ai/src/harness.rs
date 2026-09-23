@@ -587,7 +587,6 @@ impl Harness {
     /// deleting a documented measurement to satisfy a dead-code warning is how a
     /// measurement gets taken twice. Its *doc* now says what it is: a record,
     /// not a lever.
-    #[allow(dead_code)]
     pub fn streams_deltas(self) -> bool {
         match self {
             Harness::Claude | Harness::Antigravity => true,

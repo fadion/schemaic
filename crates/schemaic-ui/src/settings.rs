@@ -1373,22 +1373,6 @@ fn thousands(n: usize) -> String {
     out
 }
 
-// A bold section header separating the functional groups.
-/// Where the app's log lives, as the Settings row's hint.
-///
-/// The **full path**, not "your config directory": the row exists because the
-/// log was undiscoverable, and a description of the location is not the
-/// location. It stays readable even where the button cannot work — a headless
-/// or sandboxed machine with no file manager — which is the case the fallback
-/// string is for.
-/// **The file that is actually open, not a path derived from one that exists.**
-/// This row's whole purpose is to answer "where is the log", so it has to answer
-/// about the writer: a config directory can exist and be unwritable — a
-/// locked-down profile, a read-only roaming mount, an ACL the user lost — and
-/// `logging::init` then degrades to stdout with a warning that goes to a console
-/// a release build does not have. The row went on naming a file nobody had
-/// written, and a crash report gathered from it comes back empty with nobody able
-/// to say why.
 /// Is this CLI-path field stable enough to be worth a `--help` probe?
 ///
 /// `resolves` is "does this path name a runnable binary" — the same predicate
@@ -1414,6 +1398,22 @@ fn should_ask_for_a_notice(path: &str, resolves: impl Fn(String) -> bool) -> boo
     path.trim().is_empty() || resolves(path.to_string())
 }
 
+/// Where the app's log lives, as the Settings row's hint.
+///
+/// The **full path**, not "your config directory": the row exists because the
+/// log was undiscoverable, and a description of the location is not the
+/// location. It stays readable even where the button cannot work — a headless
+/// or sandboxed machine with no file manager — which is the case the fallback
+/// string is for.
+///
+/// **The file that is actually open, not a path derived from one that exists.**
+/// This row's whole purpose is to answer "where is the log", so it has to answer
+/// about the writer: a config directory can exist and be unwritable — a
+/// locked-down profile, a read-only roaming mount, an ACL the user lost — and
+/// `logging::init` then degrades to stdout with a warning that goes to a console
+/// a release build does not have. The row went on naming a file nobody had
+/// written, and a crash report gathered from it comes back empty with nobody able
+/// to say why.
 fn log_hint(log: Option<&std::path::Path>) -> String {
     match log {
         Some(p) => format!(
@@ -1583,6 +1583,7 @@ fn cli_row(
     .style(|s| s.flex_col().width_full().gap(theme::scaled(6.0)))
 }
 
+/// A bold section header separating the functional groups.
 fn settings_section_header(t: &'static str) -> impl IntoView {
     text(t).style(|s| {
         s.font_size(theme::font_body())

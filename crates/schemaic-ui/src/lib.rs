@@ -6651,14 +6651,6 @@ fn term_cell_at(
     )
 }
 
-/// Root view: the app shell (header / body / footer) with any open overlays
-/// (connection menu, Find Anywhere, Manage Connections) stacked on top, and the
-/// window's own resize border over all of it.
-///
-/// Takes the `WindowId` because the window has no title bar of its own any more
-/// (`WindowConfig::show_titlebar(false)`): the caption buttons in the header are
-/// ours, and they need the window to minimize, maximize and close it. See
-/// `window_chrome`.
 /// Should a failed statement un-collapse the editor? — the guard on
 /// `workspace`'s un-collapse effect, keyed by the tab the failure belongs to.
 ///
@@ -6682,6 +6674,14 @@ fn should_uncollapse(prev: Option<(usize, bool)>, now: (usize, bool), collapsed:
     failed && prev != Some((id, true)) && collapsed
 }
 
+/// Root view: the app shell (header / body / footer) with any open overlays
+/// (connection menu, Find Anywhere, Manage Connections) stacked on top, and the
+/// window's own resize border over all of it.
+///
+/// Takes the `WindowId` because the window has no title bar of its own any more
+/// (`WindowConfig::show_titlebar(false)`): the caption buttons in the header are
+/// ours, and they need the window to minimize, maximize and close it. See
+/// `window_chrome`.
 pub fn workspace(ui: Ui, window: WindowId) -> impl IntoView {
     let chrome = window_chrome::WindowChrome::new(window);
     let last_mouse = ui.overlay.last_mouse;

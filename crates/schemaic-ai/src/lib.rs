@@ -236,7 +236,7 @@ fn seal_args(seal: CliSeal) -> Vec<String> {
 /// old flag set with a permission route deliberately left unanswered, `Skill`,
 /// `ToolSearch` and `Monitor` each executed inside the turn with no
 /// `can_use_tool` request emitted at all. What justifies this flag is what those
-/// tools can do, *not* the stall recorded in `TODO.md`, whose cause these
+/// tools can do, *not* the turn stall once attributed to them, whose cause these
 /// measurements do not explain and which remains unidentified.
 ///
 /// **The session sees only the MCP server and the settings we hand it.**

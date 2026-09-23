@@ -3951,7 +3951,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
     let editor_box = container(input)
         // A click in the editor repositions the caret (no edit fires, so the
         // recompute path doesn't run) → dismiss a stale completion popup here.
-        // `cont` so the editor still handles the click and places the caret (TODO).
+        // `cont` so the editor still handles the click and places the caret.
         .on_event_cont(EventListener::PointerDown, move |_| {
             comp.open.set(false);
             // Also dismiss the Ctrl+K prompt — but **only while it is still just a

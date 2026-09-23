@@ -3142,8 +3142,6 @@ fn render_ai_context(
     out
 }
 
-/// Pull a bare SQL statement out of the assistant's reply, stripping a markdown
-/// code fence if the model wrapped it despite instructions.
 /// Drop a fenced block's language tag from `after` (everything past the opening
 /// backticks), leaving the body.
 ///
@@ -3172,6 +3170,8 @@ fn strip_fence_tag(after: &str) -> &str {
     after
 }
 
+/// Pull a bare SQL statement out of the assistant's reply, stripping a markdown
+/// code fence if the model wrapped it despite instructions.
 pub(crate) fn extract_sql(text: &str) -> String {
     let t = text.trim();
     if t.starts_with("```") {

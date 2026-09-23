@@ -201,14 +201,6 @@ fn looks_numeric(s: &str) -> bool {
     !s.is_empty() && s.parse::<f64>().is_ok()
 }
 
-/// Does the first line name the columns?
-///
-/// There's only one reliable signal, and it's negative: a numeric field in the
-/// first row means it's data. Everything else is ambiguous — an all-text file
-/// genuinely could go either way — so this answers "yes" unless it has that
-/// evidence to the contrary. That's the common case, and the preview makes a
-/// wrong guess obvious immediately (the header row shows up as data, or the
-/// first data row goes missing).
 /// Is `t` a plain decimal numeral — an optional sign, digits, and at most one
 /// decimal point?
 ///
@@ -230,6 +222,14 @@ fn is_decimal_numeral(t: &str) -> bool {
     digits > 0 && points <= 1
 }
 
+/// Does the first line name the columns?
+///
+/// There's only one reliable signal, and it's negative: a numeric field in the
+/// first row means it's data. Everything else is ambiguous — an all-text file
+/// genuinely could go either way — so this answers "yes" unless it has that
+/// evidence to the contrary. That's the common case, and the preview makes a
+/// wrong guess obvious immediately (the header row shows up as data, or the
+/// first data row goes missing).
 fn guess_header(lines: &[&str], d: u8) -> bool {
     !split_unquoted(lines[0], d).iter().any(|f| looks_numeric(f))
 }

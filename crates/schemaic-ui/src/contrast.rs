@@ -44,7 +44,8 @@
 //! at **1.29:1**, and 31 of the 48 (4 roles × 2 surfaces × 6 theme combinations)
 //! miss AA. That is one structural defect with one fix — give the popup a
 //! surface from the same axis as its text — not 31 palette entries, so it is
-//! filed in `TODO.md` rather than baselined into a wall of exemptions here.
+//! left out as that one open fix rather than baselined into a wall of exemptions
+//! here.
 
 use floem::peniko::Color;
 

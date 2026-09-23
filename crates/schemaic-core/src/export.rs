@@ -732,17 +732,6 @@ pub fn value_to_json(v: &Value) -> serde_json::Value {
     }
 }
 
-/// Quote a CSV field if it contains a delimiter/quote/newline, and neutralize
-/// spreadsheet formula/DDE injection (§7.5): a value a spreadsheet would evaluate
-/// as a formula — leading `=`, `+`, `@`, `-`, or a `\t`/`\r` control char — is
-/// prefixed with a single quote so Excel/Sheets import it as text (a cell
-/// `=HYPERLINK(...)` otherwise executes on open).
-///
-/// **Leading `-` is guarded only when the value isn't a number.** It was once
-/// skipped entirely, on the grounds that prefixing it would corrupt every
-/// negative value — but that dichotomy isn't forced. `-1+1+cmd|' /C calc'!A0` is
-/// a DDE payload and `-5.25` is a number, and [`is_negative_number`] tells them
-/// apart, so both cases can be served.
 /// Is `s` a plain negative number — the one leading-`-` shape a spreadsheet
 /// should be allowed to evaluate?
 ///
@@ -776,6 +765,17 @@ fn is_negative_number(s: &str) -> bool {
     mantissa_ok && exponent_ok
 }
 
+/// Quote a CSV field if it contains a delimiter/quote/newline, and neutralize
+/// spreadsheet formula/DDE injection (§7.5): a value a spreadsheet would evaluate
+/// as a formula — leading `=`, `+`, `@`, `-`, or a `\t`/`\r` control char — is
+/// prefixed with a single quote so Excel/Sheets import it as text (a cell
+/// `=HYPERLINK(...)` otherwise executes on open).
+///
+/// **Leading `-` is guarded only when the value isn't a number.** It was once
+/// skipped entirely, on the grounds that prefixing it would corrupt every
+/// negative value — but that dichotomy isn't forced. `-1+1+cmd|' /C calc'!A0` is
+/// a DDE payload and `-5.25` is a number, and [`is_negative_number`] tells them
+/// apart, so both cases can be served.
 pub fn csv_field(s: &str) -> String {
     let guarded;
     let s = if matches!(

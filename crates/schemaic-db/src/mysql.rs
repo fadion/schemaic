@@ -1754,31 +1754,6 @@ type MyShowCreateEventRow = (
     String,
 );
 
-/// The **body** of a `SHOW CREATE {PROCEDURE|FUNCTION}` statement — everything
-/// after the parameter list and the characteristics that follow it.
-///
-/// The same shape as [`trigger_body_of`] and for the same reason, but it cannot
-/// anchor on a keyword: a routine has no `FOR EACH ROW`, and what separates the
-/// header from the body is *running out of characteristics*. So the parameter
-/// list is skipped as a balanced group (through [`sql::balanced_paren_span`], so
-/// a default or a type inside it can hold a paren in a string), and then the
-/// clauses MySQL prints between it and the body are consumed by keyword.
-///
-/// **Greedy consumption is safe because the two vocabularies are disjoint.** The
-/// characteristic words are `COMMENT`, `LANGUAGE`, `NOT`, `DETERMINISTIC`,
-/// `CONTAINS`, `NO`, `READS`, `MODIFIES`, `SQL`, `DATA`, `SECURITY`, `DEFINER`,
-/// `INVOKER` and `RETURNS`; no MySQL statement — and therefore no routine body —
-/// begins with any of them. The first word that isn't one of them starts the
-/// body, which is returned untouched.
-///
-/// `RETURNS` is the one clause with an argument that isn't a single token: the
-/// type may carry a length (`VARCHAR(10)`) and trailing modifiers, so the word
-/// after it takes an optional balanced group and then any of the type-modifier
-/// words with it.
-///
-/// `None` when there is no parameter list to anchor on, or nothing after the
-/// characteristics — both of which mean this didn't understand the text, and a
-/// caller that gets `None` keeps the body it already had rather than blanking it.
 /// Does this `SHOW CREATE` text declare a MariaDB **aggregate** function?
 ///
 /// The one fact about a routine that `information_schema.ROUTINES` does not
@@ -1822,6 +1797,31 @@ fn routine_is_aggregate(create_sql: &str) -> bool {
     false
 }
 
+/// The **body** of a `SHOW CREATE {PROCEDURE|FUNCTION}` statement — everything
+/// after the parameter list and the characteristics that follow it.
+///
+/// The same shape as [`trigger_body_of`] and for the same reason, but it cannot
+/// anchor on a keyword: a routine has no `FOR EACH ROW`, and what separates the
+/// header from the body is *running out of characteristics*. So the parameter
+/// list is skipped as a balanced group (through [`sql::balanced_paren_span`], so
+/// a default or a type inside it can hold a paren in a string), and then the
+/// clauses MySQL prints between it and the body are consumed by keyword.
+///
+/// **Greedy consumption is safe because the two vocabularies are disjoint.** The
+/// characteristic words are `COMMENT`, `LANGUAGE`, `NOT`, `DETERMINISTIC`,
+/// `CONTAINS`, `NO`, `READS`, `MODIFIES`, `SQL`, `DATA`, `SECURITY`, `DEFINER`,
+/// `INVOKER` and `RETURNS`; no MySQL statement — and therefore no routine body —
+/// begins with any of them. The first word that isn't one of them starts the
+/// body, which is returned untouched.
+///
+/// `RETURNS` is the one clause with an argument that isn't a single token: the
+/// type may carry a length (`VARCHAR(10)`) and trailing modifiers, so the word
+/// after it takes an optional balanced group and then any of the type-modifier
+/// words with it.
+///
+/// `None` when there is no parameter list to anchor on, or nothing after the
+/// characteristics — both of which mean this didn't understand the text, and a
+/// caller that gets `None` keeps the body it already had rather than blanking it.
 fn routine_body_of(create_sql: &str) -> Option<String> {
     const CHARACTERISTIC: &[&str] = &[
         "NOT",

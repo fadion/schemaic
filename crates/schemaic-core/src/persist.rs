@@ -774,7 +774,6 @@ fn write_mode(path: &Path, bytes: &[u8], exclusive: bool) -> std::io::Result<()>
         use std::os::unix::fs::OpenOptionsExt;
         opts.mode(0o600);
     }
-    #[allow(unused_mut)]
     let mut f = opts.open(path)?;
     // `OpenOptions::mode` applies only when the call *creates* the file, so an
     // existing one — say a 0644 written by a build from before this — would keep
@@ -812,8 +811,7 @@ pub fn open_private_append(path: &Path) -> std::io::Result<std::fs::File> {
         use std::os::unix::fs::OpenOptionsExt;
         opts.mode(0o600);
     }
-    #[allow(unused_mut)]
-    let mut f = opts.open(path)?;
+    let f = opts.open(path)?;
     // As in `write_mode`: the mode applies only on creation, so a file an older
     // build already created 0644 keeps it. Narrowed through the open handle, so
     // there is no path to re-resolve and no TOCTOU. A rotation is a `rename`,
@@ -823,8 +821,6 @@ pub fn open_private_append(path: &Path) -> std::io::Result<std::fs::File> {
         use std::os::unix::fs::PermissionsExt;
         let _ = f.set_permissions(std::fs::Permissions::from_mode(0o600));
     }
-    #[cfg(not(unix))]
-    let _ = &mut f;
     Ok(f)
 }
 

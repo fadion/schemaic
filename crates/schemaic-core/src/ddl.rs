@@ -7433,11 +7433,6 @@ pub fn checks_equal(a: &CheckInfo, b: &CheckInfo, dialect: SqlDialect) -> bool {
 
 // ── The diff ─────────────────────────────────────────────────────────────────
 
-/// Everything that has to happen to turn `current` into `draft`.
-///
-/// Diffing a table against [`TableDraft::from_table`] of itself must produce
-/// nothing — that's the round-trip gate, and it's what catches a model-fidelity
-/// gap before a user ever sees a phantom change.
 /// Can `dialect` have its **views** edited here?
 ///
 /// All three, now — but they don't get there the same way, which is why the two
@@ -8025,20 +8020,6 @@ pub fn schema_body_is_emittable(dialect: SqlDialect) -> bool {
     }
 }
 
-/// Does an auto-increment column on `dialect` draw from a **separate counter**
-/// that a restore has to be told about?
-///
-/// PostgreSQL's does: a `serial` or an identity column is backed by a sequence,
-/// and loading rows with explicit keys leaves that sequence where it was, so the
-/// first ordinary `INSERT` after a "successful" restore is a duplicate-key
-/// error. The dump answers it with a `setval` per column
-/// ([`crate::dump::sequence_resync_sql`]). MySQL's `AUTO_INCREMENT` and SQLite's
-/// `rowid` both advance from the data already in the table, so there is nothing
-/// to resync.
-///
-/// An exhaustive `match` rather than the `!= Postgres` this shipped as: that
-/// spelling hands a fourth engine MySQL's answer silently, and there is no
-/// comparison left in the tree to grep for when someone comes looking.
 /// Does `dialect` roll a **whole DDL plan** back when one statement of it is
 /// stopped or fails?
 ///
@@ -8065,6 +8046,20 @@ pub fn ddl_rolls_back_as_a_whole(dialect: SqlDialect) -> bool {
     }
 }
 
+/// Does an auto-increment column on `dialect` draw from a **separate counter**
+/// that a restore has to be told about?
+///
+/// PostgreSQL's does: a `serial` or an identity column is backed by a sequence,
+/// and loading rows with explicit keys leaves that sequence where it was, so the
+/// first ordinary `INSERT` after a "successful" restore is a duplicate-key
+/// error. The dump answers it with a `setval` per column
+/// ([`crate::dump::sequence_resync_sql`]). MySQL's `AUTO_INCREMENT` and SQLite's
+/// `rowid` both advance from the data already in the table, so there is nothing
+/// to resync.
+///
+/// An exhaustive `match` rather than the `!= Postgres` this shipped as: that
+/// spelling hands a fourth engine MySQL's answer silently, and there is no
+/// comparison left in the tree to grep for when someone comes looking.
 pub fn supports_sequence_resync(dialect: SqlDialect) -> bool {
     match dialect {
         SqlDialect::Postgres => true,
@@ -9439,6 +9434,11 @@ pub fn supports_change(dialect: SqlDialect, change: &Change) -> bool {
     )
 }
 
+/// Everything that has to happen to turn `current` into `draft`.
+///
+/// Diffing a table against [`TableDraft::from_table`] of itself must produce
+/// nothing — that's the round-trip gate, and it's what catches a model-fidelity
+/// gap before a user ever sees a phantom change.
 pub fn diff(current: &TableInfo, draft: &TableDraft, target: impl Into<Target>) -> ChangeSet {
     let Target { dialect, flavour } = target.into();
     let mut changes: Vec<Change> = Vec::new();
@@ -20742,7 +20742,7 @@ mod sqlite_view_tests {
     /// draft came from the user's edit rather than from `after`, so a server
     /// that normalised the body away from it *fails*, which is precisely the
     /// "permanently dirty in the editor" claim those comments make. Fixing them
-    /// needs a live run; `TODO.md` carries it.
+    /// needs a live run.
     ///
     /// This test exists so the next person to reach for the spelling finds out
     /// here, without a server.

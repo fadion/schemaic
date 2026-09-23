@@ -1354,8 +1354,6 @@ use crate::{ColRow, IdxRow, group_by};
 /// fetch can be partitioned per schema before folding.
 type InSchema<T> = (String, T);
 
-/// Order schemas for display: `public` first (it's the default namespace and
-/// where most work happens), everything else alphabetically.
 /// Every index of every browsable schema, one row per **key position** in
 /// `indkey` order (`unnest(…) WITH ORDINALITY` preserves it). See the comment at
 /// its call site for what each of the trailing columns is for.
@@ -1414,6 +1412,8 @@ fn pg_indexdef_is_lossy(def: &str) -> bool {
     def.contains("NULLS NOT DISTINCT")
 }
 
+/// Order schemas for display: `public` first (it's the default namespace and
+/// where most work happens), everything else alphabetically.
 fn schema_sort_key(name: &str) -> (u8, String) {
     if name == schemaic_core::schema::PG_DEFAULT_SCHEMA {
         (0, String::new())

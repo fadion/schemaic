@@ -264,16 +264,6 @@ impl Find {
     }
 }
 
-/// The find popup: the editor's and grid's bar, in the diagram's top-right corner.
-///
-/// 10px in from the canvas's top and right edges — the canvas starts below the
-/// toolbar, so that clears it without having to know its height.
-///
-/// There is **no prev/next pair** here, unlike the other two bars. Those step a
-/// caret through an ordered document; a diagram has no such order, and this search
-/// answers a different question — it lights up every match at once, and moves the
-/// canvas only when there is exactly one card to move to. A "next" button would
-/// have to invent a sequence over a 2-D canvas before it had anything to do.
 /// Did a press on the find bar land somewhere **other** than the search field?
 ///
 /// `pos` is relative to the bar; `field` is the laid-out size of the field,
@@ -298,6 +288,16 @@ fn press_missed_the_field(pos: Point, field: Size, pad: (f64, f64)) -> bool {
     !on_field
 }
 
+/// The find popup: the editor's and grid's bar, in the diagram's top-right corner.
+///
+/// 10px in from the canvas's top and right edges — the canvas starts below the
+/// toolbar, so that clears it without having to know its height.
+///
+/// There is **no prev/next pair** here, unlike the other two bars. Those step a
+/// caret through an ordered document; a diagram has no such order, and this search
+/// answers a different question — it lights up every match at once, and moves the
+/// canvas only when there is exactly one card to move to. A "next" button would
+/// have to invent a sequence over a 2-D canvas before it had anything to do.
 fn find_bar(find: Find, matches: Memo<erd::Matches>) -> impl IntoView {
     dyn_container(
         move || find.open.get(),

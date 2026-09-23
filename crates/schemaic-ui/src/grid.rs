@@ -4956,8 +4956,6 @@ fn grid_view(rs: Arc<ResultSet>, gctx: GridCtx) -> impl IntoView {
     })
 }
 
-/// Handle a key press while the grid body is focused: move the active cell,
-/// extend the selection (shift), copy (Ctrl+C), select-all, open the viewer.
 /// Return keyboard focus to the grid body after an in-cell edit ends. Deferred
 /// past the current event so the text_input's disposal (which would otherwise
 /// grab focus back) doesn't leave the grid unable to receive arrow/Enter keys.
@@ -7483,6 +7481,8 @@ fn find_readout(pos: usize, total: usize, more: bool) -> String {
     format!("{pos}/{total}{tail}")
 }
 
+/// Handle a key press while the grid body is focused: move the active cell,
+/// extend the selection (shift), copy (Ctrl+C), select-all, open the viewer.
 fn grid_key(gs: GridState, nrows: usize, ncols: usize, e: &Event) -> EventPropagation {
     let Event::KeyDown(ke) = e else {
         return EventPropagation::Continue;
@@ -9218,9 +9218,6 @@ fn data_row(
     .style(|s| s.height(row_h()))
 }
 
-/// Apply a display formatter to column `ci`: update the live per-column state (so
-/// cells re-render) and, when the source table is known, upsert + persist the rule
-/// so it survives restarts.
 /// Is this pick a change? — the guard [`set_format`] opens with.
 ///
 /// A column the result does not have answers **true**, deliberately: this
@@ -9232,6 +9229,9 @@ fn format_change_needed(formats: &[ColumnFormat], ci: usize, fmt: ColumnFormat) 
     formats.get(ci) != Some(&fmt)
 }
 
+/// Apply a display formatter to column `ci`: update the live per-column state (so
+/// cells re-render) and, when the source table is known, upsert + persist the rule
+/// so it survives restarts.
 fn set_format(gs: GridState, ci: usize, fmt: ColumnFormat) {
     // **Picking the format that is already on costs nothing.**
     //

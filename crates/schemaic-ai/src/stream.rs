@@ -803,7 +803,7 @@ impl StreamParser {
                 //
                 // The separator is a NUL because Codex mints these ids and none
                 // it has produced contains one — *not* because a NUL is
-                // impossible in a JSON string, which it is not: ` ` is
+                // impossible in a JSON string, which it is not: `\0` is
                 // legal and `serde_json` decodes it, so an id of `t1`+NUL+`done`
                 // would collide with item `t1`'s done-key. Nothing outside that
                 // CLI chooses an id, so this is a statement about the source and

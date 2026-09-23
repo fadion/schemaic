@@ -41,7 +41,8 @@ fn c(s: &str) -> Color {
     parse_hex(s).unwrap_or_else(|| panic!("themes: invalid hex colour {s:?}"))
 }
 
-/// Fallible hex parser (kept public-ish in spirit for a future JSON loader).
+/// Fallible hex parser — the one `c` panics over for the built-ins, and the one
+/// the connection form reads its colours through.
 pub fn parse_hex(s: &str) -> Option<Color> {
     let h = s.strip_prefix('#').unwrap_or(s);
     // `h.len()` is a **byte** count while the arms below index by byte on the
