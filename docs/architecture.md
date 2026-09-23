@@ -8286,9 +8286,15 @@ existing prose was left alone.
   plus `reloptions` for the storage params a replace would reset (`pg_view_options`) — all
   folded on *after* the shared `assemble_schema` (which both engines share and neither's
   extras belong in). **That fold looks each table up rather than filtering for it**: the checks,
-  triggers, FK rules and the per-namespace row sets are bucketed once by `group_by`, where a
-  `.filter` per table (and per namespace) made the load O(tables × rows) — measured 1.25 s against
-  0.24 s on a 2400-table database with one CHECK, trigger and FK each.
+  triggers and the per-namespace row sets are bucketed once by `group_by` and the FK rules keyed
+  by `(namespace, table, constraint)`, where a `.filter` per table (and per namespace) and a scan
+  of every FK rule per table made the load O(tables × rows) — measured 1.25 s against
+  0.24 s on a 2400-table database with one CHECK, trigger and FK each. `group_by` lives in `lib.rs`
+  beside `assemble_schema`, because both engines read it: `pg_fold_types` buckets an enum's labels
+  and a domain's constraints by `(namespace, type)` through it rather than filtering and cloning
+  both row sets per type, MySQL's `apply_check_constraints` and `apply_triggers` bucket by table
+  name, and `apply_fk_rules` — which does not call it — builds a name → table-index map once, the
+  first table of a name winning as the per-rule `find` did.
   **`table_list_sql` returns four columns, and the fourth is the table comment.** It is the one
   table option PostgreSQL has and nothing was reading it: the designer emits `COMMENT ON TABLE`
   correctly and this query never selected `obj_description`, so a comment set through the app was

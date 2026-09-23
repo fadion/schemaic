@@ -2028,10 +2028,14 @@ fn mysql_check_clause(clause: &str, mariadb: bool) -> String {
 /// second query's worth of rows keyed by table, not part of the row shape the
 /// two engines share.
 fn apply_check_constraints(schema: &mut DbSchema, rows: &[MyCheckRow], mariadb: bool) {
+    // Bucketed once rather than filtered per table — see `group_by`.
+    let by_table = crate::group_by(rows.iter().map(|r| (r.0.as_str(), r)));
     for t in schema.tables.iter_mut() {
-        t.check_constraints = rows
+        t.check_constraints = by_table
+            .get(t.name.as_str())
+            .map(Vec::as_slice)
+            .unwrap_or_default()
             .iter()
-            .filter(|(table, ..)| *table == t.name)
             .map(|(_, name, clause, enforced, level)| CheckInfo {
                 name: name.clone(),
                 // `CHECK_CLAUSE` is the server's re-print of the predicate,
@@ -2144,12 +2148,12 @@ fn mysql_triggers(rows: &[MyTriggerRow]) -> Vec<TriggerInfo> {
 /// Hang each trigger off the table it fires on, dropping any whose table wasn't
 /// in this fetch — the same rule [`assemble_schema`] applies to column rows.
 fn apply_triggers(schema: &mut DbSchema, triggers: Vec<TriggerInfo>) {
+    // Bucketed once rather than filtered per table — see `group_by`. A table
+    // name is unique within the one database a MySQL fetch reads, so each
+    // bucket is taken whole.
+    let mut by_table = crate::group_by(triggers.into_iter().map(|g| (g.table.clone(), g)));
     for t in schema.tables.iter_mut() {
-        t.triggers = triggers
-            .iter()
-            .filter(|g| g.table == t.name)
-            .cloned()
-            .collect();
+        t.triggers = by_table.remove(&t.name).unwrap_or_default();
     }
 }
 
@@ -2694,8 +2698,14 @@ fn apply_fk_rules(schema: &mut DbSchema, rows: &[(String, String, String, String
         let r = rule.trim();
         (!r.is_empty() && !r.eq_ignore_ascii_case("NO ACTION")).then(|| r.to_uppercase())
     };
+    // Each table found by name once, not by a scan per rule — see `group_by`.
+    // The first table of a name wins, as the scan's `find` did.
+    let mut index: HashMap<String, usize> = HashMap::with_capacity(schema.tables.len());
+    for (i, t) in schema.tables.iter().enumerate() {
+        index.entry(t.name.clone()).or_insert(i);
+    }
     for (table, name, on_delete, on_update) in rows {
-        let Some(t) = schema.tables.iter_mut().find(|t| t.name == *table) else {
+        let Some(t) = index.get(table).map(|&i| &mut schema.tables[i]) else {
             continue;
         };
         let Some(fk) = t.foreign_keys.iter_mut().find(|f| f.name == *name) else {
