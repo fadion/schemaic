@@ -6325,17 +6325,22 @@ pub struct Ui {
     pub cli_command: CliCommand,
 }
 
-/// The Command line row's two actions and the one state they share.
+/// The Command line row's two actions and the two signals they share: where
+/// the last one got to, and whether Remove is on offer at all.
 ///
 /// A registry edit or a symlink, so both actions are the app boundary's job for
-/// the same reason as [`Ui::open_config_dir`]; each runs off-thread and reports
-/// through `state`, and the app ignores either click while one is running.
+/// the same reason as [`Ui::open_config_dir`]; each runs off-thread, reports
+/// through `state`, refreshes `installed`, and the app ignores either click
+/// while one is running.
 #[derive(Clone)]
 pub struct CliCommand {
     pub install: Rc<dyn Fn()>,
     pub remove: Rc<dyn Fn()>,
     /// Where the last Install or Remove got to, and what it said. Transient.
     pub state: RwSignal<schemaic_core::cli_install::InstallState>,
+    /// Would Remove do anything? Read at startup and after every Install or
+    /// Remove; Remove is offered only while it holds. Transient.
+    pub installed: RwSignal<bool>,
 }
 
 /// Which panel occupies the right column. AI and Terminal are mutually

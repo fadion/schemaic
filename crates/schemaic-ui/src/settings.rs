@@ -12,8 +12,7 @@ use floem::prelude::*;
 use crate::consts::{TERM_FONT_SIZES, chat_pad_h};
 use crate::widgets::{
     ActionKind, MenuEntry, action_button, action_button_dyn, action_gap, autohide,
-    focus_root_with_ring, footer_error, form_hint, form_label_style, modal_title, nothing,
-    panel_style,
+    focus_root_with_ring, form_hint, form_label_style, modal_title, nothing, panel_style,
 };
 use crate::{
     AiActions, AiEffort, AiUi, ConnUi, FieldCfg, Harness, LayoutUi, SchemaScope, TermActions,
@@ -1472,6 +1471,16 @@ fn log_row(open: Rc<dyn Fn()>, ring: crate::widgets::FocusRing, tabindex: u32) -
 /// are thrown away (Windows also has the uninstall hook). The guard against a
 /// second click while either is running is the app's, beside the launch; the
 /// labels only say so. `tabindex` is Install's; Remove follows it.
+///
+/// **Remove exists only while it would do something** (`installed`), built in
+/// a `dyn_container` so it also leaves the Tab ring when it goes — a button
+/// that reports "nothing to remove" is one the row should not have offered.
+///
+/// **The outcome is a line of its own under the whole row**, not a third line
+/// in the label column. In the column it made the column taller, so the
+/// buttons — centred on the column — slid down to sit beside the message
+/// instead of the label; and a long error sharing the row with the buttons was
+/// laid out wider than the modal and clipped.
 fn cli_row(
     cmd: crate::CliCommand,
     ring: crate::widgets::FocusRing,
@@ -1481,18 +1490,23 @@ fn cli_row(
         install,
         remove,
         state,
+        installed,
     } = cmd;
+    let outcome_line = |msg: String, color: fn() -> floem::peniko::Color| {
+        text(msg)
+            .style(move |s| {
+                s.width_full()
+                    .min_width(0.0)
+                    .color(color())
+                    .font_size(theme::font_label())
+            })
+            .into_any()
+    };
     let outcome = dyn_container(
         move || state.get(),
-        |st| match st {
-            InstallState::Done(msg) => text(msg)
-                .style(|s| {
-                    s.color(theme::text_dim())
-                        .font_size(theme::font_label())
-                        .max_width(theme::scaled(460.0))
-                })
-                .into_any(),
-            InstallState::Failed(msg) => footer_error(msg),
+        move |st| match st {
+            InstallState::Done(msg) => outcome_line(msg, theme::text_dim),
+            InstallState::Failed(msg) => outcome_line(msg, theme::error),
             InstallState::Idle | InstallState::Running | InstallState::Removing => nothing(),
         },
     )
@@ -1501,49 +1515,72 @@ fn cli_row(
     // AI modal's harness notice.
     .style(move |s| {
         match state.with(|st| matches!(st, InstallState::Done(_) | InstallState::Failed(_))) {
-            true => s,
+            true => s.width_full().min_width(0.0),
             false => s.display(floem::style::Display::None),
         }
     });
-    h_stack((
-        v_stack((
-            text("Command line").style(|s| s.color(theme::text()).font_size(theme::font_label())),
-            form_hint(cli_install::hint(cli_install::Os::current())),
-            outcome,
-        ))
-        .style(|s| {
-            s.flex_col()
-                .gap(theme::scaled(2.0))
-                .flex_grow(1.0_f32)
-                .min_width(0.0)
-        }),
+    let remove_slot = {
+        let ring = ring.clone();
+        dyn_container(
+            move || installed.get(),
+            move |yes| {
+                if !yes {
+                    return nothing();
+                }
+                let remove = remove.clone();
+                action_button_dyn(
+                    move || match state.get() {
+                        InstallState::Removing => "Removing".to_string(),
+                        _ => "Remove".to_string(),
+                    },
+                    ActionKind::Quiet,
+                    true,
+                    ring.clone(),
+                    tabindex + 5,
+                    move || remove(),
+                )
+            },
+        )
+        // Hidden when empty, for the same reason as `outcome`: an empty flex
+        // child still takes the gap beside Install.
+        .style(move |s| match installed.get() {
+            true => s,
+            false => s.display(floem::style::Display::None),
+        })
+    };
+    v_stack((
         h_stack((
-            action_button_dyn(
-                move || match state.get() {
-                    InstallState::Running => "Installing".to_string(),
-                    _ => "Install".to_string(),
-                },
-                ActionKind::Quiet,
-                true,
-                ring.clone(),
-                tabindex,
-                move || install(),
-            ),
-            action_button_dyn(
-                move || match state.get() {
-                    InstallState::Removing => "Removing".to_string(),
-                    _ => "Remove".to_string(),
-                },
-                ActionKind::Quiet,
-                true,
-                ring,
-                tabindex + 5,
-                move || remove(),
-            ),
+            v_stack((
+                text("Command line")
+                    .style(|s| s.color(theme::text()).font_size(theme::font_label())),
+                form_hint(cli_install::hint(cli_install::Os::current())),
+            ))
+            .style(|s| {
+                s.flex_col()
+                    .gap(theme::scaled(2.0))
+                    .flex_grow(1.0_f32)
+                    .min_width(0.0)
+            }),
+            h_stack((
+                action_button_dyn(
+                    move || match state.get() {
+                        InstallState::Running => "Installing".to_string(),
+                        _ => "Install".to_string(),
+                    },
+                    ActionKind::Quiet,
+                    true,
+                    ring,
+                    tabindex,
+                    move || install(),
+                ),
+                remove_slot,
+            ))
+            .style(|s| s.flex_row().items_center().gap(action_gap())),
         ))
-        .style(|s| s.flex_row().items_center().gap(action_gap())),
+        .style(|s| s.items_center().width_full().gap(theme::scaled(10.0))),
+        outcome,
     ))
-    .style(|s| s.items_center().width_full().gap(theme::scaled(10.0)))
+    .style(|s| s.flex_col().width_full().gap(theme::scaled(6.0)))
 }
 
 fn settings_section_header(t: &'static str) -> impl IntoView {

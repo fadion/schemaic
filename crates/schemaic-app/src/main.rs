@@ -11572,29 +11572,41 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
 
     // Settings → General → Command line → Install / Remove. Off-thread because
     // the Windows arm waits on a broadcast to every top-level window; the guard
-    // against a click while either runs sits here, beside the launch.
+    // against a click while either runs sits here, beside the launch. Whether
+    // Remove is on offer is re-read on the same thread after each one, and once
+    // at startup — a registry read or a `stat`, but not the UI thread's to wait
+    // on.
     let cli_command = {
         use schemaic_core::cli_install::InstallState;
         let state = RwSignal::new(InstallState::default());
+        let installed = RwSignal::new(false);
+        let report_installed = create_ext_action(cx, move |now: bool| installed.set(now));
+        std::thread::spawn(move || report_installed(install_cli::installed()));
         let action = move |running: InstallState, work: fn() -> Result<String, String>| {
             Rc::new(move || {
                 if state.get_untracked().busy() {
                     return;
                 }
                 state.set(running.clone());
-                let report = create_ext_action(cx, move |res: Result<String, String>| {
-                    state.set(match res {
-                        Ok(msg) => InstallState::Done(msg),
-                        Err(msg) => InstallState::Failed(msg),
+                let report =
+                    create_ext_action(cx, move |(res, now): (Result<String, String>, bool)| {
+                        installed.set(now);
+                        state.set(match res {
+                            Ok(msg) => InstallState::Done(msg),
+                            Err(msg) => InstallState::Failed(msg),
+                        });
                     });
+                std::thread::spawn(move || {
+                    let res = work();
+                    report((res, install_cli::installed()));
                 });
-                std::thread::spawn(move || report(work()));
             }) as Rc<dyn Fn()>
         };
         schemaic_ui::CliCommand {
             install: action(InstallState::Running, install_cli::install),
             remove: action(InstallState::Removing, install_cli::remove),
             state,
+            installed,
         }
     };
 

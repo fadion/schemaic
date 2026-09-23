@@ -32,6 +32,51 @@ pub(crate) fn remove() -> Result<String, String> {
     }
 }
 
+/// Would Remove do anything — is the command ours to take away? The Settings
+/// row shows Remove only when it is. A read that fails answers no: the worst
+/// case is a missing button, never a Remove that reports it found nothing.
+pub(crate) fn installed() -> bool {
+    use cli_install::Found;
+    let Ok(probe) = probe() else {
+        return false;
+    };
+    let Ok(removal) = cli_install::removal(&probe) else {
+        return false;
+    };
+    let found = match &removal {
+        Removal::Package { .. } => Found::Nothing,
+        Removal::UserPath { .. } => read_user_path().map_or(Found::Nothing, Found::UserPath),
+        Removal::Unlink { link, .. } => read_link_state(link).map_or(Found::Nothing, Found::Link),
+    };
+    #[cfg(windows)]
+    let lookup = env_lookup;
+    #[cfg(not(windows))]
+    let lookup = |_: &str| None;
+    cli_install::removable(&removal, &found, lookup)
+}
+
+#[cfg(windows)]
+fn read_user_path() -> Option<String> {
+    win::UserPath::open(win::Access::Read)
+        .ok()
+        .map(|p| p.raw.clone())
+}
+
+#[cfg(not(windows))]
+fn read_user_path() -> Option<String> {
+    None
+}
+
+#[cfg(unix)]
+fn read_link_state(link: &Path) -> Option<cli_install::Existing> {
+    existing_at(link).ok()
+}
+
+#[cfg(not(unix))]
+fn read_link_state(_link: &Path) -> Option<cli_install::Existing> {
+    None
+}
+
 /// Velopack's `--veloapp-uninstall` hook: take this copy's folder back off the
 /// user `PATH` before the uninstaller deletes it. Windows only — Velopack has no
 /// uninstaller anywhere else, so nothing of ours runs when a macOS app or an
@@ -87,7 +132,7 @@ fn remove_user_path(_dir: &Path) -> Result<String, String> {
 /// Append `dir` to `HKCU\Environment\Path`, then tell running programs.
 #[cfg(windows)]
 fn add_user_path(dir: &Path) -> Result<String, String> {
-    let path = win::UserPath::open()?;
+    let path = win::UserPath::open(win::Access::Write)?;
     let Some(updated) = cli_install::user_path_update(&path.raw, dir, env_lookup) else {
         // Already in the registry — written after this process started, which
         // is why the planner's look at our own PATH missed it.
@@ -103,7 +148,7 @@ fn add_user_path(dir: &Path) -> Result<String, String> {
 /// running programs.
 #[cfg(windows)]
 fn remove_user_path(dir: &Path) -> Result<String, String> {
-    let path = win::UserPath::open()?;
+    let path = win::UserPath::open(win::Access::Write)?;
     let Some(updated) = cli_install::user_path_remove(&path.raw, dir, env_lookup) else {
         return Ok(cli_install::report_path_absent(dir));
     };
@@ -120,7 +165,7 @@ mod win {
     use windows_sys::Win32::System::Registry::{
         HKEY, HKEY_CURRENT_USER, KEY_QUERY_VALUE, KEY_SET_VALUE, REG_EXPAND_SZ,
         REG_OPTION_NON_VOLATILE, REG_SZ, REG_VALUE_TYPE, RegCloseKey, RegCreateKeyExW,
-        RegQueryValueExW, RegSetValueExW,
+        RegOpenKeyExW, RegQueryValueExW, RegSetValueExW,
     };
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         HWND_BROADCAST, SMTO_ABORTIFHUNG, SendMessageTimeoutW, WM_SETTINGCHANGE,
@@ -151,30 +196,48 @@ mod win {
 
     impl Drop for UserPath {
         fn drop(&mut self) {
-            // SAFETY: `self.key` is a key `RegCreateKeyExW` opened, and only
-            // this drop closes it.
+            // SAFETY: `self.key` is a key `open` opened, and only this drop
+            // closes it.
             unsafe { RegCloseKey(self.key) };
         }
     }
 
+    /// How [`UserPath::open`] opens the key. Only Install and Remove write; the
+    /// Settings row's "is it installed?" read runs at every launch, and a read
+    /// has no business asking for write access or creating the key.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    pub(super) enum Access {
+        Read,
+        Write,
+    }
+
     impl UserPath {
-        pub(super) fn open() -> Result<UserPath, String> {
+        pub(super) fn open(access: Access) -> Result<UserPath, String> {
             let subkey = wide("Environment");
             let mut key: HKEY = std::ptr::null_mut();
             // SAFETY: every pointer is to a live local; the class and security
             // attributes are documented as optional.
             let rc = unsafe {
-                RegCreateKeyExW(
-                    HKEY_CURRENT_USER,
-                    subkey.as_ptr(),
-                    0,
-                    std::ptr::null(),
-                    REG_OPTION_NON_VOLATILE,
-                    KEY_QUERY_VALUE | KEY_SET_VALUE,
-                    std::ptr::null(),
-                    &mut key,
-                    std::ptr::null_mut(),
-                )
+                match access {
+                    Access::Write => RegCreateKeyExW(
+                        HKEY_CURRENT_USER,
+                        subkey.as_ptr(),
+                        0,
+                        std::ptr::null(),
+                        REG_OPTION_NON_VOLATILE,
+                        KEY_QUERY_VALUE | KEY_SET_VALUE,
+                        std::ptr::null(),
+                        &mut key,
+                        std::ptr::null_mut(),
+                    ),
+                    Access::Read => RegOpenKeyExW(
+                        HKEY_CURRENT_USER,
+                        subkey.as_ptr(),
+                        0,
+                        KEY_QUERY_VALUE,
+                        &mut key,
+                    ),
+                }
             };
             if rc != 0 {
                 return Err(format!(

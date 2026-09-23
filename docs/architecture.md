@@ -7318,6 +7318,17 @@ existing prose was left alone.
     over to this half (`removal_reports_name_the_path`). **On Windows Velopack's uninstall hook runs
     `removal` as well; nothing of ours runs when a macOS app or an AppImage is thrown away**, so
     there the Remove button is the only undo.
+    **`removable(&Removal, &Found, lookup) -> bool` is whether the Settings row offers Remove at
+    all, and it is those two functions asked without acting** — `user_path_remove(..).is_some()`
+    for `Removal::UserPath`, `unlink_step(..) == UnlinkStep::Remove` for `Unlink` — so the button
+    and the action cannot disagree about what counts as installed. `Found` is what the app read
+    where the `Removal` would edit: `UserPath(raw)`, `Link(Existing)`, or `Nothing` for a package
+    install or a read that failed. Only those two matching pairs can answer `true`; a `Package`, an
+    unread state and a mismatched pairing — a Windows removal handed a link, or the reverse, which
+    is a bug at the boundary — are never removable, because the safe answer to any of them is not
+    to offer Remove (`a_package_or_an_unread_state_is_never_removable`,
+    `a_mismatched_read_is_never_removable`). A dangling link counts, as it does for `unlink_step`
+    (`removable_when_the_link_is_ours_or_dangling`).
   - **Small persisted / UI-state models**, each a flat `Vec` keyed by `conn_id` and each pure +
     tested (they share `history.rs`'s shape; a new one belongs here, not in the UI):
     - `search_history.rs` — recent Find-Anywhere targets (`MAX_PER_CONN`, newest-first, deduped).
@@ -11985,14 +11996,32 @@ existing prose was left alone.
     `cli_row` sits under it and is General's other trip outside the app: **Command line**, the
     per-OS hint from `core::cli_install::hint`, **Install** and **Remove** side by side at
     `action_gap()` (tabindex 30 and 35), reading **Installing** / **Removing** while one runs, and
-    the outcome under the hint — dim text on success, `footer_error` on failure — which stays there
-    for the rest of the session, naming the path the operation resolved. Remove is on the row
-    because it is the only undo on macOS and under an AppImage, where nothing of ours runs when the
-    app is thrown away. Both arrive as one `Ui::cli_command: CliCommand { install, remove, state }`
-    — two actions and the one `RwSignal<InstallState>` they share, which the app owns: a registry
-    write or a symlink is the app boundary's job for `open_config_dir`'s reason. **Both buttons
-    stay enabled while either runs**, and the guard against a click on either is `main.rs`'s,
-    beside the launch — the labels only say so.
+    the outcome on a line of its own under the whole row — `theme::text_dim` on success,
+    `theme::error` on failure — which stays there for the rest of the session, naming the path the
+    operation resolved. Remove is on the row because it is the only undo on macOS and under an
+    AppImage, where nothing of ours runs when the app is thrown away. **It is offered only while it
+    would do something**: it first shipped unconditionally, so a copy that had never installed
+    showed a Remove that could only report it found nothing. It is now built in a `dyn_container`
+    over `CliCommand::installed` — `core::cli_install::removable`'s answer, read by
+    `install_cli::installed` — so it also leaves the Tab ring when it goes, a ring control
+    registering when it is built and unregistering in its cleanup; one that goes while it holds the
+    keyboard hands it back through `in_focus_ring_with`'s cleanup like any other. The container
+    and the outcome's are both `Display::None` when they have nothing to show, not merely empty,
+    since an empty flex child still takes its gap — the AI modal's harness-notice fix. **The
+    outcome sits under the row, not in the label column, and a tidy-up that moves it back
+    reintroduces the bug**: as a third line there it made the column taller, and the buttons,
+    centred on the column, slid down to sit beside the message instead of the label. So the row is
+    a `v_stack` of an `h_stack` (label column and buttons, `items_center`) and the outcome, at a
+    gap of 6. **Both outcomes are a local `outcome_line`, not `widgets::footer_error`**: that one's
+    `max_width(scaled(460))` is a wrap hint which relies on `modal_footer_split` to shrink it, and
+    in the Settings modal's `modal_w(420)` nothing did, so a long error was laid out past the
+    modal's edge and clipped. `outcome_line` is `width_full().min_width(0)`, so it wraps at the
+    modal's width. All of it arrives as one
+    `Ui::cli_command: CliCommand { install, remove, state, installed }` — two actions, the one
+    `RwSignal<InstallState>` they share and the `RwSignal<bool>` behind Remove, which the app
+    owns: a registry write or a symlink is the app boundary's job for `open_config_dir`'s reason.
+    **Both buttons stay enabled while either runs**, and the guard against a click on either is
+    `main.rs`'s, beside the launch — the labels only say so.
     **The AI modal is where the harness is chosen, and half its controls follow that choice.** The
     *Agent CLI* dropdown is `focusable_dropdown(harness, Harness::ALL, Harness::label, …)` over the
     workspace's **one** `Harness` — `schemaic-ui` depends on `schemaic-ai` for it, deliberately, and
@@ -18989,9 +19018,9 @@ existing prose was left alone.
     tells Explorer, so a terminal it starts next gets the new value; that is best-effort, the value
     being written either way, and a terminal already open keeps the old `PATH`, which
     `report_added` and `report_removed` say. `env_lookup`, the `%NAME%` resolver both directions
-    hand to core, is `cfg(windows)`: nothing else reads it, and left unconditional it is dead code on
-    Linux, which CI's clippy `-D warnings` fails. **The whole operation runs on a `std::thread`, not
-    the UI thread**, because
+    and `installed` hand to core, is `cfg(windows)`: nothing else reads it, and left unconditional
+    it is dead code on Linux, which CI's clippy `-D warnings` fails. **The whole operation runs on a
+    `std::thread`, not the UI thread**, because
     the broadcast waits on every top-level window and a slow one should stall a thread nobody is
     looking at. This is `schemaic-app`'s first *direct* `windows-sys` dependency — 0.61,
     `cfg(windows)`, features `Win32_Foundation`, `Win32_Security`, `Win32_System_Registry` and
@@ -19005,10 +19034,24 @@ existing prose was left alone.
     `link_command` asks `link_step`, then `create_dir_all`s `~/.local/bin`, removes a dangling link
     it is replacing and `std::os::unix::fs::symlink`s; `unlink_command` asks `unlink_step` and
     `remove_file`s the link — which on a symlink removes the link, never what it points at, so an
-    AppImage outlives its link. The closures the Settings row calls are built in `main.rs` next to
-    `update::start`, one factory making both: it owns the **double-click guard** — a click on
-    either button while `state.busy()` is ignored, so an Install blocks a Remove and the reverse,
-    the buttons themselves staying enabled — and posts the result back with `create_ext_action`.
+    AppImage outlives its link.
+    **`installed()` is the row's other question — would Remove do anything — and it decides
+    nothing itself**: it runs the same `probe` and `removal`, reads what sits where the `Removal`
+    would edit into a `core::cli_install::Found` — `read_user_path` through the same
+    `win::UserPath::open` Remove uses but with `Access::Read` (`RegOpenKeyExW`, `KEY_QUERY_VALUE`
+    only: a check that runs at every launch has no business asking for write access or creating the
+    key, which `Access::Write`'s `RegCreateKeyExW` would), `read_link_state` through `existing_at`,
+    nothing at all for a `Package` — and asks `removable`. **Every failure answers `false`**: a probe or removal that
+    errs, a registry value `open` refuses, a link that can't be read. The worst case is then a
+    missing button, never a Remove that reports it found nothing. The closures the Settings row
+    calls are built in `main.rs` next to `update::start`, one factory making both: it owns the
+    **double-click guard** — a click on either button while `state.busy()` is ignored, so an
+    Install blocks a Remove and the reverse, the buttons themselves staying enabled — and posts the
+    result back with `create_ext_action` as a `(Result, bool)`, the `bool` being `installed()`
+    re-read on the same worker thread once the operation is done, so Remove appears or goes in the
+    same update that shows the outcome. The block also reads it once at startup, on a `std::thread`
+    of its own — a registry read or a `stat`, but not the UI thread's to wait on — and
+    `CliCommand::installed` is `false` until that answers.
     **Verified by hand on both platforms.** Linux, under WSL: Remove with nothing there, Install
     then Remove, a dangling link removed, a live link elsewhere and a regular file both refused, an
     AppImage's target file surviving the removal, and the package case. Windows: an Install → Remove

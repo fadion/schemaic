@@ -433,6 +433,37 @@ pub fn unlink_step(existing: &Existing, link: &Path, target: &Path) -> UnlinkSte
     }
 }
 
+/// What sits where a [`Removal`] would edit, read at the app boundary.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Found {
+    /// The raw user `PATH` (Windows).
+    UserPath(String),
+    /// Whatever is at the link (macOS/Linux).
+    Link(Existing),
+    /// Nothing was read — a package install, or the read failed.
+    Nothing,
+}
+
+/// Would Remove do anything? The Settings row offers Remove only when it
+/// would: this copy's folder is on the user `PATH`, or the link is ours. It is
+/// [`user_path_remove`] and [`unlink_step`] asked without acting, so the button
+/// and the action can't disagree about what counts as installed.
+pub fn removable(
+    removal: &Removal,
+    found: &Found,
+    lookup: impl Fn(&str) -> Option<String>,
+) -> bool {
+    match (removal, found) {
+        (Removal::UserPath { dir }, Found::UserPath(raw)) => {
+            user_path_remove(raw, dir, lookup).is_some()
+        }
+        (Removal::Unlink { link, target }, Found::Link(existing)) => {
+            unlink_step(existing, link, target) == UnlinkStep::Remove
+        }
+        _ => false,
+    }
+}
+
 /// The report once `dir` has left the user `PATH`.
 pub fn report_removed(dir: &Path) -> String {
     format!(
@@ -1105,6 +1136,83 @@ mod tests {
             panic!("expected a refusal");
         };
         assert!(why.contains(LINK), "{why}");
+    }
+
+    // ---- removable ----
+
+    fn user_path_removal() -> Removal {
+        Removal::UserPath {
+            dir: PathBuf::from(VELOPACK_DIR),
+        }
+    }
+
+    fn unlink_removal() -> Removal {
+        Removal::Unlink {
+            link: PathBuf::from(LINK),
+            target: PathBuf::from(TARGET),
+        }
+    }
+
+    #[test]
+    fn removable_when_the_folder_is_on_the_user_path() {
+        let raw = format!(r"C:\a;{VELOPACK_DIR}");
+        assert!(removable(&user_path_removal(), &Found::UserPath(raw), env));
+        let raw = r"%LOCALAPPDATA%\Schemaic\current".to_string();
+        assert!(removable(&user_path_removal(), &Found::UserPath(raw), env));
+    }
+
+    #[test]
+    fn not_removable_when_the_folder_is_not_on_the_user_path() {
+        let found = Found::UserPath(r"C:\a;C:\b".to_string());
+        assert!(!removable(&user_path_removal(), &found, env));
+        let found = Found::UserPath(String::new());
+        assert!(!removable(&user_path_removal(), &found, env));
+    }
+
+    #[test]
+    fn removable_when_the_link_is_ours_or_dangling() {
+        let to = PathBuf::from(TARGET);
+        let found = Found::Link(Existing::Link { to, live: true });
+        assert!(removable(&unlink_removal(), &found, env));
+        let to = PathBuf::from("/gone");
+        let found = Found::Link(Existing::Link { to, live: false });
+        assert!(removable(&unlink_removal(), &found, env));
+    }
+
+    #[test]
+    fn not_removable_when_the_link_is_absent_or_not_ours() {
+        for existing in [
+            Existing::Nothing,
+            Existing::Other,
+            Existing::Link {
+                to: PathBuf::from("/opt/other"),
+                live: true,
+            },
+        ] {
+            let found = Found::Link(existing.clone());
+            assert!(!removable(&unlink_removal(), &found, env), "{existing:?}");
+        }
+    }
+
+    #[test]
+    fn a_package_or_an_unread_state_is_never_removable() {
+        let package = Removal::Package {
+            dir: PathBuf::from("/usr/bin"),
+        };
+        assert!(!removable(&package, &Found::Nothing, env));
+        assert!(!removable(&user_path_removal(), &Found::Nothing, env));
+        assert!(!removable(&unlink_removal(), &Found::Nothing, env));
+    }
+
+    #[test]
+    fn a_mismatched_read_is_never_removable() {
+        // A Windows removal handed a link, or the other way round, is a bug at
+        // the boundary — and the safe answer to it is "don't offer Remove".
+        let to = PathBuf::from(TARGET);
+        let link = Found::Link(Existing::Link { to, live: true });
+        assert!(!removable(&user_path_removal(), &link, env));
+        let path = Found::UserPath(VELOPACK_DIR.to_string());
+        assert!(!removable(&unlink_removal(), &path, env));
     }
 
     #[test]
