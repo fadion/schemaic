@@ -1766,6 +1766,146 @@ fn underline_seg_at(
     Some((x0, y, (x1 - x0).max(2.0).min(vis_hi - x0)))
 }
 
+/// One visible diagnostic's hover target, in `editor_area` coords: the
+/// underlined text from its line's top to the bottom of the wave, exactly as
+/// wide as the squiggle drawn under it.
+#[derive(Clone, Debug, PartialEq)]
+struct DiagHit {
+    x: f64,
+    top: f64,
+    w: f64,
+    bottom: f64,
+    severity: Severity,
+    message: String,
+}
+
+/// The hover box `(x, top, w, bottom)` for the diagnostic `[lo, hi]` — the
+/// squiggle's own horizontal extent from [`underline_seg_at`], so the pointer
+/// finds a message exactly where a wave is drawn and nowhere else; vertically
+/// the line the text sits on plus the wave below it. `None` whenever
+/// `underline_seg_at` is: nothing drawn, nothing to hover.
+fn diag_hit_at(
+    points: impl Fn(usize) -> Option<(Point, Point)>,
+    content_x: f64,
+    lo: usize,
+    hi: usize,
+    vp: Rect,
+) -> Option<(f64, f64, f64, f64)> {
+    let (x, wave_y, w) = underline_seg_at(&points, content_x, lo, hi, vp)?;
+    let (top, _) = points(lo)?;
+    Some((x, top.y + EDITOR_PAD_TOP - vp.y0, w, wave_y + WAVE_H))
+}
+
+/// The diagnostic under `p`, if any. Where two overlap — the offline pass and
+/// the server's verdict on the same token — the error beats the warning and
+/// then the narrower span wins, since it is the more specific claim.
+fn diag_under(hits: &[DiagHit], p: Point) -> Option<&DiagHit> {
+    let rank = |s: Severity| match s {
+        Severity::Error => 0,
+        Severity::Warning => 1,
+    };
+    hits.iter()
+        .filter(|h| p.x >= h.x && p.x < h.x + h.w && p.y >= h.top && p.y <= h.bottom)
+        .min_by(|a, b| {
+            rank(a.severity)
+                .cmp(&rank(b.severity))
+                .then(a.w.total_cmp(&b.w))
+        })
+}
+
+/// Where a diagnostic's hover tip sits.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum TipAt {
+    /// Its top edge this far down `editor_area`, just under the wave.
+    Below { top: f64 },
+    /// Its bottom edge this far up from `editor_area`'s bottom, just above the
+    /// line — for a line in the lower half, where below would run off the pane.
+    Above { bottom: f64 },
+}
+
+/// Air between the tip and the line it explains, and between the tip and the
+/// pane's edges.
+const TIP_GAP: f64 = 4.0;
+const TIP_EDGE: f64 = 8.0;
+
+/// How long the pointer rests on a squiggle before its message shows — the
+/// app-wide `.tooltip()` delay (`TooltipContainerClass` at the root), so this
+/// tip and every other one in the app answer at the same pace.
+const DIAG_TIP_DELAY: std::time::Duration = std::time::Duration::from_millis(300);
+
+/// The widest a diagnostic's tip grows before it wraps, before UI scaling.
+const DIAG_TIP_MAX_W: f64 = 480.0;
+
+/// The least room right of a squiggle worth opening the tip into, before UI
+/// scaling; with less, it opens leftward from the squiggle's end instead.
+const DIAG_TIP_MIN_W: f64 = 240.0;
+
+/// Which edge of a diagnostic's tip is pinned, and how wide it may grow.
+///
+/// **Pinned, not slid.** The tip's real width is its message's, unknown until
+/// layout, so it has to be anchored by the edge that stays put. Sliding a left
+/// edge far enough to fit `max_w` was the first spelling, and it moved every
+/// short message too: in a 640px pane every squiggle right of ~150px opened its
+/// tip at ~150px, under whichever error came first.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum TipX {
+    /// Its left edge here — under the squiggle's start — growing rightward.
+    Left { left: f64, max_w: f64 },
+    /// Its right edge this far in from `editor_area`'s right edge — under the
+    /// squiggle's end — growing leftward, for a squiggle near the right edge.
+    Right { right: f64, max_w: f64 },
+}
+
+impl TipX {
+    fn max_w(self) -> f64 {
+        match self {
+            TipX::Left { max_w, .. } | TipX::Right { max_w, .. } => max_w,
+        }
+    }
+}
+
+/// Place the tip for `hit` in an `area_w` × `area_h` editor area. It starts
+/// under the squiggle and may grow to `max_w`, or to the pane's edge if that
+/// comes first; when less than `min_w` is left that way it opens leftward from
+/// the squiggle's end instead. Below the line in the pane's upper half, above
+/// it in the lower half, so a long message is never clipped by the bottom edge.
+fn diag_tip_place(
+    hit: &DiagHit,
+    area_w: f64,
+    area_h: f64,
+    max_w: f64,
+    min_w: f64,
+) -> (TipX, TipAt) {
+    let left = hit.x.max(TIP_EDGE);
+    let room_right = area_w - TIP_EDGE - left;
+    let end = (hit.x + hit.w).min(area_w - TIP_EDGE);
+    let room_left = end - TIP_EDGE;
+    // Rightward when there is enough room that way — or when there is not
+    // enough either way and rightward still has more, rather than flipping into
+    // a narrower column.
+    let x = if room_right >= min_w.min(max_w) || room_right >= room_left {
+        TipX::Left {
+            left,
+            max_w: max_w.min(room_right).max(0.0),
+        }
+    } else {
+        TipX::Right {
+            right: area_w - end,
+            max_w: max_w.min(room_left).max(0.0),
+        }
+    };
+    let at = if hit.top > area_h / 2.0 {
+        TipAt::Above {
+            bottom: area_h - hit.top + TIP_GAP,
+        }
+    } else {
+        TipAt::Below {
+            top: hit.bottom + TIP_GAP,
+        }
+    };
+    (x, at)
+}
+
 /// Pixel box in `editor_area` coords around the single-line span `[lo, hi]`.
 /// `None` when off screen.
 fn span_box(content_x: f64, ed: &Editor, lo: usize, hi: usize) -> Option<(f64, f64, f64, f64)> {
@@ -4741,8 +4881,9 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
     // editor, drawn in the descender gap below the glyphs. The container is
     // click-through (`pointer_events(false)`) so text selection is unaffected.
     //
-    // **There is no hover tooltip, and there cannot be one in this shape.** This
-    // comment used to say the opposite — "only the individual squiggle strips
+    // **The squiggles cannot own a tooltip in this shape**, which is why the
+    // message on hover comes from `editor_area` instead (below). This comment
+    // once claimed otherwise — "only the individual squiggle strips
     // re-enable pointer events so hovering the underline reveals the message" —
     // and so did `docs/architecture.md`, which listed the squiggles among the
     // things `pointer_events(false)` is right for. Both were wrong, and the
@@ -4767,26 +4908,29 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
     // would make the rectangle between them dead to selection, scrolling and
     // the caret.
     //
-    // What it actually needs is the remedy the invariant states: "an overlay
-    // that both covers the window and contains something clickable cannot be
-    // one view: it has to be spread as loose siblings, each small enough to be
-    // skipped on a miss." That means the squiggles becoming direct children of
-    // `editor_area`'s own `stack` — which takes at most 16 children and is
-    // already near that — so it is a restructure of the overlay composition and
-    // an attended one, not a decorator moved. `erd_view`'s card header is the
-    // same lesson solved the easy way: it drops the opt-out on the branch that
-    // has a tooltip, because there the tooltip's owner *is* the small view.
-    let syntax_view = {
+    // The invariant's own remedy — "an overlay that both covers the window and
+    // contains something clickable cannot be one view: it has to be spread as
+    // loose siblings, each small enough to be skipped on a miss" — would mean
+    // the squiggles becoming direct children of `editor_area`'s `stack`, which
+    // takes at most 16 children and has none to spare, and a varying number of
+    // squiggles cannot be fixed tuple slots anyway.
+    //
+    // **So the message is shown without making anything here hoverable.** The
+    // squiggles stay click-through; `editor_area` listens to `PointerMove` with
+    // `on_event_cont` — floem's own editor handles it the same way, so the event
+    // reaches `editor_area`'s listeners after the editor has had it — and hit-
+    // tests the pointer against `diag_hits`, the very boxes the waves are drawn
+    // from (`diag_under`). The message then appears in `diag_tip_view`, which is
+    // paint-only for the same reason `signature_popup` is and shares its slot.
+    // Nothing gains a hit rect, so nothing can eat a click, select or scroll.
+    //
+    // `diag_hits` carries the message, which the squiggle memo was once kept
+    // free of: the drawing memo derived from it (`segs`) drops it again, so a
+    // message-only change still rebuilds nothing drawn, and only on-screen
+    // diagnostics are cloned — `diag_hit_at`'s `None` filters first.
+    let diag_hits = {
         let ed = ed_syntax;
-        // The squiggle's *width* is baked into the SVG markup (floem's `svg()`
-        // takes a `String`, not a signal), so unlike the other overlays this one
-        // can't just recompute inside a `.style()` closure — the view itself has
-        // to be rebuilt when the geometry moves. A memo is what makes that
-        // affordable: it tracks `viewport`/`screen_lines` and so re-runs on every
-        // scroll, but memos dedup on `PartialEq`, so the container below only
-        // rebuilds when a squiggle actually changes position, width, severity or
-        // message. Same trick the grid uses for its column window.
-        let segs = create_memo(move |_| {
+        create_memo(move |_| {
             let mut diags = syntax.get();
             diags.extend(db_diag.get());
             let vp = ed.viewport.get();
@@ -4798,11 +4942,11 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
             // 125 ms at 16 MiB, on the UI thread, on a memo that re-runs on
             // every scroll tick and every keystroke.
             //
-            // **`with`, not `get`**, for the reason the find scan ~300 lines
-            // below writes down: "the scan borrows the document, and cloning a
-            // 16 MiB buffer to hand it to a function that takes `&str` was 2.4 ms
-            // of a 20.3 ms keystroke". `content_x_of` is the only use of the
-            // document in this whole memo, and it takes `&str` — so `get` was a
+            // **`with`, not `get`**, for the reason the find scan further down
+            // writes down: "the scan borrows the document, and cloning a 16 MiB
+            // buffer to hand it to a function that takes `&str` was 2.4 ms of a
+            // 20.3 ms keystroke". `content_x_of` is the only use of the document
+            // in this whole memo, and it takes `&str` — so `get` was a
             // full-document allocation and memcpy per **scroll frame** as well
             // as per keystroke, on a document with zero diagnostics as much as
             // on one covered in them.
@@ -4810,19 +4954,136 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
             diags
                 .iter()
                 .filter_map(|d| {
-                    // `None` = off screen. Rendering nothing is the point: this
-                    // used to collapse to a 2px stub at the editor's top-left
-                    // carrying the tooltip of an error twenty lines away.
-                    // **No `d.message`.** Nothing renders it since the tooltip
-                    // came out, so carrying it here was a `String` clone per
-                    // diagnostic on a memo that re-runs on every scroll tick and
-                    // every keystroke, and it made the memo rebuild the whole
-                    // container for a message change that alters nothing drawn.
-                    // Restoring the tooltip means putting it back.
-                    underline_seg_at(&points, content_x, d.range.0, d.range.1, vp)
-                        .map(|(x, y, w)| (x, y, w, d.severity))
+                    // `None` = off screen, and then there is no box and no
+                    // message clone: rendering nothing is the point — this once
+                    // collapsed to a 2px stub at the editor's top-left carrying
+                    // the tooltip of an error twenty lines away.
+                    let (x, top, w, bottom) =
+                        diag_hit_at(&points, content_x, d.range.0, d.range.1, vp)?;
+                    Some(DiagHit {
+                        x,
+                        top,
+                        w,
+                        bottom,
+                        severity: d.severity,
+                        message: d.message.clone(),
+                    })
                 })
                 .collect::<Vec<_>>()
+        })
+    };
+    // The tip on screen, and the one the pointer is on — shown or still inside
+    // its delay. `diag_tip_gen` retires a pending delay the pointer has since
+    // left, the same guard the Test button's flash uses.
+    let diag_tip: RwSignal<Option<DiagHit>> = RwSignal::new(None);
+    let diag_pending: RwSignal<Option<DiagHit>> = RwSignal::new(None);
+    let diag_tip_gen: RwSignal<u64> = RwSignal::new(0);
+    let hover_diag = move |p: Option<Point>| {
+        // Not over the completion list: typing is what opens it, and a message
+        // about the text being replaced is noise over the list replacing it.
+        let under = p
+            .filter(|_| !comp.open.get_untracked())
+            .and_then(|p| diag_hits.with_untracked(|hs| diag_under(hs, p).cloned()));
+        // Every pointer move lands here, so a move that changes nothing must
+        // not touch a signal — a set notifies even when the value is equal, and
+        // the tip view would rebuild on every pixel.
+        if under == diag_pending.get_untracked() {
+            return;
+        }
+        diag_pending.set(under.clone());
+        if diag_tip.with_untracked(Option::is_some) {
+            diag_tip.set(None);
+        }
+        let this = diag_tip_gen.get_untracked().wrapping_add(1);
+        diag_tip_gen.set(this);
+        if let Some(hit) = under {
+            floem::action::exec_after(DIAG_TIP_DELAY, move |_| {
+                // `try_`: the tab may have closed inside the delay.
+                if diag_tip_gen.try_get_untracked() == Some(this) {
+                    diag_tip.set(Some(hit));
+                }
+            });
+        }
+    };
+    // Anything that moves or rewrites the text under the tip retires it: an
+    // edit, a scroll, a new set of diagnostics, the completion list opening. The
+    // next pointer move finds whatever is under it now.
+    create_effect(move |_| {
+        diag_hits.with(|_| ());
+        query.with(|_| ());
+        comp.open.with(|_| ());
+        // Runs on every keystroke and scroll frame, so it touches the signals
+        // only when there is something to retire. A delay is only ever pending
+        // while `diag_pending` holds its candidate, so that is also the only
+        // time the generation needs bumping.
+        if diag_pending.with_untracked(Option::is_some) {
+            diag_pending.set(None);
+            diag_tip_gen.update(|g| *g = g.wrapping_add(1));
+        }
+        if diag_tip.with_untracked(Option::is_some) {
+            diag_tip.set(None);
+        }
+    });
+    let diag_tip_view = {
+        let place = move || {
+            diag_tip.with(|t| {
+                t.as_ref().map(|hit| {
+                    diag_tip_place(
+                        hit,
+                        area_w.get(),
+                        area_h.get(),
+                        theme::scaled(DIAG_TIP_MAX_W),
+                        theme::scaled(DIAG_TIP_MIN_W),
+                    )
+                })
+            })
+        };
+        dyn_container(
+            move || diag_tip.get().map(|hit| hit.message),
+            move |message| match message {
+                None => empty().into_any(),
+                Some(message) => text(message)
+                    .style(move |s| {
+                        let max_w = place().map_or(0.0, |(x, _)| x.max_w());
+                        crate::widgets::tooltip_style(s).max_width(max_w)
+                    })
+                    .into_any(),
+            },
+        )
+        .style(move |s| match place() {
+            None => s.hide(),
+            Some((x, at)) => {
+                let s = s.absolute().max_width(x.max_w());
+                let s = match x {
+                    TipX::Left { left, .. } => s.inset_left(left),
+                    TipX::Right { right, .. } => s.inset_right(right),
+                };
+                match at {
+                    TipAt::Below { top } => s.inset_top(top),
+                    TipAt::Above { bottom } => s.inset_bottom(bottom),
+                }
+            }
+        })
+        .pointer_events(|| false)
+    };
+
+    let syntax_view = {
+        // The squiggle's *width* is baked into the SVG markup (floem's `svg()`
+        // takes a `String`, not a signal), so unlike the other overlays this one
+        // can't just recompute inside a `.style()` closure — the view itself has
+        // to be rebuilt when the geometry moves. A memo is what makes that
+        // affordable: it tracks `viewport`/`screen_lines` and so re-runs on every
+        // scroll, but memos dedup on `PartialEq`, so the container below only
+        // rebuilds when a squiggle actually changes position, width or severity.
+        // Same trick the grid uses for its column window. It reads `diag_hits`
+        // rather than repeating its geometry, so the wave and the hover box are
+        // one computation and cannot drift apart.
+        let segs = create_memo(move |_| {
+            diag_hits.with(|hits| {
+                hits.iter()
+                    .map(|h| (h.x, h.bottom - WAVE_H, h.w, h.severity))
+                    .collect::<Vec<_>>()
+            })
         });
         dyn_container(
             move || segs.get(),
@@ -4835,8 +5096,9 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                         s.absolute()
                             .inset_left(x)
                             .inset_top(y)
-                            // A slightly taller hit area than the wave so the
-                            // hover is catchable, still within the descender gap.
+                            // The wave's box, with room below the stroke;
+                            // still within the descender gap. Paint-only — the
+                            // hover box is `diag_hits`', not this.
                             .height(WAVE_H + 4.0)
                             .width(w)
                             .color(match sev {
@@ -5433,7 +5695,17 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
         occurrences_view,
         run_overlay,
         completion_popup(comp, ed_comp, area_h, area_w, ed_vp),
-        signature_popup(comp, ed_vp),
+        // The two paint-only hints share one slot — the stack is at its 16 — at
+        // the signature hint's layer. Floem 0.2's `z_index` is the renderer's
+        // paint layer, set when a view paints and inherited by its descendants
+        // (`context.rs` `save`/`restore`), so the wrapper's 1001 puts the
+        // squiggle tip over the bars, the scrollbars and the results pane below
+        // too; `signature_popup` keeps its own 1001, which agrees. Click-through
+        // as a whole, which is safe because neither child has anything to hover
+        // (the squiggle tip's hover is `editor_area`'s — see `diag_tip_view`).
+        stack((signature_popup(comp, ed_vp), diag_tip_view))
+            .style(|s| s.absolute().inset(0.0).z_index(1001))
+            .pointer_events(|| false),
         error_bar,
         guard_bar,
         cmdk_view,
@@ -5470,7 +5742,21 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
     .on_resize(move |rect| {
         area_h.set(rect.height());
         area_w.set(rect.width());
-    });
+    })
+    // The diagnostic tip's hover — `cont`, never `stop`: the editor, the find
+    // bar and everything else under the pointer have already had this event,
+    // and an ancestor that consumed it would take nothing from them but would
+    // be one more listener claiming a move it only watched. The position is in
+    // `editor_area`'s own coords, the ones `diag_hits` are measured in.
+    .on_event_cont(EventListener::PointerMove, move |e| {
+        if let Event::PointerMove(pe) = e {
+            hover_diag(Some(pe.pos));
+        }
+    })
+    // A press starts a selection (the editor then owns every move until the
+    // release) or a click somewhere else entirely; either way the tip is done.
+    .on_event_cont(EventListener::PointerDown, move |_| hover_diag(None))
+    .on_event_cont(EventListener::PointerLeave, move |_| hover_diag(None));
     // The pane no longer pads its contents (so the title can sit flush at the
     // pane edge, matching SCHEMA); the editor's inset moves to this wrapper.
     // Padding the wrapper — not `editor_area` itself — keeps editor_area's
@@ -5976,6 +6262,253 @@ mod geometry_tests {
     /// An unscrolled viewport wide enough that nothing in these fixtures clamps —
     /// the cases that *do* clamp pass their own.
     const VP: Rect = Rect::new(0.0, 0.0, 800.0, 180.0);
+
+    // ── Diagnostic hover ──────────────────────────────────────────────────
+
+    fn hit(x: f64, w: f64, severity: Severity, message: &str) -> DiagHit {
+        DiagHit {
+            x,
+            top: 40.0,
+            w,
+            bottom: 60.0,
+            severity,
+            message: message.to_string(),
+        }
+    }
+
+    #[test]
+    fn the_hover_box_is_exactly_as_wide_as_the_squiggle() {
+        let cx = content_x_of(SQL);
+        let (x, _, w, _) = diag_hit_at(at(36.0), cx, 30, 40, VP).unwrap();
+        let (ux, _, uw) = underline_seg_at(at(36.0), cx, 30, 40, VP).unwrap();
+        assert_eq!((x, w), (ux, uw));
+    }
+
+    #[test]
+    fn the_hover_box_spans_the_line_and_the_wave_below_it() {
+        let cx = content_x_of(SQL);
+        let (_, top, _, bottom) = diag_hit_at(at(36.0), cx, 30, 40, VP).unwrap();
+        let (_, wave_y, _) = underline_seg_at(at(36.0), cx, 30, 40, VP).unwrap();
+        // The line's top, in editor_area coords: its document y plus the pad.
+        assert_eq!(top, 36.0 + EDITOR_PAD_TOP);
+        assert_eq!(bottom, wave_y + WAVE_H);
+        assert!(top < wave_y);
+    }
+
+    #[test]
+    fn the_hover_box_follows_the_scroll() {
+        let cx = content_x_of(SQL);
+        let scrolled = Rect::new(0.0, 100.0, 800.0, 280.0);
+        let (_, top, _, _) = diag_hit_at(at(136.0), cx, 30, 40, scrolled).unwrap();
+        assert_eq!(top, 36.0 + EDITOR_PAD_TOP);
+    }
+
+    #[test]
+    fn nothing_drawn_means_nothing_to_hover() {
+        let cx = content_x_of(SQL);
+        assert_eq!(diag_hit_at(|_| None, cx, 30, 40, VP), None);
+        // Scrolled out sideways: underline_seg_at draws nothing, so neither
+        // does the hover box.
+        let far_right = Rect::new(5000.0, 0.0, 5800.0, 180.0);
+        assert_eq!(underline_seg_at(at(0.0), cx, 30, 40, far_right), None);
+        assert_eq!(diag_hit_at(at(0.0), cx, 30, 40, far_right), None);
+    }
+
+    #[test]
+    fn diag_under_finds_the_squiggle_under_the_pointer() {
+        let hits = [hit(100.0, 50.0, Severity::Error, "unknown table")];
+        let found = diag_under(&hits, Point::new(120.0, 50.0));
+        assert_eq!(found.map(|h| h.message.as_str()), Some("unknown table"));
+    }
+
+    #[test]
+    fn diag_under_misses_beside_above_and_below() {
+        let hits = [hit(100.0, 50.0, Severity::Error, "e")];
+        for p in [
+            Point::new(99.0, 50.0),
+            Point::new(151.0, 50.0),
+            Point::new(120.0, 39.0),
+            Point::new(120.0, 61.0),
+        ] {
+            assert_eq!(diag_under(&hits, p), None, "{p:?}");
+        }
+    }
+
+    #[test]
+    fn diag_under_is_inclusive_left_and_exclusive_right() {
+        let hits = [hit(100.0, 50.0, Severity::Error, "e")];
+        assert!(diag_under(&hits, Point::new(100.0, 50.0)).is_some());
+        assert!(diag_under(&hits, Point::new(150.0, 50.0)).is_none());
+    }
+
+    #[test]
+    fn diag_under_is_none_in_the_gap_between_two_squiggles() {
+        let hits = [
+            hit(100.0, 20.0, Severity::Error, "a"),
+            hit(200.0, 20.0, Severity::Error, "b"),
+        ];
+        assert_eq!(diag_under(&hits, Point::new(150.0, 50.0)), None);
+        assert_eq!(diag_under(&[], Point::new(150.0, 50.0)), None);
+    }
+
+    #[test]
+    fn an_overlapping_error_beats_a_warning() {
+        let hits = [
+            hit(100.0, 20.0, Severity::Warning, "typo?"),
+            hit(90.0, 80.0, Severity::Error, "syntax error"),
+        ];
+        let found = diag_under(&hits, Point::new(110.0, 50.0));
+        assert_eq!(found.map(|h| h.message.as_str()), Some("syntax error"));
+    }
+
+    #[test]
+    fn between_equals_the_narrower_span_wins() {
+        let hits = [
+            hit(90.0, 80.0, Severity::Error, "wide"),
+            hit(100.0, 20.0, Severity::Error, "narrow"),
+        ];
+        let found = diag_under(&hits, Point::new(110.0, 50.0));
+        assert_eq!(found.map(|h| h.message.as_str()), Some("narrow"));
+    }
+
+    /// Where the tip's two edges can reach, whichever edge is pinned: its left
+    /// edge at the least, and its right edge if it grew to `max_w`.
+    fn tip_reach(x: TipX, area_w: f64) -> (f64, f64) {
+        match x {
+            TipX::Left { left, max_w } => (left, left + max_w),
+            TipX::Right { right, max_w } => (area_w - right - max_w, area_w - right),
+        }
+    }
+
+    #[test]
+    fn the_tip_sits_below_a_line_in_the_upper_half() {
+        let h = hit(100.0, 50.0, Severity::Error, "e"); // top 40, bottom 60
+        let (_, at) = diag_tip_place(&h, 800.0, 300.0, 420.0, 240.0);
+        assert_eq!(
+            at,
+            TipAt::Below {
+                top: 60.0 + TIP_GAP
+            }
+        );
+    }
+
+    #[test]
+    fn the_tip_sits_above_a_line_in_the_lower_half() {
+        let mut h = hit(100.0, 50.0, Severity::Error, "e");
+        h.top = 200.0;
+        h.bottom = 220.0;
+        let (_, at) = diag_tip_place(&h, 800.0, 300.0, 420.0, 240.0);
+        assert_eq!(
+            at,
+            TipAt::Above {
+                bottom: 300.0 - 200.0 + TIP_GAP
+            }
+        );
+    }
+
+    /// The reported bug: three errors on one line of a ~640px pane, and every
+    /// tip opened under the first. Sliding the left edge far enough to fit the
+    /// *maximum* width pinned every squiggle right of `area_w - max_w` to the
+    /// same x, whatever its message's real width.
+    #[test]
+    fn each_squiggle_gets_its_tip_under_itself_when_there_is_room() {
+        for x in [60.0, 300.0, 380.0] {
+            let h = hit(x, 50.0, Severity::Error, "e");
+            let (tip, _) = diag_tip_place(&h, 640.0, 300.0, 480.0, 240.0);
+            let TipX::Left { left, max_w } = tip else {
+                panic!("squiggle at {x}: expected a left-pinned tip, got {tip:?}");
+            };
+            assert_eq!(left, x, "squiggle at {x}");
+            // It may grow only as far as the pane's edge.
+            assert_eq!(
+                max_w,
+                480.0_f64.min(640.0 - TIP_EDGE - x),
+                "squiggle at {x}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_squiggle_near_the_right_edge_opens_its_tip_leftward_from_its_end() {
+        let h = hit(700.0, 50.0, Severity::Error, "e"); // ends at 750
+        let (tip, _) = diag_tip_place(&h, 800.0, 300.0, 420.0, 240.0);
+        assert_eq!(
+            tip,
+            TipX::Right {
+                right: 800.0 - 750.0,
+                max_w: 420.0
+            }
+        );
+    }
+
+    #[test]
+    fn exactly_the_minimum_room_still_opens_rightward() {
+        let x = 800.0 - TIP_EDGE - 240.0;
+        let h = hit(x, 50.0, Severity::Error, "e");
+        let (tip, _) = diag_tip_place(&h, 800.0, 300.0, 420.0, 240.0);
+        assert_eq!(
+            tip,
+            TipX::Left {
+                left: x,
+                max_w: 240.0
+            }
+        );
+    }
+
+    #[test]
+    fn a_squiggle_running_past_the_edge_pins_the_tip_at_the_margin() {
+        let h = hit(760.0, 100.0, Severity::Error, "e"); // ends at 860, off the pane
+        let (tip, _) = diag_tip_place(&h, 800.0, 300.0, 420.0, 240.0);
+        assert!(
+            matches!(tip, TipX::Right { right, .. } if right == TIP_EDGE),
+            "{tip:?}"
+        );
+    }
+
+    #[test]
+    fn the_tip_stays_inside_the_pane_margins_wherever_the_squiggle_is() {
+        for area_w in [200.0, 300.0, 640.0, 1200.0] {
+            for x in [0.0, 2.0, 50.0, 150.0, 400.0, 700.0, 1150.0] {
+                if x >= area_w {
+                    continue;
+                }
+                let h = hit(x, 40.0, Severity::Error, "e");
+                let (tip, _) = diag_tip_place(&h, area_w, 300.0, 480.0, 240.0);
+                let (lo, hi) = tip_reach(tip, area_w);
+                assert!(lo >= TIP_EDGE, "{area_w}/{x}: {tip:?}");
+                assert!(hi <= area_w - TIP_EDGE, "{area_w}/{x}: {tip:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn with_too_little_room_either_way_the_tip_takes_the_roomier_side() {
+        // 184px to the right, 32px left of the squiggle's end: flipping would
+        // wrap the message into a 32px column.
+        let h = hit(0.0, 40.0, Severity::Error, "e");
+        let (tip, _) = diag_tip_place(&h, 200.0, 300.0, 480.0, 240.0);
+        assert_eq!(
+            tip,
+            TipX::Left {
+                left: TIP_EDGE,
+                max_w: 200.0 - 2.0 * TIP_EDGE
+            }
+        );
+        // And the mirror image: near the right edge of the same pane.
+        let h = hit(150.0, 40.0, Severity::Error, "e");
+        let (tip, _) = diag_tip_place(&h, 200.0, 300.0, 480.0, 240.0);
+        assert!(matches!(tip, TipX::Right { .. }), "{tip:?}");
+    }
+
+    #[test]
+    fn the_tip_never_starts_left_of_the_edge_margin() {
+        let h = hit(2.0, 50.0, Severity::Error, "e");
+        let (tip, _) = diag_tip_place(&h, 800.0, 300.0, 420.0, 240.0);
+        assert!(
+            matches!(tip, TipX::Left { left, .. } if left == TIP_EDGE),
+            "{tip:?}"
+        );
+    }
 
     // ── The vertical scrollbar's geometry ─────────────────────────────────
 

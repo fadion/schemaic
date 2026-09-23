@@ -14865,7 +14865,42 @@ existing prose was left alone.
     called from the results strip's body). `editor_pane.rs` — SQL editor pane
     (`query_pane` + the Ctrl+K bar, statement highlight, custom scrollbars). `compute_diagnostics`
     bridges the tab's schema/active-db to `intel::diagnostics`; `syntax_view` draws severity-coloured
-    squiggles (red errors / amber typo warnings) with hover tooltips.
+    squiggles (red errors / amber typo warnings).
+    **Hovering a squiggle shows its message, and nothing about the squiggle is hoverable** — a
+    `.tooltip()` on each one never fired and cannot be made to (the *Floem 0.2 gotchas* pointer
+    bullet says why). `editor_area` watches `PointerMove` with `on_event_cont` and hit-tests the
+    position, already in its own coordinates, against `diag_hits`: one `DiagHit` per on-screen
+    diagnostic, whose box is `diag_hit_at`'s — `underline_seg_at`'s x and width, so the pointer finds
+    a message exactly where a wave is drawn and nowhere else, from the line's top down to the wave's
+    bottom. The drawing memo `segs` is *derived* from `diag_hits` and drops the message, so a
+    message-only change still rebuilds nothing drawn and the wave and its hover box are one
+    computation that cannot drift apart; the geometry's two perf rules (`content_x_of` once per list,
+    the document read with `with`, not `get`) moved onto `diag_hits` with their measured comments.
+    `diag_under` settles an overlap —
+    the offline pass and the server's verdict on the same token — error before warning, then the
+    narrower span, inclusive on the left and exclusive on the right. `hover_diag` returns before
+    touching a signal on a move that changes nothing, because every pointer move lands there and a
+    set notifies even when the value is equal; otherwise it records the candidate in `diag_pending`
+    and shows it after `DIAG_TIP_DELAY` — 300 ms, the app-wide `.tooltip()` delay set on
+    `TooltipContainerClass` at the root, so every tip in the app answers at one pace — behind a
+    generation counter read with `try_get_untracked`, since the tab may close inside the delay. It
+    offers nothing while the completion list is open. `PointerDown` and `PointerLeave` retire the
+    tip, and so does an effect on any change of `diag_hits` (a scroll, a new set of diagnostics), of
+    the document, or of `comp.open`. `diag_tip_view` is paint-only, styled with
+    `widgets::tooltip_style` and placed by `diag_tip_place`, below the line in the pane's upper half
+    and above it (`inset_bottom`) in the lower half, so a long message is never cut by the bottom
+    edge. **Horizontally it pins an edge (`TipX`) rather than sliding one**, because the tip's real
+    width is its message's and unknown until layout: its left edge at the squiggle's start, growing
+    rightward up to `DIAG_TIP_MAX_W` (480, scaled) or the pane's edge less `TIP_EDGE`, whichever
+    comes first — or, when less than `DIAG_TIP_MIN_W` (240, scaled) is left that way and the other
+    way has more, its right edge (`inset_right`) at the squiggle's end, growing leftward. The first
+    spelling slid a left edge far enough to fit the *maximum* width, which moved every short message
+    too: in a ~640px pane every squiggle right of ~150px opened its tip at ~150px, under whichever
+    error on the line came first (`each_squiggle_gets_its_tip_under_itself_when_there_is_room`).
+    Tests in `geometry_tests` pin the rest — `the_hover_box_is_exactly_as_wide_as_the_squiggle`
+    holds the hover box to the wave, and
+    `the_tip_stays_inside_the_pane_margins_wherever_the_squiggle_is` sweeps pane widths and squiggle
+    positions for either edge ever reaching past a margin.
     **The Ctrl+K suggestion is not drawn here** — it is phantom rows in the editor's own line flow
     (`inline_diff`, below), and what `cmdk_popup` still draws is the two ends of the block: the
     question bar (sparkle, a `multiline` `edit_field` capped at three rows, then a send affordance or
@@ -15143,6 +15178,17 @@ existing prose was left alone.
     `absolute().inset(0)`, a pane-sized view above the editor that takes pointer events, and it ate
     every click, drag and wheel in the editor for as long as it existed (see the pointer-routing
     gotcha, which states the general form).
+    **The squiggle tip found its slot the other way round**: `signature_popup` and `diag_tip_view`,
+    both paint-only, share one child as `stack((signature_popup(..), diag_tip_view))`,
+    `absolute().inset(0)` and `pointer_events(false)`, so the stack stays at 16. The wrapper carries
+    `z_index(1001)`, the signature hint's own layer: in floem 0.2 `z_index` is not a sibling order
+    but the renderer's paint layer, set when a view paints and inherited by its descendants
+    (`context.rs`'s `save`/`restore` of `z_index`) — the same fact the completion popup's
+    `z_index(1000)` relies on to overhang the results pane — so the wrapper's value reaches the
+    squiggle tip and lifts it over the bars, the scrollbars and the results pane; the hint's own
+    `z_index(1001)` in `completion.rs` agrees and keeps it right wherever it is placed. That is
+    a pane-sized wrapper above the editor — the very shape the previous sentence forbids — and it is
+    harmless only because it is click-through and neither child has anything to hover.
     **`visible_hunk_lines` is a filter, never a clamp.** A line outside the viewport is dropped, not
     pulled to the nearest one — the rule `top_of` already states for a line past the end of the
     document, and for its reason: a band placed against whatever text happens to be at the clamped
@@ -22108,9 +22154,21 @@ Re-introducing the anti-patterns these guard against is a regression:
   first child containing the point whether or not that child consumes it, so two errors twenty lines
   apart would make the rectangle between them dead to selection, scrolling and the caret. It wants
   the loose-siblings remedy stated above, which for this overlay means the strips becoming direct
-  children of `editor_area`'s `stack` — already at its 16-child limit. `erd_view`'s card header is
-  the same lesson where it happens to be easy: the tooltip's owner *is* the small view, so it simply
-  drops the opt-out.
+  children of `editor_area`'s `stack` — already at its 16-child limit, and a varying number of
+  squiggles cannot be fixed tuple slots anyway. `erd_view`'s card header is the same lesson where it
+  happens to be easy: the tooltip's owner *is* the small view, so it simply drops the opt-out.
+  **What shipped makes nothing hoverable instead.** The squiggles stay click-through, and
+  `editor_area` — the ancestor, not an overlay — listens for `PointerMove` with `on_event_cont` and
+  hit-tests the position against the boxes the waves are drawn from (`diag_hits`, see
+  `editor_pane.rs` under *Crates*). It sees every move over the editor because of two facts about
+  dispatch, either of which a tidy-up could break: floem's editor content view takes `PointerMove`
+  with `on_event_cont` too (`floem-0.2.0/src/views/editor/view.rs:1152`), so it never stops the
+  event; and `unconditional_view_event` runs a view's own listeners *after* its child walk when no
+  child reported the event processed (`context.rs:143-168`, then its `PointerMove` arm), so an
+  ancestor hears every move its children let through, in its own coordinates. Keep that listener
+  `cont`: it watches a move the editor has already had and has no business claiming it. The tip it
+  raises is paint-only and shares `signature_popup`'s click-through slot, so where a tooltip would
+  have needed a hit rect this route adds none — nothing can eat a click, a selection or a wheel.
   **A container introduced for layout or arity reasons is a hit target too**, and this is the trap
   rather than any one overlay. `absolute().inset(0)` on a wrapper whose children are small and
   edge-pinned turns a few thin overlays into a single pane-sized one, and nothing about it says so:
@@ -22121,7 +22179,9 @@ Re-introducing the anti-patterns these guard against is a regression:
   arity. They are listed one by one now (exactly 16), with a comment at the site saying never to
   group them. The `stack((editor_box, inline_band_view))` nesting is safe by contrast because it
   wraps the editor *itself* rather than floating above it: the question is never how big the wrapper
-  is, but whether it sits over other interactive views.
+  is, but whether it sits over other interactive views. `stack((signature_popup(..), diag_tip_view))`
+  is an arity wrapper that *does* float over the editor at full pane size, and it is safe only
+  because it is `pointer_events(false)` with nothing to hover beneath it.
 - **A programmatic `cursor` change shows a phantom caret on an *unfocused* editor.** `edit_field`'s
   signal→doc reconcile sets `cursor` to preserve caret position, but floem's internal "reset cursor
   blinking" effect tracks `ed.cursor` → `cursor_info.reset()` → shows + blinks the caret even with no
