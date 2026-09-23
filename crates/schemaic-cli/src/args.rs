@@ -54,10 +54,10 @@ pub enum Command {
         #[arg(long, default_value = "table")]
         format: Format,
         /// Maximum rows to return.
-        #[arg(long, default_value_t = DEFAULT_LIMIT)]
+        #[arg(long, default_value_t = DEFAULT_LIMIT, value_parser = at_least_one_row())]
         limit: usize,
         /// Seconds before the statement is cancelled.
-        #[arg(long, default_value_t = 30)]
+        #[arg(long, default_value_t = 30, value_parser = at_least_one_second())]
         timeout: u64,
     },
     /// Run a statement that writes.
@@ -73,7 +73,7 @@ pub enum Command {
         #[arg(long)]
         yes: bool,
         /// Seconds before the statement is cancelled.
-        #[arg(long, default_value_t = 30)]
+        #[arg(long, default_value_t = 30, value_parser = at_least_one_second())]
         timeout: u64,
     },
 }
@@ -85,7 +85,7 @@ pub struct Target {
     #[arg(short = 'c', long, env = "SCHEMAIC_CONNECTION")]
     pub connection: String,
     /// Database to run in. Defaults to the connection's own.
-    #[arg(short = 'd', long)]
+    #[arg(short = 'd', long, value_parser = non_blank)]
     pub database: Option<String>,
     /// Read the connection's password from stdin instead of the OS keyring.
     ///
@@ -95,6 +95,30 @@ pub struct Target {
     /// there.
     #[arg(long)]
     pub password_stdin: bool,
+}
+
+/// `--database`'s parser: a name, never a blank.
+///
+/// A blank is what `-d "$DB"` sends with `DB` unset, and it is not "no flag":
+/// taken as a name, PostgreSQL connects to the database named after the user,
+/// which is the unscoped landing the exec guard's "no database selected" arm is
+/// there to stop — reached without the guard ever seeing it.
+fn non_blank(s: &str) -> Result<String, String> {
+    if s.trim().is_empty() {
+        Err("the database name is empty; leave out -d to use the connection's own".to_string())
+    } else {
+        Ok(s.to_string())
+    }
+}
+
+/// `--limit`'s parser: zero rows is a typo, not a request.
+fn at_least_one_row() -> clap::builder::RangedU64ValueParser<usize> {
+    clap::builder::RangedU64ValueParser::<usize>::new().range(1..)
+}
+
+/// `--timeout`'s parser: zero seconds cancels every statement before it runs.
+fn at_least_one_second() -> clap::builder::RangedU64ValueParser<u64> {
+    clap::builder::RangedU64ValueParser::<u64>::new().range(1..)
 }
 
 /// Does this argv mean the CLI rather than the app?
@@ -327,6 +351,44 @@ mod tests {
             };
             assert_eq!(target.database.as_deref(), Some("app"));
         }
+    }
+
+    /// **A blank database is refused, not read as "no flag".** `-d "$DB"` with
+    /// `DB` unset arrives as an empty string; taken as a name, PostgreSQL
+    /// connects to the database named after the user — exactly the unscoped
+    /// landing the exec guard's "no database selected" arm exists to stop.
+    #[test]
+    fn a_blank_database_is_refused_at_parse_time() {
+        for blank in ["", "   "] {
+            for sub in ["query", "exec"] {
+                let err =
+                    parse(&["schemaic", sub, "SELECT 1", "-c", "1", "-d", blank]).unwrap_err();
+                assert_eq!(
+                    err.kind(),
+                    clap::error::ErrorKind::ValueValidation,
+                    "{sub} -d {blank:?}"
+                );
+            }
+        }
+    }
+
+    /// A zero timeout cancels every statement before it can run, and a zero
+    /// limit asks for no rows; both are typos, not requests.
+    #[test]
+    fn a_zero_timeout_or_limit_is_refused() {
+        for args in [
+            ["schemaic", "query", "SELECT 1", "-c", "1", "--timeout", "0"],
+            ["schemaic", "exec", "SELECT 1", "-c", "1", "--timeout", "0"],
+            ["schemaic", "query", "SELECT 1", "-c", "1", "--limit", "0"],
+        ] {
+            let err = parse(&args).unwrap_err();
+            assert_eq!(
+                err.kind(),
+                clap::error::ErrorKind::ValueValidation,
+                "{args:?}"
+            );
+        }
+        assert!(parse(&["schemaic", "query", "SELECT 1", "-c", "1", "--limit", "1"]).is_ok());
     }
 
     /// `help` has to work as a subcommand, because that is what someone

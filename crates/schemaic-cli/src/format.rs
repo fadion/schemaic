@@ -139,6 +139,22 @@ pub fn truncation_warning(rs: &ResultSet, format: Format) -> Option<String> {
     ))
 }
 
+/// What `exec` says on **stderr** when a statement returned more rows than it
+/// prints — `UPDATE … RETURNING`, a `CALL` that selects.
+///
+/// Every format, the table's included: its in-band footer says "more were
+/// available", which is true and still misleading, because what a reader needs
+/// to know about a write is that the cap applied to the *display* and not to the
+/// statement. And no `--limit` advice — `exec` has no such flag.
+pub fn exec_truncation_warning(rs: &ResultSet) -> Option<String> {
+    rs.truncated.then(|| {
+        format!(
+            "warning: only the first {} returned rows are shown; the statement itself ran in full.",
+            rs.row_count()
+        )
+    })
+}
+
 /// What a write reports: how many rows it changed.
 ///
 /// A purpose-built shape rather than a row renderer, because there are no rows
@@ -294,6 +310,22 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&out).unwrap();
         assert_eq!(v.as_array().unwrap().len(), 2, "rows only, no envelope");
         assert!(!render_rows(&capped, Format::Csv).contains("capped"));
+    }
+
+    /// **An `exec` that returned more rows than it shows must say so — and must
+    /// say the statement ran in full.** `UPDATE … RETURNING` over a thousand
+    /// rows printed one of them and nothing else, which reads as a one-row
+    /// update. `exec` has no `--limit`, so the query's advice to raise it would
+    /// point at a flag that isn't there.
+    #[test]
+    fn a_capped_exec_result_warns_that_the_statement_still_ran_in_full() {
+        let mut capped = rs();
+        capped.truncated = true;
+        let warning = exec_truncation_warning(&capped).expect("a capped exec warns");
+        assert!(warning.contains("first 2"), "{warning}");
+        assert!(warning.contains("ran in full"), "{warning}");
+        assert!(!warning.contains("--limit"), "{warning}");
+        assert!(exec_truncation_warning(&rs()).is_none());
     }
 
     #[test]

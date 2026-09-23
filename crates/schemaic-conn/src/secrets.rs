@@ -12,8 +12,9 @@
 use std::sync::{Mutex, OnceLock};
 
 use keyring::Entry;
+use schemaic_core::connection::Connection;
 use schemaic_core::persist::{self, ConnectionsFile, Saving};
-use schemaic_core::secrets::{self, Hydration, SecretStore, StoreError};
+use schemaic_core::secrets::{self, Hydration, SecretKind, SecretStore, StoreError};
 
 /// Keyring service name under which all of Schemaic's secrets are grouped; the
 /// per-secret account string comes from [`schemaic_core::secrets::account`].
@@ -132,11 +133,11 @@ pub fn load_connections() -> ConnectionsFile {
 /// about to save its own copy is how a connection list gets lost — and a
 /// migration is not something to perform as a side effect of `schemaic list`.
 ///
-/// So this hydrates from the keyring and **reports instead of repairing**: the
-/// returned notices are what the caller puts on stderr. Everything still works
-/// against an unmigrated file, because the plaintext it carries hydrates the
-/// connection just as a keyring entry would; it simply stays plaintext until
-/// the app is next opened.
+/// So this **reads without hydrating**, and [`hydrate_for_cli`] fills in the
+/// one connection the command runs against, reporting instead of repairing.
+/// Everything still works against an unmigrated file, because the plaintext it
+/// carries hydrates the connection just as a keyring entry would; it simply
+/// stays plaintext until the app is next opened.
 ///
 /// It deliberately does not touch `last_hydration` either — that exists to stop
 /// a later *save* deleting a secret it could not read, and there is no later
@@ -148,21 +149,30 @@ pub fn load_connections() -> ConnectionsFile {
 /// a save in flight looks like — and renames an unparseable primary to
 /// `.corrupt`. An unparseable file is returned as an `Err` here for the caller
 /// to report; repairing it is the app's job.
-pub fn load_connections_readonly() -> Result<(ConnectionsFile, Vec<String>), String> {
-    let mut file = persist::read_connections_unrecovered()?;
-    let hydration = secrets::hydrate_file(&mut file, &KeyringStore);
+pub fn load_connections_readonly() -> Result<ConnectionsFile, String> {
+    persist::read_connections_unrecovered()
+}
+
+/// Fill `conn`'s secrets from the keyring — **only this connection's**, and not
+/// the kinds in `supplied` — returning what the caller puts on stderr.
+///
+/// One connection because a command runs against one: reading every saved
+/// connection's secrets was a keyring round trip per secret it would never use,
+/// and a locked keyring then reported all of them in the app's own wording.
+pub fn hydrate_for_cli(conn: &mut Connection, supplied: &[SecretKind]) -> Vec<String> {
+    let hydration = secrets::hydrate_connection(conn, &KeyringStore, supplied);
     let mut notices = Vec::new();
-    if let Some(notice) = hydration.notice() {
+    if let Some(notice) = hydration.cli_notice() {
         notices.push(notice);
     }
     if hydration.needs_resave {
         notices.push(
-            "some connection secrets are still stored as plaintext in connections.json; \
+            "this connection's secrets are still stored as plaintext in connections.json; \
              open Schemaic once to move them into the OS keyring"
                 .to_string(),
         );
     }
-    Ok((file, notices))
+    notices
 }
 
 /// Persist saved connections with their secrets stored in the keyring; the JSON

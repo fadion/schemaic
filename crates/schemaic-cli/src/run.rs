@@ -8,12 +8,13 @@
 //!
 //! The exit code is the other half of that contract: see [`Exit`].
 
-use std::io::Read;
+use std::io::{IsTerminal, Read};
 use std::process::ExitCode;
 use std::time::Duration;
 
 use schemaic_core::connection::Connection;
 use schemaic_core::model::{Column, ResultSet, Value};
+use schemaic_core::secrets::SecretKind;
 use schemaic_db::Db;
 
 use crate::args::{Cli, Command, Target};
@@ -89,7 +90,9 @@ where
 }
 
 async fn dispatch(command: Command) -> Exit {
-    let (file, notices) = match schemaic_conn::secrets::load_connections_readonly() {
+    // Unhydrated: `list` shows no secret, and `open` fills in only the one
+    // connection a command runs against.
+    let file = match schemaic_conn::secrets::load_connections_readonly() {
         Ok(v) => v,
         Err(e) => {
             // Reported, never repaired: moving the file aside is the app's
@@ -100,9 +103,6 @@ async fn dispatch(command: Command) -> Exit {
             return Exit::Failed;
         }
     };
-    for notice in &notices {
-        warn(notice);
-    }
     match command {
         Command::List { all, format } => list(&file.connections, all, format),
         Command::Query {
@@ -231,15 +231,44 @@ async fn open<'a>(
             });
         }
     };
-    let mut conn = conn.clone();
-    if target.password_stdin {
+    // Read before the keyring is touched, so a refused terminal is refused
+    // before anything else is said about the connection.
+    let piped = if target.password_stdin {
+        // **A terminal is refused, not prompted.** `read_to_string` on one
+        // waits for an EOF nobody knows to type, so the command just hung — and
+        // a prompt would echo the password onto the screen. The flag is for a
+        // pipe; say so.
+        if std::io::stdin().is_terminal() {
+            warn(
+                "--password-stdin reads the password from a pipe, and stdin is a terminal; \
+                 pipe it in (e.g. `printf '%s' \"$PASSWORD\" | schemaic …`), or leave the \
+                 flag out to use the OS keyring",
+            );
+            return Err(Exit::Usage);
+        }
         let mut password = String::new();
         if let Err(e) = std::io::stdin().read_to_string(&mut password) {
             warn(&format!("could not read the password from stdin: {e}"));
             return Err(Exit::Usage);
         }
         // A password typed or piped in arrives with the newline that ended it.
-        conn.password = password.trim_end_matches(['\r', '\n']).to_string();
+        Some(password.trim_end_matches(['\r', '\n']).to_string())
+    } else {
+        None
+    };
+    let mut conn = conn.clone();
+    // The password `--password-stdin` supplies is not asked of the keyring at
+    // all, so a locked one has nothing to report about it.
+    let supplied: &[SecretKind] = if piped.is_some() {
+        &[SecretKind::DbPassword]
+    } else {
+        &[]
+    };
+    for notice in schemaic_conn::secrets::hydrate_for_cli(&mut conn, supplied) {
+        warn(&notice);
+    }
+    if let Some(password) = piped {
+        conn.password = password;
     }
     let tunnel = if conn.ssh.enabled {
         match schemaic_db::ssh::open_tunnel(&conn.ssh, &conn.host, conn.port).await {
@@ -318,13 +347,18 @@ async fn run_exec(
             return Exit::Refused;
         }
     };
-    match exec::run(&db, database.as_deref(), request, 1, timeout).await {
+    match exec::run(&db, database.as_deref(), request, timeout).await {
         Ok(rs) => {
             // A write reports what it changed; a statement that happened to
             // return rows through `exec` reports those instead.
             match rs.affected {
                 Some(n) => print!("{}", format::render_affected(n, format)),
-                None => print!("{}", format::render_rows(&rs, format)),
+                None => {
+                    print!("{}", format::render_rows(&rs, format));
+                    if let Some(w) = format::exec_truncation_warning(&rs) {
+                        warn(&w);
+                    }
+                }
             }
             Exit::Ok
         }

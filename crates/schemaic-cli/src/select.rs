@@ -16,7 +16,12 @@ pub enum NoConnection {
     /// The string names more than one saved connection. Refused rather than
     /// resolved by some tie-break, because the tie-break is invisible in a
     /// script and the two candidates may be a staging box and a production one.
-    Ambiguous { want: String, matches: Vec<String> },
+    /// `matches` is each candidate's `(id, name)` — the id because it is what
+    /// the message tells the reader to use instead.
+    Ambiguous {
+        want: String,
+        matches: Vec<(u64, String)>,
+    },
     /// Found, but the user has not granted it to the CLI.
     ///
     /// Distinct from [`NoConnection::Unknown`] on purpose: "you have not
@@ -35,7 +40,11 @@ impl NoConnection {
             NoConnection::Ambiguous { want, matches } => format!(
                 "'{want}' names {} connections ({}); use the id instead",
                 matches.len(),
-                matches.join(", ")
+                matches
+                    .iter()
+                    .map(|(id, name)| format!("{id}: {name}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
             ),
             NoConnection::NotExposed(name) => format!(
                 "connection '{name}' is not available to the CLI; \
@@ -81,7 +90,7 @@ pub fn select<'a>(conns: &'a [Connection], want: &str) -> Result<&'a Connection,
         }
         many => Err(NoConnection::Ambiguous {
             want: want.to_string(),
-            matches: many.iter().map(|c| c.name.clone()).collect(),
+            matches: many.iter().map(|c| (c.id, c.name.clone())).collect(),
         }),
     }
 }
@@ -168,6 +177,16 @@ mod tests {
         let err = select(&cs, "backup").unwrap_err();
         assert!(matches!(err, NoConnection::Ambiguous { .. }));
         assert!(err.message().contains("use the id instead"));
+    }
+
+    /// "Use the id instead" is only an instruction if the message says what the
+    /// ids are — otherwise the reader has to run `list --all` to follow it.
+    #[test]
+    fn an_ambiguous_name_lists_each_candidates_id() {
+        let cs = [conn(4, "backup", true), conn(9, "Backup", false)];
+        let message = select(&cs, "backup").unwrap_err().message();
+        assert!(message.contains("4: backup"), "{message}");
+        assert!(message.contains("9: Backup"), "{message}");
     }
 
     /// **Ambiguity is judged before the gate, over every saved connection.**

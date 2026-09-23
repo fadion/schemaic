@@ -123,18 +123,29 @@ impl ExecRequest {
     }
 }
 
+/// How many of the rows a write **returns** `exec` keeps — `UPDATE …
+/// RETURNING`, a `CALL` that selects. The cap is on what is printed, never on
+/// the statement: each engine's row loop stops reading at the cap and leaves the
+/// statement to finish.
+///
+/// It was `1`, passed at the call site, so a thousand-row `RETURNING` printed
+/// one row and no warning. It is the query's default now, and it lives here
+/// rather than as a parameter so the call site cannot choose it again.
+const RETURNED_ROW_CAP: usize = crate::args::DEFAULT_LIMIT;
+
 /// Run an approved write. Returns the result the engine gave back — for a DML
-/// statement that is a row count in [`ResultSet::affected`].
+/// statement that is a row count in [`ResultSet::affected`]; for one that
+/// returns rows, up to [`RETURNED_ROW_CAP`] of them, `truncated` if there were
+/// more.
 pub async fn run(
     db: &Db,
     database: Option<&str>,
     request: ExecRequest,
-    row_cap: usize,
     timeout: Duration,
 ) -> Result<ResultSet, NoRows> {
     let token = CancellationToken::new();
     match crate::deadline::with_deadline(
-        db.fetch_query(database, request.sql(), row_cap, token.clone()),
+        db.fetch_query(database, request.sql(), RETURNED_ROW_CAP, token.clone()),
         token,
         timeout,
     )

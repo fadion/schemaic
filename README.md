@@ -191,17 +191,25 @@ saved before this existed, because the command line runs with nobody watching.
 `schemaic list --all` shows the ones that are not exposed and why.
 
 `query` runs reads and nothing else — not a flag away from a write, a different
-subcommand. `exec` is the one that writes, it refuses outright on a connection
-marked read-only, and it asks before running something the guard flags, such as
-a `DELETE` with no `WHERE`. Output is `table`, `json`, `jsonl` or `csv`; rows go
-to stdout and everything else to stderr, so a pipe gets only data. It exits `0`
-on success, `2` on a usage error, `3` when a guard refused and `4` when the
-server did.
+subcommand. It returns 200 rows unless you raise `--limit`, and says so when it
+stopped short. `exec` is the one that writes: it refuses outright on a
+connection marked read-only, and it refuses something the guard flags — such as
+a `DELETE` with no `WHERE` — until you pass `--yes`, which answers that question
+and cannot unlock a read-only connection. Output is `table`, `json`, `jsonl` or
+`csv`; rows go to stdout and everything else to stderr, so a pipe gets only
+data. It exits `0` on success, `2` on a usage error, `3` when a guard refused
+and `4` when the server did.
 
-On Linux the `.deb` and `.rpm` put `schemaic` on your `PATH` already. Elsewhere
-it lives next to the app for now — on Windows as `schemaic.com` beside
-`schemaic.exe`, which is what lets typing `schemaic` reach the command line
-while shortcuts still open the app.
+Where there is no keyring to read — an SSH session, a container — pipe the
+password in with `--password-stdin` instead.
+
+On Linux the `.deb` and `.rpm` put `schemaic` on your `PATH` already. Elsewhere,
+**Settings → General → Command line → Install** does it: on Windows it adds the
+app's folder, where `schemaic.com` sits beside `schemaic.exe`, to your user
+`PATH` — which is what lets typing `schemaic` reach the command line while
+shortcuts still open the app — and on macOS or with an AppImage it links
+`~/.local/bin/schemaic` to the app. **Remove** undoes it, and on Windows
+uninstalling does too.
 
 ## Install
 

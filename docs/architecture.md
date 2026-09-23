@@ -6392,6 +6392,12 @@ existing prose was left alone.
     `Hydration::notice` is the read-side sentence and both halves of it are load-bearing:
     *unavailable this session* is why the connections stopped working, *were not deleted* is what
     stops the user retyping a half-remembered password over a stored one that is perfectly intact.
+    `Hydration::cli_notice` is the same fact for the headless CLI's stderr — plain text, the
+    unreadable kinds named, and `--password-stdin` offered only when the database password is
+    among them, since it supplies nothing else
+    (`the_cli_notice_does_not_offer_stdin_for_an_ssh_secret`); `hydrate_connection` is the CLI's
+    load, one connection and none of the kinds its caller `supplied`
+    (`hydrating_one_connection_skips_what_the_caller_supplied`).
     `Sanitized { file, in_the_clear, undeleted }` is the write-side counterpart — the sanitized file
     plus the two facts the save established, which used to be discarded at the only call site — and
     its `notice()` names the consequence rather than the mechanism: *your passwords are in a file
@@ -7895,9 +7901,15 @@ existing prose was left alone.
     legacy plaintext is migrated into the keyring and the on-disk copy rewritten blanked — which a
     one-shot `schemaic query` must not do as a side effect while the GUI may be running and about to
     save its own copy. So it reads through `persist::read_connections_unrecovered` (for that
-    function's own reasons), hydrates from the keyring, and hands back
-    `(ConnectionsFile, Vec<String>)`: the strings are what the caller puts on stderr, one of them
-    saying the file is still unmigrated and to open Schemaic once. It never touches
+    function's own reasons) and hands back the `ConnectionsFile` **unhydrated** — `list` shows no
+    secret — and `hydrate_for_cli(conn, supplied)` fills in only the one connection a command runs
+    against, through `core::secrets::hydrate_connection`, returning the strings the caller puts on
+    stderr: `Hydration::cli_notice`, and one saying this connection's secrets are still plaintext
+    in `connections.json` and to open Schemaic once. It used to hydrate every saved connection —
+    a keyring round trip per secret the command would never use — and a locked keyring then
+    reported all of them in the app's Markdown `notice`, which tells the user to leave form fields
+    blank. `supplied` is what the caller got another way, `DbPassword` under `--password-stdin`,
+    and the keyring is not asked for it at all. It never touches
     `last_hydration`, which exists to stop a later *save* deleting a secret it could not read, and
     there is no later save here. An unmigrated file still works — the plaintext it carries hydrates
     a connection exactly as a keyring entry would — it simply stays plaintext.
@@ -19264,11 +19276,20 @@ existing prose was left alone.
     is **200, deliberately small**: the GUI's row cap is about what a grid can hold, this one is
     about what a caller can sensibly receive down a pipe, and the caller is very often a language
     model with a context window; a person who wants the whole table says so with `--limit`.
+    `--limit` and `--timeout` refuse `0` at parse time — zero rows is a typo and zero seconds
+    cancels every statement before it runs — and `-d` goes through `non_blank`, because a blank is
+    what `-d "$DB"` sends with `DB` unset and it is not "no flag": PostgreSQL took it as a name and
+    connected to the database named after the user, the unscoped landing the exec guard's
+    no-database arm exists to stop, reached without the guard seeing it
+    (`a_blank_database_is_refused_at_parse_time`, `a_zero_timeout_or_limit_is_refused`).
     `--yes` exists on `exec` and **must not** exist on `query` — a read has nothing to consent to,
     and accepting the flag there would teach the habit of passing it everywhere
     (`query_has_no_yes_flag`). `--password-stdin` is for the headless case the keyring cannot serve:
     Linux's Secret Service needs an unlocked desktop collection, which an SSH session or a container
-    does not have, and without it the CLI would simply be unusable there.
+    does not have, and without it the CLI would simply be unusable there. It reads a pipe and
+    nothing else: `run.rs` refuses it as a usage error when stdin is a terminal, where
+    `read_to_string` waited for an EOF nobody knew to type and the command simply hung — and does
+    not prompt instead, because a prompt would echo the password.
     **`wants_cli` is the routing predicate, and it is an allowlist of the *first* argument rather
     than "are there any arguments".** This binary is re-invoked with argv by things that are not the
     CLI — the Velopack installer and updater (`--veloapp-install`, `--veloapp-updated`,
@@ -19288,7 +19309,9 @@ existing prose was left alone.
     saved connection, including the ones the CLI cannot use**, so that turning CLI access on for a
     second connection later cannot silently repoint an existing script at it
     (`ambiguity_counts_connections_the_cli_cannot_use`); two matches are refused rather than
-    tie-broken, the pair being as likely to be staging and production as duplicates. `NoConnection`
+    tie-broken, the pair being as likely to be staging and production as duplicates, and the
+    refusal lists every candidate as `id: name`, the id being what it tells the reader to use
+    instead. `NoConnection`
     keeps `Unknown` and `NotExposed` apart because the two sentences send the reader to different
     places — "you have not enabled this one" is an instruction, "no such connection" sends them
     hunting for a typo they will not find — and `run.rs` gives them different exit codes for the
@@ -19325,6 +19348,10 @@ existing prose was left alone.
     the unbounded write it would then also wave through. A read through `exec` is allowed and merely
     pointless, because refusing it would need `exec` to grow a second gate deciding what a read is.
     `run` bounds the statement through `deadline::with_deadline`, the same wrapper `query` uses.
+    **It takes no row cap**: `RETURNED_ROW_CAP` is private and is `args::DEFAULT_LIMIT`, because the
+    `1` `run.rs` used to pass printed one row of a thousand-row `UPDATE … RETURNING` with no warning,
+    and a parameter would let a call site choose it again. The cap is on what is printed, never on
+    the statement — each engine's row loop stops reading and leaves the statement to finish.
   - `cli/deadline.rs` — one deadline, for every database read the headless front ends make.
     `with_deadline(fut, token, timeout)` awaits `fut` for at most `timeout` and, on expiry, cancels
     the token and **waits for the future to finish unwinding**. That last part is the whole reason
@@ -19363,7 +19390,11 @@ existing prose was left alone.
     object in it or a CSV with a comment row is worse for every consumer than a clean stream plus a
     line on stderr, which is what `truncation_warning` is for
     (`a_capped_result_is_reported_in_band_for_table_and_on_stderr_otherwise` pins that it is said in
-    exactly one place). `newline_terminated` is the one thing this module adds to core's output —
+    exactly one place). **`exec_truncation_warning` is the exception, on stderr in every format,
+    `table` included**: the footer's "more were available" is true and still misleading about a
+    write, where what the reader needs is that the cap applied to the display and the statement ran
+    in full — and it offers no `--limit`, which `exec` does not have
+    (`a_capped_exec_result_warns_that_the_statement_still_ran_in_full`). `newline_terminated` is the one thing this module adds to core's output —
     `export` writes for *files*, where a trailing newline is noise, and a terminal wants one or the
     next shell prompt lands on the last line of the data — and an empty rendering stays empty, since
     a lone newline is not nothing to a reader counting lines. `render_affected` is purpose-built

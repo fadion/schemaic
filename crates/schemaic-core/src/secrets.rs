@@ -222,6 +222,43 @@ impl Hydration {
         ))
     }
 
+    /// [`Hydration::notice`] for the headless CLI's stderr: plain text, the
+    /// secrets named, and the one way round a locked keyring the command line
+    /// has — which is offered only when it would help, since `--password-stdin`
+    /// supplies the database password and nothing else.
+    pub fn cli_notice(&self) -> Option<String> {
+        if !self.any_unreadable() {
+            return None;
+        }
+        let names: Vec<&str> = SecretKind::ALL
+            .into_iter()
+            .filter(|&k| self.unreadable.iter().any(|&(_, u)| u == k))
+            .map(|k| match k {
+                SecretKind::DbPassword => "database password",
+                SecretKind::SshPassword => "SSH password",
+                SecretKind::SshPassphrase => "SSH key passphrase",
+            })
+            .collect();
+        let reason = match &self.error {
+            Some(e) => format!(" ({e})"),
+            None => String::new(),
+        };
+        let way_round = if self
+            .unreadable
+            .iter()
+            .any(|&(_, k)| k == SecretKind::DbPassword)
+        {
+            "; unlock the keyring, or pipe the password in with --password-stdin"
+        } else {
+            "; unlock the keyring and try again"
+        };
+        Some(format!(
+            "could not read the connection's {} from the OS keyring{reason}; \
+             nothing was deleted{way_round}",
+            names.join(" and ")
+        ))
+    }
+
     /// Drop the entries `file` has since supplied a value for.
     ///
     /// Call after a save. Once a field is non-empty the save has written it to
@@ -271,7 +308,17 @@ impl Hydration {
 /// from the keyring when an entry exists, and recorded in `out.unreadable` when
 /// the read fails.
 fn hydrate(conn: &mut Connection, store: &dyn SecretStore, out: &mut Hydration) {
-    for kind in SecretKind::ALL {
+    hydrate_kinds(conn, store, out, &[]);
+}
+
+/// [`hydrate`], leaving out the kinds in `skip`.
+fn hydrate_kinds(
+    conn: &mut Connection,
+    store: &dyn SecretStore,
+    out: &mut Hydration,
+    skip: &[SecretKind],
+) {
+    for kind in SecretKind::ALL.into_iter().filter(|k| !skip.contains(k)) {
         if field(conn, kind).is_empty() {
             match store.get(&account(conn.id, kind)) {
                 Ok(Some(v)) => {
@@ -299,6 +346,25 @@ fn hydrate(conn: &mut Connection, store: &dyn SecretStore, out: &mut Hydration) 
             out.needs_resave = true;
         }
     }
+}
+
+/// Hydrate **one** connection, leaving out the kinds in `supplied` — the
+/// headless CLI's load.
+///
+/// The app hydrates the whole file because it may show any connection; a
+/// command runs against one, and reading every other connection's secrets was
+/// a keyring round trip (and on macOS, potentially a keychain prompt) per
+/// secret it would never use. `supplied` is what the caller got another way —
+/// `--password-stdin` — which is not read at all, so a locked keyring cannot
+/// report it unreadable.
+pub fn hydrate_connection(
+    conn: &mut Connection,
+    store: &dyn SecretStore,
+    supplied: &[SecretKind],
+) -> Hydration {
+    let mut out = Hydration::default();
+    hydrate_kinds(conn, store, &mut out, supplied);
+    out
 }
 
 /// Hydrate every connection in the file (see [`hydrate`]).
@@ -644,6 +710,59 @@ mod tests {
         let mut out = Hydration::default();
         hydrate(c, store, &mut out);
         out
+    }
+
+    /// **The CLI asks the keyring only for what it will use.** A secret the
+    /// caller already has — `--password-stdin` — is not read, so a locked
+    /// keyring cannot report it unreadable and a macOS keychain has no item to
+    /// prompt for.
+    #[test]
+    fn hydrating_one_connection_skips_what_the_caller_supplied() {
+        let store = MemStore::unavailable();
+        let mut c = conn(3);
+        let out = hydrate_connection(&mut c, &store, &[SecretKind::DbPassword]);
+        assert!(!out.is_unreadable(3, SecretKind::DbPassword));
+        assert!(out.is_unreadable(3, SecretKind::SshPassword));
+    }
+
+    #[test]
+    fn hydrating_one_connection_fills_it_from_the_store() {
+        let store = MemStore::seeded(&[("conn.3.password", "s3cret")]);
+        let mut c = conn(3);
+        let out = hydrate_connection(&mut c, &store, &[]);
+        assert_eq!(c.password, "s3cret");
+        assert!(out.cli_notice().is_none());
+    }
+
+    /// **The CLI's wording, not the app's.** The app's notice is Markdown and
+    /// talks about leaving form fields blank; on stderr that is `**not**` and
+    /// advice about a form the reader is not looking at. This one names the
+    /// secret and the way round it.
+    #[test]
+    fn the_cli_notice_names_the_secret_and_the_way_round_it() {
+        let store = MemStore::unavailable();
+        let mut c = conn(3);
+        let notice = hydrate_connection(&mut c, &store, &[])
+            .cli_notice()
+            .expect("a locked keyring is reported");
+        assert!(notice.contains("database password"), "{notice}");
+        assert!(notice.contains("keyring locked"), "{notice}");
+        assert!(notice.contains("--password-stdin"), "{notice}");
+        assert!(!notice.contains("**"), "no Markdown on stderr: {notice}");
+        assert!(!notice.contains("field"), "no form advice: {notice}");
+    }
+
+    /// Only an SSH secret unreadable: `--password-stdin` supplies the database
+    /// password and cannot help, so it is not offered.
+    #[test]
+    fn the_cli_notice_does_not_offer_stdin_for_an_ssh_secret() {
+        let store = MemStore::unavailable();
+        let mut c = conn(3);
+        let notice = hydrate_connection(&mut c, &store, &[SecretKind::DbPassword])
+            .cli_notice()
+            .expect("the SSH secrets are still unreadable");
+        assert!(notice.contains("SSH"), "{notice}");
+        assert!(!notice.contains("--password-stdin"), "{notice}");
     }
 
     #[test]
