@@ -12224,7 +12224,8 @@ existing prose was left alone.
     at `line_h + chat_pad_v() * 2 + 3`, which is 34px against this 26. The grid's find bar shipped
     without it and stood 8px taller than the identical editor bar beside it, so a bar that means
     to be compact says so with this metric and never with a literal.
-  - `widgets.rs` — reusable widgets: `menu_panel`/`MenuEntry`, `modal_title`/`panel_style`/
+  - `widgets.rs` — reusable widgets: `menu_panel`/`MenuEntry`, `keycap`/`keycap_width` (the one
+    keycap, drawn by the palette and the menus alike), `modal_title`/`panel_style`/
     `menu_item_style`, `window_size`, `autohide`/`shift_hscroll`/`wheel_hscroll` scroll wrappers,
     `check_box` — **the app's one checkbox**, drawn by every multi-select list there is (the import
     review list and the dump modal's table picker), so a picker cannot quietly grow a second look;
@@ -12905,6 +12906,15 @@ existing prose was left alone.
     other half — that each name still names a live command — can only be checked against a built
     registry, so it rides `overlays::assert_names_match_labels`' `debug_assert`, without which a
     renamed command would drop its keycap in silence.
+    `MenuKey` is the third: the context menus' half of `COMMAND_KEYS`, held to the same rule (which
+    entries earn one is under *Popup menus*). It is an **enum rather than a string**, so a menu
+    cannot name an entry that is not there, and `MenuKey::row` names its `SHORTCUTS` row by group,
+    keys **and description** — stronger than `COMMAND_KEYS`' group-and-keys, so a row reworded
+    under it fails the test rather than going on vouching for the keycap. `keys()` hands it out through `keys_label`, so it is
+    respelled for macOS like the rest. `every_menu_key_is_the_shortcut_row_it_names` checks each
+    variant, walking `menu_keys_all()`, which sits beside an exhaustive `_exhaustive` match so a
+    new variant fails to compile until it is listed — a list the test walks is only as good as its
+    completeness. Palette and menus draw one keycap, `widgets::keycap`.
     **The primary modifier is asked for, never spelled at the use site.** The modal said `Ctrl+…`
     everywhere, and simply relabelling it for macOS would have been worse than the wrong word: the
     grid and the terminal already took `.control() || .meta()`, but the editor pane, the ER diagram,
@@ -24315,6 +24325,28 @@ renders the themed panel; the caller positions it absolutely. Used by the schema
   never where — so being off costs at worst a flip that wasn't needed, never a gap between the row
   and its submenu, and never an open-then-measure-then-move flicker. Same for the vertical: a panel
   that won't fit below the row pins its bottom to the window's, with no height arithmetic at all.
+- **A keycap only where the key and the click are the same act on the same thing**
+  (`MenuEntry::shortcut`, which takes a `shortcuts::MenuKey` — see `shortcuts.rs` under *Crates*).
+  It is the palette's rule, for the palette's reason: a nearly-right keycap teaches a key that does
+  something else. So the gutter menu's Copy wears Ctrl+C and the cell menu's Paste Ctrl+V (both land
+  on the selection, as the keys do), but the cell menu's Copy wears Ctrl+C only when its `CopyScope`
+  is `Selection` — the `Cell` scope copies the one raw value, which the key does not promise — and
+  the gutter menu's Delete/Undo delete wears Del only when the right-clicked row is inside the
+  selection, since outside it the menu acts on the clicked row alone while Del marks the selection.
+  The cell menu's single-row *Delete row* wears none, and neither does the editor's *Ask AI*, which
+  acts on the right-clicked statement where Ctrl+K takes the caret or selection; the editor's
+  *Format* wears Ctrl+Alt+L, being the same `format_editor` call. The builder is a no-op on
+  `Sub`/`Separator` — a submenu row's trailing slot is its chevron
+  (`a_shortcut_lands_on_an_action_and_nowhere_else`). `menu_row` draws the keycap after the same
+  flex spacer (floor `MENU_SUB_SPACER`) a chevron uses; it is one line and shorter than the label,
+  so it costs width and no height, and `menu_panel_width` adds the spacer, two `MENU_KID_GAP`s and
+  `keycap_width` *beside* the label-and-detail column, to whichever of those two lines is wider. A
+  width that forgot it clips the keycap at the panel's right edge — the one place a flip was
+  computed to keep it — which `a_shortcut_widens_its_row_by_at_least_its_keycap` pins (seen red
+  with the term zeroed). The keycap is `widgets::keycap`, the palette's extracted so the app has
+  one; `keycap_width` measures it in the mono face at `font_label()` plus `KEYCAP_PAD_H`, the very
+  constant `keycap` pads with, so the drawn and the measured cannot disagree. Its `tint` is applied
+  to both colours, which is how a disabled row (or a faded palette row) dims its keycap with it.
 - **Two menu channels**: the schema tree uses `ui.context_menu` (typed `CtxMenu`) +
   `context_menu_overlay`; everything else uses the generic `ui.popup_menu`
   (`RwSignal<Option<Vec<MenuEntry>>>`) + `popup_menu_overlay`. Both overlays live at the workspace
@@ -25151,6 +25183,10 @@ this bundle's.
   menu, because `menu_panel` calls `close` after the action whatever the action did. `alive` is
   passed as a closure so the composition can be tested without a window: a `GridState` cannot be
   built in a `#[test]`, while a disposed `Scope` holding one signal reproduces the identical hazard.
+  It replaces the action (and recurses into a submenu's children) **in place**, rather than
+  rebuilding each entry field by field, so a field added to `MenuEntry` rides through without being
+  named here; the keycap's `shortcut` is the first to rely on it
+  (`the_guard_keeps_everything_but_the_action`).
   `popup_channel_gate` keeps the door the only one, matching on the single whitespace-stripped write
   `open_menu` makes — rustfmt wraps it across two lines, and a line-based scan would find no write
   at all and pass while every installer went round it.

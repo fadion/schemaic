@@ -198,6 +198,46 @@ pub(crate) fn command_keys(name: &str) -> Option<Cow<'static, str>> {
         .map(|(_, _, k)| keys_label(k))
 }
 
+/// A context-menu entry that does **exactly** what a key does — the menus'
+/// half of [`COMMAND_KEYS`], and held to the same rule: a nearly-right keycap
+/// teaches a key that does something else, so an entry gets one only when the
+/// key and the click are the same act on the same thing. The grid cell menu's
+/// *Delete row* toggles that one row while Del marks the whole selection, so it
+/// has none; the gutter menu's *Delete* acts on the selection as Del does, so
+/// it has one.
+///
+/// An enum rather than a string key, so a menu cannot name an entry that is not
+/// here; `tests::every_menu_key_is_the_shortcut_row_it_names` holds each one to
+/// its `SHORTCUTS` row.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MenuKey {
+    /// The grid's cell and gutter *Copy*: the selection, as Ctrl+C copies it.
+    GridCopy,
+    /// The grid cell menu's *Paste*: onto the selection, as Ctrl+V pastes.
+    GridPaste,
+    /// The grid gutter menu's *Delete* / *Undo delete* over the selected rows.
+    GridDeleteRows,
+    /// The editor menu's *Format*.
+    EditorFormat,
+}
+
+impl MenuKey {
+    /// The `SHORTCUTS` row this entry shows: `(group, keys, description)`.
+    fn row(self) -> (&'static str, &'static str, &'static str) {
+        match self {
+            MenuKey::GridCopy => ("Results grid", "Ctrl+C", "Copy"),
+            MenuKey::GridPaste => ("Results grid", "Ctrl+V", "Paste as staged edits"),
+            MenuKey::GridDeleteRows => ("Results grid", "Del", "Mark row for deletion"),
+            MenuKey::EditorFormat => ("Editor", "Ctrl+Alt+L", "Format SQL"),
+        }
+    }
+
+    /// The keys as this platform reads them, for the menu's keycap.
+    pub(crate) fn keys(self) -> Cow<'static, str> {
+        keys_label(self.row().1)
+    }
+}
+
 // ── The primary modifier ─────────────────────────────────────────────────────
 // macOS spells it Cmd and every other desktop spells it Ctrl. Both halves of
 // that — what the modal *says* and what the handlers *accept* — hang off the one
@@ -248,7 +288,9 @@ fn primary_from(control: bool, meta: bool, primary_is_cmd: bool) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{COMMAND_KEYS, SHORTCUTS, command_keys, keys_label, keys_label_on, primary_from};
+    use super::{
+        COMMAND_KEYS, MenuKey, SHORTCUTS, command_keys, keys_label, keys_label_on, primary_from,
+    };
     use std::collections::BTreeSet;
     use std::path::{Path, PathBuf};
 
@@ -643,6 +685,46 @@ mod tests {
                  exactly, or name the group the binding really comes from"
             );
         }
+    }
+
+    /// **A context menu may only show a key the modal documents, for the row
+    /// that means it.** Each [`MenuKey`] names its `SHORTCUTS` row by group,
+    /// key string *and* description, so a row reworded or moved fails here
+    /// rather than leaving a menu showing a key for something else.
+    #[test]
+    fn every_menu_key_is_the_shortcut_row_it_names() {
+        for key in menu_keys_all() {
+            let (group, keys, what) = key.row();
+            let found = SHORTCUTS
+                .iter()
+                .filter(|(g, _)| *g == group)
+                .any(|(_, rows)| rows.iter().any(|(k, d)| *k == keys && *d == what));
+            assert!(
+                found,
+                "{key:?} shows {keys:?} as {what:?} in {group:?}, which is not a \
+                 SHORTCUTS row — fix the entry to name a real one"
+            );
+            assert_eq!(key.keys(), keys_label(keys));
+        }
+    }
+
+    /// Every [`MenuKey`], spelled so that a new variant fails to compile here
+    /// until it is listed — and so is checked above.
+    fn menu_keys_all() -> [MenuKey; 4] {
+        fn _exhaustive(k: MenuKey) {
+            match k {
+                MenuKey::GridCopy
+                | MenuKey::GridPaste
+                | MenuKey::GridDeleteRows
+                | MenuKey::EditorFormat => {}
+            }
+        }
+        [
+            MenuKey::GridCopy,
+            MenuKey::GridPaste,
+            MenuKey::GridDeleteRows,
+            MenuKey::EditorFormat,
+        ]
     }
 
     /// Two rows can share a key string across groups (`Ctrl+G` is Go to Line in

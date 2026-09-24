@@ -3115,6 +3115,11 @@ pub enum MenuEntry {
         /// Dimmed + inert (no click, no hover) — for an action that isn't currently
         /// applicable (e.g. "AI Fill Value" with no cell selected).
         disabled: bool,
+        /// The key that does the same thing, as a keycap at the row's right —
+        /// only ever from a [`crate::shortcuts::MenuKey`], through
+        /// [`MenuEntry::shortcut`], so a menu cannot show a key the Shortcuts
+        /// modal does not document.
+        shortcut: Option<std::borrow::Cow<'static, str>>,
         action: Rc<dyn Fn()>,
     },
     Sub {
@@ -3133,6 +3138,7 @@ impl MenuEntry {
             detail: None,
             label_color: None,
             disabled: false,
+            shortcut: None,
             action: Rc::new(action),
         }
     }
@@ -3147,6 +3153,7 @@ impl MenuEntry {
             detail: None,
             label_color: None,
             disabled: false,
+            shortcut: None,
             action: Rc::new(action),
         }
     }
@@ -3162,6 +3169,7 @@ impl MenuEntry {
             detail: None,
             label_color: Some(color),
             disabled: false,
+            shortcut: None,
             action: Rc::new(action),
         }
     }
@@ -3181,6 +3189,7 @@ impl MenuEntry {
             detail: Some(detail.into()),
             label_color: color,
             disabled: false,
+            shortcut: None,
             action: Rc::new(action),
         }
     }
@@ -3188,6 +3197,14 @@ impl MenuEntry {
     pub(crate) fn disabled(mut self, yes: bool) -> Self {
         if let MenuEntry::Action { disabled, .. } = &mut self {
             *disabled = yes;
+        }
+        self
+    }
+    /// Show the key that does what this entry does. No-op on `Sub`/`Separator`:
+    /// a submenu row's trailing slot is its chevron.
+    pub(crate) fn shortcut(mut self, key: crate::shortcuts::MenuKey) -> Self {
+        if let MenuEntry::Action { shortcut, .. } = &mut self {
+            *shortcut = Some(key.keys());
         }
         self
     }
@@ -3234,6 +3251,40 @@ pub(crate) fn menu_stops(entries: &[MenuEntry]) -> Vec<(usize, MenuAct)> {
         .collect()
 }
 
+/// A keycap's horizontal padding at 100%, per side — [`keycap`] draws it and
+/// [`keycap_width`] measures it, so the two cannot disagree.
+const KEYCAP_PAD_H: f64 = 6.0;
+
+/// A key string drawn as a keycap: the Shortcuts modal's, one size down — mono
+/// face, the deepest surface, a small radius — so a binding looks like itself
+/// wherever the app shows it. The command palette's rows and a menu entry's
+/// [`MenuEntry::Action::shortcut`] both draw this one.
+///
+/// `tint` adjusts both colours the same way, so a faded palette row or a
+/// disabled menu row dims its keycap with it.
+pub(crate) fn keycap(
+    keys: String,
+    tint: impl Fn(floem::peniko::Color) -> floem::peniko::Color + 'static,
+) -> impl IntoView {
+    text(keys).style(move |s| {
+        s.color(tint(theme::text_muted()))
+            .font_size(theme::font_label())
+            .font_family(crate::consts::MONO_FAMILY.to_string())
+            .background(tint(theme::bg_deepest()))
+            .padding_horiz(theme::scaled(KEYCAP_PAD_H))
+            .padding_vert(theme::scaled(1.0))
+            .border_radius(4.0)
+            .flex_shrink(0.0_f32)
+    })
+}
+
+/// How wide [`keycap`] draws `keys`: the text in the face and size it renders,
+/// plus its padding.
+pub(crate) fn keycap_width(keys: &str) -> f64 {
+    measure_text_px_styled(keys, theme::font_label(), false, true)
+        + theme::scaled(KEYCAP_PAD_H) * 2.0
+}
+
 /// One menu row's content: `[icon] label [→]` (the chevron only for submenus).
 /// `label_color` tints the label (a `fn` so it follows theme switches); `None`
 /// uses the default text colour.
@@ -3241,11 +3292,18 @@ pub(crate) fn menu_stops(entries: &[MenuEntry]) -> Vec<(usize, MenuAct)> {
 /// `detail` puts a faint second line under the label, in the same column — so a
 /// row with one is two lines tall and [`menu_panel_height`] adds
 /// [`MENU_DETAIL_LINE_H`] plus the gap for it.
+///
+/// `shortcut` is a [`keycap`] at the far right, set off by the spacer a
+/// submenu's chevron uses; it is one line tall and shorter than the label, so it
+/// costs the row width ([`menu_panel_width`]) and no height. A submenu row never
+/// has both — see [`MenuEntry::shortcut`].
+#[allow(clippy::too_many_arguments)]
 fn menu_row(
     icon: Option<MenuIcon>,
     label: String,
     detail: Option<String>,
     label_color: Option<fn() -> floem::peniko::Color>,
+    shortcut: Option<std::borrow::Cow<'static, str>>,
     chevron: bool,
     disabled: bool,
     cursor: impl Fn() -> bool + 'static,
@@ -3295,6 +3353,19 @@ fn menu_row(
         })
         .into_any(),
     });
+    if let Some(keys) = shortcut {
+        kids.push(
+            empty()
+                .style(|s| s.flex_grow(1.0_f32).min_width(MENU_SUB_SPACER))
+                .into_any(),
+        );
+        kids.push(
+            keycap(keys.into_owned(), move |c| {
+                if disabled { c.multiply_alpha(0.3) } else { c }
+            })
+            .into_any(),
+        );
+    }
     if chevron {
         kids.push(
             empty()
@@ -3363,30 +3434,40 @@ fn menu_entry_view(i: usize, entry: MenuEntry, level: MenuLevel, close: Rc<dyn F
             detail,
             label_color,
             disabled,
+            shortcut,
             action,
-        } => menu_row(icon, label, detail, label_color, false, disabled, is_cursor)
-            .on_click_stop(move |_| {
-                if disabled {
-                    return; // inert; the stop keeps the menu open
-                }
-                (action)();
-                (close)();
-            })
-            .on_event(EventListener::PointerEnter, move |_| {
-                // Guarded, per `close_except`'s rule: on a menu with no
-                // submenus this is `None` → `None` on every row entered, and
-                // the effect it wakes drives `submenu_layer`'s container.
-                if open_sub.get_untracked().is_some() {
-                    open_sub.set(None);
-                }
-                // A disabled row is not a stop, so the keyboard can't rest there
-                // and the pointer must not park the cursor there either.
-                if !disabled {
-                    take_cursor();
-                }
-                EventPropagation::Continue
-            })
-            .into_any(),
+        } => menu_row(
+            icon,
+            label,
+            detail,
+            label_color,
+            shortcut,
+            false,
+            disabled,
+            is_cursor,
+        )
+        .on_click_stop(move |_| {
+            if disabled {
+                return; // inert; the stop keeps the menu open
+            }
+            (action)();
+            (close)();
+        })
+        .on_event(EventListener::PointerEnter, move |_| {
+            // Guarded, per `close_except`'s rule: on a menu with no
+            // submenus this is `None` → `None` on every row entered, and
+            // the effect it wakes drives `submenu_layer`'s container.
+            if open_sub.get_untracked().is_some() {
+                open_sub.set(None);
+            }
+            // A disabled row is not a stop, so the keyboard can't rest there
+            // and the pointer must not park the cursor there either.
+            if !disabled {
+                take_cursor();
+            }
+            EventPropagation::Continue
+        })
+        .into_any(),
         MenuEntry::Sub {
             label,
             icon,
@@ -3418,27 +3499,29 @@ fn menu_entry_view(i: usize, entry: MenuEntry, level: MenuLevel, close: Rc<dyn F
                     // opening. `menu_panel` clears when `open_sub` goes `None`.
                 });
             }
-            container(menu_row(icon, label, None, None, true, false, is_cursor))
-                // The row's rect in window coordinates — `on_move` reports the
-                // window origin (fired during layout, not on pointer movement),
-                // `on_resize` the size. The layer needs both: it hangs the panel
-                // off the row's right or left edge, and lines its first item up
-                // with the row's top.
-                .on_move(move |p| row_rect.update(|r| *r = Rect::from_origin_size(p, r.size())))
-                .on_resize(move |b| {
-                    row_rect.update(|r| *r = Rect::from_origin_size(r.origin(), b.size()))
-                })
-                .on_event(EventListener::PointerEnter, move |_| {
-                    // Same guard as the leaf arm: re-entering the row that is
-                    // already open rebuilds the panel it is already showing.
-                    if open_sub.get_untracked() != Some(i) {
-                        open_sub.set(Some(i));
-                    }
-                    take_cursor();
-                    EventPropagation::Continue
-                })
-                .on_click_stop(|_| {}) // clicking the parent just holds it open
-                .into_any()
+            container(menu_row(
+                icon, label, None, None, None, true, false, is_cursor,
+            ))
+            // The row's rect in window coordinates — `on_move` reports the
+            // window origin (fired during layout, not on pointer movement),
+            // `on_resize` the size. The layer needs both: it hangs the panel
+            // off the row's right or left edge, and lines its first item up
+            // with the row's top.
+            .on_move(move |p| row_rect.update(|r| *r = Rect::from_origin_size(p, r.size())))
+            .on_resize(move |b| {
+                row_rect.update(|r| *r = Rect::from_origin_size(r.origin(), b.size()))
+            })
+            .on_event(EventListener::PointerEnter, move |_| {
+                // Same guard as the leaf arm: re-entering the row that is
+                // already open rebuilds the panel it is already showing.
+                if open_sub.get_untracked() != Some(i) {
+                    open_sub.set(Some(i));
+                }
+                take_cursor();
+                EventPropagation::Continue
+            })
+            .on_click_stop(|_| {}) // clicking the parent just holds it open
+            .into_any()
         }
     }
 }
@@ -3687,9 +3770,19 @@ pub(crate) fn menu_panel_width(entries: &[MenuEntry]) -> f64 {
                 label,
                 icon,
                 detail,
+                shortcut,
                 ..
-            } => row_w(label, icon.is_some(), false)
-                .max(detail.as_deref().map(detail_w).unwrap_or(0.0)),
+            } => {
+                // The spacer's floor and its two gaps, as for a chevron, then the
+                // keycap measured as it draws — beside the label-and-detail
+                // column, so added to whichever of the two is wider.
+                let keys = shortcut.as_deref().map_or(0.0, |k| {
+                    MENU_SUB_SPACER + theme::scaled(MENU_KID_GAP) * 2.0 + keycap_width(k)
+                });
+                row_w(label, icon.is_some(), false)
+                    .max(detail.as_deref().map(detail_w).unwrap_or(0.0))
+                    + keys
+            }
             MenuEntry::Sub { label, icon, .. } => row_w(label, icon.is_some(), true),
         })
         .fold(0.0_f64, f64::max)
@@ -8652,6 +8745,39 @@ mod menu_placement_tests {
             "an icon column is width: {iconed} vs {plain}"
         );
         assert!(subbed > plain, "a chevron is width: {subbed} vs {plain}");
+    }
+
+    /// **A shortcut's keycap is width too**, measured in the face it draws in —
+    /// a menu that forgot it clips the keycap at the panel's right edge, the one
+    /// place a flip was computed to keep it. At least the keycap's text plus its
+    /// padding, since the row adds its own spacer and gap on top.
+    #[test]
+    fn a_shortcut_widens_its_row_by_at_least_its_keycap() {
+        use crate::shortcuts::MenuKey;
+        crate::theme::set_ui_scale(crate::theme::UiScale::Normal);
+        let plain = menu_panel_width(&[MenuEntry::action("Format", || {})]);
+        let keyed =
+            menu_panel_width(&[MenuEntry::action("Format", || {}).shortcut(MenuKey::EditorFormat)]);
+        let cap = keycap_width(&MenuKey::EditorFormat.keys());
+        assert!(cap > 0.0);
+        assert!(
+            keyed >= plain + cap,
+            "a keycap is width: {keyed} vs {plain} + {cap}"
+        );
+    }
+
+    /// The builder sets the keys on an action and leaves anything else alone;
+    /// a submenu row's trailing slot is its chevron.
+    #[test]
+    fn a_shortcut_lands_on_an_action_and_nowhere_else() {
+        use crate::shortcuts::MenuKey;
+        let e = MenuEntry::action("Copy", || {}).shortcut(MenuKey::GridCopy);
+        let MenuEntry::Action { shortcut, .. } = e else {
+            panic!("an action");
+        };
+        assert_eq!(shortcut, Some(MenuKey::GridCopy.keys()));
+        let sub = MenuEntry::sub("More", vec![]).shortcut(MenuKey::GridCopy);
+        assert!(matches!(sub, MenuEntry::Sub { .. }));
     }
 
     /// A separator spans whatever the rows decide, so it contributes no width —

@@ -50,6 +50,7 @@ use schemaic_core::text_ops::contains_ignore_ascii_case;
 use schemaic_core::tx::{WRITE_WAIT_MS, WaitNote, write_wait_note};
 
 use crate::consts::*;
+use crate::shortcuts::MenuKey;
 use crate::tooltip::TooltipExt;
 use crate::widgets::{
     MenuEntry, autohide, autohide_state, centered_msg, in_strip_button, loading_dots,
@@ -2180,42 +2181,31 @@ fn body_rebuild_key<T: 'static>(
 /// without a window. A `GridState` cannot be built in a `#[test]`; a disposed
 /// `Scope` with one signal in it reproduces the identical hazard, because
 /// `alive` is `rs.try_get_untracked().is_some()` and nothing more.
+///
+/// **Replaces the action and the children in place**, touching nothing else,
+/// so a field added to an entry — the keycap was one — rides through here
+/// without this function having to name it. It used to rebuild each entry field
+/// by field, which made every new field one more edit here.
 fn guarded_entries(alive: Rc<dyn Fn() -> bool>, entries: Vec<MenuEntry>) -> Vec<MenuEntry> {
     entries
         .into_iter()
-        .map(|e| match e {
-            MenuEntry::Action {
-                label,
-                icon,
-                detail,
-                label_color,
-                disabled,
-                action,
-            } => MenuEntry::Action {
-                label,
-                icon,
-                detail,
-                label_color,
-                disabled,
-                action: {
+        .map(|mut e| {
+            match &mut e {
+                MenuEntry::Action { action, .. } => {
+                    let inner = action.clone();
                     let alive = alive.clone();
-                    Rc::new(move || {
+                    *action = Rc::new(move || {
                         if (alive)() {
-                            (action)();
+                            (inner)();
                         }
-                    })
-                },
-            },
-            MenuEntry::Sub {
-                label,
-                icon,
-                children,
-            } => MenuEntry::Sub {
-                label,
-                icon,
-                children: guarded_entries(alive.clone(), children),
-            },
-            MenuEntry::Separator => MenuEntry::Separator,
+                    });
+                }
+                MenuEntry::Sub { children, .. } => {
+                    *children = guarded_entries(alive.clone(), std::mem::take(children));
+                }
+                MenuEntry::Separator => {}
+            }
+            e
         })
         .collect()
 }
@@ -9250,7 +9240,7 @@ fn blob_launch(
 /// about a column.
 fn gutter_menu(gs: GridState, pos: usize, pending: Option<usize>) -> Vec<MenuEntry> {
     let mut entries = vec![
-        MenuEntry::action("Copy", move || copy_selection(gs)),
+        MenuEntry::action("Copy", move || copy_selection(gs)).shortcut(MenuKey::GridCopy),
         // The rows as the toolbar's Copy renders the whole result — an
         // `INSERT`, a JSON array, a Markdown table — for just these rows. Text
         // formats only, for the reason that menu gives.
@@ -9295,14 +9285,24 @@ fn gutter_menu(gs: GridState, pos: usize, pending: Option<usize>) -> Vec<MenuEnt
             clone_rows(gs, &dup);
         }));
         let del = idxs;
-        entries.push(MenuEntry::action(
+        let delete = MenuEntry::action(
             if all_deleted {
                 "Undo delete".to_string()
             } else {
                 plural("Delete")
             },
             move || set_rows_deleted(gs, &del, !all_deleted),
-        ));
+        );
+        // Del's keycap only when the rows are the selection's, which is what the
+        // key marks — a click outside it acts on the clicked row alone.
+        let on_selection = gs
+            .bounds_untracked()
+            .is_some_and(|(r0, _, r1, _)| (r0..=r1).contains(&pos));
+        entries.push(if on_selection {
+            delete.shortcut(MenuKey::GridDeleteRows)
+        } else {
+            delete
+        });
     }
     if ai_data_of(gs).may_attach() {
         entries.push(MenuEntry::Separator);
@@ -10579,12 +10579,18 @@ fn data_cell(
             // about the block — and says which of the two it is, since Ctrl+C
             // and the gutter menu's Copy both mean the whole selection.
             let scope = schemaic_core::edit::copy_scope(gs.bounds_untracked(), i, ci);
-            entries.push(MenuEntry::action(scope.label(), move || match scope {
+            let copy = MenuEntry::action(scope.label(), move || match scope {
                 schemaic_core::edit::CopyScope::Selection => copy_selection(gs),
                 schemaic_core::edit::CopyScope::Cell => {
                     let _ = floem::Clipboard::set_contents(v_copy.clone());
                 }
-            }));
+            });
+            // Ctrl+C's keycap only when this *is* Ctrl+C — the selection. The cell
+            // scope copies the one raw value, which the key does not promise.
+            entries.push(match scope {
+                schemaic_core::edit::CopyScope::Selection => copy.shortcut(MenuKey::GridCopy),
+                schemaic_core::edit::CopyScope::Cell => copy,
+            });
             // Only when this column shows a formatted (non-raw) value.
             if fmt != ColumnFormat::None {
                 entries.push(MenuEntry::action("Copy formatted", move || {
@@ -10596,7 +10602,10 @@ fn data_cell(
             // to paste into either. The action still lands on the *selection*,
             // not on this cell — Ctrl+V and this entry do the same thing.
             if text_editable && !deleted {
-                entries.push(MenuEntry::action("Paste", move || paste_selection(gs)));
+                entries.push(
+                    MenuEntry::action("Paste", move || paste_selection(gs))
+                        .shortcut(MenuKey::GridPaste),
+                );
             }
             // Server-side filter: splice this value into the base query's WHERE and
             // re-run (full table). NULL cells become IS NULL / IS NOT NULL.
@@ -11948,6 +11957,42 @@ mod guarded_entry_tests {
         );
         fire(&entries);
         assert_eq!(hits.get(), 2, "the top entry and the submenu's");
+    }
+
+    /// **The guard changes the action and nothing else** — a keycap, a tint and
+    /// the disabled flag reach the menu as the entry set them, at any depth, so
+    /// every grid menu shows the keycaps its entries were given.
+    #[test]
+    fn the_guard_keeps_everything_but_the_action() {
+        let entries = guarded_entries(
+            Rc::new(|| true),
+            vec![
+                MenuEntry::action("Copy", || {}).shortcut(MenuKey::GridCopy),
+                MenuEntry::sub(
+                    "More",
+                    vec![
+                        MenuEntry::action("Paste", || {})
+                            .shortcut(MenuKey::GridPaste)
+                            .disabled(true),
+                    ],
+                ),
+            ],
+        );
+        let MenuEntry::Action { shortcut, .. } = &entries[0] else {
+            panic!("an action");
+        };
+        assert_eq!(shortcut.as_deref(), Some(&*MenuKey::GridCopy.keys()));
+        let MenuEntry::Sub { children, .. } = &entries[1] else {
+            panic!("a submenu");
+        };
+        let MenuEntry::Action {
+            shortcut, disabled, ..
+        } = &children[0]
+        else {
+            panic!("an action");
+        };
+        assert_eq!(shortcut.as_deref(), Some(&*MenuKey::GridPaste.keys()));
+        assert!(*disabled);
     }
 
     /// **The whole finding, in the composition that carries it.**

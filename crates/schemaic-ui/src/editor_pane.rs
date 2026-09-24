@@ -3498,7 +3498,8 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                 }),
                 MenuEntry::action("Format", move || {
                     format_editor(&ed_format, comp, dialect.get_untracked())
-                }),
+                })
+                .shortcut(crate::shortcuts::MenuKey::EditorFormat),
             ];
             // First when it's there: over a squiggle it is the most specific
             // thing this menu can offer, and the one the user came for.

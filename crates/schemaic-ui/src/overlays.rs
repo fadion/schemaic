@@ -4935,23 +4935,8 @@ pub(crate) fn find_overlay(ui: Ui) -> impl IntoView {
                             cells.push(empty().style(|s| s.flex_grow(1.0_f32)).into_any());
                         }
                         if let Some(keys) = item.keys.as_deref() {
-                            // The Shortcuts modal's keycap, one size down: same
-                            // mono face, surface and radius, so a binding looks
-                            // like itself wherever the app shows it.
-                            cells.push(
-                                text(keys)
-                                    .style(move |s| {
-                                        s.color(fade(theme::text_muted()))
-                                            .font_size(theme::font_label())
-                                            .font_family("IBM Plex Mono".to_string())
-                                            .background(fade(theme::bg_deepest()))
-                                            .padding_horiz(theme::scaled(6.0))
-                                            .padding_vert(theme::scaled(1.0))
-                                            .border_radius(4.0)
-                                            .flex_shrink(0.0_f32)
-                                    })
-                                    .into_any(),
-                            );
+                            // The one keycap, which the context menus draw too.
+                            cells.push(crate::widgets::keycap(keys.to_string(), fade).into_any());
                         }
                         if let Some(ri) = item.right_icon {
                             cells.push(
