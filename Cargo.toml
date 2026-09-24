@@ -199,8 +199,9 @@ clap = { version = "4", default-features = false, features = [
     "usage",
     "error-context",
     "derive",
-    # `SCHEMAIC_CONNECTION`, so an agent's shell can be pointed at one
-    # connection once instead of repeating `-c` on every invocation.
+    # `SCHEMAIC_CONNECTION` and `SCHEMAIC_DATABASE`, so an agent's shell can be
+    # pointed at one connection and database once instead of repeating `-c`/`-d`
+    # on every invocation.
     "env",
 ] }
 

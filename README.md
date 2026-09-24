@@ -194,7 +194,10 @@ saved before this existed, because the command line runs with nobody watching.
 A statement runs in the connection's default database, or the one `-d`/`--database`
 names. Schemaic itself never needs a default — it lists every database — so a saved
 connection often has none; `schemaic databases` lists the names `-d` takes, and a
-statement that failed for want of one says so. `schemaic version` prints the version.
+statement that failed for want of one says so. `SCHEMAIC_CONNECTION` and
+`SCHEMAIC_DATABASE` stand in for `-c` and `-d`, so a shell — or an agent's — can be
+pointed at one connection and database once; a flag given as well wins. `schemaic
+version` prints the version.
 
 `query` runs reads and nothing else — not a flag away from a write, a different
 subcommand, on a session the server itself holds read-only. It returns 200 rows

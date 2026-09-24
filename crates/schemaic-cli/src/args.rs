@@ -117,7 +117,7 @@ pub struct Target {
     pub conn: ConnArgs,
     /// Database to run in. Defaults to the connection's own; `schemaic
     /// databases` lists the names.
-    #[arg(short = 'd', long, value_parser = non_blank)]
+    #[arg(short = 'd', long, env = "SCHEMAIC_DATABASE", value_parser = non_blank)]
     pub database: Option<String>,
 }
 
@@ -145,9 +145,18 @@ pub struct ConnArgs {
 /// taken as a name, PostgreSQL connects to the database named after the user,
 /// which is the unscoped landing the exec guard's "no database selected" arm is
 /// there to stop — reached without the guard ever seeing it.
+///
+/// **`SCHEMAIC_DATABASE` set but empty goes through here too**, and is refused
+/// the same way rather than read as unset: it is the same `"$DB"` with `DB`
+/// unset, one step removed. The message names both sources, since the reader
+/// may not have typed a `-d` at all.
 fn non_blank(s: &str) -> Result<String, String> {
     if s.trim().is_empty() {
-        Err("the database name is empty; leave out -d to use the connection's own".to_string())
+        Err(
+            "the database name is empty; leave out -d, and unset SCHEMAIC_DATABASE, \
+             to use the connection's own"
+                .to_string(),
+        )
     } else {
         Ok(s.to_string())
     }
@@ -634,6 +643,42 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The `env` attribute of `sub`'s argument `id`, read off the parser
+    /// rather than by setting the variable: the process environment is shared
+    /// by every test running beside this one.
+    fn env_of(sub: &str, id: &str) -> Option<String> {
+        let cmd = <Cli as clap::CommandFactory>::command();
+        let sub = cmd.find_subcommand(sub).expect("a subcommand");
+        let arg = sub
+            .get_arguments()
+            .find(|a| a.get_id() == id)
+            .expect("an argument");
+        arg.get_env().map(|e| e.to_string_lossy().into_owned())
+    }
+
+    /// **`-d` comes from `SCHEMAIC_DATABASE` the way `-c` comes from
+    /// `SCHEMAIC_CONNECTION`**, on both subcommands that run in one — so an
+    /// agent's shell is pointed at a connection *and* a database once.
+    #[test]
+    fn the_database_and_the_connection_can_come_from_the_environment() {
+        for sub in ["query", "exec"] {
+            assert_eq!(
+                env_of(sub, "database").as_deref(),
+                Some("SCHEMAIC_DATABASE"),
+                "{sub}"
+            );
+            assert_eq!(
+                env_of(sub, "connection").as_deref(),
+                Some("SCHEMAIC_CONNECTION"),
+                "{sub}"
+            );
+        }
+        assert_eq!(
+            env_of("databases", "connection").as_deref(),
+            Some("SCHEMAIC_CONNECTION")
+        );
     }
 
     /// A zero timeout cancels every statement before it can run, and a zero

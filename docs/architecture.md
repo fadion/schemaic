@@ -19910,6 +19910,14 @@ existing prose was left alone.
     connected to the database named after the user, the unscoped landing the exec guard's
     no-database arm exists to stop, reached without the guard seeing it
     (`a_blank_database_is_refused_at_parse_time`, `a_zero_timeout_or_limit_is_refused`).
+    **`-c` falls back to `SCHEMAIC_CONNECTION` and `-d` to `SCHEMAIC_DATABASE`** (clap's `env`; a
+    flag on the command line wins), on `query` and `exec` alike and `-c` on `databases`, so an
+    agent's shell is pointed at a connection and a database once. A `SCHEMAIC_DATABASE` that is set
+    but blank goes through the same `non_blank` and is refused, not read as unset — it is `-d "$DB"`
+    one step removed — which is why the message names both sources. The test reads the `env`
+    attribute off clap's `Command` rather than setting the variable, since the process environment
+    is shared by tests running in parallel
+    (`the_database_and_the_connection_can_come_from_the_environment`).
     `--yes` exists on `exec` and **must not** exist on `query` — a read has nothing to consent to,
     and accepting the flag there would teach the habit of passing it everywhere
     (`query_has_no_yes_flag`). `--fail-on-cap` is the reverse, on `query` alone: exit 6 for a read
