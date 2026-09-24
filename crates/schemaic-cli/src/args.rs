@@ -65,6 +65,32 @@ pub enum Command {
         #[arg(long, default_value_t = PING_TIMEOUT_SECS, value_parser = at_least_one_second())]
         timeout: u64,
     },
+    /// List the tables and views in a database.
+    Tables {
+        #[command(flatten)]
+        target: Target,
+        #[command(flatten)]
+        output: OutputArgs,
+        /// Maximum rows to return.
+        #[arg(long, default_value_t = DEFAULT_LIMIT, value_parser = at_least_one_row())]
+        limit: usize,
+        /// Seconds before the listing is cancelled.
+        #[arg(long, default_value_t = DEFAULT_TIMEOUT_SECS, value_parser = at_least_one_second())]
+        timeout: u64,
+    },
+    /// Show a table's or view's columns: type, nullability, default and key.
+    Describe {
+        /// The table or view. On PostgreSQL it may be schema-qualified, and is
+        /// read as a query would read it: folded to lower case unless quoted.
+        table: String,
+        #[command(flatten)]
+        target: Target,
+        #[command(flatten)]
+        output: OutputArgs,
+        /// Seconds before the lookup is cancelled.
+        #[arg(long, default_value_t = DEFAULT_TIMEOUT_SECS, value_parser = at_least_one_second())]
+        timeout: u64,
+    },
     /// Run a read-only statement.
     Query {
         #[command(flatten)]
@@ -149,6 +175,8 @@ impl Command {
             Command::List { output, .. }
             | Command::Databases { output, .. }
             | Command::Ping { output, .. }
+            | Command::Tables { output, .. }
+            | Command::Describe { output, .. }
             | Command::Query { output, .. }
             | Command::Exec { output, .. } => Some(output),
             Command::Version => None,
@@ -317,6 +345,8 @@ pub fn wants_cli(argv: &[String]) -> bool {
             "list"
                 | "databases"
                 | "ping"
+                | "tables"
+                | "describe"
                 | "query"
                 | "exec"
                 | "version"
@@ -551,6 +581,46 @@ mod tests {
         assert!(parse(&["schemaic", "ping", "-c", "1", "--password-stdin"]).is_ok());
     }
 
+    /// **`tables` runs in a database like `query`**, so it takes `-d` (and
+    /// `SCHEMAIC_DATABASE`), and it caps like one: a schema of thousands of
+    /// tables is a lot to hand an agent unasked.
+    #[test]
+    fn tables_takes_a_target_and_a_limit() {
+        let cli = parse(&["schemaic", "tables", "-c", "prod", "-d", "shop"]).unwrap();
+        let Command::Tables {
+            target,
+            limit,
+            timeout,
+            ..
+        } = cli.command
+        else {
+            panic!("expected tables");
+        };
+        assert_eq!(target.conn.connection, "prod");
+        assert_eq!(target.database.as_deref(), Some("shop"));
+        assert_eq!(limit, DEFAULT_LIMIT);
+        assert_eq!(timeout, crate::query::DEFAULT_TIMEOUT.as_secs());
+        assert_eq!(
+            env_of("tables", "database").as_deref(),
+            Some("SCHEMAIC_DATABASE")
+        );
+    }
+
+    /// `describe` names one table, and there is nothing to cap.
+    #[test]
+    fn describe_takes_one_table_and_a_target() {
+        let cli = parse(&["schemaic", "describe", "public.orders", "-c", "1"]).unwrap();
+        let Command::Describe { table, target, .. } = cli.command else {
+            panic!("expected describe");
+        };
+        assert_eq!(table, "public.orders");
+        assert_eq!(target.database, None);
+        let err = parse(&["schemaic", "describe", "-c", "1"]).unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+        let err = parse(&["schemaic", "describe", "t", "-c", "1", "--limit", "5"]).unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::UnknownArgument);
+    }
+
     #[test]
     fn a_query_needs_a_connection() {
         let err = parse(&["schemaic", "query", "SELECT 1"]).unwrap_err();
@@ -685,6 +755,8 @@ mod tests {
             &["schemaic", "list", "--no-header"][..],
             &["schemaic", "databases", "-c", "1", "--no-header"],
             &["schemaic", "ping", "-c", "1", "--no-header"],
+            &["schemaic", "tables", "-c", "1", "--no-header"],
+            &["schemaic", "describe", "t", "-c", "1", "--no-header"],
             &["schemaic", "query", "SELECT 1", "-c", "1", "--no-header"],
             &["schemaic", "exec", "SELECT 1", "-c", "1", "--no-header"],
         ] {

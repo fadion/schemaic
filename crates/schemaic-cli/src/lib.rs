@@ -1,5 +1,5 @@
 //! Schemaic without a window: the headless front end behind `schemaic list`,
-//! `schemaic databases`, `schemaic query` and `schemaic exec`.
+//! `databases`, `ping`, `tables`, `describe`, `query` and `exec`.
 //!
 //! **Why it is a library and not a binary.** It has two front ends and they
 //! differ per platform. On Linux and macOS the `schemaic` binary takes an argv
@@ -22,6 +22,7 @@
 //! [`Connection::cli_access`]: schemaic_core::connection::Connection::cli_access
 
 pub mod args;
+pub mod catalog;
 pub mod deadline;
 pub mod exec;
 pub mod format;

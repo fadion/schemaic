@@ -19792,7 +19792,7 @@ existing prose was left alone.
     ordering between them is free, and this way the protocol stream stays clean whichever of the
     four opened it.
     **The headless-CLI branch sits between those two, and being *before* Velopack is the load-bearing
-    part.** `schemaic list`/`databases`/`ping`/`query`/`exec`/`version` return from `main` ahead of the hook, the file
+    part.** `schemaic list`/`databases`/`ping`/`tables`/`describe`/`query`/`exec`/`version` return from `main` ahead of the hook, the file
     logger, the fonts and Floem: none of that belongs in a one-shot command, and `auto_apply_on_startup` is free
     to find a staged package and exit-and-relaunch the process — which is safe for a launch that has
     read no session state and is not safe in the middle of a command whose output someone is piping.
@@ -19890,8 +19890,8 @@ existing prose was left alone.
     `APPDATA` redirected to a scratch profile, removed a seeded entry, exited 0, left `PATH`
     byte-identical to the backup and logged the removal. **`row_status` is not yet verified by
     hand**: the greyed Install and the "comes with the app" hint need a real `.deb` install to see.
-- `schemaic-cli` — Schemaic without a window: `schemaic list` / `databases` / `ping` / `query` /
-  `exec` / `version` / `help`, so a person or an agent can run SQL against a saved connection with the app closed and without being
+- `schemaic-cli` — Schemaic without a window: `schemaic list` / `databases` / `ping` / `tables` /
+  `describe` / `query` / `exec` / `version` / `help`, so a person or an agent can run SQL against a saved connection with the app closed and without being
   handed a credential. Its whole dependency list is `schemaic-core`, `schemaic-conn`, `schemaic-db`,
   `clap`, `tokio` and `tokio-util` — **no floem**, which is what splitting `schemaic-conn` out of
   `schemaic-app` was for. It is a **library** with two front ends, because the front ends differ per
@@ -19932,7 +19932,8 @@ existing prose was left alone.
     no-database arm exists to stop, reached without the guard seeing it
     (`a_blank_database_is_refused_at_parse_time`, `a_zero_timeout_or_limit_is_refused`).
     **`-c` falls back to `SCHEMAIC_CONNECTION` and `-d` to `SCHEMAIC_DATABASE`** (clap's `env`; a
-    flag on the command line wins), on `query` and `exec` alike and `-c` on `databases` and `ping`
+    flag on the command line wins), on `query`, `exec`, `tables` and `describe` alike and `-c` on
+    `databases` and `ping`
     (through `ConnArgs`), so an agent's shell is pointed at a connection and a database once. A `SCHEMAIC_DATABASE` that is set
     but blank goes through the same `non_blank` and is refused, not read as unset — it is `-d "$DB"`
     one step removed — which is why the message names both sources. The test reads the `env`
@@ -19947,8 +19948,9 @@ existing prose was left alone.
     (`fail_on_cap_is_an_opt_in_query_flag`). `exec` has no `--limit` and its cap bounds only what
     is printed, so there is nothing for the flag to report (`exec_has_no_fail_on_cap_flag`).
     **`OutputArgs { format, no_header }` is flattened into every subcommand that prints rows** —
-    `list`, `databases`, `ping`, `query` and `exec` — in place of a `format` field of each one's
-    own, so `--no-header` is on all of them at once (`no_header_is_on_every_row_printing_subcommand`).
+    `list`, `databases`, `ping`, `tables`, `describe`, `query` and `exec` — in place of a `format`
+    field of each one's own, so `--no-header` is on all of them at once
+    (`no_header_is_on_every_row_printing_subcommand`).
     `OutputArgs::output()` is `format::Output::new`, and whether the pair goes together is judged
     there rather than by clap; `Command::output_args()` hands it to `run.rs`, `None` for `version`.
     `--password-stdin` is for the headless case the keyring cannot serve:
@@ -19987,15 +19989,22 @@ existing prose was left alone.
     `query::DEFAULT_TIMEOUT` through `DEFAULT_TIMEOUT_SECS`, not a second literal beside it
     (`exec_defaults_to_the_shared_timeout`).
     **`ConnArgs` is `Target` without the database** — `-c` and `--password-stdin`, flattened into
-    `Target { conn, database }` for `query` and `exec`, and taken alone by the two subcommands with
+    `Target { conn, database }` for `query`, `exec`, `tables` and `describe`, and taken alone by the
+    two subcommands with
     no database to run in: `databases` lists the names `-d` takes, and `ping` asks whether the
     server answers at all, so neither has a `-d` and passing one is a parse error
     (`databases_has_no_database_flag`, `ping_takes_a_connection_and_the_reachability_timeout`).
-    `run.rs`'s `select_conn` and `connect` take `&ConnArgs`, which is what lets all four share them.
+    `run.rs`'s `select_conn` and `connect` take `&ConnArgs`, which is what lets all six share them.
     **`ping`'s `--timeout` defaults to `PING_TIMEOUT_SECS`, not `DEFAULT_TIMEOUT_SECS`** — it is
     `schemaic_db::PING_TIMEOUT`, five seconds, the bound after which the app's own health check
     says *Disconnected*, so the CLI and the app agree on when a host is dead; the 30 s statement
     default would have a script wait six times as long to be told the same thing.
+    **`tables` and `describe <table>` take a whole `Target`**, `-d` and `SCHEMAIC_DATABASE`
+    included, because what they list lives in a database — `catalog.rs` has which engines cannot
+    answer without one. `tables` has `--limit` at `DEFAULT_LIMIT`, like `query`; `describe` has
+    none, and passing one is a parse error — it names one table, so there is nothing to cap, and
+    `run.rs` holds it to a memory bound instead (`tables_takes_a_target_and_a_limit`,
+    `describe_takes_one_table_and_a_target`). Both default `--timeout` to `DEFAULT_TIMEOUT_SECS`.
     **`wants_cli` is the routing predicate, and it is an allowlist of the *first* argument rather
     than "are there any arguments".** This binary is re-invoked with argv by things that are not the
     CLI — the Velopack installer and updater (`--veloapp-install`, `--veloapp-updated`,
@@ -20007,7 +20016,8 @@ existing prose was left alone.
     `a_subcommand_further_along_does_not_route` holds the *first*-argument half, since
     `schemaic --mcp-serve list` is the app being asked to serve). The converse holds too: through the
     app's own binary a new subcommand does not reach the CLI until its name is added here, as
-    `databases` and `ping` were (`every_subcommand_routes_to_the_cli`) — `schemaic.com` calls
+    `databases` and `ping` were, and `tables` and `describe` after them — the test was seen red
+    until both names went in (`every_subcommand_routes_to_the_cli`) — `schemaic.com` calls
     `run::main` without asking, so a missing name shows everywhere except through it. **That test
     and `the_help_text_names_every_subcommand` read the names off clap's `Command`**
     (`subcommand_names()`, plus `help`) rather than a list of their own, which is what makes them
@@ -20042,7 +20052,8 @@ existing prose was left alone.
     same reason. `listed` is what `list` prints; `list --all` is what shows the rest, with their
     status, so a human can see *why* an expected connection is unreachable.
   - `cli/query.rs` — **the one headless read path, and both non-GUI front ends are on it**:
-    `schemaic query` and the MCP server's `run_query`. Written twice they would have had every
+    `schemaic query` and the MCP server's `run_query` — and `tables` and `describe`, whose canned SQL
+    (`catalog.rs`) is a query the user did not type. Written twice they would have had every
     reason to drift — same gate, same timeout, same normalisation, and only one of them getting the
     next fix. The gate is
     `core::sql::read_only_reason` and is strictly stronger than the editor's `run_verdict`: an
@@ -20074,6 +20085,51 @@ existing prose was left alone.
     what is returned, and `ResultSet::truncated` is the front end's to pass on — a caller silently
     told a capped result was the whole answer has been given a wrong answer by a command that
     succeeded.
+  - `cli/catalog.rs` — the canned SQL behind `schemaic tables` and `schemaic describe <table>`: two
+    pure builders, `tables_sql(dialect, database)` and `describe_sql(dialect, database, table)`, and
+    `DESCRIBE_COLUMNS`. **Text run through `query::read_only_query`, not a `Db` method of its
+    own**, because what they print is rows like any query's — so the gate, the read-only session,
+    the deadline and the cap are the one headless read path's, and `--format` means what it means
+    everywhere. Only the SQL is per dialect, because the question is: PostgreSQL and SQLite have no
+    `DESCRIBE`, and MySQL's `SHOW` names its columns after the database. So each builder is an
+    exhaustive `match` over the three, and every engine answers under the **same column names** —
+    `name`, `type` for `tables`, with `schema` first on PostgreSQL alone, the one engine whose
+    database holds more than one namespace; `column`, `type`, `nullable`, `default`, `key` for
+    `describe` — so a script reading one engine's output reads the others'. They are aliased through
+    `export::ident_sql`, since `default`, `key` and `column` are reserved words on at least one of
+    them (`every_engine_answers_under_the_same_column_names`), and a type is spelled one way
+    everywhere: `table`, `view`, and PostgreSQL's own `materialized view` and `foreign table`.
+    **`None` means the dialect cannot answer without a database**, and `run.rs` says so before
+    anything is dialled. MySQL's reads filter on `DATABASE()` — the database the statement runs in,
+    which is the one `-d` named — and without one that is NULL and the listing is silently empty;
+    PostgreSQL's would list the maintenance database's tables as though they were the connection's.
+    A SQLite file always is a database: `main`, or the attached one `-d` names — quoted as a name in
+    `"main".sqlite_master`, passed as a literal in `pragma_table_info('t', 'main')`
+    (`only_a_file_database_needs_no_database_named`, `a_sqlite_database_is_quoted_where_it_is_used`).
+    **PostgreSQL's listing reads `pg_class`, not `information_schema.tables`**, which has no
+    materialized views: relkinds `r`/`p`/`v`/`m`/`f`, partitions left out (`NOT relispartition` —
+    their parent is the table), and `pg_catalog`, `information_schema`, `pg_toast*` and the
+    per-session `pg_temp_*` schemas with them. Its `describe` finds the relation through
+    `pg_catalog.to_regclass(<literal>)`, which reads the name the way a query would — through the
+    search path when bare, `schema.table` when qualified, case-folded unless double-quoted — and a
+    name it cannot find is NULL, matching no row. SQLite's is `pragma_table_info` as a table-valued
+    function, because that makes it a `SELECT`, the only head the read gate lets through
+    (`every_canned_statement_passes_the_read_gate`). **What `key` can say differs per engine**,
+    always in MySQL's `COLUMN_KEY` words: MySQL gives its own `PRI`/`UNI`/`MUL`, PostgreSQL `PRI`
+    and `UNI` (a single-column unique index only), and SQLite `PRI` alone, since `pragma_table_info`
+    says nothing of unique indexes. **No rows means no such table** to `run.rs`; a PostgreSQL
+    relation with no columns at all (`CREATE TABLE t ()`) reads the same, and is accepted as rare
+    enough to take the wrong message.
+    **A name from the command line reaches the SQL only as a literal**, through
+    `export::sql_literal`, never spliced as an identifier — so a quote in it is doubled and cannot
+    end the string (`a_table_name_reaches_the_sql_only_as_a_literal`, whose `o'; DROP TABLE x; --`
+    still passes the gate as one read). The MySQL literal doubles a backslash, which is the default
+    `sql_mode`'s reading, and the read-only session holds the server to it: `mysql::enforce_session`
+    takes `NO_BACKSLASH_ESCAPES` out of the mode before the statement runs and refuses the
+    statement if the server puts it back. Verified live on MariaDB `classicmodels`,
+    PostgreSQL `chinook` and a scratch schema — a mixed-case quoted name, a view, a materialized
+    view, a partitioned table whose partition stayed hidden, and an injection-shaped name that came
+    back a plain miss — and SQLite through a throwaway `APPDATA` profile.
   - `cli/exec.rs` — the write path, and the guard that is the only way into it. **A separate
     subcommand, not a flag on `query`**: a flag would put the dangerous case one character from the
     safe one, and it would give two paths one gate when they do not want the same gate — `query`
@@ -20311,7 +20367,8 @@ existing prose was left alone.
     `OutputArgs::output`, and a pair that does not go together — `--no-header` with a format that
     has no header — is a `warn` and `Exit::Usage` before anything is read, the way clap's own
     refusals are. The resolved
-    `Output` is what `list`, `databases`, `ping`, `run_query`, `run_exec` and `emit_rows` take in place of
+    `Output` is what `list`, `databases`, `ping`, `tables`, `describe`, `run_query`, `run_exec` and
+    `emit_rows` take in place of
     a `Format`. No test pins that order; it is the code's.
     **`databases` lists the names `-d` takes, because a CLI user usually starts with none.** The
     app never needs a default database — the tree lists every one — so a saved connection often
@@ -20331,6 +20388,17 @@ existing prose was left alone.
     mean what they do for `list` (`a_ping_reports_the_connection_and_its_round_trip`). **No answer
     is the driver's error on stderr and exit 4, and there is no "down" row**: a script tests the
     exit code, and a person reads the driver's reason on stderr, where every other failure goes.
+    **`tables` and `describe` are `run_catalog`, which is `run_query`'s order with a statement the
+    user did not type**: `select_conn`, the dialect, `database_for`, the `catalog.rs` builder, then
+    `query::gate` asked early as `run_query` asks it, then `connect` and `read_only_query`. A canned
+    statement the gate refused would be this crate's bug, but it is still refused before a login. A
+    builder's `None` — MySQL or PostgreSQL with no database — is a `warn` that the subcommand "needs
+    a database to look in", the `Refused` arm of the no-database hint below, and `Exit::Usage`, with
+    nothing dialled. `tables` prints its rows and the truncation warning as `query` does.
+    `describe` runs under `DESCRIBE_CAP`, 32 768, a bound on memory rather than a cap any real
+    table meets (SQLite's compile-time column ceiling is 32 767), and **zero rows is "no table or
+    view named 'x' in <db>", exit 2** — the command named something that is not there, as a
+    connection that is not there is.
     **After a failure for want of a database, a `hint:` line on stderr names the way out** — `-d
     <database>`, a default picked in Schemaic, and `schemaic databases -c <conn>` with the user's own
     `-c` echoed back, quoted if it has whitespace. `hint` prints it on a line of its own after

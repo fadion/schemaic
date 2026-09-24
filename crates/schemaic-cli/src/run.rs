@@ -20,7 +20,7 @@ use schemaic_db::Db;
 
 use crate::args::{Cli, Command, ConnArgs, OutputArgs, SqlArgs, SqlSource, Target};
 use crate::format::{self, Format, Output};
-use crate::{exec, query, select};
+use crate::{catalog, exec, query, select};
 
 /// What the process exits with.
 ///
@@ -222,6 +222,36 @@ async fn dispatch(command: Command) -> Exit {
             output: _,
             timeout,
         } => ping(&file.connections, &conn, out, Duration::from_secs(timeout)).await,
+        Command::Tables {
+            target,
+            output: _,
+            limit,
+            timeout,
+        } => {
+            tables(
+                &file.connections,
+                &target,
+                out,
+                limit,
+                Duration::from_secs(timeout),
+            )
+            .await
+        }
+        Command::Describe {
+            table,
+            target,
+            output: _,
+            timeout,
+        } => {
+            describe(
+                &file.connections,
+                &target,
+                &table,
+                out,
+                Duration::from_secs(timeout),
+            )
+            .await
+        }
         Command::Query {
             sql,
             target,
@@ -714,6 +744,102 @@ async fn run_query(
             exit_for_no_rows(&e)
         }
     }
+}
+
+/// Run one of [`catalog`]'s canned reads for `target`, as `what`: the rows, or
+/// the exit that has already been explained on stderr.
+///
+/// **The same order and the same path as [`run_query`]** — select, gate,
+/// connect, then `read_only_query` — because it *is* a query, only one the
+/// user did not type. A dialect that cannot answer without a database is told
+/// so before anything is dialled, with the hint a failed query gets.
+async fn run_catalog(
+    conns: &[Connection],
+    target: &Target,
+    what: &str,
+    sql: impl FnOnce(schemaic_core::intel::SqlDialect, Option<&str>) -> Option<String>,
+    limit: usize,
+    timeout: Duration,
+) -> Result<ResultSet, Exit> {
+    let conn = select_conn(conns, &target.conn)?;
+    let dialect = schemaic_core::intel::SqlDialect::from_db_type(&conn.db_type);
+    let database = database_for(target, conn);
+    let Some(sql) = sql(dialect, database.as_deref()) else {
+        warn(&format!("`{what}` needs a database to look in"));
+        hint(&no_database_hint(
+            &target.conn.connection,
+            NoDatabaseFailure::Refused,
+        ));
+        return Err(Exit::Usage);
+    };
+    // Asked here as `run_query` asks it: a canned statement the gate refused
+    // would be this crate's bug, but it must still be refused before a login.
+    if let Err(e) = query::gate(&sql, dialect) {
+        warn(&e.message());
+        return Err(exit_for_no_rows(&e));
+    }
+    let (db, _tunnel) = connect(conn, &target.conn, timeout).await?;
+    query::read_only_query(&db, database.as_deref(), &sql, limit, timeout)
+        .await
+        .map_err(|e| {
+            warn(&e.message());
+            exit_for_no_rows(&e)
+        })
+}
+
+/// `schemaic tables`.
+async fn tables(
+    conns: &[Connection],
+    target: &Target,
+    out: Output,
+    limit: usize,
+    timeout: Duration,
+) -> Exit {
+    let rs = match run_catalog(conns, target, "tables", catalog::tables_sql, limit, timeout).await {
+        Ok(rs) => rs,
+        Err(exit) => return exit,
+    };
+    if let Err(exit) = emit_rows(&rs, out) {
+        return exit;
+    }
+    if let Some(w) = format::truncation_warning(&rs, out) {
+        warn(&w);
+    }
+    Exit::Ok
+}
+
+/// No column can be more than this; it is a bound on memory, never a cap a
+/// real table meets (SQLite's compile-time ceiling is 32 767, and the other
+/// two stop far below it).
+const DESCRIBE_CAP: usize = 32_768;
+
+/// `schemaic describe <table>`.
+///
+/// **No rows is "no such table", exit 2** — the command named something that
+/// is not there, as a connection that is not there is — said with where it
+/// was looked for, since a table in another database is the usual reason.
+async fn describe(
+    conns: &[Connection],
+    target: &Target,
+    table: &str,
+    out: Output,
+    timeout: Duration,
+) -> Exit {
+    let sql = |d, db: Option<&str>| catalog::describe_sql(d, db, table);
+    let rs = match run_catalog(conns, target, "describe", sql, DESCRIBE_CAP, timeout).await {
+        Ok(rs) => rs,
+        Err(exit) => return exit,
+    };
+    if rs.row_count() == 0 {
+        let conn = select_conn(conns, &target.conn).ok();
+        let place = conn
+            .and_then(|c| database_for(target, c))
+            .map(|db| format!(" in {db}"))
+            .unwrap_or_default();
+        warn(&format!("no table or view named '{table}'{place}"));
+        return Exit::Usage;
+    }
+    emit_rows(&rs, out).err().unwrap_or(Exit::Ok)
 }
 
 /// Did this statement fail because it ran with no database — so the
