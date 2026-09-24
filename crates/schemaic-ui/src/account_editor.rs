@@ -37,8 +37,8 @@
 //! it can become visible is the preview's SQL. That is deliberate — the preview
 //! is the app's one gate between a plan and a server, and a statement it showed
 //! with a field blanked would not be the statement it ran. On PostgreSQL even
-//! that shows a SCRAM verifier rather than the password, for any password in
-//! printable ASCII: Preview SQL stamps a fresh salt (`fresh_salt`), and
+//! that shows a SCRAM verifier rather than the password, for any password
+//! SASLprep leaves alone: Preview SQL stamps a fresh salt (`fresh_salt`), and
 //! `users::password_hint` under the field says which the preview will hold.
 
 use std::rc::Rc;

@@ -1693,8 +1693,9 @@ pub fn password_hint(dialect: SqlDialect) -> &'static str {
     if supports_password_verifier(dialect) {
         "The previewed SQL, which is the statement that runs, carries a hash of the \
          password in the form this server stores, not the password itself — unless it \
-         has characters outside printable ASCII, or the server runs a password-check \
-         extension, which are sent as typed."
+         has characters the login would normalise (full-width letters, ligatures, \
+         no-break spaces), or the server runs a password-check extension, which are \
+         sent as typed."
     } else {
         "The password appears in the previewed SQL, which is the statement that runs."
     }
@@ -1789,7 +1790,7 @@ fn md5_verifier(password: &str, role: &str) -> String {
 
 /// The password clause's literal: a verifier where the engine takes one and
 /// the draft carries a salt, the password as typed otherwise — including a
-/// password [`crate::scram::verifier`] declines, one outside printable ASCII.
+/// password [`crate::scram::verifier`] declines, one SASLprep would rewrite.
 ///
 /// `policy` is the server's ([`PasswordPolicy`]), where it was read; `None`
 /// keeps the SCRAM default this had before it existed. A loaded check hook
@@ -3379,10 +3380,6 @@ mod tests {
         );
     }
 
-    /// A password `scram` declines — outside printable ASCII, where SASLprep
-    /// *may* rewrite it at login and this crate has no SASLprep to tell — is
-    /// sent as typed rather than hashed into a verifier the login might not
-    /// match.
     /// **A mistyped confirmation holds Preview back**, on a reset as on a
     /// create — the one place a slip in a masked field can still be caught.
     #[test]
@@ -3570,16 +3567,27 @@ mod tests {
         assert!(!hooked("mypasswordcheckx", &[]));
     }
 
+    /// A password `scram` declines — one SASLprep would rewrite at login, so a
+    /// verifier of the typed form might not match — is sent as typed.
     #[test]
-    fn a_non_ascii_password_is_sent_as_typed_even_when_salted() {
+    fn a_password_saslprep_would_rewrite_is_sent_as_typed_even_when_salted() {
         assert_eq!(
-            account_draft_sql(&salted("pässword"), SqlDialect::Postgres).unwrap(),
-            "CREATE USER \"app\" PASSWORD 'pässword'"
+            account_draft_sql(&salted("ｆｕｌｌ"), SqlDialect::Postgres).unwrap(),
+            "CREATE USER \"app\" PASSWORD 'ｆｕｌｌ'"
         );
         assert_eq!(
-            set_password_sql(&salted_reset("pässword"), SqlDialect::Postgres).unwrap(),
-            "ALTER ROLE \"app\" PASSWORD 'pässword'"
+            set_password_sql(&salted_reset("ｆｕｌｌ"), SqlDialect::Postgres).unwrap(),
+            "ALTER ROLE \"app\" PASSWORD 'ｆｕｌｌ'"
         );
+    }
+
+    /// …and a non-ASCII one it leaves alone is hashed like any other: the
+    /// password never reaches the server's logs.
+    #[test]
+    fn a_non_ascii_password_saslprep_leaves_alone_is_hashed() {
+        let sql = account_draft_sql(&salted("pässword"), SqlDialect::Postgres).unwrap();
+        assert!(sql.contains("PASSWORD 'SCRAM-SHA-256$4096:"), "{sql}");
+        assert!(!sql.contains("pässword"), "{sql}");
     }
 
     /// No salt is the behaviour before verifiers existed, so a caller that
@@ -3619,8 +3627,11 @@ mod tests {
             pg.contains("hash") && pg.contains("not the password"),
             "{pg}"
         );
-        // And names the one case that is still sent as typed.
-        assert!(pg.contains("ASCII"), "{pg}");
+        // And names the cases still sent as typed.
+        assert!(
+            pg.contains("normalise") && pg.contains("password-check"),
+            "{pg}"
+        );
         let my = password_hint(SqlDialect::MySql);
         assert!(my.contains("password appears"), "{my}");
         for d in [SqlDialect::Postgres, SqlDialect::MySql, SqlDialect::Sqlite] {

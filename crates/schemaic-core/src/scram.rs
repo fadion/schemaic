@@ -19,18 +19,20 @@
 //! - `StoredKey = SHA-256(HMAC(SaltedPassword, "Client Key"))`
 //! - `ServerKey = HMAC(SaltedPassword, "Server Key")`
 //!
-//! **Only printable ASCII is hashed.** The client normalises the password it
-//! types at login with SASLprep before deriving anything. SASLprep is the
-//! identity on 0x20–0x7E; outside it, it *may* rewrite the password — NFKC
-//! (`ｆｕｌｌ` becomes `full`), non-ASCII spaces mapped to U+0020, some
-//! characters deleted — while an already-normalised password such as `pässword`
-//! passes through unchanged, and one holding a prohibited character is used as
-//! raw bytes. This module does not implement SASLprep, so it cannot tell which
-//! case a password is in, and it declines rather than risk a verifier the login
-//! would not match: [`verifier`] answers `None` there and the caller sends the
-//! password as typed, which is what the app did before this module existed. The
-//! decline is a missing implementation, not an impossibility — and until it is
-//! filled, such a password still reaches the server as text.
+//! **A password is hashed exactly when SASLprep cannot rewrite it.** The client
+//! normalises the password it types at login with SASLprep (RFC 4013) before
+//! deriving anything, and the server does the same to a password handed to it
+//! as text: non-ASCII spaces mapped to U+0020, a few characters mapped to
+//! nothing, then NFKC — and if the result holds a prohibited character (a
+//! control character, a lone bidi mix, an unassigned code point) every
+//! implementation falls back to the raw bytes. So a password that the mapping
+//! and NFKC leave **unchanged** — all of printable ASCII, and `pässword`,
+//! `日本`, even `tab\there` — is hashed as the bytes it already is by every
+//! path, whether SASLprep accepts it or falls back ([`saslprep_fixed`]). One it
+//! would rewrite (`ｆｕｌｌ` becomes `full`, a no-break space becomes a space)
+//! is declined: [`verifier`] answers `None` and the caller sends it as typed,
+//! because hashing the rewritten form would rest on this crate's Unicode tables
+//! agreeing with every client's, and a disagreement is a lockout.
 //!
 //! The salt is an argument, never generated here: the account form stamps it
 //! into the draft once, so the preview and the Apply run one identical
@@ -43,7 +45,7 @@ pub type Salt = [u8; 16];
 pub const ITERATIONS: u32 = 4096;
 
 /// The verifier for `password` under `salt`, or `None` for a password that is
-/// empty or not wholly printable ASCII — see the module doc for why those are
+/// empty or that SASLprep would rewrite — see the module doc for why those are
 /// sent as typed instead.
 pub fn verifier(password: &str, salt: &Salt) -> Option<String> {
     verifier_with(password, salt, ITERATIONS)
@@ -57,10 +59,7 @@ pub fn verifier_with(password: &str, salt: &Salt, iterations: u32) -> Option<Str
     use base64::Engine as _;
     use base64::engine::general_purpose::STANDARD as B64;
 
-    if iterations == 0
-        || password.is_empty()
-        || !password.bytes().all(|b| (0x20..=0x7e).contains(&b))
-    {
+    if iterations == 0 || password.is_empty() || !saslprep_fixed(password) {
         return None;
     }
     let salted = salted_password(password.as_bytes(), salt, iterations);
@@ -72,6 +71,29 @@ pub fn verifier_with(password: &str, salt: &Salt, iterations: u32) -> Option<Str
         B64.encode(stored_key),
         B64.encode(server_key)
     ))
+}
+
+/// Does SASLprep leave `password` exactly as it is — its mapping step (RFC 4013
+/// §2.1) and NFKC (§2.2) the identity?
+///
+/// That is the whole question, because what follows those two steps only
+/// *checks*: a prohibited or unassigned character makes SASLprep fail, and on
+/// failure libpq, `postgres-protocol` and the server's own `pg_saslprep` all
+/// use the raw password. So for a fixed password every path hashes the same
+/// bytes, and no path's opinion of which characters are prohibited matters.
+pub fn saslprep_fixed(password: &str) -> bool {
+    use stringprep::tables::{commonly_mapped_to_nothing, non_ascii_space_character};
+    use unicode_normalization::UnicodeNormalization;
+    // The fast path libpq and the server take: pure ASCII is used unchanged.
+    if password.is_ascii() {
+        return true;
+    }
+    password
+        .chars()
+        .map(|c| if non_ascii_space_character(c) { ' ' } else { c })
+        .filter(|&c| !commonly_mapped_to_nothing(c))
+        .nfkc()
+        .eq(password.chars())
 }
 
 /// PBKDF2-HMAC-SHA-256 (RFC 8018) for the single 32-byte block SCRAM uses —
@@ -202,21 +224,54 @@ mod tests {
         assert!(verifier("it's \\ a \"test\"", &[0; 16]).is_some());
     }
 
+    /// A password SASLprep leaves alone is hashed, non-ASCII or not: an
+    /// already-composed `pässword` and `日本` pass it unchanged, and a control
+    /// character makes it fail, where every implementation falls back to the
+    /// raw bytes — the same bytes either way.
     #[test]
-    fn outside_printable_ascii_is_not_hashed() {
-        // Not because each would be rewritten — `pässword` and `日本` pass
-        // SASLprep unchanged, and the control characters are prohibited so the
-        // raw bytes are used — but because telling those apart from `ｆｕｌｌ`
-        // (NFKC to `full`) needs a SASLprep this module does not have.
+    fn a_password_saslprep_leaves_alone_is_hashed() {
         for pw in [
             "pässword",
+            "日本",
+            "Ελληνικά",
             "tab\there",
             "new\nline",
             "del\u{7f}",
-            "ｆｕｌｌ",
-            "日本",
+            // Prohibited in stored strings (unassigned), and unchanged by NFKC.
+            "x\u{0378}",
         ] {
+            assert!(saslprep_fixed(pw), "{pw:?}");
+            assert!(verifier(pw, &[0; 16]).is_some(), "{pw:?}");
+        }
+    }
+
+    /// One SASLprep would rewrite is declined, so the login's rewritten form
+    /// never meets a verifier of the raw one: NFKC folds full-width letters and
+    /// ligatures, a decomposed `ä` composes, a no-break space becomes a space,
+    /// and a soft hyphen is mapped to nothing.
+    #[test]
+    fn a_password_saslprep_would_rewrite_is_not_hashed() {
+        for pw in [
+            "ｆｕｌｌ",
+            "ﬁne",
+            "pa\u{0308}ssword",
+            "no\u{a0}break",
+            "soft\u{ad}hyphen",
+        ] {
+            assert!(!saslprep_fixed(pw), "{pw:?}");
             assert_eq!(verifier(pw, &[0; 16]), None, "{pw:?}");
+        }
+    }
+
+    /// Where SASLprep succeeds, "fixed" is exactly "SASLprep returns it
+    /// unchanged" — checked against the `stringprep` crate `postgres-protocol`
+    /// logs in with.
+    #[test]
+    fn fixed_agrees_with_the_clients_saslprep() {
+        for pw in ["pässword", "日本", "ｆｕｌｌ", "no\u{a0}break", "plain"] {
+            if let Ok(prepped) = stringprep::saslprep(pw) {
+                assert_eq!(saslprep_fixed(pw), prepped == pw, "{pw:?}");
+            }
         }
     }
 

@@ -30,6 +30,11 @@ base64 = "0.22"
 # a SCRAM verifier there locks out every client that cannot do SCRAM. The same
 # crate and version `postgres-protocol` already has in the graph.
 md-5 = "0.11"
+# SASLprep's mapping tables and NFKC, so `scram` can hash a non-ASCII password
+# SASLprep would leave alone. The crates and versions `postgres-protocol` uses
+# for its own SASLprep; nothing new enters the lock file.
+stringprep = "0.1.5"
+unicode-normalization = "0.1.25"
 
 [lints]
 workspace = true

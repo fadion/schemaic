@@ -5031,8 +5031,10 @@ dependencies = [
  "serde_json",
  "sha2 0.11.0",
  "sqlparser",
+ "stringprep",
  "thiserror 2.0.20",
  "tracing",
+ "unicode-normalization",
  "zip",
 ]
 
