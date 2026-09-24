@@ -5051,8 +5051,15 @@ pub(crate) async fn fetch_query(
     sql: &str,
     dest: &mut RowDest,
     cancel: CancellationToken,
+    enforce: Option<crate::Enforce>,
 ) -> Result<ResultSet, DbError> {
     let mut conn = db.open(database, false).await?;
+    if let Some(enforce) = enforce
+        && let Err(e) = enforce_session(&mut conn, enforce).await
+    {
+        let _ = conn.disconnect().await;
+        return Err(e);
+    }
     // The connection id, so a second connection can KILL its in-flight query.
     let conn_id = conn.id();
 
@@ -5066,6 +5073,47 @@ pub(crate) async fn fetch_query(
 
     let _ = conn.disconnect().await;
     outcome
+}
+
+/// Put a fresh connection in the state [`crate::Enforce`] asks for, before the
+/// gated statement is sent.
+///
+/// **The mode is read back, not trusted.** The pin removes names from the
+/// server's own mode (`sql::mysql_mode_lexed_like_the_gate`), and a server that
+/// puts one back — a combination mode the list does not know — must fail the
+/// statement rather than run it under a lexer the gate did not use. Sent as a
+/// bound parameter, so nothing the server listed is spliced into SQL text.
+///
+/// `SET SESSION TRANSACTION READ ONLY` covers the autocommit statement that
+/// follows, which is a transaction of its own; a stored function cannot lift it
+/// from inside, because a transaction's access mode cannot change while it runs.
+async fn enforce_session(conn: &mut Conn, enforce: crate::Enforce) -> Result<(), DbError> {
+    let qerr = |e: mysql_async::Error| DbError::Query(e.to_string());
+    let mode: Option<String> = conn
+        .query_first("SELECT @@SESSION.sql_mode")
+        .await
+        .map_err(qerr)?;
+    let pinned = schemaic_core::sql::mysql_mode_lexed_like_the_gate(mode.as_deref().unwrap_or(""));
+    conn.exec_drop("SET SESSION sql_mode = ?", (pinned,))
+        .await
+        .map_err(qerr)?;
+    let back: Option<String> = conn
+        .query_first("SELECT @@SESSION.sql_mode")
+        .await
+        .map_err(qerr)?;
+    if !schemaic_core::sql::mysql_mode_is_lexed_like_the_gate(back.as_deref().unwrap_or("")) {
+        return Err(DbError::Query(format!(
+            "refused: the server's sql_mode ({}) reads quotes differently from the \
+             statement check, and could not be changed for this session",
+            back.unwrap_or_default()
+        )));
+    }
+    if enforce == crate::Enforce::ReadOnly {
+        conn.query_drop("SET SESSION TRANSACTION READ ONLY")
+            .await
+            .map_err(qerr)?;
+    }
+    Ok(())
 }
 
 /// `DbError` isn't `Clone`; this reproduces one for the "connect failed"

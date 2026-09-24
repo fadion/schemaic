@@ -8,14 +8,19 @@
 //!
 //! The gate is [`schemaic_core::sql::read_only_reason`], and it is **strictly
 //! stronger than the editor's** `run_verdict`: an allowlist of read-only
-//! statement heads per dialect, with no confirm arm to say yes to. That is the
-//! right shape when there is nobody at the keyboard to ask. Writes are
-//! [`crate::exec`], behind their own guard.
+//! statement *heads* per dialect plus a deny-list of keywords anywhere, with no
+//! confirm arm to say yes to. That is the right shape when there is nobody at
+//! the keyboard to ask — and it is **not** what makes the statement read-only.
+//! A head is a spelling; a function called from a `SELECT` can write. The
+//! statement runs in a read-only session ([`Enforce::ReadOnly`]), which refuses
+//! a write by its effect, and the gate stays in front for what such a session
+//! allows (sleeps, locks, server-side file reads). Writes are [`crate::exec`],
+//! behind their own guard.
 
 use std::time::Duration;
 
 use schemaic_core::model::ResultSet;
-use schemaic_db::Db;
+use schemaic_db::{Db, Enforce};
 use tokio_util::sync::CancellationToken;
 
 /// How long a headless statement may run before it is cancelled.
@@ -100,8 +105,12 @@ pub async fn read_only_query(
         return Err(NoRows::NotARead(why));
     }
     let token = CancellationToken::new();
+    // **Read-only at the session too, because the gate reads only the text.**
+    // `SELECT setval(…)`, `SELECT lo_unlink(…)` and a `SELECT` of a function
+    // whose body deletes all pass it and all write; a read-only transaction
+    // refuses them by what they do rather than how they are spelled.
     match crate::deadline::with_deadline(
-        db.fetch_query(database, stmt, row_cap, token.clone()),
+        db.fetch_query_enforced(database, stmt, row_cap, token.clone(), Enforce::ReadOnly),
         token,
         timeout,
     )

@@ -854,11 +854,17 @@ pub(crate) async fn fetch_query(
     sql: &str,
     dest: &mut crate::RowDest,
     cancel: CancellationToken,
+    enforce: Option<crate::Enforce>,
 ) -> Result<ResultSet, DbError> {
     refuse_if_cancelled(&cancel)?;
     let sql = sql.to_string();
     let db = db.clone();
     let (tx, rx) = tokio::sync::oneshot::channel();
+    // `AsJudged` asks nothing of SQLite: it has no backslash escape and no
+    // setting that would give it one. `ReadOnly` is `query_only`, which refuses
+    // every change to a database file for the life of the connection — and a
+    // `SELECT` cannot set a pragma, so the statement cannot lift it.
+    let read_only = enforce == Some(crate::Enforce::ReadOnly);
 
     // The row loop is the blocking half, so the destination travels *with* it and
     // comes back: a stream's `sent` is written inside that loop, and the caller
@@ -871,6 +877,9 @@ pub(crate) async fn fetch_query(
             Ok(c) => c,
             Err(e) => return (Err(e), moved),
         };
+        if read_only && let Err(e) = conn.execute_batch("PRAGMA query_only = ON") {
+            return (Err(DbError::Query(e.to_string())), moved);
+        }
         // Hand the interrupt handle to the async side before doing any work.
         let _ = tx.send(conn.get_interrupt_handle());
         let rs = run_query(&conn, &sql, &mut moved);
@@ -4670,6 +4679,72 @@ mod tests {
             uri,
         );
         (keeper, db)
+    }
+
+    /// **The session refuses a write the text gate let through.** The gate is
+    /// bypassed on purpose — a write reaching this layer is exactly the case it
+    /// exists for — and the read beside it proves the refusal is about the write,
+    /// not a session that refuses everything.
+    #[tokio::test]
+    async fn a_read_only_fetch_refuses_a_write_and_still_reads() {
+        let (keeper, db) = shared_memory("enforced_read_only");
+        keeper
+            .execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY); INSERT INTO t VALUES (1);")
+            .expect("seed");
+        let fetch = |sql: &'static str| {
+            let db = db.clone();
+            async move {
+                db.fetch_query_enforced(
+                    None,
+                    sql,
+                    10,
+                    CancellationToken::new(),
+                    crate::Enforce::ReadOnly,
+                )
+                .await
+            }
+        };
+        assert!(
+            fetch("INSERT INTO t VALUES (2)").await.is_err(),
+            "a read-only session ran a write"
+        );
+        let n: i64 = keeper
+            .query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0))
+            .expect("count");
+        assert_eq!(n, 1, "the refused write left a row behind");
+        let rs = fetch("SELECT id FROM t").await.expect("a read runs");
+        assert_eq!(rs.row_count(), 1);
+    }
+
+    /// `AsJudged` is not read-only, and the unguarded path is untouched: the
+    /// editor's `fetch_query` must keep writing.
+    #[tokio::test]
+    async fn only_the_read_only_enforcement_refuses_a_write() {
+        let (keeper, db) = shared_memory("enforced_as_judged");
+        keeper
+            .execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY);")
+            .expect("seed");
+        db.fetch_query_enforced(
+            None,
+            "INSERT INTO t VALUES (1)",
+            10,
+            CancellationToken::new(),
+            crate::Enforce::AsJudged,
+        )
+        .await
+        .expect("AsJudged writes");
+        db.fetch_query(
+            None,
+            "INSERT INTO t VALUES (2)",
+            10,
+            CancellationToken::new(),
+        )
+        .await
+        .expect("fetch_query writes");
+        let n: i64 = keeper
+            .query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0))
+            .expect("count");
+        assert_eq!(n, 2);
     }
 
     fn edit(table: &str, set: &[(&str, Option<&str>)], key: &[(&str, Value)]) -> RowEdit {

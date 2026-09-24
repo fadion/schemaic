@@ -178,6 +178,11 @@ pub struct Target {
     /// SQLite, and PostgreSQL is the only leg in this tier that can catch it.
     pub trigger_condition: Option<&'static str>,
     pub trigger_update_columns: &'static [&'static str],
+    /// How this server creates `purge_all()`: a function that deletes every row
+    /// of `{table}` and returns `1`, so `SELECT purge_all()` is a write whose
+    /// text is a read — what [`crate::enforced`] asks a read-only session to
+    /// refuse. (Not `purge()`: `PURGE` is a reserved word on MySQL.)
+    pub purging_function: &'static str,
     /// A statement that does nothing for a given number of seconds, in this
     /// server's spelling, with `{}` where the count goes and `{marker}` where
     /// the caller's marker goes — what the cancellation test interrupts. There
@@ -260,6 +265,13 @@ pub struct Target {
     expected_keyed_cases: usize,
 }
 
+/// [`Target::purging_function`] for both MySQL-family legs. `DETERMINISTIC` is
+/// what lets a server with binary logging on accept it from a user without
+/// `log_bin_trust_function_creators`; it is a lie about the function, and the
+/// function exists only inside a scratch database.
+const MYSQL_PURGING_FUNCTION: &str = "CREATE FUNCTION purge_all() RETURNS INT DETERMINISTIC \
+     MODIFIES SQL DATA BEGIN DELETE FROM {table}; RETURN 1; END";
+
 pub static MARIADB: Target = Target {
     name: "mariadb",
     engine: Engine::MySql,
@@ -283,6 +295,7 @@ pub static MARIADB: Target = Target {
     trigger_function_name: None,
     trigger_condition: None,
     trigger_update_columns: &[],
+    purging_function: MYSQL_PURGING_FUNCTION,
     sleep_template: "SELECT SLEEP({}) /* {marker} */",
     running_sleeps_sql: "SELECT COUNT(*) FROM information_schema.PROCESSLIST \n         WHERE INFO LIKE CONCAT('%{head}', '{tail}%')",
     types: cases::MYSQL_FAMILY,
@@ -315,6 +328,7 @@ pub static MYSQL: Target = Target {
     trigger_function_name: None,
     trigger_condition: None,
     trigger_update_columns: &[],
+    purging_function: MYSQL_PURGING_FUNCTION,
     sleep_template: "SELECT SLEEP({}) /* {marker} */",
     running_sleeps_sql: "SELECT COUNT(*) FROM information_schema.PROCESSLIST \n         WHERE INFO LIKE CONCAT('%{head}', '{tail}%')",
     types: cases::MYSQL_FAMILY,
@@ -349,6 +363,8 @@ pub static POSTGRES: Target = Target {
     trigger_function_name: Some("upper_name"),
     trigger_condition: Some("NEW.name IS NOT NULL"),
     trigger_update_columns: &["name"],
+    purging_function: "CREATE FUNCTION purge_all() RETURNS int LANGUAGE sql AS \
+         $$ DELETE FROM {table}; SELECT 1 $$",
     sleep_template: "SELECT pg_sleep({}) /* {marker} */",
     running_sleeps_sql: "SELECT count(*) FROM pg_stat_activity \n         WHERE state = 'active' AND query LIKE '%{head}' || '{tail}%'",
     types: cases::POSTGRES,

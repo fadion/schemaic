@@ -763,6 +763,21 @@ pub(crate) fn should_retry_plaintext(
         )
 }
 
+/// What the **session** is asked to enforce about a statement a text gate has
+/// already judged — see [`Db::fetch_query_enforced`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Enforce {
+    /// The server reads the statement's quotes the way the gate did, so where
+    /// the gate saw one statement the server sees one. On MySQL/MariaDB that is
+    /// a pinned `sql_mode` (`sql::mysql_mode_lexed_like_the_gate`); PostgreSQL
+    /// pins its one such setting on every connection already, and SQLite has
+    /// none.
+    AsJudged,
+    /// [`Enforce::AsJudged`], and the session refuses every write: a read-only
+    /// transaction on the two servers, `PRAGMA query_only` on SQLite.
+    ReadOnly,
+}
+
 impl Db {
     /// Connect (scoped to `database`), run `sql` (up to `row_cap` rows), and
     /// return the result. If `cancel` fires first, the running query is killed
@@ -774,8 +789,42 @@ impl Db {
         row_cap: usize,
         cancel: CancellationToken,
     ) -> Result<ResultSet, DbError> {
-        self.run_to(database, sql, &mut RowDest::Capped(row_cap), cancel)
+        self.run_to(database, sql, &mut RowDest::Capped(row_cap), cancel, None)
             .await
+    }
+
+    /// [`Self::fetch_query`] for a statement a **text gate** has judged, with
+    /// the session made to agree with the judgement — the headless paths
+    /// (`schemaic query`/`exec`, the MCP server's `run_query`), where nobody is
+    /// at the keyboard to notice the gate was wrong.
+    ///
+    /// **A gate that reads the text cannot see what a function does.**
+    /// `SELECT setval('s', 1000)`, `SELECT lo_unlink(…)` and a `SELECT` of a
+    /// user function whose body `DELETE`s all begin with a read head and name
+    /// no denied keyword, and on an ordinary session they write. A read-only
+    /// transaction is the one layer that sees the effect instead of the
+    /// spelling, so [`Enforce::ReadOnly`] asks the server for it; the gate
+    /// stays in front for what such a transaction allows (sleeps, locks,
+    /// server-side file reads).
+    ///
+    /// Failing to put the session in the asked-for state fails the statement:
+    /// it never runs on a session that was only *meant* to be guarded.
+    pub async fn fetch_query_enforced(
+        &self,
+        database: Option<&str>,
+        sql: &str,
+        row_cap: usize,
+        cancel: CancellationToken,
+        enforce: Enforce,
+    ) -> Result<ResultSet, DbError> {
+        self.run_to(
+            database,
+            sql,
+            &mut RowDest::Capped(row_cap),
+            cancel,
+            Some(enforce),
+        )
+        .await
     }
 
     /// Run `sql` with **no row cap**, handing the rows to `tx` in blocks of
@@ -810,7 +859,7 @@ impl Db {
             tx: tx.clone(),
             sent: 0,
         };
-        let outcome = self.run_to(database, sql, &mut dest, cancel).await;
+        let outcome = self.run_to(database, sql, &mut dest, cancel, None).await;
         match outcome {
             // **A statement with no result set is not an empty export.** All
             // three engines return before their tail flush when the statement
@@ -844,14 +893,15 @@ impl Db {
         sql: &str,
         dest: &mut RowDest,
         cancel: CancellationToken,
+        enforce: Option<Enforce>,
     ) -> Result<ResultSet, DbError> {
         // Stamped here, in the one place that knows what the connection was
         // actually scoped to, rather than by the caller from the tab it will land
         // in — see `ResultSet::database`.
         let mut rs = match self.engine {
-            Engine::Postgres => pg::fetch_query(self, database, sql, dest, cancel).await?,
-            Engine::Sqlite => sqlite::fetch_query(self, sql, dest, cancel).await?,
-            Engine::MySql => mysql::fetch_query(self, database, sql, dest, cancel).await?,
+            Engine::Postgres => pg::fetch_query(self, database, sql, dest, cancel, enforce).await?,
+            Engine::Sqlite => sqlite::fetch_query(self, sql, dest, cancel, enforce).await?,
+            Engine::MySql => mysql::fetch_query(self, database, sql, dest, cancel, enforce).await?,
         };
         // A SQLite connection has exactly one database and the caller passes none,
         // so the label comes from the engine rather than from a scope nobody set.

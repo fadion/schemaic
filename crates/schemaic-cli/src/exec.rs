@@ -22,7 +22,7 @@ use std::time::Duration;
 use schemaic_core::connection::Connection;
 use schemaic_core::model::ResultSet;
 use schemaic_core::sql::{GuardPolicy, RunVerdict};
-use schemaic_db::Db;
+use schemaic_db::{Db, Enforce};
 use tokio_util::sync::CancellationToken;
 
 use crate::query::{NoRows, normalize_stmt};
@@ -68,6 +68,11 @@ impl NotRun {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ExecRequest {
     sql: String,
+    /// What the session must enforce, minted from the connection the verdict
+    /// judged: a read-only connection's approved statement is a read *to the
+    /// text check*, and `SELECT setval(…)` is one of those. The session is what
+    /// refuses it.
+    enforce: Enforce,
 }
 
 impl ExecRequest {
@@ -115,11 +120,21 @@ impl ExecRequest {
         }
         .map(|()| ExecRequest {
             sql: stmt.to_string(),
+            enforce: if conn.read_only {
+                Enforce::ReadOnly
+            } else {
+                Enforce::AsJudged
+            },
         })
     }
 
     pub fn sql(&self) -> &str {
         &self.sql
+    }
+
+    /// What the session this request runs on must enforce.
+    pub fn enforce(&self) -> Enforce {
+        self.enforce
     }
 }
 
@@ -145,7 +160,16 @@ pub async fn run(
 ) -> Result<ResultSet, NoRows> {
     let token = CancellationToken::new();
     match crate::deadline::with_deadline(
-        db.fetch_query(database, request.sql(), RETURNED_ROW_CAP, token.clone()),
+        // Never plain `fetch_query`: `approved` counted one statement with the
+        // gate's lexer, and on MySQL only a pinned `sql_mode` makes the server
+        // count the same.
+        db.fetch_query_enforced(
+            database,
+            request.sql(),
+            RETURNED_ROW_CAP,
+            token.clone(),
+            request.enforce(),
+        ),
         token,
         timeout,
     )
@@ -243,6 +267,25 @@ mod tests {
             ),
             Err(NotRun::Several)
         );
+    }
+
+    /// **A read-only connection's approval runs on a read-only session.** The
+    /// verdict is a text check, and `SELECT setval(…)` is a read to it; only the
+    /// session sees that it writes.
+    #[test]
+    fn a_read_only_connection_mints_a_read_only_session() {
+        let r = ExecRequest::approved(&conn(true), Some("app"), "SELECT setval('s', 1)", false)
+            .expect("a SELECT passes the text check on a read-only connection");
+        assert_eq!(r.enforce(), Enforce::ReadOnly);
+    }
+
+    /// A writable connection still gets the lexer pin, never the bare session:
+    /// the one-statement count above was the gate's, and only a session that
+    /// lexes like it makes the server's count agree.
+    #[test]
+    fn a_writable_connection_mints_a_session_that_lexes_like_the_gate() {
+        let r = approved("DELETE FROM t WHERE id = 1", false).unwrap();
+        assert_eq!(r.enforce(), Enforce::AsJudged);
     }
 
     /// A read through `exec` is not an error — it is pointless but harmless,

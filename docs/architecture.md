@@ -289,6 +289,30 @@ existing prose was left alone.
     prompt being told it *"is not permitted in an AI query"* is being answered about somebody else's
     session. The denied-keyword refusal says *read-only query* instead. The head-list refusal above
     never named a front end, which is why only the one sentence changed.
+    **It is a text gate, and it is not what makes a statement read-only.** A head is a spelling, and
+    the gate cannot see what a function does: `SELECT setval('s', 1000)`, `SELECT lo_unlink(…)`,
+    PostgreSQL's `SELECT 1 INTO newtable` and a `SELECT` of a user function whose body `DELETE`s all
+    open with a read head and name no denied word, and all of them wrote through MCP `run_query` and
+    `schemaic query` — shown live on PostgreSQL 16 and MariaDB 10.11 — while this document called the
+    gate read-only. What refuses them is the session (`Db::fetch_query_enforced` with
+    `Enforce::ReadOnly`, under `schemaic-db`); the gate stays in front for the one-statement count and
+    for what a read-only session still allows — sleeps, locks, server-side file reads. **And the
+    one-statement count is only as good as the server's agreement about where a statement ends.**
+    `skip_noncode` assumes `\` escapes inside every quote, which a MySQL/MariaDB server stops doing
+    under `NO_BACKSLASH_ESCAPES`, and under `ANSI_QUOTES` it reads `"a\"` as an identifier with no
+    escapes at all — so `SELECT 'a\'; DELETE FROM t; -- '` is one `SELECT` here and three statements
+    there (`a_backslash_quote_hides_a_second_statement_from_the_gate` pins the gate's half: it
+    passes). The gate cannot know the server's mode, so the session is put in the one it assumed.
+    `mysql_mode_lexed_like_the_gate` removes every name in `MYSQL_MODES_THAT_MOVE_A_QUOTE` and keeps
+    the rest — the combination modes `ANSI`, `DB2`, `MAXDB`, `MSSQL`, `ORACLE` and `POSTGRESQL` are on
+    the list because each implies `ANSI_QUOTES`, and dropping the flag while keeping the combination
+    would have the server put it straight back (`a_combination_mode_that_implies_ansi_quotes_goes_too`).
+    It removes names rather than overwriting the mode, for `export::MYSQL_LITERAL_MODE_SQL`'s reason:
+    the strictness the server was configured with is not its business, and what a combination implied
+    apart from the quote survives as the flags the server lists beside it.
+    `mysql_mode_is_lexed_like_the_gate` is the read-back check the session makes *after* the `SET`,
+    matching whole names so `NO_BACKSLASH_ESCAPES_X` is not a hazard
+    (`a_mode_name_is_matched_whole_not_by_substring`).
     **A quoted name in front of a `(` is a function call, and the deny scan has to see it.**
     PostgreSQL resolves a double-quoted identifier against the stored lower-case `pg_proc.proname`,
     so `SELECT "pg_read_file"('/etc/passwd')` is the same call as the unquoted one — while
@@ -8396,8 +8420,8 @@ existing prose was left alone.
   can reach — the same reason `error_chain`'s tests use a synthetic chain. Live:
   `a_refused_write_says_which_value_the_server_refused`, with `Target::error_names_the_value`
   recording which engines carry a separate detail field at all.
-  `fetch_query`/`stream_query`/`run_batch`/`fetch_schema`/`ping`/`commit_writes`/`refetch_rows`/
-  `prepare_check`
+  `fetch_query`/`fetch_query_enforced`/`stream_query`/`run_batch`/`fetch_schema`/`ping`/
+  `commit_writes`/`refetch_rows`/`prepare_check`
   (non-executing `PREPARE` for the editor's live validation)/`run_ddl`/`run_script`/`fetch_table_stats`/
   `count_rows`/`fetch_blob` are `Db` methods taking the target DB per call.
   **`Db::fetch_blob` is the binary-cell panel's whole backend** — one connection, one `SELECT`, one
@@ -8612,6 +8636,42 @@ existing prose was left alone.
   spellings cannot drift. `pg::cell_kinds` is the same hoist on PostgreSQL and answers the numeric
   kind and the binary flag **together**, once per column, replacing a per-cell
   `to_ascii_uppercase()`.
+  **`Db::fetch_query_enforced` is `fetch_query` for a statement a text gate has already judged, with
+  the session made to agree with the judgement** — the headless paths, where nobody is at the
+  keyboard to notice the gate was wrong. It takes an `Enforce` down the same `run_to` dispatch, whose
+  `None` is what every other caller passes, and each variant answers one thing a gate that reads
+  text cannot know. **`Enforce::ReadOnly` is the effect the text does not show**: `SELECT setval(…)`,
+  `SELECT lo_unlink(…)`, PostgreSQL's `SELECT 1 INTO newtable` and a `SELECT` of a function whose body
+  deletes all pass `sql::read_only_reason` and all wrote through the headless read path (see
+  `core::sql`). So the session refuses writes — `SET SESSION CHARACTERISTICS AS TRANSACTION READ
+  ONLY` on PostgreSQL, `SET SESSION TRANSACTION READ ONLY` on MySQL/MariaDB, `PRAGMA query_only = ON`
+  on SQLite. On PostgreSQL it is the session default rather than a `BEGIN READ ONLY`, so the
+  statement's own implicit transaction is the read-only one and there is no transaction of ours for
+  it to sit inside. None of the three can be lifted by the statement it guards: PostgreSQL refuses
+  `transaction_read_only` once a transaction has taken its snapshot, which a `SELECT` has; a MySQL
+  transaction's access mode cannot change while it runs, so a stored function cannot undo it from
+  inside; and a `SELECT` cannot set a pragma. **`Enforce::AsJudged` is the lexer the gate
+  assumed.** On a MySQL/MariaDB server whose `sql_mode` carries `NO_BACKSLASH_ESCAPES` or
+  `ANSI_QUOTES`, `SELECT 'a\'; DELETE FROM t; -- '` is one `SELECT` to the gate and three statements
+  to the server, and the `DELETE` runs, because `mysql_async` sends multi-statement text whether the
+  caller wants it or not — `CLIENT_MULTI_STATEMENTS` is hard-coded in 0.37's
+  `Opts::get_capabilities`, with no toggle. Shown end to end on a throwaway MariaDB 11.8 with the
+  global mode set: plain `fetch_query` deleted a row, and both `Enforce` modes deleted nothing.
+  `mysql::enforce_session` runs on **both** variants: it reads `@@SESSION.sql_mode`, strips it
+  through `core::sql::mysql_mode_lexed_like_the_gate`, sets the result as a **bound parameter** so
+  nothing the server listed is spliced into SQL text, and **reads it back** through
+  `mysql_mode_is_lexed_like_the_gate` rather than trusting the `SET` — a combination mode the list
+  does not know must fail the statement, not run it under a lexer the gate did not use — before
+  `ReadOnly` adds its `SET SESSION TRANSACTION READ ONLY`. PostgreSQL's `AsJudged` asks nothing,
+  because the one setting that moves a quote there, `standard_conforming_strings`, is already pinned
+  on the startup packet by `connect_probe` (above) — the same hazard, closed earlier — and SQLite's
+  asks nothing because it has no backslash escape to disagree about. **Failing to put the session in
+  the asked-for state fails the statement**: it never runs on a session that was only *meant* to be
+  guarded. The editor's `fetch_query` is untouched by any of this. `sqlite.rs` carries
+  `a_read_only_fetch_refuses_a_write_and_still_reads` (the row count afterwards, not just the error,
+  and a read beside it so a session that refuses everything fails) and
+  `only_the_read_only_enforcement_refuses_a_write`, which holds `AsJudged` and plain `fetch_query` to
+  still writing; the server legs are the live tier's `enforced.rs`, below.
   **MySQL reads one row through two protocols, and `convert_row` has to make them agree.**
   `collect_rows` loads a result with `query_iter` (the **text** protocol, every value a `Bytes` that
   `parse_typed` keeps the server's own characters of), while `refetch_on` re-reads one row with
@@ -10090,6 +10150,20 @@ existing prose was left alone.
   `staged_bytes_reach_the_column_as_bytes`, stage → commit → re-read on all three servers, which is
   what proves each engine's `cell_param` binding (see `schemaic-db`'s entry for what it deliberately
   does not pin).
+  **`enforced.rs` is the session's half of the headless read gate**, and only a server can hold it:
+  `read_only_reason` reads text, and `SELECT purge_all()` is a read head naming no denied word while
+  `purge_all()` empties a table. `Target::purging_function` is each server's `CREATE FUNCTION` for it
+  — `purge_all` rather than `purge`, `PURGE` being reserved on MySQL, and `DETERMINISTIC` on the MySQL
+  family, which is a lie about the function and is what lets a server with binary logging on accept
+  it from a user without `log_bin_trust_function_creators`.
+  `a_read_only_session_refuses_a_write_a_select_hides` asserts the premise first — the gate passes the statement, which is the composition the bug lived
+  in — then that `Enforce::ReadOnly` fails it **and** that all three rows are still there, since an
+  error alone could be a session that refuses everything; `a_read_only_session_still_reads` is the
+  other side of that, and `a_session_pinned_to_the_gates_lexer_still_writes` holds `AsJudged` to
+  *not* being read-only, `exec` on a writable connection running on it. **The `sql_mode` pin has no
+  case here**: no leg sets a mode that moves a quote, so the smuggle `AsJudged` closes on the MySQL
+  family was measured once, by hand, on a throwaway MariaDB 11.8, and what holds it now is
+  `core::sql`'s pure tests over the strip and the read-back. Nothing in the tier reproduces that run.
   **In `users.rs` the reads are of accounts that were already there and the writes make their own.**
   An account is server-wide — it is not inside the scratch database and would not go away with it —
   so the read half asks about the account the suite **connected as** (`Target::user()`), that being
@@ -10278,9 +10352,9 @@ existing prose was left alone.
   needed it yet: streaming a genuinely large export, and multi-schema PostgreSQL.
   **It is gated as a *target*, not at runtime.** The manifest declares the target
   `required-features = ["live-tests"]`, so `cargo test --workspace` does not build it and the pure
-  tier stays pure by construction. It is **353 tests** as this is written — 113 suite functions
-  expanded across the three legs by `main.rs`'s macro (339), the eight in the two catalog oracles
-  outside it (`pg_catalog`'s four and `mariadb_catalog`'s four), and the six that need no server
+  tier stays pure by construction. It is **385 tests** as this is written — 122 suite functions
+  expanded across the three legs by `main.rs`'s macro (366), the thirteen in the two catalog oracles
+  outside it (`pg_catalog`'s six and `mariadb_catalog`'s seven), and the six that need no server
   (the four name-guard cases, `endpoint.rs`'s declared-case count, and the skip-notice source gate).
   The figure this sentence carried for a while was 306, a count that had never included the oracles
   and went stale as the suite grew; `cargo test -p schemaic-db --features live-tests --test live --
@@ -17974,6 +18048,9 @@ existing prose was left alone.
   the **caller words it**, because they do not all mean the same thing: a timed-out `run_query` is an
   error the model must see, while a timed-out sample degrades to the same "(unavailable: …)" line an
   unselectable view already produces, with the table's DDL and keys still returned.
+  **The sample runs on a read-only session too** (`fetch_query_enforced` with `Enforce::ReadOnly`,
+  as `run_query`'s read does): the statement is `filter::table_query`'s own, but the object it names
+  is not, and a view can call a function that writes.
   **A read with nothing to cancel needs the other wrapper, and `with_deadline` over one is not a
   deadline at all.** `list_schema`'s per-database table-list loop calls `fetch_table_list`, which
   takes no `CancellationToken` on any of the three engines — it is a name listing, not the full
@@ -19336,8 +19413,14 @@ existing prose was left alone.
     reason to drift — same gate, same timeout, same normalisation, and only one of them getting the
     next fix. The gate is
     `core::sql::read_only_reason` and is strictly stronger than the editor's `run_verdict`: an
-    allowlist of read-only statement heads per dialect with no confirm arm to say yes to, which is
-    the right shape when there is nobody at the keyboard. It is asked in the **connection's own**
+    allowlist of read-only statement *heads* per dialect plus a deny-list of keywords anywhere, with
+    no confirm arm to say yes to, which is the right shape when there is nobody at the keyboard.
+    **It is not what makes the statement read-only**, and this entry used to say it was: a head is a
+    spelling, and `SELECT setval(…)` or a `SELECT` of a function that deletes passes it and writes. So
+    the statement runs through `Db::fetch_query_enforced` with `Enforce::ReadOnly`, a session that
+    refuses a write by its effect — and on MySQL/MariaDB one whose `sql_mode` is pinned to the lexer
+    the gate counted statements with — while the gate stays in front for what such a session still
+    allows: sleeps, locks, server-side file reads. It is asked in the **connection's own**
     dialect, so a PostgreSQL `#` operator is not lexed as a comment on the way in. `normalize_stmt`
     is pure and owns the trailing-`;` rule — a person types the semicolon out of habit and a
     `SELECT 1;` answered "empty query" would be a baffling way to learn it was unwanted — and
@@ -19362,6 +19445,13 @@ existing prose was left alone.
     the unbounded write it would then also wave through. A read through `exec` is allowed and merely
     pointless, because refusing it would need `exec` to grow a second gate deciding what a read is.
     `run` bounds the statement through `deadline::with_deadline`, the same wrapper `query` uses.
+    **It runs through `fetch_query_enforced`, never plain `fetch_query`**, with an `Enforce` that
+    `approved` mints into a private field from the connection the verdict judged: `ReadOnly` on a
+    `read_only` connection, because what the verdict lets through there is a read *to the text
+    check* and `SELECT setval(…)` is one of those; `AsJudged` otherwise, because the one-statement
+    count `approved` made was the gate's lexer's, and on MySQL only a pinned `sql_mode` makes the
+    server count the same (`a_read_only_connection_mints_a_read_only_session`,
+    `a_writable_connection_mints_a_session_that_lexes_like_the_gate`).
     **It takes no row cap**: `RETURNED_ROW_CAP` is private and is `args::DEFAULT_LIMIT`, because the
     `1` `run.rs` used to pass printed one row of a thousand-row `UPDATE … RETURNING` with no warning,
     and a parameter would let a call site choose it again. The cap is on what is printed, never on
@@ -19623,11 +19713,24 @@ Re-introducing the anti-patterns these guard against is a regression:
   the defect living, as ever here, at its composition with the caller.
   **The headless CLI is the fourth path, and it splits the question in two rather than adding a
   gate.** `schemaic query` runs `cli/query.rs`'s `read_only_query`, whose gate is
-  `sql::read_only_reason` — an allowlist of read heads per dialect with **no `Confirm` arm to say
-  yes to**, which is the right shape when there is nobody at the keyboard, and stronger than the
-  verdict on the same axis `rerunnable_for_export` is. That function is the one headless read path:
-  the MCP server's `run_query` calls it too, rather than the CLI writing a second copy of the gate
-  beside the one `mcp.rs` already had.
+  `sql::read_only_reason` — an allowlist of read heads per dialect plus a keyword deny-list, with
+  **no `Confirm` arm to say yes to**, which is the right shape when there is nobody at the keyboard,
+  and stronger than the verdict on the same axis `rerunnable_for_export` is. That function is the
+  one headless read path: the MCP server's `run_query` calls it too, rather than the CLI writing a
+  second copy of the gate beside the one `mcp.rs` already had.
+  **A head is a spelling, not a read, and this paragraph called the gate read-only while it was
+  not.** `SELECT setval('s', 1000)`, `SELECT lo_unlink(…)`, PostgreSQL's `SELECT 1 INTO newtable` and
+  a `SELECT` of a function whose body `DELETE`s all passed it and wrote through both front ends —
+  shown live on PostgreSQL 16 and MariaDB 10.11. A text gate cannot see what a function does, so
+  `read_only_query` now runs the statement through `Db::fetch_query_enforced` with
+  `Enforce::ReadOnly`, a session that refuses a write by its effect, and the gate stays in front for
+  what that session still allows (sleeps, locks, server-side file reads) and for the one-statement
+  count — which that session also pins, on MySQL/MariaDB, to the lexer the gate counted with (see
+  `schemaic-db`'s entry for the `sql_mode` smuggle that closed). **`read_only_reason` has no minted
+  request**: it is enforced inside `read_only_query` itself, and the refusals and the requests are
+  two separate lists. The refusals are `rerunnable_for_export`, `script_verdict` and
+  `read_only_reason`; the requests are `RerunRequest`, minted against the first, `ScriptRequest`,
+  against the second, and `ExecRequest`, minted against `run_verdict` itself.
   **`schemaic exec` is the write half, and it is the third minted request.** `ExecRequest` has a
   private field, `ExecRequest::approved` is its only constructor and `exec::run` takes one by value
   — the same shape as `ScriptRequest::approved` and `RerunRequest::approved`, reached deliberately
@@ -19666,7 +19769,7 @@ Re-introducing the anti-patterns these guard against is a regression:
   `an_unfiltered_read_reruns_as_itself_even_when_it_cannot_be_rewritten`, the join-and-CTE property
   the read-more link exists for).
   **The terminal is where this model stops, and the position is stated here rather than left to be
-  inferred.** The sentence above is *every path that executes user SQL*, with two named refusals
+  inferred.** The sentence above is *every path that executes user SQL*, with three named refusals
   beside it — and a terminal running `mysql`, `psql` or `sqlite3` executes user SQL that never
   passes through this app. No per-statement guard is possible there: the statements are typed into
   another process, Schemaic sees bytes on a PTY, there is no `&[String]` for `run_verdict` to judge

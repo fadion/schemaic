@@ -69,13 +69,19 @@ substitute for the statement, and none of these is a style preference.
   *strictly stronger* than it. There are **three** such refusals now:
   `sql::rerunnable_for_export`, which has no `Confirm` arm; `sql::script_verdict`, which treats
   a whole `.sql` file as a write without reading it; and `sql::read_only_reason`, a per-dialect
-  allowlist of read-only statement heads with no confirm arm at all, which is the gate for both
-  paths that run SQL with nobody at the keyboard — the MCP server's `run_query` tool and
-  `schemaic query`. Never a second, laxer gate — and **each is reached only through a request its
-  guard mints**: `ScriptRequest::approved` for the file, `RerunRequest::approved` for `apply_view`,
-  `open_table_filtered` and the grid's post-commit re-fetch, and
-  `cli::exec::ExecRequest::approved` for `schemaic exec`, whose `--yes` answers a `Confirm` and
-  cannot answer a `Block`. That shape is the invariant, not a detail of it: the guard being a
+  allowlist of read-only statement *heads* plus a keyword deny-list, with no confirm arm at all,
+  which is the gate for both paths that run SQL with nobody at the keyboard — the MCP server's
+  `run_query` tool and `schemaic query`. **A head is a spelling, not a read**: `SELECT setval(…)`
+  passes it and writes, so those paths also run on a session that refuses writes by their effect
+  (`Db::fetch_query_enforced` with `Enforce::ReadOnly`), and the text gate stays in front for what
+  such a session still allows. Never a second, laxer gate. **The requests its guard mints are a
+  separate list from the refusals**: `ScriptRequest::approved` for the file,
+  `RerunRequest::approved` for `apply_view`, `open_table_filtered` and the grid's post-commit
+  re-fetch, and `cli::exec::ExecRequest::approved` for `schemaic exec` — minted against
+  `run_verdict` itself, whose `--yes` answers a `Confirm` and cannot answer a `Block`.
+  `read_only_reason` has no request: it is enforced inside `cli::query::read_only_query`, the one
+  headless read path, which both front ends call. That shape is the invariant, not a detail of
+  it: the guard being a
   *step* the launcher had to remember is how one `return` came to be all that stood between a
   read-only connection and a file, and how three of the four re-run affordances came to rest on
   predicates that were not about writes — the post-commit re-fetch was the last of them, and the

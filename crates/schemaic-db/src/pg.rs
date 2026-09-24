@@ -428,11 +428,27 @@ pub(crate) async fn fetch_query(
     sql: &str,
     dest: &mut crate::RowDest,
     cancel: CancellationToken,
+    enforce: Option<crate::Enforce>,
 ) -> Result<ResultSet, DbError> {
     let client = match database {
         Some(d) => connect_to(db, d).await?,
         None => connect_maintenance(db).await?,
     };
+    // `AsJudged` needs nothing here: the one setting that moves a quote,
+    // `standard_conforming_strings`, is pinned on the startup packet of every
+    // connection this module opens.
+    //
+    // `ReadOnly` is the session default rather than a `BEGIN READ ONLY`, so the
+    // statement's own implicit transaction is read-only with no transaction of
+    // ours for it to be inside — `in_tx` stays false below. A statement cannot
+    // undo it for itself: `transaction_read_only` is refused once the
+    // transaction has taken its snapshot, which a `SELECT` has.
+    if enforce == Some(crate::Enforce::ReadOnly) {
+        client
+            .batch_execute("SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY")
+            .await
+            .map_err(|e| db_err(&e))?;
+    }
     // A connection of its own, opened three lines up: no transaction to fence.
     run_statement(
         db,
@@ -616,6 +632,7 @@ pub(crate) async fn fetch_table(
         &sql,
         &mut crate::RowDest::Capped(limit),
         cancel,
+        None,
     )
     .await
 }
@@ -647,6 +664,7 @@ pub(crate) async fn explain(
             &format!("EXPLAIN {stmt}"),
             &mut crate::RowDest::Capped(10_000),
             cancel,
+            None,
         )
         .await;
     }

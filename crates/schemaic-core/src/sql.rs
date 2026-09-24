@@ -1967,6 +1967,64 @@ pub fn read_only_reason(sql: &str, dialect: SqlDialect) -> Result<(), String> {
     Ok(())
 }
 
+/// The `sql_mode` names under which a MySQL/MariaDB server reads a quote
+/// differently from [`skip_noncode`], which assumes `\` escapes inside every
+/// quote.
+///
+/// **A text gate is only as good as its agreement with the server about where a
+/// statement ends.** Under `NO_BACKSLASH_ESCAPES` the server closes
+/// `'a\'` at the second quote, and under `ANSI_QUOTES` it reads `"a\"` as an
+/// identifier with no escapes at all — so `SELECT 'a\'; DELETE FROM t; -- '` is
+/// one string and one `SELECT` to the gate and three statements to the server,
+/// and the driver sends multi-statement text. The combination modes are here
+/// because each one *implies* `ANSI_QUOTES`: dropping the flag and keeping
+/// `ANSI` would have the server put it straight back.
+const MYSQL_MODES_THAT_MOVE_A_QUOTE: &[&str] = &[
+    "NO_BACKSLASH_ESCAPES",
+    "ANSI_QUOTES",
+    "ANSI",
+    "DB2",
+    "MAXDB",
+    "MSSQL",
+    "ORACLE",
+    "POSTGRESQL",
+];
+
+/// `mode` (a server's `@@SESSION.sql_mode`) with every name that would make the
+/// server lex a quote differently from the gate taken out, and everything else
+/// kept.
+///
+/// **It removes names rather than overwriting the mode**, for the reason
+/// `export::MYSQL_LITERAL_MODE_SQL` does: the strictness the server was
+/// configured with is not this function's business. A combination mode is
+/// listed by the server beside the flags it expands to, so what it implied
+/// apart from the quote survives as those flags.
+pub fn mysql_mode_lexed_like_the_gate(mode: &str) -> String {
+    mode.split(',')
+        .map(str::trim)
+        .filter(|m| !m.is_empty())
+        .filter(|m| {
+            !MYSQL_MODES_THAT_MOVE_A_QUOTE
+                .iter()
+                .any(|bad| m.eq_ignore_ascii_case(bad))
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// Does a server in `mode` lex quotes the way [`skip_noncode`] does?
+///
+/// The check a session makes **after** pinning its mode, reading it back rather
+/// than trusting the `SET` — a server that puts a flag back (a combination
+/// mode this list does not know) must fail the statement, not run it.
+pub fn mysql_mode_is_lexed_like_the_gate(mode: &str) -> bool {
+    mode.split(',').map(str::trim).all(|m| {
+        !MYSQL_MODES_THAT_MOVE_A_QUOTE
+            .iter()
+            .any(|bad| m.eq_ignore_ascii_case(bad))
+    })
+}
+
 /// Keywords that make a statement a write *wherever* they appear in it, not just
 /// at its head — the set that survives the read-head allowlist below.
 ///
@@ -3551,6 +3609,65 @@ mod tests {
         for (d, sql) in cases {
             assert!(gate(sql, *d).is_err(), "{d:?} passed `{sql}`");
         }
+    }
+
+    /// **The smuggle the mode pin exists for.** Under the gate's lexer this is
+    /// one `SELECT` and one string; under `NO_BACKSLASH_ESCAPES` it is three
+    /// statements. The gate cannot know the server's mode, which is why the
+    /// session has to be put in the one the gate assumed.
+    #[test]
+    fn a_backslash_quote_hides_a_second_statement_from_the_gate() {
+        use super::read_only_reason as gate;
+        assert!(gate("SELECT 'a\\'; DELETE FROM t; -- '", SqlDialect::MySql).is_ok());
+        assert!(gate("SELECT \"a\\\"; DELETE FROM t; -- \"", SqlDialect::MySql).is_ok());
+    }
+
+    #[test]
+    fn the_pinned_mode_drops_the_flags_that_move_a_quote() {
+        use super::mysql_mode_lexed_like_the_gate as pin;
+        assert_eq!(
+            pin("STRICT_TRANS_TABLES,NO_BACKSLASH_ESCAPES,NO_ENGINE_SUBSTITUTION"),
+            "STRICT_TRANS_TABLES,NO_ENGINE_SUBSTITUTION"
+        );
+        assert_eq!(pin("ANSI_QUOTES"), "");
+        assert_eq!(pin(""), "");
+    }
+
+    /// A combination mode implies `ANSI_QUOTES`; keeping it would have the
+    /// server put the flag straight back. What it implied *apart* from the quote
+    /// is listed beside it and survives.
+    #[test]
+    fn a_combination_mode_that_implies_ansi_quotes_goes_too() {
+        use super::mysql_mode_lexed_like_the_gate as pin;
+        assert_eq!(
+            pin("REAL_AS_FLOAT,PIPES_AS_CONCAT,ANSI_QUOTES,IGNORE_SPACE,ONLY_FULL_GROUP_BY,ANSI"),
+            "REAL_AS_FLOAT,PIPES_AS_CONCAT,IGNORE_SPACE,ONLY_FULL_GROUP_BY"
+        );
+        assert_eq!(
+            pin("PIPES_AS_CONCAT,ANSI_QUOTES,IGNORE_SPACE,ORACLE,NO_KEY_OPTIONS"),
+            "PIPES_AS_CONCAT,IGNORE_SPACE,NO_KEY_OPTIONS"
+        );
+    }
+
+    /// A name that merely *contains* a hazard is not one.
+    #[test]
+    fn a_mode_name_is_matched_whole_not_by_substring() {
+        use super::{
+            mysql_mode_is_lexed_like_the_gate as ok, mysql_mode_lexed_like_the_gate as pin,
+        };
+        assert_eq!(pin("NO_BACKSLASH_ESCAPES_X"), "NO_BACKSLASH_ESCAPES_X");
+        assert!(ok("NO_BACKSLASH_ESCAPES_X,STRICT_ALL_TABLES"));
+    }
+
+    /// The read-back check: a mode still carrying a hazard fails the session.
+    #[test]
+    fn a_mode_is_lexed_like_the_gate_only_without_every_hazard() {
+        use super::mysql_mode_is_lexed_like_the_gate as ok;
+        assert!(ok(""));
+        assert!(ok("STRICT_TRANS_TABLES,NO_ENGINE_SUBSTITUTION"));
+        assert!(!ok("STRICT_TRANS_TABLES,NO_BACKSLASH_ESCAPES"));
+        assert!(!ok("ansi_quotes"));
+        assert!(!ok("MSSQL"));
     }
 
     /// The other engine's spelling is *not* refused — over-blocking is the safe

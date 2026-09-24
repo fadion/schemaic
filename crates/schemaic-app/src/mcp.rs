@@ -935,8 +935,17 @@ async fn describe_table(
     // never answered. A sample is a bonus, so a timeout degrades to the same
     // "(unavailable: …)" line an unselectable view already produces: the table's
     // DDL and keys are still returned.
+    //
+    // A read-only session, like `run_query`'s: the statement is ours, but the
+    // object is not — a view can call a function that writes.
     match with_deadline(
-        db.fetch_query(Some(database), &sql, SAMPLE_ROWS, token.clone()),
+        db.fetch_query_enforced(
+            Some(database),
+            &sql,
+            SAMPLE_ROWS,
+            token.clone(),
+            schemaic_db::Enforce::ReadOnly,
+        ),
         token,
     )
     .await
