@@ -4716,6 +4716,7 @@ mod tests {
             kind: crate::users::PrincipalKind::User,
             password: "hunter2-in-the-clear".to_string(),
             scram_salt: None,
+            password_policy: None,
         };
         let name = draft.name.clone();
         let plan = SchemaPlan {

@@ -451,7 +451,7 @@ fn list_pane(ctx: &UsersCtx, target: &UsersTarget, gate: WriteGate, ring: FocusR
                 .min_height(0.0)
                 .margin_top(theme::scaled(10.0))
         })),
-        new_account_row(ctx.conn, ctx.ddl, target, gate, ring),
+        new_account_row(ctx.conn, ctx.ddl, ctx.overlay, target, gate, ring),
     ))
     .style(|s| {
         // **Full height, and nothing cuts across it.** The footer used to span
@@ -844,6 +844,15 @@ fn read_only_tracked(conns: RwSignal<Vec<Connection>>, conn_id: u64) -> bool {
     conns.with(|cs| schemaic_core::connection::read_only_of(cs, conn_id))
 }
 
+/// The server's password policy, read with the account list — what the account
+/// form stamps on the plan it builds. `None` until the list has loaded.
+fn loaded_policy(overlay: OverlayUi) -> Option<schemaic_core::users::PasswordPolicy> {
+    overlay.users_state.with_untracked(|s| match s {
+        UsersState::Loaded(p) => p.password_policy,
+        _ => None,
+    })
+}
+
 /// **`+ New account`, at the foot of the list column** — the shape Manage
 /// Connections' `New connection` row has, and in the same place: under the list
 /// it adds to rather than beside the box that searches it, so the column reads
@@ -851,6 +860,7 @@ fn read_only_tracked(conns: RwSignal<Vec<Connection>>, conn_id: u64) -> bool {
 fn new_account_row(
     conn: ConnUi,
     ddl: DdlUi,
+    overlay: OverlayUi,
     target: &UsersTarget,
     gate: WriteGate,
     ring: FocusRing,
@@ -868,7 +878,7 @@ fn new_account_row(
         // The read-only refusal is inside `open_for_new`, so this launch is
         // guarded in the same step that launches it — the dimming says the
         // action is unavailable, this is what makes it so.
-        crate::account_editor::open_for_new(conn, ddl, &anchor, &database);
+        crate::account_editor::open_for_new(conn, ddl, &anchor, &database, loaded_policy(overlay));
     };
     let open_click = open.clone();
     in_ring_button(
@@ -994,6 +1004,7 @@ fn actions_row(
                     &reset_target,
                     &reset_target.database.clone().unwrap_or_default(),
                     &reset_who,
+                    loaded_policy(overlay),
                 );
             },
         )

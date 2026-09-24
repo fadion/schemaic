@@ -224,6 +224,7 @@ live_suite!(
         a_created_account_can_log_in_with_the_password_it_was_given,
         a_reset_password_replaces_the_one_the_account_had,
         a_salted_password_logs_in_on_create_and_on_reset,
+        a_server_password_policy_decides_what_is_stored,
         a_password_with_a_backslash_is_stored_as_it_was_typed,
         a_role_the_server_made_is_never_offered_a_password_reset,
         a_created_role_is_one_the_server_accepts,

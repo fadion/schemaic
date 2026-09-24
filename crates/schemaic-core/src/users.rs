@@ -843,12 +843,20 @@ pub struct Principals {
     pub list: Vec<Principal>,
     /// What the list does not cover, when the answer is necessarily partial.
     pub note: Option<String>,
+    /// The server's [`PasswordPolicy`], read with the list — PostgreSQL only,
+    /// and `None` where it could not be read. The account form stamps it on
+    /// the plan it builds.
+    pub password_policy: Option<PasswordPolicy>,
 }
 
 impl Principals {
     /// A complete answer — every account the server has.
     pub fn complete(list: Vec<Principal>) -> Self {
-        Self { list, note: None }
+        Self {
+            list,
+            note: None,
+            password_policy: None,
+        }
     }
 }
 
@@ -1518,6 +1526,10 @@ pub struct AccountDraft {
     /// typed, which is what the app did before verifiers — so a caller that
     /// forgets to stamp one gets the old behaviour, never a locked-out account.
     pub scram_salt: Option<crate::scram::Salt>,
+    /// The server's [`PasswordPolicy`], stamped beside the salt and on the same
+    /// terms. `None` — not read, or not an engine that has one — keeps the
+    /// SCRAM default.
+    pub password_policy: Option<PasswordPolicy>,
 }
 
 impl AccountDraft {
@@ -1543,6 +1555,44 @@ impl AccountDraft {
             role_ambiguous: false,
         }
     }
+}
+
+/// May the account form's **Preview** go ahead? `confirm` is the second,
+/// "confirm password" field; `resetting` is whether the form is resetting an
+/// existing account rather than creating one.
+///
+/// **The password is typed twice because nothing else shows it.** The field is
+/// masked, and on PostgreSQL the preview now carries a verifier instead of the
+/// text, so a slip — `hunter3` for `hunter2` — was visible nowhere before an
+/// irreversible reset, and the application configured with the right one could
+/// no longer connect. A role takes no password (its row is not shown), so the
+/// confirmation is not asked of one.
+pub fn account_form_ready(draft: &AccountDraft, confirm: &str, resetting: bool) -> bool {
+    account_form_blocker(draft, confirm, resetting).is_none()
+}
+
+/// Why the account form's Preview is held back, in the sentence its footer
+/// shows — or `None` when [`account_form_ready`]. One function, so the button
+/// and the reason under it cannot disagree about what is missing.
+pub fn account_form_blocker(
+    draft: &AccountDraft,
+    confirm: &str,
+    resetting: bool,
+) -> Option<&'static str> {
+    if resetting && draft.password.is_empty() {
+        return Some("A password is required.");
+    }
+    if !resetting && draft.name.trim().is_empty() {
+        return Some("A name is required.");
+    }
+    if draft.kind == PrincipalKind::User && draft.password != confirm {
+        return Some(if confirm.is_empty() {
+            "Type the password again to confirm it."
+        } else {
+            "The two passwords differ."
+        });
+    }
+    None
 }
 
 /// `CREATE USER` / `CREATE ROLE`, or `None` for a draft with no name.
@@ -1584,7 +1634,13 @@ pub fn account_draft_sql(d: &AccountDraft, dialect: SqlDialect) -> Option<String
                     SqlDialect::Postgres | SqlDialect::Sqlite => "PASSWORD",
                     SqlDialect::MySql => "IDENTIFIED BY",
                 },
-                password_literal(&d.password, d.scram_salt.as_ref(), dialect)
+                password_literal(
+                    &d.password,
+                    d.scram_salt.as_ref(),
+                    d.password_policy.as_ref(),
+                    d.name.trim(),
+                    dialect
+                )
             ));
         }
     }
@@ -1609,6 +1665,8 @@ pub struct PasswordReset {
     pub password: String,
     /// See [`AccountDraft::scram_salt`] — the same stamp, on the same terms.
     pub scram_salt: Option<crate::scram::Salt>,
+    /// See [`AccountDraft::password_policy`].
+    pub password_policy: Option<PasswordPolicy>,
 }
 
 /// Does `dialect` take a precomputed password **verifier** in its password
@@ -1634,24 +1692,128 @@ pub fn supports_password_verifier(dialect: SqlDialect) -> bool {
 pub fn password_hint(dialect: SqlDialect) -> &'static str {
     if supports_password_verifier(dialect) {
         "The previewed SQL, which is the statement that runs, carries a hash of the \
-         password and not the password itself — unless it has characters outside \
-         printable ASCII, which are sent as typed."
+         password in the form this server stores, not the password itself — unless it \
+         has characters outside printable ASCII, or the server runs a password-check \
+         extension, which are sent as typed."
     } else {
         "The password appears in the previewed SQL, which is the statement that runs."
     }
 }
 
+/// How the server stores a password it is handed — PostgreSQL's
+/// `password_encryption`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum PasswordEncryption {
+    /// `scram-sha-256`, the default since PostgreSQL 14.
+    #[default]
+    ScramSha256,
+    /// `md5` (spelled `on` before 14), which a cluster keeps for clients that
+    /// cannot do SCRAM.
+    Md5,
+}
+
+/// What a server's own settings say should become of a password, read when the
+/// account browser loads — the input a pre-hashed password would otherwise
+/// override.
+///
+/// **A verifier the app computes is a decision the server did not get to
+/// make.** Measured on PostgreSQL 16.15: under `password_encryption = md5` a
+/// role created from the form stored `SCRAM-SHA-256$…` and every client that
+/// cannot do SCRAM was locked out of it, while the same `CREATE ROLE` from
+/// psql stored `md5…`; under a raised `scram_iterations` the verifier came in
+/// at 4096; and `passwordcheck` passed a one-character password it refuses as
+/// text, since a hook can only inspect a plaintext password.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PasswordPolicy {
+    pub encryption: PasswordEncryption,
+    /// `scram_iterations` (PostgreSQL 16+), `4096` where the server has none.
+    pub scram_iterations: u32,
+    /// A `check_password_hook` extension (`passwordcheck`, `credcheck`) is
+    /// loaded. It can judge only a password it receives as text, and credcheck
+    /// refuses a pre-hashed one outright by default.
+    pub checks_plaintext: bool,
+}
+
+impl PasswordPolicy {
+    /// The policy from the server's settings as `current_setting` spells them:
+    /// `password_encryption`, `scram_iterations` (`None` before 16), and
+    /// `shared_preload_libraries` (empty where the role may not read it).
+    /// `custom` is the names of any extension settings the server lists —
+    /// `credcheck.*` shows there once loaded, even where the preload list is
+    /// hidden.
+    pub fn from_settings(
+        password_encryption: &str,
+        scram_iterations: Option<&str>,
+        shared_preload_libraries: &str,
+        custom: &[String],
+    ) -> PasswordPolicy {
+        let enc = password_encryption.trim().to_ascii_lowercase();
+        let encryption = match enc.as_str() {
+            "md5" | "on" => PasswordEncryption::Md5,
+            _ => PasswordEncryption::ScramSha256,
+        };
+        let scram_iterations = scram_iterations
+            .and_then(|s| s.trim().parse::<u32>().ok())
+            .filter(|n| *n > 0)
+            .unwrap_or(crate::scram::ITERATIONS);
+        let hooks = ["passwordcheck", "credcheck"];
+        let preloaded = shared_preload_libraries
+            .split(',')
+            .map(|l| l.trim().trim_matches('"').to_ascii_lowercase())
+            .any(|l| {
+                hooks
+                    .iter()
+                    .any(|h| l == *h || l.ends_with(&format!("/{h}")))
+            });
+        let custom_hook = custom.iter().any(|name| {
+            let name = name.to_ascii_lowercase();
+            hooks.iter().any(|h| name.starts_with(&format!("{h}.")))
+        });
+        PasswordPolicy {
+            encryption,
+            scram_iterations,
+            checks_plaintext: preloaded || custom_hook,
+        }
+    }
+}
+
+/// PostgreSQL's `md5` verifier: `md5` then the hex MD5 of the password followed
+/// by the role name. Still not the password, and the one form a cluster kept on
+/// `md5` authenticates every client with.
+fn md5_verifier(password: &str, role: &str) -> String {
+    use md5::Digest;
+    let digest = md5::Md5::digest(format!("{password}{role}").as_bytes());
+    let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+    format!("md5{hex}")
+}
+
 /// The password clause's literal: a verifier where the engine takes one and
 /// the draft carries a salt, the password as typed otherwise — including a
 /// password [`crate::scram::verifier`] declines, one outside printable ASCII.
+///
+/// `policy` is the server's ([`PasswordPolicy`]), where it was read; `None`
+/// keeps the SCRAM default this had before it existed. A loaded check hook
+/// gets the password as typed, so the hook the administrator installed is the
+/// one that judges it; an `md5` cluster gets an `md5` verifier, which needs the
+/// role's name, `role`.
 fn password_literal(
     password: &str,
     salt: Option<&crate::scram::Salt>,
+    policy: Option<&PasswordPolicy>,
+    role: &str,
     dialect: SqlDialect,
 ) -> String {
     let verifier = salt
         .filter(|_| supports_password_verifier(dialect))
-        .and_then(|salt| crate::scram::verifier(password, salt));
+        .filter(|_| !policy.is_some_and(|p| p.checks_plaintext))
+        .and_then(|salt| match policy.map(|p| p.encryption) {
+            Some(PasswordEncryption::Md5) => Some(md5_verifier(password, role)),
+            _ => crate::scram::verifier_with(
+                password,
+                salt,
+                policy.map_or(crate::scram::ITERATIONS, |p| p.scram_iterations),
+            ),
+        });
     crate::schema::ddl_string(verifier.as_deref().unwrap_or(password), dialect)
 }
 
@@ -1716,7 +1878,13 @@ pub fn set_password_sql(r: &PasswordReset, dialect: SqlDialect) -> Option<String
     };
     Some(format!(
         "{verb} {who} {clause} {}",
-        password_literal(&r.password, r.scram_salt.as_ref(), dialect)
+        password_literal(
+            &r.password,
+            r.scram_salt.as_ref(),
+            r.password_policy.as_ref(),
+            &r.account.name,
+            dialect
+        )
     ))
 }
 
@@ -3122,6 +3290,7 @@ mod tests {
             account: my_account(),
             password: pw.to_string(),
             scram_salt: None,
+            password_policy: None,
         }
     }
 
@@ -3214,6 +3383,193 @@ mod tests {
     /// *may* rewrite it at login and this crate has no SASLprep to tell — is
     /// sent as typed rather than hashed into a verifier the login might not
     /// match.
+    /// **A mistyped confirmation holds Preview back**, on a reset as on a
+    /// create — the one place a slip in a masked field can still be caught.
+    #[test]
+    fn the_form_is_ready_only_when_the_password_is_confirmed() {
+        let user = AccountDraft {
+            name: "app".into(),
+            kind: PrincipalKind::User,
+            password: "hunter2".into(),
+            ..Default::default()
+        };
+        assert!(account_form_ready(&user, "hunter2", false));
+        assert!(!account_form_ready(&user, "hunter3", false));
+        assert!(account_form_ready(&user, "hunter2", true));
+        assert!(!account_form_ready(&user, "hunter3", true));
+        assert!(!account_form_ready(&user, "", true));
+        // A reset still needs a password; a create may leave it unset.
+        let blank = AccountDraft {
+            password: String::new(),
+            ..user.clone()
+        };
+        assert!(!account_form_ready(&blank, "", true));
+        assert!(account_form_ready(&blank, "", false));
+        // No name, no create.
+        let nameless = AccountDraft {
+            name: "  ".into(),
+            ..user.clone()
+        };
+        assert!(!account_form_ready(&nameless, "hunter2", false));
+        // A role has no password row, so nothing to confirm.
+        let role = AccountDraft {
+            kind: PrincipalKind::Role,
+            ..user.clone()
+        };
+        assert!(account_form_ready(&role, "", false));
+        // And the footer says which thing is missing.
+        assert_eq!(
+            account_form_blocker(&user, "", false),
+            Some("Type the password again to confirm it.")
+        );
+        assert_eq!(
+            account_form_blocker(&user, "hunter3", false),
+            Some("The two passwords differ.")
+        );
+        assert_eq!(account_form_blocker(&user, "hunter2", false), None);
+    }
+
+    fn policy(encryption: PasswordEncryption, iterations: u32, hook: bool) -> PasswordPolicy {
+        PasswordPolicy {
+            encryption,
+            scram_iterations: iterations,
+            checks_plaintext: hook,
+        }
+    }
+
+    fn with_policy(pw: &str, p: PasswordPolicy) -> AccountDraft {
+        AccountDraft {
+            password_policy: Some(p),
+            ..salted(pw)
+        }
+    }
+
+    /// **An oracle from PostgreSQL itself**: `SET password_encryption = 'md5';
+    /// CREATE ROLE zz_md5_oracle LOGIN PASSWORD 'correct horse ~ battery!'`,
+    /// then `rolpassword` from `pg_authid`, on PostgreSQL 16.15.
+    #[test]
+    fn the_md5_verifier_matches_one_postgresql_built() {
+        assert_eq!(
+            md5_verifier("correct horse ~ battery!", "zz_md5_oracle"),
+            "md52f26feeb0465d3108e611aca1d50b546"
+        );
+    }
+
+    /// **An md5 cluster gets an md5 verifier, not SCRAM.** A SCRAM-stored role
+    /// there locks out every client that cannot do SCRAM, on a cluster kept on
+    /// md5 precisely for them.
+    #[test]
+    fn an_md5_policy_emits_an_md5_verifier() {
+        let sql = account_draft_sql(
+            &with_policy("hunter2", policy(PasswordEncryption::Md5, 4096, false)),
+            SqlDialect::Postgres,
+        )
+        .unwrap();
+        assert!(sql.contains("PASSWORD 'md5"), "{sql}");
+        assert!(!sql.contains("SCRAM-SHA-256$"), "{sql}");
+        assert!(!sql.contains("hunter2"), "{sql}");
+        // A reset hashes under the account's own name.
+        let mut r = salted_reset("hunter2");
+        r.password_policy = Some(policy(PasswordEncryption::Md5, 4096, false));
+        let sql = set_password_sql(&r, SqlDialect::Postgres).unwrap();
+        assert!(
+            sql.contains(&md5_verifier("hunter2", &r.account.name)),
+            "{sql}"
+        );
+    }
+
+    /// **A raised `scram_iterations` is kept, not cut to the default.**
+    #[test]
+    fn a_scram_policy_hashes_at_the_servers_iteration_count() {
+        let sql = account_draft_sql(
+            &with_policy(
+                "hunter2",
+                policy(PasswordEncryption::ScramSha256, 100_000, false),
+            ),
+            SqlDialect::Postgres,
+        )
+        .unwrap();
+        assert!(sql.contains("SCRAM-SHA-256$100000:"), "{sql}");
+    }
+
+    /// **A check hook sees the password it judges.** passwordcheck can inspect
+    /// only a plaintext password, and credcheck refuses a pre-hashed one — so
+    /// under either the password goes as typed.
+    #[test]
+    fn a_check_hook_gets_the_password_as_typed() {
+        let sql = account_draft_sql(
+            &with_policy(
+                "hunter2",
+                policy(PasswordEncryption::ScramSha256, 4096, true),
+            ),
+            SqlDialect::Postgres,
+        )
+        .unwrap();
+        assert_eq!(sql, "CREATE USER \"app\" PASSWORD 'hunter2'");
+    }
+
+    /// No policy read is the SCRAM default this had before the policy existed.
+    #[test]
+    fn no_policy_keeps_the_scram_default() {
+        let sql = account_draft_sql(&salted("hunter2"), SqlDialect::Postgres).unwrap();
+        assert!(sql.contains("SCRAM-SHA-256$4096:"), "{sql}");
+    }
+
+    /// MySQL takes no verifier, whatever a policy says.
+    #[test]
+    fn a_policy_changes_nothing_on_mysql() {
+        let sql = account_draft_sql(
+            &with_policy("hunter2", policy(PasswordEncryption::Md5, 4096, false)),
+            SqlDialect::MySql,
+        )
+        .unwrap();
+        assert!(sql.ends_with("IDENTIFIED BY 'hunter2'"), "{sql}");
+    }
+
+    #[test]
+    fn the_policy_is_read_from_the_servers_own_spellings() {
+        let p = PasswordPolicy::from_settings("scram-sha-256", Some("4096"), "", &[]);
+        assert_eq!(p, policy(PasswordEncryption::ScramSha256, 4096, false));
+        // `on` is md5's spelling before PostgreSQL 14.
+        for md5 in ["md5", "on", " MD5 "] {
+            assert_eq!(
+                PasswordPolicy::from_settings(md5, None, "", &[]).encryption,
+                PasswordEncryption::Md5,
+                "{md5:?}"
+            );
+        }
+        // No `scram_iterations` before 16, and nonsense is not a count.
+        assert_eq!(
+            PasswordPolicy::from_settings("scram-sha-256", None, "", &[]).scram_iterations,
+            4096
+        );
+        assert_eq!(
+            PasswordPolicy::from_settings("scram-sha-256", Some("0"), "", &[]).scram_iterations,
+            4096
+        );
+        assert_eq!(
+            PasswordPolicy::from_settings("scram-sha-256", Some("100000"), "", &[])
+                .scram_iterations,
+            100_000
+        );
+    }
+
+    #[test]
+    fn a_check_hook_is_found_in_the_preload_list_or_its_own_settings() {
+        let hooked = |libs: &str, custom: &[&str]| {
+            let custom: Vec<String> = custom.iter().map(|s| s.to_string()).collect();
+            PasswordPolicy::from_settings("scram-sha-256", None, libs, &custom).checks_plaintext
+        };
+        assert!(hooked("passwordcheck", &[]));
+        assert!(hooked("pg_stat_statements, \"credcheck\"", &[]));
+        assert!(hooked("$libdir/passwordcheck", &[]));
+        assert!(hooked("", &["credcheck.username_min_length"]));
+        assert!(!hooked("pg_stat_statements", &["pg_stat_statements.max"]));
+        assert!(!hooked("", &[]));
+        // A library whose name merely contains one is not it.
+        assert!(!hooked("mypasswordcheckx", &[]));
+    }
+
     #[test]
     fn a_non_ascii_password_is_sent_as_typed_even_when_salted() {
         assert_eq!(
@@ -3338,6 +3694,7 @@ mod tests {
             account: p.clone(),
             password: "hunter2".to_string(),
             scram_salt: None,
+            password_policy: None,
         };
         assert!(
             !supports_password_reset(SqlDialect::MySql, &p),

@@ -2902,7 +2902,9 @@ existing prose was left alone.
     the clone is re-emitted and a salt left on it hashed the *placeholder* into a verifier — the
     script said "Replace PUT-THE-PASSWORD-HERE below" over a statement with nothing to replace, and
     running it would have set the password to that text. A verifier is not for a clipboard in any
-    case, being enough to brute-force the password offline.
+    case, being enough to brute-force the password offline. The `password_policy` beside it is left
+    in place, and clearing the salt is still enough: `users::password_literal` builds *every*
+    verifier only under a salt, the `md5` one included though it uses none.
     `a_salted_password_exports_the_placeholder_and_no_verifier` was seen failing with exactly that
     output before the fix. The preview itself still renders `statements`, which is the statement
     that runs: a modal showing a blanked-out plan would not be showing the plan.
@@ -4815,12 +4817,50 @@ existing prose was left alone.
     pure — and `None` is the old behaviour, the password as typed, so a caller that forgets to stamp
     one sends a password the logs keep rather than locking the account out. A password
     `scram::verifier` declines, one outside printable ASCII, falls back to typed on the same terms.
+    **A verifier the app computes is a decision the server did not get to make, and
+    `PasswordPolicy` hands it back.** Measured on PostgreSQL 16.15, the SCRAM-4096 verifier this
+    used to send overrode three settings at once: under `password_encryption = md5` the role stored
+    `SCRAM-SHA-256$…` where the same `CREATE ROLE` from psql stored `md5…`, locking out every client
+    that cannot do SCRAM on a cluster kept on md5 for exactly those clients; a raised
+    `scram_iterations` came in cut to 4096; and `passwordcheck` passed a one-character password it
+    refuses as text, a check hook being able to judge only a plaintext password — credcheck, for its
+    part, refuses a pre-hashed one outright by default. So `password_literal` takes the policy and
+    the role's name and answers in that order: a check hook loaded (`checks_plaintext`) sends the
+    password as typed, so the hook the administrator installed is the one that judges it; `Md5` sends
+    PostgreSQL's `md5` verifier — `md5` and the hex MD5 of the password followed by the role name,
+    which is why the name is an argument, and a reset hashes under the *listed* account's; anything
+    else is SCRAM at the server's own count (`scram::verifier_with`). `PasswordPolicy::from_settings`
+    reads the server's spellings: `md5`, or `on` (md5's spelling before 14), is `Md5` and anything
+    else SCRAM; a missing, `0` or non-numeric iteration count is 4096; and a hook counts as loaded
+    when `passwordcheck` or `credcheck` is in `shared_preload_libraries` — a bare name, a `$libdir/`
+    path or quoted, while `mypasswordcheckx` is not one — or when a `passwordcheck.*`/`credcheck.*`
+    setting is listed, which is the half that still answers for a role that may not read the
+    preload list (`pg::password_policy` has why). `Principals::password_policy` carries it out of
+    the fetch; `AccountDraft` and `PasswordReset` carry it as `password_policy`, stamped at Preview
+    beside the salt and on the same terms, and **`None` is the SCRAM-4096 behaviour from before the
+    policy existed** — the settings did not read, or the plan was built without them. MySQL passes
+    `None` and takes no verifier whatever a policy says (`a_policy_changes_nothing_on_mysql`).
+    **Every verifier is still gated on the salt, the `md5` one included, though it uses none** — and
+    that is load-bearing rather than incidental: `ChangeSet::without_secrets` clears `scram_salt`
+    and leaves the policy, and it is the salt's absence alone that sends the placeholder out as text
+    under any policy. The md5 arm's oracle is `the_md5_verifier_matches_one_postgresql_built`, the
+    `rolpassword` PostgreSQL 16.15 stored for `correct horse ~ battery!` as `zz_md5_oracle` under
+    `password_encryption = 'md5'`; `md-5` became a direct dependency of core for it, the crate and
+    version `postgres-protocol` already had in the lock.
     `password_hint(dialect)` is the line under the form's password field and says which of the two
-    the preview will show: on a verifier engine a hash and not the password, unless it has characters
-    outside printable ASCII; elsewhere the password itself. The salted tests pin the PostgreSQL
+    the preview will show: on a verifier engine a hash in the form this server stores and not the
+    password, unless it has characters outside printable ASCII or the server runs a password-check
+    extension; elsewhere the password itself. The salted tests pin the PostgreSQL
     create and reset to exactly `scram::verifier`'s output with the password nowhere in it, and that
     a salt changes nothing on MySQL, a salted role still takes no clause and a salted blank reset
     still has no statement.
+    `account_form_ready(draft, confirm, resetting)` is the account form's Preview gate and
+    `account_form_blocker` the sentence under it — one function behind both, so the button and the
+    reason cannot disagree about what is missing: a reset needs a password ("A password is
+    required."), a create a name ("A name is required."), and a user — never a role, which has no
+    password row to confirm — a second copy equal to the first ("Type the password again to confirm
+    it." while it is empty, "The two passwords differ." once it is not). A create may still leave
+    the password blank, the two empty fields matching. Why it is typed twice is under the form.
     `drop_account_sql` is the last, and like `DropDatabase` never
     `IF EXISTS`: the account came off the browser's list, so one that isn't there means the list is
     stale and a drop that dropped nothing is about to be reported as a success.
@@ -4875,7 +4915,13 @@ existing prose was left alone.
     statement. `verifier(password, &Salt)` builds the server's own format,
     `SCRAM-SHA-256$<iterations>:<salt>$<StoredKey>:<ServerKey>` in standard base64, at `ITERATIONS`
     (4096, PostgreSQL's default `scram_iterations`) over a 16-byte `Salt`, through a hand-written
-    PBKDF2-HMAC-SHA-256 of **one block** — SCRAM's output is exactly one HMAC wide. The `sha2`,
+    PBKDF2-HMAC-SHA-256 of **one block** — SCRAM's output is exactly one HMAC wide.
+    `verifier_with(password, &Salt, iterations)` is the same at a count the caller names, and
+    `verifier` is it at `ITERATIONS`: a server stores a verifier as given *whatever* its own
+    `password_encryption` and `scram_iterations` say, so one built at the default under a hardened
+    setting silently weakens every password it sets — `users::PasswordPolicy` is what reads the
+    server's count and decides whether a SCRAM verifier is sent at all. `0` is not an iteration
+    count and answers `None`. The `sha2`,
     `hmac` and `base64` it calls are the versions `postgres-protocol` already put in the lock, so
     making them direct dependencies of core added no new version.
     **Only printable ASCII is hashed; anything else, and an empty password, is `None`.** The client
@@ -8318,7 +8364,17 @@ existing prose was left alone.
   button — cannot forget to. `pg::fetch_principals` reads `pg_roles` on the **maintenance**
   connection (the catalogue is cluster-wide and the browser may be open with no database selected)
   and, unlike `pg::roles` behind the Owner dropdown, **keeps** the `pg_` predefined roles, since they
-  hold real privileges and `users::from_pg_rows` sorts them last. `pg::fetch_grants` is **five
+  hold real privileges and `users::from_pg_rows` sorts them last. **It reads the server's
+  `users::PasswordPolicy` on the same connection** (`pg::password_policy`), so a
+  `password_encryption` set per role is the one the plan's role gets:
+  `current_setting('password_encryption')`, `current_setting('scram_iterations', true)` — the
+  `true` because the setting only exists from 16 — and the `pg_settings` row for
+  `shared_preload_libraries`, which is simply *absent* for a role without `pg_read_all_settings`
+  rather than an error, so the names of any `passwordcheck.%`/`credcheck.%` settings are asked
+  too, credcheck's being listed to everyone once it is loaded. A failed read is `None`, the SCRAM
+  default, and never fails the list. What it does not see is a setting made per *database* on the
+  one the plan will run in, this being the maintenance connection. The MySQL half passes `None`.
+  `pg::fetch_grants` is **five
   queries, because PostgreSQL has no `SHOW GRANTS`**: `pg_auth_members`, then `aclexplode` over
   `pg_database.datacl`, `pg_namespace.nspacl` and `pg_class.relacl` (relkinds `r p v m f S`, filtered
   rather than left open so an index or a composite type can't reach the statement builder, and `S`
@@ -10369,6 +10425,15 @@ existing prose was left alone.
   — shown to be in force by a control, an md5-stored role that logged in under that prefix and was
   refused outside it — where it still passed, PostgreSQL switching to SCRAM for a SCRAM-stored
   verifier. The rule was removed afterwards; nothing in the tier reproduces that run.
+  **`a_server_password_policy_decides_what_is_stored` is the same form's policy half**, PostgreSQL
+  only — the MySQL legs return, there being no verifier for a policy to shape. It asserts first that
+  `fetch_principals` brings a policy back at all, since a read that failed quietly leaves `None`,
+  which is the SCRAM default and passes everything else here; then it creates through
+  `ScratchAccount::create_with_policy` (which `create_salted` now delegates to with `None`) and reads
+  `rolpassword` out of `pg_authid`, because the statement succeeding says nothing about what was
+  stored: under an `Md5` policy it starts `md5`, and under 5000 iterations it starts
+  `SCRAM-SHA-256$5000:` and the typed password logs in. The md5 role is checked by what is stored,
+  not by a login. Watched failing with the policy ignored.
   **`a_password_with_a_backslash_is_stored_as_it_was_typed` is the leg-gated one beside it, and
   what it pins is a *connection option* rather than anything this file emits.** PostgreSQL only —
   MySQL's mirror hazard is `NO_BACKSLASH_ESCAPES` and `mysql::run_ddl` already sends
@@ -10459,8 +10524,8 @@ existing prose was left alone.
   needed it yet: streaming a genuinely large export, and multi-schema PostgreSQL.
   **It is gated as a *target*, not at runtime.** The manifest declares the target
   `required-features = ["live-tests"]`, so `cargo test --workspace` does not build it and the pure
-  tier stays pure by construction. It is **385 tests** as this is written — 122 suite functions
-  expanded across the three legs by `main.rs`'s macro (366), the thirteen in the two catalog oracles
+  tier stays pure by construction. It is **388 tests** as this is written — 123 suite functions
+  expanded across the three legs by `main.rs`'s macro (369), the thirteen in the two catalog oracles
   outside it (`pg_catalog`'s six and `mariadb_catalog`'s seven), and the six that need no server
   (the four name-guard cases, `endpoint.rs`'s declared-case count, and the skip-notice source gate).
   The figure this sentence carried for a while was 306, a count that had never included the oracles
@@ -13955,7 +14020,9 @@ existing prose was left alone.
     `account_draft` and `grant_draft` are app-lifetime signals, so clearing `ddl.account` alone left
     the plaintext password sitting in a signal for the rest of the process — after Cancel and after
     Apply alike, reachable by anything holding the bundle. Both forms re-seed from their target on
-    open, so there is nothing to keep. `close_preview` is the same one-door idea for the preview
+    open, so there is nothing to keep. `account_confirm`, the form's second copy of the password, is
+    cleared on the same line for the same reason; the account form's `reset_then_seed` reaches it
+    through this list on every open, and its own close clears it beside the draft. `close_preview` is the same one-door idea for the preview
     itself, because `ddl.sql` is app-lifetime too and held the last plan's script for the life of
     the process; there were two `set(None)` sites and a third would have had to remember. **That
     clear is load-bearing rather than defence in depth**, and it changed sides without the helper
@@ -14577,7 +14644,7 @@ existing prose was left alone.
     in the browser, and neither engine offers a
     rename that is safe to perform. **Which of the two it means rides on `AccountTarget::resetting`**
     (`Option<Principal>`), not on whether some field happens to be filled: `account_change(draft,
-    resetting, salt)` reads the statement's *subject* from there, so a reset cannot rename or re-host the
+    resetting, salt, policy)` reads the statement's *subject* from there, so a reset cannot rename or re-host the
     account it is resetting even though the form seeds the draft's name and host in order to say
     whose password it is — reading them back would do it silently, `ALTER USER 'b'@'%'` on an account
     that does not exist being an error the preview would blame on the server. That mapping is
@@ -14589,34 +14656,58 @@ existing prose was left alone.
     password" (a form that will emit an `ALTER` under "Create account" being the one thing the title
     may not do), readiness and the status line ask a different question per mode — a create needs a
     name, a reset needs a non-empty password, because `set_password_sql` refuses a blank one and the
-    plan would otherwise come back empty and read as the app being broken — and `password_row` was
+    plan would otherwise come back empty and read as the app being broken — both through
+    `users::account_form_ready`/`account_form_blocker`, so the button and the sentence under it
+    cannot disagree, and `password_row` was
     extracted so both modes wear the one `masked_edit_field`, which is why that widget is
     `pub(crate)`.
     In create mode its Kind picker comes first because it decides what the rest of
     the form means: a role takes no host and no password on either engine, so those fields **vanish
     rather than sitting there inert**, and Host is absent on PostgreSQL, which has no such thing at
-    all. **The form holds a password, and nothing else in this crate does.** It is blanked on every
+    all. **The form holds a password — in `account_draft` and, typed a second time, in
+    `DdlUi::account_confirm` — and nothing else in this crate does.** Both are blanked on every
     open — a form that reopened holding the last one would put a credential on screen nobody typed
-    this time — cleared on Cancel (`ddl_preview::close_peers` empties `account_draft` with the
-    target, since the draft is app-lifetime and the target is not), never persisted and never
-    logged, and it becomes visible in
+    this time — cleared on Cancel (`ddl_preview::close_peers` empties `account_draft` and
+    `account_confirm` with the target, since both are app-lifetime and the target is not), never
+    persisted and never logged; the confirmation never reaches a plan, `account_form_ready` being
+    its only reader. The password becomes visible in
     exactly one place: the preview's SQL. That is deliberate. The preview is the app's one gate
     between a plan and a server, and a statement shown there with a field blanked out would not be
     the statement it ran — but nothing *leaves* the preview carrying it, which is
     `ChangeSet::export_script`'s job. **On PostgreSQL the preview does not show it either**, for any
-    password in printable ASCII: Preview SQL calls `account_change` with `fresh_salt()` — 16 bytes
-    from `getrandom::fill` — and the salt stamped on either change makes the statement carry
-    `core::scram`'s verifier instead, so what the preview shows is what the server logs and neither
-    is the password. The salt is handed in rather than drawn inside `account_change` so the mapping
+    password in printable ASCII on a server with no password-check extension loaded: Preview SQL
+    calls `preview_change(draft, target)`, which is `account_change` with `fresh_salt()` — 16 bytes
+    from `getrandom::fill` — and `target.password_policy`, and the salt stamped on either change
+    makes the statement carry a verifier instead — `core::scram`'s at the server's own
+    `scram_iterations`, or an `md5` one on a cluster kept on md5 — so what the preview shows is what
+    the server logs and neither is the password. The policy comes from the browser:
+    `users_view::loaded_policy` reads it out of `UsersState::Loaded` when **+ New account** or
+    **Reset password** is pressed, `None` before the list has loaded, and `open_for_new` /
+    `open_for_reset` put it on `AccountTarget::password_policy`, captured with the target's other
+    fields. The salt is handed in rather than drawn inside `account_change` so the mapping
     stays pure, and it is fresh per press because two previews of one password sharing a salt is
     the salt no longer doing its job (`every_plan_gets_its_own_salt`). An OS with no randomness gives
     `None`, which is the password as typed and never a lockout. `password_row` takes the dialect and
-    renders `users::password_hint` beneath the field, so the line says which of the two the preview
-    will hold. `the_form_hashes_a_postgres_password_under_the_salt_it_was_given` is the composition
+    renders `users::password_hint` beneath both fields, so the line says which of the two the
+    preview will hold. `the_form_hashes_a_postgres_password_under_the_salt_it_was_given` is the composition
     test: the emitter's own tests prove a salted change becomes a verifier and this proves the form
     builds a salted one, for create and reset alike — a stamp lost between the two puts the password
     back in PostgreSQL's logs with every other test green, and an `account_change` that dropped the
-    salt was seen failing it. **The field itself is
+    salt was seen failing it. **That test still left the salt's own call site unreached**: the
+    button called `account_change(.., fresh_salt(), ..)` inline, and `None` substituted there kept
+    the suite green while every PostgreSQL password went back into the server's logs as text —
+    `None` being, by design, the silent fallback. `preview_change` is that call site as a function,
+    and `the_preview_change_carries_a_verifier_not_the_password` pins it for a create and, under an
+    `Md5` policy, a reset; it was watched failing with `None` in place of `fresh_salt()`.
+    **The password is typed twice, in a masked Confirm field at tab stop 31 under Password's 30,
+    because nothing else shows it.** The field is masked and on PostgreSQL the preview now carries a
+    verifier rather than the text, so a slip — `hunter3` for `hunter2` — was visible nowhere before
+    an irreversible reset, after which whatever was configured with the right password could no
+    longer connect. The footer's reason and Preview's enable both come from
+    `users::account_form_blocker`/`account_form_ready`, so an empty Confirm reads "Type the password
+    again to confirm it." and a mismatch "The two passwords differ." — checked by hand in the
+    sandboxed app, where a match enabled Preview. A role has no password row and is not asked.
+    **The field itself is
     `connection_form::masked_edit_field`**, the same one the three saved-connection secrets wear:
     this was the app's only *unmasked* secret field, so its real characters were on screen and a
     Ctrl+A/Ctrl+C from the clipboard. That helper is `pub(crate)` precisely so there is one of them

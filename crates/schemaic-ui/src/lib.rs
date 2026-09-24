@@ -1316,6 +1316,10 @@ pub struct AccountTarget {
     /// that already exists. Carried whole, like [`GrantTarget::account`], because
     /// `users::account_sql` needs the host too and a MySQL account *is* the pair.
     pub resetting: Option<schemaic_core::users::Principal>,
+    /// The server's password policy as the account browser read it — what a
+    /// PostgreSQL password is hashed (or not hashed) under. `None` keeps the
+    /// SCRAM default; see `users::PasswordPolicy`.
+    pub password_policy: Option<schemaic_core::users::PasswordPolicy>,
 }
 
 /// The grant editor's target; doubles as its open flag.
@@ -1657,12 +1661,18 @@ pub struct DdlUi {
     /// plan is built from exactly it.
     ///
     /// **It holds a password while the form is open**, and nothing else in the
-    /// app does. It is cleared on every open and on Cancel, it is never
+    /// app does but `account_confirm` below, on the same terms. It is cleared on
+    /// every open and on Cancel, it is never
     /// persisted and never logged, and the one place its value becomes visible
     /// is the preview's SQL — which is the app's one gate between a plan and a
     /// server, and so the one place a statement may not be shown with a field
     /// blanked out. See `users::account_draft_sql`.
     pub account_draft: RwSignal<schemaic_core::users::AccountDraft>,
+    /// The account form's **confirm password** field. It holds a password too,
+    /// so it is cleared everywhere `account_draft` is — on every open and on
+    /// every close — and it never reaches a plan: only
+    /// `users::account_form_ready` reads it.
+    pub account_confirm: RwSignal<String>,
     /// The grant editor's target; doubles as its open flag.
     pub grant: RwSignal<Option<GrantTarget>>,
     pub grant_draft: RwSignal<schemaic_core::users::GrantDraft>,

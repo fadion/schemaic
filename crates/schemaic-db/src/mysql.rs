@@ -271,6 +271,8 @@ async fn collect_my_users(conn: &mut Conn) -> Result<users::Principals, DbError>
     Ok(users::Principals {
         list: users::from_mysql_rows(&rows),
         note: Some(users::my_own_account_only_note()),
+        // MySQL/MariaDB take no verifier, so there is no policy to honour.
+        password_policy: None,
     })
 }
 

@@ -5025,6 +5025,7 @@ dependencies = [
  "chrono",
  "csv",
  "hmac 0.13.0",
+ "md-5",
  "rust_xlsxwriter",
  "serde",
  "serde_json",

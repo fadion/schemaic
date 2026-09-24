@@ -22469,6 +22469,7 @@ mod database_tests {
                 account: an_account(),
                 password: "s3cret".into(),
                 scram_salt: None,
+                password_policy: None,
             })),
             Change::GrantPrivileges(a_privilege_change(&["SELECT"])),
             Change::RevokePrivileges(a_privilege_change(&["SELECT"])),
@@ -22694,6 +22695,7 @@ mod database_tests {
             account: role,
             password: "hunter2".into(),
             scram_salt: None,
+            password_policy: None,
         }));
         for d in [MySql, Postgres] {
             assert!(
@@ -22713,6 +22715,7 @@ mod database_tests {
             account: an_account(),
             password: "hunter2".into(),
             scram_salt: None,
+            password_policy: None,
         }));
         assert!(supports_change(MySql, &user));
         assert_eq!(cs_len(MySql, user), 1);
@@ -22736,6 +22739,7 @@ mod database_tests {
                 account: an_account(),
                 password: password.into(),
                 scram_salt: None,
+                password_policy: None,
             }))
         };
         // The property, over every shape: whatever `supports_change` calls

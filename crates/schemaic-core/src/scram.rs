@@ -46,17 +46,28 @@ pub const ITERATIONS: u32 = 4096;
 /// empty or not wholly printable ASCII — see the module doc for why those are
 /// sent as typed instead.
 pub fn verifier(password: &str, salt: &Salt) -> Option<String> {
+    verifier_with(password, salt, ITERATIONS)
+}
+
+/// [`verifier`] at `iterations` — the server's own `scram_iterations`, which an
+/// administrator can raise on PostgreSQL 16 and later. A verifier built at the
+/// default under a hardened setting silently weakens every password it sets.
+/// `0` is not an iteration count and answers `None`.
+pub fn verifier_with(password: &str, salt: &Salt, iterations: u32) -> Option<String> {
     use base64::Engine as _;
     use base64::engine::general_purpose::STANDARD as B64;
 
-    if password.is_empty() || !password.bytes().all(|b| (0x20..=0x7e).contains(&b)) {
+    if iterations == 0
+        || password.is_empty()
+        || !password.bytes().all(|b| (0x20..=0x7e).contains(&b))
+    {
         return None;
     }
-    let salted = salted_password(password.as_bytes(), salt, ITERATIONS);
+    let salted = salted_password(password.as_bytes(), salt, iterations);
     let stored_key = sha256(&hmac(&salted, b"Client Key"));
     let server_key = hmac(&salted, b"Server Key");
     Some(format!(
-        "SCRAM-SHA-256${ITERATIONS}:{}${}:{}",
+        "SCRAM-SHA-256${iterations}:{}${}:{}",
         B64.encode(salt),
         B64.encode(stored_key),
         B64.encode(server_key)

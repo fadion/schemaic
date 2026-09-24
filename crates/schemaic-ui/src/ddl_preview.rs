@@ -103,6 +103,7 @@ pub(crate) fn close_peers(d: crate::DdlUi, keep_trigger: bool) {
     // reachable by anything that reads the bundle. The form re-seeds itself from
     // its target on open, so there is nothing to keep.
     d.account_draft.set(Default::default());
+    d.account_confirm.set(String::new());
     d.grant_draft.set(Default::default());
 }
 
@@ -1298,6 +1299,7 @@ pub(crate) fn test_ddl_ui(scope: floem::reactive::Scope) -> crate::DdlUi {
         database_draft: scope.create_rw_signal(Default::default()),
         account: scope.create_rw_signal(None),
         account_draft: scope.create_rw_signal(Default::default()),
+        account_confirm: scope.create_rw_signal(String::new()),
         grant: scope.create_rw_signal(None),
         grant_draft: scope.create_rw_signal(Default::default()),
         roles: scope.create_rw_signal(Vec::new()),
@@ -1504,6 +1506,7 @@ mod tests {
             dialect: SqlDialect::MySql,
             read_only: false,
             resetting: None,
+            password_policy: None,
         }));
         d.grant.set(Some(crate::GrantTarget {
             conn_id: 1,
@@ -1691,6 +1694,7 @@ mod tests {
                     dialect: SqlDialect::MySql,
                     read_only: false,
                     resetting: None,
+                    password_policy: None,
                 }))
             }),
             ("grant", |d| {

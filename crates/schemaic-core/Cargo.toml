@@ -26,6 +26,10 @@ zip = { workspace = true }
 sha2 = "0.11"
 hmac = "0.13"
 base64 = "0.22"
+# The `md5` verifier, for a cluster whose `password_encryption` is still `md5`:
+# a SCRAM verifier there locks out every client that cannot do SCRAM. The same
+# crate and version `postgres-protocol` already has in the graph.
+md-5 = "0.11"
 
 [lints]
 workspace = true

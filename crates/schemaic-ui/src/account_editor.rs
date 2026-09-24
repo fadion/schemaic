@@ -186,7 +186,16 @@ fn door_read_only(conn: ConnUi, from: &UsersTarget) -> bool {
 /// `dialect` come from** — not `edit_ctx`, which reads the switcher *now*. The
 /// reasoning is written out once, over `open_for_grant`'s copy of the same four
 /// lines, and `anchor_gate` is what holds both to it.
-pub(crate) fn open_for_new(conn: ConnUi, d: DdlUi, from: &UsersTarget, database: &str) {
+///
+/// `password_policy` is the server's, as the browser read it with the account
+/// list — stamped on the target so the plan honours it (`users::PasswordPolicy`).
+pub(crate) fn open_for_new(
+    conn: ConnUi,
+    d: DdlUi,
+    from: &UsersTarget,
+    database: &str,
+    password_policy: Option<schemaic_core::users::PasswordPolicy>,
+) {
     // **No `edit_ctx` here at all.** These three read nothing else from it, and
     // what they did read was the switcher's flag — see `door_read_only`. A live
     // read of the active connection in a door launched from a captured target
@@ -209,6 +218,7 @@ pub(crate) fn open_for_new(conn: ConnUi, d: DdlUi, from: &UsersTarget, database:
         dialect: from.dialect,
         read_only: door_read_only,
         resetting: None,
+        password_policy,
     }));
 }
 
@@ -235,6 +245,7 @@ pub(crate) fn open_for_reset(
     from: &UsersTarget,
     database: &str,
     account: &Principal,
+    password_policy: Option<schemaic_core::users::PasswordPolicy>,
 ) {
     // **No `edit_ctx` here at all.** These three read nothing else from it, and
     // what they did read was the switcher's flag — see `door_read_only`. A live
@@ -263,6 +274,7 @@ pub(crate) fn open_for_reset(
             password: String::new(),
             // Stamped when the plan is built (`account_change`), not here.
             scram_salt: None,
+            password_policy: None,
         },
     );
     d.account.set(Some(AccountTarget {
@@ -271,6 +283,7 @@ pub(crate) fn open_for_reset(
         dialect: from.dialect,
         read_only: door_read_only,
         resetting: Some(account.clone()),
+        password_policy,
     }));
 }
 
@@ -527,11 +540,13 @@ pub(crate) fn fresh_salt() -> Option<schemaic_core::scram::Salt> {
 ///
 /// `salt` is stamped onto whichever change it builds — handed in rather than
 /// drawn here so this stays pure — and it is what a PostgreSQL password is
-/// hashed under (`users::supports_password_verifier`).
+/// hashed under (`users::supports_password_verifier`). `policy` is stamped
+/// beside it: the server's own say in what that hash is (`users::PasswordPolicy`).
 pub(crate) fn account_change(
     draft: &AccountDraft,
     resetting: Option<&Principal>,
     salt: Option<schemaic_core::scram::Salt>,
+    policy: Option<schemaic_core::users::PasswordPolicy>,
 ) -> ddl::Change {
     // **The subject comes from `resetting`, never from the draft.** The form
     // seeds the draft's name and host so it can say whose password this is, and
@@ -544,13 +559,31 @@ pub(crate) fn account_change(
             account: account.clone(),
             password: draft.password.clone(),
             scram_salt: salt,
+            password_policy: policy,
         }));
     }
     let mut d = draft.clone();
     d.name = d.name.trim().to_string();
     d.host = d.host.trim().to_string();
     d.scram_salt = salt;
+    d.password_policy = policy;
     ddl::Change::CreateAccount(Box::new(d))
+}
+
+/// The change the **Preview** button builds: [`account_change`] with a
+/// [`fresh_salt`] drawn now and the target's policy.
+///
+/// Its own function so the composition is tested and not only its halves. The
+/// salt's call site was untested, and replacing `fresh_salt()` there with
+/// `None` kept the suite green while every PostgreSQL password went back into
+/// the server's logs as text — `None` being, by design, the silent fallback.
+pub(crate) fn preview_change(draft: &AccountDraft, target: &AccountTarget) -> ddl::Change {
+    account_change(
+        draft,
+        target.resetting.as_ref(),
+        fresh_salt(),
+        target.password_policy,
+    )
 }
 
 fn account_form(
@@ -685,10 +718,21 @@ fn password_row(d: crate::DdlUi, ring: FocusRing, dialect: SqlDialect) -> AnyVie
         }
         v
     });
+    // **Typed twice**, because nothing else shows it: the field is masked, and
+    // on PostgreSQL the preview carries a verifier rather than the text, so a
+    // slip was visible nowhere before an irreversible reset. Cleared wherever
+    // the draft is; a mismatch is said in the footer (`account_form_blocker`).
+    let confirm = d.account_confirm;
     v_stack((
         form_setting(
             "Password",
-            crate::connection_form::masked_edit_field(pw, ring, 30)
+            crate::connection_form::masked_edit_field(pw, ring.clone(), 30)
+                .style(|s| s.width(field_w()))
+                .into_any(),
+        ),
+        form_setting(
+            "Confirm",
+            crate::connection_form::masked_edit_field(confirm, ring, 31)
                 .style(|s| s.width(field_w()))
                 .into_any(),
         ),
@@ -734,6 +778,7 @@ pub(crate) fn account_editor_overlay(d: DdlUi) -> impl IntoView {
     let close = move || {
         d.account.set(None);
         d.account_draft.set(Default::default());
+        d.account_confirm.set(String::new());
     };
 
     dyn_container(
@@ -801,41 +846,38 @@ pub(crate) fn account_editor_overlay(d: DdlUi) -> impl IntoView {
                 // asks one question about one field, so cloning the whole
                 // `AccountDraft` to reach it is the defect `consts`'
                 // `get_clone_gate` is named for.
+                //
+                // The reason is `users::account_form_blocker`'s, the same call
+                // `account_form_ready` makes for the button beside it — so the
+                // sentence and the dimming cannot disagree about what is
+                // missing, the confirmation included.
                 move || {
-                    d.account_draft.with(|a| {
-                        if resetting {
-                            a.password.is_empty()
-                        } else {
-                            a.name.trim().is_empty()
-                        }
+                    d.account_confirm.with(|confirm| {
+                        d.account_draft.with(|a| {
+                            schemaic_core::users::account_form_blocker(a, confirm, resetting)
+                        })
                     })
                 },
-                move |missing| {
-                    if missing {
-                        text(if resetting {
-                            "A password is required."
-                        } else {
-                            "A name is required."
-                        })
+                move |missing| match missing {
+                    Some(why) => text(why)
                         .style(|s| s.color(theme::error()).font_size(theme::font_label()))
-                        .into_any()
-                    } else {
-                        crate::widgets::nothing().into_any()
-                    }
+                        .into_any(),
+                    None => crate::widgets::nothing().into_any(),
                 },
             );
 
             let preview_target = target.clone();
             let ring_actions = root_ring.clone();
             let actions = dyn_container(
-                move || d.account_draft.get(),
-                move |draft| {
+                move || (d.account_draft.get(), d.account_confirm.get()),
+                move |(draft, confirm)| {
                     let target = preview_target.clone();
                     let ring = ring_actions.clone();
-                    let ready = match &target.resetting {
-                        Some(_) => !draft.password.is_empty(),
-                        None => !draft.name.trim().is_empty(),
-                    };
+                    let ready = schemaic_core::users::account_form_ready(
+                        &draft,
+                        &confirm,
+                        target.resetting.is_some(),
+                    );
                     h_stack((
                         action_button(
                             "Cancel",
@@ -857,7 +899,7 @@ pub(crate) fn account_editor_overlay(d: DdlUi) -> impl IntoView {
                                     d,
                                     (&target).into(),
                                     &subject,
-                                    account_change(&draft, target.resetting.as_ref(), fresh_salt()),
+                                    preview_change(&draft, &target),
                                 );
                             },
                         ),
@@ -1651,8 +1693,9 @@ mod account_change_tests {
             kind: PrincipalKind::User,
             password: "hunter2".into(),
             scram_salt: None,
+            password_policy: None,
         };
-        match account_change(&d, None, None) {
+        match account_change(&d, None, None, None) {
             ddl::Change::CreateAccount(a) => {
                 // Trimmed on the way out, which is the other thing this function
                 // does and the reason it is not a bare constructor call.
@@ -1682,8 +1725,9 @@ mod account_change_tests {
             kind: PrincipalKind::User,
             password: "hunter2".into(),
             scram_salt: None,
+            password_policy: None,
         };
-        match account_change(&d, Some(&an_account()), None) {
+        match account_change(&d, Some(&an_account()), None, None) {
             ddl::Change::SetAccountPassword(r) => {
                 assert_eq!(r.account, an_account());
                 assert_eq!(r.password, "hunter2");
@@ -1702,8 +1746,9 @@ mod account_change_tests {
             kind: PrincipalKind::User,
             password: "hunter2".into(),
             scram_salt: None,
+            password_policy: None,
         };
-        let change = account_change(&d, Some(&an_account()), None);
+        let change = account_change(&d, Some(&an_account()), None, None);
         let cs = ddl::account("app", SqlDialect::MySql, change);
         assert_eq!(
             cs.emit(),
@@ -1733,9 +1778,9 @@ mod account_change_tests {
         let mut pg_account = an_account();
         pg_account.host = None;
         for (change, verb) in [
-            (account_change(&d, None, Some(salt)), "CREATE USER"),
+            (account_change(&d, None, Some(salt), None), "CREATE USER"),
             (
-                account_change(&d, Some(&pg_account), Some(salt)),
+                account_change(&d, Some(&pg_account), Some(salt), None),
                 "ALTER ROLE",
             ),
         ] {
@@ -1745,6 +1790,53 @@ mod account_change_tests {
             assert!(emitted[0].contains(&v), "{emitted:?}");
             assert!(!emitted[0].contains("hunter2"), "{emitted:?}");
         }
+    }
+
+    /// **What the Preview button builds hashes a PostgreSQL password.** The
+    /// composition the salt's call site stood for, and the one no test
+    /// reached: `None` there kept the suite green and sent every password as
+    /// text. On a reset as on a create, and under the target's policy.
+    #[test]
+    fn the_preview_change_carries_a_verifier_not_the_password() {
+        let draft = AccountDraft {
+            name: "app".into(),
+            kind: PrincipalKind::User,
+            password: "hunter2".into(),
+            ..Default::default()
+        };
+        let mut target = AccountTarget {
+            conn_id: 1,
+            database: "db".into(),
+            dialect: SqlDialect::Postgres,
+            read_only: false,
+            resetting: None,
+            password_policy: None,
+        };
+        let emit = |target: &AccountTarget| {
+            ddl::account("app", SqlDialect::Postgres, preview_change(&draft, target))
+                .emit()
+                .join("\n")
+        };
+        let create = emit(&target);
+        assert!(create.contains("SCRAM-SHA-256$4096:"), "{create}");
+        assert!(!create.contains("hunter2"), "{create}");
+
+        target.resetting = Some(Principal {
+            name: "app".into(),
+            host: None,
+            kind: PrincipalKind::User,
+            system: false,
+            attributes: Vec::new(),
+            role_ambiguous: false,
+        });
+        target.password_policy = Some(schemaic_core::users::PasswordPolicy {
+            encryption: schemaic_core::users::PasswordEncryption::Md5,
+            scram_iterations: 4096,
+            checks_plaintext: false,
+        });
+        let reset = emit(&target);
+        assert!(reset.contains("PASSWORD 'md5"), "{reset}");
+        assert!(!reset.contains("hunter2"), "{reset}");
     }
 
     /// A fresh salt per plan: two previews of the same password must not share

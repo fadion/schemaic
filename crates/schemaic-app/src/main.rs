@@ -11883,6 +11883,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             database_draft: RwSignal::new(schemaic_core::ddl::DatabaseDraft::default()),
             account: RwSignal::new(None),
             account_draft: RwSignal::new(schemaic_core::users::AccountDraft::default()),
+            account_confirm: RwSignal::new(String::new()),
             grant: RwSignal::new(None),
             grant_draft: RwSignal::new(schemaic_core::users::GrantDraft::default()),
             roles: RwSignal::new(Vec::new()),

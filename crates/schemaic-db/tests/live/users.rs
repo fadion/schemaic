@@ -323,6 +323,25 @@ impl ScratchAccount {
         host: &str,
         scram_salt: Option<schemaic_core::scram::Salt>,
     ) -> ScratchAccount {
+        Self::create_with_policy(
+            target, scratch, suffix, kind, password, host, scram_salt, None,
+        )
+        .await
+    }
+
+    /// [`Self::create_salted`], under a server password policy as the account
+    /// form stamps one (`users::PasswordPolicy`).
+    #[allow(clippy::too_many_arguments)]
+    async fn create_with_policy(
+        target: &'static Target,
+        scratch: &Scratch,
+        suffix: &str,
+        kind: PrincipalKind,
+        password: &str,
+        host: &str,
+        scram_salt: Option<schemaic_core::scram::Salt>,
+        password_policy: Option<schemaic_core::users::PasswordPolicy>,
+    ) -> ScratchAccount {
         let name = format!("{PREFIX}{}_{}_{suffix}", std::process::id(), target.name);
         assert_scratch_name(&name);
         assert!(
@@ -337,6 +356,7 @@ impl ScratchAccount {
             kind,
             password: password.to_string(),
             scram_salt,
+            password_policy,
         };
         let principal = draft.principal(dialect);
         let me = ScratchAccount {
@@ -723,6 +743,7 @@ pub async fn a_reset_password_replaces_the_one_the_account_had(target: &'static 
             account: listed,
             password: now.to_string(),
             scram_salt: None,
+            password_policy: None,
         })))
         .await;
 
@@ -804,6 +825,7 @@ pub async fn a_salted_password_logs_in_on_create_and_on_reset(target: &'static T
             account: listed,
             password: second.to_string(),
             scram_salt: Some([0xa5; 16]),
+            password_policy: None,
         })))
         .await;
     login(second).await.unwrap_or_else(|e| {
@@ -820,6 +842,115 @@ pub async fn a_salted_password_logs_in_on_create_and_on_reset(target: &'static T
     );
 
     account.teardown().await;
+    scratch.teardown().await;
+}
+
+/// **The server's password policy, read with the account list, decides what a
+/// PostgreSQL role stores.**
+///
+/// A verifier the app computes is a decision the server did not get to make:
+/// under `password_encryption = md5` a pre-hashed SCRAM verifier stored SCRAM
+/// and locked out every client that cannot do it, and under a raised
+/// `scram_iterations` it came in at 4096 (both measured on PG 16.15). So the
+/// list has to carry the policy, an md5 policy has to store `md5…`, and a
+/// hardened count has to be the count stored — and still log in.
+///
+/// The md5 role is checked by what is stored, not by a login: the tier's
+/// `pg_hba` may authenticate with SCRAM only. PostgreSQL only, for the gate
+/// the backslash test below gives.
+pub async fn a_server_password_policy_decides_what_is_stored(target: &'static Target) {
+    use schemaic_core::users::{PasswordEncryption, PasswordPolicy};
+    if target.accounts_have_hosts() {
+        // MySQL family: no verifier, so no policy to honour.
+        return;
+    }
+    let principals = target
+        .base_db()
+        .fetch_principals()
+        .await
+        .unwrap_or_else(|e| panic!("{}: principals: {e}", target.endpoint()));
+    let read = principals
+        .password_policy
+        .unwrap_or_else(|| panic!("{}: the list came back without a policy", target.endpoint()));
+    assert!(read.scram_iterations > 0, "{read:?}");
+
+    let scratch = Scratch::create(target, "pgpolicy").await;
+    let stored = |account: &ScratchAccount| {
+        let sql = format!(
+            "SELECT rolpassword FROM pg_catalog.pg_authid WHERE rolname = {}",
+            schemaic_core::export::sql_literal(
+                &schemaic_core::model::Value::Str(account.principal.name.clone()),
+                SqlDialect::Postgres
+            )
+        );
+        let db = scratch.db.clone();
+        let database = scratch.database.clone();
+        async move {
+            let rs = db
+                .fetch_query(Some(&database), &sql, 1, CancellationToken::new())
+                .await
+                .expect("pg_authid is readable to the tier's superuser");
+            rs.cell(0, 0)
+                .map(|c| c.text().to_string())
+                .unwrap_or_default()
+        }
+    };
+
+    // An md5 cluster: the role stores md5, as the server's own CREATE would.
+    let md5 = PasswordPolicy {
+        encryption: PasswordEncryption::Md5,
+        scram_iterations: 4096,
+        checks_plaintext: false,
+    };
+    let under_md5 = ScratchAccount::create_with_policy(
+        target,
+        &scratch,
+        "m5",
+        PrincipalKind::User,
+        "hunter2-md5",
+        "",
+        Some([0x11; 16]),
+        Some(md5),
+    )
+    .await;
+    let got = stored(&under_md5).await;
+    assert!(
+        got.starts_with("md5"),
+        "{}: stored {got:?}",
+        target.endpoint()
+    );
+
+    // A hardened iteration count is kept, and the account still logs in.
+    let hardened = PasswordPolicy {
+        encryption: PasswordEncryption::ScramSha256,
+        scram_iterations: 5000,
+        checks_plaintext: false,
+    };
+    let under_5000 = ScratchAccount::create_with_policy(
+        target,
+        &scratch,
+        "s5k",
+        PrincipalKind::User,
+        "hunter2-5k",
+        "",
+        Some([0x22; 16]),
+        Some(hardened),
+    )
+    .await;
+    let got = stored(&under_5000).await;
+    assert!(
+        got.starts_with("SCRAM-SHA-256$5000:"),
+        "{}: stored {got:?}",
+        target.endpoint()
+    );
+    target
+        .db_as(&under_5000.principal.name, "hunter2-5k")
+        .ping(std::time::Duration::from_secs(10))
+        .await
+        .unwrap_or_else(|e| panic!("{}: 5000-iteration login: {e}", target.endpoint()));
+
+    under_md5.teardown().await;
+    under_5000.teardown().await;
     scratch.teardown().await;
 }
 
@@ -900,6 +1031,7 @@ pub async fn a_password_with_a_backslash_is_stored_as_it_was_typed(target: &'sta
             // Unsalted on purpose: this test is about how the *literal* is
             // parsed, and a verifier would take the backslash out of it.
             scram_salt: None,
+            password_policy: None,
         })))
         .await;
 
@@ -997,6 +1129,7 @@ pub async fn a_role_the_server_made_is_never_offered_a_password_reset(target: &'
                 account: listed_role.clone(),
                 password: "hunter2".to_string(),
                 scram_salt: None,
+                password_policy: None,
             },
             scratch.dialect()
         ),

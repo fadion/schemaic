@@ -2788,7 +2788,44 @@ pub(crate) async fn fetch_principals(db: &Db) -> Result<users::Principals, DbErr
         .collect();
     // Complete: `pg_roles` is world-readable, so unlike MySQL's `mysql.user`
     // there is no rung below this one and nothing to disclose.
-    Ok(users::Principals::complete(users::from_pg_rows(&rows)))
+    let mut out = users::Principals::complete(users::from_pg_rows(&rows));
+    out.password_policy = password_policy(&client).await;
+    Ok(out)
+}
+
+/// The server's password policy, or `None` where it cannot be read — which
+/// keeps the account form's SCRAM default rather than failing the list.
+///
+/// Read on this session, so a `password_encryption` set per role applies to
+/// the role the plan will run as. `shared_preload_libraries` is hidden from a
+/// role without `pg_read_all_settings` — `pg_settings` then has no row for it
+/// rather than an error — which is why an extension's own settings are asked
+/// too: `credcheck.*` is listed to everyone once the library is loaded.
+async fn password_policy(client: &Client) -> Option<users::PasswordPolicy> {
+    let rows = query_all(
+        client,
+        "SELECT current_setting('password_encryption'), \
+                current_setting('scram_iterations', true), \
+                (SELECT setting FROM pg_catalog.pg_settings \
+                  WHERE name = 'shared_preload_libraries')",
+    )
+    .await
+    .ok()?;
+    let row = rows.first()?;
+    let custom: Vec<String> = query_all(
+        client,
+        "SELECT name FROM pg_catalog.pg_settings \
+          WHERE name LIKE 'passwordcheck.%' OR name LIKE 'credcheck.%'",
+    )
+    .await
+    .map(|rows| rows.iter().map(|r| cell(r, 0)).collect())
+    .unwrap_or_default();
+    Some(users::PasswordPolicy::from_settings(
+        &cell(row, 0),
+        opt(row, 1).as_deref(),
+        &cell(row, 2),
+        &custom,
+    ))
 }
 
 /// `pg_roles` in the order [`PgRoleRow`] reads it.
