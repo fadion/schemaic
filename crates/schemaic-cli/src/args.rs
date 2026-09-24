@@ -6,7 +6,7 @@
 
 use clap::{Parser, Subcommand};
 
-use crate::format::Format;
+use crate::format::{Format, Output};
 
 /// How many rows a `query` returns unless asked for more.
 ///
@@ -42,15 +42,15 @@ pub enum Command {
         /// explained rather than just absent.
         #[arg(long)]
         all: bool,
-        #[arg(long, default_value = "table")]
-        format: Format,
+        #[command(flatten)]
+        output: OutputArgs,
     },
     /// List the databases on a connection — the names `-d` takes.
     Databases {
         #[command(flatten)]
         conn: ConnArgs,
-        #[arg(long, default_value = "table")]
-        format: Format,
+        #[command(flatten)]
+        output: OutputArgs,
         /// Seconds before the listing is given up on.
         #[arg(long, default_value_t = DEFAULT_TIMEOUT_SECS, value_parser = at_least_one_second())]
         timeout: u64,
@@ -61,8 +61,8 @@ pub enum Command {
         sql: SqlArgs,
         #[command(flatten)]
         target: Target,
-        #[arg(long, default_value = "table")]
-        format: Format,
+        #[command(flatten)]
+        output: OutputArgs,
         /// Maximum rows to return.
         #[arg(long, default_value_t = DEFAULT_LIMIT, value_parser = at_least_one_row())]
         limit: usize,
@@ -80,8 +80,8 @@ pub enum Command {
         sql: SqlArgs,
         #[command(flatten)]
         target: Target,
-        #[arg(long, default_value = "table")]
-        format: Format,
+        #[command(flatten)]
+        output: OutputArgs,
         /// Answer the guard's question — in practice, "this statement has no
         /// WHERE clause". It cannot unlock a read-only connection.
         #[arg(long)]
@@ -107,6 +107,38 @@ const DEFAULT_TIMEOUT_SECS: u64 = crate::query::DEFAULT_TIMEOUT.as_secs();
 
 /// The statement argument that means "read it from stdin".
 pub const SQL_FROM_STDIN: &str = "-";
+
+/// How stdout is written — every subcommand that prints rows takes these.
+#[derive(clap::Args, Debug, PartialEq, Eq)]
+pub struct OutputArgs {
+    #[arg(long, default_value = "table")]
+    pub format: Format,
+    /// Leave out the column names — for `table`, the footer too — so the
+    /// output is the rows alone. `table` and `csv` only.
+    #[arg(long)]
+    pub no_header: bool,
+}
+
+impl OutputArgs {
+    /// The two flags as one [`Output`], or why they do not go together.
+    pub fn output(&self) -> Result<Output, String> {
+        Output::new(self.format, self.no_header)
+    }
+}
+
+impl Command {
+    /// The output flags, for the subcommands that print rows — so they can be
+    /// judged before anything else is read.
+    pub fn output_args(&self) -> Option<&OutputArgs> {
+        match self {
+            Command::List { output, .. }
+            | Command::Databases { output, .. }
+            | Command::Query { output, .. }
+            | Command::Exec { output, .. } => Some(output),
+            Command::Version => None,
+        }
+    }
+}
 
 /// Where the statement comes from: the argument, stdin, or a file — exactly
 /// one of them, which the group makes a parse error rather than a precedence
@@ -368,24 +400,28 @@ mod tests {
                     "schemaic", sub, sql, "-c", "prod", "--format", "json",
                 ]));
                 let cli = parse_os(argv).unwrap_or_else(|e| panic!("{sub} {sql:?}: {e}"));
-                let (got, target, format) = match cli.command {
+                let (got, target, output) = match cli.command {
                     Command::Query {
                         sql,
                         target,
-                        format,
+                        output,
                         ..
                     }
                     | Command::Exec {
                         sql,
                         target,
-                        format,
+                        output,
                         ..
-                    } => (sql, target, format),
+                    } => (sql, target, output),
                     other => panic!("{other:?}"),
                 };
                 assert_eq!(got.source(), SqlSource::Text(sql));
                 assert_eq!(target.conn.connection, "prod");
-                assert_eq!(format, Format::Json, "the flags after it still apply");
+                assert_eq!(
+                    output.format,
+                    Format::Json,
+                    "the flags after it still apply"
+                );
             }
         }
     }
@@ -520,7 +556,10 @@ mod tests {
                     connection: "prod".to_string(),
                     password_stdin: false,
                 },
-                format: Format::Table,
+                output: OutputArgs {
+                    format: Format::Table,
+                    no_header: false,
+                },
                 timeout: crate::query::DEFAULT_TIMEOUT.as_secs(),
             }
         );
@@ -553,7 +592,7 @@ mod tests {
     fn the_defaults_are_table_and_a_small_limit() {
         let cli = parse(&["schemaic", "query", "SELECT 1", "-c", "1"]).unwrap();
         let Command::Query {
-            format,
+            output,
             limit,
             timeout,
             ..
@@ -561,7 +600,8 @@ mod tests {
         else {
             panic!("expected a query");
         };
-        assert_eq!(format, Format::Table);
+        assert_eq!(output.format, Format::Table);
+        assert!(!output.no_header, "the header is there unless asked away");
         assert_eq!(limit, DEFAULT_LIMIT);
         assert_eq!(timeout, crate::query::DEFAULT_TIMEOUT.as_secs());
     }
@@ -582,10 +622,47 @@ mod tests {
             "schemaic", "query", "SELECT 1", "-c", "1", "--format", "jsonl",
         ])
         .unwrap();
-        let Command::Query { format, .. } = cli.command else {
+        let Command::Query { output, .. } = cli.command else {
             panic!("expected a query");
         };
-        assert_eq!(format, Format::Jsonl);
+        assert_eq!(output.format, Format::Jsonl);
+    }
+
+    /// **`--no-header` is on every subcommand that prints rows**, and is
+    /// judged against the format before anything is read — a pair that does
+    /// not go together is a usage error, not a header quietly kept.
+    #[test]
+    fn no_header_is_on_every_row_printing_subcommand() {
+        for args in [
+            &["schemaic", "list", "--no-header"][..],
+            &["schemaic", "databases", "-c", "1", "--no-header"],
+            &["schemaic", "query", "SELECT 1", "-c", "1", "--no-header"],
+            &["schemaic", "exec", "SELECT 1", "-c", "1", "--no-header"],
+        ] {
+            let cli = parse(args).unwrap_or_else(|e| panic!("{args:?}: {e}"));
+            let output = cli.command.output_args().expect("prints rows");
+            assert!(output.no_header, "{args:?}");
+            assert_eq!(output.output().map(|o| o.header), Ok(false));
+        }
+        let cli = parse(&[
+            "schemaic",
+            "query",
+            "SELECT 1",
+            "-c",
+            "1",
+            "--no-header",
+            "--format",
+            "json",
+        ])
+        .unwrap();
+        assert!(cli.command.output_args().unwrap().output().is_err());
+        assert_eq!(
+            parse(&["schemaic", "version"])
+                .unwrap()
+                .command
+                .output_args(),
+            None
+        );
     }
 
     /// A bad format must fail at parse time, naming the real ones — not reach a
@@ -685,7 +762,10 @@ mod tests {
             cli.command,
             Command::List {
                 all: false,
-                format: Format::Table
+                output: OutputArgs {
+                    format: Format::Table,
+                    no_header: false,
+                },
             }
         );
     }

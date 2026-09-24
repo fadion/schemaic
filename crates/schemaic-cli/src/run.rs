@@ -18,8 +18,8 @@ use schemaic_core::secrets::SecretKind;
 use schemaic_core::sql::NoDatabaseFailure;
 use schemaic_db::Db;
 
-use crate::args::{Cli, Command, ConnArgs, SqlArgs, SqlSource, Target};
-use crate::format::{self, Format};
+use crate::args::{Cli, Command, ConnArgs, OutputArgs, SqlArgs, SqlSource, Target};
+use crate::format::{self, Format, Output};
 use crate::{exec, query, select};
 
 /// What the process exits with.
@@ -187,6 +187,15 @@ async fn dispatch(command: Command) -> Exit {
             .err()
             .unwrap_or(Exit::Ok);
     }
+    // A command line that cannot be printed is a usage error before anything
+    // is read, the way clap's own refusals are.
+    let out = match command.output_args().map(OutputArgs::output).transpose() {
+        Ok(out) => out.unwrap_or_else(|| Format::Table.into()),
+        Err(e) => {
+            warn(&e);
+            return Exit::Usage;
+        }
+    };
     // Unhydrated: `list` shows no secret, and `connect` fills in only the one
     // connection a command runs against, once its guard has said yes.
     let file = match schemaic_conn::secrets::load_connections_readonly() {
@@ -202,24 +211,16 @@ async fn dispatch(command: Command) -> Exit {
     };
     match command {
         Command::Version => unreachable!("`version` is answered before the file is read"),
-        Command::List { all, format } => list(&file.connections, all, format),
+        Command::List { all, output: _ } => list(&file.connections, all, out),
         Command::Databases {
             conn,
-            format,
+            output: _,
             timeout,
-        } => {
-            databases(
-                &file.connections,
-                &conn,
-                format,
-                Duration::from_secs(timeout),
-            )
-            .await
-        }
+        } => databases(&file.connections, &conn, out, Duration::from_secs(timeout)).await,
         Command::Query {
             sql,
             target,
-            format,
+            output: _,
             limit,
             fail_on_cap,
             timeout,
@@ -228,7 +229,7 @@ async fn dispatch(command: Command) -> Exit {
                 &file.connections,
                 &target,
                 &sql,
-                format,
+                out,
                 limit,
                 fail_on_cap,
                 Duration::from_secs(timeout),
@@ -238,7 +239,7 @@ async fn dispatch(command: Command) -> Exit {
         Command::Exec {
             sql,
             target,
-            format,
+            output: _,
             yes,
             timeout,
         } => {
@@ -246,7 +247,7 @@ async fn dispatch(command: Command) -> Exit {
                 &file.connections,
                 &target,
                 &sql,
-                format,
+                out,
                 yes,
                 Duration::from_secs(timeout),
             )
@@ -260,7 +261,7 @@ async fn dispatch(command: Command) -> Exit {
 /// The listing is built as a [`ResultSet`] and handed to the same renderers a
 /// query's rows go through, so `--format=json` means the same thing here as it
 /// does there and there is no second table-drawing code path to keep in step.
-fn list(conns: &[Connection], all: bool, format: Format) -> Exit {
+fn list(conns: &[Connection], all: bool, out: Output) -> Exit {
     let shown: Vec<&Connection> = if all {
         conns.iter().collect()
     } else {
@@ -298,7 +299,7 @@ fn list(conns: &[Connection], all: bool, format: Format) -> Exit {
     let columns = names.into_iter().map(text_column).collect();
     if let Err(exit) = emit_stdout(&format::render_rows(
         &ResultSet::from_rows(columns, rows),
-        format,
+        out,
     )) {
         return exit;
     }
@@ -361,12 +362,7 @@ fn text_column(name: &str) -> Column {
 /// schemas left out), rendered like any other rows so `--format` means what it
 /// means everywhere. It reaches a server, so it is a CLI-access connection like
 /// the rest; there is no statement for a guard to judge.
-async fn databases(
-    conns: &[Connection],
-    args: &ConnArgs,
-    format: Format,
-    timeout: Duration,
-) -> Exit {
+async fn databases(conns: &[Connection], args: &ConnArgs, out: Output, timeout: Duration) -> Exit {
     let conn = match select_conn(conns, args) {
         Ok(c) => c,
         Err(exit) => return exit,
@@ -398,7 +394,7 @@ async fn databases(
     };
     let rows = names.into_iter().map(|n| vec![Value::Str(n)]).collect();
     let rs = ResultSet::from_rows(vec![text_column("database")], rows);
-    emit_stdout(&format::render_rows(&rs, format))
+    emit_stdout(&format::render_rows(&rs, out))
         .err()
         .unwrap_or(Exit::Ok)
 }
@@ -598,9 +594,9 @@ async fn connect(
 }
 
 /// The rows, then what could not be said in them — on stderr.
-fn emit_rows(rs: &ResultSet, format: Format) -> Result<(), Exit> {
-    emit_stdout(&format::render_rows(rs, format))?;
-    if let Some(w) = format::withheld_warning(rs, format) {
+fn emit_rows(rs: &ResultSet, out: Output) -> Result<(), Exit> {
+    emit_stdout(&format::render_rows(rs, out))?;
+    if let Some(w) = format::withheld_warning(rs, out.format) {
         warn(&w);
     }
     Ok(())
@@ -615,7 +611,7 @@ async fn run_query(
     conns: &[Connection],
     target: &Target,
     sql: &SqlArgs,
-    format: Format,
+    out: Output,
     limit: usize,
     fail_on_cap: bool,
     timeout: Duration,
@@ -640,10 +636,10 @@ async fn run_query(
     let database = database_for(target, conn);
     match query::read_only_query(&db, database.as_deref(), &sql, limit, timeout).await {
         Ok(rs) => {
-            if let Err(exit) = emit_rows(&rs, format) {
+            if let Err(exit) = emit_rows(&rs, out) {
                 return exit;
             }
-            if let Some(w) = format::truncation_warning(&rs, format) {
+            if let Some(w) = format::truncation_warning(&rs, out) {
                 warn(&w);
             }
             exit_for_rows(&rs, fail_on_cap)
@@ -689,7 +685,7 @@ async fn run_exec(
     conns: &[Connection],
     target: &Target,
     sql: &SqlArgs,
-    format: Format,
+    out: Output,
     yes: bool,
     timeout: Duration,
 ) -> Exit {
@@ -729,8 +725,8 @@ async fn run_exec(
             // A write reports what it changed; a statement that happened to
             // return rows through `exec` reports those instead.
             let shown = match rs.affected {
-                Some(n) => emit_stdout(&format::render_affected(n, format)),
-                None => emit_rows(&rs, format).map(|()| {
+                Some(n) => emit_stdout(&format::render_affected(n, out)),
+                None => emit_rows(&rs, out).map(|()| {
                     if let Some(w) = format::exec_truncation_warning(&rs) {
                         warn(&w);
                     }

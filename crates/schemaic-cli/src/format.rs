@@ -85,27 +85,75 @@ impl FromStr for Format {
     }
 }
 
+/// How stdout is written: the format, and whether its name row leads.
+///
+/// A format alone converts into one with its header, which is what every
+/// caller but `--no-header` means.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Output {
+    pub format: Format,
+    /// The column names — and, for `table`, the `---` row and the row-count
+    /// footer, which are the rest of what is not a row.
+    pub header: bool,
+}
+
+impl From<Format> for Output {
+    fn from(format: Format) -> Output {
+        Output {
+            format,
+            header: true,
+        }
+    }
+}
+
+impl Output {
+    /// `--format` with `--no-header`, or why the two do not go together.
+    ///
+    /// **Only `table` and `csv` have a header to leave out.** JSON names every
+    /// value in every row and `vertical` every line; taking the flag there
+    /// and changing nothing would be a promise the output does not keep.
+    pub fn new(format: Format, no_header: bool) -> Result<Output, String> {
+        if no_header && !matches!(format, Format::Table | Format::Csv) {
+            return Err(format!(
+                "--no-header applies to table and csv; {format} names the column \
+                 beside every value, so it has no header to leave out"
+            ));
+        }
+        Ok(Output {
+            format,
+            header: !no_header,
+        })
+    }
+
+    /// Does the output itself say "there were more rows"? The table's footer
+    /// does, and a header-less table has no footer.
+    fn reports_truncation_in_band(self) -> bool {
+        self.format.for_a_reader() && self.header
+    }
+}
+
 /// Every row, in the order the result carries them.
 fn display_order(rs: &ResultSet) -> Vec<usize> {
     (0..rs.row_count()).collect()
 }
 
-/// The rows, as `format` writes them. This is the whole of stdout for a query.
-pub fn render_rows(rs: &ResultSet, format: Format) -> String {
+/// The rows, as `output` writes them. This is the whole of stdout for a query.
+pub fn render_rows(rs: &ResultSet, output: impl Into<Output>) -> String {
+    let Output { format, header } = output.into();
     let order = display_order(rs);
     match format {
         Format::Table => {
             // NULL spelled out: `''` is the empty cell, and the two printed
             // identically.
-            let mut out = export::export_markdown_null_as(rs, &order, "NULL");
-            if let Some(note) = row_count_note(rs) {
+            let mut out = export::export_markdown_null_as(rs, &order, "NULL", header);
+            if header && let Some(note) = row_count_note(rs) {
                 out.push_str(&note);
             }
             out
         }
         Format::Json => newline_terminated(export::export_json(rs, &order)),
         Format::Jsonl => export::export_jsonl(rs, &order),
-        Format::Csv => newline_terminated(export::export_csv_plain(rs, &order)),
+        Format::Csv => newline_terminated(export::export_csv_plain(rs, &order, header)),
         Format::Vertical => {
             let mut out = export::export_vertical(rs, &order, "NULL");
             if let Some(note) = row_count_note(rs) {
@@ -182,8 +230,8 @@ fn row_count_note(rs: &ResultSet) -> Option<String> {
 /// rows off stdout and concludes the table has 200 rows in it has been given a
 /// wrong answer by a command that succeeded. The cap is named in the message so
 /// the fix is in the reader's hands.
-pub fn truncation_warning(rs: &ResultSet, format: Format) -> Option<String> {
-    if !rs.truncated || format.for_a_reader() {
+pub fn truncation_warning(rs: &ResultSet, output: impl Into<Output>) -> Option<String> {
+    if !rs.truncated || output.into().reports_truncation_in_band() {
         return None;
     }
     Some(format!(
@@ -214,7 +262,13 @@ pub fn exec_truncation_warning(rs: &ResultSet) -> Option<String> {
 /// A purpose-built shape rather than a row renderer, because there are no rows
 /// — `export`'s emitters all describe a result set, and a statement that
 /// returned none has nothing for them to describe.
-pub fn render_affected(affected: u64, format: Format) -> String {
+///
+/// Without a header it is the bare number, for `n=$(schemaic exec …)`.
+pub fn render_affected(affected: u64, output: impl Into<Output>) -> String {
+    let Output { format, header } = output.into();
+    if !header {
+        return format!("{affected}\n");
+    }
     match format {
         Format::Table | Format::Vertical => format!(
             "({affected} {} affected)\n",
@@ -499,6 +553,66 @@ mod tests {
         assert_eq!(line["e"], "");
         assert!(line["avatar"].is_null());
         assert_eq!(line["n_2"], 7);
+    }
+
+    fn headerless(format: Format) -> Output {
+        Output::new(format, true).expect("a format that has a header")
+    }
+
+    /// **`--no-header` is the rows alone** — psql's `-t`: no name row, and for
+    /// the table no `---` row and no footer either, so `while read` and `wc -l`
+    /// count records.
+    #[test]
+    fn without_a_header_the_table_and_csv_are_the_rows_alone() {
+        assert_eq!(
+            render_rows(&rs(), headerless(Format::Table)),
+            "| 1 | a |\n| 2 | b |\n"
+        );
+        assert_eq!(render_rows(&rs(), headerless(Format::Csv)), "1,a\n2,b\n");
+        let empty = ResultSet::from_rows(vec![col("id")], vec![]);
+        assert_eq!(render_rows(&empty, headerless(Format::Table)), "");
+        assert_eq!(render_rows(&empty, headerless(Format::Csv)), "");
+    }
+
+    /// **The footer carried the cap; without it, stderr has to.** A header-less
+    /// table that was cut short and said nothing is the wrong answer from a
+    /// command that succeeded.
+    #[test]
+    fn a_headerless_table_reports_its_cap_on_stderr() {
+        let mut capped = rs();
+        capped.truncated = true;
+        assert!(!render_rows(&capped, headerless(Format::Table)).contains("capped"));
+        assert!(truncation_warning(&capped, headerless(Format::Table)).is_some());
+        assert!(truncation_warning(&capped, Format::Table).is_none());
+    }
+
+    /// Only the formats with a name row have one to leave out. JSON names
+    /// every value in every row and `vertical` every line; accepting the flag
+    /// there would be a promise nothing keeps.
+    #[test]
+    fn no_header_is_refused_where_there_is_no_header() {
+        for format in [Format::Json, Format::Jsonl, Format::Vertical] {
+            let err = Output::new(format, true).unwrap_err();
+            assert!(err.contains("--no-header"), "{err}");
+            assert!(Output::new(format, false).is_ok());
+        }
+        for format in [Format::Table, Format::Csv] {
+            assert_eq!(
+                Output::new(format, true),
+                Ok(Output {
+                    format,
+                    header: false
+                })
+            );
+        }
+    }
+
+    /// A write's count without its label is the number, for `n=$(…)`.
+    #[test]
+    fn a_headerless_write_reports_the_bare_count() {
+        assert_eq!(render_affected(3, headerless(Format::Table)), "3\n");
+        assert_eq!(render_affected(3, headerless(Format::Csv)), "3\n");
+        assert_eq!(render_affected(3, Format::Csv), "affected\n3\n");
     }
 
     /// **`vertical` is `\G`**: core's records, NULL spelled out as the table

@@ -208,7 +208,9 @@ that writes: it refuses outright on a connection marked read-only, and it
 refuses something the guard flags — such as a `DELETE` with no `WHERE` — until
 you pass `--yes`, which answers that question and cannot unlock a read-only
 connection. Output is `table`, `json`, `jsonl`, `csv` or `vertical` (one
-`name: value` record per row, like the `mysql` client's `\G`); rows go to stdout and
+`name: value` record per row, like the `mysql` client's `\G`), and `--no-header`
+leaves the column names — and the table's footer — out of `table` and `csv`, so
+the output is the rows alone; rows go to stdout and
 everything else to stderr, so a pipe gets only data. It exits `0` on success,
 `2` on a usage error, `3` when a guard refused (nothing was sent), `4` when the
 server or the connection failed, `5` when a write timed out after it was

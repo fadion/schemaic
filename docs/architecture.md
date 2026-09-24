@@ -2056,10 +2056,18 @@ existing prose was left alone.
     writes a non-null empty string as `""`**, since the emitter writes nothing for a NULL — the
     `COPY … CSV` convention, so a program reading the pipe can tell the two apart; the guarded
     `csv_field` still writes both as an empty field. Like `export_jsonl` it has no `ExportFormat`
-    variant. **`export_markdown_null_as(rs, order, null)` is the same split
+    variant. **`export_markdown_null_as(rs, order, null, header)` is the same split
     for Markdown**: the CLI's `table` passes `"NULL"`, the GUI's `export_markdown` keeps the empty
-    cell, and both go through the private `markdown_chunks_with(w, src, null)`, which
+    cell, and both go through the private `markdown_chunks_with(w, src, null, header)`, which
     `export_markdown_chunks` calls with `""` — so only the NULL cell's spelling is a parameter.
+    **Both CLI emitters take a `header: bool`, and both private emitters with them**, for
+    `--no-header`; `export_csv_chunks` and `export_markdown_chunks` pass `true`, so the GUI's
+    exports cannot lose a header through it. Without one, the CSV has no name row — so an empty
+    result is `""` rather than the name row alone — and the Markdown has neither the name row nor
+    the `---` row under it, which leaves it no longer a Markdown table, and it is not meant to be
+    one: it is rows for `while read` and `cut`, which take a header line for a record
+    (`plain_csv_without_a_header_is_the_rows_alone`,
+    `a_markdown_table_without_a_header_is_the_rows_alone`).
     **`export_vertical(rs, order, null)` is the `mysql` client's `\G`**, for a row too wide for a
     table to be readable: a numbered `*** N. row ***` banner per row, then one `name: value` line
     per column with the names right-aligned so the values start in one column. It is written for a
@@ -19938,6 +19946,11 @@ existing prose was left alone.
     footer and only a caller that asks should get a non-zero exit for rows read correctly
     (`fail_on_cap_is_an_opt_in_query_flag`). `exec` has no `--limit` and its cap bounds only what
     is printed, so there is nothing for the flag to report (`exec_has_no_fail_on_cap_flag`).
+    **`OutputArgs { format, no_header }` is flattened into every subcommand that prints rows** —
+    `list`, `databases`, `query` and `exec` — in place of a `format` field of each one's own, so
+    `--no-header` is on all four at once (`no_header_is_on_every_row_printing_subcommand`).
+    `OutputArgs::output()` is `format::Output::new`, and whether the pair goes together is judged
+    there rather than by clap; `Command::output_args()` hands it to `run.rs`, `None` for `version`.
     `--password-stdin` is for the headless case the keyring cannot serve:
     Linux's Secret Service needs an unlocked desktop collection, which an SSH session or a container
     does not have, and without it the CLI would simply be unusable there. It reads a pipe and
@@ -20171,11 +20184,30 @@ existing prose was left alone.
     whether or not stdout is a terminal, there being **no TTY auto-switch** to make a piped command
     mean something different from the same command run by hand. `vertical` is
     `export::export_vertical` with NULL as `NULL`, the table's spelling, and every `--format`
-    subcommand takes it. **Only the two formats a person reads report truncation in band** —
-    `table` and `vertical`, the private `for_a_reader()`, which both `truncation_warning` and
-    `withheld_warning` ask — as the same `row_count_note` footer (for `vertical` with no rows, just
+    subcommand takes it. **`Output { format, header }` is what the row renderers take** —
+    `render_rows`, `truncation_warning` and `render_affected`, as `impl Into<Output>`, with
+    `From<Format>` giving the header, so every caller but `--no-header` still passes a bare
+    `Format`; `withheld_warning` takes `Format` alone, the header changing nothing it says.
+    `Output::new(format, no_header)` refuses the flag for `json`, `jsonl` and `vertical`, which
+    name every value (or every line) and so have no header to leave out — accepting it there and
+    changing nothing would be a promise the output does not keep
+    (`no_header_is_refused_where_there_is_no_header`). **A header-less `table` drops the
+    `row_count_note` footer too**, psql's `-t`, so `wc -l` and `while read` count records
+    (`without_a_header_the_table_and_csv_are_the_rows_alone`), and **a header-less write is the
+    bare count**, `3\n` for `table` and `csv` alike, for `n=$(schemaic exec …)`
+    (`a_headerless_write_reports_the_bare_count`).
+    **Only the two formats a person reads report truncation in band** —
+    `table` and `vertical`, the private `for_a_reader()`, which `withheld_warning` asks directly and
+    `truncation_warning` through `Output::reports_truncation_in_band()` — as the same
+    `row_count_note` footer (for `vertical` with no rows, just
     `(0 rows)` with no blank line over nothing, `vertical_of_no_rows_is_just_the_count`;
-    `vertical_reports_a_cap_in_band_and_withholds_nothing`). The machine formats stay pure data, because a JSON array with a metadata
+    `vertical_reports_a_cap_in_band_and_withholds_nothing`). **Because the footer is what carries
+    the cap, the in-band answer depends on the header too**: `reports_truncation_in_band` is
+    `for_a_reader() && header`, so a header-less `table` that was capped warns on stderr as a
+    machine format does — without that, `--no-header` would have removed the only word of the cap,
+    and a result cut short would have said nothing from a command that succeeded
+    (`a_headerless_table_reports_its_cap_on_stderr`). Asking `for_a_reader()` alone there, as it
+    used to be asked, is the tidy spelling that reintroduces the silence. The machine formats stay pure data, because a JSON array with a metadata
     object in it or a CSV with a comment row is worse for every consumer than a clean stream plus a
     line on stderr, which is what `truncation_warning` is for
     (`a_capped_result_is_reported_in_band_for_table_and_on_stderr_otherwise` pins that it is said in
@@ -20261,7 +20293,13 @@ existing prose was left alone.
     build they have — the first thing asked of someone reporting it damaged. Checked by hand with a
     corrupt file: `schemaic version` printed `schemaic 0.27.1` and exited 0, `schemaic list` 4. The
     `match` below keeps an `unreachable!` arm for it; folding `version` into that `match` like its
-    peers would look tidier and put the file read back in front of it.
+    peers would look tidier and put the file read back in front of it. **The output flags are
+    judged next, still before the file is read**: `command.output_args()` resolved through
+    `OutputArgs::output`, and a pair that does not go together — `--no-header` with a format that
+    has no header — is a `warn` and `Exit::Usage` before anything is read, the way clap's own
+    refusals are. The resolved
+    `Output` is what `list`, `databases`, `run_query`, `run_exec` and `emit_rows` take in place of
+    a `Format`. No test pins that order; it is the code's.
     **`databases` lists the names `-d` takes, because a CLI user usually starts with none.** The
     app never needs a default database — the tree lists every one — so a saved connection often
     has none, and on MySQL 8.4 `schemaic query -c AEU "SELECT COUNT(*) FROM company"` failed with

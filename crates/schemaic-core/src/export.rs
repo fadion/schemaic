@@ -1320,23 +1320,28 @@ pub fn export_csv_to<W: Write>(w: &mut W, rs: &ResultSet, order: &[usize]) -> io
 /// [`OneChunk`] yields even for an empty result, so a header-only CSV stays a
 /// header-only CSV rather than an empty file.
 pub fn export_csv_chunks<W: Write>(w: &mut W, src: &mut dyn RowChunks) -> io::Result<ExportTally> {
-    csv_chunks_with(w, src, csv_field)
+    csv_chunks_with(w, src, csv_field, true)
 }
 
 /// [`export_csv`] with [`csv_field_plain`] for every field — the headless
 /// CLI's `--format=csv`, which promises RFC 4180 and is read by programs. The
-/// file export keeps the guard.
-pub fn export_csv_plain(rs: &ResultSet, order: &[usize]) -> String {
-    to_string(|w| csv_chunks_with(w, &mut OneChunk::new(rs, order), csv_field_plain).map(|_| ()))
+/// file export keeps the guard. `header: false` leaves out the name row, for
+/// the CLI's `--no-header`.
+pub fn export_csv_plain(rs: &ResultSet, order: &[usize], header: bool) -> String {
+    to_string(|w| {
+        csv_chunks_with(w, &mut OneChunk::new(rs, order), csv_field_plain, header).map(|_| ())
+    })
 }
 
-/// The one CSV emitter, parameterised on how a field is written.
+/// The one CSV emitter, parameterised on how a field is written and whether
+/// the name row leads.
 fn csv_chunks_with<W: Write>(
     w: &mut W,
     src: &mut dyn RowChunks,
     csv_field: fn(&str) -> String,
+    header: bool,
 ) -> io::Result<ExportTally> {
-    let mut first = true;
+    let mut first = header;
     let mut tally = ExportTally::default();
     while let Some(c) = src.next_chunk()? {
         if first {
@@ -1780,9 +1785,16 @@ pub fn export_markdown(rs: &ResultSet, order: &[usize]) -> String {
 /// [`export_markdown`] with NULL spelled `NULL` rather than an empty cell —
 /// the headless CLI's table, where a reader has no grid to tell a NULL from an
 /// empty string and the two otherwise printed identically. The `mysql` client's
-/// spelling; the GUI's Markdown copy keeps the empty cell.
-pub fn export_markdown_null_as(rs: &ResultSet, order: &[usize], null: &str) -> String {
-    to_string(|w| markdown_chunks_with(w, &mut OneChunk::new(rs, order), null).map(|_| ()))
+/// spelling; the GUI's Markdown copy keeps the empty cell. `header: false`
+/// leaves out the name row and the `---` row under it, for the CLI's
+/// `--no-header` — no longer a Markdown table, and not meant to be one.
+pub fn export_markdown_null_as(
+    rs: &ResultSet,
+    order: &[usize],
+    null: &str,
+    header: bool,
+) -> String {
+    to_string(|w| markdown_chunks_with(w, &mut OneChunk::new(rs, order), null, header).map(|_| ()))
 }
 
 /// [`export_markdown`], streamed.
@@ -1816,17 +1828,19 @@ pub fn export_markdown_chunks<W: Write>(
     w: &mut W,
     src: &mut dyn RowChunks,
 ) -> io::Result<ExportTally> {
-    markdown_chunks_with(w, src, "")
+    markdown_chunks_with(w, src, "", true)
 }
 
 /// [`export_markdown_chunks`] with each NULL cell written as the given `null`
-/// text (`""` for the GUI's copy, `"NULL"` for the CLI's table).
+/// text (`""` for the GUI's copy, `"NULL"` for the CLI's table), and the header
+/// rows only when `header`.
 fn markdown_chunks_with<W: Write>(
     w: &mut W,
     src: &mut dyn RowChunks,
     null: &str,
+    header: bool,
 ) -> io::Result<ExportTally> {
-    let mut first = true;
+    let mut first = header;
     let mut tally = ExportTally::default();
     while let Some(c) = src.next_chunk()? {
         tally.note(c.rs, &[]);
@@ -3907,6 +3921,29 @@ mod tests {
         assert!(json[0]["thumb"].is_null());
     }
 
+    /// **Without its header the plain CSV is the rows alone** — the CLI's
+    /// `--no-header`, for `while read` and `cut`, which take a header line for
+    /// a record. Nothing else changes, and no rows is no output at all.
+    #[test]
+    fn plain_csv_without_a_header_is_the_rows_alone() {
+        assert_eq!(export_csv_plain(&rs(), &[0, 1], false), "1,x\n,y\n");
+        assert!(export_csv_plain(&rs(), &[0, 1], true).starts_with("id,"));
+        let empty = ResultSet::from_rows(vec![col("id")], vec![]);
+        assert_eq!(export_csv_plain(&empty, &[], false), "");
+        assert_eq!(export_csv_plain(&empty, &[], true), "id\n");
+    }
+
+    /// The same for the CLI's table: no name row and no `---` row under it.
+    #[test]
+    fn a_markdown_table_without_a_header_is_the_rows_alone() {
+        assert_eq!(
+            export_markdown_null_as(&rs(), &[0, 1], "NULL", false),
+            "| 1 | x |\n| NULL | y |\n"
+        );
+        let with = export_markdown_null_as(&rs(), &[0, 1], "NULL", true);
+        assert!(with.starts_with("| id | a`b |\n| --- | --- |\n"), "{with}");
+    }
+
     /// **The plain CSV keeps a value that starts like a formula as it is.**
     /// The guarded one prefixes an apostrophe for a spreadsheet; a program
     /// reading the pipe got `'+15551234` for a phone number.
@@ -3919,7 +3956,7 @@ mod tests {
                 Value::Str("=1,2".to_string()),
             ]],
         );
-        let plain = export_csv_plain(&rs, &[0]);
+        let plain = export_csv_plain(&rs, &[0], true);
         assert_eq!(plain.lines().nth(1), Some("+15551234,\"=1,2\""), "{plain}");
         let guarded = export_csv(&rs, &[0]);
         assert!(
