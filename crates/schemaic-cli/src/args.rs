@@ -45,6 +45,16 @@ pub enum Command {
         #[arg(long, default_value = "table")]
         format: Format,
     },
+    /// List the databases on a connection — the names `-d` takes.
+    Databases {
+        #[command(flatten)]
+        conn: ConnArgs,
+        #[arg(long, default_value = "table")]
+        format: Format,
+        /// Seconds before the listing is given up on.
+        #[arg(long, default_value_t = DEFAULT_TIMEOUT_SECS, value_parser = at_least_one_second())]
+        timeout: u64,
+    },
     /// Run a read-only statement.
     Query {
         /// The SQL to run. One statement; `-` reads it from stdin.
@@ -89,13 +99,22 @@ pub const SQL_FROM_STDIN: &str = "-";
 /// Which connection, and which database on it.
 #[derive(clap::Args, Debug, PartialEq, Eq)]
 pub struct Target {
+    #[command(flatten)]
+    pub conn: ConnArgs,
+    /// Database to run in. Defaults to the connection's own; `schemaic
+    /// databases` lists the names.
+    #[arg(short = 'd', long, value_parser = non_blank)]
+    pub database: Option<String>,
+}
+
+/// Which connection, and how to authenticate to it — [`Target`] without the
+/// database, for the one subcommand that has none to run in.
+#[derive(clap::Args, Debug, PartialEq, Eq)]
+pub struct ConnArgs {
     /// Saved connection, by id or by name — or `#<id>`, which is only ever
     /// the id.
     #[arg(short = 'c', long, env = "SCHEMAIC_CONNECTION")]
     pub connection: String,
-    /// Database to run in. Defaults to the connection's own.
-    #[arg(short = 'd', long, value_parser = non_blank)]
-    pub database: Option<String>,
     /// Read the connection's password from stdin instead of the OS keyring.
     ///
     /// **For the headless case the keyring cannot serve.** Linux's Secret
@@ -146,7 +165,9 @@ fn at_least_one_second() -> clap::builder::RangedU64ValueParser<u64> {
 pub fn wants_cli(argv: &[String]) -> bool {
     matches!(
         argv.get(1).map(String::as_str),
-        Some("list" | "query" | "exec" | "help" | "--help" | "-h" | "--version" | "-V")
+        Some(
+            "list" | "databases" | "query" | "exec" | "help" | "--help" | "-h" | "--version" | "-V"
+        )
     )
 }
 
@@ -164,7 +185,7 @@ mod tests {
 
     #[test]
     fn every_subcommand_routes_to_the_cli() {
-        for name in ["list", "query", "exec", "help"] {
+        for name in ["list", "databases", "query", "exec", "help"] {
             assert!(
                 wants_cli(&argv(&["schemaic", name])),
                 "`{name}` must reach the CLI"
@@ -227,8 +248,45 @@ mod tests {
             panic!("expected a query");
         };
         assert_eq!(sql, "SELECT 1");
-        assert_eq!(target.connection, "prod");
+        assert_eq!(target.conn.connection, "prod");
         assert_eq!(target.database, None);
+    }
+
+    #[test]
+    fn databases_takes_a_connection_and_the_shared_defaults() {
+        let cli = parse(&["schemaic", "databases", "-c", "prod"]).unwrap();
+        assert_eq!(
+            cli.command,
+            Command::Databases {
+                conn: ConnArgs {
+                    connection: "prod".to_string(),
+                    password_stdin: false,
+                },
+                format: Format::Table,
+                timeout: crate::query::DEFAULT_TIMEOUT.as_secs(),
+            }
+        );
+        let err = parse(&["schemaic", "databases"]).unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+    }
+
+    /// **`databases` has no `-d`.** It lists what `-d` may name; accepting one
+    /// would suggest the listing was scoped by it.
+    #[test]
+    fn databases_has_no_database_flag() {
+        let err = parse(&["schemaic", "databases", "-c", "1", "-d", "app"]).unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::UnknownArgument);
+    }
+
+    /// The headless case the keyring cannot serve applies to listing as much
+    /// as to querying.
+    #[test]
+    fn databases_takes_the_password_from_stdin_too() {
+        let cli = parse(&["schemaic", "databases", "-c", "1", "--password-stdin"]).unwrap();
+        let Command::Databases { conn, .. } = cli.command else {
+            panic!("expected a databases listing");
+        };
+        assert!(conn.password_stdin);
     }
 
     /// The defaults are the contract: a person who types the shortest possible
@@ -423,7 +481,7 @@ mod tests {
     #[test]
     fn the_help_text_names_every_subcommand() {
         let text = parse(&["schemaic", "help"]).unwrap_err().to_string();
-        for name in ["list", "query", "exec"] {
+        for name in ["list", "databases", "query", "exec"] {
             assert!(text.contains(name), "help must mention `{name}`");
         }
     }

@@ -15,9 +15,10 @@ use std::time::Duration;
 use schemaic_core::connection::Connection;
 use schemaic_core::model::{Column, ResultSet, Value};
 use schemaic_core::secrets::SecretKind;
+use schemaic_core::sql::NoDatabaseFailure;
 use schemaic_db::Db;
 
-use crate::args::{Cli, Command, Target};
+use crate::args::{Cli, Command, ConnArgs, Target};
 use crate::format::{self, Format};
 use crate::{exec, query, select};
 
@@ -119,6 +120,12 @@ fn warn(message: &str) {
     eprintln!("schemaic: {message}");
 }
 
+/// What to do about the [`warn`] just before it, on a line of its own so the
+/// error above stays the driver's words alone.
+fn hint(message: &str) {
+    eprintln!("hint: {message}");
+}
+
 /// Parse, then run. The whole entry point, for both front ends.
 pub fn main<I, T>(argv: I) -> ExitCode
 where
@@ -171,6 +178,19 @@ async fn dispatch(command: Command) -> Exit {
     };
     match command {
         Command::List { all, format } => list(&file.connections, all, format),
+        Command::Databases {
+            conn,
+            format,
+            timeout,
+        } => {
+            databases(
+                &file.connections,
+                &conn,
+                format,
+                Duration::from_secs(timeout),
+            )
+            .await
+        }
         Command::Query {
             sql,
             target,
@@ -276,11 +296,87 @@ fn text_column(name: &str) -> Column {
     }
 }
 
-/// The saved connection `target` names, or the exit that says why not. No
+/// `schemaic databases` — the names `-d` takes on this connection.
+///
+/// The same list the app's schema tree shows (`Db::fetch_databases`, system
+/// schemas left out), rendered like any other rows so `--format` means what it
+/// means everywhere. It reaches a server, so it is a CLI-access connection like
+/// the rest; there is no statement for a guard to judge.
+async fn databases(
+    conns: &[Connection],
+    args: &ConnArgs,
+    format: Format,
+    timeout: Duration,
+) -> Exit {
+    let conn = match select_conn(conns, args) {
+        Ok(c) => c,
+        Err(exit) => return exit,
+    };
+    let (db, _tunnel) = match connect(conn, args, timeout).await {
+        Ok(v) => v,
+        Err(exit) => return exit,
+    };
+    // `fetch_databases` takes no token — there is no statement of the user's
+    // to `KILL` — and gives up by itself at `PING_TIMEOUT`, so the cancel here
+    // reaches nothing: a `--timeout` past five seconds never fires on the
+    // listing, and a shorter one fails a late answer without returning sooner.
+    // It is wrapped because `deadline`'s gate holds every read in this crate to
+    // it; what `--timeout` really bounds for this command is the SSH tunnel.
+    let token = tokio_util::sync::CancellationToken::new();
+    let names = match crate::deadline::with_deadline(db.fetch_databases(), token, timeout).await {
+        Some(Ok(names)) => names,
+        Some(Err(e)) => {
+            warn(&e.to_string());
+            return Exit::Failed;
+        }
+        None => {
+            warn(&format!(
+                "listing the databases exceeded {}s",
+                timeout.as_secs().max(1)
+            ));
+            return Exit::Failed;
+        }
+    };
+    let rows = names.into_iter().map(|n| vec![Value::Str(n)]).collect();
+    let rs = ResultSet::from_rows(vec![text_column("database")], rows);
+    emit_stdout(&format::render_rows(&rs, format))
+        .err()
+        .unwrap_or(Exit::Ok)
+}
+
+/// What to say after a failure that [`schemaic_core::sql::no_database_failure`]
+/// recognises, or the guard's own no-database refusal: how to name one, and how
+/// to find out which there are.
+///
+/// `connection` is the `-c` the user gave, echoed back so the command can be
+/// copied; quoted when it has a space, since a name is allowed one.
+fn no_database_hint(connection: &str, how: NoDatabaseFailure) -> String {
+    let c = if connection.contains(char::is_whitespace) {
+        format!("\"{connection}\"")
+    } else {
+        connection.to_string()
+    };
+    // A statement that ran somewhere has to be told where, or "does not
+    // exist" reads as a wrong table name. One that was refused did not run,
+    // and saying it did is worse than saying nothing.
+    let why = match how {
+        NoDatabaseFailure::RanElsewhere => {
+            "this connection has no default database, so the statement ran in the \
+             server's maintenance database"
+        }
+        NoDatabaseFailure::Refused => "this connection has no default database",
+    };
+    format!(
+        "{why}; pass -d <database>, or pick a default for the connection in \
+         Schemaic. `schemaic databases -c {c}` lists them"
+    )
+}
+
+/// The saved connection `args` names, or the exit that says why not. No
 /// secret is read and nothing is dialled: this is the half of opening a
 /// connection the guard can run after, and before anything reaches a server.
-fn select_conn<'a>(conns: &'a [Connection], target: &Target) -> Result<&'a Connection, Exit> {
-    select::select(conns, &target.connection).map_err(|e| {
+fn select_conn<'a>(conns: &'a [Connection], args: &ConnArgs) -> Result<&'a Connection, Exit> {
+    select::select(conns, &args.connection).map_err(|e| {
         warn(&e.message());
         exit_for_no_connection(&e)
     })
@@ -315,7 +411,7 @@ fn read_stdin(what: &str, example: &str) -> Result<String, Exit> {
 /// after, the exposure the app keeps such statements out of its own history for.
 fn statement(sql: &str, target: &Target, conn: &Connection) -> Result<String, Exit> {
     if sql == crate::args::SQL_FROM_STDIN {
-        if target.password_stdin {
+        if target.conn.password_stdin {
             warn(
                 "the statement and --password-stdin cannot both come from stdin; \
                  leave the password to the OS keyring, or pass the statement as an argument",
@@ -347,12 +443,12 @@ fn statement(sql: &str, target: &Target, conn: &Connection) -> Result<String, Ex
 /// command for as long as nobody killed it.
 async fn connect(
     conn: &Connection,
-    target: &Target,
+    args: &ConnArgs,
     timeout: Duration,
 ) -> Result<(Db, Option<schemaic_db::ssh::TunnelHandle>), Exit> {
     // Read before the keyring is touched, so a refused terminal is refused
     // before anything else is said about the connection.
-    let piped = if target.password_stdin {
+    let piped = if args.password_stdin {
         let raw = read_stdin(
             "--password-stdin's password",
             "printf '%s' \"$PASSWORD\" | schemaic …",
@@ -424,7 +520,7 @@ async fn run_query(
     limit: usize,
     timeout: Duration,
 ) -> Exit {
-    let conn = match select_conn(conns, target) {
+    let conn = match select_conn(conns, &target.conn) {
         Ok(c) => c,
         Err(exit) => return exit,
     };
@@ -437,7 +533,7 @@ async fn run_query(
         warn(&e.message());
         return exit_for_no_rows(&e);
     }
-    let (db, _tunnel) = match connect(conn, target, timeout).await {
+    let (db, _tunnel) = match connect(conn, &target.conn, timeout).await {
         Ok(v) => v,
         Err(exit) => return exit,
     };
@@ -454,9 +550,37 @@ async fn run_query(
         }
         Err(e) => {
             warn(&e.message());
+            if let Some(how) = no_database_failure(database.as_deref(), &e, dialect) {
+                hint(&no_database_hint(&target.conn.connection, how));
+            }
             exit_for_no_rows(&e)
         }
     }
+}
+
+/// Did this statement fail because it ran with no database — so the
+/// [`no_database_hint`] is the next thing to say?
+///
+/// Both halves, because each alone is wrong: the error text of a missing table
+/// on a *scoped* run matches on PostgreSQL, and an unscoped run fails for every
+/// other reason too.
+fn no_database_failure(
+    database: Option<&str>,
+    e: &query::NoRows,
+    dialect: schemaic_core::intel::SqlDialect,
+) -> Option<NoDatabaseFailure> {
+    match e {
+        query::NoRows::Failed(m) if database.is_none() => {
+            schemaic_core::sql::no_database_failure(m, dialect)
+        }
+        _ => None,
+    }
+}
+
+/// Did the write guard refuse for want of a database? It says so on PostgreSQL,
+/// where the server would not — see `sql::needs_database`.
+fn refused_for_no_database(e: &exec::NotRun) -> bool {
+    matches!(e, exec::NotRun::Blocked(why) if why == schemaic_core::sql::NO_DATABASE_SELECTED)
 }
 
 /// `schemaic exec`. Select, approve, then connect — [`run_query`]'s order, for
@@ -469,7 +593,7 @@ async fn run_exec(
     yes: bool,
     timeout: Duration,
 ) -> Exit {
-    let conn = match select_conn(conns, target) {
+    let conn = match select_conn(conns, &target.conn) {
         Ok(c) => c,
         Err(exit) => return exit,
     };
@@ -477,6 +601,7 @@ async fn run_exec(
         Ok(s) => s,
         Err(exit) => return exit,
     };
+    let dialect = schemaic_core::intel::SqlDialect::from_db_type(&conn.db_type);
     let database = database_for(target, conn);
     // The guard, and the only way to build what `exec::run` takes. Its subject
     // is the *saved* connection — what the user configured.
@@ -484,12 +609,18 @@ async fn run_exec(
         Ok(r) => r,
         Err(e) => {
             warn(&e.message());
+            if refused_for_no_database(&e) {
+                hint(&no_database_hint(
+                    &target.conn.connection,
+                    NoDatabaseFailure::Refused,
+                ));
+            }
             return Exit::Refused;
         }
     };
     // Connected through the request, so the statement runs on the connection
     // its verdict judged — not on whatever a second caller had to hand.
-    let (db, _tunnel) = match connect(request.connection(), target, timeout).await {
+    let (db, _tunnel) = match connect(request.connection(), &target.conn, timeout).await {
         Ok(v) => v,
         Err(exit) => return exit,
     };
@@ -509,6 +640,9 @@ async fn run_exec(
         }
         Err(e) => {
             warn(&e.message());
+            if let Some(how) = no_database_failure(database.as_deref(), &e, dialect) {
+                hint(&no_database_hint(&target.conn.connection, how));
+            }
             exit_for_no_rows(&e)
         }
     }
@@ -618,9 +752,110 @@ mod tests {
 
     fn target(database: Option<&str>) -> Target {
         Target {
-            connection: "1".to_string(),
+            conn: ConnArgs {
+                connection: "1".to_string(),
+                password_stdin: false,
+            },
             database: database.map(str::to_string),
-            password_stdin: false,
+        }
+    }
+
+    const MYSQL_1046: &str =
+        "query failed: Server error: `ERROR 1046 (3D000): No database selected'";
+
+    /// **The case issue #2 reported**: a MySQL connection with no database,
+    /// no `-d`, and the server's 1046. The hint names the flag and the command
+    /// that lists what to give it, for the connection the user typed.
+    #[test]
+    fn an_unscoped_1046_gets_the_hint_naming_d_and_databases() {
+        use schemaic_core::intel::SqlDialect;
+        let e = query::NoRows::Failed(MYSQL_1046.into());
+        let how = no_database_failure(None, &e, SqlDialect::MySql)
+            .expect("an unscoped 1046 is the no-database failure");
+        let h = no_database_hint("AEU", how);
+        assert!(h.contains("-d <database>"), "{h}");
+        assert!(h.contains("schemaic databases -c AEU"), "{h}");
+    }
+
+    /// **A scoped run is never told to pass `-d`** — on PostgreSQL its missing
+    /// table reads exactly like the unscoped one, and it already has a database.
+    #[test]
+    fn a_scoped_failure_gets_no_hint() {
+        use schemaic_core::intel::SqlDialect;
+        let pg = query::NoRows::Failed("query failed: relation \"company\" does not exist".into());
+        assert_eq!(
+            no_database_failure(None, &pg, SqlDialect::Postgres),
+            Some(NoDatabaseFailure::RanElsewhere)
+        );
+        assert_eq!(
+            no_database_failure(Some("app"), &pg, SqlDialect::Postgres),
+            None
+        );
+        let my = query::NoRows::Failed(MYSQL_1046.into());
+        assert_eq!(
+            no_database_failure(Some("app"), &my, SqlDialect::MySql),
+            None
+        );
+    }
+
+    /// Only a server failure carries the server's words; a timeout or a
+    /// refusal on an unscoped run is not this.
+    #[test]
+    fn only_a_server_failure_can_be_the_no_database_one() {
+        use schemaic_core::intel::SqlDialect;
+        for e in [
+            query::NoRows::Empty,
+            query::NoRows::NotARead(MYSQL_1046.into()),
+            query::NoRows::TimedOut(Duration::from_secs(1)),
+            query::NoRows::Indeterminate(Duration::from_secs(1)),
+        ] {
+            assert_eq!(
+                no_database_failure(None, &e, SqlDialect::MySql),
+                None,
+                "{e:?}"
+            );
+        }
+    }
+
+    /// A statement that ran somewhere is told where — or "does not exist"
+    /// reads as a typo in the table name. **One that was refused is not**:
+    /// the first cut said "ran in the maintenance database" after `exec`'s
+    /// guard on PostgreSQL had refused it and nothing had run at all.
+    #[test]
+    fn only_a_statement_that_ran_is_told_where_it_ran() {
+        assert!(
+            no_database_hint("pg", NoDatabaseFailure::RanElsewhere)
+                .contains("maintenance database")
+        );
+        assert!(!no_database_hint("pg", NoDatabaseFailure::Refused).contains("maintenance"));
+    }
+
+    /// A connection name may have a space; the echoed command must still be
+    /// one argument when pasted.
+    #[test]
+    fn a_connection_name_with_a_space_is_quoted_in_the_hint() {
+        let h = no_database_hint("Prod EU", NoDatabaseFailure::Refused);
+        assert!(h.contains("schemaic databases -c \"Prod EU\""), "{h}");
+    }
+
+    /// `exec`'s guard refuses an unscoped PostgreSQL write itself, before the
+    /// server can; that refusal gets the same hint, and no other refusal does.
+    #[test]
+    fn the_guards_no_database_refusal_is_recognised_and_nothing_else_is() {
+        use exec::NotRun;
+        let mut pg = conn("");
+        pg.db_type = "PostgreSQL".to_string();
+        pg.cli_access = true;
+        let e = exec::ExecRequest::approved(&pg, None, "CREATE TABLE t (id int)", false)
+            .expect_err("an unscoped CREATE TABLE on PostgreSQL is refused");
+        assert!(refused_for_no_database(&e), "{e:?}");
+        for other in [
+            NotRun::Empty,
+            NotRun::Several,
+            NotRun::Blocked("Read-only connection.".into()),
+            NotRun::NeedsConsent(schemaic_core::sql::NO_DATABASE_SELECTED.into()),
+        ] {
+            assert!(!refused_for_no_database(&other), "{other:?}");
         }
     }
 

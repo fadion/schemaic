@@ -1552,6 +1552,60 @@ pub fn needs_database(sql: &str, dialect: SqlDialect) -> bool {
     true
 }
 
+/// How a statement failed for want of a database — see [`no_database_failure`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NoDatabaseFailure {
+    /// The server refused to run it anywhere.
+    Refused,
+    /// The server ran it — in a database nobody chose — and it failed there.
+    RanElsewhere,
+}
+
+/// Did this server error happen **because the statement ran with no
+/// database** — so naming one is the fix? And if so, did it run at all?
+///
+/// `message` is the error as the driver layer reported it (`DbError`'s text),
+/// and only the caller knows the other half: that nothing was selected. Asked of
+/// an error from a scoped run, a match here is still a missing table, not a
+/// missing database.
+///
+/// Per engine, because each says it differently — and one does not say it:
+///
+/// - **MySQL/MariaDB** refuse outright: `ERROR 1046 (3D000): No database
+///   selected`. Matched on the code and SQLSTATE, which the driver prints ahead
+///   of the message and neither server localises.
+/// - **PostgreSQL** never refuses. An unscoped connection lands in a
+///   maintenance database (see [`GuardPolicy::no_database`]), so the failure is
+///   the table not being *there*: `relation "company" does not exist`
+///   (`42P01`). The driver layer carries the server's words without the code,
+///   so this reads the English text; a server with a translated `lc_messages`
+///   gets no match, which only loses the hint.
+/// - **SQLite** has no database to leave out — the file is the database.
+///
+/// An exhaustive `match` rather than a comparison, so a fourth engine has to
+/// say how it spells this rather than falling onto one side of a `!=`.
+pub fn no_database_failure(message: &str, dialect: SqlDialect) -> Option<NoDatabaseFailure> {
+    match dialect {
+        SqlDialect::MySql => message
+            .contains("ERROR 1046 (3D000)")
+            .then_some(NoDatabaseFailure::Refused),
+        // The message has to *be* about the relation — at the start, or after
+        // `DbError`'s `query failed: ` — since `column "x" of relation "t" does
+        // not exist` names one that is there.
+        SqlDialect::Postgres => ((message.starts_with("relation \"")
+            || message.contains(": relation \""))
+            && message.contains("\" does not exist"))
+        .then_some(NoDatabaseFailure::RanElsewhere),
+        SqlDialect::Sqlite => None,
+    }
+}
+
+/// What the write guard says when a statement [`needs_database`] and none is
+/// selected — the words MySQL's own ERROR 1046 uses. Named, so a front end that
+/// adds a hint to this refusal recognises it by identity rather than by
+/// re-typing it.
+pub const NO_DATABASE_SELECTED: &str = "No database selected.";
+
 /// The write guard, as one decision over the statements about to run.
 ///
 /// This is *the* answer to "may this run", and it exists as a function because
@@ -1578,7 +1632,7 @@ pub fn run_verdict(stmts: &[String], policy: GuardPolicy) -> RunVerdict {
         // refuses (ERROR 1046), because the connection simply carries no
         // database. PostgreSQL's carries a hidden one instead, so the refusal has
         // to come from here — and it should read the same either way.
-        return RunVerdict::Block("No database selected.".to_string());
+        return RunVerdict::Block(NO_DATABASE_SELECTED.to_string());
     }
     if let Some(message) = stmts.iter().find_map(|s| first_unsafe(s, policy.dialect)) {
         return RunVerdict::Confirm(message);
@@ -1657,7 +1711,7 @@ pub fn script_verdict(policy: GuardPolicy, file: &str) -> RunVerdict {
         return RunVerdict::Block("Read-only connection.".to_string());
     }
     if policy.no_database {
-        return RunVerdict::Block("No database selected.".to_string());
+        return RunVerdict::Block(NO_DATABASE_SELECTED.to_string());
     }
     RunVerdict::Confirm(format!(
         "Run every statement in {file}? A script can create, alter and drop \
@@ -2317,6 +2371,106 @@ mod tests {
             // always saying yes.
             assert!(!GuardPolicy::of(Some(&c), false, false).no_database);
         }
+    }
+
+    /// **The two spellings of "you ran this nowhere", as the driver layer
+    /// reports them.** The MySQL line is the text `schemaic query` printed
+    /// against a MySQL 8.4 connection with no database (issue #2), `DbError`'s
+    /// prefix included.
+    #[test]
+    fn a_failure_for_want_of_a_database_is_recognised_per_engine() {
+        assert_eq!(
+            no_database_failure(
+                "query failed: Server error: `ERROR 1046 (3D000): No database selected'",
+                SqlDialect::MySql
+            ),
+            Some(NoDatabaseFailure::Refused)
+        );
+        assert_eq!(
+            no_database_failure(
+                "query failed: relation \"company\" does not exist",
+                SqlDialect::Postgres
+            ),
+            Some(NoDatabaseFailure::RanElsewhere)
+        );
+        // PostgreSQL appends DETAIL/HINT after the message; still a match.
+        assert_eq!(
+            no_database_failure(
+                "query failed: relation \"public.company\" does not exist — Perhaps you meant …",
+                SqlDialect::Postgres
+            ),
+            Some(NoDatabaseFailure::RanElsewhere)
+        );
+    }
+
+    /// **Any other failure is not this one**, or every missing table on a
+    /// scoped run would be told to pass `-d`.
+    #[test]
+    fn other_failures_are_not_mistaken_for_a_missing_database() {
+        for (message, dialect) in [
+            (
+                "query failed: Server error: `ERROR 1146 (42S02): Table 'app.company' doesn't exist'",
+                SqlDialect::MySql,
+            ),
+            (
+                "query failed: Server error: `ERROR 1064 (42000): You have an error in your SQL syntax'",
+                SqlDialect::MySql,
+            ),
+            (
+                "query failed: column \"company\" does not exist",
+                SqlDialect::Postgres,
+            ),
+            (
+                "query failed: database \"app\" does not exist",
+                SqlDialect::Postgres,
+            ),
+            // The relation is there; its column is not. Naming a relation is
+            // not the same as saying it is missing.
+            (
+                "query failed: column \"x\" of relation \"company\" does not exist",
+                SqlDialect::Postgres,
+            ),
+            ("connection failed: timed out", SqlDialect::MySql),
+            ("connection failed: timed out", SqlDialect::Postgres),
+            ("", SqlDialect::MySql),
+            ("", SqlDialect::Postgres),
+        ] {
+            assert_eq!(no_database_failure(message, dialect), None, "{message:?}");
+        }
+    }
+
+    /// **One engine's spelling is not another's.** SQLite has no database to
+    /// leave out, so nothing it says means that; and MySQL's code in a
+    /// PostgreSQL error is a coincidence of text, not the failure.
+    #[test]
+    fn the_match_is_the_connections_own_engine_only() {
+        let mysql = "query failed: Server error: `ERROR 1046 (3D000): No database selected'";
+        let pg = "query failed: relation \"company\" does not exist";
+        assert_eq!(no_database_failure(mysql, SqlDialect::Postgres), None);
+        assert_eq!(no_database_failure(pg, SqlDialect::MySql), None);
+        for message in [mysql, pg, "query failed: no such table: company"] {
+            assert_eq!(no_database_failure(message, SqlDialect::Sqlite), None);
+        }
+    }
+
+    /// The guard's refusal and the constant a front end compares against are
+    /// the same words, on both paths that refuse for it.
+    #[test]
+    fn the_no_database_refusal_is_the_named_constant() {
+        let policy = GuardPolicy {
+            read_only: false,
+            confirm_writes: false,
+            dialect: SqlDialect::Postgres,
+            no_database: true,
+        };
+        assert_eq!(
+            run_verdict(&["CREATE TABLE t (id int)".to_string()], policy),
+            RunVerdict::Block(NO_DATABASE_SELECTED.to_string())
+        );
+        assert_eq!(
+            script_verdict(policy, "dump.sql"),
+            RunVerdict::Block(NO_DATABASE_SELECTED.to_string())
+        );
     }
 
     /// A connection the registry has lost falls back to the default engine and to

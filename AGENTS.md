@@ -4,7 +4,7 @@ A native SQL editor (Rust + [Floem](https://github.com/lapce/floem) 0.2.0), MySQ
 Zed-inspired, aiming to replace DataGrip. Workspace crates: `schemaic-core` (models + the pure,
 unit-tested SQL/edit/export/DDL logic), `schemaic-db` (MySQL/MariaDB + PostgreSQL + SQLite + SSH
 tunnels), `schemaic-conn` (saved connections hydrated from the OS keyring — the seam a non-GUI
-front end loads a connection through), `schemaic-cli` (the headless `schemaic list`/`query`/`exec`,
+front end loads a connection through), `schemaic-cli` (the headless `schemaic list`/`databases`/`query`/`exec`,
 no Floem), `schemaic-ai`, `schemaic-term`, `schemaic-ui` (the Floem views), `schemaic-app` (signal
 wiring, the built-in MCP server, the CLI's argv branch).
 

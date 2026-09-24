@@ -19691,8 +19691,8 @@ existing prose was left alone.
     ordering between them is free, and this way the protocol stream stays clean whichever of the
     four opened it.
     **The headless-CLI branch sits between those two, and being *before* Velopack is the load-bearing
-    part.** `schemaic list`/`query`/`exec` return from `main` ahead of the hook, the file logger, the
-    fonts and Floem: none of that belongs in a one-shot command, and `auto_apply_on_startup` is free
+    part.** `schemaic list`/`databases`/`query`/`exec` return from `main` ahead of the hook, the file
+    logger, the fonts and Floem: none of that belongs in a one-shot command, and `auto_apply_on_startup` is free
     to find a staged package and exit-and-relaunch the process — which is safe for a launch that has
     read no session state and is not safe in the middle of a command whose output someone is piping.
     What routes it is `schemaic_cli::args::wants_cli`, an allowlist of the **first** argument, which
@@ -19783,8 +19783,8 @@ existing prose was left alone.
     Remove reported it absent; and the real debug `schemaic.exe --veloapp-uninstall 0.26.0`, with
     `APPDATA` redirected to a scratch profile, removed a seeded entry, exited 0, left `PATH`
     byte-identical to the backup and logged the removal.
-- `schemaic-cli` — Schemaic without a window: `schemaic list` / `query` / `exec` / `help`, so a
-  person or an agent can run SQL against a saved connection with the app closed and without being
+- `schemaic-cli` — Schemaic without a window: `schemaic list` / `databases` / `query` / `exec` /
+  `help`, so a person or an agent can run SQL against a saved connection with the app closed and without being
   handed a credential. Its whole dependency list is `schemaic-core`, `schemaic-conn`, `schemaic-db`,
   `clap`, `tokio` and `tokio-util` — **no floem**, which is what splitting `schemaic-conn` out of
   `schemaic-app` was for. It is a **library** with two front ends, because the front ends differ per
@@ -19803,7 +19803,8 @@ existing prose was left alone.
   click and never at install time: `core::cli_install` decides (the user `PATH` on Windows, a
   `~/.local/bin` link elsewhere) and `app/install_cli.rs` writes. **Remove** beside it undoes that,
   and on Windows so does the Velopack uninstall hook.
-  The command surface was verified end to end against a live MariaDB.
+  The command surface was verified end to end against a live MariaDB; `databases` and the
+  no-database hint against MySQL 8.4 and PostgreSQL 16.
   - `cli/args.rs` — the clap surface, kept separate from doing anything so that defaults, aliases
     and which flag belongs to which subcommand are all testable without a database. `DEFAULT_LIMIT`
     is **200, deliberately small**: the GUI's row cap is about what a grid can hold, this one is
@@ -19837,6 +19838,11 @@ existing prose was left alone.
     rather than a guess at which came first. `--timeout`'s two `default_value_t`s read
     `query::DEFAULT_TIMEOUT` through `DEFAULT_TIMEOUT_SECS`, not a second literal beside it
     (`exec_defaults_to_the_shared_timeout`).
+    **`ConnArgs` is `Target` without the database** — `-c` and `--password-stdin`, flattened into
+    `Target { conn, database }` for `query` and `exec`, and taken alone by `databases`, the one
+    subcommand with no database to run in: it lists the names `-d` takes, so it has no `-d`, and
+    passing one is a parse error (`databases_has_no_database_flag`). `run.rs`'s `select_conn` and
+    `connect` take `&ConnArgs`, which is what lets all three share them.
     **`wants_cli` is the routing predicate, and it is an allowlist of the *first* argument rather
     than "are there any arguments".** This binary is re-invoked with argv by things that are not the
     CLI — the Velopack installer and updater (`--veloapp-install`, `--veloapp-updated`,
@@ -19846,7 +19852,10 @@ existing prose was left alone.
     like a CLI bug. So a new flag on the app is safe by default: it has to be added here to reach the
     CLI (`the_apps_own_flags_are_not_cli_invocations` names all seven, and
     `a_subcommand_further_along_does_not_route` holds the *first*-argument half, since
-    `schemaic --mcp-serve list` is the app being asked to serve).
+    `schemaic --mcp-serve list` is the app being asked to serve). The converse holds too: through the
+    app's own binary a new subcommand does not reach the CLI until its name is added here, as
+    `databases` was (`every_subcommand_routes_to_the_cli`) — `schemaic.com` calls `run::main`
+    without asking, so a missing name shows everywhere except through it.
   - `cli/select.rs` — which saved connection an invocation means, and whether it may have it.
     **One entry point, and it gates**: `select` resolves the id-or-name *and* applies
     `Connection::cli_access`, rather than handing a connection back for a caller to remember to
@@ -19961,10 +19970,18 @@ existing prose was left alone.
     therefore `timeout` plus the grace, not `timeout`. The SSH tunnel is opened before this wrapper
     is ever entered, so it has a bound of its own in `run.rs`.
     **It is deliberately not a merge with `app/mcp.rs`'s `with_deadline`**, which stays where it is:
-    that one wraps reads this crate never makes (`fetch_schema`, `fetch_databases`), and one of them
-    genuinely must abandon its future, which is why `with_deadline_abandoning` sits beside it. It
+    that one wraps a read this crate never makes (`fetch_schema`), and the tokenless ones there
+    (`fetch_databases`, `fetch_table_list`) go through `with_deadline_abandoning` beside it. It
     does share the bound: its wait after the cancel is `UNWIND_GRACE` too, for the same
     still-connecting driver.
+    **`schemaic databases` is the one caller here whose token is not the future's.**
+    `fetch_databases` takes none, so `run.rs` hands `with_deadline` a fresh one and the cancel
+    reaches nothing — the case the paragraph above warns about. It is wrapped anyway because this
+    module's gate requires every `db.` read in the crate to be, and it is bounded regardless:
+    `fetch_databases` gives up at `PING_TIMEOUT`, five seconds, on every engine, inside the
+    `UNWIND_GRACE` the wait after the cancel allows. What that costs is `--timeout`'s meaning for
+    the listing — it still bounds the tunnel — where one past five seconds never fires and a
+    shorter one turns a late answer into a failure without returning any sooner.
     **The gate that produced this module is the part worth keeping.** `mcp.rs`'s
     `no_database_read_is_awaited_without_a_deadline` carries a floor on how many reads it finds, so
     that a needle which stopped matching could not read as a clean file — and folding `run_query`
@@ -20064,6 +20081,45 @@ existing prose was left alone.
     not an error but carries a hint, since "no connection has CLI access yet" is the correct answer
     to *what may I use* and the baffling one without it. `database_for` is the flag, else the connection's own, else `None` —
     an empty string there would read as a real database name to the guard's `no_database` arm.
+    **`databases` lists the names `-d` takes, because a CLI user usually starts with none.** The
+    app never needs a default database — the tree lists every one — so a saved connection often
+    has none, and on MySQL 8.4 `schemaic query -c AEU "SELECT COUNT(*) FROM company"` failed with
+    the server's bare `ERROR 1046 (3D000): No database selected` and nothing pointing at `-d`
+    (issue #2). It is `Db::fetch_databases` — the list the schema tree is built from, system
+    schemas left out, though not the ones the user hid there — rendered like `list` through
+    `format::render_rows` as a one-column `database` result, so `--format` means what it does
+    elsewhere. It takes the same `select_conn` and `connect` as the others, and a failed connection
+    or listing is exit 4; `deadline.rs` has what its `--timeout` does and does not bound.
+    **After a failure for want of a database, a `hint:` line on stderr names the way out** — `-d
+    <database>`, a default picked in Schemaic, and `schemaic databases -c <conn>` with the user's own
+    `-c` echoed back, quoted if it has whitespace. `hint` prints it on a line of its own after
+    `warn`'s, so the error line stays the driver's words, and no exit code changes. Whether a failure
+    is that one is `core::sql::no_database_failure(message, dialect)`, and `run.rs`'s
+    `no_database_failure` asks it only of a `NoRows::Failed` on a run `database_for` answered `None`,
+    because each half alone is wrong: an unscoped run fails for every other reason too, and on
+    PostgreSQL a scoped run's missing table reads exactly like the unscoped one
+    (`a_scoped_failure_gets_no_hint`). The engines say it differently and one does not say it.
+    MySQL/MariaDB refuse, `ERROR 1046 (3D000)`, matched on the code and SQLSTATE. PostgreSQL never
+    refuses — an unscoped connection lands in a maintenance database — so what it reports is
+    `relation "…" does not exist`, matched only where the message *is* about the relation, at its
+    start or after `: `, since `column "x" of relation "t" does not exist` names one that is there.
+    That match is on English text, because `DbError` carries no SQLSTATE for PostgreSQL: a server
+    with a translated `lc_messages` loses the hint, and nothing else. SQLite answers `None`, and the
+    `match` is exhaustive over the dialect, per the capability rule.
+    **`NoDatabaseFailure` has two arms because the hint must not say a statement ran when it did
+    not.** `RanElsewhere` adds that it ran in the server's maintenance database — without that,
+    "does not exist" reads as a typo in the table name — and `Refused` does not. The first cut keyed
+    that wording on the dialect, and so told `exec`'s refused PostgreSQL write it had run
+    (`only_a_statement_that_ran_is_told_where_it_ran`). That refusal is the guard's own
+    `Block(NO_DATABASE_SELECTED)`, reached through `needs_database`, and it gets the `Refused` hint:
+    `core::sql::NO_DATABASE_SELECTED` is now the one spelling `run_verdict` and `script_verdict`
+    both block with, so `refused_for_no_database` recognises it by identity rather than by
+    re-typing it (`the_no_database_refusal_is_the_named_constant`).
+    **An up-front refusal of an unscoped `query` was considered and rejected.** The CLI cannot tell
+    from the text whether a statement needs a database — `SELECT 1`, `SELECT … FROM app.t` and `SHOW
+    DATABASES` all run fine without one — and PostgreSQL never reports "no database" at all. So the
+    server decides and the CLI adds the hint; `exec`'s up-front `no_database` arm — a PostgreSQL
+    statement that `needs_database`, which no read is — is unchanged.
   - `cli/schemaic-cli.rs` — the console-subsystem binary, at `src/bin/`. Its body is one call to
     `run::main`, deliberately: it is the same entry point the app's argv branch calls, two front
     ends over one program. It is **built on every platform** even though only Windows packages it,

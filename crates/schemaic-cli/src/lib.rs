@@ -1,5 +1,5 @@
 //! Schemaic without a window: the headless front end behind `schemaic list`,
-//! `schemaic query` and `schemaic exec`.
+//! `schemaic databases`, `schemaic query` and `schemaic exec`.
 //!
 //! **Why it is a library and not a binary.** It has two front ends and they
 //! differ per platform. On Linux and macOS the `schemaic` binary takes an argv
