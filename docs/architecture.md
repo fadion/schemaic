@@ -369,6 +369,24 @@ existing prose was left alone.
     5.0 / 20.5 / 80.7 ms at 1 / 4 / 16 MiB — an arrow key's worth of UI-thread work to locate a
     statement whose actual work, `intel::signature_help` on the isolated statement, is 8 µs. `None`
     keeps the full walk, which is what every other caller wants.
+    **`unsafe_reason` asks first about what destroys stored rows, and about nothing else.** It is
+    the warning behind `first_unsafe`, which `run_verdict` turns into `Confirm` whatever
+    `confirm_writes` says: a `DELETE`/`UPDATE` with no top-level `WHERE`, a `TRUNCATE`, and a `DROP
+    TABLE`/`DATABASE`/`SCHEMA` — the object word read after `DROP` with `leading_keyword_end` +
+    `leading_keyword`, as `needs_database` reads it. `DROP` was the gap: a CLI test run found
+    `schemaic exec "DROP TABLE t"` running with no `--yes` and exiting 0 with "(0 rows affected)"
+    while the less destructive `TRUNCATE` was held, and since this is the one guard both front ends
+    use, the editor's Run let it through unasked as well. The scope stops there on purpose. `DROP
+    TEMPORARY TABLE` dies with the session, and a dropped view, index, trigger, routine or user
+    holds no stored rows — a guard that fires on every DDL statement is one people learn to click
+    through (`dropping_a_table_database_or_schema_asks_first`,
+    `dropping_what_holds_no_stored_rows_does_not_ask`). The schema tree's own Drop is not asked
+    twice: it goes through the DDL preview and `Db::run_ddl`, never `run_verdict`.
+    **The every-row half is `every_row_reason`, and `unsafe_reason` is it plus the `DROP` arm.**
+    `script::probe` asks the half on its own for `Probe::unqualified`, the `.sql` panel's "act on
+    every row … with no WHERE" line: borrowing the whole guard put a dump's every `DROP TABLE IF
+    EXISTS` under that line, beside the destruction line that already counts it
+    (`a_dumps_drop_before_create_is_destructive_and_not_unqualified`, watched fail at 2).
   - `intel.rs` — the **SQL intelligence** layer (structure-aware, dialect-pluggable). Parses a
     *complete* statement with a real per-dialect AST (`sqlparser`; `SqlDialect` seam — MySQL,
     PostgreSQL and SQLite all wired) and answers what a token stream can't: `statement_scope`
@@ -19992,7 +20010,8 @@ existing prose was left alone.
     subcommand, not a flag on `query`**: a flag would put the dangerous case one character from the
     safe one, and it would give two paths one gate when they do not want the same gate — `query`
     runs an allowlist with no override, while a write has to consult the connection's read-only
-    flag, the missing-`WHERE` warning and the user's own say-so. `ExecRequest::approved` is the
+    flag, the unsafe-statement warning (`sql::unsafe_reason` — a missing `WHERE`, a `TRUNCATE`, a
+    `DROP` of a table, database or schema) and the user's own say-so. `ExecRequest::approved` is the
     guard and the only constructor; the fields are private and `run` takes one by value. **The
     request carries the target its verdict judged** — a clone of the `Connection` and the
     database, read back through `connection()` and `database()` — and `run(db, request, timeout)`
@@ -20467,8 +20486,9 @@ Re-introducing the anti-patterns these guard against is a regression:
   to remember would go unnoticed longest. What it mints against is `run_verdict` itself, not a
   stronger refusal, because `exec` *does* have someone to ask: the caller is at a prompt, and
   `--yes` is that answer. The asymmetry is the whole of it — `--yes` answers a `Confirm`, in
-  practice the missing-`WHERE` warning, and **cannot** answer a `Block`, so a read-only connection
-  has no override from a command line either
+  practice `unsafe_reason`'s warning (a missing `WHERE`, a `TRUNCATE`, or a `DROP TABLE`, which ran
+  unasked and exited 0 until `dropping_a_table_needs_yes`), and **cannot** answer a `Block`, so a
+  read-only connection has no override from a command line either
   (`a_read_only_connection_blocks_a_write_and_yes_does_not_help` asserts it for both values of the
   flag). Two refusals sit in front of the verdict rather than inside it: an empty statement, and
   *several* statements, which `exec` will not half-run because a one-shot command has nowhere to

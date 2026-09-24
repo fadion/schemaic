@@ -608,7 +608,7 @@ pub struct Probe {
     /// Statements that destroy something. Named in plain language before the
     /// run, the way generated DDL is.
     pub destructive: usize,
-    /// Statements that act on **every row** — [`crate::sql::unsafe_reason`]'s
+    /// Statements that act on **every row** — [`crate::sql::every_row_reason`]'s
     /// question, asked per statement.
     ///
     /// **A separate count because it is a separate fact, and because the
@@ -623,9 +623,12 @@ pub struct Probe {
     /// none and structurally cannot call it, so the named owner of the question
     /// was unreachable for every `.sql` file.
     ///
-    /// Asking `unsafe_reason` here is the same predicate rather than a second
-    /// wording of it — which is what the deferral was protecting. A statement
-    /// can be in both counts (an unqualified `DELETE`, a `TRUNCATE`); they say
+    /// Asking `every_row_reason` here is the run guard's own every-row predicate
+    /// rather than a second wording of it — which is what the deferral was
+    /// protecting. Not the whole guard (`unsafe_reason`): its `DROP` arm is
+    /// destruction, counted above, and would have put every `DROP TABLE IF
+    /// EXISTS` of a dump under a line about missing `WHERE`s. A statement can
+    /// be in both counts (an unqualified `DELETE`, a `TRUNCATE`); they say
     /// different things about it and the panel prints one line each.
     pub unqualified: usize,
     /// Bytes the probe actually read.
@@ -777,9 +780,10 @@ pub fn probe<R: std::io::Read>(r: R, dialect: SqlDialect) -> std::io::Result<Pro
         if is_destructive(&s.sql, &kind, dialect) {
             destructive += 1;
         }
-        // The same predicate the run guard asks, asked where the statements
-        // are — see `Probe::unqualified`.
-        if sql::unsafe_reason(&s.sql, dialect).is_some() {
+        // The run guard's every-row predicate, asked where the statements
+        // are — see `Probe::unqualified`. Not all of `unsafe_reason`: its
+        // `DROP` arm is destruction, which `is_destructive` counts above.
+        if sql::every_row_reason(&s.sql, dialect).is_some() {
             unqualified += 1;
         }
         *counts.entry(kind).or_default() += 1;
@@ -1349,9 +1353,9 @@ mod tests {
     /// The doc deferred the question to `sql::first_unsafe`, and on this path
     /// that deferral was hollow: `first_unsafe` is reached only from
     /// `sql::run_verdict`, which takes the statements; `script_verdict` takes
-    /// none and cannot call it. So the probe asks `sql::unsafe_reason` itself,
-    /// per statement, which is the same predicate rather than a second wording
-    /// of it.
+    /// none and cannot call it. So the probe asks `sql::every_row_reason`
+    /// itself, per statement — the guard's own every-row predicate rather than
+    /// a second wording of it, without the guard's `DROP` arm.
     #[test]
     fn the_probe_counts_the_writes_that_name_no_row() {
         let p = probed("UPDATE users SET email = NULL; UPDATE orders SET status = 'x';");
@@ -1381,6 +1385,19 @@ mod tests {
         // top-level WHERE scan can reach — `unsafe_reason`'s own `WITH` arm.
         let cte = probed("WITH d AS (DELETE FROM t RETURNING *) SELECT * FROM d;");
         assert_eq!(cte.unqualified, 1, "{:?}", cte.kinds);
+    }
+
+    /// **A `DROP` is destroyed, not unqualified.** The run guard now asks
+    /// before a `DROP TABLE`, and the probe had borrowed its predicate — so a
+    /// `mysqldump` restore, a `DROP TABLE IF EXISTS` before every table, would
+    /// have told the panel that each of them "acts on every row … with no
+    /// WHERE", beside the destruction line that already counts them.
+    #[test]
+    fn a_dumps_drop_before_create_is_destructive_and_not_unqualified() {
+        let p = probed("DROP TABLE IF EXISTS a; CREATE TABLE a (id int); DROP DATABASE old;");
+        assert_eq!(p.destructive, 2, "{:?}", p.kinds);
+        assert_eq!(p.unqualified, 0, "{:?}", p.kinds);
+        assert_eq!(unqualified_notice(&p), None);
     }
 
     /// **A migration script's real shape.** `ALTER TABLE … DROP COLUMN`

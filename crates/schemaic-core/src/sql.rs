@@ -1377,9 +1377,46 @@ pub fn has_top_level_where(sql: &str, dialect: SqlDialect) -> bool {
     false
 }
 
-/// If `stmt` would rewrite/erase every row (DELETE/UPDATE without a top-level
-/// WHERE, or TRUNCATE), the warning to show the user; else `None`.
+/// The run guard's warning for `stmt`, if it should be asked about first:
+/// [`every_row_reason`], or a `DROP` of a table, database or schema.
+///
+/// **`DROP` asks only for what holds stored rows.** It ran unasked while the
+/// less destructive `TRUNCATE` was held — found by a CLI test run, but the gap
+/// was the editor's too, since this is the one guard both use. A `TEMPORARY`
+/// table dies with the session, and a view, index, trigger, routine or user
+/// holds no rows, so those run as before: a guard that fires on every DDL
+/// statement is one people learn to click through. The schema tree's own Drop
+/// goes through the DDL preview instead, so it is not asked twice.
 pub fn unsafe_reason(stmt: &str, dialect: SqlDialect) -> Option<String> {
+    every_row_reason(stmt, dialect).or_else(|| drop_reason(stmt, dialect))
+}
+
+/// The warning for a `DROP` that deletes stored rows with the object.
+fn drop_reason(stmt: &str, dialect: SqlDialect) -> Option<String> {
+    if leading_keyword(stmt, dialect)? != "DROP" {
+        return None;
+    }
+    let rest = leading_keyword_end(stmt, dialect)
+        .map(|e| &stmt[e..])
+        .unwrap_or("");
+    match leading_keyword(rest, dialect)?.as_str() {
+        "TABLE" => Some("DROP TABLE deletes the table and every row in it.".to_string()),
+        obj @ ("DATABASE" | "SCHEMA") => Some(format!(
+            "DROP {obj} deletes the {} and every table in it.",
+            obj.to_ascii_lowercase()
+        )),
+        _ => None,
+    }
+}
+
+/// If `stmt` would rewrite or erase every row of a table (DELETE/UPDATE
+/// without a top-level WHERE, TRUNCATE, or a data-modifying CTE that names no
+/// row), the warning to show the user; else `None`.
+///
+/// Its own question, apart from [`unsafe_reason`], because the `.sql` panel
+/// counts exactly these (`script::Probe::unqualified`) under a line that says
+/// so — and counts a `DROP` separately, as destruction.
+pub fn every_row_reason(stmt: &str, dialect: SqlDialect) -> Option<String> {
     match leading_keyword(stmt, dialect)?.as_str() {
         "TRUNCATE" => Some("TRUNCATE removes every row in the table.".to_string()),
         kind @ ("DELETE" | "UPDATE") => {
@@ -3687,6 +3724,41 @@ mod tests {
         assert!(unsafe_reason("SELECT * FROM t").is_none());
         // A `#`-commented WHERE doesn't make a full-table DELETE look safe.
         assert!(unsafe_reason("DELETE FROM t # WHERE id=1").is_some());
+    }
+
+    /// **Dropping what holds rows asks first, like `TRUNCATE`** — a CLI test
+    /// run found `DROP TABLE` running with no `--yes` while the less
+    /// destructive `TRUNCATE` was held. The warning names what goes.
+    #[test]
+    fn dropping_a_table_database_or_schema_asks_first() {
+        for (sql, noun) in [
+            ("DROP TABLE t", "table"),
+            ("drop table if exists a, b", "table"),
+            ("DROP DATABASE app", "database"),
+            ("DROP SCHEMA IF EXISTS app CASCADE", "schema"),
+            ("/* tidy */ DROP TABLE t", "table"),
+        ] {
+            let why = unsafe_reason(sql).unwrap_or_else(|| panic!("{sql} must ask"));
+            assert!(why.contains(noun), "{sql}: {why}");
+        }
+    }
+
+    /// **Only what holds data.** A temporary table dies with the session, and
+    /// a view, index, trigger or function holds no rows, so none of them is
+    /// held back — a guard that fires on every DDL statement is one users learn
+    /// to click through.
+    #[test]
+    fn dropping_what_holds_no_stored_rows_does_not_ask() {
+        for sql in [
+            "DROP TEMPORARY TABLE t",
+            "DROP VIEW v",
+            "DROP INDEX i ON t",
+            "DROP TRIGGER tr",
+            "DROP FUNCTION f",
+            "DROP USER u",
+        ] {
+            assert_eq!(unsafe_reason(sql), None, "{sql}");
+        }
     }
 
     /// Every dialect, because a verdict that does *not* depend on the engine must

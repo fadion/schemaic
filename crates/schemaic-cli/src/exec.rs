@@ -223,6 +223,19 @@ mod tests {
         assert_eq!(r.sql(), "DELETE FROM t WHERE id = 1");
     }
 
+    /// **`DROP TABLE` waits for `--yes`, as `TRUNCATE` does.** A CLI test run
+    /// found it running unasked and exiting 0 with "(0 rows affected)".
+    #[test]
+    fn dropping_a_table_needs_yes() {
+        for sql in ["DROP TABLE t", "DROP DATABASE app"] {
+            assert!(
+                matches!(approved(sql, false), Err(NotRun::NeedsConsent(_))),
+                "{sql}"
+            );
+            assert!(approved(sql, true).is_ok(), "{sql} with --yes");
+        }
+    }
+
     #[test]
     fn a_trailing_semicolon_does_not_reach_the_server() {
         assert_eq!(
