@@ -865,6 +865,54 @@ impl ResultSet {
         }
         self.n_rows += rows.len();
     }
+
+    /// The same rows with only the columns in `keep`, **in `keep`'s order** —
+    /// for a reader that takes a block of a result rather than all of it, such
+    /// as the gutter's *Copy as* over a highlighted range, in the order the
+    /// columns are drawn.
+    ///
+    /// Shares the kept columns' storage rather than copying it, and carries the
+    /// per-column facts (`capped_columns`, `binary_columns`) along renumbered,
+    /// since every downstream withholding rule reads them by index. An index
+    /// past the end is skipped.
+    pub fn project_columns(&self, keep: &[usize]) -> ResultSet {
+        let keep: Vec<usize> = keep
+            .iter()
+            .copied()
+            .filter(|&ci| ci < self.cols.len())
+            .collect();
+        let renumber = |old: &[usize]| -> Vec<usize> {
+            keep.iter()
+                .enumerate()
+                .filter(|(_, ci)| old.contains(ci))
+                .map(|(new, _)| new)
+                .collect()
+        };
+        ResultSet {
+            columns: keep.iter().map(|&ci| self.columns[ci].clone()).collect(),
+            cols: keep.iter().map(|&ci| self.cols[ci].clone()).collect(),
+            n_rows: self.n_rows,
+            capped_columns: renumber(&self.capped_columns),
+            binary_columns: renumber(&self.binary_columns),
+            ..self.clone_meta()
+        }
+    }
+
+    /// Every field but the column data, for a result rebuilt around a different
+    /// set of columns.
+    fn clone_meta(&self) -> ResultSet {
+        ResultSet {
+            columns: Vec::new(),
+            cols: Vec::new(),
+            n_rows: 0,
+            elapsed_ms: self.elapsed_ms,
+            truncated: self.truncated,
+            capped_columns: Vec::new(),
+            binary_columns: Vec::new(),
+            affected: self.affected,
+            database: self.database.clone(),
+        }
+    }
 }
 
 /// Assembles a columnar [`ResultSet`] one row at a time, so a large result never
@@ -1686,6 +1734,38 @@ mod tests {
             type_name: type_name.to_string(),
             origin: None,
         }
+    }
+
+    /// **The kept columns, in `keep`'s order, with their per-column facts
+    /// renumbered.** A `binary_columns` entry left at its old index would name
+    /// whichever column now sits there, and the export would withhold the wrong
+    /// one.
+    #[test]
+    fn project_columns_reorders_and_renumbers_the_per_column_facts() {
+        let mut rs = ResultSet::from_rows(
+            vec![named("a", "INT"), named("b", "BLOB"), named("c", "TEXT")],
+            vec![vec![
+                Value::Int(1),
+                Value::Str(binary_display(2)),
+                Value::Str("x".into()),
+            ]],
+        );
+        rs.binary_columns = vec![1];
+        rs.capped_columns = vec![2];
+        let p = rs.project_columns(&[2, 1]);
+        let names: Vec<&str> = p.columns.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, ["c", "b"]);
+        assert_eq!(p.binary_columns, vec![1], "b moved from 1 to 1");
+        assert_eq!(p.capped_columns, vec![0], "c moved from 2 to 0");
+        assert_eq!(
+            p.cell(0, 0).map(|c| c.display().to_string()).as_deref(),
+            Some("x")
+        );
+        assert_eq!(p.row_count(), 1);
+        // A dropped column's facts go with it; an index past the end is skipped.
+        let q = rs.project_columns(&[0, 9]);
+        assert_eq!(q.col_count(), 1);
+        assert!(q.binary_columns.is_empty() && q.capped_columns.is_empty());
     }
 
     // ── Chunked loads (the streamed export's builder) ──

@@ -1894,6 +1894,60 @@ pub fn export_html_chunks<W: Write>(w: &mut W, src: &mut dyn RowChunks) -> io::R
     Ok(tally)
 }
 
+/// An owned `(database, namespace, table)`, as [`insert_shape`] names a target.
+pub type TableRef = (String, Option<String>, String);
+
+/// Where an `INSERT` export of `rs` should land, and `rs` with its columns
+/// named as that table names them.
+///
+/// **Read off the result, not the tab.** A grid tab's `source` is the table it
+/// was *opened* on and is kept however its text is edited, so `SELECT id, name
+/// FROM customers` run in a tab opened on `users` exported `INSERT INTO users`
+/// — customer rows, landing silently wherever the columns lined up. The
+/// columns' origins are what the server said the rows are:
+///
+/// - **every column from one table** → that table, and each column renamed to
+///   its real name, so `id AS user_id` inserts into `id` rather than into a
+///   column the table has not got;
+/// - **no column with an origin at all** (the server reported none) → `tab`,
+///   which then cannot be contradicted;
+/// - **anything else** — a join, a computed column beside real ones → `None`,
+///   the `table` placeholder, for the user to decide rather than a guess.
+pub fn insert_shape(
+    rs: &ResultSet,
+    tab: Option<(&str, Option<&str>, &str)>,
+) -> (Option<TableRef>, ResultSet) {
+    let origins: Vec<Option<&crate::model::ColumnOrigin>> =
+        rs.columns.iter().map(|c| c.origin.as_ref()).collect();
+    if origins.iter().all(Option::is_none) {
+        let tab = tab.map(|(d, s, t)| (d.to_string(), s.map(str::to_string), t.to_string()));
+        return (tab, rs.clone());
+    }
+    let Some(first) = origins.first().copied().flatten() else {
+        return (None, rs.clone());
+    };
+    let same = |o: &crate::model::ColumnOrigin| {
+        o.database == first.database && o.schema == first.schema && o.table == first.table
+    };
+    if !origins.iter().all(|o| o.is_some_and(same)) {
+        return (None, rs.clone());
+    }
+    let mut out = rs.clone();
+    for c in &mut out.columns {
+        if let Some(o) = &c.origin {
+            c.name = o.column.clone();
+        }
+    }
+    (
+        Some((
+            first.database.clone(),
+            first.schema.clone(),
+            first.table.clone(),
+        )),
+        out,
+    )
+}
+
 /// The result as `INSERT` statements, in the connection's dialect. `source` is
 /// the real `(database, namespace, table)` when known; otherwise a `table`
 /// placeholder is emitted for the user to fill in.
@@ -2036,7 +2090,8 @@ fn withheld_binary(mask: &[bool], ci: usize, c: &crate::model::CellRef<'_>) -> b
 /// The columns a JSON or CSV rendering of `rs` (rows in `order`) writes as
 /// `null` / an empty field because their bytes were never carried — what
 /// [`ExportTally::withheld`] names, for a caller that renders to a string and
-/// so never sees a tally — the CLI's machine formats.
+/// so never sees a tally — the CLI's machine formats, and the grid's clipboard
+/// Copy ▸ JSON/CSV and *Copy as*, which say it on the bar.
 pub fn withheld_columns(rs: &ResultSet, order: &[usize]) -> Vec<String> {
     dropped_binary_columns(rs, order)
         .into_iter()
@@ -3549,6 +3604,72 @@ mod tests {
             out.contains("thumb"),
             "the note should name the column: {out}"
         );
+    }
+
+    fn from(table: &str, column: &str, alias: &str) -> Column {
+        Column {
+            name: alias.to_string(),
+            type_name: "INT".to_string(),
+            origin: Some(crate::model::ColumnOrigin {
+                database: "db".to_string(),
+                schema: None,
+                table: table.to_string(),
+                column: column.to_string(),
+                flags: Default::default(),
+                binary: false,
+                implicit_key: false,
+            }),
+        }
+    }
+
+    const TAB: Option<(&str, Option<&str>, &str)> = Some(("db", None, "users"));
+
+    /// **The rows' own table wins over the tab's.** A tab opened on `users`
+    /// and rerun as `SELECT … FROM customers` exported `INSERT INTO users`.
+    #[test]
+    fn insert_shape_names_the_table_the_rows_came_from() {
+        let rs = ResultSet::from_rows(
+            vec![
+                from("customers", "id", "id"),
+                from("customers", "name", "name"),
+            ],
+            vec![],
+        );
+        let (target, _) = insert_shape(&rs, TAB);
+        assert_eq!(target, Some(("db".into(), None, "customers".into())));
+    }
+
+    /// An alias is the query's name for the column, not the table's.
+    #[test]
+    fn insert_shape_inserts_into_the_real_column_not_the_alias() {
+        let rs = ResultSet::from_rows(vec![from("users", "id", "user_id")], vec![]);
+        let (target, shaped) = insert_shape(&rs, TAB);
+        assert_eq!(target.map(|t| t.2), Some("users".to_string()));
+        assert_eq!(shaped.columns[0].name, "id");
+        let sql = export_inserts(&shaped, &[], Some(("db", None, "users")), MySql);
+        assert!(!sql.contains("user_id"), "{sql}");
+    }
+
+    /// A computed column beside real ones, or two tables, is not one table:
+    /// the placeholder, rather than a guess the user did not see made.
+    #[test]
+    fn insert_shape_refuses_to_guess_for_a_join_or_a_computed_column() {
+        let join = ResultSet::from_rows(
+            vec![from("users", "id", "id"), from("orders", "id", "oid")],
+            vec![],
+        );
+        assert_eq!(insert_shape(&join, TAB).0, None);
+        let computed = ResultSet::from_rows(vec![from("users", "id", "id"), col("two")], vec![]);
+        assert_eq!(insert_shape(&computed, TAB).0, None);
+    }
+
+    /// With no origin anywhere the server said nothing, and the tab's table is
+    /// the only answer there is.
+    #[test]
+    fn insert_shape_falls_back_to_the_tab_when_no_column_has_an_origin() {
+        let (target, shaped) = insert_shape(&rs(), TAB);
+        assert_eq!(target, Some(("db".into(), None, "users".into())));
+        assert_eq!(shaped.columns[0].name, rs().columns[0].name);
     }
 
     /// `withheld_columns` names exactly the columns the JSON/CSV emitters null

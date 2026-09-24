@@ -1395,21 +1395,112 @@ impl GridCells<'_> {
     /// the pending rows past the real ones, so slicing it by display position is
     /// the one reading that copies what is on screen. Pending rows are copied
     /// too — unlike a delete, a copy has nothing to refuse them for.
+    ///
+    /// **And the columns the gesture means, in the order they are drawn.**
+    /// Inside a highlighted block that is the block's columns; outside one it is
+    /// the whole row. Either way in [`visual_cols`] order, so a frozen column
+    /// comes first — what Copy and Attach beside this entry already take. It
+    /// copied every column in index order, so one menu said "Copy" for a 3×2
+    /// block and for all N columns of the same three rows.
     pub fn exported_rows_at(
         &self,
-        selection: Option<(usize, usize)>,
+        selection: Option<(usize, usize, usize, usize)>,
         pos: usize,
+        frozen: Option<usize>,
     ) -> (ResultSet, Vec<usize>) {
         let (out, order) = self.exported();
-        let (r0, r1) = match selection {
-            Some((r0, r1)) if pos >= r0 && pos <= r1 => (r0, r1),
-            _ => (pos, pos),
-        };
-        let picked = order
-            .get(r0..order.len().min(r1 + 1))
-            .unwrap_or_default()
-            .to_vec();
-        (out, picked)
+        let (rows, cols) = self.gesture_at(selection, pos, frozen);
+        let picked = pick(&order, rows);
+        (project(&out, &cols), picked)
+    }
+
+    /// The display rows and drawn columns a gutter gesture at `pos` means — see
+    /// [`GridCells::exported_rows_at`].
+    fn gesture_at(
+        &self,
+        selection: Option<(usize, usize, usize, usize)>,
+        pos: usize,
+        frozen: Option<usize>,
+    ) -> (std::ops::RangeInclusive<usize>, Vec<usize>) {
+        let ncols = self.rs.col_count();
+        match selection {
+            Some((r0, c0, r1, c1)) if pos >= r0 && pos <= r1 => (
+                r0..=r1,
+                selected_cols((c0, c1), ncols, frozen)
+                    .into_iter()
+                    .filter(|&ci| ci < ncols)
+                    .collect(),
+            ),
+            _ => (pos..=pos, visual_cols(ncols, frozen)),
+        }
+    }
+
+    /// [`GridCells::exported_rows_at`] for an **`INSERT`** export: the same
+    /// rows and columns, as blocks that each carry only columns with a value.
+    ///
+    /// **An unset cell of a pending row is not a NULL.** It takes the server's
+    /// default — the grid previews it as `<auto>` and its own Commit leaves the
+    /// column out — so an `INSERT` listing it with `NULL` writes something
+    /// else: on PostgreSQL a `serial` key refused the row outright, and MySQL in
+    /// non-strict mode stored an implicit `0` or `''` over the declared
+    /// default. So the stored rows are one block, and pending rows are grouped
+    /// by which columns they set, each group projected to those. `DEFAULT` in
+    /// `VALUES` would say the same in one statement, and SQLite refuses it.
+    /// A pending row with nothing set has nothing to insert and is left out.
+    pub fn insert_blocks_at(
+        &self,
+        selection: Option<(usize, usize, usize, usize)>,
+        pos: usize,
+        frozen: Option<usize>,
+    ) -> Vec<(ResultSet, Vec<usize>)> {
+        let (rows, cols) = self.gesture_at(selection, pos, frozen);
+        self.insert_blocks(rows, &cols)
+    }
+
+    /// [`GridCells::insert_blocks_at`] over the whole result, every column in
+    /// index order — the whole-result Copy ▸ SQL.
+    pub fn insert_blocks_all(&self) -> Vec<(ResultSet, Vec<usize>)> {
+        let cols: Vec<usize> = (0..self.rs.col_count()).collect();
+        self.insert_blocks(0..=usize::MAX - 1, &cols)
+    }
+
+    fn insert_blocks(
+        &self,
+        rows: std::ops::RangeInclusive<usize>,
+        cols: &[usize],
+    ) -> Vec<(ResultSet, Vec<usize>)> {
+        let (out, order) = self.exported();
+        let nreal = self.rs.row_count();
+        let picked = pick(&order, rows);
+        let (real, pending): (Vec<usize>, Vec<usize>) =
+            picked.into_iter().partition(|&di| di < nreal);
+        let mut blocks = Vec::new();
+        if !real.is_empty() {
+            blocks.push((project(&out, cols), real));
+        }
+        let mut groups: Vec<(Vec<usize>, Vec<usize>)> = Vec::new();
+        for di in pending {
+            let set: Vec<usize> = cols
+                .iter()
+                .copied()
+                .filter(|ci| {
+                    self.new_rows
+                        .get(di - nreal)
+                        .is_some_and(|r| r.contains_key(ci))
+                })
+                .collect();
+            if set.is_empty() {
+                continue;
+            }
+            match groups.iter_mut().find(|(k, _)| *k == set) {
+                Some((_, rows)) => rows.push(di),
+                None => groups.push((set, vec![di])),
+            }
+        }
+        for (set, rows) in groups {
+            blocks.push((out.project_columns(&set), rows));
+        }
+        blocks
     }
 
     /// How many rows [`GridCells::exported`] would hand back, **without
@@ -1516,6 +1607,26 @@ pub fn visual_cols(ncols: usize, frozen: Option<usize>) -> Vec<usize> {
             .chain((0..ncols).filter(move |c| *c != f))
             .collect(),
         None => (0..ncols).collect(),
+    }
+}
+
+/// The data rows at display positions `rows` of `order`, clamped to the rows
+/// that exist.
+fn pick(order: &[usize], rows: std::ops::RangeInclusive<usize>) -> Vec<usize> {
+    let (r0, r1) = rows.into_inner();
+    order
+        .get(r0.min(order.len())..order.len().min(r1.saturating_add(1)))
+        .unwrap_or_default()
+        .to_vec()
+}
+
+/// `rs` narrowed to `cols` in that order — or `rs` itself when `cols` is every
+/// column in index order, which is what a whole row outside any freeze is.
+fn project(rs: &ResultSet, cols: &[usize]) -> ResultSet {
+    if cols.iter().copied().eq(0..rs.col_count()) {
+        rs.clone()
+    } else {
+        rs.project_columns(cols)
     }
 }
 
@@ -4179,7 +4290,7 @@ mod tests {
         let formats = vec![crate::format::ColumnFormat::None];
         let dirty = HashMap::new();
         let c = cells(&rs, &order, &formats, &dirty, &new_rows);
-        let (out, ord) = c.exported_rows_at(Some((0, 1)), 1);
+        let (out, ord) = c.exported_rows_at(Some((0, 0, 1, 0)), 1, None);
         assert_eq!(csv_rows(&out, &ord), ["c", "a"]);
     }
 
@@ -4191,7 +4302,7 @@ mod tests {
         let formats = vec![crate::format::ColumnFormat::None];
         let dirty = HashMap::new();
         let c = cells(&rs, &order, &formats, &dirty, &new_rows);
-        let (out, ord) = c.exported_rows_at(Some((0, 1)), 2);
+        let (out, ord) = c.exported_rows_at(Some((0, 0, 1, 0)), 2, None);
         assert_eq!(csv_rows(&out, &ord), ["b"]);
     }
 
@@ -4204,7 +4315,7 @@ mod tests {
         let mut dirty = HashMap::new();
         dirty.insert((0, 0), CellEdit::Text("A".into()));
         let c = cells(&rs, &order, &formats, &dirty, &new_rows);
-        let (out, ord) = c.exported_rows_at(Some((1, 3)), 3);
+        let (out, ord) = c.exported_rows_at(Some((1, 0, 3, 0)), 3, None);
         assert_eq!(csv_rows(&out, &ord), ["A", "b", "new"]);
     }
 
@@ -4215,8 +4326,66 @@ mod tests {
         let formats = vec![crate::format::ColumnFormat::None];
         let dirty = HashMap::new();
         let c = cells(&rs, &order, &formats, &dirty, &new_rows);
-        let (out, ord) = c.exported_rows_at(Some((2, 9)), 2);
+        let (out, ord) = c.exported_rows_at(Some((2, 0, 9, 0)), 2, None);
         assert_eq!(csv_rows(&out, &ord), ["b", "new"]);
+    }
+
+    /// Three columns `a b c`, one stored row `1 2 3`.
+    fn three_cols() -> ResultSet {
+        ResultSet::from_rows(
+            vec![
+                col("a", "INT", "t", false, false),
+                col("b", "INT", "t", false, false),
+                col("c", "INT", "t", false, false),
+            ],
+            vec![vec![Value::Int(1), Value::Int(2), Value::Int(3)]],
+        )
+    }
+
+    /// **Inside a block, the block's columns — in drawn order.** Copy and
+    /// Attach beside this entry took the 1×2 block; Copy as took all three.
+    #[test]
+    fn exported_rows_at_takes_the_blocks_columns_in_drawn_order() {
+        let rs = three_cols();
+        let (order, formats, dirty) = (vec![0], vec![Default::default(); 3], HashMap::new());
+        let new_rows: Vec<HashMap<usize, CellEdit>> = Vec::new();
+        let c = cells(&rs, &order, &formats, &dirty, &new_rows);
+        let (out, ord) = c.exported_rows_at(Some((0, 1, 0, 2)), 0, None);
+        assert_eq!(csv_rows(&out, &ord), ["2,3"]);
+        // Column 2 frozen: drawn first, so copied first.
+        let (out, ord) = c.exported_rows_at(Some((0, 1, 0, 2)), 0, Some(2));
+        assert_eq!(csv_rows(&out, &ord), ["3,2"]);
+        // Outside any block: the whole row, still in drawn order.
+        let (out, ord) = c.exported_rows_at(None, 0, Some(2));
+        assert_eq!(csv_rows(&out, &ord), ["3,1,2"]);
+    }
+
+    /// **A pending row's unset cell is left out of its INSERT, not written as
+    /// NULL** — the server's default is what the grid previews, and an
+    /// explicit NULL overrode it (a PostgreSQL `serial` refused the row).
+    #[test]
+    fn an_insert_of_a_pending_row_omits_the_cells_it_did_not_set() {
+        let rs = three_cols();
+        let (order, formats, dirty) = (vec![0], vec![Default::default(); 3], HashMap::new());
+        let mut typed = HashMap::new();
+        typed.insert(1, CellEdit::Text("9".into()));
+        let new_rows = vec![typed, HashMap::new()];
+        let c = cells(&rs, &order, &formats, &dirty, &new_rows);
+        let sql: String = c
+            .insert_blocks_all()
+            .iter()
+            .map(|(out, ord)| {
+                crate::export::export_inserts(out, ord, None, crate::intel::SqlDialect::MySql)
+            })
+            .collect();
+        assert!(sql.contains("(`a`, `b`, `c`) VALUES\n(1, 2, 3)"), "{sql}");
+        assert!(sql.contains("(`b`) VALUES\n('9')"), "{sql}");
+        assert!(
+            !sql.contains("NULL"),
+            "an unset cell went out as NULL: {sql}"
+        );
+        // The empty pending row has nothing to insert.
+        assert_eq!(sql.matches("INSERT INTO").count(), 2, "{sql}");
     }
 
     /// A staged NULL is a null in the file, not the word — the mapping

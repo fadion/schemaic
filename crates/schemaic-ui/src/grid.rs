@@ -2515,19 +2515,49 @@ fn exported_row_count(gs: GridState) -> usize {
     grid_cells(&rs, &order, &formats, &dirty, &new_rows).exported_row_count()
 }
 
-/// [`exported_rows`], narrowed to the rows a gutter gesture at display row
-/// `pos` means — see [`schemaic_core::edit::GridCells::exported_rows_at`].
+/// [`exported_rows`], narrowed to the rows and columns a gutter gesture at
+/// display row `pos` means — see
+/// [`schemaic_core::edit::GridCells::exported_rows_at`]. The whole selection
+/// rectangle and the freeze go down, so the columns are the block's, drawn
+/// order, as Copy and Attach beside it take them.
 fn exported_rows_at(gs: GridState, pos: usize) -> (ResultSet, Vec<usize>) {
     let (rs, order) = (gs.rs.get_untracked(), gs.order.get_untracked());
     let (dirty, new_rows) = (gs.dirty.get_untracked(), gs.new_rows.get_untracked());
     let formats = gs.formats.get_untracked();
-    let selection = gs.bounds_untracked().map(|(r0, _, r1, _)| (r0, r1));
-    grid_cells(&rs, &order, &formats, &dirty, &new_rows).exported_rows_at(selection, pos)
+    grid_cells(&rs, &order, &formats, &dirty, &new_rows).exported_rows_at(
+        gs.bounds_untracked(),
+        pos,
+        gs.frozen.get_untracked(),
+    )
 }
 
-/// Render the whole result in `format`. The single dispatch point for both the
-/// copy menu and the save-to-file menu, so the two can't drift.
+/// The same gesture as [`exported_rows_at`], as the blocks an `INSERT` export
+/// takes — a pending row's unset cells left out rather than written `NULL`.
+/// See [`schemaic_core::edit::GridCells::insert_blocks_at`].
+fn insert_blocks_at(gs: GridState, pos: usize) -> Vec<(ResultSet, Vec<usize>)> {
+    let (rs, order) = (gs.rs.get_untracked(), gs.order.get_untracked());
+    let (dirty, new_rows) = (gs.dirty.get_untracked(), gs.new_rows.get_untracked());
+    let formats = gs.formats.get_untracked();
+    grid_cells(&rs, &order, &formats, &dirty, &new_rows).insert_blocks_at(
+        gs.bounds_untracked(),
+        pos,
+        gs.frozen.get_untracked(),
+    )
+}
+
+/// [`insert_blocks_at`] over the whole result.
+fn insert_blocks_all(gs: GridState) -> Vec<(ResultSet, Vec<usize>)> {
+    let (rs, order) = (gs.rs.get_untracked(), gs.order.get_untracked());
+    let (dirty, new_rows) = (gs.dirty.get_untracked(), gs.new_rows.get_untracked());
+    let formats = gs.formats.get_untracked();
+    grid_cells(&rs, &order, &formats, &dirty, &new_rows).insert_blocks_all()
+}
+
+/// Render the whole result in `format` — the toolbar's Copy ▸ menu.
 fn render_export(gs: GridState, format: ExportFormat) -> String {
+    if format == ExportFormat::Sql {
+        return render_inserts(gs, insert_blocks_all(gs));
+    }
     let (rs, order) = exported_rows(gs);
     render_order(gs, &rs, &order, format)
 }
@@ -2535,19 +2565,67 @@ fn render_export(gs: GridState, format: ExportFormat) -> String {
 /// Render the rows the gutter menu was opened on in `format` — the row menu's
 /// *Copy as*, through the same renderer as the whole-result copy.
 fn render_rows_at(gs: GridState, pos: usize, format: ExportFormat) -> String {
+    if format == ExportFormat::Sql {
+        return render_inserts(gs, insert_blocks_at(gs, pos));
+    }
     let (rs, order) = exported_rows_at(gs, pos);
     render_order(gs, &rs, &order, format)
 }
 
-/// `format`'s rendering of `order` over an already-resolved `rs`.
+/// Each block's `INSERT`s, one after another.
+///
+/// **Nothing to insert is said, not silent.** A block that covers only a new
+/// row's unset cells has no value to write — they take the server's default —
+/// and a copy that put nothing anywhere reads as one that failed. The callers
+/// leave the clipboard alone for an empty rendering; this says why.
+fn render_inserts(gs: GridState, blocks: Vec<(ResultSet, Vec<usize>)>) -> String {
+    let out = blocks
+        .iter()
+        .map(|(rs, order)| render_order(gs, rs, order, ExportFormat::Sql))
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
+    if out.is_empty() {
+        gs.commit_note.set(Some(
+            "Nothing to copy as SQL — the selected cells of the new row have no value yet, \
+             and take the server's default."
+                .to_string(),
+        ));
+    }
+    out
+}
+
+/// `format`'s rendering of `order` over an already-resolved `rs`, **for the
+/// clipboard** — which is why a withheld blob is said on the bar here: the
+/// string has nowhere to carry it, and a JSON `null` reads as a NULL.
 fn render_order(gs: GridState, rs: &ResultSet, order: &[usize], format: ExportFormat) -> String {
+    use schemaic_core::export::{ExportTally, export_note, insert_shape, withheld_columns};
     let source = gs.source.get_untracked();
+    let tab = source
+        .as_ref()
+        .map(|s| (s.database.as_str(), s.schema.as_deref(), s.table.as_str()));
+    // The `INSERT`'s target is the rows' own table where they name one, not
+    // the tab's sticky opened-from table — see `export::insert_shape`.
+    let (target, shaped) = match format {
+        ExportFormat::Sql => insert_shape(rs, tab),
+        _ => (None, rs.clone()),
+    };
+    if matches!(format, ExportFormat::Json | ExportFormat::Csv) {
+        let tally = ExportTally {
+            rows: order.len() as u64,
+            withheld: withheld_columns(rs, order),
+            ..Default::default()
+        };
+        if let Some(note) = export_note(&tally, "the clipboard", false) {
+            gs.commit_note.set(Some(note));
+        }
+    }
     format.render(
-        rs,
+        &shaped,
         order,
-        source
+        target
             .as_ref()
-            .map(|s| (s.database.as_str(), s.schema.as_deref(), s.table.as_str())),
+            .map(|(d, s, t)| (d.as_str(), s.as_deref(), t.as_str())),
         // The tab's own connection dialect — an exported `INSERT` has to load into
         // the engine the rows came from.
         gs.dialect,
@@ -2712,9 +2790,25 @@ fn save_export(gs: GridState, format: ExportFormat, all_rows: bool, estimate: Op
     // must not change what was asked for. See `exported_rows` — the file and
     // Ctrl+C are two surfaces of one grid and used to disagree about it.
     let (resolved, resolved_order) = exported_rows(gs);
+    // An `INSERT` file names the rows' own table, not the tab's opened-from one
+    // — the clipboard's rule (`render_order`), so the two cannot disagree.
+    let (resolved, source) = match format {
+        ExportFormat::Sql => {
+            let tab = gs.source.get_untracked();
+            let (target, shaped) = schemaic_core::export::insert_shape(
+                &resolved,
+                tab.as_ref()
+                    .map(|s| (s.database.as_str(), s.schema.as_deref(), s.table.as_str())),
+            );
+            (
+                shaped,
+                target.map(|(d, s, t)| schemaic_core::schema::TableSource::new(d, s, t)),
+            )
+        }
+        _ => (resolved, gs.source.get_untracked()),
+    };
     let rs = std::sync::Arc::new(resolved);
     let order = std::sync::Arc::new(resolved_order);
-    let source = gs.source.get_untracked();
     let dialect = gs.dialect;
     // The statement is snapshotted with the rows and for the same reason: the
     // dialog is modal and slow, and a filter typed while it stood open must not
@@ -8409,7 +8503,12 @@ fn grid_toolbar(
             ExportFormat::clipboard_formats()
                 .map(|f| {
                     MenuEntry::action(f.label(), move || {
-                        let _ = floem::Clipboard::set_contents(render_export(gs, f));
+                        // An empty rendering is "nothing to copy", said on the
+                        // bar by `render_inserts` — not a clipboard wiped blank.
+                        let text = render_export(gs, f);
+                        if !text.is_empty() {
+                            let _ = floem::Clipboard::set_contents(text);
+                        }
                     })
                 })
                 .collect(),
@@ -9103,7 +9202,11 @@ fn gutter_menu(gs: GridState, pos: usize, pending: Option<usize>) -> Vec<MenuEnt
             ExportFormat::clipboard_formats()
                 .map(|f| {
                     MenuEntry::action(f.label(), move || {
-                        let _ = floem::Clipboard::set_contents(render_rows_at(gs, pos, f));
+                        // See the toolbar's twin: empty is said, not copied.
+                        let text = render_rows_at(gs, pos, f);
+                        if !text.is_empty() {
+                            let _ = floem::Clipboard::set_contents(text);
+                        }
                     })
                 })
                 .collect(),
@@ -11072,13 +11175,34 @@ mod cell_preview_tests {
                 "`{name}` still reads the fetched result directly:\n{f}"
             );
         }
-        // And both resolvers go through `GridCells`, rather than reaching for
+        // **The row menu's scope, not just its resolution.** Any resolver
+        // satisfied the check above, so `render_rows_at` switched to
+        // `exported_rows(gs)` copied the whole result — up to the row cap — off
+        // a right-click on one row, with the suite green. Both of its paths must
+        // be the gesture-scoped ones.
+        let at = body.find("fn render_rows_at(").expect("render_rows_at");
+        let end = body[at..].find("\n}").expect("no end");
+        let f = &body[at..at + end];
+        for needle in ["exported_rows_at(gs, pos)", "insert_blocks_at(gs, pos)"] {
+            assert!(
+                f.contains(needle),
+                "`render_rows_at` no longer renders the rows the gesture named \
+                 (`{needle}` is gone):\n{f}"
+            );
+        }
+        assert!(
+            !f.contains("exported_rows(gs)") && !f.contains("insert_blocks_all("),
+            "`render_rows_at` renders the whole result:\n{f}"
+        );
+        // And every resolver goes through `GridCells`, rather than reaching for
         // the overlay a second time — which is how the menu and the file came to
         // disagree about a row count in the first place.
         for name in [
             "fn exported_rows(",
             "fn exported_rows_at(",
             "fn exported_row_count(",
+            "fn insert_blocks_at(",
+            "fn insert_blocks_all(",
         ] {
             let at = body
                 .find(name)
