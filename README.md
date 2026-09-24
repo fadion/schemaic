@@ -189,7 +189,7 @@ Schemaic.
 A connection is reachable this way only once you turn on **CLI access** for it
 in its connection settings. That is off for every connection, including ones you
 saved before this existed, because the command line runs with nobody watching.
-`schemaic list --all` shows the ones that are not exposed and why.
+`schemaic list` says how many it left out, and `schemaic list --all` shows them.
 
 A statement runs in the connection's default database, or the one `-d`/`--database`
 names. Schemaic itself never needs a default — it lists every database — so a saved

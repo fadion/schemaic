@@ -302,15 +302,47 @@ fn list(conns: &[Connection], all: bool, format: Format) -> Exit {
     )) {
         return exit;
     }
-    // An empty list is not an error — it is the correct answer to "what may I
-    // use". The hint is what makes it actionable rather than baffling.
-    if shown.is_empty() && !all {
-        warn(
-            "no connection has CLI access yet; turn it on for one in Schemaic, \
-             or run `schemaic list --all` to see them all",
-        );
+    if let Some(note) = list_note(conns.len(), shown.len(), all) {
+        warn(&note);
     }
     Exit::Ok
+}
+
+/// What `list` says on stderr about what it did not show: `total` saved,
+/// `shown` of them listed.
+///
+/// **A count, not only the empty case.** A listing of three reads as "these
+/// are my connections", and the fourth that has no CLI access was simply
+/// absent — the reader went looking for a typo. An empty list is still not an
+/// error: it is the correct answer to "what may I use", and this is what makes
+/// it actionable rather than baffling.
+fn list_note(total: usize, shown: usize, all: bool) -> Option<String> {
+    let hidden = total - shown;
+    if all || (hidden == 0 && total > 0) {
+        return None;
+    }
+    Some(if total == 0 {
+        "no saved connections yet; add one in Schemaic".to_string()
+    } else if shown == 0 {
+        let which = if total == 1 {
+            "the one saved connection has no".to_string()
+        } else {
+            format!("none of the {total} saved connections has")
+        };
+        format!(
+            "{which} CLI access yet; turn it on in Schemaic, or run `schemaic list --all` \
+             to see them all"
+        )
+    } else {
+        format!(
+            "{hidden} {} without CLI access not shown; `schemaic list --all` lists them",
+            if hidden == 1 {
+                "connection"
+            } else {
+                "connections"
+            }
+        )
+    })
 }
 
 /// A listing column. The listing is not a query result, so no column of it has
@@ -727,6 +759,37 @@ fn database_for(target: &Target, conn: &Connection) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **`list` says how many it left out**, so a connection that is missing
+    /// from it reads as "not exposed" rather than "not there".
+    #[test]
+    fn list_counts_what_it_hid() {
+        let n = list_note(5, 3, false).expect("two were hidden");
+        assert!(n.contains("2 connections"), "{n}");
+        assert!(n.contains("--all"), "{n}");
+        let n = list_note(4, 3, false).expect("one was hidden");
+        assert!(n.contains("1 connection "), "{n}");
+    }
+
+    /// Nothing hidden, or `--all`, which hides nothing: nothing to say.
+    #[test]
+    fn list_is_quiet_when_it_hid_nothing() {
+        assert_eq!(list_note(3, 3, false), None);
+        assert_eq!(list_note(5, 5, true), None);
+        assert_eq!(list_note(0, 0, true), None);
+    }
+
+    /// An empty listing is explained either way — but "turn CLI access on"
+    /// is no answer when nothing has been saved at all.
+    #[test]
+    fn an_empty_list_says_whether_anything_is_saved() {
+        let n = list_note(2, 0, false).expect("all hidden");
+        assert!(n.contains("none of the 2"), "{n}");
+        assert!(n.contains("--all"), "{n}");
+        let n = list_note(0, 0, false).expect("nothing saved");
+        assert!(n.contains("no saved connections"), "{n}");
+        assert!(!n.contains("--all"), "{n}");
+    }
 
     #[test]
     fn the_exit_codes_are_the_documented_ones() {

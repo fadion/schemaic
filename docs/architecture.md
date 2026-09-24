@@ -20244,9 +20244,17 @@ existing prose was left alone.
     tokio runtime is **current-thread and built here**, mirroring `--mcp-serve`: one statement on
     one connection has no use for a pool and would pay its startup. `list` builds a `ResultSet` and
     hands it to the same renderers a query's rows go through, so `--format=json` means the same
-    thing there as here and there is no second table-drawing path to keep in step; an empty list is
-    not an error but carries a hint, since "no connection has CLI access yet" is the correct answer
-    to *what may I use* and the baffling one without it. `database_for` is the flag, else the connection's own, else `None` —
+    thing there as here and there is no second table-drawing path to keep in step. **Without
+    `--all` it says on stderr how many it left out**, not only when it left out everything: a
+    listing of three read as "these are my connections", and the fourth, with no CLI access, was
+    simply absent — the reader went looking for a typo. `list_note(total, shown, all)` is the pure
+    decision: silent under `--all` or when nothing was hidden, "K connection(s) without CLI access
+    not shown" pointing at `schemaic list --all` otherwise, and an empty list still no error but a
+    hint, since "none has CLI access yet" is the correct answer to *what may I use* and the
+    baffling one without it. **Nothing saved at all is a different sentence** — add one in
+    Schemaic, no `--all` advice — because the old single hint told a user with no connections to
+    turn CLI access on (`list_counts_what_it_hid`, `list_is_quiet_when_it_hid_nothing`,
+    `an_empty_list_says_whether_anything_is_saved`). stdout stays the rows alone. `database_for` is the flag, else the connection's own, else `None` —
     an empty string there would read as a real database name to the guard's `no_database` arm.
     **`version` is answered at the top of `dispatch`, before `load_connections_readonly` runs**: it
     needs no saved connection, and a damaged `connections.json` must not stop anyone learning which
