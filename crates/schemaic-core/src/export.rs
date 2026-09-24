@@ -1917,35 +1917,80 @@ pub fn insert_shape(
     rs: &ResultSet,
     tab: Option<(&str, Option<&str>, &str)>,
 ) -> (Option<TableRef>, ResultSet) {
-    let origins: Vec<Option<&crate::model::ColumnOrigin>> =
-        rs.columns.iter().map(|c| c.origin.as_ref()).collect();
-    if origins.iter().all(Option::is_none) {
-        let tab = tab.map(|(d, s, t)| (d.to_string(), s.map(str::to_string), t.to_string()));
-        return (tab, rs.clone());
+    let target = result_table(rs, tab);
+    let mut out = rs.clone();
+    // Renamed only when the target is the columns' own table, not the tab's.
+    if target.is_some() && rs.columns.iter().any(|c| c.origin.is_some()) {
+        for c in &mut out.columns {
+            if let Some(o) = &c.origin {
+                c.name = o.column.clone();
+            }
+        }
     }
-    let Some(first) = origins.first().copied().flatten() else {
-        return (None, rs.clone());
+    (target, out)
+}
+
+/// The table `rs`'s rows are rows of, by [`insert_shape`]'s rule — its target,
+/// without the renamed copy: every column from one table → that table; no
+/// column with an origin → `tab`; anything else → `None`.
+///
+/// **Everything that acts on "this result's table" asks this, not the tab's
+/// `source`**, which is the table the tab was opened on and survives any edit
+/// of its text — the results toolbar's Properties and Live Monitor, and the
+/// chat attachment's label. Each of them otherwise described or watched
+/// `users` while the grid showed `SELECT * FROM orders`.
+///
+/// The origin is what the server says, and for a view it is not always the
+/// view: measured on MariaDB 10.11, a `MERGE` view's columns name the view but
+/// an `ALGORITHM=TEMPTABLE` one's name its base table, while PostgreSQL 16
+/// names the view. A tab on a temptable view therefore resolves to the table
+/// underneath — where the rows really are, and what `INSERT` export targets.
+pub fn result_table(rs: &ResultSet, tab: Option<(&str, Option<&str>, &str)>) -> Option<TableRef> {
+    let owned = |(d, s, t): (&str, Option<&str>, &str)| {
+        (d.to_string(), s.map(str::to_string), t.to_string())
+    };
+    let mut origins = rs.columns.iter().map(|c| c.origin.as_ref());
+    let Some(first) = origins.next() else {
+        return tab.map(owned);
+    };
+    let Some(first) = first else {
+        return if rs.columns.iter().all(|c| c.origin.is_none()) {
+            tab.map(owned)
+        } else {
+            None
+        };
     };
     let same = |o: &crate::model::ColumnOrigin| {
         o.database == first.database && o.schema == first.schema && o.table == first.table
     };
-    if !origins.iter().all(|o| o.is_some_and(same)) {
-        return (None, rs.clone());
-    }
-    let mut out = rs.clone();
-    for c in &mut out.columns {
-        if let Some(o) = &c.origin {
-            c.name = o.column.clone();
-        }
-    }
-    (
-        Some((
+    origins.all(|o| o.is_some_and(same)).then(|| {
+        (
             first.database.clone(),
             first.schema.clone(),
             first.table.clone(),
-        )),
-        out,
-    )
+        )
+    })
+}
+
+/// The table column `ci` of `rs` comes from: its own origin when the server
+/// gave one, else `tab` when **no** column has one (nothing contradicts it),
+/// else `None` — a computed column in a result that does name real tables.
+///
+/// Per column rather than [`result_table`], because a question about one column
+/// (the grid's AI Summary) has an answer even in a join, where the result as a
+/// whole has none.
+pub fn column_table(
+    rs: &ResultSet,
+    ci: usize,
+    tab: Option<(&str, Option<&str>, &str)>,
+) -> Option<TableRef> {
+    match rs.columns.get(ci).and_then(|c| c.origin.as_ref()) {
+        Some(o) => Some((o.database.clone(), o.schema.clone(), o.table.clone())),
+        None if rs.columns.iter().all(|c| c.origin.is_none()) => {
+            tab.map(|(d, s, t)| (d.to_string(), s.map(str::to_string), t.to_string()))
+        }
+        None => None,
+    }
 }
 
 /// The result as `INSERT` statements, in the connection's dialect. `source` is
@@ -3713,6 +3758,56 @@ mod tests {
         let (target, shaped) = insert_shape(&rs(), TAB);
         assert_eq!(target, Some(("db".into(), None, "users".into())));
         assert_eq!(shaped.columns[0].name, rs().columns[0].name);
+    }
+
+    /// `result_table` is `insert_shape`'s target on every arm — the one rule
+    /// asked by Properties, the Live Monitor and the chat label as well.
+    #[test]
+    fn result_table_answers_what_insert_shape_targets() {
+        let other = ResultSet::from_rows(vec![from("orders", "id", "id")], vec![]);
+        let join = ResultSet::from_rows(
+            vec![from("users", "id", "id"), from("orders", "id", "oid")],
+            vec![],
+        );
+        let computed = ResultSet::from_rows(vec![col("two"), from("users", "id", "id")], vec![]);
+        let empty = ResultSet::from_rows(vec![], vec![]);
+        for rs in [&other, &join, &computed, &rs(), &empty] {
+            assert_eq!(result_table(rs, TAB), insert_shape(rs, TAB).0);
+        }
+        assert_eq!(
+            result_table(&other, TAB).map(|t| t.2),
+            Some("orders".into())
+        );
+        // A computed *first* column still refuses — the tab is no answer once
+        // any column names a table.
+        assert_eq!(result_table(&computed, TAB), None);
+        assert_eq!(result_table(&empty, TAB).map(|t| t.2), Some("users".into()));
+        assert_eq!(result_table(&rs(), None), None);
+    }
+
+    /// A column's table is its own even in a join; a computed column beside
+    /// real ones has none; and only a result with no origins at all falls back
+    /// to the tab.
+    #[test]
+    fn column_table_is_the_columns_own_origin() {
+        let join = ResultSet::from_rows(
+            vec![
+                from("users", "id", "id"),
+                from("orders", "id", "oid"),
+                col("n"),
+            ],
+            vec![],
+        );
+        assert_eq!(
+            column_table(&join, 1, TAB).map(|t| t.2),
+            Some("orders".into())
+        );
+        assert_eq!(column_table(&join, 2, TAB), None);
+        assert_eq!(column_table(&join, 9, TAB), None);
+        assert_eq!(
+            column_table(&rs(), 0, TAB).map(|t| t.2),
+            Some("users".into())
+        );
     }
 
     /// `withheld_columns` names exactly the columns the JSON/CSV emitters null

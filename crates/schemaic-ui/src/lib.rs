@@ -9018,11 +9018,33 @@ fn results_section(
         }
         shown
     });
-    // Properties + Live Monitor: both act on the tab's source table. Captured
-    // before `gctx` moves.
+    // Properties + Live Monitor: both act on the shown result's own table.
+    // Captured before `gctx` moves.
     let open_monitor = gctx.open_monitor.clone();
     let open_properties = gctx.open_properties.clone();
     let (monitor_source, monitor_conn) = (gctx.source, gctx.conn_id);
+    let (panels, shown) = (tab.result_tabs, tab.active_result);
+    // **The result's table, not the tab's** — `export::result_table` over the
+    // panel on screen. `source` is the table the tab was opened on and survives
+    // any edit of its text, so a tab opened on `users` and rerun as `SELECT *
+    // FROM orders` described and watched `users` under a grid of orders. With no
+    // loaded result there is nothing to contradict the tab, so it answers; a
+    // join or a computed column beside real ones answers nothing, and both
+    // buttons go dim rather than guessing.
+    let shown_table = move || -> Option<TableSource> {
+        let tab_source = monitor_source.get();
+        let active = shown.get();
+        panels.with(|v| match shown_panel(v, active).map(|p| &p.state) {
+            Some(QueryState::Loaded(rs)) => schemaic_core::export::result_table(
+                rs,
+                tab_source
+                    .as_ref()
+                    .map(|s| (s.database.as_str(), s.schema.as_deref(), s.table.as_str())),
+            )
+            .map(|(d, s, t)| TableSource::new(d, s, t)),
+            _ => tab_source,
+        })
+    };
     let body = results_multi(tab, cancel, gctx).style(|s| {
         s.flex_grow(1.0_f32)
             .width_full()
@@ -9039,14 +9061,15 @@ fn results_section(
     //
     // Properties leads, because it describes the table as it stands while the
     // monitor watches it change — the same order the schema tree's menu puts them
-    // in. Both are gated on the tab having a source table, and both then let their
-    // own panel answer what it can't ("no statistics for a view", "no row key for
-    // this table") rather than the button being silently dead.
-    let has_source = move || monitor_source.get().is_some();
+    // in. Both are gated on the shown result having a table (`shown_table`), and
+    // both then let their own panel answer what it can't ("no statistics for a
+    // view", "no row key for this table") rather than the button being silently
+    // dead.
+    let has_source = move || shown_table().is_some();
     let properties_btn = {
         let open_properties = open_properties.clone();
         toolbar_icon(icons::TABLE_PROPERTIES, 5.0, 2.0, has_source, move || {
-            if let Some(src) = monitor_source.get_untracked() {
+            if let Some(src) = shown_table() {
                 (open_properties)(monitor_conn.get_untracked(), src);
             }
         })
@@ -9055,7 +9078,7 @@ fn results_section(
     let monitor_btn = {
         let open_monitor = open_monitor.clone();
         toolbar_icon(icons::ACTIVITY, 5.0, 2.0, has_source, move || {
-            if let Some(src) = monitor_source.get_untracked() {
+            if let Some(src) = shown_table() {
                 (open_monitor)(monitor_conn.get_untracked(), src);
             }
         })

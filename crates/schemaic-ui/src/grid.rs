@@ -2444,7 +2444,7 @@ fn attach_to_chat(gs: GridState, whole: bool) {
     // The summary is what survives to disk, and what the user reads back later
     // to know what they sent — so it counts what was *taken*, not what was
     // selected, and names the source when the result has one.
-    let source = source_table(gs)
+    let source = source_table(gs, None)
         .map(|t| format!(" from {t}"))
         .unwrap_or_default();
     let capped = if total > rows.len() {
@@ -5148,12 +5148,27 @@ fn reclaim_keyboard(pointer: (f64, f64), grid: Rect) -> bool {
     grid.contains(Point::new(pointer.0, pointer.1))
 }
 
-/// The result's source table, qualified, for an AI prompt's context — `None`
-/// for an arbitrary SELECT that isn't backed by one table.
-fn source_table(gs: GridState) -> Option<String> {
-    gs.source
-        .get_untracked()
-        .map(|src| format!("{}.{}", src.database, src.display()))
+/// The table the result's rows come from — or, given `column`, that column's
+/// values — qualified, for an AI prompt's context or a chat attachment's label.
+/// `None` for an arbitrary SELECT that isn't backed by one table.
+///
+/// **Read off the result, not the tab** (`export::result_table` /
+/// `column_table`): `gs.source` is the table the tab was opened on and survives
+/// any edit of its text, so a tab opened on `users` and rerun as `SELECT * FROM
+/// orders` told the model its sample of `orders` came from `users`.
+fn source_table(gs: GridState, column: Option<usize>) -> Option<String> {
+    use schemaic_core::export::{column_table, result_table};
+    let rs = gs.rs.get_untracked();
+    let tab = gs.source.get_untracked();
+    let tab = tab
+        .as_ref()
+        .map(|s| (s.database.as_str(), s.schema.as_deref(), s.table.as_str()));
+    let (database, schema, table) = match column {
+        Some(ci) => column_table(&rs, ci, tab),
+        None => result_table(&rs, tab),
+    }?;
+    let src = TableSource::new(database, schema, table);
+    Some(format!("{}.{}", src.database, src.display()))
 }
 
 /// Aim the binary panel at a cell — **the one spelling**, called by the
@@ -9602,7 +9617,7 @@ fn header_cell(
                 .map(|c| (c.name.clone(), c.type_name.clone()))
                 .unwrap_or_default();
             let msg = summary::column_prompt(
-                source_table(gs).as_deref(),
+                source_table(gs, Some(ci)).as_deref(),
                 &column,
                 &type_name,
                 &summary::sample_column(&rs, ci, summary::COLUMN_SAMPLE),
@@ -10496,7 +10511,7 @@ fn data_cell(
                 None => summary::sample_row(&rs, data_idx, ci, summary::CELL_ROW_FIELDS),
             };
             let msg = summary::cell_prompt(
-                source_table(gs).as_deref(),
+                source_table(gs, Some(ci)).as_deref(),
                 &column,
                 &type_name,
                 &val,
@@ -11158,6 +11173,33 @@ mod cell_preview_tests {
     ///
     /// `exported_rows` is the only place allowed to read the raw pair, and it is
     /// the one that resolves.
+    /// **What the AI is told a result is, is the result's table.** The tab's
+    /// `source` survives any edit of its text, so the AI Summary and the chat
+    /// attachment named `users` for a sample of `SELECT * FROM orders`.
+    /// `export::result_table`/`column_table` are the rule; this pins that the one
+    /// helper every such label goes through asks them.
+    #[test]
+    fn an_ai_prompt_names_the_results_table_not_the_tabs() {
+        let src = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("src")
+                .join("grid.rs"),
+        )
+        .expect("grid.rs");
+        let body = crate::source_gate::production_code(&src);
+        let at = body.find("fn source_table(").expect("source_table is gone");
+        let end = body[at..].find("\n}").expect("no end");
+        let f = &body[at..at + end];
+        for needle in ["result_table(", "column_table("] {
+            assert!(
+                f.contains(needle),
+                "`source_table` no longer asks `{needle}`:\n{f}"
+            );
+        }
+        // Each column prompt asks about its own column.
+        assert_eq!(body.matches("source_table(gs, Some(ci))").count(), 2);
+    }
+
     #[test]
     fn no_export_path_renders_the_unresolved_result() {
         let src = std::fs::read_to_string(

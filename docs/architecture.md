@@ -2055,7 +2055,21 @@ existing prose was left alone.
     leaves `export_inserts_chunks` alone, so a dump, which names its own tables, is untouched. The
     grid's clipboard (`render_order`) and its `.sql` file (`save_export`) both call it, so the two
     cannot name different targets; the four `insert_shape_*` tests pin the three arms and the
-    rename. **`export_insert_blocks(w, blocks, dialect, chunk_rows, watch)` is the one sanctioned
+    rename. **`result_table(rs, tab)` is that target without the renamed copy, and everything else
+    that acts on "this result's table" asks it rather than the tab's `source`** — the RESULTS title
+    bar's Properties and Live Monitor, and the chat attachment's label, each of which described or
+    watched `users` under a grid of `SELECT * FROM orders` while they read `source`. `insert_shape`
+    delegates its target to it, so the export and those buttons cannot disagree about which table a
+    result is. **`column_table(rs, ci, tab)` is the per-column answer** — the column's own origin,
+    else `tab` when no column has one, else `None` — because a question about one column (the grid's
+    AI Summary) has an answer even in a join, where the result as a whole has none
+    (`result_table_answers_what_insert_shape_targets`, `column_table_is_the_columns_own_origin`).
+    **The origin is what the server says, and for a view it is not always the view**: measured on
+    MariaDB 10.11, a `MERGE` view's columns name the view but an `ALGORITHM=TEMPTABLE` one's name its
+    base table, while PostgreSQL 16 names the view. A tab opened on a temptable view therefore
+    resolves to the table underneath — where the rows are, and what an `INSERT` export targets —
+    and its Properties and Live Monitor act on that table, not on the view.
+    **`export_insert_blocks(w, blocks, dialect, chunk_rows, watch)` is the one sanctioned
     way round `RowChunk`'s rule that every chunk of an export carries the same columns** — a rule
     that exists because the header is written from the first chunk and never revisited. A file of
     `INSERT`s has no header, and a pending ＋Row's `INSERT` must name only the columns it set (see
@@ -13375,7 +13389,7 @@ existing prose was left alone.
     via `TabsActions::run_plan` → `Db::explain`.
   - `properties.rs` — the **table properties** modal (`properties_overlay`), opened by setting
     `overlay.properties` — from a Table or View row's context menu, or from the RESULTS title bar's
-    Properties icon for a tab with a source table; an effect in the modal calls
+    Properties icon for a result that names one table; an effect in the modal calls
     `SchemaActions::table_stats`, whose result lands in `overlay.properties_state`. Both entry
     points go through `open_for_table`, which takes the **connection explicitly** rather than
     reading the active one: a query tab keeps the connection it was opened on, and the fetch keys on
@@ -16065,7 +16079,7 @@ existing prose was left alone.
     user asked for the export. It touches no signal and no file, so the app runs it on a worker
     thread (`export_erd`) and writes the bytes it returns.
   - `monitor_view.rs` — the **Live Monitor** modal (`monitor_overlay`), opened from the results
-    title bar with the tab's `(conn_id, database, table)`. It renders `overlay.monitor_log` — built
+    title bar with the tab's `conn_id` and the shown result's own table. It renders `overlay.monitor_log` — built
     by the app's poll loop through `core::monitor::diff_snapshots` — as a Time·Action·ID·Data table,
     and owns *none* of the polling: closing the modal flips `overlay.monitor_open` false, and that
     is what stops the loop.
@@ -24529,7 +24543,14 @@ this bundle's.
   the same word for three different amounts was the bug), `Set to NULL` (editable **and** nullable —
   stages a `CellEdit::Null`, and it is `editable` it asks, not `text_editable`, because emptying a
   blob writes no text), and
-  `AI summary` (reveals the AI panel, prompts with source table + column for context).
+  `AI summary` (reveals the AI panel, prompts with the column's own table + column for context).
+  **That table is the column's, not the tab's**: `source_table(gs, Some(ci))` asks
+  `export::column_table` over `gs.rs`, and the chat attachment's " from db.t" label asks
+  `source_table(gs, None)` → `result_table`, with the tab's sticky `source` only as their
+  fallback. Reading `source` told the model a sample of `SELECT * FROM orders`, rerun in a tab
+  opened on `users`, came from `users` (`an_ai_prompt_names_the_results_table_not_the_tabs`, which
+  also pins that both column prompts pass `Some(ci)`). AI Fill and AI Seed never had the fault —
+  they take their table from the edit model (`model.table(ti)`, `insert_target()`).
   **`Edit binary` / `View binary` is the one entry that opens a cell the grid is not holding**
   (`blob_launch` →
   `open_blob` → `ui.tab_actions.view_blob`, over `core::blob::blob_source`; a **double-click** on
@@ -25249,7 +25270,12 @@ this bundle's.
 - **The RESULTS title bar carries Properties, Live Monitor and the editor-collapse toggle**, in that
   order and all tooltipped. Properties leads because it describes the table as it stands while the
   monitor watches it change — the same order the schema tree's Read group puts them in. Both act on
-  the tab's source table and are gated on it *existing*, which is deliberately weaker than the row
+  the **shown result's** table — `shown_table`, `export::result_table` over the active panel's
+  `QueryState::Loaded` result — not the tab's sticky `source`, which survives any edit of the SQL
+  and had them describing and watching `users` under a grid of `SELECT * FROM orders`. With no
+  loaded result `source` answers, having nothing to contradict it; a join, or a computed column
+  beside real ones, answers nothing and both buttons dim rather than guess. They are gated on that
+  table *existing*, which is deliberately weaker than the row
   actions' `insert_target`: a table with no usable row key passes, and the monitor then answers "No
   row key for this table" rather than the button being silently dead. The same reasoning covers a
   view, whose properties panel says which figures an engine publishes for one.
