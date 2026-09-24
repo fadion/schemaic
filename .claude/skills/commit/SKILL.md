@@ -66,7 +66,8 @@ CI failure, and catching it now folds the fix into the change instead of leaving
 a stray `style:` commit later. If it fails, run `cargo fmt --all` and include the
 result in *this* commit — it is the same change, not a separate one.
 
-Clippy (`cargo clippy --workspace --all-targets -- -D warnings`) is not a gate
+Clippy (`cargo clippy --workspace --all-targets --features schemaic-db/live-tests -- -D warnings`,
+CI's spelling) is not a gate
 here; CI runs it and a failure blocks the push, not this commit. Run it anyway
 when the change is more than a few lines, because a fixup commit later costs more
 than the wait now.

@@ -34,12 +34,16 @@ cargo fmt --all --check
 ```
 
 ```bash
-cargo clippy --workspace --all-targets -- -D warnings
+cargo clippy --workspace --all-targets --features schemaic-db/live-tests -- -D warnings
 ```
 
 ```powershell
-$env:RUSTDOCFLAGS = '-D warnings'; cargo doc --workspace --no-deps
+$env:RUSTDOCFLAGS = '-D warnings'; cargo doc --workspace --no-deps --document-private-items
 ```
+
+Both spelled as `ci.yml` spells them: the feature makes clippy build the live tier, and
+`--document-private-items` checks a private item's doc links. Either one left off passes a tree
+CI then rejects.
 
 ```bash
 cargo deny check

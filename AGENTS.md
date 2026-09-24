@@ -271,9 +271,10 @@ Recovery, if it happens anyway: `git show HEAD:<path> > <path>` per file. Plain 
   `chore: release vX.Y.Z`.
 - **Releases are tag-driven.** Bump → commit → `git tag vX.Y.Z && git push origin vX.Y.Z` (keep tag
   and `Cargo.toml` in sync). The tag triggers `release.yml` (Linux + Windows binaries → GitHub
-  Release); `ci.yml` runs fmt + clippy (`-D warnings`) + **rustdoc (`RUSTDOCFLAGS=-D warnings cargo
-  doc --workspace --no-deps`)** + `cargo deny` + build/test on push/PR. Keep the tree green before
-  tagging. The rustdoc gate is the one no local habit runs, and a doc link pointing at a renamed
-  item has failed a push on exactly it — in PowerShell that check is
-  `$env:RUSTDOCFLAGS = '-D warnings'; cargo doc --workspace --no-deps`, since the POSIX env-var
-  prefix is a parse error there.
+  Release); `ci.yml` runs fmt + clippy (`--features schemaic-db/live-tests -- -D warnings`) +
+  **rustdoc (`RUSTDOCFLAGS=-D warnings cargo doc --workspace --no-deps --document-private-items`)**
+  + `cargo deny` + build/test on push/PR. Keep the tree green before tagging. The rustdoc gate is
+  the one no local habit runs, and a doc link pointing at a renamed item has failed a push on
+  exactly it — in PowerShell that check is
+  `$env:RUSTDOCFLAGS = '-D warnings'; cargo doc --workspace --no-deps --document-private-items`,
+  since the POSIX env-var prefix is a parse error there.

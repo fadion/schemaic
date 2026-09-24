@@ -64,7 +64,8 @@ Then verify, in the review tree, in order:
    `/review/` line in `.gitignore` are uncommitted, commit them first rather than reviewing from a
    dirty tree.
 2. `cargo fmt --all --check` → exit 0.
-3. `cargo clippy --workspace --all-targets -- -D warnings` → clean.
+3. `cargo clippy --workspace --all-targets --features schemaic-db/live-tests -- -D warnings` →
+   clean — CI's spelling, which also lints the live tier.
 4. `cargo test --workspace` → green, no `#[ignore]`.
 5. `cargo build -p schemaic-app` → ok, and the app launches and connects against **at least one**
    live engine. Record which. Both is better: B4/B5 lean on being able to check a MySQL/PostgreSQL

@@ -102,8 +102,11 @@ CI's passes a tree CI will reject, which is the one thing a pre-release gate exi
 
 1. `git status --short` empty. Reviewing a dirty tree reviews something that isn't shipping.
 2. `cargo fmt --all --check` → exit 0.
-3. `cargo clippy --workspace --all-targets -- -D warnings` → clean.
-4. `$env:RUSTDOCFLAGS = '-D warnings'; cargo doc --workspace --no-deps` → clean. The one gate no
+3. `cargo clippy --workspace --all-targets --features schemaic-db/live-tests -- -D warnings` →
+   clean. The feature is CI's: without it clippy never builds the live tier, which CI lints.
+4. `$env:RUSTDOCFLAGS = '-D warnings'; cargo doc --workspace --no-deps --document-private-items`
+   → clean. `--document-private-items` is CI's too: a private item's broken doc link fails CI
+   and nothing narrower. The one gate no
    local habit runs, and a doc link pointing at a renamed item has failed a release push on exactly
    it. PowerShell form deliberately: a POSIX env-var prefix is a *parse error* here, whose exit code
    reads at a glance like a rustdoc warning while the right reaction to each is the opposite.
