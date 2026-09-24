@@ -66,6 +66,10 @@ pub enum Command {
         /// Maximum rows to return.
         #[arg(long, default_value_t = DEFAULT_LIMIT, value_parser = at_least_one_row())]
         limit: usize,
+        /// Exit 6 when --limit capped the result. The rows are still printed;
+        /// the exit code is the signal for a caller that does not read stderr.
+        #[arg(long)]
+        fail_on_cap: bool,
         /// Seconds before the statement is cancelled.
         #[arg(long, default_value_t = DEFAULT_TIMEOUT_SECS, value_parser = at_least_one_second())]
         timeout: u64,
@@ -413,6 +417,39 @@ mod tests {
             panic!("expected an exec");
         };
         assert!(yes);
+    }
+
+    /// **Failing on a cap is opt-in.** A person at a terminal reads the footer;
+    /// only a caller that asks for it gets a non-zero exit for rows that were
+    /// read correctly.
+    #[test]
+    fn fail_on_cap_is_an_opt_in_query_flag() {
+        let cli = parse(&["schemaic", "query", "SELECT 1", "-c", "1"]).unwrap();
+        let Command::Query { fail_on_cap, .. } = cli.command else {
+            panic!("expected a query");
+        };
+        assert!(!fail_on_cap, "off unless asked for");
+        let cli = parse(&["schemaic", "query", "SELECT 1", "-c", "1", "--fail-on-cap"]).unwrap();
+        let Command::Query { fail_on_cap, .. } = cli.command else {
+            panic!("expected a query");
+        };
+        assert!(fail_on_cap);
+    }
+
+    /// `exec` has no `--limit`, and the cap on what it prints never bounds the
+    /// statement — there is nothing for the flag to report on.
+    #[test]
+    fn exec_has_no_fail_on_cap_flag() {
+        let err = parse(&[
+            "schemaic",
+            "exec",
+            "DELETE FROM t",
+            "-c",
+            "1",
+            "--fail-on-cap",
+        ])
+        .unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::UnknownArgument);
     }
 
     /// `--limit` is a read's concern; a write reports rows affected and has

@@ -19818,7 +19818,12 @@ existing prose was left alone.
     (`a_blank_database_is_refused_at_parse_time`, `a_zero_timeout_or_limit_is_refused`).
     `--yes` exists on `exec` and **must not** exist on `query` — a read has nothing to consent to,
     and accepting the flag there would teach the habit of passing it everywhere
-    (`query_has_no_yes_flag`). `--password-stdin` is for the headless case the keyring cannot serve:
+    (`query_has_no_yes_flag`). `--fail-on-cap` is the reverse, on `query` alone: exit 6 for a read
+    `--limit` capped (`run.rs` has why), **off by default**, since a person at a terminal reads the
+    footer and only a caller that asks should get a non-zero exit for rows read correctly
+    (`fail_on_cap_is_an_opt_in_query_flag`). `exec` has no `--limit` and its cap bounds only what
+    is printed, so there is nothing for the flag to report (`exec_has_no_fail_on_cap_flag`).
+    `--password-stdin` is for the headless case the keyring cannot serve:
     Linux's Secret Service needs an unlocked desktop collection, which an SSH session or a container
     does not have, and without it the CLI would simply be unusable there. It reads a pipe and
     nothing else: `run.rs` refuses it as a usage error when stdin is a terminal, where
@@ -20036,7 +20041,12 @@ existing prose was left alone.
     object in it or a CSV with a comment row is worse for every consumer than a clean stream plus a
     line on stderr, which is what `truncation_warning` is for
     (`a_capped_result_is_reported_in_band_for_table_and_on_stderr_otherwise` pins that it is said in
-    exactly one place). **`exec_truncation_warning` is the exception, on stderr in every format,
+    exactly one place). Issue #3's in-band alternative for JSON — a `"truncated": true`, or an
+    envelope around the rows — was declined for that reason and one more: an envelope changes the
+    shape every existing `--format json` consumer parses
+    (`a_capped_machine_format_still_emits_only_rows`). A caller reading stdout alone asks for
+    exit 6 instead, through `query --fail-on-cap`.
+    **`exec_truncation_warning` is the exception, on stderr in every format,
     `table` included**: the footer's "more were available" is true and still misleading about a
     write, where what the reader needs is that the cap applied to the display and the statement ran
     in full — and it offers no `--limit`, which `exec` does not have
@@ -20047,10 +20057,11 @@ existing prose was left alone.
     rather than a row renderer because a write has no rows for `export`'s emitters to describe.
   - `cli/run.rs` — dispatch, and the module that owns the output contract. **stdout is data; stderr
     is everything else** — no banners, no warnings, no progress — which is what makes `--format=json`
-    safe to parse and `--format=csv` safe to redirect. The other half is `Exit`, and it has **five**
+    safe to parse and `--format=csv` safe to redirect. The other half is `Exit`, and it has **six**
     outcomes rather than two: 0 ok, 2 usage (including a connection that is not there), 3 a guard
     refusal, 4 a server or connection failure, 5 a **write** whose deadline passed after it was
-    sent. A caller that can only tell success from failure
+    sent, 6 a read `--limit` cut short, under `query --fail-on-cap` only. A new outcome gets a new
+    number, never an old one's. A caller that can only tell success from failure
     retries the refusal that will never succeed and gives up on the timeout that would have;
     `the_exit_codes_are_the_documented_ones` pins the numbers, because scripts depend on them.
     **5 is the one a script must not retry blind**: 4 says retrying may work, and the timed-out
@@ -20059,6 +20070,17 @@ existing prose was left alone.
     (`a_connection_not_exposed_is_a_refusal_and_a_missing_one_is_usage`,
     `a_guard_refusal_a_server_failure_and_an_unknown_write_exit_differently`) rather than spelled
     at each call site.
+    **6 answers issue #3**: a capped `--format json` read exited 0 with the only word of the cap on
+    stderr, so a script or agent reading stdout alone got a clean-looking answer that was silently
+    short — the issue's "there are only 200 companies". `exit_for_rows(rs, fail_on_cap)` gives it
+    only when `rs.truncated` and the flag are both true (`a_capped_read_exits_6_only_when_asked_to`,
+    `a_complete_read_exits_0_whatever_the_flag_says`), and `run_query` asks it *after* the rows
+    and the truncation warning are out: the rows are still printed, being correct and only
+    incomplete. **Not 4**, because nothing failed and retrying returns the same cap. The in-band
+    alternative the issue also offered is declined under `format.rs`.
+    Verified against PostgreSQL 16: `--limit 2 --format jsonl` on a 4078-row table exited 0
+    without the flag and 6 with it, rows and stderr warning printed both times; `table` with the
+    flag exited 6 under its capped footer; a complete result with the flag exited 0.
     **3 promises that nothing was sent, and the order of the steps is what keeps that true**:
     select the connection, take the statement, gate it (`query::gate`) or approve it
     (`ExecRequest::approved`), and only then connect. It used to connect first, so a refusal had

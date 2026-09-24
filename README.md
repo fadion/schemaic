@@ -198,15 +198,18 @@ statement that failed for want of one says so. `schemaic version` prints the ver
 
 `query` runs reads and nothing else — not a flag away from a write, a different
 subcommand, on a session the server itself holds read-only. It returns 200 rows
-unless you raise `--limit`, and says so when it stopped short. `exec` is the one
+unless you raise `--limit`, and says so when it stopped short — on stderr, or in
+the table's footer; with `--fail-on-cap` it also exits `6`, for a script that
+reads only stdout. `exec` is the one
 that writes: it refuses outright on a connection marked read-only, and it
 refuses something the guard flags — such as a `DELETE` with no `WHERE` — until
 you pass `--yes`, which answers that question and cannot unlock a read-only
 connection. Output is `table`, `json`, `jsonl` or `csv`; rows go to stdout and
 everything else to stderr, so a pipe gets only data. It exits `0` on success,
 `2` on a usage error, `3` when a guard refused (nothing was sent), `4` when the
-server or the connection failed, and `5` when a write timed out after it was
-sent — it may have been applied, so check before running it again.
+server or the connection failed, `5` when a write timed out after it was
+sent — it may have been applied, so check before running it again — and `6`
+when `--fail-on-cap` was given and the rows were cut short.
 
 Where there is no keyring to read — an SSH session, a container — pipe the
 password in with `--password-stdin` instead. A statement that itself carries a

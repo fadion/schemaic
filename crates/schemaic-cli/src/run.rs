@@ -24,9 +24,10 @@ use crate::{exec, query, select};
 
 /// What the process exits with.
 ///
-/// **Five outcomes, not two.** A caller that can only tell success from failure
+/// **Six outcomes, not two.** A caller that can only tell success from failure
 /// retries the refusal that will never succeed and gives up on the timeout that
-/// would have. These are stable: scripts depend on them.
+/// would have. These are stable: scripts depend on them — a new outcome gets a
+/// new number, never an old one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum Exit {
@@ -47,6 +48,20 @@ pub enum Exit {
     /// whole or in part — a cancel does not undo a non-transactional engine's
     /// changes — so retrying may apply it twice. Check first.
     Unknown = 5,
+    /// A read ran and its rows were printed, but `--limit` cut them short —
+    /// only under `query --fail-on-cap`, for a caller that reads stdout and not
+    /// stderr. Not 4: nothing failed, and retrying returns the same cap.
+    Capped = 6,
+}
+
+/// The exit for a read that returned rows: [`Exit::Capped`] if the cap bit and
+/// the caller asked to hear about it with a code, else success.
+fn exit_for_rows(rs: &ResultSet, fail_on_cap: bool) -> Exit {
+    if rs.truncated && fail_on_cap {
+        Exit::Capped
+    } else {
+        Exit::Ok
+    }
 }
 
 /// The exit for a connection `select` could not hand back. One that exists but
@@ -205,6 +220,7 @@ async fn dispatch(command: Command) -> Exit {
             target,
             format,
             limit,
+            fail_on_cap,
             timeout,
         } => {
             run_query(
@@ -213,6 +229,7 @@ async fn dispatch(command: Command) -> Exit {
                 &sql,
                 format,
                 limit,
+                fail_on_cap,
                 Duration::from_secs(timeout),
             )
             .await
@@ -527,6 +544,7 @@ async fn run_query(
     sql: &str,
     format: Format,
     limit: usize,
+    fail_on_cap: bool,
     timeout: Duration,
 ) -> Exit {
     let conn = match select_conn(conns, &target.conn) {
@@ -555,7 +573,7 @@ async fn run_query(
             if let Some(w) = format::truncation_warning(&rs, format) {
                 warn(&w);
             }
-            Exit::Ok
+            exit_for_rows(&rs, fail_on_cap)
         }
         Err(e) => {
             warn(&e.message());
@@ -676,6 +694,33 @@ mod tests {
         assert_eq!(Exit::Refused as u8, 3);
         assert_eq!(Exit::Failed as u8, 4);
         assert_eq!(Exit::Unknown as u8, 5);
+        assert_eq!(Exit::Capped as u8, 6);
+    }
+
+    fn two_rows(truncated: bool) -> ResultSet {
+        let mut rs = ResultSet::from_rows(
+            vec![text_column("id")],
+            vec![vec![Value::Int(1)], vec![Value::Int(2)]],
+        );
+        rs.truncated = truncated;
+        rs
+    }
+
+    /// **Issue #3: a capped read exits 6 when the caller asked for it**, and
+    /// its own code rather than 4 — the rows it printed are right, there are
+    /// only more of them, and "retrying may work" is not what a script should
+    /// do about a cap.
+    #[test]
+    fn a_capped_read_exits_6_only_when_asked_to() {
+        assert_eq!(exit_for_rows(&two_rows(true), true), Exit::Capped);
+        assert_eq!(exit_for_rows(&two_rows(true), false), Exit::Ok);
+    }
+
+    /// A complete result is a success with or without the flag.
+    #[test]
+    fn a_complete_read_exits_0_whatever_the_flag_says() {
+        assert_eq!(exit_for_rows(&two_rows(false), true), Exit::Ok);
+        assert_eq!(exit_for_rows(&two_rows(false), false), Exit::Ok);
     }
 
     /// Which outcome gets which code is the contract scripts retry on.
