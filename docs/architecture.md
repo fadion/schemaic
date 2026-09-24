@@ -13196,8 +13196,9 @@ existing prose was left alone.
     *Floem 0.2 gotchas* — a text box whose `max_width` is a bare float while the `font_size` beside
     it scales (`lib.rs`'s `scaled_text_width_gate`, whose subject is under *Architecture
     invariants*, with the empty allowlist it should keep), an unscaled `const` length in
-    `consts.rs` that says nowhere why (`consts::unscaled_const_gate`), a connection form that
-    decides its own trimming instead of going through `Connection::trimmed` (`lib.rs`'s
+    `consts.rs` that says nowhere why (`consts::unscaled_const_gate`), a menu label ending in an
+    ellipsis (`no_menu_label_ends_in_an_ellipsis`, whose subject is under *UI conventions*), a
+    connection form that decides its own trimming instead of going through `Connection::trimmed` (`lib.rs`'s
     `the_connection_form_trims_through_core`, which is a gate because `to_connection` reads eighteen
     signals and needs a Floem scope) — and an engine comparison with no capability behind it,
     `lib.rs`'s
@@ -22348,11 +22349,15 @@ Re-introducing the anti-patterns these guard against is a regression:
   its own, which is what the dump modal's table picker was until it adopted it.
 - **Menu labels carry no trailing ellipsis**, even when the entry opens a dialog. The platform
   convention says a `…` means "this will ask you something first", but this app doesn't keep it:
-  of the ~110 menu labels in `schemaic-ui`, the only three that ever had one were added in a single
-  sitting and removed in the next. Follow the count, not the platform guideline — a menu where
-  three entries out of a hundred trail dots reads as an inconsistency, which is what it is. Written
-  down here because it was unwritten, and an unwritten convention costs a review round every time
-  somebody adds a menu.
+  of the menu labels in the two view crates, the handful that ever had one were each the odd one
+  out, added and later removed. Follow the count, not the platform guideline — a menu where a few
+  entries out of a hundred trail dots reads as an inconsistency, which is what it is. **It is a
+  source gate**, because written down was not enough: the grid's AI sparkle menu carried
+  `AI seed table…` past this bullet, and `source_gate::tests::no_menu_label_ends_in_an_ellipsis`
+  was seen red on exactly that label. It scans both view crates' production source (`crate_sources`) for every
+  `MenuEntry::<constructor>(` whose first argument is a string literal and fails on one ending in
+  `…` or `...`, with a floor of 50 labels scanned so a scan that stopped matching cannot report
+  success. It reads source, so a label built at run time is not seen.
 - **The footer's panel toggles: a control that can't act must not look like one, and when the user
   can fix that, say so.** Below their breakpoints the side panels are *force-hidden* — the schema
   tree at `panels_min_schema_w`, the right column at the wider `panels_min_full_w` — and the window

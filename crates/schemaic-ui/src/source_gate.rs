@@ -1152,6 +1152,59 @@ mod tests {
         );
     }
 
+    /// **No menu label ends in an ellipsis.** `Create database`, never
+    /// `Create database…` — AGENTS.md's rule, and one that kept having to be
+    /// corrected after the fact because nothing but a reader enforced it: the
+    /// grid's `AI seed table…` shipped past it.
+    ///
+    /// Every `MenuEntry::<constructor>(` whose first argument is a literal. A
+    /// label built at run time is not seen, which is the price of reading
+    /// source; the literal case is the habit this is for.
+    #[test]
+    fn no_menu_label_ends_in_an_ellipsis() {
+        let files = crate_sources();
+        let needle = "MenuEntry::";
+        let mut scanned = 0usize;
+        let mut offenders = Vec::new();
+        for (name, code) in &files {
+            let mut from = 0usize;
+            while let Some(rel) = code[from..].find(needle) {
+                let at = from + rel + needle.len();
+                from = at;
+                let rest = &code[at..];
+                let ctor = rest
+                    .find(|c: char| !(c.is_alphanumeric() || c == '_'))
+                    .unwrap_or(0);
+                let Some(args) = rest[ctor..].strip_prefix('(') else {
+                    continue;
+                };
+                let Some(lit) = args.trim_start().strip_prefix('"') else {
+                    continue;
+                };
+                let Some(end) = lit.find('"') else {
+                    continue;
+                };
+                scanned += 1;
+                let label = lit[..end].trim_end();
+                if label.ends_with('…') || label.ends_with("...") {
+                    let line = 1 + code[..at].bytes().filter(|c| *c == b'\n').count();
+                    offenders.push(format!("{name}:{line}: {label:?}"));
+                }
+            }
+        }
+        assert!(
+            scanned >= 50,
+            "the scan stopped finding menu labels: {scanned} — a gate that scans \
+             nothing reports success"
+        );
+        assert!(
+            offenders.is_empty(),
+            "a menu label ends in an ellipsis; this app writes `Create database`, \
+             never `Create database…`:\n{}",
+            offenders.join("\n")
+        );
+    }
+
     /// **A deferred hand-back to the SQL editor either claims the keyboard or
     /// stands down.**
     ///

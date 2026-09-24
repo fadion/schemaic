@@ -5679,10 +5679,10 @@ fn add_pending_row(gs: GridState) {
     }
 }
 
-// AI seed-data actions (toolbar sparkle menu). Each will drive the one-shot AI
-// pipeline — bottom-sample the base table → build a prompt from the DDL + sample →
-// `inline_args` one-shot call → parse → stage as green pending edits (never
-// auto-committed). Stubbed for now; the toolbar menu + wiring land first.
+// AI seed-data actions (toolbar sparkle menu): fill value, insert row and seed
+// table. Each drives the one-shot AI pipeline — bottom-sample the base table →
+// build a prompt from the DDL + sample → `inline_args` one-shot call → parse →
+// stage as green pending edits, never auto-committed.
 /// Start the "generating" pulse clock if it isn't already running. A single
 /// self-rescheduling tick advances `ai_pulse` while `ai_busy`; the generating
 /// cells read the phase to breathe their purple wash. Reused by every AI seed-data
@@ -8744,7 +8744,7 @@ fn grid_toolbar(
                             move || ai_insert_row(gs),
                         ),
                         MenuEntry::action_icon(
-                            "AI seed table…",
+                            "AI seed table",
                             (icons::SPARKLES, theme::key_foreign),
                             move || open_seed_popover(gs),
                         ),
