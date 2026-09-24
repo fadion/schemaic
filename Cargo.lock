@@ -5013,6 +5013,7 @@ version = "0.27.0"
 dependencies = [
  "keyring",
  "schemaic-core",
+ "tokio",
  "tracing",
 ]
 

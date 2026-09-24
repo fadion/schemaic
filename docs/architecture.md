@@ -8165,11 +8165,29 @@ existing prose was left alone.
     a connection exactly as a keyring entry would — it simply stays plaintext.
     The target-gated `keyring` backends
     came with it and are in this crate's manifest now: Windows Credential Manager, macOS Keychain,
-    and on Linux the **pure-Rust** `async-secret-service` (with `async-io`, so keyring blocks on its
-    own executor rather than nesting a tokio runtime) and not `sync-secret-service`, which pulls
+    and on Linux the **pure-Rust** `async-secret-service` and not `sync-secret-service`, which pulls
     `dbus-secret-service` → `libdbus-sys` and would put a C system library into the portable
     glibc-2.31 zigbuild the tarball and the AppImage are built from. `schemaic-app`'s manifest keeps
     a two-line pointer where those blocks used to be.
+    **The manifest asks for `async-io`, and does not get it.** floem's `rfd-tokio` feature turns on
+    `rfd/tokio` → `ashpd/tokio` → `zbus/tokio`, cargo unifies features across the build, and zbus's
+    `tokio` backend wins — so every blocking keyring call on Linux runs `Runtime::block_on` on a
+    runtime zbus keeps, and Tokio panics when that happens on a thread already driving one. This
+    entry and the manifest both used to say the opposite ("blocks on its own executor rather than
+    nesting a tokio runtime"), and `schemaic query -c <conn>` exited 101 on Linux with zbus's
+    "Cannot start a runtime from within a runtime" (issue #1): `cli::run::main` does everything
+    inside `rt.block_on(dispatch(..))`, and `hydrate_for_cli` → `KeyringStore::get` ran there.
+    `schemaic list` reads no secret and never tripped it; the GUI reaches the keyring from its UI
+    thread, which drives no runtime; Windows' Credential Manager is synchronous. **So
+    `KeyringStore::{get,set,delete}` each run their whole body, `Entry::new` included, through
+    `off_runtime`**, a `std::thread::scope` thread with no runtime context whatever the caller's,
+    whose panic is resumed on the caller. It is fixed at this boundary rather than at the CLI's call
+    site so that no caller, present or future, can trip it; the price is a thread spawn per secret,
+    against a D-Bus round trip per secret. Don't "simplify" it back to a direct call because the
+    GUI works without it. `a_keyring_call_made_inside_a_runtime_does_not_start_one_on_its_thread`
+    runs a nested `block_on` inside an outer one through `off_runtime`, and with `off_runtime`
+    stubbed to `f()` it panics with the issue's exact message. It is why `tokio` is a
+    dev-dependency here, and only that.
     **The move took this file out of the UI crate's source-gate census for a while**, and it is
     back in: `source_gate::workspace_sources()` lists `schemaic-conn` with a floor of its own (2),
     and `the_wider_scan_reaches_the_keyring_store` asserts this file is among what it reads —

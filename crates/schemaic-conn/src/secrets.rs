@@ -56,23 +56,52 @@ fn classify_delete(answer: Result<(), keyring::Error>) -> bool {
     matches!(answer, Ok(()) | Err(keyring::Error::NoEntry))
 }
 
+/// Run a keyring operation on a thread of its own, **never on the caller's**.
+///
+/// The Linux backend is zbus, and it is not on the `async-io` executor the
+/// manifest asks for: floem's `rfd-tokio` feature turns on zbus's `tokio`
+/// backend too, cargo unifies the two, and `tokio` wins — so every blocking
+/// keyring call runs `Runtime::block_on` on a runtime zbus keeps for itself.
+/// Tokio refuses that on a thread already driving a runtime, and panics. The
+/// GUI reads and writes the keyring from its UI thread, which drives none; the
+/// headless CLI reads it inside its own `block_on`, and `schemaic query`
+/// exited 101 on every Linux desktop (issue #1).
+///
+/// A plain scoped thread has no runtime context, whatever the caller's, so the
+/// answer here does not depend on who is asking — which is the point of doing it
+/// at this boundary rather than at the one caller that tripped it. It costs a
+/// thread spawn per secret, against a D-Bus round trip per secret.
+fn off_runtime<T: Send>(f: impl FnOnce() -> T + Send) -> T {
+    std::thread::scope(|s| {
+        s.spawn(f)
+            .join()
+            .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+    })
+}
+
 impl SecretStore for KeyringStore {
     fn get(&self, account: &str) -> Result<Option<String>, StoreError> {
-        let entry = Entry::new(SERVICE, account).map_err(|e| StoreError(e.to_string()))?;
-        classify_get(entry.get_password())
+        off_runtime(|| {
+            let entry = Entry::new(SERVICE, account).map_err(|e| StoreError(e.to_string()))?;
+            classify_get(entry.get_password())
+        })
     }
 
     fn set(&self, account: &str, secret: &str) -> bool {
-        Entry::new(SERVICE, account)
-            .and_then(|e| e.set_password(secret))
-            .is_ok()
+        off_runtime(|| {
+            Entry::new(SERVICE, account)
+                .and_then(|e| e.set_password(secret))
+                .is_ok()
+        })
     }
 
     fn delete(&self, account: &str) -> bool {
-        let Ok(e) = Entry::new(SERVICE, account) else {
-            return false;
-        };
-        classify_delete(e.delete_credential())
+        off_runtime(|| {
+            let Ok(e) = Entry::new(SERVICE, account) else {
+                return false;
+            };
+            classify_delete(e.delete_credential())
+        })
     }
 }
 
@@ -251,7 +280,30 @@ pub fn forget_connection(id: u64) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{classify_delete, classify_get};
+    use super::{classify_delete, classify_get, off_runtime};
+
+    /// **A keyring call made from inside an async runtime must not start a
+    /// runtime there** — issue #1. On Linux the keyring is zbus, and floem's
+    /// `rfd-tokio` feature unifies zbus onto its `tokio` backend, whose blocking
+    /// API blocks on a runtime of its own; Tokio panics when that happens on a
+    /// thread already driving one. `schemaic query` read the password inside its
+    /// `block_on` and exited 101. The closure here is that nested `block_on`,
+    /// without a keyring: called directly it panics exactly as the report did.
+    #[test]
+    fn a_keyring_call_made_inside_a_runtime_does_not_start_one_on_its_thread() {
+        let outer = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("a runtime");
+        let got = outer.block_on(async {
+            off_runtime(|| {
+                tokio::runtime::Builder::new_current_thread()
+                    .build()
+                    .expect("a runtime")
+                    .block_on(async { 7 })
+            })
+        });
+        assert_eq!(got, 7);
+    }
 
     /// **The one classification the whole scheme rests on, finally asserted
     /// against the real backend's error type.** Every test that names the
