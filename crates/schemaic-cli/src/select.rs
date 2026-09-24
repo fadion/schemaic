@@ -42,7 +42,7 @@ impl NoConnection {
                 matches.len(),
                 matches
                     .iter()
-                    .map(|(id, name)| format!("{id}: {name}"))
+                    .map(|(id, name)| format!("'#{id}': {name}"))
                     .collect::<Vec<_>>()
                     .join(", ")
             ),
@@ -59,7 +59,16 @@ impl NoConnection {
 /// Both spellings, because a human types the name and a script wants the id's
 /// stability. `id` never changes and is never reissued; a name can be edited
 /// out from under a script.
+///
+/// **`#<id>` is the id and nothing else.** A bare number is both — a name
+/// that is a number collides with another connection's id, and the refusal
+/// told the reader to "use the id", which was the very string refused. So a
+/// swapped pair (id 5 named "6", id 6 named "5") could not be reached at all.
+/// `#5` never matches a name, so every id always has one spelling that works.
 fn names(conn: &Connection, want: &str) -> bool {
+    if let Some(id) = want.strip_prefix('#') {
+        return id.parse::<u64>() == Ok(conn.id);
+    }
     conn.name.eq_ignore_ascii_case(want) || want.parse::<u64>() == Ok(conn.id)
 }
 
@@ -185,8 +194,8 @@ mod tests {
     fn an_ambiguous_name_lists_each_candidates_id() {
         let cs = [conn(4, "backup", true), conn(9, "Backup", false)];
         let message = select(&cs, "backup").unwrap_err().message();
-        assert!(message.contains("4: backup"), "{message}");
-        assert!(message.contains("9: Backup"), "{message}");
+        assert!(message.contains("'#4': backup"), "{message}");
+        assert!(message.contains("'#9': Backup"), "{message}");
     }
 
     /// **Ambiguity is judged before the gate, over every saved connection.**
@@ -210,6 +219,31 @@ mod tests {
             select(&cs, "2"),
             Err(NoConnection::Ambiguous { .. })
         ));
+    }
+
+    /// **…and the id stays reachable.** `#2` names id 2 and never a name, so
+    /// the pair above has a spelling for each — and the refusal's advice is
+    /// that spelling, not the bare number that was just ambiguous. A swapped
+    /// pair (id 5 named "6", id 6 named "5") had no spelling at all.
+    #[test]
+    fn a_hash_prefixed_id_names_only_the_id() {
+        let cs = [conn(5, "6", true), conn(6, "5", true)];
+        assert!(matches!(
+            select(&cs, "5"),
+            Err(NoConnection::Ambiguous { .. })
+        ));
+        assert_eq!(select(&cs, "#5").unwrap().id, 5);
+        assert_eq!(select(&cs, "#6").unwrap().id, 6);
+        let message = select(&cs, "5").unwrap_err().message();
+        assert!(
+            message.contains("'#5'") && message.contains("'#6'"),
+            "{message}"
+        );
+        // Not a name match, even for a connection literally called "#5".
+        let cs = [conn(1, "#5", true)];
+        assert!(matches!(select(&cs, "#5"), Err(NoConnection::Unknown(_))));
+        assert_eq!(select(&cs, "#1").unwrap().id, 1);
+        assert!(matches!(select(&cs, "#x"), Err(NoConnection::Unknown(_))));
     }
 
     #[test]

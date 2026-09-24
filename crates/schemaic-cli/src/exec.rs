@@ -65,7 +65,7 @@ impl NotRun {
 /// **Only [`ExecRequest::approved`] can build one**, and that function *is* the
 /// guard. The field is private and there is no other constructor, so a future
 /// caller cannot reach [`run`] without passing through `sql::run_verdict`.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct ExecRequest {
     sql: String,
     /// What the session must enforce, minted from the connection the verdict
@@ -73,6 +73,14 @@ pub struct ExecRequest {
     /// text check*, and `SELECT setval(…)` is one of those. The session is what
     /// refuses it.
     enforce: Enforce,
+    /// **The target the verdict judged, minted with it.** `run` took a `Db` and
+    /// a database of its own, so nothing tied the connection a statement ran on
+    /// to the one whose `read_only` flag approved it — one caller passing the
+    /// same locals twice was the whole guarantee. The caller now connects
+    /// through [`ExecRequest::connection`] and `run` reads the database from
+    /// here, so a second caller cannot pair an approval with another target.
+    conn: Connection,
+    database: Option<String>,
 }
 
 impl ExecRequest {
@@ -125,11 +133,23 @@ impl ExecRequest {
             } else {
                 Enforce::AsJudged
             },
+            conn: conn.clone(),
+            database: database.map(str::to_string),
         })
     }
 
     pub fn sql(&self) -> &str {
         &self.sql
+    }
+
+    /// The saved connection the verdict judged — what the caller connects to.
+    pub fn connection(&self) -> &Connection {
+        &self.conn
+    }
+
+    /// The database the verdict judged, which is where [`run`] runs it.
+    pub fn database(&self) -> Option<&str> {
+        self.database.as_deref()
     }
 
     /// What the session this request runs on must enforce.
@@ -152,19 +172,17 @@ const RETURNED_ROW_CAP: usize = crate::args::DEFAULT_LIMIT;
 /// statement that is a row count in [`ResultSet::affected`]; for one that
 /// returns rows, up to [`RETURNED_ROW_CAP`] of them, `truncated` if there were
 /// more.
-pub async fn run(
-    db: &Db,
-    database: Option<&str>,
-    request: ExecRequest,
-    timeout: Duration,
-) -> Result<ResultSet, NoRows> {
+///
+/// `db` must be opened on [`ExecRequest::connection`]; the database is the
+/// request's own.
+pub async fn run(db: &Db, request: ExecRequest, timeout: Duration) -> Result<ResultSet, NoRows> {
     let token = CancellationToken::new();
     match crate::deadline::with_deadline(
         // Never plain `fetch_query`: `approved` counted one statement with the
         // gate's lexer, and on MySQL only a pinned `sql_mode` makes the server
         // count the same.
         db.fetch_query_enforced(
-            database,
+            request.database(),
             request.sql(),
             RETURNED_ROW_CAP,
             token.clone(),
@@ -287,6 +305,21 @@ mod tests {
     fn a_writable_connection_mints_a_session_that_lexes_like_the_gate() {
         let r = approved("DELETE FROM t WHERE id = 1", false).unwrap();
         assert_eq!(r.enforce(), Enforce::AsJudged);
+    }
+
+    /// **The request names the target its verdict judged** — the connection
+    /// whose `read_only` flag it read and the database whose absence it
+    /// weighed — so `run` and the connect cannot be handed another pair.
+    #[test]
+    fn a_request_carries_the_connection_and_database_it_was_judged_against() {
+        let ro = conn(true);
+        let r = ExecRequest::approved(&ro, None, "SELECT 1", false).unwrap();
+        assert_eq!(r.connection(), &ro);
+        assert!(r.connection().read_only);
+        assert_eq!(r.database(), None);
+        let w = approved("DELETE FROM t WHERE id = 1", false).unwrap();
+        assert_eq!(w.database(), Some("app"));
+        assert!(!w.connection().read_only);
     }
 
     /// A read through `exec` is not an error — it is pointless but harmless,

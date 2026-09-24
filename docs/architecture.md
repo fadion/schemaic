@@ -2034,8 +2034,14 @@ existing prose was left alone.
     (`plain_csv_writes_a_leading_plus_as_the_value`, which asserts the guarded export still
     prefixes it). The two share one private emitter, `csv_chunks_with(w, src, field_fn)`, which
     `export_csv_chunks` calls with `csv_field`, so the header rule and the withheld-binary rule
-    cannot drift between them — only how a field is written is a parameter. Like `export_jsonl` it
-    has no `ExportFormat` variant. **`withheld_columns(rs, order)` is `ExportTally::withheld` for a
+    cannot drift between them — only how a field is written is a parameter. **`csv_field_plain`
+    writes a non-null empty string as `""`**, since the emitter writes nothing for a NULL — the
+    `COPY … CSV` convention, so a program reading the pipe can tell the two apart; the guarded
+    `csv_field` still writes both as an empty field. Like `export_jsonl` it has no `ExportFormat`
+    variant. **`export_markdown_null_as(rs, order, null)` is the same split
+    for Markdown**: the CLI's `table` passes `"NULL"`, the GUI's `export_markdown` keeps the empty
+    cell, and both go through the private `markdown_chunks_with(w, src, null)`, which
+    `export_markdown_chunks` calls with `""` — so only the NULL cell's spelling is a parameter. **`withheld_columns(rs, order)` is `ExportTally::withheld` for a
     caller that renders to a string** and so never sees a tally: the names of the columns a JSON or
     CSV rendering writes as `null` / an empty field, off the same `dropped_binary_columns` the
     emitters use, so the caveat cannot name a different set than the file actually lost
@@ -19758,13 +19764,18 @@ existing prose was left alone.
     `Connection::cli_access`, rather than handing a connection back for a caller to remember to
     check — the run guard's rule, for the run guard's reason, which is why there is no `find` here
     that returns an ungated connection. Both spellings resolve, because a human types the name
-    (case-insensitively) and a script wants the id's stability. **Ambiguity is judged over every
-    saved connection, including the ones the CLI cannot use**, so that turning CLI access on for a
+    (case-insensitively) and a script wants the id's stability. **`#<id>` is the id and nothing
+    else**; a bare number still matches a name or an id. Without it a numeric name colliding with
+    another connection's id made that id unreachable — id 5 named "6" and id 6 named "5" left
+    neither id with a spelling that worked, and the refusal's "use the id instead" pointed back at
+    the ambiguous string. `#5` never matches a name, not even one literally spelled `#5`
+    (`a_hash_prefixed_id_names_only_the_id`), and `--connection`'s help names the form.
+    **Ambiguity is judged over every saved connection, including the ones the CLI cannot use**, so that turning CLI access on for a
     second connection later cannot silently repoint an existing script at it
     (`ambiguity_counts_connections_the_cli_cannot_use`); two matches are refused rather than
     tie-broken, the pair being as likely to be staging and production as duplicates, and the
-    refusal lists every candidate as `id: name`, the id being what it tells the reader to use
-    instead. `NoConnection`
+    refusal lists every candidate as `'#4': backup`, the `#<id>` being what it tells the reader to
+    use instead. `NoConnection`
     keeps `Unknown` and `NotExposed` apart because the two sentences send the reader to different
     places — "you have not enabled this one" is an instruction, "no such connection" sends them
     hunting for a typo they will not find — and `run.rs` gives them different exit codes for the
@@ -19805,7 +19816,13 @@ existing prose was left alone.
     safe one, and it would give two paths one gate when they do not want the same gate — `query`
     runs an allowlist with no override, while a write has to consult the connection's read-only
     flag, the missing-`WHERE` warning and the user's own say-so. `ExecRequest::approved` is the
-    guard and the only constructor; the field is private and `run` takes one by value. Its
+    guard and the only constructor; the fields are private and `run` takes one by value. **The
+    request carries the target its verdict judged** — a clone of the `Connection` and the
+    database, read back through `connection()` and `database()` — and `run(db, request, timeout)`
+    takes no database of its own, running in `request.database()`, while `run.rs`'s `run_exec`
+    connects through `request.connection()`. When both were arguments beside the request, a second
+    caller could pair an approval judged against one connection with another connection or database
+    (`a_request_carries_the_connection_and_database_it_was_judged_against`). Its
     reasoning, the `--yes` asymmetry and why several statements are refused rather than half-run are
     under *Architecture invariants* with the other two minted requests. The one thing stated here
     rather than there is `confirm_writes: false`: typing `exec` is the caller saying this writes,
@@ -19883,7 +19900,14 @@ existing prose was left alone.
     quoting and nothing else, where the file export prefixes `'` to a value a spreadsheet would
     evaluate — right for a file a person opens in Excel, wrong down a pipe whose reader is a
     program: `+15551234` came out `'+15551234`, a different phone number from the one the JSON of
-    the same cell gave (`csv_writes_a_formula_like_value_as_it_is`). **`withheld_warning` says on
+    the same cell gave (`csv_writes_a_formula_like_value_as_it_is`). **Every format tells a NULL
+    from an empty string**, which the table and the CSV used not to (review finding S3-L1-04):
+    `table` goes through `export::export_markdown_null_as(rs, order, "NULL")`, the `mysql`
+    client's spelling, with `''` left empty; CSV writes `''` as `""` and NULL as the bare empty
+    field, PostgreSQL's `COPY … CSV` convention; JSON always had `null` against `""`
+    (`the_table_tells_a_null_from_an_empty_string`, `csv_tells_a_null_from_an_empty_string`,
+    `json_tells_a_null_from_an_empty_string`). The table inherits the `mysql` client's ambiguity
+    along with its spelling: a string `'NULL'` prints the same. **`withheld_warning` says on
     stderr what the machine formats cannot say in band**: json, jsonl and csv write a blob they
     cannot carry as `null` or an empty field, and a column of those reads as "no data", so the
     columns `export::withheld_columns` names are listed — after the rows, for `query` and for rows
@@ -19931,7 +19955,8 @@ existing prose was left alone.
     each time round. That is why opening is two functions: `select_conn` reads no secret and dials
     nothing, and `connect` is the half that does. `connect` hands back the `TunnelHandle` alongside
     the `Db` because dropping it closes the tunnel, and it hydrates and patches a *clone* of the
-    **saved** connection, so the guard's subject is what the user configured. **The tunnel is
+    **saved** connection, so the guard's subject is what the user configured — for `exec`, the
+    connection `ExecRequest` carries, so what is dialled is what was judged. **The tunnel is
     bounded by `--timeout` in a `tokio::time::timeout` of its own**, because the statement's
     deadline never covered it: an SSH endpoint that accepts TCP and never sends a banner held the
     command until something killed it. Measured after the fix, an unreachable SSH host under
@@ -20187,9 +20212,10 @@ Re-introducing the anti-patterns these guard against is a regression:
   is what keeps the early one from being the only check. The refusals are `rerunnable_for_export`, `script_verdict` and
   `read_only_reason`; the requests are `RerunRequest`, minted against the first, `ScriptRequest`,
   against the second, and `ExecRequest`, minted against `run_verdict` itself.
-  **`schemaic exec` is the write half, and it is the third minted request.** `ExecRequest` has a
-  private field, `ExecRequest::approved` is its only constructor and `exec::run` takes one by value
-  — the same shape as `ScriptRequest::approved` and `RerunRequest::approved`, reached deliberately
+  **`schemaic exec` is the write half, and it is the third minted request.** `ExecRequest`'s
+  fields are private — the statement, its `Enforce`, and the connection and database the verdict
+  judged, so an approval cannot be spent on another target; `ExecRequest::approved` is its only
+  constructor and `exec::run` takes one by value — the same shape as `ScriptRequest::approved` and `RerunRequest::approved`, reached deliberately
   rather than arrived at, since a front end with no window is exactly where a guard the launcher has
   to remember would go unnoticed longest. What it mints against is `run_verdict` itself, not a
   stronger refusal, because `exec` *does* have someone to ask: the caller is at a prompt, and

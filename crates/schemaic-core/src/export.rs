@@ -802,8 +802,14 @@ pub fn csv_field(s: &str) -> String {
 /// where it rewrote `+15551234` as `'+15551234` — a phone number with a stray
 /// apostrophe in every tool that loads it, disagreeing with the JSON of the
 /// same cell, and said nowhere.
+///
+/// **An empty string is quoted, `""`**, because a NULL is the bare empty field
+/// ([`csv_chunks_with`] writes nothing for one) — PostgreSQL's `COPY … CSV`
+/// convention, so the two stay distinct for a program reading the file back.
 pub fn csv_field_plain(s: &str) -> String {
-    if s.contains([',', '"', '\n', '\r']) {
+    if s.is_empty() {
+        "\"\"".to_string()
+    } else if s.contains([',', '"', '\n', '\r']) {
         format!("\"{}\"", s.replace('"', "\"\""))
     } else {
         s.to_string()
@@ -1771,6 +1777,14 @@ pub fn export_markdown(rs: &ResultSet, order: &[usize]) -> String {
     to_string(|w| export_markdown_to(w, rs, order))
 }
 
+/// [`export_markdown`] with NULL spelled `NULL` rather than an empty cell —
+/// the headless CLI's table, where a reader has no grid to tell a NULL from an
+/// empty string and the two otherwise printed identically. The `mysql` client's
+/// spelling; the GUI's Markdown copy keeps the empty cell.
+pub fn export_markdown_null_as(rs: &ResultSet, order: &[usize], null: &str) -> String {
+    to_string(|w| markdown_chunks_with(w, &mut OneChunk::new(rs, order), null).map(|_| ()))
+}
+
 /// [`export_markdown`], streamed.
 pub fn export_markdown_to<W: Write>(w: &mut W, rs: &ResultSet, order: &[usize]) -> io::Result<()> {
     export_markdown_chunks(w, &mut OneChunk::new(rs, order)).map(|_| ())
@@ -1802,6 +1816,16 @@ pub fn export_markdown_chunks<W: Write>(
     w: &mut W,
     src: &mut dyn RowChunks,
 ) -> io::Result<ExportTally> {
+    markdown_chunks_with(w, src, "")
+}
+
+/// [`export_markdown_chunks`] with each NULL cell written as the given `null`
+/// text (`""` for the GUI's copy, `"NULL"` for the CLI's table).
+fn markdown_chunks_with<W: Write>(
+    w: &mut W,
+    src: &mut dyn RowChunks,
+    null: &str,
+) -> io::Result<ExportTally> {
     let mut first = true;
     let mut tally = ExportTally::default();
     while let Some(c) = src.next_chunk()? {
@@ -1820,7 +1844,7 @@ pub fn export_markdown_chunks<W: Write>(
                 w,
                 &mut (0..n).map(|ci| match c.rs.cell(di, ci) {
                     None => String::new(),
-                    Some(cell) if cell.is_null() => String::new(),
+                    Some(cell) if cell.is_null() => null.to_string(),
                     Some(cell) => md_cell(cell.display()),
                 }),
             )?;

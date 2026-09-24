@@ -487,11 +487,13 @@ async fn run_exec(
             return Exit::Refused;
         }
     };
-    let (db, _tunnel) = match connect(conn, target, timeout).await {
+    // Connected through the request, so the statement runs on the connection
+    // its verdict judged — not on whatever a second caller had to hand.
+    let (db, _tunnel) = match connect(request.connection(), target, timeout).await {
         Ok(v) => v,
         Err(exit) => return exit,
     };
-    match exec::run(&db, database.as_deref(), request, timeout).await {
+    match exec::run(&db, request, timeout).await {
         Ok(rs) => {
             // A write reports what it changed; a statement that happened to
             // return rows through `exec` reports those instead.

@@ -89,7 +89,8 @@ pub const SQL_FROM_STDIN: &str = "-";
 /// Which connection, and which database on it.
 #[derive(clap::Args, Debug, PartialEq, Eq)]
 pub struct Target {
-    /// Saved connection, by id or by name.
+    /// Saved connection, by id or by name — or `#<id>`, which is only ever
+    /// the id.
     #[arg(short = 'c', long, env = "SCHEMAIC_CONNECTION")]
     pub connection: String,
     /// Database to run in. Defaults to the connection's own.

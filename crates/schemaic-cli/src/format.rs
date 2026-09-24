@@ -87,7 +87,9 @@ pub fn render_rows(rs: &ResultSet, format: Format) -> String {
     let order = display_order(rs);
     match format {
         Format::Table => {
-            let mut out = export::export_markdown(rs, &order);
+            // NULL spelled out: `''` is the empty cell, and the two printed
+            // identically.
+            let mut out = export::export_markdown_null_as(rs, &order, "NULL");
             if let Some(note) = row_count_note(rs) {
                 out.push_str(&note);
             }
@@ -246,6 +248,39 @@ mod tests {
         for name in Format::NAMES {
             assert!(err.contains(name), "the error must list {name}");
         }
+    }
+
+    /// A NULL and an empty string — the same row, two different facts.
+    fn null_and_empty() -> ResultSet {
+        ResultSet::from_rows(
+            vec![col("a"), col("b")],
+            vec![vec![Value::Null, Value::Str(String::new())]],
+        )
+    }
+
+    /// **The table says NULL, and leaves `''` empty** — the `mysql` client's
+    /// spelling. They printed identically, so "which rows have no email"
+    /// could not be answered by reading the table.
+    #[test]
+    fn the_table_tells_a_null_from_an_empty_string() {
+        let out = render_rows(&null_and_empty(), Format::Table);
+        let row = out.lines().nth(2).expect("a data row");
+        assert_eq!(row, "| NULL |  |", "{out}");
+    }
+
+    /// **CSV quotes the empty string and leaves NULL bare** — PostgreSQL's own
+    /// `COPY … CSV` convention, so a loader that follows it reads both back.
+    #[test]
+    fn csv_tells_a_null_from_an_empty_string() {
+        let out = render_rows(&null_and_empty(), Format::Csv);
+        assert_eq!(out, "a,b\n,\"\"\n", "{out:?}");
+    }
+
+    /// JSON always could: `null` against `""`.
+    #[test]
+    fn json_tells_a_null_from_an_empty_string() {
+        let out = render_rows(&null_and_empty(), Format::Jsonl);
+        assert_eq!(out.trim(), r#"{"a":null,"b":""}"#);
     }
 
     #[test]
