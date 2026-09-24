@@ -218,6 +218,8 @@ Where there is no keyring to read — an SSH session, a container — pipe the
 password in with `--password-stdin` instead. A statement that itself carries a
 password (`ALTER ROLE … PASSWORD …`) belongs on stdin too: pass `-` as the SQL
 and pipe it in, so it stays out of the process list and your shell's history.
+`-f`/`--file <path>` reads the statement from a file instead — still one
+statement, not a script.
 
 On Linux the `.deb` and `.rpm` put `schemaic` on your `PATH` already. Elsewhere,
 **Settings → General → Command line → Install** does it: on Windows it adds the

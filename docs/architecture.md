@@ -19937,12 +19937,27 @@ existing prose was left alone.
     character — "Access denied" for the right password — while the newline `echo` adds is the
     pipe's but a second one may be the password's, which stripping every trailing CR/LF, as it
     used to, took as well (`a_piped_password_loses_a_bom_and_one_line_ending`).
-    **A statement argument of `-` (`SQL_FROM_STDIN`) reads the statement from stdin**, and that is
-    where one carrying a password belongs: argv sits in the process list while the command runs and
-    in the shell's history afterwards, the exposure the app keeps such statements out of its own
-    history for, so an argv statement `sql::carries_credential` recognises is run but warned about
-    on stderr. Stdin has one reader, so `-` together with `--password-stdin` is a usage error
-    rather than a guess at which came first. `--timeout`'s two `default_value_t`s read
+    **The statement is `SqlArgs`, flattened into `query` and `exec`: the positional or `-f`/`--file
+    <PATH>`, exactly one**, which `#[group(required = true, multiple = false)]` makes a parse error
+    (exit 2) rather than a precedence rule (`the_statement_can_come_from_a_file`,
+    `a_statement_and_a_file_together_are_refused`, `a_statement_or_a_file_is_required`).
+    `SqlArgs::source()` resolves it to `SqlSource::{Text, Stdin, File}`, and **`-`
+    (`SQL_FROM_STDIN`) means stdin in either place** — psql's `-f -`. Stdin is where a statement
+    carrying a password belongs: argv sits in the process list while the command runs and in the
+    shell's history afterwards, the exposure the app keeps such statements out of its own history
+    for, so an argv statement `sql::carries_credential` recognises is run but warned about on
+    stderr, and one from stdin or a file is not, being in neither. Stdin has one reader, so stdin
+    (either spelling) together with `--password-stdin` is a usage error rather than a guess at which
+    came first. **A file is still one statement**, not a script: several hit the guards they would
+    as an argument — `exec`'s `NotRun::Several`, `query`'s gate — and nothing here goes near
+    `Db::run_script`. `run.rs`'s `statement(&SqlArgs, …)` takes it; `read_sql_file` answers an
+    unreadable or non-UTF-8 file with a warning and `Exit::Usage` before anything is sent, and
+    **`sql_text` takes one leading U+FEFF off text read from stdin or a file**, for the reason
+    `piped_password` does: Notepad and Windows PowerShell 5.1 put a byte-order mark ahead of the
+    text, and `read_only_reason` refused `\u{FEFF}SELECT 1` as not a read — a file saying nothing
+    else came back refused. Only a *leading* mark goes; anywhere else it is data
+    (`a_statement_from_a_file_or_pipe_loses_its_bom`, which asserts the gate refuses the raw text
+    first). `--timeout`'s two `default_value_t`s read
     `query::DEFAULT_TIMEOUT` through `DEFAULT_TIMEOUT_SECS`, not a second literal beside it
     (`exec_defaults_to_the_shared_timeout`).
     **`ConnArgs` is `Target` without the database** — `-c` and `--password-stdin`, flattened into

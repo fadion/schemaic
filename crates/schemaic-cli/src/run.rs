@@ -18,7 +18,7 @@ use schemaic_core::secrets::SecretKind;
 use schemaic_core::sql::NoDatabaseFailure;
 use schemaic_db::Db;
 
-use crate::args::{Cli, Command, ConnArgs, Target};
+use crate::args::{Cli, Command, ConnArgs, SqlArgs, SqlSource, Target};
 use crate::format::{self, Format};
 use crate::{exec, query, select};
 
@@ -430,23 +430,63 @@ fn read_stdin(what: &str, example: &str) -> Result<String, Exit> {
     Ok(text)
 }
 
-/// The statement to run: the argument, or stdin when it is `-`.
+/// Statement text read from a pipe or a file, with a byte-order mark taken
+/// off the front.
+///
+/// **An editor's BOM is not SQL.** Notepad and Windows PowerShell 5.1 both put
+/// `EF BB BF` ahead of UTF-8 text, and U+FEFF before `SELECT` is not a
+/// statement head the read gate knows: `query -f q.sql` was refused as "not a
+/// read" for a file that said nothing else. [`piped_password`] strips the same
+/// mark for the same reason.
+fn sql_text(raw: String) -> String {
+    match raw.strip_prefix('\u{FEFF}') {
+        Some(rest) => rest.to_string(),
+        None => raw,
+    }
+}
+
+/// The statement in the file at `path`, or the usage exit that says why not
+/// — nothing has been sent anywhere yet, and the fix is in the command line.
+fn read_sql_file(path: &std::path::Path) -> Result<String, Exit> {
+    let bytes = std::fs::read(path).map_err(|e| {
+        warn(&format!(
+            "could not read the statement from {}: {e}",
+            path.display()
+        ));
+        Exit::Usage
+    })?;
+    String::from_utf8(bytes).map_err(|_| {
+        warn(&format!(
+            "{} is not UTF-8 text; save it as UTF-8 and try again",
+            path.display()
+        ));
+        Exit::Usage
+    })
+}
+
+/// The statement to run: the argument, stdin, or a file.
 ///
 /// Stdin has one reader, so a statement and a password cannot both come from
 /// it. An argument that carries a credential is run, but said — it is in the
 /// process list for as long as the command runs and in the shell's history
 /// after, the exposure the app keeps such statements out of its own history for.
-fn statement(sql: &str, target: &Target, conn: &Connection) -> Result<String, Exit> {
-    if sql == crate::args::SQL_FROM_STDIN {
-        if target.conn.password_stdin {
-            warn(
-                "the statement and --password-stdin cannot both come from stdin; \
-                 leave the password to the OS keyring, or pass the statement as an argument",
-            );
-            return Err(Exit::Usage);
+/// Stdin and a file are neither, so they are not warned about.
+fn statement(sql: &SqlArgs, target: &Target, conn: &Connection) -> Result<String, Exit> {
+    let sql = match sql.source() {
+        SqlSource::Stdin => {
+            if target.conn.password_stdin {
+                warn(
+                    "the statement and --password-stdin cannot both come from stdin; \
+                     leave the password to the OS keyring, or pass the statement as an \
+                     argument or with -f",
+                );
+                return Err(Exit::Usage);
+            }
+            return read_stdin("the statement", "schemaic exec -c … - < change.sql").map(sql_text);
         }
-        return read_stdin("the statement", "schemaic exec -c … - < change.sql");
-    }
+        SqlSource::File(path) => return read_sql_file(path).map(sql_text),
+        SqlSource::Text(sql) => sql,
+    };
     let dialect = schemaic_core::intel::SqlDialect::from_db_type(&conn.db_type);
     if schemaic_core::sql::carries_credential(sql, dialect) {
         warn(
@@ -542,7 +582,7 @@ fn emit_rows(rs: &ResultSet, format: Format) -> Result<(), Exit> {
 async fn run_query(
     conns: &[Connection],
     target: &Target,
-    sql: &str,
+    sql: &SqlArgs,
     format: Format,
     limit: usize,
     fail_on_cap: bool,
@@ -616,7 +656,7 @@ fn refused_for_no_database(e: &exec::NotRun) -> bool {
 async fn run_exec(
     conns: &[Connection],
     target: &Target,
-    sql: &str,
+    sql: &SqlArgs,
     format: Format,
     yes: bool,
     timeout: Duration,
@@ -755,6 +795,24 @@ mod tests {
         let m = NoRows::Indeterminate(d).message();
         assert!(!m.contains("cancelled"), "{m}");
         assert!(m.contains("may have been applied"), "{m}");
+    }
+
+    /// **An editor's byte-order mark is not part of the statement.** The read
+    /// gate refuses U+FEFF ahead of `SELECT`, so a Notepad-saved `-f q.sql`
+    /// (or PowerShell 5.1 piping one) came back "not a read".
+    #[test]
+    fn a_statement_from_a_file_or_pipe_loses_its_bom() {
+        use schemaic_core::intel::SqlDialect;
+        let raw = "\u{FEFF}SELECT 1\n".to_string();
+        assert!(
+            query::gate(&raw, SqlDialect::MySql).is_err(),
+            "the bug: the gate refuses a BOM-led read"
+        );
+        let sql = sql_text(raw);
+        assert_eq!(sql, "SELECT 1\n");
+        assert_eq!(query::gate(&sql, SqlDialect::MySql), Ok("SELECT 1"));
+        // Only a leading mark is the file's; anywhere else it is data.
+        assert_eq!(sql_text("SELECT '\u{FEFF}'".into()), "SELECT '\u{FEFF}'");
     }
 
     /// **PowerShell 5.1's byte-order mark is not part of the password.**

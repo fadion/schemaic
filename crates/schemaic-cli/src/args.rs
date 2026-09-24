@@ -57,8 +57,8 @@ pub enum Command {
     },
     /// Run a read-only statement.
     Query {
-        /// The SQL to run. One statement; `-` reads it from stdin.
-        sql: String,
+        #[command(flatten)]
+        sql: SqlArgs,
         #[command(flatten)]
         target: Target,
         #[arg(long, default_value = "table")]
@@ -76,10 +76,8 @@ pub enum Command {
     },
     /// Run a statement that writes.
     Exec {
-        /// The SQL to run. One statement; `-` reads it from stdin — the place
-        /// for one that carries a password, which on the command line lands in
-        /// the process list and the shell's history.
-        sql: String,
+        #[command(flatten)]
+        sql: SqlArgs,
         #[command(flatten)]
         target: Target,
         #[arg(long, default_value = "table")]
@@ -109,6 +107,46 @@ const DEFAULT_TIMEOUT_SECS: u64 = crate::query::DEFAULT_TIMEOUT.as_secs();
 
 /// The statement argument that means "read it from stdin".
 pub const SQL_FROM_STDIN: &str = "-";
+
+/// Where the statement comes from: the argument, stdin, or a file — exactly
+/// one of them, which the group makes a parse error rather than a precedence
+/// rule.
+#[derive(clap::Args, Debug, PartialEq, Eq)]
+#[group(required = true, multiple = false)]
+pub struct SqlArgs {
+    /// The SQL to run: one statement. `-` reads it from stdin — the place for
+    /// one that carries a password, which on the command line lands in the
+    /// process list and the shell's history.
+    pub sql: Option<String>,
+    /// Read the statement from a file instead (`-` is stdin). Still one
+    /// statement: a whole script is not what this runs.
+    #[arg(short = 'f', long, value_name = "PATH")]
+    pub file: Option<std::path::PathBuf>,
+}
+
+/// [`SqlArgs`], resolved to the one place it names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SqlSource<'a> {
+    Text(&'a str),
+    Stdin,
+    File(&'a std::path::Path),
+}
+
+impl SqlArgs {
+    /// Which source was given. `-` means stdin as the argument and as the
+    /// file alike.
+    pub fn source(&self) -> SqlSource<'_> {
+        match (&self.sql, &self.file) {
+            (_, Some(f)) if f.as_os_str() == SQL_FROM_STDIN => SqlSource::Stdin,
+            (_, Some(f)) => SqlSource::File(f),
+            (Some(s), None) if s == SQL_FROM_STDIN => SqlSource::Stdin,
+            (Some(s), None) => SqlSource::Text(s),
+            // The group requires one; an empty statement is what the guard
+            // already refuses, so this is not a second place to decide it.
+            (None, None) => SqlSource::Text(""),
+        }
+    }
+}
 
 /// Which connection, and which database on it.
 #[derive(clap::Args, Debug, PartialEq, Eq)]
@@ -345,7 +383,7 @@ mod tests {
                     } => (sql, target, format),
                     other => panic!("{other:?}"),
                 };
-                assert_eq!(got, sql);
+                assert_eq!(got.source(), SqlSource::Text(sql));
                 assert_eq!(target.conn.connection, "prod");
                 assert_eq!(format, Format::Json, "the flags after it still apply");
             }
@@ -372,6 +410,63 @@ mod tests {
         assert!(parse_os(argv).is_ok());
     }
 
+    fn sql_of(cli: Cli) -> SqlArgs {
+        match cli.command {
+            Command::Query { sql, .. } | Command::Exec { sql, .. } => sql,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// **`-f` is a third place for the statement, beside the argument and
+    /// stdin**, on both subcommands that take one — and `-f -` is stdin, the
+    /// spelling `psql -f -` taught.
+    #[test]
+    fn the_statement_can_come_from_a_file() {
+        for sub in ["query", "exec"] {
+            for flag in ["-f", "--file"] {
+                let sql = sql_of(parse(&["schemaic", sub, flag, "q.sql", "-c", "1"]).unwrap());
+                assert_eq!(
+                    sql.source(),
+                    SqlSource::File(std::path::Path::new("q.sql")),
+                    "{sub} {flag}"
+                );
+            }
+            let sql = sql_of(parse(&["schemaic", sub, "-f", "-", "-c", "1"]).unwrap());
+            assert_eq!(sql.source(), SqlSource::Stdin);
+            let sql = sql_of(parse(&["schemaic", sub, "-", "-c", "1"]).unwrap());
+            assert_eq!(sql.source(), SqlSource::Stdin);
+            let sql = sql_of(parse(&["schemaic", sub, "SELECT 1", "-c", "1"]).unwrap());
+            assert_eq!(sql.source(), SqlSource::Text("SELECT 1"));
+        }
+    }
+
+    /// **One source, never two** — which of a statement and a file ran would
+    /// be a rule nobody could see from the command line.
+    #[test]
+    fn a_statement_and_a_file_together_are_refused() {
+        for sub in ["query", "exec"] {
+            let err = parse(&["schemaic", sub, "SELECT 1", "-f", "q.sql", "-c", "1"]).unwrap_err();
+            assert_eq!(
+                err.kind(),
+                clap::error::ErrorKind::ArgumentConflict,
+                "{sub}"
+            );
+        }
+    }
+
+    /// And none at all is still a usage error, not an empty statement.
+    #[test]
+    fn a_statement_or_a_file_is_required() {
+        for sub in ["query", "exec"] {
+            let err = parse(&["schemaic", sub, "-c", "1"]).unwrap_err();
+            assert_eq!(
+                err.kind(),
+                clap::error::ErrorKind::MissingRequiredArgument,
+                "{sub}"
+            );
+        }
+    }
+
     #[test]
     fn a_query_needs_a_connection() {
         let err = parse(&["schemaic", "query", "SELECT 1"]).unwrap_err();
@@ -384,7 +479,7 @@ mod tests {
         let Command::Query { sql, target, .. } = cli.command else {
             panic!("expected a query");
         };
-        assert_eq!(sql, "SELECT 1");
+        assert_eq!(sql.source(), SqlSource::Text("SELECT 1"));
         assert_eq!(target.conn.connection, "prod");
         assert_eq!(target.database, None);
     }
