@@ -10,6 +10,10 @@ members = [
     "crates/schemaic-ui",
     "crates/schemaic-app",
 ]
+# Vendored dependencies are not ours to test, lint or document; `[patch]` below
+# is what uses them. Without this a path dependency inside the workspace
+# directory would join it as a member.
+exclude = ["vendor"]
 
 # CI runs `cargo doc` with `-D warnings`, so a doc comment that points at
 # something no longer there fails the build — the class that let `history.rs`
@@ -313,3 +317,10 @@ debug = "line-tables-only"
 [profile.dev.package.schemaic-app]
 opt-level = 0
 debug = "line-tables-only"
+
+# **Floem 0.2.0, vendored and patched** — see `vendor/floem/PATCHES.md` for
+# every change against the published crate and why. The crate is upstream's,
+# byte for byte, apart from what that file lists; to take a new Floem release,
+# re-vendor it and re-apply the list, or drop this once upstream has the change.
+[patch.crates-io]
+floem = { path = "vendor/floem" }

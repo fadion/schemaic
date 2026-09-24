@@ -1825,8 +1825,6 @@ checksum = "98de4bbd547a563b716d8dfa9aad1cb19bfab00f4fa09a6a4ed21dbcf44ce9c4"
 [[package]]
 name = "floem"
 version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "015c4ae49e377fa0b8a7ba737541c8868ff9b7683f1a7a97a4e48296a5b3bd35"
 dependencies = [
  "bitflags 2.13.1",
  "clipboard-win 3.1.1",
