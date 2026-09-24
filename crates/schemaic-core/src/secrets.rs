@@ -357,14 +357,39 @@ fn hydrate_kinds(
 /// secret it would never use. `supplied` is what the caller got another way —
 /// `--password-stdin` — which is not read at all, so a locked keyring cannot
 /// report it unreadable.
+///
+/// **Nor is a secret the connection cannot use.** A connection with no tunnel
+/// has no SSH password to read, and asking for one on a locked keyring told the
+/// user to unlock it and retry a command that had just succeeded — see
+/// [`unused_kinds`].
 pub fn hydrate_connection(
     conn: &mut Connection,
     store: &dyn SecretStore,
     supplied: &[SecretKind],
 ) -> Hydration {
     let mut out = Hydration::default();
-    hydrate_kinds(conn, store, &mut out, supplied);
+    let mut skip = unused_kinds(conn);
+    skip.extend_from_slice(supplied);
+    hydrate_kinds(conn, store, &mut out, &skip);
     out
+}
+
+/// The secret kinds `conn` has no use for as configured: both SSH secrets when
+/// it has no tunnel, and the one its SSH auth method does not take — the
+/// passphrase for a password login, the password for a key, both for the agent.
+///
+/// The app still hydrates every kind (a form can switch the auth method and
+/// should find the secret there); this is for a caller that only connects.
+pub fn unused_kinds(conn: &Connection) -> Vec<SecretKind> {
+    use crate::connection::SshAuth;
+    if !conn.ssh.enabled {
+        return vec![SecretKind::SshPassword, SecretKind::SshPassphrase];
+    }
+    match conn.ssh.auth {
+        SshAuth::Password => vec![SecretKind::SshPassphrase],
+        SshAuth::KeyPair => vec![SecretKind::SshPassword],
+        SshAuth::Agent => vec![SecretKind::SshPassword, SecretKind::SshPassphrase],
+    }
 }
 
 /// Hydrate every connection in the file (see [`hydrate`]).
@@ -720,6 +745,8 @@ mod tests {
     fn hydrating_one_connection_skips_what_the_caller_supplied() {
         let store = MemStore::unavailable();
         let mut c = conn(3);
+        // A tunnel, so the SSH password is one it does use.
+        c.ssh.enabled = true;
         let out = hydrate_connection(&mut c, &store, &[SecretKind::DbPassword]);
         assert!(!out.is_unreadable(3, SecretKind::DbPassword));
         assert!(out.is_unreadable(3, SecretKind::SshPassword));
@@ -758,11 +785,42 @@ mod tests {
     fn the_cli_notice_does_not_offer_stdin_for_an_ssh_secret() {
         let store = MemStore::unavailable();
         let mut c = conn(3);
+        c.ssh.enabled = true;
         let notice = hydrate_connection(&mut c, &store, &[SecretKind::DbPassword])
             .cli_notice()
-            .expect("the SSH secrets are still unreadable");
-        assert!(notice.contains("SSH"), "{notice}");
+            .expect("the SSH password is still unreadable");
+        assert!(notice.contains("SSH password"), "{notice}");
+        // A password login has no passphrase to be missing.
+        assert!(!notice.contains("passphrase"), "{notice}");
         assert!(!notice.contains("--password-stdin"), "{notice}");
+    }
+
+    /// **A connection with no tunnel has no SSH secret to be unreadable.** It
+    /// warned about two, and to retry a command that had succeeded.
+    #[test]
+    fn a_connection_with_no_tunnel_is_not_asked_for_ssh_secrets() {
+        let store = MemStore::unavailable();
+        let mut c = conn(3);
+        assert!(!c.ssh.enabled);
+        let got = hydrate_connection(&mut c, &store, &[SecretKind::DbPassword]);
+        assert_eq!(got.cli_notice(), None);
+    }
+
+    #[test]
+    fn the_unused_kinds_follow_the_ssh_auth_method() {
+        use crate::connection::SshAuth;
+        let mut c = conn(1);
+        assert_eq!(
+            unused_kinds(&c),
+            vec![SecretKind::SshPassword, SecretKind::SshPassphrase]
+        );
+        c.ssh.enabled = true;
+        c.ssh.auth = SshAuth::KeyPair;
+        assert_eq!(unused_kinds(&c), vec![SecretKind::SshPassword]);
+        c.ssh.auth = SshAuth::Password;
+        assert_eq!(unused_kinds(&c), vec![SecretKind::SshPassphrase]);
+        c.ssh.auth = SshAuth::Agent;
+        assert_eq!(unused_kinds(&c).len(), 2);
     }
 
     #[test]

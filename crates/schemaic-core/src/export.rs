@@ -795,6 +795,21 @@ pub fn csv_field(s: &str) -> String {
     }
 }
 
+/// [`csv_field`] **without** the spreadsheet formula guard: RFC 4180 quoting and
+/// nothing else, for a CSV whose reader is a program.
+///
+/// The guard is right for a file a person opens in Excel and wrong down a pipe,
+/// where it rewrote `+15551234` as `'+15551234` — a phone number with a stray
+/// apostrophe in every tool that loads it, disagreeing with the JSON of the
+/// same cell, and said nowhere.
+pub fn csv_field_plain(s: &str) -> String {
+    if s.contains([',', '"', '\n', '\r']) {
+        format!("\"{}\"", s.replace('"', "\"\""))
+    } else {
+        s.to_string()
+    }
+}
+
 /// A cell as a SQL literal (non-finite float → NULL; strings escaped).
 ///
 /// **Backslashes are dialect-critical.** MySQL treats `\` as an escape character
@@ -1299,6 +1314,22 @@ pub fn export_csv_to<W: Write>(w: &mut W, rs: &ResultSet, order: &[usize]) -> io
 /// [`OneChunk`] yields even for an empty result, so a header-only CSV stays a
 /// header-only CSV rather than an empty file.
 pub fn export_csv_chunks<W: Write>(w: &mut W, src: &mut dyn RowChunks) -> io::Result<ExportTally> {
+    csv_chunks_with(w, src, csv_field)
+}
+
+/// [`export_csv`] with [`csv_field_plain`] for every field — the headless
+/// CLI's `--format=csv`, which promises RFC 4180 and is read by programs. The
+/// file export keeps the guard.
+pub fn export_csv_plain(rs: &ResultSet, order: &[usize]) -> String {
+    to_string(|w| csv_chunks_with(w, &mut OneChunk::new(rs, order), csv_field_plain).map(|_| ()))
+}
+
+/// The one CSV emitter, parameterised on how a field is written.
+fn csv_chunks_with<W: Write>(
+    w: &mut W,
+    src: &mut dyn RowChunks,
+    csv_field: fn(&str) -> String,
+) -> io::Result<ExportTally> {
     let mut first = true;
     let mut tally = ExportTally::default();
     while let Some(c) = src.next_chunk()? {
@@ -2000,6 +2031,17 @@ fn binary_mask(rs: &ResultSet, dropped: &[usize]) -> Vec<bool> {
 /// `mask` comes from [`binary_mask`].
 fn withheld_binary(mask: &[bool], ci: usize, c: &crate::model::CellRef<'_>) -> bool {
     mask.get(ci).copied().unwrap_or(false) && crate::model::is_binary_display(c.text())
+}
+
+/// The columns a JSON or CSV rendering of `rs` (rows in `order`) writes as
+/// `null` / an empty field because their bytes were never carried — what
+/// [`ExportTally::withheld`] names, for a caller that renders to a string and
+/// so never sees a tally — the CLI's machine formats.
+pub fn withheld_columns(rs: &ResultSet, order: &[usize]) -> Vec<String> {
+    dropped_binary_columns(rs, order)
+        .into_iter()
+        .filter_map(|ci| rs.columns.get(ci).map(|c| c.name.clone()))
+        .collect()
 }
 
 /// The sentence a finished export puts on the grid's bar, or `None` when there
@@ -3506,6 +3548,47 @@ mod tests {
         assert!(
             out.contains("thumb"),
             "the note should name the column: {out}"
+        );
+    }
+
+    /// `withheld_columns` names exactly the columns the JSON/CSV emitters null
+    /// out — the caveat a string-rendering caller has no tally to read it from.
+    #[test]
+    fn withheld_columns_names_the_blob_and_nothing_else() {
+        let mut blob = col("thumb");
+        blob.type_name = "BLOB".to_string();
+        let rs = ResultSet::from_rows(
+            vec![col("id"), blob],
+            vec![vec![
+                Value::Int(1),
+                Value::Str(crate::model::binary_display(4096)),
+            ]],
+        );
+        assert_eq!(withheld_columns(&rs, &[0]), vec!["thumb".to_string()]);
+        assert!(withheld_columns(&self::rs(), &[0]).is_empty());
+        // And it agrees with what the emitter actually did.
+        let json: serde_json::Value = serde_json::from_str(&export_json(&rs, &[0])).unwrap();
+        assert!(json[0]["thumb"].is_null());
+    }
+
+    /// **The plain CSV keeps a value that starts like a formula as it is.**
+    /// The guarded one prefixes an apostrophe for a spreadsheet; a program
+    /// reading the pipe got `'+15551234` for a phone number.
+    #[test]
+    fn plain_csv_writes_a_leading_plus_as_the_value() {
+        let rs = ResultSet::from_rows(
+            vec![col("phone"), col("f")],
+            vec![vec![
+                Value::Str("+15551234".to_string()),
+                Value::Str("=1,2".to_string()),
+            ]],
+        );
+        let plain = export_csv_plain(&rs, &[0]);
+        assert_eq!(plain.lines().nth(1), Some("+15551234,\"=1,2\""), "{plain}");
+        let guarded = export_csv(&rs, &[0]);
+        assert!(
+            guarded.contains("'+15551234"),
+            "the file export keeps its guard"
         );
     }
 

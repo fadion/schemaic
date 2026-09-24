@@ -191,17 +191,21 @@ saved before this existed, because the command line runs with nobody watching.
 `schemaic list --all` shows the ones that are not exposed and why.
 
 `query` runs reads and nothing else — not a flag away from a write, a different
-subcommand. It returns 200 rows unless you raise `--limit`, and says so when it
-stopped short. `exec` is the one that writes: it refuses outright on a
-connection marked read-only, and it refuses something the guard flags — such as
-a `DELETE` with no `WHERE` — until you pass `--yes`, which answers that question
-and cannot unlock a read-only connection. Output is `table`, `json`, `jsonl` or
-`csv`; rows go to stdout and everything else to stderr, so a pipe gets only
-data. It exits `0` on success, `2` on a usage error, `3` when a guard refused
-and `4` when the server did.
+subcommand, on a session the server itself holds read-only. It returns 200 rows
+unless you raise `--limit`, and says so when it stopped short. `exec` is the one
+that writes: it refuses outright on a connection marked read-only, and it
+refuses something the guard flags — such as a `DELETE` with no `WHERE` — until
+you pass `--yes`, which answers that question and cannot unlock a read-only
+connection. Output is `table`, `json`, `jsonl` or `csv`; rows go to stdout and
+everything else to stderr, so a pipe gets only data. It exits `0` on success,
+`2` on a usage error, `3` when a guard refused (nothing was sent), `4` when the
+server or the connection failed, and `5` when a write timed out after it was
+sent — it may have been applied, so check before running it again.
 
 Where there is no keyring to read — an SSH session, a container — pipe the
-password in with `--password-stdin` instead.
+password in with `--password-stdin` instead. A statement that itself carries a
+password (`ALTER ROLE … PASSWORD …`) belongs on stdin too: pass `-` as the SQL
+and pipe it in, so it stays out of the process list and your shell's history.
 
 On Linux the `.deb` and `.rpm` put `schemaic` on your `PATH` already. Elsewhere,
 **Settings → General → Command line → Install** does it: on Windows it adds the

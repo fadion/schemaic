@@ -1997,6 +1997,21 @@ existing prose was left alone.
     a consumer can parse the first row before the last has arrived — and an empty result is the empty
     string rather than `[]`, there being no envelope to emit. It has **no `ExportFormat` variant** on
     purpose: this is `schemaic query --format=jsonl`, not a format offered in the Download menu.
+    **`export_csv_plain` is the CLI's CSV, and it differs from the file export in one place: no
+    formula guard.** `csv_field_plain` is `csv_field`'s RFC 4180 quoting without the `'` prefix,
+    which is right for a file a person opens in a spreadsheet and wrong for a program reading a
+    pipe, where it rewrote `+15551234` as `'+15551234` — a phone number with a stray apostrophe in
+    every tool that loads it, disagreeing with the JSON of the same cell and said nowhere
+    (`plain_csv_writes_a_leading_plus_as_the_value`, which asserts the guarded export still
+    prefixes it). The two share one private emitter, `csv_chunks_with(w, src, field_fn)`, which
+    `export_csv_chunks` calls with `csv_field`, so the header rule and the withheld-binary rule
+    cannot drift between them — only how a field is written is a parameter. Like `export_jsonl` it
+    has no `ExportFormat` variant. **`withheld_columns(rs, order)` is `ExportTally::withheld` for a
+    caller that renders to a string** and so never sees a tally: the names of the columns a JSON or
+    CSV rendering writes as `null` / an empty field, off the same `dropped_binary_columns` the
+    emitters use, so the caveat cannot name a different set than the file actually lost
+    (`withheld_columns_names_the_blob_and_nothing_else`). Its one caller is the CLI's
+    `format::withheld_warning`.
     And
     `all_rows_label(size, sorted, manual_tx, staged)` is the Download menu's `All rows` entry, four
     disclosures made at the point of choice in place of an untested `match` in the view (*Data grid*).
@@ -6366,7 +6381,14 @@ existing prose was left alone.
     `read_connections_unrecovered` parses the primary and stops — absent is the default value (what
     every install looks like before its first connection is saved), unparseable is an `Err` for the
     caller to report and nothing is moved — over `read_unrecovered`, the `FileStore`-taking half, so
-    all three outcomes are testable without a disk. The pin is
+    every outcome is testable without a disk. **Only `NotFound` is an absence**: any other read
+    error — a denied permission, a sharing violation — is an `Err` as well, `load_json_strict`'s rule
+    for its reason. It was an `.ok()`, which folded all of them into "no file", so the CLI listed no
+    connections and called a real one unknown, sending the user after a toggle or a typo
+    (`an_unreadable_file_is_reported_not_read_as_absent`). The fake store keeps the two apart the
+    way a disk does — its `read` answers `NotFound` for a missing path and `PermissionDenied` for
+    anything in its `unreadable` set — because the read now tells the two apart by nothing but the
+    error's kind. The pin is
     `the_recovering_read_sweeps_a_save_in_flight_and_the_unrecovered_one_does_not`, which runs the
     two loads over the same staged `.tmp` **in one test**, because the claim is about the difference
     between them and either half alone reads as a property of loading rather than a choice;
@@ -6429,7 +6451,14 @@ existing prose was left alone.
     among them, since it supplies nothing else
     (`the_cli_notice_does_not_offer_stdin_for_an_ssh_secret`); `hydrate_connection` is the CLI's
     load, one connection and none of the kinds its caller `supplied`
-    (`hydrating_one_connection_skips_what_the_caller_supplied`).
+    (`hydrating_one_connection_skips_what_the_caller_supplied`) — **nor any `unused_kinds`**, the
+    secrets the connection has no use for as configured: both SSH kinds with no tunnel, the
+    passphrase under password auth, the password under a key pair, both under the agent
+    (`the_unused_kinds_follow_the_ssh_auth_method`). Asking for those on a locked keyring warned
+    about two SSH secrets on a connection with no tunnel, telling the user to unlock it and retry a
+    command that had just succeeded (`a_connection_with_no_tunnel_is_not_asked_for_ssh_secrets`).
+    The app's whole-file `hydrate_file` still reads every kind, because a form can switch the auth
+    method and should find the secret there.
     `Sanitized { file, in_the_clear, undeleted }` is the write-side counterpart — the sanitized file
     plus the two facts the save established, which used to be discarded at the only call site — and
     its `notice()` names the consequence rather than the mechanism: *your passwords are in a file
@@ -7965,7 +7994,7 @@ existing prose was left alone.
     save its own copy. So it reads through `persist::read_connections_unrecovered` (for that
     function's own reasons) and hands back the `ConnectionsFile` **unhydrated** — `list` shows no
     secret — and `hydrate_for_cli(conn, supplied)` fills in only the one connection a command runs
-    against, through `core::secrets::hydrate_connection`, returning the strings the caller puts on
+    against, and only the secrets it will use, through `core::secrets::hydrate_connection`, returning the strings the caller puts on
     stderr: `Hydration::cli_notice`, and one saying this connection's secrets are still plaintext
     in `connections.json` and to open Schemaic once. It used to hydrate every saved connection —
     a keyring round trip per secret the command would never use — and a locked keyring then
@@ -18053,7 +18082,8 @@ existing prose was left alone.
   written out here first; the CLI needed all four, and writing them again would have left two copies
   of a *gate* — the shape this codebase has already been bitten by, and one where only the front end
   that got the next fix would have kept it. So this calls
-  `schemaic_cli::query::read_only_query` with `MCP_ROW_CAP` and `QUERY_TIMEOUT`, and
+  `schemaic_cli::query::read_only_query` with `MCP_ROW_CAP` and `QUERY_TIMEOUT` — which is
+  `schemaic_cli::query::DEFAULT_TIMEOUT` itself, read where it is defined rather than restated — and
   `normalize_stmt` and its tests left with the function. **The wording stays here**: `NoRows` is
   matched arm by arm into this server's own sentences, because `NoRows::message` points a refused
   write at `schemaic exec` and the assistant's route to a write is `propose_table_change`. Same
@@ -19419,7 +19449,21 @@ existing prose was left alone.
     does not have, and without it the CLI would simply be unusable there. It reads a pipe and
     nothing else: `run.rs` refuses it as a usage error when stdin is a terminal, where
     `read_to_string` waited for an EOF nobody knew to type and the command simply hung — and does
-    not prompt instead, because a prompt would echo the password.
+    not prompt instead, because a prompt would echo the password. What it reads becomes the
+    password through `run.rs`'s pure `piped_password`, which takes **one** leading U+FEFF and
+    **exactly one** trailing line ending off and nothing else: Windows PowerShell 5.1 pipes a
+    byte-order mark ahead of the text, and the server was sent U+FEFF as the password's first
+    character — "Access denied" for the right password — while the newline `echo` adds is the
+    pipe's but a second one may be the password's, which stripping every trailing CR/LF, as it
+    used to, took as well (`a_piped_password_loses_a_bom_and_one_line_ending`).
+    **A statement argument of `-` (`SQL_FROM_STDIN`) reads the statement from stdin**, and that is
+    where one carrying a password belongs: argv sits in the process list while the command runs and
+    in the shell's history afterwards, the exposure the app keeps such statements out of its own
+    history for, so an argv statement `sql::carries_credential` recognises is run but warned about
+    on stderr. Stdin has one reader, so `-` together with `--password-stdin` is a usage error
+    rather than a guess at which came first. `--timeout`'s two `default_value_t`s read
+    `query::DEFAULT_TIMEOUT` through `DEFAULT_TIMEOUT_SECS`, not a second literal beside it
+    (`exec_defaults_to_the_shared_timeout`).
     **`wants_cli` is the routing predicate, and it is an allowlist of the *first* argument rather
     than "are there any arguments".** This binary is re-invoked with argv by things that are not the
     CLI — the Velopack installer and updater (`--veloapp-install`, `--veloapp-updated`,
@@ -19465,11 +19509,18 @@ existing prose was left alone.
     `SELECT 1;` answered "empty query" would be a baffling way to learn it was unwanted — and
     `NoRows::is_refusal` separates the guard's answer from the server's, because a caller that
     cannot tell "you asked for the wrong thing" from "the database is down" retries the one that
-    will never succeed. `DEFAULT_TIMEOUT` is 30 s — the CLI's default and the MCP server's fixed
-    value, moved by `schemaic query --timeout` — and the read itself goes through
-    `deadline::with_deadline`. The row cap bounds what is held and what is returned, and
-    `ResultSet::truncated` is the front end's to pass on — a caller silently told a capped result was
-    the whole answer has been given a wrong answer by a command that succeeded.
+    will never succeed. **`gate(sql, dialect)` is the text half of that guard, public so a front end
+    can ask it before connecting**: `run.rs` used to connect first, so a refusal — exit 3, whose
+    promise is that nothing reached a server — had already read the keyring and logged in over SSH.
+    `read_only_query` asks it again, in the connection's own dialect, so asking early is never the
+    only check. `DEFAULT_TIMEOUT` is 30 s — the CLI's default and the MCP server's fixed
+    value, moved by `schemaic query --timeout` — and both read it from here rather than restating
+    it: `args.rs`'s defaults through `DEFAULT_TIMEOUT_SECS`, `mcp.rs`'s `QUERY_TIMEOUT` as the
+    constant itself. The read goes through `deadline::with_deadline`. `NoRows::Indeterminate` is
+    the one arm a read never produces — it is `exec`'s, below. The row cap bounds what is held and
+    what is returned, and `ResultSet::truncated` is the front end's to pass on — a caller silently
+    told a capped result was the whole answer has been given a wrong answer by a command that
+    succeeded.
   - `cli/exec.rs` — the write path, and the guard that is the only way into it. **A separate
     subcommand, not a flag on `query`**: a flag would put the dangerous case one character from the
     safe one, and it would give two paths one gate when they do not want the same gate — `query`
@@ -19484,6 +19535,14 @@ existing prose was left alone.
     the unbounded write it would then also wave through. A read through `exec` is allowed and merely
     pointless, because refusing it would need `exec` to grow a second gate deciding what a read is.
     `run` bounds the statement through `deadline::with_deadline`, the same wrapper `query` uses.
+    **What it does not share with `query` is what a timeout means.** A read past its deadline was
+    cancelled and changed nothing, which `NoRows::TimedOut` says; a write past it *had been sent*,
+    and a cancel does not undo what a non-transactional engine already changed, nor a commit whose
+    reply was in flight. Live on MariaDB, a timed-out MyISAM `UPDATE` had changed 9 of 40 rows while
+    the command said it "was cancelled" and exit 4 told the script that retrying may work. So `run`
+    answers the deadline with `NoRows::Indeterminate`, whose message says the statement may have
+    been applied in whole or in part and to check before running it again, and `run.rs` gives it
+    exit 5. The MCP server folds it into its timeout arm, having no write that could produce it.
     **It runs through `fetch_query_enforced`, never plain `fetch_query`**, with an `Enforce` that
     `approved` mints into a private field from the connection the verdict judged: `ReadOnly` on a
     `read_only` connection, because what the verdict lets through there is a read *to the text
@@ -19506,15 +19565,31 @@ existing prose was left alone.
     admitting to being one, and a trade subtle enough that it should exist once. The token handed in
     must be the one the future was given, or the cancel reaches nothing and the "deadline" returns
     after the *query* rather than after `timeout`.
+    **The wait after the cancel is bounded, at `UNWIND_GRACE`** — `schemaic_db::CANCEL_TIMEOUT`
+    plus one second — after which the future is abandoned, because not every future is listening. A
+    driver still *connecting* has not reached its `select!` on the token, so a host that drops
+    packets held a `--timeout 2` command for the OS connect timeout, ~21 s, on both engines.
+    Abandoning is safe exactly there — before the statement has started there is nothing
+    server-side to `KILL` — and once it has started the driver's own `KILL` is bounded by
+    `CANCEL_TIMEOUT` and finishes inside the grace, so the await-past-the-cancel reasoning above
+    still holds for every statement that reached the server
+    (`a_future_that_ignores_the_cancel_is_abandoned_after_the_grace`). The worst case is
+    therefore `timeout` plus the grace, not `timeout`. The SSH tunnel is opened before this wrapper
+    is ever entered, so it has a bound of its own in `run.rs`.
     **It is deliberately not a merge with `app/mcp.rs`'s `with_deadline`**, which stays where it is:
     that one wraps reads this crate never makes (`fetch_schema`, `fetch_databases`), and one of them
-    genuinely must abandon its future, which is why `with_deadline_abandoning` sits beside it.
+    genuinely must abandon its future, which is why `with_deadline_abandoning` sits beside it. It
+    does share the bound: its wait after the cancel is `UNWIND_GRACE` too, for the same
+    still-connecting driver.
     **The gate that produced this module is the part worth keeping.** `mcp.rs`'s
     `no_database_read_is_awaited_without_a_deadline` carries a floor on how many reads it finds, so
     that a needle which stopped matching could not read as a clean file — and folding `run_query`
     onto `query::read_only_query` moved one read out of that file, seven to six, into a crate no gate
     was watching. So `no_database_read_in_this_crate_is_awaited_without_a_deadline` lives here and
-    asks the same thing of `query.rs`, `exec.rs` and `run.rs`, with its own floor of two. Both are
+    asks the same thing of `query.rs`, `exec.rs` and `run.rs`, with its own floor of two. **Its
+    needle is every `db.<method>(` but `engine()`**, the one accessor that does no I/O — the reach
+    `mcp.rs`'s gate already had. It was `db.fetch_`, which a switch to `db.run_batch` or a new
+    `db.ping()` would have walked straight past; a scratch `db.ping()` in `run.rs` turns it red. Both are
     **lexical** in the same way: the read must be an argument to a `with_deadline` call with no
     statement boundary in between, which is what lets a call rustfmt has wrapped across lines still
     count. The two unit tests beside it run on tokio's paused clock, and the crate declares `tokio`
@@ -19524,7 +19599,21 @@ existing prose was left alone.
   - `cli/format.rs` — how a result reaches stdout, and **every emitter in it is `core::export`'s**.
     Nothing here formats a cell; it chooses which of core's emitters to call and what to say about
     truncation, so a duplicate column name, an embedded newline or a withheld blob reads the same
-    whether a row left through the Download menu or down a pipe. `Format` is `table` / `json` /
+    whether a row left through the Download menu or down a pipe. **With one deliberate difference:
+    CSV here has no formula guard.** `render_rows` calls `export::export_csv_plain`, RFC 4180
+    quoting and nothing else, where the file export prefixes `'` to a value a spreadsheet would
+    evaluate — right for a file a person opens in Excel, wrong down a pipe whose reader is a
+    program: `+15551234` came out `'+15551234`, a different phone number from the one the JSON of
+    the same cell gave (`csv_writes_a_formula_like_value_as_it_is`). **`withheld_warning` says on
+    stderr what the machine formats cannot say in band**: json, jsonl and csv write a blob they
+    cannot carry as `null` or an empty field, and a column of those reads as "no data", so the
+    columns `export::withheld_columns` names are listed — after the rows, for `query` and for rows
+    `exec` returned alike — while `table` stays silent, its `<n bytes>` placeholder already saying
+    what it is (`a_withheld_blob_is_warned_about_in_every_machine_format`). The `lossy()` fixture —
+    a NULL, an empty string, a blob, a leading `+` and a repeated column name in one row — pins
+    what each format makes of the cells they disagree about, and
+    `json_and_jsonl_render_the_lossy_row_identically` that the two JSON shapes agree on all of them.
+    `Format` is `table` / `json` /
     `jsonl` / `csv`, parsed through `FromStr` so a bad name fails at parse time naming the real ones
     instead of reaching a database and failing after the work is done; `table` is the default
     whether or not stdout is a terminal, there being **no TTY auto-switch** to make a piped command
@@ -19544,20 +19633,41 @@ existing prose was left alone.
     rather than a row renderer because a write has no rows for `export`'s emitters to describe.
   - `cli/run.rs` — dispatch, and the module that owns the output contract. **stdout is data; stderr
     is everything else** — no banners, no warnings, no progress — which is what makes `--format=json`
-    safe to parse and `--format=csv` safe to redirect. The other half is `Exit`, and it has **four**
+    safe to parse and `--format=csv` safe to redirect. The other half is `Exit`, and it has **five**
     outcomes rather than two: 0 ok, 2 usage (including a connection that is not there), 3 a guard
-    refusal, 4 a server or connection failure. A caller that can only tell success from failure
+    refusal, 4 a server or connection failure, 5 a **write** whose deadline passed after it was
+    sent. A caller that can only tell success from failure
     retries the refusal that will never succeed and gives up on the timeout that would have;
-    `the_exit_codes_are_the_documented_ones` pins the numbers, because scripts depend on them. The
+    `the_exit_codes_are_the_documented_ones` pins the numbers, because scripts depend on them.
+    **5 is the one a script must not retry blind**: 4 says retrying may work, and the timed-out
+    MyISAM `UPDATE` that got it had already changed 9 of 40 rows (`exec.rs` has the rest). Which
+    outcome gets which code is `exit_for_no_connection` and `exit_for_no_rows`, pure and tested
+    (`a_connection_not_exposed_is_a_refusal_and_a_missing_one_is_usage`,
+    `a_guard_refusal_a_server_failure_and_an_unknown_write_exit_differently`) rather than spelled
+    at each call site.
+    **3 promises that nothing was sent, and the order of the steps is what keeps that true**:
+    select the connection, take the statement, gate it (`query::gate`) or approve it
+    (`ExecRequest::approved`), and only then connect. It used to connect first, so a refusal had
+    already read the keyring and logged in over SSH, and a loop on a refusal made a real SSH login
+    each time round. That is why opening is two functions: `select_conn` reads no secret and dials
+    nothing, and `connect` is the half that does. `connect` hands back the `TunnelHandle` alongside
+    the `Db` because dropping it closes the tunnel, and it hydrates and patches a *clone* of the
+    **saved** connection, so the guard's subject is what the user configured. **The tunnel is
+    bounded by `--timeout` in a `tokio::time::timeout` of its own**, because the statement's
+    deadline never covered it: an SSH endpoint that accepts TCP and never sends a banner held the
+    command until something killed it. Measured after the fix, an unreachable SSH host under
+    `--timeout 2` returned in 2.02 s.
+    **Every byte of data goes through `emit`, never `print!`**, which panics when the write fails:
+    `schemaic list | head -3` exited 101 — no code the contract names — with a panic message on the
+    stderr an agent reads as the diagnosis. A `BrokenPipe` is a quiet `Exit::Ok`, the reader having
+    had what it wanted, and any other write error is `Exit::Failed`
+    (`a_closed_stdout_ends_quietly_and_any_other_write_error_fails`). The
     tokio runtime is **current-thread and built here**, mirroring `--mcp-serve`: one statement on
     one connection has no use for a pool and would pay its startup. `list` builds a `ResultSet` and
     hands it to the same renderers a query's rows go through, so `--format=json` means the same
     thing there as here and there is no second table-drawing path to keep in step; an empty list is
     not an error but carries a hint, since "no connection has CLI access yet" is the correct answer
-    to *what may I use* and the baffling one without it. `open` hands back the `TunnelHandle`
-    alongside the `Db` because dropping it closes the tunnel, and it hands back a borrow of the
-    **saved** connection rather than the clone `--password-stdin` patched, so the guard's subject is
-    what the user configured. `database_for` is the flag, else the connection's own, else `None` —
+    to *what may I use* and the baffling one without it. `database_for` is the flag, else the connection's own, else `None` —
     an empty string there would read as a real database name to the guard's `no_database` arm.
   - `cli/schemaic-cli.rs` — the console-subsystem binary, at `src/bin/`. Its body is one call to
     `run::main`, deliberately: it is the same entry point the app's argv branch calls, two front
@@ -19767,7 +19877,10 @@ Re-introducing the anti-patterns these guard against is a regression:
   count — which that session also pins, on MySQL/MariaDB, to the lexer the gate counted with (see
   `schemaic-db`'s entry for the `sql_mode` smuggle that closed). **`read_only_reason` has no minted
   request**: it is enforced inside `read_only_query` itself, and the refusals and the requests are
-  two separate lists. The refusals are `rerunnable_for_export`, `script_verdict` and
+  two separate lists. `schemaic query` also asks it once *earlier*, through `query::gate`, before
+  the keyring is read or a tunnel opened — as `schemaic exec` runs `ExecRequest::approved` before
+  it connects — so that exit 3's "nothing was sent" is true; the asking inside `read_only_query`
+  is what keeps the early one from being the only check. The refusals are `rerunnable_for_export`, `script_verdict` and
   `read_only_reason`; the requests are `RerunRequest`, minted against the first, `ScriptRequest`,
   against the second, and `ExecRequest`, minted against `run_verdict` itself.
   **`schemaic exec` is the write half, and it is the third minted request.** `ExecRequest` has a

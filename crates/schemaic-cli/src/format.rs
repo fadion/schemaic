@@ -5,7 +5,11 @@
 //! duplicate column name, an embedded newline or a withheld blob reads the same
 //! whether it left through the GUI or through a pipe. Nothing in this module
 //! formats a cell; it chooses which of core's emitters to call and what to say
-//! about truncation.
+//! about truncation and withheld bytes.
+//!
+//! **One deliberate difference: CSV here has no formula guard.** The file
+//! export prefixes `'` to a value a spreadsheet would evaluate; a pipe's reader
+//! is a program, and to it `'+15551234` is a different phone number.
 
 use std::fmt;
 use std::str::FromStr;
@@ -91,8 +95,36 @@ pub fn render_rows(rs: &ResultSet, format: Format) -> String {
         }
         Format::Json => newline_terminated(export::export_json(rs, &order)),
         Format::Jsonl => export::export_jsonl(rs, &order),
-        Format::Csv => newline_terminated(export::export_csv(rs, &order)),
+        Format::Csv => newline_terminated(export::export_csv_plain(rs, &order)),
     }
+}
+
+/// What to tell the user on **stderr** about binary columns the format wrote
+/// as `null` / an empty field, if any.
+///
+/// `table` shows the `<n bytes>` placeholder, which says what it is; the
+/// machine formats cannot, and a column of `null`s reads as "no data" — a
+/// script asking which rows have an avatar concluded none did. The GUI's
+/// export says the same thing after every file it writes.
+pub fn withheld_warning(rs: &ResultSet, format: Format) -> Option<String> {
+    if format == Format::Table {
+        return None;
+    }
+    let cols = export::withheld_columns(rs, &display_order(rs));
+    if cols.is_empty() {
+        return None;
+    }
+    let written = if format == Format::Csv {
+        "empty fields"
+    } else {
+        "null"
+    };
+    Some(format!(
+        "warning: {} {} binary data this format cannot carry, written as {written}; \
+         select it hex-encoded to get the bytes.",
+        cols.join(", "),
+        if cols.len() == 1 { "holds" } else { "hold" },
+    ))
 }
 
 /// End a non-empty rendering with a newline.
@@ -338,6 +370,68 @@ mod tests {
             serde_json::from_str(render_affected(3, Format::Jsonl).trim()).unwrap();
         assert_eq!(line["affected"], 3);
         assert_eq!(render_affected(3, Format::Csv), "affected\n3\n");
+    }
+
+    /// A row holding every cell the formats treat differently: a NULL, an
+    /// empty string, a withheld blob, a value that starts like a formula, and a
+    /// column name used twice.
+    fn lossy() -> ResultSet {
+        let mut blob = col("avatar");
+        blob.type_name = "BLOB".to_string();
+        ResultSet::from_rows(
+            vec![col("n"), col("e"), blob, col("phone"), col("n")],
+            vec![vec![
+                Value::Null,
+                Value::Str(String::new()),
+                Value::Str(schemaic_core::model::binary_display(2)),
+                Value::Str("+15551234".to_string()),
+                Value::Int(7),
+            ]],
+        )
+    }
+
+    /// **A blob the machine formats cannot carry is said on stderr, naming
+    /// it.** It used to reach a pipe as `null` with nothing said, which reads
+    /// as "no data".
+    #[test]
+    fn a_withheld_blob_is_warned_about_in_every_machine_format() {
+        for format in [Format::Json, Format::Jsonl, Format::Csv] {
+            let w = withheld_warning(&lossy(), format)
+                .unwrap_or_else(|| panic!("{format} must warn about the blob"));
+            assert!(w.contains("avatar"), "{w}");
+        }
+        // The table shows the placeholder, which already says what it is.
+        assert!(withheld_warning(&lossy(), Format::Table).is_none());
+        assert!(render_rows(&lossy(), Format::Table).contains("2 bytes"));
+        assert!(withheld_warning(&rs(), Format::Json).is_none());
+    }
+
+    /// **CSV down a pipe is RFC 4180 and nothing else.** No apostrophe in
+    /// front of a leading `+`, and the same value JSON gives for the cell.
+    #[test]
+    fn csv_writes_a_formula_like_value_as_it_is() {
+        let csv = render_rows(&lossy(), Format::Csv);
+        let row = csv.lines().nth(1).unwrap();
+        assert!(row.contains(",+15551234,"), "{row}");
+        let json: serde_json::Value =
+            serde_json::from_str(&render_rows(&lossy(), Format::Json)).unwrap();
+        assert_eq!(json[0]["phone"], "+15551234");
+    }
+
+    /// What the JSON shapes promise for the lossy cells, identically in both:
+    /// NULL is `null`, `''` is `""`, a withheld blob is `null`, and a repeated
+    /// name gets `_2` rather than overwriting the first.
+    #[test]
+    fn json_and_jsonl_render_the_lossy_row_identically() {
+        let arr: serde_json::Value =
+            serde_json::from_str(&render_rows(&lossy(), Format::Json)).unwrap();
+        let line: serde_json::Value =
+            serde_json::from_str(render_rows(&lossy(), Format::Jsonl).trim()).unwrap();
+        assert_eq!(arr[0], line);
+        assert!(line["n"].is_null());
+        assert_eq!(line["e"], "");
+        assert!(line["avatar"].is_null());
+        assert_eq!(line["n_2"], 7);
     }
 
     #[test]

@@ -1639,13 +1639,22 @@ pub fn read_connections_unrecovered() -> Result<ConnectionsFile, String> {
     read_unrecovered(&Fs, &path)
 }
 
-/// [`read_connections_unrecovered`] over any [`FileStore`], so the three
-/// outcomes are testable without a filesystem.
+/// [`read_connections_unrecovered`] over any [`FileStore`], so every outcome —
+/// parsed, absent, unreadable, unparseable — is testable without a filesystem.
 pub(crate) fn read_unrecovered<T: Default + for<'de> Deserialize<'de>>(
     store: &dyn FileStore,
     path: &Path,
 ) -> Result<T, String> {
-    match classify::<T>(store.read(path).ok().as_deref()) {
+    // **Only a missing file is an absence.** `.ok()` folded every read error —
+    // a denied permission, a sharing violation — into "no file", so the CLI
+    // listed no connections and called a real one unknown, sending the user
+    // after a toggle or a typo. [`load_json_strict`]'s rule, for its reason.
+    let bytes = match store.read(path) {
+        Ok(b) => Some(b),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(e.to_string()),
+    };
+    match classify::<T>(bytes.as_deref()) {
         Load::Ok(v) => Ok(v),
         // Absent is not a failure: it is what every install looks like before
         // the first connection is saved.
@@ -2108,6 +2117,9 @@ mod tests {
         /// Paths whose `write` fails, and whether `rename` fails at all.
         unwritable: RefCell<Vec<PathBuf>>,
         rename_fails: RefCell<bool>,
+        /// Paths whose `read` fails as a denied permission would — present,
+        /// and not readable.
+        unreadable: RefCell<Vec<PathBuf>>,
         /// Every `remove` and `sync`, in order.
         ///
         /// **The order is the property** for an erasing save: whether the
@@ -2134,11 +2146,16 @@ mod tests {
 
     impl FileStore for FakeFs {
         fn read(&self, path: &Path) -> std::io::Result<Vec<u8>> {
+            if self.unreadable.borrow().iter().any(|p| p == path) {
+                return Err(std::io::ErrorKind::PermissionDenied.into());
+            }
+            // A missing file says so, as the real one does: the unrecovered read
+            // tells absent from unreadable by the kind.
             self.files
                 .borrow()
                 .get(path)
                 .cloned()
-                .ok_or_else(FakeFs::err)
+                .ok_or_else(|| std::io::ErrorKind::NotFound.into())
         }
         fn write(&self, path: &Path, bytes: &[u8]) -> std::io::Result<()> {
             if self.unwritable.borrow().iter().any(|p| p == path) {
@@ -2262,6 +2279,25 @@ mod tests {
             unrecovered.get(&in_flight).is_some(),
             "the unrecovered load must leave the save in flight alone"
         );
+    }
+
+    /// **An unreadable file is an error, not an empty one.** Read as absent,
+    /// the CLI listed no connections and called a real one unknown.
+    #[test]
+    fn an_unreadable_file_is_reported_not_read_as_absent() {
+        let fs = FakeFs::default();
+        fs.put(CREDS, r#"{"connections":[]}"#);
+        fs.unreadable.borrow_mut().push(PathBuf::from(CREDS));
+        let got: Result<ConnectionsFile, String> = read_unrecovered(&fs, Path::new(CREDS));
+        assert!(got.is_err(), "{got:?}");
+    }
+
+    /// A missing file is still the empty list a first run gets.
+    #[test]
+    fn a_missing_file_is_still_an_empty_list() {
+        let fs = FakeFs::default();
+        let got: ConnectionsFile = read_unrecovered(&fs, Path::new(CREDS)).expect("absent is fine");
+        assert!(got.connections.is_empty());
     }
 
     /// An unparseable file is **reported, not quarantined**. The recovering

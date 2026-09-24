@@ -17,13 +17,24 @@ use std::time::Duration;
 
 use tokio_util::sync::CancellationToken;
 
+/// How long a cancelled future is waited for before it is abandoned: long
+/// enough for the driver's own `KILL`, which [`schemaic_db::CANCEL_TIMEOUT`]
+/// bounds, and then a moment more.
+pub const UNWIND_GRACE: Duration =
+    schemaic_db::CANCEL_TIMEOUT.saturating_add(Duration::from_secs(1));
+
 /// Await `fut` for at most `timeout`; on expiry cancel `token` and wait for the
-/// future to finish unwinding.
+/// future to finish unwinding — for at most [`UNWIND_GRACE`].
 ///
 /// `None` means the deadline passed. The token must be the one handed to the
-/// future, or the cancel reaches nothing and this blocks for the server's own
-/// time — which would make the "deadline" return *after* the query rather than
-/// after `timeout`.
+/// future, or the cancel reaches nothing.
+///
+/// **The wait after the cancel is bounded, because not every future listens.**
+/// A driver still *connecting* has not reached its `select!` on the token, so a
+/// host that drops packets held a `--timeout 2` command for the OS connect
+/// timeout — about 21 s in all, measured on both engines. Before the statement has
+/// started there is nothing server-side to `KILL`, so abandoning it then is
+/// safe; once it has, the driver's cancel branch finishes well inside the grace.
 pub async fn with_deadline<F>(
     fut: F,
     token: CancellationToken,
@@ -37,7 +48,7 @@ where
         r = &mut fut => Some(r),
         _ = tokio::time::sleep(timeout) => {
             token.cancel();
-            let _ = fut.await;
+            let _ = tokio::time::timeout(UNWIND_GRACE, fut).await;
             None
         }
     }
@@ -75,6 +86,27 @@ mod tests {
         assert!(token.is_cancelled(), "the driver must have been told");
     }
 
+    /// **A future that never hears the cancel is abandoned, not awaited
+    /// forever.** It stands in for a driver stuck connecting to a host that
+    /// drops packets, before it has any token to watch.
+    #[tokio::test(start_paused = true)]
+    async fn a_future_that_ignores_the_cancel_is_abandoned_after_the_grace() {
+        let token = CancellationToken::new();
+        let start = tokio::time::Instant::now();
+        let got = with_deadline(
+            std::future::pending::<()>(),
+            token.clone(),
+            Duration::from_secs(2),
+        )
+        .await;
+        assert_eq!(got, None);
+        assert!(
+            start.elapsed() <= Duration::from_secs(2) + UNWIND_GRACE,
+            "held for {:?}",
+            start.elapsed()
+        );
+    }
+
     /// **Every database read in this crate is inside a deadline.**
     ///
     /// `app/mcp.rs` carries this gate over its own source and counts the reads
@@ -95,11 +127,32 @@ mod tests {
         ];
         let mut checked = 0usize;
         let mut offenders = Vec::new();
+        // **Every awaited `db.` call, not one family of them.** The needle was
+        // `db.fetch_`, which a switch to `db.run_batch` or a new `db.ping()`
+        // would have walked straight past. `engine()` is the one accessor that
+        // does no I/O.
+        let needle = format!("{}.", "db");
         for (name, body) in sources {
             let mut from = 0usize;
-            while let Some(rel) = body[from..].find("db.fetch_") {
+            while let Some(rel) = body[from..].find(&needle) {
                 let at = from + rel;
                 from = at + 1;
+                // A method call on a variable called `db`, not `self.db` or a
+                // word ending in `db`.
+                if body[..at]
+                    .chars()
+                    .next_back()
+                    .is_some_and(|c| c.is_alphanumeric() || c == '_' || c == '.')
+                {
+                    continue;
+                }
+                let method: String = body[at + needle.len()..]
+                    .chars()
+                    .take_while(|c| c.is_alphanumeric() || *c == '_')
+                    .collect();
+                if method.is_empty() || method == "engine" {
+                    continue;
+                }
                 checked += 1;
                 let before = &body[..at];
                 let wrapped = before.rfind("with_deadline").is_some_and(|w| {

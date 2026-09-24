@@ -176,7 +176,8 @@ pub async fn run(
     .await
     {
         Some(r) => r.map_err(|e| NoRows::Failed(e.to_string())),
-        None => Err(NoRows::TimedOut(timeout)),
+        // Not `TimedOut`: that says "cancelled", which a write cannot promise.
+        None => Err(NoRows::Indeterminate(timeout)),
     }
 }
 

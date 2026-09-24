@@ -474,8 +474,9 @@ fn dialect_of(db: &Db) -> SqlDialect {
 }
 
 /// Statement timeout for AI-issued queries — a backstop against `SLEEP()` /
-/// heavy scans holding the connection open.
-const QUERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+/// heavy scans holding the connection open. The CLI's default, read from where
+/// it is defined rather than restated.
+const QUERY_TIMEOUT: std::time::Duration = schemaic_cli::query::DEFAULT_TIMEOUT;
 
 /// Await a database read with [`QUERY_TIMEOUT`] over it, cancelling the token on
 /// expiry so the statement is killed **server-side** rather than merely
@@ -520,7 +521,13 @@ where
             // `QUERY_TIMEOUT`. [`with_deadline_abandoning`] is that case, and it
             // is a separate function so the choice has to be made rather than
             // inherited.
-            let _ = fut.await;
+            //
+            // **Bounded all the same**, at the CLI's `UNWIND_GRACE`: a driver
+            // still *connecting* has not reached its token, and a host that
+            // drops packets held the command for the OS connect timeout. The
+            // grace outlasts a started statement's own KILL, which is bounded
+            // by `CANCEL_TIMEOUT`.
+            let _ = tokio::time::timeout(schemaic_cli::deadline::UNWIND_GRACE, fut).await;
             None
         }
     }
@@ -569,7 +576,9 @@ async fn run_query(db: &Db, database: Option<&str>, sql: &str) -> (String, bool)
         Err(NoRows::Empty) => ("Empty query.".to_string(), true),
         Err(NoRows::NotARead(reason)) => (format!("Rejected: {reason}."), true),
         Err(NoRows::Failed(e)) => (format!("Query error: {e}"), true),
-        Err(NoRows::TimedOut(d)) => (
+        // A read never reports `Indeterminate` — that is a write's timeout —
+        // but a read-only session makes the two the same event here anyway.
+        Err(NoRows::TimedOut(d) | NoRows::Indeterminate(d)) => (
             format!("Query timed out ({}s) and was cancelled.", d.as_secs()),
             true,
         ),

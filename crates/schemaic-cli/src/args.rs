@@ -47,7 +47,7 @@ pub enum Command {
     },
     /// Run a read-only statement.
     Query {
-        /// The SQL to run. One statement.
+        /// The SQL to run. One statement; `-` reads it from stdin.
         sql: String,
         #[command(flatten)]
         target: Target,
@@ -57,12 +57,14 @@ pub enum Command {
         #[arg(long, default_value_t = DEFAULT_LIMIT, value_parser = at_least_one_row())]
         limit: usize,
         /// Seconds before the statement is cancelled.
-        #[arg(long, default_value_t = 30, value_parser = at_least_one_second())]
+        #[arg(long, default_value_t = DEFAULT_TIMEOUT_SECS, value_parser = at_least_one_second())]
         timeout: u64,
     },
     /// Run a statement that writes.
     Exec {
-        /// The SQL to run. One statement.
+        /// The SQL to run. One statement; `-` reads it from stdin — the place
+        /// for one that carries a password, which on the command line lands in
+        /// the process list and the shell's history.
         sql: String,
         #[command(flatten)]
         target: Target,
@@ -72,11 +74,17 @@ pub enum Command {
         /// WHERE clause". It cannot unlock a read-only connection.
         #[arg(long)]
         yes: bool,
-        /// Seconds before the statement is cancelled.
-        #[arg(long, default_value_t = 30, value_parser = at_least_one_second())]
+        /// Seconds before the statement is stopped.
+        #[arg(long, default_value_t = DEFAULT_TIMEOUT_SECS, value_parser = at_least_one_second())]
         timeout: u64,
     },
 }
+
+/// [`crate::query::DEFAULT_TIMEOUT`] in the unit `--timeout` takes.
+const DEFAULT_TIMEOUT_SECS: u64 = crate::query::DEFAULT_TIMEOUT.as_secs();
+
+/// The statement argument that means "read it from stdin".
+pub const SQL_FROM_STDIN: &str = "-";
 
 /// Which connection, and which database on it.
 #[derive(clap::Args, Debug, PartialEq, Eq)]
@@ -238,7 +246,17 @@ mod tests {
         };
         assert_eq!(format, Format::Table);
         assert_eq!(limit, DEFAULT_LIMIT);
-        assert_eq!(timeout, 30);
+        assert_eq!(timeout, crate::query::DEFAULT_TIMEOUT.as_secs());
+    }
+
+    /// The exec default is the same constant, not a second literal beside it.
+    #[test]
+    fn exec_defaults_to_the_shared_timeout() {
+        let cli = parse(&["schemaic", "exec", "DELETE FROM t", "-c", "1"]).unwrap();
+        let Command::Exec { timeout, .. } = cli.command else {
+            panic!("expected an exec");
+        };
+        assert_eq!(timeout, crate::query::DEFAULT_TIMEOUT.as_secs());
     }
 
     #[test]

@@ -41,6 +41,12 @@ pub enum NoRows {
     Failed(String),
     /// The deadline passed and the statement was cancelled server-side.
     TimedOut(Duration),
+    /// A **write**'s deadline passed. It was sent, and a cancel does not undo
+    /// what a non-transactional engine already changed — nine of forty MyISAM
+    /// rows were updated by one that reported "cancelled" — nor a commit whose
+    /// reply was in flight. What happened is unknown, and saying "cancelled"
+    /// told a script that retrying was safe.
+    Indeterminate(Duration),
 }
 
 impl NoRows {
@@ -58,6 +64,11 @@ impl NoRows {
             NoRows::TimedOut(d) => {
                 format!("query exceeded {}s and was cancelled", d.as_secs().max(1))
             }
+            NoRows::Indeterminate(d) => format!(
+                "the statement exceeded {}s and was stopped, but it had been sent: it may have \
+                 been applied in whole or in part. Check before running it again",
+                d.as_secs().max(1)
+            ),
         }
     }
 
@@ -82,6 +93,18 @@ pub fn normalize_stmt(sql: &str) -> Option<&str> {
     (!stmt.is_empty()).then_some(stmt)
 }
 
+/// The text half of the read guard: the statement to run, or why not.
+///
+/// Public so a front end can ask it **before** connecting — a refusal that has
+/// already read the keyring and logged in over SSH has sent something to a
+/// server, which exit 3 promises it has not. [`read_only_query`] asks again, so
+/// asking early is never the only check.
+pub fn gate(sql: &str, dialect: schemaic_core::intel::SqlDialect) -> Result<&str, NoRows> {
+    let stmt = normalize_stmt(sql).ok_or(NoRows::Empty)?;
+    schemaic_core::sql::read_only_reason(stmt, dialect).map_err(NoRows::NotARead)?;
+    Ok(stmt)
+}
+
 /// Run a **read**, or say why not.
 ///
 /// `row_cap` bounds what is held in memory and reaches the caller;
@@ -96,14 +119,9 @@ pub async fn read_only_query(
     row_cap: usize,
     timeout: Duration,
 ) -> Result<ResultSet, NoRows> {
-    let Some(stmt) = normalize_stmt(sql) else {
-        return Err(NoRows::Empty);
-    };
     // Gated in the connection's own dialect, so a PostgreSQL `#` operator is not
     // mistaken for a comment on the way in.
-    if let Err(why) = schemaic_core::sql::read_only_reason(stmt, db.engine().dialect()) {
-        return Err(NoRows::NotARead(why));
-    }
+    let stmt = gate(sql, db.engine().dialect())?;
     let token = CancellationToken::new();
     // **Read-only at the session too, because the gate reads only the text.**
     // `SELECT setval(…)`, `SELECT lo_unlink(…)` and a `SELECT` of a function
