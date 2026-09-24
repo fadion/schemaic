@@ -34,6 +34,36 @@ use schemaic_core::connection::{SshAuth, SshTunnel};
 /// The persisted known-hosts store: `"host:port"` → server-key SHA256 fingerprint.
 const KNOWN_HOSTS_FILE: &str = "ssh_known_hosts.json";
 
+/// How long [`open_tunnel`] waits for the SSH server to connect and finish the
+/// key exchange. russh has no bound of its own here: its default
+/// `inactivity_timeout` is `None`, `read_ssh_id` waits for a banner forever, and
+/// the keepalives only start once a session exists. An endpoint that accepts TCP
+/// and never speaks (a port-forward to a dead backend) held the connect spinner
+/// indefinitely, and a host that drops packets held it for the OS connect timeout.
+pub const TUNNEL_CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// How long [`open_tunnel`] waits for authentication once the transport is up.
+/// Longer than [`TUNNEL_CONNECT_TIMEOUT`] on purpose: an agent may ask a person
+/// to approve the signature (1Password, Pageant with confirmation, a hardware
+/// key's touch), and that wait is theirs, not the network's.
+pub const TUNNEL_AUTH_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// `fut`, or the refusal naming the phase that did not answer within `limit`.
+async fn within<T>(
+    limit: Duration,
+    phase: &str,
+    host_port: &str,
+    fut: impl std::future::Future<Output = Result<T, DbError>>,
+) -> Result<T, DbError> {
+    match tokio::time::timeout(limit, fut).await {
+        Ok(r) => r,
+        Err(_) => Err(DbError::Connect(format!(
+            "SSH {phase} with {host_port}: no answer within {}s",
+            limit.as_secs()
+        ))),
+    }
+}
+
 /// A live SSH tunnel. Dropping it aborts the accept loop, releasing the local
 /// listener + port (and, once in-flight forwards finish, the SSH session).
 pub struct TunnelHandle {
@@ -353,21 +383,30 @@ pub async fn open_tunnel(
     let host_port = format!("{}:{}", ssh.host, ssh.port);
     let refusal: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     let handler = TunnelClient {
-        host_port,
+        host_port: host_port.clone(),
         refusal: refusal.clone(),
     };
-    let mut session = client::connect(config, (ssh.host.as_str(), ssh.port), handler)
-        .await
-        .map_err(|e| {
-            // A host-key refusal reaches here as russh's generic `UnknownKey`.
-            // Our own verdict is the one worth showing.
-            match refusal.lock().ok().and_then(|g| g.clone()) {
-                Some(msg) => DbError::Connect(msg),
-                None => DbError::Connect(format!("SSH connect failed: {e}")),
-            }
-        })?;
+    let connect = async {
+        client::connect(config, (ssh.host.as_str(), ssh.port), handler)
+            .await
+            .map_err(|e| {
+                // A host-key refusal reaches here as russh's generic `UnknownKey`.
+                // Our own verdict is the one worth showing.
+                match refusal.lock().ok().and_then(|g| g.clone()) {
+                    Some(msg) => DbError::Connect(msg),
+                    None => DbError::Connect(format!("SSH connect failed: {e}")),
+                }
+            })
+    };
+    let mut session = within(TUNNEL_CONNECT_TIMEOUT, "connect", &host_port, connect).await?;
 
-    authenticate(&mut session, ssh).await?;
+    within(
+        TUNNEL_AUTH_TIMEOUT,
+        "authentication",
+        &host_port,
+        authenticate(&mut session, ssh),
+    )
+    .await?;
 
     let listener = TcpListener::bind(("127.0.0.1", 0))
         .await
@@ -419,7 +458,44 @@ pub async fn open_tunnel(
 #[cfg(test)]
 mod tests {
     use super::{HostKeyVerdict, known_host_decision, refusal_message};
+    use super::{TUNNEL_AUTH_TIMEOUT, TUNNEL_CONNECT_TIMEOUT, within};
+    use crate::DbError;
     use std::collections::HashMap;
+    use std::time::Duration;
+
+    /// A server that accepts the connection and never answers is refused once the
+    /// bound passes, naming the phase and the host — not awaited forever.
+    #[tokio::test(start_paused = true)]
+    async fn a_silent_ssh_server_is_given_up_on_at_the_bound() {
+        let silent = std::future::pending::<Result<(), DbError>>();
+        let got = within(TUNNEL_CONNECT_TIMEOUT, "connect", "bastion:22", silent).await;
+        match got {
+            Err(DbError::Connect(msg)) => {
+                assert_eq!(msg, "SSH connect with bastion:22: no answer within 20s");
+            }
+            other => panic!("expected a connect refusal, got {other:?}"),
+        }
+    }
+
+    /// An answer inside the bound comes back as it was — including the phase's
+    /// own error, which must not be replaced by a timeout message.
+    #[tokio::test(start_paused = true)]
+    async fn an_answer_inside_the_bound_is_passed_through() {
+        let ok = within(TUNNEL_CONNECT_TIMEOUT, "connect", "h:22", async {
+            tokio::time::sleep(Duration::from_secs(19)).await;
+            Ok::<_, DbError>(5)
+        })
+        .await;
+        assert_eq!(ok.unwrap(), 5);
+        let refused = within(TUNNEL_AUTH_TIMEOUT, "authentication", "h:22", async {
+            Err::<(), _>(DbError::Connect("SSH authentication failed".into()))
+        })
+        .await;
+        match refused {
+            Err(DbError::Connect(msg)) => assert_eq!(msg, "SSH authentication failed"),
+            other => panic!("expected the auth refusal itself, got {other:?}"),
+        }
+    }
 
     fn store(pairs: &[(&str, &str)]) -> HashMap<String, String> {
         pairs

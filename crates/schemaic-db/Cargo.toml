@@ -55,7 +55,9 @@ tracing-subscriber = { workspace = true }
 # into it: it can reach this crate's public API and its *dev*-dependencies, and
 # nothing else.
 schemaic-core = { workspace = true }
-tokio = { workspace = true }
+# `test-util` for tokio's paused clock, so the SSH handshake bound can be shown to
+# fire without waiting it out. Dev-only: no shipped binary carries it.
+tokio = { workspace = true, features = ["test-util"] }
 tokio-util = { workspace = true }
 
 # The live tier is one target rather than one per engine: the suite is written

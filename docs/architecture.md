@@ -9566,6 +9566,23 @@ existing prose was left alone.
   means to a fingerprint store before it has anything to hash. That is a migration on the code that
   decides whether to trust a host, not a version bump, and it is not being done inside a dependency
   sweep.
+  **`open_tunnel` bounds its own handshake, for every caller**, because russh bounds none of it:
+  the default `inactivity_timeout` is `None`, `read_ssh_id` waits for a banner forever, and the
+  keepalives above only start once a session exists. So an endpoint that accepts TCP and never
+  speaks — a port-forward to a dead backend — held the GUI's connect spinner indefinitely, and only
+  the CLI, whose `run.rs` wraps the call in `--timeout`, ever gave up. There are two bounds, not
+  one, and the difference is deliberate: `TUNNEL_CONNECT_TIMEOUT` (20 s) covers TCP connect, banner
+  and key exchange, while `TUNNEL_AUTH_TIMEOUT` (60 s) is longer because an agent may be waiting on
+  a *person* — a 1Password prompt, Pageant's confirmation, a hardware key's touch — and that wait is
+  theirs, not the network's. Both go through the private `within`, which turns an elapsed bound into
+  `DbError::Connect("SSH {phase} with {host:port}: no answer within Ns")` and passes the phase's own
+  result through untouched otherwise — **its own error included**, so a host-key refusal or a wrong
+  key still names itself rather than reading as a timeout
+  (`an_answer_inside_the_bound_is_passed_through`, beside
+  `a_silent_ssh_server_is_given_up_on_at_the_bound`; both on tokio's paused clock, which is why the
+  crate's dev-dependencies enable `test-util`). The bound sits inside the function rather than at
+  the three call sites — the app's connect, the form's Test button, `cli::run::connect` — so no
+  caller has to remember it: while it was the caller's job, two of the three had none.
   **PostgreSQL cannot connect without naming a database**, which is protocol rather than
   preference and stayed invisible while almost every server had a `postgres` one anybody could
   reach — so `connect_maintenance` guessed at that, the username and `template1` for server-level
@@ -19819,7 +19836,10 @@ existing prose was left alone.
     bounded by `--timeout` in a `tokio::time::timeout` of its own**, because the statement's
     deadline never covered it: an SSH endpoint that accepts TCP and never sends a banner held the
     command until something killed it. Measured after the fix, an unreachable SSH host under
-    `--timeout 2` returned in 2.02 s.
+    `--timeout 2` returned in 2.02 s. `ssh::open_tunnel` now bounds its own handshake too (20 s to
+    connect, 60 s to authenticate — the `ssh.rs` entry has why), so this wrapper is no longer the
+    only thing between a silent endpoint and a hung command. It stays: `--timeout` may be shorter
+    than either, and whichever bound is shorter answers first.
     **Every byte of data goes through `emit`, never `print!`**, which panics when the write fails:
     `schemaic list | head -3` exited 101 — no code the contract names — with a panic message on the
     stderr an agent reads as the diagnosis. A `BrokenPipe` is a quiet `Exit::Ok`, the reader having
