@@ -20,8 +20,9 @@ use schemaic_core::model::ResultSet;
 /// What `--format` accepts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Format {
-    /// A Markdown pipe table. The default, and the only format that reports
-    /// truncation in-band, because it is the only one a person reads directly.
+    /// A Markdown pipe table. The default, and with `vertical` the formats
+    /// that report truncation in-band, because they are the ones a person reads
+    /// directly.
     #[default]
     Table,
     /// A pretty-printed JSON array of row objects — byte-for-byte what
@@ -31,20 +32,25 @@ pub enum Format {
     Jsonl,
     /// RFC 4180 CSV with a header row.
     Csv,
+    /// One `name: value` record per row, the `mysql` client's `\G` — for a
+    /// row too wide for the table to be readable.
+    Vertical,
 }
 
 impl Format {
     /// Every accepted spelling, for the usage text and the parse error.
-    pub const NAMES: [&'static str; 4] = ["table", "json", "jsonl", "csv"];
+    pub const NAMES: [&'static str; 5] = ["table", "json", "jsonl", "csv", "vertical"];
 
-    /// Can this format say "there were more rows" inside its own output?
+    /// Is this a format a person reads, rather than a program?
     ///
-    /// Only `table` can. The machine formats are deliberately *pure data* —
-    /// a JSON array with a stray metadata object in it, or a CSV with a comment
-    /// row, is worse for every consumer than a clean stream plus a line on
-    /// stderr. See [`truncation_warning`].
-    fn reports_truncation_in_band(self) -> bool {
-        matches!(self, Format::Table)
+    /// `table` and `vertical`. They say "there were more rows" inside their
+    /// own output, and show a blob as its `<n bytes>` placeholder, which says
+    /// what it is. The machine formats are deliberately *pure data* — a JSON
+    /// array with a stray metadata object in it, or a CSV with a comment row,
+    /// is worse for every consumer than a clean stream plus a line on stderr.
+    /// See [`truncation_warning`] and [`withheld_warning`].
+    fn for_a_reader(self) -> bool {
+        matches!(self, Format::Table | Format::Vertical)
     }
 }
 
@@ -55,6 +61,7 @@ impl fmt::Display for Format {
             Format::Json => "json",
             Format::Jsonl => "jsonl",
             Format::Csv => "csv",
+            Format::Vertical => "vertical",
         };
         f.write_str(s)
     }
@@ -69,6 +76,7 @@ impl FromStr for Format {
             "json" => Ok(Format::Json),
             "jsonl" | "ndjson" => Ok(Format::Jsonl),
             "csv" => Ok(Format::Csv),
+            "vertical" => Ok(Format::Vertical),
             other => Err(format!(
                 "unknown format '{other}'; expected one of {}",
                 Format::NAMES.join(", ")
@@ -98,18 +106,30 @@ pub fn render_rows(rs: &ResultSet, format: Format) -> String {
         Format::Json => newline_terminated(export::export_json(rs, &order)),
         Format::Jsonl => export::export_jsonl(rs, &order),
         Format::Csv => newline_terminated(export::export_csv_plain(rs, &order)),
+        Format::Vertical => {
+            let mut out = export::export_vertical(rs, &order, "NULL");
+            if let Some(note) = row_count_note(rs) {
+                // No records means no blank line to set the count off from.
+                out.push_str(if out.is_empty() {
+                    note.trim_start_matches('\n')
+                } else {
+                    &note
+                });
+            }
+            out
+        }
     }
 }
 
 /// What to tell the user on **stderr** about binary columns the format wrote
 /// as `null` / an empty field, if any.
 ///
-/// `table` shows the `<n bytes>` placeholder, which says what it is; the
-/// machine formats cannot, and a column of `null`s reads as "no data" — a
-/// script asking which rows have an avatar concluded none did. The GUI's
+/// `table` and `vertical` show the `<n bytes>` placeholder, which says what it
+/// is; the machine formats cannot, and a column of `null`s reads as "no data" —
+/// a script asking which rows have an avatar concluded none did. The GUI's
 /// export says the same thing after every file it writes.
 pub fn withheld_warning(rs: &ResultSet, format: Format) -> Option<String> {
-    if format == Format::Table {
+    if format.for_a_reader() {
         return None;
     }
     let cols = export::withheld_columns(rs, &display_order(rs));
@@ -163,7 +183,7 @@ fn row_count_note(rs: &ResultSet) -> Option<String> {
 /// wrong answer by a command that succeeded. The cap is named in the message so
 /// the fix is in the reader's hands.
 pub fn truncation_warning(rs: &ResultSet, format: Format) -> Option<String> {
-    if !rs.truncated || format.reports_truncation_in_band() {
+    if !rs.truncated || format.for_a_reader() {
         return None;
     }
     Some(format!(
@@ -196,7 +216,7 @@ pub fn exec_truncation_warning(rs: &ResultSet) -> Option<String> {
 /// returned none has nothing for them to describe.
 pub fn render_affected(affected: u64, format: Format) -> String {
     match format {
-        Format::Table => format!(
+        Format::Table | Format::Vertical => format!(
             "({affected} {} affected)\n",
             if affected == 1 { "row" } else { "rows" }
         ),
@@ -479,6 +499,42 @@ mod tests {
         assert_eq!(line["e"], "");
         assert!(line["avatar"].is_null());
         assert_eq!(line["n_2"], 7);
+    }
+
+    /// **`vertical` is `\G`**: core's records, NULL spelled out as the table
+    /// spells it, and the table's footer — it is the other format a person
+    /// reads directly.
+    #[test]
+    fn vertical_writes_records_with_the_tables_footer() {
+        let out = render_rows(&null_and_empty(), Format::Vertical);
+        assert_eq!(
+            out,
+            "*************************** 1. row ***************************\n\
+             a: NULL\n\
+             b: \n\
+             \n(1 row)\n"
+        );
+    }
+
+    /// A read with no rows says so, without a blank line over nothing.
+    #[test]
+    fn vertical_of_no_rows_is_just_the_count() {
+        let empty = ResultSet::from_rows(vec![col("id")], vec![]);
+        assert_eq!(render_rows(&empty, Format::Vertical), "(0 rows)\n");
+    }
+
+    /// It reports a cap in-band, like the table, and so not on stderr as
+    /// well; and it shows a blob's placeholder, so there is nothing withheld
+    /// to warn about.
+    #[test]
+    fn vertical_reports_a_cap_in_band_and_withholds_nothing() {
+        let mut capped = rs();
+        capped.truncated = true;
+        assert!(render_rows(&capped, Format::Vertical).contains("capped"));
+        assert!(truncation_warning(&capped, Format::Vertical).is_none());
+        assert!(withheld_warning(&lossy(), Format::Vertical).is_none());
+        assert!(render_rows(&lossy(), Format::Vertical).contains("avatar: <2 bytes>"));
+        assert_eq!(render_affected(1, Format::Vertical), "(1 row affected)\n");
     }
 
     #[test]

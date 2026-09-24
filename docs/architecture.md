@@ -2059,7 +2059,20 @@ existing prose was left alone.
     variant. **`export_markdown_null_as(rs, order, null)` is the same split
     for Markdown**: the CLI's `table` passes `"NULL"`, the GUI's `export_markdown` keeps the empty
     cell, and both go through the private `markdown_chunks_with(w, src, null)`, which
-    `export_markdown_chunks` calls with `""` — so only the NULL cell's spelling is a parameter. **`withheld_columns(rs, order)` is `ExportTally::withheld` for a
+    `export_markdown_chunks` calls with `""` — so only the NULL cell's spelling is a parameter.
+    **`export_vertical(rs, order, null)` is the `mysql` client's `\G`**, for a row too wide for a
+    table to be readable: a numbered `*** N. row ***` banner per row, then one `name: value` line
+    per column with the names right-aligned so the values start in one column. It is written for a
+    person, so a blob keeps its `<n bytes>` placeholder as the CLI's table does — nothing reads it
+    back. A multi-line value continues under its own first line (width + 2 spaces) rather than at
+    the margin, where a continuation would read as a field of its own, and a trailing `\r` goes with
+    the line ending it belongs to (`export_vertical_indents_a_multi_line_value_under_itself`).
+    Alignment counts `char`s, not bytes — `é` is two bytes and one column — and carries no
+    unicode-width table, so a CJK name is off by its double width; that is the trade, taken for the
+    names a schema actually has (`export_vertical_aligns_names_by_character`). No rows is `""`, not
+    a banner over nothing. Like `export_jsonl` it has no `ExportFormat` variant — it is
+    `schemaic --format vertical`, not a Download-menu entry — so
+    `every_format_is_covered_by_a_parity_test` does not see it. **`withheld_columns(rs, order)` is `ExportTally::withheld` for a
     caller that renders to a string** and so never sees a tally: the names of the columns a JSON or
     CSV rendering writes as `null` / an empty field, off the same `dropped_binary_columns` the
     emitters use, so the caveat cannot name a different set than the file actually lost
@@ -20148,17 +20161,21 @@ existing prose was left alone.
     stderr what the machine formats cannot say in band**: json, jsonl and csv write a blob they
     cannot carry as `null` or an empty field, and a column of those reads as "no data", so the
     columns `export::withheld_columns` names are listed — after the rows, for `query` and for rows
-    `exec` returned alike — while `table` stays silent, its `<n bytes>` placeholder already saying
-    what it is (`a_withheld_blob_is_warned_about_in_every_machine_format`). The `lossy()` fixture —
+    `exec` returned alike — while `table` and `vertical` stay silent, their `<n bytes>` placeholder
+    already saying what it is (`a_withheld_blob_is_warned_about_in_every_machine_format`). The `lossy()` fixture —
     a NULL, an empty string, a blob, a leading `+` and a repeated column name in one row — pins
     what each format makes of the cells they disagree about, and
     `json_and_jsonl_render_the_lossy_row_identically` that the two JSON shapes agree on all of them.
-    `Format` is `table` / `json` /
-    `jsonl` / `csv`, parsed through `FromStr` so a bad name fails at parse time naming the real ones
-    instead of reaching a database and failing after the work is done; `table` is the default
+    `Format` is `table` / `json` / `jsonl` / `csv` / `vertical`, parsed through `FromStr` so a bad
+    name fails at parse time naming the real ones instead of reaching a database and failing after the work is done; `table` is the default
     whether or not stdout is a terminal, there being **no TTY auto-switch** to make a piped command
-    mean something different from the same command run by hand. **Only `table` reports truncation
-    in band**, as a footer: the machine formats stay pure data, because a JSON array with a metadata
+    mean something different from the same command run by hand. `vertical` is
+    `export::export_vertical` with NULL as `NULL`, the table's spelling, and every `--format`
+    subcommand takes it. **Only the two formats a person reads report truncation in band** —
+    `table` and `vertical`, the private `for_a_reader()`, which both `truncation_warning` and
+    `withheld_warning` ask — as the same `row_count_note` footer (for `vertical` with no rows, just
+    `(0 rows)` with no blank line over nothing, `vertical_of_no_rows_is_just_the_count`;
+    `vertical_reports_a_cap_in_band_and_withholds_nothing`). The machine formats stay pure data, because a JSON array with a metadata
     object in it or a CSV with a comment row is worse for every consumer than a clean stream plus a
     line on stderr, which is what `truncation_warning` is for
     (`a_capped_result_is_reported_in_band_for_table_and_on_stderr_otherwise` pins that it is said in
@@ -20175,7 +20192,8 @@ existing prose was left alone.
     `export` writes for *files*, where a trailing newline is noise, and a terminal wants one or the
     next shell prompt lands on the last line of the data — and an empty rendering stays empty, since
     a lone newline is not nothing to a reader counting lines. `render_affected` is purpose-built
-    rather than a row renderer because a write has no rows for `export`'s emitters to describe.
+    rather than a row renderer because a write has no rows for `export`'s emitters to describe;
+    `vertical` gives the table's `(n rows affected)`.
   - `cli/run.rs` — dispatch, and the module that owns the output contract. **stdout is data; stderr
     is everything else** — no banners, no warnings, no progress — which is what makes `--format=json`
     safe to parse and `--format=csv` safe to redirect. The other half is `Exit`, and it has **six**

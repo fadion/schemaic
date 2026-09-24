@@ -1854,6 +1854,59 @@ fn markdown_chunks_with<W: Write>(
     Ok(tally)
 }
 
+/// The result as vertical records — the `mysql` client's `\G`: each row under
+/// a numbered banner, one `name: value` line per column, names right-aligned so
+/// the values start in one column. NULL is written as the caller's `null`
+/// text (the CLI's `NULL`).
+///
+/// **For a person reading a wide row**, which a table wraps into noise: the
+/// headless CLI's `--format vertical`. Nothing reads it back, so a blob keeps
+/// the grid's `<n bytes>` placeholder, as the CLI's table does. A value with
+/// line breaks continues under its own first line rather than at the margin,
+/// where a continuation line would read as a field of its own; a CR is dropped
+/// with the line ending it belongs to.
+///
+/// Alignment counts `char`s — right for the names a schema actually has, and
+/// no width table to carry for the CJK name that would be off by its double
+/// width.
+pub fn export_vertical(rs: &ResultSet, order: &[usize], null: &str) -> String {
+    let width = rs
+        .columns
+        .iter()
+        .map(|c| c.name.chars().count())
+        .max()
+        .unwrap_or(0);
+    let indent = " ".repeat(width + 2);
+    let mut out = String::new();
+    let rows = order.iter().filter(|&&di| di < rs.row_count());
+    for (n, &di) in rows.enumerate() {
+        out.push_str(&format!(
+            "*************************** {}. row ***************************\n",
+            n + 1
+        ));
+        for (ci, col) in rs.columns.iter().enumerate() {
+            let pad = width - col.name.chars().count();
+            out.push_str(&" ".repeat(pad));
+            out.push_str(&col.name);
+            out.push_str(": ");
+            let value = match rs.cell(di, ci) {
+                None => "",
+                Some(cell) if cell.is_null() => null,
+                Some(cell) => cell.display(),
+            };
+            for (li, line) in value.split('\n').enumerate() {
+                if li > 0 {
+                    out.push('\n');
+                    out.push_str(&indent);
+                }
+                out.push_str(line.strip_suffix('\r').unwrap_or(line));
+            }
+            out.push('\n');
+        }
+    }
+    out
+}
+
 /// The whole result as an HTML `<table>` (thead + tbody). Cells/headers are
 /// escaped via [`html_escape`]; NULL renders as an empty `<td>` (matching
 /// [`export_csv`]).
@@ -6008,6 +6061,73 @@ mod tests {
         assert_eq!(lines[1], "| --- | --- |");
         assert_eq!(lines[2], "|  | y |");
         assert_eq!(lines[3], "| 1 | x |");
+    }
+
+    /// **The `mysql` client's `\G`**: one record per row under a numbered
+    /// banner, names right-aligned so the values line up, in the order asked
+    /// for, and NULL spelled as the caller says.
+    #[test]
+    fn export_vertical_writes_one_numbered_record_per_row() {
+        let out = export_vertical(&rs(), &[1, 0], "NULL");
+        assert_eq!(
+            out,
+            "*************************** 1. row ***************************\n \
+             id: NULL\n\
+             a`b: y\n\
+             *************************** 2. row ***************************\n \
+             id: 1\n\
+             a`b: x\n"
+        );
+    }
+
+    /// A value with a newline keeps its lines under the value column rather
+    /// than back at the margin, where they read as a field of their own; a CR
+    /// is the line ending's, not text.
+    #[test]
+    fn export_vertical_indents_a_multi_line_value_under_itself() {
+        let rs = ResultSet::from_rows(
+            vec![col("id"), col("body")],
+            vec![vec![Value::Int(1), Value::Str("one\r\ntwo\nthree".into())]],
+        );
+        let out = export_vertical(&rs, &[0], "NULL");
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines[1], "  id: 1");
+        assert_eq!(lines[2], "body: one");
+        assert_eq!(lines[3], "      two");
+        assert_eq!(lines[4], "      three");
+        assert!(!out.contains('\r'), "{out:?}");
+    }
+
+    /// Alignment counts characters, not bytes: `é` is two bytes and one
+    /// column on a terminal.
+    #[test]
+    fn export_vertical_aligns_names_by_character() {
+        let rs = ResultSet::from_rows(
+            vec![col("é"), col("ab")],
+            vec![vec![Value::Int(1), Value::Int(2)]],
+        );
+        let out = export_vertical(&rs, &[0], "NULL");
+        assert!(out.contains("\n é: 1\nab: 2\n"), "{out:?}");
+    }
+
+    /// An empty result is no records at all — not a banner over nothing.
+    #[test]
+    fn export_vertical_of_no_rows_is_empty() {
+        let empty = ResultSet::from_rows(vec![col("id")], vec![]);
+        assert_eq!(export_vertical(&empty, &[], "NULL"), "");
+    }
+
+    /// A blob reads as the grid's `<n bytes>` placeholder, as it does in the
+    /// CLI's table — this is a format for a person, and nothing reads it back.
+    #[test]
+    fn export_vertical_shows_a_blob_as_its_placeholder() {
+        let mut blob = col("avatar");
+        blob.type_name = "BLOB".to_string();
+        let rs = ResultSet::from_rows(
+            vec![blob],
+            vec![vec![Value::Str(crate::model::binary_display(3))]],
+        );
+        assert!(export_vertical(&rs, &[0], "NULL").contains("avatar: <3 bytes>"));
     }
 
     #[test]
