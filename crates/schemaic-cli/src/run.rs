@@ -147,6 +147,7 @@ where
     I: IntoIterator<Item = T>,
     T: Into<std::ffi::OsString> + Clone,
 {
+    let argv = crate::args::comment_led_sql_last(argv.into_iter().map(Into::into).collect());
     let cli = match <Cli as clap::Parser>::try_parse_from(argv) {
         Ok(cli) => cli,
         Err(e) => {

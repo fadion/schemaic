@@ -163,6 +163,45 @@ fn at_least_one_second() -> clap::builder::RangedU64ValueParser<u64> {
     clap::builder::RangedU64ValueParser::<u64>::new().range(1..)
 }
 
+/// Move SQL that opens with a `--` line comment behind a `--` separator, so
+/// the parser takes it as the statement rather than as a long option.
+///
+/// **A saved snippet very often starts with a comment line**, and clap read
+/// `$'-- note\nSELECT 1'` as the option `-- note…` and exited 2 before
+/// anything reached a server, while the same text piped on stdin ran. What
+/// tells them apart is the byte after `--`: no option is spelled with
+/// whitespace there (`--format`, `--connection=Prod EU`), and a SQL line
+/// comment always is. Such a token before any `--` of the user's own goes
+/// after one; everything else keeps its place, so a command line with no
+/// comment-led token comes back unchanged.
+pub fn comment_led_sql_last(argv: Vec<std::ffi::OsString>) -> Vec<std::ffi::OsString> {
+    let comment_led = |a: &std::ffi::OsString| {
+        a.to_str().is_some_and(|s| {
+            s.strip_prefix("--")
+                .and_then(|rest| rest.chars().next())
+                .is_some_and(char::is_whitespace)
+        })
+    };
+    let separator = argv.iter().position(|a| a == "--");
+    let before_separator = |i: usize| separator.is_none_or(|s| i < s);
+    let (mut kept, mut moved) = (Vec::new(), Vec::new());
+    for (i, a) in argv.into_iter().enumerate() {
+        // `i > 0`: the program's own name is never a statement.
+        if i > 0 && before_separator(i) && comment_led(&a) {
+            moved.push(a);
+        } else {
+            kept.push(a);
+        }
+    }
+    if !moved.is_empty() {
+        if separator.is_none() {
+            kept.push("--".into());
+        }
+        kept.extend(moved);
+    }
+    kept
+}
+
 /// Does this argv mean the CLI rather than the app?
 ///
 /// **An allowlist of the first argument, never "are there any arguments".**
@@ -256,6 +295,72 @@ mod tests {
     #[test]
     fn a_subcommand_further_along_does_not_route() {
         assert!(!wants_cli(&argv(&["schemaic", "--mcp-serve", "list"])));
+    }
+
+    fn os(args: &[&str]) -> Vec<std::ffi::OsString> {
+        args.iter().map(Into::into).collect()
+    }
+
+    fn parse_os(args: Vec<std::ffi::OsString>) -> Result<Cli, clap::Error> {
+        Cli::try_parse_from(args)
+    }
+
+    /// **SQL that opens with a `--` comment is the statement, not a flag.** A
+    /// saved snippet very often starts with a comment line, and clap read
+    /// `$'-- note\nSELECT 1'` as an unknown long option and exited 2 before
+    /// anything reached a server — while the same text piped on stdin worked.
+    #[test]
+    fn sql_led_by_a_line_comment_is_the_statement() {
+        for sub in ["query", "exec"] {
+            for sql in [
+                "-- note\nSELECT 1",
+                "--\tnote\nSELECT 1",
+                "-- only a comment",
+            ] {
+                let argv = comment_led_sql_last(os(&[
+                    "schemaic", sub, sql, "-c", "prod", "--format", "json",
+                ]));
+                let cli = parse_os(argv).unwrap_or_else(|e| panic!("{sub} {sql:?}: {e}"));
+                let (got, target, format) = match cli.command {
+                    Command::Query {
+                        sql,
+                        target,
+                        format,
+                        ..
+                    }
+                    | Command::Exec {
+                        sql,
+                        target,
+                        format,
+                        ..
+                    } => (sql, target, format),
+                    other => panic!("{other:?}"),
+                };
+                assert_eq!(got, sql);
+                assert_eq!(target.conn.connection, "prod");
+                assert_eq!(format, Format::Json, "the flags after it still apply");
+            }
+        }
+    }
+
+    /// Only a `--` **followed by whitespace** is moved: no flag is spelled that
+    /// way, and every other token — a real flag, a `--name=value` whose value
+    /// has a space, the bare separator — is the command line's as it was.
+    #[test]
+    fn nothing_but_a_comment_led_token_is_moved() {
+        let argv = os(&[
+            "schemaic",
+            "query",
+            "SELECT 1",
+            "--connection=Prod EU",
+            "--format",
+            "csv",
+        ]);
+        assert_eq!(comment_led_sql_last(argv.clone()), argv);
+        // After an explicit `--` a token is already the statement.
+        let argv = os(&["schemaic", "query", "-c", "1", "--", "-- note\nSELECT 1"]);
+        assert_eq!(comment_led_sql_last(argv.clone()), argv);
+        assert!(parse_os(argv).is_ok());
     }
 
     #[test]

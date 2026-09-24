@@ -19897,6 +19897,13 @@ existing prose was left alone.
     is **200, deliberately small**: the GUI's row cap is about what a grid can hold, this one is
     about what a caller can sensibly receive down a pipe, and the caller is very often a language
     model with a context window; a person who wants the whole table says so with `--limit`.
+    **SQL that opens with a `--` comment is moved behind a `--` separator before clap sees it**
+    (`comment_led_sql_last`, called at the top of `run::main`): clap read `$'-- note\nSELECT 1'` as
+    an unknown long option and exited 2, though a saved snippet very often starts with a comment
+    line. What tells the two apart is the byte after `--` — whitespace in a SQL comment, never in
+    an option (`--connection=Prod EU` included) — and a command line with no such token comes back
+    unchanged (`sql_led_by_a_line_comment_is_the_statement`,
+    `nothing_but_a_comment_led_token_is_moved`).
     `--limit` and `--timeout` refuse `0` at parse time — zero rows is a typo and zero seconds
     cancels every statement before it runs — and `-d` goes through `non_blank`, because a blank is
     what `-d "$DB"` sends with `DB` unset and it is not "no flag": PostgreSQL took it as a name and

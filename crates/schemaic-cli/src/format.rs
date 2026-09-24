@@ -196,7 +196,10 @@ pub fn exec_truncation_warning(rs: &ResultSet) -> Option<String> {
 /// returned none has nothing for them to describe.
 pub fn render_affected(affected: u64, format: Format) -> String {
     match format {
-        Format::Table => format!("({affected} rows affected)\n"),
+        Format::Table => format!(
+            "({affected} {} affected)\n",
+            if affected == 1 { "row" } else { "rows" }
+        ),
         Format::Json => format!("{{\n  \"affected\": {affected}\n}}\n"),
         Format::Jsonl => format!("{{\"affected\":{affected}}}\n"),
         Format::Csv => format!("affected\n{affected}\n"),
@@ -393,6 +396,15 @@ mod tests {
         assert!(warning.contains("ran in full"), "{warning}");
         assert!(!warning.contains("--limit"), "{warning}");
         assert!(exec_truncation_warning(&rs()).is_none());
+    }
+
+    /// One row is a row here too — `query`'s footer already said "(1 row)"
+    /// while `exec` said "(1 rows affected)".
+    #[test]
+    fn a_single_affected_row_is_not_plural() {
+        assert_eq!(render_affected(1, Format::Table), "(1 row affected)\n");
+        assert_eq!(render_affected(0, Format::Table), "(0 rows affected)\n");
+        assert_eq!(render_affected(2, Format::Table), "(2 rows affected)\n");
     }
 
     #[test]
