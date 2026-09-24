@@ -1833,6 +1833,22 @@ const TIP_EDGE: f64 = 8.0;
 /// tip and every other one in the app answer at the same pace.
 const DIAG_TIP_DELAY: std::time::Duration = std::time::Duration::from_millis(300);
 
+/// `v`, marking `on_overlay` whenever a pointer move reaches it — **the
+/// squiggle tip's occlusion test**.
+///
+/// The tip's hover listens on `editor_area`, the ancestor of every bar and menu
+/// drawn over the text, and floem runs an ancestor's listeners after its
+/// children's for a move none of them consumed — which none of these do. So a
+/// squiggle under the error bar, the run menu's full-pane catcher, the find or
+/// goto bar or the Ctrl+K bar counted as hovered, and its tip (at a
+/// window-global z of 1001) painted over whatever covered it. The overlay's own
+/// listener runs first and sets the flag; `editor_area`'s reads and clears it in
+/// the same dispatch, so it never outlives the move that set it.
+fn marks_pointer<V: View + 'static>(v: V, on_overlay: &Rc<std::cell::Cell<bool>>) -> V {
+    let on_overlay = on_overlay.clone();
+    v.on_event_cont(EventListener::PointerMove, move |_| on_overlay.set(true))
+}
+
 /// The widest a diagnostic's tip grows before it wraps, before UI scaling.
 const DIAG_TIP_MAX_W: f64 = 480.0;
 
@@ -3008,6 +3024,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
         default_key_handler(editor_sig)(kp, mods)
     });
     let ed = editor.editor().clone();
+    let ed_tip = ed.clone(); // the squiggle tip's retire effect watches its caret
     let ed_cmdk = ed.clone(); // for the Ctrl+K popup (the editor's `.update` moves `ed`)
     let ed_menu = ed.clone(); // right-click handler: read caret offset
     let ed_menu2 = ed.clone(); // menu actions: anchor point for "Ask AI"
@@ -4978,6 +4995,9 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
     let diag_tip: RwSignal<Option<DiagHit>> = RwSignal::new(None);
     let diag_pending: RwSignal<Option<DiagHit>> = RwSignal::new(None);
     let diag_tip_gen: RwSignal<u64> = RwSignal::new(0);
+    // Set by an overlay the pointer is over, read by `editor_area`'s move — see
+    // `marks_pointer`.
+    let on_overlay: Rc<std::cell::Cell<bool>> = Rc::new(std::cell::Cell::new(false));
     let hover_diag = move |p: Option<Point>| {
         // Not over the completion list: typing is what opens it, and a message
         // about the text being replaced is noise over the list replacing it.
@@ -4998,20 +5018,38 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
         diag_tip_gen.set(this);
         if let Some(hit) = under {
             floem::action::exec_after(DIAG_TIP_DELAY, move |_| {
-                // `try_`: the tab may have closed inside the delay.
-                if diag_tip_gen.try_get_untracked() == Some(this) {
+                // `try_`: the tab may have closed inside the delay. And not over
+                // a modal or menu that opened inside it — a keyboard route to one
+                // may never have reached this pane to retire the delay.
+                if diag_tip_gen.try_get_untracked() == Some(this)
+                    && crate::widgets::innermost_focus_root().is_none()
+                {
                     diag_tip.set(Some(hit));
                 }
             });
         }
     };
     // Anything that moves or rewrites the text under the tip retires it: an
-    // edit, a scroll, a new set of diagnostics, the completion list opening. The
-    // next pointer move finds whatever is under it now.
+    // edit, a scroll, a new set of diagnostics, the completion list opening —
+    // and anything that comes up over the text: the run menu, the Ctrl+K bar,
+    // the find and goto bars, the error and guard bars — and the keyboard: a
+    // caret move, or the editor losing focus to a modal a shortcut opened. Not
+    // a KeyDown listener alone, because the editor consumes the keys it
+    // handles and `editor_area` never sees them; the caret and the focus are
+    // what those keys change. The next pointer move finds whatever is under
+    // it now.
     create_effect(move |_| {
         diag_hits.with(|_| ());
         query.with(|_| ());
         comp.open.with(|_| ());
+        ed_tip.cursor.track();
+        editor_focused.with(|_| ());
+        run_menu.with(|_| ());
+        cmdk.open.with(|_| ());
+        find_open.with(|_| ());
+        goto_open.with(|_| ());
+        error_msg.with(|_| ());
+        guard.with(|_| ());
         // Runs on every keystroke and scroll frame, so it touches the signals
         // only when there is something to retire. A delay is only ever pending
         // while `diag_pending` holds its candidate, so that is also the only
@@ -5706,9 +5744,9 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
         stack((signature_popup(comp, ed_vp), diag_tip_view))
             .style(|s| s.absolute().inset(0.0).z_index(1001))
             .pointer_events(|| false),
-        error_bar,
-        guard_bar,
-        cmdk_view,
+        marks_pointer(error_bar, &on_overlay),
+        marks_pointer(guard_bar, &on_overlay),
+        marks_pointer(cmdk_view.into_any(), &on_overlay),
         // Above the Ctrl+K bars, not below them. The bars run edge to edge — they
         // belong to the block of lines they close, and a row that stopped short of
         // the border would read as a floating panel — so at this layer they covered
@@ -5725,9 +5763,9 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
         // so that wrapper silently ate every click, drag and wheel in the editor.
         v_scrollbar,
         h_scrollbar,
-        run_menu_view,
-        find_bar,
-        goto_bar,
+        marks_pointer(run_menu_view, &on_overlay),
+        marks_pointer(find_bar, &on_overlay),
+        marks_pointer(goto_bar, &on_overlay),
     ))
     .style(|s| {
         s.flex_grow(1.0_f32)
@@ -5748,14 +5786,24 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
     // and an ancestor that consumed it would take nothing from them but would
     // be one more listener claiming a move it only watched. The position is in
     // `editor_area`'s own coords, the ones `diag_hits` are measured in.
-    .on_event_cont(EventListener::PointerMove, move |e| {
-        if let Event::PointerMove(pe) = e {
-            hover_diag(Some(pe.pos));
+    .on_event_cont(EventListener::PointerMove, {
+        let on_overlay = on_overlay.clone();
+        move |e| {
+            if let Event::PointerMove(pe) = e {
+                // Read and cleared in one step — see `marks_pointer`. A move an
+                // overlay took is a move over the overlay, not over the text.
+                let covered = on_overlay.replace(false);
+                hover_diag((!covered).then_some(pe.pos));
+            }
         }
     })
     // A press starts a selection (the editor then owns every move until the
     // release) or a click somewhere else entirely; either way the tip is done.
     .on_event_cont(EventListener::PointerDown, move |_| hover_diag(None))
+    // **And so does a key**, floem's own tooltip rule, for the keys that reach
+    // here — the ones the editor does not consume. The ones it does move the
+    // caret, which the retire effect watches.
+    .on_event_cont(EventListener::KeyDown, move |_| hover_diag(None))
     .on_event_cont(EventListener::PointerLeave, move |_| hover_diag(None));
     // The pane no longer pads its contents (so the title can sit flush at the
     // pane edge, matching SCHEMA); the editor's inset moves to this wrapper.
@@ -7357,5 +7405,45 @@ mod editor_freeze_gate {
             edits >= 3,
             "the scan found only {edits} document edits — has `edit_single` been renamed?"
         );
+    }
+}
+
+/// **Every overlay drawn over the text tells the squiggle tip it is there.**
+///
+/// The tip's hover listens on `editor_area`, beneath all of them, so an overlay
+/// that is not wrapped in `marks_pointer` lets a squiggle it covers count as
+/// hovered, and the tip paints over it at a window-global z. The run menu, the
+/// error, guard, find, goto and Ctrl+K bars all did. A new bar added to that
+/// stack has to be wrapped too, which is what this names.
+#[cfg(test)]
+mod diag_tip_occlusion_gate {
+    use crate::source_gate::production_code;
+
+    #[test]
+    fn every_overlay_over_the_text_marks_the_pointer() {
+        let src =
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/editor_pane.rs"))
+                .expect("this file");
+        let body = production_code(&src);
+        for overlay in [
+            "error_bar",
+            "guard_bar",
+            "cmdk_view",
+            "run_menu_view",
+            "find_bar",
+            "goto_bar",
+        ] {
+            let bare = format!("\n        {overlay},\n");
+            assert!(
+                !body.contains(&bare),
+                "`{overlay}` is listed over the editor without `marks_pointer`, so \
+                 the squiggle tip opens through it"
+            );
+            assert!(
+                body.contains(&format!("marks_pointer({overlay}")),
+                "`{overlay}` is not wrapped in `marks_pointer` — this gate is stale \
+                 if it moved"
+            );
+        }
     }
 }

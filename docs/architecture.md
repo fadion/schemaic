@@ -69,7 +69,15 @@ existing prose was left alone.
     text, under the same copy-on-write rule, so nothing but the listed cells can differ.
     `append_rows` is the other half of the same caller's need — the grid's *pending* rows, which the
     server has never seen, padded with NULL exactly as `from_rows` pads. Both exist for
-    `edit::GridCells::exported`. `retained_bytes` sums what a result costs to *hold* —
+    `edit::GridCells::exported`. `project_columns(keep)` is the third reader's need: the same rows
+    with only `keep`'s columns, **in `keep`'s order**, for a reader that takes a block rather than
+    the whole result — the gutter's *Copy as* over a highlighted range, in drawn order, and each
+    pending-row group of an `INSERT` copy (`edit::GridCells::insert_blocks_at`). It clones the kept
+    columns' `Arc`s rather than their arenas, and it **renumbers `capped_columns` and
+    `binary_columns`** onto the new positions, because every withholding rule downstream reads them
+    by index: carried over as they were, they would name whichever column now sits at the old
+    index. The private `clone_meta` supplies every other field. No test here pins the renumbering;
+    it is reached only through `edit`'s projection tests. `retained_bytes` sums what a result costs to *hold* —
     each column's arena plus its packed offset word per cell, as allocated — which is what the
     results strip shows on a kept result, and the reason a result of nothing but NULLs is still
     megabytes: the cost is per cell, not per character.
@@ -1394,15 +1402,33 @@ existing prose was left alone.
     that. Unformatted, like `tsv`: a formatter is how a value is shown and an export writes the
     value, so `formats` is the one field of this struct the method does not consult. Cheap on a
     clean grid, since the columns are refcounted and `splice_cells` rebuilds only a column whose
-    listed cell really differs. `exported_rows_at(selection, pos)` is that resolution narrowed to
-    the rows a gutter gesture at **display** row `pos` means — the highlighted rows when the click
-    is inside them, else that row alone, the reading `selected_data_rows` gives — for the row
-    menu's *Copy as*. It slices the *exported* order by display position rather than reading the
+    listed cell really differs. `exported_rows_at(selection, pos, frozen)` is that resolution
+    narrowed to what a gutter gesture at **display** row `pos` means — the highlighted rows when
+    the click is inside them, else that row alone, the reading `selected_data_rows` gives — for the
+    row menu's *Copy as*. It slices the *exported* order by display position rather than reading the
     selection as data indices, which on a sorted grid are different numbers and would copy the wrong
     rows; slicing the resolved order is what carries the sort, the staged values and the pending
     rows at once. Unlike the delete it keeps the pending rows, since a copy has nothing to refuse
     them for, and a range past the last row is clamped rather than a panic
-    (`exported_rows_at_clamps_to_the_rows_that_exist`). One rule,
+    (`exported_rows_at_clamps_to_the_rows_that_exist`). **And the columns the gesture means, in the
+    order they are drawn**: inside the highlighted block, the block's columns in `visual_cols` order;
+    outside it, the whole row in that order. It used to take only the row pair and copy every column
+    in index order, so one menu said *Copy* for a 3×2 block and meant six cells while *Copy as*
+    beside it took every column of the same three rows
+    (`exported_rows_at_takes_the_blocks_columns_in_drawn_order`). `gesture_at` reads the rows and
+    columns off the gesture, `pick` slices the order and `project` narrows the columns, handing the
+    result back untouched for a whole row outside a freeze. **`insert_blocks_at(selection, pos,
+    frozen)` and `insert_blocks_all()` are the same gesture, and the whole result, for an `INSERT`
+    — and they return blocks rather than one result, because a pending row's unset cell is not a
+    NULL.** It takes the server's default — the grid previews it as `<auto>` and its own Commit
+    leaves the column out — so an `INSERT` listing it as `NULL` wrote something else: PostgreSQL
+    refused the row over a `serial` key, and MySQL in non-strict mode stored an implicit `0` or `''`
+    over the declared default. So the stored rows are one block, and the pending rows are grouped by
+    which columns they set, each group projected to those (`model::ResultSet::project_columns`); a
+    pending row with nothing set has nothing to insert and is left out
+    (`an_insert_of_a_pending_row_omits_the_cells_it_did_not_set`). `DEFAULT` in `VALUES` would say
+    the same in one statement, and SQLite refuses it. CSV and JSON keep `exported_rows_at`'s single
+    result, blank cells and all. One rule,
     because this resolution kept going out one source short where nothing could test it:
     `attached_rows` first read `rs.cell` and never `dirty`, so a green uncommitted edit was on
     screen while the pre-edit value went to the model, and the fix for *that* left the rule in
@@ -2011,8 +2037,25 @@ existing prose was left alone.
     caller that renders to a string** and so never sees a tally: the names of the columns a JSON or
     CSV rendering writes as `null` / an empty field, off the same `dropped_binary_columns` the
     emitters use, so the caveat cannot name a different set than the file actually lost
-    (`withheld_columns_names_the_blob_and_nothing_else`). Its one caller is the CLI's
-    `format::withheld_warning`.
+    (`withheld_columns_names_the_blob_and_nothing_else`). Its callers are the CLI's
+    `format::withheld_warning` and the grid's clipboard renderer `render_order` — Copy ▸ JSON/CSV
+    and the gutter's *Copy as* of those — which puts the caveat on `commit_note` through
+    `export_note(…, "the clipboard", false)`; the clipboard used to write `null` or an empty field
+    for a withheld blob and say nothing, and a JSON `null` reads as a NULL.
+    **`insert_shape(rs, tab)` is where an `INSERT` export lands, and it reads the result rather than
+    the tab.** A grid tab's `source` is the table it was *opened* on and is kept however its text is
+    edited, so a tab opened on `users` and rerun as `SELECT … FROM customers` exported
+    `INSERT INTO users` — customer rows, landing silently wherever the columns lined up. The
+    columns' `ColumnOrigin`s are what the server said the rows are: every column from one table
+    names that table, as a `TableRef` (an owned `(database, namespace, table)`), and renames each
+    column to `origin.column`, so `id AS user_id` inserts into `id` rather than into a column the
+    table has not got; no column with an origin at all falls back to `tab`, which then has nothing
+    to contradict it; anything else — a join, a computed column beside real ones — is `None`, the
+    `table` placeholder, for the user to decide rather than a guess. It reshapes the input and
+    leaves `export_inserts_chunks` alone, so a dump, which names its own tables, is untouched. The
+    grid's clipboard (`render_order`) and its `.sql` file (`save_export`) both call it, so the two
+    cannot name different targets; the four `insert_shape_*` tests pin the three arms and the
+    rename.
     And
     `all_rows_label(size, sorted, manual_tx, staged)` is the Download menu's `All rows` entry, four
     disclosures made at the point of choice in place of an untested `match` in the view (*Data grid*).
@@ -15167,9 +15210,30 @@ existing prose was left alone.
     and shows it after `DIAG_TIP_DELAY` — 300 ms, the app-wide `.tooltip()` delay set on
     `TooltipContainerClass` at the root, so every tip in the app answers at one pace — behind a
     generation counter read with `try_get_untracked`, since the tab may close inside the delay. It
-    offers nothing while the completion list is open. `PointerDown` and `PointerLeave` retire the
-    tip, and so does an effect on any change of `diag_hits` (a scroll, a new set of diagnostics), of
-    the document, or of `comp.open`. `diag_tip_view` is paint-only, styled with
+    offers nothing while the completion list is open, **nor where an overlay covers the text**.
+    Each view `editor_area`'s stack draws over the editor — `error_bar`, `guard_bar`, `cmdk_view`,
+    `run_menu_view`, `find_bar`, `goto_bar` — is wrapped in `marks_pointer`, which sets a shared
+    `Rc<Cell<bool>>` from its own `PointerMove`, and `editor_area`'s listener reads and clears it in
+    one step (`replace(false)`) and hands `hover_diag` `None` when it was set. That leans on floem
+    0.2's dispatch (`context.rs`): a pointer event goes to the topmost child whose rect contains the
+    point, the child loop then breaks, and the parent's own listeners run after — so the overlay has
+    always marked the move by the time `editor_area` reads it, and the flag never outlives the
+    dispatch that set it. **Both listeners stay `cont`**: an overlay that consumed the move would
+    keep `editor_area` from hearing it at all, and a tip pending when the pointer crossed onto the
+    overlay would still open. Before this the hit test saw straight through every one of them — the
+    run menu's full-pane catcher included — and the tip, at the window-global z of 1001 (below),
+    painted over whatever covered its squiggle.
+    `diag_tip_occlusion_gate::every_overlay_over_the_text_marks_the_pointer` holds those six to the
+    wrapper **by name**, so a new overlay added to the stack is not caught until it joins the list.
+    `PointerDown`, `PointerLeave` and `KeyDown` retire the tip, and so does an effect on any change
+    of `diag_hits` (a scroll, a new set of diagnostics), of the document, of `comp.open`, of
+    anything that comes up over the text (`run_menu`, `cmdk.open`, `find_open`, `goto_open`,
+    `error_msg`, `guard`), of the caret (`ed.cursor`) and of `editor_focused`. **The caret and the
+    focus are what catch the keyboard, not the `KeyDown` listener**: the editor consumes the keys it
+    handles, so `editor_area` hears only the rest, while a key the editor takes moves the caret and a
+    modal a shortcut opens blurs the editor. The delay also refuses to show while
+    `widgets::innermost_focus_root()` is `Some`, for a keyboard route to a modal or menu that never
+    reached this pane to retire it. `diag_tip_view` is paint-only, styled with
     `widgets::tooltip_style` and placed by `diag_tip_place`, below the line in the pane's upper half
     and above it (`inset_bottom`) in the lower half, so a long message is never cut by the bottom
     edge. **Horizontally it pins an edge (`TipX`) rather than sliding one**, because the tip's real
@@ -15471,7 +15535,10 @@ existing prose was left alone.
     squiggle tip and lifts it over the bars, the scrollbars and the results pane; the hint's own
     `z_index(1001)` in `completion.rs` agrees and keeps it right wherever it is placed. That is
     a pane-sized wrapper above the editor — the very shape the previous sentence forbids — and it is
-    harmless only because it is click-through and neither child has anything to hover.
+    harmless only because it is click-through and neither child has anything to hover. The same
+    layer is why the tip must never *open* where something covers its squiggle: 1001 is above every
+    bar in the stack, so a tip raised under the run menu or the find bar paints over it, and
+    `marks_pointer` (above) is what keeps it from being raised there.
     **`visible_hunk_lines` is a filter, never a clamp.** A line outside the viewport is dropped, not
     pulled to the nearest one — the rule `top_of` already states for a line past the end of the
     document, and for its reason: a band placed against whatever text happens to be at the clamped
@@ -22611,6 +22678,11 @@ Re-introducing the anti-patterns these guard against is a regression:
   `cont`: it watches a move the editor has already had and has no business claiming it. The tip it
   raises is paint-only and shares `signature_popup`'s click-through slot, so where a tooltip would
   have needed a hit rect this route adds none — nothing can eat a click, a selection or a wheel.
+  **The corollary is that the ancestor hears moves over its overlays too**: none of the bars drawn
+  over the text consumes `PointerMove`, so `editor_area` heard a move over the run menu as a move
+  over the squiggle beneath it and opened the tip over the menu. Each such overlay now marks the
+  moves it receives (`marks_pointer`, see `editor_pane.rs`), which relies on the same ordering —
+  child first, ancestor after, in one dispatch.
   **A container introduced for layout or arity reasons is a hit target too**, and this is the trap
   rather than any one overlay. `absolute().inset(0)` on a wrapper whose children are small and
   edge-pinned turns a few thin overlays into a single pane-sized one, and nothing about it says so:
@@ -24222,12 +24294,30 @@ this bundle's.
   and slow, and an edit typed while it stands open must not change what was asked for. The gate is
   `no_export_path_renders_the_unresolved_result`, which lists every export path — those four,
   `export_menu` (whose `Fetched rows (N)` label counts what the file will hold) and the gutter
-  menu's *Copy as* — holds each to one of three resolvers, and holds every resolver to
-  `grid_cells`; fixing one of four is exactly how this class came back. The resolvers are
+  menu's *Copy as* — holds each to one of three resolvers, and holds every resolver, the
+  `INSERT` pair `insert_blocks_at`/`insert_blocks_all` included, to `grid_cells`; fixing one of
+  four is exactly how this class came back. The resolvers are
   `exported_rows`, its count-only half `exported_row_count` (what `export_menu` needs, with
-  nothing built), and `exported_rows_at`, its row-narrowed sibling for *Copy as*
-  (`render_rows_at`), which reads the raw pair plus the selection. It shares `render_order`
+  nothing built), and `exported_rows_at`, its gesture-narrowed sibling for *Copy as*
+  (`render_rows_at`), which reads the raw pair plus the selection rectangle and the freeze.
+  **The gate also holds `render_rows_at` to the gesture's scope, not just to a resolver**: it must
+  contain `exported_rows_at(gs, pos)` and `insert_blocks_at(gs, pos)` and neither
+  `exported_rows(gs)` nor `insert_blocks_all(`, because any resolver passed the first check, and
+  `exported_rows(gs)` swapped in copied the whole result — up to the row cap — off a right-click
+  on one row with the suite green. It shares `render_order`
   with `render_export`, so a row copy and the whole-result copy cannot render a format differently.
+  An `INSERT` reaches it through `render_inserts`, which renders each of `insert_blocks_*`'s blocks
+  (see `core::edit`: a pending row's unset cells are left out rather than written `NULL`) and joins
+  them — and when nothing is left to insert, a selection covering only a new row's unset cells, it
+  says so on `commit_note`, and both menu entries leave the clipboard as it was rather than setting
+  it to an empty string. **`render_order` is
+  also where a clipboard copy gets its target and its caveat**: an `INSERT` is shaped by
+  `export::insert_shape`, so it names the rows' own table rather than the tab's sticky `source`,
+  and a JSON or CSV copy puts `export_note` over `withheld_columns` on `commit_note`, the string
+  having nowhere to carry a withheld blob but a `null` that reads as NULL. `save_export` shapes the
+  file through `insert_shape` too. **What this does not cover**: the saved `.sql` file still takes
+  `exported_rows`, not `insert_blocks_all`, so a pending row's unset cells are still written `NULL`
+  there, and the clipboard and the file disagree about that row's `INSERT`.
   The reason is under `core::edit`: the rule went out one source
   short twice in the view, most recently without `format::apply`, so a `Timestamp` column attached
   the epoch integer the cell does not show. The **painter** is the exception and stays one:
@@ -24355,7 +24445,10 @@ this bundle's.
   column. `Copy as` is the toolbar's Copy menu for just these rows: the same
   `ExportFormat::clipboard_formats()` list (text formats only, for the reason `export.rs`'s entry
   gives), each rendered through `render_rows_at` → `edit::GridCells::exported_rows_at`, so it
-  copies the rows on screen in screen order, staged values and pending rows included. Its row
+  copies the rows on screen in screen order, staged values and pending rows included — and, when
+  the click is inside a highlighted block, only the block's columns in drawn order, which is what
+  the *Copy* beside it takes; SQL goes through `insert_blocks_at` instead (the export bullet above
+  says why). Its row
   actions take **every selected row** (`selected_data_rows` → `set_rows_deleted` /
   `clone_rows`) and count them in the label: the same menu naming five rows in one entry and acting
   on one in the next is how four deletions go missing unnoticed. **`set_rows_deleted` batches, and
