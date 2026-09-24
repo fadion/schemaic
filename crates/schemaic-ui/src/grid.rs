@@ -2798,23 +2798,47 @@ fn save_export(gs: GridState, format: ExportFormat, all_rows: bool, estimate: Op
     let (resolved, resolved_order) = exported_rows(gs);
     // An `INSERT` file names the rows' own table, not the tab's opened-from one
     // — the clipboard's rule (`render_order`), so the two cannot disagree.
-    let (resolved, source) = match format {
-        ExportFormat::Sql => {
-            let tab = gs.source.get_untracked();
-            let (target, shaped) = schemaic_core::export::insert_shape(
-                &resolved,
-                tab.as_ref()
-                    .map(|s| (s.database.as_str(), s.schema.as_deref(), s.table.as_str())),
-            );
-            (
-                shaped,
-                target.map(|(d, s, t)| schemaic_core::schema::TableSource::new(d, s, t)),
-            )
+    let shape = |rs: &ResultSet| {
+        let tab = gs.source.get_untracked();
+        let (target, shaped) = schemaic_core::export::insert_shape(
+            rs,
+            tab.as_ref()
+                .map(|s| (s.database.as_str(), s.schema.as_deref(), s.table.as_str())),
+        );
+        crate::ExportBlock {
+            rs: std::sync::Arc::new(shaped),
+            order: std::sync::Arc::new(Vec::new()),
+            source: target.map(|(d, s, t)| schemaic_core::schema::TableSource::new(d, s, t)),
         }
-        _ => (resolved, gs.source.get_untracked()),
     };
-    let rs = std::sync::Arc::new(resolved);
-    let order = std::sync::Arc::new(resolved_order);
+    // **And its blocks are the clipboard's too** (`render_export`): a pending
+    // ＋Row's `INSERT` names only the columns it set, where `exported_rows` has
+    // its unset cells as `NULL` — which overrides the server's default. The
+    // first block rides in `rs`/`order`, the rest in `more`. With no block at
+    // all (only empty ＋Rows) the file is empty, as the copy is.
+    let (first, more) = match format {
+        ExportFormat::Sql => {
+            let mut blocks = insert_blocks_all(gs).into_iter().map(|(rs, order)| {
+                let mut b = shape(&rs);
+                b.order = std::sync::Arc::new(order);
+                b
+            });
+            let first = blocks.next().unwrap_or_else(|| shape(&resolved));
+            (first, blocks.collect())
+        }
+        _ => (
+            crate::ExportBlock {
+                rs: std::sync::Arc::new(resolved),
+                order: std::sync::Arc::new(resolved_order),
+                source: gs.source.get_untracked(),
+            },
+            Vec::new(),
+        ),
+    };
+    let crate::ExportBlock { rs, order, source } = first;
+    let more: Vec<crate::ExportBlock> = more;
+    // What the modal counts to: every block's rows.
+    let fetched_total = order.len() + more.iter().map(|b| b.order.len()).sum::<usize>();
     let dialect = gs.dialect;
     // The statement is snapshotted with the rows and for the same reason: the
     // dialog is modal and slow, and a filter typed while it stood open must not
@@ -2903,7 +2927,7 @@ fn save_export(gs: GridState, format: ExportFormat, all_rows: bool, estimate: Op
             total: if streaming {
                 estimate
             } else {
-                Some(order.len() as u64)
+                Some(fetched_total as u64)
             },
             approx: streaming,
             run,
@@ -2917,6 +2941,7 @@ fn save_export(gs: GridState, format: ExportFormat, all_rows: bool, estimate: Op
                 rs: rs.clone(),
                 order: order.clone(),
                 source: source.clone(),
+                more: more.clone(),
                 dialect,
                 // The modal above carries a Stop for every grid export, both
                 // scopes — so every one of them belongs in the cancel slot.
@@ -11200,6 +11225,18 @@ mod cell_preview_tests {
             !f.contains("exported_rows(gs)") && !f.contains("insert_blocks_all("),
             "`render_rows_at` renders the whole result:\n{f}"
         );
+        // **The file's `INSERT`s are the clipboard's blocks.** `exported_rows`
+        // satisfies the resolution check above and still has a pending ＋Row's
+        // unset cells as `NULL`, so Save .sql wrote them — overriding the
+        // server's default — while Copy ▸ SQL left them out.
+        for name in ["fn render_export(", "fn save_export("] {
+            let at = body.find(name).expect(name);
+            let end = body[at..].find("\n}").expect("no end");
+            assert!(
+                body[at..at + end].contains("insert_blocks_all(gs)"),
+                "`{name}` writes SQL without the pending rows' own column lists"
+            );
+        }
         // And every resolver goes through `GridCells`, rather than reaching for
         // the overlay a second time — which is how the menu and the file came to
         // disagree about a row count in the first place.

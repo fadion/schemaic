@@ -2055,7 +2055,20 @@ existing prose was left alone.
     leaves `export_inserts_chunks` alone, so a dump, which names its own tables, is untouched. The
     grid's clipboard (`render_order`) and its `.sql` file (`save_export`) both call it, so the two
     cannot name different targets; the four `insert_shape_*` tests pin the three arms and the
-    rename.
+    rename. **`export_insert_blocks(w, blocks, dialect, chunk_rows, watch)` is the one sanctioned
+    way round `RowChunk`'s rule that every chunk of an export carries the same columns** — a rule
+    that exists because the header is written from the first chunk and never revisited. A file of
+    `INSERT`s has no header, and a pending ＋Row's `INSERT` must name only the columns it set (see
+    `core::edit`'s `insert_blocks_all`: an unset cell written `NULL` overrides the server's default,
+    and `DEFAULT` in `VALUES` is refused by SQLite), so the grid's `.sql` file cannot be one stream.
+    Each `InsertBlock { rs, order, target }` goes through `export_inserts_chunks` in its own
+    `SliceChunks` of `chunk_rows`, naming its own column list and target, and the tallies fold
+    through `ExportTally::absorb`. `watch` is `SliceChunks::watching`'s hook over the **whole** file
+    — each block's source adds the rows of the blocks before it, so the progress count runs across
+    block edges rather than restarting — and a `false` is still an `io::Error`, for the reason above
+    (`a_saved_insert_file_omits_a_pending_rows_unset_cells_too`, which also checks the running total,
+    and `a_stop_between_insert_blocks_is_an_error`, both in `edit.rs`). It is for `INSERT` blocks
+    only: the other five formats have a header and still need one column set.
     And
     `all_rows_label(size, sorted, manual_tx, staged)` is the Download menu's `All rows` entry, four
     disclosures made at the point of choice in place of an untested `match` in the view (*Data grid*).
@@ -17420,7 +17433,11 @@ existing prose was left alone.
   **The export is the other way past the cap, and it is a different shape.** `export_file` branches
   on `ExportScope`: `Fetched` is the one `spawn_blocking` it has always been and needs no channel of
   rows, everything being in memory already — but it renders in `EXPORT_CHUNK_ROWS` blocks all the
-  same, through `export::SliceChunks` rather than `ExportFormat::render_to`. **Not for memory**: the
+  same, through `export::SliceChunks` rather than `ExportFormat::render_to` — or, for SQL, through
+  `export::export_insert_blocks` over the request's first block followed by `ExportRequest::more`,
+  with the same `watching` closure, because a pending ＋Row's `INSERT` names only the columns it
+  set and cannot share one stream's column list (`core::export` has it). `AllRows` ignores `more`:
+  it re-runs the statement, and pending rows are not on the server. **Not for memory**: the
   rows are in hand and a chunk copies nothing either way. It is for the two things a single block
   cannot offer — **progress**, since rendered whole there is no moment between "started" and
   "finished" at which anything can be reported and a large Excel export is indistinguishable from a
@@ -24426,9 +24443,15 @@ this bundle's.
   `export::insert_shape`, so it names the rows' own table rather than the tab's sticky `source`,
   and a JSON or CSV copy puts `export_note` over `withheld_columns` on `commit_note`, the string
   having nowhere to carry a withheld blob but a `null` that reads as NULL. `save_export` shapes the
-  file through `insert_shape` too. **What this does not cover**: the saved `.sql` file still takes
-  `exported_rows`, not `insert_blocks_all`, so a pending row's unset cells are still written `NULL`
-  there, and the clipboard and the file disagree about that row's `INSERT`.
+  file through `insert_shape` too, **one block at a time**, as `render_order` does. **The saved
+  `.sql` file takes `insert_blocks_all` too**, and until it did the clipboard and the file disagreed
+  about a pending row's `INSERT`: the file went through `exported_rows`, so the row's unset cells
+  were written `NULL` over the server's default. `save_export` now takes `exported_rows` only for
+  the other formats; for SQL the first block rides in `ExportRequest`'s `rs`/`order`/`source` and
+  the rest in `ExportRequest::more`, and the app writes them with `export::export_insert_blocks`.
+  With no block at all — only ＋Rows that set nothing — the order is empty and so is the file, as
+  the copy is. The gate asserts both `render_export` and `save_export` contain
+  `insert_blocks_all(gs)`.
   The reason is under `core::edit`: the rule went out one source
   short twice in the view, most recently without `format::apply`, so a `Timestamp` column attached
   the epoch integer the cell does not show. The **painter** is the exception and stays one:
@@ -25014,7 +25037,8 @@ this bundle's.
   gone from the screen. And **staged edits**: this scope asks the server again, and the server has
   not been told, so it reads `without your staged edits` — a disclosure that became load-bearing at
   precisely the moment the *fetched* scope stopped diverging, since that file now goes through
-  `exported_rows` and carries the green cells and the pending rows exactly as Ctrl+C does. Before
+  `exported_rows` — `insert_blocks_all` for SQL — and carries the green cells and the pending rows
+  exactly as Ctrl+C does. Before
   that, both scopes were wrong the same way and "an export is of what was fetched" covered it. So
   the label reads `All rows (~16k, server order)`,
   `All rows (~16k, committed rows only)`, `All rows (server order)` where there is no estimate, or
@@ -25173,7 +25197,9 @@ this bundle's.
   catalogue's guess — the figure the `~All rows (M)` entry was named after, threaded from
   `export_menu` through `save_export` — so it reads `40k of ~180k rows`, is never divided by, and is
   not a ceiling: a real count larger than it is ordinary. `save_export` sets `total` as
-  `if streaming { estimate } else { Some(order.len()) }` and `approx` as `streaming`, and `approx`
+  `if streaming { estimate } else { Some(fetched_total) }` — `fetched_total` being the rows of
+  every block, since an SQL file of pending ＋Rows is several (`ExportRequest::more`) — and `approx`
+  as `streaming`, and `approx`
   is **carried rather than inferred from the scope** because by the time the modal draws the scope is
   gone. Both sit on the *target* rather than on each progress message because the writer that counts
   rows has never heard of the catalogue, so a message carrying the field would carry `None` and wipe

@@ -2630,6 +2630,49 @@ fn close_batch<W: Write>(w: &mut W, open_rows: &mut usize) -> io::Result<()> {
     Ok(())
 }
 
+/// One block of an `INSERT` file: the rows of `rs` in `order`, into `target`
+/// (`None` writes the `table` placeholder, as [`export_inserts_chunks`] does).
+pub struct InsertBlock<'a> {
+    pub rs: &'a ResultSet,
+    pub order: &'a [usize],
+    pub target: Option<(&'a str, Option<&'a str>, &'a str)>,
+}
+
+/// Several [`InsertBlock`]s into one file, one after another, each through
+/// [`export_inserts_chunks`] in `chunk_rows`-row chunks — so each block names
+/// **its own** column list. Returns the tally of them all.
+///
+/// **Why a file of `INSERT`s is not one [`RowChunks`] stream.** Every chunk of a
+/// stream carries the same columns ([`RowChunk`]), and a pending ＋Row's unset
+/// cells must not be in its column list at all: written as `NULL` they override
+/// the server's default — a PostgreSQL `serial` refuses the row, MySQL in
+/// non-strict mode stores `0`. `DEFAULT` would say it, but SQLite rejects it in
+/// `VALUES`. So the grid hands its rows over as
+/// [`GridCells::insert_blocks_all`](crate::edit::GridCells::insert_blocks_all)
+/// groups them — the real rows, then each set of pending rows that set the same
+/// columns — and this writes the groups in turn. It is the clipboard's Copy ▸
+/// SQL, for a file.
+///
+/// `watch` is [`SliceChunks::watching`]'s hook over the **whole** file: it sees
+/// a running total across the blocks, and a `false` stops the export there.
+pub fn export_insert_blocks<W: Write>(
+    w: &mut W,
+    blocks: &[InsertBlock<'_>],
+    dialect: SqlDialect,
+    chunk_rows: usize,
+    watch: &mut dyn FnMut(u64) -> bool,
+) -> io::Result<ExportTally> {
+    let mut tally = ExportTally::default();
+    let mut base = 0u64;
+    for b in blocks {
+        let at = base;
+        let mut src = SliceChunks::new(b.rs, b.order, chunk_rows).watching(|n| watch(at + n));
+        tally.absorb(export_inserts_chunks(w, &mut src, b.target, dialect)?);
+        base += b.order.len() as u64;
+    }
+    Ok(tally)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

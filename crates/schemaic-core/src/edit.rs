@@ -4408,6 +4408,82 @@ mod tests {
         assert_eq!(sql.matches("INSERT INTO").count(), 2, "{sql}");
     }
 
+    /// The same blocks written as a **file** — `export_insert_blocks`, what Save
+    /// .sql streams — keep each block's own column list, count across them, and
+    /// write no `NULL` for the pending row's unset cells. The file used to take
+    /// `exported()`'s single result, where those cells are `NULL`.
+    #[test]
+    fn a_saved_insert_file_omits_a_pending_rows_unset_cells_too() {
+        use crate::export::{InsertBlock, export_insert_blocks};
+        let rs = three_cols();
+        let (order, formats, dirty) = (vec![0], vec![Default::default(); 3], HashMap::new());
+        let mut typed = HashMap::new();
+        typed.insert(1, CellEdit::Text("9".into()));
+        let new_rows = vec![typed, HashMap::new()];
+        let c = cells(&rs, &order, &formats, &dirty, &new_rows);
+        let blocks = c.insert_blocks_all();
+        let blocks: Vec<InsertBlock<'_>> = blocks
+            .iter()
+            .map(|(rs, order)| InsertBlock {
+                rs,
+                order,
+                target: Some(("shop", None, "t")),
+            })
+            .collect();
+        let mut seen = Vec::new();
+        let mut out = Vec::new();
+        // Chunks of one row, so the running total has to cross the block edge.
+        let tally = export_insert_blocks(
+            &mut out,
+            &blocks,
+            crate::intel::SqlDialect::MySql,
+            1,
+            &mut |n| {
+                seen.push(n);
+                true
+            },
+        )
+        .expect("a Vec cannot fail");
+        let sql = String::from_utf8(out).expect("utf-8");
+        assert!(sql.contains("(`a`, `b`, `c`) VALUES\n(1, 2, 3);"), "{sql}");
+        assert!(sql.contains("(`b`) VALUES\n('9');"), "{sql}");
+        assert!(
+            !sql.contains("NULL"),
+            "an unset cell went out as NULL: {sql}"
+        );
+        assert_eq!(tally.rows, 2);
+        assert_eq!(seen, vec![1, 2], "the total runs across blocks");
+    }
+
+    /// A Stop in the second block stops the file there, as an error — not a
+    /// finished file missing its last block.
+    #[test]
+    fn a_stop_between_insert_blocks_is_an_error() {
+        use crate::export::{InsertBlock, export_insert_blocks};
+        let rs = three_cols();
+        let order = [0usize];
+        let blocks = [
+            InsertBlock {
+                rs: &rs,
+                order: &order,
+                target: None,
+            },
+            InsertBlock {
+                rs: &rs,
+                order: &order,
+                target: None,
+            },
+        ];
+        let got = export_insert_blocks(
+            &mut Vec::new(),
+            &blocks,
+            crate::intel::SqlDialect::MySql,
+            10,
+            &mut |n| n < 2,
+        );
+        assert!(got.is_err(), "a stop must not read as a finished file");
+    }
+
     /// A staged NULL is a null in the file, not the word — the mapping
     /// [`CellEdit::to_value`]'s doc argues for, asserted where it lands.
     #[test]

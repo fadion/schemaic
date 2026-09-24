@@ -149,6 +149,14 @@ pub type CommitDoneFn = Rc<dyn Fn(CommitDone)>;
 /// [`CommitDoneFn`]. Aliased to keep the field/signal types below readable.
 pub type CommitFn = Rc<dyn Fn(GridWrite, Option<RefetchRequest>, CommitDoneFn)>;
 
+/// One further block of an `INSERT` file — see [`ExportRequest::more`].
+#[derive(Clone)]
+pub struct ExportBlock {
+    pub rs: Arc<schemaic_core::model::ResultSet>,
+    pub order: Arc<Vec<usize>>,
+    pub source: Option<TableSource>,
+}
+
 /// What to write, and where. Everything here is owned or refcounted so the
 /// request can cross to a worker thread — the `Arc`s mean a 200k-row snapshot
 /// costs a refcount, not a copy.
@@ -160,6 +168,12 @@ pub struct ExportRequest {
     /// The result's base table, when it has one — only the SQL format uses it, to
     /// name the `INSERT` target.
     pub source: Option<TableSource>,
+    /// Further `INSERT` blocks, written after `rs`/`order` — filled for the SQL
+    /// format only, and read only by a `Fetched` export: `AllRows` re-runs the
+    /// statement, and pending rows are not on the server. A pending ＋Row's
+    /// `INSERT` names only the columns it set, so it cannot share `rs`'s column
+    /// list; see `export::export_insert_blocks`.
+    pub more: Vec<ExportBlock>,
     /// The tab's connection dialect, so an exported `INSERT` loads back into the
     /// engine the rows came from.
     pub dialect: schemaic_core::intel::SqlDialect,

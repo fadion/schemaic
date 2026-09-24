@@ -1007,6 +1007,7 @@ fn save_log(
                 // it — these rows are observations *about* a table, not rows of
                 // one, so there is nothing to `INSERT INTO`.
                 source: None,
+                more: Vec::new(),
                 dialect: Default::default(),
                 // The log is the rows in hand by definition — it is a record of
                 // what the monitor saw, not a query anything could re-run.

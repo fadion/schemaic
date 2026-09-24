@@ -3832,6 +3832,16 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                         };
                         let (report, died) = (ext(), ext());
                         let (rs, order) = (req.rs.clone(), req.order.clone());
+                        let more: Vec<_> = req
+                            .more
+                            .iter()
+                            .map(|b| {
+                                let s = b.source.as_ref().map(|s| {
+                                    (s.database.clone(), s.schema.clone(), s.table.clone())
+                                });
+                                (b.rs.clone(), b.order.clone(), s)
+                            })
+                            .collect();
                         let progress = export_tx.clone();
                         // Named, not a bare field read — see `reports_progress`.
                         let reports = req.reports_progress();
@@ -3856,12 +3866,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                                     // the render as an *error*, which is the only
                                     // way to stop without the file looking
                                     // finished.
-                                    let mut src = schemaic_core::export::SliceChunks::new(
-                                        rs.as_ref(),
-                                        order.as_slice(),
-                                        EXPORT_CHUNK_ROWS,
-                                    )
-                                    .watching(move |n| {
+                                    let mut watch = move |n| {
                                         // **Only a run with the modal reports.**
                                         // `export_progress` is one signal for the
                                         // window and the messages carry no run
@@ -3877,15 +3882,59 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                                             let _ = progress.send(n);
                                         }
                                         !w_token.is_cancelled()
-                                    });
-                                    let tally = format.stream_to(
-                                        &mut w,
-                                        &mut src,
-                                        source.as_ref().map(|(d, ns, t)| {
+                                    };
+                                    #[allow(clippy::type_complexity)]
+                                    fn target(
+                                        s: &Option<(String, Option<String>, String)>,
+                                    ) -> Option<(&str, Option<&str>, &str)>
+                                    {
+                                        s.as_ref().map(|(d, ns, t)| {
                                             (d.as_str(), ns.as_deref(), t.as_str())
-                                        }),
-                                        dialect,
-                                    )?;
+                                        })
+                                    }
+                                    // An `INSERT` file is written block by block,
+                                    // each naming its own columns — a pending
+                                    // ＋Row's unset cells are left out, not `NULL`.
+                                    // See `export::export_insert_blocks`.
+                                    let tally = if format
+                                        == schemaic_core::export::ExportFormat::Sql
+                                    {
+                                        use schemaic_core::export::InsertBlock;
+                                        let blocks: Vec<InsertBlock<'_>> =
+                                            std::iter::once(InsertBlock {
+                                                rs: rs.as_ref(),
+                                                order: order.as_slice(),
+                                                target: target(&source),
+                                            })
+                                            .chain(more.iter().map(|(rs, order, s)| InsertBlock {
+                                                rs: rs.as_ref(),
+                                                order: order.as_slice(),
+                                                target: target(s),
+                                            }))
+                                            .collect();
+                                        schemaic_core::export::export_insert_blocks(
+                                            &mut w,
+                                            &blocks,
+                                            dialect,
+                                            EXPORT_CHUNK_ROWS,
+                                            &mut watch,
+                                        )?
+                                    } else {
+                                        // One hook, both jobs, asked at one
+                                        // instant — see `SliceChunks::watching`.
+                                        let mut src = schemaic_core::export::SliceChunks::new(
+                                            rs.as_ref(),
+                                            order.as_slice(),
+                                            EXPORT_CHUNK_ROWS,
+                                        )
+                                        .watching(watch);
+                                        format.stream_to(
+                                            &mut w,
+                                            &mut src,
+                                            target(&source),
+                                            dialect,
+                                        )?
+                                    };
                                     // Explicit: `BufWriter` swallows a flush failure
                                     // on drop, which is exactly the case where the
                                     // last block never reached the disk — silently
