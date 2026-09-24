@@ -30,7 +30,8 @@ a plain `contains` could not fail for twelve of the modules it governs — seven
 suffixes of another module's (`date.rs` ⊂ `update.rs`, `import.rs` ⊂ `conn_import.rs`, and five
 more), and the longer name is itself guaranteed to be written down, so deleting every mention of
 `core/date.rs` left the guard green. And a basename that exists in **two** crates — `dump.rs`,
-`script.rs`, `secrets.rs`, `update.rs`, `window_chrome.rs` — must be named with its crate, since
+`format.rs`, `script.rs`, `secrets.rs`, `update.rs`, `window_chrome.rs` — must be named with its
+crate, since
 `app/secrets.rs` answered for `core/secrets.rs` for free while the failure message told the reader
 to add them per crate. Everywhere else a bare mention is still enough, which is why this document's
 existing prose was left alone.
@@ -4835,10 +4836,14 @@ existing prose was left alone.
     `hmac` and `base64` it calls are the versions `postgres-protocol` already put in the lock, so
     making them direct dependencies of core added no new version.
     **Only printable ASCII is hashed; anything else, and an empty password, is `None`.** The client
-    SASLpreps the password it types at login before deriving anything, and SASLprep is the identity
-    on 0x20–0x7E and not in general, so a verifier over any other password would store a credential
-    nobody can log in with. The caller sends those as typed, which is what the app did before this
-    module existed. **The salt is always an argument, never drawn here**: the form stamps it into
+    SASLpreps the password it types at login before deriving anything. SASLprep is the identity on
+    0x20–0x7E; outside it, it *may* rewrite the password (NFKC, non-ASCII spaces, deletions) while
+    an already-normalised `pässword` passes through unchanged, and this module does not implement
+    it, so it cannot tell the cases apart and declines rather than risk a verifier the login would
+    not match. The caller sends those as typed, which is what the app did before this module
+    existed — so such a password still reaches the server as text. The decline is a missing
+    SASLprep, not an impossibility; a `pässword` verifier built over the raw bytes logged in on PG
+    16. **The salt is always an argument, never drawn here**: the form stamps it into
     the draft once (`users::AccountDraft::scram_salt`), so the preview and the Apply run one
     identical statement and `ChangeSet::emit` stays a pure function. Two of the tests are oracles
     rather than round trips, because a verifier computed wrong is the silent failure — the server
@@ -8011,10 +8016,10 @@ existing prose was left alone.
     `dbus-secret-service` → `libdbus-sys` and would put a C system library into the portable
     glibc-2.31 zigbuild the tarball and the AppImage are built from. `schemaic-app`'s manifest keeps
     a two-line pointer where those blocks used to be.
-    **The move also took this file out of the UI crate's source-gate census** —
-    `source_gate::workspace_sources()` names `ui`, `app`, `core` and `db` only, so the gates that
-    once reported `app/secrets.rs` no longer read it; `ui/source_gate.rs` has what that costs and
-    why adding a fifth directory is not a one-word change.
+    **The move took this file out of the UI crate's source-gate census for a while**, and it is
+    back in: `source_gate::workspace_sources()` lists `schemaic-conn` with a floor of its own (2),
+    and `the_wider_scan_reaches_the_keyring_store` asserts this file is among what it reads —
+    `ui/source_gate.rs` has the per-label floors.
 - `schemaic-db` — MySQL/MariaDB (`mysql_async`) in `mysql.rs`, PostgreSQL in `pg.rs`,
   SQLite in `sqlite.rs`, SSH tunnels in `ssh.rs`, and
   the pinned manual-transaction connection in `session.rs`.

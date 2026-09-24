@@ -7403,9 +7403,9 @@ fn header(ui: Ui, chrome: window_chrome::WindowChrome) -> impl IntoView {
     // Find-anywhere trigger: a plain Lucide search glyph, 24px, 20px from the
     // header's right edge (brightens on hover like the schema-panel icons).
     //
-    // All three glyphs are icon-only, so each carries a tooltip like every other
-    // icon button in the app; the tooltip goes last because `.tooltip()` wraps
-    // the view rather than decorating it (see the result chips' note).
+    // All three glyphs are icon-only, so each carries a tooltip; the tooltip goes
+    // last because `.tooltip()` wraps the view rather than decorating it (see
+    // the result chips' note).
     let search = icons::icon(icons::SEARCH, 20.0)
         .on_click_stop(move |_| find_open.set(true))
         .style(|s| {

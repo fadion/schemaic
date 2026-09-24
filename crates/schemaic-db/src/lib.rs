@@ -1716,8 +1716,11 @@ pub(crate) type FkColRow = (
 /// rows): 2400 PostgreSQL tables, each with one check, trigger and foreign key,
 /// took 1.25 s, nearly all of it rescanning rows that belonged to other tables.
 /// Grouping once and looking each table up is one pass, and the same database
-/// loads in 0.24 s. Order within a bucket is the catalogue query's `ORDER BY`,
-/// which is the only thing ordering a table's checks and triggers.
+/// loads in 0.24 s. Order within a bucket is **arrival order**: whatever ordered
+/// the input orders the bucket — PostgreSQL's catalogue `ORDER BY`, the sort in
+/// `mysql::mysql_triggers` for MySQL's triggers — and MySQL's check constraints
+/// arrive in whatever order the server's `information_schema` scan yields, since
+/// that query has no `ORDER BY`.
 pub(crate) fn group_by<K: Eq + std::hash::Hash, T>(
     rows: impl IntoIterator<Item = (K, T)>,
 ) -> HashMap<K, Vec<T>> {

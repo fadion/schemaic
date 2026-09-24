@@ -2206,20 +2206,6 @@ mod tests {
         LOCK.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// **The erasing save is the one with no recovery copy, so it is the one
-    /// that has to sync before it removes the old one.**
-    ///
-    /// `Saving::Replacing` keeps the previous generation as `.bak`, so the
-    /// window between a rename and the contents reaching stable storage is
-    /// covered: a crash there leaves a zero-length primary, which fails
-    /// `from_slice`, comes back `Load::Corrupt`, and is read from the backup.
-    /// That is why the ordinary path does not pay for a sync.
-    ///
-    /// `Saving::Erasing` removes the `.bak` — that is the point of it — so the
-    /// same window has nothing to cover it with. On `connections.json`, which
-    /// this module's own prose calls "the only config file with no second copy
-    /// anywhere", deleting one connection could lose all of them.
-    ///
     /// **The whole point of the unrecovered read: it writes nothing.**
     ///
     /// Not "it does not call `save`" — it must not rename, must not remove, and
@@ -2329,6 +2315,20 @@ mod tests {
         );
     }
 
+    /// **The erasing save is the one with no recovery copy, so it is the one
+    /// that has to sync before it removes the old one.**
+    ///
+    /// `Saving::Replacing` keeps the previous generation as `.bak`, so the
+    /// window between a rename and the contents reaching stable storage is
+    /// covered: a crash there leaves a zero-length primary, which fails
+    /// `from_slice`, comes back `Load::Corrupt`, and is read from the backup.
+    /// That is why the ordinary path does not pay for a sync.
+    ///
+    /// `Saving::Erasing` removes the `.bak` — that is the point of it — so the
+    /// same window has nothing to cover it with. On `connections.json`, which
+    /// this module's own prose calls "the only config file with no second copy
+    /// anywhere", deleting one connection could lose all of them.
+    ///
     /// Asserted as an **order**, because both orderings end with the same set
     /// of files and a store that recorded only the outcome could not tell them
     /// apart.

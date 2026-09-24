@@ -20,11 +20,17 @@
 //! - `ServerKey = HMAC(SaltedPassword, "Server Key")`
 //!
 //! **Only printable ASCII is hashed.** The client normalises the password it
-//! types at login with SASLprep before deriving anything; SASLprep is the
-//! identity on 0x20–0x7E and is not in general, so a verifier built over any
-//! other password without it would store a credential nobody can log in with.
-//! [`verifier`] answers `None` there and the caller sends the password as
-//! typed, which is what the app did before this module existed.
+//! types at login with SASLprep before deriving anything. SASLprep is the
+//! identity on 0x20–0x7E; outside it, it *may* rewrite the password — NFKC
+//! (`ｆｕｌｌ` becomes `full`), non-ASCII spaces mapped to U+0020, some
+//! characters deleted — while an already-normalised password such as `pässword`
+//! passes through unchanged, and one holding a prohibited character is used as
+//! raw bytes. This module does not implement SASLprep, so it cannot tell which
+//! case a password is in, and it declines rather than risk a verifier the login
+//! would not match: [`verifier`] answers `None` there and the caller sends the
+//! password as typed, which is what the app did before this module existed. The
+//! decline is a missing implementation, not an impossibility — and until it is
+//! filled, such a password still reaches the server as text.
 //!
 //! The salt is an argument, never generated here: the account form stamps it
 //! into the draft once, so the preview and the Apply run one identical
@@ -187,8 +193,10 @@ mod tests {
 
     #[test]
     fn outside_printable_ascii_is_not_hashed() {
-        // SASLprep would rewrite these at login, and a verifier over the raw
-        // bytes is a credential nobody can use.
+        // Not because each would be rewritten — `pässword` and `日本` pass
+        // SASLprep unchanged, and the control characters are prohibited so the
+        // raw bytes are used — but because telling those apart from `ｆｕｌｌ`
+        // (NFKC to `full`) needs a SASLprep this module does not have.
         for pw in [
             "pässword",
             "tab\there",

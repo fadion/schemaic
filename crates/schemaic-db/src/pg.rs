@@ -697,11 +697,6 @@ pub(crate) async fn explain(
     out
 }
 
-/// Execute one statement over the text protocol and materialize a [`ResultSet`].
-/// Column names + types come from a non-executing `PREPARE`; when the statement
-/// isn't preparable (some utility statements) the columns fall back to those on
-/// the first returned row (names only). A statement with no result columns
-/// (DML/DDL) reports its affected-row count instead of a grid.
 /// The PostgreSQL half of [`Db::run_ddl`]: one transaction around the whole
 /// plan. `ALTER TABLE`, `CREATE INDEX` and `COMMENT ON` are all transactional
 /// here, so a failure anywhere leaves the table exactly as it was — which is why
@@ -926,6 +921,12 @@ pub(crate) async fn run_script(
 /// name would have the inner `RELEASE` free the outer one's fence.
 const DESCRIBE_FENCE: &str = "schemaic_describe";
 
+/// Execute one statement over the text protocol and materialize a [`ResultSet`].
+/// Column names + types come from a non-executing `PREPARE`; when the statement
+/// isn't preparable (some utility statements) the columns fall back to those on
+/// the first returned row (names only). A statement with no result columns
+/// (DML/DDL) reports its affected-row count instead of a grid.
+///
 /// `in_tx` — **is this connection already inside a transaction?**
 ///
 /// It decides whether the non-executing describe below is bracketed by a
@@ -1440,15 +1441,6 @@ fn schema_sort_key(name: &str) -> (u8, String) {
     }
 }
 
-/// Introspect every **user** schema of one database (tables → columns +
-/// PK/unique/FK + all indexes) via `information_schema` + `pg_catalog`.
-///
-/// The catalogue rows are fetched for all namespaces in one round trip each, then
-/// **partitioned by namespace** and handed to the shared, engine-agnostic
-/// [`assemble_schema`] one schema at a time — that function keys its rows by table
-/// name alone, so feeding it two schemas at once would silently merge same-named
-/// tables. Each resulting [`TableInfo`] carries
-/// its namespace, and the schemas are concatenated `public`-first.
 /// The PostgreSQL half of [`Db::fetch_table_list`]: the same table list the full
 /// fetch starts from, and none of the four catalogue queries after it.
 pub(crate) async fn fetch_table_list(db: &Db, database: &str) -> Result<DbSchema, DbError> {
@@ -1775,6 +1767,15 @@ pub(crate) async fn kill_session(db: &Db, id: i64, kind: KillKind) -> Result<(),
     activity::kill_verdict(cell.as_deref(), kind, id).map_err(DbError::Query)
 }
 
+/// Introspect every **user** schema of one database (tables → columns +
+/// PK/unique/FK + all indexes) via `information_schema` + `pg_catalog`.
+///
+/// The catalogue rows are fetched for all namespaces in one round trip each, then
+/// **partitioned by namespace** and handed to the shared, engine-agnostic
+/// [`assemble_schema`] one schema at a time — that function keys its rows by table
+/// name alone, so feeding it two schemas at once would silently merge same-named
+/// tables. Each resulting [`TableInfo`] carries
+/// its namespace, and the schemas are concatenated `public`-first.
 pub(crate) async fn fetch_schema(
     db: &Db,
     database: &str,
@@ -3386,7 +3387,6 @@ async fn query_all(client: &Client, sql: &str) -> Result<Vec<Vec<Option<String>>
     Ok(out)
 }
 
-/// Column `i` of a text row as an owned `String` (empty when NULL/missing).
 /// The expression text for one index key position, as `pg_get_indexdef(oid, n,
 /// true)` renders it, without the parentheses it wraps a compound expression in.
 ///
@@ -3401,6 +3401,7 @@ fn expr_key(def: &str) -> String {
         .to_string()
 }
 
+/// Column `i` of a text row as an owned `String` (empty when NULL/missing).
 fn cell(row: &[Option<String>], i: usize) -> String {
     row.get(i).and_then(|c| c.clone()).unwrap_or_default()
 }

@@ -149,8 +149,10 @@ pub(crate) fn has_editor_behind(d: crate::DdlUi) -> bool {
 ///
 /// **This clear is load-bearing, not defence in depth.** It was the latter while
 /// the box showed [`ChangeSet::export_script`]'s redacted copy; it now holds
-/// [`ChangeSet::emit`]'s statements, which for an account plan carry the real
-/// password — see [`open_preview`] for why the box shows those.
+/// [`ChangeSet::emit`]'s statements, which for an account plan carry the
+/// password — or on PostgreSQL its SCRAM verifier, which is as good as the
+/// password to an offline attacker — see [`open_preview`] for why the box shows
+/// those.
 ///
 /// [`ChangeSet::export_script`]: schemaic_core::ddl::ChangeSet::export_script
 /// [`ChangeSet::emit`]: schemaic_core::ddl::ChangeSet::emit

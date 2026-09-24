@@ -3211,8 +3211,9 @@ mod tests {
     }
 
     /// A password `scram` declines — outside printable ASCII, where SASLprep
-    /// would rewrite it at login — is sent as typed rather than hashed into a
-    /// credential nobody could use.
+    /// *may* rewrite it at login and this crate has no SASLprep to tell — is
+    /// sent as typed rather than hashed into a verifier the login might not
+    /// match.
     #[test]
     fn a_non_ascii_password_is_sent_as_typed_even_when_salted() {
         assert_eq!(

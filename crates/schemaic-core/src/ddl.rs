@@ -16952,6 +16952,13 @@ mod tests {
             t
         }
 
+        /// Emit the full CREATE for a table, through the real emitter — which is
+        /// where the table-level comment is written, unlike
+        /// `TableInfo::create_ddl`.
+        fn emit_create(t: &TableInfo, dialect: SqlDialect) -> String {
+            create_table_sql(&TableDraft::from_table(t), dialect).join("\n")
+        }
+
         /// **No DDL test fed a value that needed escaping**, which is why the
         /// missing backslash handling in `ddl_string` survived — and the
         /// round-trip gate structurally cannot catch it, since both sides of
@@ -16960,13 +16967,6 @@ mod tests {
         /// So assert on the emitted text: MySQL treats `\` as an escape inside a
         /// literal and must double it; PostgreSQL takes it literally and must
         /// not, or the value is corrupted the other way.
-        /// Emit the full CREATE for a table, through the real emitter — which is
-        /// where the table-level comment is written, unlike
-        /// `TableInfo::create_ddl`.
-        fn emit_create(t: &TableInfo, dialect: SqlDialect) -> String {
-            create_table_sql(&TableDraft::from_table(t), dialect).join("\n")
-        }
-
         #[test]
         fn emitted_ddl_escapes_a_backslash_per_dialect() {
             let my = emit_create(&backslashes(MySql), MySql);
