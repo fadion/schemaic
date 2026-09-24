@@ -235,10 +235,20 @@ pub fn truncation_warning(rs: &ResultSet, output: impl Into<Output>) -> Option<S
         return None;
     }
     Some(format!(
-        "warning: only the first {} rows were read; the result was capped. \
+        "warning: only the {} read; the result was capped. \
          Raise it with --limit, or narrow the query.",
-        rs.row_count()
+        first_rows(rs.row_count(), "row was", "rows were")
     ))
+}
+
+/// "first row was" or "first 5 rows were": `one` and `many` carry the verb,
+/// since it agrees with the count too.
+fn first_rows(n: usize, one: &str, many: &str) -> String {
+    if n == 1 {
+        format!("first {one}")
+    } else {
+        format!("first {n} {many}")
+    }
 }
 
 /// What `exec` says on **stderr** when a statement returned more rows than it
@@ -251,8 +261,8 @@ pub fn truncation_warning(rs: &ResultSet, output: impl Into<Output>) -> Option<S
 pub fn exec_truncation_warning(rs: &ResultSet) -> Option<String> {
     rs.truncated.then(|| {
         format!(
-            "warning: only the first {} returned rows are shown; the statement itself ran in full.",
-            rs.row_count()
+            "warning: only the {} shown; the statement itself ran in full.",
+            first_rows(rs.row_count(), "returned row is", "returned rows are")
         )
     })
 }
@@ -470,6 +480,27 @@ mod tests {
         assert!(warning.contains("ran in full"), "{warning}");
         assert!(!warning.contains("--limit"), "{warning}");
         assert!(exec_truncation_warning(&rs()).is_none());
+    }
+
+    /// **"The first 1 rows" is the plural the footer already lost** — both
+    /// stderr warnings count a cap of one as a row, as `--limit 1` produces.
+    #[test]
+    fn a_cap_of_one_row_is_not_plural_on_stderr() {
+        let mut one = ResultSet::from_rows(vec![col("id")], vec![vec![Value::Int(1)]]);
+        one.truncated = true;
+        let w = truncation_warning(&one, Format::Json).unwrap();
+        assert!(w.contains("only the first row was read"), "{w}");
+        let w = exec_truncation_warning(&one).unwrap();
+        assert!(w.contains("only the first returned row is shown"), "{w}");
+        let mut two = rs();
+        two.truncated = true;
+        let w = truncation_warning(&two, Format::Json).unwrap();
+        assert!(w.contains("only the first 2 rows were read"), "{w}");
+        let w = exec_truncation_warning(&two).unwrap();
+        assert!(
+            w.contains("only the first 2 returned rows are shown"),
+            "{w}"
+        );
     }
 
     /// One row is a row here too — `query`'s footer already said "(1 row)"
