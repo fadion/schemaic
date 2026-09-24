@@ -2399,6 +2399,9 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
     let users_generation: RwSignal<u64> = RwSignal::new(0);
     // The schema tree's size column (persisted; see `UiState::show_table_sizes`).
     let table_sizes = RwSignal::new(ui_state.show_table_sizes);
+    // The schema tree's filter text, as it was left (see `UiState::schema_filter`).
+    // The panel types into this signal directly.
+    let schema_filter = RwSignal::new(ui_state.schema_filter.clone());
     // Bumped whenever a refresh puts some node's statistics back to `Idle`, and
     // read by the size-column effect below — the *only* thing that tells it to
     // look again.
@@ -7228,6 +7231,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                     restore_tabs: restore_tabs.get_untracked(),
                     live_validate: live_validate.get_untracked(),
                     show_table_sizes: table_sizes.get_untracked(),
+                    schema_filter: schema_filter.get_untracked(),
                     // Carried straight back out — see `UiState::extra`. This
                     // build cannot say anything about these keys except that
                     // some build could.
@@ -7250,6 +7254,48 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             save_ui(persist::Saving::Replacing);
         });
     }
+
+    // Persist the schema tree's filter — on a trailing debounce, since it changes
+    // per keystroke and every other effect here saves off a setting that doesn't.
+    // `tabs.json`'s shape: each change bumps a generation, and only the last of a
+    // burst writes. A quit inside the window is covered by the `WindowClosed`
+    // flush at the bottom of this function.
+    let filter_unsaved = Rc::new(Cell::new(false));
+    {
+        let save_ui = save_ui.clone();
+        let filter_unsaved = filter_unsaved.clone();
+        let filter_save_gen = Rc::new(Cell::new(0u64));
+        create_effect(move |prev: Option<()>| {
+            schema_filter.track();
+            // The first run (no previous value) is the text just loaded; writing
+            // it back is noise.
+            if prev.is_none() {
+                return;
+            }
+            filter_unsaved.set(true);
+            let g = filter_save_gen.get() + 1;
+            filter_save_gen.set(g);
+            let gen_at = filter_save_gen.clone();
+            let save_ui = save_ui.clone();
+            let filter_unsaved = filter_unsaved.clone();
+            exec_after(Duration::from_millis(600), move |_| {
+                if gen_at.get() == g {
+                    filter_unsaved.set(false);
+                    save_ui(persist::Saving::Replacing);
+                }
+            });
+        });
+    }
+    // The quit-time half of the above: written only when a save is pending, so a
+    // quit does not rewrite `ui_state.json` (and its `.bak`) for nothing.
+    let flush_filter: Rc<dyn Fn()> = {
+        let save_ui = save_ui.clone();
+        Rc::new(move || {
+            if filter_unsaved.replace(false) {
+                save_ui(persist::Saving::Replacing);
+            }
+        })
+    };
 
     // Persist the theme choice whenever the picker changes it. (First run writes
     // the current values back — harmless; the file already holds them.)
@@ -11872,6 +11918,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             active_table,
             hidden_dbs,
             table_sizes,
+            schema_filter,
             db_menu_open,
             schema_menu_open,
             db_menu_anchor: RwSignal::new(floem::kurbo::Point::ZERO),
@@ -12225,10 +12272,13 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
     // window stop mattering. See `flush_session`.
     {
         use floem::views::Decorators;
-        schemaic_ui::workspace(ui, window)
-            .on_event_cont(floem::event::EventListener::WindowClosed, move |_| {
-                flush_session()
-            })
+        schemaic_ui::workspace(ui, window).on_event_cont(
+            floem::event::EventListener::WindowClosed,
+            move |_| {
+                flush_session();
+                flush_filter();
+            },
+        )
     }
 }
 

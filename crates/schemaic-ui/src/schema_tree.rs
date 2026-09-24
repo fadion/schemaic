@@ -1093,11 +1093,13 @@ pub(crate) fn schema_panel(ui: Ui) -> impl IntoView {
     // how the activity clock's dropdown came to be missing from this one.
     let menus =
         crate::widgets::MenuFlags::of(ui.overlay, ui.schema, ui.conn, ui.tabs_ui, ui.activity);
-    // Search filter (local to the panel). `filter_input` is bound to the search box
-    // (updates per keystroke); `filter` is its debounced mirror — the tree filters,
+    // Search filter. `filter_input` is bound to the search box (updates per
+    // keystroke); `filter` is its debounced mirror — the tree filters,
     // highlights, and re-expands off `filter`, so a burst of typing churns the
-    // (potentially large) schema once, not on every character.
-    let filter_input = RwSignal::new(String::new());
+    // (potentially large) schema once, not on every character. The input is
+    // the app's signal rather than the panel's, because it outlives the
+    // session (`UiState::schema_filter`).
+    let filter_input = ui.schema.schema_filter;
     let filter = debounced(filter_input, Duration::from_millis(SEARCH_DEBOUNCE_MS));
     // Keyboard-navigation cursor + focus (local to the panel).
     let nav = Nav {

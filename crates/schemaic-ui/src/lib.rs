@@ -5117,6 +5117,10 @@ pub struct SchemaUi {
     /// is the big one" — but it costs a catalogue query per expanded database,
     /// so it is opt-in.
     pub table_sizes: RwSignal<bool>,
+    /// The schema tree's filter box's text — the box types into it directly.
+    /// Owned by the app because it outlives the session: loaded from
+    /// `UiState::schema_filter` and saved back on a debounce.
+    pub schema_filter: RwSignal<String>,
     /// Whether the database-visibility menu is open.
     pub db_menu_open: RwSignal<bool>,
     /// Whether the SCHEMA settings menu (Refresh) is open.

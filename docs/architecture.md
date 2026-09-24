@@ -6495,6 +6495,15 @@ existing prose was left alone.
     `stored_rules_are_never_overwritten_by_a_second_migration` and
     `an_empty_legacy_list_is_nothing_to_do_not_not_yet`; the first was watched failing against the
     `None => (stored, Vec::new())` this function exists to rule out.
+    **`schema_filter` is one `String`, not a rule list, because there is one box.** The tree's
+    filter runs over every connection's `db_nodes` at once, so what is left in it is a single fact
+    about the panel rather than one per connection; the `Vec<Rule>`-keyed-by-`conn_id` shape the
+    expansion, hidden-database, colour and favourite stores share does not fit it, and a
+    per-connection key would also have had to join `delete_conn_now`'s prune census for nothing.
+    `#[serde(default)]` reads an older file as empty, which filters nothing
+    (`the_schema_filter_round_trips_and_defaults_to_none`). It changes per keystroke, so it is saved
+    on a debounce and again at quit rather than by the effects the other fields share (*app/main.rs*,
+    beside the `WindowClosed` flush).
     **An absent primary is not a first run**, and treating it as one was silent data loss.
     `recover(primary, staged, backup)` returns the value *and* a `Recovered` — `Primary`,
     `FirstRun`, `Corrupt(err)` or `Restored(sibling)` — and an absent primary walks `.tmp` then
@@ -15195,6 +15204,12 @@ existing prose was left alone.
     `BUDGET`'s said it was carried "for `table_colors` alone" (true of half of `table_node`). It
     was reached in three functions for six things, one of them an `active_conn` the struct already
     had a field for. Nothing checks a comment; the field list is checked by the compiler.
+    **The filter box's text is the app's signal, `SchemaUi::schema_filter`, not the panel's**,
+    because it outlives the session (`UiState::schema_filter`); it was a panel-local
+    `RwSignal::new(String::new())` until the filter was persisted. The debounced `filter` mirror the
+    tree filters, highlights and re-expands off is unchanged, and a restored filter applies at once
+    because `widgets::debounced` seeds its output from the source's current value — seeded empty,
+    the tree would draw unfiltered for one debounce interval under a box that already said otherwise.
     **The panel's title is the only place a long catalogue read can be reported.**
     `SchemaState::begin_refresh` deliberately leaves an already-loaded database's rows on screen
     through a refresh, and the per-database `Loading` row only ever appears for a *first* load — the
@@ -18009,6 +18024,13 @@ existing prose was left alone.
   dot, reporting itself as matching disk. Confidently wrong is worse than stale. The snapshot is
   built by one closure (`session_snapshot`) shared with the debounced effect, because the builder
   that runs at quit is the one nobody watches.
+  **The schema tree's filter rides the same listener, as `flush_filter`, for the same reason.** It is
+  saved to `ui_state.json` on a 600 ms trailing debounce in `tabs.json`'s generation shape — each
+  change bumps a generation and only the last of a burst writes — because it changes per keystroke
+  and every other `ui_state` effect saves off a setting that does not; the effect's first run is the
+  value just loaded and is skipped. `flush_filter` writes only when a save is pending (a
+  `filter_unsaved` cell, set on change and cleared by the timer's save), so a quit inside the window
+  keeps the text and a quit with nothing pending does not rewrite `ui_state.json` and its `.bak`.
   **And "restore tabs off" is not a licence to drop unrecoverable text.** With the setting off, the
   flush writes — and the restore reads — only `SavedTabsFile::unsaved_files_only`: a file-backed tab
   with unsaved edits, whose text is neither on disk nor retypeable. Every other tab is a query the
@@ -22250,10 +22272,10 @@ Re-introducing the anti-patterns these guard against is a regression:
   **`ui_state` is the sixth, and it is the one that did not move: some candidates are not liftable,
   and saying so is the outcome.** It was next on the list after the three store cuts above and is
   not store-shaped at all — the tell is a value assembled from dozens of *unrelated* signals.
-  `save_ui` reads twenty-nine of them (theme, scale, fonts, the AI settings, panel geometry, the row
-  limit, the statement timeout) into a thirty-one-field `UiState`, and each is also read by some
-  other part of `app_view` that has nothing to do with the save. A module for it takes either a
-  twenty-nine-parameter function or a struct holding all of them — which is `UiState` again, one
+  `save_ui` reads some thirty of them (theme, scale, fonts, the AI settings, panel geometry, the row
+  limit, the statement timeout, the schema filter) into a `UiState` of a few more fields, and each
+  is also read by some other part of `app_view` that has nothing to do with the save. A module for
+  it takes either a thirty-parameter function or a struct holding all of them — which is `UiState` again, one
   level removed, with a second place to forget a field. What was worth taking out was the duplicated
   *decision* inside it rather than the state: `persist::migrate_legacy_once`, the legacy-list
   bargain `main.rs` had written out twice. Record the refusal where the next session will look for

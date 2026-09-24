@@ -171,6 +171,12 @@ pub struct UiState {
     /// something every session pays for.
     #[serde(default)]
     pub show_table_sizes: bool,
+    /// The schema tree's filter text, as it was left — one box over every
+    /// connection's tree, so one value rather than a rule per connection.
+    /// Default: empty, which filters nothing. Saved on a trailing debounce
+    /// and again when the window closes, never per keystroke.
+    #[serde(default)]
+    pub schema_filter: String,
     /// **Legacy.** Bare names of databases hidden from the schema panel and
     /// search, with no connection dimension — read once at startup and folded
     /// into `hidden_db_rules` by [`crate::db_hidden::migrate_flat`], then never
@@ -393,6 +399,7 @@ impl Default for UiState {
             expanded: Vec::new(),
             expanded_rules: Vec::new(),
             show_table_sizes: false,
+            schema_filter: String::new(),
             hidden_dbs: Vec::new(),
             hidden_db_rules: Vec::new(),
             schema_visible: true,
@@ -2056,6 +2063,21 @@ mod tests {
         let state: UiState = serde_json::from_str(old).expect("older files still parse");
         assert_eq!(state.statement_timeout_secs, 0);
         assert_eq!(state.row_limit, 1000);
+    }
+
+    /// **The schema tree's filter comes back as it was left** — and a file
+    /// from before it was kept loads with none, rather than failing to parse.
+    #[test]
+    fn the_schema_filter_round_trips_and_defaults_to_none() {
+        let old = r#"{"row_limit": 1000}"#;
+        let state: UiState = serde_json::from_str(old).expect("older files still parse");
+        assert_eq!(state.schema_filter, "");
+        let kept = UiState {
+            schema_filter: "ord".to_string(),
+            ..UiState::default()
+        };
+        let back: UiState = serde_json::from_str(&serde_json::to_string(&kept).unwrap()).unwrap();
+        assert_eq!(back.schema_filter, "ord");
     }
 
     /// Every `ui_state.json` written before Schemaic drove more than one agent
