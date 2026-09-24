@@ -223,7 +223,8 @@ everything else to stderr, so a pipe gets only data. It exits `0` on success,
 `2` on a usage error, `3` when a guard refused (nothing was sent), `4` when the
 server or the connection failed, `5` when a write timed out after it was
 sent — it may have been applied, so check before running it again — and `6`
-when `--fail-on-cap` was given and the rows were cut short.
+when `--fail-on-cap` was given and the rows were cut short. `schemaic --help`
+lists the formats and the exit codes too.
 
 Where there is no keyring to read — an SSH session, a container — pipe the
 password in with `--password-stdin` instead. A statement that itself carries a

@@ -16,6 +16,34 @@ use crate::format::{Format, Output};
 /// whole table says so with `--limit`.
 pub const DEFAULT_LIMIT: usize = 200;
 
+/// What the top-level `--help` says after the commands: the formats and the
+/// exit codes, which a script's author needs and would otherwise have to find
+/// in the README.
+///
+/// **A literal, checked against the code rather than built from it** — clap
+/// takes a `&'static str` here — by `run.rs`'s
+/// `the_help_lists_every_exit_code_and_no_other` and
+/// `the_help_lists_every_format`, which compare it with `Exit` and
+/// `Format::NAMES`.
+const AFTER_HELP: &str = "\
+Output formats (--format):
+  table     A Markdown table with a row-count footer (the default)
+  json      A JSON array of row objects
+  jsonl     One JSON object per line
+  csv       RFC 4180 CSV with a header row
+  vertical  One `name: value` record per row, like the mysql client's \\G
+--no-header leaves the column names, and the table's footer, out of table and csv.
+Rows go to stdout; everything else goes to stderr.
+
+Exit codes:
+  0  It ran
+  2  A usage error, or a connection, file or table that is not there; nothing was sent
+  3  A guard refused: not a read, a read-only connection, no --yes, or no CLI access; \
+nothing was sent
+  4  The server or the connection failed; retrying may work
+  5  A write timed out after it was sent and may have been applied; check before retrying
+  6  query --fail-on-cap: --limit cut the rows short (they were still printed)";
+
 #[derive(Parser, Debug, PartialEq, Eq)]
 #[command(
     name = "schemaic",
@@ -26,7 +54,8 @@ pub const DEFAULT_LIMIT: usize = 200;
                   command line. A connection is reachable only once you have turned on \
                   CLI access for it in Schemaic.",
     version,
-    disable_help_subcommand = false
+    disable_help_subcommand = false,
+    after_help = AFTER_HELP
 )]
 pub struct Cli {
     #[command(subcommand)]
@@ -152,6 +181,8 @@ pub const SQL_FROM_STDIN: &str = "-";
 /// How stdout is written — every subcommand that prints rows takes these.
 #[derive(clap::Args, Debug, PartialEq, Eq)]
 pub struct OutputArgs {
+    /// table, json, jsonl, csv or vertical — `schemaic --help` says what each
+    /// is.
     #[arg(long, default_value = "table")]
     pub format: Format,
     /// Leave out the column names — for `table`, the footer too — so the

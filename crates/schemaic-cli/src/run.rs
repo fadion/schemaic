@@ -34,8 +34,9 @@ pub enum Exit {
     /// It ran. Also the exit when the reader of stdout went away first (`| head`)
     /// — it had what it wanted.
     Ok = 0,
-    /// The command line was wrong, or named a connection that is not there.
-    /// Nothing was sent to a server.
+    /// The command line was wrong, or named a connection, a `-f` file or a
+    /// `describe` table that is not there. Nothing was sent to a server — or,
+    /// for the table, nothing but the lookup that found it missing.
     Usage = 2,
     /// A guard refused: not a read, a read-only connection, consent not given,
     /// or a connection the user has not exposed to the CLI. Nothing was sent to
@@ -991,6 +992,77 @@ mod tests {
         let n = list_note(0, 0, false).expect("nothing saved");
         assert!(n.contains("no saved connections"), "{n}");
         assert!(!n.contains("--all"), "{n}");
+    }
+
+    /// Every outcome, spelled so that a new variant fails to compile here
+    /// until it is added to the list — and so to the help's check below.
+    fn every_exit() -> [Exit; 6] {
+        fn _exhaustive(e: Exit) {
+            match e {
+                Exit::Ok
+                | Exit::Usage
+                | Exit::Refused
+                | Exit::Failed
+                | Exit::Unknown
+                | Exit::Capped => {}
+            }
+        }
+        [
+            Exit::Ok,
+            Exit::Usage,
+            Exit::Refused,
+            Exit::Failed,
+            Exit::Unknown,
+            Exit::Capped,
+        ]
+    }
+
+    fn top_level_help() -> String {
+        <Cli as clap::Parser>::try_parse_from(["schemaic", "--help"])
+            .unwrap_err()
+            .to_string()
+    }
+
+    /// **`--help` lists every exit code**, since a script's author reads the
+    /// help and not this file, and the codes are the contract they retry on.
+    /// Each on a line of its own, and only the ones there are.
+    #[test]
+    fn the_help_lists_every_exit_code_and_no_other() {
+        let help = top_level_help();
+        let section = help
+            .split("Exit codes:")
+            .nth(1)
+            .expect("the help has an exit-code section");
+        let listed: Vec<u8> = section
+            .lines()
+            .filter_map(|l| l.split_whitespace().next()?.parse().ok())
+            .collect();
+        let real: Vec<u8> = every_exit().iter().map(|e| *e as u8).collect();
+        assert_eq!(listed, real, "{section}");
+    }
+
+    /// And every `--format`, from the same list the parser accepts.
+    #[test]
+    fn the_help_lists_every_format() {
+        let help = top_level_help();
+        let section = help
+            .split("Output formats")
+            .nth(1)
+            .and_then(|s| s.split("Exit codes:").next())
+            .expect("the help has a format section");
+        let listed: Vec<&str> = section
+            .lines()
+            .filter(|l| l.starts_with("  "))
+            .filter_map(|l| l.split_whitespace().next())
+            .collect();
+        assert_eq!(listed, Format::NAMES, "{section}");
+        // A subcommand's own help names them where `--format` is.
+        let sub = <Cli as clap::Parser>::try_parse_from(["schemaic", "query", "--help"])
+            .unwrap_err()
+            .to_string();
+        for name in Format::NAMES {
+            assert!(sub.contains(name), "`query --help` must name {name}");
+        }
     }
 
     #[test]

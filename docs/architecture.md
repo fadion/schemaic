@@ -19953,6 +19953,15 @@ existing prose was left alone.
     (`no_header_is_on_every_row_printing_subcommand`).
     `OutputArgs::output()` is `format::Output::new`, and whether the pair goes together is judged
     there rather than by clap; `Command::output_args()` hands it to `run.rs`, `None` for `version`.
+    **The top-level `--help` ends with the formats and the exit codes** (`AFTER_HELP`, as `Cli`'s
+    `after_help`), since a script's author reads the help and would otherwise have had to find
+    either in the README; `OutputArgs::format`'s doc line names the five, so each subcommand's
+    help lists them where `--format` is. It is **a literal, checked against the code rather than
+    built from it**, because clap takes a `&'static str` there — `run.rs`'s tests hold it to `Exit`
+    and `Format::NAMES`. Those tests read the text by its shape, which is the part to keep when
+    editing it: an exit line is one whose first word is a number (the `\` continuation on 3 keeps
+    its tail on the same line), and a format line is one indented by two spaces, so the
+    `--no-header` and stdout/stderr lines under the formats sit at column 0 on purpose.
     `--password-stdin` is for the headless case the keyring cannot serve:
     Linux's Secret Service needs an unlocked desktop collection, which an SSH session or a container
     does not have, and without it the CLI would simply be unusable there. It reads a pipe and
@@ -20298,12 +20307,18 @@ existing prose was left alone.
   - `cli/run.rs` — dispatch, and the module that owns the output contract. **stdout is data; stderr
     is everything else** — no banners, no warnings, no progress — which is what makes `--format=json`
     safe to parse and `--format=csv` safe to redirect. The other half is `Exit`, and it has **six**
-    outcomes rather than two: 0 ok, 2 usage (including a connection that is not there), 3 a guard
+    outcomes rather than two: 0 ok, 2 usage (including a connection, `-f` file or `describe` table that is not there), 3 a guard
     refusal, 4 a server or connection failure, 5 a **write** whose deadline passed after it was
     sent, 6 a read `--limit` cut short, under `query --fail-on-cap` only. A new outcome gets a new
     number, never an old one's. A caller that can only tell success from failure
     retries the refusal that will never succeed and gives up on the timeout that would have;
     `the_exit_codes_are_the_documented_ones` pins the numbers, because scripts depend on them.
+    **The top-level `--help` lists them** (`args.rs`'s `AFTER_HELP`), and
+    `the_help_lists_every_exit_code_and_no_other` holds the list to `every_exit()` — all six
+    variants, beside a nested `_exhaustive` `match` so a seventh fails to compile until it is added
+    there, and so to the help. `the_help_lists_every_format` does the same for the formats against
+    `Format::NAMES`, and checks `query --help` names each. Both were seen red before the section
+    existed.
     **5 is the one a script must not retry blind**: 4 says retrying may work, and the timed-out
     MyISAM `UPDATE` that got it had already changed 9 of 40 rows (`exec.rs` has the rest). Which
     outcome gets which code is `exit_for_no_connection` and `exit_for_no_rows`, pure and tested
