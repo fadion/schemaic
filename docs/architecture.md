@@ -19792,7 +19792,7 @@ existing prose was left alone.
     ordering between them is free, and this way the protocol stream stays clean whichever of the
     four opened it.
     **The headless-CLI branch sits between those two, and being *before* Velopack is the load-bearing
-    part.** `schemaic list`/`databases`/`query`/`exec`/`version` return from `main` ahead of the hook, the file
+    part.** `schemaic list`/`databases`/`ping`/`query`/`exec`/`version` return from `main` ahead of the hook, the file
     logger, the fonts and Floem: none of that belongs in a one-shot command, and `auto_apply_on_startup` is free
     to find a staged package and exit-and-relaunch the process — which is safe for a launch that has
     read no session state and is not safe in the middle of a command whose output someone is piping.
@@ -19890,8 +19890,8 @@ existing prose was left alone.
     `APPDATA` redirected to a scratch profile, removed a seeded entry, exited 0, left `PATH`
     byte-identical to the backup and logged the removal. **`row_status` is not yet verified by
     hand**: the greyed Install and the "comes with the app" hint need a real `.deb` install to see.
-- `schemaic-cli` — Schemaic without a window: `schemaic list` / `databases` / `query` / `exec` /
-  `version` / `help`, so a person or an agent can run SQL against a saved connection with the app closed and without being
+- `schemaic-cli` — Schemaic without a window: `schemaic list` / `databases` / `ping` / `query` /
+  `exec` / `version` / `help`, so a person or an agent can run SQL against a saved connection with the app closed and without being
   handed a credential. Its whole dependency list is `schemaic-core`, `schemaic-conn`, `schemaic-db`,
   `clap`, `tokio` and `tokio-util` — **no floem**, which is what splitting `schemaic-conn` out of
   `schemaic-app` was for. It is a **library** with two front ends, because the front ends differ per
@@ -19932,8 +19932,8 @@ existing prose was left alone.
     no-database arm exists to stop, reached without the guard seeing it
     (`a_blank_database_is_refused_at_parse_time`, `a_zero_timeout_or_limit_is_refused`).
     **`-c` falls back to `SCHEMAIC_CONNECTION` and `-d` to `SCHEMAIC_DATABASE`** (clap's `env`; a
-    flag on the command line wins), on `query` and `exec` alike and `-c` on `databases`, so an
-    agent's shell is pointed at a connection and a database once. A `SCHEMAIC_DATABASE` that is set
+    flag on the command line wins), on `query` and `exec` alike and `-c` on `databases` and `ping`
+    (through `ConnArgs`), so an agent's shell is pointed at a connection and a database once. A `SCHEMAIC_DATABASE` that is set
     but blank goes through the same `non_blank` and is refused, not read as unset — it is `-d "$DB"`
     one step removed — which is why the message names both sources. The test reads the `env`
     attribute off clap's `Command` rather than setting the variable, since the process environment
@@ -19947,8 +19947,8 @@ existing prose was left alone.
     (`fail_on_cap_is_an_opt_in_query_flag`). `exec` has no `--limit` and its cap bounds only what
     is printed, so there is nothing for the flag to report (`exec_has_no_fail_on_cap_flag`).
     **`OutputArgs { format, no_header }` is flattened into every subcommand that prints rows** —
-    `list`, `databases`, `query` and `exec` — in place of a `format` field of each one's own, so
-    `--no-header` is on all four at once (`no_header_is_on_every_row_printing_subcommand`).
+    `list`, `databases`, `ping`, `query` and `exec` — in place of a `format` field of each one's
+    own, so `--no-header` is on all of them at once (`no_header_is_on_every_row_printing_subcommand`).
     `OutputArgs::output()` is `format::Output::new`, and whether the pair goes together is judged
     there rather than by clap; `Command::output_args()` hands it to `run.rs`, `None` for `version`.
     `--password-stdin` is for the headless case the keyring cannot serve:
@@ -19987,10 +19987,15 @@ existing prose was left alone.
     `query::DEFAULT_TIMEOUT` through `DEFAULT_TIMEOUT_SECS`, not a second literal beside it
     (`exec_defaults_to_the_shared_timeout`).
     **`ConnArgs` is `Target` without the database** — `-c` and `--password-stdin`, flattened into
-    `Target { conn, database }` for `query` and `exec`, and taken alone by `databases`, the one
-    subcommand with no database to run in: it lists the names `-d` takes, so it has no `-d`, and
-    passing one is a parse error (`databases_has_no_database_flag`). `run.rs`'s `select_conn` and
-    `connect` take `&ConnArgs`, which is what lets all three share them.
+    `Target { conn, database }` for `query` and `exec`, and taken alone by the two subcommands with
+    no database to run in: `databases` lists the names `-d` takes, and `ping` asks whether the
+    server answers at all, so neither has a `-d` and passing one is a parse error
+    (`databases_has_no_database_flag`, `ping_takes_a_connection_and_the_reachability_timeout`).
+    `run.rs`'s `select_conn` and `connect` take `&ConnArgs`, which is what lets all four share them.
+    **`ping`'s `--timeout` defaults to `PING_TIMEOUT_SECS`, not `DEFAULT_TIMEOUT_SECS`** — it is
+    `schemaic_db::PING_TIMEOUT`, five seconds, the bound after which the app's own health check
+    says *Disconnected*, so the CLI and the app agree on when a host is dead; the 30 s statement
+    default would have a script wait six times as long to be told the same thing.
     **`wants_cli` is the routing predicate, and it is an allowlist of the *first* argument rather
     than "are there any arguments".** This binary is re-invoked with argv by things that are not the
     CLI — the Velopack installer and updater (`--veloapp-install`, `--veloapp-updated`,
@@ -20002,8 +20007,12 @@ existing prose was left alone.
     `a_subcommand_further_along_does_not_route` holds the *first*-argument half, since
     `schemaic --mcp-serve list` is the app being asked to serve). The converse holds too: through the
     app's own binary a new subcommand does not reach the CLI until its name is added here, as
-    `databases` was (`every_subcommand_routes_to_the_cli`) — `schemaic.com` calls `run::main`
-    without asking, so a missing name shows everywhere except through it. **`version` is what a
+    `databases` and `ping` were (`every_subcommand_routes_to_the_cli`) — `schemaic.com` calls
+    `run::main` without asking, so a missing name shows everywhere except through it. **That test
+    and `the_help_text_names_every_subcommand` read the names off clap's `Command`**
+    (`subcommand_names()`, plus `help`) rather than a list of their own, which is what makes them
+    catch this: a hand list was one more place a new subcommand had to be added, and a subcommand
+    left off both passed. Taking `ping` out of `wants_cli` turns it red. **`version` is what a
     missing name costs**: `--version`/`-V` were routed, but `schemaic version` was neither a
     subcommand nor on this list, so through `schemaic.com` it was a usage error and through the
     app's own binary it **opened the GUI** instead of answering. The test now names it, and was
@@ -20132,7 +20141,7 @@ existing prose was left alone.
     (`fetch_databases`, `fetch_table_list`) go through `with_deadline_abandoning` beside it. It
     does share the bound: its wait after the cancel is `UNWIND_GRACE` too, for the same
     still-connecting driver.
-    **`schemaic databases` is the one caller here whose token is not the future's.**
+    **`schemaic databases` is one of two callers here whose token is not the future's.**
     `fetch_databases` takes none, so `run.rs` hands `with_deadline` a fresh one and the cancel
     reaches nothing — the case the paragraph above warns about. It is wrapped anyway because this
     module's gate requires every `db.` read in the crate to be, and it is bounded regardless:
@@ -20140,6 +20149,10 @@ existing prose was left alone.
     `UNWIND_GRACE` the wait after the cancel allows. What that costs is `--timeout`'s meaning for
     the listing — it still bounds the tunnel — where one past five seconds never fires and a
     shorter one turns a late answer into a failure without returning any sooner.
+    **`schemaic ping` is the second, and there the two bounds are one.** `Db::ping` takes no token
+    either, but it takes the timeout, so `run.rs` passes `--timeout` to both it and the wrapper: the
+    check gives up by itself at the same moment the deadline would, and the wrap is there for the
+    gate rather than for a cancel it cannot deliver.
     **The gate that produced this module is the part worth keeping.** `mcp.rs`'s
     `no_database_read_is_awaited_without_a_deadline` carries a floor on how many reads it finds, so
     that a needle which stopped matching could not read as a clean file — and folding `run_query`
@@ -20298,7 +20311,7 @@ existing prose was left alone.
     `OutputArgs::output`, and a pair that does not go together — `--no-header` with a format that
     has no header — is a `warn` and `Exit::Usage` before anything is read, the way clap's own
     refusals are. The resolved
-    `Output` is what `list`, `databases`, `run_query`, `run_exec` and `emit_rows` take in place of
+    `Output` is what `list`, `databases`, `ping`, `run_query`, `run_exec` and `emit_rows` take in place of
     a `Format`. No test pins that order; it is the code's.
     **`databases` lists the names `-d` takes, because a CLI user usually starts with none.** The
     app never needs a default database — the tree lists every one — so a saved connection often
@@ -20309,6 +20322,15 @@ existing prose was left alone.
     `format::render_rows` as a one-column `database` result, so `--format` means what it does
     elsewhere. It takes the same `select_conn` and `connect` as the others, and a failed connection
     or listing is exit 4; `deadline.rs` has what its `--timeout` does and does not bound.
+    **`ping` is the app's health check, run once**: `select_conn` (so the CLI-access gate and exits
+    2 and 3 as everywhere), `connect` (keyring or `--password-stdin`, the tunnel under `--timeout`),
+    then `Db::ping` — log in, `SELECT 1` — under `deadline::with_deadline`. An answer is **one
+    row**, `ping_rows(conn, elapsed)`: `connection`, `engine`, `endpoint`, `status` (`ok`) and `ms`,
+    whole milliseconds as a `UInt` and timed around `Db::ping` alone, so its login is in the figure
+    and the tunnel is not. It goes through `format::render_rows`, so `--format` and `--no-header`
+    mean what they do for `list` (`a_ping_reports_the_connection_and_its_round_trip`). **No answer
+    is the driver's error on stderr and exit 4, and there is no "down" row**: a script tests the
+    exit code, and a person reads the driver's reason on stderr, where every other failure goes.
     **After a failure for want of a database, a `hint:` line on stderr names the way out** — `-d
     <database>`, a default picked in Schemaic, and `schemaic databases -c <conn>` with the user's own
     `-c` echoed back, quoted if it has whitespace. `hint` prints it on a line of its own after

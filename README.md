@@ -176,6 +176,7 @@ already saved:
 ```
 schemaic list
 schemaic databases --connection=prod
+schemaic ping --connection=prod
 schemaic query "SELECT * FROM orders LIMIT 5" --connection=prod --database=shop --format=json
 schemaic exec "UPDATE orders SET state = 'sent' WHERE id = 7" --connection=prod
 ```
@@ -197,6 +198,8 @@ connection often has none; `schemaic databases` lists the names `-d` takes, and 
 statement that failed for want of one says so. `SCHEMAIC_CONNECTION` and
 `SCHEMAIC_DATABASE` stand in for `-c` and `-d`, so a shell — or an agent's — can be
 pointed at one connection and database once; a flag given as well wins. `schemaic
+ping` logs in and runs `SELECT 1`, printing the round trip, or exits `4` with
+the server's reason. `schemaic
 version` prints the version.
 
 `query` runs reads and nothing else — not a flag away from a write, a different

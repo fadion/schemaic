@@ -55,6 +55,16 @@ pub enum Command {
         #[arg(long, default_value_t = DEFAULT_TIMEOUT_SECS, value_parser = at_least_one_second())]
         timeout: u64,
     },
+    /// Check that a connection answers: log in and run `SELECT 1`.
+    Ping {
+        #[command(flatten)]
+        conn: ConnArgs,
+        #[command(flatten)]
+        output: OutputArgs,
+        /// Seconds before the server is given up on.
+        #[arg(long, default_value_t = PING_TIMEOUT_SECS, value_parser = at_least_one_second())]
+        timeout: u64,
+    },
     /// Run a read-only statement.
     Query {
         #[command(flatten)]
@@ -105,6 +115,11 @@ pub fn version_text() -> String {
 /// [`crate::query::DEFAULT_TIMEOUT`] in the unit `--timeout` takes.
 const DEFAULT_TIMEOUT_SECS: u64 = crate::query::DEFAULT_TIMEOUT.as_secs();
 
+/// `ping`'s default: the app's own answer to "the server is not responding",
+/// the five seconds after which its health check says Disconnected — so the
+/// two agree on a dead host.
+const PING_TIMEOUT_SECS: u64 = schemaic_db::PING_TIMEOUT.as_secs();
+
 /// The statement argument that means "read it from stdin".
 pub const SQL_FROM_STDIN: &str = "-";
 
@@ -133,6 +148,7 @@ impl Command {
         match self {
             Command::List { output, .. }
             | Command::Databases { output, .. }
+            | Command::Ping { output, .. }
             | Command::Query { output, .. }
             | Command::Exec { output, .. } => Some(output),
             Command::Version => None,
@@ -300,6 +316,7 @@ pub fn wants_cli(argv: &[String]) -> bool {
         Some(
             "list"
                 | "databases"
+                | "ping"
                 | "query"
                 | "exec"
                 | "version"
@@ -324,9 +341,22 @@ mod tests {
         args.iter().map(|s| s.to_string()).collect()
     }
 
+    /// Every subcommand clap knows, read off the parser rather than listed
+    /// here — so a new one that [`wants_cli`] was not told about fails this,
+    /// instead of reaching the GUI as an unknown flag.
+    fn subcommand_names() -> Vec<String> {
+        <Cli as clap::CommandFactory>::command()
+            .get_subcommands()
+            .map(|s| s.get_name().to_string())
+            .chain(["help".to_string()])
+            .collect()
+    }
+
     #[test]
     fn every_subcommand_routes_to_the_cli() {
-        for name in ["list", "databases", "query", "exec", "version", "help"] {
+        let names = subcommand_names();
+        assert!(names.len() > 5, "{names:?}");
+        for name in &names {
             assert!(
                 wants_cli(&argv(&["schemaic", name])),
                 "`{name}` must reach the CLI"
@@ -503,6 +533,24 @@ mod tests {
         }
     }
 
+    /// **`ping` names a connection and nothing to run.** No statement, no
+    /// `-d` — it asks whether the server answers — and a timeout of the app's
+    /// own reachability check, not a statement's.
+    #[test]
+    fn ping_takes_a_connection_and_the_reachability_timeout() {
+        let cli = parse(&["schemaic", "ping", "-c", "prod"]).unwrap();
+        let Command::Ping { conn, timeout, .. } = cli.command else {
+            panic!("expected a ping");
+        };
+        assert_eq!(conn.connection, "prod");
+        assert_eq!(timeout, schemaic_db::PING_TIMEOUT.as_secs());
+        let err = parse(&["schemaic", "ping", "-c", "1", "-d", "app"]).unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::UnknownArgument);
+        let err = parse(&["schemaic", "ping"]).unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+        assert!(parse(&["schemaic", "ping", "-c", "1", "--password-stdin"]).is_ok());
+    }
+
     #[test]
     fn a_query_needs_a_connection() {
         let err = parse(&["schemaic", "query", "SELECT 1"]).unwrap_err();
@@ -636,6 +684,7 @@ mod tests {
         for args in [
             &["schemaic", "list", "--no-header"][..],
             &["schemaic", "databases", "-c", "1", "--no-header"],
+            &["schemaic", "ping", "-c", "1", "--no-header"],
             &["schemaic", "query", "SELECT 1", "-c", "1", "--no-header"],
             &["schemaic", "exec", "SELECT 1", "-c", "1", "--no-header"],
         ] {
@@ -850,10 +899,13 @@ mod tests {
                 "{sub}"
             );
         }
-        assert_eq!(
-            env_of("databases", "connection").as_deref(),
-            Some("SCHEMAIC_CONNECTION")
-        );
+        for sub in ["databases", "ping"] {
+            assert_eq!(
+                env_of(sub, "connection").as_deref(),
+                Some("SCHEMAIC_CONNECTION"),
+                "{sub}"
+            );
+        }
     }
 
     /// A zero timeout cancels every statement before it can run, and a zero
@@ -888,8 +940,8 @@ mod tests {
     #[test]
     fn the_help_text_names_every_subcommand() {
         let text = parse(&["schemaic", "help"]).unwrap_err().to_string();
-        for name in ["list", "databases", "query", "exec", "version"] {
-            assert!(text.contains(name), "help must mention `{name}`");
+        for name in subcommand_names() {
+            assert!(text.contains(&name), "help must mention `{name}`");
         }
     }
 

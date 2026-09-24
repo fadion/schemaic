@@ -217,6 +217,11 @@ async fn dispatch(command: Command) -> Exit {
             output: _,
             timeout,
         } => databases(&file.connections, &conn, out, Duration::from_secs(timeout)).await,
+        Command::Ping {
+            conn,
+            output: _,
+            timeout,
+        } => ping(&file.connections, &conn, out, Duration::from_secs(timeout)).await,
         Command::Query {
             sql,
             target,
@@ -397,6 +402,63 @@ async fn databases(conns: &[Connection], args: &ConnArgs, out: Output, timeout: 
     emit_stdout(&format::render_rows(&rs, out))
         .err()
         .unwrap_or(Exit::Ok)
+}
+
+/// `schemaic ping` — log in and run `SELECT 1`, through `Db::ping`, which is
+/// the app's own health check.
+///
+/// **An answer is a row and exit 0; no answer is stderr and exit 4.** There
+/// is no "down" row: a script tests the exit code, and a person reads the
+/// driver's reason on stderr, where every other failure goes. `--timeout`
+/// bounds the tunnel and the check separately, as each is its own wait.
+async fn ping(conns: &[Connection], args: &ConnArgs, out: Output, timeout: Duration) -> Exit {
+    let conn = match select_conn(conns, args) {
+        Ok(c) => c,
+        Err(exit) => return exit,
+    };
+    let (db, _tunnel) = match connect(conn, args, timeout).await {
+        Ok(v) => v,
+        Err(exit) => return exit,
+    };
+    let started = std::time::Instant::now();
+    // `ping` bounds itself at `timeout` and takes no token, so the deadline
+    // here is `databases`' belt over the braces: the crate's gate holds every
+    // read to one, and this one never outlives the other.
+    let token = tokio_util::sync::CancellationToken::new();
+    match crate::deadline::with_deadline(db.ping(timeout), token, timeout).await {
+        Some(Ok(())) => {}
+        Some(Err(e)) => {
+            warn(&e.to_string());
+            return Exit::Failed;
+        }
+        None => {
+            warn(&format!("no answer within {}s", timeout.as_secs().max(1)));
+            return Exit::Failed;
+        }
+    }
+    emit_stdout(&format::render_rows(
+        &ping_rows(conn, started.elapsed()),
+        out,
+    ))
+    .err()
+    .unwrap_or(Exit::Ok)
+}
+
+/// What a ping that was answered prints: the connection, and the round trip.
+fn ping_rows(conn: &Connection, elapsed: Duration) -> ResultSet {
+    let columns = ["connection", "engine", "endpoint", "status", "ms"]
+        .into_iter()
+        .map(text_column)
+        .collect();
+    let ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
+    let row = vec![
+        Value::Str(conn.name.clone()),
+        Value::Str(conn.db_type.clone()),
+        Value::Str(conn.endpoint()),
+        Value::Str("ok".to_string()),
+        Value::UInt(ms),
+    ];
+    ResultSet::from_rows(columns, vec![row])
 }
 
 /// What to say after a failure that [`schemaic_core::sql::no_database_failure`]
@@ -755,6 +817,24 @@ fn database_for(target: &Target, conn: &Connection) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **A ping answers with which connection answered, and how fast** — a
+    /// row, so `--format` means what it means everywhere; whole milliseconds,
+    /// since the fraction is noise at a network's scale.
+    #[test]
+    fn a_ping_reports_the_connection_and_its_round_trip() {
+        let mut c = conn("");
+        c.name = "Prod EU".to_string();
+        let rs = ping_rows(&c, Duration::from_micros(12_700));
+        let names: Vec<&str> = rs.columns.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, ["connection", "engine", "endpoint", "status", "ms"]);
+        let out = format::render_rows(&rs, Format::Jsonl);
+        let row: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+        assert_eq!(row["connection"], "Prod EU");
+        assert_eq!(row["endpoint"], "h:3306");
+        assert_eq!(row["status"], "ok");
+        assert_eq!(row["ms"], 12);
+    }
 
     /// **`list` says how many it left out**, so a connection that is missing
     /// from it reads as "not exposed" rather than "not there".
