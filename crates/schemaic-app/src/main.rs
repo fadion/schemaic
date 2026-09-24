@@ -12846,10 +12846,16 @@ mod app_tests {
         // file whole to `search_history.json.bak`, leaving the deleted
         // connection's table names, column names and searched text on disk
         // under a confirm saying it cannot be undone.
-        assert!(
-            erasing >= 10,
-            "only {erasing} erasing saves in the delete closure; every store keyed \
-             to the connection has to be one"
+        //
+        // **An equality, not a floor.** The floor stayed at ten after the count
+        // reached eleven, so deleting one prune (`table_colors.erase`) kept this
+        // green — the slack a floor leaves is exactly one lost store. A new
+        // store raises this number in the same change that adds its erase.
+        assert_eq!(
+            erasing, 11,
+            "{erasing} erasing saves in the delete closure, not the eleven stores \
+             keyed to the connection; every one has to be erased, and a new one \
+             raises this count"
         );
     }
 

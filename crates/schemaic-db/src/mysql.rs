@@ -3857,6 +3857,65 @@ mod schema_tests {
         assert_eq!(t.enabled, schemaic_core::schema::TriggerEnabled::Origin);
     }
 
+    fn check_row(table: &str, name: &str, clause: &str) -> MyCheckRow {
+        (s(table), s(name), s(clause), s("YES"), s("Table"))
+    }
+
+    /// **Each check lands on its own table**, rows interleaved as a server
+    /// with no `ORDER BY` may return them. A bucket keyed wrong puts a check on
+    /// a table that does not have it, and the next diff offers to "fix" it.
+    #[test]
+    fn apply_check_constraints_puts_each_check_on_its_own_table() {
+        let tables = [(s("a"), s("BASE TABLE")), (s("b"), s("BASE TABLE"))];
+        let mut schema = assemble_schema(None, &tables, &[], &[], &[], &[]);
+        let rows = [
+            check_row("b", "b1", "(`x` > 0)"),
+            check_row("a", "a1", "(`y` > 1)"),
+            check_row("b", "b2", "(`x` < 9)"),
+            check_row("ghost", "g1", "(1)"),
+        ];
+        apply_check_constraints(&mut schema, &rows, true);
+        let names = |t: usize| -> Vec<&str> {
+            schema.tables[t]
+                .check_constraints
+                .iter()
+                .map(|c| c.name.as_str())
+                .collect()
+        };
+        assert_eq!(names(0), ["a1"]);
+        assert_eq!(names(1), ["b1", "b2"], "in row order within the table");
+        assert_eq!(schema.tables[0].check_constraints[0].expression, "`y` > 1");
+    }
+
+    /// **The first table of a name wins**, as the per-rule `find` it replaced
+    /// did — and a rule for a key the table has not got is dropped, not
+    /// attached somewhere else.
+    #[test]
+    fn apply_fk_rules_sets_the_rule_on_the_first_table_of_a_name() {
+        let fk = |name: &str| schemaic_core::schema::ForeignKeyInfo {
+            name: s(name),
+            ..Default::default()
+        };
+        let mut schema = DbSchema::default();
+        for _ in 0..2 {
+            schema.tables.push(TableInfo {
+                name: s("orders"),
+                foreign_keys: vec![fk("fk_customer")],
+                ..Default::default()
+            });
+        }
+        let rows = [
+            (s("orders"), s("fk_customer"), s("CASCADE"), s("NO ACTION")),
+            (s("orders"), s("fk_missing"), s("CASCADE"), s("CASCADE")),
+        ];
+        apply_fk_rules(&mut schema, &rows);
+        let first = &schema.tables[0].foreign_keys[0];
+        assert_eq!(first.on_delete.as_deref(), Some("CASCADE"));
+        assert_eq!(first.on_update, None, "NO ACTION stays unwritten");
+        assert_eq!(schema.tables[1].foreign_keys[0].on_delete, None);
+        assert_eq!(schema.tables[0].foreign_keys.len(), 1);
+    }
+
     #[test]
     fn apply_triggers_drops_rows_for_tables_not_in_this_fetch() {
         let tables = [(s("orders"), s("BASE TABLE"))];

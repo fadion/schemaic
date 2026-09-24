@@ -14513,6 +14513,45 @@ mod window_key_gate {
     /// omission. A hostname pasted with the trailing space a copy picks up was
     /// saved as typed, and every operation on the connection failed on name
     /// resolution for a host that looks correct on screen.
+    /// **A loaded connection survives the form unchanged** — every field, and
+    /// in particular the two whose silent loss is unsafe: `read_only` (the
+    /// edited connection would lose its write block) and `cli_access` (a
+    /// hardcoded `false` at `to_connection` compiled, and cleared the flag every
+    /// time a user edited an exposed connection).
+    #[test]
+    fn a_loaded_connection_survives_the_form_unchanged() {
+        use crate::DraftSignals;
+        use floem::reactive::Scope;
+        use schemaic_core::connection::{AiData, Connection, Environment, SshAuth, SslMode};
+        let mut c: Connection = serde_json::from_str(
+            r#"{"id":42,"name":"prod","host":"db.example","port":5433,"user":"app","password":"pw"}"#,
+        )
+        .expect("a minimal connection parses");
+        c.db_type = "PostgreSQL".to_string();
+        c.database = "shop".to_string();
+        c.ssh.enabled = true;
+        c.ssh.host = "bastion".to_string();
+        c.ssh.port = 2222;
+        c.ssh.user = "ops".to_string();
+        c.ssh.auth = SshAuth::KeyPair;
+        c.ssh.key_path = "/k".to_string();
+        c.ssh.key_passphrase = "kp".to_string();
+        c.tls.mode = SslMode::Require;
+        c.tls.ca_path = "/ca".to_string();
+        c.color = Some("#ff0000".to_string());
+        c.prominent_color = true;
+        c.read_only = true;
+        c.cli_access = true;
+        c.environment = Environment::Production;
+        c.ai_data = Some(AiData::Full);
+
+        let cx = Scope::new();
+        let form = DraftSignals::new(cx);
+        form.load(&c);
+        assert_eq!(form.to_connection(c.id), c.clone().trimmed().sanitized());
+        cx.dispose();
+    }
+
     #[test]
     fn the_connection_form_trims_through_core() {
         let src = std::fs::read_to_string(
