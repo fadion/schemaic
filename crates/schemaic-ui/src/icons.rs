@@ -51,6 +51,10 @@ pub const SQUARE_FUNCTION: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" wid
 /// function glyph that stands for something you evaluate).
 pub const SQUARE_PLAY: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="18" height="18" x="3" y="3" rx="2"/><path d="m9 8 6 4-6 4Z"/></svg>"#;
 
+/// Lucide `circle-slash-2` — ∅, the results grid's nullable-column marker in
+/// a header's name line.
+pub const CIRCLE_SLASH_2: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M22 2 2 22"/></svg>"#;
+
 /// Lucide `circle-dot` (boolean column types).
 pub const CIRCLE_DOT: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><circle cx="12" cy="12" r="1"/></svg>"#;
 

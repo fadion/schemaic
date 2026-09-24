@@ -39,8 +39,8 @@ use schemaic_core::format::{self, ColumnFormat, ColumnFormatRule};
 use schemaic_core::intel::SqlDialect;
 use schemaic_core::jsontree::{JsonNode, PathSeg, RowKind, TreeRow};
 use schemaic_core::model::{
-    CellEdit, CellRef, CellTag, CommitDone, GridWrite, QueryState, RefetchRequest, RefetchRow,
-    ResultSet, RowDelete, RowEdit, RowInsert, Value, drop_committed,
+    CellEdit, CellRef, CellTag, Column, CommitDone, GridWrite, QueryState, RefetchRequest,
+    RefetchRow, ResultSet, RowDelete, RowEdit, RowInsert, Value, drop_committed,
 };
 use schemaic_core::rowjson::{self, ColSpec};
 use schemaic_core::schema::{DbSchema, ForeignKeyInfo, SchemaState, TableInfo, TableSource};
@@ -1734,13 +1734,31 @@ fn rescale_widths(widths: &[f64], ratio: f64, min_w: f64) -> Vec<f64> {
     widths.iter().map(|w| (w * ratio).max(min_w)).collect()
 }
 
+/// The nullable marker on a header's name line, in grid characters: a 10px
+/// icon and its 4px margin are two 7px characters — exact at the default font
+/// size, and near enough at another, which moves the icon and not the budget.
+const NULL_MARK_CHARS: usize = 2;
+
+/// How many grid characters a header's **name line** needs: the name, room
+/// for the sort chevron, and the nullable marker when the column has one.
+/// Both width estimators start from this, so the header they size is the one
+/// [`header_cell`] draws.
+fn header_name_chars(col: &Column) -> usize {
+    let mark = if col.is_nullable() {
+        NULL_MARK_CHARS
+    } else {
+        0
+    };
+    col.name.chars().count() + 3 + mark
+}
+
 fn init_widths(rs: &ResultSet, key_map: &HashMap<usize, ColKey>) -> Vec<f64> {
     let sample = rs.row_count().min(200);
     rs.columns
         .iter()
         .enumerate()
         .map(|(ci, col)| {
-            let mut chars = col.name.chars().count() + 3; // room for the sort arrow
+            let mut chars = header_name_chars(col);
             chars = chars.max(col.type_name.chars().count());
             for r in 0..sample {
                 if let Some(c) = rs.cell(r, ci) {
@@ -1767,11 +1785,7 @@ fn init_widths(rs: &ResultSet, key_map: &HashMap<usize, ColKey>) -> Vec<f64> {
 /// `has_key` budgets for the header's leading key icon, and the type-name line is
 /// included so a long type (e.g. `INT UNSIGNED`) isn't clipped after auto-fit.
 fn autofit_width(rs: &ResultSet, ci: usize, has_key: bool) -> f64 {
-    let mut chars = rs
-        .columns
-        .get(ci)
-        .map(|c| c.name.chars().count() + 3)
-        .unwrap_or(6);
+    let mut chars = rs.columns.get(ci).map(header_name_chars).unwrap_or(6);
     if let Some(c) = rs.columns.get(ci) {
         chars = chars.max(c.type_name.chars().count());
     }
@@ -5381,11 +5395,7 @@ fn row_colspecs(gs: GridState, di: usize) -> Vec<ColSpec> {
         .map(|(ci, c)| ColSpec {
             name: c.name.clone(),
             editable: model.text_editable(ci),
-            nullable: c
-                .origin
-                .as_ref()
-                .map(|o| !o.flags.not_null)
-                .unwrap_or(false),
+            nullable: c.is_nullable(),
             value: rs
                 .cell(di, ci)
                 .map(|cell| cell.to_value())
@@ -9532,7 +9542,24 @@ fn header_cell(
                 .into_any()
         }
     });
-    let name_row = h_stack((name_line, trailing)).style(|s| s.items_center());
+    // ∅ after the name for a column whose base column allows NULL — on the name
+    // line rather than beside the key icon, so a numeric header stays
+    // right-aligned over its values (a key icon gives that up, and a marker on
+    // most columns would take it from most headers). Faint, because it is
+    // information and the keys are the emphasis. `header_name_chars` budgets it.
+    let null_mark = if col.is_some_and(Column::is_nullable) {
+        icons::icon(icons::CIRCLE_SLASH_2, 10.0)
+            .style(|s| {
+                s.color(theme::text_faint())
+                    .margin_left(theme::scaled(4.0))
+                    .flex_shrink(0.0_f32)
+            })
+            .tooltip(|| text("Nullable").style(crate::widgets::tooltip_style))
+            .into_any()
+    } else {
+        empty().into_any()
+    };
+    let name_row = h_stack((name_line, null_mark, trailing)).style(|s| s.items_center());
     // SQL type, nudged 2px lower for a touch more breathing room under the name.
     let type_line = text(type_name).style(|s| {
         s.font_size(theme::scaled_font(11.0))
@@ -10481,13 +10508,7 @@ fn data_cell(
             let deleted =
                 pending.is_none() && gs.del_rows.with_untracked(|d| d.contains(&data_idx));
             // Nullable = editable + the base column isn't NOT NULL.
-            let nullable = editable
-                && rs
-                    .columns
-                    .get(ci)
-                    .and_then(|c| c.origin.as_ref())
-                    .map(|o| !o.flags.not_null)
-                    .unwrap_or(false);
+            let nullable = editable && rs.columns.get(ci).is_some_and(Column::is_nullable);
             // Server-side "Filter by / Exclude this value" — real rows of a
             // filter-eligible result whose column maps to a real base-table column.
             // `filter_val` is the cell's raw (unformatted) value, or `None` for NULL
@@ -12270,6 +12291,39 @@ mod tests {
                 );
             });
         }
+    }
+
+    /// **A nullable column's header carries its marker on the name line, and
+    /// both estimators budget for it** — or the marker pushes the name into
+    /// clipping on exactly the columns whose widest text is the name.
+    #[test]
+    fn a_nullable_columns_name_line_budgets_for_its_marker() {
+        let mut nullable = col("customer_name", "VARCHAR");
+        nullable.origin = Some(schemaic_core::model::ColumnOrigin {
+            database: "shop".into(),
+            schema: None,
+            table: "t".into(),
+            column: "customer_name".into(),
+            flags: Default::default(),
+            binary: false,
+            implicit_key: false,
+        });
+        let mut required = nullable.clone();
+        required.origin.as_mut().unwrap().flags.not_null = true;
+        let plain = header_name_chars(&required);
+        assert_eq!(plain, "customer_name".len() + 3);
+        assert_eq!(header_name_chars(&nullable), plain + NULL_MARK_CHARS);
+        // A name-widest column, so the estimate is the name line's.
+        let key_map = HashMap::new();
+        let w = |c: &Column| {
+            let rs = ResultSet::from_rows(vec![c.clone()], vec![vec![Value::Str("x".into())]]);
+            (init_widths(&rs, &key_map)[0], autofit_width(&rs, 0, false))
+        };
+        let (init_n, fit_n) = w(&nullable);
+        let (init_r, fit_r) = w(&required);
+        let mark = NULL_MARK_CHARS as f64 * grid_char_w();
+        assert_eq!(init_n, init_r + mark);
+        assert_eq!(fit_n, fit_r + mark);
     }
 
     /// **A stored width does not follow the scale, so it has to be carried.**

@@ -109,7 +109,14 @@ existing prose was left alone.
     write-back provenance the wire reports per column, and a binary column is read-only **as
     text**: `<n bytes>` is a placeholder rather than a value, so typing or pasting one back would
     write the ASCII of its own size into the column (`edit::EditModel::text_editable`). The bytes
-    themselves are writable, through the blob panel and nothing else.
+    themselves are writable, through the blob panel and nothing else. `Column::is_nullable` is the
+    column's *declared* nullability — `origin.is_some_and(|o| !o.flags.not_null)` — and so `false`
+    for a column with no origin: an expression, aggregate or literal has no declaration, and calling
+    it nullable would be a guess (`only_a_sourced_column_without_not_null_is_nullable`). It answers
+    for the base column, not the row. `flags.not_null` is filled on every engine — MySQL's wire
+    `NOT_NULL_FLAG`, a catalog query on PostgreSQL, `table_info` on SQLite — so the grid's header
+    marker, its cell menu's *Set to NULL* and the row editor's NULL toggle (`row_colspecs`) all
+    read it.
     **A raw-bytes cell has exactly one rendering, and
     it lives here:** `binary_display(len)` → `<n bytes>`, with `is_binary_display` as its
     recognizer and `type_is_binary` / `Column::is_binary` as the question "is this column bytes at
@@ -26108,7 +26115,22 @@ this bundle's.
   key-square; colours shared with the schema tree via `key_primary/index/foreign`) come from
   `column_key_map`, cross-referencing the tab's `source` against the loaded schema (`db_nodes`). Only
   populated when the tab was opened from a table with schema loaded; arbitrary SELECTs get none.
-  Nullable markers deferred.
+  **Nullable markers** need none of that: a faint 10px ∅ (`icons::CIRCLE_SLASH_2`,
+  `theme::text_faint()`, a *Nullable* tooltip) follows the name of any column for which
+  `Column::is_nullable` holds, which is on the `ResultSet` from the moment it arrives — table tab or
+  arbitrary SELECT alike, no `db_nodes`, no `key_gen`. It sits on the **name line**, between the
+  name and the sort chevron, and deliberately not beside the key icon at the left: a leading icon
+  gives up the right-alignment of a numeric header, as a key column's already does, and a marker
+  that most columns carry would take it from most headers. It marks the *declared* nullability of
+  the base column, not the row's — a `LEFT JOIN` still puts NULL in a `NOT NULL` column's place, and
+  an expression column carries no marker because it has no declaration to report. **The width
+  estimators budget for it**: `init_widths` and `autofit_width` both start from
+  `header_name_chars(col)` — name + 3 for the chevron + `NULL_MARK_CHARS` (2) when marked — so they
+  size the header `header_cell` actually draws; left out, the marker pushes the name into clipping
+  on exactly the columns whose widest text is the name
+  (`a_nullable_columns_name_line_budgets_for_its_marker`). The 2 is exact only at the default font
+  size — `icons::icon` sizes the glyph by `scaled_font`, the budget is in `scaled` grid characters —
+  so another size moves the icon without moving the budget.
 - **Column virtualization.** Both rows (`virtual_stack`) *and* columns are virtualized: the header and
   every data row render only the columns intersecting the horizontal viewport (+ a small overscan)
   between two width-preserving spacers, so a wide table builds ~10-14 cells/row instead of all of them

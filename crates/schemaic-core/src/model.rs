@@ -422,6 +422,17 @@ impl Column {
             .unwrap_or_default();
         NUMERIC_TYPES.iter().any(|k| head.eq_ignore_ascii_case(k))
     }
+
+    /// May this column hold NULL — **as far as its base column says**?
+    ///
+    /// `false` for a column with no [`ColumnOrigin`]: an expression, an
+    /// aggregate or a literal has no declared nullability to report, and the
+    /// grid's header marker, its *Set to NULL* entry and the row editor's NULL
+    /// toggle all mean the declared one. A `LEFT JOIN` can still
+    /// put NULL in a `NOT NULL` column's place; this is the column, not the row.
+    pub fn is_nullable(&self) -> bool {
+        self.origin.as_ref().is_some_and(|o| !o.flags.not_null)
+    }
 }
 
 /// Width of the offset field in a packed cell word; the remaining top 3 bits
@@ -2171,6 +2182,18 @@ mod tests {
         let map = rs.origin_columns("shop", None, "t");
         assert_eq!(map.len(), 1);
         assert_eq!(map.get("id"), Some(&1));
+    }
+
+    /// **Nullable is a fact about a base column**, so only a column with an
+    /// origin has an answer: an expression's nullability is not something the
+    /// wire or the catalog says, and "nullable" there would be a guess.
+    #[test]
+    fn only_a_sourced_column_without_not_null_is_nullable() {
+        let mut c = sourced("id", "shop", None, "t", "id");
+        assert!(c.is_nullable(), "no NOT NULL on a base column");
+        c.origin.as_mut().unwrap().flags.not_null = true;
+        assert!(!c.is_nullable());
+        assert!(!col("int").is_nullable(), "an expression says nothing");
     }
 
     /// The namespace is part of the table's identity — the case `build_follow_specs`
