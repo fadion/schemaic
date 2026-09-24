@@ -29,6 +29,7 @@ use schemaic_core::schema::{
 use schemaic_core::text::plural;
 
 use crate::consts::*;
+use crate::tooltip::TooltipExt;
 use crate::widgets;
 use crate::widgets::{
     autohide, debounced, dedup_key, highlight_text, loading_dots, row_menu_mark, section_title,

@@ -50,6 +50,7 @@ use schemaic_core::text_ops::contains_ignore_ascii_case;
 use schemaic_core::tx::{WRITE_WAIT_MS, WaitNote, write_wait_note};
 
 use crate::consts::*;
+use crate::tooltip::TooltipExt;
 use crate::widgets::{
     MenuEntry, autohide, autohide_state, centered_msg, in_strip_button, loading_dots,
     measure_text_px, shift_hscroll, thin_scroll, toolbar_icon, verb_spinner,

@@ -10,9 +10,9 @@ use floem::event::{Event, EventListener, EventPropagation};
 use floem::prelude::*;
 use floem::reactive::create_effect;
 use floem::style::TextOverflow;
-use floem::views::TooltipExt;
 
 use crate::consts::{chat_pad_h, tab_bar_h, tab_max_w};
+use crate::tooltip::TooltipExt;
 use crate::widgets::{MenuEntry, measure_text_px, wheel_hscroll};
 use crate::{
     ConnUi, DbColorRule, FieldCfg, OverlayUi, Tab, TabsActions, TabsUi, bg_transparent,
@@ -293,8 +293,8 @@ fn tab_chip(
                     s
                 }
             });
-            // Tooltip chrome comes from the global `TooltipClass` style (see
-            // `tooltip_style`), so the tip is just its text.
+            // Tooltip chrome is `tooltip_style`, which the tooltip applies to
+            // every tip, so the tip is just its text.
             //
             // A file tab tips its **full path**, which subsumes the truncated-title
             // case and answers the question the chip can't: *which* `orders.sql`.

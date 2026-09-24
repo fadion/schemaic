@@ -70,6 +70,7 @@ mod table_designer;
 mod tabs;
 pub mod theme;
 pub mod themes;
+mod tooltip;
 mod trigger_editor;
 mod users_view;
 mod view_editor;
@@ -127,9 +128,7 @@ use floem::views::editor::keypress::default_key_handler;
 use floem::views::editor::keypress::key::KeyInput;
 use floem::views::editor::text::{WrapMethod, default_dark_color};
 use floem::views::scroll::{Handle, Rounded, Thickness, Track};
-use floem::views::{
-    Decorators, Delay, LabelClass, TextInputClass, TooltipClass, TooltipContainerClass,
-};
+use floem::views::{Decorators, Delay, LabelClass, TextInputClass, TooltipContainerClass};
 use floem::window::WindowId;
 use schemaic_core::connection::{AiData, ConnStatus, Connection, Environment, SshAuth, SslMode};
 use schemaic_core::db_color::{DbColorRule, TableColorRule};
@@ -141,6 +140,7 @@ use schemaic_core::model::{CommitDone, GridWrite, QueryState, RefetchRequest};
 use schemaic_core::resource::ResourceSample;
 use schemaic_core::tx::{TabTx, TxMode, TxState, write_blocking_tabs};
 use schemaic_core::update::UpdateState;
+use tooltip::TooltipExt;
 
 /// The grid-commit completion callback, invoked on the UI thread with the outcome.
 pub type CommitDoneFn = Rc<dyn Fn(CommitDone)>;
@@ -6939,8 +6939,8 @@ pub fn workspace(ui: Ui, window: WindowId) -> impl IntoView {
             // own selection model), which are separate views and unaffected.
             // A class rule cascades to the whole subtree, and Floem's dropdown
             // popup carries the ambient context style into its overlay, so that
-            // gets it too; a tooltip tip only inherits `TooltipClass`, so
-            // `tooltip_style` repeats the rule for those.
+            // gets it too; a tooltip tip is an overlay outside this tree, styled
+            // by `tooltip_style` alone, so that repeats the rule for those.
             .class(LabelClass, |s| s.selectable(false))
             // Floem's default theme paints text inputs white — and also sets
             // light backgrounds for the hover/active/focus states. Override the
@@ -6982,10 +6982,9 @@ pub fn workspace(ui: Ui, window: WindowId) -> impl IntoView {
                 let clear = floem::peniko::Color::TRANSPARENT;
                 s.background(clear).hover(|s| s.background(clear))
             })
-            // Custom tooltip chrome (replaces Floem's bare default) — a compact
-            // bordered panel with a soft drop shadow, applied to every `.tooltip(…)`.
-            .class(TooltipClass, tooltip_style)
             // Shorten the hover delay from Floem's 600ms default (felt sluggish).
+            // `tooltip::AnchoredTooltip` carries this class and reads the delay
+            // off it; the tip's chrome is `tooltip_style`, which it applies itself.
             .class(TooltipContainerClass, |s| {
                 s.set(Delay, std::time::Duration::from_millis(300))
             })
@@ -7242,11 +7241,10 @@ fn header(ui: Ui, chrome: window_chrome::WindowChrome) -> impl IntoView {
     // connections sharing a 15-character prefix became indistinguishable in both
     // places a connection is chosen. Display-only — nothing truncated ever
     // reaches a connect — but "which of these two is prod" is exactly the
-    // question the header is there to answer. Empty when nothing was cut, so an
-    // ordinary name raises no tooltip at all.
+    // question the header is there to answer.
     // `None` when nothing was cut — and through `tip_when`, which is the only
-    // thing that makes that mean "no tooltip". Floem has no "not now": once the
-    // hover delay fires it always adds the overlay, and `TooltipClass` paints
+    // thing that makes that mean "no tooltip". The tooltip has no "not now": once the
+    // hover delay fires it always adds the overlay, and `tooltip_style` paints
     // the panel chrome onto whatever root it is handed, so an empty `text("")`
     // is a small empty bordered box rather than nothing. On this control, which
     // is the most-hovered in the app, it appeared for every name of fifteen
@@ -9413,7 +9411,7 @@ fn result_tab_chip(panel: ResultPanel, tab: Tab, gctx: GridCtx) -> impl IntoView
     // is built.
     let tip = move || {
         // `None`, not an empty string: floem always adds the overlay once the
-        // hover delay fires and `TooltipClass` paints the chrome onto it, so an
+        // hover delay fires and `tooltip_style` paints the chrome onto it, so an
         // empty tip is an empty bordered box. Only `tip_when`'s hidden root is
         // actually nothing. (Reachable while a closing panel is still on screen.)
         let panel = result_tabs.with_untracked(|v| v.iter().find(|p| p.id == id).cloned())?;

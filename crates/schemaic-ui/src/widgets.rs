@@ -20,6 +20,7 @@ use floem::views::scroll::ScrollCustomStyle;
 use schemaic_core::intel::SqlDialect;
 
 use crate::consts::*;
+use crate::tooltip::TooltipExt;
 use crate::{icons, theme};
 
 // ── Focus roots ─────────────────────────────────────────────────────────────
@@ -2483,8 +2484,8 @@ pub(crate) fn menu_icon_color_gated(enabled: bool, open: bool, hovered: bool) ->
     }
 }
 
-/// The app's tooltip chrome, applied globally to Floem's `TooltipClass` (see the
-/// root stylesheet in `lib.rs`) so every `.tooltip(…)` gets it — a compact
+/// The app's tooltip chrome, which `tooltip::AnchoredTooltip` applies to every
+/// tip, so every `.tooltip(…)` gets it — a compact
 /// bordered panel matching the app's popovers, with a soft drop shadow lifting it
 /// off the content. `color`/`font_size` are inherited, so a bare `text(…)` tip
 /// picks them up.
@@ -2519,13 +2520,13 @@ pub(crate) fn tooltip_style(s: floem::style::Style) -> floem::style::Style {
 /// truncated ERD header, a tab's path) decide *once*, at build, and an `AnyView`
 /// branch is right for them. This one's condition is the window width, which the
 /// user is dragging — so it has to be answered later than build. It is:
-/// `Tooltip::update` calls the tip closure at the moment the hover delay fires,
+/// `AnchoredTooltip::update` calls the tip closure at the moment the hover delay fires,
 /// so a signal read in here is read fresh on every hover, with no rebuild of the
 /// view underneath.
 ///
-/// **Why `hide()` rather than an empty tip.** Floem's tooltip has no "not now" —
+/// **Why `hide()` rather than an empty tip.** The tooltip has no "not now" —
 /// once the delay fires it always adds the overlay. Returning an empty view is
-/// therefore *not* nothing: `TooltipClass` paints the panel chrome (background,
+/// therefore *not* nothing: [`tooltip_style`] paints the panel chrome (background,
 /// border, padding, shadow) on whatever root it is handed, so an empty tip is a
 /// small empty box on screen. A `display: none` root is the one thing that chrome
 /// cannot override, and not by luck — floem hands **each** `.style()` closure a
@@ -2537,7 +2538,7 @@ pub(crate) fn tooltip_style(s: floem::style::Style) -> floem::style::Style {
 /// an owned `String` — and so it went round this helper with a bare
 /// `.tooltip(|| text(conn_tip()))` returning `""` for any name short enough not
 /// to be elided. Which is every ordinary name: floem still added the overlay,
-/// `TooltipClass` still painted background, border, padding and shadow onto it,
+/// the tooltip chrome still painted background, border, padding and shadow onto it,
 /// and the app's most-hovered header control grew a small empty chip. The site's
 /// own comment claimed the opposite ("so an ordinary name raises no tooltip at
 /// all"), which is this function's rule stated at a call site that wasn't

@@ -40,6 +40,7 @@ use schemaic_core::monitor::{
 
 use crate::settings::focusable_dropdown;
 use crate::theme::{font_body, font_label};
+use crate::tooltip::TooltipExt;
 use crate::widgets::{
     autohide_state, follow_after_scroll, loading_dots, modal_h, modal_w, panel_style,
     shift_hscroll, thin_scroll, with_scroll_gesture,

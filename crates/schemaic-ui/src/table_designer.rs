@@ -32,6 +32,7 @@ use schemaic_core::intel::SqlDialect;
 use schemaic_core::schema::{CheckInfo, ColumnInfo, ForeignKeyInfo, IndexInfo, ServerFlavour};
 
 use crate::settings::focusable_toggle_row;
+use crate::tooltip::TooltipExt;
 use crate::widgets::{
     ACTION_TAB, ActionKind, FocusRing, MenuEntry, action_button, action_gap, autohide,
     focus_root_with_ring, form_gap, form_hint, form_setting, modal_footer_split, modal_h,

@@ -21,6 +21,7 @@ use schemaic_core::schema::{SchemaState, TableSource, db_visible};
 use schemaic_core::skeleton::{delete_skeleton, insert_skeleton, update_skeleton};
 
 use crate::consts::{chat_pad_h, chat_pad_v, db_menu_w};
+use crate::tooltip::TooltipExt;
 use crate::widgets::{
     ACTION_TAB, CURSOR_MENU_GAP, MenuEntry, autohide, box_menu_inset, cursor_menu_insets,
     dialog_button, first_enabled, focus_root, list_step_enabled, measure_text_px_at,

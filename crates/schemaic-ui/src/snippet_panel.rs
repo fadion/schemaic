@@ -25,6 +25,7 @@ use schemaic_core::intel::SqlDialect;
 
 use crate::consts::{MONO_FAMILY, SEARCH_DEBOUNCE_MS};
 use crate::theme::{font_body, font_label};
+use crate::tooltip::TooltipExt;
 use crate::widgets::{
     MenuEntry, autohide, debounced, highlight_sql_mono, highlight_text, section_title, toolbar_icon,
 };

@@ -56,6 +56,7 @@ use schemaic_core::erd_export;
 use schemaic_core::schema::{DbSchema, SchemaState, classify_column_type};
 
 use crate::schema_tree::column_type_icon;
+use crate::tooltip::TooltipExt;
 use crate::widgets::{
     MenuEntry, centered_msg, measure_text_px_at, measure_text_px_bold_at, modal_title_borderless,
     panel_style, window_size,

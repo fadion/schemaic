@@ -32,6 +32,7 @@ use schemaic_core::transcript::{
 
 use crate::consts::{chat_pad_h, follow_slack};
 use crate::markdown::{CodeActions, render_markdown};
+use crate::tooltip::TooltipExt;
 use crate::widgets::{
     autohide, autohide_state, follow_after_scroll, jump_to_bottom_button, next_floor,
     section_title, shift_hscroll, thin_scroll, toolbar_icon, verb_spinner, with_scroll_gesture,

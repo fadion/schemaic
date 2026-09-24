@@ -12304,6 +12304,65 @@ existing prose was left alone.
     *because* `grid_key` has no Tab arm rather than by accident, which is what
     `the_panel_handler_behind_the_strip_claims_no_tab` pins by reading `grid_key`'s own span in
     `grid.rs` and refusing a `NamedKey::Tab` in it.
+  - `tooltip.rs` — the app's `.tooltip(…)`: floem 0.2's `Tooltip`, **anchored to the element
+    instead of the pointer**. floem opens its tip at the pointer plus 10px (`window_origin +
+    hover.pos + 10/scale` in its `update`, `floem-0.2.0/src/views/tooltip.rs:83-87`), and its
+    default theme adds as much again: `TooltipClass` carries a `margin(10.0)`
+    (`floem-0.2.0/src/theme.rs:261-272`) that the app's chrome, merged on top, never overrode — so
+    **the pointer plus 20px**, wherever on the element the pointer happened to rest when the delay
+    ran out. Where a tip landed was a fact about the hover rather than the control: on a 16px icon,
+    resting on its right half started the tip past the icon, far enough out to read as the next
+    one's. That was reported as every tooltip in the app opening shifted to the right of its icon —
+    and nothing in the repository or in floem had changed; it was floem's rule all along.
+    `anchor_below` (pure, pinned by `a_tip_opens_under_the_element_at_its_left_edge` and
+    `the_gap_is_measured_from_the_elements_bottom_edge`) opens it under the element's own box,
+    `theme::scaled(6.0)` below, **aligned to its left edge and not centred**: a tip is usually wider
+    than the icon it names, and a centred one would reach left over the neighbour as far as it
+    reaches right.
+    **The element's own box is the child's, not the wrapper's** — `element_box`, pure, pinned by
+    `a_childs_margin_is_not_part_of_the_box_the_tip_hangs_from` and
+    `without_a_laid_out_child_the_wrappers_box_is_used`. The wrapper is laid out around its child's
+    *margin* box, so hanging the tip from the wrapper put the editor's parameter-type chip's tip 7px
+    left of the chip it names — the chip carries `margin_left(theme::scaled(7.0))`, in
+    `editor_pane.rs`. `update` takes the first child's layout rect offset by the wrapper's window
+    origin, and falls back to the wrapper's own box only while the child has no layout.
+    `AnchoredTooltip` is floem's view copied with that one decision changed and the rest kept on
+    purpose — the hover delay (it carries `TooltipContainerClass` and reads floem's `Delay` through
+    its own `prop_extractor!`, so the root's 300 ms rule still sets it), the events that dismiss it
+    (leave, press, release, wheel, key down or up), no tip while a drag is held, and the overlay
+    removed on cleanup. The drag rule is the nearest the public API reaches, not floem's own:
+    `is_dragging()` goes false the moment a drag is released, whereas floem's view waited for its
+    `pub(crate)` `dragging` field (`floem-0.2.0/src/app_state.rs:36`) to clear, and so also held
+    tips off through a released drag's animation. It inlines floem's `default_compute_layout`,
+    which 0.2 does not re-export. Keeping the tip inside the window is still floem's `OverlayView`,
+    whose paint pulls one that would run past the right or bottom edge back in by the overflow — a
+    shift, not a flip, so under a control on the window's bottom edge the tip is painted up over the
+    control rather than above it.
+    **The chrome is `widgets::tooltip_style`, applied to the tip directly.** floem computed the tip's
+    style from the global `TooltipClass` rule off the tooltip view's style context, because the tip
+    is an overlay — a child of the window, not of the app root — and sees none of the root's class
+    rules. Applying the style itself is the same chrome without the indirection, **less what floem's
+    theme had put in `TooltipClass` underneath it**: the `margin(10.0)` above, half the reported
+    shift, which the tip no longer carries. With nothing reading the class, the root stylesheet's
+    `.class(TooltipClass, tooltip_style)` rule was dead, and it is gone. The theme's
+    `box_shadow_h_offset(2.0)` is *not* part of that difference, whatever a reading of the theme
+    suggests: the shadow is one property (`BoxShadowProp`, `floem-0.2.0/src/style.rs:1649`), and
+    `tooltip_style`'s shadow builders, handed a fresh `Style` by `.class`, had already replaced it
+    whole with a zero horizontal offset.
+    `TooltipContainerClass`'s `Delay` rule stays. The chrome is still a *later* style layer than
+    anything the tip closure set, which is what `widgets::tip_when`'s `hide()` rests on (*UI
+    conventions*).
+    **It is reached by floem's own method name, and that is the hazard.** floem's `TooltipExt`
+    arrives in every file through `floem::prelude::*`, and only an explicit
+    `use crate::tooltip::TooltipExt;` shadows it — so a file that calls `.tooltip(…)` without the
+    import still compiles and quietly gets the pointer-placed tip. `erd_view.rs` was that file while
+    this was being written. `tooltip_gate::every_file_that_calls_tooltip_imports_the_anchored_one`
+    scans `source_gate::crate_sources()` and fails any file that calls `.tooltip(` without naming
+    `tooltip::TooltipExt`, that imports `floem::views::TooltipExt` by name, or that contains
+    `views::tooltip(` — floem's free function, the other way round the anchored view. It has a floor
+    of more than five callers so a scan of the wrong tree cannot pass empty. The module is
+    crate-private, so a `.tooltip(` written in `schemaic-app` — also in that corpus, and with none
+    today — fails the gate with no import that could satisfy it.
   - `modals.rs` — **the modal layer** (`modal_layer`) and the four predicates that raise it
     (`ddl_modals_up`, `ddl_editors_up`, `workspace_modals_up`, `settings_modals_up`,
     `modal_backdrop_up`), plus the `modal_backdrop_gate` tests. It mounts no modal of its own and
@@ -21917,13 +21976,14 @@ Re-introducing the anti-patterns these guard against is a regression:
   drags a window edge. `PaletteItem::enabled` carries it, `widgets::list_step_enabled` and
   `first_enabled` keep the arrow keys off dead rows (unit-tested, including a cursor left on a row
   that has just gone dead), and `open_sel` refuses one that Enter still reaches.
-- **A tooltip that appears only sometimes needs `widgets::tip_when`, not a branch.** Floem's
-  `.tooltip()` has no "not now": once the hover delay fires it always adds the overlay, and an empty
-  tip is a small empty box because `TooltipClass` paints its chrome on whatever root it is handed.
+- **A tooltip that appears only sometimes needs `widgets::tip_when`, not a branch.** The app's
+  `.tooltip()`, like the floem one it was copied from, has no "not now": once the hover delay fires
+  it always adds the overlay, and an empty tip is a small empty box because `AnchoredTooltip`
+  applies `tooltip_style`'s chrome to whatever root it is handed.
   The two older conditional tips (a truncated ERD header, a tab's path) decide **once, at build**,
   and an `AnyView` branch is right for them. A condition that changes while the app runs — a window
-  width — cannot use that shape, and does not need to: floem calls the tip closure at the moment the
-  delay fires, so a signal read there is read fresh on every hover with no rebuild underneath. What
+  width — cannot use that shape, and does not need to: `AnchoredTooltip::update` calls the tip
+  closure at the moment the delay fires, so a signal read there is read fresh on every hover with no rebuild underneath. What
   it returns when there is nothing to say is a `display: none` root, which the chrome cannot
   override — floem hands each `.style()` closure a fresh `Style` and merges results per property by
   push order, and `tooltip_style` sets no `display`.
@@ -21943,7 +22003,8 @@ Re-introducing the anti-patterns these guard against is a regression:
 - **Labels aren't selectable** — Floem's `Selectable` defaults to *true*, so every caption/header/tree
   row would drag-highlight like a web page. The workspace root sets `.class(LabelClass, |s|
   s.selectable(false))`, which cascades to the whole tree (and, via the captured context style, into
-  dropdown popups); `tooltip_style` repeats it because a tip overlay only inherits `TooltipClass`.
+  dropdown popups); `tooltip_style` repeats it because a tip is an overlay outside that tree, styled
+  by `tooltip_style` alone.
   Text selection belongs to real text surfaces — `text_input`/`edit_field`, the SQL editor, and the
   terminal (which paints its own selection). Don't re-enable it on a label.
 - **Colors live in `theme.rs`** as named fns — add one rather than inlining a hex literal. They read
@@ -23020,8 +23081,9 @@ Re-introducing the anti-patterns these guard against is a regression:
   `Clip` and the surface container. Adding a background container around a wrapping text view is
   what turns the omitted second style into a visible bug.
 - **`tooltip()` re-parents its child, so every style chained *after* it lands on the wrapper and not
-  on your view.** It is not a decorator: `floem::views::tooltip` (floem-0.2.0,
-  `src/views/tooltip.rs:45-51`) mints its own `ViewId` and calls `id.set_children(vec![child])`, so
+  on your view.** It is not a decorator: the app's `tooltip::tooltip`, like the
+  `floem::views::tooltip` it was copied from (floem-0.2.0, `src/views/tooltip.rs:45-51`), mints its
+  own `ViewId` and calls `id.set_children(vec![child])`, so
   the view you wrote is no longer the view the next `.style()` in the chain sees. That is the
   general hazard with **any constructor that wraps rather than decorates**, and the `.clip()` bullet
   above is the same fact read from the other end — but the two fail in *opposite* directions, so

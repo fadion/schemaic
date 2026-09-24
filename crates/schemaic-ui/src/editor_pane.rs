@@ -56,6 +56,7 @@ use crate::completion::{
 use crate::consts::*;
 use crate::inline_diff;
 use crate::shortcuts::primary_held;
+use crate::tooltip::TooltipExt;
 use crate::widgets::*;
 use crate::{
     ConnNode, CtxMenu, FieldCfg, InlineAiRequest, InlineAiState, NavKeys, PopupAnchor, RightPanel,
