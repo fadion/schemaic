@@ -26,4 +26,30 @@ this directory and the `[patch]` entry.
 
 ## Changes against upstream
 
-None yet.
+Each change is marked in the source with a `schemaic patch (PATCHES.md)`
+comment, so `grep -rn "schemaic patch" src` finds all of them.
+
+### 1. `WindowConfig::app_id` — the window's application id on Linux
+
+**Why.** Floem 0.2 has no way to name a window's application. winit sets the
+Wayland `app_id` only when a name is passed through its platform attributes,
+and Floem never passes one, so under GNOME on Wayland (Ubuntu's default) the
+shell cannot match the window to `io.github.fadion.Schemaic.desktop` and the
+taskbar shows a generic icon. On X11, winit falls back to the executable's name
+for `WM_CLASS`, which the desktop entry's `StartupWMClass=schemaic` was
+matching.
+
+**What.**
+
+- `src/window.rs`: a `pub(crate) app_id: Option<String>` field on
+  `WindowConfig`, `None` by default, and a `pub fn app_id(self, impl
+  Into<String>)` builder beside `title`.
+- `src/app_handle.rs`, `new_window`: the field is destructured with the others
+  and, on free Unix (not macOS/iOS/Android/Emscripten/wasm), passed to winit as
+  `WindowBuilderExtX11::with_name(app_id, app_id)`. The X11 and Wayland
+  `with_name` both set the same `platform_specific.name`, which the X11
+  backend turns into `WM_CLASS` and the Wayland one into `app_id`, so one call
+  covers both.
+
+Schemaic passes `schemaic_core::APP_ID`. Upstream Floem (after 0.2) may grow
+its own setter; if it does, drop this entry and use theirs.

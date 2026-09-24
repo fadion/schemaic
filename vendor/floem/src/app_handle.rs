@@ -287,6 +287,7 @@ impl ApplicationHandle {
             fullscreen,
             window_icon,
             title,
+            app_id,
             enabled_buttons,
             resizable,
             undecorated,
@@ -351,6 +352,25 @@ impl ApplicationHandle {
         {
             use floem_winit::platform::windows::WindowBuilderExtWindows;
             window_builder = window_builder.with_undecorated_shadow(undecorated_shadow);
+        }
+
+        // schemaic patch (PATCHES.md): hand the application id to winit. The
+        // X11 and Wayland `with_name` set the same field, which each backend
+        // reads — as `WM_CLASS` on X11 and `app_id` on Wayland — so one call
+        // covers both.
+        #[cfg(all(
+            unix,
+            not(any(
+                target_os = "macos",
+                target_os = "ios",
+                target_os = "android",
+                target_os = "emscripten",
+                target_arch = "wasm32"
+            ))
+        ))]
+        if let Some(app_id) = app_id {
+            use floem_winit::platform::x11::WindowBuilderExtX11;
+            window_builder = window_builder.with_name(app_id.clone(), app_id);
         }
 
         #[cfg(target_os = "macos")]

@@ -290,7 +290,11 @@ fn main() -> std::process::ExitCode {
         // Windows only, and a no-op elsewhere: keeps the DWM drop shadow (and
         // with it the window's visual edge) behind a frameless window.
         .undecorated_shadow(chrome.wants_drop_shadow())
-        .title(schemaic_core::APP_NAME);
+        .title(schemaic_core::APP_NAME)
+        // Linux only: the Wayland `app_id` and X11 `WM_CLASS` the shell matches
+        // against the installed `.desktop` file for the taskbar icon. Floem 0.2
+        // has no such setter upstream — `vendor/floem/PATCHES.md`.
+        .app_id(schemaic_core::APP_ID);
     if let Some(icon) = app_icon() {
         config = config.window_icon(icon);
     }

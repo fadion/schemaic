@@ -20,6 +20,9 @@ pub struct WindowConfig {
     pub(crate) fullscreen: Option<Fullscreen>,
     pub(crate) window_icon: Option<Icon>,
     pub(crate) title: String,
+    // schemaic patch (PATCHES.md): the window's application id.
+    #[allow(dead_code)]
+    pub(crate) app_id: Option<String>,
     pub(crate) enabled_buttons: WindowButtons,
     pub(crate) resizable: bool,
     pub(crate) undecorated: bool,
@@ -42,6 +45,7 @@ impl Default for WindowConfig {
             fullscreen: None,
             window_icon: None,
             title: "Floem window".to_owned(),
+            app_id: None,
             enabled_buttons: WindowButtons::all(),
             resizable: true,
             undecorated: false,
@@ -134,6 +138,21 @@ impl WindowConfig {
     #[inline]
     pub fn title(mut self, title: impl Into<String>) -> Self {
         self.title = title.into();
+        self
+    }
+
+    /// Sets the window's application id: the Wayland `app_id`, and on X11 the
+    /// class of `WM_CLASS`. A desktop shell matches a window to its `.desktop`
+    /// file by it, which is where the taskbar icon comes from — so it should be
+    /// that file's name without `.desktop`. Ignored on other platforms.
+    ///
+    /// The default is `None`: on X11 winit then falls back to the executable's
+    /// name, and on Wayland no id is sent at all.
+    ///
+    /// schemaic patch (PATCHES.md); not in upstream Floem 0.2.0.
+    #[inline]
+    pub fn app_id(mut self, app_id: impl Into<String>) -> Self {
+        self.app_id = Some(app_id.into());
         self
     }
 

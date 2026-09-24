@@ -19647,6 +19647,30 @@ existing prose was left alone.
     provides, the spec names *sonames* because every rpm distribution auto-provides them, which is
     what lets one spec serve Fedora, RHEL and openSUSE despite their disagreeing on nearly every
     package name.
+    **A Linux shell finds the running window's icon by name, and on Wayland it had none to find.**
+    It matches a window to the desktop entry whose file name is the window's application id — the
+    Wayland `app_id`, or the class of X11's `WM_CLASS` — and draws that entry's `Icon=`. Floem
+    0.2.0's `WindowConfig` has no way to set one, and floem-winit 0.29.5 sends `app_id` only when its
+    platform attributes carry a name, which Floem never passes. On X11 winit falls back to argv[0],
+    `schemaic`, and the entry's `StartupWMClass=schemaic` matched that; under GNOME on Wayland —
+    Ubuntu 22's default — nothing was sent, and an `install.sh` install showed a generic icon in the
+    taskbar and dock while launcher search showed the right one. `WindowConfig::app_id` is the
+    vendored Floem's first patch (`vendor/floem/PATCHES.md`, and *Floem 0.2 gotchas*): on free Unix
+    it reaches winit as `WindowBuilderExtX11::with_name(id, id)`, and since the X11 and Wayland
+    `with_name` set the same field, one call names the window under both. `app/main.rs` passes
+    `core::APP_ID` — `io.github.fadion.Schemaic`, beside `APP_NAME` in `core/lib.rs` — which is at
+    once the window's id, the `.desktop` file's name, the icon's name and the macOS `--bundleId`,
+    and so is identity in the invariant's sense (*A Velopack channel name is app identity*).
+    `the_app_id_names_the_desktop_entry_and_matches_every_packager`, beside the constant, requires
+    `packaging/linux/<APP_ID>.desktop` to exist and **every packager's copy** to spell the same
+    value — `install.sh`'s and `stage-payload.sh`'s `APP_ID="…"`, `schemaic.spec`'s `%global
+    appid`, the metainfo file's `<id>` and `<launchable>`, and `release.yml`'s `--bundleId`; it was
+    watched fail with the constant lower-cased. On a case-insensitive filesystem the entry's
+    existence cannot tell the two spellings apart, so the text comparisons are what catch that.
+    **`StartupWMClass=schemaic` stays, and is not dead weight**: it is what matches a build from
+    before the patch on X11, and `install.sh`'s AppImage route fetches the `.desktop` from `main`
+    while the binary beside it comes from the latest release, so the two can be any number of
+    commits apart. It does not stand in the way of the name match — GNOME tries both.
     **macOS is a third leg on its own `osx-arm64` channel — permanent for the reason above, and
     named `arm64` rather than a bare `osx` so that an Intel leg can be added later without renaming
     this one — and Velopack builds its bundle for us.** `release.yml` hands `vpk pack` a staged
@@ -21844,6 +21868,13 @@ Re-introducing the anti-patterns these guard against is a regression:
   silent. `release.yml`'s *Resolve the package version* step fails the job when `${GITHUB_REF_NAME#v}`
   and the `Cargo.toml` value disagree, and it sits beside the channel guard for the channel guard's
   stated reason: a bad identity value should cost seconds, not a compile.
+  **`core::APP_ID` is another value of this class, and the one a unit test can guard, because a
+  crate names it.** It is the Linux window's `app_id`/`WM_CLASS`, the desktop entry's file name and
+  the macOS `--bundleId` at once, and a shell draws a window's icon by matching the first against
+  the second, so renaming it orphans every entry already installed under the old name — the
+  constant's own doc says as much. `the_app_id_names_the_desktop_entry_and_matches_every_packager`
+  pins it against `packaging/linux/<APP_ID>.desktop` and every packager's copy of the id, down to
+  `release.yml`'s `--bundleId`; the list, and why the value exists, are under `app::update`.
   **The published package-repository identity is the same rule with a second instance**, and a more
   thinly guarded one. `https://fadion.github.io/schemaic/deb` and `/rpm`, `Origin: Schemaic`,
   `Suite: stable`, and the keyring path `/usr/share/keyrings/schemaic-archive-keyring.gpg` that
@@ -22341,6 +22372,23 @@ Re-introducing the anti-patterns these guard against is a regression:
 
 ## Floem 0.2 gotchas (learned the hard way)
 
+- **`floem` is vendored and patched, so a Floem bump is a re-vendor, not a version edit.**
+  `vendor/floem/` is the published 0.2.0 crate — its `src/`, the normalised manifest crates.io
+  serves, `LICENSE` and `README` — used through `[patch.crates-io] floem = { path = "vendor/floem" }`
+  in the root `Cargo.toml`; the `floem = { version = "0.2.0", … }` line above it is unchanged and
+  still carries the feature list. `vendor/floem/PATCHES.md` is the record: every change against
+  upstream, each marked in the source with a `schemaic patch (PATCHES.md)` comment so one grep finds
+  them all, and the procedure for a new release — vendor it the same way, re-apply the list, drop
+  what upstream has absorbed, and delete the directory and the `[patch]` entry once the list is
+  empty. The first entry is `WindowConfig::app_id`, which Floem 0.2 has no counterpart for; why the
+  app needs it is under `app::update`'s Linux packaging. **Three measures keep upstream's code out
+  of the workspace's checks, and each looks removable**: `exclude = ["vendor"]` in the root
+  manifest, since a path dependency inside the workspace directory would otherwise join it as a
+  member; `vendor/floem/rustfmt.toml` with `disable_all_formatting = true`, since `cargo fmt --all`
+  formats local path dependencies too and CI's `--check` would fail on code that is not ours; and a
+  `[lints]` table appended to the vendored manifest allowing every rust and clippy lint, since Cargo
+  caps a registry crate's warnings but not a path dependency's. The last is in the manifest rather
+  than the source so that `src/` stays upstream's byte for byte, apart from what `PATCHES.md` lists.
 - **One `on_scroll` per scroll** — setting it twice clobbers. `autohide` sets its own; a scroll
   needing custom `on_scroll` must inline `autohide_state()` (results grid + AI convo).
 - **No `opacity` property.** Fade via color alpha (`multiply_alpha`) + `.transition_*`. Toggle
@@ -22382,8 +22430,9 @@ Re-introducing the anti-patterns these guard against is a regression:
   `img_dynamic(impl Fn() -> peniko::Image)`, is `pub(crate)` and used only by floem's own inspector,
   and the SHA-256 in `Img::update` is floem's too, over the decoded RGBA. So what is left is a
   bounded, one-off, panel-open cost — `PREVIEW_EDGE_CAP` holds either edge to 4096, so the decode it
-  admits is at most ~16.8 megapixels of RGBA — and closing it needs an upstream API rather than a
-  change here.
+  admits is at most ~16.8 megapixels of RGBA — and closing it needs an API floem does not export,
+  upstream's or one a `PATCHES.md` entry adds to the vendored copy (above), rather than a change
+  in the panel.
   **And the RAM is not the fatal limit — the texture is.** floem's images live in the same atlas as
   its glyphs, and that atlas grows to `2 × max(width, height)` with no clamp of its own; wgpu's
   default `max_texture_dimension_2d` is 8192, and no floem crate installs an `on_uncaptured_error`

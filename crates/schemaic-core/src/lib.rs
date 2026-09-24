@@ -75,6 +75,17 @@ pub mod window_chrome;
 /// Product name, shown in the window title and the Settings version line.
 pub const APP_NAME: &str = "Schemaic";
 
+/// The application id: the Linux window's Wayland `app_id` and X11
+/// `WM_CLASS`, the desktop entry's file name, and the macOS bundle id.
+///
+/// **It is identity, like Velopack's `--packId`.** A Linux shell finds the
+/// window's icon by matching this against the installed `.desktop` file's name,
+/// so the constant, `packaging/linux/<id>.desktop` and every packager's copy —
+/// `install.sh`, `stage-payload.sh`, the RPM spec, the AppStream metainfo and
+/// `release.yml`'s `--bundleId` — have to agree, which a test here checks; and
+/// renaming it orphans every installed entry.
+pub const APP_ID: &str = "io.github.fadion.Schemaic";
+
 /// Current app version (mirrors the workspace package version).
 pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -106,6 +117,53 @@ mod tests {
             app_version_label(),
             format!("Schemaic v{}", env!("CARGO_PKG_VERSION"))
         );
+    }
+
+    /// **The window's application id is the desktop entry's name**, or a Linux
+    /// shell cannot match the running window to its `.desktop` file and draws
+    /// a generic taskbar icon. Every packager spells it too, and none can share
+    /// this constant, so this reads each of them — the repository's own files,
+    /// the one exempt kind of file access. On a case-insensitive filesystem the
+    /// entry's existence cannot tell `Schemaic` from `schemaic`; the text
+    /// comparisons can.
+    #[test]
+    fn the_app_id_names_the_desktop_entry_and_matches_every_packager() {
+        let root = concat!(env!("CARGO_MANIFEST_DIR"), "/../..");
+        let desktop = format!("{root}/packaging/linux/{APP_ID}.desktop");
+        assert!(
+            std::path::Path::new(&desktop).is_file(),
+            "no desktop entry named after APP_ID: {desktop}"
+        );
+        let metainfo = format!("packaging/linux/{APP_ID}.metainfo.xml");
+        for (file, spelling) in [
+            // The name an AppImage install writes the entry under.
+            ("install.sh", format!("APP_ID=\"{APP_ID}\"")),
+            // The deb/rpm payload: the entry and icon it installs.
+            (
+                "packaging/linux/stage-payload.sh",
+                format!("APP_ID=\"{APP_ID}\""),
+            ),
+            (
+                "packaging/linux/schemaic.spec",
+                format!("%global appid {APP_ID}\n"),
+            ),
+            // AppStream: the software centre's id and the entry it launches.
+            (metainfo.as_str(), format!("<id>{APP_ID}</id>")),
+            (
+                metainfo.as_str(),
+                format!("<launchable type=\"desktop-id\">{APP_ID}.desktop</launchable>"),
+            ),
+            // macOS's bundle id is the same value.
+            (
+                ".github/workflows/release.yml",
+                format!("--bundleId {APP_ID}"),
+            ),
+        ] {
+            let text = std::fs::read_to_string(format!("{root}/{file}"))
+                .unwrap_or_else(|e| panic!("{file}: {e}"))
+                .replace("\r\n", "\n");
+            assert!(text.contains(&spelling), "{file} does not say {spelling:?}");
+        }
     }
 
     #[test]
