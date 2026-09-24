@@ -2052,10 +2052,44 @@ pub fn read_only_reason(sql: &str, dialect: SqlDialect) -> Result<(), String> {
             heads.join("/")
         ));
     }
-    if let Some(bad) = words.iter().find(|w| is_denied(w, dialect)) {
-        return Err(format!("`{bad}` is not permitted in a read-only query"));
+    if let Some(k) = words.iter().position(|w| is_denied(w, dialect)) {
+        if let Some(clause) = locking_clause(&words, k) {
+            return Err(format!(
+                "`{clause}` locks the rows it reads, which a read-only query does not; \
+                 drop the locking clause"
+            ));
+        }
+        return Err(format!(
+            "`{}` is not permitted in a read-only query",
+            words[k]
+        ));
     }
     Ok(())
+}
+
+/// The row-locking clause the denied word at `words[k]` belongs to, if it does.
+///
+/// **Refused either way, but named for what it is.** `SELECT … FOR UPDATE`
+/// used to answer "`UPDATE` is not permitted", which reads as a write having
+/// been found. The refusal is right — it takes row locks a read-only query must
+/// not hold — but the reason is the lock, and the fix is dropping the clause.
+fn locking_clause(words: &[String], k: usize) -> Option<&'static str> {
+    let before = |n: usize| {
+        k.checked_sub(n)
+            .and_then(|i| words.get(i))
+            .map(String::as_str)
+    };
+    let after = |n: usize| words.get(k + n).map(String::as_str);
+    match words[k].as_str() {
+        "UPDATE" if before(1) == Some("FOR") => Some("FOR UPDATE"),
+        "UPDATE" if (before(3), before(2), before(1)) == (Some("FOR"), Some("NO"), Some("KEY")) => {
+            Some("FOR NO KEY UPDATE")
+        }
+        "LOCK" if (after(1), after(2), after(3)) == (Some("IN"), Some("SHARE"), Some("MODE")) => {
+            Some("LOCK IN SHARE MODE")
+        }
+        _ => None,
+    }
 }
 
 /// The `sql_mode` names under which a MySQL/MariaDB server reads a quote
@@ -3796,6 +3830,52 @@ mod tests {
         // The backtick is not standard, so this one is deliberately not in the
         // sweep — see `the_gate_reads_this_engines_identifier_quoting`.
         assert!(read_only_reason("SELECT `update` FROM t").is_ok());
+    }
+
+    /// **A locking read is refused as a lock, not as a write.** `SELECT … FOR
+    /// UPDATE` was refused with "`UPDATE` is not permitted", which reads as a
+    /// write having been detected; the refusal is right — it takes row locks —
+    /// and the message should say that and name the clause.
+    #[test]
+    fn a_locking_read_is_refused_by_naming_its_locking_clause() {
+        for (d, sql, clause) in [
+            (
+                SqlDialect::MySql,
+                "SELECT * FROM t FOR UPDATE",
+                "FOR UPDATE",
+            ),
+            (
+                SqlDialect::Postgres,
+                "SELECT * FROM t WHERE id = 1 FOR UPDATE SKIP LOCKED",
+                "FOR UPDATE",
+            ),
+            (
+                SqlDialect::Postgres,
+                "select * from t for no key update",
+                "FOR NO KEY UPDATE",
+            ),
+            (
+                SqlDialect::MySql,
+                "SELECT * FROM t LOCK IN SHARE MODE",
+                "LOCK IN SHARE MODE",
+            ),
+        ] {
+            let why = super::read_only_reason(sql, d).expect_err(sql);
+            assert!(why.contains(clause), "{sql}: {why}");
+            assert!(why.contains("lock"), "{sql}: {why}");
+            assert!(!why.contains("not permitted"), "{sql}: {why}");
+        }
+    }
+
+    /// And a real `UPDATE` inside a read is still named as the write it is.
+    #[test]
+    fn a_write_hidden_in_a_read_keeps_its_own_refusal() {
+        let why = super::read_only_reason(
+            "WITH d AS (UPDATE t SET a = 1 RETURNING *) SELECT * FROM d",
+            SqlDialect::Postgres,
+        )
+        .unwrap_err();
+        assert_eq!(why, "`UPDATE` is not permitted in a read-only query");
     }
 
     /// **The deny list is per-engine for the same reason the heads are, and it

@@ -19988,7 +19988,10 @@ existing prose was left alone.
     the statement runs through `Db::fetch_query_enforced` with `Enforce::ReadOnly`, a session that
     refuses a write by its effect — and on MySQL/MariaDB one whose `sql_mode` is pinned to the lexer
     the gate counted statements with — while the gate stays in front for what such a session still
-    allows: sleeps, locks, server-side file reads. It is asked in the **connection's own**
+    allows: sleeps, locks, server-side file reads. A **locking read** (`FOR UPDATE`, `FOR NO KEY
+    UPDATE`, `LOCK IN SHARE MODE`) is refused by naming the clause and the lock
+    (`sql::locking_clause`); it used to answer "`UPDATE` is not permitted", which read as a write
+    found (`a_locking_read_is_refused_by_naming_its_locking_clause`). It is asked in the **connection's own**
     dialect, so a PostgreSQL `#` operator is not lexed as a comment on the way in. `normalize_stmt`
     is pure and owns the trailing-`;` rule — a person types the semicolon out of habit and a
     `SELECT 1;` answered "empty query" would be a baffling way to learn it was unwanted — and
