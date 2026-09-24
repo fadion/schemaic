@@ -3201,6 +3201,9 @@ pub struct PanelView {
     /// index, `gctx.panel_frozen` is whether the result is pinned — and the two
     /// spelled the same way is a wrong-variable bug waiting for the next reader.
     pub frozen_col: RwSignal<Option<usize>>,
+    /// The columns hidden from the grid, by absolute index — the panel's for
+    /// `frozen_col`'s reason: it is about this result's columns.
+    pub hidden_cols: RwSignal<std::collections::BTreeSet<usize>>,
     /// Staged cell edits: `(data row, column) → the new value`, uncommitted.
     pub dirty: RwSignal<schemaic_core::edit::DirtyCells>,
     /// Rows the user has added and not yet committed.
@@ -3226,6 +3229,7 @@ impl PanelView {
             widths_at: cx.create_rw_signal(0.0),
             sort: cx.create_rw_signal(None),
             frozen_col: cx.create_rw_signal(None),
+            hidden_cols: cx.create_rw_signal(Default::default()),
             dirty: cx.create_rw_signal(Default::default()),
             new_rows: cx.create_rw_signal(Vec::new()),
             del_rows: cx.create_rw_signal(Default::default()),

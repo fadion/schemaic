@@ -1289,8 +1289,8 @@ impl GridCells<'_> {
     /// Columns in the order they are **drawn** ([`visual_cols`]), not in index
     /// order: whoever receives the block reads it left to right, and under a
     /// freeze the two disagree.
-    pub fn tsv(&self, rect: (usize, usize, usize, usize), frozen: Option<usize>) -> String {
-        self.tsv_block(rect, frozen).text
+    pub fn tsv(&self, rect: (usize, usize, usize, usize), layout: impl Into<ColLayout>) -> String {
+        self.tsv_block(rect, layout).text
     }
 
     /// [`GridCells::tsv`], plus **what the format could not carry**.
@@ -1310,9 +1310,9 @@ impl GridCells<'_> {
     pub fn tsv_block(
         &self,
         (r0, c0, r1, c1): (usize, usize, usize, usize),
-        frozen: Option<usize>,
+        layout: impl Into<ColLayout>,
     ) -> TsvBlock {
-        let cols = selected_cols((c0, c1), self.rs.col_count(), frozen);
+        let cols = selected_cols((c0, c1), self.rs.col_count(), &layout.into());
         let mut out = String::new();
         let mut split = 0usize;
         for i in r0..=r1 {
@@ -1420,10 +1420,10 @@ impl GridCells<'_> {
         &self,
         selection: Option<(usize, usize, usize, usize)>,
         pos: usize,
-        frozen: Option<usize>,
+        layout: impl Into<ColLayout>,
     ) -> (ResultSet, Vec<usize>) {
         let (out, order) = self.exported();
-        let (rows, cols) = self.gesture_at(selection, pos, frozen);
+        let (rows, cols) = self.gesture_at(selection, pos, &layout.into());
         let picked = pick(&order, rows);
         (project(&out, &cols), picked)
     }
@@ -1434,18 +1434,18 @@ impl GridCells<'_> {
         &self,
         selection: Option<(usize, usize, usize, usize)>,
         pos: usize,
-        frozen: Option<usize>,
+        layout: &ColLayout,
     ) -> (std::ops::RangeInclusive<usize>, Vec<usize>) {
         let ncols = self.rs.col_count();
         match selection {
             Some((r0, c0, r1, c1)) if pos >= r0 && pos <= r1 => (
                 r0..=r1,
-                selected_cols((c0, c1), ncols, frozen)
+                selected_cols((c0, c1), ncols, layout)
                     .into_iter()
                     .filter(|&ci| ci < ncols)
                     .collect(),
             ),
-            _ => (pos..=pos, visual_cols(ncols, frozen)),
+            _ => (pos..=pos, layout.visual_cols(ncols)),
         }
     }
 
@@ -1465,9 +1465,9 @@ impl GridCells<'_> {
         &self,
         selection: Option<(usize, usize, usize, usize)>,
         pos: usize,
-        frozen: Option<usize>,
+        layout: impl Into<ColLayout>,
     ) -> Vec<(ResultSet, Vec<usize>)> {
-        let (rows, cols) = self.gesture_at(selection, pos, frozen);
+        let (rows, cols) = self.gesture_at(selection, pos, &layout.into());
         self.insert_blocks(rows, &cols)
     }
 
@@ -1554,9 +1554,9 @@ impl GridCells<'_> {
         &self,
         (r0, c0, r1, c1): (usize, usize, usize, usize),
         cap: usize,
-        frozen: Option<usize>,
+        layout: impl Into<ColLayout>,
     ) -> (Vec<String>, Vec<Vec<String>>, usize) {
-        let cols = selected_cols((c0, c1), self.rs.col_count(), frozen);
+        let cols = selected_cols((c0, c1), self.rs.col_count(), &layout.into());
         let columns: Vec<String> = cols
             .iter()
             .map(|&ci| {
@@ -1624,6 +1624,93 @@ pub fn visual_cols(ncols: usize, frozen: Option<usize>) -> Vec<usize> {
     }
 }
 
+/// **Which of the grid's columns are drawn, and in what order**: the frozen
+/// column and the hidden set, as one answer every reader asks.
+///
+/// Hiding is the second thing that makes draw order differ from index order,
+/// and it is the stronger one: a frozen column only moves, a hidden one is not
+/// there. So copy, attach and a gesture's *Copy as* leave it out — they take
+/// what is on screen — and a paste never writes into it, extending past it to
+/// the next drawn column or, for a single value filling the selection, skipping
+/// it. A hidden frozen column is not frozen: it is not drawn at all.
+///
+/// **What hiding does not reach**, deliberately: the whole-result exports
+/// ([`GridCells::exported`], [`GridCells::insert_blocks_all`]). Those are about
+/// *the result* — the *All rows* export re-runs the query on the server, which
+/// has no notion of a column hidden in a grid — so they keep every column
+/// rather than having two exports of one result disagree about its shape.
+///
+/// A `From<Option<usize>>` makes a frozen column alone a layout, which is what
+/// every caller that predates hiding still passes.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ColLayout {
+    /// The frozen column's absolute index, if any.
+    pub frozen: Option<usize>,
+    /// Absolute indices of the columns not drawn.
+    pub hidden: std::collections::BTreeSet<usize>,
+}
+
+impl From<Option<usize>> for ColLayout {
+    fn from(frozen: Option<usize>) -> ColLayout {
+        ColLayout {
+            frozen,
+            hidden: Default::default(),
+        }
+    }
+}
+
+impl ColLayout {
+    /// Is column `ci` hidden?
+    pub fn is_hidden(&self, ci: usize) -> bool {
+        self.hidden.contains(&ci)
+    }
+
+    /// The frozen column as drawn: none when it is hidden or past the result.
+    pub fn frozen_drawn(&self, ncols: usize) -> Option<usize> {
+        self.frozen.filter(|&f| f < ncols && !self.is_hidden(f))
+    }
+
+    /// The drawn columns in the order they are drawn — [`visual_cols`] with the
+    /// hidden ones left out.
+    pub fn visual_cols(&self, ncols: usize) -> Vec<usize> {
+        visual_cols(ncols, self.frozen_drawn(ncols))
+            .into_iter()
+            .filter(|&ci| !self.is_hidden(ci))
+            .collect()
+    }
+
+    /// The drawn columns in **index** order: what the arrow keys walk and the
+    /// data pane lays out after the frozen one.
+    pub fn shown(&self, ncols: usize) -> Vec<usize> {
+        (0..ncols).filter(|&ci| !self.is_hidden(ci)).collect()
+    }
+
+    /// How many of this result's columns are hidden — an index past `ncols`
+    /// hides nothing, so it is not counted. The count the grid's gutter corner
+    /// and its header menu both show.
+    pub fn hidden_in(&self, ncols: usize) -> usize {
+        self.hidden.iter().filter(|&&ci| ci < ncols).count()
+    }
+
+    /// The scrolling pane's columns: every drawn column but the frozen one, in
+    /// index order. The grid lays these out beside the frozen pane, and
+    /// scroll-into-view sums their widths — one list, so the two agree.
+    pub fn scrolling(&self, ncols: usize) -> Vec<usize> {
+        let frozen = self.frozen_drawn(ncols);
+        self.shown(ncols)
+            .into_iter()
+            .filter(|&ci| Some(ci) != frozen)
+            .collect()
+    }
+
+    /// May column `ci` be hidden — drawn now, and not the last one drawn? The
+    /// last has to stay: a grid of no columns is a gutter with nothing on it to
+    /// bring the others back from.
+    pub fn may_hide(&self, ci: usize, ncols: usize) -> bool {
+        ci < ncols && !self.is_hidden(ci) && self.shown(ncols).len() > 1
+    }
+}
+
 /// The data rows at display positions `rows` of `order`, clamped to the rows
 /// that exist.
 fn pick(order: &[usize], rows: std::ops::RangeInclusive<usize>) -> Vec<usize> {
@@ -1646,13 +1733,15 @@ fn project(rs: &ResultSet, cols: &[usize]) -> ResultSet {
 
 /// The columns a selection rectangle covers, in the order they are drawn.
 ///
-/// Membership is the absolute range `c0..=c1` — that is what the grid paints as
-/// highlighted, and which columns are selected is settled; only their order is
-/// in question here. `ncols` is widened to include `c1` so a rectangle reaching
-/// past the result's last column still yields the same positions it always did
-/// (the cells there read as empty rather than vanishing).
-fn selected_cols((c0, c1): (usize, usize), ncols: usize, frozen: Option<usize>) -> Vec<usize> {
-    visual_cols(ncols.max(c1 + 1), frozen)
+/// Membership is the absolute range `c0..=c1`, **less the hidden columns** —
+/// the grid paints the range as highlighted, and a hidden column in it is not
+/// painted at all; only their order is otherwise in question here. `ncols` is
+/// widened to include `c1` so a rectangle reaching past the result's last
+/// column still yields the same positions it always did (the cells there read
+/// as empty rather than vanishing).
+fn selected_cols((c0, c1): (usize, usize), ncols: usize, layout: &ColLayout) -> Vec<usize> {
+    layout
+        .visual_cols(ncols.max(c1 + 1))
         .into_iter()
         .filter(|ci| (c0..=c1).contains(ci))
         .collect()
@@ -1832,17 +1921,36 @@ pub fn plan_paste(
     (r0, c0, r1, c1): (usize, usize, usize, usize),
     rows: usize,
     cols: usize,
-    frozen: Option<usize>,
+    layout: impl Into<ColLayout>,
     editable: impl Fn(usize) -> bool,
 ) -> PastePlan {
+    let layout = layout.into();
     let mut plan = PastePlan::default();
     if block.is_empty() || rows == 0 || cols == 0 {
         return plan;
     }
     let single = block.len() == 1 && block[0].len() == 1;
-    // A single value covers the selection; anything else covers its own shape.
+    // The column the `dc`-th value of a row lands in. A single value fills the
+    // selection, so those are the selected columns; a block extends from the
+    // anchor in **draw** order, which is what the user pointed along. Neither
+    // includes a hidden column: a write aimed at the screen lands on the screen.
+    let target_cols: Vec<usize> = if single {
+        (c0..=c1).filter(|&ci| !layout.is_hidden(ci)).collect()
+    } else {
+        let visual = layout.visual_cols(cols);
+        match visual.iter().position(|&ci| ci == c0) {
+            Some(at) => visual[at..].to_vec(),
+            // The anchor is not a column of this result. Nothing lands, and the
+            // walk counts every value as dropped rather than sliding the block
+            // onto whatever column happens to be first.
+            None => Vec::new(),
+        }
+    };
+    // A single value covers the selection's *drawn* cells — a hidden column in
+    // it is neither filled nor counted as a drop; anything else covers its own
+    // shape.
     let (span_r, span_c) = if single {
-        (r1.saturating_sub(r0) + 1, c1.saturating_sub(c0) + 1)
+        (r1.saturating_sub(r0) + 1, target_cols.len())
     } else {
         (
             block.len(),
@@ -1856,21 +1964,6 @@ pub fn plan_paste(
         span_r.saturating_mul(span_c)
     } else {
         block.iter().map(Vec::len).sum()
-    };
-    // The column the `dc`-th value of a row lands in. A single value fills the
-    // selection, so those are the selected columns; a block extends from the
-    // anchor in **draw** order, which is what the user pointed along.
-    let target_cols: Vec<usize> = if single {
-        (c0..=c1).collect()
-    } else {
-        let visual = visual_cols(cols, frozen);
-        match visual.iter().position(|&ci| ci == c0) {
-            Some(at) => visual[at..].to_vec(),
-            // The anchor is not a column of this result. Nothing lands, and the
-            // walk counts every value as dropped rather than sliding the block
-            // onto whatever column happens to be first.
-            None => Vec::new(),
-        }
     };
     let mut seen = 0usize;
     'block: for dr in 0..span_r {
@@ -5019,6 +5112,103 @@ mod tests {
         // A column that cannot be drawn moves nothing.
         assert_eq!(visual_cols(3, Some(7)), vec![0, 1, 2]);
         assert_eq!(visual_cols(0, Some(0)), Vec::<usize>::new());
+    }
+
+    // ── Hidden columns: what is drawn at all ─────────────────────────────────
+
+    fn hiding(frozen: Option<usize>, hidden: &[usize]) -> ColLayout {
+        ColLayout {
+            frozen,
+            hidden: hidden.iter().copied().collect(),
+        }
+    }
+
+    /// **A hidden column is not drawn, so it is in no order at all** — and a
+    /// hidden frozen column is not drawn first, it is simply not drawn.
+    #[test]
+    fn a_hidden_column_leaves_the_draw_order() {
+        assert_eq!(hiding(None, &[1, 3]).visual_cols(5), vec![0, 2, 4]);
+        assert_eq!(hiding(Some(3), &[1]).visual_cols(5), vec![3, 0, 2, 4]);
+        assert_eq!(hiding(Some(3), &[3]).visual_cols(5), vec![0, 1, 2, 4]);
+        assert_eq!(hiding(Some(3), &[3]).frozen_drawn(5), None);
+        assert_eq!(hiding(Some(3), &[1]).frozen_drawn(5), Some(3));
+        // A hidden index the result does not have hides nothing, and is not
+        // counted as hidden either.
+        assert_eq!(hiding(None, &[9]).visual_cols(3), vec![0, 1, 2]);
+        assert_eq!(hiding(None, &[1, 9]).hidden_in(3), 1);
+        // And nothing hidden is exactly the frozen-only order.
+        assert_eq!(hiding(Some(3), &[]).visual_cols(5), visual_cols(5, Some(3)));
+    }
+
+    /// **Copy and Attach take what is on screen.** A selection spanning a
+    /// hidden column copies the columns either side of it, adjacent — the
+    /// block the user was looking at.
+    #[test]
+    fn a_copy_across_a_hidden_column_leaves_it_out() {
+        let rs = three_cols();
+        let (order, formats, dirty) = (vec![0], vec![Default::default(); 3], HashMap::new());
+        let new_rows: Vec<HashMap<usize, CellEdit>> = Vec::new();
+        let c = cells(&rs, &order, &formats, &dirty, &new_rows);
+        assert_eq!(c.tsv((0, 0, 0, 2), hiding(None, &[1])), "1\t3");
+        let (names, rows, _) = c.attached((0, 0, 0, 2), 10, hiding(None, &[1]));
+        assert_eq!(names.len(), 2);
+        assert_eq!(rows, vec![vec!["1".to_string(), "3".to_string()]]);
+        // The gutter's Copy as, outside any block: the whole *drawn* row.
+        let (out, ord) = c.exported_rows_at(None, 0, hiding(None, &[0]));
+        assert_eq!(csv_rows(&out, &ord), ["2,3"]);
+    }
+
+    /// **A paste never writes into a column the user cannot see** — a block
+    /// extends across it to the next drawn column, and a single value filling
+    /// the selection skips it. Either way the hidden cell is untouched, which
+    /// is the only safe reading of a write aimed at the screen.
+    #[test]
+    fn a_paste_skips_a_hidden_column() {
+        let block = parse_tsv_block("x\ty");
+        let plan = plan_paste(&block, (0, 0, 0, 0), 2, 4, hiding(None, &[1]), all_editable);
+        assert_eq!(
+            plan.cells,
+            vec![(0, 0, Some("x".to_string())), (0, 2, Some("y".to_string()))]
+        );
+        let one = parse_tsv_block("v");
+        let plan = plan_paste(&one, (0, 0, 0, 2), 2, 4, hiding(None, &[1]), all_editable);
+        let cols: Vec<usize> = plan.cells.iter().map(|&(_, c, _)| c).collect();
+        assert_eq!(cols, vec![0, 2]);
+        assert_eq!(plan.dropped, 0, "a hidden cell is skipped, not lost");
+    }
+
+    /// **The scrolling pane's columns**: every drawn column but the frozen one,
+    /// in index order — what the grid lays out beside the frozen pane, and what
+    /// scroll-into-view sums widths over. It is `visual_cols` less its head
+    /// when something is frozen, which is the agreement the two need.
+    #[test]
+    fn the_scrolling_pane_is_the_draw_order_less_the_frozen_column() {
+        for l in [
+            hiding(Some(3), &[1]),
+            hiding(Some(3), &[3]),
+            hiding(None, &[0, 4]),
+            hiding(Some(0), &[]),
+        ] {
+            let mut drawn = l.visual_cols(5);
+            if l.frozen_drawn(5).is_some() {
+                drawn.remove(0);
+            }
+            assert_eq!(l.scrolling(5), drawn, "{l:?}");
+        }
+        assert_eq!(hiding(Some(3), &[1]).scrolling(5), vec![0, 2, 4]);
+    }
+
+    /// The columns still drawn, in **index** order — what arrow keys walk —
+    /// and whether one more may go: the last one drawn may not, or the grid
+    /// would be a gutter and nothing to bring the columns back from.
+    #[test]
+    fn the_shown_columns_and_the_last_one_that_must_stay() {
+        let l = hiding(Some(3), &[1]);
+        assert_eq!(l.shown(5), vec![0, 2, 3, 4]);
+        assert!(l.may_hide(0, 5));
+        let last = hiding(None, &[0, 1]);
+        assert!(!last.may_hide(2, 3), "the only column left");
+        assert!(!last.may_hide(1, 3), "already hidden");
     }
 
     /// **The paste lands where the user pointed.** `(id, name, email, ssn,

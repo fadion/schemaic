@@ -30,8 +30,8 @@ use schemaic_core::blob::BlobRef;
 use schemaic_core::celledit::{self, CellEditor};
 use schemaic_core::connection::{AiData, Connection};
 use schemaic_core::edit::{
-    self, CellActivation, DirtyCells, EditModel, analyze_edit, refetch_key, refetch_template,
-    row_key,
+    self, CellActivation, ColLayout, DirtyCells, EditModel, analyze_edit, refetch_key,
+    refetch_template, row_key,
 };
 use schemaic_core::export::{ExportFormat, suggested_filename};
 use schemaic_core::filter::{FilterError, build_query, eq_condition, rerun_of};
@@ -275,6 +275,11 @@ struct GridState {
     /// The frozen column: its *absolute* index, pinned to the left of the grid
     /// (`None` = nothing frozen). Set from the header right-click menu.
     frozen: RwSignal<Option<usize>>,
+    /// Columns the user has hidden, by *absolute* index. Set from the header
+    /// right-click menu; the panel's, like `frozen`. Read through
+    /// [`GridState::layout_untracked`], which is what every reader of draw
+    /// order asks.
+    hidden: RwSignal<std::collections::BTreeSet<usize>>,
     scroll_to: RwSignal<Option<Point>>,
     vp: RwSignal<Rect>,
     focus_id: RwSignal<Option<floem::ViewId>>,
@@ -675,6 +680,11 @@ impl GridState {
             active: RwSignal::new(None),
             anchor: RwSignal::new(None),
             frozen: RwSignal::new(gctx.panel.and_then(|p| p.frozen_col.get_untracked())),
+            hidden: RwSignal::new(
+                gctx.panel
+                    .map(|p| p.hidden_cols.get_untracked())
+                    .unwrap_or_default(),
+            ),
             scroll_to: RwSignal::new(None),
             vp: RwSignal::new(Rect::ZERO),
             focus_id: RwSignal::new(None),
@@ -1578,6 +1588,15 @@ impl GridState {
             a.1.max(anc.1),
         ))
     }
+    /// Which columns are drawn, and in what order — the frozen column and the
+    /// hidden set, as the one answer copy, paste, attach and the gutter's Copy
+    /// as all ask (`core::edit::ColLayout`).
+    fn layout_untracked(&self) -> ColLayout {
+        ColLayout {
+            frozen: self.frozen.get_untracked(),
+            hidden: self.hidden.get_untracked(),
+        }
+    }
     fn bounds_untracked(&self) -> Option<(usize, usize, usize, usize)> {
         let a = self.active.get_untracked()?;
         let anc = self.anchor.get_untracked().unwrap_or(a);
@@ -1833,27 +1852,113 @@ enum Nav {
 /// to the real-row count instead maps a pending-row position back *up* into the
 /// real rows (Arrow-Down jumping backwards) and leaves a pending row unreachable
 /// by keyboard.
+///
+/// `shown` is the columns drawn, in index order (`ColLayout::shown`) — a hidden
+/// column is stepped over, so the arrows never land on a cell nobody can see.
+/// An empty list is an empty grid, and every move stays at the origin.
 fn nav_target(
     rows: usize,
-    cols: usize,
+    shown: &[usize],
     page: usize,
     (r, c): (usize, usize),
     nav: Nav,
 ) -> (usize, usize) {
     let last_r = rows.saturating_sub(1);
-    let last_c = cols.saturating_sub(1);
+    let first_c = shown.first().copied().unwrap_or(0);
+    let last_c = shown.last().copied().unwrap_or(0);
+    // The nearest shown column either side of `c`, which need not be shown
+    // itself — it may be the column just hidden under the cursor.
+    let right = shown
+        .iter()
+        .copied()
+        .find(|&ci| ci > c)
+        .unwrap_or(c.max(first_c));
+    let left = shown
+        .iter()
+        .rev()
+        .copied()
+        .find(|&ci| ci < c)
+        .unwrap_or(c.min(last_c));
     match nav {
         Nav::Down => ((r + 1).min(last_r), c),
         Nav::Up => (r.saturating_sub(1), c),
-        Nav::Right => (r, (c + 1).min(last_c)),
-        Nav::Left => (r, c.saturating_sub(1)),
-        Nav::RowStart => (r, 0),
+        Nav::Right => (r, right.min(last_c)),
+        Nav::Left => (r, left.max(first_c)),
+        Nav::RowStart => (r, first_c),
         Nav::RowEnd => (r, last_c),
-        Nav::First => (0, 0),
+        Nav::First => (0, first_c),
         Nav::Last => (last_r, last_c),
         Nav::PageDown => ((r + page).min(last_r), c),
         Nav::PageUp => (r.saturating_sub(page), c),
     }
+}
+
+/// The drawn column nearest `c`: `c` itself when it is drawn, else the next one
+/// to its right — the column that closes over it — else the last one to its
+/// left. `shown` is in index order; empty leaves `c` where it is.
+fn nearest_shown(c: usize, shown: &[usize]) -> usize {
+    if shown.contains(&c) {
+        return c;
+    }
+    shown
+        .iter()
+        .copied()
+        .find(|&ci| ci > c)
+        .or_else(|| shown.iter().rev().copied().find(|&ci| ci < c))
+        .unwrap_or(c)
+}
+
+/// Hide column `ci`, if it may be (`ColLayout::may_hide`).
+///
+/// A frozen column that is hidden is unfrozen with it — frozen and not drawn
+/// is no state anyone asked for, and it would come back pinned when shown. The
+/// selection's corners move off it (`nearest_shown`), because an active cell
+/// on a hidden column is one the keyboard types into and nobody can see.
+fn hide_column(gs: GridState, ci: usize) {
+    let ncols = gs.rs.get_untracked().col_count();
+    if !gs.layout_untracked().may_hide(ci, ncols) {
+        return;
+    }
+    if gs.frozen.get_untracked() == Some(ci) {
+        gs.frozen.set(None);
+    }
+    gs.hidden.update(|h| {
+        h.insert(ci);
+    });
+    let shown = gs.layout_untracked().shown(ncols);
+    for corner in [gs.active, gs.anchor] {
+        if let Some((r, c)) = corner.get_untracked() {
+            let to = nearest_shown(c, &shown);
+            if to != c {
+                corner.set(Some((r, to)));
+            }
+        }
+    }
+}
+
+/// The header menu's *Show hidden columns*: one entry per hidden column, by
+/// name, then *Show all*. One click shows one column, since a menu closes on a
+/// click — so *Show all* is there for the case of several.
+fn show_columns_submenu(gs: GridState, layout: &ColLayout) -> Vec<MenuEntry> {
+    let rs = gs.rs.get_untracked();
+    let mut entries: Vec<MenuEntry> = layout
+        .hidden
+        .iter()
+        .filter(|&&ci| ci < rs.col_count())
+        .map(|&ci| {
+            let name = rs.columns[ci].name.clone();
+            MenuEntry::action(name, move || {
+                gs.hidden.update(|h| {
+                    h.remove(&ci);
+                });
+            })
+        })
+        .collect();
+    entries.push(MenuEntry::Separator);
+    entries.push(MenuEntry::action("Show all", move || {
+        gs.hidden.set(Default::default())
+    }));
+    entries
 }
 
 /// The grid's cell values, read out of the signals once, for the surfaces that
@@ -1980,14 +2085,16 @@ fn scroll_active_into_view(gs: GridState, i: usize, ci: usize) {
     }
     // Horizontal scroll applies only to data-pane columns; the frozen column lives
     // in its own always-visible pane. Compute the target x in *data-pane* space —
-    // widths summed excluding the frozen column — matching the column-virtualized
-    // spacer math, so scroll-into-view lands correctly even under a freeze.
+    // widths summed over the scrolling pane's columns before this one, the list
+    // the pane lays out (`ColLayout::scrolling`) — so scroll-into-view lands
+    // correctly under a freeze and past a hidden column alike.
     let widths = gs.widths.get_untracked();
-    let frozen = gs.frozen.get_untracked();
-    if frozen != Some(ci) {
-        let x0: f64 = (0..ci)
-            .filter(|j| frozen != Some(*j))
-            .map(|j| widths.get(j).copied().unwrap_or(0.0))
+    let pane = gs.layout_untracked().scrolling(widths.len());
+    if pane.contains(&ci) {
+        let x0: f64 = pane
+            .iter()
+            .take_while(|&&j| j != ci)
+            .map(|&j| widths.get(j).copied().unwrap_or(0.0))
             .sum();
         let x1 = x0 + widths.get(ci).copied().unwrap_or(0.0);
         if x0 < vp.x0 {
@@ -2152,16 +2259,24 @@ pub(crate) struct CommittedStaging {
 ///
 /// Generic in the row type so the composition can be tested with no window —
 /// see `body_key_tests`. Only the count is read, and only `Vec::len` is called.
+///
+/// The frozen column and the hidden set go in as one [`ColLayout`], since both
+/// repartition the columns between the panes and the builder reads them as
+/// one answer.
 fn body_rebuild_key<T: 'static>(
     sort: RwSignal<SortState>,
     frozen: RwSignal<Option<usize>>,
+    hidden: RwSignal<std::collections::BTreeSet<usize>>,
     new_rows: RwSignal<Vec<T>>,
     key_gen: RwSignal<u64>,
-) -> Memo<(SortState, Option<usize>, usize, u64)> {
+) -> Memo<(SortState, ColLayout, usize, u64)> {
     create_memo(move |_| {
         (
             sort.get(),
-            frozen.get(),
+            ColLayout {
+                frozen: frozen.get(),
+                hidden: hidden.get(),
+            },
             new_rows.with(Vec::len),
             key_gen.get(),
         )
@@ -2223,7 +2338,7 @@ fn copy_selection(gs: GridState) {
     // absolute index, so a selection that crosses it reads one way on screen and
     // another in the range. The clipboard's consumer is outside this grid and has
     // only the order to go on.
-    let block = cells.tsv_block(rect, gs.frozen.get_untracked());
+    let block = cells.tsv_block(rect, gs.layout_untracked());
     // **What the format could not carry, said at the only step that knows.** A
     // cell holding a tab is copied as two cells and pasted as two, shifting
     // every later column of the row — and once the block is on the clipboard
@@ -2276,13 +2391,14 @@ fn paste_selection(gs: GridState) {
     // `frozen` is what "the column beside the anchor" means: the grid draws the
     // frozen column first while every cell keeps its absolute index, so a block
     // walked in index order lands in columns the user never pointed at — and the
-    // far-left one is the column they were protecting by freezing it.
-    let frozen = gs.frozen.get_untracked();
+    // far-left one is the column they were protecting by freezing it. And a
+    // hidden column is not beside anything: nothing lands in it.
+    let layout = gs.layout_untracked();
     // `text_editable`: a paste is text, and the clipboard's own round trip is
     // what makes a binary column dangerous here — a copied blob cell carries the
     // `<n bytes>` placeholder, and pasting it back would stage those characters
     // as the column's value.
-    let plan = schemaic_core::edit::plan_paste(&block, rect, rows, rs.col_count(), frozen, |ci| {
+    let plan = schemaic_core::edit::plan_paste(&block, rect, rows, rs.col_count(), layout, |ci| {
         model.text_editable(ci)
     });
     if plan.cells.is_empty() && plan.dropped == 0 && plan.read_only == 0 {
@@ -2356,7 +2472,7 @@ fn attached_rows(
     cells.attached(
         rect,
         schemaic_core::prompt::ATTACH_ROW_CAP,
-        gs.frozen.get_untracked(),
+        gs.layout_untracked(),
     )
 }
 
@@ -2532,7 +2648,7 @@ fn exported_rows_at(gs: GridState, pos: usize) -> (ResultSet, Vec<usize>) {
     grid_cells(&rs, &order, &formats, &dirty, &new_rows).exported_rows_at(
         gs.bounds_untracked(),
         pos,
-        gs.frozen.get_untracked(),
+        gs.layout_untracked(),
     )
 }
 
@@ -2546,7 +2662,7 @@ fn insert_blocks_at(gs: GridState, pos: usize) -> Vec<(ResultSet, Vec<usize>)> {
     grid_cells(&rs, &order, &formats, &dirty, &new_rows).insert_blocks_at(
         gs.bounds_untracked(),
         pos,
-        gs.frozen.get_untracked(),
+        gs.layout_untracked(),
     )
 }
 
@@ -4355,7 +4471,7 @@ fn grid_view(rs: Arc<ResultSet>, gctx: GridCtx) -> impl IntoView {
             .filter(|(ci, _)| *ci < ncols),
     );
     // **The other half of restoring it**: mirror what the user does back into the
-    // panel. Three effects rather than writes at each call site — a width is
+    // panel. One effect per field rather than writes at each call site — a width is
     // changed by a drag, by the double-click auto-fit, by the interface scale and
     // by a column menu, and a rule kept at four call sites is a rule kept at
     // three of them. They cost nothing when the panel is gone: the grid is
@@ -4364,6 +4480,7 @@ fn grid_view(rs: Arc<ResultSet>, gctx: GridCtx) -> impl IntoView {
         create_effect(move |_| pv.widths.set(Some(gs.widths.get())));
         create_effect(move |_| pv.widths_at.set(gs.widths_at.get()));
         create_effect(move |_| pv.frozen_col.set(gs.frozen.get()));
+        create_effect(move |_| pv.hidden_cols.set(gs.hidden.get()));
         create_effect(move |_| pv.sort.set(sort.get()));
     }
 
@@ -4388,31 +4505,32 @@ fn grid_view(rs: Arc<ResultSet>, gctx: GridCtx) -> impl IntoView {
         strip.clone(),
     );
 
-    // Header + body rebuild together on a sort change OR a freeze toggle (both
-    // repartition the columns between the frozen pane and the scrolling pane).
+    // Header + body rebuild together on a sort change OR a change of the column
+    // layout — a freeze toggle or a column hidden or shown, which all repartition
+    // the columns between the frozen pane and the scrolling pane.
     // Layout is two panes side by side: a frozen pane (row-number gutter + an
     // optional frozen first column) and a horizontally-scrolling data pane. Both
     // panes are vertical scrolls kept in lockstep through `gs.scroll_to` (the
     // shared offset — data pane also owns the horizontal `h_off`).
-    // The body rebuilds on every sort/freeze/new-row change, so the ring is cloned
+    // The body rebuilds on every sort/layout/new-row change, so the ring is cloned
     // per build rather than captured once.
     let strip_for_body = strip.clone();
-    let body_key = body_rebuild_key(sort, gs.frozen, gs.new_rows, key_gen);
+    let body_key = body_rebuild_key(sort, gs.frozen, gs.hidden, gs.new_rows, key_gen);
     let grid = dyn_container(
-        // Rebuild on sort / freeze change, and when the number of pending new rows
+        // Rebuild on sort / layout change, and when the number of pending new rows
         // changes (adding/removing a row extends the virtual-stack length).
         move || body_key.get(),
-        move |(sort_val, frozen_col, new_len, _key_gen)| {
+        move |(sort_val, layout, new_len, _key_gen)| {
             let strip_entry = strip_for_body.clone();
             let rs = gs.rs.get_untracked();
             // Total displayed rows = real rows + pending new rows (rendered below).
             let total = nrows + new_len;
-            // The frozen column (if any), clamped to the valid range. The data
-            // pane renders every *other* column, in order — cells keep their
-            // absolute `ci`, so selection/sort/resize stay consistent.
-            let frozen_col = frozen_col.filter(|&c| c < ncols);
-            let data_cols: Arc<Vec<usize>> =
-                Arc::new((0..ncols).filter(|ci| Some(*ci) != frozen_col).collect());
+            // The frozen column (if any, and not hidden), clamped to the valid
+            // range. The data pane renders every *other* drawn column, in order —
+            // cells keep their absolute `ci`, so selection/sort/resize stay
+            // consistent. Both from `ColLayout`, which copy and paste ask too.
+            let frozen_col = layout.frozen_drawn(ncols);
+            let data_cols: Arc<Vec<usize>> = Arc::new(layout.scrolling(ncols));
             let order = Arc::new(compute_order(&rs, sort_val));
             gs.order.set(order.clone());
 
@@ -4450,11 +4568,43 @@ fn grid_view(rs: Arc<ResultSet>, gctx: GridCtx) -> impl IntoView {
             });
 
             // ── Headers ──
-            let gutter_header = container(text("#").style(|s| {
-                s.font_size(theme::scaled_font(11.0))
-                    .color(theme::text_faint())
-            }))
-            .style(|s| {
+            // The gutter's corner says when columns are hidden — otherwise nothing
+            // on screen does, and a result quietly short of a column reads as
+            // one that never had it. Built here because this container already
+            // rebuilds on every change of the hidden set.
+            let n_hidden = layout.hidden_in(ncols);
+            let corner = if n_hidden > 0 {
+                h_stack((
+                    icons::icon(icons::EYE, 12.0).style(|s| {
+                        s.color(theme::text_faint())
+                            .margin_right(theme::scaled(3.0))
+                            .flex_shrink(0.0_f32)
+                    }),
+                    text(n_hidden.to_string()).style(|s| {
+                        s.font_size(theme::scaled_font(11.0))
+                            .color(theme::text_faint())
+                    }),
+                ))
+                .style(|s| s.items_center().cursor(floem::style::CursorStyle::Pointer))
+                .on_click_stop(move |_| gs.hidden.set(Default::default()))
+                .tooltip(move || {
+                    text(format!(
+                        "{n_hidden} hidden {} — click to show all, or right-click a \
+                         header to choose",
+                        if n_hidden == 1 { "column" } else { "columns" }
+                    ))
+                    .style(crate::widgets::tooltip_style)
+                })
+                .into_any()
+            } else {
+                text("#")
+                    .style(|s| {
+                        s.font_size(theme::scaled_font(11.0))
+                            .color(theme::text_faint())
+                    })
+                    .into_any()
+            };
+            let gutter_header = container(corner).style(|s| {
                 s.width(gutter_w())
                     .height(grid_header_h())
                     .flex_shrink(0.0_f32)
@@ -7428,7 +7578,16 @@ fn grid_find(gs: GridState, forward: bool, from_current: bool) {
         forward,
         from_current,
     };
-    if let Some((dr, ci)) = next_match(&cells, nrows, ncols, &q, from, FIND_COUNT_CELL_BUDGET) {
+    let hidden = gs.hidden.get_untracked();
+    if let Some((dr, ci)) = next_match(
+        &cells,
+        nrows,
+        ncols,
+        &q,
+        from,
+        FIND_COUNT_CELL_BUDGET,
+        &hidden,
+    ) {
         gs.active.set(Some((dr, ci)));
         gs.anchor.set(Some((dr, ci)));
         scroll_active_into_view(gs, dr, ci);
@@ -7488,6 +7647,7 @@ fn next_match(
     q: &str,
     from: MatchFrom,
     budget: usize,
+    hidden: &std::collections::BTreeSet<usize>,
 ) -> Option<(usize, usize)> {
     let total = nrows * ncols;
     if total == 0 || q.is_empty() {
@@ -7505,6 +7665,11 @@ fn next_match(
             (start + scan * 2 - off - 1) % scan
         };
         let (dr, ci) = (lin / ncols, lin % ncols);
+        // A hidden column's cell is in the window and not on screen — the
+        // count passes over it the same way.
+        if hidden.contains(&ci) {
+            continue;
+        }
         // `with_text`, not `text`: borrowed wherever the value already is a
         // string, which is three of its four sources. Matching against an
         // allocated copy cost two heap allocations per cell.
@@ -7535,7 +7700,8 @@ fn grid_find_hits(gs: GridState) -> (Vec<usize>, bool) {
     let formats = gs.formats.get_untracked();
     let dirty = gs.dirty.get_untracked();
     let new_rows = gs.new_rows.get_untracked();
-    find_hits(&grid_cells(&rs, &order, &formats, &dirty, &new_rows), &q)
+    let cells = grid_cells(&rs, &order, &formats, &dirty, &new_rows);
+    find_hits_shown(&cells, &q, &gs.hidden.get_untracked())
 }
 
 /// Which cells match `q`, as **display** positions (`display_row * ncols + col`),
@@ -7553,8 +7719,22 @@ fn grid_find_hits(gs: GridState) -> (Vec<usize>, bool) {
 ///
 /// `more` is true when either budget cut the scan short, so the bar can say
 /// "500+" rather than reporting a floor as a total.
+///
+/// With nothing hidden — the tests' spelling; the grid calls
+/// [`find_hits_shown`] with its hidden set.
+#[cfg(test)]
 fn find_hits(cells: &schemaic_core::edit::GridCells<'_>, q: &str) -> (Vec<usize>, bool) {
-    find_hits_within(cells, q, FIND_COUNT_CELL_BUDGET)
+    find_hits_shown(cells, q, &Default::default())
+}
+
+/// [`find_hits`] over the columns that are drawn — a hidden column's cells
+/// are not on screen, so the find bar neither counts nor jumps to them.
+fn find_hits_shown(
+    cells: &schemaic_core::edit::GridCells<'_>,
+    q: &str,
+    hidden: &std::collections::BTreeSet<usize>,
+) -> (Vec<usize>, bool) {
+    find_hits_within(cells, q, FIND_COUNT_CELL_BUDGET, hidden)
 }
 
 /// [`find_hits`] over a given window.
@@ -7568,6 +7748,7 @@ fn find_hits_within(
     cells: &schemaic_core::edit::GridCells<'_>,
     q: &str,
     budget: usize,
+    hidden: &std::collections::BTreeSet<usize>,
 ) -> (Vec<usize>, bool) {
     if q.is_empty() {
         return (Vec::new(), false);
@@ -7584,6 +7765,13 @@ fn find_hits_within(
                 break 'outer;
             }
             scanned += 1;
+            // Passed over, but **inside the window**: a hidden cell still spends
+            // budget, so the count's window stays the linear `0..budget` that
+            // `next_match` walks — skipping it free would stretch this window
+            // past the jump's, the disagreement `next_match`'s doc is about.
+            if hidden.contains(&ci) {
+                continue;
+            }
             if cells.with_text(dr, ci, true, |t| contains_ignore_ascii_case(t, q)) {
                 hits.push(dr * ncols + ci);
                 if hits.len() >= FIND_MAX_HITS {
@@ -7646,8 +7834,9 @@ fn grid_key(gs: GridState, nrows: usize, ncols: usize, e: &Event) -> EventPropag
     let last_r = rows - 1;
     let last_c = ncols - 1;
     let page = ((gs.vp.get_untracked().height() / row_h()).floor() as usize).max(1);
+    let shown = gs.layout_untracked().shown(ncols);
     let go = |nav: Nav| {
-        let (nr, nc) = nav_target(rows, ncols, page, (r, c), nav);
+        let (nr, nc) = nav_target(rows, &shown, page, (r, c), nav);
         set_active(gs, nr, nc, shift);
     };
     // With no cell selected yet, the first navigation keypress selects the
@@ -7666,8 +7855,14 @@ fn grid_key(gs: GridState, nrows: usize, ncols: usize, e: &Event) -> EventPropag
                 | NamedKey::PageUp
         )
     );
+    // The first and last columns *drawn*: a selection corner on a hidden column
+    // would be an active cell nobody can see.
+    let (first_c, last_c) = (
+        shown.first().copied().unwrap_or(0),
+        shown.last().copied().unwrap_or(last_c),
+    );
     if active_opt.is_none() && is_nav {
-        set_active(gs, 0, 0, shift);
+        set_active(gs, 0, first_c, shift);
         return EventPropagation::Stop;
     }
     match &ke.key.logical_key {
@@ -7729,7 +7924,7 @@ fn grid_key(gs: GridState, nrows: usize, ncols: usize, e: &Event) -> EventPropag
         Key::Character(s) if ctrl && matches!(s.as_str(), "c" | "C") => copy_selection(gs),
         Key::Character(s) if ctrl && matches!(s.as_str(), "v" | "V") => paste_selection(gs),
         Key::Character(s) if ctrl && matches!(s.as_str(), "a" | "A") => {
-            gs.anchor.set(Some((0, 0)));
+            gs.anchor.set(Some((0, first_c)));
             gs.active.set(Some((last_r, last_c)));
         }
         Key::Character(s) if ctrl && matches!(s.as_str(), "f" | "F") => {
@@ -9665,8 +9860,22 @@ fn header_cell(
             });
             gs.popup_anchor.set(None); // right-click → open at the cursor
             let name = column.clone();
-            let mut entries = vec![
-                freeze_item,
+            let layout = gs.layout_untracked();
+            let mut entries = vec![freeze_item];
+            // Hide this column; bring back the ones already hidden. The last drawn
+            // column cannot go — see `ColLayout::may_hide`.
+            entries.push(
+                MenuEntry::action("Hide column", move || hide_column(gs, ci))
+                    .disabled(!layout.may_hide(ci, rs.col_count())),
+            );
+            let n_hidden = layout.hidden_in(rs.col_count());
+            if n_hidden > 0 {
+                entries.push(MenuEntry::sub(
+                    format!("Show hidden columns ({n_hidden})"),
+                    show_columns_submenu(gs, &layout),
+                ));
+            }
+            entries.extend([
                 MenuEntry::sub("Format as", format_submenu(gs, ci)),
                 MenuEntry::Separator,
                 // The name as the header shows it — an alias where the query
@@ -9674,7 +9883,7 @@ fn header_cell(
                 MenuEntry::action("Copy name", move || {
                     let _ = floem::Clipboard::set_contents(name.clone());
                 }),
-            ];
+            ]);
             if let Some(q) = qualified {
                 entries.push(MenuEntry::action("Copy qualified name", move || {
                     let _ = floem::Clipboard::set_contents(q.clone());
@@ -11778,7 +11987,7 @@ mod body_key_tests {
     /// stands for the `dyn_container` builder, which rebuilds both panes, the
     /// header and two memos, and re-runs `compute_order` over the whole result
     /// — 14.3 ms at 200,000 rows on a sorted column.
-    fn runs_of(key: Memo<(SortState, Option<usize>, usize, u64)>) -> Rc<std::cell::Cell<u32>> {
+    fn runs_of(key: Memo<(SortState, ColLayout, usize, u64)>) -> Rc<std::cell::Cell<u32>> {
         let n = Rc::new(std::cell::Cell::new(0u32));
         let c = n.clone();
         create_effect(move |_| {
@@ -11804,7 +12013,8 @@ mod body_key_tests {
         // One pending row, whose contents are patched in place.
         let new_rows: RwSignal<Vec<Vec<u8>>> = scope.create_rw_signal(vec![Vec::new()]);
         let key_gen = scope.create_rw_signal(0u64);
-        let runs = runs_of(body_rebuild_key(sort, frozen, new_rows, key_gen));
+        let hidden = scope.create_rw_signal(std::collections::BTreeSet::new());
+        let runs = runs_of(body_rebuild_key(sort, frozen, hidden, new_rows, key_gen));
         assert_eq!(runs.get(), 1, "the builder's first run");
 
         for col in 0..10u8 {
@@ -11864,7 +12074,8 @@ mod body_key_tests {
         let frozen = scope.create_rw_signal(None);
         let new_rows: RwSignal<Vec<Vec<u8>>> = scope.create_rw_signal(Vec::new());
         let key_gen = scope.create_rw_signal(0u64);
-        let runs = runs_of(body_rebuild_key(sort, frozen, new_rows, key_gen));
+        let hidden = scope.create_rw_signal(std::collections::BTreeSet::new());
+        let runs = runs_of(body_rebuild_key(sort, frozen, hidden, new_rows, key_gen));
         assert_eq!(runs.get(), 1);
 
         key_gen.update(|g| *g += 1); // the schema landed
@@ -11886,7 +12097,8 @@ mod body_key_tests {
         let frozen = scope.create_rw_signal(None);
         let new_rows: RwSignal<Vec<Vec<u8>>> = scope.create_rw_signal(Vec::new());
         let key_gen = scope.create_rw_signal(0u64);
-        let runs = runs_of(body_rebuild_key(sort, frozen, new_rows, key_gen));
+        let hidden = scope.create_rw_signal(std::collections::BTreeSet::new());
+        let runs = runs_of(body_rebuild_key(sort, frozen, hidden, new_rows, key_gen));
         assert_eq!(runs.get(), 1);
 
         new_rows.update(|v| v.push(Vec::new())); // ＋ Row
@@ -11899,6 +12111,17 @@ mod body_key_tests {
             v.pop();
         }); // discard the pending row
         assert_eq!(runs.get(), 5, "removing a pending row must rebuild");
+        // **Hiding a column repartitions the panes as freezing one does**, and
+        // showing it again rebuilds back — while a write of the set already
+        // there does not.
+        hidden.update(|h| {
+            h.insert(2);
+        });
+        assert_eq!(runs.get(), 6, "hiding a column must rebuild");
+        hidden.set([2].into_iter().collect());
+        assert_eq!(runs.get(), 6, "an unchanged hidden set rebuilt the grid");
+        hidden.set(Default::default());
+        assert_eq!(runs.get(), 7, "showing it again must rebuild");
     }
 }
 
@@ -13106,7 +13329,47 @@ mod tests {
 
     // 3 real rows + 2 pending = 5 display rows, 4 columns, one viewport page = 2.
     fn nav(from: (usize, usize), n: Nav) -> (usize, usize) {
-        nav_target(5, 4, 2, from, n)
+        nav_target(5, &[0, 1, 2, 3], 2, from, n)
+    }
+
+    /// **A selection corner on a column just hidden moves to a drawn one** —
+    /// the one to its right, as the columns close over it, else the one to its
+    /// left at the right edge. A corner already on a drawn column stays put.
+    #[test]
+    fn a_corner_on_a_hidden_column_moves_to_the_nearest_shown() {
+        assert_eq!(nearest_shown(1, &[0, 2, 3]), 2);
+        assert_eq!(nearest_shown(3, &[0, 1]), 1, "the right edge");
+        assert_eq!(nearest_shown(2, &[0, 2, 3]), 2, "already drawn");
+        assert_eq!(
+            nearest_shown(4, &[]),
+            4,
+            "nothing drawn, nothing to move to"
+        );
+    }
+
+    /// **The arrows walk the columns that are drawn.** With `1` hidden out of
+    /// four, Right from `0` lands on `2` — not on a cell nobody can see, where
+    /// the next keystroke would type into it — and every edge move stops at
+    /// the first or last *shown* column.
+    #[test]
+    fn nav_target_steps_over_a_hidden_column() {
+        let shown = [0, 2, 3];
+        assert_eq!(nav_target(5, &shown, 2, (1, 0), Nav::Right), (1, 2));
+        assert_eq!(nav_target(5, &shown, 2, (1, 2), Nav::Left), (1, 0));
+        let edges = [1, 3];
+        assert_eq!(nav_target(5, &edges, 2, (2, 3), Nav::RowStart), (2, 1));
+        assert_eq!(nav_target(5, &edges, 2, (2, 1), Nav::RowEnd), (2, 3));
+        assert_eq!(nav_target(5, &edges, 2, (2, 3), Nav::First), (0, 1));
+        assert_eq!(nav_target(5, &edges, 2, (2, 1), Nav::Last), (4, 3));
+        assert_eq!(
+            nav_target(5, &edges, 2, (2, 1), Nav::Left),
+            (2, 1),
+            "no shown column left of it"
+        );
+        // Standing on a column that has just been hidden, the arrows still find
+        // the neighbours either side of it.
+        assert_eq!(nav_target(5, &edges, 2, (2, 2), Nav::Right), (2, 3));
+        assert_eq!(nav_target(5, &edges, 2, (2, 2), Nav::Left), (2, 1));
     }
 
     #[test]
@@ -13143,7 +13406,7 @@ mod tests {
     fn nav_target_on_an_empty_grid_stays_at_the_origin() {
         // `grid_key` returns early here, but the helper must not underflow.
         for n in [Nav::Down, Nav::Right, Nav::Last, Nav::RowEnd, Nav::PageDown] {
-            assert_eq!(nav_target(0, 0, 2, (0, 0), n), (0, 0));
+            assert_eq!(nav_target(0, &[], 2, (0, 0), n), (0, 0));
         }
     }
 
@@ -13662,7 +13925,7 @@ mod find_hits_tests {
         let budget = 12; // six rows of two columns
 
         // The count finds it: display row 4, column 0 → linear 8.
-        let (hits, more) = find_hits_within(&cells, "needle", budget);
+        let (hits, more) = find_hits_within(&cells, "needle", budget, &Default::default());
         assert_eq!(hits, vec![8], "the fixture's premise");
         assert!(more, "the scan stopped short, so the bar reads N+");
 
@@ -13676,7 +13939,15 @@ mod find_hits_tests {
                 from_current: false,
             };
             assert_eq!(
-                next_match(&cells, rows.len(), 2, "needle", from, budget),
+                next_match(
+                    &cells,
+                    rows.len(),
+                    2,
+                    "needle",
+                    from,
+                    budget,
+                    &Default::default()
+                ),
                 Some((4, 0)),
                 "forward={forward}: the bar counts a match the jump cannot reach"
             );
@@ -13689,11 +13960,45 @@ mod find_hits_tests {
                 from_current: false,
             };
             assert_eq!(
-                next_match(&cells, rows.len(), 2, "needle", from, budget),
+                next_match(
+                    &cells,
+                    rows.len(),
+                    2,
+                    "needle",
+                    from,
+                    budget,
+                    &Default::default()
+                ),
                 Some((4, 0)),
                 "forward={forward}"
             );
         }
+    }
+
+    /// **A hidden column's match is off screen, so find has none there** —
+    /// neither the count nor the jump, which have to agree about it as they
+    /// agree about the budget. The visible match is still both.
+    #[test]
+    fn a_match_in_a_hidden_column_is_neither_counted_nor_jumped_to() {
+        let rows: Vec<[&str; 2]> = vec![["x", "needle"], ["needle", "y"]];
+        let rs = grid(&rows);
+        let order: Vec<usize> = (0..rows.len()).collect();
+        let (formats, dirty) = (fmts(), DirtyCells::new());
+        let cells = stored(&rs, &order, &formats, &dirty, &[]);
+        let hidden: std::collections::BTreeSet<usize> = [1].into_iter().collect();
+        let (hits, more) = find_hits_within(&cells, "needle", 100, &hidden);
+        assert_eq!(hits, vec![2], "only row 1, column 0");
+        assert!(!more);
+        let from = MatchFrom {
+            start: 0,
+            forward: true,
+            from_current: true,
+        };
+        assert_eq!(
+            next_match(&cells, 2, 2, "needle", from, 100, &hidden),
+            Some((1, 0)),
+            "the jump passes over (0, 1)"
+        );
     }
 
     /// And a needle that is genuinely outside the counted window is reported by
@@ -13708,14 +14013,26 @@ mod find_hits_tests {
         let (formats, dirty) = (fmts(), DirtyCells::new());
         let cells = stored(&rs, &order, &formats, &dirty, &[]);
         let budget = 12;
-        assert!(find_hits_within(&cells, "needle", budget).0.is_empty());
+        assert!(
+            find_hits_within(&cells, "needle", budget, &Default::default())
+                .0
+                .is_empty()
+        );
         let from = MatchFrom {
             start: 0,
             forward: true,
             from_current: false,
         };
         assert_eq!(
-            next_match(&cells, rows.len(), 2, "needle", from, budget),
+            next_match(
+                &cells,
+                rows.len(),
+                2,
+                "needle",
+                from,
+                budget,
+                &Default::default()
+            ),
             None
         );
     }
@@ -13870,12 +14187,16 @@ mod find_hits_tests {
             from_current: true,
         };
         // The match is the eighth cell, so seven is not enough.
-        assert_eq!(next_match(&cells, 4, 2, "needle", from, 7), None);
-        assert_eq!(next_match(&cells, 4, 2, "needle", from, 8), Some((3, 1)));
+        let none = Default::default();
+        assert_eq!(next_match(&cells, 4, 2, "needle", from, 7, &none), None);
+        assert_eq!(
+            next_match(&cells, 4, 2, "needle", from, 8, &none),
+            Some((3, 1))
+        );
         // A generous budget is not a different answer, only a slower way to
         // the same one.
         assert_eq!(
-            next_match(&cells, 4, 2, "needle", from, FIND_COUNT_CELL_BUDGET),
+            next_match(&cells, 4, 2, "needle", from, FIND_COUNT_CELL_BUDGET, &none),
             Some((3, 1))
         );
     }
@@ -13901,6 +14222,7 @@ mod find_hits_tests {
                     from_current,
                 },
                 FIND_COUNT_CELL_BUDGET,
+                &Default::default(),
             )
         };
         // Enter re-checks where you are; next steps off it and finds the other.
@@ -13925,10 +14247,14 @@ mod find_hits_tests {
             forward: true,
             from_current: true,
         };
-        assert_eq!(next_match(&cells, 1, 2, "", from, 100), None);
-        assert_eq!(next_match(&cells, 0, 0, "a", from, 100), None);
+        let none = Default::default();
+        assert_eq!(next_match(&cells, 1, 2, "", from, 100, &none), None);
+        assert_eq!(next_match(&cells, 0, 0, "a", from, 100, &none), None);
         // An out-of-range caret is clamped rather than panicking.
-        assert_eq!(next_match(&cells, 1, 2, "a", from, 100), Some((0, 0)));
+        assert_eq!(
+            next_match(&cells, 1, 2, "a", from, 100, &none),
+            Some((0, 0))
+        );
     }
 
     /// **A staged edit is what the cell shows, so it is what Find must

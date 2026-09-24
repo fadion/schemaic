@@ -1408,11 +1408,11 @@ existing prose was left alone.
     `GridCells` is a borrow struct over what the grid's signals hold — `rs`, the display→data
     `order`, the per-column `formats`, `dirty` and `new_rows` — and `text(i, ci, formatted)`
     resolves one *display* cell in the painter's order: a pending new row's typed value, then a
-    staged edit, then the stored cell through `format::apply`. `tsv_block(rect, frozen)` is the
+    staged edit, then the stored cell through `format::apply`. `tsv_block(rect, layout)` is the
     clipboard's block **plus what the format could not carry** — `TsvBlock { text, split }`, `split`
     counting the copied cells that hold a tab or a newline of their own, phrased by
     `copy_split_note` and reported by the grid (`tsv` is the wrapper that throws the count away);
-    and `attached(rect, cap, frozen)` is an AI attachment's column names, rows and pre-cap
+    and `attached(rect, cap, layout)` is an AI attachment's column names, rows and pre-cap
     total — both emitting the selected columns in the order they are **drawn** (`visual_cols`) rather
     than in index order, because whoever receives the block reads it left to right and a copy across
     a freeze reached a spreadsheet transposed.
@@ -1429,7 +1429,7 @@ existing prose was left alone.
     that. Unformatted, like `tsv`: a formatter is how a value is shown and an export writes the
     value, so `formats` is the one field of this struct the method does not consult. Cheap on a
     clean grid, since the columns are refcounted and `splice_cells` rebuilds only a column whose
-    listed cell really differs. `exported_rows_at(selection, pos, frozen)` is that resolution
+    listed cell really differs. `exported_rows_at(selection, pos, layout)` is that resolution
     narrowed to what a gutter gesture at **display** row `pos` means — the highlighted rows when
     the click is inside them, else that row alone, the reading `selected_data_rows` gives — for the
     row menu's *Copy as*. It slices the *exported* order by display position rather than reading the
@@ -1445,7 +1445,7 @@ existing prose was left alone.
     (`exported_rows_at_takes_the_blocks_columns_in_drawn_order`). `gesture_at` reads the rows and
     columns off the gesture, `pick` slices the order and `project` narrows the columns, handing the
     result back untouched for a whole row outside a freeze. **`insert_blocks_at(selection, pos,
-    frozen)` and `insert_blocks_all()` are the same gesture, and the whole result, for an `INSERT`
+    layout)` and `insert_blocks_all()` are the same gesture, and the whole result, for an `INSERT`
     — and they return blocks rather than one result, because a pending row's unset cell is not a
     NULL.** It takes the server's default — the grid previews it as `<auto>` and its own Commit
     leaves the column out — so an `INSERT` listing it as `NULL` wrote something else: PostgreSQL
@@ -1515,13 +1515,39 @@ existing prose was left alone.
     range instead put the second value of a two-wide paste dropped on `email` into a frozen `ssn` —
     a column at the far *left* of the screen the user never pointed at, one `UPDATE … SET ssn` away
     from destroying it — and sent a copy across the freeze to a spreadsheet transposed. One list,
-    because `grid::scroll_active_into_view` already sums widths with the same filter and a second
-    spelling of the order is a second chance to disagree with it. The **single-value** paste is not
+    because the grid's pane builder and `grid::scroll_active_into_view` partition the columns the
+    same way (both now through `ColLayout::scrolling`, below) and a second spelling of the order is a
+    second chance to disagree with it. The **single-value** paste is not
     an exception: it fills the *selection*, which is the set of cells already painted highlighted, so
     no translation applies. **What this deliberately does not fix**: a selection whose absolute range
     straddles the frozen column is visually discontiguous, so copy→paste of such a selection no
     longer round-trips. The ambiguity is in the selection model, not in either surface, and both now
     agree with what is drawn rather than with each other.
+    **`ColLayout` is that order once columns can be hidden** — the frozen column plus a `BTreeSet`
+    of hidden indices — and hiding is the stronger of the two reasons draw and index order part: a
+    frozen column only moves, a hidden one is not there. Every surface above takes
+    `layout: impl Into<ColLayout>` where it took `frozen`, and `From<Option<usize>>` makes a frozen
+    column alone a layout, so every caller and test that predates hiding still passes `Some(n)` or
+    `None`. It answers four different lists, and they differ on purpose: `visual_cols` is the free
+    function's order less the hidden — what copy, attach and a block paste walk; `shown` is the drawn
+    columns in **index** order — what the arrow keys step through; `scrolling` is `shown` less the
+    drawn frozen column — the data pane's columns and what scroll-into-view sums widths over, equal
+    to `visual_cols` less its head under a freeze
+    (`the_scrolling_pane_is_the_draw_order_less_the_frozen_column`); and `frozen_drawn` is `None`
+    for a frozen column that is hidden, which is not drawn first but not drawn at all
+    (`a_hidden_column_leaves_the_draw_order`). `selected_cols` keeps the absolute range as
+    membership and subtracts the hidden, since the grid paints a hidden column inside the range not
+    at all (`a_copy_across_a_hidden_column_leaves_it_out`). A block paste extends across a hidden
+    column to the next drawn one, and the single-value fill skips it, its span taken from the columns
+    it fills so the skip is not reported as `dropped` (`a_paste_skips_a_hidden_column`) — a write
+    aimed at the screen lands on the screen. `may_hide` refuses the last drawn column, because a grid
+    of none is a gutter with nothing on it to bring the others back from
+    (`the_shown_columns_and_the_last_one_that_must_stay`). **What hiding deliberately does not
+    reach**: the whole-result exports, `exported` and `insert_blocks_all`. They are about the result,
+    and the *All rows* export re-runs the query on the server, which knows nothing of a grid's
+    hidden columns — so a fetched export honouring the hidden set would have two exports of one
+    result disagree about its shape. The gesture-scoped `exported_rows_at`/`insert_blocks_at` do
+    honour it, being about what was pointed at.
   - `blob.rs` — **one raw-bytes cell, fetched on demand**: the pure half of the grid's binary-cell
     panel. Nothing here writes a blob back — the file goes to the grid's dirty map as a
     `CellEdit::Bytes` (see `blob_view.rs`), never through here — though the panel it serves is a
@@ -24850,12 +24876,13 @@ its × would be, and "Close all" spares the pins — the query strip's rules, re
   `Tab::shown_frozen` is the untracked half of the pair, for callers acting *now* inside an event
   handler; anything answering the question while a grid is mounted takes the memo.
 - **What a panel remembers.** `PanelView` — column widths (with the `grid_char_w` they were measured
-  against), the client-side sort, the frozen column, and the **staged-edit trio** `dirty` /
+  against), the client-side sort, the frozen column, the hidden columns (`hidden_cols`, an index set,
+  the panel's for the frozen column's reason), and the **staged-edit trio** `dirty` /
   `new_rows` / `del_rows` — as **signals in the panel's own child scope**, not fields in the panel
   list: the grid writes a width on every mouse-move of a resize
   drag, and through the list that would clone and re-notify the whole strip each time. `GridState::new`
   seeds from them (length-checked against the column count, so a restore can't leave the header and
-  the body disagreeing) and four effects in `grid_view` mirror changes back. Selection is
+  the body disagreeing) and five effects in `grid_view` mirror changes back. Selection is
   deliberately *not* remembered: it is where the user last clicked, not a property of the result.
   Nothing is persisted — a strip is session-only, like the results themselves.
   **The trio is here because it was not.** `GridState::new` created those three with a bare
@@ -24934,7 +24961,9 @@ this bundle's.
 
 - **Two panes** side by side (`h_stack`): a **frozen pane** (row-number gutter + optional frozen
   column) and a horizontally-scrolling **data pane**. Rebuilt by a `dyn_container` keyed on
-  `body_rebuild_key` — sort state, frozen column, **how many** pending new rows there are, and a
+  `body_rebuild_key` — sort state, the column layout (the frozen column and the hidden set as one
+  `core::edit::ColLayout`, since both repartition the columns between the panes), **how many**
+  pending new rows there are, and a
   `key_gen` counter — and it is a **memo, not the bare closure it used to be**. `dyn_container`
   does not dedup (`create_updater`'s `UpdaterEffect::run` calls `on_change` on every notification,
   whether or not the value moved), and `new_rows` takes *shape-preserving* writes: every
@@ -24945,8 +24974,10 @@ this bundle's.
   sort, *before* the rebuild it sits inside, with each rebuild also republishing `gs.order` and so
   re-firing the selection aggregate and restarting the find-count rescan. A memo compares on
   `PartialEq`, which covers all three layout terms rather than only the length —
-  `add_cloned_rows`' batching becomes an optimisation instead of the only defence, and a `sort` or
-  `frozen` write landing on the value already there stops rebuilding too. `key_gen` is the fourth
+  `add_cloned_rows`' batching becomes an optimisation instead of the only defence, and a `sort`,
+  `frozen` or `hidden` write landing on the value already there stops rebuilding too
+  (`adding_a_row_or_changing_the_sort_still_rebuilds` pins that hiding and showing rebuild and an
+  unchanged set does not). `key_gen` is the fourth
   term and the only one that is not about layout: it counts changes to the source table's **key
   map**, which the header cells read by value from inside this container, so a schema arriving
   after the result — ordinary on a large server, where introspection is ten-plus round trips per
@@ -24956,11 +24987,35 @@ this bundle's.
   with no window (`body_key_tests`); only `Vec::len` is called.
   **Freeze is per-column, any column**: `gs.frozen` holds the frozen column's
   *absolute* index, set from the header right-click menu (no toolbar button). The data pane renders
-  `data_cols` = `(0..ncols)` minus the frozen index (an `Arc<Vec<usize>>`); cells keep their
+  `data_cols` = `ColLayout::scrolling` (an `Arc<Vec<usize>>`) and the frozen pane
+  `ColLayout::frozen_drawn`; cells keep their
   *absolute* `ci` so selection/resize/sort stay consistent. Frozen pane width = `GUTTER_W + widths[frozen]`.
+  The list used to be an inline `(0..ncols).filter(!= frozen)` — the second spelling `core::edit`
+  warns about — and is now the same core list scroll-into-view sums over.
   The resulting **draw order** — frozen first, then the rest in index order — is
   `core::edit::visual_cols`, and it is what paste, Ctrl+C and an AI attachment walk (see `core::edit`)
   so they agree with the screen rather than with the index.
+  **Hiding is per-column too**, from the same menu: *Hide column* after Freeze/Unfreeze (disabled
+  where `ColLayout::may_hide` refuses — the last drawn column), and while any are hidden a *Show
+  hidden columns (N)* submenu, one entry per column by name and then *Show all*, because a menu
+  closes on a click and one click can only show one. `gs.hidden` is seeded from
+  `PanelView::hidden_cols` and mirrored back beside `frozen_col` — session-only, like the rest of
+  the panel. `hide_column` unfreezes a column it hides, since frozen and not drawn is no state anyone
+  asked for and it would come back pinned, and moves the active and anchor corners off it through
+  `nearest_shown` — the right neighbour, the one that closes over it, else the left
+  (`a_corner_on_a_hidden_column_moves_to_the_nearest_shown`) — because an active cell on a hidden
+  column is one the keyboard types into and nobody can see. `nav_target` takes the `shown` list
+  rather than a column count and steps over a hidden column; Right and Left find the nearest shown
+  column either side even from one just hidden, and Home/End/Ctrl+Home/Ctrl+End land on the first
+  or last shown (`nav_target_steps_over_a_hidden_column`), as do the first-arrow select and Ctrl+A's
+  anchor. **The gutter's `#` corner becomes an eye and a count while columns are hidden**, with a
+  tooltip saying how to get them back and a click that shows all: otherwise nothing on screen says a
+  result is short a column, and one quietly missing a column reads as one that never had it. It is
+  built inside the body's container because that already rebuilds on every change of the set.
+  Hiding does **not** touch sort, widths (a hidden column keeps its width for when it returns), the
+  row editor (*Edit row* still shows every column) or the selection aggregate, which reads the
+  anchor column and so never stays on a hidden one; nor the whole-result exports, for the reason
+  under `core::edit`.
 - **⚠️ Scroll-sync rule (cost a hang):** a scroll view must **never both read and write the same
   offset signal** — it re-enters its own layout and hangs the UI thread. Strict one-writer/one-reader:
   the **data pane writes `vscroll`** (`on_scroll`) and reads `gs.scroll_to` (keyboard channel); the
@@ -25044,11 +25099,12 @@ this bundle's.
   lays the block over the grid: **one copied cell fills the whole selection** (that is how a column
   gets set to a constant), anything larger keeps **its own** shape from the selection's top-left,
   and everything is clipped to the display rows — pending new rows included, so a paste can fill
-  rows the user just added. **It takes `frozen`, because that is what "extends" means**: a block
+  rows the user just added. **It takes the layout, because that is what "extends" means**: a block
   grows into the columns drawn beside the anchor, which under a freeze are not the ones indexed
   beside it (`core::edit::visual_cols`), and the index walk it replaced put the second value of a
   two-wide paste on `email` into a frozen `ssn` at the far left of the screen. The single-value case
-  still fills the *selection*, which is what is painted highlighted, so it needs no translation. What falls outside, what lands on a read-only column, and what lands
+  still fills the *selection*, which is what is painted highlighted, so it needs no translation —
+  less any hidden column in it, which a block likewise extends across (`core::edit::ColLayout`). What falls outside, what lands on a read-only column, and what lands
   on a row marked for deletion are **counted and reported** in the same bottom bar a commit error
   uses (set *after* staging, since `stage` clears it), because a paste that discarded half a
   spreadsheet looks exactly like one that worked. **Which surface** is
@@ -25091,9 +25147,10 @@ this bundle's.
   about the dispatch order costs a block overwrite instead of a caret insertion.
 - **What a cell *says* is resolved in one place, and it isn't the view.** `copy_selection` and
   `attached_rows` read the signals once into `grid_cells` — a `core::edit::GridCells` borrow over
-  `rs`, `order`, `formats`, `dirty` and `new_rows` — and ask it for `tsv(rect, frozen)` or
-  `attached(rect, cap, frozen)`, both of which emit the selected columns in **draw** order
-  (`visual_cols`) because the receiver reads them left to right; they contain no resolution of their
+  `rs`, `order`, `formats`, `dirty` and `new_rows` — and ask it for `tsv(rect, layout)` or
+  `attached(rect, cap, layout)` (`GridState::layout_untracked`), both of which emit the selected
+  columns in **draw** order (`visual_cols`), hidden ones left out, because the receiver reads them
+  left to right; they contain no resolution of their
   own, and `displayed_cell_text` /
   `pending_cell_text` are gone. **A copy also says what the format could not carry**, because it is
   the only step that still can: `tsv_block` returns `edit::TsvBlock { text, split }` — `tsv` is now
@@ -25120,7 +25177,7 @@ this bundle's.
   four is exactly how this class came back. The resolvers are
   `exported_rows`, its count-only half `exported_row_count` (what `export_menu` needs, with
   nothing built), and `exported_rows_at`, its gesture-narrowed sibling for *Copy as*
-  (`render_rows_at`), which reads the raw pair plus the selection rectangle and the freeze.
+  (`render_rows_at`), which reads the raw pair plus the selection rectangle and the column layout.
   **The gate also holds `render_rows_at` to the gesture's scope, not just to a resolver**: it must
   contain `exported_rows_at(gs, pos)` and `insert_blocks_at(gs, pos)` and neither
   `exported_rows(gs)` nor `insert_blocks_all(`, because any resolver passed the first check, and
@@ -25975,7 +26032,8 @@ this bundle's.
   while the bar said there was a match. The mirror case read `0/N+` with the caret sitting on the
   matched cell. The walk is over `0..budget` **itself** now — the count's window, exactly — starting
   at the caret within it and wrapping inside it, so a cell past the budget is neither counted nor
-  jumped to, which is the agreement the paragraph above claims. `find_hits_within(cells, q, budget)`
+  jumped to, which is the agreement the paragraph above claims. `find_hits_within(cells, q, budget,
+  hidden)`
   is the sibling that makes that seam testable: with the budget a constant, the only grid a test can
   write is one small enough for the two windows to coincide — which is the one configuration in
   which their disagreement is invisible, and is what all three of the existing budget tests used. It is
@@ -25983,6 +26041,13 @@ this bundle's.
   a live grid, and a budget nothing asserts is a constant nobody would miss. The cells themselves
   are read through `edit::GridCells::with_text`, which is what took two heap allocations per cell
   off that walk.
+  **A hidden column's cells are passed over by both, and still spend budget.** The find bar searches
+  what is on screen, so neither the count nor the jump lands on one
+  (`a_match_in_a_hidden_column_is_neither_counted_nor_jumped_to`) — but the count charges a hidden
+  cell to its budget all the same, so its window stays the linear `0..budget` that `next_match`
+  walks. Skipping one for free would stretch the count's window past the jump's, which is the
+  disagreement above over again. The grid calls `find_hits_shown` with its hidden set; `find_hits`,
+  nothing hidden, is `#[cfg(test)]` now.
   **`0` in that readout means two different things, and only one of them is `0`.** `find_pos`'
   binary search answers `0` both when the caret is not on a match and when it is on one the
   *collection* never reached, and the second is still reachable through the other budget:
@@ -26198,4 +26263,5 @@ this bundle's.
   changes, not every pixel. Header and every row read the **same** `win` memo, so the panes stay
   aligned. Invariant: `gs.widths` stays full-length and each row's total width = `sum(widths[data_cols])`
   (spacers make up the hidden columns), so `h_off`/`scroll_to` geometry is unchanged —
-  `scroll_active_into_view` sums in data-pane space (excluding the frozen column) to match.
+  `scroll_active_into_view` sums in data-pane space (`ColLayout::scrolling`, which excludes the
+  frozen column and the hidden ones) to match.
