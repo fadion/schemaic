@@ -7569,6 +7569,15 @@ existing prose was left alone.
     unexpanded — and returns `None` when the directory is already there once `expand_env` has been
     applied (`%NAME%` the way `ExpandEnvironmentStringsW` does it, an unknown name and a lone `%`
     left as written — `user_path_update_sees_an_unexpanded_entry_as_present`).
+    **`user_path_type` and `decode_user_path` are how the app turns that raw value into text, and
+    both refuse rather than guess**, because the write goes back in the type it was read in: only
+    `REG_SZ` and `REG_EXPAND_SZ` pass — a `REG_MULTI_SZ` or a blob is left alone
+    (`only_a_text_path_value_is_read`) — and the UTF-16 units lose every trailing NUL, since one
+    left behind would be written back as part of the last entry
+    (`the_terminators_are_dropped_and_nothing_else`), then must convert losslessly: an unpaired
+    surrogate cannot survive a `String`, and a replacement character written back would corrupt the
+    entry holding it (`a_value_that_is_not_lossless_utf16_is_refused`). The two type constants are
+    core's own numbers, so this crate links no Windows API; the app pins them to `windows-sys`'s.
     `link_step` decides what to do about whatever already sits at the link: `Create` where nothing
     is, `Keep` a link already resolving to the target (a relative one resolved lexically against its
     own directory), `Replace` a *dangling* one — an AppImage that was moved or deleted — and
@@ -19625,8 +19634,8 @@ existing prose was left alone.
     the one place ahead of the normal `init` that needs it: with no UI the log is the only record
     of what the hook did, and it lives in the config directory, which the uninstall leaves behind.
     Velopack has no uninstaller on macOS or for an AppImage, so nothing of ours runs there at all.
-  - `install_cli.rs` — the side-effect half of `core::cli_install`, which owns every decision but
-    one, and every test: this gathers the `Probe` (`current_exe`, whether it still `exists`,
+  - `install_cli.rs` — the side-effect half of `core::cli_install`, which owns every decision: this
+    gathers the `Probe` (`current_exe`, whether it still `exists`,
     `APPIMAGE`, `HOME`, `PATH`, whether `schemaic.com` sits beside the exe, whether it is a
     Velopack install — its folder named `current`, compared ASCII-case-insensitively, with
     `Update.exe` in the parent, neither of which the portable `.zip` ships — and on Windows
@@ -19638,11 +19647,13 @@ existing prose was left alone.
     type**, through `RegCreateKeyExW`/`RegQueryValueExW`/`RegSetValueExW`: a `REG_EXPAND_SZ` must
     stay one or every `%USERPROFILE%\…` entry in it stops resolving, and a missing value is created
     as `REG_EXPAND_SZ`. A value of any other type, or one that is not valid UTF-16, is **refused
-    rather than written back lossily**. **That decode is the one decision made here rather than in
-    core, and nothing tests it**: the type gate (`REG_SZ`/`REG_EXPAND_SZ` only), the trailing-NUL
-    trim and the lossless UTF-16 conversion sit inline in `win::UserPath::open`, between the two
-    `RegQueryValueExW` calls, where no test reaches them without a registry — an open gap,
-    backlogged, not a sanctioned exception. Both directions share that through a `win` module:
+    rather than written back lossily**, and both refusals are core's: `win::UserPath::open` only
+    reads the bytes — sizing with the first `RegQueryValueExW`, truncating its buffer to the length
+    the second returns — and hands the type to `cli_install::user_path_type` and the units to
+    `decode_user_path`. That decode used to sit inline here, the one decision made outside core and
+    one no test could reach without a registry. Core's `REG_SZ`/`REG_EXPAND_SZ` are its own numbers,
+    and `cores_registry_types_are_windows_own`, a `cfg(windows)` test and this module's only one,
+    pins them to `windows-sys`'s. Both directions share that through a `win` module:
     `UserPath { key, ty, raw }`, whose `open` reads the raw value in its own type (or refuses it),
     whose `write` puts a value back in the type it was read in, and whose `Drop` closes the key, so
     every early return between the open and the write closes it too; and

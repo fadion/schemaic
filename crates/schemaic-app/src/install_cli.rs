@@ -1,8 +1,9 @@
 //! Settings → General → Command line → Install / Remove, and the Windows
 //! uninstall hook: the side-effect half of [`schemaic_core::cli_install`],
-//! which owns every decision but one, and every test. The one is the registry
-//! value's decode in `win::UserPath::open` (text types only, trailing NULs
-//! trimmed, lossless UTF-16), which no test reaches without a registry.
+//! which owns every decision — the registry value's decode included
+//! (`user_path_type`, `decode_user_path`): `win::UserPath::open` only reads the
+//! bytes and hands them over. The one test here pins core's registry type
+//! numbers to the Windows API's.
 //!
 //! This module gathers the [`Probe`] and performs the [`Plan`] or the
 //! [`Removal`] — a registry edit plus a `WM_SETTINGCHANGE` broadcast on
@@ -187,12 +188,12 @@ fn remove_user_path(dir: &Path) -> Result<String, String> {
 
 #[cfg(windows)]
 mod win {
-    use std::os::windows::ffi::{OsStrExt, OsStringExt};
+    use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::Foundation::ERROR_FILE_NOT_FOUND;
     use windows_sys::Win32::System::Registry::{
         HKEY, HKEY_CURRENT_USER, KEY_QUERY_VALUE, KEY_SET_VALUE, REG_EXPAND_SZ,
-        REG_OPTION_NON_VOLATILE, REG_SZ, REG_VALUE_TYPE, RegCloseKey, RegCreateKeyExW,
-        RegOpenKeyExW, RegQueryValueExW, RegSetValueExW,
+        REG_OPTION_NON_VOLATILE, REG_VALUE_TYPE, RegCloseKey, RegCreateKeyExW, RegOpenKeyExW,
+        RegQueryValueExW, RegSetValueExW,
     };
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         HWND_BROADCAST, SMTO_ABORTIFHUNG, SendMessageTimeoutW, WM_SETTINGCHANGE,
@@ -301,12 +302,7 @@ mod win {
             if rc != 0 {
                 return Err(format!("Couldn't read your user PATH: {}", os_error(rc)));
             }
-            if ty != REG_SZ && ty != REG_EXPAND_SZ {
-                return Err(
-                    "Your user PATH isn't stored as text in the registry, so it was left alone."
-                        .to_string(),
-                );
-            }
+            schemaic_core::cli_install::user_path_type(ty)?;
             // Rounded up to whole u16s, plus room for a terminator the stored
             // value may lack.
             let mut buf = vec![0u16; (bytes as usize).div_ceil(2) + 1];
@@ -326,16 +322,11 @@ mod win {
                 return Err(format!("Couldn't read your user PATH: {}", os_error(rc)));
             }
             buf.truncate(len as usize / 2);
-            while buf.last() == Some(&0) {
-                buf.pop();
-            }
-            path.raw = std::ffi::OsString::from_wide(&buf)
-                .into_string()
-                .map_err(|_| {
-                    "Your user PATH contains characters that can't be read back safely, so it \
-                     was left alone."
-                        .to_string()
-                })?;
+            // Asked again of the type this read returned: the value could have
+            // been rewritten as another type between the two calls, and `ty` is
+            // what the write goes back in.
+            schemaic_core::cli_install::user_path_type(ty)?;
+            path.raw = schemaic_core::cli_install::decode_user_path(&buf)?;
             path.ty = ty;
             Ok(path)
         }
@@ -456,5 +447,18 @@ fn unlink_command(link: &Path, target: &Path) -> Result<String, String> {
             tracing::info!(link = %link.display(), "unlinked the CLI");
             Ok(cli_install::report_unlinked(link))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// Core decides by the registry's type numbers without linking the Windows
+    /// API; these are the numbers the API means by them.
+    #[cfg(windows)]
+    #[test]
+    fn cores_registry_types_are_windows_own() {
+        use windows_sys::Win32::System::Registry::{REG_EXPAND_SZ, REG_SZ};
+        assert_eq!(schemaic_core::cli_install::REG_SZ, REG_SZ);
+        assert_eq!(schemaic_core::cli_install::REG_EXPAND_SZ, REG_EXPAND_SZ);
     }
 }

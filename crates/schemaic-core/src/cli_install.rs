@@ -253,6 +253,47 @@ fn normalize_entry(entry: &str, os: Os) -> String {
     s
 }
 
+/// The registry's `REG_SZ` value type.
+pub const REG_SZ: u32 = 1;
+/// The registry's `REG_EXPAND_SZ` value type — what Windows gives a user
+/// `Path`, and what one is created as when there is none yet.
+pub const REG_EXPAND_SZ: u32 = 2;
+
+/// May a user `Path` value of registry type `ty` be read and written back?
+///
+/// Text only. Anything else — a `REG_MULTI_SZ` a tool wrote, a binary blob — is
+/// refused rather than reinterpreted, because the write goes back in the type it
+/// was read in and a guess about bytes would be written over the user's PATH.
+pub fn user_path_type(ty: u32) -> Result<(), String> {
+    if ty == REG_SZ || ty == REG_EXPAND_SZ {
+        Ok(())
+    } else {
+        Err(
+            "Your user PATH isn't stored as text in the registry, so it was left alone."
+                .to_string(),
+        )
+    }
+}
+
+/// The text of a user `Path` value from the UTF-16 units the registry returned.
+///
+/// Trailing NULs are the terminator — a stored value may carry one, two, or
+/// none — and are dropped. The rest must be **lossless** UTF-16: an unpaired
+/// surrogate cannot survive the round trip through a `String`, and writing back
+/// a replacement character would corrupt the entry holding it, so the value is
+/// refused and left as it is.
+pub fn decode_user_path(units: &[u16]) -> Result<String, String> {
+    let mut end = units.len();
+    while end > 0 && units[end - 1] == 0 {
+        end -= 1;
+    }
+    String::from_utf16(&units[..end]).map_err(|_| {
+        "Your user PATH contains characters that can't be read back safely, so it was left \
+         alone."
+            .to_string()
+    })
+}
+
 /// Is `dir` one of the entries of a `PATH`-style value?
 ///
 /// Entries are compared with trailing separators dropped; on Windows also
@@ -652,6 +693,45 @@ impl InstallState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn utf16(s: &str) -> Vec<u16> {
+        s.encode_utf16().collect()
+    }
+
+    /// Both text types are read; anything else is left alone.
+    #[test]
+    fn only_a_text_path_value_is_read() {
+        assert!(user_path_type(REG_SZ).is_ok());
+        assert!(user_path_type(REG_EXPAND_SZ).is_ok());
+        // REG_BINARY, REG_DWORD, REG_MULTI_SZ.
+        for ty in [3, 4, 7] {
+            assert!(user_path_type(ty).is_err(), "{ty}");
+        }
+    }
+
+    /// However many terminators the value was stored with, none reaches the
+    /// text — one left behind would be written back as part of the last entry.
+    #[test]
+    fn the_terminators_are_dropped_and_nothing_else() {
+        let body = r"C:\a;%USERPROFILE%\b;C:\ünï";
+        for nuls in 0..3 {
+            let mut units = utf16(body);
+            units.extend(std::iter::repeat_n(0, nuls));
+            assert_eq!(decode_user_path(&units).unwrap(), body, "{nuls} NULs");
+        }
+        assert_eq!(decode_user_path(&[]).unwrap(), "");
+        assert_eq!(decode_user_path(&[0, 0]).unwrap(), "");
+    }
+
+    /// An unpaired surrogate cannot come back out of a `String`, so the value
+    /// is refused rather than written back with a replacement character in it.
+    #[test]
+    fn a_value_that_is_not_lossless_utf16_is_refused() {
+        let mut units = utf16(r"C:\a;C:\b");
+        units.push(0xD800);
+        units.push(0);
+        assert!(decode_user_path(&units).is_err());
+    }
 
     fn win(exe: &str, path_var: &str, shim: bool) -> Probe {
         Probe {
