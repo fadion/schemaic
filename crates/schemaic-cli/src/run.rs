@@ -163,6 +163,14 @@ where
 }
 
 async fn dispatch(command: Command) -> Exit {
+    // **Before the saved connections are read**: a version needs none of them,
+    // and a damaged file must not stop anyone learning which build they have —
+    // the first thing to ask when reporting that it is damaged.
+    if command == Command::Version {
+        return emit_stdout(&crate::args::version_text())
+            .err()
+            .unwrap_or(Exit::Ok);
+    }
     // Unhydrated: `list` shows no secret, and `connect` fills in only the one
     // connection a command runs against, once its guard has said yes.
     let file = match schemaic_conn::secrets::load_connections_readonly() {
@@ -177,6 +185,7 @@ async fn dispatch(command: Command) -> Exit {
         }
     };
     match command {
+        Command::Version => unreachable!("`version` is answered before the file is read"),
         Command::List { all, format } => list(&file.connections, all, format),
         Command::Databases {
             conn,

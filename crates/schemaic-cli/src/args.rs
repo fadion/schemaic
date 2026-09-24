@@ -88,6 +88,16 @@ pub enum Command {
         #[arg(long, default_value_t = DEFAULT_TIMEOUT_SECS, value_parser = at_least_one_second())]
         timeout: u64,
     },
+    /// Print the version — the same line as `--version`.
+    Version,
+}
+
+/// What `schemaic version` prints: clap's own `--version` text, so the
+/// subcommand and the flag are one answer rather than two that agree today.
+pub fn version_text() -> String {
+    <Cli as clap::CommandFactory>::command()
+        .render_version()
+        .to_string()
 }
 
 /// [`crate::query::DEFAULT_TIMEOUT`] in the unit `--timeout` takes.
@@ -166,7 +176,16 @@ pub fn wants_cli(argv: &[String]) -> bool {
     matches!(
         argv.get(1).map(String::as_str),
         Some(
-            "list" | "databases" | "query" | "exec" | "help" | "--help" | "-h" | "--version" | "-V"
+            "list"
+                | "databases"
+                | "query"
+                | "exec"
+                | "version"
+                | "help"
+                | "--help"
+                | "-h"
+                | "--version"
+                | "-V"
         )
     )
 }
@@ -185,7 +204,7 @@ mod tests {
 
     #[test]
     fn every_subcommand_routes_to_the_cli() {
-        for name in ["list", "databases", "query", "exec", "help"] {
+        for name in ["list", "databases", "query", "exec", "version", "help"] {
             assert!(
                 wants_cli(&argv(&["schemaic", name])),
                 "`{name}` must reach the CLI"
@@ -250,6 +269,32 @@ mod tests {
         assert_eq!(sql, "SELECT 1");
         assert_eq!(target.conn.connection, "prod");
         assert_eq!(target.database, None);
+    }
+
+    /// `version` is what someone types before they know the flag spelling,
+    /// and it needs nothing else.
+    #[test]
+    fn version_is_a_subcommand_of_its_own() {
+        assert_eq!(
+            parse(&["schemaic", "version"]).unwrap().command,
+            Command::Version
+        );
+        let err = parse(&["schemaic", "version", "-c", "1"]).unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::UnknownArgument);
+    }
+
+    /// **The subcommand and the flag print the same thing** — one text, the
+    /// one clap renders for `--version`, so the two cannot drift apart.
+    #[test]
+    fn version_prints_what_the_flag_prints() {
+        let flag = parse(&["schemaic", "--version"]).unwrap_err();
+        assert_eq!(flag.kind(), clap::error::ErrorKind::DisplayVersion);
+        assert_eq!(version_text(), flag.to_string());
+        assert!(
+            version_text().contains(env!("CARGO_PKG_VERSION")),
+            "{}",
+            version_text()
+        );
     }
 
     #[test]
@@ -481,7 +526,7 @@ mod tests {
     #[test]
     fn the_help_text_names_every_subcommand() {
         let text = parse(&["schemaic", "help"]).unwrap_err().to_string();
-        for name in ["list", "databases", "query", "exec"] {
+        for name in ["list", "databases", "query", "exec", "version"] {
             assert!(text.contains(name), "help must mention `{name}`");
         }
     }

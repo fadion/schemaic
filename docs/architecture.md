@@ -19691,7 +19691,7 @@ existing prose was left alone.
     ordering between them is free, and this way the protocol stream stays clean whichever of the
     four opened it.
     **The headless-CLI branch sits between those two, and being *before* Velopack is the load-bearing
-    part.** `schemaic list`/`databases`/`query`/`exec` return from `main` ahead of the hook, the file
+    part.** `schemaic list`/`databases`/`query`/`exec`/`version` return from `main` ahead of the hook, the file
     logger, the fonts and Floem: none of that belongs in a one-shot command, and `auto_apply_on_startup` is free
     to find a staged package and exit-and-relaunch the process — which is safe for a launch that has
     read no session state and is not safe in the middle of a command whose output someone is piping.
@@ -19784,7 +19784,7 @@ existing prose was left alone.
     `APPDATA` redirected to a scratch profile, removed a seeded entry, exited 0, left `PATH`
     byte-identical to the backup and logged the removal.
 - `schemaic-cli` — Schemaic without a window: `schemaic list` / `databases` / `query` / `exec` /
-  `help`, so a person or an agent can run SQL against a saved connection with the app closed and without being
+  `version` / `help`, so a person or an agent can run SQL against a saved connection with the app closed and without being
   handed a credential. Its whole dependency list is `schemaic-core`, `schemaic-conn`, `schemaic-db`,
   `clap`, `tokio` and `tokio-util` — **no floem**, which is what splitting `schemaic-conn` out of
   `schemaic-app` was for. It is a **library** with two front ends, because the front ends differ per
@@ -19855,7 +19855,13 @@ existing prose was left alone.
     `schemaic --mcp-serve list` is the app being asked to serve). The converse holds too: through the
     app's own binary a new subcommand does not reach the CLI until its name is added here, as
     `databases` was (`every_subcommand_routes_to_the_cli`) — `schemaic.com` calls `run::main`
-    without asking, so a missing name shows everywhere except through it.
+    without asking, so a missing name shows everywhere except through it. **`version` is what a
+    missing name costs**: `--version`/`-V` were routed, but `schemaic version` was neither a
+    subcommand nor on this list, so through `schemaic.com` it was a usage error and through the
+    app's own binary it **opened the GUI** instead of answering. The test now names it, and was
+    watched fail before the name went in. `Command::Version` takes no arguments and prints
+    `version_text`, which is clap's own `render_version()`, so the subcommand and the flag are one
+    answer rather than two that agree today (`version_prints_what_the_flag_prints`).
   - `cli/select.rs` — which saved connection an invocation means, and whether it may have it.
     **One entry point, and it gates**: `select` resolves the id-or-name *and* applies
     `Connection::cli_access`, rather than handing a connection back for a caller to remember to
@@ -20081,6 +20087,12 @@ existing prose was left alone.
     not an error but carries a hint, since "no connection has CLI access yet" is the correct answer
     to *what may I use* and the baffling one without it. `database_for` is the flag, else the connection's own, else `None` —
     an empty string there would read as a real database name to the guard's `no_database` arm.
+    **`version` is answered at the top of `dispatch`, before `load_connections_readonly` runs**: it
+    needs no saved connection, and a damaged `connections.json` must not stop anyone learning which
+    build they have — the first thing asked of someone reporting it damaged. Checked by hand with a
+    corrupt file: `schemaic version` printed `schemaic 0.27.1` and exited 0, `schemaic list` 4. The
+    `match` below keeps an `unreachable!` arm for it; folding `version` into that `match` like its
+    peers would look tidier and put the file read back in front of it.
     **`databases` lists the names `-d` takes, because a CLI user usually starts with none.** The
     app never needs a default database — the tree lists every one — so a saved connection often
     has none, and on MySQL 8.4 `schemaic query -c AEU "SELECT COUNT(*) FROM company"` failed with
