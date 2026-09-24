@@ -129,7 +129,11 @@ substitute for the statement, and none of these is a style preference.
   published package-repository identity is the same rule, second instance**: the Pages base URL,
   `Origin`/`Suite`, the `Signed-By` keyring path and the **published key fingerprint** are written
   into users' source lists — or checked against by hand — and moving one orphans every install just
-  as silently. Its guards are CI steps in `pages.yml`, for the same reason. They were added one
+  as silently. Its guards are CI steps in `pages.yml`, for the same reason. **The application id
+  (`core::APP_ID`) is a third instance** — the Linux window's `app_id`/`WM_CLASS`, the desktop
+  entry's file name and the macOS bundle id at once; renaming it orphans every installed entry and
+  its taskbar icon. A crate names this one, so its guard is a `cargo test`
+  (`the_app_id_names_the_desktop_entry_and_matches_every_packager`) that reads every packager's copy. They were added one
   value at a time and the list above ran ahead of them: for a while only the base URL was actually
   compared, while this sentence claimed all of it.
 - **Splitting `lib.rs`/`main.rs`** has its own procedure; read it before starting one.

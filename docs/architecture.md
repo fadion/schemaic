@@ -12551,8 +12551,11 @@ existing prose was left alone.
     `Cargo.toml`, and that number is already what the caption renders, so there is no second edit to
     remember. Two tests sit beside the function, and the equality one is honest in its own doc
     comment about how far it reaches — same-crate `env!` on both sides means a literal substituted
-    for the derivation still passes until the *next* bump parts the two; catching it the moment it
-    was written would mean reading `Cargo.toml` from a test, which the no-filesystem rule forbids.
+    for the derivation still passes until the *next* bump parts the two. Reading `Cargo.toml` would
+    not close that gap — it holds the same number `env!` does — and catching the literal the moment
+    it was written would take a source gate over `app_version_label`'s body: the kind of test that
+    reading the repository's own files is exempt for (the `ui::source_gate` family, `APP_ID`'s
+    packager test), which nobody has judged worth writing for a one-line function.
     It is a **caption, not a fifth heading**: `theme::text_dim()` at `theme::font_body()`, unbold,
     deliberately not `settings_section_header`'s styling, so it identifies the panel instead of
     competing with `General`. **Its spacing is derived from the section header's, not chosen**, and
@@ -19667,6 +19670,11 @@ existing prose was left alone.
     appid`, the metainfo file's `<id>` and `<launchable>`, and `release.yml`'s `--bundleId`; it was
     watched fail with the constant lower-cased. On a case-insensitive filesystem the entry's
     existence cannot tell the two spellings apart, so the text comparisons are what catch that.
+    **Verified on Wayland, not yet on X11**: a Linux debug build run under WSLg with
+    `WAYLAND_DEBUG=1` and a throwaway `XDG_CONFIG_HOME` sent
+    `xdg_toplevel.set_app_id("io.github.fadion.Schemaic")` before its `set_title`. X11 reads the
+    same winit field into `WM_CLASS`, but `xprop` has not been run against it; nor has a real GNOME
+    dock been seen to draw the icon.
     **`StartupWMClass=schemaic` stays, and is not dead weight**: it is what matches a build from
     before the patch on X11, and `install.sh`'s AppImage route fetches the `.desktop` from `main`
     while the binary beside it comes from the latest release, so the two can be any number of
