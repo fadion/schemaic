@@ -2175,13 +2175,6 @@ async fn collect_schema(client: &Client) -> Result<DbSchema, DbError> {
         ),
     )
     .await?;
-    let mut trigger_cols: HashMap<(String, String, String), Vec<String>> = HashMap::new();
-    for r in &trigger_cols_all {
-        trigger_cols
-            .entry((cell(r, 0), cell(r, 1), cell(r, 2)))
-            .or_default()
-            .push(cell(r, 3));
-    }
 
     // Post-fold enrichment: the things `assemble_schema` can't carry because
     // MySQL has no equivalent — an index's backing constraint, and each foreign
@@ -2208,17 +2201,95 @@ async fn collect_schema(client: &Client) -> Result<DbSchema, DbError> {
         .filter(|(.., cm)| !cm.is_empty())
         .map(|(ns, name, _, cm)| ((ns.clone(), name.clone()), cm.clone()))
         .collect();
-    let checks = group_by(check_all.iter().map(|r| ((cell(r, 0), cell(r, 1)), r)));
-    let triggers = group_by(trigger_all.iter().map(|r| ((cell(r, 0), cell(r, 1)), r)));
+    pg_fold_checks_and_triggers(&mut tables, &check_all, &trigger_all, &trigger_cols_all);
     for t in &mut tables {
         let ns = t.schema.clone().unwrap_or_default();
         let key = (ns.clone(), t.name.clone());
-        let checks = checks.get(&key).map(Vec::as_slice).unwrap_or_default();
-        let triggers = triggers.get(&key).map(Vec::as_slice).unwrap_or_default();
         t.comment = table_comments.get(&key).cloned();
         if t.is_view {
             t.view_options = view_options.get(&key).cloned();
         }
+        for ix in &mut t.indexes {
+            ix.constraint = idx_constraints
+                .get(&(ns.clone(), t.name.clone(), ix.name.clone()))
+                .cloned();
+        }
+        for fk in &mut t.foreign_keys {
+            if let Some((on_delete, on_update, match_type, deferrable)) =
+                fk_rules.get(&(ns.clone(), t.name.clone(), fk.name.clone()))
+            {
+                fk.on_delete = on_delete.clone();
+                fk.on_update = on_update.clone();
+                fk.match_type = match_type.clone();
+                fk.deferrable = deferrable.clone();
+            }
+        }
+    }
+
+    // The standalone objects. They hang off the database, not off any table, so
+    // they're gathered after the per-table fold rather than inside it.
+    let (enums, domains) = pg_types(client).await?;
+    Ok(DbSchema {
+        tables,
+        enums,
+        domains,
+        sequences: pg_sequences(client).await?,
+        routines: routines_on(client)
+            .await?
+            .into_iter()
+            .map(std::sync::Arc::new)
+            .collect(),
+        // PostgreSQL has no scheduled events — `pg_cron` is an extension with
+        // its own catalogue and no `CREATE EVENT` grammar — so this stays empty
+        // and `ddl::supports_event_editing` is false here.
+        events: Vec::new(),
+        // A MySQL-family flavour is meaningless here, and `Unknown` is what
+        // makes the emitter withhold MariaDB-specific behaviour rather than
+        // assume it.
+        flavour: schemaic_core::schema::ServerFlavour::Unknown,
+        // Not recorded, and not a gap: the only reader of `DbSchema::database`
+        // subtracts an object's own address, and nothing PostgreSQL reports
+        // carries one — `ref_schema` here is a real namespace inside the
+        // database and `pg_get_viewdef` qualifies with that namespace, both of
+        // which are part of the object. Filling it would cost a
+        // `current_database()` round trip to change no answer.
+        database: None,
+        extension_routines: extension_routine_names(client).await?,
+    })
+}
+
+/// Put each table's CHECK constraints and triggers on it — and, on a view, the
+/// `INSTEAD OF` triggers its re-create would drop — from [`collect_schema`]'s
+/// three catalogue reads: `checks` (`nspname, relname, conname,
+/// pg_get_constraintdef`), `triggers` (`nspname, relname, tgname, tgtype,
+/// tgenabled, is-constraint, function, pg_get_triggerdef, old table, new
+/// table`) and `trigger_cols` (`nspname, relname, tgname, attname`, one row per
+/// `UPDATE OF` column, in order).
+///
+/// Pure, so the fold is tested without a server — [`pg_fold_types`]' shape,
+/// and MySQL's `apply_check_constraints` is the same fold for that engine. Each
+/// read is bucketed by `(schema, table)` once rather than rescanned per table;
+/// a row for a table not in `tables` is dropped.
+fn pg_fold_checks_and_triggers(
+    tables: &mut [TableInfo],
+    checks: &[Vec<Option<String>>],
+    triggers: &[Vec<Option<String>>],
+    trigger_cols: &[Vec<Option<String>>],
+) {
+    let mut update_of: HashMap<(String, String, String), Vec<String>> = HashMap::new();
+    for r in trigger_cols {
+        update_of
+            .entry((cell(r, 0), cell(r, 1), cell(r, 2)))
+            .or_default()
+            .push(cell(r, 3));
+    }
+    let checks = group_by(checks.iter().map(|r| ((cell(r, 0), cell(r, 1)), r)));
+    let triggers = group_by(triggers.iter().map(|r| ((cell(r, 0), cell(r, 1)), r)));
+    for t in tables {
+        let ns = t.schema.clone().unwrap_or_default();
+        let key = (ns.clone(), t.name.clone());
+        let checks = checks.get(&key).map(Vec::as_slice).unwrap_or_default();
+        let triggers = triggers.get(&key).map(Vec::as_slice).unwrap_or_default();
         t.check_constraints = checks
             .iter()
             .map(|r| CheckInfo {
@@ -2252,7 +2323,7 @@ async fn collect_schema(client: &Client) -> Result<DbSchema, DbError> {
                     table: t.name.clone(),
                     timing,
                     events,
-                    update_columns: trigger_cols
+                    update_columns: update_of
                         .get(&(ns.clone(), t.name.clone(), cell(r, 2)))
                         .cloned()
                         .unwrap_or_default(),
@@ -2311,14 +2382,13 @@ async fn collect_schema(client: &Client) -> Result<DbSchema, DbError> {
                     // server had been refusing silently ran the trigger
                     // function, and a replica-only trigger fired on the origin —
                     // under a plan reporting success and a preview saying the
-                    // statement was "put back afterwards". The model three lines
-                    // up already reads `tgenabled` and names this hazard; the
+                    // statement was "put back afterwards". The model above
+                    // already reads `tgenabled` and names this hazard; the
                     // replay added in the same file did not ask it.
                     match TriggerEnabled::parse(&cell(r, 4)).alter_clause() {
                         None => create,
                         Some(clause) => format!(
-                            "{create}
-ALTER TABLE {}.{} {clause} {};",
+                            "{create}\nALTER TABLE {}.{} {clause} {};",
                             pg_ident(&ns),
                             pg_ident(&t.name),
                             pg_ident(&cell(r, 2)),
@@ -2327,53 +2397,7 @@ ALTER TABLE {}.{} {clause} {};",
                 })
                 .collect();
         }
-        for ix in &mut t.indexes {
-            ix.constraint = idx_constraints
-                .get(&(ns.clone(), t.name.clone(), ix.name.clone()))
-                .cloned();
-        }
-        for fk in &mut t.foreign_keys {
-            if let Some((on_delete, on_update, match_type, deferrable)) =
-                fk_rules.get(&(ns.clone(), t.name.clone(), fk.name.clone()))
-            {
-                fk.on_delete = on_delete.clone();
-                fk.on_update = on_update.clone();
-                fk.match_type = match_type.clone();
-                fk.deferrable = deferrable.clone();
-            }
-        }
     }
-
-    // The standalone objects. They hang off the database, not off any table, so
-    // they're gathered after the per-table fold rather than inside it.
-    let (enums, domains) = pg_types(client).await?;
-    Ok(DbSchema {
-        tables,
-        enums,
-        domains,
-        sequences: pg_sequences(client).await?,
-        routines: routines_on(client)
-            .await?
-            .into_iter()
-            .map(std::sync::Arc::new)
-            .collect(),
-        // PostgreSQL has no scheduled events — `pg_cron` is an extension with
-        // its own catalogue and no `CREATE EVENT` grammar — so this stays empty
-        // and `ddl::supports_event_editing` is false here.
-        events: Vec::new(),
-        // A MySQL-family flavour is meaningless here, and `Unknown` is what
-        // makes the emitter withhold MariaDB-specific behaviour rather than
-        // assume it.
-        flavour: schemaic_core::schema::ServerFlavour::Unknown,
-        // Not recorded, and not a gap: the only reader of `DbSchema::database`
-        // subtracts an object's own address, and nothing PostgreSQL reports
-        // carries one — `ref_schema` here is a real namespace inside the
-        // database and `pg_get_viewdef` qualifies with that namespace, both of
-        // which are part of the object. Filling it would cost a
-        // `current_database()` round trip to change no answer.
-        database: None,
-        extension_routines: extension_routine_names(client).await?,
-    })
 }
 
 /// The **names** of every function an extension owns — the complement of what
@@ -5815,6 +5839,105 @@ mod index_key_tests {
         ];
         let (enums, _) = pg_fold_types(&types, &labels, &[]);
         assert_eq!(enums[0].values, vec!["a,b", "line1\nline2", ""]);
+    }
+
+    // ── Checks and triggers ─────────────────────────────────────────────────
+
+    fn table(schema: &str, name: &str, is_view: bool) -> TableInfo {
+        TableInfo {
+            schema: Some(schema.to_string()),
+            name: name.to_string(),
+            is_view,
+            ..Default::default()
+        }
+    }
+
+    /// `nspname, relname, tgname, tgtype, tgenabled, is-constraint, function,
+    /// pg_get_triggerdef, old table, new table`. `tgtype` 19 is `ROW | BEFORE |
+    /// UPDATE`.
+    fn trigger_row(ns: &str, rel: &str, name: &str, enabled: &str) -> Vec<Option<String>> {
+        let def = format!(
+            "CREATE TRIGGER {name} BEFORE UPDATE ON {ns}.{rel} FOR EACH ROW EXECUTE FUNCTION f()"
+        );
+        row(&[ns, rel, name, "19", enabled, "0", "f", &def, "", ""])
+    }
+
+    /// Each check lands on its own table, keyed by schema **and** name — two
+    /// schemas may both have a `t` — and a check for a table this fetch did not
+    /// list is dropped rather than attached somewhere.
+    #[test]
+    fn a_check_goes_to_the_table_of_its_own_schema() {
+        let mut tables = vec![table("public", "t", false), table("sales", "t", false)];
+        let checks = vec![
+            row(&["sales", "t", "s_pos", "CHECK ((x > 0)) NOT VALID"]),
+            row(&["public", "t", "p_pos", "CHECK ((y >= 0))"]),
+            row(&["public", "gone", "g", "CHECK ((z > 0))"]),
+        ];
+        pg_fold_checks_and_triggers(&mut tables, &checks, &[], &[]);
+        let names = |t: &TableInfo| {
+            t.check_constraints
+                .iter()
+                .map(|c| c.name.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(names(&tables[0]), vec!["p_pos"]);
+        assert_eq!(names(&tables[1]), vec!["s_pos"]);
+        assert_eq!(tables[0].check_constraints[0].expression, "y >= 0");
+        // `NOT VALID` is read from the same clause the predicate came from.
+        assert!(tables[0].check_constraints[0].validated);
+        assert!(!tables[1].check_constraints[0].validated);
+    }
+
+    /// A trigger's `UPDATE OF` columns are its own, in the order the server
+    /// listed them — not those of a same-named trigger on another table — and
+    /// a table with no rows gets none.
+    #[test]
+    fn a_trigger_takes_its_own_update_of_columns_in_order() {
+        let mut tables = vec![
+            table("public", "a", false),
+            table("public", "b", false),
+            table("public", "c", false),
+        ];
+        let triggers = vec![
+            trigger_row("public", "a", "trg", "O"),
+            trigger_row("public", "b", "trg", "D"),
+        ];
+        let cols = vec![
+            row(&["public", "a", "trg", "z"]),
+            row(&["public", "b", "trg", "q"]),
+            row(&["public", "a", "trg", "a,b"]),
+        ];
+        pg_fold_checks_and_triggers(&mut tables, &[], &triggers, &cols);
+        assert_eq!(tables[0].triggers.len(), 1);
+        assert_eq!(tables[0].triggers[0].update_columns, vec!["z", "a,b"]);
+        assert_eq!(tables[0].triggers[0].table, "a");
+        assert_eq!(tables[1].triggers[0].update_columns, vec!["q"]);
+        assert_eq!(tables[1].triggers[0].enabled, TriggerEnabled::Disabled);
+        assert!(tables[2].triggers.is_empty());
+        // Empty transition-table names are absent, not `Some("")`.
+        assert_eq!(tables[0].triggers[0].old_table, None);
+        // Only a view records what a re-create would drop.
+        assert!(tables[0].dependent_ddl.is_empty());
+    }
+
+    /// A view's triggers are replayed after its drop-and-create, with the
+    /// enabled state `pg_get_triggerdef` leaves out restated.
+    #[test]
+    fn a_views_triggers_are_kept_for_its_re_create_with_their_state() {
+        let mut tables = vec![table("public", "v", true)];
+        let triggers = vec![
+            trigger_row("public", "v", "on", "O"),
+            trigger_row("public", "v", "off", "D"),
+        ];
+        pg_fold_checks_and_triggers(&mut tables, &[], &triggers, &[]);
+        let ddl = &tables[0].dependent_ddl;
+        assert_eq!(ddl.len(), 2);
+        assert!(!ddl[0].contains("ALTER TABLE"), "{}", ddl[0]);
+        assert!(
+            ddl[1].ends_with("\nALTER TABLE \"public\".\"v\" DISABLE TRIGGER \"off\";"),
+            "{}",
+            ddl[1]
+        );
     }
 
     #[test]

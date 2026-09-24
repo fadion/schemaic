@@ -5891,7 +5891,10 @@ existing prose was left alone.
     the one engine that takes that arm, so a view with an `INSTEAD OF INSERT` trigger, narrowed in the
     view editor, came back with none — measured on 16.15, with the plan reporting success and the
     preview naming nothing. `pg::fetch_schema` fills it from `pg_get_triggerdef` for a view and leaves
-    it empty for a table, and the live tier's `a_recreated_view_keeps_the_triggers_the_drop_took`
+    it empty for a table — in the pure `pg_fold_checks_and_triggers`, where
+    `a_views_triggers_are_kept_for_its_re_create_with_their_state` pins the replay and the disabled
+    state it restates without a server — and the live tier's
+    `a_recreated_view_keeps_the_triggers_the_drop_took`
     gates on the arm the plan takes rather than on the engine. Deliberately the server's own statement
     rather than a
     re-emission from `TriggerInfo` — and that stays the call now that `sqlite::triggers_of` *does*
@@ -8502,7 +8505,15 @@ existing prose was left alone.
   and a domain's constraints by `(namespace, type)` through it rather than filtering and cloning
   both row sets per type, MySQL's `apply_check_constraints` and `apply_triggers` bucket by table
   name, and `apply_fk_rules` — which does not call it — builds a name → table-index map once, the
-  first table of a name winning as the per-rule `find` did.
+  first table of a name winning as the per-rule `find` did. **The checks and triggers are folded by
+  a pure function**, `pg_fold_checks_and_triggers`, defined after `collect_schema` in the shape of
+  `pg_fold_types` and MySQL's `apply_check_constraints`: it takes the three row sets (checks,
+  triggers, `UPDATE OF` columns) as the owned `Vec<Vec<Option<String>>>` `query_all` already
+  returns, so nothing about the wire stands between it and a unit test. It used to sit inline in
+  the per-table loop with no test at all, while the MySQL folds beside it had theirs. It builds the
+  `UPDATE OF` map itself, keyed `(namespace, table, trigger)` — two tables may each have a `trg` —
+  and `a_check_goes_to_the_table_of_its_own_schema` and
+  `a_trigger_takes_its_own_update_of_columns_in_order` pin the two keys.
   **`table_list_sql` returns four columns, and the fourth is the table comment.** It is the one
   table option PostgreSQL has and nothing was reading it: the designer emits `COMMENT ON TABLE`
   correctly and this query never selected `obj_description`, so a comment set through the app was
