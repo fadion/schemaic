@@ -7351,18 +7351,29 @@ existing prose was left alone.
     directory is the one holding `schemaic.com`, and **a copy with no shim beside it is refused**
     rather than planned — a development build has `schemaic-cli.exe` there instead, so putting that
     directory on `PATH` would hand a terminal the GUI
-    (`windows_without_the_shim_is_refused_and_says_why`). **`Already` is read off
+    (`windows_without_the_shim_is_refused_and_says_why`). So is a folder whose name holds a `;`:
+    `D:\Downloads;old\Schemaic` would be read back as `D:\Downloads` and a cwd-relative
+    `old\Schemaic`, neither of them this folder and neither one Remove could ever match
+    (`a_folder_whose_name_holds_a_semicolon_is_refused`). **A copy at a drive root plans `D:\`,
+    never `D:`** — `parent_of` keeps a root's separator on Windows, because a bare `D:` as a `PATH`
+    entry is whatever folder is current on drive D, not its root
+    (`a_copy_at_a_drive_root_adds_the_root_not_the_drive`). **`Already` is read off
     `Probe::user_path`** — the registry's user `PATH` at probe time, `%NAME%`-expanded — and off
     the process `PATH` only when that can't be read, because the process `PATH` was fixed at
     launch: after Install → restart → Remove it still held the folder, so Install answered
     "already on your `PATH`" and wrote nothing
     (`windows_decides_from_the_user_path_in_the_registry_when_it_can_read_it`). A copy only on
     the machine `PATH` gets a redundant user entry, harmless. macOS and a loose Linux binary get
-    `~/.local/bin/schemaic` → the running executable. **Under an AppImage the target is `$APPIMAGE`,
+    `~/.local/bin/schemaic` → the running executable, **and are refused when `Probe::exe_exists`
+    says it is gone**: once a package upgrade has replaced the binary under a running process,
+    Linux's `current_exe()` reports `<exe> (deleted)`, and Install linked to that and reported
+    success (`a_replaced_binary_is_not_linked_to`). **Under an AppImage the target is `$APPIMAGE`,
     never `current_exe`**: the running executable sits inside the image's mount, which is gone the
     moment the app exits, so a link to it — or an "already on `PATH`" answered because of it — would
     be false by the next terminal (`an_appimage_links_the_image_not_its_mount`,
-    `an_appimage_mount_on_path_is_not_already_installed`). A `.deb`/`.rpm` install is
+    `an_appimage_mount_on_path_is_not_already_installed`); the existence check is skipped there,
+    since the target is the image and not `exe` (`an_appimage_links_to_the_image_whatever_exe_says`).
+    A `.deb`/`.rpm` install is
     `/usr/bin/schemaic` with `/usr/bin` on `PATH`, so the planner answers `Already` and nothing is
     written; that needs the target to be *named* `schemaic`, since a `schemaic-nightly` in a `PATH`
     directory does not make the command resolve
@@ -7370,7 +7381,9 @@ existing prose was left alone.
     `path_has_dir` is string work rather than `Path`, per OS — `;`, case-folding, `/` read as `\`,
     quotes and trailing separators dropped on Windows; `:` and exact bytes elsewhere — so the Windows
     arms answer the same when the tests run on Linux CI, where a backslash is an ordinary file-name
-    byte. An empty entry never matches, because on Unix it means the current directory.
+    byte. An empty entry never matches, because on Unix it means the current directory. A drive
+    root keeps its separator through `normalize_entry`, which used to trim `d:\` to `d:` and so
+    made the root and the drive-relative entry one (`a_drive_relative_entry_is_not_the_drive_root`).
     **`user_path_update` appends to the *raw* user `PATH`, and that is the point of it.** The
     classic `setx PATH "%PATH%;…"` writes the *expanded, merged* system-plus-user value back into
     the user key; this keeps every entry as written — an unexpanded `%USERPROFILE%\…` stays
@@ -7398,14 +7411,31 @@ existing prose was left alone.
     `PATH` — the uninstall hook must clean up whether or not the shim survived
     (`windows_removal_does_not_need_the_shim`), and what this process inherited says nothing about
     the registry, which is what Remove edits (`windows_removal_ignores_the_process_path`).
+    **It is offered only to a Velopack install**: `removal` refuses when `Probe::velopack` is false —
+    the exe's folder is not `current\` with `Update.exe` in its parent, which the portable `.zip`
+    never is. A Velopack folder is one nobody else puts programs in, so an entry naming it is
+    Install's; a portable copy's may be a `C:\tools` the user had on `PATH` for years, where Install
+    answered `Already` and wrote nothing, and the entry cannot say who wrote it — so Remove would
+    have taken every other program in that folder off `PATH` with ours
+    (`a_portable_copy_is_not_offered_remove`). The cost is that a portable copy's Install has no
+    in-app undo; the refusal points at Environment Variables instead. The uninstall hook is
+    unaffected, since it only ever runs for a Velopack install.
     `Unlink { link, target }` is the pair Install computes, because `plan` and `removal` both go
     through `link_target`, `on_path_as_command` and `link_path` — so under an AppImage Remove looks
     for a link to `$APPIMAGE` too (`unix_removal_targets_the_same_link_install_writes`).
     `Package { dir }` is a deb/rpm's `/usr/bin`: the command came with the package, so removing it
     is the package manager's job, and `report_package` says so instead of touching it.
-    `user_path_remove` takes out every entry naming the directory once `expand_env` has been applied
-    — so an entry written unexpanded goes too — keeps every other entry verbatim, empty ones
-    included, and returns `None` when there was none. **The round-trip is pinned**:
+    `user_path_remove` takes out every entry whose *whole* `expand_env` expansion, normalised, is
+    the directory — so an entry written unexpanded goes too
+    (`remove_takes_a_variable_that_is_exactly_our_folder`) — keeps every other entry verbatim, empty
+    ones included, and returns `None` when there was none. **Whole, not any `;`-piece of it**: that
+    was the old test, so a `%TOOLS%` expanding to `C:\tools;<dir>` was dropped and took `C:\tools`
+    off `PATH` with ours. Such an entry is now left as written
+    (`remove_leaves_a_variable_that_names_other_folders_too`) — taking one folder out of a variable
+    is an edit to the variable, not to `PATH`. The asymmetry is deliberate: `plan` and
+    `user_path_update` still count that variable as holding the folder, since the command does
+    resolve through it, so Install writes nothing, and `removable` answers `false`, so no Remove is
+    offered for an entry Remove would not take. **The round-trip is pinned**:
     `user_path_remove_undoes_user_path_update_exactly` gives back every entry the user wrote, and
     the one difference it allows is a trailing `;`, the separator the entry was appended after.
     `unlink_step` mirrors `link_step` over the same `link_points_at` resolution: `Remove` a link to
@@ -12179,7 +12209,9 @@ existing prose was left alone.
     the outcome on a line of its own under the whole row — `theme::text_dim` on success,
     `theme::error` on failure — which stays there for the rest of the session, naming the path the
     operation resolved. Remove is on the row because it is the only undo on macOS and under an
-    AppImage, where nothing of ours runs when the app is thrown away. **It is offered only while it
+    AppImage, where nothing of ours runs when the app is thrown away; on Windows a portable copy
+    never shows it, because `core::cli_install::removal` refuses a non-Velopack install and
+    `install_cli::installed` answers `false` for it. **It is offered only while it
     would do something**: it first shipped unconditionally, so a copy that had never installed
     showed a Remove that could only report it found nothing. It is now built in a `dyn_container`
     over `CliCommand::installed` — `core::cli_install::removable`'s answer, read by
@@ -19278,17 +19310,24 @@ existing prose was left alone.
     the one place ahead of the normal `init` that needs it: with no UI the log is the only record
     of what the hook did, and it lives in the config directory, which the uninstall leaves behind.
     Velopack has no uninstaller on macOS or for an AppImage, so nothing of ours runs there at all.
-  - `install_cli.rs` — the side-effect half of `core::cli_install`, which owns every decision and
-    every test: this gathers the `Probe` (`current_exe`, `APPIMAGE`, `HOME`, `PATH`, whether
-    `schemaic.com` sits beside the exe, and on Windows `user_path_now` — the registry value read
-    and expanded) and performs the `Plan` (`install`) or the `Removal`
+  - `install_cli.rs` — the side-effect half of `core::cli_install`, which owns every decision but
+    one, and every test: this gathers the `Probe` (`current_exe`, whether it still `exists`,
+    `APPIMAGE`, `HOME`, `PATH`, whether `schemaic.com` sits beside the exe, whether it is a
+    Velopack install — its folder named `current`, compared ASCII-case-insensitively, with
+    `Update.exe` in the parent, neither of which the portable `.zip` ships — and on Windows
+    `user_path_now` — the registry value read and expanded) and performs the `Plan` (`install`) or
+    the `Removal`
     (`remove`); `on_uninstall`, Windows-only, is `remove` for the Velopack hook with the outcome
     logged rather than shown — a copy that never ran Install finds nothing and changes nothing.
     **On Windows it is a read-modify-write of `HKCU\Environment\Path` in the value's own registry
     type**, through `RegCreateKeyExW`/`RegQueryValueExW`/`RegSetValueExW`: a `REG_EXPAND_SZ` must
     stay one or every `%USERPROFILE%\…` entry in it stops resolving, and a missing value is created
     as `REG_EXPAND_SZ`. A value of any other type, or one that is not valid UTF-16, is **refused
-    rather than written back lossily**. Both directions share that through a `win` module:
+    rather than written back lossily**. **That decode is the one decision made here rather than in
+    core, and nothing tests it**: the type gate (`REG_SZ`/`REG_EXPAND_SZ` only), the trailing-NUL
+    trim and the lossless UTF-16 conversion sit inline in `win::UserPath::open`, between the two
+    `RegQueryValueExW` calls, where no test reaches them without a registry — an open gap,
+    backlogged, not a sanctioned exception. Both directions share that through a `win` module:
     `UserPath { key, ty, raw }`, whose `open` reads the raw value in its own type (or refuses it),
     whose `write` puts a value back in the type it was read in, and whose `Drop` closes the key, so
     every early return between the open and the write closes it too; and

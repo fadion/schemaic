@@ -1,6 +1,8 @@
 //! Settings → General → Command line → Install / Remove, and the Windows
 //! uninstall hook: the side-effect half of [`schemaic_core::cli_install`],
-//! which owns every decision and its tests.
+//! which owns every decision but one, and every test. The one is the registry
+//! value's decode in `win::UserPath::open` (text types only, trailing NULs
+//! trimmed, lossless UTF-16), which no test reaches without a registry.
 //!
 //! This module gathers the [`Probe`] and performs the [`Plan`] or the
 //! [`Removal`] — a registry edit plus a `WM_SETTINGCHANGE` broadcast on
@@ -97,7 +99,18 @@ fn probe() -> Result<Probe, String> {
     let console_shim = exe
         .parent()
         .is_some_and(|dir| dir.join(cli_install::WINDOWS_SHIM).is_file());
+    // Velopack's Windows layout: `<root>\current\schemaic.exe` with
+    // `<root>\Update.exe`. The portable `.zip` ships neither.
+    let velopack = exe.parent().is_some_and(|dir| {
+        dir.file_name()
+            .is_some_and(|n| n.eq_ignore_ascii_case("current"))
+            && dir
+                .parent()
+                .is_some_and(|root| root.join("Update.exe").is_file())
+    });
     Ok(Probe {
+        velopack,
+        exe_exists: exe.exists(),
         os: Os::current(),
         // An empty `APPIMAGE` is no image at all.
         appimage: std::env::var_os("APPIMAGE")

@@ -20,7 +20,7 @@
 //!   directory on `PATH` and there is nothing to do.
 //!
 //! [`removal`] is the inverse, and only ever undoes what Install could have
-//! written: this copy's folder out of the user `PATH`, or a link that points at
+//! written: a Velopack install's folder out of the user `PATH`, or a link that points at
 //! this copy (or at nothing). On Windows Velopack's uninstall hook runs it too;
 //! nothing of ours runs when a macOS app or an AppImage is thrown away, so
 //! there the Remove button is the only undo.
@@ -75,6 +75,14 @@ pub struct Probe {
     pub user_path: Option<String>,
     /// Windows only: whether [`WINDOWS_SHIM`] sits beside `exe`.
     pub console_shim: bool,
+    /// Windows only: whether `exe` is a Velopack install — its folder is
+    /// `current\` with `Update.exe` beside it. The portable `.zip` is not, and
+    /// may be unpacked into a folder the user already had on `PATH`.
+    pub velopack: bool,
+    /// Whether `exe` still exists. On Linux `current_exe()` names the old
+    /// binary with a ` (deleted)` suffix once a package upgrade has replaced it
+    /// under the running process, and a link to that points at nothing.
+    pub exe_exists: bool,
 }
 
 /// What Install will do.
@@ -102,6 +110,16 @@ pub fn plan(p: &Probe) -> Result<Plan, String> {
                      development build doesn't."
                 ));
             }
+            // A `;` inside the folder's name would be read back as two entries —
+            // `D:\Downloads;old\Schemaic` puts `D:\Downloads` and a cwd-relative
+            // `old\Schemaic` on PATH, neither of them this folder, and neither
+            // one that Remove could ever match.
+            if dir.contains(';') {
+                return Err(format!(
+                    "This copy of Schemaic is in {dir}, whose name holds a ';' — PATH would read \
+                     it as two different folders. Move it somewhere without one and try again."
+                ));
+            }
             let dir = PathBuf::from(dir);
             // The registry's user PATH when it can be read, because that is
             // what the next terminal gets; this process's PATH was fixed at
@@ -117,6 +135,15 @@ pub fn plan(p: &Probe) -> Result<Plan, String> {
         }
         Os::MacOs | Os::Linux => {
             let target = link_target(p);
+            // The AppImage's target is the image file, not `exe`, so only a
+            // plain binary is asked whether it is still there.
+            if p.appimage.is_none() && !p.exe_exists {
+                return Err(format!(
+                    "{} was replaced while Schemaic was running, so a link to it would point at \
+                     nothing. Restart Schemaic, then Install again.",
+                    p.exe.display()
+                ));
+            }
             if let Some(dir) = on_path_as_command(p, &target) {
                 return Ok(Plan::Already { dir });
             }
@@ -184,10 +211,24 @@ fn seps(os: Os) -> &'static [char] {
 }
 
 /// Everything before the last separator; the root itself when that is the only
-/// one.
+/// one — `/` on Unix, and on Windows a drive's root **with its separator**:
+/// `D:` alone is not the root of D but whatever folder is current on D, so a
+/// PATH entry of `D:` finds the wrong programs.
 fn parent_of(path: &str, os: Os) -> Option<&str> {
     let i = path.rfind(seps(os))?;
-    Some(if i == 0 { &path[..1] } else { &path[..i] })
+    Some(
+        if i == 0 || (os == Os::Windows && is_drive_root(&path[..=i])) {
+            &path[..=i]
+        } else {
+            &path[..i]
+        },
+    )
+}
+
+/// `X:\` (or `X:/`) exactly.
+fn is_drive_root(s: &str) -> bool {
+    let b = s.as_bytes();
+    b.len() == 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && (b[2] == b'\\' || b[2] == b'/')
 }
 
 fn file_name(path: &str, os: Os) -> &str {
@@ -205,7 +246,8 @@ fn normalize_entry(entry: &str, os: Os) -> String {
             .to_lowercase(),
         Os::MacOs | Os::Linux => entry.to_string(),
     };
-    while s.len() > 1 && s.ends_with(seps(os)) {
+    // A drive root keeps its separator: `d:\` and `d:` are different entries.
+    while s.len() > 1 && s.ends_with(seps(os)) && !(os == Os::Windows && is_drive_root(&s)) {
         s.pop();
     }
     s
@@ -368,12 +410,26 @@ pub enum Removal {
 /// Unlike [`plan`] this does not ask for the Windows shim: the entry to remove
 /// is this copy's folder whether or not `schemaic.com` survived, and the
 /// uninstall hook in particular must clean up without it.
+///
+/// **On Windows only a Velopack install is offered Remove.** Its folder is one
+/// nobody else puts programs in, so an entry naming it is Install's. A portable
+/// copy's folder is whatever the user unpacked it into — a `C:\tools` that was
+/// on `PATH` for years, which Install found there and did not write — and
+/// taking it out would take every other program in it with it. The entry
+/// itself cannot say who wrote it.
 pub fn removal(p: &Probe) -> Result<Removal, String> {
     match p.os {
         Os::Windows => {
             let exe = p.exe.to_string_lossy();
             let dir = parent_of(&exe, Os::Windows)
                 .ok_or_else(|| format!("Can't tell which folder {exe} is in."))?;
+            if !p.velopack {
+                return Err(format!(
+                    "This is a portable copy, so Remove can't tell whether Install put {dir} on \
+                     your PATH or it was there already with other programs in it. Take it out \
+                     under Environment Variables if Install added it."
+                ));
+            }
             Ok(Removal::UserPath {
                 dir: PathBuf::from(dir),
             })
@@ -395,16 +451,26 @@ pub fn removal(p: &Probe) -> Result<Removal, String> {
 /// `%NAME%` expansion through `lookup`, so an entry written unexpanded goes
 /// too — or `None` when there was none. Every other entry, empty ones and a
 /// trailing `;` included, is kept exactly as written.
+///
+/// **An entry is ours only when its whole expansion is `dir`.** A `%TOOLS%`
+/// that expands to `C:\tools;<dir>` names our folder among others, and
+/// dropping it took `C:\tools` off `PATH` with ours; such an entry is left as
+/// written, since removing one folder from inside a variable is an edit to the
+/// variable, not to `PATH`.
 pub fn user_path_remove(
     raw: &str,
     dir: &Path,
     lookup: impl Fn(&str) -> Option<String>,
 ) -> Option<String> {
+    let want = normalize_entry(&dir.to_string_lossy(), Os::Windows);
+    if want.is_empty() {
+        return None;
+    }
     let mut removed = false;
     let kept: Vec<&str> = raw
         .split(';')
         .filter(|entry| {
-            let ours = path_has_dir(&expand_env(entry, &lookup), dir, Os::Windows);
+            let ours = normalize_entry(&expand_env(entry, &lookup), Os::Windows) == want;
             removed |= ours;
             !ours
         })
@@ -596,6 +662,8 @@ mod tests {
             path_var: path_var.to_string(),
             user_path: None,
             console_shim: shim,
+            velopack: true,
+            exe_exists: true,
         }
     }
 
@@ -608,7 +676,95 @@ mod tests {
             path_var: path_var.to_string(),
             user_path: None,
             console_shim: false,
+            velopack: false,
+            exe_exists: true,
         }
+    }
+
+    // ---- the review's cases (v0.26.0..) ----
+
+    /// **A drive root keeps its separator.** `D:` on PATH is whatever folder is
+    /// current on D, not its root.
+    #[test]
+    fn a_copy_at_a_drive_root_adds_the_root_not_the_drive() {
+        assert_eq!(
+            plan(&win(r"D:\schemaic.exe", "", true)),
+            Ok(Plan::AddUserPath {
+                dir: PathBuf::from(r"D:\")
+            })
+        );
+    }
+
+    /// `D:\` and `D:` are different entries, so an existing `D:` does not make
+    /// the root "already on PATH".
+    #[test]
+    fn a_drive_relative_entry_is_not_the_drive_root() {
+        assert!(!path_has_dir("D:", Path::new(r"D:\"), Os::Windows));
+        assert!(path_has_dir(r"d:\", Path::new(r"D:\"), Os::Windows));
+        assert!(path_has_dir(r"C:\x\", Path::new(r"C:\x"), Os::Windows));
+    }
+
+    /// A `;` in the folder's name would be read back as two unrelated entries.
+    #[test]
+    fn a_folder_whose_name_holds_a_semicolon_is_refused() {
+        let got = plan(&win(r"D:\Downloads;old\Schemaic\schemaic.exe", "", true));
+        let why = got.expect_err("a folder PATH cannot hold");
+        assert!(why.contains(';'), "{why}");
+    }
+
+    /// **A variable naming several folders is not ours to drop.** Removing it
+    /// took the user's other folders off PATH with ours.
+    #[test]
+    fn remove_leaves_a_variable_that_names_other_folders_too() {
+        let tools = format!(r"C:\tools;{VELOPACK_DIR}");
+        let lookup = |n: &str| (n == "TOOLS").then(|| tools.clone());
+        assert_eq!(
+            user_path_remove(r"%TOOLS%;C:\x", Path::new(VELOPACK_DIR), lookup),
+            None
+        );
+    }
+
+    /// A variable that expands to exactly our folder is still ours.
+    #[test]
+    fn remove_takes_a_variable_that_is_exactly_our_folder() {
+        let lookup = |n: &str| (n == "SCH").then(|| VELOPACK_DIR.to_string());
+        assert_eq!(
+            user_path_remove(r"%SCH%;C:\x", Path::new(VELOPACK_DIR), lookup),
+            Some(r"C:\x".to_string())
+        );
+    }
+
+    /// **A portable copy is not offered Remove.** Its folder may be a shared
+    /// one that was on PATH long before Schemaic, and the entry cannot say who
+    /// wrote it.
+    #[test]
+    fn a_portable_copy_is_not_offered_remove() {
+        let mut p = win(r"C:\tools\schemaic.exe", r"C:\tools", true);
+        p.velopack = false;
+        // `installed()` answers false for a refused removal, so this is also
+        // what keeps the Settings row from offering the button.
+        assert!(removal(&p).is_err());
+        p.velopack = true;
+        assert!(removal(&p).is_ok(), "the installed copy still is");
+    }
+
+    /// **A binary replaced under the running process is not linked to.** Linux
+    /// names it `<exe> (deleted)`, a path that exists nowhere.
+    #[test]
+    fn a_replaced_binary_is_not_linked_to() {
+        let mut p = unix(Os::Linux, "/usr/bin/schemaic (deleted)", "/usr/bin:/bin");
+        p.exe_exists = false;
+        assert!(plan(&p).is_err());
+    }
+
+    /// Under an AppImage the target is the image, so a missing mount path does
+    /// not refuse.
+    #[test]
+    fn an_appimage_links_to_the_image_whatever_exe_says() {
+        let mut p = unix(Os::Linux, "/tmp/.mount_x/usr/bin/schemaic", "/usr/bin");
+        p.exe_exists = false;
+        p.appimage = Some(PathBuf::from("/home/me/Schemaic.AppImage"));
+        assert!(matches!(plan(&p), Ok(Plan::Link { .. })));
     }
 
     const VELOPACK_EXE: &str = r"C:\Users\me\AppData\Local\Schemaic\current\schemaic.exe";
