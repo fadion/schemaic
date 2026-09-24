@@ -11665,32 +11665,40 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
     // Settings → General → Command line → Install / Remove. Off-thread because
     // the Windows arm waits on a broadcast to every top-level window; the guard
     // against a click while either runs sits here, beside the launch. Whether
-    // Remove is on offer is re-read on the same thread after each one, and once
-    // at startup — a registry read or a `stat`, but not the UI thread's to wait
-    // on.
+    // Remove is on offer, and what the row says ahead of a click, are re-read on
+    // the same thread after each one, and once at startup — a registry read or
+    // a `stat`, but not the UI thread's to wait on.
     let cli_command = {
-        use schemaic_core::cli_install::InstallState;
+        use schemaic_core::cli_install::{InstallState, Os, RowStatus, row_status};
         let state = RwSignal::new(InstallState::default());
         let installed = RwSignal::new(false);
-        let report_installed = create_ext_action(cx, move |now: bool| installed.set(now));
-        std::thread::spawn(move || report_installed(install_cli::installed()));
+        let status = RwSignal::new(row_status(Os::current(), None));
+        let read_now = || (install_cli::installed(), install_cli::row_status());
+        let report_now = create_ext_action(cx, move |(now, st): (bool, RowStatus)| {
+            installed.set(now);
+            status.set(st);
+        });
+        std::thread::spawn(move || report_now(read_now()));
         let action = move |running: InstallState, work: fn() -> Result<String, String>| {
             Rc::new(move || {
                 if state.get_untracked().busy() {
                     return;
                 }
                 state.set(running.clone());
-                let report =
-                    create_ext_action(cx, move |(res, now): (Result<String, String>, bool)| {
+                let report = create_ext_action(
+                    cx,
+                    move |(res, (now, st)): (Result<String, String>, (bool, RowStatus))| {
                         installed.set(now);
+                        status.set(st);
                         state.set(match res {
                             Ok(msg) => InstallState::Done(msg),
                             Err(msg) => InstallState::Failed(msg),
                         });
-                    });
+                    },
+                );
                 std::thread::spawn(move || {
                     let res = work();
-                    report((res, install_cli::installed()));
+                    report((res, read_now()));
                 });
             }) as Rc<dyn Fn()>
         };
@@ -11699,6 +11707,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             remove: action(InstallState::Removing, install_cli::remove),
             state,
             installed,
+            status,
         }
     };
 

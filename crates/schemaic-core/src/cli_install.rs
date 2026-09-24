@@ -668,6 +668,53 @@ pub fn hint(os: Os) -> &'static str {
     }
 }
 
+/// What the Settings row says before anything is clicked, and whether Install
+/// has anything left to do.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RowStatus {
+    pub hint: String,
+    pub can_install: bool,
+}
+
+/// The row's status from [`plan`]'s answer — `None` until it has been read.
+///
+/// **The hint used to be [`hint`] alone**, a description of what Install
+/// *would* do, so a deb/rpm install on Linux read "Links it into
+/// ~/.local/bin" beside an enabled Install, and the click answered that the
+/// command was already on `PATH`, in `/usr/bin`. [`Plan::Already`] is that
+/// answer ahead of the click: the row says where the command is and has
+/// nothing to install. On macOS and Linux it means the running binary *is*
+/// the command; on Windows, that its folder is on the user `PATH` already.
+///
+/// Anything else keeps the plain hint and the button — including a plan that
+/// failed, whose reason the click reports; a disabled button would give none.
+pub fn row_status(os: Os, plan: Option<&Result<Plan, String>>) -> RowStatus {
+    let Some(Ok(Plan::Already { dir })) = plan else {
+        return RowStatus {
+            hint: hint(os).to_string(),
+            can_install: true,
+        };
+    };
+    let hint = match os {
+        Os::Windows => format!(
+            "Run Schemaic from a terminal by name. Its folder, {}, is already on your user \
+             PATH.",
+            dir.display()
+        ),
+        // Joined by hand: `dir` is a Unix path here, and `Path::join` would use
+        // the separator of whatever platform is asking.
+        Os::MacOs | Os::Linux => format!(
+            "Run Schemaic from a terminal by name. The {COMMAND} command comes with the app, \
+             at {}/{COMMAND}.",
+            dir.display().to_string().trim_end_matches('/')
+        ),
+    };
+    RowStatus {
+        hint,
+        can_install: false,
+    }
+}
+
 /// The Settings row's lifecycle. Transient — never persisted.
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub enum InstallState {
@@ -1531,5 +1578,70 @@ mod tests {
         }
         assert!(hint(Os::Windows).contains("PATH"));
         assert!(hint(Os::MacOs).contains(".local/bin"));
+    }
+
+    // ---- row_status: what the row says before a click ----
+
+    /// **The Linux report: a deb/rpm install was offered Install, under a hint
+    /// promising a `~/.local/bin` link**, and the click answered "already on
+    /// your PATH, in /usr/bin". The row now says so up front — the command
+    /// comes with the app, and where — and has nothing to install.
+    #[test]
+    fn a_package_install_says_where_the_command_is_and_offers_no_install() {
+        let p = unix(
+            Os::Linux,
+            "/usr/bin/schemaic",
+            "/usr/local/bin:/usr/bin:/bin",
+        );
+        let s = row_status(Os::Linux, Some(&plan(&p)));
+        assert!(!s.can_install, "{s:?}");
+        assert!(s.hint.contains("/usr/bin/schemaic"), "{s:?}");
+        assert!(s.hint.contains("comes with"), "{s:?}");
+        assert!(!s.hint.contains(".local/bin"), "{s:?}");
+    }
+
+    /// Windows' `Already` is a folder Install (or the user) put on the user
+    /// PATH — Remove's case, not a package's — so it is worded as that.
+    #[test]
+    fn a_windows_folder_already_on_path_offers_no_install_and_names_it() {
+        let mut p = win(&format!(r"{VELOPACK_DIR}\schemaic.exe"), "", true);
+        p.user_path = Some(format!(r"C:\Windows;{VELOPACK_DIR}"));
+        let s = row_status(Os::Windows, Some(&plan(&p)));
+        assert!(!s.can_install, "{s:?}");
+        assert!(s.hint.contains(VELOPACK_DIR), "{s:?}");
+        assert!(s.hint.contains("user PATH"), "{s:?}");
+    }
+
+    /// **Where Install has work, the row is unchanged**: an AppImage links, so
+    /// it keeps the link hint and an enabled button.
+    #[test]
+    fn an_install_with_work_to_do_keeps_the_hint_and_the_button() {
+        let mut p = unix(Os::Linux, "/tmp/.mount_x/usr/bin/schemaic", "/usr/bin");
+        p.appimage = Some(PathBuf::from("/home/me/Apps/Schemaic.AppImage"));
+        let s = row_status(Os::Linux, Some(&plan(&p)));
+        assert_eq!(
+            s,
+            RowStatus {
+                hint: hint(Os::Linux).to_string(),
+                can_install: true
+            }
+        );
+    }
+
+    /// Not read yet, or a plan that failed: Install stays on offer, because the
+    /// click is what says why — a disabled button with no reason is worse.
+    #[test]
+    fn an_unread_or_failed_plan_leaves_install_on_offer() {
+        for os in [Os::Windows, Os::MacOs, Os::Linux] {
+            assert_eq!(
+                row_status(os, None),
+                RowStatus {
+                    hint: hint(os).to_string(),
+                    can_install: true
+                }
+            );
+            let failed: Result<Plan, String> = Err("no home".to_string());
+            assert!(row_status(os, Some(&failed)).can_install);
+        }
     }
 }

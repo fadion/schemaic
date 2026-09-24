@@ -7587,7 +7587,29 @@ existing prose was left alone.
     (`reports_name_the_path_they_resolved`); `report_linked` **always** adds a "put it on your
     `PATH`" hint on macOS, since an app started from Finder gets launchd's minimal `PATH` and cannot
     tell whether the user's shell has `~/.local/bin` (`report_linked_always_hints_on_macos`), and on
-    Linux only when the process's own `PATH` lacks it. `InstallState` (`Idle`, `Running`,
+    Linux only when the process's own `PATH` lacks it.
+    **`row_status(os, Option<&Result<Plan, String>>) -> RowStatus { hint, can_install }` is `plan`'s
+    answer asked ahead of the click.** The row's hint used to be `hint(os)` alone — a description of
+    what Install *would* do — beside an Install that was always enabled, with `plan` run only behind
+    the button: on a `.deb` install the row read "Links it into ~/.local/bin", and the click
+    answered that the command was already on `PATH`, in `/usr/bin`. Now
+    `Some(Ok(Plan::Already { dir }))` gives `can_install: false` and a hint naming where — on macOS
+    and Linux that the command comes with the app, at `{dir}/schemaic`, joined by hand because
+    `dir` is a Unix path and `Path::join` would use the separator of whichever platform is asking;
+    on Windows that its folder is already on the user `PATH`, since `Already` there is a folder
+    Install or the user put there, Remove's case rather than a package's
+    (`a_package_install_says_where_the_command_is_and_offers_no_install`,
+    `a_windows_folder_already_on_path_offers_no_install_and_names_it`). Everything else — `None` for
+    a plan not read yet, `Link`, `AddUserPath`, and a plan that *failed* — keeps `hint(os)` and the
+    button (`an_install_with_work_to_do_keeps_the_hint_and_the_button`,
+    `an_unread_or_failed_plan_leaves_install_on_offer`). **The failed plan is the one not to
+    tidy**: its reason reaches the user only through the click, so a disabled button there would
+    refuse with no explanation — and it is why a Windows development build, whose missing
+    `schemaic.com` is an `Err`, keeps the old row. The tests get their `Plan` from `plan(&probe)`,
+    never a hand-made one, so they cover the composition rather than `row_status` alone. A link
+    Install made does not grey the button on macOS or Linux: `plan` goes on answering `Link` while
+    the target's own directory is not on `PATH`, and a second click is `link_step`'s `Keep`; on
+    Windows the re-read registry answers `Already`, so it does. `InstallState` (`Idle`, `Running`,
     `Removing`, `Done(String)`, `Failed(String)`) is the Settings row's lifecycle — transient, never
     persisted — and `busy()` is `Running | Removing`, because **either operation blocks both
     buttons**: a Remove racing an Install over the same registry value or link would leave
@@ -12549,9 +12571,9 @@ existing prose was left alone.
     Spawning a file manager is a process launch, so it is the app boundary's `open_config_dir` and
     not a `Command` in a view; a machine with no config directory gets the path-less hint and a
     disabled button rather than a control that silently does nothing.
-    `cli_row` sits under it and is General's other trip outside the app: **Command line**, the
-    per-OS hint from `core::cli_install::hint`, **Install** and **Remove** side by side at
-    `action_gap()` (tabindex 30 and 35), reading **Installing** / **Removing** while one runs, and
+    `cli_row` sits under it and is General's other trip outside the app: **Command line**, a
+    hint read from `CliCommand::status` (`core::cli_install::row_status`), **Install** and
+    **Remove** side by side at `action_gap()` (tabindex 30 and 35), reading **Installing** / **Removing** while one runs, and
     the outcome on a line of its own under the whole row — `theme::text_dim` on success,
     `theme::error` on failure — which stays there for the rest of the session, naming the path the
     operation resolved. Remove is on the row because it is the only undo on macOS and under an
@@ -12565,8 +12587,15 @@ existing prose was left alone.
     registering when it is built and unregistering in its cleanup; one that goes while it holds the
     keyboard hands it back through `in_focus_ring_with`'s cleanup like any other. The container
     and the outcome's are both `Display::None` when they have nothing to show, not merely empty,
-    since an empty flex child still takes its gap — the AI modal's harness-notice fix. **The
-    outcome sits under the row, not in the label column, and a tidy-up that moves it back
+    since an empty flex child still takes its gap — the AI modal's harness-notice fix. **Install,
+    by contrast, is disabled rather than hidden when it has nothing to do**: a greyed Install beside
+    a hint saying where the command already is reads as "done", where an empty row would read as
+    "missing". It first shipped always enabled under a static hint, so a `.deb` install read "Links
+    it into ~/.local/bin" and the click answered that the command was already in `/usr/bin`. The
+    hint is now a reactive `label` over `status`, and Install is built in a `dyn_container` keyed on
+    `can_install`, because `action_button_dyn`'s `enabled` is fixed when the button is built — the
+    same reason Remove sits in one. That container is never empty, so it needs no `Display::None`.
+    **The outcome sits under the row, not in the label column, and a tidy-up that moves it back
     reintroduces the bug**: as a third line there it made the column taller, and the buttons,
     centred on the column, slid down to sit beside the message instead of the label. So the row is
     a `v_stack` of an `h_stack` (label column and buttons, `items_center`) and the outcome, at a
@@ -12575,9 +12604,10 @@ existing prose was left alone.
     in the Settings modal's `modal_w(420)` nothing did, so a long error was laid out past the
     modal's edge and clipped. `outcome_line` is `width_full().min_width(0)`, so it wraps at the
     modal's width. All of it arrives as one
-    `Ui::cli_command: CliCommand { install, remove, state, installed }` — two actions, the one
-    `RwSignal<InstallState>` they share and the `RwSignal<bool>` behind Remove, which the app
-    owns: a registry write or a symlink is the app boundary's job for `open_config_dir`'s reason.
+    `Ui::cli_command: CliCommand { install, remove, state, installed, status }` — two actions, the
+    one `RwSignal<InstallState>` they share, the `RwSignal<bool>` behind Remove and the
+    `RwSignal<RowStatus>` behind the hint and Install, which the app owns: a registry write or a
+    symlink is the app boundary's job for `open_config_dir`'s reason.
     **Both buttons stay enabled while either runs**, and the guard against a click on either is
     `main.rs`'s, beside the launch — the labels only say so.
     **The AI modal is where the harness is chosen, and half its controls follow that choice.** The
@@ -19767,22 +19797,28 @@ existing prose was left alone.
     key, which `Access::Write`'s `RegCreateKeyExW` would), `read_link_state` through `existing_at`,
     nothing at all for a `Package` — and asks `removable`. **Every failure answers `false`**: a probe or removal that
     errs, a registry value `open` refuses, a link that can't be read. The worst case is then a
-    missing button, never a Remove that reports it found nothing. The closures the Settings row
-    calls are built in `main.rs` next to `update::start`, one factory making both: it owns the
+    missing button, never a Remove that reports it found nothing. **`row_status()` is the third
+    question — what the row says, and whether Install has anything to do** — and decides as little:
+    `probe`, `plan`, and core's `row_status`, with a probe that fails passed on as a plan not yet
+    read, so it too keeps the plain hint and an enabled Install, whose click reports why. The
+    closures the Settings row calls are built in `main.rs` next to `update::start`, one factory making both: it owns the
     **double-click guard** — a click on either button while `state.busy()` is ignored, so an
     Install blocks a Remove and the reverse, the buttons themselves staying enabled — and posts the
-    result back with `create_ext_action` as a `(Result, bool)`, the `bool` being `installed()`
-    re-read on the same worker thread once the operation is done, so Remove appears or goes in the
-    same update that shows the outcome. The block also reads it once at startup, on a `std::thread`
-    of its own — a registry read or a `stat`, but not the UI thread's to wait on — and
-    `CliCommand::installed` is `false` until that answers.
+    result back with `create_ext_action` as a `(Result, (bool, RowStatus))`, the pair being
+    `installed()` and `row_status()` re-read together on the same worker thread once the operation
+    is done, so Remove appears or goes, and Install greys or returns, in the same update that shows
+    the outcome. The block also reads the pair once at startup, on a `std::thread` of its own — a
+    registry read or a `stat`, but not the UI thread's to wait on — and until that answers
+    `CliCommand::installed` is `false` and `status` is `row_status(os, None)`: the plain hint and an
+    enabled Install.
     **Verified by hand on both platforms.** Linux, under WSL: Remove with nothing there, Install
     then Remove, a dangling link removed, a live link elsewhere and a regular file both refused, an
     AppImage's target file surviving the removal, and the package case. Windows: an Install → Remove
     round-trip left the real user `PATH` byte-identical and still `REG_EXPAND_SZ`, and a second
     Remove reported it absent; and the real debug `schemaic.exe --veloapp-uninstall 0.26.0`, with
     `APPDATA` redirected to a scratch profile, removed a seeded entry, exited 0, left `PATH`
-    byte-identical to the backup and logged the removal.
+    byte-identical to the backup and logged the removal. **`row_status` is not yet verified by
+    hand**: the greyed Install and the "comes with the app" hint need a real `.deb` install to see.
 - `schemaic-cli` — Schemaic without a window: `schemaic list` / `databases` / `query` / `exec` /
   `version` / `help`, so a person or an agent can run SQL against a saved connection with the app closed and without being
   handed a credential. Its whole dependency list is `schemaic-core`, `schemaic-conn`, `schemaic-db`,
@@ -19802,7 +19838,8 @@ existing prose was left alone.
   reachable only by its full path. Settings → General → Command line → **Install** closes that, on a
   click and never at install time: `core::cli_install` decides (the user `PATH` on Windows, a
   `~/.local/bin` link elsewhere) and `app/install_cli.rs` writes. **Remove** beside it undoes that,
-  and on Windows so does the Velopack uninstall hook.
+  and on Windows so does the Velopack uninstall hook. On a `.deb`/`.rpm` the row says where the
+  command already is and greys Install out, rather than offering a link it would not make.
   The command surface was verified end to end against a live MariaDB; `databases` and the
   no-database hint against MySQL 8.4 and PostgreSQL 16.
   - `cli/args.rs` — the clap surface, kept separate from doing anything so that defaults, aliases

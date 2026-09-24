@@ -35,6 +35,15 @@ pub(crate) fn remove() -> Result<String, String> {
     }
 }
 
+/// What the Settings row says before a click, and whether Install has anything
+/// to do: [`cli_install::plan`]'s answer, asked ahead of the button rather than
+/// only behind it. A probe that fails is an unread plan — the plain hint and
+/// an enabled Install, whose click reports why.
+pub(crate) fn row_status() -> cli_install::RowStatus {
+    let plan = probe().map(|p| cli_install::plan(&p));
+    cli_install::row_status(Os::current(), plan.as_ref().ok())
+}
+
 /// Would Remove do anything — is the command ours to take away? The Settings
 /// row shows Remove only when it is. A read that fails answers no: the worst
 /// case is a missing button, never a Remove that reports it found nothing.

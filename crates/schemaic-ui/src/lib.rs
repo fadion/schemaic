@@ -6254,6 +6254,10 @@ pub struct CliCommand {
     /// Would Remove do anything? Read at startup and after every Install or
     /// Remove; Remove is offered only while it holds. Transient.
     pub installed: RwSignal<bool>,
+    /// The row's hint, and whether Install has anything to do — read when
+    /// `installed` is. On a deb/rpm install the command already comes with
+    /// the app, so the row says where and Install is disabled. Transient.
+    pub status: RwSignal<schemaic_core::cli_install::RowStatus>,
 }
 
 /// Which panel occupies the right column. AI and Terminal are mutually

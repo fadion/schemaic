@@ -12,13 +12,14 @@ use floem::prelude::*;
 use crate::consts::{TERM_FONT_SIZES, chat_pad_h};
 use crate::widgets::{
     ActionKind, MenuEntry, action_button, action_button_dyn, action_gap, autohide,
-    focus_root_with_ring, form_hint, form_label_style, modal_title, nothing, panel_style,
+    focus_root_with_ring, form_hint, form_hint_style, form_label_style, modal_title, nothing,
+    panel_style,
 };
 use crate::{
     AiActions, AiEffort, AiUi, ConnUi, FieldCfg, Harness, LayoutUi, SchemaScope, TermActions,
     TermCursor, TermUi, edit_field, icons, theme,
 };
-use schemaic_core::cli_install::{self, InstallState};
+use schemaic_core::cli_install::InstallState;
 
 // ===== moved from lib.rs (settings modals) =====
 // The Terminal settings pane: shell + font size + cursor style dropdowns, and
@@ -1476,6 +1477,13 @@ fn log_row(open: Rc<dyn Fn()>, ring: crate::widgets::FocusRing, tabindex: u32) -
 /// a `dyn_container` so it also leaves the Tab ring when it goes — a button
 /// that reports "nothing to remove" is one the row should not have offered.
 ///
+/// **Install is disabled, not hidden, when there is nothing to install**
+/// (`status`) — a deb/rpm on Linux, whose `/usr/bin` binary already is the
+/// command. The hint says so and where, and a greyed button beside it reads as
+/// "done" where an empty row would read as "missing". It was offered anyway,
+/// under a hint promising a `~/.local/bin` link, and the click answered that
+/// the command was already in `/usr/bin`.
+///
 /// **The outcome is a line of its own under the whole row**, not a third line
 /// in the label column. In the column it made the column taller, so the
 /// buttons — centred on the column — slid down to sit beside the message
@@ -1491,6 +1499,7 @@ fn cli_row(
         remove,
         state,
         installed,
+        status,
     } = cmd;
     let outcome_line = |msg: String, color: fn() -> floem::peniko::Color| {
         text(msg)
@@ -1548,12 +1557,33 @@ fn cli_row(
             false => s.display(floem::style::Display::None),
         })
     };
+    // **Disabled when there is nothing to install** — a deb/rpm's `/usr/bin`
+    // binary is already the command, and the hint above says so and where.
+    // Rebuilt on that one bool, like Remove, since the button's enabled state
+    // is fixed when it is built; the bool changes only after a click.
+    let install_slot = dyn_container(
+        move || status.with(|s| s.can_install),
+        move |can| {
+            let install = install.clone();
+            action_button_dyn(
+                move || match state.get() {
+                    InstallState::Running => "Installing".to_string(),
+                    _ => "Install".to_string(),
+                },
+                ActionKind::Quiet,
+                can,
+                ring.clone(),
+                tabindex,
+                move || install(),
+            )
+        },
+    );
     v_stack((
         h_stack((
             v_stack((
                 text("Command line")
                     .style(|s| s.color(theme::text()).font_size(theme::font_label())),
-                form_hint(cli_install::hint(cli_install::Os::current())),
+                floem::views::label(move || status.with(|s| s.hint.clone())).style(form_hint_style),
             ))
             .style(|s| {
                 s.flex_col()
@@ -1561,21 +1591,8 @@ fn cli_row(
                     .flex_grow(1.0_f32)
                     .min_width(0.0)
             }),
-            h_stack((
-                action_button_dyn(
-                    move || match state.get() {
-                        InstallState::Running => "Installing".to_string(),
-                        _ => "Install".to_string(),
-                    },
-                    ActionKind::Quiet,
-                    true,
-                    ring,
-                    tabindex,
-                    move || install(),
-                ),
-                remove_slot,
-            ))
-            .style(|s| s.flex_row().items_center().gap(action_gap())),
+            h_stack((install_slot, remove_slot))
+                .style(|s| s.flex_row().items_center().gap(action_gap())),
         ))
         .style(|s| s.items_center().width_full().gap(theme::scaled(10.0))),
         outcome,
