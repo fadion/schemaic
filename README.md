@@ -175,7 +175,8 @@ already saved:
 
 ```
 schemaic list
-schemaic query "SELECT * FROM orders LIMIT 5" --connection=prod --format=json
+schemaic databases --connection=prod
+schemaic query "SELECT * FROM orders LIMIT 5" --connection=prod --database=shop --format=json
 schemaic exec "UPDATE orders SET state = 'sent' WHERE id = 7" --connection=prod
 ```
 
@@ -189,6 +190,11 @@ A connection is reachable this way only once you turn on **CLI access** for it
 in its connection settings. That is off for every connection, including ones you
 saved before this existed, because the command line runs with nobody watching.
 `schemaic list --all` shows the ones that are not exposed and why.
+
+A statement runs in the connection's default database, or the one `-d`/`--database`
+names. Schemaic itself never needs a default — it lists every database — so a saved
+connection often has none; `schemaic databases` lists the names `-d` takes, and a
+statement that failed for want of one says so. `schemaic version` prints the version.
 
 `query` runs reads and nothing else — not a flag away from a write, a different
 subcommand, on a session the server itself holds read-only. It returns 200 rows
