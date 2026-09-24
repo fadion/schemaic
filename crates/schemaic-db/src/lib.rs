@@ -854,12 +854,29 @@ impl Db {
         cancel: CancellationToken,
         tx: tokio::sync::mpsc::Sender<ExportChunk>,
     ) -> Result<u64, DbError> {
+        self.stream_query_enforced(database, sql, chunk_rows, cancel, tx, None)
+            .await
+    }
+
+    /// [`Self::stream_query`] on a session enforcing `enforce` — the grid's
+    /// *All rows* export on a read-only connection, which re-runs the tab's
+    /// statement and so must be refused a write the text gate passed exactly
+    /// as the run that showed it was. See [`Self::fetch_query_enforced`].
+    pub async fn stream_query_enforced(
+        &self,
+        database: Option<&str>,
+        sql: &str,
+        chunk_rows: usize,
+        cancel: CancellationToken,
+        tx: tokio::sync::mpsc::Sender<ExportChunk>,
+        enforce: Option<Enforce>,
+    ) -> Result<u64, DbError> {
         let mut dest = RowDest::Chunked {
             chunk: chunk_rows.max(1),
             tx: tx.clone(),
             sent: 0,
         };
-        let outcome = self.run_to(database, sql, &mut dest, cancel, None).await;
+        let outcome = self.run_to(database, sql, &mut dest, cancel, enforce).await;
         match outcome {
             // **A statement with no result set is not an empty export.** All
             // three engines return before their tail flush when the statement
@@ -1001,15 +1018,24 @@ impl Db {
     /// it was right. Note the limit this shares with every MySQL write path: on a
     /// non-transactional table (MyISAM) the rollback does nothing, and on a DDL
     /// statement the server commits implicitly.
+    ///
+    /// **`read_only` closes that limit for a read-only connection**: the
+    /// measuring transaction is opened read-only, so the server refuses a write
+    /// the rollback could not undo — a MyISAM row, or a PostgreSQL sequence,
+    /// which `setval` moves outside any transaction. SQLite never executes the
+    /// statement here, so it has nothing to refuse.
     pub async fn explain(
         &self,
         database: Option<&str>,
         sql: &str,
         analyze: bool,
+        read_only: bool,
         cancel: CancellationToken,
     ) -> Result<ResultSet, DbError> {
         match self.engine {
-            Engine::Postgres => return pg::explain(self, database, sql, analyze, cancel).await,
+            Engine::Postgres => {
+                return pg::explain(self, database, sql, analyze, read_only, cancel).await;
+            }
             Engine::Sqlite => {
                 // SQLite's `EXPLAIN` disassembles the statement into VDBE opcodes,
                 // which is a different artefact from the other two engines' plans
@@ -1028,7 +1054,7 @@ impl Db {
                     .fetch_query(database, &plan, EXPLAIN_ROW_CAP, cancel)
                     .await;
             }
-            Engine::MySql => mysql::explain(self, database, sql, analyze, cancel).await,
+            Engine::MySql => mysql::explain(self, database, sql, analyze, read_only, cancel).await,
         }
     }
 
@@ -1234,6 +1260,25 @@ impl Db {
         cancel: CancellationToken,
         on_result: impl FnMut(usize, Result<ResultSet, DbError>),
     ) {
+        self.run_batch_enforced(database, stmts, row_cap, cancel, on_result, None)
+            .await
+    }
+
+    /// [`Self::run_batch`] with its one connection put in the state `enforce`
+    /// asks for before the first statement — the editor's Run All on a
+    /// read-only connection, whose statements a text gate has judged. See
+    /// [`Self::fetch_query_enforced`]. A connection that cannot be put in that
+    /// state fails the first statement and cancels the rest, as one that
+    /// cannot connect does: nothing runs on a session only meant to be guarded.
+    pub async fn run_batch_enforced(
+        &self,
+        database: Option<&str>,
+        stmts: &[String],
+        row_cap: usize,
+        cancel: CancellationToken,
+        on_result: impl FnMut(usize, Result<ResultSet, DbError>),
+        enforce: Option<Enforce>,
+    ) {
         // Wrap the sink once so the scope is stamped on every statement's result
         // whichever engine produced it — a per-engine stamp is one a new path
         // forgets. See `ResultSet::database`.
@@ -1265,7 +1310,7 @@ impl Db {
         };
         match self.engine {
             Engine::Postgres => {
-                pg::run_batch(self, database, stmts, row_cap, cancel, on_result).await;
+                pg::run_batch(self, database, stmts, row_cap, cancel, on_result, enforce).await;
             }
             Engine::Sqlite => {
                 // **One connection, like the other two arms and like this
@@ -1283,14 +1328,14 @@ impl Db {
                 //
                 // The `scope` stamping above is still a no-op for an engine with
                 // one database.
-                sqlite::run_batch(self, stmts, row_cap, cancel, on_result).await;
+                sqlite::run_batch(self, stmts, row_cap, cancel, on_result, enforce).await;
             }
             // `scope` and the dialect go across because `USE` is MySQL's alone —
             // see `mysql::run_batch` for why one engine's arm takes two
             // arguments its peers do not.
             Engine::MySql => {
                 mysql::run_batch(
-                    self, database, stmts, row_cap, cancel, on_result, scope, dialect,
+                    self, database, stmts, row_cap, cancel, on_result, scope, dialect, enforce,
                 )
                 .await;
             }

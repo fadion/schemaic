@@ -945,7 +945,10 @@ pub(crate) async fn run_batch(
     row_cap: usize,
     cancel: CancellationToken,
     mut on_result: impl FnMut(usize, Result<ResultSet, DbError>),
+    enforce: Option<crate::Enforce>,
 ) {
+    // `query_only`, as `fetch_query`'s enforced path sets it.
+    let read_only = enforce == Some(crate::Enforce::ReadOnly);
     let n = stmts.len();
     let owned: Vec<String> = stmts.to_vec();
     let db = db.clone();
@@ -963,6 +966,10 @@ pub(crate) async fn run_batch(
                 return;
             }
         };
+        if read_only && let Err(e) = conn.execute_batch("PRAGMA query_only = ON") {
+            let _ = res_tx.send((0usize, Err(DbError::Query(e.to_string()))));
+            return;
+        }
         // The interrupt handle goes out before any work, the same shape
         // `fetch_query` and `run_script` use — a mid-flight statement is what
         // Stop has to reach.
@@ -4714,6 +4721,51 @@ mod tests {
         assert_eq!(n, 1, "the refused write left a row behind");
         let rs = fetch("SELECT id FROM t").await.expect("a read runs");
         assert_eq!(rs.row_count(), 1);
+    }
+
+    /// **Run All on a read-only connection is refused the write too** — its
+    /// statements share one connection, and that connection is put in
+    /// `query_only` before the first. The same batch unenforced writes, so the
+    /// refusal is the session's.
+    #[tokio::test]
+    async fn a_read_only_batch_refuses_a_write_and_still_reads() {
+        let (keeper, db) = shared_memory("enforced_batch");
+        keeper
+            .execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY); INSERT INTO t VALUES (1);")
+            .expect("seed");
+        let stmts = vec![
+            "SELECT id FROM t".to_string(),
+            "INSERT INTO t VALUES (2)".to_string(),
+        ];
+        let run = |enforce| {
+            let (db, stmts) = (db.clone(), stmts.clone());
+            async move {
+                let mut out = Vec::new();
+                db.run_batch_enforced(
+                    None,
+                    &stmts,
+                    100,
+                    CancellationToken::new(),
+                    |_, r| out.push(r.is_ok()),
+                    enforce,
+                )
+                .await;
+                out
+            }
+        };
+        assert_eq!(
+            run(Some(crate::Enforce::ReadOnly)).await,
+            vec![true, false],
+            "the read runs and the write is refused"
+        );
+        let count = || -> i64 {
+            keeper
+                .query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0))
+                .expect("count")
+        };
+        assert_eq!(count(), 1, "the refused write left a row behind");
+        assert_eq!(run(None).await, vec![true, true]);
+        assert_eq!(count(), 2, "the unenforced batch is the one that writes");
     }
 
     /// `AsJudged` is not read-only, and the unguarded path is untouched: the

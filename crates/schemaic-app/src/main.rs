@@ -733,6 +733,22 @@ enum Refusal {
     TabMovedOn,
 }
 
+/// What the session running the user's SQL on connection `conn_id` must
+/// enforce: `Enforce::ReadOnly` on a read-only connection, nothing otherwise.
+///
+/// **`run_verdict` reads the statement; only the server sees what it does.**
+/// `SELECT setval('s', 1000)` opens with a read head and names no write, so the
+/// editor's gate passes it on a read-only connection — and on an ordinary
+/// session it moves the sequence. The headless paths closed this with
+/// `Db::fetch_query_enforced`; this is the same answer for the editor's run
+/// (auto-commit and a Manual tab's pinned `Session`), EXPLAIN ANALYZE, and the
+/// *All rows* export that re-runs the tab's statement. The text gate stays in
+/// front, for what a read-only session still allows.
+fn session_enforce(connections: &[Connection], conn_id: u64) -> Option<schemaic_db::Enforce> {
+    schemaic_core::connection::read_only_of(connections, conn_id)
+        .then_some(schemaic_db::Enforce::ReadOnly)
+}
+
 /// Does a refused health check still let the action through?
 ///
 /// **A superseded failure is not the same as a stale one.** A check that lands
@@ -2800,6 +2816,10 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                 .get_untracked()
                 .unwrap_or_else(|| row_limit.get_untracked());
             let timeout_secs = statement_timeout.get_untracked();
+            // A Manual tab's pinned session was opened enforcing this already
+            // (`open_session`); an auto-commit run's own connection asks for it.
+            let enforce =
+                connections.with_untracked(|cs| session_enforce(cs, tab.conn_id.get_untracked()));
             handle.spawn(async move {
                 // Wall-clock, and around everything: connecting, the statement,
                 // and pulling the rows back are all time the user waited — which
@@ -2823,10 +2843,16 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                             (out.result, Some(out.stmt))
                         }
                     }
-                    None => (
-                        db.fetch_query(database.as_deref(), &sql, cap, token).await,
-                        None,
-                    ),
+                    None => {
+                        let out = match enforce {
+                            Some(e) => {
+                                db.fetch_query_enforced(database.as_deref(), &sql, cap, token, e)
+                                    .await
+                            }
+                            None => db.fetch_query(database.as_deref(), &sql, cap, token).await,
+                        };
+                        (out, None)
+                    }
                 };
                 let timed_out = watchdog.fired();
                 drop(watchdog);
@@ -2980,9 +3006,14 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             // EXPLAIN only plans and is bounded too — it costs nothing, and an
             // introspection query that hangs is still a hang.
             let timeout_secs = statement_timeout.get_untracked();
+            let read_only = connections
+                .with_untracked(|cs| session_enforce(cs, tab.conn_id.get_untracked()))
+                .is_some();
             handle.spawn(async move {
                 let watchdog = RunTimeout::arm(&token, timeout_secs);
-                let res = db.explain(database.as_deref(), &sql, analyze, token).await;
+                let res = db
+                    .explain(database.as_deref(), &sql, analyze, read_only, token)
+                    .await;
                 let timed_out = watchdog.fired();
                 drop(watchdog);
                 let st = match res {
@@ -3258,6 +3289,9 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             );
             let cap = row_limit.get_untracked();
             let timeout_secs = statement_timeout.get_untracked();
+            // A Manual tab's pinned session carries it already (`open_session`).
+            let enforce =
+                connections.with_untracked(|cs| session_enforce(cs, tab.conn_id.get_untracked()));
             handle.spawn(async move {
                 let mut states: Vec<QueryState> = vec![QueryState::Cancelled; n];
                 let mut outcomes: Vec<Option<StmtOutcome>> = vec![None; n];
@@ -3355,20 +3389,27 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                         // this path has. It is dropped (and so disarmed) when
                         // the closure is, which is when `run_batch` returns.
                         let mut watchdog = RunTimeout::arm(&token, timeout_secs);
-                        db.run_batch(database.as_deref(), &stmts, cap, token.clone(), |i, res| {
-                            let timed_out = watchdog.fired();
-                            watchdog = RunTimeout::arm(&token, timeout_secs);
-                            took[i] = clock.elapsed().as_millis() as u64;
-                            clock = std::time::Instant::now();
-                            states[i] = match res {
-                                Ok(rs) => QueryState::Loaded(Arc::new(rs)),
-                                Err(DbError::Cancelled) if timed_out => {
-                                    QueryState::Failed(timeout_message(timeout_secs))
-                                }
-                                Err(DbError::Cancelled) => QueryState::Cancelled,
-                                Err(e) => QueryState::Failed(e.to_string()),
-                            };
-                        })
+                        db.run_batch_enforced(
+                            database.as_deref(),
+                            &stmts,
+                            cap,
+                            token.clone(),
+                            |i, res| {
+                                let timed_out = watchdog.fired();
+                                watchdog = RunTimeout::arm(&token, timeout_secs);
+                                took[i] = clock.elapsed().as_millis() as u64;
+                                clock = std::time::Instant::now();
+                                states[i] = match res {
+                                    Ok(rs) => QueryState::Loaded(Arc::new(rs)),
+                                    Err(DbError::Cancelled) if timed_out => {
+                                        QueryState::Failed(timeout_message(timeout_secs))
+                                    }
+                                    Err(DbError::Cancelled) => QueryState::Cancelled,
+                                    Err(e) => QueryState::Failed(e.to_string()),
+                                };
+                            },
+                            enforce,
+                        )
                         .await;
                     }
                 }
@@ -4024,6 +4065,10 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                                 return;
                             }
                         };
+                        // The rows' connection, as the `Db` above is: a re-run
+                        // on a read-only one is refused a write the way the run
+                        // that showed it was.
+                        let enforce = connections.with_untracked(|cs| session_enforce(cs, conn_id));
                         // **One streamed export at a time.** The token is a
                         // single slot, and it can be, because this refuses the
                         // second rather than overwriting it: two exports sharing
@@ -4145,12 +4190,13 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                         });
                         handle.spawn(async move {
                             let read = db
-                                .stream_query(
+                                .stream_query_enforced(
                                     database.as_deref(),
                                     &sql,
                                     EXPORT_CHUNK_ROWS,
                                     token,
                                     tx,
+                                    enforce,
                                 )
                                 .await;
                             let written = writer.await;
@@ -5107,6 +5153,8 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                 }
             };
             let database = tab.database.get_untracked();
+            let enforce =
+                connections.with_untracked(|cs| session_enforce(cs, tab.conn_id.get_untracked()));
             let sessions = sessions.clone();
             let closer = handle.clone();
             let opened = create_ext_action(cx, move |res: Result<Arc<Session>, String>| {
@@ -5147,7 +5195,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             });
             handle.spawn(async move {
                 opened(
-                    Session::open(&db, database.as_deref())
+                    Session::open_enforced(&db, database.as_deref(), enforce)
                         .await
                         .map_err(|e| e.to_string()),
                 );
@@ -12951,6 +12999,87 @@ mod app_tests {
              open a write session on is read-only. A disabled control is not a \
              guard, and the two controls did not even agree on the question."
         );
+    }
+
+    /// A read-only connection's session refuses writes; any other's is left
+    /// alone — and an id no connection has is not read-only, as
+    /// `read_only_of` answers it.
+    #[test]
+    fn only_a_read_only_connection_asks_for_a_read_only_session() {
+        use super::session_enforce;
+        let with = |id: u64, read_only: bool| Connection {
+            id,
+            read_only,
+            ..conn()
+        };
+        let cs = [with(1, true), with(2, false)];
+        assert_eq!(
+            session_enforce(&cs, 1),
+            Some(schemaic_db::Enforce::ReadOnly)
+        );
+        assert_eq!(session_enforce(&cs, 2), None);
+        assert_eq!(session_enforce(&cs, 9), None);
+    }
+
+    /// **Every path that runs the editor's SQL asks the session to enforce the
+    /// connection's read-only flag**, not only `run_verdict`'s text gate, which
+    /// passes `SELECT setval(…)`. Each region below executes user SQL: the run
+    /// and Run All (auto-commit on their own connection, a Manual tab on the
+    /// session `open_session` pins), EXPLAIN ANALYZE, and the *All rows*
+    /// export's re-run. Dropping `session_enforce` from any of them compiles and keeps
+    /// every other test green.
+    #[test]
+    fn every_editor_sql_path_runs_on_a_session_enforcing_read_only() {
+        let src = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("src")
+                .join("main.rs"),
+        )
+        .expect("this file's own source");
+        let body = schemaic_ui::source_gate::production_code(&src);
+        let region = |head: &str| {
+            let at = body
+                .find(head)
+                .unwrap_or_else(|| panic!("`{head}` — this gate is stale"));
+            let end = at + body[at..].find("\n    };").expect("the end of the closure");
+            &body[at..end]
+        };
+        let cases: [(&str, &[&str], &[&str]); 5] = [
+            (
+                "let run_query_core: Rc<dyn Fn(String, bool)> = {",
+                &["session_enforce(", "fetch_query_enforced("],
+                &[],
+            ),
+            (
+                "let run_all: Rc<dyn Fn(Vec<String>)> = {",
+                &["session_enforce(", "run_batch_enforced("],
+                &[".run_batch("],
+            ),
+            (
+                "let run_plan: Rc<dyn Fn(String, bool)> = {",
+                &["session_enforce(", "read_only, token)"],
+                &[],
+            ),
+            (
+                "let open_session: Rc<dyn Fn(usize)> = {",
+                &["session_enforce(", "Session::open_enforced("],
+                &["Session::open("],
+            ),
+            (
+                "let export_file: schemaic_ui::ExportFn = {",
+                &["session_enforce(cs, conn_id)", "stream_query_enforced("],
+                &[".stream_query("],
+            ),
+        ];
+        for (head, must, must_not) in cases {
+            let r = region(head);
+            for needle in must {
+                assert!(r.contains(needle), "`{head}` lost `{needle}`");
+            }
+            for needle in must_not {
+                assert!(!r.contains(needle), "`{head}` still calls `{needle}`");
+            }
+        }
     }
 
     /// **And the two builders own the tunnelled-TLS refusal**, rather than a

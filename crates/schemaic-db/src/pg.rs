@@ -472,10 +472,22 @@ pub(crate) async fn run_batch(
     row_cap: usize,
     cancel: CancellationToken,
     mut on_result: impl FnMut(usize, Result<ResultSet, DbError>),
+    enforce: Option<crate::Enforce>,
 ) {
     let client = match database {
         Some(d) => connect_to(db, d).await,
         None => connect_maintenance(db).await,
+    };
+    // The session default, as `fetch_query`'s enforced path sets it: every
+    // statement's implicit transaction — and any `BEGIN` the batch itself
+    // issues — is then a read-only one.
+    let client = match client {
+        Ok(c) if enforce == Some(crate::Enforce::ReadOnly) => c
+            .batch_execute("SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY")
+            .await
+            .map(|_| c)
+            .map_err(|e| db_err(&e)),
+        other => other,
     };
     let client = match client {
         Ok(c) => c,
@@ -648,12 +660,17 @@ pub(crate) async fn fetch_table(
 /// the statement and any reading of a statement can be wrong — a data-modifying
 /// CTE fooled it once already. Measuring must not be the thing that changes the
 /// data, so the rollback holds whether or not the gate above it was right.
-/// PostgreSQL is fully transactional here, so the rollback is real.
+/// PostgreSQL is fully transactional here, so the rollback is real — for the
+/// rows. **Not for a sequence**: `setval`/`nextval` are never rolled back, so a
+/// `SELECT setval(…)` measured here moved the sequence for good. `read_only`
+/// (a read-only connection's) makes the transaction `BEGIN READ ONLY`, which
+/// refuses that too.
 pub(crate) async fn explain(
     db: &Db,
     database: Option<&str>,
     sql: &str,
     analyze: bool,
+    read_only: bool,
     cancel: CancellationToken,
 ) -> Result<ResultSet, DbError> {
     let stmt = sql.trim().trim_end_matches(';').trim_end();
@@ -675,7 +692,11 @@ pub(crate) async fn explain(
     };
     // `BEGIN` isn't a preparable statement, so it goes through `batch_execute`.
     client
-        .batch_execute("BEGIN")
+        .batch_execute(if read_only {
+            "BEGIN READ ONLY"
+        } else {
+            "BEGIN"
+        })
         .await
         .map_err(|e| db_err(&e))?;
     let out = run_statement(

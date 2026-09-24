@@ -129,6 +129,31 @@ impl Session {
     /// flipping to Manual and then changing your mind costs nothing on the
     /// server.
     pub async fn open(db: &Db, database: Option<&str>) -> Result<Arc<Session>, DbError> {
+        Session::open_enforced(db, database, None).await
+    }
+
+    /// [`Session::open`], with the pinned connection made to enforce `enforce`
+    /// for its whole life — [`Db::fetch_query_enforced`]'s guarantee, for a tab
+    /// in Manual mode. A read-only connection's pinned session is opened with
+    /// [`Enforce::ReadOnly`](crate::Enforce::ReadOnly): the session default is
+    /// set before any `BEGIN`, so every transaction [`Session::ensure_tx`]
+    /// opens on it is a read-only one, and a `SELECT setval(…)` the text gate
+    /// passed is refused by the server instead of written.
+    ///
+    /// It guards against a statement's *effect*, not against the person at the
+    /// keyboard: a `SET SESSION TRANSACTION READ WRITE` that reached the session
+    /// would lift it. The editor's `run_verdict` refuses that spelling on a
+    /// read-only connection before it gets here — `SET` is no read head — and
+    /// the state is decided once, at open: ticking the box on a connection whose
+    /// tab already holds a session does not reach that session.
+    ///
+    /// Failing to put the session in that state fails the open — no statement
+    /// ever runs on a session that was only meant to be guarded.
+    pub async fn open_enforced(
+        db: &Db,
+        database: Option<&str>,
+        enforce: Option<crate::Enforce>,
+    ) -> Result<Arc<Session>, DbError> {
         // Paired, because the id is a by-product of opening and each engine
         // learns it a different way — MySQL from the handshake, PostgreSQL from a
         // question.
@@ -138,7 +163,13 @@ impl Session {
                 // guard counts *matched* rows, not *changed* ones. A pinned
                 // connection serves reads and writes both, so it has to be on
                 // here or the safety net quietly changes meaning.
-                let conn = db.open(database, true).await?;
+                let mut conn = db.open(database, true).await?;
+                if let Some(e) = enforce
+                    && let Err(err) = crate::mysql::enforce_session(&mut conn, e).await
+                {
+                    let _ = conn.disconnect().await;
+                    return Err(err);
+                }
                 let conn_id = conn.id();
                 (Backend::MySql { conn, conn_id }, Some(i64::from(conn_id)))
             }
@@ -150,6 +181,15 @@ impl Session {
                     Some(d) => pg::connect_to(db, d).await?,
                     None => pg::connect_maintenance(db).await?,
                 };
+                // `AsJudged` needs nothing here, for the reason `pg`'s own
+                // enforced path gives: the one quote-moving setting is pinned on
+                // every connection's startup packet.
+                if enforce == Some(crate::Enforce::ReadOnly) {
+                    client
+                        .batch_execute("SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY")
+                        .await
+                        .map_err(|e| DbError::Query(e.to_string()))?;
+                }
                 // Best effort — a session whose pid we failed to learn still
                 // works, it just can't be recognised as ours later.
                 let pid = pg::backend_pid(&client).await;

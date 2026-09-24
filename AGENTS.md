@@ -75,7 +75,9 @@ substitute for the statement, and none of these is a style preference.
   `run_query` tool and `schemaic query`. **A head is a spelling, not a read**: `SELECT setval(…)`
   passes it and writes, so those paths also run on a session that refuses writes by their effect
   (`Db::fetch_query_enforced` with `Enforce::ReadOnly`), and the text gate stays in front for what
-  such a session still allows. Never a second, laxer gate. **The requests its guard mints are a
+  such a session still allows. **So does the editor on a read-only connection** — its run, Run All,
+  a Manual tab's pinned `Session`, EXPLAIN ANALYZE and the *All rows* export all take their `Enforce` from
+  the app's `session_enforce`, since `run_verdict` is a text gate too. Never a second, laxer gate. **The requests its guard mints are a
   separate list from the refusals**: `ScriptRequest::approved` for the file,
   `RerunRequest::approved` for `apply_view`, `open_table_filtered` and the grid's post-commit
   re-fetch, and `cli::exec::ExecRequest::approved` for `schemaic exec` — minted against

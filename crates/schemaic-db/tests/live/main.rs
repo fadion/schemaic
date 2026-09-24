@@ -123,6 +123,10 @@ live_suite!(
         a_read_only_session_refuses_a_write_a_select_hides,
         a_read_only_session_still_reads,
         a_session_pinned_to_the_gates_lexer_still_writes,
+        a_read_only_pinned_session_refuses_a_write_a_select_hides,
+        a_read_only_explain_analyze_refuses_a_write_a_select_hides,
+        a_read_only_stream_refuses_a_write_a_select_hides,
+        a_read_only_batch_refuses_a_write_a_select_hides,
     ],
     routines: [
         a_pg_redefinition_keeps_a_functions_planner_attributes,

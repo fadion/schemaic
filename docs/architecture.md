@@ -304,7 +304,9 @@ existing prose was left alone.
     open with a read head and name no denied word, and all of them wrote through MCP `run_query` and
     `schemaic query` — shown live on PostgreSQL 16 and MariaDB 10.11 — while this document called the
     gate read-only. What refuses them is the session (`Db::fetch_query_enforced` with
-    `Enforce::ReadOnly`, under `schemaic-db`); the gate stays in front for the one-statement count and
+    `Enforce::ReadOnly`, under `schemaic-db`) — and the editor's `run_verdict` reads the same kind of
+    text, so a read-only connection's editor runs take that session too (the write-guard invariant
+    lists the five paths); the gate stays in front for the one-statement count and
     for what a read-only session still allows — sleeps, locks, server-side file reads. **And the
     one-statement count is only as good as the server's agreement about where a statement ends.**
     `skip_noncode` assumes `\` escapes inside every quote, which a MySQL/MariaDB server stops doing
@@ -8621,7 +8623,8 @@ existing prose was left alone.
   can reach — the same reason `error_chain`'s tests use a synthetic chain. Live:
   `a_refused_write_says_which_value_the_server_refused`, with `Target::error_names_the_value`
   recording which engines carry a separate detail field at all.
-  `fetch_query`/`fetch_query_enforced`/`stream_query`/`run_batch`/`fetch_schema`/`ping`/
+  `fetch_query`/`fetch_query_enforced`/`stream_query`/`stream_query_enforced`/`run_batch`/
+  `run_batch_enforced`/`fetch_schema`/`ping`/
   `commit_writes`/`refetch_rows`/`prepare_check`
   (non-executing `PREPARE` for the editor's live validation)/`run_ddl`/`run_script`/`fetch_table_stats`/
   `count_rows`/`fetch_blob` are `Db` methods taking the target DB per call.
@@ -8839,7 +8842,8 @@ existing prose was left alone.
   `to_ascii_uppercase()`.
   **`Db::fetch_query_enforced` is `fetch_query` for a statement a text gate has already judged, with
   the session made to agree with the judgement** — the headless paths, where nobody is at the
-  keyboard to notice the gate was wrong. It takes an `Enforce` down the same `run_to` dispatch, whose
+  keyboard to notice the gate was wrong, and the editor's runs on a read-only connection, whose
+  `run_verdict` is a text gate too. It takes an `Enforce` down the same `run_to` dispatch, whose
   `None` is what every other caller passes, and each variant answers one thing a gate that reads
   text cannot know. **`Enforce::ReadOnly` is the effect the text does not show**: `SELECT setval(…)`,
   `SELECT lo_unlink(…)`, PostgreSQL's `SELECT 1 INTO newtable` and a `SELECT` of a function whose body
@@ -8868,11 +8872,37 @@ existing prose was left alone.
   on the startup packet by `connect_probe` (above) — the same hazard, closed earlier — and SQLite's
   asks nothing because it has no backslash escape to disagree about. **Failing to put the session in
   the asked-for state fails the statement**: it never runs on a session that was only *meant* to be
-  guarded. The editor's `fetch_query` is untouched by any of this. `sqlite.rs` carries
+  guarded. The editor asks for `ReadOnly` on a read-only connection and for nothing otherwise
+  (`main.rs`'s `session_enforce`), so a writable connection's run is plain `fetch_query` as it always
+  was. `sqlite.rs` carries
   `a_read_only_fetch_refuses_a_write_and_still_reads` (the row count afterwards, not just the error,
   and a read beside it so a session that refuses everything fails) and
   `only_the_read_only_enforcement_refuses_a_write`, which holds `AsJudged` and plain `fetch_query` to
   still writing; the server legs are the live tier's `enforced.rs`, below.
+  **The editor's four other ways to run SQL take the same `Enforce` rather than a second
+  mechanism.** `Db::stream_query_enforced` is `stream_query` with an `Enforce` down the same
+  `run_to` — `stream_query` is it with `None` — for the *All rows* export, which re-runs the tab's
+  statement. `Db::run_batch_enforced` is `run_batch` (which passes `None`) for the auto-commit Run
+  All, with its one connection put in the state before the first statement: `enforce_session` after
+  the open on MySQL/MariaDB, `SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY` after the
+  connect on PostgreSQL, `PRAGMA query_only = ON` on SQLite. A connection that cannot be put in it
+  fails the first statement and cancels the rest, exactly as one that cannot connect does.
+  `Session::open_enforced(db, database, enforce)` is `Session::open` (which passes `None`)
+  with the pinned connection put in the state **before any `BEGIN`**: `mysql::enforce_session`, now
+  `pub(crate)` for it, on MySQL/MariaDB — a failure disconnects and fails the open — and `SET SESSION
+  CHARACTERISTICS AS TRANSACTION READ ONLY` on PostgreSQL, so every transaction `ensure_tx` opens
+  for the tab's life is a read-only one. `Db::explain` takes a `read_only` flag, because `EXPLAIN
+  ANALYZE` *executes* the statement inside a transaction it always rolls back, and the rollback is
+  not the guarantee it looks like: it undoes an InnoDB write but not a MyISAM or Aria one, and on
+  PostgreSQL `setval`/`nextval` are never rolled back, so a measured `SELECT setval(…)` moved the
+  sequence for good. With the flag, `mysql::explain_in_rolled_back_tx` opens `START TRANSACTION READ
+  ONLY` and `pg::explain` opens `BEGIN READ ONLY`, which refuse both; plain `EXPLAIN` only plans and
+  is untouched, and SQLite's `explain` never executes, so the flag is moot there. **What none of
+  them guards is the person at the keyboard**: a `SET SESSION TRANSACTION READ WRITE` reaching the
+  pinned session would lift it, as unticking the connection's read-only box would — though on a
+  read-only connection that spelling is a `Block` first, `SET` being no read head to
+  `contains_write`, which `Session::open_enforced`'s doc now says too. The pinned session's state is
+  decided once, when `open_session` opens it.
   **MySQL reads one row through two protocols, and `convert_row` has to make them agree.**
   `collect_rows` loads a result with `query_iter` (the **text** protocol, every value a `Bytes` that
   `parse_typed` keeps the server's own characters of), while `refetch_on` re-reads one row with
@@ -10368,7 +10398,7 @@ existing prose was left alone.
   `staged_bytes_reach_the_column_as_bytes`, stage → commit → re-read on all three servers, which is
   what proves each engine's `cell_param` binding (see `schemaic-db`'s entry for what it deliberately
   does not pin).
-  **`enforced.rs` is the session's half of the headless read gate**, and only a server can hold it:
+  **`enforced.rs` is the session's half of the read-only gates**, and only a server can hold it:
   `read_only_reason` reads text, and `SELECT purge_all()` is a read head naming no denied word while
   `purge_all()` empties a table. `Target::purging_function` is each server's `CREATE FUNCTION` for it
   — `purge_all` rather than `purge`, `PURGE` being reserved on MySQL, and `DETERMINISTIC` on the MySQL
@@ -10378,7 +10408,16 @@ existing prose was left alone.
   in — then that `Enforce::ReadOnly` fails it **and** that all three rows are still there, since an
   error alone could be a session that refuses everything; `a_read_only_session_still_reads` is the
   other side of that, and `a_session_pinned_to_the_gates_lexer_still_writes` holds `AsJudged` to
-  *not* being read-only, `exec` on a writable connection running on it. **The `sql_mode` pin has no
+  *not* being read-only, `exec` on a writable connection running on it. The editor's four other
+  enforced paths have a case each, over the same `SELECT purge_all()` and the same three-rows check:
+  `a_read_only_pinned_session_refuses_a_write_a_select_hides` (`Session::open_enforced`, then
+  `ensure_tx`), `a_read_only_explain_analyze_refuses_a_write_a_select_hides` (`Db::explain` with
+  `read_only`), `a_read_only_stream_refuses_a_write_a_select_hides` (`stream_query_enforced`) and
+  `a_read_only_batch_refuses_a_write_a_select_hides` (`run_batch_enforced`, with a read ahead of the
+  hidden write, so the batch must answer read-then-refused). Each runs an unenforced control that
+  must succeed, so the refusal is the session's and not a function that fails anyway — and the
+  stream and batch controls assert the table then *is* empty. SQLite's batch leg is pure, in
+  `sqlite.rs` (`a_read_only_batch_refuses_a_write_and_still_reads`). **The `sql_mode` pin has no
   case here**: no leg sets a mode that moves a quote, so the smuggle `AsJudged` closes on the MySQL
   family was measured once, by hand, on a throwaway MariaDB 11.8, and what holds it now is
   `core::sql`'s pure tests over the strip and the read-back. Nothing in the tier reproduces that run.
@@ -20005,8 +20044,30 @@ Re-introducing the anti-patterns these guard against is a regression:
   verdict** — a new protection is an arm of `run_verdict`, and a `RunVerdict::Block` must stay
   un-overridable. (`plan_view`'s `contains_write` is not a second guard: it decides whether
   `EXPLAIN ANALYZE` may run a statement for its timings.)
+  **On a read-only connection the verdict's `Block` is a text answer, so the session backs it.**
+  `run_verdict` refuses a write by `contains_write`, a whitelist of heads, and `SELECT setval('s',
+  1000)`, `SELECT lo_unlink(…)` and a `SELECT` of a function whose body deletes all open with one —
+  the hole the headless gate had (below), still open on the editor after that one was closed.
+  `main.rs`'s `session_enforce(connections, conn_id)` answers `Enforce::ReadOnly` for a read-only
+  connection and `None` otherwise, an id no connection has counting as writable, as
+  `read_only_of` answers it (`only_a_read_only_connection_asks_for_a_read_only_session`). Five
+  closures ask it: `run_query_core`'s auto-commit arm takes `Db::fetch_query_enforced` — which
+  carries every `apply_view` re-run with it (filter/sort, the capped notice's read-more, the
+  post-commit re-fetch) and `open_table_filtered`, since they all end there; `run_all`'s auto-commit
+  arm takes `Db::run_batch_enforced`; `open_session` pins a Manual tab's connection through
+  `Session::open_enforced`, which is what both runs use in Manual mode; `run_plan` hands
+  `Db::explain` its `read_only`; and `export_file`'s `AllRows` arm streams through
+  `Db::stream_query_enforced`. `schemaic-db`'s entry has what each does to the session. Each is a
+  closure in `app_view` where dropping the call compiles and keeps every other test green, so
+  `every_editor_sql_path_runs_on_a_session_enforcing_read_only` reads those five regions of
+  `main.rs` and asserts the call in each — and, for `run_all`, `open_session` and the export, that
+  the unenforced spelling is gone. The verdict still stands in front and still decides:
+  it refuses a plain `DELETE` before a connection is opened, with a sentence, where the session
+  would answer with a server error. The flag is read when each closure runs, so a Manual tab's
+  pinned session keeps the state it was opened in.
   **The re-run affordances answer to the guard too, through a refusal strictly stronger than
-  it.** `ExportScope::AllRows` re-executes the tab's captured statement through `Db::stream_query`;
+  it.** `ExportScope::AllRows` re-executes the tab's captured statement through
+  `Db::stream_query_enforced`;
   the capped notice's "read N rows" re-executes it through `apply_view` at a bigger ceiling; the
   grid **filter/sort bar** re-executes a rewritten one through the same action; and **Follow
   relation** opens a new tab running a `SELECT` the grid built, through `open_table_filtered`.
@@ -25064,7 +25125,7 @@ this bundle's.
   streams the *server's* order, because a column-header sort is a permutation of the rows in hand
   (`compute_order`) that no re-run reproduces — the menu had presented the two as one export at two
   sizes. And a **manual-transaction tab**: `AllRows` is a second read on a fresh connection
-  (`Db::stream_query`, deliberately outside the tab's pinned session), so a `TxMode::Manual` tab's
+  (`Db::stream_query_enforced`, deliberately outside the tab's pinned session), so a `TxMode::Manual` tab's
   uncommitted rows are on screen and absent from the file, and rows it deleted are in the file and
   gone from the screen. And **staged edits**: this scope asks the server again, and the server has
   not been told, so it reads `without your staged edits` — a disclosure that became load-bearing at

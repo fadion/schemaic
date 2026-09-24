@@ -5148,7 +5148,10 @@ pub(crate) async fn fetch_query(
 /// `SET SESSION TRANSACTION READ ONLY` covers the autocommit statement that
 /// follows, which is a transaction of its own; a stored function cannot lift it
 /// from inside, because a transaction's access mode cannot change while it runs.
-async fn enforce_session(conn: &mut Conn, enforce: crate::Enforce) -> Result<(), DbError> {
+pub(crate) async fn enforce_session(
+    conn: &mut Conn,
+    enforce: crate::Enforce,
+) -> Result<(), DbError> {
     let qerr = |e: mysql_async::Error| DbError::Query(e.to_string());
     let mode: Option<String> = conn
         .query_first("SELECT @@SESSION.sql_mode")
@@ -5216,8 +5219,19 @@ pub(crate) async fn run_batch(
     mut on_result: impl FnMut(usize, Result<ResultSet, DbError>),
     scope: std::sync::Arc<std::sync::Mutex<Option<String>>>,
     dialect: SqlDialect,
+    enforce: Option<crate::Enforce>,
 ) {
-    let mut conn = match db.open(database, false).await {
+    let opened = match (db.open(database, false).await, enforce) {
+        (Ok(mut c), Some(e)) => match enforce_session(&mut c, e).await {
+            Ok(()) => Ok(c),
+            Err(err) => {
+                let _ = c.disconnect().await;
+                Err(err)
+            }
+        },
+        (other, _) => other,
+    };
+    let mut conn = match opened {
         Ok(c) => c,
         Err(e) => {
             // Couldn't even connect: fail the first statement, cancel the rest.
@@ -5278,11 +5292,16 @@ pub(crate) async fn run_batch(
 /// first**: MySQL has `EXPLAIN ANALYZE` and MariaDB has `ANALYZE <stmt>`, and
 /// neither accepts the other's. Asking the server which it is would be a round
 /// trip to avoid a round trip, so the fallback runs on the refusal.
+///
+/// `read_only` (a read-only connection's) opens the measuring transaction as
+/// `START TRANSACTION READ ONLY`: the rollback undoes an InnoDB write but not a
+/// MyISAM or Aria one, and a read-only transaction refuses both.
 pub(crate) async fn explain(
     db: &Db,
     database: Option<&str>,
     sql: &str,
     analyze: bool,
+    read_only: bool,
     cancel: CancellationToken,
 ) -> Result<ResultSet, DbError> {
     let (primary, fallback) = explain_commands(sql, analyze);
@@ -5291,10 +5310,10 @@ pub(crate) async fn explain(
             .fetch_query(database, &primary, EXPLAIN_ROW_CAP, cancel)
             .await;
     }
-    match explain_in_rolled_back_tx(db, database, &primary, cancel.clone()).await {
+    match explain_in_rolled_back_tx(db, database, &primary, read_only, cancel.clone()).await {
         // MariaDB: `EXPLAIN ANALYZE` is invalid — retry with `ANALYZE <stmt>`.
         Err(DbError::Query(_)) if fallback.is_some() => {
-            explain_in_rolled_back_tx(db, database, &fallback.unwrap(), cancel).await
+            explain_in_rolled_back_tx(db, database, &fallback.unwrap(), read_only, cancel).await
         }
         other => other,
     }
@@ -5308,11 +5327,17 @@ async fn explain_in_rolled_back_tx(
     db: &Db,
     database: Option<&str>,
     cmd: &str,
+    read_only: bool,
     cancel: CancellationToken,
 ) -> Result<ResultSet, DbError> {
     let mut conn = db.open(database, false).await?;
     let conn_id = conn.id();
-    if let Err(e) = conn.query_drop("BEGIN").await {
+    let begin = if read_only {
+        "START TRANSACTION READ ONLY"
+    } else {
+        "BEGIN"
+    };
+    if let Err(e) = conn.query_drop(begin).await {
         let _ = conn.disconnect().await;
         return Err(DbError::Query(e.to_string()));
     }

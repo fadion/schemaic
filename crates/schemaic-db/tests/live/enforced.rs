@@ -104,3 +104,157 @@ pub async fn a_session_pinned_to_the_gates_lexer_still_writes(target: &'static T
     assert_eq!(rows_left(&scratch, &t).await, "2", "{}", target.name);
     scratch.teardown().await;
 }
+
+/// **A Manual tab's pinned session is read-only for its whole life** on a
+/// read-only connection: every transaction `ensure_tx` opens on it refuses the
+/// hidden write. The unenforced session beside it runs the same statement,
+/// which is what makes the refusal about the session rather than a function
+/// that fails anyway — and neither commits, so the table is untouched.
+pub async fn a_read_only_pinned_session_refuses_a_write_a_select_hides(target: &'static Target) {
+    use schemaic_db::Session;
+    let (scratch, t) = seeded(target, "enforce_pinned").await;
+    let run = |enforce: Option<Enforce>| {
+        let scratch = &scratch;
+        async move {
+            let s = Session::open_enforced(&scratch.db, Some(&scratch.database), enforce)
+                .await
+                .unwrap_or_else(|e| panic!("{}: open: {e}", target.name));
+            s.ensure_tx().await.expect("BEGIN");
+            let got = s
+                .fetch_query("SELECT purge_all()", 100, CancellationToken::new())
+                .await
+                .result
+                .map(|_| ())
+                .map_err(|e| e.to_string());
+            let _ = s.rollback().await;
+            s.close().await;
+            got
+        }
+    };
+    assert!(
+        run(Some(Enforce::ReadOnly)).await.is_err(),
+        "{}: a read-only pinned session ran a function that deletes",
+        target.name
+    );
+    run(None).await.unwrap_or_else(|e| {
+        panic!(
+            "{}: the ordinary session could not run it: {e}",
+            target.name
+        )
+    });
+    assert_eq!(rows_left(&scratch, &t).await, "3", "{}", target.name);
+    scratch.teardown().await;
+}
+
+/// EXPLAIN ANALYZE **executes** the statement, inside a transaction it rolls
+/// back — which undoes neither a MyISAM write nor a PostgreSQL sequence. On a
+/// read-only connection that transaction is read-only and refuses the write;
+/// on any other the same measurement runs.
+pub async fn a_read_only_explain_analyze_refuses_a_write_a_select_hides(target: &'static Target) {
+    let (scratch, t) = seeded(target, "enforce_explain").await;
+    let explain = |read_only: bool| {
+        scratch.db.explain(
+            Some(&scratch.database),
+            "SELECT purge_all()",
+            true,
+            read_only,
+            CancellationToken::new(),
+        )
+    };
+    assert!(
+        explain(true).await.is_err(),
+        "{}: a read-only EXPLAIN ANALYZE ran a function that deletes",
+        target.name
+    );
+    explain(false)
+        .await
+        .unwrap_or_else(|e| panic!("{}: the ordinary measurement failed: {e}", target.name));
+    assert_eq!(rows_left(&scratch, &t).await, "3", "{}", target.name);
+    scratch.teardown().await;
+}
+
+/// The *All rows* export re-runs the tab's statement, so on a read-only
+/// connection its stream is refused the hidden write the run was.
+pub async fn a_read_only_stream_refuses_a_write_a_select_hides(target: &'static Target) {
+    let (scratch, t) = seeded(target, "enforce_stream").await;
+    let stream = |enforce: Option<Enforce>| {
+        let scratch = &scratch;
+        async move {
+            let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+            let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+            let got = scratch
+                .db
+                .stream_query_enforced(
+                    Some(&scratch.database),
+                    "SELECT purge_all()",
+                    100,
+                    CancellationToken::new(),
+                    tx,
+                    enforce,
+                )
+                .await;
+            let _ = drain.await;
+            got.map(|_| ()).map_err(|e| e.to_string())
+        }
+    };
+    assert!(
+        stream(Some(Enforce::ReadOnly)).await.is_err(),
+        "{}: a read-only stream ran a function that deletes",
+        target.name
+    );
+    assert_eq!(rows_left(&scratch, &t).await, "3", "{}", target.name);
+    stream(None)
+        .await
+        .unwrap_or_else(|e| panic!("{}: the unenforced stream failed: {e}", target.name));
+    assert_eq!(
+        rows_left(&scratch, &t).await,
+        "0",
+        "{}: the unenforced stream is the one that deletes",
+        target.name
+    );
+    scratch.teardown().await;
+}
+
+/// **Run All on a read-only connection** shares one connection across its
+/// statements, and that connection refuses the hidden write; the same batch
+/// unenforced runs it, so the refusal is the session's.
+pub async fn a_read_only_batch_refuses_a_write_a_select_hides(target: &'static Target) {
+    let (scratch, t) = seeded(target, "enforce_batch").await;
+    let stmts = vec![
+        format!("SELECT id FROM {t}"),
+        "SELECT purge_all()".to_string(),
+    ];
+    let run = |enforce: Option<Enforce>| {
+        let (scratch, stmts) = (&scratch, stmts.clone());
+        async move {
+            let mut out = Vec::new();
+            scratch
+                .db
+                .run_batch_enforced(
+                    Some(&scratch.database),
+                    &stmts,
+                    100,
+                    CancellationToken::new(),
+                    |_, r| out.push(r.is_ok()),
+                    enforce,
+                )
+                .await;
+            out
+        }
+    };
+    assert_eq!(
+        run(Some(Enforce::ReadOnly)).await,
+        vec![true, false],
+        "{}: the read runs and the hidden write is refused",
+        target.name
+    );
+    assert_eq!(rows_left(&scratch, &t).await, "3", "{}", target.name);
+    assert_eq!(run(None).await, vec![true, true], "{}", target.name);
+    assert_eq!(
+        rows_left(&scratch, &t).await,
+        "0",
+        "{}: the unenforced batch is the one that deletes",
+        target.name
+    );
+    scratch.teardown().await;
+}
