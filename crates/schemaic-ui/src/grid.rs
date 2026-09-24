@@ -2553,8 +2553,14 @@ fn insert_blocks_all(gs: GridState) -> Vec<(ResultSet, Vec<usize>)> {
     grid_cells(&rs, &order, &formats, &dirty, &new_rows).insert_blocks_all()
 }
 
-/// Render the whole result in `format` — the toolbar's Copy ▸ menu.
+/// Render in `format` for the toolbar's Copy ▸ menu: the highlighted block when
+/// there is one of more than one cell (`edit::toolbar_copy_block`), else the
+/// whole result. It copied every row whatever was selected.
 fn render_export(gs: GridState, format: ExportFormat) -> String {
+    if let Some((r0, ..)) = schemaic_core::edit::toolbar_copy_block(gs.bounds_untracked()) {
+        // `r0` is inside the block, so the gesture resolves to the block.
+        return render_rows_at(gs, r0, format);
+    }
     if format == ExportFormat::Sql {
         return render_inserts(gs, insert_blocks_all(gs));
     }

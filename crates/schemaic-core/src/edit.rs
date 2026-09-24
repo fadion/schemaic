@@ -935,6 +935,20 @@ pub fn copy_scope(
     }
 }
 
+/// The block the results toolbar's **Copy ▸ format** takes, or `None` for the
+/// whole result.
+///
+/// **A highlighted block of more than one cell is what the user means.** The
+/// menu copied every row whatever was selected, so selecting three rows and
+/// choosing Copy ▸ CSV put the whole result on the clipboard. A single cell is
+/// where the cursor rests, not a selection of anything, and the whole result
+/// stays the answer there — the same threshold [`copy_scope`] draws.
+pub fn toolbar_copy_block(
+    selection: Option<(usize, usize, usize, usize)>,
+) -> Option<(usize, usize, usize, usize)> {
+    selection.filter(|&(r0, c0, r1, c1)| r0 != r1 || c0 != c1)
+}
+
 /// The literal a staged SQL NULL reads as, everywhere a surface reads the grid.
 /// The cell paints it, so the clipboard and an attachment say it too.
 const STAGED_NULL: &str = "NULL";
@@ -3995,6 +4009,12 @@ mod tests {
         assert_eq!(copy_scope(Some((0, 0, 3, 0)), 2, 0), CopyScope::Selection);
         // Nothing selected at all.
         assert_eq!(copy_scope(None, 0, 0), CopyScope::Cell);
+        // The toolbar's Copy ▸ takes a multi-cell block, and the whole result
+        // for a lone cursor or no selection at all.
+        assert_eq!(toolbar_copy_block(Some((1, 0, 3, 4))), Some((1, 0, 3, 4)));
+        assert_eq!(toolbar_copy_block(Some((2, 0, 2, 4))), Some((2, 0, 2, 4)));
+        assert_eq!(toolbar_copy_block(Some((2, 3, 2, 3))), None);
+        assert_eq!(toolbar_copy_block(None), None);
 
         assert_eq!(CopyScope::Cell.label(), "Copy value");
         assert_eq!(CopyScope::Selection.label(), "Copy");
