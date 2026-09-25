@@ -1,7 +1,8 @@
 name: CI
 
-# Runs on every push to main and on pull requests. Lints once (Linux) and
-# builds + tests on both Linux and Windows.
+# Runs on every push to main and on pull requests. Lints on Linux, builds +
+# tests on Linux, Windows and macOS, and runs clippy again on the last two for
+# the code only they compile.
 on:
   push:
     branches: [main]
@@ -110,7 +111,19 @@ jobs:
           done
           sudo timeout 300 apt-get install -y libxkbcommon-dev libwayland-dev libxcb1-dev libx11-dev pkg-config
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
       - uses: Swatinem/rust-cache@v2
+      # The lint job runs on Linux, where `#[cfg(windows)]` and
+      # `#[cfg(target_os = "macos")]` code is never compiled — so clippy had
+      # never seen it: Windows-only code was linted only when someone happened
+      # to run clippy locally, and macOS-only code, with nobody on a Mac, not at
+      # all. (`cfg!(…)` expressions compile everywhere and were never the gap.)
+      # Linux is skipped here because the lint job already covers it, and
+      # `live-tests` is left off because that tier is not platform-specific.
+      - name: Clippy (warnings = errors)
+        if: runner.os != 'Linux'
+        run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Build
         run: cargo build --workspace
       - name: Test
