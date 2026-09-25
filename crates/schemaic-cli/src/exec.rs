@@ -227,7 +227,14 @@ mod tests {
     /// found it running unasked and exiting 0 with "(0 rows affected)".
     #[test]
     fn dropping_a_table_needs_yes() {
-        for sql in ["DROP TABLE t", "DROP DATABASE app"] {
+        for sql in [
+            "DROP TABLE t",
+            "DROP TABLES t",
+            "DROP DATABASE app",
+            "CREATE OR REPLACE TABLE t (id int)",
+            "EXPLAIN ANALYZE DELETE FROM t",
+            "ALTER TABLE t TRUNCATE PARTITION ALL",
+        ] {
             assert!(
                 matches!(approved(sql, false), Err(NotRun::NeedsConsent(_))),
                 "{sql}"

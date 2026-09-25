@@ -1378,9 +1378,10 @@ pub fn has_top_level_where(sql: &str, dialect: SqlDialect) -> bool {
 }
 
 /// The run guard's warning for `stmt`, if it should be asked about first:
-/// [`every_row_reason`], or a `DROP` of a table, database or schema.
+/// [`every_row_reason`], or [`drop_reason`] — a statement that destroys an
+/// object holding stored rows.
 ///
-/// **`DROP` asks only for what holds stored rows.** It ran unasked while the
+/// **It asks only for what holds stored rows.** `DROP` ran unasked while the
 /// less destructive `TRUNCATE` was held — found by a CLI test run, but the gap
 /// was the editor's too, since this is the one guard both use. A `TEMPORARY`
 /// table dies with the session, and a view, index, trigger, routine or user
@@ -1391,22 +1392,160 @@ pub fn unsafe_reason(stmt: &str, dialect: SqlDialect) -> Option<String> {
     every_row_reason(stmt, dialect).or_else(|| drop_reason(stmt, dialect))
 }
 
-/// The warning for a `DROP` that deletes stored rows with the object.
-fn drop_reason(stmt: &str, dialect: SqlDialect) -> Option<String> {
-    if leading_keyword(stmt, dialect)? != "DROP" {
-        return None;
-    }
-    let rest = leading_keyword_end(stmt, dialect)
-        .map(|e| &stmt[e..])
-        .unwrap_or("");
-    match leading_keyword(rest, dialect)?.as_str() {
-        "TABLE" => Some("DROP TABLE deletes the table and every row in it.".to_string()),
-        obj @ ("DATABASE" | "SCHEMA") => Some(format!(
+/// The warning for a statement that deletes stored rows **with the object that
+/// holds them**, rather than row by row.
+///
+/// `DROP TABLE`/`TABLES` (MySQL's grammar has both spellings, and the plural
+/// once ran unasked beside a held singular), `DATABASE` and `SCHEMA`; and the
+/// spellings that destroy the same thing under another name: MariaDB's `CREATE
+/// OR REPLACE TABLE`/`DATABASE`, which drops what is there before creating it
+/// empty; PostgreSQL's `DROP OWNED`, which drops everything a role owns; a
+/// `DROP TYPE`/`DOMAIN`/`EXTENSION … CASCADE`, which drops every column of the
+/// type with its values (without `CASCADE` the server refuses while anything
+/// depends on it); and MySQL's `ALTER TABLE … TRUNCATE PARTITION` /
+/// `DROP PARTITION`. An `ALTER … DROP COLUMN` stays out, deliberately — it is
+/// the everyday schema edit this guard would teach people to click through.
+///
+/// `pub(crate)` for the `.sql` panel, which counts these as destruction
+/// (`script::is_destructive`), apart from the every-row count.
+pub(crate) fn drop_reason(stmt: &str, dialect: SqlDialect) -> Option<String> {
+    let stmt = analyzed_statement(stmt, dialect).unwrap_or(stmt);
+    let words = leading_words(stmt, PARTITION_WORDS, dialect);
+    let word = |i: usize| words.get(i).map(String::as_str);
+    match (word(0)?, word(1)) {
+        ("DROP", Some("TABLE" | "TABLES")) => {
+            Some("DROP TABLE deletes the table and every row in it.".to_string())
+        }
+        ("DROP", Some(obj @ ("DATABASE" | "SCHEMA"))) => Some(format!(
             "DROP {obj} deletes the {} and every table in it.",
             obj.to_ascii_lowercase()
         )),
+        ("DROP", Some("OWNED")) => Some(
+            "DROP OWNED deletes everything the role owns, every table and its rows with it."
+                .to_string(),
+        ),
+        ("DROP", Some(obj @ ("TYPE" | "DOMAIN" | "EXTENSION")))
+            if word_tokens(stmt, dialect).0.iter().any(|w| w == "CASCADE") =>
+        {
+            Some(format!(
+                "DROP {obj} … CASCADE deletes every column that depends on it, with its values."
+            ))
+        }
+        ("CREATE", Some("OR")) if word(2) == Some("REPLACE") => match word(3)? {
+            "TABLE" => Some(
+                "CREATE OR REPLACE TABLE deletes the existing table and every row in it."
+                    .to_string(),
+            ),
+            obj @ ("DATABASE" | "SCHEMA") => Some(format!(
+                "CREATE OR REPLACE {obj} deletes the existing {} and every table in it.",
+                obj.to_ascii_lowercase()
+            )),
+            _ => None,
+        },
+        ("ALTER", _) => {
+            let at = words.windows(2).position(|w| {
+                matches!(w[0].as_str(), "TRUNCATE" | "DROP") && w[1] == "PARTITION"
+            })?;
+            let why = match words[at].as_str() {
+                "TRUNCATE" => "TRUNCATE PARTITION removes every row in the partitions it names.",
+                _ => "DROP PARTITION deletes the partition and every row in it.",
+            };
+            Some(why.to_string())
+        }
         _ => None,
     }
+}
+
+/// How far into an `ALTER TABLE` [`drop_reason`] looks for its partition
+/// clause: `ALTER [ONLINE] [IGNORE] TABLE db . t TRUNCATE PARTITION` is seven
+/// words, and a bound keeps the look at a statement's head a look at its head.
+const PARTITION_WORDS: usize = 10;
+
+/// The statement an `EXPLAIN ANALYZE` (PostgreSQL, MySQL 8) or MariaDB's bare
+/// `ANALYZE` **runs**, if `stmt` is one: the text after the prefix.
+///
+/// Those prefixes execute what they explain — `EXPLAIN ANALYZE DELETE FROM t`
+/// deletes every row of `t` — so the guard's head-based arms have to judge the
+/// statement underneath, or the prefix is a way round every one of them. A
+/// plain `EXPLAIN` only plans and is `None`, as is `ANALYZE TABLE t` / PG's
+/// `ANALYZE t` (their remainder is no statement an arm matches). The options
+/// PostgreSQL writes in parentheses count as analysing when `ANALYZE` is among
+/// them — `ANALYZE false` included, since over-asking is the safe direction.
+fn analyzed_statement(stmt: &str, dialect: SqlDialect) -> Option<&str> {
+    let head = leading_keyword(stmt, dialect)?;
+    let mut i = leading_keyword_end(stmt, dialect)?;
+    let mut analyzed = head == "ANALYZE";
+    if head != "EXPLAIN" && !analyzed {
+        return None;
+    }
+    let b = stmt.as_bytes();
+    loop {
+        i = skip_blank(b, i, dialect);
+        if head == "EXPLAIN" && b.get(i) == Some(&b'(') {
+            let close = matching_paren(b, i, dialect)?;
+            analyzed |= leading_words(&stmt[i + 1..close], usize::MAX, dialect)
+                .iter()
+                .any(|w| w == "ANALYZE");
+            i = close + 1;
+            continue;
+        }
+        let rest = &stmt[i..];
+        match leading_keyword(rest, dialect).as_deref() {
+            Some("ANALYZE") => analyzed = true,
+            Some("VERBOSE" | "EXTENDED" | "PARTITIONS") => {}
+            // `FORMAT=TREE` / `FORMAT = JSON`: the word, the `=`, the value.
+            Some("FORMAT") => {
+                let at = skip_blank(b, i + leading_keyword_end(rest, dialect)?, dialect);
+                if b.get(at) != Some(&b'=') {
+                    break;
+                }
+                let value = &stmt[at + 1..];
+                i = at + 1 + leading_keyword_end(value, dialect)?;
+                continue;
+            }
+            _ => break,
+        }
+        i += leading_keyword_end(rest, dialect)?;
+    }
+    analyzed.then(|| &stmt[i..])
+}
+
+/// `i` moved past whitespace and comments.
+fn skip_blank(b: &[u8], mut i: usize, dialect: SqlDialect) -> usize {
+    loop {
+        while i < b.len() && b[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        match skip_comment(b, i, dialect) {
+            Some(j) if i < b.len() => i = j,
+            _ => return i,
+        }
+    }
+}
+
+/// The index of the `)` closing the `(` at `open`, skipping strings, quoted
+/// identifiers and comments; `None` when it is never closed.
+fn matching_paren(b: &[u8], open: usize, dialect: SqlDialect) -> Option<usize> {
+    let mut depth = 0usize;
+    let mut i = open;
+    while i < b.len() {
+        if let Some(j) = skip_noncode(b, i, dialect) {
+            i = j;
+            continue;
+        }
+        match b[i] {
+            b'(' => depth += 1,
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
 }
 
 /// If `stmt` would rewrite or erase every row of a table (DELETE/UPDATE
@@ -1416,8 +1555,20 @@ fn drop_reason(stmt: &str, dialect: SqlDialect) -> Option<String> {
 /// Its own question, apart from [`unsafe_reason`], because the `.sql` panel
 /// counts exactly these (`script::Probe::unqualified`) under a line that says
 /// so — and counts a `DROP` separately, as destruction.
+///
+/// Under an `EXPLAIN ANALYZE` (or MariaDB's `ANALYZE`) it judges the statement
+/// the prefix runs ([`analyzed_statement`]); and MySQL's `ALTER TABLE …
+/// TRUNCATE PARTITION ALL` is a `TRUNCATE` by another name.
 pub fn every_row_reason(stmt: &str, dialect: SqlDialect) -> Option<String> {
+    let stmt = analyzed_statement(stmt, dialect).unwrap_or(stmt);
     match leading_keyword(stmt, dialect)?.as_str() {
+        "ALTER" => {
+            let words = leading_words(stmt, PARTITION_WORDS + 1, dialect);
+            words
+                .windows(3)
+                .any(|w| w[0] == "TRUNCATE" && w[1] == "PARTITION" && w[2] == "ALL")
+                .then(|| "TRUNCATE PARTITION ALL removes every row in the table.".to_string())
+        }
         "TRUNCATE" => Some("TRUNCATE removes every row in the table.".to_string()),
         kind @ ("DELETE" | "UPDATE") => {
             if has_top_level_where(stmt, dialect) {
@@ -3765,35 +3916,130 @@ mod tests {
     /// **Dropping what holds rows asks first, like `TRUNCATE`** — a CLI test
     /// run found `DROP TABLE` running with no `--yes` while the less
     /// destructive `TRUNCATE` was held. The warning names what goes.
+    ///
+    /// Every dialect: the verdict does not depend on the engine, and it reads
+    /// two `leading_keyword`s, which do (`#` comments, `[ident]`, `$$`).
     #[test]
     fn dropping_a_table_database_or_schema_asks_first() {
-        for (sql, noun) in [
-            ("DROP TABLE t", "table"),
-            ("drop table if exists a, b", "table"),
-            ("DROP DATABASE app", "database"),
-            ("DROP SCHEMA IF EXISTS app CASCADE", "schema"),
-            ("/* tidy */ DROP TABLE t", "table"),
-        ] {
-            let why = unsafe_reason(sql).unwrap_or_else(|| panic!("{sql} must ask"));
-            assert!(why.contains(noun), "{sql}: {why}");
+        for d in EVERY_DIALECT {
+            for (sql, noun) in [
+                ("DROP TABLE t", "table"),
+                ("drop table if exists a, b", "table"),
+                // MySQL's grammar is `DROP [TEMPORARY] {TABLE | TABLES}`, and
+                // the plural drops the table just the same.
+                ("DROP TABLES t", "table"),
+                ("drop tables if exists a, b", "table"),
+                ("DROP DATABASE app", "database"),
+                ("DROP SCHEMA IF EXISTS app CASCADE", "schema"),
+                ("/* tidy */ DROP TABLE t", "table"),
+                ("DROP TABLE \"t\" CASCADE", "table"),
+            ] {
+                let why =
+                    super::unsafe_reason(sql, d).unwrap_or_else(|| panic!("{d:?}: {sql} must ask"));
+                assert!(why.contains(noun), "{d:?}: {sql}: {why}");
+            }
+        }
+        assert!(super::unsafe_reason("drop table [t]", SqlDialect::Sqlite).is_some());
+    }
+
+    /// **What destroys stored rows without being spelled `DROP TABLE`.**
+    /// MariaDB's `CREATE OR REPLACE TABLE` drops the table before creating the
+    /// empty one (and `… DATABASE` every table in it); PostgreSQL's `DROP OWNED
+    /// BY` drops everything a role owns, and a `DROP TYPE`/`DOMAIN`/`EXTENSION
+    /// … CASCADE` every column of that type, with its values. And MySQL's
+    /// partition surgery: `TRUNCATE PARTITION` and `DROP PARTITION` erase the
+    /// rows they name.
+    #[test]
+    fn a_statement_that_destroys_stored_rows_by_another_name_asks_first() {
+        for d in EVERY_DIALECT {
+            for (sql, noun) in [
+                ("CREATE OR REPLACE TABLE orders (id int)", "table"),
+                ("create or replace database app", "database"),
+                ("DROP OWNED BY app_owner", "owns"),
+                ("DROP OWNED BY r CASCADE", "owns"),
+                ("DROP TYPE mood CASCADE", "column"),
+                ("DROP DOMAIN d CASCADE", "column"),
+                ("DROP EXTENSION IF EXISTS hstore CASCADE", "column"),
+                ("ALTER TABLE t TRUNCATE PARTITION p0, p1", "partition"),
+                ("ALTER TABLE t DROP PARTITION p0", "partition"),
+                ("ALTER TABLE t TRUNCATE PARTITION ALL", "every row"),
+            ] {
+                let why =
+                    super::unsafe_reason(sql, d).unwrap_or_else(|| panic!("{d:?}: {sql} must ask"));
+                assert!(why.contains(noun), "{d:?}: {sql}: {why}");
+            }
         }
     }
 
     /// **Only what holds data.** A temporary table dies with the session, and
     /// a view, index, trigger or function holds no rows, so none of them is
     /// held back — a guard that fires on every DDL statement is one users learn
-    /// to click through.
+    /// to click through. A type or domain with no `CASCADE` is refused by the
+    /// server while anything depends on it, so it takes no rows either; and a
+    /// `CREATE OR REPLACE` of what holds no rows is how MariaDB and PostgreSQL
+    /// users write every view and routine.
     #[test]
     fn dropping_what_holds_no_stored_rows_does_not_ask() {
+        for d in EVERY_DIALECT {
+            for sql in [
+                "DROP VIEW v",
+                "DROP INDEX i ON t",
+                "DROP TRIGGER tr",
+                "DROP FUNCTION f",
+                "DROP USER u",
+                "DROP TYPE mood",
+                "DROP DOMAIN d",
+                "DROP VIEW v CASCADE",
+                "CREATE OR REPLACE VIEW v AS SELECT 1",
+                "CREATE OR REPLACE FUNCTION f() RETURNS int AS $$ SELECT 1 $$ LANGUAGE sql",
+                "CREATE OR REPLACE TRIGGER tr BEFORE INSERT ON t FOR EACH ROW SET @x = 1",
+                "CREATE TABLE t (id int)",
+                "ALTER TABLE t ADD PARTITION (PARTITION p9 VALUES LESS THAN (9))",
+                "ALTER TABLE t DROP COLUMN c",
+            ] {
+                assert_eq!(super::unsafe_reason(sql, d), None, "{d:?}: {sql}");
+            }
+        }
         for sql in [
             "DROP TEMPORARY TABLE t",
-            "DROP VIEW v",
-            "DROP INDEX i ON t",
-            "DROP TRIGGER tr",
-            "DROP FUNCTION f",
-            "DROP USER u",
+            "DROP TEMPORARY TABLES t",
+            "CREATE OR REPLACE TEMPORARY TABLE t (id int)",
         ] {
             assert_eq!(unsafe_reason(sql), None, "{sql}");
+        }
+    }
+
+    /// **An `EXPLAIN ANALYZE` runs the statement it explains** — PostgreSQL's
+    /// and MySQL 8's, and MariaDB's bare `ANALYZE` — so an every-row `DELETE`
+    /// under one is asked about exactly as it is without it. A plain `EXPLAIN`
+    /// only plans, so it is not; nor is a scoped statement under `ANALYZE`, nor
+    /// `ANALYZE TABLE`, which is maintenance.
+    #[test]
+    fn an_analyzed_statement_is_judged_as_the_statement_it_runs() {
+        for d in EVERY_DIALECT {
+            for sql in [
+                "EXPLAIN ANALYZE DELETE FROM t",
+                "explain analyze verbose update t set a = 1",
+                "EXPLAIN (ANALYZE, BUFFERS) DELETE FROM t",
+                "EXPLAIN (FORMAT JSON, ANALYZE true) DELETE FROM t",
+                "EXPLAIN ANALYZE FORMAT=TREE DELETE FROM t",
+                "ANALYZE DELETE FROM t",
+                "ANALYZE FORMAT=JSON UPDATE t SET a = 1",
+                "/* why */ EXPLAIN ANALYZE TRUNCATE t",
+            ] {
+                assert!(super::every_row_reason(sql, d).is_some(), "{d:?}: {sql}");
+                assert!(super::unsafe_reason(sql, d).is_some(), "{d:?}: {sql}");
+            }
+            for sql in [
+                "EXPLAIN DELETE FROM t",
+                "EXPLAIN (FORMAT JSON) DELETE FROM t",
+                "EXPLAIN ANALYZE DELETE FROM t WHERE id = 1",
+                "ANALYZE TABLE t",
+                "ANALYZE t",
+                "EXPLAIN ANALYZE SELECT * FROM t",
+            ] {
+                assert_eq!(super::unsafe_reason(sql, d), None, "{d:?}: {sql}");
+            }
         }
     }
 

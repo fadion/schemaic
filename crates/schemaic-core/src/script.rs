@@ -411,11 +411,17 @@ fn is_destructive(sql: &str, kind: &str, dialect: SqlDialect) -> bool {
     // to look past the pair the histogram prints. Bounded by `KIND_WORDS` like
     // every other look at a statement's head, and read through `leading_words`
     // so a `DROP` inside a comment or a string cannot reach it.
-    kind.starts_with("ALTER")
+    //
+    // And whatever the run guard counts as destroying stored rows with their
+    // object — `CREATE OR REPLACE TABLE`, `DROP OWNED`, a `TRUNCATE PARTITION`
+    // — so the panel, which is a file's only confirmation, names what the
+    // editor would have asked about. Its reads are bounded at the head too.
+    (kind.starts_with("ALTER")
         && sql::leading_words(sql, KIND_WORDS, dialect)
             .iter()
             .skip(1)
-            .any(|w| w == "DROP")
+            .any(|w| w == "DROP"))
+        || sql::drop_reason(sql, dialect).is_some()
 }
 
 /// What the modal's red confirmation should say about a probe.
@@ -1385,6 +1391,38 @@ mod tests {
         // top-level WHERE scan can reach — `unsafe_reason`'s own `WITH` arm.
         let cte = probed("WITH d AS (DELETE FROM t RETURNING *) SELECT * FROM d;");
         assert_eq!(cte.unqualified, 1, "{:?}", cte.kinds);
+    }
+
+    /// **What the run guard asks about, the panel counts.** A `TRUNCATE
+    /// PARTITION ALL` empties the table (both counts), a named one or a
+    /// `CREATE OR REPLACE TABLE` destroys rows with their object, and an
+    /// every-row `DELETE` under `EXPLAIN ANALYZE` still runs.
+    #[test]
+    fn the_probe_counts_what_destroys_rows_by_another_name() {
+        let all = probed("ALTER TABLE t TRUNCATE PARTITION ALL;");
+        assert_eq!(
+            (all.destructive, all.unqualified),
+            (1, 1),
+            "{:?}",
+            all.kinds
+        );
+        let named =
+            probed("ALTER TABLE t TRUNCATE PARTITION p0; CREATE OR REPLACE TABLE u (id int);");
+        assert_eq!(
+            (named.destructive, named.unqualified),
+            (2, 0),
+            "{:?}",
+            named.kinds
+        );
+        let analyzed = probed("EXPLAIN ANALYZE DELETE FROM t;");
+        assert_eq!(analyzed.unqualified, 1, "{:?}", analyzed.kinds);
+        let view = probed("CREATE OR REPLACE VIEW v AS SELECT 1; ALTER TABLE t ADD COLUMN c int;");
+        assert_eq!(
+            (view.destructive, view.unqualified),
+            (0, 0),
+            "{:?}",
+            view.kinds
+        );
     }
 
     /// **A `DROP` is destroyed, not unqualified.** The run guard now asks

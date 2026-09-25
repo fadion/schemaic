@@ -378,22 +378,44 @@ existing prose was left alone.
     keeps the full walk, which is what every other caller wants.
     **`unsafe_reason` asks first about what destroys stored rows, and about nothing else.** It is
     the warning behind `first_unsafe`, which `run_verdict` turns into `Confirm` whatever
-    `confirm_writes` says: a `DELETE`/`UPDATE` with no top-level `WHERE`, a `TRUNCATE`, and a `DROP
-    TABLE`/`DATABASE`/`SCHEMA` — the object word read after `DROP` with `leading_keyword_end` +
-    `leading_keyword`, as `needs_database` reads it. `DROP` was the gap: a CLI test run found
+    `confirm_writes` says: `every_row_reason` (below), or `drop_reason`, a statement that destroys
+    stored rows *with the object holding them*. `DROP` was the gap: a CLI test run found
     `schemaic exec "DROP TABLE t"` running with no `--yes` and exiting 0 with "(0 rows affected)"
     while the less destructive `TRUNCATE` was held, and since this is the one guard both front ends
-    use, the editor's Run let it through unasked as well. The scope stops there on purpose. `DROP
-    TEMPORARY TABLE` dies with the session, and a dropped view, index, trigger, routine or user
-    holds no stored rows — a guard that fires on every DDL statement is one people learn to click
-    through (`dropping_a_table_database_or_schema_asks_first`,
-    `dropping_what_holds_no_stored_rows_does_not_ask`). The schema tree's own Drop is not asked
-    twice: it goes through the DDL preview and `Db::run_ddl`, never `run_verdict`.
-    **The every-row half is `every_row_reason`, and `unsafe_reason` is it plus the `DROP` arm.**
+    use, the editor's Run let it through unasked as well. **The first fix asked about `DROP
+    TABLE`/`DATABASE`/`SCHEMA` and called everything else rowless, which several spellings made
+    false** — MySQL's `DROP TABLES` among them, running unasked beside a held singular. `drop_reason`
+    now reads `DROP TABLE`/`TABLES`/`DATABASE`/`SCHEMA`; PostgreSQL's `DROP OWNED` (everything a role
+    owns); `DROP TYPE`/`DOMAIN`/`EXTENSION … CASCADE`, which takes every dependent column with its
+    values — without `CASCADE` the server refuses while anything depends, so there is nothing to
+    ask; MariaDB's `CREATE OR REPLACE TABLE`/`DATABASE`/`SCHEMA`, which drops what is there first;
+    and MySQL's `ALTER TABLE … TRUNCATE PARTITION`/`DROP PARTITION`, looked for through
+    `leading_words` within `PARTITION_WORDS` (10) words so the look stays at the statement's head.
+    The scope still stops on purpose. `DROP TEMPORARY TABLE` and `CREATE OR REPLACE TEMPORARY
+    TABLE` die with the session; a dropped view, index, trigger, routine or user holds no stored
+    rows, nor does a `CREATE OR REPLACE VIEW`/`FUNCTION`/`TRIGGER`, which is how every view and
+    routine is written there; and `ALTER … DROP COLUMN`, which does destroy values, stays out
+    deliberately as the everyday schema edit — a guard that fires on every DDL statement is one
+    people learn to click through (`dropping_a_table_database_or_schema_asks_first`,
+    `a_statement_that_destroys_stored_rows_by_another_name_asks_first`,
+    `dropping_what_holds_no_stored_rows_does_not_ask`, all over `EVERY_DIALECT`). The schema tree's
+    own Drop is not asked twice: it goes through the DDL preview and `Db::run_ddl`, never
+    `run_verdict`.
+    **The every-row half is `every_row_reason`, and `unsafe_reason` is it plus `drop_reason`.**
     `script::probe` asks the half on its own for `Probe::unqualified`, the `.sql` panel's "act on
     every row … with no WHERE" line: borrowing the whole guard put a dump's every `DROP TABLE IF
     EXISTS` under that line, beside the destruction line that already counts it
-    (`a_dumps_drop_before_create_is_destructive_and_not_unqualified`, watched fail at 2).
+    (`a_dumps_drop_before_create_is_destructive_and_not_unqualified`, watched fail at 2). Beside the
+    missing-`WHERE` `DELETE`/`UPDATE` and the `TRUNCATE` it asks about MySQL's `ALTER TABLE …
+    TRUNCATE PARTITION ALL`, a `TRUNCATE` by another name.
+    **Both halves judge the statement an executing prefix runs, not the prefix.** `EXPLAIN ANALYZE`
+    (with `VERBOSE`/`FORMAT=…`), PostgreSQL's `EXPLAIN (… ANALYZE …)` option list and MariaDB's bare
+    `ANALYZE [FORMAT=JSON]` execute what they explain, and every arm reads a head, so `EXPLAIN
+    ANALYZE DELETE FROM t` deleted every row with no missing-`WHERE` ask — through `schemaic exec`
+    with no `--yes` as well. `analyzed_statement` strips the prefix before either half reads it. A
+    plain `EXPLAIN` only plans and `ANALYZE TABLE t`/PostgreSQL's `ANALYZE t` gather statistics, so
+    neither is asked; an option list's `ANALYZE false` still counts as analysing, over-asking being
+    the safe direction (`an_analyzed_statement_is_judged_as_the_statement_it_runs`).
   - `intel.rs` — the **SQL intelligence** layer (structure-aware, dialect-pluggable). Parses a
     *complete* statement with a real per-dialect AST (`sqlparser`; `SqlDialect` seam — MySQL,
     PostgreSQL and SQLite all wired) and answers what a token stream can't: `statement_scope`
@@ -7424,7 +7446,10 @@ existing prose was left alone.
     can only show what its opening statements **do**, which is the thing worth knowing before
     running one — a kind histogram (`INSERT ×400`, `DROP TABLE ×12`), how many statements destroy or
     delete data (`is_destructive`, and see the write-guard invariant for why that count *is* the
-    confirmation and why its net therefore includes `DELETE`), and whether the file opens its own
+    confirmation and why its net therefore includes `DELETE` — and whatever `sql::drop_reason`
+    answers, so a `CREATE OR REPLACE TABLE` and an `ALTER TABLE … TRUNCATE PARTITION` are counted
+    where their kind alone would not be; `the_probe_counts_what_destroys_rows_by_another_name`), and
+    whether the file opens its own
     transaction (`dump.rs`'s *Replaying → One
     transaction* put one there, and the runner must not wrap an already-wrapped file). It is bounded
     by `PROBE_MAX_BYTES` — the same 8 MB as `SAMPLE_MAX_BYTES`, for the same reason: the user asked
@@ -20337,8 +20362,9 @@ existing prose was left alone.
     subcommand, not a flag on `query`**: a flag would put the dangerous case one character from the
     safe one, and it would give two paths one gate when they do not want the same gate — `query`
     runs an allowlist with no override, while a write has to consult the connection's read-only
-    flag, the unsafe-statement warning (`sql::unsafe_reason` — a missing `WHERE`, a `TRUNCATE`, a
-    `DROP` of a table, database or schema) and the user's own say-so. `ExecRequest::approved` is the
+    flag, the unsafe-statement warning (`sql::unsafe_reason` — a missing `WHERE`, a `TRUNCATE`, or
+    a statement that destroys stored rows with their object, listed under `core::sql`) and the
+    user's own say-so. `ExecRequest::approved` is the
     guard and the only constructor; the fields are private and `run` takes one by value. **The
     request carries the target its verdict judged** — a clone of the `Connection` and the
     database, read back through `connection()` and `database()` — and `run(db, request, timeout)`
@@ -20845,8 +20871,9 @@ Re-introducing the anti-patterns these guard against is a regression:
   `DELETE` raises "Run anyway" because nothing stood between typing it and running it; a script was
   chosen from a file dialog and is run from a panel that first names the statement counts and, in
   red, how many of them destroy or delete data — `script::is_destructive`, whose net is drawn wide
-  (it counts `DELETE`, which no dump writes and a hand-written script does) precisely because that
-  sentence *is* the confirmation. `run_script` matches the verdict **exhaustively** so this is a
+  (it counts `DELETE`, which no dump writes and a hand-written script does, and everything
+  `sql::drop_reason` asks about, so a `CREATE OR REPLACE TABLE` the editor would have held is
+  named here too) precisely because that sentence *is* the confirmation. `run_script` matches the verdict **exhaustively** so this is a
   decision on the page rather than a fall-through: for one build the call site was an
   `if let RunVerdict::Block(..)`, so a verdict of "ask first" ran the file anyway, and the three
   tests over `script_verdict` all passed because every one of them exercised the function alone —
@@ -20883,7 +20910,9 @@ Re-introducing the anti-patterns these guard against is a regression:
   stronger refusal, because `exec` *does* have someone to ask: the caller is at a prompt, and
   `--yes` is that answer. The asymmetry is the whole of it — `--yes` answers a `Confirm`, in
   practice `unsafe_reason`'s warning (a missing `WHERE`, a `TRUNCATE`, or a `DROP TABLE`, which ran
-  unasked and exited 0 until `dropping_a_table_needs_yes`), and **cannot** answer a `Block`, so a
+  unasked and exited 0 until `dropping_a_table_needs_yes` — which now also holds `DROP TABLES`,
+  `CREATE OR REPLACE TABLE`, `TRUNCATE PARTITION ALL` and `EXPLAIN ANALYZE DELETE`, each of which
+  ran with no `--yes` before), and **cannot** answer a `Block`, so a
   read-only connection has no override from a command line either
   (`a_read_only_connection_blocks_a_write_and_yes_does_not_help` asserts it for both values of the
   flag). Two refusals sit in front of the verdict rather than inside it: an empty statement, and
