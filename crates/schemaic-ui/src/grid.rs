@@ -7623,7 +7623,7 @@ struct MatchFrom {
 /// surfaces agree about where they stopped looking.
 ///
 /// **They share the budget's *value*, and they did not share its *window*.**
-/// [`find_hits`] walks row-major from display row 0 and stops after `budget`
+/// [`find_hits_within`] walks row-major from display row 0 and stops after `budget`
 /// cells; this walked `budget` cells from the *caret*, wrapping. On a grid past
 /// the budget the two windows only overlap. A 12-column result at the 200,000-row
 /// cap is 2,400,000 cells: the count covers rows 0..166,666 and a caret at row
@@ -7727,8 +7727,9 @@ fn find_hits(cells: &schemaic_core::edit::GridCells<'_>, q: &str) -> (Vec<usize>
     find_hits_shown(cells, q, &Default::default())
 }
 
-/// [`find_hits`] over the columns that are drawn — a hidden column's cells
-/// are not on screen, so the find bar neither counts nor jumps to them.
+/// The match count over the columns that are drawn — a hidden column's cells
+/// are not on screen, so the find bar neither counts nor jumps to them. What
+/// the grid calls; `find_hits` is its nothing-hidden spelling, for the tests.
 fn find_hits_shown(
     cells: &schemaic_core::edit::GridCells<'_>,
     q: &str,
@@ -7737,7 +7738,7 @@ fn find_hits_shown(
     find_hits_within(cells, q, FIND_COUNT_CELL_BUDGET, hidden)
 }
 
-/// [`find_hits`] over a given window.
+/// [`find_hits_shown`] over a given window.
 ///
 /// The budget is a parameter for the reason it already is one on [`next_match`]:
 /// the two have to scan the **same window**, and a test that cannot shrink the
