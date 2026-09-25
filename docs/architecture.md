@@ -20299,9 +20299,18 @@ existing prose was left alone.
     refuses a write by its effect — and on MySQL/MariaDB one whose `sql_mode` is pinned to the lexer
     the gate counted statements with — while the gate stays in front for what such a session still
     allows: sleeps, locks, server-side file reads. A **locking read** (`FOR UPDATE`, `FOR NO KEY
-    UPDATE`, `LOCK IN SHARE MODE`) is refused by naming the clause and the lock
-    (`sql::locking_clause`); it used to answer "`UPDATE` is not permitted", which read as a write
-    found (`a_locking_read_is_refused_by_naming_its_locking_clause`). It is asked in the **connection's own**
+    UPDATE`, `LOCK IN SHARE MODE`, and the shared `FOR SHARE`/`FOR KEY SHARE` no deny-list word
+    catches, which a MySQL 8 read-only session runs, locks held) is refused by naming the clause and
+    the lock (`sql::locking_clause`, `shared_locks`); it used to answer "`UPDATE` is not permitted",
+    which read as a write found (`a_locking_read_is_refused_by_naming_its_locking_clause`). A lock
+    is named only when nothing else in the statement is refused: a locking CTE ahead of a deleting
+    one was told to drop the clause, and the retry was refused as the `DELETE`
+    (`a_write_hidden_in_a_read_keeps_its_own_refusal`). **`sql::read_only_refusal` carries whether
+    the refusal is about a write** (`ReadRefusal::writes`), and `gate` sorts it into
+    `NoRows::NotARead`, whose message points at `exec`, or `NoRows::NotPermitted` — a lock, a
+    sleep, a second statement — whose message does not: the CLI answered a `FOR UPDATE` with "use
+    `exec` to write" after core's own words said it was no write
+    (`refusing_what_is_no_write_does_not_name_exec`). Both exit 3. It is asked in the **connection's own**
     dialect, so a PostgreSQL `#` operator is not lexed as a comment on the way in. `normalize_stmt`
     is pure and owns the trailing-`;` rule — a person types the semicolon out of habit and a
     `SELECT 1;` answered "empty query" would be a baffling way to learn it was unwanted — and

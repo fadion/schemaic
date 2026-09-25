@@ -574,7 +574,9 @@ async fn run_query(db: &Db, database: Option<&str>, sql: &str) -> (String, bool)
     {
         Ok(rs) => (format_table(&rs), false),
         Err(NoRows::Empty) => ("Empty query.".to_string(), true),
-        Err(NoRows::NotARead(reason)) => (format!("Rejected: {reason}."), true),
+        Err(NoRows::NotARead(reason) | NoRows::NotPermitted(reason)) => {
+            (format!("Rejected: {reason}."), true)
+        }
         Err(NoRows::Failed(e)) => (format!("Query error: {e}"), true),
         // A read never reports `Indeterminate` — that is a write's timeout —
         // but a read-only session makes the two the same event here anyway.

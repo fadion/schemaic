@@ -35,8 +35,13 @@ pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 pub enum NoRows {
     /// Nothing but whitespace and semicolons.
     Empty,
-    /// The statement is not a read. Carries `read_only_reason`'s words.
+    /// The statement is not a read — it writes, so `exec` is where it goes.
+    /// Carries `read_only_reason`'s words.
     NotARead(String),
+    /// Refused as no read-only query, but **not as a write**: a lock, a sleep,
+    /// a second statement (`sql::ReadRefusal::writes` is false). `exec` is no
+    /// answer to any of them, so the message does not point there.
+    NotPermitted(String),
     /// The server refused it, or the connection failed.
     Failed(String),
     /// The deadline passed and the statement was cancelled server-side.
@@ -57,6 +62,7 @@ impl NoRows {
             NoRows::NotARead(why) => {
                 format!("refused: {why}. `query` only runs reads; use `exec` to write")
             }
+            NoRows::NotPermitted(why) => format!("refused: {why}"),
             // No prefix of our own: `DbError`'s Display already says what
             // failed ("query failed: …", "could not connect: …"), and a second
             // one printed "query failed: query failed: …".
@@ -78,7 +84,10 @@ impl NoRows {
     /// thing and a database that is down are different problems, and a caller
     /// that cannot tell them apart retries the one that will never succeed.
     pub fn is_refusal(&self) -> bool {
-        matches!(self, NoRows::Empty | NoRows::NotARead(_))
+        matches!(
+            self,
+            NoRows::Empty | NoRows::NotARead(_) | NoRows::NotPermitted(_)
+        )
     }
 }
 
@@ -101,7 +110,13 @@ pub fn normalize_stmt(sql: &str) -> Option<&str> {
 /// asking early is never the only check.
 pub fn gate(sql: &str, dialect: schemaic_core::intel::SqlDialect) -> Result<&str, NoRows> {
     let stmt = normalize_stmt(sql).ok_or(NoRows::Empty)?;
-    schemaic_core::sql::read_only_reason(stmt, dialect).map_err(NoRows::NotARead)?;
+    schemaic_core::sql::read_only_refusal(stmt, dialect).map_err(|r| {
+        if r.writes {
+            NoRows::NotARead(r.reason)
+        } else {
+            NoRows::NotPermitted(r.reason)
+        }
+    })?;
     Ok(stmt)
 }
 
@@ -185,6 +200,31 @@ mod tests {
         let m = NoRows::NotARead("DELETE is not a read".into()).message();
         assert!(m.contains("DELETE is not a read"));
         assert!(m.contains("exec"), "the message must say where writes go");
+    }
+
+    /// **And only a write's does.** Through `gate`, the composition: a
+    /// locking read was told "use `exec` to write" after core's own words
+    /// said the lock was no write — and `exec` would not run two `SELECT`s or
+    /// a `SLEEP` any better. Each is still a refusal, exit 3.
+    #[test]
+    fn refusing_what_is_no_write_does_not_name_exec() {
+        use schemaic_core::intel::SqlDialect;
+        for sql in [
+            "SELECT * FROM t FOR UPDATE",
+            "SELECT * FROM t FOR SHARE",
+            "SELECT 1; SELECT 2",
+            "SELECT SLEEP(5)",
+        ] {
+            let refusal = gate(sql, SqlDialect::MySql).unwrap_err();
+            let m = refusal.message();
+            assert!(!m.contains("exec") && !m.contains("write"), "{sql}: {m}");
+            assert!(m.starts_with("refused: "), "{sql}: {m}");
+            assert!(refusal.is_refusal(), "{sql}");
+        }
+        let m = gate("DELETE FROM t", SqlDialect::MySql)
+            .unwrap_err()
+            .message();
+        assert!(m.contains("exec"), "{m}");
     }
 
     /// The driver's message is already contextualised; repeating our own in

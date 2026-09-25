@@ -2189,33 +2189,83 @@ pub fn read_only_heads(dialect: SqlDialect) -> &'static [&'static str] {
 /// typing a `SLEEP()` at a prompt being told it "is not permitted in an AI
 /// query" is being answered about somebody else's session.
 pub fn read_only_reason(sql: &str, dialect: SqlDialect) -> Result<(), String> {
+    read_only_refusal(sql, dialect).map_err(|r| r.reason)
+}
+
+/// Why [`read_only_refusal`] refused a statement.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReadRefusal {
+    /// The words [`read_only_reason`] answers with.
+    pub reason: String,
+    /// Whether the refusal is about a **write** — a statement that is not a
+    /// read, or a write keyword inside one — so a front end with a write path
+    /// may point at it. A lock, a sleep or a second statement is not one:
+    /// `schemaic query` answered a `FOR UPDATE` with "use `exec` to write",
+    /// which re-labelled the lock as the write its own message said it was not.
+    pub writes: bool,
+}
+
+/// [`read_only_reason`], with the refusal's kind — see [`ReadRefusal`].
+///
+/// **A write is named before a lock, whatever order they come in.** The lock
+/// message tells the caller to drop the clause, and for a statement that also
+/// deletes, that retry is refused again as the `DELETE` — so a lock is named
+/// only when nothing else in the statement is refused.
+pub fn read_only_refusal(sql: &str, dialect: SqlDialect) -> Result<(), ReadRefusal> {
+    let refuse = |reason: String, writes: bool| Err(ReadRefusal { reason, writes });
     let (words, multi) = word_tokens(sql, dialect);
     if multi {
-        return Err("only a single statement is allowed".to_string());
+        return refuse("only a single statement is allowed".to_string(), false);
     }
     let heads = read_only_heads(dialect);
     let head = words.first().map(|s| s.as_str()).unwrap_or("");
     if !heads.contains(&head) {
         // Naming this engine's heads, not a union of all three: a model told it
         // may `SHOW` on SQLite will keep trying.
-        return Err(format!(
-            "only read-only queries ({}) are allowed",
-            heads.join("/")
-        ));
+        return refuse(
+            format!("only read-only queries ({}) are allowed", heads.join("/")),
+            true,
+        );
     }
-    if let Some(k) = words.iter().position(|w| is_denied(w, dialect)) {
-        if let Some(clause) = locking_clause(&words, k) {
-            return Err(format!(
+    let denied: Vec<usize> = (0..words.len())
+        .filter(|&k| is_denied(&words[k], dialect))
+        .collect();
+    if let Some(&k) = denied
+        .iter()
+        .find(|&&k| locking_clause(&words, k).is_none())
+    {
+        return refuse(
+            format!("`{}` is not permitted in a read-only query", words[k]),
+            WRITE_KEYWORDS.contains(&words[k].as_str()),
+        );
+    }
+    let lock = denied
+        .iter()
+        .filter_map(|&k| Some((k, locking_clause(&words, k)?)))
+        .chain(shared_locks(&words))
+        .min_by_key(|&(k, _)| k);
+    if let Some((_, clause)) = lock {
+        return refuse(
+            format!(
                 "`{clause}` locks the rows it reads, which a read-only query does not; \
                  drop the locking clause"
-            ));
-        }
-        return Err(format!(
-            "`{}` is not permitted in a read-only query",
-            words[k]
-        ));
+            ),
+            false,
+        );
     }
     Ok(())
+}
+
+/// The shared-lock clauses no deny-list word catches — `FOR SHARE` (MySQL 8,
+/// PostgreSQL) and `FOR KEY SHARE` (PostgreSQL) — with where each starts.
+/// `SHARE` itself is no denied word: a column may be called that.
+fn shared_locks(words: &[String]) -> impl Iterator<Item = (usize, &'static str)> + '_ {
+    let at = |i: usize| words.get(i).map(String::as_str);
+    (0..words.len()).filter_map(move |i| match (at(i)?, at(i + 1), at(i + 2)) {
+        ("FOR", Some("SHARE"), _) => Some((i, "FOR SHARE")),
+        ("FOR", Some("KEY"), Some("SHARE")) => Some((i, "FOR KEY SHARE")),
+        _ => None,
+    })
 }
 
 /// The row-locking clause the denied word at `words[k]` belongs to, if it does.
@@ -4107,23 +4157,75 @@ mod tests {
                 "SELECT * FROM t LOCK IN SHARE MODE",
                 "LOCK IN SHARE MODE",
             ),
+            // The shared locks no deny-list word catches: a MySQL 8 read-only
+            // session runs these and holds the locks for the statement.
+            (SqlDialect::MySql, "SELECT * FROM t FOR SHARE", "FOR SHARE"),
+            (
+                SqlDialect::MySql,
+                "SELECT * FROM t FOR SHARE OF t NOWAIT",
+                "FOR SHARE",
+            ),
+            (
+                SqlDialect::Postgres,
+                "SELECT * FROM t FOR SHARE",
+                "FOR SHARE",
+            ),
+            (
+                SqlDialect::Postgres,
+                "select * from t for key share",
+                "FOR KEY SHARE",
+            ),
         ] {
-            let why = super::read_only_reason(sql, d).expect_err(sql);
+            let refusal = super::read_only_refusal(sql, d).expect_err(sql);
+            let why = &refusal.reason;
             assert!(why.contains(clause), "{sql}: {why}");
             assert!(why.contains("lock"), "{sql}: {why}");
             assert!(!why.contains("not permitted"), "{sql}: {why}");
+            assert!(!refusal.writes, "{sql}: a lock is no write");
+            assert_eq!(super::read_only_reason(sql, d), Err(refusal.reason));
+        }
+        // A column that happens to be called `share` is still a read.
+        assert!(super::read_only_reason("SELECT share, key FROM t", SqlDialect::MySql).is_ok());
+    }
+
+    /// And a real `UPDATE` inside a read is still named as the write it is —
+    /// **whichever comes first**. A locking CTE ahead of a deleting one was
+    /// told to drop the locking clause, and the retry was refused as `DELETE`.
+    #[test]
+    fn a_write_hidden_in_a_read_keeps_its_own_refusal() {
+        for sql in [
+            "WITH d AS (UPDATE t SET a = 1 RETURNING *) SELECT * FROM d",
+            "WITH l AS (SELECT * FROM a FOR UPDATE), d AS (UPDATE t SET a = 1 RETURNING *) \
+             SELECT * FROM d",
+            "WITH l AS (SELECT * FROM a FOR SHARE), d AS (UPDATE t SET a = 1 RETURNING *) \
+             SELECT * FROM d",
+        ] {
+            let refusal = super::read_only_refusal(sql, SqlDialect::Postgres).unwrap_err();
+            assert_eq!(
+                refusal.reason, "`UPDATE` is not permitted in a read-only query",
+                "{sql}"
+            );
+            assert!(refusal.writes, "{sql}");
         }
     }
 
-    /// And a real `UPDATE` inside a read is still named as the write it is.
+    /// **`writes` says whether the fix is a write path**, which is what a
+    /// front end with one (`schemaic exec`) needs to know before pointing at
+    /// it: a statement that is not a read, or one carrying a write, is; a
+    /// sleep, a second `SELECT` or a lock is not.
     #[test]
-    fn a_write_hidden_in_a_read_keeps_its_own_refusal() {
-        let why = super::read_only_reason(
-            "WITH d AS (UPDATE t SET a = 1 RETURNING *) SELECT * FROM d",
-            SqlDialect::Postgres,
-        )
-        .unwrap_err();
-        assert_eq!(why, "`UPDATE` is not permitted in a read-only query");
+    fn a_refusal_says_whether_it_was_a_write() {
+        let writes = |s: &str| {
+            super::read_only_refusal(s, SqlDialect::MySql)
+                .unwrap_err()
+                .writes
+        };
+        assert!(writes("DELETE FROM t"));
+        assert!(writes("INSERT INTO t VALUES (1)"));
+        assert!(writes("SELECT * INTO OUTFILE '/tmp/x' FROM t"));
+        assert!(!writes("SELECT SLEEP(5)"));
+        assert!(!writes("SELECT 1; SELECT 2"));
+        assert!(!writes("SELECT * FROM t FOR UPDATE"));
     }
 
     /// **The deny list is per-engine for the same reason the heads are, and it

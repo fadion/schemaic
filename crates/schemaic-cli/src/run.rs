@@ -80,7 +80,7 @@ fn exit_for_no_connection(e: &select::NoConnection) -> Exit {
 fn exit_for_no_rows(e: &query::NoRows) -> Exit {
     use query::NoRows;
     match e {
-        NoRows::Empty | NoRows::NotARead(_) => Exit::Refused,
+        NoRows::Empty | NoRows::NotARead(_) | NoRows::NotPermitted(_) => Exit::Refused,
         NoRows::Failed(_) | NoRows::TimedOut(_) => Exit::Failed,
         NoRows::Indeterminate(_) => Exit::Unknown,
     }
@@ -1141,6 +1141,10 @@ mod tests {
         assert_eq!(exit_for_no_rows(&NoRows::Empty), Exit::Refused);
         assert_eq!(
             exit_for_no_rows(&NoRows::NotARead("x".into())),
+            Exit::Refused
+        );
+        assert_eq!(
+            exit_for_no_rows(&NoRows::NotPermitted("x".into())),
             Exit::Refused
         );
         assert_eq!(exit_for_no_rows(&NoRows::Failed("x".into())), Exit::Failed);
