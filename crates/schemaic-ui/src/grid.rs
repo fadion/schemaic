@@ -1908,6 +1908,44 @@ fn nearest_shown(c: usize, shown: &[usize]) -> usize {
         .unwrap_or(c)
 }
 
+/// The grid's Ctrl+letter bindings — the *Results grid* rows of the Shortcuts
+/// table.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GridCtrl {
+    Copy,
+    Paste,
+    SelectAll,
+    Find,
+    GoToRow,
+}
+
+/// Which grid binding `key` with `m` is, if any.
+///
+/// **Ctrl and nothing else.** The table documents every one of these as a
+/// plain Ctrl+letter, and a Shift variant is a different key in this app:
+/// Ctrl+Shift+A toggles the AI panel, Ctrl+Shift+T reopens a tab. The arms
+/// matched `ctrl` alone, so with the grid focused Ctrl+Shift+A selected every
+/// cell and the window's toggle never ran. Alt is out for the reason AltGr is
+/// Ctrl+Alt on Windows: AltGr+V is a character on many European layouts, and
+/// it pasted.
+fn grid_ctrl_command(key: &str, m: floem::keyboard::Modifiers) -> Option<GridCtrl> {
+    let ctrl = m.control() || m.meta();
+    if !ctrl || m.shift() || m.alt() {
+        return None;
+    }
+    // Spelled as case pairs, not folded first: `"x" | "X"` is one of the forms
+    // `shortcuts::tests::bound_letters` reads, and this is the grid's only
+    // binding site for these letters — folded, the documentation gate saw none.
+    match key {
+        "c" | "C" => Some(GridCtrl::Copy),
+        "v" | "V" => Some(GridCtrl::Paste),
+        "a" | "A" => Some(GridCtrl::SelectAll),
+        "f" | "F" => Some(GridCtrl::Find),
+        "g" | "G" => Some(GridCtrl::GoToRow),
+        _ => None,
+    }
+}
+
 /// Hide column `ci`, if it may be (`ColLayout::may_hide`).
 ///
 /// A frozen column that is hidden is unfrozen with it — frozen and not drawn
@@ -7922,17 +7960,21 @@ fn grid_key(gs: GridState, nrows: usize, ncols: usize, e: &Event) -> EventPropag
                 CellActivation::Nothing => {}
             }
         }
-        Key::Character(s) if ctrl && matches!(s.as_str(), "c" | "C") => copy_selection(gs),
-        Key::Character(s) if ctrl && matches!(s.as_str(), "v" | "V") => paste_selection(gs),
-        Key::Character(s) if ctrl && matches!(s.as_str(), "a" | "A") => {
-            gs.anchor.set(Some((0, first_c)));
-            gs.active.set(Some((last_r, last_c)));
-        }
-        Key::Character(s) if ctrl && matches!(s.as_str(), "f" | "F") => {
-            gs.find_open.set(true); // its input autofocuses on mount
-        }
-        Key::Character(s) if ctrl && matches!(s.as_str(), "g" | "G") => {
-            gs.goto_open.set(true); // its input autofocuses on mount
+        // The grid's Ctrl+letters, and only with Ctrl alone — a Ctrl+Shift
+        // variant falls through to the window's global handler.
+        Key::Character(s) if grid_ctrl_command(s, m).is_some() => {
+            match grid_ctrl_command(s, m) {
+                Some(GridCtrl::Copy) => copy_selection(gs),
+                Some(GridCtrl::Paste) => paste_selection(gs),
+                Some(GridCtrl::SelectAll) => {
+                    gs.anchor.set(Some((0, first_c)));
+                    gs.active.set(Some((last_r, last_c)));
+                }
+                // Their inputs autofocus on mount.
+                Some(GridCtrl::Find) => gs.find_open.set(true),
+                Some(GridCtrl::GoToRow) => gs.goto_open.set(true),
+                None => {}
+            }
         }
         Key::Named(NamedKey::Delete)
             // Toggle "marked for deletion" over every real row the selection
@@ -13333,6 +13375,88 @@ mod tests {
         nav_target(5, &[0, 1, 2, 3], 2, from, n)
     }
 
+    fn mods(ctrl: bool, shift: bool, alt: bool) -> floem::keyboard::Modifiers {
+        use floem::keyboard::Modifiers;
+        let mut m = Modifiers::empty();
+        m.set(Modifiers::CONTROL, ctrl);
+        m.set(Modifiers::SHIFT, shift);
+        m.set(Modifiers::ALT, alt);
+        m
+    }
+
+    /// **A global Ctrl+Shift shortcut is not the grid's Ctrl+letter.** With
+    /// the grid focused, Ctrl+Shift+A selected every cell — the grid's Ctrl+A
+    /// arm took it and the AI panel toggle never ran. Checked against the
+    /// Shortcuts table itself, so a Ctrl+Shift binding added there later is
+    /// covered on the day it is added.
+    #[test]
+    fn no_global_ctrl_shift_shortcut_is_taken_by_the_grid() {
+        let global = crate::shortcuts::SHORTCUTS
+            .iter()
+            .find(|(g, _)| *g == "Global")
+            .expect("a Global group")
+            .1;
+        let mut checked = 0;
+        for (keys, what) in global {
+            let Some(letter) = keys.strip_prefix("Ctrl+Shift+") else {
+                continue;
+            };
+            if letter.chars().count() != 1 {
+                continue;
+            }
+            checked += 1;
+            for key in [letter.to_lowercase(), letter.to_uppercase()] {
+                assert_eq!(
+                    grid_ctrl_command(&key, mods(true, true, false)),
+                    None,
+                    "{keys} ({what}) is swallowed by the grid"
+                );
+            }
+        }
+        assert!(
+            checked >= 3,
+            "the table's Ctrl+Shift rows went missing: {checked}"
+        );
+    }
+
+    /// And the grid's own rows still answer: each documented Ctrl+letter, in
+    /// either case, and nothing with Alt — AltGr arrives as Ctrl+Alt, and
+    /// AltGr+V types a character on half of Europe's layouts.
+    #[test]
+    fn the_grids_ctrl_letters_answer_plain_ctrl_only() {
+        let want = [
+            ("c", GridCtrl::Copy),
+            ("v", GridCtrl::Paste),
+            ("a", GridCtrl::SelectAll),
+            ("f", GridCtrl::Find),
+            ("g", GridCtrl::GoToRow),
+        ];
+        for (key, cmd) in want {
+            assert_eq!(grid_ctrl_command(key, mods(true, false, false)), Some(cmd));
+            let upper = key.to_uppercase();
+            assert_eq!(
+                grid_ctrl_command(&upper, mods(true, false, false)),
+                Some(cmd)
+            );
+            assert_eq!(
+                grid_ctrl_command(key, mods(true, true, false)),
+                None,
+                "{key}"
+            );
+            assert_eq!(
+                grid_ctrl_command(key, mods(true, false, true)),
+                None,
+                "{key}"
+            );
+            assert_eq!(
+                grid_ctrl_command(key, mods(false, false, false)),
+                None,
+                "{key}"
+            );
+        }
+        assert_eq!(grid_ctrl_command("x", mods(true, false, false)), None);
+    }
+
     /// **A selection corner on a column just hidden moves to a drawn one** —
     /// the one to its right, as the columns close over it, else the one to its
     /// left at the right edge. A corner already on a drawn column stays put.
@@ -14096,6 +14220,36 @@ mod find_hits_tests {
             "the Delete arm no longer refuses a modified press, so Ctrl+Delete \
              from a results-strip button stages a row deletion"
         );
+    }
+
+    /// **Every letter `grid_key` answers goes through `grid_ctrl_command`.** The
+    /// two tests of that function pass on their own; the bug was at the call
+    /// site — an arm guarded `ctrl && matches!(s, "a" | "A")` — and one more
+    /// `Key::Character` arm above the dispatch would bring it back with both
+    /// green. So every such arm in the handler must be the one that asks it.
+    #[test]
+    fn every_letter_arm_in_grid_key_asks_grid_ctrl_command() {
+        let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/grid.rs"))
+            .expect("this file's own source");
+        let body = crate::source_gate::production_code(&src);
+        let at = body
+            .find("fn grid_key(")
+            .expect("grid_key — this gate is stale");
+        let end = at + body[at..].find("\n}\n").expect("the end of grid_key");
+        let f = &body[at..end];
+        let arms: Vec<&str> = f
+            .lines()
+            .filter(|l| l.trim_start().starts_with("Key::Character("))
+            .collect();
+        assert!(!arms.is_empty(), "no letter arm found — this gate is stale");
+        for arm in arms {
+            assert!(
+                arm.contains("grid_ctrl_command("),
+                "a letter arm in grid_key decides its own modifiers, so a Ctrl+Shift \
+                 global shortcut can be swallowed again: {}",
+                arm.trim()
+            );
+        }
     }
 
     /// **…and the *position* half of the same readout.**

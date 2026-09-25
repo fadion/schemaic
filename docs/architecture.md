@@ -25100,6 +25100,24 @@ this bundle's.
   menu used to do unconditionally) destroys the very block the menu is about, and the entries then
   describe one cell. Outside it, the press selects first, so a menu never describes something
   invisible. Copy (Ctrl+C / toolbar) emits TSV; a lone cell copies its raw value.
+- **The grid's Ctrl+letters are Ctrl and nothing else.** Copy, Paste, Select all, Find and Go to row
+  are answered by one pure `grid_ctrl_command(key, modifiers) -> Option<GridCtrl>`, which says
+  `None` the moment Shift or Alt is held. The arms it replaced were `ctrl && matches!(s, "a" | "A")`,
+  so with a cell focused **Ctrl+Shift+A selected every cell** and the AI panel never toggled: a key
+  event goes to the focused view and, consumed, to nobody else, and the window's `KeyDown` handler
+  that owns the Global shortcuts was never asked. A Shift variant is a different key in this app;
+  declined here, it reaches `grid_key`'s `_ => Continue` and falls through to the window. Alt is out
+  because AltGr arrives as Ctrl+Alt on Windows and AltGr+V is a character on many European
+  layouts — it pasted. `no_global_ctrl_shift_shortcut_is_taken_by_the_grid` walks every
+  `Ctrl+Shift+<letter>` row of the `SHORTCUTS` Global group rather than a list of its own, so a
+  Global binding added later is covered the day it lands (it was seen red naming Ctrl+Shift+A);
+  `the_grids_ctrl_letters_answer_plain_ctrl_only` pins the other side. Both test the pure function,
+  and the bug was at the call site, so **`every_letter_arm_in_grid_key_asks_grid_ctrl_command`**
+  reads `grid_key` and fails on any `Key::Character` arm that decides its own modifiers (seen red on
+  the old spelling). The function spells its letters as `"x" | "X"` pairs rather than folding case
+  first, because that is a form `shortcuts`' `bound_letters` reads and this is the grid's one binding
+  site for them — folded, the documentation gate saw no grid letters at all (checked: a probe
+  `"q" | "Q"` arm fails `every_bound_letter_is_documented` naming `grid.rs`).
 - **Paste (Ctrl+V / the cell menu) stages, it does not write.** Every pasted cell goes through the
   same `GridState::stage`/`stage_new` a typed edit does, so it lands as ordinary green edits and
   the write-back plan, the one-row safety net and Commit/Discard all apply unchanged — a paste is
