@@ -19362,7 +19362,14 @@ existing prose was left alone.
     (required — naming only a local file with nothing beside it is the main file's error) and the
     local half, if it is there, for the user names. *Choose a file…* goes through the same
     `open_source`, so a project file picked by hand arrives with its users too, and picking the
-    local half reads the whole pair. `PGPASSFILE`/`PGSERVICEFILE` are honoured,
+    local half reads the whole pair — **and a local half that was picked and fails to read is
+    reported**, where `.ok()` dropped it and the import went on with every user blank
+    (`a_named_local_half_that_cannot_be_read_says_so`); an unnamed sibling stays optional. Both
+    compositions are tested over a seam, since the parsers alone could not pin them:
+    `open_source_with` takes the file reader (`opening_either_jetbrains_half_reads_the_pair`), and
+    `jetbrains_files_in` a `Probe` for the directory listing, the file check and the small read
+    (`the_jetbrains_walk_finds_globals_then_listed_then_default_projects`, which pins the
+    globals-first order too). `PGPASSFILE`/`PGSERVICEFILE` are honoured,
     because libpq reads them first. Reads are capped at 4 MiB and a file that fails is silently
     skipped — this runs over paths the user never named — *except* one they picked by hand, which
     goes through `open_source` — `read_source` is that call with the error dropped — and is

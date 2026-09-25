@@ -142,14 +142,32 @@ impl SourceError {
 /// (`conn_import::parse_datagrip_with_local`). The local half is optional — a
 /// global `options/` file may carry its users inline — but the main half is not:
 /// naming only the local file, with nothing beside it, is the main file's error.
+/// **A local half the user named is not optional either**: its failure is
+/// theirs to hear, where it used to be dropped and the import went ahead with
+/// every user blank.
 pub fn open_source(path: &Path, source: ImportSource) -> Result<SourceFile, SourceError> {
+    open_source_with(path, source, read_text)
+}
+
+/// [`open_source`] over `read`, the one file read it makes — apart so a test
+/// can hand it a filesystem of its own.
+fn open_source_with(
+    path: &Path,
+    source: ImportSource,
+    read: impl Fn(&Path, ImportSource) -> Result<SourceFile, SourceError>,
+) -> Result<SourceFile, SourceError> {
     if source == ImportSource::DataGrip {
         let (main, local) = jetbrains_pair(path);
-        let mut file = read_text(&main, source)?;
-        file.local = read_text(&local, source).ok().map(|f| f.text);
+        let named_local = local.as_path() == path;
+        let mut file = read(&main, source)?;
+        file.local = match read(&local, source) {
+            Ok(f) => Some(f.text),
+            Err(e) if named_local => return Err(e),
+            Err(_) => None,
+        };
         return Ok(file);
     }
-    read_text(path, source)
+    read(path, source)
 }
 
 /// One file's text, bounded and decoded. See [`open_source`].
@@ -260,21 +278,54 @@ fn dbeaver_files() -> Vec<(ImportSource, PathBuf)> {
 /// IDE *binary* lives (JetBrains Toolbox, a tarball, a package) does not matter:
 /// its configuration is under the config root either way.
 fn jetbrains_files() -> Vec<(ImportSource, PathBuf)> {
-    let home_dir = home();
-    let home_str = home_dir
-        .as_ref()
+    jetbrains_files_in(&Disk, &config_roots(), home().as_deref())
+}
+
+/// What the JetBrains walk asks of the filesystem — a trait so a test can hand
+/// [`jetbrains_files_in`] one of its own, since the walk is the composition that
+/// makes project discovery work and the parser alone could not pin it.
+trait Probe {
+    /// The immediate sub-directories of `dir`, or nothing if it isn't one.
+    fn children(&self, dir: &Path) -> Vec<PathBuf>;
+    fn is_file(&self, path: &Path) -> bool;
+    /// See the free [`read_small`].
+    fn read_small(&self, path: &Path) -> Option<String>;
+}
+
+/// The real filesystem.
+struct Disk;
+
+impl Probe for Disk {
+    fn children(&self, dir: &Path) -> Vec<PathBuf> {
+        children(dir)
+    }
+    fn is_file(&self, path: &Path) -> bool {
+        path.is_file()
+    }
+    fn read_small(&self, path: &Path) -> Option<String> {
+        read_small(path)
+    }
+}
+
+/// [`jetbrains_files`] over `fs`, `roots` (the config roots) and `home`.
+fn jetbrains_files_in(
+    fs: &impl Probe,
+    roots: &[PathBuf],
+    home: Option<&Path>,
+) -> Vec<(ImportSource, PathBuf)> {
+    let home_str = home
         .map(|h| h.to_string_lossy().into_owned())
         .unwrap_or_default();
     let mut projects: Vec<PathBuf> = Vec::new();
     let mut globals: Vec<PathBuf> = Vec::new();
-    for root in config_roots() {
-        for product in children(&root.join("JetBrains")) {
+    for root in roots {
+        for product in fs.children(&root.join("JetBrains")) {
             let options = product.join("options");
             let global = options.join("dataSources.xml");
-            if global.is_file() {
+            if fs.is_file(&global) {
                 globals.push(global);
             }
-            if let Some(recent) = read_small(&options.join("recentProjects.xml")) {
+            if let Some(recent) = fs.read_small(&options.join("recentProjects.xml")) {
                 projects.extend(
                     schemaic_core::conn_import::recent_project_dirs(
                         &recent,
@@ -287,15 +338,15 @@ fn jetbrains_files() -> Vec<(ImportSource, PathBuf)> {
             }
         }
     }
-    if let Some(home) = &home_dir {
-        projects.extend(children(&home.join("DataGripProjects")));
+    if let Some(home) = home {
+        projects.extend(fs.children(&home.join("DataGripProjects")));
     }
     // Globals first, then projects: `discover` drops a second path to the same
     // file, and `scan` keeps the first description of a server.
     let project_files = projects
         .iter()
         .map(|p| p.join(".idea").join("dataSources.xml"))
-        .filter(|p| p.is_file());
+        .filter(|p| fs.is_file(p));
     globals
         .into_iter()
         .chain(project_files)
@@ -481,6 +532,145 @@ mod tests {
         // A directory is not a source, even though it exists.
         let dir = std::env::temp_dir();
         assert!(read_source(&dir, ImportSource::Url).is_none());
+    }
+
+    /// A reader over an in-memory filesystem: each path's text, or its error.
+    fn reader(
+        files: Vec<(PathBuf, Result<&'static str, SourceError>)>,
+    ) -> impl Fn(&Path, ImportSource) -> Result<SourceFile, SourceError> {
+        move |path, source| match files.iter().find(|(p, _)| p == path) {
+            Some((_, Ok(text))) => Ok(SourceFile {
+                source,
+                path: path.to_string_lossy().into_owned(),
+                text: text.to_string(),
+                local: None,
+            }),
+            Some((_, Err(e))) => Err(e.clone()),
+            None => Err(SourceError::NotAFile),
+        }
+    }
+
+    /// **Both halves are read, whichever was named** — the composition that
+    /// delivers a project's users, which `jetbrains_pair` alone could not pin:
+    /// the line filling `local` could be deleted with the suite green.
+    #[test]
+    fn opening_either_jetbrains_half_reads_the_pair() {
+        let dir = Path::new("/p/.idea");
+        let (main, local) = (
+            dir.join("dataSources.xml"),
+            dir.join("dataSources.local.xml"),
+        );
+        let read = reader(vec![
+            (main.clone(), Ok("MAIN")),
+            (local.clone(), Ok("LOCAL")),
+        ]);
+        for named in [&main, &local] {
+            let f = open_source_with(named, ImportSource::DataGrip, &read).unwrap();
+            assert_eq!(
+                (f.text.as_str(), f.local.as_deref()),
+                ("MAIN", Some("LOCAL"))
+            );
+        }
+        // Another source is one file, with no pairing.
+        let f = open_source_with(&main, ImportSource::Url, &read).unwrap();
+        assert_eq!(f.local, None);
+    }
+
+    /// **A local half the user named reports its own failure.** It was
+    /// dropped through `.ok()`, and the import went ahead with every user
+    /// blank and nothing said about the file they picked. A sibling nobody
+    /// named stays optional, as a global file may carry its users inline.
+    #[test]
+    fn a_named_local_half_that_cannot_be_read_says_so() {
+        let dir = Path::new("/p/.idea");
+        let (main, local) = (
+            dir.join("dataSources.xml"),
+            dir.join("dataSources.local.xml"),
+        );
+        let big = reader(vec![
+            (main.clone(), Ok("MAIN")),
+            (local.clone(), Err(SourceError::TooBig(9 << 20))),
+        ]);
+        assert_eq!(
+            open_source_with(&local, ImportSource::DataGrip, &big),
+            Err(SourceError::TooBig(9 << 20))
+        );
+        let f = open_source_with(&main, ImportSource::DataGrip, &big).unwrap();
+        assert_eq!(f.local, None, "an unnamed sibling is optional");
+        let alone = reader(vec![(main.clone(), Ok("MAIN"))]);
+        assert_eq!(
+            open_source_with(&main, ImportSource::DataGrip, &alone).map(|f| f.local),
+            Ok(None)
+        );
+    }
+
+    /// An in-memory filesystem for the JetBrains walk: directories, files,
+    /// and what reading a small file answers.
+    #[derive(Default)]
+    struct FakeFs {
+        dirs: Vec<(PathBuf, Vec<PathBuf>)>,
+        files: Vec<PathBuf>,
+        texts: Vec<(PathBuf, &'static str)>,
+    }
+
+    impl Probe for FakeFs {
+        fn children(&self, dir: &Path) -> Vec<PathBuf> {
+            self.dirs
+                .iter()
+                .find(|(d, _)| d == dir)
+                .map(|(_, c)| c.clone())
+                .unwrap_or_default()
+        }
+        fn is_file(&self, path: &Path) -> bool {
+            self.files.iter().any(|f| f == path)
+        }
+        fn read_small(&self, path: &Path) -> Option<String> {
+            self.texts
+                .iter()
+                .find(|(p, _)| p == path)
+                .map(|(_, t)| t.to_string())
+        }
+    }
+
+    /// **The walk, whole**: each product's global file first, then every
+    /// project its `recentProjects.xml` names, then each `~/DataGripProjects`
+    /// child — the order `scan`'s keep-the-first rule relies on — and only
+    /// projects that have the file. Each piece could be deleted with the suite
+    /// green while only the parser was tested.
+    #[test]
+    fn the_jetbrains_walk_finds_globals_then_listed_then_default_projects() {
+        let root = PathBuf::from("/cfg");
+        let product = root.join("JetBrains").join("DataGrip2025.2");
+        let options = product.join("options");
+        let home = PathBuf::from("/home/me");
+        let shop = PathBuf::from("/home/me/work/shop");
+        let gone = PathBuf::from("/home/me/work/gone");
+        let inv = home.join("DataGripProjects").join("inv");
+        let file = |p: &Path| p.join(".idea").join("dataSources.xml");
+        let fs = FakeFs {
+            dirs: vec![
+                (root.join("JetBrains"), vec![product.clone()]),
+                (home.join("DataGripProjects"), vec![inv.clone()]),
+            ],
+            files: vec![options.join("dataSources.xml"), file(&shop), file(&inv)],
+            texts: vec![(
+                options.join("recentProjects.xml"),
+                r#"<map><entry key="$USER_HOME$/work/shop"><value /></entry>
+                   <entry key="$USER_HOME$/work/gone"><value /></entry></map>"#,
+            )],
+        };
+        let found: Vec<PathBuf> = jetbrains_files_in(&fs, &[root], Some(&home))
+            .into_iter()
+            .map(|(source, p)| {
+                assert_eq!(source, ImportSource::DataGrip);
+                p
+            })
+            .collect();
+        assert_eq!(
+            found,
+            vec![options.join("dataSources.xml"), file(&shop), file(&inv)]
+        );
+        assert!(!found.contains(&file(&gone)), "no file, no source");
     }
 
     #[test]
