@@ -31,11 +31,12 @@ use schemaic_core::connection::SslMode;
 
 use crate::consts::MASK_CH;
 use crate::settings::{focusable_dropdown, focusable_toggle_row};
+use crate::tooltip::TooltipExt;
 use crate::widgets;
 use crate::widgets::{
-    ACTION_TAB, ActionKind, FocusRing, MenuEntry, NAV_TAB, NavAxis, action_button_icon,
-    action_face, action_gap, autohide, control_button, focus_root_with_ring, form_hint,
-    form_label_style, in_ring_button, loading_dots, menu_item_style, modal_h, modal_title, modal_w,
+    ACTION_TAB, ActionKind, FocusRing, MenuEntry, NAV_TAB, NavAxis, action_button,
+    action_button_icon, action_face, action_gap, autohide, control_button, focus_root_with_ring,
+    form_hint, form_label_style, in_ring_button, menu_item_style, modal_h, modal_title, modal_w,
     nav_group, panel_style,
 };
 use crate::{ConnActions, ConnUi, DraftSignals, FieldCfg, OverlayUi, edit_field, icons, theme};
@@ -44,10 +45,9 @@ use crate::{ConnActions, ConnUi, DraftSignals, FieldCfg, OverlayUi, edit_field, 
 /// glance away from the button, short enough that it can't still be showing when
 /// the next edit is made and would then be confirming the wrong write.
 const SAVE_FLASH: std::time::Duration = std::time::Duration::from_millis(2000);
-/// The same for Test's result icon, held longer: a failure is worth going back
-/// and looking at, and unlike Save there is nothing else on screen that says how
-/// it went.
-const TEST_FLASH: std::time::Duration = std::time::Duration::from_millis(4000);
+/// How long "Connected" stands beside the Test button before it hides. A failure
+/// does not hide on a timer (`TestState::line`).
+const TEST_FLASH: std::time::Duration = std::time::Duration::from_millis(5000);
 /// Width of the connection list's right-click menu. Narrower than the shared
 /// 170px default because both its labels are one short word; the editor's
 /// right-click menu makes the same call at 120.
@@ -656,8 +656,8 @@ pub(crate) fn manage_modal(conn: ConnUi, o: OverlayUi, actions: Rc<ConnActions>)
     let popup_anchor = o.popup_anchor;
     let popup_width = o.popup_width;
     let conn_test = conn.conn_test;
-    // Transient confirmations standing in for the two safe actions' labels: a
-    // check on Save, the result icon on Test. Created here (once, in the stable
+    // Transient confirmations: a check standing in for Save's label, and Test's
+    // result on the status line beside it. Created here (once, in the stable
     // workspace scope), not inside the open/close `dyn_container`, so a deferred
     // reset never fires on a disposed signal.
     let save_flash = RwSignal::new(false);
@@ -707,7 +707,7 @@ pub(crate) fn manage_modal(conn: ConnUi, o: OverlayUi, actions: Rc<ConnActions>)
                 });
             }
             // Editing any field resets the state, which withdraws the result the
-            // icon was reporting.
+            // line was reporting.
             _ => {
                 if test_flash.get_untracked() {
                     test_flash.set(false);
@@ -1684,40 +1684,15 @@ fn conn_form(
     );
 
     // Test: `Neutral`, the same grey as every modal's Cancel — it commits
-    // nothing, and a fill of its own said otherwise. Its label is replaced, in
-    // place, by the result icon, which keeps its green or red: with the button no
-    // longer carrying a colour, the glyph is the only thing that says how it went.
-    // The width is pinned to `Test...` so none of the three faces — label,
-    // animated dots, icon — moves the button.
+    // nothing, and a fill of its own said otherwise. It always reads "Test"; how
+    // the test is going is said by the status line beside it (`test_status`).
     let test = test_conn.clone();
-    let test_btn = action_face(
-        "Test...",
+    let test_btn = action_button(
+        "Test",
         ActionKind::Neutral,
         true,
         ring.clone(),
         ACTION_TAB + 10,
-        dyn_container(
-            move || (conn_test.get(), test_flash.get()),
-            move |(st, flashing)| match st {
-                crate::TestState::Testing => {
-                    loading_dots("Test", theme::btn_neutral_text, theme::font_body).into_any()
-                }
-                crate::TestState::Ok if flashing => icons::icon(icons::CIRCLE_CHECK, 16.0)
-                    .style(|s| s.color(theme::conn_test_ok()))
-                    .into_any(),
-                crate::TestState::Fail(_) if flashing => icons::icon(icons::CIRCLE_X, 16.0)
-                    .style(|s| s.color(theme::conn_test_fail()))
-                    .into_any(),
-                // Centred, like every other face here. It deliberately does *not*
-                // claim `loading_dots`' reserved `Test...` box: doing so pinned
-                // the word to the left of a button sized for three dots it isn't
-                // showing, which is a permanently off-centre label bought to
-                // avoid a one-off shift as the test starts.
-                _ => text("Test")
-                    .style(move |s| s.font_size(theme::font_body()))
-                    .into_any(),
-            },
-        ),
         move || (test)(),
     );
 
@@ -1762,39 +1737,73 @@ fn conn_form(
             });
         },
     );
-    // **Why the test failed, in words, above the row that failed it.**
+    // **How the test went, in words, beside the button that ran it**: "Testing…"
+    // while it runs, then "Connected" for `TEST_FLASH`, or the failure until the
+    // next test or edit (`TestState::line`). A failure is one line ending in an
+    // ellipsis, and the whole reason — the SSH host-key refusal runs to several
+    // sentences naming both fingerprints — is its tooltip.
     //
-    // The icon is a flash: `TEST_FLASH` takes it away again, and its own comment
-    // says a failure "is worth going back and looking at, and unlike Save there
-    // is nothing else on screen that says how it went". That was exactly true —
-    // the several sentences `ssh::refusal_message` composes about a host key
-    // that has *changed* were dropped by the caller, and the one message in this
-    // app that matters most read as a red X. So this line is **not** tied to
-    // `test_flash`: it stays until the next test or the next edit, both of which
-    // move `conn_test` off `Fail`.
-    let failure_line = dyn_container(
-        move || conn_test.get(),
-        move |st| match st.failure() {
-            // The padding is inside the arm: on the container it would leave a
-            // permanent band above the footer, since a hidden child still gives
-            // its parent that parent's own padding.
-            Some(msg) => container(widgets::footer_error(msg.to_string()))
-                .style(|s| {
-                    s.width_full()
-                        .padding_horiz(theme::scaled(14.0))
-                        .padding_top(theme::scaled(10.0))
-                })
-                .into_any(),
-            None => widgets::nothing(),
+    // It shrinks and the buttons do not, the `modal_footer_split` contract:
+    // `min_width(0)` on every box between the row and the text, or taffy's
+    // automatic minimum keeps the text at full width and it pushes the buttons
+    // out instead of ending in `…`.
+    // The key reads `test_flash` only for a success, the one line it governs:
+    // `dyn_container` rebuilds on every change of its key, equal or not, so a
+    // failure keyed on the flash would be rebuilt when its timer ran out —
+    // closing the tooltip being read, the very thing a failure's not timing out
+    // is for.
+    let test_status = dyn_container(
+        move || {
+            conn_test.with(|st| {
+                let shown = matches!(st, crate::TestState::Ok) && test_flash.get();
+                st.line(shown)
+            })
+        },
+        move |line| {
+            let Some(line) = line else {
+                return widgets::nothing();
+            };
+            let color: fn() -> floem::peniko::Color = match line {
+                crate::TestLine::Testing => theme::text_dim,
+                crate::TestLine::Connected => theme::conn_test_ok,
+                crate::TestLine::Failed(_) => theme::conn_test_fail,
+            };
+            let failed = matches!(line, crate::TestLine::Failed(_));
+            let words = text(line.text().to_string()).style(move |s| {
+                s.color(color())
+                    .font_size(theme::font_label())
+                    .min_width(0.0)
+                    .text_ellipsis()
+            });
+            let words = if failed {
+                words
+                    .tooltip(move || {
+                        let full = conn_test.with_untracked(|st| {
+                            st.failure().unwrap_or("Connection failed").to_string()
+                        });
+                        text(full).style(|s| s.max_width(theme::scaled(420.0)))
+                    })
+                    .into_any()
+            } else {
+                words.into_any()
+            };
+            words
+                .style(|s| s.min_width(0.0).margin_right(action_gap()))
+                .into_any()
         },
     )
-    .style(|s| s.width_full());
+    .style(|s| s.min_width(0.0).flex_shrink(1.0_f32));
 
-    let right_actions =
-        h_stack((test_btn, save_btn)).style(|s| s.flex_row().items_center().gap(action_gap()));
+    let right_actions = h_stack((test_btn, save_btn)).style(|s| {
+        s.flex_row()
+            .items_center()
+            .gap(action_gap())
+            .flex_shrink(0.0_f32)
+    });
     let buttons = h_stack((
         delete_btn,
-        empty().style(|s| s.flex_grow(1.0_f32)),
+        empty().style(|s| s.flex_grow(1.0_f32).min_width(10.0).flex_shrink(1.0_f32)),
+        test_status,
         right_actions,
     ))
     .style(|s| {
@@ -1809,7 +1818,6 @@ fn conn_form(
 
     v_stack((
         autohide(scroll(fields)).style(|s| s.flex_grow(1.0_f32).width_full().min_height(0.0)),
-        failure_line,
         buttons,
     ))
     .style(|s| s.flex_grow(1.0_f32).height_full().flex_col().min_width(0.0))

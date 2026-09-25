@@ -5283,7 +5283,8 @@ pub struct SchemaActions {
 }
 
 /// Result of a "Test" of the Manage-Connections draft (host + credentials),
-/// shown as an icon on the Test button. Transient — never persisted.
+/// reported by the status line beside the Test button ([`TestState::line`]).
+/// Transient — never persisted.
 #[derive(Clone, PartialEq, Eq, Default)]
 pub enum TestState {
     /// No test run yet (or the draft was edited since the last one).
@@ -5306,8 +5307,9 @@ pub enum TestState {
     /// one identical red X with no text anywhere. The message was moved out of
     /// band from russh precisely so a caller could show it.
     ///
-    /// Empty is allowed and renders nothing extra; it is never the *expected*
-    /// state, which is what `a_failed_test_always_carries_its_reason` holds.
+    /// Empty is allowed and reads "Connection failed" ([`TestLine::text`]); it is
+    /// never the *expected* state, which is what
+    /// `a_failed_test_always_carries_its_reason` holds.
     Fail(String),
 }
 
@@ -5324,6 +5326,107 @@ impl TestState {
             TestState::Fail(msg) if !msg.trim().is_empty() => Some(msg.as_str()),
             _ => None,
         }
+    }
+
+    /// What the status line beside the Test button says, if anything.
+    ///
+    /// `shown` is whether a success is still inside its display window: only
+    /// "Connected" auto-hides. A test in flight stays until its answer replaces
+    /// it, and a failure until the next test or the next edit moves the state off
+    /// `Fail` — it is worth going back and reading, the SSH host-key refusal most
+    /// of all. A failure is folded onto one line, because the line is one row
+    /// beside the button and ends in an ellipsis; the whole reason is
+    /// [`failure`](Self::failure), for the tooltip.
+    pub fn line(&self, shown: bool) -> Option<TestLine> {
+        match self {
+            TestState::Idle => None,
+            TestState::Testing => Some(TestLine::Testing),
+            TestState::Ok if shown => Some(TestLine::Connected),
+            TestState::Ok => None,
+            TestState::Fail(msg) => Some(TestLine::Failed(
+                msg.split_whitespace().collect::<Vec<_>>().join(" "),
+            )),
+        }
+    }
+}
+
+/// The status line beside the Test button — see [`TestState::line`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TestLine {
+    Testing,
+    Connected,
+    /// The failure's reason, on one line (possibly empty).
+    Failed(String),
+}
+
+impl TestLine {
+    pub fn text(&self) -> &str {
+        match self {
+            TestLine::Testing => "Testing…",
+            TestLine::Connected => "Connected",
+            TestLine::Failed(msg) if msg.is_empty() => "Connection failed",
+            TestLine::Failed(msg) => msg,
+        }
+    }
+}
+
+#[cfg(test)]
+mod test_line_tests {
+    use super::{TestLine, TestState};
+
+    #[test]
+    fn an_idle_test_says_nothing() {
+        assert_eq!(TestState::Idle.line(true), None);
+        assert_eq!(TestState::Idle.line(false), None);
+    }
+
+    /// A test in flight is not a result, so the display window that retires
+    /// results does not retire it: it stays until the answer replaces it.
+    #[test]
+    fn a_running_test_says_so_until_it_lands() {
+        assert_eq!(TestState::Testing.line(true), Some(TestLine::Testing));
+        assert_eq!(TestState::Testing.line(false), Some(TestLine::Testing));
+        assert_eq!(TestLine::Testing.text(), "Testing…");
+    }
+
+    #[test]
+    fn a_passed_test_says_connected_while_shown() {
+        assert_eq!(TestState::Ok.line(true), Some(TestLine::Connected));
+        assert_eq!(TestLine::Connected.text(), "Connected");
+        assert_eq!(TestState::Ok.line(false), None, "the result auto-hides");
+    }
+
+    /// The line is one row beside the button, so a multi-sentence reason — the
+    /// SSH host-key refusal spans several lines — is folded onto one. The whole
+    /// text is still `failure()`, which the tooltip shows.
+    #[test]
+    fn a_failed_test_shows_its_reason_on_one_line() {
+        let st = TestState::Fail("Access denied\n  for user 'root'@'localhost'".into());
+        assert_eq!(
+            st.line(true),
+            Some(TestLine::Failed(
+                "Access denied for user 'root'@'localhost'".into()
+            ))
+        );
+    }
+
+    /// **A failure does not auto-hide.** It is worth going back and reading —
+    /// the host-key refusal most of all — so it stays until the next test or the
+    /// next edit moves the state off `Fail`; only "Connected" times out.
+    #[test]
+    fn a_failure_outlasts_the_display_window() {
+        let st = TestState::Fail("Access denied".into());
+        assert_eq!(
+            st.line(false),
+            Some(TestLine::Failed("Access denied".into()))
+        );
+    }
+
+    /// A failure with no words is still a failure — the line must not open blank.
+    #[test]
+    fn a_failed_test_without_a_reason_still_says_it_failed() {
+        let line = TestState::Fail("  ".into()).line(true).unwrap();
+        assert_eq!(line.text(), "Connection failed");
     }
 }
 

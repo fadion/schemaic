@@ -13064,22 +13064,41 @@ existing prose was left alone.
     a `menu_row: RwSignal<Option<u64>>` created in the modal's **stable scope** beside `save_flash`
     and `test_flash` and for the same reason — the clearing effect outlives the open/close
     `dyn_container`, and a signal built inside it would be disposed out from under that effect.
-    Those two flashes are the transient confirmations standing in for the safe actions' labels (a
-    check on **Save**, the result icon on **Test**), and the stable scope was only half of what they
-    needed. `save_gen` — the generation the deferred clear checks itself against — stayed inside the
-    form the `dyn_container` disposes, so closing the modal inside `SAVE_FLASH` left the pending
-    `exec_after` reading `None` from a dead generation: it declined to clear, and the check was
-    still on the button the next time the modal opened. What answers it is an effect on `open` that
-    **withdraws the confirmation when the modal closes**, rather than hoisting `save_gen` out beside
+    Those two flashes are the transient confirmations of the safe actions (a check standing in for
+    **Save**'s label, **Test**'s *Connected* on the status line beside it), and the stable scope was
+    only half of what they needed. `save_gen` — the generation the deferred clear checks itself
+    against — stayed inside the form the `dyn_container` disposes, so closing the modal inside
+    `SAVE_FLASH` left the pending `exec_after` reading `None` from a dead generation: it declined to
+    clear, and the check was still on the button the next time the modal opened. What answers it is
+    an effect on `open` that **withdraws the confirmation when the modal closes**, rather than
+    hoisting `save_gen` out beside
     the flash — a check reporting a save from a previous visit is wrong even while its two seconds
     are still running (the guard-scope gotcha below states the general rule). **Test has the same
     shape and is deliberately not fixed**: `test_gen` is already in the stable scope so its timer
     does fire, but a close-and-reopen inside `TEST_FLASH` still shows the previous visit's result
-    icon, and `test_flash` is also driven by `conn_test` state that would likely need resetting with
-    it.
-    **Why the test failed is printed in words above the button row, and that line is deliberately
-    *not* tied to `test_flash`.** `TestState::Fail` carries a `String` (so the enum is no longer
-    `Copy`), `TestState::{landed, failure}` are the two questions asked of it, and `main.rs`'s
+    on the status line, and `test_flash` is also driven by `conn_test` state that would likely need
+    resetting with it.
+    **Test's button always reads *Test*; how the test went is a status line immediately left of
+    it.** The footer is Delete · spacer · status · [Test, Save], so the flex spacer pushes the line
+    right-aligned against the button that ran it. The button is a plain `action_button` — it used to
+    be an `action_face` whose face was swapped for animated dots while running and a result icon
+    after, and the user asked for words instead. `TestState::line(shown)` in `lib.rs` decides them,
+    as a `TestLine`: `Testing` (*Testing…*, `text_dim`), `Connected` (`conn_test_ok`) or
+    `Failed(reason)` (`conn_test_fail`), with `shown` being `test_flash`. A test in flight is not a
+    result, so *Testing…* ignores `shown` and stays until the answer replaces it, and a failure
+    ignores it too, for the reason below; only `Ok` waits on it, so *Connected* goes after
+    `TEST_FLASH` (5000 ms) (`test_line_tests`). `contrast.rs` holds all three to `Body` on
+    `bg_panel` — the failure is a sentence to be read, not a glyph to be spotted — and that is why
+    the running state is `text_dim`: `text_muted` was tried first and failed there, at 2.55:1 Dark
+    and 2.89:1 Light. The line shrinks and the buttons do not, the `modal_footer_split` contract
+    spelled by hand because this footer is not that widget: `min_width(0)` on every box from the row
+    down to the text, `flex_shrink(1)` on the status, `flex_shrink(0)` on the buttons, so a long
+    error ends in `…` rather than pushing Test and Save out of the panel. Its `margin_right` lives
+    inside the `Some` arm, since a margin on the container would leave a gap before Test with
+    nothing in it.
+    **Why the test failed is that line, folded onto one row, with the whole reason as its
+    tooltip.** `TestState::Fail` carries a `String` (so the enum is no longer `Copy`),
+    `TestState::{landed, failure}` are the two questions asked of it, and `main.rs`'s
     `test_outcome` is the one mapping from the round trip's `Result`. It used to be a bare `bool`:
     `open_tunnel`'s failure arm was `Err(_) => { send(false); return; }`, which is where
     `ssh::refusal_message` — several sentences naming the host, both fingerprints, that the key *"has
@@ -13087,12 +13106,22 @@ existing prose was left alone.
     existing. `ssh::authenticate`'s own doc names this button as the surface for exactly those
     errors, and the *real* connect path never had the gap (`Err(e) => send(Err(e.to_string()))`), so
     only the diagnostic control lost the diagnosis: an unreadable trust store, a wrong SSH password
-    and an unreachable host were one identical red X with no text anywhere. The icon is a flash and
-    `TEST_FLASH` takes it away again, so the sentence stays until the next test or the next edit —
-    both of which move `conn_test` off `Fail` — and its padding lives inside the `Some` arm, since a
-    hidden child still gives its parent that parent's own padding and would leave a permanent band
-    above the footer. An empty reason renders nothing extra and is never the expected state
+    and an unreachable host were one identical red X with no text anywhere. `line` collapses the
+    reason's whitespace, because the status is one row ending in `…` and a refusal runs to several
+    lines; the whole of `TestState::failure()` is the line's tooltip (the anchored `.tooltip`,
+    wrapped at `scaled(420)`), and that is where the host-key refusal is read now. An empty reason
+    reads *Connection failed* rather than opening blank
+    (`a_failed_test_without_a_reason_still_says_it_failed`), and is never the expected state
     (`a_failed_test_always_carries_its_reason`, `an_unfinished_test_reports_neither_way`).
+    **The failure is deliberately *not* on `TEST_FLASH`; *Connected* is.** A failure stays until the
+    next test or the next edit moves `conn_test` off `Fail` (`conn_form`'s reset effect), because it
+    is worth going back and reading — the host-key refusal most of all — and its full text lives in
+    the tooltip, a child of the line. A timed failure was tried and rejected for exactly that: the
+    line going on schedule would take the tooltip with it mid-read
+    (`a_failure_outlasts_the_display_window`). **The `test_status` key reads `test_flash` only
+    under `TestState::Ok`**, because `dyn_container` rebuilds its child on every change of its key,
+    equal or not: keyed on the flash, a failure's unchanged line would be rebuilt when the timer ran out,
+    closing the very tooltip it stays up for.
     **`tls_fields` is always visible on a networked engine, not behind a toggle like the SSH
     block**: a database that enforces TLS is the ordinary case rather than the advanced one, and a
     checkbox marked "use SSL" is the control that leaves people believing a connection is verified

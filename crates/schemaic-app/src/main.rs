@@ -14116,8 +14116,8 @@ mod app_tests {
             assert!(!st.landed(), "{:?}", st.failure());
             assert_eq!(st.failure(), None);
         }
-        // An empty reason is not a sentence: the icon still says it failed, and
-        // the line below the footer stays away rather than opening blank.
+        // An empty reason is not a sentence: the status line falls back to its
+        // own "Connection failed" (`TestLine::text`) rather than opening blank.
         assert_eq!(TestState::Fail(String::new()).failure(), None);
         assert!(TestState::Fail(String::new()).landed());
     }

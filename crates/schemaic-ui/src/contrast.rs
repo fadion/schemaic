@@ -431,12 +431,11 @@ pub const UI_PAIRINGS: &[Pairing<UiTheme>] = &[
     pair!(btn_quiet_text on btn_quiet_hover, Body, "preview footer: hovering one"),
     pair!(btn_danger_text on btn_danger, Body, "preview footer: Apply, on a destructive plan"),
     pair!(btn_danger_text on btn_danger_hover, Body, "preview footer: hovering it"),
-    // Test's result icon, on the neutral fill it flashes inside. Both hover
-    // states listed too: the pointer is on the button that was just pressed.
-    pair!(conn_test_ok on btn_neutral, Icon, "Manage Connections: the test-passed tick"),
-    pair!(conn_test_ok on btn_neutral_hover, Icon, "Manage Connections: hovering it"),
-    pair!(conn_test_fail on btn_neutral, Icon, "Manage Connections: the test-failed cross"),
-    pair!(conn_test_fail on btn_neutral_hover, Icon, "Manage Connections: hovering it"),
+    // Test's result, in words on the modal's footer beside the button. Prose, so
+    // `Body` — the failure is a sentence to be read, not a glyph to be spotted.
+    pair!(conn_test_ok on bg_panel, Body, "Manage Connections: \"Connected\""),
+    pair!(conn_test_fail on bg_panel, Body, "Manage Connections: why a test failed"),
+    pair!(text_dim on bg_panel, Body, "Manage Connections: \"Testing…\""),
     // Preview SQL before there is anything to preview — the one action that sits
     // disabled for more than a moment, so it's the disabled state worth tracking.
     disabled!(btn_primary_text(0.5) on btn_primary(0.5) over bg_panel, Recessive, "modal footer: an action not yet available"),
