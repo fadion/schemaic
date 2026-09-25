@@ -1542,7 +1542,24 @@ existing prose was left alone.
     it fills so the skip is not reported as `dropped` (`a_paste_skips_a_hidden_column`) — a write
     aimed at the screen lands on the screen. `may_hide` refuses the last drawn column, because a grid
     of none is a gutter with nothing on it to bring the others back from
-    (`the_shown_columns_and_the_last_one_that_must_stay`). **What hiding deliberately does not
+    (`the_shown_columns_and_the_last_one_that_must_stay`). **The inline editor is drawn columns
+    only, too.** `next_editable` is the Tab/Enter hop, walking `visual_cols` — draw order, so Tab
+    off a frozen column goes to the one drawn beside it — with `None` the caller's cue to close the
+    editor. The grid's `next_editable_col` used to walk `ci+1..ncols` by index, so a Tab past a
+    hidden column opened an editor nobody could see; it seeded a NULL cell with `""`, and the next
+    commit wrote `SET hidden_col = ''` over the NULL (`the_editor_hop_steps_over_a_hidden_column`,
+    `the_editor_hop_walks_the_draw_order`). `first_editable` is where `+ Row` opens its editor and a
+    clone lands, which picked the first editable column by index for the same reason
+    (`a_new_rows_editor_opens_on_the_first_drawn_editable_column`). `edges` is the first and last
+    drawn column in index order — the corners of every **whole-row** gesture (the gutter, *Go to
+    row*), which said `0` and `ncols - 1`: with the first column hidden, a gutter-selected row was
+    anchored on a cell nobody could see, a paste there found no drawn column to start from and
+    dropped every value (`a_block_paste_onto_a_gutter_selected_row_lands_past_a_hidden_first_column`),
+    and Enter opened an editor the data pane never built. With nothing drawn it is `(0, ncols - 1)`,
+    saturating (`the_edges_are_the_first_and_last_drawn_columns`). `hide` is the hide itself — the
+    unfreeze and the corner move described under *Data grid*, through a private `nearest_shown` that
+    used to live in the grid (`hiding_a_column_unfreezes_it_and_moves_the_corners_off_it`,
+    `a_corner_on_a_hidden_column_moves_to_the_nearest_shown`). **What hiding deliberately does not
     reach**: the whole-result exports, `exported` and `insert_blocks_all`. They are about the result,
     and the *All rows* export re-runs the query on the server, which knows nothing of a grid's
     hidden columns — so a fetched export honouring the hidden set would have two exports of one
@@ -25123,15 +25140,24 @@ this bundle's.
   hidden columns (N)* submenu, one entry per column by name and then *Show all*, because a menu
   closes on a click and one click can only show one. `gs.hidden` is seeded from
   `PanelView::hidden_cols` and mirrored back beside `frozen_col` — session-only, like the rest of
-  the panel. `hide_column` unfreezes a column it hides, since frozen and not drawn is no state anyone
-  asked for and it would come back pinned, and moves the active and anchor corners off it through
-  `nearest_shown` — the right neighbour, the one that closes over it, else the left
-  (`a_corner_on_a_hidden_column_moves_to_the_nearest_shown`) — because an active cell on a hidden
-  column is one the keyboard types into and nobody can see. `nav_target` takes the `shown` list
+  the panel. `hide_column` is a wrapper over `ColLayout::hide`, which unfreezes a column it hides,
+  since frozen and not drawn is no state anyone asked for and it would come back pinned, and moves
+  the active and anchor corners off it through `nearest_shown` — the right neighbour, the one that
+  closes over it, else the left (`a_corner_on_a_hidden_column_moves_to_the_nearest_shown`) —
+  because an active cell on a hidden column is one the keyboard types into and nobody can see.
+  `nav_target` takes the `shown` list
   rather than a column count and steps over a hidden column; Right and Left find the nearest shown
   column either side even from one just hidden, and Home/End/Ctrl+Home/Ctrl+End land on the first
   or last shown (`nav_target_steps_over_a_hidden_column`), as do the first-arrow select and Ctrl+A's
-  anchor. **The gutter's `#` corner becomes an eye and a count while columns are hidden**, with a
+  anchor, those two through `ColLayout::edges` — which is also where the gutter's whole-row
+  gestures and *Go to row* take their corners. **No editor opens on a hidden column**: the Tab/Enter hop, `+ Row`
+  and a clone ask `ColLayout::next_editable`/`first_editable` (why, under `core::edit`), and behind
+  them `start_edit` refuses a hidden column and `commit_edit` *drops* rather than stages an edit on
+  one — the backstop, since an editor nobody can see commits `''` over a NULL. That drop is why
+  `hide_column` commits an edit open on the column **before** writing the hidden set: it is the
+  user's typing, drawn until then. The schema tree's column double-click un-hides the column it
+  asks for before selecting it, since a hidden column selected whole is a selection nothing paints
+  and a scroll to nowhere. **The gutter's `#` corner becomes an eye and a count while columns are hidden**, with a
   tooltip saying how to get them back and a click that shows all: otherwise nothing on screen says a
   result is short a column, and one quietly missing a column reads as one that never had it. It is
   built inside the body's container because that already rebuilds on every change of the set.
@@ -25183,7 +25209,8 @@ this bundle's.
   Normal is under the 77px floor at Huge). A `ratio` that is not positive and finite leaves the
   widths alone: the old measurement beats a column collapsed to the floor.
 - **Selection**: click sets `active`+`anchor`; `PointerEnter` while `selecting` extends the range
-  (drag-select, no capture); a gutter press selects the whole row and arms `row_selecting`, whose
+  (drag-select, no capture); a gutter press selects the whole row — its first to last *drawn*
+  column (`ColLayout::edges`, which `model::row_selection` takes) — and arms `row_selecting`, whose
   own `PointerEnter` extends by **rows** (`model::row_range_selection`) — a second flag, because
   sharing `selecting` would collapse a gutter drag to one column the moment it crossed a cell.
   Shift+click in the gutter extends from the current anchor. **A right-click inside the selection
@@ -26227,9 +26254,11 @@ this bundle's.
   the scroll column — so `grid_view` is a wrapper rather than a place any of them can quietly
   change. The gesture is `model::row_selection`, shared with the gutter click so the two can't
   drift: a divergence would also stop the aggregates bar reading the jump as a *row* and start it
-  summing ids, which is why one test asserts that agreement across the crate boundary. `scroll_col`
-  is **0**, not the active cell's column, so a jump doesn't also fling the viewport to the far
-  right of a wide result. `goto_fires` is the first-run nonce guard (the effect is created whenever
+  summing ids, which is why one test asserts that agreement across the crate boundary. Both take
+  the drawn `edges` rather than `ncols`, so the row spans only the columns on screen
+  (`a_row_gesture_spans_only_the_drawn_columns`). `scroll_col` is the **first drawn column**
+  (`edges.0` — 0 until that one is hidden), not the active cell's column, so a jump doesn't also
+  fling the viewport to the far right of a wide result. `goto_fires` is the first-run nonce guard (the effect is created whenever
   the grid is, and must not jump on its build run), and `one_bar_at_a_time` the find/goto exclusion
   — which is a **reactive** test over two signals in a `Scope`, the pattern to reach for when a
   rule is genuinely about signal propagation rather than about a value.

@@ -1361,10 +1361,20 @@ impl GridState {
     }
 
     /// Commit the in-progress inline edit (if any) into `dirty` / `new_rows`.
+    ///
+    /// An edit on a **hidden** column is dropped, not staged: nothing drew its
+    /// editor, so its buffer is no value the user typed — only the seed, and a
+    /// NULL seeds as `""`, which staged is a write over the NULL nobody saw.
+    /// `start_edit` refuses to open one; this is the backstop for any route
+    /// that still parks `edit_cell` there.
     fn commit_edit(&self) {
         let Some((i, ci)) = self.edit_cell.get_untracked() else {
             return;
         };
+        if self.hidden.with_untracked(|h| h.contains(&ci)) {
+            self.edit_cell.set(None);
+            return;
+        }
         let new = self.edit_buf.get_untracked();
         let nrows = self.rs.get_untracked().row_count();
         if i >= nrows {
@@ -1893,21 +1903,6 @@ fn nav_target(
     }
 }
 
-/// The drawn column nearest `c`: `c` itself when it is drawn, else the next one
-/// to its right — the column that closes over it — else the last one to its
-/// left. `shown` is in index order; empty leaves `c` where it is.
-fn nearest_shown(c: usize, shown: &[usize]) -> usize {
-    if shown.contains(&c) {
-        return c;
-    }
-    shown
-        .iter()
-        .copied()
-        .find(|&ci| ci > c)
-        .or_else(|| shown.iter().rev().copied().find(|&ci| ci < c))
-        .unwrap_or(c)
-}
-
 /// The grid's Ctrl+letter bindings — the *Results grid* rows of the Shortcuts
 /// table.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1946,30 +1941,29 @@ fn grid_ctrl_command(key: &str, m: floem::keyboard::Modifiers) -> Option<GridCtr
     }
 }
 
-/// Hide column `ci`, if it may be (`ColLayout::may_hide`).
-///
-/// A frozen column that is hidden is unfrozen with it — frozen and not drawn
-/// is no state anyone asked for, and it would come back pinned when shown. The
-/// selection's corners move off it (`nearest_shown`), because an active cell
-/// on a hidden column is one the keyboard types into and nobody can see.
+/// Hide column `ci`, if it may be — a wrapper over `ColLayout::hide`, which
+/// decides what goes with it (the freeze, and the selection's corners) and is
+/// where that is tested. Each signal is written only when it changed.
 fn hide_column(gs: GridState, ci: usize) {
     let ncols = gs.rs.get_untracked().col_count();
-    if !gs.layout_untracked().may_hide(ci, ncols) {
+    let mut layout = gs.layout_untracked();
+    let before = [gs.active.get_untracked(), gs.anchor.get_untracked()];
+    let mut corners = before;
+    if !layout.hide(ci, ncols, &mut corners) {
         return;
     }
-    if gs.frozen.get_untracked() == Some(ci) {
-        gs.frozen.set(None);
+    // An edit open on the column is the user's typing, drawn until now: stage
+    // it while it still is, since `commit_edit` drops one on a hidden column.
+    if gs.edit_cell.get_untracked().is_some_and(|(_, c)| c == ci) {
+        gs.commit_edit();
     }
-    gs.hidden.update(|h| {
-        h.insert(ci);
-    });
-    let shown = gs.layout_untracked().shown(ncols);
-    for corner in [gs.active, gs.anchor] {
-        if let Some((r, c)) = corner.get_untracked() {
-            let to = nearest_shown(c, &shown);
-            if to != c {
-                corner.set(Some((r, to)));
-            }
+    if gs.frozen.get_untracked() != layout.frozen {
+        gs.frozen.set(layout.frozen);
+    }
+    gs.hidden.set(layout.hidden);
+    for ((corner, was), now) in [gs.active, gs.anchor].into_iter().zip(before).zip(corners) {
+        if was != now {
+            corner.set(now);
         }
     }
 }
@@ -4451,6 +4445,13 @@ fn grid_view(rs: Arc<ResultSet>, gctx: GridCtx) -> impl IntoView {
         let Some(ci) = rs_hl.columns.iter().position(|c| c.name == name) else {
             return;
         };
+        // Asked for by name, so shown: a hidden column selected whole would be
+        // a selection nothing paints and a scroll to nowhere.
+        if gs.hidden.with_untracked(|h| h.contains(&ci)) {
+            gs.hidden.update(|h| {
+                h.remove(&ci);
+            });
+        }
         // Anchor at the last row, active at the first, so the whole column is
         // selected while the scroll target (active) keeps the view at the top.
         let last = nrows.saturating_sub(1);
@@ -4977,9 +4978,10 @@ fn grid_view(rs: Arc<ResultSet>, gctx: GridCtx) -> impl IntoView {
         // reads `*`, not a number, so counting them in made "row 101" land on a
         // row showing no number at all, and made a row of 9s stop one short of
         // the last row that does.
+        let edges = gs.layout_untracked().edges(ncols);
         let target = gs
             .goto_query
-            .with_untracked(|q| schemaic_core::model::goto_target(q, nrows, ncols));
+            .with_untracked(|q| schemaic_core::model::goto_target(q, nrows, edges));
         if let Some(t) = target {
             gs.anchor.set(Some(t.anchor));
             gs.active.set(Some(t.active));
@@ -5408,8 +5410,16 @@ fn row_at(gs: GridState, i: usize) -> (usize, Option<usize>) {
 /// one costs is specific: the field seeds from a binary cell's `<n bytes>`
 /// placeholder, and pressing Enter stages those characters as the column's
 /// value.
+///
+/// **A hidden column is refused here too**, for the same reason: the data pane
+/// builds no cell for it, so the editor would be one nobody sees, and it seeds
+/// a NULL with `""` that the next commit writes (`commit_edit` refuses to flush
+/// one, as the second half of the same rule).
 fn start_edit(gs: GridState, i: usize, ci: usize) {
     if !gs.edit_model.get_untracked().text_editable(ci) {
+        return;
+    }
+    if gs.hidden.with_untracked(|h| h.contains(&ci)) {
         return;
     }
     let nrows = gs.rs.get_untracked().row_count();
@@ -5732,15 +5742,13 @@ fn commit_row_update(
 /// The next (`forward`) / previous column after `ci` an **inline editor** can
 /// open on, if any — used to hop between cells while filling a row with Tab /
 /// Enter. A binary column is skipped: the hop opens a text field, and there is
-/// no text to put in one.
+/// no text to put in one. So is a hidden one, and the walk is in draw order —
+/// `ColLayout::next_editable`, where both are decided and tested.
 fn next_editable_col(gs: GridState, ci: usize, forward: bool) -> Option<usize> {
     let model = gs.edit_model.get_untracked();
     let ncols = gs.rs.get_untracked().col_count();
-    if forward {
-        (ci + 1..ncols).find(|&c| model.text_editable(c))
-    } else {
-        (0..ci).rev().find(|&c| model.text_editable(c))
-    }
+    gs.layout_untracked()
+        .next_editable(ncols, ci, forward, |c| model.text_editable(c))
 }
 
 /// Stage the in-progress edit at display row `i`, column `ci`, then hop to the
@@ -5825,7 +5833,10 @@ fn stage_cloned_rows(gs: GridState, data_idxs: &[usize]) {
     let ncols = rs.col_count();
     let disp = nrows + pidx;
     let model = gs.edit_model.get_untracked();
-    let first = (0..ncols).find(|&ci| model.text_editable(ci)).unwrap_or(0);
+    let layout = gs.layout_untracked();
+    let first = layout
+        .first_editable(ncols, |ci| model.text_editable(ci))
+        .unwrap_or(layout.edges(ncols).0);
     floem::action::exec_after(std::time::Duration::ZERO, move |_| {
         // One tick is a smaller window than the find bar's 150 ms, but it is not
         // no window: `scroll_active_into_view` reads `gs.vp`.
@@ -5848,7 +5859,8 @@ fn add_pending_row(gs: GridState) {
     let ncols = rs.col_count();
     let disp = nrows + pidx;
     let model = gs.edit_model.get_untracked();
-    let first_editable = (0..ncols).find(|&ci| model.text_editable(ci));
+    let layout = gs.layout_untracked();
+    let first_editable = layout.first_editable(ncols, |ci| model.text_editable(ci));
     match first_editable {
         Some(ci) => {
             floem::action::exec_after(std::time::Duration::ZERO, move |_| {
@@ -5861,8 +5873,9 @@ fn add_pending_row(gs: GridState) {
             });
         }
         None => {
-            gs.active.set(Some((disp, 0)));
-            gs.anchor.set(Some((disp, 0)));
+            let first = layout.edges(ncols).0;
+            gs.active.set(Some((disp, first)));
+            gs.anchor.set(Some((disp, first)));
         }
     }
 }
@@ -7871,7 +7884,6 @@ fn grid_key(gs: GridState, nrows: usize, ncols: usize, e: &Event) -> EventPropag
     let active_opt = gs.active.get_untracked();
     let (r, c) = active_opt.unwrap_or((0, 0));
     let last_r = rows - 1;
-    let last_c = ncols - 1;
     let page = ((gs.vp.get_untracked().height() / row_h()).floor() as usize).max(1);
     let shown = gs.layout_untracked().shown(ncols);
     let go = |nav: Nav| {
@@ -7896,10 +7908,7 @@ fn grid_key(gs: GridState, nrows: usize, ncols: usize, e: &Event) -> EventPropag
     );
     // The first and last columns *drawn*: a selection corner on a hidden column
     // would be an active cell nobody can see.
-    let (first_c, last_c) = (
-        shown.first().copied().unwrap_or(0),
-        shown.last().copied().unwrap_or(last_c),
-    );
+    let (first_c, last_c) = gs.layout_untracked().edges(ncols);
     if active_opt.is_none() && is_nav {
         set_active(gs, 0, first_c, shift);
         return EventPropagation::Stop;
@@ -9183,8 +9192,9 @@ fn gutter_cell(gs: GridState, pos: usize, ncols: usize, pending: Option<usize>) 
                     } else {
                         pos
                     };
+                    let edges = gs.layout_untracked().edges(ncols);
                     let (anchor, active) =
-                        schemaic_core::model::row_range_selection(anchor_row, pos, ncols);
+                        schemaic_core::model::row_range_selection(anchor_row, pos, edges);
                     gs.anchor.set(Some(anchor));
                     gs.active.set(Some(active));
                     // A *row* drag, kept apart from the cells' `selecting` flag:
@@ -9205,8 +9215,9 @@ fn gutter_cell(gs: GridState, pos: usize, ncols: usize, pending: Option<usize>) 
         .on_event_cont(EventListener::PointerEnter, move |_| {
             if gs.row_selecting.get_untracked() {
                 let anchor_row = gs.anchor.get_untracked().map(|(r, _)| r).unwrap_or(pos);
+                let edges = gs.layout_untracked().edges(ncols);
                 let (anchor, active) =
-                    schemaic_core::model::row_range_selection(anchor_row, pos, ncols);
+                    schemaic_core::model::row_range_selection(anchor_row, pos, edges);
                 gs.anchor.set(Some(anchor));
                 gs.active.set(Some(active));
             }
@@ -9227,7 +9238,8 @@ fn gutter_cell(gs: GridState, pos: usize, ncols: usize, pending: Option<usize>) 
             let inside =
                 matches!(gs.bounds_untracked(), Some((r0, _, r1, _)) if pos >= r0 && pos <= r1);
             if !inside {
-                let (anchor, active) = schemaic_core::model::row_selection(pos, ncols);
+                let edges = gs.layout_untracked().edges(ncols);
+                let (anchor, active) = schemaic_core::model::row_selection(pos, edges);
                 gs.anchor.set(Some(anchor));
                 gs.active.set(Some(active));
             }
@@ -13457,21 +13469,6 @@ mod tests {
         assert_eq!(grid_ctrl_command("x", mods(true, false, false)), None);
     }
 
-    /// **A selection corner on a column just hidden moves to a drawn one** —
-    /// the one to its right, as the columns close over it, else the one to its
-    /// left at the right edge. A corner already on a drawn column stays put.
-    #[test]
-    fn a_corner_on_a_hidden_column_moves_to_the_nearest_shown() {
-        assert_eq!(nearest_shown(1, &[0, 2, 3]), 2);
-        assert_eq!(nearest_shown(3, &[0, 1]), 1, "the right edge");
-        assert_eq!(nearest_shown(2, &[0, 2, 3]), 2, "already drawn");
-        assert_eq!(
-            nearest_shown(4, &[]),
-            4,
-            "nothing drawn, nothing to move to"
-        );
-    }
-
     /// **The arrows walk the columns that are drawn.** With `1` hidden out of
     /// four, Right from `0` lands on `2` — not on a cell nobody can see, where
     /// the next keystroke would type into it — and every edge move stops at
@@ -13853,7 +13850,7 @@ mod row_selection_tests {
     /// agreement between them can only be asserted here.
     #[test]
     fn a_row_gesture_reads_as_a_row_selection() {
-        let (anchor, active) = row_selection(4, 5);
+        let (anchor, active) = row_selection(4, (0, 4));
         let bounds = Some((anchor.0, anchor.1, active.0, active.1));
         assert_eq!(selection_kind(bounds, Some(anchor), 5), SelKind::WholeRow);
     }
@@ -13864,7 +13861,7 @@ mod row_selection_tests {
     /// rules meet here and either reading looks defensible in isolation.
     #[test]
     fn a_row_gesture_on_a_single_column_result_is_one_cell() {
-        let (anchor, active) = row_selection(4, 1);
+        let (anchor, active) = row_selection(4, (0, 0));
         assert_eq!(active, (4, 0), "the last column is also the first");
         let bounds = Some((anchor.0, anchor.1, active.0, active.1));
         assert_eq!(selection_kind(bounds, Some(anchor), 1), SelKind::Nothing);
@@ -13874,7 +13871,7 @@ mod row_selection_tests {
     /// as a row selection too.
     #[test]
     fn a_jump_reads_as_a_row_selection() {
-        let t = goto_target("5", 100, 5).unwrap();
+        let t = goto_target("5", 100, (0, 4)).unwrap();
         let bounds = Some((t.anchor.0, t.anchor.1, t.active.0, t.active.1));
         assert_eq!(selection_kind(bounds, Some(t.anchor), 5), SelKind::WholeRow);
     }

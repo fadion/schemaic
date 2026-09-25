@@ -1529,23 +1529,30 @@ pub fn goto_row_index(input: &str, total: usize) -> Option<usize> {
     Some(n.clamp(1, total) - 1)
 }
 
-/// The selection a **whole-row** gesture makes: anchor at column 0, active at the
-/// last column, in display coordinates.
+/// The selection a **whole-row** gesture makes: anchor at the first drawn
+/// column, active at the last, in display coordinates.
+///
+/// `(first, last)` is [`crate::edit::ColLayout::edges`] — the drawn edges, not
+/// `0` and `ncols - 1`. A corner on a hidden column is a cell nobody can see:
+/// Enter opened an editor there that the data pane never built, and a paste
+/// anchored on it found no drawn column to start from and dropped every value.
 ///
 /// Shared by the grid's gutter click and the Ctrl+G jump, which have to stay
 /// bug-for-bug identical — the jump exists to land you where a click would, so
 /// the row lights up the way the user already knows. It also decides how the
 /// **aggregates bar** reads the result: its whole-row arm keys on a span covering
-/// every column, so a divergence here would quietly start summing the id column.
-///
-/// A result with no columns at all saturates rather than underflowing into a
-/// huge index.
-pub fn row_selection(row: usize, ncols: usize) -> ((usize, usize), (usize, usize)) {
-    ((row, 0), (row, ncols.saturating_sub(1)))
+/// every drawn column, so a divergence here would quietly start summing the id
+/// column.
+pub fn row_selection(
+    row: usize,
+    (first, last): (usize, usize),
+) -> ((usize, usize), (usize, usize)) {
+    ((row, first), (row, last))
 }
 
-/// The selection a whole-row **drag** makes: every column, from the row the drag
-/// started on to the row under the pointer.
+/// The selection a whole-row **drag** makes: every drawn column (`edges`, as
+/// [`row_selection`] takes them), from the row the drag started on to the row
+/// under the pointer.
 ///
 /// The anchor keeps the starting row even when the drag runs upwards — the
 /// rectangle is normalised downstream (`bounds`), and keeping the anchor where
@@ -1553,9 +1560,9 @@ pub fn row_selection(row: usize, ncols: usize) -> ((usize, usize), (usize, usize
 pub fn row_range_selection(
     anchor_row: usize,
     active_row: usize,
-    ncols: usize,
+    (first, last): (usize, usize),
 ) -> ((usize, usize), (usize, usize)) {
-    ((anchor_row, 0), (active_row, ncols.saturating_sub(1)))
+    ((anchor_row, first), (active_row, last))
 }
 
 /// How a grid selection names itself in the "Attach … to chat" action — the
@@ -1584,26 +1591,28 @@ pub fn attach_scope_label(rows: usize, cols: usize, ncols: usize) -> String {
 pub struct GotoTarget {
     pub anchor: (usize, usize),
     pub active: (usize, usize),
-    /// **0, not the active cell's column.** Following the active cell would fling
-    /// the viewport to the far right of a wide result on every jump — the one
-    /// line that stops a row jump from also being a horizontal one.
+    /// **The first drawn column, not the active cell's.** Following the active
+    /// cell would fling the viewport to the far right of a wide result on every
+    /// jump — the one line that stops a row jump from also being a horizontal
+    /// one.
     pub scroll_col: usize,
 }
 
 /// Resolve the grid's **go to row** box: what to select and where to scroll.
 ///
-/// `total` is the count of rows the gutter *numbers*, and `ncols` the result's
-/// column count. The three decisions the grid used to make inline around
-/// [`goto_row_index`] — which row, the landing gesture, and the scroll column —
-/// are here together so they can be tested as one and so `grid_view` is a
-/// wrapper rather than a place where any of them can quietly change.
-pub fn goto_target(input: &str, total: usize, ncols: usize) -> Option<GotoTarget> {
+/// `total` is the count of rows the gutter *numbers*, and `edges` the first
+/// and last drawn columns ([`crate::edit::ColLayout::edges`]). The three
+/// decisions the grid used to make inline around [`goto_row_index`] — which
+/// row, the landing gesture, and the scroll column — are here together so they
+/// can be tested as one and so `grid_view` is a wrapper rather than a place
+/// where any of them can quietly change.
+pub fn goto_target(input: &str, total: usize, edges: (usize, usize)) -> Option<GotoTarget> {
     let row = goto_row_index(input, total)?;
-    let (anchor, active) = row_selection(row, ncols);
+    let (anchor, active) = row_selection(row, edges);
     Some(GotoTarget {
         anchor,
         active,
-        scroll_col: 0,
+        scroll_col: edges.0,
     })
 }
 
@@ -3032,14 +3041,14 @@ mod tests {
 
     #[test]
     fn a_row_drag_covers_every_column_of_every_row_it_crossed() {
-        assert_eq!(row_range_selection(2, 5, 4), ((2, 0), (5, 3)));
+        assert_eq!(row_range_selection(2, 5, (0, 3)), ((2, 0), (5, 3)));
         // Dragging upwards keeps the anchor where the gesture began, so
         // reversing the drag doesn't move the far end of the selection.
-        assert_eq!(row_range_selection(5, 2, 4), ((5, 0), (2, 3)));
+        assert_eq!(row_range_selection(5, 2, (0, 3)), ((5, 0), (2, 3)));
         // One row is the same shape a click makes.
-        assert_eq!(row_range_selection(3, 3, 4), row_selection(3, 4));
-        // No columns saturates rather than underflowing.
-        assert_eq!(row_range_selection(1, 2, 0), ((1, 0), (2, 0)));
+        assert_eq!(row_range_selection(3, 3, (0, 3)), row_selection(3, (0, 3)));
+        // With the edge columns hidden, the drag spans the drawn ones.
+        assert_eq!(row_range_selection(1, 2, (1, 2)), ((1, 1), (2, 2)));
     }
 
     // ── The attach action's label ──
@@ -3076,34 +3085,48 @@ mod tests {
     /// why it is one function: the jump exists to land you where a click would,
     /// so the row lights up the way the user already knows.
     #[test]
-    fn a_row_gesture_anchors_at_column_zero_and_ends_at_the_last() {
-        assert_eq!(row_selection(4, 5), ((4, 0), (4, 4)));
-        assert_eq!(row_selection(0, 1), ((0, 0), (0, 0)));
+    fn a_row_gesture_anchors_at_the_first_drawn_column_and_ends_at_the_last() {
+        assert_eq!(row_selection(4, (0, 4)), ((4, 0), (4, 4)));
+        assert_eq!(row_selection(0, (0, 0)), ((0, 0), (0, 0)));
     }
 
-    /// A result with no columns at all can't underflow into a huge index.
+    /// **Hiding moves the corners with the edges.** `ColLayout::edges` is what
+    /// the grid passes, so a hidden first or last column is not a corner — and
+    /// a whole row of no columns saturates there rather than underflowing.
     #[test]
-    fn a_row_gesture_with_no_columns_does_not_underflow() {
-        assert_eq!(row_selection(3, 0), ((3, 0), (3, 0)));
+    fn a_row_gesture_spans_only_the_drawn_columns() {
+        let hiding = |hidden: &[usize]| crate::edit::ColLayout {
+            frozen: None,
+            hidden: hidden.iter().copied().collect(),
+        };
+        assert_eq!(row_selection(4, hiding(&[0]).edges(5)), ((4, 1), (4, 4)));
+        assert_eq!(row_selection(4, hiding(&[4]).edges(5)), ((4, 0), (4, 3)));
+        assert_eq!(row_selection(3, hiding(&[]).edges(0)), ((3, 0), (3, 0)));
+        let t = goto_target("2", 10, hiding(&[0, 4]).edges(5)).unwrap();
+        assert_eq!((t.anchor, t.active), ((1, 1), (1, 3)));
+        assert_eq!(t.scroll_col, 1, "the leftmost column drawn");
     }
 
     /// The jump's landing, as one decision: which row, the gesture, and the
     /// scroll column. All three used to be inline in the grid's effect.
     #[test]
     fn a_jump_lands_on_the_row_as_a_whole_row_selection() {
-        let t = goto_target("40", 100, 6).unwrap();
+        let t = goto_target("40", 100, (0, 5)).unwrap();
         assert_eq!(t.anchor, (39, 0), "1-based in, 0-based out");
         assert_eq!(t.active, (39, 5));
     }
 
-    /// **Column 0, not the active cell's column.** Following the active cell
+    /// **The first column, not the active cell's.** Following the active cell
     /// would fling the viewport to the far right of a wide result on every jump
     /// — this is the one line that stops a row jump from also being a horizontal
     /// one.
     #[test]
-    fn a_jump_scrolls_at_column_zero_however_wide_the_result() {
+    fn a_jump_scrolls_at_the_first_column_however_wide_the_result() {
         for ncols in [1, 6, 50] {
-            assert_eq!(goto_target("40", 100, ncols).unwrap().scroll_col, 0);
+            assert_eq!(
+                goto_target("40", 100, (0, ncols - 1)).unwrap().scroll_col,
+                0
+            );
         }
     }
 
@@ -3111,10 +3134,13 @@ mod tests {
     /// the two cases that mean no row.
     #[test]
     fn a_jump_inherits_what_the_box_can_read() {
-        assert_eq!(goto_target("999999", 100, 3).unwrap().anchor.0, 99);
-        assert_eq!(goto_target("200k", 200_000, 3).unwrap().anchor.0, 199_999);
-        assert_eq!(goto_target("abc", 100, 3), None);
-        assert_eq!(goto_target("1", 0, 3), None, "an empty grid");
+        assert_eq!(goto_target("999999", 100, (0, 2)).unwrap().anchor.0, 99);
+        assert_eq!(
+            goto_target("200k", 200_000, (0, 2)).unwrap().anchor.0,
+            199_999
+        );
+        assert_eq!(goto_target("abc", 100, (0, 2)), None);
+        assert_eq!(goto_target("1", 0, (0, 2)), None, "an empty grid");
     }
 
     // ── settle_after_switch ─────────────────────────────────────────────────

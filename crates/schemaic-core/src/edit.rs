@@ -1709,6 +1709,107 @@ impl ColLayout {
     pub fn may_hide(&self, ci: usize, ncols: usize) -> bool {
         ci < ncols && !self.is_hidden(ci) && self.shown(ncols).len() > 1
     }
+
+    /// The first and last columns drawn, in index order — the two corners of a
+    /// **whole-row** selection (a gutter click, *Go to row*, Ctrl+A) and the
+    /// column the first arrow press lands on.
+    ///
+    /// Every one of those used to say `0` and `ncols - 1`, which is the same
+    /// thing only while nothing is hidden: with the first column hidden, a
+    /// gutter row's anchor sat on a cell nobody could see, and a paste anchored
+    /// there found no drawn column to start from and dropped every value.
+    ///
+    /// With nothing drawn at all (`may_hide` keeps one, so only an empty result
+    /// gets here) it is `(0, ncols - 1)`, saturating — the answer before hiding.
+    pub fn edges(&self, ncols: usize) -> (usize, usize) {
+        let shown = self.shown(ncols);
+        match (shown.first(), shown.last()) {
+            (Some(&first), Some(&last)) => (first, last),
+            _ => (0, ncols.saturating_sub(1)),
+        }
+    }
+
+    /// The column an **inline editor's hop** (Tab, Shift+Tab, Enter in a row)
+    /// moves to from `ci`: the next drawn column after it (`forward`) or before
+    /// it, in **draw** order, that `editable` accepts.
+    ///
+    /// Draw order because the hop moves the editor across the screen — with a
+    /// column frozen, Tab from it goes to the column drawn beside it, not the
+    /// one indexed beside it. And drawn columns only, because an editor opened
+    /// on a hidden column is one nobody sees: it seeds a NULL cell with `""`,
+    /// and the next commit writes that empty string over the NULL. `None` —
+    /// nothing drawn left that direction — is the caller's cue to close the
+    /// editor. A `ci` that is not drawn itself is placed by index among the
+    /// drawn columns, so the hop still goes somewhere visible.
+    pub fn next_editable(
+        &self,
+        ncols: usize,
+        ci: usize,
+        forward: bool,
+        editable: impl Fn(usize) -> bool,
+    ) -> Option<usize> {
+        let drawn = self.visual_cols(ncols);
+        let (before, after) = match drawn.iter().position(|&c| c == ci) {
+            Some(p) => (drawn[..p].to_vec(), drawn[p + 1..].to_vec()),
+            None => drawn.iter().partition(|&&c| c < ci),
+        };
+        if forward {
+            after.into_iter().find(|&c| editable(c))
+        } else {
+            before.into_iter().rev().find(|&c| editable(c))
+        }
+    }
+
+    /// The first drawn column, in draw order, that `editable` accepts — where a
+    /// new row's editor opens (`+ Row`) and a cloned row's selection lands.
+    pub fn first_editable(&self, ncols: usize, editable: impl Fn(usize) -> bool) -> Option<usize> {
+        self.visual_cols(ncols).into_iter().find(|&c| editable(c))
+    }
+
+    /// Hide column `ci`, if it may be ([`ColLayout::may_hide`]); `false` when it
+    /// may not, and then nothing changes.
+    ///
+    /// A frozen column that is hidden is unfrozen with it — frozen and not
+    /// drawn is no state anyone asked for, and it would come back pinned when
+    /// shown. Each of `corners` (the selection's active cell and anchor) that
+    /// sits on the column moves to the nearest drawn one — the column that
+    /// closes over it from the right, else the last one to its left — because
+    /// an active cell on a hidden column is one the keyboard types into and
+    /// nobody can see.
+    pub fn hide(
+        &mut self,
+        ci: usize,
+        ncols: usize,
+        corners: &mut [Option<(usize, usize)>],
+    ) -> bool {
+        if !self.may_hide(ci, ncols) {
+            return false;
+        }
+        if self.frozen == Some(ci) {
+            self.frozen = None;
+        }
+        self.hidden.insert(ci);
+        let shown = self.shown(ncols);
+        for (_, c) in corners.iter_mut().flatten() {
+            *c = nearest_shown(*c, &shown);
+        }
+        true
+    }
+}
+
+/// The drawn column nearest `c`: `c` itself when it is drawn, else the next one
+/// to its right — the column that closes over it — else the last one to its
+/// left. `shown` is in index order; empty leaves `c` where it is.
+fn nearest_shown(c: usize, shown: &[usize]) -> usize {
+    if shown.contains(&c) {
+        return c;
+    }
+    shown
+        .iter()
+        .copied()
+        .find(|&ci| ci > c)
+        .or_else(|| shown.iter().rev().copied().find(|&ci| ci < c))
+        .unwrap_or(c)
 }
 
 /// The data rows at display positions `rows` of `order`, clamped to the rows
@@ -5209,6 +5310,119 @@ mod tests {
         let last = hiding(None, &[0, 1]);
         assert!(!last.may_hide(2, 3), "the only column left");
         assert!(!last.may_hide(1, 3), "already hidden");
+    }
+
+    /// **The editor's hop never opens on a column nobody can see.** With
+    /// `phone` (1) hidden, Tab from `name` (0) goes to `email` (2): an editor
+    /// on `phone` would seed its NULL with `""`, and the next commit would
+    /// write that over it. Nothing drawn left that way closes the editor.
+    #[test]
+    fn the_editor_hop_steps_over_a_hidden_column() {
+        let l = hiding(None, &[1]);
+        assert_eq!(l.next_editable(4, 0, true, all_editable), Some(2));
+        assert_eq!(l.next_editable(4, 2, false, all_editable), Some(0));
+        let tail = hiding(None, &[2, 3]);
+        assert_eq!(tail.next_editable(4, 1, true, all_editable), None);
+        // A refused column is stepped over too, as it always was.
+        assert_eq!(l.next_editable(4, 0, true, |c| c != 2), Some(3));
+    }
+
+    /// **The hop follows the screen.** `[ssn=3][id][name][email]` with `ssn`
+    /// frozen: Tab from `ssn` goes to `id` drawn beside it, and Shift+Tab from
+    /// `id` back to `ssn` — not to whatever is indexed beside each. A column
+    /// that is not drawn itself is placed by index, so the hop still lands.
+    #[test]
+    fn the_editor_hop_walks_the_draw_order() {
+        let l = hiding(Some(3), &[]);
+        assert_eq!(l.next_editable(4, 3, true, all_editable), Some(0));
+        assert_eq!(l.next_editable(4, 0, false, all_editable), Some(3));
+        assert_eq!(l.next_editable(4, 2, true, all_editable), None);
+        let h = hiding(None, &[1]);
+        assert_eq!(h.next_editable(4, 1, true, all_editable), Some(2));
+        assert_eq!(h.next_editable(4, 1, false, all_editable), Some(0));
+    }
+
+    /// `+ Row` opens its editor, and a clone lands, on the first *drawn*
+    /// editable column in draw order.
+    #[test]
+    fn a_new_rows_editor_opens_on_the_first_drawn_editable_column() {
+        assert_eq!(hiding(None, &[0]).first_editable(3, all_editable), Some(1));
+        assert_eq!(
+            hiding(Some(2), &[]).first_editable(3, all_editable),
+            Some(2)
+        );
+        assert_eq!(hiding(None, &[0]).first_editable(3, |c| c == 0), None);
+    }
+
+    /// The corners of a whole-row gesture: the first and last drawn columns,
+    /// and — only for a result with nothing to draw — the pre-hiding answer.
+    #[test]
+    fn the_edges_are_the_first_and_last_drawn_columns() {
+        assert_eq!(hiding(None, &[]).edges(5), (0, 4));
+        assert_eq!(hiding(None, &[0, 4]).edges(5), (1, 3));
+        assert_eq!(
+            hiding(Some(3), &[]).edges(5),
+            (0, 4),
+            "index order, not draw"
+        );
+        assert_eq!(hiding(None, &[]).edges(0), (0, 0));
+    }
+
+    /// **Hiding takes the freeze and the corners with it.** Hiding the frozen
+    /// column unfreezes it (it would come back pinned otherwise); a corner on
+    /// it moves to the column that closes over it, or the last one to its left
+    /// at the right edge; a column that may not be hidden changes nothing.
+    #[test]
+    fn hiding_a_column_unfreezes_it_and_moves_the_corners_off_it() {
+        let mut l = hiding(Some(1), &[]);
+        let mut corners = [Some((4, 1)), Some((0, 0)), None];
+        assert!(l.hide(1, 3, &mut corners));
+        assert_eq!(l.frozen, None);
+        assert!(l.is_hidden(1));
+        assert_eq!(corners, [Some((4, 2)), Some((0, 0)), None]);
+        let mut edge = [Some((2, 2))];
+        assert!(l.hide(2, 3, &mut edge));
+        assert_eq!(edge, [Some((2, 0))], "the right edge moves left");
+        let before = l.clone();
+        assert!(!l.hide(0, 3, &mut edge), "the last column drawn stays");
+        assert_eq!(l, before);
+    }
+
+    /// **A selection corner on a column just hidden moves to a drawn one** —
+    /// the one to its right, as the columns close over it, else the one to its
+    /// left at the right edge. A corner already on a drawn column stays put.
+    #[test]
+    fn a_corner_on_a_hidden_column_moves_to_the_nearest_shown() {
+        assert_eq!(nearest_shown(1, &[0, 2, 3]), 2);
+        assert_eq!(nearest_shown(3, &[0, 1]), 1, "the right edge");
+        assert_eq!(nearest_shown(2, &[0, 2, 3]), 2, "already drawn");
+        assert_eq!(
+            nearest_shown(4, &[]),
+            4,
+            "nothing drawn, nothing to move to"
+        );
+    }
+
+    /// **The composition that dropped a paste.** A gutter click over a result
+    /// whose first column is hidden, then Ctrl+V: the row selection is what the
+    /// paste is anchored on, so each is green alone and only the two together
+    /// say whether `x<TAB>y` lands. It lands on the two drawn columns.
+    #[test]
+    fn a_block_paste_onto_a_gutter_selected_row_lands_past_a_hidden_first_column() {
+        let layout = hiding(None, &[0]);
+        let (anchor, active) = crate::model::row_selection(2, layout.edges(4));
+        let bounds = (
+            anchor.0,
+            anchor.1.min(active.1),
+            active.0,
+            anchor.1.max(active.1),
+        );
+        let plan = plan_paste(&parse_tsv_block("x\ty"), bounds, 5, 4, layout, all_editable);
+        assert_eq!(
+            plan.cells,
+            vec![(2, 1, Some("x".to_string())), (2, 2, Some("y".to_string()))]
+        );
+        assert_eq!(plan.dropped, 0);
     }
 
     /// **The paste lands where the user pointed.** `(id, name, email, ssn,
