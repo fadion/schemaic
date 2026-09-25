@@ -13183,7 +13183,13 @@ existing prose was left alone.
     **Why the test failed is that line, folded onto one row, with the whole reason as its
     tooltip.** `TestState::Fail` carries a `String` (so the enum is no longer `Copy`),
     `TestState::{landed, failure}` are the two questions asked of it, and `main.rs`'s
-    `test_outcome` is the one mapping from the round trip's `Result`. It used to be a bare `bool`:
+    `test_outcome` is the one mapping from the round trip's `Result`. **A result lands only on the
+    test that asked for it** (`TestState::landing`): while the state still reads `Testing` — any
+    edit, a load from the list and a reopen all reset it to `Idle` — and only for the latest press,
+    by a per-press sequence number in `test_conn`. It landed unconditionally, so a slow test of A
+    finishing after the list loaded B put A's "Connected" beside B's settings, and a failure, which
+    no longer times out, stayed there (`a_late_test_result_does_not_land_on_another_test`). It used
+    to be a bare `bool`:
     `open_tunnel`'s failure arm was `Err(_) => { send(false); return; }`, which is where
     `ssh::refusal_message` — several sentences naming the host, both fingerprints, that the key *"has
     CHANGED since Schemaic first trusted it"*, and the out-of-band check to perform — stopped

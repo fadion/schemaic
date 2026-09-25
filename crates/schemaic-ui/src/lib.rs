@@ -5285,7 +5285,7 @@ pub struct SchemaActions {
 /// Result of a "Test" of the Manage-Connections draft (host + credentials),
 /// reported by the status line beside the Test button ([`TestState::line`]).
 /// Transient — never persisted.
-#[derive(Clone, PartialEq, Eq, Default)]
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub enum TestState {
     /// No test run yet (or the draft was edited since the last one).
     #[default]
@@ -5318,6 +5318,19 @@ impl TestState {
     /// the one question that does not care which answer came back.
     pub fn landed(&self) -> bool {
         matches!(self, TestState::Ok | TestState::Fail(_))
+    }
+
+    /// What a finished test started as generation `started` should write over
+    /// `self`, the state now, when the latest press was generation `current`:
+    /// its `outcome`, or nothing when the form has moved on.
+    ///
+    /// **Late results land on whatever the form holds by then**, and that is
+    /// how A's "Connected" came to stand beside B's untested settings. Every
+    /// edit or load resets the state to `Idle`, so a result may land only while
+    /// the state is still `Testing` — and only the latest press's, since two
+    /// presses share that state and either could answer last.
+    pub fn landing(&self, started: u64, current: u64, outcome: TestState) -> Option<TestState> {
+        (matches!(self, TestState::Testing) && started == current).then_some(outcome)
     }
 
     /// The reason a test failed, if it failed and gave one.
@@ -5373,6 +5386,30 @@ impl TestLine {
 #[cfg(test)]
 mod test_line_tests {
     use super::{TestLine, TestState};
+
+    /// **A result lands only on the test that asked for it.** A test of A
+    /// that finished after the list loaded B showed A's "Connected" beside
+    /// B's settings — and a failure stayed there, since a failure no longer
+    /// times out. Any edit or load resets the state to `Idle`, so `Testing`
+    /// still standing means nothing moved; the generation catches a second
+    /// press, whose answer is the one the form is waiting for.
+    #[test]
+    fn a_late_test_result_does_not_land_on_another_test() {
+        let fail = || TestState::Fail("timed out".into());
+        // The one in flight, answered.
+        assert_eq!(
+            TestState::Testing.landing(3, 3, TestState::Ok),
+            Some(TestState::Ok)
+        );
+        assert_eq!(TestState::Testing.landing(3, 3, fail()), Some(fail()));
+        // The form moved on (another connection loaded, a field edited, the
+        // modal reopened): it reads `Idle`, and the old answer is dropped.
+        assert_eq!(TestState::Idle.landing(3, 3, TestState::Ok), None);
+        // Pressed again before the first answer: only the second may land.
+        assert_eq!(TestState::Testing.landing(3, 4, fail()), None);
+        // A result already standing is not replaced by a stale one.
+        assert_eq!(TestState::Ok.landing(3, 4, fail()), None);
+    }
 
     #[test]
     fn an_idle_test_says_nothing() {

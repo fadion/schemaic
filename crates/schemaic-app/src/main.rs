@@ -9481,8 +9481,14 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
     // The result lands in `conn_test` as an icon on the Test button.
     let test_conn: Rc<dyn Fn()> = {
         let handle = handle.clone();
+        // Which press is the latest — see `TestState::landing`. A `Cell`, not
+        // a signal: nothing draws it, and the callback reads it once.
+        let test_seq = Rc::new(std::cell::Cell::new(0u64));
         Rc::new(move || {
             conn_test.set(TestState::Testing);
+            let started = test_seq.get().wrapping_add(1);
+            test_seq.set(started);
+            let seq = test_seq.clone();
             let conn = draft.to_connection(0);
             // **The reason, not a bool.** The tunnel's failure is sometimes a
             // security control firing — `ssh::refusal_message`'s several
@@ -9491,8 +9497,14 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             // `Err(_)` made a machine-in-the-middle refusal, an unreadable trust
             // store, a wrong password and an unreachable host one red X.
             // `ssh::authenticate`'s doc names this button as their surface.
+            // Only onto the test that asked: a result that lands after the
+            // form loaded another connection, was edited, or was pressed
+            // again is about settings no longer on screen.
             let send = create_ext_action(cx, move |res: Result<(), String>| {
-                conn_test.set(test_outcome(res));
+                let now = conn_test.get_untracked();
+                if let Some(st) = now.landing(started, seq.get(), test_outcome(res)) {
+                    conn_test.set(st);
+                }
             });
             handle.spawn(async move {
                 // Keep the tunnel handle alive for the duration of the ping; it
