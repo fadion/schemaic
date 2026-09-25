@@ -5818,7 +5818,9 @@ existing prose was left alone.
     draws — a `ListedRow::Folder` heading over its `ListedRow::Connection(id)`s, and no folders at
     all is the saved order with no headings — and `listed_ids` is the ids in drawn order, which is
     what the arrow keys walk: stepping in saved order would jump between folders on screen
-    (`a_listing_heads_each_folder_and_the_arrows_walk_it_as_drawn`). The command palette's Switch
+    (`a_listing_heads_each_folder_and_the_arrows_walk_it_as_drawn`). `first_listed` is its top row,
+    where a delete lands — form, fallback active connection and switch alike; they took the first
+    *saved* one, which folders put under any heading. The command palette's Switch
     Connection, `schemaic list` and the MCP server do not group; they stay flat.
     `AiData` is the connection's **AI data-access level** — `SchemaOnly` / `OnRequest` (the
     default) / `Full` — and the single gate over every path that can carry this connection's rows

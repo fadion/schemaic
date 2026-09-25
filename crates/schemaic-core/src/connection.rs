@@ -1362,6 +1362,15 @@ pub fn listed_ids(conns: &[Connection]) -> Vec<u64> {
         .collect()
 }
 
+/// The connection on the **top row** of the drawn list ([`listed_ids`]'s
+/// first) — where Manage Connections lands after a delete. The first *saved*
+/// connection was the top row until folders; with them it can sit under any
+/// heading, so the fallback jumped to the middle of the list.
+pub fn first_listed(conns: &[Connection]) -> Option<&Connection> {
+    let id = *listed_ids(conns).first()?;
+    conns.iter().find(|c| c.id == id)
+}
+
 /// Shorten a connection's *name* to `max_chars` for a narrow row.
 ///
 /// Plain right-hand elision, unlike [`elide_endpoint`]: a name has no part that
@@ -1984,6 +1993,10 @@ mod tests {
             ]
         );
         assert_eq!(listed_ids(&cs), vec![2, 3, 1, 4]);
+        // The top row is the ungrouped one, not the first saved (which sits
+        // under `Prod`, the list's last folder) — where a delete lands.
+        assert_eq!(first_listed(&cs).map(|c| c.id), Some(2));
+        assert_eq!(first_listed(&[]).map(|c| c.id), None);
         // No folders: no headings, and the saved order.
         let flat = [in_folder(7, "x", ""), in_folder(8, "y", "")];
         assert_eq!(

@@ -10051,9 +10051,12 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                 ai_session.borrow_mut().take();
             }
             connections.update(|cs| cs.retain(|c| c.id != id));
-            let fallback = connections.with_untracked(|cs| cs.first().map(|c| c.id));
+            // The **top row as drawn**, which with folders need not be the
+            // first saved — the form, the fallback and the switch all take it.
+            let top = connections
+                .with_untracked(|cs| schemaic_core::connection::first_listed(cs).cloned());
             let new_active = if was_active {
-                fallback
+                top.as_ref().map(|c| c.id)
             } else {
                 Some(active_conn.get_untracked())
             };
@@ -10064,8 +10067,8 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             // keyring is unreachable — into `connections.json.bak`, where
             // nothing removes it.
             persist_conns(new_active, persist::Saving::Erasing);
-            match connections.with_untracked(|cs| cs.first().cloned()) {
-                Some(c) => draft.load(&c),
+            match &top {
+                Some(c) => draft.load(c),
                 None => {
                     draft.blank();
                     // A fresh blank form still gets an identity colour so a
@@ -10081,7 +10084,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                 // the notice being about a connection that no longer exists.
                 conn_status.set(ConnStatus::Unknown);
                 health_failures.set(0);
-                match connections.with_untracked(|cs| cs.first().cloned()) {
+                match top {
                     Some(conn) => {
                         // Both halves — see `use_conn`. The survivor's tree must
                         // not be rendered against the deleted connection's keys.
