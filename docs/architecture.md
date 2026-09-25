@@ -605,7 +605,7 @@ existing prose was left alone.
     — 4–7 bytes, threshold 1 — and all nineteen pass too. The useful result is the one that is not
     a fix: the failing population was never "short user names", it was extension names.
     **A catalog is data, so the engine checks it** — `schemaic-db/tests/sqlite_catalog.rs`, which
-    lives over there rather than beside the catalog because only that crate links rusqlite, and needs
+    lives over there rather than beside the catalog because `schemaic-core` does not link rusqlite, and needs
     no server, no file and no network (the in-memory-SQLite allowance).
     `every_function_the_engine_reports_is_in_the_catalog` asks `pragma_function_list` on an in-memory
     connection — the engine's own answer to the same question, rather than anyone's memory of the
@@ -20327,25 +20327,47 @@ existing prose was left alone.
     `export::ident_sql`, since `default`, `key` and `column` are reserved words on at least one of
     them (`every_engine_answers_under_the_same_column_names`), and a type is spelled one way
     everywhere: `table`, `view`, and PostgreSQL's own `materialized view` and `foreign table`.
+    **MariaDB's `TABLE_TYPE` has more spellings than MySQL's**, and the listing used to pass any it
+    did not map through `LOWER(TABLE_TYPE)` — so a system-versioned table came out as `system
+    versioned`, and a script filtering `type == "table"` dropped every one of them. Now `SYSTEM
+    VERSIONED` maps to `table` and `SYSTEM VIEW` to `view`, and a `TABLE_TYPE IN (…)` filter
+    replaces the pass-through, which leaves MariaDB's `SEQUENCE` out as the PostgreSQL listing's
+    relkind filter leaves sequences out — no type reaches the output unmapped
+    (`a_mysql_listing_spells_every_type_one_way`).
     **`None` means the dialect cannot answer without a database**, and `run.rs` says so before
     anything is dialled. MySQL's reads filter on `DATABASE()` — the database the statement runs in,
     which is the one `-d` named — and without one that is NULL and the listing is silently empty;
     PostgreSQL's would list the maintenance database's tables as though they were the connection's.
-    A SQLite file always is a database: `main`, or the attached one `-d` names — quoted as a name in
-    `"main".sqlite_master`, passed as a literal in `pragma_table_info('t', 'main')`
-    (`only_a_file_database_needs_no_database_named`, `a_sqlite_database_is_quoted_where_it_is_used`).
+    A SQLite file always is a database, and it is always `main` — `"main".sqlite_master`,
+    `pragma_table_xinfo('t', 'main')` (`only_a_file_database_needs_no_database_named`). **`-d` and
+    `SCHEMAIC_DATABASE` are ignored there**, as `query` already ignored them: they used to be
+    spliced in as the schema (`"shop".sqlite_master`), which fails with exit 4 — "retry may work" —
+    on a command line that never could, and a `SCHEMAIC_DATABASE` exported for another engine did
+    the same. Every CLI operation opens its own connection, so nothing but `main` is ever attached
+    for a name to mean (`a_sqlite_listing_ignores_the_database_it_is_given`).
     **PostgreSQL's listing reads `pg_class`, not `information_schema.tables`**, which has no
     materialized views: relkinds `r`/`p`/`v`/`m`/`f`, partitions left out (`NOT relispartition` —
     their parent is the table), and `pg_catalog`, `information_schema`, `pg_toast*` and the
     per-session `pg_temp_*` schemas with them. Its `describe` finds the relation through
     `pg_catalog.to_regclass(<literal>)`, which reads the name the way a query would — through the
     search path when bare, `schema.table` when qualified, case-folded unless double-quoted — and a
-    name it cannot find is NULL, matching no row. SQLite's is `pragma_table_info` as a table-valued
-    function, because that makes it a `SELECT`, the only head the read gate lets through
-    (`every_canned_statement_passes_the_read_gate`). **What `key` can say differs per engine**,
+    name it cannot find is NULL, matching no row. **`to_regclass` also finds an index or a
+    sequence**, and one was printed as a table with exit 0, so the read joins `pg_class` and holds
+    the relation to `relkind IN ('r','p','v','m','f')`, the set of kinds `tables` lists
+    (`a_postgres_describe_is_of_a_listed_relation_only`). SQLite's
+    is `pragma_table_xinfo` as a table-valued function, because that makes it a `SELECT`, the only
+    head the read gate lets through (`every_canned_statement_passes_the_read_gate`). **`xinfo`, not
+    `pragma_table_info`**, because only `xinfo` reports a generated column (`hidden` 2 or 3) —
+    `describe` silently left them out, a different column set from the servers' with nothing to say
+    so (`a_sqlite_describe_lists_generated_columns`). `hidden = 1` is a virtual table's hidden
+    column, no column of its rows, and `WHERE hidden <> 1` drops it, as `db::sqlite`'s own column
+    read does. Both SQLite tests run the statement against in-memory SQLite, through a `rusqlite`
+    dev-dependency of this crate, since a pragma's column set is the engine's answer and not
+    something a string assertion can check. **What `key` can say differs per engine**,
     always in MySQL's `COLUMN_KEY` words: MySQL gives its own `PRI`/`UNI`/`MUL`, PostgreSQL `PRI`
-    and `UNI` (a single-column unique index only), and SQLite `PRI` alone, since `pragma_table_info`
-    says nothing of unique indexes. **No rows means no such table** to `run.rs`; a PostgreSQL
+    and `UNI` (a single-column unique index only, and not a partial one — `indpred IS NULL`, since
+    a unique index over some rows is no uniqueness of the column), and SQLite `PRI` alone, since
+    `pragma_table_xinfo` says nothing of unique indexes. **No rows means no such table** to `run.rs`; a PostgreSQL
     relation with no columns at all (`CREATE TABLE t ()`) reads the same, and is accepted as rare
     enough to take the wrong message.
     **A name from the command line reaches the SQL only as a literal**, through
@@ -20357,7 +20379,8 @@ existing prose was left alone.
     statement if the server puts it back. Verified live on MariaDB `classicmodels`,
     PostgreSQL `chinook` and a scratch schema — a mixed-case quoted name, a view, a materialized
     view, a partitioned table whose partition stayed hidden, and an injection-shaped name that came
-    back a plain miss — and SQLite through a throwaway `APPDATA` profile.
+    back a plain miss — and SQLite through a throwaway `APPDATA` profile. The type mapping was
+    verified live on MariaDB 10.11 and the relkind and partial-index filters on PostgreSQL 16.
   - `cli/exec.rs` — the write path, and the guard that is the only way into it. **A separate
     subcommand, not a flag on `query`**: a flag would put the dangerous case one character from the
     safe one, and it would give two paths one gate when they do not want the same gate — `query`
@@ -21550,7 +21573,7 @@ Re-introducing the anti-patterns these guard against is a regression:
   structs at 200k × 50, before a byte is compressed — which is exactly the size the streaming path
   exists for, so the bound is worth more than the purity. The file is created and removed inside the
   call, so a test of it is still deterministic and still needs no server; it is the same pragmatic
-  exception in-memory SQLite already is in `schemaic-db`. Read it as the one case, not as licence
+  exception in-memory SQLite already is in `schemaic-db` and `cli::catalog`'s tests. Read it as the one case, not as licence
   for a second: anything else wanting a file still models it at the boundary.
 - **What the source knew is carried, never re-derived from the text it rendered into.** Two
   separate defects turned out to be one shape — a precise oracle two functions upstream, dropped by

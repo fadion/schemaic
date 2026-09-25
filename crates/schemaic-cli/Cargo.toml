@@ -34,6 +34,9 @@ serde_json = { workspace = true }
 # dev-dependencies and the tests compiled, while `cargo test -p schemaic-cli`
 # alone did not — a crate has to carry what it uses.
 tokio = { workspace = true, features = ["test-util", "macros"] }
+# The SQLite catalog statements are run for real, in memory: a pragma's column
+# set is the engine's answer, not something a string assertion can check.
+rusqlite = { workspace = true }
 
 [lints]
 workspace = true

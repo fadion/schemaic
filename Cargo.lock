@@ -5009,6 +5009,7 @@ name = "schemaic-cli"
 version = "0.28.0"
 dependencies = [
  "clap",
+ "rusqlite",
  "schemaic-conn",
  "schemaic-core",
  "schemaic-db",
