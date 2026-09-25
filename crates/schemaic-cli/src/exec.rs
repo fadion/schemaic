@@ -86,8 +86,10 @@ pub struct ExecRequest {
 impl ExecRequest {
     /// The guard and the request in one step.
     ///
-    /// `assume_yes` answers a [`RunVerdict::Confirm`] — in practice the
-    /// missing-`WHERE` warning — and **cannot** answer a [`RunVerdict::Block`],
+    /// `assume_yes` answers a [`RunVerdict::Confirm`] — on this path
+    /// `sql::unsafe_reason`'s: a missing `WHERE`, a `TRUNCATE`, or a statement
+    /// that destroys stored rows with their object — and **cannot** answer a
+    /// [`RunVerdict::Block`],
     /// which is what a read-only connection produces. That asymmetry is the
     /// point: `--yes` is for a question, not for a refusal.
     pub fn approved(

@@ -20510,7 +20510,7 @@ existing prose was left alone.
     program: `+15551234` came out `'+15551234`, a different phone number from the one the JSON of
     the same cell gave (`csv_writes_a_formula_like_value_as_it_is`). **Every format tells a NULL
     from an empty string**, which the table and the CSV used not to (review finding S3-L1-04):
-    `table` goes through `export::export_markdown_null_as(rs, order, "NULL")`, the `mysql`
+    `table` goes through `export::export_markdown_null_as(rs, order, "NULL", header)`, the `mysql`
     client's spelling, with `''` left empty; CSV writes `''` as `""` and NULL as the bare empty
     field, PostgreSQL's `COPY … CSV` convention; JSON always had `null` against `""`
     (`the_table_tells_a_null_from_an_empty_string`, `csv_tells_a_null_from_an_empty_string`,

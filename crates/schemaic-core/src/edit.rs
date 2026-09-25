@@ -1610,8 +1610,9 @@ pub fn attach_span(r0: usize, r1: usize, cap: usize) -> (usize, usize) {
 ///   it, so its columns have to be in the order they were on screen.
 ///
 /// One list, because the two have to agree: the grid's own
-/// `scroll_active_into_view` already sums widths with the same filter, and a
-/// second spelling of the order is a second chance to disagree with it.
+/// `scroll_active_into_view` sums widths over the same order, less the frozen
+/// and hidden columns ([`ColLayout::scrolling`]), and a second spelling of the
+/// order is a second chance to disagree with it.
 ///
 /// A `frozen` index at or past `ncols` is ignored — it cannot be drawn, so it
 /// does not move anything.

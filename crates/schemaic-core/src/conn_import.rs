@@ -1162,7 +1162,7 @@ fn overlay(dst: &mut String, v: Option<String>) {
 /// into a project's `.idea/`).
 ///
 /// A narrow element scan rather than a real XML parse, and that is a decision
-/// with a cost: it reads exactly `<data-source>`'s `name` attribute and its
+/// with a cost: it reads exactly `<data-source>`'s `name` and `uuid` attributes and its
 /// `<jdbc-url>`, `<user-name>` and `<driver-ref>` children, and would be
 /// defeated by either of those inside a comment or a CDATA section. The
 /// alternative is a new dependency in `schemaic-core` — which has none for

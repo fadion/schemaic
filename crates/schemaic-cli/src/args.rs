@@ -147,8 +147,9 @@ pub enum Command {
         target: Target,
         #[command(flatten)]
         output: OutputArgs,
-        /// Answer the guard's question — in practice, "this statement has no
-        /// WHERE clause". It cannot unlock a read-only connection.
+        /// Answer the guard's question: a DELETE or UPDATE with no WHERE, a
+        /// TRUNCATE, or a statement that drops a table, database or schema.
+        /// It cannot unlock a read-only connection.
         #[arg(long)]
         yes: bool,
         /// Seconds before the statement is stopped.
@@ -1065,6 +1066,25 @@ mod tests {
         for name in subcommand_names() {
             assert!(text.contains(&name), "help must mention `{name}`");
         }
+    }
+
+    /// **`--yes` says every question it answers.** The help called the
+    /// missing-WHERE warning the one in practice after a `DROP TABLE` began
+    /// asking too — the user-facing text for the one flag that refusal needs.
+    #[test]
+    fn exec_help_names_every_question_yes_answers() {
+        let text = parse(&["schemaic", "exec", "--help"])
+            .unwrap_err()
+            .to_string();
+        let yes = text
+            .split("--yes")
+            .nth(1)
+            .and_then(|t| t.split("--timeout").next())
+            .expect("exec --help documents --yes");
+        for word in ["WHERE", "TRUNCATE", "drops a table"] {
+            assert!(yes.contains(word), "`--yes` help lacks {word}: {yes}");
+        }
+        assert!(!yes.contains("in practice"), "{yes}");
     }
 
     /// No subcommand at all is a usage error with the help text, not a silent

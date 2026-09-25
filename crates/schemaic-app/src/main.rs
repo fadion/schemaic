@@ -185,8 +185,8 @@ fn main() -> std::process::ExitCode {
         return std::process::ExitCode::SUCCESS;
     }
 
-    // Headless CLI mode — `schemaic list` / `databases` / `query` / `exec` / `version` /
-    // `help`. Like
+    // Headless CLI mode — `schemaic list` / `databases` / `tables` / `describe` /
+    // `query` / `exec` / `ping` / `version` / `help`. Like
     // `--mcp-serve` above it returns before Velopack, the file logger, the
     // fonts and Floem: none of that belongs in a one-shot command, and the
     // updater's auto-apply-on-startup would be free to exit and relaunch the
