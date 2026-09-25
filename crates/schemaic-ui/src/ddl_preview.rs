@@ -1357,6 +1357,7 @@ mod tests {
             cli_access: false,
             environment: Default::default(),
             ai_data: None,
+            folder: String::new(),
         }
     }
 

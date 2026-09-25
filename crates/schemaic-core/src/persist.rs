@@ -2909,6 +2909,7 @@ mod tests {
             cli_access: false,
             environment: Environment::Production,
             ai_data: None,
+            folder: String::new(),
         };
         let file = ConnectionsFile {
             connections: vec![c],

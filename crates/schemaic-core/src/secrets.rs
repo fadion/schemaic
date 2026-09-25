@@ -651,6 +651,7 @@ mod tests {
             cli_access: false,
             environment: crate::connection::Environment::None,
             ai_data: None,
+            folder: String::new(),
         }
     }
 

@@ -23,8 +23,8 @@ use floem::keyboard::{Key, NamedKey};
 use floem::prelude::*;
 use floem::reactive::create_effect;
 use schemaic_core::connection::AiData;
-use schemaic_core::connection::Connection;
 use schemaic_core::connection::Environment;
+use schemaic_core::connection::{ListedRow, listed_ids, listed_rows};
 
 use schemaic_core::connection::SshAuth;
 use schemaic_core::connection::SslMode;
@@ -116,6 +116,32 @@ fn conn_field_w() -> f64 {
 }
 
 // ===== moved from lib.rs (connection form + password masking) =====
+/// A folder's heading in a connection list — Manage Connections and the
+/// header's connection menu both draw this one, over the rows
+/// `connection::listed_rows` groups under it. Not a stop for the pointer or
+/// the keyboard: it names a group, it does nothing.
+pub(crate) fn folder_heading(name: String) -> impl IntoView {
+    h_stack((
+        icons::icon(icons::FOLDER, 12.0)
+            .style(|s| s.color(theme::text_faint()).flex_shrink(0.0_f32)),
+        text(name).style(|s| {
+            s.font_size(theme::font_label())
+                .color(theme::text_faint())
+                .text_ellipsis()
+                .min_width(0.0)
+        }),
+    ))
+    .style(|s| {
+        s.flex_row()
+            .items_center()
+            .gap(theme::scaled(6.0))
+            .width_full()
+            .padding_horiz(theme::scaled(12.0))
+            .padding_top(theme::scaled(8.0))
+            .padding_bottom(theme::scaled(2.0))
+    })
+}
+
 // One labelled text field for the connection form.
 /// One labelled text field, placed in the modal's Tab order at `tabindex`.
 ///
@@ -705,11 +731,16 @@ pub(crate) fn manage_modal(conn: ConnUi, o: OverlayUi, actions: Rc<ConnActions>)
             let select = select_conn.clone();
             let row_dup = duplicate_conn.clone();
             let row_del = delete_conn.clone();
+            // Rows as `connection::listed_rows` lays them out: ungrouped first,
+            // then a heading per folder over its connections.
             let list = dyn_stack(
-                move || connections.get(),
-                |c: &Connection| c.id,
-                move |c| {
-                    let id = c.id;
+                move || connections.with(|cs| listed_rows(cs)),
+                |r: &ListedRow| r.clone(),
+                move |row| {
+                    let id = match row {
+                        ListedRow::Folder(name) => return folder_heading(name).into_any(),
+                        ListedRow::Connection(id) => id,
+                    };
                     let select = select.clone();
                     let menu_select = select.clone();
                     let dup = row_dup.clone();
@@ -833,6 +864,7 @@ pub(crate) fn manage_modal(conn: ConnUi, o: OverlayUi, actions: Rc<ConnActions>)
                                     .hover(|s| s.color(theme::conn_list_sel_text()))
                             }
                         })
+                        .into_any()
                 },
             )
             // Full width so the selected row's background spans the pane; +5px gap
@@ -854,8 +886,9 @@ pub(crate) fn manage_modal(conn: ConnUi, o: OverlayUi, actions: Rc<ConnActions>)
                 NAV_TAB,
                 NavAxis::Vertical,
                 move |delta| {
-                    let ids: Vec<u64> =
-                        connections.with_untracked(|cs| cs.iter().map(|c| c.id).collect());
+                    // In the order drawn, folders and all — the saved order
+                    // would jump between folders on screen.
+                    let ids: Vec<u64> = connections.with_untracked(|cs| listed_ids(cs));
                     // **Nothing selected is not "the cursor is at 0".** With an
                     // unsaved new connection in the form (`draft.id == None`),
                     // folding the two together made the first ↓ select the
@@ -1591,8 +1624,23 @@ fn conn_form(
     ))
     .style(|s| s.flex_col().gap(theme::scaled(20.0)).width_full());
 
+    // Folder: a heading this connection lists under, in the header's connection
+    // menu and the list on the left. Free text — a folder is only its name, and
+    // exists while a connection names it (`connection::group_by_folder`). 17:
+    // after the swatches (15), before the first toggle (20), where it sits.
+    let folder_field = v_stack((
+        field("Folder", draft.folder, ring.clone(), 17),
+        text("Optional. Connections with the same folder are listed together.").style(|s| {
+            s.width_full()
+                .font_size(theme::font_hint())
+                .color(theme::text_muted())
+        }),
+    ))
+    .style(|s| s.flex_col().gap(theme::scaled(6.0)).width_full());
+
     let fields = v_stack((
         name_color,
+        folder_field,
         prominent_toggle,
         read_only_toggle,
         cli_access_toggle,

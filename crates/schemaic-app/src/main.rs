@@ -14904,6 +14904,7 @@ mod app_tests {
             cli_access: false,
             environment: Default::default(),
             ai_data: None,
+            folder: String::new(),
         }
     }
 

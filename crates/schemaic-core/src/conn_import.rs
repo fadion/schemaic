@@ -2128,6 +2128,7 @@ fn blank(db_type: &str) -> Connection {
         cli_access: false,
         environment: Environment::default(),
         ai_data: None,
+        folder: String::new(),
     }
 }
 

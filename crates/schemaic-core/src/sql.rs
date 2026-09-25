@@ -2432,6 +2432,7 @@ mod tests {
                 cli_access: false,
                 environment: crate::connection::Environment::None,
                 ai_data: None,
+                folder: String::new(),
             };
             let p = GuardPolicy::of(Some(&c), true, false);
             assert!(p.no_database, "{db_type}");
@@ -2578,6 +2579,7 @@ mod tests {
             cli_access: false,
             environment: crate::connection::Environment::None,
             ai_data: None,
+            folder: String::new(),
         };
         assert!(GuardPolicy::of(Some(&c), false, false).read_only);
         assert!(matches!(

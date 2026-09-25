@@ -3481,6 +3481,8 @@ pub struct DraftSignals {
     /// always holds a resolved level, so saving an old connection also settles
     /// its `None` — the user has now been shown a value and left it standing.
     pub ai_data: RwSignal<AiData>,
+    /// The folder the connection lists under; empty for none.
+    pub folder: RwSignal<String>,
 }
 
 impl DraftSignals {
@@ -3513,6 +3515,7 @@ impl DraftSignals {
             cli_access: cx.create_rw_signal(false),
             environment: cx.create_rw_signal(Environment::None),
             ai_data: cx.create_rw_signal(AiData::default()),
+            folder: cx.create_rw_signal(String::new()),
         }
     }
 
@@ -3548,6 +3551,7 @@ impl DraftSignals {
         // An unset level resolves to the default here, so the form shows the
         // level actually in force rather than a blank the user has to guess at.
         self.ai_data.set(c.ai_data.unwrap_or_default());
+        self.folder.set(c.folder.clone());
     }
 
     /// Reset the form for a brand-new connection.
@@ -3579,6 +3583,7 @@ impl DraftSignals {
         self.cli_access.set(false);
         self.environment.set(Environment::None);
         self.ai_data.set(AiData::default());
+        self.folder.set(String::new());
     }
 
     /// Build a `Connection` from the current form values (with the given id).
@@ -3636,6 +3641,7 @@ impl DraftSignals {
             cli_access: self.cli_access.get_untracked(),
             environment: self.environment.get_untracked(),
             ai_data: Some(self.ai_data.get_untracked()),
+            folder: self.folder.get_untracked(),
         }
         .trimmed()
         .sanitized()

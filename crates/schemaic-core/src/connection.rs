@@ -866,6 +866,12 @@ pub struct Connection {
     /// assistant more access nor silently takes away what the user had.
     #[serde(default)]
     pub ai_data: Option<AiData>,
+    /// The folder the connection lists under, in the header's connection menu
+    /// and Manage Connections; empty is none. A name rather than an id into a
+    /// folder table, because nothing else describes a folder — it exists while
+    /// a connection names it, and [`group_by_folder`] is what reads it.
+    #[serde(default)]
+    pub folder: String,
 }
 
 /// Redacting, for [`SshTunnel`]'s reasons — the DB password here, and the two
@@ -889,6 +895,7 @@ impl std::fmt::Debug for Connection {
             .field("read_only", &self.read_only)
             .field("environment", &self.environment)
             .field("ai_data", &self.ai_data)
+            .field("folder", &self.folder)
             .finish()
     }
 }
@@ -987,6 +994,9 @@ impl Connection {
         trim(&mut self.tls.ca_path);
         trim(&mut self.tls.client_cert_path);
         trim(&mut self.tls.client_key_path);
+        // A label, like `name`, but one that is matched: `Prod ` and `Prod`
+        // would be one folder on screen and two in the file.
+        trim(&mut self.folder);
         self
     }
 
@@ -1290,6 +1300,66 @@ impl Connection {
     pub fn is_reload_of(&self, other: &Connection) -> bool {
         self.id == other.id && self.targets_same_server(other)
     }
+}
+
+/// The connections in the order the lists show them, grouped by
+/// [`Connection::folder`]: the ungrouped ones first under no heading — the
+/// list as it was before folders — then each folder, A–Z ignoring case, under
+/// its name. Within a group, the saved order.
+///
+/// **A folder is its name as read**: trimmed, a blank one is none, and names
+/// that differ only in case are one folder, headed by the spelling met first —
+/// two folders a user cannot tell apart on screen would be a place to lose a
+/// connection. One function because two lists (the header's connection menu
+/// and Manage Connections) show it, and two orderings would disagree.
+pub fn group_by_folder(conns: &[Connection]) -> Vec<(String, Vec<&Connection>)> {
+    let mut groups: Vec<(String, Vec<&Connection>)> = Vec::new();
+    for c in conns {
+        let folder = c.folder.trim();
+        let key = folder.to_lowercase();
+        match groups.iter_mut().find(|(f, _)| f.to_lowercase() == key) {
+            Some((_, members)) => members.push(c),
+            None => groups.push((folder.to_string(), vec![c])),
+        }
+    }
+    // Stable, so each group keeps its saved order and the ungrouped (`""`,
+    // which sorts first) stay ahead of every folder.
+    groups.sort_by_key(|(f, _)| (!f.is_empty(), f.to_lowercase()));
+    groups
+}
+
+/// One row of a connection list: a folder's heading, or a connection by id.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum ListedRow {
+    Folder(String),
+    Connection(u64),
+}
+
+/// [`group_by_folder`] as the rows a list draws: the ungrouped connections
+/// under no heading, then each folder's heading and its connections. A list
+/// with no folders is its connections in saved order, as it always was.
+pub fn listed_rows(conns: &[Connection]) -> Vec<ListedRow> {
+    let mut rows = Vec::new();
+    for (folder, members) in group_by_folder(conns) {
+        if !folder.is_empty() {
+            rows.push(ListedRow::Folder(folder));
+        }
+        rows.extend(members.iter().map(|c| ListedRow::Connection(c.id)));
+    }
+    rows
+}
+
+/// The connection ids in the order [`listed_rows`] draws them — what a list's
+/// arrow keys step through, so ↓ moves to the row below rather than to the next
+/// one saved.
+pub fn listed_ids(conns: &[Connection]) -> Vec<u64> {
+    listed_rows(conns)
+        .into_iter()
+        .filter_map(|r| match r {
+            ListedRow::Connection(id) => Some(id),
+            ListedRow::Folder(_) => None,
+        })
+        .collect()
 }
 
 /// Shorten a connection's *name* to `max_chars` for a narrow row.
@@ -1752,6 +1822,7 @@ mod tests {
             cli_access: false,
             environment: Environment::None,
             ai_data: None,
+            folder: String::new(),
         };
         assert_eq!(c.endpoint(), "db.example.com:3307");
         // A server connection has no file to label.
@@ -1849,7 +1920,101 @@ mod tests {
             cli_access: false,
             environment: Environment::None,
             ai_data: None,
+            folder: String::new(),
         }
+    }
+
+    fn in_folder(id: u64, name: &str, folder: &str) -> Connection {
+        Connection {
+            id,
+            name: name.to_string(),
+            folder: folder.to_string(),
+            ..conn()
+        }
+    }
+
+    /// **Ungrouped first, then each folder under its name, A–Z** — and within
+    /// a group the saved order, which is the order a user who never made a
+    /// folder has always seen. No folders is one headless group: the list as
+    /// it was.
+    #[test]
+    fn connections_group_ungrouped_first_then_folders_by_name() {
+        let cs = [
+            in_folder(1, "a", "Prod"),
+            in_folder(2, "b", ""),
+            in_folder(3, "c", "dev"),
+            in_folder(4, "d", "Prod"),
+            in_folder(5, "e", ""),
+        ];
+        let groups = group_by_folder(&cs);
+        let shape: Vec<(&str, Vec<u64>)> = groups
+            .iter()
+            .map(|(f, cs)| (f.as_str(), cs.iter().map(|c| c.id).collect()))
+            .collect();
+        assert_eq!(
+            shape,
+            vec![("", vec![2, 5]), ("dev", vec![3]), ("Prod", vec![1, 4])]
+        );
+        let flat = [in_folder(1, "a", ""), in_folder(2, "b", "")];
+        assert_eq!(group_by_folder(&flat).len(), 1, "no folders: no headings");
+        assert!(group_by_folder(&[]).is_empty());
+    }
+
+    /// **What a list draws, row by row**: the ungrouped connections with no
+    /// heading, then a heading per folder followed by its connections. And the
+    /// order the arrow keys walk is exactly the connections of that listing —
+    /// stepping in saved order would jump between folders on screen.
+    #[test]
+    fn a_listing_heads_each_folder_and_the_arrows_walk_it_as_drawn() {
+        let cs = [
+            in_folder(1, "a", "Prod"),
+            in_folder(2, "b", ""),
+            in_folder(3, "c", "dev"),
+            in_folder(4, "d", "Prod"),
+        ];
+        assert_eq!(
+            listed_rows(&cs),
+            vec![
+                ListedRow::Connection(2),
+                ListedRow::Folder("dev".into()),
+                ListedRow::Connection(3),
+                ListedRow::Folder("Prod".into()),
+                ListedRow::Connection(1),
+                ListedRow::Connection(4),
+            ]
+        );
+        assert_eq!(listed_ids(&cs), vec![2, 3, 1, 4]);
+        // No folders: no headings, and the saved order.
+        let flat = [in_folder(7, "x", ""), in_folder(8, "y", "")];
+        assert_eq!(
+            listed_rows(&flat),
+            vec![ListedRow::Connection(7), ListedRow::Connection(8)]
+        );
+    }
+
+    /// A folder is its name as the user reads it: surrounding spaces are not
+    /// part of it, a blank one is no folder, and `prod` and `Prod` are one —
+    /// under the spelling that came first.
+    #[test]
+    fn a_folder_name_is_trimmed_and_matched_ignoring_case() {
+        let cs = [
+            in_folder(1, "a", " Prod "),
+            in_folder(2, "b", "   "),
+            in_folder(3, "c", "prod"),
+        ];
+        let groups = group_by_folder(&cs);
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].0, "");
+        assert_eq!(groups[1].0, "Prod");
+        assert_eq!(groups[1].1.len(), 2);
+    }
+
+    /// A file written before folders existed has none, and loads ungrouped.
+    #[test]
+    fn a_connection_saved_before_folders_has_none() {
+        let json = r#"{"id":1,"name":"c","host":"h","port":3306,"user":"u","password":""}"#;
+        let c: Connection = serde_json::from_str(json).unwrap();
+        assert_eq!(c.folder, "");
     }
 
     /// A connection with every secret-bearing field filled — what a duplicate
@@ -2185,6 +2350,7 @@ mod tests {
         c.tls.ca_path = " C:/certs/ca.pem ".into();
         c.tls.client_cert_path = " C:/certs/client.pem ".into();
         c.tls.client_key_path = " C:/certs/client.key ".into();
+        c.folder = " Prod ".into();
         c.password = " secret ".into();
         c.ssh.password = " ssh-secret ".into();
         c.ssh.key_passphrase = " key-secret ".into();
@@ -2200,6 +2366,7 @@ mod tests {
         assert_eq!(t.tls.ca_path, "C:/certs/ca.pem");
         assert_eq!(t.tls.client_cert_path, "C:/certs/client.pem");
         assert_eq!(t.tls.client_key_path, "C:/certs/client.key");
+        assert_eq!(t.folder, "Prod");
 
         assert_eq!(t.password, " secret ", "a password is stored verbatim");
         assert_eq!(t.ssh.password, " ssh-secret ");
@@ -2741,6 +2908,7 @@ mod tls_tests {
             cli_access: false,
             environment: Environment::None,
             ai_data: None,
+            folder: String::new(),
         }
     }
 

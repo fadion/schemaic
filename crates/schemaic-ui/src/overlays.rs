@@ -632,11 +632,24 @@ pub(crate) fn conn_menu_overlay(
             let switch = switch.clone();
             let select_conn = select_conn.clone();
 
+            // Rows as `connection::listed_rows` lays them out — the order and
+            // headings Manage Connections shows too.
             let list = dyn_stack(
-                move || connections.get(),
-                |c: &Connection| c.id,
-                move |c| {
-                    let id = c.id;
+                move || connections.with(|cs| schemaic_core::connection::listed_rows(cs)),
+                |r: &schemaic_core::connection::ListedRow| r.clone(),
+                move |row| {
+                    use schemaic_core::connection::ListedRow;
+                    let id = match row {
+                        ListedRow::Folder(name) => {
+                            return crate::connection_form::folder_heading(name).into_any();
+                        }
+                        ListedRow::Connection(id) => id,
+                    };
+                    let Some(c) = connections
+                        .with_untracked(|cs| schemaic_core::connection::by_id(cs, id).cloned())
+                    else {
+                        return empty().into_any();
+                    };
                     let switch = switch.clone();
                     // Leading identity dot in a fixed 14px slot — this
                     // connection's own colour, the same one on the switcher's
@@ -743,6 +756,7 @@ pub(crate) fn conn_menu_overlay(
                     // The wrapper `tooltip()` inserted, given the width the row
                     // resolves its own `width_full` against.
                     .style(|s| s.width_full())
+                    .into_any()
                 },
             )
             .style(|s| s.flex_col());

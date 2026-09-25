@@ -5678,7 +5678,9 @@ existing prose was left alone.
     honest omission, and the modal says how many were left behind. DBeaver names its engine twice
     and only the *driver* distinguishes MariaDB (it ships under the `mysql` provider); its rows are
     sorted by name because the file is a JSON object keyed by internal ids, so "the order in the
-    file" is not an order anyone chose. The DataGrip reader is a narrow element scan
+    file" is not an order anyone chose. Its `folders` are not read yet: every DBeaver row arrives
+    ungrouped (`blank` sets `folder` empty), which is future work rather than a decision. The
+    DataGrip reader is a narrow element scan
     (`<data-source>`'s `name`, `<jdbc-url>`, `<user-name>`, `<driver-ref>`) rather than a real XML
     parse — `schemaic-core` has no XML dependency, and if JetBrains ever moves that shape this
     reports zero connections rather than wrong ones. `.my.cnf`'s `[client]` is the base every
@@ -5735,6 +5737,23 @@ existing prose was left alone.
     the GUI writes it — the CLI reads `connections.json` and never writes it, since the app may be
     running and owns that file — and `cli/select.rs`'s `select` is the one place a connection is
     *refused* on it, its `listed` and `run`'s `list --all` column being the two that merely read it.
+    **`folder` is a name, not an id into a folder table**: nothing else describes a folder, so one
+    exists exactly while some connection names it, and there is nothing to create, rename or delete
+    on its own. `""` is none, and it is `#[serde(default)]`, so a file written before folders loads
+    ungrouped (`a_connection_saved_before_folders_has_none`) with no migration beyond that; there is
+    no collapse state either, a heading in a dropdown needing none. `group_by_folder` is the one
+    ordering, because two lists draw it — the header's `conn_menu_overlay` and Manage Connections —
+    and two orderings would disagree: the ungrouped connections first under no heading, which is the
+    list exactly as it was before folders, then each folder A–Z ignoring case, each group in saved
+    order. A folder is its name **as read**: trimmed, a blank one is none, and names differing only
+    in case are one folder headed by the spelling met first, since two folders a user cannot tell
+    apart on screen would be a place to lose a connection
+    (`a_folder_name_is_trimmed_and_matched_ignoring_case`). `listed_rows` is that as the rows a list
+    draws — a `ListedRow::Folder` heading over its `ListedRow::Connection(id)`s, and no folders at
+    all is the saved order with no headings — and `listed_ids` is the ids in drawn order, which is
+    what the arrow keys walk: stepping in saved order would jump between folders on screen
+    (`a_listing_heads_each_folder_and_the_arrows_walk_it_as_drawn`). The command palette's Switch
+    Connection, `schemaic list` and the MCP server do not group; they stay flat.
     `AiData` is the connection's **AI data-access level** — `SchemaOnly` / `OnRequest` (the
     default) / `Full` — and the single gate over every path that can carry this connection's rows
     off the machine: the `run_query` tool, `describe_table`'s sample rows, the grid's
@@ -5822,10 +5841,12 @@ existing prose was left alone.
     **The three secrets are deliberately not trimmed**, and that is asserted as hard as the rest: a
     leading or trailing space is a legal character in a password, an SSH password and a key
     passphrase, and mangling a credential the user cannot see is the worse failure of the two;
-    `name` is left alone too, being a label rather than a coordinate. `conn_import` trims a host of
+    `name` is left alone too, being a label rather than a coordinate. `folder` is a label as well and
+    *is* trimmed, because it is one that is matched: `Prod ` and `Prod` would be one folder on screen
+    and two in the file. `conn_import` trims a host of
     its own, so a connection *imported* from DBeaver got one and a connection *typed* did not —
     routing that path through here as well is a separate change and has not been made. The defect is
-    a composition, so `trimmed`'s own unit test cannot see it: the call site reads eighteen signals
+    a composition, so `trimmed`'s own unit test cannot see it: the call site reads a couple of dozen signals
     and needs a Floem scope, which is why the second half is the source gate
     `the_connection_form_trims_through_core` (under `ui/lib.rs`).
   - `schema.rs` — the introspected model. `ColumnInfo` carries the **full** column definition
@@ -13006,6 +13027,17 @@ existing prose was left alone.
     `to_connection` exactly as `read_only` is, and that is the part worth pinning: a hardcoded
     `false` at `to_connection` would have compiled and silently cleared the flag every time a user
     edited an exposed connection for any other reason.
+    **The *Folder* field is free text, right after Name and Colour**, because a folder is only its
+    name (`Connection::folder`) and there is no list of them to pick from. It sits at tabindex 17 —
+    after the swatches' 15, before the first toggle's 20 — which is where it sits on screen, for the
+    CLI toggle's reason; its hint is *"Optional. Connections with the same folder are listed
+    together."*, and `DraftSignals::folder` is threaded through create, load, reset and
+    `to_connection` like the rest. The list on the left iterates `connection::listed_rows`, keyed by
+    the `ListedRow`, and its Up/Down `nav_group` steps through `listed_ids` — the order drawn, not the
+    order saved, which would jump between folders. `folder_heading` (the `FOLDER` icon and the name,
+    in `text_faint` at `font_label`) is the one heading both lists draw: this one and the header's
+    `conn_menu_overlay`, which iterates `listed_rows` the same way and looks each connection up by
+    id. It is deliberately not a pointer or a keyboard stop — it names a group, it does nothing.
     **The mask is replayed from the editor's own delta, never diffed out of the buffer.** The
     document holds `MASK_CH` throughout, so comparing the text before and after an edit cannot tell
     a mask character the *user* typed from one that was already there — and the ambiguity was not
@@ -13251,8 +13283,8 @@ existing prose was left alone.
     `consts.rs` that says nowhere why (`consts::unscaled_const_gate`), a menu label ending in an
     ellipsis (`no_menu_label_ends_in_an_ellipsis`, whose subject is under *UI conventions*), a
     connection form that decides its own trimming instead of going through `Connection::trimmed` (`lib.rs`'s
-    `the_connection_form_trims_through_core`, which is a gate because `to_connection` reads eighteen
-    signals and needs a Floem scope) — and an engine comparison with no capability behind it,
+    `the_connection_form_trims_through_core`, which is a gate because `to_connection` reads a couple
+    of dozen signals and needs a Floem scope) — and an engine comparison with no capability behind it,
     `lib.rs`'s
     `engine_comparison_gate`, which is a per-file budget with a written reason rather than a ban and
     whose subject is under *Architecture invariants*; and more of the root `Ui` bundle than the file

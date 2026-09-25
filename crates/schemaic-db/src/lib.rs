@@ -3008,6 +3008,7 @@ mod tests {
             cli_access: false,
             environment: Default::default(),
             ai_data: None,
+            folder: String::new(),
         };
         // No tunnel → direct host/port passthrough.
         let direct = Db::connect(&conn, None);
@@ -3054,6 +3055,7 @@ mod tests {
                 cli_access: false,
                 environment: Default::default(),
                 ai_data: None,
+                folder: String::new(),
             };
 
             let direct = Db::connect(&conn, None);
@@ -3103,6 +3105,7 @@ mod tests {
             cli_access: false,
             environment: Default::default(),
             ai_data: None,
+            folder: String::new(),
         };
         let db = Db::connect(&conn, Some(55001));
         assert_eq!(db.engine(), Engine::Sqlite);
