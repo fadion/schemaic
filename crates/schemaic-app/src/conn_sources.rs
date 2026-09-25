@@ -16,7 +16,9 @@
 //! Nothing is written, and nothing outside a known layout is opened: the walks
 //! below are bounded to a fixed depth under a named directory, so a symlink farm
 //! or a large workspace cannot turn "open the import modal" into a filesystem
-//! scan.
+//! scan. The one place a path comes from elsewhere is a JetBrains IDE's own list
+//! of its projects (`recentProjects.xml`), and there only one fixed file inside
+//! each named project is checked.
 
 use std::path::{Path, PathBuf};
 
@@ -133,7 +135,25 @@ impl SourceError {
 /// scan turned that into `None`, so the file vanished from the list with no note
 /// anywhere while the modal said the files are "in known places". At its worst
 /// the vanished file is `~/.pgpass`. `text::decode_text_file` reads all three.
+///
+/// **A JetBrains file is read as a pair**, whichever half was named
+/// ([`jetbrains_pair`]): `dataSources.xml` for the servers, and the
+/// `dataSources.local.xml` beside it for the user names
+/// (`conn_import::parse_datagrip_with_local`). The local half is optional — a
+/// global `options/` file may carry its users inline — but the main half is not:
+/// naming only the local file, with nothing beside it, is the main file's error.
 pub fn open_source(path: &Path, source: ImportSource) -> Result<SourceFile, SourceError> {
+    if source == ImportSource::DataGrip {
+        let (main, local) = jetbrains_pair(path);
+        let mut file = read_text(&main, source)?;
+        file.local = read_text(&local, source).ok().map(|f| f.text);
+        return Ok(file);
+    }
+    read_text(path, source)
+}
+
+/// One file's text, bounded and decoded. See [`open_source`].
+fn read_text(path: &Path, source: ImportSource) -> Result<SourceFile, SourceError> {
     let meta = std::fs::metadata(path).map_err(|e| match e.kind() {
         std::io::ErrorKind::NotFound => SourceError::NotAFile,
         _ => SourceError::Unreadable(e.to_string()),
@@ -149,7 +169,24 @@ pub fn open_source(path: &Path, source: ImportSource) -> Result<SourceFile, Sour
         source,
         path: path.to_string_lossy().into_owned(),
         text: schemaic_core::text::decode_text_file(&bytes),
+        local: None,
     })
+}
+
+/// The two halves of a JetBrains data-source list, as `(main, local)`, given
+/// either one: `dataSources.xml` and the `dataSources.local.xml` beside it.
+///
+/// The half that was named keeps its own spelling; only the *other* half is
+/// spelled the way JetBrains writes it. On a case-sensitive filesystem a
+/// respelled `DATASOURCES.XML` would be a different file, or none.
+fn jetbrains_pair(path: &Path) -> (PathBuf, PathBuf) {
+    let dir = path.parent().unwrap_or(Path::new(""));
+    let named_local = file_name(path).eq_ignore_ascii_case("dataSources.local.xml");
+    if named_local {
+        (dir.join("dataSources.xml"), path.to_path_buf())
+    } else {
+        (path.to_path_buf(), dir.join("dataSources.local.xml"))
+    }
 }
 
 /// Which parser a file the user picked by hand should go through.
@@ -204,27 +241,73 @@ fn dbeaver_files() -> Vec<(ImportSource, PathBuf)> {
     out
 }
 
-/// `…/JetBrains/<Product><Version>/options/dataSources.xml`.
+/// `…/JetBrains/<Product><Version>/options/dataSources.xml`, and the
+/// `.idea/dataSources.xml` of every **project** those IDEs know about.
 ///
-/// Every JetBrains IDE with the database plugin writes this file under its own
-/// product directory, so the walk does not filter by product name: DataGrip is
-/// the one this is named for, but a user's connections are just as likely to
+/// Every JetBrains IDE with the database plugin writes the global file under its
+/// own product directory, so the walk does not filter by product name: DataGrip
+/// is the one this is named for, but a user's connections are just as likely to
 /// live under IntelliJ or PhpStorm, and the file's shape is identical.
 ///
-/// Per-project `.idea/dataSources.xml` files are **not** searched. They are
-/// scattered wherever the user keeps code, finding them would mean walking the
-/// home directory, and the modal's "Choose a file…" opens one directly.
+/// **Most DataGrip connections are not in the global file** — they belong to a
+/// project, in its `.idea/`. Projects are scattered wherever the user keeps
+/// code, and finding them by walking the home directory is what this module
+/// refuses to do; the IDE's own list of them is not. So each product's
+/// `options/recentProjects.xml` is read (`conn_import::recent_project_dirs`)
+/// and each project it names is checked for the file. `~/DataGripProjects/*`
+/// — where DataGrip puts a new project on every platform — is checked as well,
+/// one level deep, for a project that has fallen off the recent list. Where the
+/// IDE *binary* lives (JetBrains Toolbox, a tarball, a package) does not matter:
+/// its configuration is under the config root either way.
 fn jetbrains_files() -> Vec<(ImportSource, PathBuf)> {
-    let mut out = Vec::new();
+    let home_dir = home();
+    let home_str = home_dir
+        .as_ref()
+        .map(|h| h.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let mut projects: Vec<PathBuf> = Vec::new();
+    let mut globals: Vec<PathBuf> = Vec::new();
     for root in config_roots() {
         for product in children(&root.join("JetBrains")) {
-            let path = product.join("options").join("dataSources.xml");
-            if path.is_file() {
-                out.push((ImportSource::DataGrip, path));
+            let options = product.join("options");
+            let global = options.join("dataSources.xml");
+            if global.is_file() {
+                globals.push(global);
+            }
+            if let Some(recent) = read_small(&options.join("recentProjects.xml")) {
+                projects.extend(
+                    schemaic_core::conn_import::recent_project_dirs(&recent, &home_str)
+                        .into_iter()
+                        .map(PathBuf::from),
+                );
             }
         }
     }
-    out
+    if let Some(home) = &home_dir {
+        projects.extend(children(&home.join("DataGripProjects")));
+    }
+    // Globals first, then projects: `discover` drops a second path to the same
+    // file, and `scan` keeps the first description of a server.
+    let project_files = projects
+        .iter()
+        .map(|p| p.join(".idea").join("dataSources.xml"))
+        .filter(|p| p.is_file());
+    globals
+        .into_iter()
+        .chain(project_files)
+        .map(|p| (ImportSource::DataGrip, p))
+        .collect()
+}
+
+/// A small text file's contents, or `None` — for a file that only steers the
+/// search ([`jetbrains_files`]) and is never itself a source.
+fn read_small(path: &Path) -> Option<String> {
+    let meta = std::fs::metadata(path).ok()?;
+    if !meta.is_file() || meta.len() > MAX_BYTES {
+        return None;
+    }
+    let bytes = std::fs::read(path).ok()?;
+    Some(schemaic_core::text::decode_text_file(&bytes))
 }
 
 /// The three command-line clients' files, at the paths their own documentation
@@ -351,6 +434,29 @@ mod tests {
             source_for_path(Path::new("/x/DATASOURCES.XML")),
             ImportSource::DataGrip
         );
+    }
+
+    /// Whichever half the user picks, both are read: the main file for the
+    /// servers, the local one for the user names.
+    #[test]
+    fn a_jetbrains_file_is_paired_with_its_other_half() {
+        let main = Path::new("/p/.idea").join("dataSources.xml");
+        let local = Path::new("/p/.idea").join("dataSources.local.xml");
+        assert_eq!(jetbrains_pair(&main), (main.clone(), local.clone()));
+        assert_eq!(jetbrains_pair(&local), (main.clone(), local.clone()));
+        // Picked through a case-insensitive spelling, it is still the local half.
+        let shouted = Path::new("/p/.idea").join("DATASOURCES.LOCAL.XML");
+        assert_eq!(jetbrains_pair(&shouted), (main, shouted.clone()));
+    }
+
+    /// A main file the user named is read **as named**. On a case-sensitive
+    /// filesystem `DATASOURCES.XML` and `dataSources.xml` are two files, and
+    /// respelling the one picked would read the other — or nothing.
+    #[test]
+    fn a_named_main_file_keeps_its_own_spelling() {
+        let shouted = Path::new("/p/.idea").join("DATASOURCES.XML");
+        let local = Path::new("/p/.idea").join("dataSources.local.xml");
+        assert_eq!(jetbrains_pair(&shouted), (shouted.clone(), local));
     }
 
     #[test]

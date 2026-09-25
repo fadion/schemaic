@@ -5681,9 +5681,27 @@ existing prose was left alone.
     file" is not an order anyone chose. Its `folders` are not read yet: every DBeaver row arrives
     ungrouped (`blank` sets `folder` empty), which is future work rather than a decision. The
     DataGrip reader is a narrow element scan
-    (`<data-source>`'s `name`, `<jdbc-url>`, `<user-name>`, `<driver-ref>`) rather than a real XML
-    parse — `schemaic-core` has no XML dependency, and if JetBrains ever moves that shape this
-    reports zero connections rather than wrong ones. `.my.cnf`'s `[client]` is the base every
+    (`<data-source>`'s `name` and `uuid`, `<jdbc-url>`, `<user-name>`, `<driver-ref>`) rather than a
+    real XML parse — `schemaic-core` has no XML dependency, and if JetBrains ever moves that shape
+    this reports zero connections rather than wrong ones. **A project's file is only half of each
+    data source**: `.idea/dataSources.xml` is the part meant for version control — name, driver,
+    URL — and the user name is per-person, so it lives in the `dataSources.local.xml` beside it
+    under the same `uuid`. Reading only the first imported every project connection with a blank
+    user. `parse_datagrip_with_local` takes the second (`SourceFile::local`; `parse_datagrip` is it
+    with `None`) and matches an entry by `uuid`, falling back to `name` only where a uuid cannot
+    decide it — either side lacking one — because a local entry keyed by a uuid belongs to that
+    uuid and its name goes stale on a rename (`a_projects_user_names_come_from_its_local_file_by_uuid`
+    is the stale-name case). A user in the main file wins, and the local file never adds a row or a
+    skip of its own: an entry there with no counterpart has no server to connect to. `scan` is what
+    carries the local text down, and `scan_hands_a_datagrip_files_local_half_to_the_parser` pins
+    that composition rather than the parser alone. `recent_project_dirs` is the other half of
+    finding a *project*, and exists so the app never has to walk the home directory for one: it
+    returns the paths an IDE wrote into its `options/recentProjects.xml` — the current
+    `additionalInfo` map's `<entry key>`s and the older `recentPaths` list — with `$USER_HOME$`
+    expanded, keeping only strings that look like a path (the macro, `/`, a drive letter) and each
+    once, in the file's order. Nothing else in that file is a project: `lastProjectLocation` is
+    where the *next* one would go, and the metadata's `value`s are build numbers
+    (`only_project_entries_count_as_recent_projects`). `.my.cnf`'s `[client]` is the base every
     client group inherits, so a `[client_prod]` is read *layered on it* (what
     `--defaults-group-suffix` does); `[mysqld]` is the server's own configuration and is not a
     client at all.
@@ -19232,12 +19250,34 @@ existing prose was left alone.
     (`DBeaverData/workspace<N>/<project>/.dbeaver/data-sources.json`) and both are real — taking
     only `General` misses every connection of anyone who made a second project. JetBrains is
     `JetBrains/<Product><Version>/options/dataSources.xml` and is **not** filtered by product,
-    since the file's shape is identical under IntelliJ or PhpStorm. Per-project
-    `.idea/dataSources.xml` files are not searched at all: they are wherever the user keeps code,
-    and the modal's "Choose a file…" opens one directly. `PGPASSFILE`/`PGSERVICEFILE` are honoured,
+    since the file's shape is identical under IntelliJ or PhpStorm — **and that global file is not
+    where a DataGrip project keeps its connections.** A user with DataGrip installed through
+    JetBrains Toolbox on Linux got nothing from Import: every connection was in a project,
+    `~/DataGripProjects/<project>/.idea/dataSources.xml`, and only the global file was read. (The
+    Toolbox install was never the cause — wherever the binary lives, its configuration is under the
+    config root.) Projects sit wherever the user keeps code, and walking the home directory for them
+    is what this module refuses to do; the IDE's own record of them is not a walk. So each
+    product's `options/recentProjects.xml` is read — by `read_small`, under the same 4 MiB cap, and
+    never itself a source — through `conn_import::recent_project_dirs`, and
+    `<project>/.idea/dataSources.xml` is checked for every project it names, plus
+    `~/DataGripProjects/*` one level deep, DataGrip's default project location on every platform,
+    for a project that has fallen off the recent list. The only paths that come from outside a known
+    layout are ones the IDE itself recorded, and only that one fixed file inside each is opened.
+    Globals are listed before projects, so where both describe one server `scan` keeps the global
+    row; a project reached twice (the recent list and `DataGripProjects`, or two products' lists) is
+    one file to `discover`'s resolved-path check. **A JetBrains file is read as a pair**, whichever
+    half is named: `jetbrains_pair` keeps the named half's own spelling and spells only the *other*
+    half the JetBrains way, beside it — respelling a picked `DATASOURCES.XML` would, on a
+    case-sensitive filesystem, name a different file or none (`a_named_main_file_keeps_its_own_spelling`)
+    — and `open_source` reads the main half for the servers
+    (required — naming only a local file with nothing beside it is the main file's error) and the
+    local half, if it is there, for the user names. *Choose a file…* goes through the same
+    `open_source`, so a project file picked by hand arrives with its users too, and picking the
+    local half reads the whole pair. `PGPASSFILE`/`PGSERVICEFILE` are honoured,
     because libpq reads them first. Reads are capped at 4 MiB and a file that fails is silently
     skipped — this runs over paths the user never named — *except* one they picked by hand, which
-    goes through the same `read_source` and is reported by the modal.
+    goes through `open_source` — `read_source` is that call with the error dropped — and is
+    reported by the modal.
     `password_sources` is the narrow half of that walk — today just `~/.pgpass` — for the one path
     that reads a single file: a hand-picked DataGrip export would otherwise arrive with twelve
     blank passwords that libpq's file, on the same machine, holds every one of, and whether a row

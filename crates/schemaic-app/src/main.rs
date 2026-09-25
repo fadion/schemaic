@@ -9601,6 +9601,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             source: conn_import::ImportSource::Url,
             path: String::new(),
             text,
+            local: None,
         };
         let scan = conn_import::scan(&[file], &existing);
         // A paste that produced nothing at all is answered under the field,

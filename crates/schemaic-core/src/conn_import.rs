@@ -517,6 +517,10 @@ pub struct SourceFile {
     pub path: String,
     /// The file's contents.
     pub text: String,
+    /// JetBrains only: the `dataSources.local.xml` beside a `dataSources.xml`,
+    /// which is where a project keeps its **user names**
+    /// ([`parse_datagrip_with_local`]). `None` for every other source.
+    pub local: Option<String>,
 }
 
 /// Parse every source file, complete what can be completed, and mark what is
@@ -539,7 +543,7 @@ pub fn scan(files: &[SourceFile], existing: &[Connection]) -> ImportScan {
         let mut one = match f.source {
             ImportSource::Url => parse_url_scan(&f.text),
             ImportSource::DBeaver => parse_dbeaver(&f.text),
-            ImportSource::DataGrip => parse_datagrip(&f.text),
+            ImportSource::DataGrip => parse_datagrip_with_local(&f.text, f.local.as_deref()),
             ImportSource::MyCnf => parse_my_cnf(&f.text),
             ImportSource::Pgpass => parse_pgpass(&f.text),
             ImportSource::PgService => parse_pg_service(&f.text),
@@ -1168,6 +1172,56 @@ fn overlay(dst: &mut String, v: Option<String>) {
 ///
 /// Passwords are in the OS credential store, not here.
 pub fn parse_datagrip(xml: &str) -> ImportScan {
+    parse_datagrip_with_local(xml, None)
+}
+
+/// [`parse_datagrip`], completing each row's user from `local` — the
+/// `dataSources.local.xml` beside the file.
+///
+/// **A project splits a data source in two.** Its `.idea/dataSources.xml` is the
+/// half meant for version control — name, driver, URL — and the user name is
+/// per-person, so it lives in `dataSources.local.xml` under the same `uuid`.
+/// Reading only the first file imported every project connection with a blank
+/// user. The local entry is matched by `uuid`, and by `name` when it has none; a
+/// user already in the main file wins. The local file never adds a row of its
+/// own: an entry there with no counterpart has no server to connect to.
+pub fn parse_datagrip_with_local(xml: &str, local: Option<&str>) -> ImportScan {
+    // (uuid, name, user) for every local entry that names a user.
+    let local_users: Vec<(Option<String>, String, String)> = local
+        .map(|l| {
+            elements(strip_bom(l), "data-source")
+                .into_iter()
+                .filter_map(|b| {
+                    let user = child_text(b.body, "user-name")?;
+                    let user = user.trim();
+                    (!user.is_empty()).then(|| {
+                        (
+                            attribute(b.head, "uuid").filter(|u| !u.is_empty()),
+                            attribute(b.head, "name").unwrap_or_default(),
+                            user.to_string(),
+                        )
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let local_user = |uuid: Option<&str>, name: &str| -> Option<&str> {
+        let by_uuid = uuid.and_then(|u| {
+            local_users
+                .iter()
+                .find(|(lu, _, _)| lu.as_deref() == Some(u))
+        });
+        // By name only where a uuid cannot decide it: a local entry keyed by a
+        // uuid belongs to that uuid, and its name may be stale (a rename).
+        by_uuid
+            .or_else(|| {
+                local_users.iter().find(|(lu, ln, _)| {
+                    (uuid.is_none() || lu.is_none()) && !name.is_empty() && ln == name
+                })
+            })
+            .map(|(_, _, user)| user.as_str())
+    };
+
     let mut out = ImportScan::default();
     for block in elements(strip_bom(xml), "data-source") {
         let name = attribute(block.head, "name").unwrap_or_default();
@@ -1196,6 +1250,10 @@ pub fn parse_datagrip(xml: &str) -> ImportScan {
         if let Some(u) = child_text(block.body, "user-name") {
             set_if_empty(&mut c.user, u.trim());
         }
+        let uuid = attribute(block.head, "uuid");
+        if let Some(u) = local_user(uuid.as_deref(), &name) {
+            set_if_empty(&mut c.user, u);
+        }
         if !name.trim().is_empty() {
             c.name = name;
         }
@@ -1204,6 +1262,53 @@ pub fn parse_datagrip(xml: &str) -> ImportScan {
             imp.note(ImportNote::UnexpandedPath);
         }
         out.found.push(imp);
+    }
+    out
+}
+
+/// The project directories a JetBrains IDE lists in its
+/// `options/recentProjects.xml`, with `$USER_HOME$` expanded against `home`.
+///
+/// This is how the app finds a **project's** `.idea/dataSources.xml` without
+/// walking the home directory: the IDE already wrote down every project it has
+/// opened. Two layouts are read — the current `additionalInfo` map, keyed by the
+/// project path, and the older flat `recentPaths` list. Nothing else in the
+/// file counts: `lastProjectLocation` is where the *next* project would go, and
+/// the metadata's own `value`s are build numbers. A path is kept only if it
+/// looks like one (the macro, `/` or a drive letter), and each is returned
+/// once, in the file's order.
+pub fn recent_project_dirs(xml: &str, home: &str) -> Vec<String> {
+    let xml = strip_bom(xml);
+    let mut raw: Vec<String> = Vec::new();
+    if let Some(at) = xml.find(r#"name="recentPaths""#) {
+        let list = &xml[at..];
+        let list = &list[..list.find("</list>").unwrap_or(list.len())];
+        raw.extend(
+            elements(list, "option")
+                .into_iter()
+                .filter_map(|e| attribute(e.head, "value")),
+        );
+    }
+    raw.extend(
+        elements(xml, "entry")
+            .into_iter()
+            .filter_map(|e| attribute(e.head, "key")),
+    );
+
+    let home = home.trim_end_matches(['/', '\\']);
+    let mut out: Vec<String> = Vec::new();
+    for p in raw {
+        let p = p.trim();
+        let looks_like_a_path = p.starts_with("$USER_HOME$")
+            || p.starts_with('/')
+            || p.as_bytes().get(1) == Some(&b':');
+        if !looks_like_a_path {
+            continue;
+        }
+        let p = p.replace("$USER_HOME$", home);
+        if !out.contains(&p) {
+            out.push(p);
+        }
     }
     out
 }
@@ -2917,6 +3022,193 @@ mod tests {
         assert!(proj.connection.file.contains("$PROJECT_DIR$"));
     }
 
+    /// A **project's** `dataSources.xml` is the shareable half: it holds the
+    /// URL and driver, and the user name lives in the `dataSources.local.xml`
+    /// beside it, keyed by the same `uuid`.
+    const DATAGRIP_PROJECT: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+    <project version="4">
+      <component name="DataSourceManagerImpl" format="xml" multifile-model="true">
+        <data-source source="LOCAL" name="inventory@localhost" uuid="aa-1">
+          <driver-ref>mysql.8</driver-ref>
+          <jdbc-url>jdbc:mysql://localhost:3306/inventory</jdbc-url>
+        </data-source>
+        <data-source source="LOCAL" name="reports" uuid="aa-2">
+          <driver-ref>postgresql</driver-ref>
+          <jdbc-url>jdbc:postgresql://pg.example:5432/reports</jdbc-url>
+        </data-source>
+        <data-source source="LOCAL" name="legacy">
+          <jdbc-url>jdbc:mysql://old.example:3306/legacy</jdbc-url>
+        </data-source>
+      </component>
+    </project>"#;
+
+    const DATAGRIP_PROJECT_LOCAL: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+    <project version="4">
+      <component name="dataSourceStorageLocal" created-in="DB-252.1">
+        <data-source name="inventory@localhost" uuid="aa-1">
+          <database-info product="MySQL" version="8.0.36" />
+          <secret-storage>master_key</secret-storage>
+          <user-name>root</user-name>
+        </data-source>
+        <data-source name="renamed since" uuid="aa-2">
+          <user-name>analyst</user-name>
+        </data-source>
+        <data-source name="legacy">
+          <user-name>old_app</user-name>
+        </data-source>
+        <data-source name="only here" uuid="zz-9">
+          <user-name>ghost</user-name>
+        </data-source>
+      </component>
+    </project>"#;
+
+    #[test]
+    fn a_projects_user_names_come_from_its_local_file_by_uuid() {
+        let scan = parse_datagrip_with_local(DATAGRIP_PROJECT, Some(DATAGRIP_PROJECT_LOCAL));
+        let user = |name: &str| {
+            scan.found
+                .iter()
+                .find(|i| i.connection.name == name)
+                .map(|i| i.connection.user.clone())
+        };
+        assert_eq!(user("inventory@localhost").as_deref(), Some("root"));
+        // Matched on the uuid, not the name — the local file's name is stale.
+        assert_eq!(user("reports").as_deref(), Some("analyst"));
+    }
+
+    #[test]
+    fn a_local_entry_without_a_uuid_is_matched_by_name() {
+        let scan = parse_datagrip_with_local(DATAGRIP_PROJECT, Some(DATAGRIP_PROJECT_LOCAL));
+        let legacy = scan
+            .found
+            .iter()
+            .find(|i| i.connection.name == "legacy")
+            .expect("legacy row");
+        assert_eq!(legacy.connection.user, "old_app");
+    }
+
+    /// The local file only completes rows; an entry with no counterpart in the
+    /// main file has no server to connect to and adds nothing, not even a skip.
+    #[test]
+    fn the_local_file_never_adds_a_connection_of_its_own() {
+        let scan = parse_datagrip_with_local(DATAGRIP_PROJECT, Some(DATAGRIP_PROJECT_LOCAL));
+        assert_eq!(scan.found.len(), 3);
+        assert!(scan.skipped.is_empty(), "{:?}", scan.skipped);
+        assert!(scan.found.iter().all(|i| i.connection.user != "ghost"));
+    }
+
+    #[test]
+    fn a_user_name_in_the_main_file_wins_over_the_local_one() {
+        let main = r#"<data-source name="a" uuid="u1"><jdbc-url>jdbc:mysql://h:3306/d</jdbc-url><user-name>from_main</user-name></data-source>"#;
+        let local =
+            r#"<data-source name="a" uuid="u1"><user-name>from_local</user-name></data-source>"#;
+        let scan = parse_datagrip_with_local(main, Some(local));
+        assert_eq!(scan.found[0].connection.user, "from_main");
+    }
+
+    #[test]
+    fn without_its_local_file_a_project_row_has_no_user() {
+        let scan = parse_datagrip_with_local(DATAGRIP_PROJECT, None);
+        assert_eq!(scan.found.len(), 3);
+        assert!(scan.found.iter().all(|i| i.connection.user.is_empty()));
+    }
+
+    /// `scan` is the one entry point, so the local text has to reach the
+    /// parser through it — the parser alone being right is not the feature.
+    #[test]
+    fn scan_hands_a_datagrip_files_local_half_to_the_parser() {
+        let files = [SourceFile {
+            source: ImportSource::DataGrip,
+            path: "/p/.idea/dataSources.xml".into(),
+            text: DATAGRIP_PROJECT.into(),
+            local: Some(DATAGRIP_PROJECT_LOCAL.into()),
+        }];
+        let scan = scan(&files, &[]);
+        let row = scan
+            .found
+            .iter()
+            .find(|i| i.connection.name == "inventory@localhost")
+            .expect("row");
+        assert_eq!(row.connection.user, "root");
+    }
+
+    // -- JetBrains recent projects -------------------------------------------
+
+    const RECENT_PROJECTS: &str = r#"<application>
+      <component name="RecentProjectsManager">
+        <option name="additionalInfo">
+          <map>
+            <entry key="$USER_HOME$/DataGripProjects/inventory">
+              <value>
+                <RecentProjectMetaInfo frameTitle="inventory" projectWorkspaceId="x1">
+                  <option name="build" value="DB-252.23892.449" />
+                  <option name="productionCode" value="DB" />
+                </RecentProjectMetaInfo>
+              </value>
+            </entry>
+            <entry key="/srv/work/shop">
+              <value><RecentProjectMetaInfo /></value>
+            </entry>
+          </map>
+        </option>
+        <option name="lastProjectLocation" value="$USER_HOME$/DataGripProjects" />
+      </component>
+    </application>"#;
+
+    #[test]
+    fn recent_projects_are_read_with_the_home_macro_expanded() {
+        assert_eq!(
+            recent_project_dirs(RECENT_PROJECTS, "/home/me"),
+            vec![
+                "/home/me/DataGripProjects/inventory".to_string(),
+                "/srv/work/shop".to_string(),
+            ]
+        );
+    }
+
+    /// `lastProjectLocation` is where the *next* project would go, and the
+    /// metadata's `value`s are build numbers — neither is a project.
+    #[test]
+    fn only_project_entries_count_as_recent_projects() {
+        let dirs = recent_project_dirs(RECENT_PROJECTS, "/home/me");
+        assert!(!dirs.iter().any(|d| d.ends_with("/DataGripProjects")));
+        assert!(!dirs.iter().any(|d| d.contains("DB-252")));
+    }
+
+    /// The older layout: a flat `recentPaths` list.
+    #[test]
+    fn the_older_recent_paths_list_is_read_too() {
+        let xml = r#"<application><component name="RecentProjectsManager">
+          <option name="recentPaths">
+            <list>
+              <option value="$USER_HOME$/IdeaProjects/api" />
+              <option value="C:/work/shop" />
+            </list>
+          </option>
+          <option name="lastProjectLocation" value="$USER_HOME$/IdeaProjects" />
+        </component></application>"#;
+        assert_eq!(
+            recent_project_dirs(xml, "C:/Users/me"),
+            vec![
+                "C:/Users/me/IdeaProjects/api".to_string(),
+                "C:/work/shop".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_project_listed_twice_is_returned_once() {
+        let xml = r#"<option name="recentPaths"><list><option value="/a/p" /></list></option>
+          <map><entry key="/a/p"><value /></entry></map>"#;
+        assert_eq!(recent_project_dirs(xml, "/h"), vec!["/a/p".to_string()]);
+    }
+
+    #[test]
+    fn a_file_that_is_not_a_recent_projects_list_yields_nothing() {
+        assert!(recent_project_dirs("", "/h").is_empty());
+        assert!(recent_project_dirs("not xml at all", "/h").is_empty());
+    }
+
     #[test]
     fn the_element_scan_does_not_confuse_a_longer_tag_for_the_one_it_wants() {
         // `<data-sources>` shares a prefix with `<data-source`.
@@ -3886,6 +4178,7 @@ mod tests {
             source,
             path: path.to_string(),
             text: text.to_string(),
+            local: None,
         }
     }
 
@@ -4007,6 +4300,7 @@ mod tests {
             source: ImportSource::Url,
             path: "history.txt".into(),
             text: junk,
+            local: None,
         }];
         let scan = scan(&files, &[]);
 
