@@ -25234,10 +25234,15 @@ this bundle's.
   tooltip saying how to get them back and a click that shows all: otherwise nothing on screen says a
   result is short a column, and one quietly missing a column reads as one that never had it. It is
   built inside the body's container because that already rebuilds on every change of the set.
-  Hiding does **not** touch sort, widths (a hidden column keeps its width for when it returns), the
-  row editor (*Edit row* still shows every column) or the selection aggregate, which reads the
-  anchor column and so never stays on a hidden one; nor the whole-result exports, for the reason
-  under `core::edit`.
+  Hiding does **not** touch sort, widths (a hidden column keeps its width for when it returns) or
+  the row editor (*Edit row* still shows every column); nor the whole-result exports, for the
+  reason under `core::edit`. What it does reach, besides copy and paste: the selection aggregate's
+  whole-row reading (its entry below), the find count, whose effect tracks `hidden` rather than
+  recounting only because a rebuild happens to republish `order`
+  (`the_find_count_tracks_every_signal_it_reads`), and both *Attach … to chat* labels — a consent
+  notice, so they count the drawn columns `GridCells::attached` sends, and a hidden one keeps
+  them from saying "whole rows" (`attach_scope`,
+  `the_attach_label_counts_only_the_drawn_columns`).
 - **⚠️ Scroll-sync rule (cost a hang):** a scroll view must **never both read and write the same
   offset signal** — it re-enters its own layout and hangs the UI thread. Strict one-writer/one-reader:
   the **data pane writes `vscroll`** (`on_scroll`) and reads `gs.scroll_to` (keyboard channel); the
@@ -25864,15 +25869,18 @@ this bundle's.
   unmarks, which reads as the key doing nothing) — that vote is `delete_vote`, and it is applied in
   **one** `del_rows.update` and one `dirty.update`: `toggle_delete` per row was two notifications
   each, so Ctrl+A then Del at the 200k row limit fired 400,000 of them and locked the window, on
-  the two-keystroke gesture the feature exists to enable. The set write is `mark_rows`, shared with
-  the gutter menu's *Delete N rows* — which followed this rule late, and whose entry above carries
-  the measurements.
+  the two-keystroke gesture the feature exists to enable. The write is `GridState::mark_deleted`
+  (over `mark_rows`), shared with the gutter menu's *Delete N rows* — which followed this rule late,
+  and whose entry above carries the measurements — and it asks the join guard.
   **Which column the arithmetic is about is the *anchor's*** — the one the selection started on, so
   dragging from `price` across to `name` still reports `price`. It reads `gs.anchor` rather than
   `bounds()`, which is a normalised rect and has forgotten which corner you began at. A selection
-  covering *every* column is a row selection (gutter click, Ctrl+A, the Ctrl+G jump) whose anchor
-  column is column 0 — usually an id, whose sum means nothing — so those get counts only; a
+  covering every *drawn* column is a row selection (gutter click, Ctrl+A, the Ctrl+G jump) whose
+  anchor column is the first — usually an id, whose sum means nothing — so those get counts only; a
   single-column result is exempt, since there covering every column is covering the one you meant.
+  *Drawn* because the row gestures span `ColLayout::edges`: asked against the raw column count,
+  Ctrl+A with column 0 hidden summed column 1, so `selection_kind` takes `ColLayout::shown` and the
+  effect tracks `hidden` (`a_row_gesture_over_hidden_edges_reads_as_a_row_selection`).
   Those three rules are `selection_kind`, extracted and tested — they were inline in the effect
   while the arithmetic they gate had seventeen tests, so flipping `ncols > 1` to `>= 1` broke the
   exemption with nothing failing. The effect tracks `rs`, `order`, `dirty` and `new_rows` as well

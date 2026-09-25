@@ -1724,14 +1724,17 @@ pub(crate) enum SelKind {
 /// rather than the rectangle is the point: `bounds` is normalised and has
 /// forgotten which corner you began at.
 ///
-/// **A span covering every column is a row selection** (a gutter click, Ctrl+A,
-/// the Ctrl+G jump), and its anchor column is column 0 — usually an id, whose
-/// sum means nothing — so those get counts only. A **single-column result is
-/// exempt**: there, covering every column is covering the one you meant.
+/// **A span covering every drawn column is a row selection** (a gutter click,
+/// Ctrl+A, the Ctrl+G jump), and its anchor column is the first one — usually
+/// an id, whose sum means nothing — so those get counts only. A **single-column
+/// result is exempt**: there, covering every column is covering the one you
+/// meant. `shown` is the drawn columns in index order (`ColLayout::shown`):
+/// this asked the raw column count, so with an edge column hidden a row
+/// gesture — which spans the drawn edges — read as the anchor column's range.
 pub(crate) fn selection_kind(
     bounds: Option<(usize, usize, usize, usize)>,
     anchor: Option<(usize, usize)>,
-    ncols: usize,
+    shown: &[usize],
 ) -> SelKind {
     let Some((r0, c0, r1, c1)) = bounds else {
         return SelKind::Nothing;
@@ -1739,7 +1742,7 @@ pub(crate) fn selection_kind(
     if r0 == r1 && c0 == c1 {
         return SelKind::Nothing;
     }
-    if ncols > 1 && c1 - c0 + 1 == ncols {
+    if shown.len() > 1 && shown.iter().all(|c| (c0..=c1).contains(c)) {
         return SelKind::WholeRow;
     }
     match anchor {
@@ -2565,14 +2568,32 @@ fn ai_data_of(gs: GridState) -> AiData {
 /// — `core::model::attach_scope_label` over the selected rectangle, with the row
 /// count capped at what an attachment actually carries.
 fn selection_scope_label(gs: GridState) -> String {
-    let (rows, cols) = match gs.bounds_untracked() {
-        Some((r0, c0, r1, c1)) => (r1.saturating_sub(r0) + 1, c1.saturating_sub(c0) + 1),
-        None => (1, 1),
-    };
+    let (r0, c0, r1, c1) = gs.bounds_untracked().unwrap_or((0, 0, 0, 0));
+    let ncols = gs.rs.get_untracked().col_count();
+    attach_scope(
+        r1.saturating_sub(r0) + 1,
+        (c0, c1),
+        &gs.layout_untracked(),
+        ncols,
+    )
+}
+
+/// The consent label's phrase for attaching `rows` rows (capped) over columns
+/// `c0..=c1`, of which it counts only the **drawn** ones — what
+/// `GridCells::attached` sends. Counted against every column of the result,
+/// so a hidden one keeps the label from saying "whole rows" over an
+/// attachment that leaves it out; the label counted the raw rectangle, which
+/// overstated what would go.
+fn attach_scope(rows: usize, (c0, c1): (usize, usize), layout: &ColLayout, ncols: usize) -> String {
+    let cols = layout
+        .visual_cols(ncols)
+        .into_iter()
+        .filter(|c| (c0..=c1).contains(c))
+        .count();
     schemaic_core::model::attach_scope_label(
         rows.min(schemaic_core::prompt::ATTACH_ROW_CAP),
         cols,
-        gs.rs.get_untracked().col_count(),
+        ncols,
     )
 }
 
@@ -2583,14 +2604,11 @@ fn selection_scope_label(gs: GridState) -> String {
 /// can't come to describe the same thing differently.
 fn attach_label(gs: GridState) -> String {
     let ncols = gs.rs.get_untracked().col_count();
-    let n = gs
-        .order
-        .get_untracked()
-        .len()
-        .min(schemaic_core::prompt::ATTACH_ROW_CAP);
+    let n = gs.order.get_untracked().len();
+    let cols = (0, ncols.saturating_sub(1));
     format!(
         "Attach {} to chat",
-        schemaic_core::model::attach_scope_label(n, ncols, ncols)
+        attach_scope(n, cols, &gs.layout_untracked(), ncols)
     )
 }
 
@@ -5039,7 +5057,13 @@ fn grid_view(rs: Arc<ResultSet>, gctx: GridCtx) -> impl IntoView {
         let (rs, order) = (gs.rs.get(), gs.order.get());
         gs.dirty.track();
         gs.new_rows.track();
-        let kind = selection_kind(gs.bounds(), gs.anchor.get(), ncols);
+        // Tracked: hiding an edge column turns a row's span into a range.
+        let shown = ColLayout {
+            frozen: None,
+            hidden: gs.hidden.get(),
+        }
+        .shown(ncols);
+        let kind = selection_kind(gs.bounds(), gs.anchor.get(), &shown);
         let anchor_col = match kind {
             SelKind::Nothing => {
                 sel_summary.set(None);
@@ -5179,13 +5203,15 @@ fn grid_view(rs: Arc<ResultSet>, gctx: GridCtx) -> impl IntoView {
         // nothing, so the bar read **0/1** with the caret on a highlighted
         // match. `dirty`/`new_rows` are tracked for the same reason: since
         // `find_hits` reads the cell the grid draws, a staged edit changes the
-        // count.
+        // count. And `hidden`, since a match in a hidden column is not one:
+        // a hide recounted only through the body rebuild's `order` write.
         let _ = gs.find_query.get();
         let _ = gs.order.get();
         let _ = gs.formats.get();
         gs.rs.track();
         gs.dirty.track();
         gs.new_rows.track();
+        gs.hidden.track();
         if gs.find_query.with(|q| q.is_empty()) {
             find_hits.set(Arc::new(Vec::new()));
             find_total.set(0);
@@ -11398,6 +11424,10 @@ mod cell_preview_tests {
             "gs.rs.track()",
             "gs.dirty.track()",
             "gs.new_rows.track()",
+            // A match in a hidden column is not counted, so hiding one moves
+            // the count. It recounted only because every body rebuild happens
+            // to republish `order` — an incidental write a dedupe would drop.
+            "gs.hidden.track()",
         ] {
             assert!(
                 f.contains(term),
@@ -13882,7 +13912,38 @@ mod row_selection_tests {
     fn a_row_gesture_reads_as_a_row_selection() {
         let (anchor, active) = row_selection(4, (0, 4));
         let bounds = Some((anchor.0, anchor.1, active.0, active.1));
-        assert_eq!(selection_kind(bounds, Some(anchor), 5), SelKind::WholeRow);
+        assert_eq!(
+            selection_kind(bounds, Some(anchor), &[0, 1, 2, 3, 4]),
+            SelKind::WholeRow
+        );
+    }
+
+    /// **With an edge column hidden too.** The gesture spans the drawn edges
+    /// (`ColLayout::edges`), so the reading has to ask the drawn columns — it
+    /// asked `ncols`, and Ctrl+A with column 0 hidden summed column 1.
+    #[test]
+    fn a_row_gesture_over_hidden_edges_reads_as_a_row_selection() {
+        let layout = ColLayout {
+            frozen: None,
+            hidden: [0, 4].into_iter().collect(),
+        };
+        let shown = layout.shown(5);
+        let (anchor, active) = row_selection(4, layout.edges(5));
+        let bounds = Some((anchor.0, anchor.1, active.0, active.1));
+        assert_eq!(
+            selection_kind(bounds, Some(anchor), &shown),
+            SelKind::WholeRow
+        );
+        // Ctrl+A's rectangle, anchored at the first drawn column.
+        assert_eq!(
+            selection_kind(Some((0, 1, 9, 3)), Some((0, 1)), &shown),
+            SelKind::WholeRow
+        );
+        // One drawn column short of the row is a column's range.
+        assert_eq!(
+            selection_kind(Some((0, 1, 9, 2)), Some((0, 1)), &shown),
+            SelKind::Column(1)
+        );
     }
 
     /// On a **one-column** result a row gesture selects a single cell, and the
@@ -13894,7 +13955,7 @@ mod row_selection_tests {
         let (anchor, active) = row_selection(4, (0, 0));
         assert_eq!(active, (4, 0), "the last column is also the first");
         let bounds = Some((anchor.0, anchor.1, active.0, active.1));
-        assert_eq!(selection_kind(bounds, Some(anchor), 1), SelKind::Nothing);
+        assert_eq!(selection_kind(bounds, Some(anchor), &[0]), SelKind::Nothing);
     }
 
     /// And the jump lands on the same shape the gutter click makes, so it reads
@@ -13903,7 +13964,10 @@ mod row_selection_tests {
     fn a_jump_reads_as_a_row_selection() {
         let t = goto_target("5", 100, (0, 4)).unwrap();
         let bounds = Some((t.anchor.0, t.anchor.1, t.active.0, t.active.1));
-        assert_eq!(selection_kind(bounds, Some(t.anchor), 5), SelKind::WholeRow);
+        assert_eq!(
+            selection_kind(bounds, Some(t.anchor), &[0, 1, 2, 3, 4]),
+            SelKind::WholeRow
+        );
     }
 }
 
@@ -13911,18 +13975,42 @@ mod row_selection_tests {
 mod selection_kind_tests {
     use super::*;
 
+    /// `n` columns, none hidden.
+    fn all(n: usize) -> Vec<usize> {
+        (0..n).collect()
+    }
+
+    /// **The Attach label is a consent notice, so it counts what is sent** —
+    /// and `GridCells::attached` leaves a hidden column out. With `ssn` hidden
+    /// in five columns, a gutter row said "1 row" (whole rows) over an
+    /// attachment of four columns, and the whole-result entry "N rows".
+    #[test]
+    fn the_attach_label_counts_only_the_drawn_columns() {
+        let hidden = ColLayout {
+            frozen: None,
+            hidden: [3].into_iter().collect(),
+        };
+        let none = ColLayout::default();
+        // One row reads as its columns, as a lone cell does.
+        assert_eq!(attach_scope(1, (0, 4), &hidden, 5), "4 columns");
+        assert_eq!(attach_scope(3, (0, 4), &hidden, 5), "3 rows and 4 columns");
+        assert_eq!(attach_scope(3, (0, 4), &none, 5), "3 rows");
+        assert_eq!(attach_scope(2, (2, 3), &hidden, 5), "2 rows and 1 column");
+        assert_eq!(attach_scope(0, (0, 0), &none, 0), "0 rows and 0 columns");
+    }
+
     /// A lone cell aggregates to itself, so there is nothing worth saying.
     #[test]
     fn a_single_cell_gets_no_readout() {
         assert_eq!(
-            selection_kind(Some((3, 1, 3, 1)), Some((3, 1)), 5),
+            selection_kind(Some((3, 1, 3, 1)), Some((3, 1)), &all(5)),
             SelKind::Nothing
         );
     }
 
     #[test]
     fn nothing_selected_gets_no_readout() {
-        assert_eq!(selection_kind(None, None, 5), SelKind::Nothing);
+        assert_eq!(selection_kind(None, None, &all(5)), SelKind::Nothing);
     }
 
     /// The column is the **anchor's**, not the rectangle's left edge: dragging
@@ -13932,7 +14020,7 @@ mod selection_kind_tests {
     fn the_column_is_the_one_the_selection_started_on() {
         // Dragged from (0,3) leftward to (4,1): the rect starts at column 1.
         assert_eq!(
-            selection_kind(Some((0, 1, 4, 3)), Some((0, 3)), 8),
+            selection_kind(Some((0, 1, 4, 3)), Some((0, 3)), &all(8)),
             SelKind::Column(3)
         );
     }
@@ -13943,7 +14031,7 @@ mod selection_kind_tests {
     #[test]
     fn a_span_over_every_column_is_counts_only() {
         assert_eq!(
-            selection_kind(Some((0, 0, 9, 4)), Some((0, 0)), 5),
+            selection_kind(Some((0, 0, 9, 4)), Some((0, 0)), &all(5)),
             SelKind::WholeRow
         );
     }
@@ -13954,7 +14042,7 @@ mod selection_kind_tests {
     #[test]
     fn a_single_column_result_still_aggregates() {
         assert_eq!(
-            selection_kind(Some((0, 0, 9, 0)), Some((0, 0)), 1),
+            selection_kind(Some((0, 0, 9, 0)), Some((0, 0)), &all(1)),
             SelKind::Column(0)
         );
     }
@@ -13964,7 +14052,7 @@ mod selection_kind_tests {
     #[test]
     fn a_partial_span_names_the_anchor_column() {
         assert_eq!(
-            selection_kind(Some((0, 2, 3, 3)), Some((0, 2)), 5),
+            selection_kind(Some((0, 2, 3, 3)), Some((0, 2)), &all(5)),
             SelKind::Column(2)
         );
     }
