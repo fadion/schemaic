@@ -109,11 +109,13 @@ existing prose was left alone.
     write-back provenance the wire reports per column, and a binary column is read-only **as
     text**: `<n bytes>` is a placeholder rather than a value, so typing or pasting one back would
     write the ASCII of its own size into the column (`edit::EditModel::text_editable`). The bytes
-    themselves are writable, through the blob panel and nothing else. `Column::is_nullable` is the
-    column's *declared* nullability — `origin.is_some_and(|o| !o.flags.not_null)` — and so `false`
-    for a column with no origin: an expression, aggregate or literal has no declaration, and calling
-    it nullable would be a guess (`only_a_sourced_column_without_not_null_is_nullable`). It answers
-    for the base column, not the row. `flags.not_null` is filled on every engine — MySQL's wire
+    themselves are writable, through the blob panel and nothing else. `Column::is_nullable` is
+    whether the result column may be NULL **as the engine reports it** —
+    `origin.is_some_and(|o| !o.flags.not_null)` — and so `false` for a column with no origin: an
+    expression, aggregate or literal carries no answer, and calling it nullable would be a guess
+    (`only_a_sourced_column_without_not_null_is_nullable`). The engines report from different
+    places, the result on MySQL and the catalog on PostgreSQL, so an outer join or a view reads
+    differently on each (the grid's *Nullable markers* entry has both). `flags.not_null` is filled on every engine — MySQL's wire
     `NOT_NULL_FLAG`, a catalog query on PostgreSQL, `table_info` on SQLite — so the grid's header
     marker, its cell menu's *Set to NULL* and the row editor's NULL toggle (`row_colspecs`) all
     read it. On SQLite the rowid alias (`INTEGER PRIMARY KEY`) is `not_null` although the pragma
@@ -26547,9 +26549,17 @@ this bundle's.
   arbitrary SELECT alike, no `db_nodes`, no `key_gen`. It sits on the **name line**, between the
   name and the sort chevron, and deliberately not beside the key icon at the left: a leading icon
   gives up the right-alignment of a numeric header, as a key column's already does, and a marker
-  that most columns carry would take it from most headers. It marks the *declared* nullability of
-  the base column, not the row's — a `LEFT JOIN` still puts NULL in a `NOT NULL` column's place, and
-  an expression column carries no marker because it has no declaration to report. **The width
+  that most columns carry would take it from most headers. **It means "this result column may be
+  NULL, as the engine reports it"**, and the engines report from different places, so it is
+  stated per engine rather than made uniform: MySQL and MariaDB answer for the result — an outer
+  join's `NOT NULL` column is marked, a view keeps its base's `NOT NULL` — and PostgreSQL for the
+  catalog row the column resolves to — an outer-joined `NOT NULL` column is not marked though its
+  row can hold NULL, and a view's columns all are, since the catalog carries no `NOT NULL` for
+  them. It used to be documented as the base column's declared nullability, which was true on
+  PostgreSQL alone; making it that on MySQL would take a catalog read per result for a faint
+  icon. The live tier pins both directions on each leg (`nullable_mark_is_the_engines_answer`,
+  over `Target::nullability_is_the_results`). An expression column carries no marker because it
+  has no answer to report. **The width
   estimators budget for it**: `init_widths` and `autofit_width` both start from
   `header_name_chars(col)` — name + 3 for the chevron + `NULL_MARK_CHARS` (2) when marked — so they
   size the header `header_cell` actually draws; left out, the marker pushes the name into clipping

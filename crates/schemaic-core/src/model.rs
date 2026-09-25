@@ -423,13 +423,21 @@ impl Column {
         NUMERIC_TYPES.iter().any(|k| head.eq_ignore_ascii_case(k))
     }
 
-    /// May this column hold NULL — **as far as its base column says**?
+    /// May this result column be NULL — **as the engine reports it**?
+    ///
+    /// The engines answer from different places, and this is their answer
+    /// rather than a uniform one. MySQL and MariaDB report the result's own
+    /// nullability on the wire, so an outer join's `NOT NULL` column is
+    /// nullable and a view keeps its base's `NOT NULL`. PostgreSQL's comes from
+    /// the catalog row the column resolves to, so an outer-joined `NOT NULL`
+    /// column is not nullable here though the row can hold NULL, and a view's
+    /// columns, which carry no `NOT NULL` there, all are. SQLite's is the
+    /// pragma, less the rowid alias.
     ///
     /// `false` for a column with no [`ColumnOrigin`]: an expression, an
-    /// aggregate or a literal has no declared nullability to report, and the
-    /// grid's header marker, its *Set to NULL* entry and the row editor's NULL
-    /// toggle all mean the declared one. A `LEFT JOIN` can still
-    /// put NULL in a `NOT NULL` column's place; this is the column, not the row.
+    /// aggregate or a literal carries no answer, and calling it nullable would
+    /// be a guess. The grid's header marker, its *Set to NULL* entry and the
+    /// row editor's NULL toggle all read this.
     pub fn is_nullable(&self) -> bool {
         self.origin.as_ref().is_some_and(|o| !o.flags.not_null)
     }

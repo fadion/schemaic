@@ -139,6 +139,15 @@ pub struct Target {
     /// Data on the target rather than an `if engine == Postgres` in a test
     /// body, for the reason at the top of [`crate::suite`].
     pub error_names_the_value: bool,
+    /// Where a result column's **nullability** comes from, which decides the
+    /// grid header's ∅ mark: `true` when the server reports it for the result
+    /// itself (MySQL and MariaDB clear `NOT_NULL_FLAG` on an outer join's
+    /// nullable side, and keep it through a view), `false` when it is read off
+    /// the catalog row the column resolves to (PostgreSQL's
+    /// `pg_attribute.attnotnull`: an outer-joined `NOT NULL` column stays not
+    /// null, and a view's columns, which carry no `NOT NULL` there, all read as
+    /// nullable). `nullable_mark_is_the_engines_answer` pins both.
+    pub nullability_is_the_results: bool,
     /// The **view options** this server has, split where its grammar puts
     /// them: what goes between `CREATE ` and `VIEW `, and what goes after the
     /// body.
@@ -288,6 +297,7 @@ pub static MARIADB: Target = Target {
     grants_are_database_scoped: false,
     primary_key_include: None,
     error_names_the_value: false,
+    nullability_is_the_results: true,
     view_prefix_options: "SQL SECURITY INVOKER ",
     view_suffix_options: " WITH CASCADED CHECK OPTION",
     trigger_body: Some("SET NEW.name = UPPER(NEW.name)"),
@@ -321,6 +331,7 @@ pub static MYSQL: Target = Target {
     grants_are_database_scoped: false,
     primary_key_include: None,
     error_names_the_value: false,
+    nullability_is_the_results: true,
     view_prefix_options: "SQL SECURITY INVOKER ",
     view_suffix_options: " WITH CASCADED CHECK OPTION",
     trigger_body: Some("SET NEW.name = UPPER(NEW.name)"),
@@ -354,6 +365,7 @@ pub static POSTGRES: Target = Target {
     grants_are_database_scoped: true,
     primary_key_include: Some(" INCLUDE (payload)"),
     error_names_the_value: true,
+    nullability_is_the_results: false,
     view_prefix_options: "",
     view_suffix_options: " WITH CASCADED CHECK OPTION",
     trigger_body: None,

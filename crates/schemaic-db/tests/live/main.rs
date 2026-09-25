@@ -118,6 +118,7 @@ live_suite!(
         a_binary_column_is_read_only_inside_an_editable_row,
         one_table_offers_itself_as_the_insert_target,
         an_include_column_is_not_part_of_the_write_key,
+        nullable_mark_is_the_engines_answer,
     ],
     enforced: [
         a_read_only_session_refuses_a_write_a_select_hides,

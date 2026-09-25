@@ -915,3 +915,80 @@ pub async fn an_include_column_is_not_part_of_the_write_key(target: &'static Tar
 
     scratch.teardown().await;
 }
+
+/// **The ∅ mark is the engine's answer to "may this result column be NULL",
+/// and the engines answer from different places** — which is the meaning the
+/// mark has, stated rather than made uniform (see
+/// [`Target::nullability_is_the_results`]).
+///
+/// A plain `NOT NULL` column is unmarked everywhere, and a nullable one is
+/// marked everywhere. Past that they diverge, and both directions are pinned
+/// so a driver change on either side shows: MySQL and MariaDB mark an outer
+/// join's `NOT NULL` column (the server says the result can be NULL there) and
+/// keep a view's `NOT NULL`; PostgreSQL leaves the outer-joined column
+/// unmarked (the catalog says `NOT NULL`) and marks a view's columns (the
+/// catalog carries no `NOT NULL` for them).
+pub async fn nullable_mark_is_the_engines_answer(target: &'static Target) {
+    let scratch = Scratch::create(target, "nullmark").await;
+    seed(
+        &scratch,
+        "parent",
+        "(id INTEGER NOT NULL PRIMARY KEY, n INTEGER NOT NULL)",
+    )
+    .await;
+    seed(
+        &scratch,
+        "child",
+        "(id INTEGER NOT NULL PRIMARY KEY, parent_id INTEGER, v INTEGER NOT NULL)",
+    )
+    .await;
+    scratch
+        .exec(&format!(
+            "CREATE VIEW {} AS SELECT id, n FROM {}",
+            scratch.qualified("pv"),
+            scratch.qualified("parent")
+        ))
+        .await;
+    let marks =
+        |rs: &ResultSet| -> Vec<bool> { rs.columns.iter().map(|c| c.is_nullable()).collect() };
+
+    let plain = scratch
+        .exec(&format!(
+            "SELECT id, parent_id, v FROM {}",
+            scratch.qualified("child")
+        ))
+        .await;
+    assert_eq!(
+        marks(&plain),
+        [false, true, false],
+        "{}: a plain select",
+        target.name
+    );
+
+    let result_says = target.nullability_is_the_results;
+    let joined = scratch
+        .exec(&format!(
+            "SELECT p.id, c.v FROM {} p LEFT JOIN {} c ON c.parent_id = p.id",
+            scratch.qualified("parent"),
+            scratch.qualified("child")
+        ))
+        .await;
+    assert_eq!(
+        marks(&joined),
+        [false, result_says],
+        "{}: an outer join's NOT NULL column",
+        target.name
+    );
+
+    let view = scratch
+        .exec(&format!("SELECT id, n FROM {}", scratch.qualified("pv")))
+        .await;
+    assert_eq!(
+        marks(&view),
+        [!result_says, !result_says],
+        "{}: a view over NOT NULL columns",
+        target.name
+    );
+
+    scratch.teardown().await;
+}
