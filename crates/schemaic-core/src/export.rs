@@ -1760,11 +1760,41 @@ fn too_wide(n: usize) -> io::Error {
 /// doubles (else it would swallow a following `|`). Newlines would break the
 /// row — GitHub renders `<br>` inside table cells, so map them there (a lone CR
 /// is dropped so CRLF doesn't emit a double break).
+///
+/// Every other control character is shown rather than written
+/// ([`visible_controls`]): the CLI prints this table to a terminal.
 pub fn md_cell(s: &str) -> String {
-    s.replace('\\', "\\\\")
-        .replace('|', "\\|")
-        .replace('\r', "")
-        .replace('\n', "<br>")
+    visible_controls(
+        &s.replace('\\', "\\\\")
+            .replace('|', "\\|")
+            .replace('\r', "")
+            .replace('\n', "<br>"),
+    )
+    .into_owned()
+}
+
+/// `s` with each control character but a tab **shown instead of obeyed** —
+/// C0 and DEL as their Unicode control pictures (`␍`, `␛`), C1 as a `\x9b`
+/// escape, since those have no pictures — for the formats a person reads on a
+/// terminal. A value is whatever anyone could write into a table: a mid-line
+/// CR returns the cursor and prints a spoofed field over the real one, and an
+/// ESC sequence can hide text or, on terminals that honour OSC 52, write the
+/// clipboard. A caller handles its line endings first; a newline here is
+/// shown like the rest.
+pub fn visible_controls(s: &str) -> std::borrow::Cow<'_, str> {
+    if !s.chars().any(|c| c.is_control() && c != '\t') {
+        return std::borrow::Cow::Borrowed(s);
+    }
+    let mut out = String::with_capacity(s.len() + 8);
+    for c in s.chars() {
+        match c as u32 {
+            _ if c == '\t' || !c.is_control() => out.push(c),
+            n @ 0..=0x1f => out.push(char::from_u32(0x2400 + n).unwrap_or('\u{fffd}')),
+            0x7f => out.push('\u{2421}'),
+            n => out.push_str(&format!("\\x{n:02x}")),
+        }
+    }
+    std::borrow::Cow::Owned(out)
 }
 
 /// Escape text for HTML element content. `&` is replaced first so the `&` in
@@ -1913,7 +1943,9 @@ pub fn export_vertical(rs: &ResultSet, order: &[usize], null: &str) -> String {
                     out.push('\n');
                     out.push_str(&indent);
                 }
-                out.push_str(line.strip_suffix('\r').unwrap_or(line));
+                // The CR of a CRLF ending is the line ending's; any other
+                // control character is shown, not written to the terminal.
+                out.push_str(&visible_controls(line.strip_suffix('\r').unwrap_or(line)));
             }
             out.push('\n');
         }
@@ -6133,6 +6165,37 @@ mod tests {
         assert_eq!(lines[3], "      two");
         assert_eq!(lines[4], "      three");
         assert!(!out.contains('\r'), "{out:?}");
+    }
+
+    /// **A value cannot steer the terminal it is printed on.** A mid-line CR
+    /// returned the cursor so `x\r  is_admin: 1` overwrote its own field with
+    /// a spoofed one, and an ESC sequence (a clipboard write, hidden text) went
+    /// through as written — from whoever can put a value in the table. Each is
+    /// shown as its control picture instead; the line endings and a tab stay.
+    #[test]
+    fn a_reader_format_shows_control_characters_rather_than_obeying_them() {
+        let rs = ResultSet::from_rows(
+            vec![col("note")],
+            vec![vec![Value::Str(
+                "x\r  is_admin: 1\t\u{1b}]52;c;aGk=\u{7}\u{9b}2J\r\nend".into(),
+            )]],
+        );
+        let vertical = export_vertical(&rs, &[0], "NULL");
+        // The table's cell drops a CR already, as a Markdown cell always has.
+        let table = export_markdown_null_as(&rs, &[0], "NULL", true);
+        for out in [&vertical, &table] {
+            assert!(
+                !out.contains(['\r', '\u{1b}', '\u{7}', '\u{9b}']),
+                "{out:?}"
+            );
+            assert!(out.contains("\u{241b}]52;c;aGk=\u{2407}\\x9b2J"), "{out:?}");
+        }
+        assert!(
+            vertical.contains("note: x\u{240d}  is_admin: 1\t"),
+            "{vertical:?}"
+        );
+        assert!(vertical.ends_with("\n      end\n"), "{vertical:?}");
+        assert_eq!(visible_controls("plain\ttext"), "plain\ttext");
     }
 
     /// Alignment counts characters, not bytes: `é` is two bytes and one

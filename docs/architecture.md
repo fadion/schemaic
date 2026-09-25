@@ -2150,6 +2150,12 @@ existing prose was left alone.
     back. A multi-line value continues under its own first line (width + 2 spaces) rather than at
     the margin, where a continuation would read as a field of its own, and a trailing `\r` goes with
     the line ending it belongs to (`export_vertical_indents_a_multi_line_value_under_itself`).
+    **Every other control character is shown, not written** (`visible_controls`: C0 and DEL as
+    their control pictures, `␍` `␛`, C1 as a `\x9b` escape), and so it is in the table's `md_cell`:
+    both go to a terminal, and a value is whatever anyone could write into a table — a mid-line CR
+    printed a spoofed `is_admin: 1` over the field it sat in, and an ESC sequence can hide text or
+    write the clipboard (`a_reader_format_shows_control_characters_rather_than_obeying_them`).
+    A tab stays. `md_cell` is the GUI's Markdown copy too, where a raw ESC was never wanted either.
     Alignment counts `char`s, not bytes — `é` is two bytes and one column — and carries no
     unicode-width table, so a CJK name is off by its double width; that is the trade, taken for the
     names a schema actually has (`export_vertical_aligns_names_by_character`). No rows is `""`, not
