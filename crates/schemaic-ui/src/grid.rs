@@ -912,7 +912,10 @@ impl GridState {
     /// exactly one row — so the write-back's 1-row net passes, the report says
     /// one row deleted, and the other N−1 display rows of that parent sit on
     /// screen with nothing saying the row behind them is gone. Putting it on
-    /// [`GridState::toggle_delete`] and [`clone_rows`] is the rule `clone_rows`
+    /// [`GridState::toggle_delete`], its batched twin
+    /// [`GridState::mark_deleted`] (the Delete key and *Delete N rows*, which
+    /// wrote `del_rows` themselves and so passed no guard at all) and
+    /// [`clone_rows`] is the rule `clone_rows`
     /// already states for its own size question, and the one CLAUDE.md states
     /// for the run guard: a fifth caller written later cannot reach the staging
     /// without passing it. The menu terms are presentation after that.
@@ -1261,11 +1264,12 @@ impl GridState {
     /// drops any staged cell edits on it (a delete supersedes an update, so the row
     /// can never be both `UPDATE`d and `DELETE`d in one commit).
     fn toggle_delete(&self, data_idx: usize) {
-        // **The join guard is here, not on the menu that offered this.** Four
-        // routes reach this one function — the gutter menu, the cell menu, the
-        // results strip's − button and the Delete key — and gating one of them
-        // left the other three destroying a parent row behind a success report.
-        // See `row_gestures_are_safe`. Un-marking is always allowed: a row
+        // **The join guard is here, not on the menu that offered this.** The
+        // cell menu and the results strip's − button reach this function, and
+        // the Delete key and the gutter's *Delete N rows* its batched twin
+        // `mark_deleted`, which asks the same guard — gating one route left
+        // the others destroying a parent row behind a success report. See
+        // `row_gestures_are_safe`. Un-marking is always allowed: a row
         // already staged has to be reachable to unstage.
         if !self.del_rows.with_untracked(|d| d.contains(&data_idx)) && !self.row_gestures_are_safe()
         {
@@ -1281,6 +1285,30 @@ impl GridState {
         });
         if now_marked == Some(true) {
             crate::widgets::retain_pairs_if_any(self.dirty, move |(di, _), _| *di != data_idx);
+        }
+        self.clear_bar();
+    }
+
+    /// Mark (`mark`) or unmark data rows `rows` for deletion, **in one
+    /// notification** — the batched twin of [`GridState::toggle_delete`], for
+    /// the Delete key over a selection and the gutter menu's *Delete N rows*.
+    ///
+    /// Batched because a per-row toggle over Ctrl+A at the 200k row cap froze
+    /// the window (see [`set_rows_deleted`]); and **guarded like its twin**:
+    /// the Delete key wrote `del_rows` itself and never asked
+    /// `row_gestures_are_safe`, so on a 1:many join it marked the parent row
+    /// the menus and the strip's − refused, and the commit deleted it behind a
+    /// one-row success report. Un-marking is always allowed.
+    fn mark_deleted(&self, rows: &[usize], mark: bool) {
+        if rows.is_empty() || (mark && !self.row_gestures_are_safe()) {
+            return;
+        }
+        self.del_rows.update(|d| mark_rows(d, rows, mark));
+        // Marking supersedes an update: a row can't be both `UPDATE`d and
+        // `DELETE`d in one commit. One `retain` over the whole batch.
+        if mark {
+            let doomed: std::collections::HashSet<usize> = rows.iter().copied().collect();
+            crate::widgets::retain_pairs_if_any(self.dirty, move |(di, _), _| !doomed.contains(di));
         }
         self.clear_bar();
     }
@@ -8017,20 +8045,12 @@ fn grid_key(gs: GridState, nrows: usize, ncols: usize, e: &Event) -> EventPropag
                 // on a result at the default 200k row limit fired 400,000
                 // synchronous notifications and locked the window. The
                 // two-keystroke gesture this feature exists to enable was the one
-                // that couldn't be used. Observable behaviour is unchanged.
+                // that couldn't be used. `mark_deleted` is the batched write, and
+                // it asks the join guard the menus and the − button ask.
                 let mark = gs
                     .del_rows
                     .with_untracked(|d| delete_vote(|di| d.contains(&di), &rows));
-                gs.del_rows.update(|d| mark_rows(d, &rows, mark));
-                // Marking supersedes an update: a row can't be both `UPDATE`d and
-                // `DELETE`d in one commit.
-                if mark {
-                    let doomed: std::collections::HashSet<usize> = rows.into_iter().collect();
-                    crate::widgets::retain_pairs_if_any(gs.dirty, move |(di, _), _| {
-                        !doomed.contains(di)
-                    });
-                }
-                gs.clear_bar();
+                gs.mark_deleted(&rows, mark);
             }
         _ => return EventPropagation::Continue,
     }
@@ -9319,19 +9339,10 @@ pub(crate) fn mark_rows(set: &mut std::collections::HashSet<usize>, rows: &[usiz
 /// batched path is unaffected.
 ///
 /// Observable behaviour is unchanged, which is the same claim the Del key's
-/// handler makes for the same body.
+/// handler makes for the same body — both are `GridState::mark_deleted` now,
+/// which also carries the join guard.
 fn set_rows_deleted(gs: GridState, idxs: &[usize], deleted: bool) {
-    if idxs.is_empty() {
-        return;
-    }
-    gs.del_rows.update(|d| mark_rows(d, idxs, deleted));
-    // Marking supersedes an update: a row can't be both `UPDATE`d and `DELETE`d
-    // in one commit. One `retain` over the whole selection, not one per row.
-    if deleted {
-        let doomed: std::collections::HashSet<usize> = idxs.iter().copied().collect();
-        crate::widgets::retain_pairs_if_any(gs.dirty, move |(di, _), _| !doomed.contains(di));
-    }
-    gs.clear_bar();
+    gs.mark_deleted(idxs, deleted);
 }
 
 /// Raise the binary-cell panel on an already-resolved cell.
@@ -11617,7 +11628,8 @@ mod cell_preview_tests {
         .expect("grid.rs");
         let body = crate::source_gate::production_code(&src);
         let guard = format!("{}()", "row_gestures_are_safe");
-        for name in ["fn toggle_delete(", "fn clone_rows("] {
+        let mut guarded = Vec::new();
+        for name in ["fn toggle_delete(", "fn mark_deleted(", "fn clone_rows("] {
             let at = body
                 .find(name)
                 .unwrap_or_else(|| panic!("`{name}` is gone — this gate is stale"));
@@ -11634,6 +11646,24 @@ mod cell_preview_tests {
                  is a join that projects one table's columns, so the cell menu, \
                  the results strip and the Delete key each reach it unguarded:\n{f}"
             );
+            guarded.push(at..end);
+        }
+        // **And nothing marks a row outside them.** The Delete key wrote
+        // `del_rows` itself — batched, for speed — while this gate checked only
+        // the two functions it had stopped calling, and a 1:many join's parent
+        // row was deleted behind a one-row success report. Every write that
+        // can *add* a row to the set has to sit inside a guarded action.
+        let writer = format!("del_rows.{}", "update(");
+        let try_writer = format!("del_rows.{}", "try_update(");
+        for pat in [&writer, &try_writer] {
+            for (at, _) in body.match_indices(pat.as_str()) {
+                assert!(
+                    guarded.iter().any(|r| r.contains(&at)),
+                    "a `{pat}` outside `toggle_delete`/`mark_deleted` marks rows for \
+                     deletion without the join guard:\n{}",
+                    &body[at.saturating_sub(300)..at + pat.len()]
+                );
+            }
         }
         // And the guard asks the panel's own statement, not "what would a re-run
         // be" — which is `None` on a pinned panel and on every Run Everything

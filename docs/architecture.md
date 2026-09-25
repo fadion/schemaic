@@ -21853,9 +21853,15 @@ Re-introducing the anti-patterns these guard against is a regression:
   `edit::reads_one_relation`, and it **sits on the actions rather than on one menu**. It began as a
   term in the gutter menu's entry list while three other routes reach the identical staging — the
   cell context menu's Delete row / Duplicate row, the results strip's − and clone buttons, and the
-  Delete key over a gutter selection — so it is on `GridState::toggle_delete` and `clone_rows` now,
-  which is the rule `clone_rows` already states for its own size question and this invariant states
-  for writes; the menu and strip terms are presentation after that. `None` from `reads_one_relation`
+  Delete key over a gutter selection — so it is on `GridState::toggle_delete`, its batched twin
+  `GridState::mark_deleted` and `clone_rows` now, which is the rule `clone_rows` already states for
+  its own size question and this invariant states for writes; the menu and strip terms are
+  presentation after that. **This paragraph claimed the Delete key for a release while it was not
+  so**: the key had been batched into a direct `del_rows` write before the guard moved onto
+  `toggle_delete`, so on a 1:many join Del marked the parent row every menu refused, and the commit
+  deleted it. The batched write is `mark_deleted` now, and
+  `the_row_gestures_ask_the_join_guard_in_the_action` fails on any `del_rows.update`/`try_update`
+  in `grid.rs` outside the two guarded functions. `None` from `reads_one_relation`
   reads as "no", the direction every other refusal on this path takes, and it over-blocks
   deliberately: a second relation reached only through a subquery multiplies no rows and is refused
   too, the question being "could a row of this result stand for more than one row of that table" and
