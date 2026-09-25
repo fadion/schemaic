@@ -543,7 +543,9 @@ pub fn scan(files: &[SourceFile], existing: &[Connection]) -> ImportScan {
         let mut one = match f.source {
             ImportSource::Url => parse_url_scan(&f.text),
             ImportSource::DBeaver => parse_dbeaver(&f.text),
-            ImportSource::DataGrip => parse_datagrip_with_local(&f.text, f.local.as_deref()),
+            ImportSource::DataGrip => {
+                parse_datagrip_project(&f.text, f.local.as_deref(), project_dir_of(&f.path))
+            }
             ImportSource::MyCnf => parse_my_cnf(&f.text),
             ImportSource::Pgpass => parse_pgpass(&f.text),
             ImportSource::PgService => parse_pg_service(&f.text),
@@ -1226,6 +1228,27 @@ pub fn parse_datagrip(xml: &str) -> ImportScan {
 /// user already in the main file wins. The local file never adds a row of its
 /// own: an entry there with no counterpart has no server to connect to.
 pub fn parse_datagrip_with_local(xml: &str, local: Option<&str>) -> ImportScan {
+    parse_datagrip_project(xml, local, None)
+}
+
+/// The project a JetBrains `dataSources.xml` at `path` belongs to — the
+/// directory holding its `.idea/` — or `None` for one that is not a
+/// project's (an IDE's global `options/dataSources.xml`).
+fn project_dir_of(path: &str) -> Option<&str> {
+    let dir = path
+        .strip_suffix("dataSources.xml")?
+        .strip_suffix(['/', '\\'])?
+        .strip_suffix(".idea")?;
+    let project = dir.strip_suffix(['/', '\\'])?;
+    (!project.is_empty()).then_some(project)
+}
+
+/// [`parse_datagrip_with_local`] for a file read from **`project`'s**
+/// `.idea/`, which is what `$PROJECT_DIR$` names — so it is expanded rather
+/// than flagged. DataGrip writes it for every SQLite file in a project, and
+/// such a row imported a path that could not open. The note stays for a macro
+/// nothing here can expand.
+fn parse_datagrip_project(xml: &str, local: Option<&str>, project: Option<&str>) -> ImportScan {
     // (uuid, name, user) for every local entry that names a user.
     let local_users: Vec<(Option<String>, String, String)> = local
         .map(|l| {
@@ -1265,7 +1288,10 @@ pub fn parse_datagrip_with_local(xml: &str, local: Option<&str>) -> ImportScan {
     let mut out = ImportScan::default();
     for block in elements(strip_bom(xml), "data-source") {
         let name = attribute(block.head, "name").unwrap_or_default();
-        let url = child_text(block.body, "jdbc-url").unwrap_or_default();
+        let mut url = child_text(block.body, "jdbc-url").unwrap_or_default();
+        if let Some(p) = project {
+            url = url.replace("$PROJECT_DIR$", p);
+        }
         if url.trim().is_empty() {
             out.skip(
                 pick_name(&name, "(unnamed data source)"),
@@ -1307,7 +1333,10 @@ pub fn parse_datagrip_with_local(xml: &str, local: Option<&str>) -> ImportScan {
 }
 
 /// The project directories a JetBrains IDE lists in its
-/// `options/recentProjects.xml`, with `$USER_HOME$` expanded against `home`.
+/// `options/recentProjects.xml`, with `$USER_HOME$` expanded against `home`
+/// and `$APPLICATION_CONFIG_DIR$` against `config` — the product's own
+/// configuration directory, the one holding that `options/`, where the older
+/// DataGrip layout keeps its default project.
 ///
 /// This is how the app finds a **project's** `.idea/dataSources.xml` without
 /// walking the home directory: the IDE already wrote down every project it has
@@ -1315,9 +1344,9 @@ pub fn parse_datagrip_with_local(xml: &str, local: Option<&str>) -> ImportScan {
 /// project path, and the older flat `recentPaths` list. Nothing else in the
 /// file counts: `lastProjectLocation` is where the *next* project would go, and
 /// the metadata's own `value`s are build numbers. A path is kept only if it
-/// looks like one (the macro, `/` or a drive letter), and each is returned
+/// looks like one (a macro, `/` or a drive letter), and each is returned
 /// once, in the file's order.
-pub fn recent_project_dirs(xml: &str, home: &str) -> Vec<String> {
+pub fn recent_project_dirs(xml: &str, home: &str, config: &str) -> Vec<String> {
     let xml = strip_bom(xml);
     let mut raw: Vec<String> = Vec::new();
     if let Some(at) = xml.find(r#"name="recentPaths""#) {
@@ -1336,16 +1365,20 @@ pub fn recent_project_dirs(xml: &str, home: &str) -> Vec<String> {
     );
 
     let home = home.trim_end_matches(['/', '\\']);
+    let config = config.trim_end_matches(['/', '\\']);
     let mut out: Vec<String> = Vec::new();
     for p in raw {
         let p = p.trim();
         let looks_like_a_path = p.starts_with("$USER_HOME$")
+            || p.starts_with("$APPLICATION_CONFIG_DIR$")
             || p.starts_with('/')
             || p.as_bytes().get(1) == Some(&b':');
         if !looks_like_a_path {
             continue;
         }
-        let p = p.replace("$USER_HOME$", home);
+        let p = p
+            .replace("$USER_HOME$", home)
+            .replace("$APPLICATION_CONFIG_DIR$", config);
         if !out.contains(&p) {
             out.push(p);
         }
@@ -3110,6 +3143,35 @@ mod tests {
         assert!(proj.connection.file.contains("$PROJECT_DIR$"));
     }
 
+    /// **A project's own file says which project it is.** Read at
+    /// `<p>/.idea/dataSources.xml`, `$PROJECT_DIR$` is `<p>` — no longer a
+    /// guess — and DataGrip writes it for every SQLite file in a project, so
+    /// such a row imported a path that could not open. A file anywhere else
+    /// still has no project to expand against, and keeps the note.
+    #[test]
+    fn a_project_files_macro_is_expanded_against_its_own_project() {
+        let xml = r#"<data-source name="local" uuid="u">
+          <jdbc-url>jdbc:sqlite:$PROJECT_DIR$/identifier.sqlite</jdbc-url></data-source>"#;
+        let one = |path: &str| {
+            let files = [SourceFile {
+                source: ImportSource::DataGrip,
+                path: path.to_string(),
+                text: xml.to_string(),
+                local: None,
+            }];
+            scan(&files, &[]).found.remove(0)
+        };
+        let unix = one("/home/me/p/.idea/dataSources.xml");
+        assert_eq!(unix.connection.file, "/home/me/p/identifier.sqlite");
+        assert!(!unix.has(ImportNote::UnexpandedPath));
+        let windows = one(r"C:\Users\me\p\.idea\dataSources.xml");
+        assert_eq!(windows.connection.file, r"C:\Users\me\p/identifier.sqlite");
+        assert!(!windows.has(ImportNote::UnexpandedPath));
+        let global = one("/home/me/.config/JetBrains/DataGrip2025.2/options/dataSources.xml");
+        assert!(global.has(ImportNote::UnexpandedPath));
+        assert!(global.connection.file.contains("$PROJECT_DIR$"));
+    }
+
     /// A **project's** `dataSources.xml` is the shareable half: it holds the
     /// URL and driver, and the user name lives in the `dataSources.local.xml`
     /// beside it, keyed by the same `uuid`.
@@ -3246,7 +3308,7 @@ mod tests {
     #[test]
     fn recent_projects_are_read_with_the_home_macro_expanded() {
         assert_eq!(
-            recent_project_dirs(RECENT_PROJECTS, "/home/me"),
+            recent_project_dirs(RECENT_PROJECTS, "/home/me", "/c"),
             vec![
                 "/home/me/DataGripProjects/inventory".to_string(),
                 "/srv/work/shop".to_string(),
@@ -3258,7 +3320,7 @@ mod tests {
     /// metadata's `value`s are build numbers — neither is a project.
     #[test]
     fn only_project_entries_count_as_recent_projects() {
-        let dirs = recent_project_dirs(RECENT_PROJECTS, "/home/me");
+        let dirs = recent_project_dirs(RECENT_PROJECTS, "/home/me", "/c");
         assert!(!dirs.iter().any(|d| d.ends_with("/DataGripProjects")));
         assert!(!dirs.iter().any(|d| d.contains("DB-252")));
     }
@@ -3276,7 +3338,7 @@ mod tests {
           <option name="lastProjectLocation" value="$USER_HOME$/IdeaProjects" />
         </component></application>"#;
         assert_eq!(
-            recent_project_dirs(xml, "C:/Users/me"),
+            recent_project_dirs(xml, "C:/Users/me", "C:/c"),
             vec![
                 "C:/Users/me/IdeaProjects/api".to_string(),
                 "C:/work/shop".to_string(),
@@ -3288,13 +3350,29 @@ mod tests {
     fn a_project_listed_twice_is_returned_once() {
         let xml = r#"<option name="recentPaths"><list><option value="/a/p" /></list></option>
           <map><entry key="/a/p"><value /></entry></map>"#;
-        assert_eq!(recent_project_dirs(xml, "/h"), vec!["/a/p".to_string()]);
+        assert_eq!(
+            recent_project_dirs(xml, "/h", "/c"),
+            vec!["/a/p".to_string()]
+        );
     }
 
     #[test]
     fn a_file_that_is_not_a_recent_projects_list_yields_nothing() {
-        assert!(recent_project_dirs("", "/h").is_empty());
-        assert!(recent_project_dirs("not xml at all", "/h").is_empty());
+        assert!(recent_project_dirs("", "/h", "/c").is_empty());
+        assert!(recent_project_dirs("not xml at all", "/h", "/c").is_empty());
+    }
+
+    /// **A project inside the product's own config directory** is keyed on
+    /// `$APPLICATION_CONFIG_DIR$` — the older DataGrip layout, carried forward
+    /// by config migration — and was dropped, though the caller holds the
+    /// directory the macro names.
+    #[test]
+    fn a_project_in_the_config_directory_is_found_too() {
+        let xml = r#"<map><entry key="$APPLICATION_CONFIG_DIR$/projects/default"><value /></entry></map>"#;
+        assert_eq!(
+            recent_project_dirs(xml, "/h", "/c/DataGrip2024.1/"),
+            vec!["/c/DataGrip2024.1/projects/default".to_string()]
+        );
     }
 
     #[test]

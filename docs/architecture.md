@@ -5748,11 +5748,19 @@ existing prose was left alone.
     is the stale-name case). A user in the main file wins, and the local file never adds a row or a
     skip of its own: an entry there with no counterpart has no server to connect to. `scan` is what
     carries the local text down, and `scan_hands_a_datagrip_files_local_half_to_the_parser` pins
-    that composition rather than the parser alone. `recent_project_dirs` is the other half of
+    that composition rather than the parser alone. **`scan` also knows which project a
+    `.idea/dataSources.xml` is** — the directory holding that `.idea/`, off the file's own path
+    (`project_dir_of`) — so `$PROJECT_DIR$`, which DataGrip writes for every SQLite file in a
+    project, is expanded there instead of flagged `UnexpandedPath`; the flag, and the rule that it
+    is not guessed at, stand for a file whose project is unknown, the IDE's global one
+    (`a_project_files_macro_is_expanded_against_its_own_project`). `recent_project_dirs` is the other half of
     finding a *project*, and exists so the app never has to walk the home directory for one: it
     returns the paths an IDE wrote into its `options/recentProjects.xml` — the current
     `additionalInfo` map's `<entry key>`s and the older `recentPaths` list — with `$USER_HOME$`
-    expanded, keeping only strings that look like a path (the macro, `/`, a drive letter) and each
+    expanded, and `$APPLICATION_CONFIG_DIR$` against the product directory the caller is reading
+    (the older layout's default project lives there, and was dropped:
+    `a_project_in_the_config_directory_is_found_too`), keeping only strings that look like a path
+    (a macro, `/`, a drive letter) and each
     once, in the file's order. Nothing else in that file is a project: `lastProjectLocation` is
     where the *next* one would go, and the metadata's `value`s are build numbers
     (`only_project_entries_count_as_recent_projects`). `.my.cnf`'s `[client]` is the base every

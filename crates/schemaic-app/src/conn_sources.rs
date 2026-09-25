@@ -276,9 +276,13 @@ fn jetbrains_files() -> Vec<(ImportSource, PathBuf)> {
             }
             if let Some(recent) = read_small(&options.join("recentProjects.xml")) {
                 projects.extend(
-                    schemaic_core::conn_import::recent_project_dirs(&recent, &home_str)
-                        .into_iter()
-                        .map(PathBuf::from),
+                    schemaic_core::conn_import::recent_project_dirs(
+                        &recent,
+                        &home_str,
+                        &product.to_string_lossy(),
+                    )
+                    .into_iter()
+                    .map(PathBuf::from),
                 );
             }
         }
