@@ -14710,11 +14710,33 @@ mod window_key_gate {
         c.cli_access = true;
         c.environment = Environment::Production;
         c.ai_data = Some(AiData::Full);
+        // A folder too: dropped at `load` or `to_connection`, every save of a
+        // connection edited for any other reason moved it out of its folder.
+        c.folder = "Prod".to_string();
 
         let cx = Scope::new();
         let form = DraftSignals::new(cx);
         form.load(&c);
         assert_eq!(form.to_connection(c.id), c.clone().trimmed().sanitized());
+        cx.dispose();
+    }
+
+    /// **A new connection starts in no folder**, not in the one last viewed.
+    #[test]
+    fn a_blank_form_forgets_the_last_connections_folder() {
+        use crate::DraftSignals;
+        use floem::reactive::Scope;
+        use schemaic_core::connection::Connection;
+        let mut c: Connection = serde_json::from_str(
+            r#"{"id":7,"name":"a","host":"h","port":3306,"user":"u","password":""}"#,
+        )
+        .expect("a minimal connection parses");
+        c.folder = "Prod".to_string();
+        let cx = Scope::new();
+        let form = DraftSignals::new(cx);
+        form.load(&c);
+        form.blank();
+        assert_eq!(form.to_connection(0).folder, "");
         cx.dispose();
     }
 
