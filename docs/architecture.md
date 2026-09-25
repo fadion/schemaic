@@ -116,7 +116,10 @@ existing prose was left alone.
     for the base column, not the row. `flags.not_null` is filled on every engine — MySQL's wire
     `NOT_NULL_FLAG`, a catalog query on PostgreSQL, `table_info` on SQLite — so the grid's header
     marker, its cell menu's *Set to NULL* and the row editor's NULL toggle (`row_colspecs`) all
-    read it.
+    read it. On SQLite the rowid alias (`INTEGER PRIMARY KEY`) is `not_null` although the pragma
+    says `notnull = 0`: it cannot hold NULL, and taking the pragma at its word put the nullable
+    mark on nearly every table's key and offered a *Set to NULL* that failed with `datatype
+    mismatch`. `ColumnInfo::nullable` keeps the pragma's answer, which the designer's DDL needs.
     **A raw-bytes cell has exactly one rendering, and
     it lives here:** `binary_display(len)` → `<n bytes>`, with `is_binary_display` as its
     recognizer and `type_is_binary` / `Column::is_binary` as the question "is this column bytes at

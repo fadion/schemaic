@@ -632,7 +632,11 @@ fn attach_origins(
             flags: ColumnFlags {
                 primary_key: ci.primary_key,
                 unique_key: unique.iter().any(|u| u.eq_ignore_ascii_case(&ci.name)),
-                not_null: !ci.nullable,
+                // A rowid alias (`auto_increment` here) is never NULL, though
+                // the pragma reports it `notnull = 0` — the same fact as the
+                // implicit rowid's above. `ColumnInfo::nullable` keeps the
+                // pragma's answer, which is what the designer's DDL round-trips.
+                not_null: !ci.nullable || ci.auto_increment,
                 auto_increment: ci.auto_increment,
                 // A new row must supply this column or the INSERT fails. Nullable
                 // columns have an implicit NULL default, and a rowid alias fills
@@ -3785,6 +3789,10 @@ mod tests {
             id.flags.auto_increment,
             "an INTEGER PRIMARY KEY is the rowid"
         );
+        // **And so it is never NULL**, though the pragma says `notnull = 0`:
+        // the header drew the nullable mark on nearly every table's key, and
+        // *Set to NULL* on it failed with `datatype mismatch`.
+        assert!(id.flags.not_null, "the rowid alias cannot hold NULL");
         let name = o[1].as_ref().expect("name has an origin");
         assert!(name.flags.not_null);
         assert!(!name.flags.primary_key);
