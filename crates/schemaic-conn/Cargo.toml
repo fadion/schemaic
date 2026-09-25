@@ -23,10 +23,13 @@ keyring = { version = "3", default-features = false, features = ["windows-native
 [target.'cfg(target_os = "linux")'.dependencies]
 # Pure-Rust Secret Service (zbus + RustCrypto), NOT `sync-secret-service` — that
 # one pulls `dbus-secret-service` → `libdbus-sys`, a C system lib that would break
-# the portable glibc-2.31 zigbuild / AppImage build. `async-io` is asked for, but
-# floem's `rfd-tokio` also turns on zbus's `tokio` backend and that one wins after
-# feature unification — so a blocking keyring call starts a Tokio runtime, and
-# `secrets::off_runtime` is what keeps that off a thread already driving one.
+# the portable glibc-2.31 zigbuild / AppImage build. `async-io` is the zbus
+# backend, and nothing may turn on zbus's `tokio` one. floem's `rfd-tokio` once
+# did, with two separate effects: blocking keyring calls started a Tokio runtime
+# of their own (issue #1), and every Linux file dialog thread panicked for want
+# of one (`secrets::tests::zbus_is_not_on_its_tokio_backend`).
+# `secrets::off_runtime` stays regardless — a keyring call never runs on the
+# caller's thread, whatever the backend.
 keyring = { version = "3", default-features = false, features = ["async-secret-service", "async-io", "crypto-rust"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]

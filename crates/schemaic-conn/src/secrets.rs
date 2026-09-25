@@ -58,14 +58,14 @@ fn classify_delete(answer: Result<(), keyring::Error>) -> bool {
 
 /// Run a keyring operation on a thread of its own, **never on the caller's**.
 ///
-/// The Linux backend is zbus, and it is not on the `async-io` executor the
-/// manifest asks for: floem's `rfd-tokio` feature turns on zbus's `tokio`
-/// backend too, cargo unifies the two, and `tokio` wins — so every blocking
-/// keyring call runs `Runtime::block_on` on a runtime zbus keeps for itself.
-/// Tokio refuses that on a thread already driving a runtime, and panics. The
-/// GUI reads and writes the keyring from its UI thread, which drives none; the
-/// headless CLI reads it inside its own `block_on`, and `schemaic query`
-/// exited 101 on every Linux desktop (issue #1).
+/// The Linux backend is zbus. While floem's `rfd-tokio` feature put zbus on its
+/// `tokio` backend, every blocking keyring call ran `Runtime::block_on` on a
+/// runtime zbus kept for itself, and Tokio refuses that on a thread already
+/// driving a runtime: the GUI reads the keyring from its UI thread, which drives
+/// none, but the headless CLI reads it inside its own `block_on`, and `schemaic
+/// query` exited 101 on every Linux desktop (issue #1). zbus is on `async-io`
+/// now (`zbus_is_not_on_its_tokio_backend`), and this stays anyway: a backend
+/// is a feature any dependency can flip, and the rule does not depend on it.
 ///
 /// A plain scoped thread has no runtime context, whatever the caller's, so the
 /// answer here does not depend on who is asking — which is the point of doing it
@@ -283,12 +283,13 @@ mod tests {
     use super::{classify_delete, classify_get, off_runtime};
 
     /// **A keyring call made from inside an async runtime must not start a
-    /// runtime there** — issue #1. On Linux the keyring is zbus, and floem's
-    /// `rfd-tokio` feature unifies zbus onto its `tokio` backend, whose blocking
-    /// API blocks on a runtime of its own; Tokio panics when that happens on a
-    /// thread already driving one. `schemaic query` read the password inside its
-    /// `block_on` and exited 101. The closure here is that nested `block_on`,
-    /// without a keyring: called directly it panics exactly as the report did.
+    /// runtime there** — issue #1. On Linux the keyring is zbus, and while
+    /// floem's `rfd-tokio` feature unified zbus onto its `tokio` backend, its
+    /// blocking API blocked on a runtime of its own; Tokio panics when that
+    /// happens on a thread already driving one. `schemaic query` read the
+    /// password inside its `block_on` and exited 101. The closure here is that
+    /// nested `block_on`, without a keyring: called directly it panics exactly
+    /// as the report did.
     #[test]
     fn a_keyring_call_made_inside_a_runtime_does_not_start_one_on_its_thread() {
         let outer = tokio::runtime::Builder::new_current_thread()
@@ -303,6 +304,44 @@ mod tests {
             })
         });
         assert_eq!(got, 7);
+    }
+
+    /// **zbus must not be on its `tokio` backend** — read off the lockfile, so
+    /// the answer is what cargo resolved across the whole build rather than what
+    /// any one manifest asked for.
+    ///
+    /// Every file dialog in the app runs on a bare `std::thread` (floem's
+    /// `file_action`), and on Linux reaches the desktop portal through zbus.
+    /// zbus's `tokio` backend panics there — "there is no reactor running" — so
+    /// with floem's `rfd-tokio` feature no dialog ever opened on Linux, silently:
+    /// the thread died and the callback never fired. Nothing on Windows or macOS
+    /// can notice it coming back; this can. It is also the backend this crate's
+    /// keyring asks for (`async-io`), which `rfd-tokio` used to override.
+    #[test]
+    fn zbus_is_not_on_its_tokio_backend() {
+        let lock = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../Cargo.lock"));
+        // Every zbus in the lock, not the first: a second major version can be
+        // resolved alongside, and either one on `tokio` is the bug.
+        let zbuses: Vec<&str> = lock
+            .split("[[package]]")
+            .filter(|block| block.contains("\nname = \"zbus\"\n"))
+            .collect();
+        assert!(
+            !zbuses.is_empty(),
+            "zbus is in the lockfile — this guard is reading the wrong file"
+        );
+        for zbus in zbuses {
+            let deps = zbus.split("dependencies = [").nth(1).unwrap_or("");
+            let deps = &deps[..deps.find(']').unwrap_or(deps.len())];
+            // `"tokio 1.x.y"` is how the lock names it once two tokios resolve;
+            // the space keeps `tokio-util` and friends out of the match.
+            assert!(
+                !deps.contains("\"tokio\"") && !deps.contains("\"tokio "),
+                "zbus depends on tokio, so something enabled `zbus/tokio` (floem's \
+                 `rfd-tokio`?): every Linux file dialog thread will panic without a \
+                 Tokio runtime. Use floem's `rfd-async-std`."
+            );
+        }
     }
 
     /// **The one classification the whole scheme rests on, finally asserted

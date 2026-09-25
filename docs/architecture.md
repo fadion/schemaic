@@ -8311,10 +8311,11 @@ existing prose was left alone.
     `dbus-secret-service` → `libdbus-sys` and would put a C system library into the portable
     glibc-2.31 zigbuild the tarball and the AppImage are built from. `schemaic-app`'s manifest keeps
     a two-line pointer where those blocks used to be.
-    **The manifest asks for `async-io`, and does not get it.** floem's `rfd-tokio` feature turns on
-    `rfd/tokio` → `ashpd/tokio` → `zbus/tokio`, cargo unifies features across the build, and zbus's
-    `tokio` backend wins — so every blocking keyring call on Linux runs `Runtime::block_on` on a
-    runtime zbus keeps, and Tokio panics when that happens on a thread already driving one. This
+    **The manifest asks for `async-io`, and for a long time did not get it.** floem's `rfd-tokio`
+    feature turned on `rfd/tokio` → `ashpd/tokio` → `zbus/tokio`, cargo unifies features across the
+    build, and zbus's `tokio` backend won — so every blocking keyring call on Linux ran
+    `Runtime::block_on` on a runtime zbus kept, and Tokio panics when that happens on a thread
+    already driving one. This
     entry and the manifest both used to say the opposite ("blocks on its own executor rather than
     nesting a tokio runtime"), and `schemaic query -c <conn>` exited 101 on Linux with zbus's
     "Cannot start a runtime from within a runtime" (issue #1): `cli::run::main` does everything
@@ -8326,10 +8327,19 @@ existing prose was left alone.
     whose panic is resumed on the caller. It is fixed at this boundary rather than at the CLI's call
     site so that no caller, present or future, can trip it; the price is a thread spawn per secret,
     against a D-Bus round trip per secret. Don't "simplify" it back to a direct call because the
-    GUI works without it. `a_keyring_call_made_inside_a_runtime_does_not_start_one_on_its_thread`
+    GUI works without it — **nor because zbus is on `async-io` now.** The same `rfd-tokio` was
+    silently killing every Linux file dialog (*Floem 0.2 gotchas*), and the switch to
+    `rfd-async-std` that fixed those gave this manifest the backend it asks for; `off_runtime` stays
+    regardless, because "a keyring call never runs on the caller's thread" should not rest on a
+    backend any dependency in the build can flip back.
+    `a_keyring_call_made_inside_a_runtime_does_not_start_one_on_its_thread`
     runs a nested `block_on` inside an outer one through `off_runtime`, and with `off_runtime`
     stubbed to `f()` it panics with the issue's exact message. It is why `tokio` is a
-    dev-dependency here, and only that.
+    dev-dependency here, and only that. `zbus_is_not_on_its_tokio_backend` pins the backend itself:
+    it `include_str!`s the workspace `Cargo.lock` and fails if zbus's resolved dependency list names
+    `tokio` — the outcome of feature unification across the whole build, which no single manifest
+    shows. It checks every `zbus` the lock resolves, not the first, since a second major version
+    can sit alongside and either one on `tokio` is the bug.
     **The move took this file out of the UI crate's source-gate census for a while**, and it is
     back in: `source_gate::workspace_sources()` lists `schemaic-conn` with a floor of its own (2),
     and `the_wider_scan_reaches_the_keyring_store` asserts this file is among what it reads —
@@ -22790,6 +22800,18 @@ Re-introducing the anti-patterns these guard against is a regression:
   `[lints]` table appended to the vendored manifest allowing every rust and clippy lint, since Cargo
   caps a registry crate's warnings but not a path dependency's. The last is in the manifest rather
   than the source so that `src/` stays upstream's byte for byte, apart from what `PATCHES.md` lists.
+- **floem's file dialogs run on a thread with no runtime, so the `rfd` backend must need none.**
+  `file_action::open_file`/`save_as` — every open and save dialog in the app — run
+  `rfd::FileDialog` on a bare `std::thread::spawn`. floem's `rfd-tokio` feature puts rfd → `ashpd`
+  → zbus on zbus's `tokio` backend, which calls `tokio::task::spawn` and panics on that thread
+  ("there is no reactor running"), so on Linux **no dialog ever opened**: the thread died before
+  any portal request, the `create_ext_action` callback never fired, and nothing was reported.
+  Windows and macOS use native dialogs with no D-Bus and never saw it. The feature is
+  `rfd-async-std`, which despite the name pulls in no async-std — ashpd's `async-std` is
+  `zbus/async-io` plus `async-fs`/`async-net` — and zbus's `async-io` executor needs no runtime.
+  Cargo unifies features, so any dependency enabling `zbus/tokio` brings the bug back; that is why
+  the guard, `conn::secrets`'s `zbus_is_not_on_its_tokio_backend`, reads `Cargo.lock` rather than a
+  manifest (the keyring there is the other zbus user — see `schemaic-conn`).
 - **One `on_scroll` per scroll** — setting it twice clobbers. `autohide` sets its own; a scroll
   needing custom `on_scroll` must inline `autohide_state()` (results grid + AI convo).
 - **No `opacity` property.** Fade via color alpha (`multiply_alpha`) + `.transition_*`. Toggle

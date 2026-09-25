@@ -41,8 +41,16 @@ schemaic-term = { path = "crates/schemaic-term" }
 schemaic-ui = { path = "crates/schemaic-ui" }
 
 # UI
-# `rfd-tokio` enables the native file picker (`file_action::open_file`), used by
-# the Manage-Connections SSH key-pair "Browse…" button.
+# `rfd-async-std` enables the native file picker (`file_action::open_file` /
+# `save_as`) — every open and save dialog in the app. On Linux it reaches the
+# desktop portal over D-Bus through zbus, from a bare `std::thread` floem spawns
+# per dialog. **Not `rfd-tokio`**: that one puts zbus on its `tokio` backend,
+# which panics on a thread with no Tokio runtime ("there is no reactor
+# running"), so on Linux every dialog thread died before a picker opened and the
+# callback never fired. `rfd-async-std` puts zbus on its own `async-io`
+# executor, which needs no runtime — and despite the name pulls in no async-std,
+# only `async-fs`/`async-net`. It is also the backend `schemaic-conn`'s keyring
+# manifest asks for, which `rfd-tokio` used to override.
 #
 # **`image-gif` / `image-bmp` are the binary-cell panel's preview**, and they are
 # here rather than left off because the alternative is worse than a missing
@@ -58,7 +66,7 @@ schemaic-ui = { path = "crates/schemaic-ui" }
 # which `cargo deny`'s `bans` allows and which is the whole price. Pure Rust,
 # MIT/Apache, and the alternative was a panel captioned "GIF image" over an
 # empty box.
-floem = { version = "0.2.0", features = ["rfd-tokio", "image-gif", "image-bmp"] }
+floem = { version = "0.2.0", features = ["rfd-async-std", "image-gif", "image-bmp"] }
 
 # Async / DB (wired in M1)
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros", "time"] }
