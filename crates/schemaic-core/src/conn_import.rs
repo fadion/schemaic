@@ -650,7 +650,8 @@ pub fn parse_url(input: &str) -> Result<Connection, UrlError> {
         return Err(UrlError::Empty);
     }
     // `jdbc:` is a wrapper around the URL the driver itself reads.
-    let raw = strip_prefix_ci(raw, "jdbc:").unwrap_or(raw);
+    let jdbc = strip_prefix_ci(raw, "jdbc:");
+    let raw = jdbc.unwrap_or(raw);
     let (scheme, rest) = split_scheme(raw).ok_or(UrlError::NoScheme)?;
     let engine = match engine_for_scheme(scheme) {
         Some(e) => e,
@@ -662,11 +663,50 @@ pub fn parse_url(input: &str) -> Result<Connection, UrlError> {
     };
     let mut c = if is_sqlite(engine) {
         parse_sqlite_url(rest)?
+    } else if jdbc.is_some() {
+        parse_server_url(engine, &jdbc_authority(engine, rest))?
     } else {
         parse_server_url(engine, rest)?
     };
     c.name = suggest_name(&c);
     Ok(c)
+}
+
+/// The Connector/J and MariaDB Connector/J words for a clustered setup, which
+/// sit between the scheme and the `//`: `jdbc:mysql:loadbalance://h1,h2/db`.
+const JDBC_SUB_PROTOCOLS: &[&str] = &[
+    "loadbalance",
+    "replication",
+    "failover",
+    "sequential",
+    "aurora",
+];
+
+/// A JDBC URL's text after its scheme, in the `//host/db` shape
+/// [`parse_server_url`] reads — the two JDBC grammars that are not already.
+///
+/// A driver sub-protocol ([`JDBC_SUB_PROTOCOLS`]) goes: it was read as the
+/// host, and the database with it. And PgJDBC's host-less
+/// `jdbc:postgresql:reports` / `jdbc:postgresql:/` is, as its documentation
+/// says, that database (or the default one) on `localhost`; the database was
+/// taken for the host. Anything else comes back as it was.
+fn jdbc_authority<'a>(engine: &str, rest: &'a str) -> std::borrow::Cow<'a, str> {
+    use std::borrow::Cow;
+    if rest.starts_with("//") {
+        return Cow::Borrowed(rest);
+    }
+    if let Some((sub, tail)) = rest.split_once(':')
+        && tail.starts_with("//")
+        && JDBC_SUB_PROTOCOLS
+            .iter()
+            .any(|p| p.eq_ignore_ascii_case(sub))
+    {
+        return Cow::Borrowed(tail);
+    }
+    if engine == POSTGRES {
+        return Cow::Owned(format!("//localhost/{}", rest.trim_start_matches('/')));
+    }
+    Cow::Borrowed(rest)
 }
 
 /// [`parse_url`] as a scan, so the paste field and the file sources answer in
@@ -2426,6 +2466,54 @@ mod tests {
             assert_eq!(c.host, "h", "{line}");
             assert_eq!(c.password, "p", "{line}");
         }
+    }
+
+    /// **A driver's sub-protocol is not a host.** Connector/J and MariaDB
+    /// Connector/J spell their clustered setups `jdbc:mysql:loadbalance://h1,h2/db`,
+    /// and the part before `//` became the host, with the database lost —
+    /// imported as an ordinary, ticked row naming a server that does not
+    /// exist. The first host is the one a connection points at, as with
+    /// libpq's list.
+    #[test]
+    fn a_jdbc_sub_protocol_is_not_the_host() {
+        for (input, engine) in [
+            ("jdbc:mysql:loadbalance://h1:3306,h2:3306/db", MYSQL),
+            ("jdbc:mysql:replication://h1,h2/db", MYSQL),
+            ("jdbc:mysql:failover://h1,h2/db", MYSQL),
+            ("jdbc:mariadb:sequential://h1,h2/db", MARIADB),
+            ("jdbc:mariadb:aurora://h1/db", MARIADB),
+            ("jdbc:mariadb:LoadBalance://h1/db", MARIADB),
+        ] {
+            let c = url(input);
+            assert_eq!(
+                (c.db_type.as_str(), c.host.as_str(), c.database.as_str()),
+                (engine, "h1", "db"),
+                "{input}"
+            );
+        }
+    }
+
+    /// **PgJDBC's host-less forms are localhost**, as its documentation says:
+    /// `jdbc:postgresql:reports` is database `reports` on `localhost:5432`,
+    /// and `jdbc:postgresql:/` the default database there. The database name
+    /// was taken for the host.
+    #[test]
+    fn a_host_less_pgjdbc_url_is_localhost() {
+        let c = url("jdbc:postgresql:reports?user=app");
+        assert_eq!(
+            (
+                c.host.as_str(),
+                c.port,
+                c.database.as_str(),
+                c.user.as_str()
+            ),
+            ("localhost", 5432, "reports", "app")
+        );
+        let c = url("jdbc:postgresql:/");
+        assert_eq!((c.host.as_str(), c.database.as_str()), ("localhost", ""));
+        // Only under `jdbc:`, which is PgJDBC's grammar — a bare
+        // `postgresql:x` is no URL anyone writes, and stays unreadable.
+        assert!(parse_url("postgresql:reports").map(|c| c.host) != Ok("localhost".into()));
     }
 
     #[test]

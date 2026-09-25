@@ -5701,7 +5701,13 @@ existing prose was left alone.
     bracketed IPv6 literal, and the `?user=&password=&sslmode=` parameters JDBC carries instead of
     a userinfo. A scheme it doesn't know is `UrlError::UnknownScheme`, *except* when only digits
     follow it — that is `localhost:3306`, and calling its host an unknown engine sends the reader
-    looking in the wrong place.
+    looking in the wrong place. Under `jdbc:` two more grammars are read (`jdbc_authority`): a
+    Connector/J or MariaDB Connector/J sub-protocol (`jdbc:mysql:loadbalance://h1,h2/db`) is
+    dropped, and PgJDBC's host-less `jdbc:postgresql:reports` is that database on `localhost`.
+    Both used to import as an ordinary ticked row whose host was the sub-protocol or the database
+    name, the database lost (`a_jdbc_sub_protocol_is_not_the_host`,
+    `a_host_less_pgjdbc_url_is_localhost`) — and since project discovery reads every project the
+    IDE lists, they arrived without the user picking the file.
     **`split_userinfo` is where a URL comes apart, and the order is the whole point.** Everything
     past `://` is cut at the **last `@`** — an email address is an ordinary username — and only then
     is the remainder searched for a path, a `?` or a `#`. Both readers used to do it the other way
