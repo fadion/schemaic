@@ -20141,12 +20141,14 @@ existing prose was left alone.
     about what a caller can sensibly receive down a pipe, and the caller is very often a language
     model with a context window; a person who wants the whole table says so with `--limit`.
     **SQL that opens with a `--` comment is moved behind a `--` separator before clap sees it**
-    (`comment_led_sql_last`, called at the top of `run::main`): clap read `$'-- note\nSELECT 1'` as
-    an unknown long option and exited 2, though a saved snippet very often starts with a comment
-    line. What tells the two apart is the byte after `--` — whitespace in a SQL comment, never in
-    an option (`--connection=Prod EU` included) — and a command line with no such token comes back
-    unchanged (`sql_led_by_a_line_comment_is_the_statement`,
-    `nothing_but_a_comment_led_token_is_moved`).
+    (`comment_led_sql_last`, inside `args::parse_argv`, which is `run::main`'s whole front): clap
+    read `$'-- note\nSELECT 1'` as an unknown long option and exited 2, though a saved snippet very
+    often starts with a comment line. Either of two things tells the two apart — whitespace right
+    after `--`, never in an option (`--connection=Prod EU` included), or a line break anywhere in
+    the token, which catches PostgreSQL's and SQLite's `--TODO` and a `-----` banner — and a command
+    line with no such token comes back unchanged. The test drives `parse_argv`, not the pure half:
+    with only `comment_led_sql_last` pinned, its one call site could be deleted with the suite
+    green (`sql_led_by_a_line_comment_is_the_statement`, `nothing_but_a_comment_led_token_is_moved`).
     `--limit` and `--timeout` refuse `0` at parse time — zero rows is a typo and zero seconds
     cancels every statement before it runs — and `-d` goes through `non_blank`, because a blank is
     what `-d "$DB"` sends with `DB` unset and it is not "no flag": PostgreSQL took it as a name and
@@ -20216,7 +20218,8 @@ existing prose was left alone.
     text, and `read_only_reason` refused `\u{FEFF}SELECT 1` as not a read — a file saying nothing
     else came back refused. Only a *leading* mark goes; anywhere else it is data
     (`a_statement_from_a_file_or_pipe_loses_its_bom`, which asserts the gate refuses the raw text
-    first). `--timeout`'s two `default_value_t`s read
+    first). Both readers go through `read_source`, which takes them as parameters so the
+    composition is tested too (`a_file_or_pipe_source_reads_without_its_bom`). `--timeout`'s two `default_value_t`s read
     `query::DEFAULT_TIMEOUT` through `DEFAULT_TIMEOUT_SECS`, not a second literal beside it
     (`exec_defaults_to_the_shared_timeout`).
     **`ConnArgs` is `Target` without the database** — `-c` and `--password-stdin`, flattened into

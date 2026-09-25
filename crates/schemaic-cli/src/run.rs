@@ -18,7 +18,7 @@ use schemaic_core::secrets::SecretKind;
 use schemaic_core::sql::NoDatabaseFailure;
 use schemaic_db::Db;
 
-use crate::args::{Cli, Command, ConnArgs, OutputArgs, SqlArgs, SqlSource, Target};
+use crate::args::{Command, ConnArgs, OutputArgs, SqlArgs, SqlSource, Target};
 use crate::format::{self, Format, Output};
 use crate::{catalog, exec, query, select};
 
@@ -148,8 +148,7 @@ where
     I: IntoIterator<Item = T>,
     T: Into<std::ffi::OsString> + Clone,
 {
-    let argv = crate::args::comment_led_sql_last(argv.into_iter().map(Into::into).collect());
-    let cli = match <Cli as clap::Parser>::try_parse_from(argv) {
+    let cli = match crate::args::parse_argv(argv.into_iter().map(Into::into).collect()) {
         Ok(cli) => cli,
         Err(e) => {
             // clap writes help and `--version` to stdout and real errors to
@@ -585,6 +584,22 @@ fn read_sql_file(path: &std::path::Path) -> Result<String, Exit> {
     })
 }
 
+/// The text `source` names: a file through `file`, stdin through `stdin` —
+/// each with its byte-order mark taken off ([`sql_text`]) — or the argument as
+/// typed. The readers are parameters so a test can reach this without a file
+/// or a pipe.
+fn read_source(
+    source: SqlSource<'_>,
+    file: impl FnOnce(&std::path::Path) -> Result<String, Exit>,
+    stdin: impl FnOnce() -> Result<String, Exit>,
+) -> Result<String, Exit> {
+    match source {
+        SqlSource::Text(sql) => Ok(sql.to_string()),
+        SqlSource::File(path) => file(path).map(sql_text),
+        SqlSource::Stdin => stdin().map(sql_text),
+    }
+}
+
 /// The statement to run: the argument, stdin, or a file.
 ///
 /// Stdin has one reader, so a statement and a password cannot both come from
@@ -594,19 +609,20 @@ fn read_sql_file(path: &std::path::Path) -> Result<String, Exit> {
 /// Stdin and a file are neither, so they are not warned about.
 fn statement(sql: &SqlArgs, target: &Target, conn: &Connection) -> Result<String, Exit> {
     let sql = match sql.source() {
-        SqlSource::Stdin => {
-            if target.conn.password_stdin {
-                warn(
-                    "the statement and --password-stdin cannot both come from stdin; \
-                     leave the password to the OS keyring, or pass the statement as an \
-                     argument or with -f",
-                );
-                return Err(Exit::Usage);
-            }
-            return read_stdin("the statement", "schemaic exec -c … - < change.sql").map(sql_text);
+        SqlSource::Stdin if target.conn.password_stdin => {
+            warn(
+                "the statement and --password-stdin cannot both come from stdin; \
+                 leave the password to the OS keyring, or pass the statement as an \
+                 argument or with -f",
+            );
+            return Err(Exit::Usage);
         }
-        SqlSource::File(path) => return read_sql_file(path).map(sql_text),
         SqlSource::Text(sql) => sql,
+        source => {
+            return read_source(source, read_sql_file, || {
+                read_stdin("the statement", "schemaic exec -c … - < change.sql")
+            });
+        }
     };
     let dialect = schemaic_core::intel::SqlDialect::from_db_type(&conn.db_type);
     if schemaic_core::sql::carries_credential(sql, dialect) {
@@ -946,6 +962,7 @@ fn database_for(target: &Target, conn: &Connection) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::args::Cli;
 
     /// **A ping answers with which connection answered, and how fast** — a
     /// row, so `--format` means what it means everywhere; whole milliseconds,
@@ -1152,6 +1169,32 @@ mod tests {
         assert_eq!(query::gate(&sql, SqlDialect::MySql), Ok("SELECT 1"));
         // Only a leading mark is the file's; anywhere else it is data.
         assert_eq!(sql_text("SELECT '\u{FEFF}'".into()), "SELECT '\u{FEFF}'");
+    }
+
+    /// **And the source readers deliver it without the mark** — the
+    /// composition, which `sql_text` alone could not pin: either arm's call
+    /// could be deleted with the test above still green.
+    #[test]
+    fn a_file_or_pipe_source_reads_without_its_bom() {
+        let bom = || Ok("\u{FEFF}SELECT 1".to_string());
+        let path = std::path::Path::new("q.sql");
+        assert_eq!(
+            read_source(SqlSource::File(path), |_| bom(), || unreachable!()),
+            Ok("SELECT 1".to_string())
+        );
+        assert_eq!(
+            read_source(SqlSource::Stdin, |_| unreachable!(), bom),
+            Ok("SELECT 1".to_string())
+        );
+        assert_eq!(
+            read_source(
+                SqlSource::Text("\u{FEFF}x"),
+                |_| unreachable!(),
+                || unreachable!()
+            ),
+            Ok("\u{FEFF}x".to_string()),
+            "an argument is taken as typed"
+        );
     }
 
     /// **PowerShell 5.1's byte-order mark is not part of the password.**
