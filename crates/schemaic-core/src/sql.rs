@@ -109,6 +109,13 @@ impl SqlDialect {
         matches!(self, SqlDialect::Postgres)
     }
 
+    /// Do `/* … */` comments nest? PostgreSQL only, as the SQL standard has
+    /// it: `/* a /* b */ c */` is one comment there, and on MySQL and SQLite
+    /// the first `*/` ends it.
+    fn nested_block_comments(self) -> bool {
+        matches!(self, SqlDialect::Postgres)
+    }
+
     /// Does the client honour a `DELIMITER` directive? MySQL only — see
     /// [`delimiter_directive`] for why it exists there at all.
     fn delimiter_directive(self) -> bool {
@@ -119,7 +126,9 @@ impl SqlDialect {
 /// If `b[i..]` starts a comment, return the index just past it. Handles `--`
 /// (whitespace after it required per [`SqlDialect::dash_comment_needs_space`]),
 /// `#` line comments (per [`SqlDialect::hash_line_comment`]), and `/* … */` block
-/// comments (every dialect; non-nesting).
+/// comments (every dialect; nesting per [`SqlDialect::nested_block_comments`] —
+/// ending a PostgreSQL comment at its first `*/` read the rest of it as the
+/// statement, and a quote there as the start of a string that hid the next one).
 fn skip_comment(b: &[u8], i: usize, dialect: SqlDialect) -> Option<usize> {
     let n = b.len();
     if i >= n {
@@ -163,11 +172,25 @@ fn skip_comment(b: &[u8], i: usize, dialect: SqlDialect) -> Option<usize> {
         if let Some(after) = executable_marker(b, i, dialect) {
             return Some(after);
         }
+        let nests = dialect.nested_block_comments();
+        let mut depth = 1usize;
         let mut j = i + 2;
-        while j + 1 < n && !(b[j] == b'*' && b[j + 1] == b'/') {
-            j += 1;
+        while j + 1 < n {
+            if b[j] == b'*' && b[j + 1] == b'/' {
+                depth -= 1;
+                j += 2;
+                if depth == 0 {
+                    return Some(j);
+                }
+            } else if nests && b[j] == b'/' && b[j + 1] == b'*' {
+                depth += 1;
+                j += 2;
+            } else {
+                j += 1;
+            }
         }
-        return Some((j + 2).min(n));
+        // Unterminated: the comment runs to the end.
+        return Some(n);
     }
     None
 }
@@ -4056,6 +4079,41 @@ mod tests {
             "CREATE OR REPLACE TEMPORARY TABLE t (id int)",
         ] {
             assert_eq!(unsafe_reason(sql), None, "{sql}");
+        }
+    }
+
+    /// **PostgreSQL's block comments nest, and the one lexer has to know.**
+    /// It ended every `/*` at the first `*/`, so on PostgreSQL the head after
+    /// a nested comment was read from inside it: `/* a /* b */ c */ DELETE
+    /// FROM t` had head `C` to every arm, and ran the every-row DELETE with no
+    /// ask — the ordinary way it arises is commenting out a block that already
+    /// holds a comment. Worse, a quote inside the comment's tail was read as a
+    /// string opening, so a real second statement after it was invisible to
+    /// every gate. MySQL and SQLite do not nest, and keep today's reading.
+    #[test]
+    fn a_nested_block_comment_ends_where_its_dialect_ends_it() {
+        let nested = "/* old: /* note */ still comment */ DELETE FROM t";
+        let pg = SqlDialect::Postgres;
+        assert_eq!(
+            super::leading_keyword(nested, pg).as_deref(),
+            Some("DELETE")
+        );
+        assert!(super::unsafe_reason(nested, pg).is_some());
+        let block = "/* disabled\n  SELECT 1; /* keep */\n*/\nDROP TABLE t";
+        assert!(super::unsafe_reason(block, pg).is_some());
+        // The quote is inside the comment on PostgreSQL, so what follows is a
+        // second statement — refused by the read gate, and a write.
+        let hidden = "SELECT 1 /* /* */ ' */; DELETE FROM t; --'";
+        assert!(super::read_only_reason(hidden, pg).is_err());
+        assert!(super::contains_write(hidden, pg));
+        // An unterminated nest runs to the end, as an unterminated comment does.
+        assert_eq!(super::leading_keyword("/* /* */ DELETE FROM t", pg), None);
+        for d in [SqlDialect::MySql, SqlDialect::Sqlite] {
+            assert_eq!(
+                super::leading_keyword(nested, d).as_deref(),
+                Some("STILL"),
+                "{d:?} does not nest"
+            );
         }
     }
 

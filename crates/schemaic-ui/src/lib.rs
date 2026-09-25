@@ -4198,10 +4198,10 @@ mod engine_comparison_gate {
         ),
         (
             "schemaic-core/sql.rs",
-            14,
-            "Ten are the [`SqlDialect`] capability table itself — \
+            15,
+            "Eleven are the [`SqlDialect`] capability table itself — \
              `backtick_ident`, `double_quote_is_ident`, `dollar_quoted`, \
-             `e_string_backslash` and the rest — which is the one place in the \
+             `nested_block_comments`, `e_string_backslash` and the rest — which is the one place in the \
              workspace where naming an engine is the whole job. The four others \
              are the boundary lexer's own per-engine rules (SQLite's `''` \
              doubling, its trigger bodies, MySQL's `USE`, PostgreSQL's \

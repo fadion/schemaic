@@ -267,7 +267,15 @@ existing prose was left alone.
     **The per-dialect rules are a capability table on `SqlDialect`**, one predicate per divergence
     (`dash_comment_needs_space`, `hash_line_comment`, `backslash_escapes`, `e_string_backslash`,
     `double_quote_is_ident`, `backtick_ident`, `bracket_ident`, `dollar_quoted`,
-    `delimiter_directive`), and they are predicates because the question stopped being binary. The
+    `nested_block_comments`, `delimiter_directive`), and they are predicates because the question
+    stopped being binary. **`nested_block_comments` was a divergence the table did not have**:
+    PostgreSQL nests `/* … */` and `skip_comment` ended every comment at its first `*/`, so a head
+    after a nested comment was read from inside it — `/* a /* b */ c */ DELETE FROM t` ran its
+    every-row DELETE with no ask — and a quote in the comment's tail opened a "string" that hid a
+    real second statement from every gate (`a_nested_block_comment_ends_where_its_dialect_ends_it`;
+    PG 16 was checked to read `SELECT /* a /* b */ c */ 42` as one comment). The highlighter's
+    continuation of a comment across lines still looks for the first `*/`, a colouring matter
+    only. The
     scanner used to ask `dialect == Postgres` / `!= MySql`, which silently sorts any *third* engine
     onto whichever side each comparison happens to put it — with nothing failing to compile, since
     `!=` is exhaustive over any number of variants. Three of those defaults were wrong for SQLite
