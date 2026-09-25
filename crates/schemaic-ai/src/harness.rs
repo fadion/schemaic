@@ -2705,7 +2705,7 @@ mod tests {
     /// Verbatim shape of the file this was measured against.
     const AGY_SETTINGS: &str = r#"{
   "trustedWorkspaces": [
-    "C:\\Users\\jonid"
+    "C:\\Users\\me"
   ]
 }"#;
 
@@ -2741,7 +2741,7 @@ mod tests {
         let out = written(antigravity_settings_with_rules(AGY_SETTINGS, &rules));
         let v: serde_json::Value = serde_json::from_str(&out).expect("json");
         // The user's own key survives untouched — this is their file.
-        assert_eq!(v["trustedWorkspaces"][0], "C:\\Users\\jonid");
+        assert_eq!(v["trustedWorkspaces"][0], "C:\\Users\\me");
         assert_eq!(v["permissions"]["allow"][0], "mcp(schemaic/list_schema)");
     }
 
@@ -2782,7 +2782,7 @@ mod tests {
             "{out}"
         );
         // The user's own keys are still theirs.
-        assert_eq!(v["trustedWorkspaces"][0], "C:\\Users\\jonid");
+        assert_eq!(v["trustedWorkspaces"][0], "C:\\Users\\me");
 
         // Idempotent: asking for the same set again writes nothing at all, so a
         // relaunch does not rewrite another vendor's file for no change.
@@ -2833,7 +2833,7 @@ mod tests {
         let added = written(antigravity_settings_with_rules(AGY_SETTINGS, &rules));
         let back = written(antigravity_settings_without_rules(&added, &rules));
         let v: serde_json::Value = serde_json::from_str(&back).expect("json");
-        assert_eq!(v["trustedWorkspaces"][0], "C:\\Users\\jonid");
+        assert_eq!(v["trustedWorkspaces"][0], "C:\\Users\\me");
         // The scaffolding is gone, not left behind empty.
         assert!(v.get("permissions").is_none(), "{back}");
     }

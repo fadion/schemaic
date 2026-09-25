@@ -2600,9 +2600,9 @@ mod tests {
     /// two Aiven services differ only there.
     #[test]
     fn a_long_endpoint_is_elided_but_keeps_its_port() {
-        let long = "pg-397b033c-jonidashi-b5ac.b.aivencloud.com:10863";
+        let long = "pg-1a2b3c4d-example1-f00d.b.aivencloud.com:12345";
         let out = elide_endpoint(long, 20);
-        assert!(out.ends_with(":10863"), "{out}");
+        assert!(out.ends_with(":12345"), "{out}");
         assert!(out.starts_with("pg-"), "{out}");
         assert_eq!(out.chars().count(), 20, "{out}");
         assert!(out.contains('…'), "{out}");

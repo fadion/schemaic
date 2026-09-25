@@ -691,7 +691,7 @@ pub(crate) fn conn_menu_overlay(
                     // row wider than it simply widens the panel. Only the name
                     // was capped, and a local `127.0.0.1:3306` never reached the
                     // edge — so the row looked correct until a hosted endpoint
-                    // arrived. `pg-397b033c-jonidashi-b5ac.b.aivencloud.com:10863`
+                    // arrived. `pg-1a2b3c4d-example1-f00d.b.aivencloud.com:12345`
                     // is 48 characters: it pushed the whole menu out past the
                     // panel, and clipped the port off the right of it.
                     //
