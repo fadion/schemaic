@@ -1344,8 +1344,8 @@ fn parse_datagrip_project(xml: &str, local: Option<&str>, project: Option<&str>)
 /// project path, and the older flat `recentPaths` list. Nothing else in the
 /// file counts: `lastProjectLocation` is where the *next* project would go, and
 /// the metadata's own `value`s are build numbers. A path is kept only if it
-/// looks like one (a macro, `/` or a drive letter), and each is returned
-/// once, in the file's order.
+/// looks like one (a macro, `/` or a drive letter) and is not on a network
+/// share, and each is returned once, in the file's order.
 pub fn recent_project_dirs(xml: &str, home: &str, config: &str) -> Vec<String> {
     let xml = strip_bom(xml);
     let mut raw: Vec<String> = Vec::new();
@@ -1373,7 +1373,11 @@ pub fn recent_project_dirs(xml: &str, home: &str, config: &str) -> Vec<String> {
             || p.starts_with("$APPLICATION_CONFIG_DIR$")
             || p.starts_with('/')
             || p.as_bytes().get(1) == Some(&b':');
-        if !looks_like_a_path {
+        // A network share (`//server/…`, `\\server\…`) is left out: the
+        // caller stats each project with no deadline, and an unreachable one
+        // waits out the SMB timeout, or on a hard NFS mount forever.
+        let on_a_share = p.starts_with("//") || p.starts_with(r"\\");
+        if !looks_like_a_path || on_a_share {
             continue;
         }
         let p = p
@@ -3360,6 +3364,24 @@ mod tests {
     fn a_file_that_is_not_a_recent_projects_list_yields_nothing() {
         assert!(recent_project_dirs("", "/h", "/c").is_empty());
         assert!(recent_project_dirs("not xml at all", "/h", "/c").is_empty());
+    }
+
+    /// **A project on a network share is not probed.** Discovery checks each
+    /// listed project for a file, serially and with no deadline, and a stat
+    /// of an unreachable UNC path waits out the SMB timeout (on Linux, a hard
+    /// NFS mount blocks for good) — so one such entry held "Scanning…" for
+    /// the whole of it. A share is left to *Choose a file…*.
+    #[test]
+    fn a_project_on_a_network_share_is_not_listed() {
+        let xml = r#"<map>
+          <entry key="//fileserver/eng/shop"><value /></entry>
+          <entry key="\\fileserver\eng\api"><value /></entry>
+          <entry key="/srv/work/local"><value /></entry>
+        </map>"#;
+        assert_eq!(
+            recent_project_dirs(xml, "/h", "/c"),
+            vec!["/srv/work/local".to_string()]
+        );
     }
 
     /// **A project inside the product's own config directory** is keyed on

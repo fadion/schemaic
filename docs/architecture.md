@@ -5760,7 +5760,10 @@ existing prose was left alone.
     expanded, and `$APPLICATION_CONFIG_DIR$` against the product directory the caller is reading
     (the older layout's default project lives there, and was dropped:
     `a_project_in_the_config_directory_is_found_too`), keeping only strings that look like a path
-    (a macro, `/`, a drive letter) and each
+    (a macro, `/`, a drive letter) and are **not on a network share** — the app stats each one
+    serially with no deadline, and an unreachable `//server/…` waits out the SMB timeout, or on a
+    hard NFS mount blocks for good, so one such entry stalled the whole scan
+    (`a_project_on_a_network_share_is_not_listed`) — and each
     once, in the file's order. Nothing else in that file is a project: `lastProjectLocation` is
     where the *next* one would go, and the metadata's `value`s are build numbers
     (`only_project_entries_count_as_recent_projects`). `.my.cnf`'s `[client]` is the base every
