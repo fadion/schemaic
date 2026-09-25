@@ -9581,7 +9581,10 @@ fn gutter_menu(gs: GridState, pos: usize, pending: Option<usize>) -> Vec<MenuEnt
             move || set_rows_deleted(gs, &del, !all_deleted),
         );
         // Del's keycap only when the rows are the selection's, which is what the
-        // key marks — a click outside it acts on the clicked row alone.
+        // key marks. **Always so from the gutter today**: its right-click
+        // re-selects a row outside the selection before building this menu, so
+        // the entry and the key act on the same rows. The test stays for an
+        // opener that does not re-select, where the two would differ.
         let on_selection = gs
             .bounds_untracked()
             .is_some_and(|(r0, _, r1, _)| (r0..=r1).contains(&pos));

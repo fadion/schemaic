@@ -24580,7 +24580,10 @@ renders the themed panel; the caller positions it absolutely. Used by the schema
   on the selection, as the keys do), but the cell menu's Copy wears Ctrl+C only when its `CopyScope`
   is `Selection` — the `Cell` scope copies the one raw value, which the key does not promise — and
   the gutter menu's Delete/Undo delete wears Del only when the right-clicked row is inside the
-  selection, since outside it the menu acts on the clicked row alone while Del marks the selection.
+  selection, since Del marks the selection. From the gutter that is always so — its right-click
+  re-selects a row outside the selection before it builds the menu, so a row number outside it
+  shows Del too, and Del then acts on that row as the entry does; the test is for an opener that
+  does not re-select.
   The cell menu's single-row *Delete row* wears none, and neither does the editor's *Ask AI*, which
   acts on the right-clicked statement where Ctrl+K takes the caret or selection; the editor's
   *Format* wears Ctrl+Alt+L, being the same `format_editor` call. The builder is a no-op on
