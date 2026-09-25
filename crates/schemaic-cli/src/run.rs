@@ -659,7 +659,9 @@ async fn connect(
     if let Some(password) = piped {
         conn.password = password;
     }
-    let tunnel = if conn.ssh.enabled {
+    // `uses_tunnel`, the one answer every tunnel site asks: a SQLite
+    // connection with a leftover SSH block has no server to tunnel to.
+    let tunnel = if conn.uses_tunnel() {
         let opened = tokio::time::timeout(
             timeout,
             schemaic_db::ssh::open_tunnel(&conn.ssh, &conn.host, conn.port),

@@ -375,14 +375,16 @@ pub fn hydrate_connection(
 }
 
 /// The secret kinds `conn` has no use for as configured: both SSH secrets when
-/// it has no tunnel, and the one its SSH auth method does not take — the
-/// passphrase for a password login, the password for a key, both for the agent.
+/// it has no tunnel ([`Connection::uses_tunnel`] — a file has none, whatever a
+/// leftover SSH block says), and the one its SSH auth method does not take —
+/// the passphrase for a password login, the password for a key, both for the
+/// agent.
 ///
 /// The app still hydrates every kind (a form can switch the auth method and
 /// should find the secret there); this is for a caller that only connects.
 pub fn unused_kinds(conn: &Connection) -> Vec<SecretKind> {
     use crate::connection::SshAuth;
-    if !conn.ssh.enabled {
+    if !conn.uses_tunnel() {
         return vec![SecretKind::SshPassword, SecretKind::SshPassphrase];
     }
     match conn.ssh.auth {
@@ -822,6 +824,24 @@ mod tests {
         assert_eq!(unused_kinds(&c), vec![SecretKind::SshPassphrase]);
         c.ssh.auth = SshAuth::Agent;
         assert_eq!(unused_kinds(&c).len(), 2);
+    }
+
+    /// **A file has no tunnel, whatever its SSH block says.** A SQLite
+    /// connection switched over from a tunnelled server one keeps
+    /// `ssh.enabled` until its form is next saved; the CLI read the SSH
+    /// password for it from the keyring and dialled the bastion to open a
+    /// local file. `Connection::uses_tunnel` is the one answer.
+    #[test]
+    fn a_file_connection_reads_no_ssh_secret() {
+        use crate::connection::SshAuth;
+        let mut c = conn(1);
+        c.db_type = "SQLite".to_string();
+        c.ssh.enabled = true;
+        c.ssh.auth = SshAuth::Password;
+        assert_eq!(
+            unused_kinds(&c),
+            vec![SecretKind::SshPassword, SecretKind::SshPassphrase]
+        );
     }
 
     #[test]

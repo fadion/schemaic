@@ -9524,7 +9524,10 @@ existing prose was left alone.
   switched over from a tunnelled MySQL one kept `ssh.enabled` set with no control anywhere that
   could unset it, and every operation on a local file dialled a bastion with a stored credential and
   failed outright when that host was down. `Connection::uses_tunnel()` is the one answer every
-  tunnel site asks (there are six), and `Connection::sanitized()` — which `DraftSignals::to_connection`
+  tunnel site asks — the app's six, the CLI's `connect`, and `secrets::unused_kinds`, which decides
+  whether the CLI reads the SSH secrets at all. The CLI asked `ssh.enabled` for both for a while, so
+  `schemaic ping` on such a file read the SSH password from the keyring and dialled the bastion
+  (`a_file_connection_reads_no_ssh_secret`). And `Connection::sanitized()` — which `DraftSignals::to_connection`
   returns through — drops the server side on save so the state cannot exist. `is_networked` likewise
   has a single definition in `core::connection`, which `db::Engine` and the form's `DbKind` both
   delegate to; it had two, and the third consumer not asking at all is what this cost. That third
