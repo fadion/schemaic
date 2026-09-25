@@ -447,7 +447,33 @@ pub(crate) fn workspace_sources() -> Vec<(String, String)> {
         // exists to catch — one directory short-changing the corpus while the
         // total still looks healthy.
         ("schemaic-conn/", 2),
+        // **In the census since `mcp.rs` moved here**, and for the reason
+        // `conn/secrets.rs` is above: the file was a member of gates in this
+        // module (`emit().join` among them) while it lived in `schemaic-app`,
+        // and a move out of the corpus is a silent exit from every one.
+        ("schemaic-cli/", 10),
     ])
+}
+
+/// The production code of one workspace file, named as [`workspace_sources`]
+/// reports it (`schemaic-cli/mcp.rs` is `crates/schemaic-cli/src/mcp.rs`) —
+/// `.expect`ed, so a gate over a file that moved fails rather than scanning
+/// nothing. Read directly: walking the whole census to keep one file is every
+/// crate's source read and cut for nothing.
+#[cfg(test)]
+pub(crate) fn workspace_source(name: &str) -> String {
+    let (krate, rel) = name
+        .split_once('/')
+        .unwrap_or_else(|| panic!("{name} names no crate"));
+    let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("the workspace's crates dir")
+        .join(krate)
+        .join("src")
+        .join(rel);
+    let src = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("{name} is not readable at {}: {e}", path.display()));
+    production_code(&src)
 }
 
 /// The `.rs` files of the named crates, as `(display name, production code)`.
@@ -569,12 +595,20 @@ fn collect_rs(dir: &std::path::Path, label: &str, rel: &str, out: &mut Vec<(Stri
 /// the tree outside these two crates' production code are a CLI-help fixture, a
 /// synthetic source fixture and two live-test SQL strings, all of which mean
 /// their newline.
+///
+/// **And `schemaic-cli`, since `mcp.rs` moved there.** Every tool description
+/// and refusal a model reads is a literal in that file, and the move took it
+/// out of [`super::crate_sources`] — a `\n` planted in one passed this gate
+/// until the corpus followed it.
 #[cfg(test)]
 mod no_continuation_typed_as_newline_gate {
     #[test]
     fn a_wrapped_sentence_is_continued_not_broken() {
         let mut offenders: Vec<String> = Vec::new();
-        for (name, code) in super::crate_sources() {
+        let cli = super::workspace_sources()
+            .into_iter()
+            .filter(|(name, _)| name.starts_with("schemaic-cli/"));
+        for (name, code) in super::crate_sources().into_iter().chain(cli) {
             for (i, line) in code.lines().enumerate() {
                 let mut from = 0usize;
                 while let Some(at) = line[from..].find("\\n") {
@@ -595,6 +629,170 @@ mod no_continuation_typed_as_newline_gate {
             }
         }
         assert!(offenders.is_empty(), "{}", offenders.join("\n"));
+    }
+}
+
+/// The MCP server's deadline gates — over `schemaic-cli/mcp.rs`, whose own
+/// tests they were until the server moved into that crate.
+///
+/// **Here because the walk is here.** Both need [`super::production_code`]'s
+/// brace-aware cut, and `schemaic-cli` is Floem-free: a dev-dependency on this
+/// crate would compile Floem into its tests, and a second copy of the walk is
+/// the thing this module exists to prevent. `nothing_joins_the_emitted_…`
+/// below is here for the same reason.
+#[cfg(test)]
+mod mcp_deadline_gate {
+    fn mcp_rs() -> String {
+        super::workspace_source("schemaic-cli/mcp.rs")
+    }
+
+    /// **The deadline is a property of the server, not of one tool** — and it
+    /// was a property of one tool. Three of the four database reads built a
+    /// fresh `CancellationToken` that nothing ever cancelled and awaited it
+    /// bare: `describe_table`'s sample, `list_schema`'s two, and
+    /// `propose_table_change`'s.
+    ///
+    /// A unit test of `with_deadline` cannot see that, because the defect was
+    /// entirely in who called it — so the subject is the source: every
+    /// `CancellationToken::new()` in that module belongs to a `with_deadline`.
+    #[test]
+    fn every_database_read_carries_the_deadline() {
+        let body = mcp_rs();
+        let body = body.as_str();
+        // Comments dropped before the window is measured: a paragraph
+        // explaining *why* a read has a deadline would otherwise push the
+        // `with_deadline` that proves it out of view, which is exactly what it
+        // did on the first run of this gate.
+        //
+        // **Blank lines too, now that the walk *blanks* a comment rather than
+        // removing it** — which it does so that a line number still means
+        // something. The old filter asked only whether a line starts with `//`,
+        // so every comment line came through as `""` and filled the window
+        // again, in the one function whose comments are longest.
+        let code: Vec<(u32, &str)> = body
+            .split('\n')
+            .enumerate()
+            .map(|(n, l)| (n as u32 + 1, l))
+            .filter(|(_, l)| !l.trim().is_empty())
+            .filter(|(_, l)| !l.trim_start().starts_with("//"))
+            .collect();
+        let mut offenders: Vec<u32> = Vec::new();
+        let mut tokens = 0usize;
+        for (i, (line_no, line)) in code.iter().enumerate() {
+            if !line.contains("CancellationToken::new()") {
+                continue;
+            }
+            tokens += 1;
+            // Either the token is handed straight to `with_deadline` here, or it
+            // is bound here and used by one a few lines of *code* below.
+            let window = code[i..(i + 5).min(code.len())]
+                .iter()
+                .map(|(_, l)| *l)
+                .collect::<Vec<_>>()
+                .join("\n");
+            if !window.contains("with_deadline(") {
+                offenders.push(*line_no);
+            }
+        }
+        assert!(
+            tokens >= 4,
+            "the needle stopped matching: {tokens} tokens found in mcp.rs, which builds at \
+             least four — a gate that scans nothing reports success"
+        );
+        assert!(
+            offenders.is_empty(),
+            "database reads at mcp.rs {offenders:?} build a cancellation token nothing \
+             ever cancels and await it with no deadline — the serve loop is \
+             sequential, so one slow read answers nothing and wedges every \
+             request queued behind it"
+        );
+
+        // And the other direction, which is the defect the token gate could not
+        // see: a read with **no** token must not go through the `with_deadline`
+        // that keeps the future alive across the cancel, because over a
+        // tokenless read that is a wait for the server rather than a deadline.
+        for line in body
+            .split('\n')
+            .filter(|l| !l.trim_start().starts_with("//"))
+        {
+            assert!(
+                !(line.contains("with_deadline(") && line.contains("fetch_table_list")),
+                "`fetch_table_list` takes no CancellationToken, so `with_deadline` \
+                 waits it out rather than bounding it — use \
+                 `with_deadline_abandoning`:\n{line}"
+            );
+        }
+    }
+
+    /// **The property both halves above were reaching for, stated once.**
+    ///
+    /// Each of them names a spelling: one enumerates `CancellationToken::new()`
+    /// sites, the other is a literal pair check for `with_deadline(` and
+    /// `fetch_table_list` on one line. Neither could see `list_schema`'s
+    /// `db.fetch_databases().await` — the overview form's *first* read, the
+    /// tool's advertised entry point, with no deadline at all — because it
+    /// builds no token and names no function either gate knows. The commit that
+    /// wrote the second half audited this very function, restated its read count
+    /// from four to six, and still did not count that one; there are seven.
+    ///
+    /// So: **every awaited `db.…()` read in production code is lexically inside
+    /// a deadline wrapper.** No hand-maintained list, so a new read has to be
+    /// wrapped rather than added to an array. The floor is there because a
+    /// needle that stops matching must not read as a clean file.
+    #[test]
+    fn no_database_read_is_awaited_without_a_deadline() {
+        let body = mcp_rs();
+        let mut checked = 0usize;
+        let mut offenders: Vec<String> = Vec::new();
+        let mut from = 0usize;
+        while let Some(rel) = body[from..]
+            .find("db.fetch_")
+            .into_iter()
+            .chain(body[from..].find("db.run_"))
+            .min()
+        {
+            let at = from + rel;
+            from = at + 1;
+            checked += 1;
+            // **The whole call, not one line.** The wrapper is the call this one
+            // is an argument to, so it is to the left — but rustfmt breaks a
+            // long call across lines, and two of the four wrapped reads here are
+            // written that way. A line-oriented scan would report both as
+            // offenders and, worse, would report a broken *unwrapped* one as
+            // clean. So: the nearest `with_deadline` behind this read counts
+            // only if no statement boundary stands between them.
+            let before = &body[..at];
+            let wrapped = before.rfind("with_deadline").is_some_and(|w| {
+                !before[w..].contains(';')
+                    && !before[w..].contains('{')
+                    && !before[w..].contains('}')
+            });
+            if !wrapped {
+                let line = 1 + before.bytes().filter(|c| *c == b'\n').count();
+                let text = body[at..].split('\n').next().unwrap_or_default();
+                offenders.push(format!("mcp.rs:{line}: {}", text.trim()));
+            }
+        }
+        // **Six, down from seven, and the seventh was not deleted — it moved.**
+        // `run_query`'s `fetch_query` folded into `query::read_only_query` so
+        // the CLI and this server share one read path. Lowering a floor is
+        // exactly the edit this gate exists to make someone justify, so: the
+        // read is still wrapped, by `deadline::with_deadline`, and
+        // `no_database_read_in_this_crate_is_awaited_without_a_deadline` is the
+        // same gate over `query.rs`, following it. Lower this again only for
+        // the same reason, and only after checking the read still has a gate
+        // wherever it went.
+        assert!(
+            checked >= 6,
+            "the needle stopped matching: {checked} database reads found, and mcp.rs \
+             has at least six — a gate that scans nothing reports success"
+        );
+        assert!(
+            offenders.is_empty(),
+            "database reads awaited with no deadline; the serve loop is sequential, \
+             so one slow read answers nothing and wedges every request behind it:\n{}",
+            offenders.join("\n")
+        );
     }
 }
 

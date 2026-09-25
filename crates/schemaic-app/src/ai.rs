@@ -20,6 +20,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 
 use schemaic_ai::harness::{Constraint, Harness};
+use schemaic_cli::mcp::{Host, McpTool};
 use schemaic_core::connection::{AiData, Connection};
 use schemaic_core::intel::SqlDialect;
 use schemaic_core::persist;
@@ -48,11 +49,12 @@ use crate::agent_cli::{harness_bin, probe};
 /// the model in the same breath that `list_schema` and `describe_table` were
 /// unavailable.
 ///
-/// **Derived from [`crate::mcp::McpTool`], not typed out.** It used to be two
+/// **Derived from [`McpTool`], not typed out.** It used to be two
 /// hand-written `const` lists in this file — two more independent spellings of a
 /// set the compiler related to nothing, on top of the three in `mcp.rs`. A fifth
 /// tool now cannot be added without answering both gates for it, and the answers
-/// reach here.
+/// reach here — through [`McpTool::offered`] itself, so this list and the
+/// server's `tools/list` are one predicate rather than two that agree today.
 ///
 /// `describe_table` and `propose_table_change` stay available with **queries**
 /// off — they read structure and run nothing, which is not the access `AiData`
@@ -71,9 +73,9 @@ use crate::agent_cli::{harness_bin, probe};
 /// CLI's own tools — that is why nineteen of them were reachable, and why the
 /// guard on them is `--tools ""` rather than this list.
 pub(crate) fn ai_allowed_tools(may_query: bool, schema: bool) -> Vec<&'static str> {
-    crate::mcp::McpTool::ALL
+    McpTool::ALL
         .into_iter()
-        .filter(|t| (may_query || !t.reads_row_data()) && (schema || !t.reads_schema()))
+        .filter(|t| t.offered(may_query, schema, Host::Panel))
         .map(|t| t.ai_name())
         .collect()
 }
@@ -238,34 +240,12 @@ impl Drop for AiSession {
     }
 }
 
-/// What the MCP subprocess is pointed at: the DB handle, the default database
-/// for tool calls, and whether it may include sample rows in its results.
-pub(crate) struct McpEndpoint {
-    pub(crate) db: Db,
-    pub(crate) database: Option<String>,
-    /// Mirrors the AI panel's "run queries" setting — the one flag the MCP
-    /// subprocess has for [`AiData::may_query`]. With it off the server neither
-    /// advertises nor answers `run_query` (`mcp::tools_list`, `mcp::refusal_for`).
-    /// `describe_table` is a schema tool the assistant keeps either way, but its
-    /// sample-rows section reads real data — so that section is dropped rather
-    /// than the whole tool.
-    pub(crate) samples: bool,
-    /// Databases the SCHEMA eye has hidden, as of the moment this session was
-    /// spawned. `list_schema`'s server overview leaves them out — see
-    /// `mcp::listed_databases` for which half of that tool they affect and why
-    /// the other half is answered in full.
-    pub(crate) hidden: HashSet<String>,
-    /// May the assistant read the **catalogue** — the app's *Schema context*
-    /// setting, as of the moment this session was spawned.
-    ///
-    /// `false` is `SchemaScope::None`, where the system prompt carries no
-    /// databases and no tables. Without it here the subprocess still advertised
-    /// `list_schema`, whose first call hands back every database and every table
-    /// name, so the setting was defeated in one call. Plumbed like `samples`
-    /// rather than only into the prompt, for the same reason: a listing the
-    /// model already holds must not reach the DB.
-    pub(crate) schema: bool,
-}
+/// What the MCP subprocess is pointed at — the server's own
+/// [`schemaic_cli::mcp::Endpoint`], which documents each field. The app's part
+/// is building one from the blob it wrote ([`endpoint_from_value`]), always as
+/// [`Host::Panel`]; `schemaic mcp -c` builds the other kind from a saved
+/// connection.
+pub(crate) type McpEndpoint = schemaic_cli::mcp::Endpoint;
 
 /// Parse the MCP DB endpoint from the `--endpoint-file` this process was given,
 /// or from `$SCHEMAIC_MCP_ENDPOINT` (the JSON the app writes into Claude's MCP
@@ -414,6 +394,9 @@ fn endpoint_from_value(v: &serde_json::Value) -> McpEndpoint {
                     .collect()
             })
             .unwrap_or_default(),
+        // Only the app writes a blob, so a blob is the panel by construction —
+        // not a field the blob could get wrong.
+        host: Host::Panel,
     }
 }
 
@@ -4018,7 +4001,7 @@ mod tests {
                     schemaic_db::Engine::Sqlite,
                 ] {
                     let mut offered: Vec<String> =
-                        crate::mcp::tools_list(engine, reads_data, schema)
+                        schemaic_cli::mcp::tools_list(engine, reads_data, schema, Host::Panel)
                             .as_array()
                             .expect("a list")
                             .iter()

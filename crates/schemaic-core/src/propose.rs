@@ -761,7 +761,7 @@ mod tests {
     }
 
     /// **Resolving is not enough: the table has to survive `apply` too.** Both
-    /// real callers (`app/mcp.rs`'s `propose_table_change` and
+    /// real callers (`cli/mcp.rs`'s `propose_table_change` and
     /// `ui/ddl_preview.rs`'s card) do `resolve_target` and then hand the very
     /// same `TableInfo` to `apply`, so the property "every form the listings can
     /// print lands on the same table" is a property of the *composition*. The

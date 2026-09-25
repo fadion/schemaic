@@ -5,8 +5,9 @@ Zed-inspired, aiming to replace DataGrip. Workspace crates: `schemaic-core` (mod
 unit-tested SQL/edit/export/DDL logic), `schemaic-db` (MySQL/MariaDB + PostgreSQL + SQLite + SSH
 tunnels), `schemaic-conn` (saved connections hydrated from the OS keyring — the seam a non-GUI
 front end loads a connection through), `schemaic-cli` (the headless `schemaic query`/`exec` and their
-siblings, no Floem), `schemaic-ai`, `schemaic-term`, `schemaic-ui` (the Floem views), `schemaic-app` (signal
-wiring, the built-in MCP server, the CLI's argv branch).
+siblings, and the MCP server both `schemaic mcp` and the AI panel run; no Floem), `schemaic-ai`,
+`schemaic-term`, `schemaic-ui` (the Floem views), `schemaic-app` (signal wiring, the panel's
+`--mcp-serve` branch, the CLI's argv branch).
 
 **Three engines, and they are not equal.** MySQL/MariaDB and PostgreSQL are full; SQLite reads,
 writes, imports and edits **tables** (through the twelve-step rebuild — `ddl::sqlite_rebuild_sql`),

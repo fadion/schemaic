@@ -233,6 +233,24 @@ and pipe it in, so it stays out of the process list and your shell's history.
 `-f`/`--file <path>` reads the statement from a file instead — still one
 statement, not a script.
 
+`schemaic mcp --connection=prod` serves one connection to any AI agent that
+speaks [MCP](https://modelcontextprotocol.io) — an editor's assistant, a desktop
+app — over stdin and stdout. It is the same server the AI panel runs, and it is
+for the agent to launch, not for you to type:
+
+```json
+{ "mcpServers": { "prod": { "command": "schemaic", "args": ["mcp", "--connection=prod"] } } }
+```
+
+The agent gets `list_schema` and `describe_table`, and `run_query` (read-only,
+200 rows) only if the connection's **AI data access** is *Let it read data*. At
+the default, *Only what I attach*, the agent reads no rows, since an outside
+agent has no way to be handed any. The same **CLI access** switch gates it, and
+it prints on stderr — which clients keep as the server's log — what it is serving
+and why a tool is missing. `-d` sets the database the tools default to (on
+SQLite there is only ever `main`). There is
+no `--password-stdin` here, because stdin belongs to the agent.
+
 On Linux the `.deb` and `.rpm` put `schemaic` on your `PATH` already. Elsewhere,
 **Settings → General → Command line → Install** does it: on Windows it adds the
 app's folder, where `schemaic.com` sits beside `schemaic.exe`, to your user

@@ -21,7 +21,6 @@ mod history_store;
 mod install_cli;
 mod liveness;
 mod logging;
-mod mcp;
 mod opencode;
 mod script;
 mod snippet_store;
@@ -181,12 +180,12 @@ fn main() -> std::process::ExitCode {
             .enable_all()
             .build()
             .expect("build tokio runtime");
-        rt.block_on(mcp::serve(endpoint));
+        rt.block_on(schemaic_cli::mcp::serve(endpoint));
         return std::process::ExitCode::SUCCESS;
     }
 
     // Headless CLI mode — `schemaic list` / `databases` / `tables` / `describe` /
-    // `query` / `exec` / `ping` / `version` / `help`. Like
+    // `query` / `exec` / `ping` / `mcp` / `version` / `help`. Like
     // `--mcp-serve` above it returns before Velopack, the file logger, the
     // fonts and Floem: none of that belongs in a one-shot command, and the
     // updater's auto-apply-on-startup would be free to exit and relaunch the

@@ -18,7 +18,7 @@ use schemaic_core::secrets::SecretKind;
 use schemaic_core::sql::NoDatabaseFailure;
 use schemaic_db::Db;
 
-use crate::args::{Command, ConnArgs, OutputArgs, SqlArgs, SqlSource, Target};
+use crate::args::{Command, ConnArgs, McpTarget, OutputArgs, SqlArgs, SqlSource, Target};
 use crate::format::{self, Format, Output};
 use crate::{catalog, exec, query, select};
 
@@ -288,6 +288,92 @@ async fn dispatch(command: Command) -> Exit {
             )
             .await
         }
+        Command::Mcp { target } => serve_mcp(&file.connections, &target).await,
+    }
+}
+
+/// `schemaic mcp`.
+///
+/// **Select, connect, then serve until the client closes stdin.** The same
+/// [`select_conn`] as every other subcommand, so a connection without CLI
+/// access is refused before the keyring is read — exit 3, and the MCP client
+/// shows the server as failed with that line as its log. The tunnel is opened
+/// once and held for the server's lifetime; every tool call is still its own
+/// connection, since `Db` connects per operation.
+///
+/// No database connection is made before the first tool call — only the SSH
+/// tunnel, if there is one, is opened here: a database that is down
+/// right now is an error the model sees on that call and may retry, not a
+/// server that never started.
+///
+/// **stdout is the protocol's**, so what this says goes to stderr, which MCP
+/// clients keep as the server's log — and the one line said is what is being
+/// served, which is the first question when a tool is missing.
+async fn serve_mcp(conns: &[Connection], target: &McpTarget) -> Exit {
+    let args = ConnArgs {
+        connection: target.connection.clone(),
+        password_stdin: false,
+    };
+    let conn = match select_conn(conns, &args) {
+        Ok(c) => c,
+        Err(exit) => return exit,
+    };
+    let (db, _tunnel) = match connect(conn, &args, query::DEFAULT_TIMEOUT).await {
+        Ok(v) => v,
+        Err(exit) => return exit,
+    };
+    let endpoint = crate::mcp::Endpoint::standalone(
+        db,
+        default_database(target.database.as_deref(), conn),
+        conn.ai_data,
+    );
+    eprintln!(
+        "{}",
+        mcp_notice(conn, endpoint.samples, endpoint.database.as_deref())
+    );
+    crate::mcp::serve(endpoint).await;
+    Exit::Ok
+}
+
+/// What `schemaic mcp` says on stderr as it starts: which connection, and —
+/// when it is withheld — why `run_query` is missing and where that is changed.
+/// A model that finds no query tool reports it as a bug, so the reason has to
+/// be in the log beside it.
+///
+/// **And when there is no default database, it says so with the fix.** On a
+/// server engine with neither `-d` nor a saved default, every tool that needs
+/// one has to be told, call by call; an agent that does not know that sees
+/// `relation does not exist` for a table `list_schema` just showed it.
+fn mcp_notice(conn: &Connection, rows: bool, database: Option<&str>) -> String {
+    let mut s = format!(
+        "schemaic mcp: serving connection '{}' on stdin/stdout",
+        conn.name
+    );
+    if !rows {
+        s.push_str(&format!(
+            "; run_query is withheld — its AI data access is \"{}\" (set \"{}\" in \
+             Schemaic's connection settings to allow it)",
+            conn.ai_data.unwrap_or_default().label(),
+            schemaic_core::connection::AiData::Full.label(),
+        ));
+    }
+    if database.is_none() {
+        s.push_str(&format!(
+            "; no default database, so the tools run where the server puts them unless a call \
+             names one — pass -d <database> to set it (`schemaic databases -c {}` lists them)",
+            shell_word(&conn.name),
+        ));
+    }
+    s
+}
+
+/// A connection name as it can be pasted back after `-c`: quoted when it has a
+/// space, since a name is allowed one.
+fn shell_word(name: &str) -> String {
+    if name.contains(char::is_whitespace) {
+        format!("\"{name}\"")
+    } else {
+        name.to_string()
     }
 }
 
@@ -498,11 +584,7 @@ fn ping_rows(conn: &Connection, elapsed: Duration) -> ResultSet {
 /// `connection` is the `-c` the user gave, echoed back so the command can be
 /// copied; quoted when it has a space, since a name is allowed one.
 fn no_database_hint(connection: &str, how: NoDatabaseFailure) -> String {
-    let c = if connection.contains(char::is_whitespace) {
-        format!("\"{connection}\"")
-    } else {
-        connection.to_string()
-    };
+    let c = shell_word(connection);
     // A statement that ran somewhere has to be told where, or "does not
     // exist" reads as a wrong table name. One that was refused did not run,
     // and saying it did is worse than saying nothing.
@@ -953,9 +1035,12 @@ async fn run_exec(
 
 /// Which database to run in: the flag if given, else the connection's own.
 fn database_for(target: &Target, conn: &Connection) -> Option<String> {
-    target
-        .database
-        .clone()
+    default_database(target.database.as_deref(), conn)
+}
+
+/// [`database_for`]'s rule, for a `-d` that is not in a [`Target`].
+fn default_database(flag: Option<&str>, conn: &Connection) -> Option<String> {
+    flag.map(str::to_string)
         .or_else(|| (!conn.database.is_empty()).then(|| conn.database.clone()))
 }
 
@@ -1257,6 +1342,73 @@ mod tests {
             },
             database: database.map(str::to_string),
         }
+    }
+
+    /// **`mcp` is gated on CLI access like every other subcommand**, and
+    /// refused before anything is read or served: an agent pointed at a
+    /// connection the user never exposed gets exit 3 and a server that failed
+    /// to start, not a server with a tool list.
+    #[tokio::test]
+    async fn mcp_refuses_a_connection_without_cli_access() {
+        let c = conn("shop");
+        assert!(!c.cli_access, "the fixture is unexposed");
+        let target = McpTarget {
+            connection: "1".to_string(),
+            database: None,
+        };
+        assert_eq!(serve_mcp(&[c], &target).await, Exit::Refused);
+        let target = McpTarget {
+            connection: "nope".to_string(),
+            database: None,
+        };
+        assert_eq!(serve_mcp(&[], &target).await, Exit::Usage);
+    }
+
+    /// `-d` wins, else the connection's own, else none — `query`'s rule.
+    #[test]
+    fn mcp_defaults_to_the_connections_database() {
+        assert_eq!(
+            default_database(Some("a"), &conn("b")).as_deref(),
+            Some("a")
+        );
+        assert_eq!(default_database(None, &conn("b")).as_deref(), Some("b"));
+        assert_eq!(default_database(None, &conn("")), None);
+    }
+
+    /// **The start-up line says why `run_query` is missing**, naming the level
+    /// the connection is at and the one that allows it — and says nothing
+    /// about it when it is there.
+    #[test]
+    fn the_mcp_notice_explains_a_withheld_query_tool() {
+        use schemaic_core::connection::AiData;
+        let mut c = conn("");
+        c.name = "Prod EU".to_string();
+        let n = mcp_notice(&c, false, Some("shop"));
+        assert!(n.contains("'Prod EU'"), "{n}");
+        assert!(
+            n.contains(AiData::OnRequest.label()),
+            "a never-chosen level is the default: {n}"
+        );
+        assert!(n.contains(AiData::Full.label()), "{n}");
+        c.ai_data = Some(AiData::SchemaOnly);
+        assert!(mcp_notice(&c, false, Some("shop")).contains(AiData::SchemaOnly.label()));
+        let n = mcp_notice(&c, true, Some("shop"));
+        assert!(!n.contains("run_query"), "{n}");
+        assert!(!n.contains("-d"), "a default was given: {n}");
+    }
+
+    /// **No default database is said at start-up**, with the fix. Both real
+    /// saved connections the release check ran against had none, and every
+    /// tool that needed one misfired quietly — `describe_table` refused each
+    /// call without a `database`, `run_query` ran wherever the driver landed.
+    #[test]
+    fn the_mcp_notice_says_when_there_is_no_default_database() {
+        let mut c = conn("");
+        c.name = "pg".to_string();
+        let n = mcp_notice(&c, true, None);
+        assert!(n.contains("no default database"), "{n}");
+        assert!(n.contains("-d"), "{n}");
+        assert!(n.contains("schemaic databases -c pg"), "{n}");
     }
 
     const MYSQL_1046: &str =

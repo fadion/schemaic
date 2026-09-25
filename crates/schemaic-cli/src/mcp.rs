@@ -1,21 +1,38 @@
-//! Built-in MCP (stdio) server for the AI panel.
+//! The MCP (stdio) server — one server, with two ways in.
 //!
-//! Launched as `schemaic --mcp-serve` by the `claude` CLI (configured via a
-//! temp-file `--mcp-config`, so no credentials ride a command line — review C6).
-//! Speaks newline-delimited JSON-RPC over stdin/stdout and exposes three
-//! read-only tools against the DB endpoint passed in `$SCHEMAIC_MCP_ENDPOINT`:
+//! Speaks newline-delimited JSON-RPC over stdin/stdout and exposes four tools,
+//! none of which writes anything:
 //!   - `run_query` — run a single read-only statement, return the rows.
 //!   - `list_schema` — the server as an overview (databases → table names), or
 //!     one database in full (columns, PK/NOT NULL markers, foreign-key edges).
-//!   - `describe_table` — one table's DDL, foreign keys, and sample rows.
+//!   - `describe_table` — one table's DDL, foreign keys, and — where the
+//!     connection sends rows — a few sample rows.
+//!   - `propose_table_change` — check a schema change and show the DDL it would
+//!     produce, for the AI panel to turn into a preview. Runs nothing.
 //!
-//! The split is deliberate: enriching every table with keys makes each entry
-//! bigger, so the broad listing stays cheap and the detail lives behind a
-//! drill-down rather than blowing the model's context on a 50-database server.
+//! The split between the two schema tools is deliberate: enriching every table
+//! with keys makes each entry bigger, so the broad listing stays cheap and the
+//! detail lives behind a drill-down rather than blowing the model's context on
+//! a 50-database server.
 //!
-//! The endpoint points at the app's active connection (already tunnelled for
-//! SSH, since the tunnel is just a local listener any process can use), and is a
-//! structured `schemaic_db::Db` handle — no credential URL is involved.
+//! **Who starts it decides the [`Host`]**, and the host decides what is offered:
+//!
+//! - [`Host::Panel`] — `schemaic --mcp-serve`, spawned by whichever agent CLI
+//!   (`claude`, `codex`, `agy`, …) the AI panel launched. The endpoint is the
+//!   app's active connection, already tunnelled for SSH, and reaches the
+//!   process in `$SCHEMAIC_MCP_ENDPOINT` or an `--endpoint-file` — never on a
+//!   command line (review C6). The app builds it; `schemaic-app/src/ai.rs`
+//!   parses it.
+//! - [`Host::Standalone`] — `schemaic mcp -c <conn>`, spawned by any MCP client
+//!   (an editor's agent, a desktop assistant). The connection is resolved
+//!   through `schemaic-conn` exactly as `schemaic query` resolves it, gated on
+//!   `cli_access`, and its tunnel is held for the server's lifetime. Nothing
+//!   reads the model's reply there, so `propose_table_change` has nowhere to
+//!   go and is withheld.
+//!
+//! Either way the endpoint is a structured `schemaic_db::Db` handle — no
+//! credential URL is involved — and it lives in this crate rather than the app's
+//! so the second way in is the same server, not a copy of its gates.
 
 use std::collections::HashSet;
 
@@ -26,7 +43,7 @@ use schemaic_core::propose::{self, Proposal};
 use schemaic_core::schema::{DbSchema, TableInfo};
 use schemaic_db::Db;
 use serde_json::{Value, json};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio_util::sync::CancellationToken;
 
 // Max rows returned to the AI/MCP client per query (a small preview — the
@@ -60,19 +77,132 @@ fn negotiate_protocol(requested: Option<&str>) -> &'static str {
         .unwrap_or(SUPPORTED_PROTOCOLS[0])
 }
 
+/// Who started this server — and so where a tool's result can lead.
+///
+/// The distinction is what the *reply* reaches. In the panel the app reads
+/// every reply the model writes, which is what makes `propose_table_change`
+/// worth having: a proposal echoed into a fenced block becomes a change
+/// preview. Standalone, the client is someone else's and nothing of ours reads
+/// the reply, so the tool would describe a preview that never appears.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Host {
+    /// `schemaic --mcp-serve`, spawned for the AI panel.
+    Panel,
+    /// `schemaic mcp -c <conn>`, spawned by any MCP client.
+    Standalone,
+}
+
+/// What the server is pointed at, and what it may hand over.
+pub struct Endpoint {
+    pub db: Db,
+    /// The default database for tool calls — `USE`d by `run_query`, and where
+    /// `describe_table` and `propose_table_change` look when not told.
+    pub database: Option<String>,
+    /// May the assistant read **rows** on its own — the connection's
+    /// [`AiData::may_query`](schemaic_core::connection::AiData::may_query).
+    /// With it off the server neither advertises nor answers `run_query`
+    /// ([`tools_list`], [`refusal_for`]). `describe_table` is a schema tool the
+    /// assistant keeps either way, but its sample-rows section reads real
+    /// data — so that section is dropped rather than the whole tool.
+    pub samples: bool,
+    /// Databases the SCHEMA eye has hidden, as of the moment this session was
+    /// spawned. `list_schema`'s server overview leaves them out — see
+    /// [`listed_databases`] for which half of that tool they affect and why the
+    /// other half is answered in full. Empty standalone: `schemaic databases`
+    /// lists them all too, and the eye is the app's view state rather than
+    /// anything saved on the connection.
+    pub hidden: HashSet<String>,
+    /// May the assistant read the **catalogue** — the app's *Schema context*
+    /// setting, as of the moment this session was spawned.
+    ///
+    /// `false` is `SchemaScope::None`, where the system prompt carries no
+    /// databases and no tables. Without it here the subprocess still advertised
+    /// `list_schema`, whose first call hands back every database and every table
+    /// name, so the setting was defeated in one call. Plumbed like `samples`
+    /// rather than only into the prompt, for the same reason: a listing the
+    /// model already holds must not reach the DB. Always `true` standalone,
+    /// which has no system prompt to budget and whose `cli_access` already
+    /// publishes the catalogue through `schemaic tables` and `describe`.
+    pub schema: bool,
+    pub host: Host,
+}
+
+impl Endpoint {
+    /// The endpoint `schemaic mcp` serves for a saved connection, whose
+    /// `ai_data` is `ai_data`.
+    ///
+    /// **Rows only at [`AiData::Full`](schemaic_core::connection::AiData::Full)**
+    /// — `may_query`, the panel's own gate. `OnRequest` is the level whose
+    /// rows reach a model only by the user's attach gesture, and an outside
+    /// client has none, so it sends none rather than being promoted.
+    ///
+    /// **`None` is the default level, not the migration's answer.** The app
+    /// resolves a never-chosen level at startup from the legacy global
+    /// "run queries" flag, which defaulted *on*; the CLI cannot read that
+    /// flag, and guessing `Full` would hand rows to an agent on a connection
+    /// whose owner was never asked.
+    ///
+    /// **[`Db::implied_database`] comes first**, where the panel would have
+    /// passed the tree's selection: a SQLite file's `main` is the database the
+    /// user is in whether or not anyone named it — and, `catalog.rs`'s rule,
+    /// whatever `-d` or `SCHEMAIC_DATABASE` says, since every operation opens
+    /// its own connection and nothing else is ever attached.
+    pub fn standalone(
+        db: Db,
+        database: Option<String>,
+        ai_data: Option<schemaic_core::connection::AiData>,
+    ) -> Endpoint {
+        let database = db.implied_database().map(str::to_string).or(database);
+        Endpoint {
+            db,
+            database,
+            samples: ai_data.unwrap_or_default().may_query(),
+            hidden: HashSet::new(),
+            schema: true,
+            host: Host::Standalone,
+        }
+    }
+}
+
 /// Run the stdio JSON-RPC loop until stdin closes, against the resolved
 /// endpoint (its `database` is the default schema `USE`d for `run_query`).
-pub async fn serve(endpoint: crate::ai::McpEndpoint) {
-    let crate::ai::McpEndpoint {
-        db,
-        database,
-        samples: reads_data,
-        hidden,
-        schema,
-    } = endpoint;
-    let mut lines = BufReader::new(tokio::io::stdin()).lines();
-    let mut stdout = tokio::io::stdout();
-    while let Ok(Some(line)) = lines.next_line().await {
+pub async fn serve(endpoint: Endpoint) {
+    serve_on(
+        &endpoint,
+        BufReader::new(tokio::io::stdin()),
+        tokio::io::stdout(),
+    )
+    .await;
+}
+
+/// [`serve`] over any reader and writer, so the protocol loop itself — not
+/// just the pure pieces it calls — is tested.
+async fn serve_on<R, W>(endpoint: &Endpoint, input: R, mut stdout: W)
+where
+    R: AsyncBufRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let mut input = input;
+    let mut raw = Vec::new();
+    loop {
+        // **Bytes, then UTF-8, one line at a time.** `lines()` returns an
+        // error for a line that is not UTF-8, and `while let Ok(Some(..))`
+        // took that for the end of input: the server exited 0 mid-session as
+        // though the client had hung up. JSON is UTF-8 by definition, so such
+        // a line is no request — it is skipped, and said on stderr.
+        raw.clear();
+        match input.read_until(b'\n', &mut raw).await {
+            Ok(0) => break,
+            Ok(_) => {}
+            Err(e) => {
+                eprintln!("schemaic mcp: stopped reading requests: {e}");
+                break;
+            }
+        }
+        let Ok(line) = std::str::from_utf8(&raw) else {
+            eprintln!("schemaic mcp: skipped a request line that is not UTF-8");
+            continue;
+        };
         let line = line.trim();
         if line.is_empty() {
             continue;
@@ -95,7 +225,14 @@ pub async fn serve(endpoint: crate::ai::McpEndpoint) {
                     "serverInfo": { "name": "schemaic", "version": env!("CARGO_PKG_VERSION") }
                 }))
             }
-            "tools/list" => Some(json!({ "tools": tools_list(db.engine(), reads_data, schema) })),
+            "tools/list" => Some(json!({
+                "tools": tools_list(
+                    endpoint.db.engine(),
+                    endpoint.samples,
+                    endpoint.schema,
+                    endpoint.host,
+                )
+            })),
             "tools/call" => {
                 let name = req
                     .pointer("/params/name")
@@ -106,31 +243,33 @@ pub async fn serve(endpoint: crate::ai::McpEndpoint) {
                     .pointer("/params/arguments")
                     .cloned()
                     .unwrap_or(json!({}));
-                Some(
-                    call_tool(
-                        &db,
-                        database.as_deref(),
-                        reads_data,
-                        schema,
-                        &hidden,
-                        &name,
-                        &args,
-                    )
-                    .await,
-                )
+                Some(call_tool(endpoint, &name, &args).await)
             }
             "ping" => Some(json!({})),
-            // Unknown request → empty result; notifications (no id) → nothing.
-            _ => id.as_ref().map(|_| json!({})),
+            // Anything else is not implemented here. A notification (no id)
+            // is owed nothing; a request is owed JSON-RPC's "method not
+            // found" rather than an empty result, which reads as success —
+            // `resources/list` answered `{}` has no `resources`, and a strict
+            // client fails its schema check and marks the server broken.
+            _ => None,
         };
 
-        if let (Some(id), Some(result)) = (id, result) {
-            let msg = json!({ "jsonrpc": "2.0", "id": id, "result": result });
-            let _ = stdout.write_all(format!("{msg}\n").as_bytes()).await;
-            let _ = stdout.flush().await;
-        }
+        let Some(id) = id else { continue };
+        let msg = match result {
+            Some(result) => json!({ "jsonrpc": "2.0", "id": id, "result": result }),
+            None => json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "error": { "code": METHOD_NOT_FOUND, "message": format!("Method not found: {method}") }
+            }),
+        };
+        let _ = stdout.write_all(format!("{msg}\n").as_bytes()).await;
+        let _ = stdout.flush().await;
     }
 }
+
+/// JSON-RPC 2.0's code for a method the server does not implement.
+const METHOD_NOT_FOUND: i64 = -32601;
 
 /// The tools this server offers — **the set, as a type**.
 ///
@@ -149,7 +288,7 @@ pub async fn serve(endpoint: crate::ai::McpEndpoint) {
 /// rule `ai/harness.rs`'s `env_seal` states one crate over — *"a fifth harness
 /// is a compile error here rather than a silent default there"*.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum McpTool {
+pub enum McpTool {
     RunQuery,
     ListSchema,
     DescribeTable,
@@ -158,7 +297,7 @@ pub(crate) enum McpTool {
 
 impl McpTool {
     /// Every tool, in the order `tools/list` advertises them.
-    pub(crate) const ALL: [McpTool; 4] = [
+    pub const ALL: [McpTool; 4] = [
         McpTool::RunQuery,
         McpTool::ListSchema,
         McpTool::DescribeTable,
@@ -166,7 +305,7 @@ impl McpTool {
     ];
 
     /// The name on the wire.
-    pub(crate) fn name(self) -> &'static str {
+    pub fn name(self) -> &'static str {
         match self {
             McpTool::RunQuery => "run_query",
             McpTool::ListSchema => "list_schema",
@@ -178,7 +317,7 @@ impl McpTool {
     /// The name a CLI harness's allow-list spells it under. Written out rather
     /// than `format!`ed so it is a `&'static str` the allow-lists can hold —
     /// and so a fifth tool has to state it here too.
-    pub(crate) fn ai_name(self) -> &'static str {
+    pub fn ai_name(self) -> &'static str {
         match self {
             McpTool::RunQuery => "mcp__schemaic__run_query",
             McpTool::ListSchema => "mcp__schemaic__list_schema",
@@ -187,7 +326,7 @@ impl McpTool {
         }
     }
 
-    pub(crate) fn from_name(name: &str) -> Option<Self> {
+    pub fn from_name(name: &str) -> Option<Self> {
         McpTool::ALL.into_iter().find(|t| t.name() == name)
     }
 
@@ -198,7 +337,7 @@ impl McpTool {
     /// One predicate, consulted twice — [`tools_list`] leaves the tool out and
     /// [`refusal_for`] turns a call to it away — so a tool can never be
     /// advertised by one rule and denied by another.
-    pub(crate) fn reads_row_data(self) -> bool {
+    pub fn reads_row_data(self) -> bool {
         match self {
             McpTool::RunQuery => true,
             McpTool::ListSchema | McpTool::DescribeTable | McpTool::ProposeTableChange => false,
@@ -223,18 +362,36 @@ impl McpTool {
     ///
     /// The hidden-database set is a separate matter and still unconsulted on
     /// this path — it reaches only `listed_databases`.
-    pub(crate) fn reads_schema(self) -> bool {
+    pub fn reads_schema(self) -> bool {
         match self {
             McpTool::RunQuery => false,
             McpTool::ListSchema | McpTool::DescribeTable | McpTool::ProposeTableChange => true,
         }
     }
 
-    /// Is this tool available at this connection's two levels? The one place
-    /// the two gates are combined, so the listing and the refusal cannot
-    /// disagree about what "available" means.
-    fn offered(self, reads_data: bool, schema: bool) -> bool {
-        (reads_data || !self.reads_row_data()) && (schema || !self.reads_schema())
+    /// Does this tool only mean something when the **app reads the reply** —
+    /// [`Host::Panel`]?
+    ///
+    /// `propose_table_change` does: its whole result is an instruction to echo
+    /// the proposal into a fenced block "and Schemaic turns that into a change
+    /// preview". Under `schemaic mcp` no Schemaic is reading, so the model
+    /// would be told the user has a preview to review when they have a code
+    /// block — and an assistant that believes the user reviewed a change is
+    /// the one that stops describing it.
+    pub fn needs_panel(self) -> bool {
+        match self {
+            McpTool::ProposeTableChange => true,
+            McpTool::RunQuery | McpTool::ListSchema | McpTool::DescribeTable => false,
+        }
+    }
+
+    /// Is this tool available at this connection's levels, from this host? The
+    /// one place the gates are combined, so the listing, the refusal and the
+    /// panel's allow-list cannot disagree about what "available" means.
+    pub fn offered(self, reads_data: bool, schema: bool, host: Host) -> bool {
+        (reads_data || !self.reads_row_data())
+            && (schema || !self.reads_schema())
+            && (host == Host::Panel || !self.needs_panel())
     }
 }
 
@@ -255,11 +412,33 @@ const NO_DATA_ACCESS: &str = "Refused: this connection's AI data access is set s
      — they can attach rows from a result grid, or raise the connection's AI data access \
      setting.";
 
-/// The refusal a tool call earns from the connection's data-access level, if
-/// any. Pure, so the gate is unit-tested without a live endpoint.
-fn refusal_for(tool: McpTool, reads_data: bool, schema: bool) -> Option<&'static str> {
+/// [`NO_DATA_ACCESS`] for [`Host::Standalone`]. The panel's advice — attach
+/// rows from a result grid — names a gesture this client does not have, so a
+/// model passing it on would send the user looking for a grid that is not
+/// there.
+const NO_DATA_ACCESS_STANDALONE: &str = "Refused: this connection's AI data access, set in \
+     Schemaic, lets no assistant read rows on its own, so run_query is unavailable. Ask the user \
+     for the values you need — or ask them to set the connection's AI data access to \"Let it \
+     read data\" in Schemaic's connection settings and restart this server.";
+
+/// What the server says when a panel-only tool is called from outside the
+/// panel. Says what to do instead, for the reason the other two do.
+const NO_PANEL: &str = "Refused: propose_table_change hands its result to Schemaic's AI panel, \
+     which turns it into a change preview, and this server was started outside the panel by \
+     `schemaic mcp`. Describe the change to the user instead — list_schema and describe_table \
+     have the table's current definition.";
+
+/// The refusal a tool call earns from the connection's levels and the host,
+/// if any. Pure, so the gate is unit-tested without a live endpoint.
+fn refusal_for(tool: McpTool, reads_data: bool, schema: bool, host: Host) -> Option<&'static str> {
     if !reads_data && tool.reads_row_data() {
-        return Some(NO_DATA_ACCESS);
+        return Some(match host {
+            Host::Panel => NO_DATA_ACCESS,
+            Host::Standalone => NO_DATA_ACCESS_STANDALONE,
+        });
+    }
+    if host != Host::Panel && tool.needs_panel() {
+        return Some(NO_PANEL);
     }
     (!schema && tool.reads_schema()).then_some(NO_SCHEMA_ACCESS)
 }
@@ -285,14 +464,22 @@ fn refusal_for(tool: McpTool, reads_data: bool, schema: bool) -> Option<&'static
 /// first call hands back every database and every table name. Whether that
 /// setting is read as a token budget or as consent, a budget of zero that one
 /// tool call walks around is neither.
-pub(crate) fn tools_list(engine: schemaic_db::Engine, reads_data: bool, schema: bool) -> Value {
+///
+/// `host` withholds the tools whose result only the panel can act on
+/// ([`McpTool::needs_panel`]).
+pub fn tools_list(
+    engine: schemaic_db::Engine,
+    reads_data: bool,
+    schema: bool,
+    host: Host,
+) -> Value {
     let dialect = engine.dialect();
     let heads = schemaic_core::sql::read_only_heads(dialect).join("/");
     let mut tools = json!([
         {
             "name": "run_query",
             "description": format!(
-                "Execute ONE read-only SQL statement ({heads} only) against the user's active \
+                "Execute ONE read-only SQL statement ({heads} only) against the user's \
                  database connection and return the rows. The connection is {}, so write it in \
                  that dialect.",
                 dialect.engine_label(),
@@ -300,7 +487,12 @@ pub(crate) fn tools_list(engine: schemaic_db::Engine, reads_data: bool, schema: 
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "sql": { "type": "string", "description": "A single read-only SQL statement." }
+                    "sql": { "type": "string", "description": "A single read-only SQL statement." },
+                    "database": {
+                        "type": "string",
+                        "description": "The database to run in, as list_schema names it. Defaults \
+                                        to the connection's active database."
+                    }
                 },
                 "required": ["sql"]
             }
@@ -322,8 +514,17 @@ pub(crate) fn tools_list(engine: schemaic_db::Engine, reads_data: bool, schema: 
         },
         {
             "name": "describe_table",
-            "description": "One table in depth: its CREATE TABLE (or CREATE VIEW) definition \
-                            including indexes, its foreign keys, and a few sample rows.",
+            // The sample rows are promised only where they are sent: a model
+            // told to expect them plans its turn around rows that never come.
+            "description": format!(
+                "One table in depth: its CREATE TABLE (or CREATE VIEW) definition including \
+                 indexes{}",
+                if reads_data {
+                    ", its foreign keys, and a few sample rows."
+                } else {
+                    " and its foreign keys. No rows: this connection sends the assistant none."
+                },
+            ),
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -408,21 +609,32 @@ pub(crate) fn tools_list(engine: schemaic_db::Engine, reads_data: bool, schema: 
         // than two that happen to agree today.
         list.retain(|t| {
             McpTool::from_name(t["name"].as_str().unwrap_or(""))
-                .is_some_and(|tool| tool.offered(reads_data, schema))
+                .is_some_and(|tool| tool.offered(reads_data, schema, host))
         });
     }
     tools
 }
 
-async fn call_tool(
-    db: &Db,
-    database: Option<&str>,
-    reads_data: bool,
-    schema: bool,
-    hidden: &HashSet<String>,
-    name: &str,
-    args: &Value,
-) -> Value {
+/// The database a tool call runs against: its own `database` argument when it
+/// names one, else the endpoint's default. Pure, so the precedence is tested.
+fn tool_database<'a>(args: &'a Value, default: Option<&'a str>) -> Option<&'a str> {
+    args.get("database")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .or(default)
+}
+
+async fn call_tool(endpoint: &Endpoint, name: &str, args: &Value) -> Value {
+    let Endpoint {
+        db,
+        database,
+        samples: reads_data,
+        hidden,
+        schema,
+        host,
+    } = endpoint;
+    let (reads_data, schema, host) = (*reads_data, *schema, *host);
+    let database = database.as_deref();
     // The level gates the call as well as the listing: a client working from a
     // stale `tools/list` must not reach the DB through a tool this connection
     // withheld.
@@ -432,7 +644,7 @@ async fn call_tool(
             "isError": true
         });
     };
-    if let Some(why) = refusal_for(tool, reads_data, schema) {
+    if let Some(why) = refusal_for(tool, reads_data, schema, host) {
         return json!({ "content": [ { "type": "text", "text": why } ], "isError": true });
     }
     let arg = |key: &str| {
@@ -446,9 +658,9 @@ async fn call_tool(
     let (text, is_error) = match tool {
         McpTool::RunQuery => {
             let sql = args.get("sql").and_then(|s| s.as_str()).unwrap_or("");
-            run_query(db, database, sql).await
+            run_query(db, tool_database(args, database), sql).await
         }
-        McpTool::ListSchema => list_schema(db, arg("database"), database, hidden).await,
+        McpTool::ListSchema => list_schema(db, arg("database"), database, hidden, reads_data).await,
         McpTool::DescribeTable => match arg("table") {
             Some(table) => describe_table(db, database, arg("database"), table, reads_data).await,
             None => ("describe_table needs a `table`.".to_string(), true),
@@ -476,7 +688,7 @@ fn dialect_of(db: &Db) -> SqlDialect {
 /// Statement timeout for AI-issued queries — a backstop against `SLEEP()` /
 /// heavy scans holding the connection open. The CLI's default, read from where
 /// it is defined rather than restated.
-const QUERY_TIMEOUT: std::time::Duration = schemaic_cli::query::DEFAULT_TIMEOUT;
+const QUERY_TIMEOUT: std::time::Duration = crate::query::DEFAULT_TIMEOUT;
 
 /// Await a database read with [`QUERY_TIMEOUT`] over it, cancelling the token on
 /// expiry so the statement is killed **server-side** rather than merely
@@ -527,7 +739,7 @@ where
             // drops packets held the command for the OS connect timeout. The
             // grace outlasts a started statement's own KILL, which is bounded
             // by `CANCEL_TIMEOUT`.
-            let _ = tokio::time::timeout(schemaic_cli::deadline::UNWIND_GRACE, fut).await;
+            let _ = tokio::time::timeout(crate::deadline::UNWIND_GRACE, fut).await;
             None
         }
     }
@@ -559,7 +771,7 @@ where
 /// **One headless read path, shared with the CLI.**
 ///
 /// The normalisation, the read-only gate, the row cap and the cancel-and-wait
-/// timeout all live in [`schemaic_cli::query::read_only_query`] now. They were
+/// timeout all live in [`crate::query::read_only_query`] now. They were
 /// duplicated here, which is two copies of a *guard* — the shape this codebase
 /// has already been bitten by, and one only the front end that got the fix
 /// would have kept.
@@ -569,9 +781,8 @@ where
 /// assistant's route to a write is `propose_table_change`. Same refusal, right
 /// advice for whoever is reading it.
 async fn run_query(db: &Db, database: Option<&str>, sql: &str) -> (String, bool) {
-    use schemaic_cli::query::NoRows;
-    match schemaic_cli::query::read_only_query(db, database, sql, MCP_ROW_CAP, QUERY_TIMEOUT).await
-    {
+    use crate::query::NoRows;
+    match crate::query::read_only_query(db, database, sql, MCP_ROW_CAP, QUERY_TIMEOUT).await {
         Ok(rs) => (format_table(&rs), false),
         Err(NoRows::Empty) => ("Empty query.".to_string(), true),
         Err(NoRows::NotARead(reason) | NoRows::NotPermitted(reason)) => {
@@ -655,6 +866,7 @@ async fn list_schema(
     database: Option<&str>,
     default_db: Option<&str>,
     hidden: &HashSet<String>,
+    samples: bool,
 ) -> (String, bool) {
     if let Some(name) = database {
         let token = CancellationToken::new();
@@ -716,13 +928,16 @@ async fn list_schema(
         };
         dbs.push((name, schema));
     }
-    (format_database_list(&dbs), false)
+    (format_database_list(&dbs, samples), false)
 }
 
 /// The server overview: one heading per database, its tables listed by name.
 /// Columns deliberately stay out — the trailing hint points at the two calls
 /// that carry them. Pure so the shape is unit-tested.
-fn format_database_list(dbs: &[(String, Result<DbSchema, String>)]) -> String {
+///
+/// `samples` is the endpoint's: the pointer at `describe_table` promises sample
+/// rows only where that tool sends them, as its own description does.
+fn format_database_list(dbs: &[(String, Result<DbSchema, String>)], samples: bool) -> String {
     let mut out = String::new();
     for (name, schema) in dbs {
         match schema {
@@ -741,10 +956,15 @@ fn format_database_list(dbs: &[(String, Result<DbSchema, String>)]) -> String {
             Err(e) => out.push_str(&format!("## {name} (error: {e})\n")),
         }
     }
-    out.push_str(
-        "\nCall list_schema with {\"database\": \"<name>\"} for that database's columns and \
-         keys, or describe_table for one table's DDL, foreign keys, and sample rows.\n",
-    );
+    out.push_str(&format!(
+        "\nCall list_schema with {{\"database\": \"<name>\"}} for that database's columns and \
+         keys, or describe_table for one table's DDL{}.\n",
+        if samples {
+            ", foreign keys, and sample rows"
+        } else {
+            " and foreign keys"
+        },
+    ));
     out
 }
 
@@ -1086,10 +1306,10 @@ async fn propose_change(
 #[cfg(test)]
 mod tests {
     use super::{
-        HashSet, McpTool, NO_DATA_ACCESS, SUPPORTED_PROTOCOLS, dialect_of, find_described,
-        format_database_list, format_database_schema, format_table, format_table_detail,
-        format_table_heading, listed_databases, negotiate_protocol, proposal_from_args,
-        refusal_for,
+        HashSet, Host, McpTool, NO_DATA_ACCESS, NO_DATA_ACCESS_STANDALONE, NO_PANEL,
+        SUPPORTED_PROTOCOLS, dialect_of, find_described, format_database_list,
+        format_database_schema, format_table, format_table_detail, format_table_heading,
+        listed_databases, negotiate_protocol, proposal_from_args, refusal_for,
     };
 
     /// **A read that finishes in time comes back whole**, and the clock is not
@@ -1194,164 +1414,24 @@ mod tests {
         );
     }
 
-    /// **The deadline is a property of the server, not of one tool** — and it
-    /// was a property of one tool. Three of the four database reads built a
-    /// fresh `CancellationToken` that nothing ever cancelled and awaited it
-    /// bare: `describe_table`'s sample, `list_schema`'s two, and
-    /// `propose_table_change`'s.
-    ///
-    /// A unit test of `with_deadline` cannot see that, because the defect was
-    /// entirely in who called it — so the subject is the source: every
-    /// `CancellationToken::new()` in this module belongs to a `with_deadline`.
-    #[test]
-    fn every_database_read_carries_the_deadline() {
-        let src = include_str!("mcp.rs");
-        // The shared walk, not a cut at the first `#[cfg(test)]` — positional
-        // and not comment-aware. See `source_gate::production_code`, and the
-        // gate below, which reads this same file.
-        let body = schemaic_ui::source_gate::production_code(src);
-        let body = body.as_str();
-        // Comments dropped before the window is measured: a paragraph
-        // explaining *why* a read has a deadline would otherwise push the
-        // `with_deadline` that proves it out of view, which is exactly what it
-        // did on the first run of this gate.
-        //
-        // **Blank lines too, now that the walk *blanks* a comment rather than
-        // removing it** — which it does so that a line number still means
-        // something. The old filter asked only whether a line starts with `//`,
-        // so every comment line came through as `""` and filled the window
-        // again, in the one function whose comments are longest.
-        let code: Vec<(u32, &str)> = body
-            .split('\n')
-            .enumerate()
-            .map(|(n, l)| (n as u32 + 1, l))
-            .filter(|(_, l)| !l.trim().is_empty())
-            .filter(|(_, l)| !l.trim_start().starts_with("//"))
-            .collect();
-        let mut offenders: Vec<u32> = Vec::new();
-        for (i, (line_no, line)) in code.iter().enumerate() {
-            if !line.contains("CancellationToken::new()") {
-                continue;
-            }
-            // Either the token is handed straight to `with_deadline` here, or it
-            // is bound here and used by one a few lines of *code* below.
-            let window = code[i..(i + 5).min(code.len())]
-                .iter()
-                .map(|(_, l)| *l)
-                .collect::<Vec<_>>()
-                .join("\n");
-            if !window.contains("with_deadline(") {
-                offenders.push(*line_no);
-            }
-        }
-        assert!(
-            offenders.is_empty(),
-            "database reads at {offenders:?} build a cancellation token nothing \
-             ever cancels and await it with no deadline — the serve loop is \
-             sequential, so one slow read answers nothing and wedges every \
-             request queued behind it"
-        );
+    // The two source gates over this file's deadlines — every token belongs to
+    // a `with_deadline`, and every awaited `db.` read sits inside one — live in
+    // `schemaic-ui`'s `source_gate::mcp_deadline_gate`, beside the brace-aware
+    // walk they need. This crate is Floem-free and a copy of the walk is what
+    // that module exists to prevent.
 
-        // And the other direction, which is the defect the token gate could not
-        // see: a read with **no** token must not go through the `with_deadline`
-        // that keeps the future alive across the cancel, because over a
-        // tokenless read that is a wait for the server rather than a deadline.
-        for line in body
-            .split('\n')
-            .filter(|l| !l.trim_start().starts_with("//"))
-        {
-            assert!(
-                !(line.contains("with_deadline(") && line.contains("fetch_table_list")),
-                "`fetch_table_list` takes no CancellationToken, so `with_deadline` \
-                 waits it out rather than bounding it — use \
-                 `with_deadline_abandoning`:\n{line}"
-            );
-        }
-    }
-
-    /// **The property both halves above were reaching for, stated once.**
-    ///
-    /// Each of them names a spelling: one enumerates `CancellationToken::new()`
-    /// sites, the other is a literal pair check for `with_deadline(` and
-    /// `fetch_table_list` on one line. Neither could see `list_schema`'s
-    /// `db.fetch_databases().await` — the overview form's *first* read, the
-    /// tool's advertised entry point, with no deadline at all — because it
-    /// builds no token and names no function either gate knows. The commit that
-    /// wrote the second half audited this very function, restated its read count
-    /// from four to six, and still did not count that one; there are seven.
-    ///
-    /// So: **every awaited `db.…()` read in production code is lexically inside
-    /// a deadline wrapper.** No hand-maintained list, so a new read has to be
-    /// wrapped rather than added to an array. The floor is there because a
-    /// needle that stops matching must not read as a clean file.
-    #[test]
-    fn no_database_read_is_awaited_without_a_deadline() {
-        let body = schemaic_ui::source_gate::production_code(include_str!("mcp.rs"));
-        let mut checked = 0usize;
-        let mut offenders: Vec<String> = Vec::new();
-        let mut from = 0usize;
-        while let Some(rel) = body[from..]
-            .find("db.fetch_")
-            .into_iter()
-            .chain(body[from..].find("db.run_"))
-            .min()
-        {
-            let at = from + rel;
-            from = at + 1;
-            checked += 1;
-            // **The whole call, not one line.** The wrapper is the call this one
-            // is an argument to, so it is to the left — but rustfmt breaks a
-            // long call across lines, and two of the four wrapped reads here are
-            // written that way. A line-oriented scan would report both as
-            // offenders and, worse, would report a broken *unwrapped* one as
-            // clean. So: the nearest `with_deadline` behind this read counts
-            // only if no statement boundary stands between them.
-            let before = &body[..at];
-            let wrapped = before.rfind("with_deadline").is_some_and(|w| {
-                !before[w..].contains(';')
-                    && !before[w..].contains('{')
-                    && !before[w..].contains('}')
-            });
-            if !wrapped {
-                let line = 1 + before.bytes().filter(|c| *c == b'\n').count();
-                let text = body[at..].split('\n').next().unwrap_or_default();
-                offenders.push(format!("{line}: {}", text.trim()));
-            }
-        }
-        // **Six, down from seven, and the seventh was not deleted — it moved.**
-        // `run_query`'s `fetch_query` folded into
-        // `schemaic_cli::query::read_only_query` so the CLI and this server
-        // share one read path. Lowering a floor is exactly the edit this gate
-        // exists to make someone justify, so: the read is still wrapped, by
-        // `schemaic_cli::deadline::with_deadline`, and
-        // `no_database_read_in_this_crate_is_awaited_without_a_deadline` is the
-        // same gate over there, following it. Lower this again only for the
-        // same reason, and only after checking the read still has a gate
-        // wherever it went.
-        assert!(
-            checked >= 6,
-            "the needle stopped matching: {checked} database reads found, and this \
-             module has at least six — a gate that scans nothing reports success"
-        );
-        assert!(
-            offenders.is_empty(),
-            "database reads awaited with no deadline; the serve loop is sequential, \
-             so one slow read answers nothing and wedges every request behind it:\n{}",
-            offenders.join("\n")
-        );
-    }
-
-    /// Tool names the server advertises, in order.
+    /// Tool names the server advertises in the panel, in order.
     fn offered(engine: schemaic_db::Engine, reads_data: bool) -> Vec<String> {
-        offered_with(engine, reads_data, true)
+        offered_with(engine, reads_data, true, Host::Panel)
     }
 
     fn offered_with(
         engine: schemaic_db::Engine,
         reads_data: bool,
         reads_schema: bool,
+        host: Host,
     ) -> Vec<String> {
-        super::tools_list(engine, reads_data, reads_schema)
+        super::tools_list(engine, reads_data, reads_schema, host)
             .as_array()
             .expect("a list")
             .iter()
@@ -1428,7 +1508,7 @@ mod tests {
             schemaic_db::Engine::Postgres,
             schemaic_db::Engine::Sqlite,
         ] {
-            let names = offered_with(engine, true, true);
+            let names = offered_with(engine, true, true, Host::Panel);
             for name in &names {
                 assert!(
                     McpTool::from_name(name).is_some(),
@@ -1459,16 +1539,19 @@ mod tests {
     #[test]
     fn a_call_to_the_withheld_tool_is_refused_with_the_reason() {
         assert_eq!(
-            refusal_for(McpTool::RunQuery, false, true),
+            refusal_for(McpTool::RunQuery, false, true, Host::Panel),
             Some(NO_DATA_ACCESS)
         );
-        assert_eq!(refusal_for(McpTool::RunQuery, true, true), None);
+        assert_eq!(
+            refusal_for(McpTool::RunQuery, true, true, Host::Panel),
+            None
+        );
         for schema_tool in [
             McpTool::ListSchema,
             McpTool::DescribeTable,
             McpTool::ProposeTableChange,
         ] {
-            assert_eq!(refusal_for(schema_tool, false, true), None);
+            assert_eq!(refusal_for(schema_tool, false, true, Host::Panel), None);
         }
     }
 
@@ -1491,7 +1574,7 @@ mod tests {
             schemaic_db::Engine::Postgres,
             schemaic_db::Engine::Sqlite,
         ] {
-            let names = offered_with(engine, true, false);
+            let names = offered_with(engine, true, false, Host::Panel);
             // **`propose_table_change` is on this list, and it was not.** Its
             // exclusion was justified as "it carries the table it is about in
             // the call and reads nothing the model did not already have", and
@@ -1523,10 +1606,280 @@ mod tests {
             McpTool::DescribeTable,
             McpTool::ProposeTableChange,
         ] {
-            let refusal = refusal_for(gone, true, false).expect("refused");
+            let refusal = refusal_for(gone, true, false, Host::Panel).expect("refused");
             assert!(refusal.contains("Schema context"), "{refusal}");
         }
-        assert_eq!(refusal_for(McpTool::RunQuery, true, false), None);
+        assert_eq!(
+            refusal_for(McpTool::RunQuery, true, false, Host::Panel),
+            None
+        );
+    }
+
+    /// **Outside the panel nothing reads the reply, so the proposal tool is
+    /// withheld** — listed, it tells the model the user has a change preview to
+    /// review, when under `schemaic mcp` they have a fenced block of JSON.
+    /// Every other tool is the connection's decision, not the host's.
+    #[test]
+    fn the_proposal_tool_is_withheld_outside_the_panel() {
+        for engine in [
+            schemaic_db::Engine::MySql,
+            schemaic_db::Engine::Postgres,
+            schemaic_db::Engine::Sqlite,
+        ] {
+            let names = offered_with(engine, true, true, Host::Standalone);
+            assert_eq!(
+                names,
+                ["run_query", "list_schema", "describe_table"],
+                "{engine:?}"
+            );
+            let names = offered_with(engine, true, true, Host::Panel);
+            assert!(
+                names.contains(&"propose_table_change".to_string()),
+                "{engine:?} lost the proposal tool in the panel: {names:?}"
+            );
+        }
+        // …and a stale listing that still names it is refused on call.
+        assert_eq!(
+            refusal_for(McpTool::ProposeTableChange, true, true, Host::Standalone),
+            Some(NO_PANEL)
+        );
+        for kept in [
+            McpTool::RunQuery,
+            McpTool::ListSchema,
+            McpTool::DescribeTable,
+        ] {
+            assert_eq!(refusal_for(kept, true, true, Host::Standalone), None);
+        }
+        assert!(McpTool::ProposeTableChange.needs_panel());
+    }
+
+    /// **The connection's AI data access still decides rows standalone.** The
+    /// host changes what a refusal *advises*, never whether it refuses: the
+    /// panel's "attach rows from a result grid" names a gesture an outside
+    /// client does not have.
+    #[test]
+    fn rows_are_withheld_standalone_with_advice_that_fits_the_client() {
+        let names = offered_with(schemaic_db::Engine::Postgres, false, true, Host::Standalone);
+        assert_eq!(names, ["list_schema", "describe_table"]);
+        let refusal = refusal_for(McpTool::RunQuery, false, true, Host::Standalone);
+        assert_eq!(refusal, Some(NO_DATA_ACCESS_STANDALONE));
+        assert!(!NO_DATA_ACCESS_STANDALONE.contains("grid"));
+        assert!(NO_DATA_ACCESS_STANDALONE.contains("Let it read data"));
+        assert_eq!(
+            schemaic_core::connection::AiData::Full.label(),
+            "Let it read data",
+            "the refusal names the level by its label"
+        );
+    }
+
+    /// The panel's allow-list and the server's listing are one predicate — so a
+    /// tool offered by one and missing from the other is impossible, at every
+    /// combination of the three gates.
+    #[test]
+    fn the_listing_is_exactly_the_tools_offered() {
+        for host in [Host::Panel, Host::Standalone] {
+            for reads_data in [false, true] {
+                for schema in [false, true] {
+                    let listed = offered_with(schemaic_db::Engine::MySql, reads_data, schema, host);
+                    let offered: Vec<&str> = McpTool::ALL
+                        .into_iter()
+                        .filter(|t| t.offered(reads_data, schema, host))
+                        .map(McpTool::name)
+                        .collect();
+                    assert_eq!(
+                        listed, offered,
+                        "{host:?} rows={reads_data} schema={schema}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Drive the real serve loop over `input`, and parse every line it wrote.
+    /// No request here reaches the database, so the handle is never dialled.
+    async fn exchange(input: &[u8]) -> Vec<serde_json::Value> {
+        let endpoint = standalone(None);
+        let mut out = Vec::new();
+        super::serve_on(&endpoint, input, &mut out).await;
+        String::from_utf8(out)
+            .expect("the server writes UTF-8")
+            .lines()
+            .map(|l| serde_json::from_str(l).expect("every line is one JSON message"))
+            .collect()
+    }
+
+    /// **A method this server does not implement is `-32601`, not `{}`.** An
+    /// empty result reads as success: a client that asks `resources/list`
+    /// gets an object with no `resources` in it and fails its own schema check,
+    /// marking the whole server broken. Standalone, any client can connect.
+    /// A notification (no id) still gets nothing at all.
+    #[tokio::test]
+    async fn an_unknown_method_is_method_not_found() {
+        let got = exchange(
+            b"{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"resources/list\"}\n\
+              {\"jsonrpc\":\"2.0\",\"method\":\"notifications/whatever\"}\n\
+              {\"jsonrpc\":\"2.0\",\"id\":8,\"method\":\"ping\"}\n",
+        )
+        .await;
+        assert_eq!(got.len(), 2, "{got:?}");
+        assert_eq!(got[0]["id"], 7);
+        assert_eq!(got[0]["error"]["code"], -32601, "{}", got[0]);
+        assert!(got[0].get("result").is_none(), "{}", got[0]);
+        assert_eq!(got[1]["id"], 8);
+        assert_eq!(got[1]["result"], serde_json::json!({}));
+    }
+
+    /// **A line that is not UTF-8 is skipped, not the end of the session.**
+    /// `while let Ok(Some(line))` ended the loop on the first read error, and
+    /// the process exited 0 as though the client had hung up — the server
+    /// vanished mid-session with nothing on stderr.
+    #[tokio::test]
+    async fn a_line_that_is_not_utf8_does_not_end_the_session() {
+        let got =
+            exchange(b"\xff\xfe not text\n{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}\n")
+                .await;
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert_eq!(got[0]["id"], 1);
+        assert_eq!(got[0]["result"], serde_json::json!({}));
+    }
+
+    /// **`run_query` takes a `database`, like the tools beside it.** It had
+    /// none, so the one database a standalone agent could query was the
+    /// endpoint's default — while `list_schema` showed it every other — and a
+    /// `database` it passed anyway was dropped: `SELECT count(*) FROM track`
+    /// with `"database": "chinook"` ran in `world` and answered `relation
+    /// "track" does not exist`. On PostgreSQL nothing else reaches another
+    /// database at all.
+    #[test]
+    fn run_query_takes_a_database_and_uses_it() {
+        let tools = super::tools_list(schemaic_db::Engine::Postgres, true, true, Host::Standalone);
+        let props = &tools[0]["inputSchema"]["properties"];
+        assert_eq!(tools[0]["name"], "run_query");
+        assert!(props.get("database").is_some(), "{props}");
+        assert_eq!(
+            tools[0]["inputSchema"]["required"],
+            serde_json::json!(["sql"])
+        );
+        let args = serde_json::json!({"sql": "SELECT 1", "database": "chinook"});
+        assert_eq!(super::tool_database(&args, Some("world")), Some("chinook"));
+        let args = serde_json::json!({"sql": "SELECT 1"});
+        assert_eq!(super::tool_database(&args, Some("world")), Some("world"));
+        let args = serde_json::json!({"sql": "SELECT 1", "database": ""});
+        assert_eq!(super::tool_database(&args, Some("world")), Some("world"));
+        assert_eq!(super::tool_database(&args, None), None);
+    }
+
+    /// **`describe_table` promises sample rows only where it sends them.** At
+    /// every level below "Let it read data" — the standalone default — the
+    /// model was told to expect rows it would never get, and planned the turn
+    /// around them.
+    #[test]
+    fn describe_table_promises_samples_only_when_it_sends_them() {
+        let describe = |samples| {
+            super::tools_list(schemaic_db::Engine::MySql, samples, true, Host::Standalone)
+                .as_array()
+                .expect("a list")
+                .iter()
+                .find(|t| t["name"] == "describe_table")
+                .expect("offered")["description"]
+                .as_str()
+                .expect("a description")
+                .to_string()
+        };
+        assert!(describe(true).contains("sample rows"), "{}", describe(true));
+        assert!(
+            !describe(false).contains("sample rows"),
+            "{}",
+            describe(false)
+        );
+    }
+
+    fn standalone(ai_data: Option<schemaic_core::connection::AiData>) -> super::Endpoint {
+        let db = schemaic_db::Db::from_parts(
+            schemaic_db::Engine::MySql,
+            "127.0.0.1".to_string(),
+            3306,
+            String::new(),
+            String::new(),
+            String::new(),
+        );
+        super::Endpoint::standalone(db, Some("shop".to_string()), ai_data)
+    }
+
+    /// **Only "Let it read data" lets an outside agent read rows**, the level
+    /// whose consent covers a value the user did not hand over. "Only what I
+    /// attach" is the default and means no rows here: an outside client has
+    /// no attach gesture, so its half of that level is empty rather than
+    /// promoted.
+    #[test]
+    fn a_standalone_endpoint_reads_rows_only_at_full_access() {
+        use schemaic_core::connection::AiData;
+        for (level, rows) in [
+            (AiData::SchemaOnly, false),
+            (AiData::OnRequest, false),
+            (AiData::Full, true),
+        ] {
+            let e = standalone(Some(level));
+            assert_eq!(e.samples, rows, "{level:?}");
+            assert_eq!(e.host, Host::Standalone);
+            assert!(
+                e.schema,
+                "{level:?}: the catalogue is cli_access's to publish"
+            );
+            assert!(e.hidden.is_empty());
+            assert_eq!(e.database.as_deref(), Some("shop"));
+        }
+    }
+
+    /// **A connection that never chose a level is not `Full`.** The app
+    /// resolves `None` at startup from the legacy global flag — which defaulted
+    /// *on* — and the CLI cannot read that flag. Guessing the migration's
+    /// answer would hand rows to an agent on a connection whose owner was
+    /// never asked; the default level is the one that sends none.
+    #[test]
+    fn a_connection_that_never_chose_a_level_sends_no_rows() {
+        assert!(!standalone(None).samples);
+    }
+
+    /// **A SQLite connection has a database even when nobody names it.** The
+    /// panel always passes the one selected in the tree (`main`); standalone
+    /// there is no tree, and `describe_table {"table": "orders"}` answered "the
+    /// connection has no default — pass a `database`" about a file that has
+    /// exactly one. A server engine with no default stays `None`: there the
+    /// model has to pick, and `list_schema` shows it the names.
+    ///
+    /// **And a named one does not displace it on SQLite**, `catalog.rs`'s rule:
+    /// every operation opens its own connection, so nothing is ever attached,
+    /// and a `SCHEMAIC_DATABASE` exported for another engine would otherwise
+    /// point every tool at a database that cannot exist.
+    #[test]
+    fn a_standalone_endpoint_defaults_to_the_engines_only_database() {
+        let db = |engine| {
+            schemaic_db::Db::from_parts(
+                engine,
+                String::new(),
+                0,
+                String::new(),
+                String::new(),
+                "shop.db".to_string(),
+            )
+        };
+        let e = super::Endpoint::standalone(db(schemaic_db::Engine::Sqlite), None, None);
+        assert_eq!(e.database.as_deref(), Some("main"));
+        for engine in [schemaic_db::Engine::MySql, schemaic_db::Engine::Postgres] {
+            let e = super::Endpoint::standalone(db(engine), None, None);
+            assert_eq!(e.database, None, "{engine:?}");
+        }
+        let e = super::Endpoint::standalone(
+            db(schemaic_db::Engine::Sqlite),
+            Some("shop".to_string()),
+            None,
+        );
+        assert_eq!(e.database.as_deref(), Some("main"));
+        for engine in [schemaic_db::Engine::MySql, schemaic_db::Engine::Postgres] {
+            let e = super::Endpoint::standalone(db(engine), Some("shop".to_string()), None);
+            assert_eq!(e.database.as_deref(), Some("shop"), "{engine:?}");
+        }
     }
 
     /// The tool's arguments carry `database` alongside the proposal's own
@@ -1568,7 +1921,7 @@ mod tests {
             schemaic_db::Engine::Postgres,
             schemaic_db::Engine::Sqlite,
         ] {
-            let tools = super::tools_list(engine, true, true);
+            let tools = super::tools_list(engine, true, true, Host::Panel);
             let tool = tools
                 .as_array()
                 .expect("a list")
@@ -1596,7 +1949,7 @@ mod tests {
             schemaic_db::Engine::Sqlite,
         ] {
             let dialect = engine.dialect();
-            let tools = super::tools_list(engine, true, true);
+            let tools = super::tools_list(engine, true, true, Host::Standalone);
             let desc = tools[0]["description"].as_str().expect("a description");
             assert_eq!(tools[0]["name"], "run_query");
             assert!(
@@ -1697,13 +2050,27 @@ mod tests {
                 ..Default::default()
             }),
         )];
-        let out = format_database_list(&dbs);
+        let out = format_database_list(&dbs, true);
         assert!(out.contains("## shop (2 tables)"));
         assert!(out.contains("- orders\n"));
         assert!(out.contains("- v_active (view)"));
         // No columns at this level — that's what the drill-down calls are for.
         assert!(!out.contains("int"));
         assert!(out.contains("describe_table"));
+    }
+
+    /// **The overview's pointer at `describe_table` promises rows only where
+    /// they are sent**, like the tool's own description. Its footer said
+    /// "sample rows" at every level, so below "Let it read data" the first
+    /// `list_schema` of a session re-made the promise the listing had just
+    /// stopped making.
+    #[test]
+    fn the_overview_promises_samples_only_when_it_sends_them() {
+        let dbs = || vec![("shop".to_string(), Ok(DbSchema::default()))];
+        assert!(format_database_list(&dbs(), true).contains("sample rows"));
+        let out = format_database_list(&dbs(), false);
+        assert!(!out.contains("sample rows"), "{out}");
+        assert!(out.contains("describe_table"), "{out}");
     }
 
     #[test]
@@ -1740,7 +2107,7 @@ mod tests {
     #[test]
     fn database_list_reports_a_failed_introspection() {
         let dbs = vec![("locked".to_string(), Err("access denied".to_string()))];
-        let out = format_database_list(&dbs);
+        let out = format_database_list(&dbs, true);
         assert!(out.contains("## locked (error: access denied)"));
     }
 
@@ -1853,7 +2220,7 @@ mod tests {
         assert!(out.contains("### public.orders"));
         assert!(out.contains("### sales.orders"));
         // The overview qualifies the same way.
-        let list = format_database_list(&[("warehouse".to_string(), Ok(schema))]);
+        let list = format_database_list(&[("warehouse".to_string(), Ok(schema))], true);
         assert!(list.contains("- public.orders"));
         assert!(list.contains("- sales.orders"));
     }
@@ -1953,7 +2320,7 @@ mod tests {
     }
 
     // `normalize_stmt`'s tests went with the function, to
-    // `schemaic_cli::query`, which owns the one copy both front ends now call.
+    // `crate::query`, which owns the one copy both front ends now call.
 
     fn col(name: &str) -> Column {
         Column {

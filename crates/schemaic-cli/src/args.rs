@@ -25,24 +25,31 @@ pub const DEFAULT_LIMIT: usize = 200;
 /// `the_help_lists_every_exit_code_and_no_other` and
 /// `the_help_lists_every_format`, which compare it with `Exit` and
 /// `Format::NAMES`.
-const AFTER_HELP: &str = "\
-Output formats (--format):
-  table     A Markdown table with a row-count footer (the default)
-  json      A JSON array of row objects
-  jsonl     One JSON object per line
-  csv       RFC 4180 CSV with a header row
-  vertical  One `name: value` record per row, like the mysql client's \\G
---no-header leaves the column names, and the table's footer, out of table and csv.
-Rows go to stdout; everything else goes to stderr.
-
-Exit codes:
-  0  It ran
-  2  A usage error, or a connection, file or table that is not there; nothing was sent
-  3  A guard refused: not a read, a read-only connection, no --yes, or no CLI access; \
-nothing was sent
-  4  The server or the connection failed; retrying may work
-  5  A write timed out after it was sent and may have been applied; check before retrying
-  6  query --fail-on-cap: --limit cut the rows short (they were still printed)";
+///
+/// **One `\n`-terminated literal per line**, not one literal with its line
+/// breaks typed in. The columns are aligned with space runs, and a space run
+/// after a real line break is what `source_gate`'s wrapped-literal gate reports
+/// — rightly, everywhere but a table like this one. A spelt `\n` is that gate's
+/// mark of a block whose spacing is deliberate.
+const AFTER_HELP: &str = concat!(
+    "Output formats (--format):\n",
+    "  table     A Markdown table with a row-count footer (the default)\n",
+    "  json      A JSON array of row objects\n",
+    "  jsonl     One JSON object per line\n",
+    "  csv       RFC 4180 CSV with a header row\n",
+    "  vertical  One `name: value` record per row, like the mysql client's \\G\n",
+    "--no-header leaves the column names, and the table's footer, out of table and csv.\n",
+    "Rows go to stdout; everything else goes to stderr.\n",
+    "\n",
+    "Exit codes:\n",
+    "  0  It ran\n",
+    "  2  A usage error, or a connection, file or table that is not there; nothing was sent\n",
+    "  3  A guard refused: not a read, a read-only connection, no --yes, or no CLI access; \
+     nothing was sent\n",
+    "  4  The server or the connection failed; retrying may work\n",
+    "  5  A write timed out after it was sent and may have been applied; check before retrying\n",
+    "  6  query --fail-on-cap: --limit cut the rows short (they were still printed)",
+);
 
 #[derive(Parser, Debug, PartialEq, Eq)]
 #[command(
@@ -156,8 +163,33 @@ pub enum Command {
         #[arg(long, default_value_t = DEFAULT_TIMEOUT_SECS, value_parser = at_least_one_second())]
         timeout: u64,
     },
+    /// Serve a connection to an AI agent over MCP, on stdin/stdout.
+    ///
+    /// For an MCP client to spawn, not for a terminal: the agent gets
+    /// read-only tools over this one connection — list_schema, describe_table,
+    /// and run_query when the connection's AI data access is "Let it read
+    /// data". Runs until the client closes stdin.
+    Mcp {
+        #[command(flatten)]
+        target: McpTarget,
+    },
     /// Print the version — the same line as `--version`.
     Version,
+}
+
+/// [`Target`] for `mcp`: a connection and a database, and **no
+/// `--password-stdin`** — stdin is the MCP client's JSON-RPC stream, so a
+/// password read from it would be the client's first request.
+#[derive(clap::Args, Debug, PartialEq, Eq)]
+pub struct McpTarget {
+    /// Saved connection, by id or by name — or `#<id>`, which is only ever
+    /// the id.
+    #[arg(short = 'c', long, env = "SCHEMAIC_CONNECTION")]
+    pub connection: String,
+    /// The database the tools default to. Defaults to the connection's own;
+    /// `schemaic databases` lists the names.
+    #[arg(short = 'd', long, env = "SCHEMAIC_DATABASE", value_parser = non_blank)]
+    pub database: Option<String>,
 }
 
 /// What `schemaic version` prints: clap's own `--version` text, so the
@@ -211,7 +243,7 @@ impl Command {
             | Command::Describe { output, .. }
             | Command::Query { output, .. }
             | Command::Exec { output, .. } => Some(output),
-            Command::Version => None,
+            Command::Mcp { .. } | Command::Version => None,
         }
     }
 }
@@ -390,6 +422,7 @@ pub fn wants_cli(argv: &[String]) -> bool {
                 | "describe"
                 | "query"
                 | "exec"
+                | "mcp"
                 | "version"
                 | "help"
                 | "--help"
@@ -670,6 +703,64 @@ mod tests {
         assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
         let err = parse(&["schemaic", "describe", "t", "-c", "1", "--limit", "5"]).unwrap_err();
         assert_eq!(err.kind(), clap::error::ErrorKind::UnknownArgument);
+    }
+
+    /// **`mcp` names a connection and, optionally, a database — nothing else.**
+    /// Stdin is the protocol's, so `--password-stdin` would read the client's
+    /// first JSON-RPC line as the password; it is not a flag here at all rather
+    /// than one that always refuses. And nothing prints rows, so no `--format`.
+    #[test]
+    fn mcp_takes_a_connection_and_a_database_and_nothing_from_stdin() {
+        let cli = parse(&["schemaic", "mcp", "-c", "prod", "-d", "shop"]).unwrap();
+        let Command::Mcp { target } = cli.command else {
+            panic!("expected mcp");
+        };
+        assert_eq!(target.connection, "prod");
+        assert_eq!(target.database.as_deref(), Some("shop"));
+        assert_eq!(
+            parse(&["schemaic", "mcp", "-c", "prod"]).unwrap().command,
+            Command::Mcp {
+                target: McpTarget {
+                    connection: "prod".to_string(),
+                    database: None,
+                }
+            }
+        );
+        for extra in [
+            &["--password-stdin"][..],
+            &["--format", "json"],
+            &["--limit", "5"],
+        ] {
+            let args: Vec<&str> = ["schemaic", "mcp", "-c", "1"]
+                .into_iter()
+                .chain(extra.iter().copied())
+                .collect();
+            let err = parse(&args).unwrap_err();
+            assert_eq!(
+                err.kind(),
+                clap::error::ErrorKind::UnknownArgument,
+                "{extra:?}"
+            );
+        }
+        let err = parse(&["schemaic", "mcp"]).unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+        let err = parse(&["schemaic", "mcp", "-c", "1", "-d", " "]).unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::ValueValidation);
+        assert_eq!(
+            env_of("mcp", "connection").as_deref(),
+            Some("SCHEMAIC_CONNECTION")
+        );
+        assert_eq!(
+            env_of("mcp", "database").as_deref(),
+            Some("SCHEMAIC_DATABASE")
+        );
+        assert!(
+            parse(&["schemaic", "mcp", "-c", "1"])
+                .unwrap()
+                .command
+                .output_args()
+                .is_none()
+        );
     }
 
     #[test]

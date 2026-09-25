@@ -540,6 +540,21 @@ impl Db {
         (!self.database.is_empty()).then_some(self.database.as_str())
     }
 
+    /// The database an engine is in by construction, where it has exactly one
+    /// to be in — SQLite's [`sqlite::MAIN`], since each operation opens its own
+    /// connection and nothing is ever attached — or `None` where the connection
+    /// has to be told.
+    ///
+    /// For a caller with no schema tree to have picked one: `schemaic mcp`'s
+    /// `describe_table` asked for a `database` on a SQLite file that has one.
+    /// Exhaustive, so a fourth engine answers here rather than defaulting.
+    pub fn implied_database(&self) -> Option<&'static str> {
+        match self.engine {
+            Engine::Sqlite => Some(sqlite::MAIN),
+            Engine::MySql | Engine::Postgres => None,
+        }
+    }
+
     /// Attach a default database to a handle built by [`Self::from_parts`] —
     /// the endpoint handoff's half of [`Self::database`], for the same reason
     /// [`Self::with_tls`] exists.

@@ -9,9 +9,11 @@
 //! issues the server-side `KILL`. Dropping the future instead returns promptly
 //! and leaves the statement running on the server with nobody left to stop it.
 //!
-//! `app/mcp.rs` has its own `with_deadline` over the same property, kept there
-//! because it wraps reads (`fetch_schema`, `fetch_databases`) this crate never
-//! makes, and because one of them genuinely *must* abandon its future.
+//! [`crate::mcp`] has its own `with_deadline` over the same property, at the
+//! server's fixed timeout rather than a `--timeout`, and beside it a
+//! `with_deadline_abandoning` for the name listings (`fetch_databases`,
+//! `fetch_table_list`), which take no token and so genuinely *must* be dropped
+//! at the deadline rather than awaited.
 
 use std::time::Duration;
 
@@ -109,9 +111,10 @@ mod tests {
 
     /// **Every database read in this crate is inside a deadline.**
     ///
-    /// `app/mcp.rs` carries this gate over its own source and counts the reads
-    /// it expects, so that a needle which stops matching cannot read as a clean
-    /// file. Folding `mcp::run_query` onto `query::read_only_query` moved one
+    /// `mcp.rs` has this gate over its own source — in `schemaic-ui`'s
+    /// `source_gate::mcp_deadline_gate`, which has the brace-aware walk — and
+    /// counts the reads it expects, so that a needle which stops matching
+    /// cannot read as a clean file. Folding `mcp::run_query` onto `query::read_only_query` moved one
     /// read *out* of that file — its count went from seven to six — and the
     /// read landed here, in a crate no gate was watching. This is that gate,
     /// following the read.

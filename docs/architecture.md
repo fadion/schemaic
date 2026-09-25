@@ -5862,7 +5862,9 @@ existing prose was left alone.
     decision is the whole point and the I/O put it out of reach. Four answers, three of them
     `None`: unparsable JSON, no such key, and a key holding something that is not a boolean. Only a
     recorded boolean is evidence, because what it decides is a one-way promotion of every saved
-    connection to `AiData::Full`, and the migration never re-resolves. There is deliberately **no masking option** — a
+    connection to `AiData::Full`, and the migration never re-resolves. It is the app's to run:
+    `schemaic mcp` cannot read the old flag, so there `None` is the default level
+    (`cli/mcp.rs`'s entry). There is deliberately **no masking option** — a
     model cannot tell a masked value from a real one, so it reasons confidently about fiction, and
     the questions where values matter are exactly the ones masking ruins.
     `SshTunnel`/`SshAuth` cover the tunnel's own
@@ -13599,7 +13601,8 @@ existing prose was left alone.
     opener existed there, so the gap was structural rather than live, and all four stay green over
     the wider corpus.
     **And the nine surviving `split("#[cfg(test)]")` cuts go through `production_code` now** — in
-    `app/main.rs`, `app/mcp.rs` and `ui/erd_view.rs`, the last places still doing it by hand. That
+    `app/main.rs`, `app/mcp.rs` (whose gates are this module's own now, `mcp_deadline_gate` below) and
+    `ui/erd_view.rs`, the last places still doing it by hand. That
     cut is positional, so a file with an inline test-only `fn` above its test module loses everything
     after it, which is how `widgets.rs` lost 87% of itself; and it is not comment-aware, so a `///`
     line that merely *mentions* the attribute cuts there — several of the gates behind those cuts are
@@ -13616,7 +13619,11 @@ existing prose was left alone.
     deliberate `\n` in prose is followed by the next word, and a wrapped string literal nested in a
     view is indented well past eight columns; the only matches outside the two crates' production
     code are a CLI-help fixture, a synthetic source fixture and two live-test SQL strings, all of
-    which mean their newline. A deliberate break puts the next line at column 0.
+    which mean their newline. A deliberate break puts the next line at column 0. **It reads
+    `schemaic-cli` as well**, since `mcp.rs` moved there: every tool description and refusal a model
+    reads is a literal in that file, and the move took it out of `crate_sources()` — a
+    `"one\n          two"` planted in `mcp.rs` passed the gate until the corpus followed it, and fails
+    it now. So it scans `crate_sources()` plus the `schemaic-cli/` files of `workspace_sources()`.
     **`no_string_literal_carries_a_wrapped_lines_indentation` is that gate's mirror image**, over the
     same typing habit inverted: a string wrapped across source lines with **no** `\` at the break
     keeps the newline *and the whole of the next line's indent* as content, so a sentence carries a
@@ -13645,9 +13652,22 @@ existing prose was left alone.
     from the label list*, which reads as a smaller-but-healthy corpus, so
     `the_wider_scan_reaches_the_keyring_store` names `schemaic-conn/secrets.rs` outright — the way
     `the_scan_reaches_both_crates_that_build_views` names `lib.rs` and `schemaic-app/main.rs` — and
-    says in its own prose that this file left the census once already. `schemaic-cli` is **not** in
-    either census: no gate here has a rule about it, and adding the label would be a claim that one
-    does.
+    says in its own prose that this file left the census once already. **`schemaic-cli` is in
+    `workspace_sources()` since `mcp.rs` moved there** (floor 10), for `conn/secrets.rs`'s reason
+    over again: the file was a member of gates here — the `emit().join` one among them — while it
+    lived in `schemaic-app`, and a move out of the corpus is a silent exit from every one. It was out
+    before, with no gate having a rule about it; including it surfaced `args.rs`'s `AFTER_HELP` in
+    the wrapped-indentation gate above, answered there by a `concat!` of `\n`-terminated literals
+    (`args.rs`'s entry). It is in `workspace_sources` only — `crate_sources` stays the two view
+    crates, and the `\n` gate above takes its `schemaic-cli/` files from there.
+    **`mcp_deadline_gate` is two gates about one file of another crate**, `schemaic-cli/mcp.rs`'s
+    `every_database_read_carries_the_deadline` and `no_database_read_is_awaited_without_a_deadline`,
+    moved here from that file's own tests because they need `production_code` and that crate is
+    Floem-free — `mcp.rs`'s entry has the rules. They take the file through
+    `workspace_source(name)`, which takes the name `workspace_sources()` reports a file under, reads
+    that one file directly — `crates/<crate>/src/<rel>`, then `production_code` — and panics naming
+    it when it is not there, so a gate over a file that moves fails rather than scanning nothing. It
+    used to walk the whole census to keep one entry, every crate's source read and cut for nothing.
   - `stored.rs` — `Stored<T>`, **a persisted store the UI can read freely and write only by
     saving**. `formats`, `db_colors`, `table_colors` and `db_favorites` used to sit on `Ui` as public
     `RwSignal`s beside three public save closures (`save_formats`, `save_db_colors`,
@@ -17849,8 +17869,9 @@ existing prose was left alone.
     It renders a zero-footprint `empty()` whenever `UpdateState::label()` is `None`, which is
     most of most sessions, and is clickable only while `is_actionable()` holds — "Updating… 40%" is a
     progress readout, and a click on it mid-download would have nothing to apply.
-- `schemaic-app` — `main.rs` wires signals + callbacks and builds the `Ui`; also the built-in MCP
-  server (`--mcp-serve`) the AI panel talks to, and the argv branch into the headless CLI
+- `schemaic-app` — `main.rs` wires signals + callbacks and builds the `Ui`; also the `--mcp-serve`
+  branch that runs the MCP server the AI panel talks to (the server is `schemaic-cli`'s `mcp.rs`,
+  handed the endpoint blob the app wrote), and the argv branch into the headless CLI
   (`schemaic-cli`, below). `main` returns a `std::process::ExitCode` so the one-shot front ends can
   answer with one. A query tab's identity is `(conn_id, database)`;
   the app resolves `conn_id` → `Db` at run time (`db_for`), so a tab keeps its connection after a
@@ -18689,172 +18710,12 @@ existing prose was left alone.
   a code block for the user to run) is the one every model reaches for by default. It is stated
   whether or not queries are allowed, since proposing reads the schema and that was never the gated
   part, and the tag comes from the constant the renderer reads
-  (`the_prompt_names_the_fence_tag_the_renderer_reads`). The MCP server itself is `mcp.rs` — four tools (`run_query`, `list_schema`,
-  `describe_table`, `propose_table_change`), described for **this** connection's engine and listed
-  for **this** connection's access level: `tools_list(engine, reads_data)` builds
-  `run_query`'s advertised statement heads from `schemaic_core::sql::read_only_heads`, the same list
-  the gate enforces, and names the engine with `SqlDialect::engine_label()`. A hard-coded
-  `SELECT/SHOW/DESCRIBE/EXPLAIN/WITH` told every model that a SQLite connection accepted
-  `SHOW TABLES`, so a model reasoning from the tool's own text spent turns on statements that could
-  only come back as parser errors; `run_query_advertises_exactly_the_heads_its_gate_allows` walks
-  every advertised head back through the gate.
-  **The four are a type — `McpTool` — and that is what makes the advertised array and the gates one
-  set.** They used to be written out independently in five places the compiler related to nothing:
-  the `json!` array in `tools_list`, a `==` in `reads_row_data`, a `matches!` in `reads_schema`,
-  `call_tool`'s dispatch with its `other =>` catch-all, and `ai.rs`'s two `mcp__schemaic__*` `const`
-  lists. A new tool therefore joined the array, joined the dispatch and **defaulted to ungated at
-  both gates**, which is exactly how `propose_table_change` came to sit on neither — full
-  `fetch_schema` access at the app's tightest setting, with nothing failing to compile and nothing
-  failing to run. `name`, `ai_name`, `reads_row_data` and `reads_schema` are exhaustive matches on
-  the enum now, so a fifth variant does not compile until both gates have answered for it: five
-  `non-exhaustive patterns` errors, checked rather than assumed, and the same rule
-  `ai/harness.rs`'s `env_seal` states one crate over. The `json!` array survives, each tool's input
-  schema being JSON, but every entry in it is filtered back through `McpTool::from_name` before it is
-  listed — a `json!` array is not a type, and matching each advertised name back to a variant is what
-  makes the array and the gates one set rather than two that agree today; `call_tool` refuses an
-  unknown name up front and then matches with **no catch-all**; and `McpTool::offered` is the one
-  place the two gates are combined, so the listing and the refusal cannot disagree about what
-  *available* means. Nothing about the behaviour moved.
-  Below `AiData::Full` the tool is **withheld, not
-  merely refused**: `reads_row_data` is the one predicate both halves ask — `tools_list` leaves the
-  tool out (through `offered`) and `refusal_for` turns a call to it away with `NO_DATA_ACCESS`,
-  which names the setting so the model asks the user for
-  values instead of retrying. Listing `run_query` and denying the call is worse than not listing
-  it — the CLI's `--allowedTools` withheld it while `tools/list` still advertised it, so the model
-  planned a turn around a tool it could see, offered to run a query and analyse the results, and
-  learned only after the user agreed that the call was denied. No system-prompt sentence outranks a
-  tool the model can see, which is why the listing is where the level has to bite; the server-side
-  refusal is the backstop for a client working from a stale listing. The mirror of that listing is
-  `ai::ai_allowed_tools(may_query)`, the `--allowedTools` the CLI is spawned
-  with — **derived from `McpTool::ALL` rather than typed out**, since it was two more hand-written
-  `const` lists (`AI_TOOLS_WITH_QUERY` / `AI_TOOLS_READ_ONLY`) of a set the compiler related to
-  nothing, on top of the three in `mcp.rs`; a fifth tool now cannot be added without answering
-  `reads_row_data` for it, and that answer is what reaches here. And since `build_session_args` empties the built-in set with `--tools ""`, that list is now
-  the session's *entire* tool set rather than an addition to it (on a CLI whose `--help` does not
-  advertise the flag it is an addition again, with the twenty-nine-name backstop behind it — see
-  `schemaic-ai`): it runs
-  non-interactively, so an **MCP** tool missing from its level's list has nobody to approve it
-  and the call is simply denied. That rule is about the MCP surface and nothing else —
-  `--allowedTools` is emitted only alongside `--mcp-config` and names only `mcp__schemaic__…`, so it
-  never governed the CLI's *own* built-in tools, which is why three of those were measured executing
-  un-allow-listed and why the guard on them had to be `--tools ""` rather than this list (that
-  measurement is under `schemaic-ai`). What a built-in would do if the CLI *did* decide it needed
-  approval is not known: none was ever observed asking, so nothing here says built-ins are never
-  gated — only that those three were not. Two lists in two files drift, which is the history behind
-  both the enum above and the test below —
-  `propose_table_change` was offered by the server from the day it landed and named by neither
-  list, so the assistant's check of a proposed change against the live table was denied every time,
-  invisibly, since the model then writes the fenced block from the schema it already has and the
-  user sees a preview either way. `every_offered_tool_is_allow_listed_at_its_level` holds the two
-  sides equal per engine and per level. **That one list now feeds three different permission
-  mechanisms** — Claude's `--allowedTools`, Codex's `tools.<name>.approval_mode` overrides and
-  Antigravity's `permissions.allow` rules — each deriving the bare name it needs through
-  `harness::bare_tool_name` rather than restating the set, so a connection's access level cannot
-  mean one thing on one harness and another on the next. Everything dialect-shaped here reads `dialect_of` →
-  `Engine::dialect()`, whose match is exhaustive, and so does `main.rs`'s namesake (via
-  `dialect_for`). Both were `if engine == Postgres { Postgres } else { MySql }`, which compiled
-  cleanly when SQLite arrived and sorted it onto the MySQL side: the read-only gate lexed AI-issued
-  SQL by MySQL's backslash-escape and `#`-comment rules, neither of which SQLite has, and
-  `describe_table`'s sample query took `filter::table_query`'s MySQL branch — qualified `main.t`,
-  which is the SQLite name the surrounding entry says never to emit, and checked the name against
-  MySQL's reserved words rather than `SQLITE_RESERVED`, so a table named `isnull`, `notnull`,
-  `returning` or `transaction` (reserved in SQLite, not in MySQL) came out unquoted and would not
-  parse (`the_dialect_is_the_engines_own_for_every_engine`). The DDL paths escaped by luck alone:
-  `TableInfo::create_ddl` hands back SQLite's own `create_sql` for a real table without consulting
-  the dialect, and a **view** fell through to `ddl::view_ddl`'s MySQL shape, which was only cosmetic
-  because SQLite accepts backticks and its views carry no `view_options`. `conn/secrets.rs` is the
+  (`the_prompt_names_the_fence_tag_the_renderer_reads`). The MCP server itself is `cli/mcp.rs`
+  now, under `schemaic-cli` below — its tools, its gates, its deadlines, and how `ai_allowed_tools`
+  is derived from them. What stays here is the blob the panel hands it: `McpEndpoint` is an alias
+  of `schemaic_cli::mcp::Endpoint`, and `endpoint_from_value` builds one as `Host::Panel`, only the
+  app ever writing a blob. `conn/secrets.rs` is the
   keyring-backed `SecretStore` behind `core::secrets`.
-  **`run_query`'s body is `cli/query.rs`'s now, and that is a guard being kept single rather than a
-  tidy-up.** The normalisation, the read-only gate, the row cap and the cancel-and-wait timeout were
-  written out here first; the CLI needed all four, and writing them again would have left two copies
-  of a *gate* — the shape this codebase has already been bitten by, and one where only the front end
-  that got the next fix would have kept it. So this calls
-  `schemaic_cli::query::read_only_query` with `MCP_ROW_CAP` and `QUERY_TIMEOUT` — which is
-  `schemaic_cli::query::DEFAULT_TIMEOUT` itself, read where it is defined rather than restated — and
-  `normalize_stmt` and its tests left with the function. **The wording stays here**: `NoRows` is
-  matched arm by arm into this server's own sentences, because `NoRows::message` points a refused
-  write at `schemaic exec` and the assistant's route to a write is `propose_table_change`. Same
-  refusal, right advice for whoever is reading it.
-  **The statement deadline is a property of the server, not of one tool.** `QUERY_TIMEOUT` (30 s)
-  existed, its doc named the reason — "a backstop against `SLEEP()` / heavy scans holding the
-  connection open" — and it was wired to exactly one of the **four** database reads this server
-  performs: `describe_table`'s sample, `list_schema`'s `fetch_schema` and its per-database table-list
-  loop, and `propose_table_change`'s `fetch_schema` each built a fresh `CancellationToken` that
-  nothing ever cancelled and awaited it bare. The serve loop awaits `call_tool` inline before reading
-  the next line, so one slow read wedges the **whole** server rather than its own call — the agent's
-  tool call never returns, the turn hangs, and the user's only exit is Stop, which ends the session;
-  a view over an aggregate is the ordinary expensive case, and a steered model can pick one
-  deliberately. `with_deadline(fut, token)` is that deadline, and it **cancels rather than abandons**:
-  on expiry it cancels the token and keeps the future alive across the cancel, so the driver's KILL
-  branch runs. Measured against PostgreSQL 16.15 through the built binary, with
-  `CREATE VIEW zz_slowview AS SELECT pg_sleep(120)::text AS x, 1 AS y` and a `ping` queued behind a
-  `describe_table` on it: **before** — killed at 100 s by the harness, zero bytes on stdout, neither
-  request answered; **after** — 30 s, the view's DDL returned with
-  *"(unavailable: timed out after 30s and was cancelled)"* for the sample, and the ping answered. And
-  `pg_stat_activity` showed **zero** active backends running `pg_sleep` once the call returned, which
-  is what keeping the future alive buys. MySQL was *accidentally* bounded at ~15 s by its driver,
-  which made this a silent per-engine divergence in a refusal path as well. `None` is the timeout and
-  the **caller words it**, because they do not all mean the same thing: a timed-out `run_query` is an
-  error the model must see, while a timed-out sample degrades to the same "(unavailable: …)" line an
-  unselectable view already produces, with the table's DDL and keys still returned.
-  **The sample runs on a read-only session too** (`fetch_query_enforced` with `Enforce::ReadOnly`,
-  as `run_query`'s read does): the statement is `filter::table_query`'s own, but the object it names
-  is not, and a view can call a function that writes.
-  **A read with nothing to cancel needs the other wrapper, and `with_deadline` over one is not a
-  deadline at all.** `list_schema`'s per-database table-list loop calls `fetch_table_list`, which
-  takes no `CancellationToken` on any of the three engines — it is a name listing, not the full
-  introspection — so `with_deadline`'s `token.cancel()` reached no driver and its `fut.await` waited
-  the server out: the call site's comment about bounding the wait was describing an intention.
-  `with_deadline_abandoning` is that case, and it is a **separate function** so the choice has to be
-  made rather than inherited — it drops the future at the deadline. The statement still runs to
-  completion on the server afterwards, which is the trade the call site always believed it was
-  making and is the smaller half, the wedge being closed being *ours*. Giving the read a real token
-  is a `schemaic-db` change and has not been made.
-  **And `list_schema`'s overview arm had no deadline at all**, on the tool's advertised entry point —
-  what a fresh turn asks first. `db.fetch_databases()` is `SHOW DATABASES` on MySQL, so behind an
-  `ALTER TABLE`'s metadata lock, or against a server that has stopped answering without dropping the
-  socket, it blocks for the server's own time; the serve loop is sequential with no outer timeout, so
-  for the whole of that the MCP server answers nothing — not `initialize`, not `tools/list`, not
-  `ping`. It goes through `with_deadline_abandoning` too, taking no token either. **Neither half of
-  the existing gate could see it**: one enumerates `CancellationToken::new()` sites, the other is a
-  literal pair check for `with_deadline(` and `fetch_table_list` on one line, and this read builds no
-  token and names neither function. The commit that wrote the second half audited this very
-  function, restated its read count from four to six, and still did not count that one; there are
-  seven. `no_database_read_is_awaited_without_a_deadline` states the property both were reaching for
-  — **every awaited `db.…()` read in production code is lexically inside a deadline wrapper** — with
-  no hand-maintained list, so a new read has to be wrapped rather than added to an array, and a floor
-  because a needle that stops matching must not read as a clean file. **That floor is six now, and
-  the seventh read was not deleted — it moved.** `run_query`'s `fetch_query` folded into
-  `schemaic_cli::query::read_only_query` so this server and the CLI share one read path, and lowering
-  a floor is exactly the edit this gate exists to make someone justify: the read is still wrapped,
-  by `schemaic_cli::deadline::with_deadline`, and `cli/deadline.rs` carries
-  `no_database_read_in_this_crate_is_awaited_without_a_deadline` — the same gate over there,
-  following the read into a crate nothing had been watching. Lower it again only for that reason,
-  and only after checking the read still has a gate wherever it went. It scans the whole
-  call rather than one line: the wrapper is the call this read is an argument to, rustfmt breaks two
-  of the wrapped reads across lines, and a line-oriented scan would report both as offenders and,
-  worse, a broken *unwrapped* one as clean.
-  `a_read_past_the_deadline_is_cancelled_server_side` asserts the cancelling half under a paused
-  clock — the token fires *and* the future observes it, so dropping the future instead would fail —
-  and `every_database_read_carries_the_deadline` is the composition. That one took two goes: its
-  first shape measured a six-line window including comments, so the eight-line paragraph explaining
-  the sample's deadline pushed the proof out of view and it reported a correct site. Comments are
-  stripped before the window is measured now.
-  `propose_table_change` is the odd one out and stays read-only like the rest: it takes a
-  `core::propose::Proposal`, introspects the table, runs `propose::apply` → `ddl::diff` → `emit`,
-  and hands the model back the change list in the *preview's own words* plus the SQL and anything
-  destructive in it — **it executes nothing**. What it buys is a self-correction loop: the model
-  learns here that it misread a column name, rather than the user being handed an offer that can't
-  be applied. It cannot reach the user directly — this is a separate `--mcp-serve` process with no
-  route into the app's overlays — so a proposal arrives only when the model echoes the same JSON
-  into its reply in a `propose::FENCE_TAG` block, which `ui::markdown` picks up through
-  `is_proposal_tag`. A model that skips the tool has therefore lost a *check*, not a safety rail:
-  the preview and the Apply click sit downstream of both paths.
-  `proposal_from_args` strips the tool's own `database` argument before parsing, because `Proposal`
-  is `deny_unknown_fields` on purpose — an invented key has to fail loudly, since a silently-dropped
-  one is a change the user was promised and wouldn't get. The tag is advertised from the constant
-  the app extracts on (`the_proposal_tool_advertises_the_tag_the_app_looks_for`), so the two can't
-  drift into a block nothing picks up.
   - `agent_cli.rs` — finding the agent CLI, and asking it what it accepts. It was `claude_cli.rs`
     until the settings gained a harness, and the rename is not cosmetic: the module now looks for
     four binaries and interrogates whichever one is selected, so leaving it named for one of them
@@ -20065,7 +19926,7 @@ existing prose was left alone.
     ordering between them is free, and this way the protocol stream stays clean whichever of the
     four opened it.
     **The headless-CLI branch sits between those two, and being *before* Velopack is the load-bearing
-    part.** `schemaic list`/`databases`/`ping`/`tables`/`describe`/`query`/`exec`/`version` return from `main` ahead of the hook, the file
+    part.** `schemaic list`/`databases`/`ping`/`tables`/`describe`/`query`/`exec`/`mcp`/`version` return from `main` ahead of the hook, the file
     logger, the fonts and Floem: none of that belongs in a one-shot command, and `auto_apply_on_startup` is free
     to find a staged package and exit-and-relaunch the process — which is safe for a launch that has
     read no session state and is not safe in the middle of a command whose output someone is piping.
@@ -20164,10 +20025,12 @@ existing prose was left alone.
     byte-identical to the backup and logged the removal. **`row_status` is not yet verified by
     hand**: the greyed Install and the "comes with the app" hint need a real `.deb` install to see.
 - `schemaic-cli` — Schemaic without a window: `schemaic list` / `databases` / `ping` / `tables` /
-  `describe` / `query` / `exec` / `version` / `help`, so a person or an agent can run SQL against a saved connection with the app closed and without being
-  handed a credential. Its whole dependency list is `schemaic-core`, `schemaic-conn`, `schemaic-db`,
-  `clap`, `tokio` and `tokio-util` — **no floem**, which is what splitting `schemaic-conn` out of
-  `schemaic-app` was for. It is a **library** with two front ends, because the front ends differ per
+  `describe` / `query` / `exec` / `mcp` / `version` / `help`, so a person or an agent can run SQL against a saved connection with the app closed and without being
+  handed a credential. It also holds the **MCP server** (`mcp.rs`), which has two ways in — the
+  app's `--mcp-serve` for the AI panel, and `schemaic mcp -c <conn>` for any MCP client. Its whole
+  dependency list is `schemaic-core`, `schemaic-conn`, `schemaic-db`, `clap`, `serde_json`, `tokio`
+  (with `io-util` and `io-std`, for that server's stdin/stdout loop) and `tokio-util` — **no
+  floem**, which is what splitting `schemaic-conn` out of `schemaic-app` was for. It is a **library** with two front ends, because the front ends differ per
   platform. On Linux and macOS the `schemaic` binary takes an argv branch into `run::main` before it
   builds a window, the shape `--mcp-serve` already had, so the CLI *is* the app's own executable —
   deliberately so on macOS, where the keychain binds an item's ACL to the creating application and a
@@ -20207,9 +20070,9 @@ existing prose was left alone.
     no-database arm exists to stop, reached without the guard seeing it
     (`a_blank_database_is_refused_at_parse_time`, `a_zero_timeout_or_limit_is_refused`).
     **`-c` falls back to `SCHEMAIC_CONNECTION` and `-d` to `SCHEMAIC_DATABASE`** (clap's `env`; a
-    flag on the command line wins), on `query`, `exec`, `tables` and `describe` alike and `-c` on
+    flag on the command line wins), on `query`, `exec`, `tables` and `describe` alike, `-c` on
     `databases` and `ping`
-    (through `ConnArgs`), so an agent's shell is pointed at a connection and a database once. A `SCHEMAIC_DATABASE` that is set
+    (through `ConnArgs`) and both on `mcp` (through `McpTarget`), so an agent's shell is pointed at a connection and a database once. A `SCHEMAIC_DATABASE` that is set
     but blank goes through the same `non_blank` and is refused, not read as unset — it is `-d "$DB"`
     one step removed — which is why the message names both sources. The test reads the `env`
     attribute off clap's `Command` rather than setting the variable, since the process environment
@@ -20227,7 +20090,8 @@ existing prose was left alone.
     field of each one's own, so `--no-header` is on all of them at once
     (`no_header_is_on_every_row_printing_subcommand`).
     `OutputArgs::output()` is `format::Output::new`, and whether the pair goes together is judged
-    there rather than by clap; `Command::output_args()` hands it to `run.rs`, `None` for `version`.
+    there rather than by clap; `Command::output_args()` hands it to `run.rs`, `None` for `version`
+    and `mcp`.
     **The top-level `--help` ends with the formats and the exit codes** (`AFTER_HELP`, as `Cli`'s
     `after_help`), since a script's author reads the help and would otherwise have had to find
     either in the README; `OutputArgs::format`'s doc line names the five, so each subcommand's
@@ -20236,7 +20100,13 @@ existing prose was left alone.
     and `Format::NAMES`. Those tests read the text by its shape, which is the part to keep when
     editing it: an exit line is one whose first word is a number (the `\` continuation on 3 keeps
     its tail on the same line), and a format line is one indented by two spaces, so the
-    `--no-header` and stdout/stderr lines under the formats sit at column 0 on purpose.
+    `--no-header` and stdout/stderr lines under the formats sit at column 0 on purpose. **It is a
+    `concat!` of `\n`-terminated literals, one per line**, not one literal with its breaks typed in:
+    the columns are aligned with space runs, and a space run after a real line break is what
+    `source_gate`'s `no_string_literal_carries_a_wrapped_lines_indentation` reports — which it did,
+    the moment `schemaic-cli` joined that census for `mcp.rs`'s sake. A spelt `\n` is the gate's mark
+    of a block whose spacing is deliberate; the rendered help was checked byte-identical by diff
+    across the change.
     `--password-stdin` is for the headless case the keyring cannot serve:
     Linux's Secret Service needs an unlocked desktop collection, which an SSH session or a container
     does not have, and without it the CLI would simply be unusable there. It reads a pipe and
@@ -20290,6 +20160,14 @@ existing prose was left alone.
     none, and passing one is a parse error — it names one table, so there is nothing to cap, and
     `run.rs` holds it to a memory bound instead (`tables_takes_a_target_and_a_limit`,
     `describe_takes_one_table_and_a_target`). Both default `--timeout` to `DEFAULT_TIMEOUT_SECS`.
+    **`mcp` takes `McpTarget` — `-c` and `-d`, and deliberately no `--password-stdin`.** Stdin is
+    the MCP client's JSON-RPC stream, so a password read from it would be the client's first
+    request; the flag is absent rather than present and refusing. `-c` and `-d` keep the
+    `SCHEMAIC_CONNECTION`/`SCHEMAIC_DATABASE` fallbacks and `-d` the same `non_blank`, and there are
+    no output flags, since nothing here prints rows
+    (`mcp_takes_a_connection_and_a_database_and_nothing_from_stdin`, which holds `--password-stdin`,
+    `--format` and `--limit` to parse errors). The cost is the headless case `--password-stdin`
+    exists for: a connection whose password the keyring cannot serve has no `schemaic mcp`.
     **`wants_cli` is the routing predicate, and it is an allowlist of the *first* argument rather
     than "are there any arguments".** This binary is re-invoked with argv by things that are not the
     CLI — the Velopack installer and updater (`--veloapp-install`, `--veloapp-updated`,
@@ -20302,7 +20180,8 @@ existing prose was left alone.
     `schemaic --mcp-serve list` is the app being asked to serve). The converse holds too: through the
     app's own binary a new subcommand does not reach the CLI until its name is added here, as
     `databases` and `ping` were, and `tables` and `describe` after them — the test was seen red
-    until both names went in (`every_subcommand_routes_to_the_cli`) — `schemaic.com` calls
+    until both names went in (`every_subcommand_routes_to_the_cli`) — and `mcp` last, which is not
+    the app's `--mcp-serve` above though both start the one server. `schemaic.com` calls
     `run::main` without asking, so a missing name shows everywhere except through it. **That test
     and `the_help_text_names_every_subcommand` read the names off clap's `Command`**
     (`subcommand_names()`, plus `help`) rather than a list of their own, which is what makes them
@@ -20510,11 +20389,12 @@ existing prose was left alone.
     (`a_future_that_ignores_the_cancel_is_abandoned_after_the_grace`). The worst case is
     therefore `timeout` plus the grace, not `timeout`. The SSH tunnel is opened before this wrapper
     is ever entered, so it has a bound of its own in `run.rs`.
-    **It is deliberately not a merge with `app/mcp.rs`'s `with_deadline`**, which stays where it is:
-    that one wraps a read this crate never makes (`fetch_schema`), and the tokenless ones there
-    (`fetch_databases`, `fetch_table_list`) go through `with_deadline_abandoning` beside it. It
-    does share the bound: its wait after the cancel is `UNWIND_GRACE` too, for the same
-    still-connecting driver.
+    **It is deliberately not a merge with `mcp.rs`'s `with_deadline`**, and the server moving into
+    this crate did not merge them: that one wraps a read none of the subcommands makes
+    (`fetch_schema`), at the server's fixed `QUERY_TIMEOUT` rather than a `--timeout`, and the
+    tokenless ones there (`fetch_databases`, `fetch_table_list`) go through
+    `with_deadline_abandoning` beside it. It does share the bound: its wait after the cancel is
+    `UNWIND_GRACE` too, for the same still-connecting driver.
     **`schemaic databases` is one of two callers here whose token is not the future's.**
     `fetch_databases` takes none, so `run.rs` hands `with_deadline` a fresh one and the cancel
     reaches nothing — the case the paragraph above warns about. It is wrapped anyway because this
@@ -20528,7 +20408,8 @@ existing prose was left alone.
     check gives up by itself at the same moment the deadline would, and the wrap is there for the
     gate rather than for a cancel it cannot deliver.
     **The gate that produced this module is the part worth keeping.** `mcp.rs`'s
-    `no_database_read_is_awaited_without_a_deadline` carries a floor on how many reads it finds, so
+    `no_database_read_is_awaited_without_a_deadline` (in `ui/source_gate.rs` now, `mcp.rs`'s entry
+    below has why) carries a floor on how many reads it finds, so
     that a needle which stopped matching could not read as a clean file — and folding `run_query`
     onto `query::read_only_query` moved one read out of that file, seven to six, into a crate no gate
     was watching. So `no_database_read_in_this_crate_is_awaited_without_a_deadline` lives here and
@@ -20680,7 +20561,9 @@ existing prose was left alone.
     Schemaic, no `--all` advice — because the old single hint told a user with no connections to
     turn CLI access on (`list_counts_what_it_hid`, `list_is_quiet_when_it_hid_nothing`,
     `an_empty_list_says_whether_anything_is_saved`). stdout stays the rows alone. `database_for` is the flag, else the connection's own, else `None` —
-    an empty string there would read as a real database name to the guard's `no_database` arm.
+    an empty string there would read as a real database name to the guard's `no_database` arm. The
+    rule itself is `default_database(flag, conn)`, factored out for `mcp`, whose `-d` is not in a
+    `Target` (`mcp_defaults_to_the_connections_database`).
     **`version` is answered at the top of `dispatch`, before `load_connections_readonly` runs**: it
     needs no saved connection, and a damaged `connections.json` must not stop anyone learning which
     build they have — the first thing asked of someone reporting it damaged. Checked by hand with a
@@ -20725,7 +20608,8 @@ existing prose was left alone.
     connection that is not there is.
     **After a failure for want of a database, a `hint:` line on stderr names the way out** — `-d
     <database>`, a default picked in Schemaic, and `schemaic databases -c <conn>` with the user's own
-    `-c` echoed back, quoted if it has whitespace. `hint` prints it on a line of its own after
+    `-c` echoed back, quoted if it has whitespace (`shell_word`, which `mcp_notice` shares).
+    `hint` prints it on a line of its own after
     `warn`'s, so the error line stays the driver's words, and no exit code changes. Whether a failure
     is that one is `core::sql::no_database_failure(message, dialect)`, and `run.rs`'s
     `no_database_failure` asks it only of a `NoRows::Failed` on a run `database_for` answered `None`,
@@ -20753,6 +20637,284 @@ existing prose was left alone.
     DATABASES` all run fine without one — and PostgreSQL never reports "no database" at all. So the
     server decides and the CLI adds the hint; `exec`'s up-front `no_database` arm — a PostgreSQL
     statement that `needs_database`, which no read is — is unchanged.
+    **`mcp` is `serve_mcp`, and it keeps the order that makes exit 3 true.** `select_conn` first, so
+    `cli_access` gates it like every subcommand: a connection the user never exposed is exit 3 and
+    an unknown one exit 2, before the keyring is read, and the MCP client shows a server that failed
+    to start, with that line as its log, rather than one with a tool list
+    (`mcp_refuses_a_connection_without_cli_access`). Then `connect` under `query::DEFAULT_TIMEOUT`,
+    which is where an SSH tunnel is opened — **once, and held (`_tunnel`) for the server's
+    lifetime**; every tool call is still its own database connection, `Db` connecting per operation.
+    *Once* also means never reopened: after the tunnel drops, every tool call fails until the
+    client restarts the server — a known limit, left as it is. Then `mcp::Endpoint::standalone` over `default_database(-d, conn)` and the connection's
+    `ai_data`, one line on stderr, and `mcp::serve` until the client closes stdin — exit 0. **No
+    database connection is made before the first tool call**, deliberately: a database that is down
+    right now is an error the model sees on that call and may retry, not a server that never
+    started. stdout is the protocol's, so the line goes to stderr, which MCP clients keep as the
+    server's log, and it is `mcp_notice`: which connection is served and — when `run_query` is
+    withheld — the level the connection is at and the one that allows it, because a model that finds
+    no query tool reports it as a bug and the reason has to be in the log beside it
+    (`the_mcp_notice_explains_a_withheld_query_tool`) — and, when the endpoint has no database, that
+    the tools run where the server puts them unless a call names one, with `-d` and the `schemaic
+    databases -c <name>` that lists what to give it. An agent that does not know that sees
+    `relation does not exist` for a table `list_schema` just showed it
+    (`the_mcp_notice_says_when_there_is_no_default_database`). `connect` is handed a `ConnArgs` with
+    `password_stdin: false`, `mcp` having no such flag.
+  - `cli/mcp.rs` — the **MCP (stdio) server**: newline-delimited JSON-RPC on stdin/stdout, and four
+    tools, none of which writes anything. It was `app/mcp.rs` until `schemaic mcp` needed it, and it
+    lives here so that the second way in is the same server rather than a copy of its gates —
+    `schemaic-cli` cannot reach into `schemaic-app`, which depends on it. The four (`run_query`,
+    `list_schema`, `describe_table`, `propose_table_change`) are described for **this**
+    connection's engine and listed for **this** connection's access levels and **this** host:
+    `tools_list(engine, reads_data, schema, host)` builds
+    `run_query`'s advertised statement heads from `schemaic_core::sql::read_only_heads`, the same list
+    the gate enforces, and names the engine with `SqlDialect::engine_label()`. A hard-coded
+    `SELECT/SHOW/DESCRIBE/EXPLAIN/WITH` told every model that a SQLite connection accepted
+    `SHOW TABLES`, so a model reasoning from the tool's own text spent turns on statements that could
+    only come back as parser errors; `run_query_advertises_exactly_the_heads_its_gate_allows` walks
+    every advertised head back through the gate.
+    **Who started it is a type, `Host`, and it decides one tool.** `Host::Panel` is `schemaic
+    --mcp-serve`, spawned by whichever agent CLI the AI panel launched, over the endpoint blob the
+    app wrote — already tunnelled, and never on a command line (`ai.rs`'s entry has the plumbing).
+    `Host::Standalone` is `schemaic mcp -c <conn>`, spawned by any MCP client, over an endpoint
+    `run.rs`'s `serve_mcp` builds from a saved connection. What differs is who reads the model's
+    *reply*. In the panel the app does, and that is the whole of `propose_table_change`'s worth — a
+    proposal echoed into a fenced block becomes a change preview. Standalone nothing of ours reads
+    it, so the tool would tell the model the user has a preview to review when they have a block of
+    JSON, and an assistant that believes the user reviewed a change is the one that stops describing
+    it. `McpTool::needs_panel` is true for that tool alone; standalone it is withheld from the
+    listing and refused on call with `NO_PANEL`, which tells the model to describe the change instead
+    (`the_proposal_tool_is_withheld_outside_the_panel`). Every other tool is the connection's
+    decision, not the host's. **The host changes what a refusal advises, never whether it
+    refuses**: the panel's `NO_DATA_ACCESS` says the user can attach rows from a result grid, a
+    gesture an outside client does not have, so `NO_DATA_ACCESS_STANDALONE` names the *Let it read
+    data* level in Schemaic's connection settings instead
+    (`rows_are_withheld_standalone_with_advice_that_fits_the_client`).
+    **`Endpoint` is the server's, and the app's `McpEndpoint` is an alias of it** — `db`,
+    `database`, `samples`, `hidden`, `schema`, `host`. It was a struct in `app/ai.rs`, which this
+    crate cannot name. `Endpoint::standalone(db, database, ai_data)` is the other constructor, and
+    each field it sets is a decision rather than a default. `samples` is
+    `ai_data.unwrap_or_default().may_query()` — rows only at `AiData::Full`: `OnRequest` is the level
+    whose rows reach a model by the user's attach gesture, and an outside client has none, so it
+    sends none rather than being promoted. **`None` is the default level here, not the migration's
+    answer**: the app settles a never-chosen level at startup from the legacy global "run queries"
+    flag, which defaulted *on*, and the CLI cannot read that flag — guessing `Full` would hand rows to
+    an agent on a connection whose owner was never asked
+    (`a_standalone_endpoint_reads_rows_only_at_full_access`,
+    `a_connection_that_never_chose_a_level_sends_no_rows`). `schema` is always `true`, there being no
+    system prompt to budget and `cli_access` already publishing the catalogue through `schemaic
+    tables` and `describe`. `hidden` is empty: the SCHEMA eye is the app's view state rather than
+    anything saved on the connection, and `schemaic databases` lists every database too. And
+    `database` is `Db::implied_database()` first — `main` on SQLite, `None` on the two server
+    engines, an exhaustive match — because the panel always passed the tree's selection and
+    standalone there is no tree: `describe_table {"table": "orders"}` on a SQLite file answered that
+    the connection had no default, about a file that has exactly one
+    (`a_standalone_endpoint_defaults_to_the_engines_only_database`). *First*, not a fallback: on
+    SQLite a `-d` or an inherited `SCHEMAIC_DATABASE` is ignored, `catalog.rs`'s rule for its reason
+    — every operation opens its own connection, so nothing else is ever attached, and a variable
+    exported for another engine would point every tool at a database that cannot exist. A server
+    engine with no default stays `None`, where the model has to pick and `list_schema` shows it the
+    names. **`run_query` takes that pick too** — an optional `database` beside `sql`, which stays
+    the only required argument, resolved by the pure `tool_database(args, default)`: the call's own
+    non-empty `database`, else the endpoint's. It had none, so standalone the one database a model
+    could query was the default while `list_schema` showed it every other, and a `database` it
+    passed anyway was dropped without a word — measured on a real PostgreSQL server, `SELECT
+    count(*) FROM track` with `"database": "chinook"` ran in `world` and answered `relation "track"
+    does not exist`. On PostgreSQL nothing else reaches another database
+    (`run_query_takes_a_database_and_uses_it`). The panel lists the same tools, so it has the
+    argument too, which the SCHEMA eye's rule already allows for: `run_query` answers in full, a
+    hidden database included.
+    **The four are a type — `McpTool` — and that is what makes the advertised array and the gates one
+    set.** They used to be written out independently in five places the compiler related to nothing:
+    the `json!` array in `tools_list`, a `==` in `reads_row_data`, a `matches!` in `reads_schema`,
+    `call_tool`'s dispatch with its `other =>` catch-all, and `ai.rs`'s two `mcp__schemaic__*` `const`
+    lists. A new tool therefore joined the array, joined the dispatch and **defaulted to ungated at
+    both gates**, which is exactly how `propose_table_change` came to sit on neither — full
+    `fetch_schema` access at the app's tightest setting, with nothing failing to compile and nothing
+    failing to run. `name`, `ai_name`, `reads_row_data` and `reads_schema` are exhaustive matches on
+    the enum now — `needs_panel` too — so a fifth variant does not compile until every gate has
+    answered for it: five `non-exhaustive patterns` errors when that was checked, before
+    `needs_panel` existed, and the same rule `ai/harness.rs`'s `env_seal` states one crate over. The
+    `json!` array survives, each tool's input
+    schema being JSON, but every entry in it is filtered back through `McpTool::from_name` before it is
+    listed — a `json!` array is not a type, and matching each advertised name back to a variant is what
+    makes the array and the gates one set rather than two that agree today; `call_tool` refuses an
+    unknown name up front and then matches with **no catch-all**; and
+    `McpTool::offered(reads_data, schema, host)` is the one place the gates are combined — three
+    now, the host the third — so the listing, the refusal and the panel's allow-list cannot disagree
+    about what *available* means (`the_listing_is_exactly_the_tools_offered`, at every combination
+    of the three). Nothing about the behaviour moved.
+    Below `AiData::Full` the tool is **withheld, not
+    merely refused**: `reads_row_data` is the one predicate both halves ask — `tools_list` leaves the
+    tool out (through `offered`) and `refusal_for` turns a call to it away with `NO_DATA_ACCESS`,
+    which names the setting so the model asks the user for
+    values instead of retrying. Listing `run_query` and denying the call is worse than not listing
+    it — the CLI's `--allowedTools` withheld it while `tools/list` still advertised it, so the model
+    planned a turn around a tool it could see, offered to run a query and analyse the results, and
+    learned only after the user agreed that the call was denied. No system-prompt sentence outranks a
+    tool the model can see, which is why the listing is where the level has to bite; the server-side
+    refusal is the backstop for a client working from a stale listing. **`describe_table`'s
+    description follows the level too**: it promises sample rows only when `reads_data`, and
+    otherwise says it returns the definition and foreign keys and no rows — below `AiData::Full`,
+    the standalone default, it told the model to expect rows that never came, and the model planned
+    its turn around them (`describe_table_promises_samples_only_when_it_sends_them`). So does the
+    pointer at `describe_table` that ends `list_schema`'s overview (`format_database_list` takes
+    the endpoint's `samples`): it said "sample rows" at every level, and re-made the promise in the
+    first reply of a session (`the_overview_promises_samples_only_when_it_sends_them`).
+    The mirror of that listing is
+    `ai::ai_allowed_tools(may_query, schema)`, the `--allowedTools` the CLI is spawned
+    with — **derived from `McpTool::ALL` rather than typed out**, since it was two more hand-written
+    `const` lists (`AI_TOOLS_WITH_QUERY` / `AI_TOOLS_READ_ONLY`) of a set the compiler related to
+    nothing, on top of the three in `mcp.rs`, and filtered through `offered(…, Host::Panel)` itself
+    now, where it used to spell the predicate out again inline; a fifth tool now cannot be added
+    without answering every gate for it, and that answer is what reaches there. And since `build_session_args` empties the built-in set with `--tools ""`, that list is now
+    the session's *entire* tool set rather than an addition to it (on a CLI whose `--help` does not
+    advertise the flag it is an addition again, with the twenty-nine-name backstop behind it — see
+    `schemaic-ai`): it runs
+    non-interactively, so an **MCP** tool missing from its level's list has nobody to approve it
+    and the call is simply denied. That rule is about the MCP surface and nothing else —
+    `--allowedTools` is emitted only alongside `--mcp-config` and names only `mcp__schemaic__…`, so it
+    never governed the CLI's *own* built-in tools, which is why three of those were measured executing
+    un-allow-listed and why the guard on them had to be `--tools ""` rather than this list (that
+    measurement is under `schemaic-ai`). What a built-in would do if the CLI *did* decide it needed
+    approval is not known: none was ever observed asking, so nothing here says built-ins are never
+    gated — only that those three were not. Two lists in two files drift, which is the history behind
+    both the enum above and the test below —
+    `propose_table_change` was offered by the server from the day it landed and named by neither
+    list, so the assistant's check of a proposed change against the live table was denied every time,
+    invisibly, since the model then writes the fenced block from the schema it already has and the
+    user sees a preview either way. `every_offered_tool_is_allow_listed_at_its_level` holds the two
+    sides equal per engine and per level. **That one list now feeds three different permission
+    mechanisms** — Claude's `--allowedTools`, Codex's `tools.<name>.approval_mode` overrides and
+    Antigravity's `permissions.allow` rules — each deriving the bare name it needs through
+    `harness::bare_tool_name` rather than restating the set, so a connection's access level cannot
+    mean one thing on one harness and another on the next. Everything dialect-shaped here reads `dialect_of` →
+    `Engine::dialect()`, whose match is exhaustive, and so does `app/main.rs`'s namesake (via
+    `dialect_for`). Both were `if engine == Postgres { Postgres } else { MySql }`, which compiled
+    cleanly when SQLite arrived and sorted it onto the MySQL side: the read-only gate lexed AI-issued
+    SQL by MySQL's backslash-escape and `#`-comment rules, neither of which SQLite has, and
+    `describe_table`'s sample query took `filter::table_query`'s MySQL branch — qualified `main.t`,
+    which is the SQLite name `core/filter.rs`'s entry says never to emit, and checked the name against
+    MySQL's reserved words rather than `SQLITE_RESERVED`, so a table named `isnull`, `notnull`,
+    `returning` or `transaction` (reserved in SQLite, not in MySQL) came out unquoted and would not
+    parse (`the_dialect_is_the_engines_own_for_every_engine`). The DDL paths escaped by luck alone:
+    `TableInfo::create_ddl` hands back SQLite's own `create_sql` for a real table without consulting
+    the dialect, and a **view** fell through to `ddl::view_ddl`'s MySQL shape, which was only cosmetic
+    because SQLite accepts backticks and its views carry no `view_options`.
+    **`run_query`'s body is `query.rs`'s now, and that is a guard being kept single rather than a
+    tidy-up.** The normalisation, the read-only gate, the row cap and the cancel-and-wait timeout were
+    written out here first; the CLI needed all four, and writing them again would have left two copies
+    of a *gate* — the shape this codebase has already been bitten by, and one where only the front end
+    that got the next fix would have kept it. So this calls
+    `query::read_only_query` with `MCP_ROW_CAP` and `QUERY_TIMEOUT` — which is
+    `query::DEFAULT_TIMEOUT` itself, read where it is defined rather than restated — and
+    `normalize_stmt` and its tests left with the function. **The wording stays here**: `NoRows` is
+    matched arm by arm into this server's own sentences, because `NoRows::message` points a refused
+    write at `schemaic exec` and the assistant's route to a write is `propose_table_change` — in the
+    panel; standalone it has none. Same refusal, right advice for whoever is reading it.
+    **The statement deadline is a property of the server, not of one tool.** `QUERY_TIMEOUT` (30 s)
+    existed, its doc named the reason — "a backstop against `SLEEP()` / heavy scans holding the
+    connection open" — and it was wired to exactly one of the **four** database reads this server
+    performs: `describe_table`'s sample, `list_schema`'s `fetch_schema` and its per-database table-list
+    loop, and `propose_table_change`'s `fetch_schema` each built a fresh `CancellationToken` that
+    nothing ever cancelled and awaited it bare. The serve loop awaits `call_tool` inline before reading
+    the next line, so one slow read wedges the **whole** server rather than its own call — the agent's
+    tool call never returns, the turn hangs, and the user's only exit is Stop, which ends the session;
+    a view over an aggregate is the ordinary expensive case, and a steered model can pick one
+    deliberately. `with_deadline(fut, token)` is that deadline, and it **cancels rather than abandons**:
+    on expiry it cancels the token and keeps the future alive across the cancel, so the driver's KILL
+    branch runs. Measured against PostgreSQL 16.15 through the built binary, with
+    `CREATE VIEW zz_slowview AS SELECT pg_sleep(120)::text AS x, 1 AS y` and a `ping` queued behind a
+    `describe_table` on it: **before** — killed at 100 s by the harness, zero bytes on stdout, neither
+    request answered; **after** — 30 s, the view's DDL returned with
+    *"(unavailable: timed out after 30s and was cancelled)"* for the sample, and the ping answered. And
+    `pg_stat_activity` showed **zero** active backends running `pg_sleep` once the call returned, which
+    is what keeping the future alive buys. MySQL was *accidentally* bounded at ~15 s by its driver,
+    which made this a silent per-engine divergence in a refusal path as well. `None` is the timeout and
+    the **caller words it**, because they do not all mean the same thing: a timed-out `run_query` is an
+    error the model must see, while a timed-out sample degrades to the same "(unavailable: …)" line an
+    unselectable view already produces, with the table's DDL and keys still returned.
+    **The sample runs on a read-only session too** (`fetch_query_enforced` with `Enforce::ReadOnly`,
+    as `run_query`'s read does): the statement is `filter::table_query`'s own, but the object it names
+    is not, and a view can call a function that writes.
+    **A read with nothing to cancel needs the other wrapper, and `with_deadline` over one is not a
+    deadline at all.** `list_schema`'s per-database table-list loop calls `fetch_table_list`, which
+    takes no `CancellationToken` on any of the three engines — it is a name listing, not the full
+    introspection — so `with_deadline`'s `token.cancel()` reached no driver and its `fut.await` waited
+    the server out: the call site's comment about bounding the wait was describing an intention.
+    `with_deadline_abandoning` is that case, and it is a **separate function** so the choice has to be
+    made rather than inherited — it drops the future at the deadline. The statement still runs to
+    completion on the server afterwards, which is the trade the call site always believed it was
+    making and is the smaller half, the wedge being closed being *ours*. Giving the read a real token
+    is a `schemaic-db` change and has not been made.
+    **And `list_schema`'s overview arm had no deadline at all**, on the tool's advertised entry point —
+    what a fresh turn asks first. `db.fetch_databases()` is `SHOW DATABASES` on MySQL, so behind an
+    `ALTER TABLE`'s metadata lock, or against a server that has stopped answering without dropping the
+    socket, it blocks for the server's own time; the serve loop is sequential with no outer timeout, so
+    for the whole of that the MCP server answers nothing — not `initialize`, not `tools/list`, not
+    `ping`. It goes through `with_deadline_abandoning` too, taking no token either. **Neither half of
+    the existing gate could see it**: one enumerates `CancellationToken::new()` sites, the other is a
+    literal pair check for `with_deadline(` and `fetch_table_list` on one line, and this read builds no
+    token and names neither function. The commit that wrote the second half audited this very
+    function, restated its read count from four to six, and still did not count that one; there are
+    seven. `no_database_read_is_awaited_without_a_deadline` states the property both were reaching for
+    — **every awaited `db.…()` read in production code is lexically inside a deadline wrapper** — with
+    no hand-maintained list, so a new read has to be wrapped rather than added to an array, and a floor
+    because a needle that stops matching must not read as a clean file. **That floor is six now, and
+    the seventh read was not deleted — it moved.** `run_query`'s `fetch_query` folded into
+    `query::read_only_query` so this server and the CLI share one read path, and lowering
+    a floor is exactly the edit this gate exists to make someone justify: the read is still wrapped,
+    by `deadline::with_deadline`, and `deadline.rs` carries
+    `no_database_read_in_this_crate_is_awaited_without_a_deadline` — the same gate over there,
+    following the read into a crate nothing had been watching. Lower it again only for that reason,
+    and only after checking the read still has a gate wherever it went. It scans the whole
+    call rather than one line: the wrapper is the call this read is an argument to, rustfmt breaks two
+    of the wrapped reads across lines, and a line-oriented scan would report both as offenders and,
+    worse, a broken *unwrapped* one as clean.
+    `a_read_past_the_deadline_is_cancelled_server_side` asserts the cancelling half under a paused
+    clock — the token fires *and* the future observes it, so dropping the future instead would fail —
+    and `every_database_read_carries_the_deadline` is the composition. That one took two goes: its
+    first shape measured a six-line window including comments, so the eight-line paragraph explaining
+    the sample's deadline pushed the proof out of view and it reported a correct site. Comments are
+    stripped before the window is measured now. It gained a floor of its own in the move
+    (`tokens >= 4`), for the other gate's reason.
+    **Both gates live in `ui/source_gate.rs`, as `mcp_deadline_gate`, not beside this file.** They
+    need `source_gate::production_code`'s brace-aware cut, and this crate is Floem-free: a
+    dev-dependency on `schemaic-ui` would compile Floem into its tests, and a second copy of the walk
+    is the thing `source_gate` exists to prevent. They read the file through
+    `workspace_source("schemaic-cli/mcp.rs")`, which fails by name if the file moves again rather
+    than scanning nothing.
+    **The loop is `serve_on(&endpoint, reader, writer)`, and `serve` only hands it stdin and
+    stdout** — any `AsyncBufRead` and `AsyncWrite`, so the protocol itself is tested rather than
+    only the pure pieces it calls: the tests drive it with a `&[u8]` and a `Vec<u8>`, and no request
+    they send reaches the database. It reads **bytes, then UTF-8**, a line at a time
+    (`read_until(b'\n')`, then `str::from_utf8`). It was `while let Ok(Some(line)) =
+    lines.next_line()`, and `lines()` answers a line that is not UTF-8 with an error, which that loop
+    took for the end of input — the server exited 0 mid-session, as though the client had hung up.
+    JSON is UTF-8 by definition, so such a line is no request: it is skipped with a note on stderr
+    and the session goes on (`a_line_that_is_not_utf8_does_not_end_the_session`); a real read error
+    still ends it, said on stderr. **A method it does not implement is JSON-RPC's `-32601`**
+    (`METHOD_NOT_FOUND`, "Method not found: <method>") when the request carries an id, and nothing
+    at all for a notification. It was `{"result": {}}`, which reads as success: `resources/list`
+    answered that way has no `resources`, and a strict client fails its own schema check and marks
+    the whole server broken (`an_unknown_method_is_method_not_found`). The handshake still speaks
+    one revision — `SUPPORTED_PROTOCOLS` is `2024-11-05` alone, a known limit left as it is — and
+    `negotiate_protocol` answers a client asking for another with that one, leaving the client to
+    decide whether to go on.
+    `propose_table_change` is the odd one out and stays read-only like the rest: it takes a
+    `core::propose::Proposal`, introspects the table, runs `propose::apply` → `ddl::diff` → `emit`,
+    and hands the model back the change list in the *preview's own words* plus the SQL and anything
+    destructive in it — **it executes nothing**. What it buys is a self-correction loop: the model
+    learns here that it misread a column name, rather than the user being handed an offer that can't
+    be applied. It cannot reach the user directly — this is a separate `--mcp-serve` process with no
+    route into the app's overlays — so a proposal arrives only when the model echoes the same JSON
+    into its reply in a `propose::FENCE_TAG` block, which `ui::markdown` picks up through
+    `is_proposal_tag`; that is why it is `needs_panel`. A model that skips the tool has therefore
+    lost a *check*, not a safety rail: the preview and the Apply click sit downstream of both paths.
+    `proposal_from_args` strips the tool's own `database` argument before parsing, because `Proposal`
+    is `deny_unknown_fields` on purpose — an invented key has to fail loudly, since a silently-dropped
+    one is a change the user was promised and wouldn't get. The tag is advertised from the constant
+    the app extracts on (`the_proposal_tool_advertises_the_tag_the_app_looks_for`), so the two can't
+    drift into a block nothing picks up.
   - `cli/schemaic-cli.rs` — the console-subsystem binary, at `src/bin/`. Its body is one call to
     `run::main`, deliberately: it is the same entry point the app's argv branch calls, two front
     ends over one program. It is **built on every platform** even though only Windows packages it,
@@ -20973,7 +21135,11 @@ Re-introducing the anti-patterns these guard against is a regression:
   **no `Confirm` arm to say yes to**, which is the right shape when there is nobody at the keyboard,
   and stronger than the verdict on the same axis `rerunnable_for_export` is. That function is the
   one headless read path: the MCP server's `run_query` calls it too, rather than the CLI writing a
-  second copy of the gate beside the one `mcp.rs` already had.
+  second copy of the gate beside the one `mcp.rs` already had. Both live in `schemaic-cli` now, and
+  `schemaic mcp` is a second way into that same server rather than a new path: its `run_query` is
+  the same call, the connection it serves has passed `cli/select.rs`'s `cli_access` gate like every
+  subcommand's, and the one tool that could lead toward a write, `propose_table_change`, is not
+  offered there at all.
   **A head is a spelling, not a read, and this paragraph called the gate read-only while it was
   not.** `SELECT setval('s', 1000)`, `SELECT lo_unlink(…)`, PostgreSQL's `SELECT 1 INTO newtable` and
   a `SELECT` of a function whose body `DELETE`s all passed it and wrote through both front ends —
@@ -21090,7 +21256,11 @@ Re-introducing the anti-patterns these guard against is a regression:
   summary's column sample and Seed Table's bottom sample all flowing regardless. Gate at the
   action as well as at the menu: a menu built a moment before the connection was locked down is
   still on screen. The default (`OnRequest`) grants **no** automatic access — rows go only where
-  the user attached them, so the gesture is the consent and there is no setting to forget. And
+  the user attached them, so the gesture is the consent and there is no setting to forget.
+  **`schemaic mcp` asks `may_query` too**, of the saved connection it serves
+  (`mcp::Endpoint::standalone`): an outside client has no attach gesture, so `OnRequest` sends it
+  no rows, and a level never chosen reads as that default rather than as the app's startup
+  migration, whose legacy flag the CLI cannot see. And
   what is sent is kept honest at both ends: `result_shape` states out loud that no rows were sent,
   and `result_attachment` states the cap it applied.
   **Which of the two a path asks is itself a decision, and two paths had it wrong the same way.**
@@ -21177,7 +21347,7 @@ Re-introducing the anti-patterns these guard against is a regression:
   capability. **Deriving the dialect is the same question**: `Engine::dialect()` is the one
   exhaustive answer, and the hand-written `if engine == Postgres { Postgres } else { MySql }` that
   stood in for it in `app::mcp` and `app::main` is exactly how SQLite came to be lexed by MySQL's
-  rules on the AI path (see `schemaic-app` below). The **terminal's DB-client button** was the last
+  rules on the AI path (see `cli/mcp.rs`, where that server lives now). The **terminal's DB-client button** was the last
   of that shape to fall (`open_db_cli`): `if is_postgres { psql } else { mysql }` handed a SQLite
   connection to the MySQL client along with the inert `127.0.0.1:3306` a *file* connection carries,
   so the button either reported no client or opened a session against an unrelated local server and
@@ -21704,8 +21874,9 @@ Re-introducing the anti-patterns these guard against is a regression:
   the model as complete.
   `source_gate::tests::nothing_joins_the_emitted_statements_outside_client_script` is the third
   spelling of the guard and the first that could have seen that fifth. It reads
-  `source_gate::workspace_sources()` — this crate plus `schemaic-app`, `schemaic-core` and
-  `schemaic-db` — and asks about the *expression* rather than one spelling: every `.emit()`, then
+  `source_gate::workspace_sources()` — this crate plus `schemaic-app`, `schemaic-core`,
+  `schemaic-db`, `schemaic-conn` and `schemaic-cli`, the last because that DDL tool's file moved
+  there and taking it out of the census would have taken it out of this gate — and asks about the *expression* rather than one spelling: every `.emit()`, then
   the rest of its statement for a `.join(` or a `.concat(`. The version before it matched the
   single literal `emit().join(` in the production halves of `ddl.rs` and `compare.rs` alone. Its
   needle is assembled rather than spelled, or the assertion's own source is the hit and the gate

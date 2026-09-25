@@ -21,13 +21,15 @@ schemaic-core = { workspace = true }
 schemaic-conn = { workspace = true }
 schemaic-db = { workspace = true }
 clap = { workspace = true }
-tokio = { workspace = true }
+# The MCP server's JSON-RPC, and the reason test connections are built through
+# serde rather than as struct literals — a new `Connection` field does not send
+# anyone editing fixtures here.
+serde_json = { workspace = true }
+# `io-std` and `io-util` for the MCP server's stdin/stdout line loop.
+tokio = { workspace = true, features = ["io-util", "io-std"] }
 tokio-util = { workspace = true }
 
-# Test connections are built through serde rather than as struct literals, so a
-# new `Connection` field does not send anyone editing fixtures here.
 [dev-dependencies]
-serde_json = { workspace = true }
 # `test-util` for tokio's paused clock, so the deadline tests can let a
 # 30-second timeout expire without waiting half a minute. Declared here rather
 # than inherited: `cargo test --workspace` unified it in from `schemaic-app`'s
