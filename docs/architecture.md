@@ -7262,16 +7262,19 @@ existing prose was left alone.
       was added to fix. **Its bytes, not just its length** — that is the one place the length-only
       rule does not carry, because every other string here only ever *grows* while a harness key is
       swapped whole. Two keys of equal length fingerprinted identically, and a message whose
-      fingerprint does not move keeps its rendered speaker label. Today's four keys happen to have
-      distinct lengths, which is luck rather than design: a fifth named `crush` or `cline` collides
-      with `codex` on length alone. A key is a handful of bytes, so the cost is still nothing.
-      **That property is pinned by a test of its own, and it has to use synthetic keys** —
+      fingerprint does not move keeps its rendered speaker label. The first five keys happened to
+      have distinct lengths, which was luck rather than design, and **the sixth ended it**: `cursor`
+      is six bytes, as `claude` is, so under a length-only fold a bubble re-stamped from one to the
+      other would keep the previous CLI's name over the new CLI's answer. A key is a handful of
+      bytes, so the cost is still nothing.
+      **That property is pinned by a test of its own, and it was written with synthetic keys** —
       `two_harness_keys_of_the_same_length_do_not_fingerprint_alike`, which is separate from the
-      walk above rather than one more assertion inside it because **no test written with real
-      harness keys can catch this**: `claude`/`codex`/`antigravity`/`opencode` are 6, 5, 11 and 8
-      bytes, so a length-only fold passes against all four and would pass against every case an
-      honest reading of today's enum suggests. It holds `codex` apart from `crush` and `cline`,
-      neither of which is a harness, and apart from an absent key and an empty one.
+      walk above rather than one more assertion inside it because, when it was written, **no test
+      using real harness keys could catch this**: `claude`/`codex`/`antigravity`/`opencode`/`copilot`
+      are 6, 5, 11, 8 and 7 bytes, so a length-only fold passed against all five. It holds `codex`
+      apart from `crush` and `cline`, neither of which is a harness, and apart from an absent key and
+      an empty one. It has not gained the real `claude`/`cursor` pair, and its own comments still
+      speak of four keys.
     - `chat.rs` — per-connection conversations persisted to `chats.json`. `ChatFile::of` replaces
       every tool `result` with `RESULT_OMITTED` before it reaches disk — a `run_query` result is up
       to 200 rows of real table data, and writing it verbatim exported user data to a plaintext
@@ -10974,11 +10977,12 @@ existing prose was left alone.
   compiles it via `--features schemaic-db/live-tests`, since otherwise it
   would be the one code in the repository no push compiles.
 - `schemaic-ai` — agent-CLI sessions (stream-json) and turn parsing, for whichever CLI the user has
-  installed. `harness.rs` and `stream.rs` model four of them (`claude`, `codex`, `antigravity`,
-  `opencode`), and **all four are driven, with database tools**. Each is selectable from the settings
-  modal's *Agent CLI* dropdown, persisted as `UiState::ai_harness`, carried on `AiSettings::harness`,
-  resolved and interrogated by `app/agent_cli.rs`, and spawned by `app/ai.rs` — Claude and
-  Antigravity as one persistent child per conversation, Codex and OpenCode as one process per turn.
+  installed. `harness.rs` and `stream.rs` model six of them (`claude`, `codex`, `antigravity`,
+  `opencode`, `copilot`, `cursor`), and **all six are driven, with database tools**. Each is
+  selectable from the settings modal's *Agent CLI* dropdown, persisted as `UiState::ai_harness`,
+  carried on `AiSettings::harness`, resolved and interrogated by `app/agent_cli.rs`, and spawned by
+  `app/ai.rs` — Claude and Antigravity as one persistent child per conversation, Codex, OpenCode,
+  GitHub Copilot and Cursor as one process per turn.
   **A fifth, `gemini`, was modelled here and refused, and it has now been deleted rather than left
   as a menu entry that says no.** Google withdrew OAuth for personal accounts, so `gemini` needs an
   API key to authenticate at all, and the CLI's own sign-in points at Antigravity as its successor —
@@ -11001,7 +11005,7 @@ existing prose was left alone.
   path for as long as all three features spawned `claude` regardless of the selection. Why they did,
   and the bug that made that the safe answer at the time, is under `app/agent_cli.rs`. A
   harness key `main.rs` does not recognise is `tracing::warn!`ed and falls back to Claude.
-  **Getting the tools to each harness is four different mechanisms, and only Claude's is per
+  **Getting the tools to each harness is six different mechanisms, and only Claude's is per
   invocation.** Claude gets a `--mcp-config` file in a directory of Schemaic's own (`ai::mcp_dir()`,
   and it was the temp dir until the credentials in it were moved somewhere only this user can
   list). **That the flag is handed a *path* is an invariant, not a call-site habit**, and this crate
@@ -11026,6 +11030,17 @@ existing prose was left alone.
   **ours rather than the user's**: `app/opencode.rs` writes an `opencode.json` into a directory
   Schemaic owns and points `XDG_CONFIG_HOME` at it, so one file carries both the MCP server and the
   seal and nothing of the user's is edited.
+  GitHub Copilot splits the two that OpenCode folds together: its server arrives by a flag on every
+  turn, `--additional-mcp-config=@<file>`, naming a `schemaic-mcp.json` that `app/copilot.rs` writes
+  into a `COPILOT_HOME` of Schemaic's own, and its seal is a second flag, `--available-tools`, on
+  the same command line. The home directory is there for isolation rather than for the server — see
+  *Copilot displaces* below, and `app/copilot.rs`'s entry.
+  Cursor is configured by **the directory it is started in**: `app/cursor.rs` writes a project
+  `.cursor/cli.json` (the permissions file that is its whole restriction) and a `.cursor/mcp.json`
+  (our server) into a working directory of Schemaic's own, and runs `cursor-agent mcp enable
+  schemaic` there once per session, because a project server loads only once approved. It has no
+  flag that empties its tools and no sandbox that holds headless, so the file is not one lever among
+  several — see `harness.rs` for what it holds and what it does not.
   **The isolation is not symmetric either, and Antigravity has none at all** — the one asymmetry the
   list above would otherwise pass over while naming every other. Claude gets `--strict-mcp-config`
   and Codex has its whole `mcp_servers` table assigned out from under it, and both of those
@@ -11038,8 +11053,8 @@ existing prose was left alone.
   and it is asked as `harness::Harness::isolates_mcp_servers` so the surface that matters to the
   *user* can read it too: `Constraint::notice` says in the panel that this harness's MCP surface is
   not Schemaic's to restrict.
-  **OpenCode displaces them as well, and is the one that does it without touching anything of the
-  user's** — `XDG_CONFIG_HOME` pointed at Schemaic's own directory takes their registered servers
+  **OpenCode displaces them as well, and is the first that did it without touching anything of the
+  user's** (Copilot, below, is the second) — `XDG_CONFIG_HOME` pointed at Schemaic's own directory takes their registered servers
   out of the resolved config entirely (measured: they vanish from `opencode debug config`), and
   because nothing of theirs was edited there is nothing to put back. It does have a startup sweep,
   but for a different currency: the roots are Schemaic's own, so a leftover costs disk rather than a
@@ -11055,10 +11070,37 @@ existing prose was left alone.
   server appears alongside ours, inside a session the panel reports as `Sealed`. Setting our own
   variables is half the seal and removing theirs is the other half, which is
   `OpenCodeConfig::env_remove` and the `cmd.env_remove(..)` loop in `ai.rs` — see both entries below.
+  **Copilot displaces the user's servers by the same move, a home directory of ours.**
+  `COPILOT_HOME` pointed at a per-instance directory under Schemaic's config dir means the user's
+  `~/.copilot/mcp-config.json` — whose servers the CLI would otherwise *start*, whether or not
+  their tools were then visible — and their skills, plugins and hooks do not exist for the session,
+  and `--disable-builtin-mcps` keeps the bundled GitHub server from starting (measured on 1.0.88:
+  its status reads `disabled`). It keeps the login because the login is carried in: with an OS
+  credential store (measured on Windows with an empty directory) the token is not under the home at
+  all, and without one — headless Linux — the CLI's own help says it goes into a plain-text config
+  file under `~/.copilot/`, so every home is seeded with the user's `config.json` and nothing else
+  (`copilot.rs`). The lever that looks like the answer is the wrong one again — `--additional-mcp-config`
+  "augments config from ~/.copilot/mcp-config.json", so on its own it puts our server in beside
+  theirs. And the inherited environment carries levers of its own here too — an exported
+  `COPILOT_ALLOW_ALL` approves every tool — so `CopilotHome::env_remove` is the second list the child
+  is cleared of; `ai::inherited_env_to_clear` chains the two, and every
+  harness's child is cleared of both.
+  **Cursor cannot displace them, which makes it the second harness with no isolation.** Its
+  user-level `~/.cursor/mcp.json` is read from a path the CLI hard-codes to the home directory —
+  not `CURSOR_CONFIG_DIR` (read out of its bundle) — so the config-directory move that works for
+  OpenCode and Copilot is not available short of moving the home itself, which on macOS and Linux
+  would move the login with it. Measured (2026.09.23
+  build): a user-level server needs no approval and is **started on every run**; its tools are
+  listed to the model and refused when called, because nothing in Schemaic's permissions file
+  allows them — unless the user's own settings do. So `isolates_mcp_servers` is false for it as for
+  Antigravity, and its notice says so in its own words. `--approve-mcps`, which would load the
+  project server without the per-session `mcp enable`, is never passed: it approves every server in
+  reach, a user's plugins' among them.
   **The spawned session is sealed to what Schemaic hands it, and that is `build_session_args`'s
   three flags rather than `DISALLOWED_TOOLS`.** That statement is now *graded* rather than boolean,
-  because not every CLI can honour it in full — `claude` and `opencode` can, by two different
-  mechanisms, and Codex and Antigravity cannot. `harness::Constraint` is the grade, and reporting
+  because not every CLI can honour it in full — `claude`, `opencode` and `copilot` can, Claude and
+  Copilot by a flag each and OpenCode by configuration, and Codex, Antigravity and Cursor cannot.
+  `harness::Constraint` is the grade, and reporting
   "sealed" for every harness would be the denylist-era bug a second time: a guard that reads
   as total over a set nobody measured. The denylist named ten built-in tools and read like
   the guard; measured against the shipped CLI by reading the `system`/`init` event's own `tools`
@@ -11148,7 +11190,7 @@ existing prose was left alone.
   `build_session_args` and `inline_args` both take one and
   turn it into argv through the single private `seal_args`, so Claude's session and one-shot paths
   cannot come to seal themselves differently — the one-shot paths being the ones with no surface
-  that would show it if they did. `CliSeal` is Claude's alone: the other three are sealed by their
+  that would show it if they did. `CliSeal` is Claude's alone: the other five are sealed by their
   own arm of `harness::turn_args` or `harness::inline_argv`, and `InlineSpec::seal` is carried past
   them unread. A version number would only stand in for the answer `--help`
   gives directly, and would need a table mapping releases to flags that nothing in this repository
@@ -11218,7 +11260,10 @@ existing prose was left alone.
   that could render a tool call — so where the chat panel merely stalls on a tool it cannot prompt
   for, those three would have run one *invisibly*. So `harness::inline_argv` hands no harness a
   server: no `--mcp-config` (Claude's `--strict-mcp-config` then leaves it with none), no `-c`
-  carrying `mcp_servers` on Codex, and an OpenCode config with the `mcp` block left out. The whole
+  carrying `mcp_servers` on Codex, an OpenCode config with the `mcp` block left out, on Copilot
+  no `--additional-mcp-config` and an allowlist naming a tool nothing provides, and on Cursor a
+  working directory of its own whose permissions file allows nothing and which has no `mcp.json`
+  at all. The whole
   request is in the prompt (`no_inline_generation_is_given_a_server_or_a_session` over
   `Harness::ALL`, `a_one_shot_generation_is_given_no_tools_and_no_servers` for Claude's arm, and
   `inline_args_flags_in_order` holds its exact argv). **On Antigravity that is a statement about the
@@ -11260,7 +11305,8 @@ existing prose was left alone.
   to the one-shot paths, and `an_oversize_refusal_names_the_levers_its_caller_has` asserts both
   messages still carry the measurement and still blame no installation.
   - `harness.rs` — which agent CLI is being driven, what it can do, and how it is constrained.
-    `Harness` (`Claude`/`Codex`/`Antigravity`/`OpenCode`) is **a dialect rather than a vendor**: the
+    `Harness` (`Claude`/`Codex`/`Antigravity`/`OpenCode`/`Copilot`/`Cursor`) is **a dialect
+    rather than a vendor**: the
     variant names the wire format a binary speaks, which is the only thing decoding needs to know,
     so a fork that still speaks its parent's JSONL is that parent here. `key`/`label`/`bin` are the
     value `UiState::ai_harness` persists, the settings label and the name looked for on `PATH` —
@@ -11291,14 +11337,16 @@ existing prose was left alone.
     model under "check your installation". The test above was green throughout, because it drove
     serde in isolation and never the composition with the caller that overwrote; it calls the rule
     now, which is the only reason it can fail.
-    **`speaker_name` is a fourth string, and it differs from `label` in exactly one place on
+    **`speaker_name` is a fourth string, and it differs from `label` in exactly two places on
     purpose**: `label` is "Claude Code", the product you install and point a path at, while a
     transcript header is naming a speaker and reads "Claude" — which is also the name that header
     carried before it learned to vary, so an existing conversation does not appear to change its
-    mind about who wrote it. The other three answer the same in both, spelled out rather than
-    delegated to `label` so that a product name gaining a suffix cannot reach the transcript on its
-    own (`the_speaker_name_is_the_product_name_except_where_it_is_deliberately_not` pins both
-    halves). The free function `speaker_label(Option<&str>)` is the only thing that turns a
+    mind about who wrote it. The second is Copilot's: the settings box names the product a user
+    installs, "GitHub Copilot", while "GITHUB COPILOT" over every answer reads as a heading rather
+    than a speaker, so the header says "COPILOT". The other four answer the same in both, spelled
+    out rather than delegated to `label` so that a product name gaining a suffix cannot reach the
+    transcript on its own (`the_speaker_name_is_the_product_name_except_where_it_is_deliberately_not`
+    pins both divergences and the agreement of the rest). The free function `speaker_label(Option<&str>)` is the only thing that turns a
     persisted `ChatMessage::harness` back into a name: the uppercased speaker name, or `"ASSISTANT"`
     for `None` **and** for a key this build does not recognise. Both fall back rather than guess, for
     `from_key`'s reason — a transcript written before the field existed could have been produced by
@@ -11310,7 +11358,8 @@ existing prose was left alone.
     (`supports_effort`, `effort_levels`, `effort_arg`, `supports_resume`, `is_persistent`,
     `session_turn_line`, `session_interrupt`, `session_system_in_first_turn`,
     `streams_deltas`, `supports_model_choice`, `suggested_models`, `restricted_means_sandbox`,
-    `seals_by_flag`, `isolates_mcp_servers`, `help_args`) — the same reason the engine
+    `seals_by_flag`, `restricts_by_workspace_rules`, `isolates_mcp_servers`, `help_args`) — the
+    same reason the engine
     predicates exist:
     `== Harness::Claude` compiles cleanly while sorting the next CLI onto whichever side it happens
     to fall. **There is no exception left.** `Constraint::notice` was documented here as the one
@@ -11347,6 +11396,12 @@ existing prose was left alone.
     passes it through untouched. That is the failure this API is shaped against: the app shipped a closed
     three-variant `AiModel` for a year, and its `from_cli` coerced every unrecognised id to Haiku, so
     a settings file naming a real model ran a different one with nothing on screen to say so.
+    Copilot's list is **`auto` alone, because its catalogue is the account's**: on the account it was
+    measured with (1.0.88, 2026-09-26), every named id — the examples `copilot help config` itself
+    lists included — was refused with *"Model "…" from --model flag is not available"*, and only the
+    router ran. A named chip is a chip that fails the turn for somebody; `auto` is the one id every
+    plan takes. Cursor's is `auto` alone too, for a milder reason: `agent models` lists the
+    account's own catalogue, long and plan-specific, and `auto` is the default every account has.
     **A capability that is a `bool` can still be too coarse, and `supports_effort` is where that
     showed.** It is true for Claude *and* Antigravity, so a site asking only it treated the two as
     interchangeable — and their `--effort` vocabularies are not: Claude takes a fourth level,
@@ -11376,8 +11431,20 @@ existing prose was left alone.
     below, and the gap widening it found on Claude. The knock-on is in
     `schemaic-ui`: a four-variant `AiEffort` intersected this list at exactly `High`, so see the
     settings-modal entry for why the enum is now the six-way union.
-    **The seal is graded here, because the four do not answer it equally well.** `Constraint` is
-    ordered `Unknown < Restricted < Sealed`, and **two** harnesses reach the top by two different
+    **Copilot has the flag and its list is empty, which is the one place the two part company.**
+    `--reasoning-effort` is real, but with no `--model` Copilot routes through `auto`, and `auto`
+    refuses it outright — *"Model "auto" does not support reasoning effort configuration (requested:
+    "high")"*, exit 1, no answer. Whether a *named* model takes it could not be measured, since no
+    named model was available on the measuring account. A control that kills the turn on the default
+    setting is worse than none, so `effort_levels` is empty, the row hides, and `effort_arg` can never
+    produce a level to send (`effort_reaches_each_harness_in_its_own_flag` asserts no
+    `--reasoning-effort` reaches the one-shot argv; `turn_args` has no arm that could emit one).
+    Cursor's list is empty for the plainer reason that it has **no flag at all**: effort is part of
+    the model id there, a named variant (`gpt-5.3-codex-high`) or a bracket parameter
+    (`…[effort=high]`), both of which the free model field passes through untouched — so the row
+    hides and the same test asserts nothing naming effort reaches its argv.
+    **The seal is graded here, because the six do not answer it equally well.** `Constraint` is
+    ordered `Unknown < Restricted < Sealed`, and **three** harnesses reach the top by three different
     mechanisms. Claude does it with a flag: `--tools ""` empties the *built-in* set outright and
     leaves nothing but the allow-listed MCP tools. OpenCode does it with *configuration* — the agent
     definition `opencode_config_json` writes carries a `tools` map setting every documented built-in
@@ -11394,7 +11461,29 @@ existing prose was left alone.
     missing costs the seal. `the_agent_has_every_built_in_tool_switched_off` (under `app/opencode.rs`)
     asserts the map is non-empty and that nothing in it is left on, and names `bash`/`read`/`write`/
     `edit` explicitly, because "everything in the map is false" stays true if a rename drops them out
-    of it. Codex and Antigravity are both `Restricted`, each by its own lever: Codex by
+    of it. Copilot does it with an **allowlist of what the model is shown** — `--available-tools`,
+    *"Only these tools will be available to the model"*. Measured on 1.0.88 (2026-09-26): given
+    `schemaic-list_schema,schemaic-run_query`, the tool list the CLI sent the model — which its own
+    `session.usage_checkpoint` reports — was exactly those two, `session.info` listed every built-in
+    as disabled, and a turn told to read a file "using any tool you have" answered that it could not
+    and named only ours. That is `Sealed` in the sense `--tools ""` is: nothing built-in left,
+    rather than a sandbox around what is. The allowlist is the connection's own, the same
+    `ai_allowed_tools` Claude's `--allowedTools` gets, carried per turn on `TurnSpec::allowed_tools`
+    because this seal lives on a command line that is rebuilt for every turn, and spelt the way
+    Copilot names an MCP tool, `<server>-<tool>`, through `bare_tool_name` — so a schema-only
+    connection's model never *sees* `run_query`, which is visibility and not merely approval
+    (`the_allowlist_names_our_tools_the_way_copilot_does_and_follows_the_access_level`).
+    **The flag fails open when it is empty, and that is the load-bearing detail here.** Measured:
+    `--available-tools` with no value, or with `=` and nothing after it, sent the model all 24 of the
+    CLI's tools, `powershell`, `create`, `edit` and `web_fetch` among them — so the list would have
+    been widest exactly where it was meant to be tightest, on an access level offering nothing and on
+    every one-shot. `copilot_available_tools` therefore never emits an empty list: an empty one
+    becomes `COPILOT_NO_TOOLS` (`schemaic-no_tools`), a name in our own server's namespace that
+    nothing provides, and that allowlist was measured to resolve to **zero** tools. The one-shot path
+    always passes it. `an_empty_allowlist_is_never_an_empty_flag` pins the constant and both argv
+    builders, and asserts no bare `--available-tools` appears on either — "tidying" the sentinel
+    into an empty value is the edit that opens the shell.
+    Codex and Antigravity are both `Restricted`, each by its own lever: Codex by
     `sandbox_mode="read-only"`, Antigravity by `--sandbox`. Both
     stop writes and command side effects and both leave built-in tools that can still *read*
     the machine the child was launched on — and Antigravity is the one where that is measured rather
@@ -11405,6 +11494,30 @@ existing prose was left alone.
     to-do. So `Constraint::notice` states that to the user in one line, and
     returns `None` for `Sealed` — a banner on every sealed session is how a user learns to ignore
     the two grades that mean something.
+    **Cursor is the third `Restricted`, and it is reached by neither a sandbox nor a flag but by rules
+    in a file** — the weakest mechanism here, which is why the grade and the notice both have to say
+    so. Measured on its CLI (2026.09.23-86fc751, Windows 11, 2026-09-26): nothing empties its
+    built-in tools, it has a `--sandbox` flag that is not what restricts it, and its `--mode ask` is
+    **not enforced** — told the Write tool still worked, the model wrote the file. What does hold is
+    a project permissions file, `<cwd>/.cursor/cli.json`, whose `deny` names `Write(**)`,
+    `Shell(*)` and `WebFetch(*)` (`CURSOR_DENY`): those refused writes, deletes and commands, a
+    `Task` subagent's included, and beat an `allow` of `Shell(ls)` in the user's own global
+    `cli-config.json`. `Read(**)` and `Grep(**)` are denied too and are **not** a seal — the `Read`
+    tool was refused and `Grep` still returned a file's contents — so the readers cannot be closed
+    and the grade is a ceiling, never `Sealed`. `cursor_permissions_json(allowed)` builds the file
+    from the connection's own list, each tool an allow rule in the CLI's own form,
+    `Mcp(schemaic:<tool>)`, and **allowing is required rather than merely permitted**: an MCP call
+    with no allow rule is refused headless (*"User rejected MCP"*), so a schema-only connection's
+    model can see `run_query` in the catalogue and is refused when it calls it. An empty `allowed`
+    is an empty allow list, which is safe here where Copilot's empty allowlist was not: Cursor's
+    allow rules only approve, so nothing opens when there are none
+    (`the_rules_allow_exactly_the_connection_s_tools`,
+    `the_rules_deny_the_writers_whatever_is_allowed`). **And a missing file fails open** — with no
+    permissions file at all a headless turn refused its shell and every MCP call, and *wrote a file
+    unprompted* — which is why the refusal on a failed write, below, is part of the grade rather
+    than tidiness. `--mode ask` is passed anyway, as a prompt that makes the model rarely try, and
+    never `--approve-mcps`, `--force`, `--yolo` or `--auto-review`, which approve what the file
+    exists to refuse (`nothing_that_approves_what_the_rules_refuse_is_ever_passed`).
     **A notice says what *this* harness gives you and stops there.** `Restricted` reads
     *"`<Harness>` runs sandboxed: its own built-in tools cannot write files or run commands, though
     they can still read this machine"*, and it used to close with *"Only Claude Code can be given no
@@ -11425,25 +11538,43 @@ existing prose was left alone.
     justification.** OpenCode is the fourth CLI it sorts onto the wrong side: its seal is a `tools` map
     and it has no sandbox at all, so the fallthrough would have promised an OS-enforced read-only that
     nothing enforces — the strongest kind of false claim, made to the user as a positive assurance. The
-    question is now three capabilities. `restricted_means_sandbox` (Codex, Antigravity) picks the
+    question is now four capabilities. `restricted_means_sandbox` (Codex, Antigravity) picks the
     sandbox sentence. `seals_by_flag` (Claude alone) picks the denylist line, because *"updating the
     CLI restores the full seal"* is advice that fixes nothing where the seal is configuration —
-    OpenCode reaches `Sealed` too, and by a file. A third arm catches a harness that is
-    neither and **promises nothing**, saying only that Schemaic could not fully restrict it. No harness
+    OpenCode reaches `Sealed` too, and by a file. **Copilot seals by a flag and still answers
+    `false`**, because the question is about the *weaker* grade: without `--available-tools` there is
+    no denylist to fall back on, so that binary is `Unknown`, never `Restricted`, and never reaches
+    the sentence the predicate chooses. `restricts_by_workspace_rules` (Cursor alone) picks a
+    sentence of its own — *"`<Harness>` is kept to answering by a permissions file Schemaic writes
+    for this session, not by a sandbox: its own tools are refused writing files and running
+    commands, but they can still read files on this machine"* — and it names the mechanism for the
+    reason this paragraph exists: Cursor answered `false` to both predicates above, so without it
+    Cursor would have taken the promise-nothing arm, and giving it the sandbox arm instead would have
+    promised an OS boundary nothing provides. The readers are named because they are the half no
+    rule closed. A last arm catches a harness that is none of these and **promises nothing**,
+    saying only that Schemaic could not fully restrict it. No harness
     reaches that arm today, and it is worded rather than left unreachable precisely because
     "unreachable" is what the Claude arm assumed too.
     **The sandbox covers the CLI's own tools, and the sentence used to claim more than that.** It read
     *"it cannot write files or run commands"* flat, while `harness.rs`'s own header records that MCP
     tools execute *under* `--sandbox` and that one harness has no MCP isolation at all — a positive
     assurance the module contradicts eleven paragraphs above it, which is the asymmetry the grade
-    exists to prevent. The claim is now scoped to *"its own built-in tools"*, and the third capability
+    exists to prevent. The claim is now scoped to *"its own built-in tools"*, and the fourth capability
     is `isolates_mcp_servers`: true for Claude (`--strict-mcp-config`), Codex (the whole `mcp_servers`
-    table assigned out from under it) and OpenCode (`XDG_CONFIG_HOME` redirection), false for
-    Antigravity, measured rather than assumed. When it is false the notice appends *"Any MCP servers
+    table assigned out from under it), OpenCode (`XDG_CONFIG_HOME` redirection) and Copilot (its own
+    `COPILOT_HOME`, with `--disable-builtin-mcps` and the allowlist behind it), false for
+    Antigravity and Cursor, measured rather than assumed. When it is false the notice says so, in
+    words each harness's measurement earned: Antigravity's sandbox sentence appends *"Any MCP servers
     you have registered with it are also available to this session, and Schemaic cannot restrict
-    them"*, so the user-global gap this document records above and again under `app/antigravity.rs`
-    is disclosed in the panel rather than only in this file
-    (`a_harness_that_lets_other_mcp_servers_in_says_so`).
+    them"*, and Cursor's rules sentence *"MCP servers you have registered with it also start with this
+    session; their tools are refused unless your own settings allow them"* — different facts, since
+    Cursor's permissions file does refuse those tools where Antigravity's rules name only ours. So the
+    user-global gap this document records above and again under `app/antigravity.rs` and
+    `app/cursor.rs` is disclosed in the panel rather than only in this file.
+    `a_harness_that_lets_other_mcp_servers_in_says_so` keys on the phrase the two wordings share,
+    *"MCP servers you have registered"*, rather than on either's second half — it keyed on
+    *"Schemaic cannot restrict them"* until Cursor's wording made that Antigravity's alone — and
+    spells out which harnesses are isolated rather than reading it back off the notice.
     **The two tests that used to pin all this asserted the notice against the predicate it branches
     on, and that is why the replacement spells its table out by hand.**
     `only_a_sandboxed_harness_is_told_the_os_is_stopping_it` computed
@@ -11455,8 +11586,14 @@ existing prose was left alone.
     `only_a_flag_sealed_harness_is_told_an_update_would_help`, spelling out a
     `(sandbox, update, other-servers)` triple **per harness** in a `match`: Antigravity
     `(true, false, true)`, Codex `(true, false, false)`, Claude `(false, true, false)`, OpenCode
-    `(false, false, false)`. A change to any of the three predicates now has to be argued for in that
-    table.
+    and Copilot `(false, false, false)`, Cursor `(false, false, true)`. A change to any of the
+    predicates now has to be argued for in that table. It also asserts that a notice says
+    *"permissions file"* and *"not by a sandbox"* exactly when `restricts_by_workspace_rules` is true,
+    and that such a notice says its tools *"can still read files"* — the mechanism named, and the
+    half it does not close. That half compares the notice with the predicate that produced it, the
+    shape this paragraph faults; what keeps it from being circular is `cursor_tests`'
+    `the_capability_answers_match_what_was_measured`, which pins the predicate true for Cursor and
+    false for every other harness by hand.
     **`Constraint::Unknown` refuses the spawn** (`is_runnable` is false), which is the opposite
     failure direction from `CliSeal`/`seal_from_help` above, and both are right for the same
     underlying fact: an unknown flag *kills* the child. An unreadable Claude probe therefore yields
@@ -11478,14 +11615,46 @@ existing prose was left alone.
     OpenCode these mechanisms were measured against; a help text without it is `Unknown` and refuses,
     exactly as with the others (`the_constraint_is_sealed_only_when_the_probe_read_a_help_page`,
     whose second half holds a readable help page for something that is *not* OpenCode to `Unknown`
-    rather than to a grade).
-    **The other half of that grade is enforced at the call site, because this is the one harness where
+    rather than to a grade). Copilot's arm is back on the lever itself — `--available-tools` present
+    is `Sealed`, absent is `Unknown` — and, unlike Claude's, has **no `Restricted` fallback**, since
+    without the flag there is no denylist to fall back on (`the_grade_is_read_off_the_flag_the_seal_is`,
+    whose fixture rows are copied from `copilot --help` 1.0.88). Its top-level page lists every flag
+    the grade and the argv depend on, so `help_args` asks it no subcommand. **Cursor's arm is
+    OpenCode's shape again, and greps `--trust`**: its lever is a file too, which `--help` cannot
+    confirm, so the evidence is a flag passed on every turn that the rest of the mechanism was
+    measured alongside — without it a headless run in a directory the CLI has not seen stops at a
+    trust prompt and exits. Present is `Restricted`, absent is `Unknown`, and there is no arm that
+    reaches `Sealed` (`the_grade_is_restricted_at_best_and_read_off_trust`, fixture rows copied from
+    `agent --help` 2026.09.23).
+    **The other half of that grade is enforced at the call site, because this is a harness where
     a missing config does not fail closed.** `--agent schemaic` naming an agent that does not exist
     does not stop the run — it leaves it on OpenCode's own default `build` agent, which has `bash`.
     So `ai::start_ai_session` **refuses the session outright** when `OpenCodeConfig::write` returns
     `None`, rather than degrading the way the Codex path does with `codex_isolation_only`. A seal that
     silently becomes a shell is precisely what `Constraint` exists to prevent, and here the grade is
-    only honest because the refusal is there.
+    only honest because the refusal is there. (Copilot's session is refused on a failed write too, but
+    for its *isolation* rather than its seal — the allowlist is on the command line and holds without
+    the home; see `app/copilot.rs`.) **Cursor is the second harness this is true of, and more
+    literally**: its file *is* the restriction, and without it writes go through unprompted, so a
+    session whose workspace cannot be written is refused, and so is a one-shot (`ai::inline_cwd`).
+    The grade's own comment says the same, since `--help` can confirm nothing about a file.
+    **`env_seal` is the capability both of those ride on, and it is asked, never assumed.** It answers
+    whether a harness's configuration is an *environment* Schemaic must set on the child and clear
+    the user's copy of: OpenCode (`XDG_CONFIG_HOME`, which carries its seal) and Copilot
+    (`COPILOT_HOME`, which carries its isolation — its seal is the flag). It exists because, by its own
+    doc, four call sites used to ask the question four ways, none compile-forced — a `match {
+    OpenCode => …, _ => Vec::new() }` for the inline environment, an `== Harness::OpenCode` on the
+    session spawn, an `== Harness::Codex` in the probe — each failing to the unsafe side for a new
+    harness. **Copilot is the case that showed asking it is not enough on its own**: the
+    one-shot path asked `env_seal()` and then called `OpenCodeConfig::write_inline()` for any `true`,
+    so a second `true` would have been "isolated" by OpenCode's config and nothing of its own.
+    `ai::inline_env` now asks `env_seal`, then matches the harness exhaustively — see `app/ai.rs`.
+    **Cursor answers `false`, although its restriction is a directory too**, because it finds that
+    directory by being *started* in it — its working directory — rather than by a variable pointing
+    at it; an `env_seal` of `true` would route it through `inline_env`, whose arm for it refuses. Its
+    counterpart is `restricts_by_workspace_rules`, and the one-shot's counterpart of `inline_env` is
+    `ai::inline_cwd`, built the same way: the capability asked, then an exhaustive `match` whose arms
+    for the harnesses it is false for refuse.
     **Codex's isolation is conditional and does not decide the grade.** `--ignore-user-config` is
     that CLI's `--strict-mcp-config` and `--setting-sources user` rolled into one — its own help text
     says *"Do not load `$CODEX_HOME/config.toml`; auth still uses `CODEX_HOME`"*, so it drops the
@@ -11505,7 +11674,7 @@ existing prose was left alone.
     the call site**, because the seam is where the bug lived: the pure decoder was tested with
     `codex exec --help` text pasted in by hand while `probe` fed it a different page, so both halves
     passed alone and neither was wrong on its own. It answers `["exec", "--help"]` for Codex and
-    `["--help"]` for the other three, and the last element is always the help flag itself, since every
+    `["--help"]` for the other five, and the last element is always the help flag itself, since every
     harness's page still has to answer the grade question
     (`codex_is_probed_on_the_subcommand_that_documents_its_isolation`, which pins this function's
     *return* — the answer, not the question the probe asks; the argv itself is pinned in
@@ -11526,8 +11695,14 @@ existing prose was left alone.
     argv `agy mcp add` registers, and OpenCode takes it in the `command` array of the `opencode.json`
     written for it — a file, like Claude's, but a **reused** one that outlives the session, which is
     why it carries the path and never the blob
-    (`the_endpoint_path_is_configured_but_the_endpoint_is_not`). So the split is one harness carrying
-    the endpoint against three carrying a path to it, for two different reasons: argv is public, and
+    (`the_endpoint_path_is_configured_but_the_endpoint_is_not`). Copilot is OpenCode's case again:
+    `copilot_mcp_config_json` is a file in a `COPILOT_HOME` reused across sessions, so its `args`
+    carry `--endpoint-file <path>` and it has no `env` map at all
+    (`the_mcp_config_names_our_server_by_path_and_nothing_else`). Cursor is the same case a third
+    time: `cursor_mcp_config_json` is the `.cursor/mcp.json` in a workspace reused across sessions,
+    its `args` carry `--endpoint-file <path>`, and it has no `env` map
+    (`the_server_is_configured_by_path_and_nothing_else`). So the split is one harness carrying
+    the endpoint against five carrying a path to it, for two different reasons: argv is public, and
     a reused directory is persistent (`main.rs`'s comment beside `--mcp-serve` says the same, and it
     named Gemini on the file side until that harness went).
     `codex_mcp_overrides` **replaces the whole `mcp_servers` table** (`mcp_servers={schemaic={…}}`)
@@ -11662,7 +11837,7 @@ existing prose was left alone.
     that function always was. **Where the prompt sits differs and is not a detail to generalise from
     one of them**: OpenCode takes it as the last *positional*, last on purpose since a flag after it
     reads as part of it; neither persistent harness carries a prompt in argv at all; and **Codex
-    takes it on stdin**, which is `Harness::prompt_on_stdin`. That capability is true of Codex alone,
+    takes it on stdin**, which is `Harness::prompt_on_stdin`. That capability was true of Codex alone,
     on the strength of `codex exec --help` (codex-cli 0.153.4): instructions are read from stdin when
     no positional is given, *and* a piped stdin alongside a positional is appended as a `<stdin>`
     block rather than obeyed — so the prompt has to **leave** argv rather than merely be duplicated
@@ -11671,8 +11846,17 @@ existing prose was left alone.
     turn read up to `ATTACH_ROW_CAP` attached rows, an AI Seed's twenty sampled rows and the table's
     full `CREATE TABLE` — a judgement this codebase had already made for the MCP endpoint
     (`codex_mcp_overrides` keeps it out of `-c` for exactly that) while the rows the `AiData` ladder
-    exists to protect went to the same place. The other three keep argv and each reason is written at
-    the capability: OpenCode's `run` documents a `message..` positional and no stdin, Antigravity
+    exists to protect went to the same place. **Copilot is the second harness it is true of, measured
+    on 1.0.88 (2026-09-26)**: with stdin piped and no `-p`, the piped text *is* the prompt — the
+    `user.message` event echoed it back as its `content`, on the `--output-format json` turn and the
+    `-s` one-shot alike. It matters more there than for Codex, because on Windows an npm install puts
+    `copilot.cmd` on `PATH` and a multi-line argument through a batch shim is refused outright (see
+    `agent_cli.rs`), so `-p` would not merely publish the prompt but fail it
+    (`the_prompt_never_reaches_the_command_line`). **Cursor is the third, measured 2026-09-26**: `-p`
+    with no value and the prompt piped in answered the piped text, on `stream-json` and `text`
+    output alike — and `-p` must then be followed by a flag, never by text, which its own
+    `the_prompt_never_reaches_the_command_line` pins. The other three keep argv and each reason is
+    written at the capability: OpenCode's `run` documents a `message..` positional and no stdin, Antigravity
     reads stdin only under its *session* shape, and Claude's stdin form passes context *alongside* a
     positional rather than replacing one. **OpenCode's leg carries a date now — re-measured
     2026-09-15**, `opencode run --help` still listing `message..` as a positional with none of its
@@ -11687,8 +11871,8 @@ existing prose was left alone.
     the capability is true, and `turn_stdin_prompt` covers the persistent shape, so moving one leg is
     this `match` arm and a measurement against the installed binary. `turn_stdin_prompt` and `inline_stdin_prompt` build what
     goes there from the same `prefixed_prompt` call the argv arm would have pushed — one
-    construction, two destinations — and both Codex arms omit the positional under the same
-    predicate, which is what `the_prompt_travels_exactly_once` and
+    construction, two destinations — and both Codex arms, like both Copilot and both Cursor arms,
+    omit the positional under the same predicate, which is what `the_prompt_travels_exactly_once` and
     `an_inline_prompt_travels_exactly_once` hold together over `Harness::ALL` (each asserts the two
     are exclusive, so a harness that claims stdin and still pushes sends the payload twice, and one
     that lost its push sends nothing).
@@ -11849,6 +12033,47 @@ existing prose was left alone.
     reason `AgyRegistration`'s allow-rules exist. Its own help calls the flag dangerous, and passing
     it would buy nothing while pre-approving whatever a future build adds to the tool set
     (`a_turn_never_passes_the_auto_approve_flag`).
+    **The Copilot argv is `--output-format json --stream on`, the allowlist, `--disable-builtin-mcps
+    --no-custom-instructions --no-auto-update --no-ask-user`, and every value a flag takes is joined
+    with `=`.** That is not style: `--available-tools` and `--allow-tool` are variadic
+    (`[<tools>...]`) and `--resume` takes an optional value, so a space-separated value is one parse
+    decision away from swallowing the argument after it
+    (`every_variadic_value_is_bound_with_an_equals_sign`). When the session has a config,
+    `--additional-mcp-config=@<file>` adds our server and `--allow-tool=schemaic` approves it, and
+    those are two questions rather than one: the allowlist decides what the model can *see*, this
+    decides what runs without a prompt, and headless there is no prompt. Measured, without it the call
+    is not made; with it, `--allow-all-tools` — which the help calls "required for non-interactive
+    mode" — is not needed, and because it names the server it can only approve what the allowlist
+    already let through. No config means no approval either, so no grant sits waiting for whatever
+    takes the name (`our_server_is_configured_by_file_and_approved_by_name`), and
+    `nothing_that_widens_the_seal_is_ever_passed` holds both argvs free of `--allow-all-tools`,
+    `--yolo`, `--autopilot` and their kin. `--no-auto-update` runs the build that was probed rather
+    than one downloaded mid-session whose flags nobody has read; `--no-custom-instructions` is defence
+    in depth behind an empty cwd, as Claude's `--setting-sources` is. **The resume is
+    `--resume=<id>`, not `--session-id`**, though both continue a session (measured):
+    `--session-id` also *creates* one when the id is unknown, so a conversation whose state had gone
+    would silently restart with no memory — on a turn `turn_system` has already stripped of the schema
+    outline. A resume that fails is a turn that says so
+    (`a_resumed_turn_resumes_and_drops_the_outline`). No `--reasoning-effort`, for `effort_levels`'
+    reason, and no prompt, which is on stdin. The CLI also advertises a persistent mode, `--acp`, and
+    it is not what is driven, for the reason Antigravity's bidirectional mode waited: it is not what
+    was measured. **Measured end to end, by the author of the change, on 1.0.88 under Windows 11
+    (2026-09-26)**: against the real `--mcp-serve` server over a SQLite endpoint the server
+    connected, `run_query` ran, a resumed second turn recalled the first, and a schema-only
+    allowlist left three tools and a model that said it could not run a query.
+    **The Cursor argv is `-p --output-format stream-json --stream-partial-output --trust --mode ask`,
+    then `--model`, then `--resume <id>` last**, and most of what matters about it is what is not
+    there. `-p` takes no value because the prompt is on stdin. `--trust` is there because a headless
+    run in a directory the CLI has not seen exits at a trust prompt, and trusting this one grants
+    nothing: it is Schemaic's own, holding only the two files that restrict and configure the session.
+    `--mode ask` is the prompt described above, not a lever. `--resume` goes last because its value
+    is optional, so nothing may follow it that could be read as the id, and in the space-separated
+    form because that is the one measured (`a_resumed_turn_names_its_chat_last_and_drops_the_outline`).
+    What restricts and configures the turn is not on the command line at all but in its working
+    directory, which is why `ai.rs` starts this harness's child somewhere other than `session_cwd`.
+    **Measured end to end on 2026.09.23-86fc751 under Windows 11 (2026-09-26)**, with this argv against
+    the real `--mcp-serve` server over a SQLite endpoint: `run_query` ran, a resumed turn recalled
+    the first, and a request to write was declined.
     **`inline_argv` is the closed counterpart of `turn_args`, and "closed" is the whole
     specification.** Ctrl+K, AI Fill and AI Seed each want one string back that a parser then reads,
     so `InlineSpec` carries intent, system, model, effort, seal, `isolate_config` and Codex's
@@ -11861,15 +12086,23 @@ existing prose was left alone.
     `isolate_config`, and the reason is the finding below). Claude's arm delegates to
     `crate::inline_args`, which gained an `effort` parameter and is
     otherwise what it was: it was the whole of this path for as long as the other three spawned Claude
-    regardless of the picker, and is now one of four.
+    regardless of the picker, and is now one of six.
     Measured against the installed binaries, Codex is `exec --ephemeral --skip-git-repo-check
     --sandbox read-only --color never`, then `--ignore-user-config` when the probe saw it, then
     `--model`, then `-c sandbox_mode="read-only"`, then `-c mcp_servers={}`, then `-o <file>` — and
     **no prompt at all**, `inline_stdin_prompt` carrying it on stdin (`Harness::prompt_on_stdin`);
     Antigravity is `-p <prompt> --output-format text --sandbox --disable-slash-commands`
     plus `--model` and `--effort`; OpenCode is `run --pure --agent schemaic --format default` plus
-    `--model` and `--variant`, prompt last. **`--output-format text` is named on Antigravity although
-    it is the default**, because the session path asks that same binary for `stream-json` and a
+    `--model` and `--variant`, prompt last; Copilot is `-s --output-format text --no-color`, then
+    `--available-tools=schemaic-no_tools` — an allowlist that allows nothing, never an absent or
+    empty one, for the fail-open above — and the same `--disable-builtin-mcps
+    --no-custom-instructions --no-auto-update --no-ask-user` as its session, plus `--model`, with
+    the prompt on stdin; Cursor is its session's argv with `text` for the stream and no resume,
+    `-p --output-format text --trust --mode ask` plus `--model`, the prompt on stdin, run in a
+    `cursor-inline` workspace whose permissions file allows nothing and configures no server
+    (`a_one_shot_asks_for_text_and_carries_no_session`).
+    **`--output-format text` is named on Antigravity and Copilot although it is
+    the default**, because the session path asks that same binary for a JSON stream and a
     default that moved would put a JSONL envelope where a parser expects SQL.
     **`-c mcp_servers={}` is on this path now, and its absence was the release review's `S2-L5-01`.**
     A Codex one-shot emitted `-c sandbox_mode="read-only"` and no `mcp_servers` override at all, so
@@ -11896,7 +12129,8 @@ existing prose was left alone.
     path, so a setting the modal presents as the assistant's applied to the chat panel alone; each
     harness takes it in its own flag — `--effort` on Claude and Antigravity, `--variant` on OpenCode,
     nothing at all on Codex, whose `effort_levels()` is empty and which therefore gets no flag rather
-    than a dropped one (`effort_reaches_each_harness_in_its_own_flag`). **The clamp lives in the
+    than a dropped one, and nothing on Copilot or Cursor either, whose lists are empty for the
+    reasons above (`effort_reaches_each_harness_in_its_own_flag`). **The clamp lives in the
     argv builder rather than at the caller, and all three builders do it now.** It was this one
     alone — three call sites reach `inline_argv` and each would have had to remember — while
     `turn_args` and `session_args` were handed an already-answered `effort_arg` by their callers in
@@ -11917,13 +12151,16 @@ existing prose was left alone.
     a second one would have to do the same.
     **Codex is the only harness whose reply is read from a file, and that is a contract rather than an
     observation.** `inline_output` is where that lives — `LastMessageFile` for Codex, `Stdout` for the
-    other three — and the reason is that `codex exec` without `--json` prints *for a person*:
+    other five — and the reason is that `codex exec` without `--json` prints *for a person*:
     measured, this build writes the final message alone, but that is a statement about a human-facing
     surface and not a promise, while `-o/--output-last-message` is documented as the file the last
     message is written to. `--color never` rides along for the same reason: escapes in a rendering
     nobody parses cost nothing, and escapes in a reply that lands in the editor do. OpenCode needs no
     such split — measured, its decoration and model banner go to **stderr** and stdout carries the
-    answer alone (`codex_writes_its_last_message_where_it_was_told_to`,
+    answer alone — and neither does Copilot, whose `-s` is "output only the agent response (no
+    stats)" and measured as exactly that, one line of SQL, nor Cursor, whose `--output-format text`
+    was measured as the answer alone, a fenced SQL block that `extract_sql` unwraps
+    (`codex_writes_its_last_message_where_it_was_told_to`,
     `every_inline_generation_asks_for_plain_text`).
     **OpenCode's one-shot gets its own config, and the difference from the session's is the whole
     `mcp` block.** `opencode_inline_config_json` defines the same sealed `schemaic` agent and
@@ -11943,8 +12180,14 @@ existing prose was left alone.
     among its own, `list_schema`, `describe_table` and `propose_table_change` included; with no
     registration it lists Antigravity's built-ins alone. So "no inline generation is given a server"
     genuinely does not hold for Antigravity while a chat session holds the registration. It does hold
-    for the other three, which are configured per invocation, and this is written down because that
-    sentence is exactly the one that would otherwise be read as covering all four.
+    for four of the other five, which are configured per invocation (Copilot's one-shot runs in a home of
+    its own, `copilot-inline`, so a live session's `schemaic-mcp.json` is not even lying beside it),
+    and this is written down because that sentence is exactly the one that would otherwise be read
+    as covering all six. **Cursor's holds for our server and not for the user's**: its one-shot runs
+    in a `cursor-inline` workspace with no `mcp.json`, so a live session's server is not in reach,
+    but the servers in the user's own `~/.cursor/mcp.json` are started on every run — a one-shot
+    included — their tools refused unless the user's own settings allow them (see
+    `isolates_mcp_servers`).
     **It did not hold for Codex either, and this paragraph said it did.** Stating the seal as settled
     fact "for the other three" was false whenever `isolate_config` was false: with no
     `--ignore-user-config` and no `mcp_servers` override, the user's own servers loaded into a
@@ -11981,15 +12224,21 @@ existing prose was left alone.
     harnesses could run a one-shot. The stderr → stdout → status order is unchanged, and it is that
     order because the CLI writes some fatal errors (an expired OAuth session among them) to stdout
     with an empty stderr, so surfacing stderr alone yields a blank.
-    With the Gemini adapter deleted, `claude`, `codex`, `agy` and `opencode` are the four, and every
+    With the Gemini adapter deleted, `claude`, `codex`, `agy` and `opencode` were the four, and every
     argv here is for a binary somebody has run — and with the Antigravity resume measured above,
-    nothing on any of the four is now carried on its help page alone. The one exception is the
+    nothing on any of those four is now carried on its help page alone. `copilot` is the fifth, and
+    every flag in both of its argvs was in a measured run (1.0.88): the session's four `--no-…`
+    flags in the end-to-end turns against the real server, and the one-shot's `--no-color` beside
+    them in a `-s` run that answered with SQL alone. `cursor-agent` is the sixth, and both of its
+    argvs were run as written (2026.09.23-86fc751): the session's in the end-to-end turns against the
+    real server, the one-shot's in a `text` run that answered with a fenced SQL block. The one exception is the
     `codex exec resume` flag list described above, which is carried on *neither*: no page was read
     and no run was recorded.
-  - `stream.rs` — one transcript vocabulary, four CLI dialects. Every harness decodes into the same
+  - `stream.rs` — one transcript vocabulary, six CLI dialects. Every harness decodes into the same
     `StreamEvent`s the panel already renders, so the dialect stops at this module and nothing
     downstream learns which CLI produced a turn. **They do not even agree on where the discriminator
-    lives**: Claude, Codex and OpenCode tag a line with `type`, while Antigravity tags it with `event`
+    lives**: Claude, Codex, OpenCode, Copilot and Cursor tag a line with `type` (Copilot nesting
+    everything else under `data`), while Antigravity tags it with `event`
     and nests the payload under a key of the same name (`{"event":"init","init":{…}}`,
     `{"event":"step_update","step_update":{…}}`). A line shaped like the other three decodes to
     nothing at all, which is why that is pinned rather than assumed
@@ -12012,8 +12261,28 @@ existing prose was left alone.
     rewritten message loses nothing rather than being diffed against a string it shares no prefix
     with. It is keyed by ids unique only within one *turn* — the narrower unit, and see the
     turn-boundary reset below for what made that distinction load-bearing — so a parser must not be
-    shared between two concurrent streams either: one per turn for Codex and OpenCode, one per
-    session for the two persistent harnesses.
+    shared between two concurrent streams either: one per turn for Codex, OpenCode, Copilot and
+    Cursor, one per session for the two persistent harnesses.
+    **Copilot sends both shapes, which is why `Coalescer::extend` exists.** Its
+    `assistant.message_delta`s are true deltas, and then `assistant.message` restates the whole
+    message. `extend` records each delta against the message id as sent, so that when the
+    restatement is fed to `advance` under the same id it answers "nothing new" — or only the tail the
+    deltas never carried — and the key is cleared once the whole message has been seen. Printing the
+    deltas and ignoring the restatement would be silence with `--stream` off; printing both would be
+    the answer twice (`a_message_with_no_deltas_is_printed_from_its_restatement`,
+    `a_restatement_longer_than_its_deltas_adds_only_the_tail`).
+    **Cursor sends both as well, in three shapes of one event, and the obvious rule for telling them
+    apart was watched failing.** Under `--stream-partial-output` every piece of prose is an
+    `assistant` event: deltas carrying `timestamp_ms` and no `model_call_id`; before a tool call, the
+    segment so far **restated whole**, carrying `timestamp_ms` *and* `model_call_id`; and at the end
+    the last segment restated whole with neither. "Timestamped means delta" prints the pre-tool
+    sentence twice. So `push_cursor` calls a line a delta only when it has `timestamp_ms` *without*
+    `model_call_id` and feeds it to `extend`; anything else is a restatement, fed to `advance` under
+    the same key and then cleared, so it prints only a tail the deltas never carried — nothing when
+    streaming, the whole segment when not (`a_segment_with_no_deltas_is_printed_from_its_restatement`).
+    **The key is a segment, not a message**: Cursor gives prose no id, so a `tool_call` clears the one
+    key `cursor-segment` and starts the next, which is what makes each restatement comparable with
+    its own deltas rather than the turn's (`a_real_cursor_turn_prints_each_segment_once`).
     **OpenCode sends neither, and that is structural rather than a sampling artefact.** Its printer
     emits a `text` part only once `time.end` is set — once the part is *finished* — so a whole answer
     arrives in one event, a measured 2964-character reply among them. `streams_deltas` is false for
@@ -12024,7 +12293,7 @@ existing prose was left alone.
     it: it claimed the panel used it to decide whether a first token means "it has started", and the
     panel decides that from `m.pending && m.segs.is_empty()` — the better rule, since it answers
     correctly for the harness that streams nothing. It is kept with `#[allow(dead_code)]` rather
-    than deleted because it is a measured fact about four CLIs that this parser's whole design rests
+    than deleted because it is a measured fact about six CLIs that this parser's whole design rests
     on, and deleting a measurement to satisfy a warning is how a measurement gets taken twice.
     `supports_resume` and `supports_model_choice` are uncalled the same way and were left alone.
     **There are two pieces of that state now, and the second is `seen_tools`.** Two dialects restate
@@ -12060,6 +12329,39 @@ existing prose was left alone.
     chip and fills it from one line. It is keyed on `callID` all the same — the part id changes
     between restatements where the call id does not — and the `running` status is handled, so a build
     that starts streaming its calls costs one chip rather than a duplicate per event.
+    Copilot opens a call on `tool.execution_start` and closes it on `tool.execution_complete`, both
+    keyed on `toolCallId` and each through `first_sight` (`<id>\0done` for the close), so a restated
+    start or completion is one chip resolved once
+    (`a_restated_copilot_tool_call_announces_and_resolves_once` — defensive, since the captured turn
+    restates neither). A completion whose start never arrived opens its own chip — labelled `tool`,
+    since the completion carries no name — rather than emitting a loose result that `TurnState`
+    would attach to another call's still-open chip; that is `side_effect`'s rule for Codex, and this
+    arm lacked it until review (`a_completion_nothing_announced_does_not_resolve_another_call`,
+    watched failing with the running call's chip taking the second call's answer). `success: false` is what marks the chip an error; `copilot_result_text`
+    reads `error.message` first on the *assumption* that a failure names itself the way Codex's does
+    — only successes were captured — then `result.content`, then the MCP blocks in
+    `result.contents`, so a failure shaped some other way shows an empty result rather than a wrong
+    one. **The name is rebuilt from fields, not unflattened from `toolName`**: Copilot reports
+    `schemaic-list_schema` *and* `mcpServerName`/`mcpToolName` beside it, so `copilot_tool_name` is
+    Codex's rebuild rather than OpenCode's prefix-strip — splitting on the dash would misread any
+    server whose own name has one — and a built-in, which carries no server field, keeps the name it
+    really has (`a_builtin_tool_is_reported_under_its_own_name`).
+    Cursor sends a `tool_call` event `started` and one `completed`, keyed on `call_id` and each
+    through `first_sight` (`<id>\0done` for the close), and **its shapes are keys rather than
+    fields**: the payload sits under `tool_call.<kind>ToolCall` (`mcpToolCall`, `readToolCall`,
+    `shellToolCall`…), and the verdict under its `result` is a key too — `success`, or one of the
+    refusals `rejected`, `permissionDenied`, `writePermissionDenied`, `readPermissionDenied` and
+    `error`, all measured. `cursor_result` treats every key but `success` as a refusal and shows
+    whichever reason field it carries, and reads an MCP result's text one level deeper than MCP's own
+    shape, `{"text":{"text":…}}` (`a_refused_call_is_a_refused_chip_with_its_reason`).
+    `cursor_tool_name` rebuilds an MCP call's name from `providerIdentifier` (or `serverIdentifier`)
+    and `toolName`, for Copilot's reason rather than splitting `schemaic-run_query`; a refused MCP
+    completion carries no `args` at all (measured), so one first seen that way is labelled `mcp`
+    rather than guessed. **Built-ins are shown under their kind, `grep`, `shell`, `edit`, because on
+    this harness the readers run unprompted** and a refused writer should be seen refused — the
+    one exception is `getMcpToolsToolCall`, the CLI looking up which MCP tools exist, which the model
+    does before nearly every call, so a chip for it would sit beside every real one saying nothing
+    (`a_builtin_reader_is_shown_and_the_catalogue_lookup_is_not`).
     **All of that state is cleared at a turn boundary, and it only began mattering when a stream
     could hold more than one Antigravity turn.** `StreamParser::push` looks at the events it has just
     produced and, if any of them is a `TurnDone`, resets `seen_tools`, the `Coalescer` and the
@@ -12129,7 +12431,8 @@ existing prose was left alone.
     list does not show.
     **`ToolUse` and `ToolResult` both carry an `id` now, and it is the pairing key rather than a
     convenience.** Every harness puts one on the wire — `tool_use.id` on Claude, `item.id` on
-    Codex, `step_index` on Antigravity, `callID` on OpenCode — and without it a result can only be
+    Codex, `step_index` on Antigravity, `callID` on OpenCode, `toolCallId` on Copilot, `call_id` on
+    Cursor — and without it a result can only be
     attached by recency, which is exactly backwards for the ordinary parallel shape: the model
     makes two calls in one step, three of the four tools the panel allow-lists being read-only ones
     a model routinely batches, and their results arrive in **call** order, so the first result
@@ -12246,10 +12549,46 @@ existing prose was left alone.
     decode a name Schemaic itself wrote — back to the qualified `mcp__schemaic__run_query` every other
     harness produces, and leaves anything unprefixed alone so a built-in still shows under its own
     name rather than being dressed up as an MCP call.
+    **Copilot's turn ends on the one line shaped unlike the rest, and the line that looks like the
+    end is not it.** Every event nests its payload under `data`; `result` carries `sessionId` and
+    `exitCode` at the top level, and it is the only turn-completion event there is.
+    `assistant.turn_end` closes a single *model call* — the captured turn with two tool calls emits
+    three, the first before any answer exists — so ending on it would close the panel's turn before
+    either query ran and land every later event in a turn the app considers finished
+    (`only_result_ends_a_copilot_turn`). **The session id arrives last rather than first**, and
+    `result` is the only place it appears, so `SessionStarted` is emitted in the same batch as the
+    `TurnDone` and *ahead* of it: `ai.rs` scans a batch for the id and then hands it to a pump that
+    stops at `TurnDone` (`the_session_id_is_emitted_ahead_of_the_turn_closing`). A turn stopped
+    before `result` therefore leaves no id, and the next one opens a fresh conversation — which
+    `turn_system` answers correctly by sending the schema again. A non-zero `exitCode` is a failed
+    turn; an absent one is not, for `opencode_is_failure`'s reasoning. **The turn reports no numbers
+    rather than wrong ones**: `usage`'s `sessionDurationMs`, `totalApiDurationMs` and
+    `premiumRequests` are *per session* — measured across a resumed pair, the second turn reported
+    6,500 ms against the first's 1,992 and two premium requests against one — so a footer reading them
+    would grow with every question (`a_copilot_turn_reports_no_session_wide_numbers_as_its_own`).
+    `session.*`, `assistant.turn_start`/`turn_end`, `assistant.reasoning`, `tool_call_delta` and
+    `user.message` decode to nothing. A fatal error — an unavailable model among them — is not in
+    this dialect at all: measured, it is plain stderr and exit 1 with no JSON line, so it reaches the
+    panel through the per-turn loop's not-`ended` arm and `cli_failure_message`, as *"The GitHub
+    Copilot turn ended unexpectedly: …"* carrying the CLI's own words.
+    **Cursor's turn has Claude's envelope and not Claude's stream.** `system`/`init` opens it with
+    the `session_id` — first, as Codex's does, so `SessionStarted` comes before anything else — and
+    `result` closes it, the only event that does; a `result` whose `subtype` is not `success`, or that
+    says `is_error`, fails the turn (`the_session_id_arrives_first_and_the_turn_ends_on_result`,
+    `a_result_that_is_not_success_fails_the_turn`). `thinking` and the echoed `user` line decode to
+    nothing. **Its numbers are the turn's own, and cached input is input**: `duration_ms` is
+    per turn — a resumed turn reported less than the first, so it is not cumulative — and `usage`
+    partitions the prompt, a resumed second turn reporting 287 `inputTokens` beside 24,960
+    `cacheReadTokens`, which 287 alone cannot be for a prompt carrying the first turn's context. So
+    `cursor_stats` adds the two, as OpenCode's arm does, and leaves `cacheWriteTokens` out for
+    OpenCode's reason with less evidence — it was 0 in every measured turn, so whether it is part of
+    the prompt or a count within it is unknown (`a_cursor_turn_counts_its_cached_input`). A provider
+    refusal is Copilot's case again: stderr only, with no `result`, so it reaches the panel through
+    the same not-`ended` arm.
     **`push` strips a leading U+FEFF before anything else, because `trim` does not.** A byte-order
     mark is not `White_Space`, so a BOM on the first line — what a Windows console redirect or a shim
     that re-encodes a pipe prepends — made `from_str` fail and the line was filed as prose. On the
-    two dialects that carry the session id on their *opening* line that costs the whole
+    dialects that carry the session id on their *opening* line that costs the whole
     conversation's continuity rather than one event: `resume` never learns the id, so every later
     turn opens a fresh conversation with no memory of the last
     (`a_byte_order_mark_does_not_swallow_the_session_id`, which also checks the line is reported as
@@ -12293,6 +12632,26 @@ existing prose was left alone.
     longer spinning — rather than on the event list alone. Keep them byte-for-byte: tidying an id or a usage key turns evidence back into a fixture
     that agrees with the code that produced it. The one dialect no binary had ever produced was
     Gemini's, and deleting that harness took it with it.
+    **Copilot's fixture sits one step back from that line, on both counts, and says so.**
+    `COPILOT_REAL_TURN` is a real 1.0.88 turn — told to call `list_schema` and then `run_query` — but
+    **trimmed rather than verbatim**: the fields nothing reads (`id`, `parentId`, `timestamp`,
+    `interactionId`, `apiCallId`, the tool schemas) are cut, every line's shape is otherwise as
+    written, and the `session.*` lines and all three `assistant.turn_end`s are kept because the
+    decoder has to walk past them. It is driven through `TurnState` as the others are —
+    `a_real_copilot_turn_renders_two_filled_chips_then_the_answer` asserts two chips, each resolved
+    with its own query's answer, and the prose once after them. Everything else in its tests is
+    hand-written.
+    **Cursor's is trimmed as well, and in the one place a trim could lie it keeps everything.**
+    `CURSOR_REAL_TURN` is a real 2026.09.23 turn under `-p --output-format stream-json
+    --stream-partial-output`, against Schemaic's own `--mcp-serve` over a SQLite endpoint, with most
+    one-token deltas merged into three per segment, the catalogue lookup's result cut to its opening,
+    and `hookAdditionalContexts`, `startedAtMs`, `request_id` and the repeated session id dropped.
+    What it keeps is every field the decoder reads or tells shapes apart by, on every line — in
+    particular the pre-tool restatement's `timestamp_ms` *and* `model_call_id` and the final
+    restatement's lack of both, which is the whole of the three-shape rule above; merge those away and
+    the fixture agrees with whichever rule the code happens to have. It is driven through `TurnState`
+    too: `a_real_cursor_turn_renders_prose_a_filled_chip_and_prose` asserts one chip — the catalogue
+    lookup is not one — filled with the server's answer, between the two segments of prose.
     **The one shape inside a measured dialect that was itself unmeasured was the `Coalescer`'s, and
     it has now been measured.** *Whether Codex restates a message cumulatively* was an assumption
     this module is built on rather than something a binary had shown — no captured fixture contained
@@ -12884,7 +13243,8 @@ existing prose was left alone.
     `xhigh`: they were one level while no
     harness took both, and OpenCode takes `max` and not `xhigh`, so the fold made a saved `max` come
     back as `Extra` and clamp to `high` on the very harness that had written it.
-    **The Effort row is hidden, not disabled, where the harness has no such flag** (Codex). A
+    **The Effort row is hidden, not disabled, where the harness has no such flag** (Codex and
+    Cursor — and Copilot, whose flag exists but whose level list is empty; see `harness.rs`). A
     greyed control still claims *this exists for you and is off*, which is a different statement and
     a false one. The row builds its dropdown **inside** a `dyn_container` because a floem view is not
     `Clone` and each keyed rebuild has to construct its own — and the key is **`effort_levels()`,
@@ -18359,7 +18719,7 @@ existing prose was left alone.
   which was Gemini and only Gemini — and with that harness deleted every variant the enum names is
   driven, so the unestablished constraint is the only refusal left. **The arm was rewritten rather
   than removed**: it is now an exhaustive
-  `match harness { Claude | Codex | Antigravity | OpenCode => None }`,
+  `match harness { Claude | Codex | Antigravity | OpenCode | Copilot | Cursor => None }`,
   so the *next* harness added to the enum lands here as a non-exhaustive-match error and has to be
   decided. A `None` fall-through would instead spawn it on an argv read off documentation, which
   dies on its first unknown flag and gets reported as an installation problem — the one thing that
@@ -18372,8 +18732,10 @@ existing prose was left alone.
   re-entered and met the same check — which is the shape of drift this document exists to catch, in a
   comment rather than a paragraph. `refuse_every_turn` is the cheap way to make that claim true: a
   task holding `rx` open that re-states the reason per turn (and ignores `Interrupt`, since Stop on an
-  idle panel is not a question). **All three** non-spawning returns take it — the constraint one, the
-  OpenCode config-write failure, and the persistent branch's oversize refusal, which was the one left
+  idle panel is not a question). **All five** non-spawning returns take it — the constraint one, the
+  OpenCode config-write failure, Copilot's home-write failure and Cursor's workspace-write failure
+  (the same `refused` block, an arm each further down), and the persistent branch's oversize
+  refusal, which was the one left
   behind and had the same silence to show for it: it returned a `tx` whose `rx` it had just dropped,
   `needs_respawn` saw no settings change, and every later question was a discarded `Err`.
   It lives on the one function that spawns an agent for the
@@ -18387,9 +18749,10 @@ existing prose was left alone.
   naming the harnesses by hand, so a harness added to the enum is covered the moment it compiles.
   **There are two session models behind one channel, and the seam is `SessionMsg`.**
   `start_ai_session` branches on `harness.is_persistent()`: Claude and Antigravity each keep one
-  bidirectional child per conversation, while Codex and OpenCode spawn **one process per turn**,
-  continuity coming from an id captured off `StreamEvent::SessionStarted`
-  (`thread.started`/`sessionID`) and handed to the next turn as `TurnSpec::resume`.
+  bidirectional child per conversation, while Codex, OpenCode, Copilot and Cursor spawn **one
+  process per turn**, continuity coming from an id captured off `StreamEvent::SessionStarted`
+  (`thread.started`/`sessionID`, Copilot's closing `result`, Cursor's opening `system`/`init`) and
+  handed to the next turn as `TurnSpec::resume`.
   **The interface upstream did not change**, and that is the point:
   `AiSession::stdin_tx` carries a typed `SessionMsg::{Turn, Interrupt}` rather than the raw stdin
   JSON line `main.rs` used to build, because that made the app's send path fluent in one CLI's wire
@@ -18429,8 +18792,8 @@ existing prose was left alone.
   unreachable**, because configuration for a harness that no longer takes that path is the copy that
   quietly stops matching the one that runs.
   **The per-turn child's stdin is piped exactly when the prompt travels on it**
-  (`Harness::turn_stdin_prompt`, which is `Harness::prompt_on_stdin` — Codex alone) **and
-  `Stdio::null()` otherwise**, and the old unconditional `null()` is the reason the "otherwise" has
+  (`Harness::turn_stdin_prompt`, which is `Harness::prompt_on_stdin` — Codex, Copilot and Cursor)
+  **and `Stdio::null()` otherwise**, and the old unconditional `null()` is the reason the "otherwise" has
   to stay: measured, and still true on codex-cli 0.153.4, `codex exec` prints *"Reading additional
   input from stdin…"* when stdin is a pipe at EOF, and appends piped stdin to the prompt as a
   `<stdin>`
@@ -18439,6 +18802,21 @@ existing prose was left alone.
   positional under the same predicate rather than duplicating the prompt. The write happens
   immediately after the spawn and the pipe is then shut down, because the CLI waits on EOF to know
   the instructions are whole.
+  **What a per-turn child is started as, and where, are not always `bin` and `cwd` — and the first
+  is resolved per turn.** Where is per session; *what* is not, because Cursor's launcher is the
+  newest `versions\<v>\` directory and the CLI updates itself into a new one, so a path resolved
+  when the session opened can name a version since replaced; one directory read per turn keeps
+  every spawn on the one that is there. `agent_cli::launch(harness, &bin)` gives the program and the arguments
+  that go ahead of the harness's own — for Cursor on Windows the newest version's `node.exe` and its
+  `index.js` rather than the `.cmd` that was found, for the reason under `agent_cli.rs` — and
+  `spawn_refusal`'s size check measures that program and that argv, prefix included, since that is
+  what is spawned. `child_cwd` is Cursor's workspace root, because its permissions file is found
+  from the working directory, and `cwd` for everyone else. **Cursor's one approval runs before the
+  first turn**, inside the session task: `cursor::approve` is a node start and a file write, so it
+  goes through `spawn_blocking` as Antigravity's registration does, and a failure becomes the
+  no-database-tools note rather than a refusal — the calls would be refused anyway, and the
+  permissions file that makes the session safe was already written. It is owed only when the
+  workspace configures a server (`CursorWorkspace::has_server`).
   And every harness folds its events through **one**
   `TurnPump` — prose and chips accumulate, a snapshot goes out when anything changed, `TurnDone`
   closes the turn and resets, and `fail()` always sends so the panel cannot spin. Claude was
@@ -18555,7 +18933,20 @@ existing prose was left alone.
   collects it. It holds the same secret and must not outlive its session any longer. **OpenCode is on
   that route for a third reason**: it is configured by a file, like Claude, but by a *reused* one, so
   the `--endpoint-file <path>` in its `opencode.json` is what keeps the credential out of a directory
-  that outlives the session (`crate::opencode`).
+  that outlives the session (`crate::opencode`). **Copilot is on it for OpenCode's reason**: its MCP
+  config *is* a file, but it lives in a `COPILOT_HOME` reused across sessions, so it carries the
+  path, and the endpoint file is what this session owns (`crate::copilot`). The two differ where the
+  endpoint file cannot be written. OpenCode's arm refuses, because its config is also its seal;
+  Copilot's degrades the way Codex's does — its seal is the argv's allowlist, which holds without a
+  server — to a server-less home (`CopilotHome::write_inline`, so the isolation survives) and the
+  same no-database-tools note. The allowlist still names the access level's tools there, and with no
+  `--additional-mcp-config` (nor, therefore, any `--allow-tool`) nothing provides them. **Cursor is
+  on the route for the same reason** — its `mcp.json` is in a workspace reused across sessions
+  (`crate::cursor`) — and without an endpoint file it degrades the way Copilot does, but for its own
+  reason: the permissions file is written regardless, because that is the half that cannot be
+  missing, and `mcp.json` is not (one an earlier session left is removed), so the session runs
+  with no server and says so. It is refused only when the workspace itself cannot be written, since
+  a missing permissions file fails open for writes.
   **Which of those two routes a harness takes is one decision, `endpoint_plumbing(harness) ->
   EndpointPlumbing { mcp_config, endpoint_file }`**, because it used to be two independent
   `match harness` sites — one in each of `start_ai_session`'s branches — and that is precisely how
@@ -18583,7 +18974,8 @@ existing prose was left alone.
   fifth harness lands in the same question rather than adding a fifth silence, and the Antigravity
   endpoint-file arm folds into it, leaving that `match` to do only what it is for. The Antigravity
   *registration* failure stays separate and has to: it is known only after two `agy` invocations,
-  i.e. after an await. `a_harness_that_lost_its_endpoint_plumbing_says_so_whichever_one_it_is` walks
+  i.e. after an await — and so does Cursor's `mcp enable` failure, for the same reason.
+  `a_harness_that_lost_its_endpoint_plumbing_says_so_whichever_one_it_is` walks
   `Harness::ALL` rather than testing Claude, because the defect was a harness nobody wrote an arm
   for.
   **And the subprocess reading that file fails closed.** `mcp_endpoint_from_env` returns
@@ -18631,9 +19023,13 @@ existing prose was left alone.
   `(harness, path)`; its own entry is below), `antigravity.rs` (that CLI's two pieces of global
   state, also below), `liveness.rs` (whether the process that left something behind is still
   running, which `antigravity.rs`'s sweep and `ai.rs`'s own sweep both ask through `may_sweep`, and
-  `opencode.rs`'s asks more directly through `process_start` — also below),
+  `opencode.rs`'s and `cursor.rs`'s ask more directly through `process_start` — also below),
   `opencode.rs` (the config directory that harness is sealed by, and the
-  environment pointing it there — also below) and `ai.rs` (`AiSession`/`start_ai_session` streaming,
+  environment pointing it there — also below), `copilot.rs` (the `COPILOT_HOME` that harness is
+  isolated by and the MCP config inside it, on `opencode.rs`'s per-instance roots — also below),
+  `cursor.rs` (the working directory that harness is restricted by, its one MCP approval, and the
+  sweep of what the CLI keeps about that directory in the user's own Cursor config — also below) and
+  `ai.rs` (`AiSession`/`start_ai_session` streaming,
   MCP-config plumbing, `ai_context`/`inline_system_prompt`). Reactive wiring (`app_view` closures)
   stays in `main.rs`.
   **Every prompt's database list comes out of one funnel**, `snapshot_databases`: it reads the
@@ -18663,8 +19059,8 @@ existing prose was left alone.
   panel's wording is right *there*, where the model can answer back.
   **One spawn shared by all three one-shot features, because they had drifted apart.** `inline_plan`
   resolves the selected harness into a runnable `InlinePlan` — binary, argv, where the reply comes
-  back from, and OpenCode's environment — or hands back the reason it will not run, and `run_inline`
-  executes it. Each of Ctrl+K, AI Fill and AI Seed carried its own copy of that before: two passed
+  back from, and the environment an `env_seal` harness is isolated by — or hands back the reason it
+  will not run, and `run_inline` executes it. Each of Ctrl+K, AI Fill and AI Seed carried its own copy of that before: two passed
   `Stdio::null()` and Ctrl+K did not, so Ctrl+K alone paid the CLI's wait on a stdin that was never
   going to arrive. That null is now conditional for the same reason the session path's is —
   `InlinePlan::stdin_prompt` is `Harness::inline_stdin_prompt`, so the pipe exists only where the
@@ -18679,7 +19075,9 @@ existing prose was left alone.
   they were Claude-only — an unsealed Claude is a refusal at `start_ai_session`, and inline never
   reached that function — but a one-shot can be Codex or Antigravity now, whose constraint *is* the
   sandbox flag, so `spawn_refusal` is asked here for the same reason it is asked there, and the
-  oversize check sits beside it. `inline_reply_path` is Codex's `-o` file, in `mcp_dir()` and named
+  oversize check sits beside it — measuring what will really be spawned, since `agent_cli::launch`
+  is resolved first and its program and prefix replace the bare binary in the plan (Cursor's node,
+  on Windows). `inline_reply_path` is Codex's `-o` file, in `mcp_dir()` and named
   with `MCP_FILE_PREFIX` so `sweep_stale_mcp_configs` collects it if the process dies between
   the spawn and the read; `run_inline` reads and removes it whatever the exit status, so a failed run
   that still wrote one leaves nothing for the sweeper. **And so does the oversize refusal**, which
@@ -18687,18 +19085,52 @@ existing prose was left alone.
   created one and then refused, orphaning a file every time. It is removed at the refusal rather than
   left to the sweep, which only collects once the owning process is gone.
   **`run_inline` runs its child in a working directory of its own too**, `InlinePlan::cwd` from the
-  same `session_cwd`, removed when the generation finishes. It used to set no `current_dir` at all,
+  same `session_cwd` — or, for Cursor, the instance's `cursor-inline` workspace (`inline_cwd`,
+  below) — removed when the generation finishes. The removal is `remove_dir`, empty-only, and on
+  Cursor that is doing real work: its workspace is one directory shared by every one-shot of the
+  instance and is never empty, so it survives for `cursor::sweep`, where a recursive removal would
+  take the permissions file out from under a concurrent generation. It used to set no
+  `current_dir` at all,
   so the child inherited the app's *own* process working directory: a user who launches Schemaic
   from a world-writable directory gave any local account a `.claude/settings.json` whose `hooks` run
   as them on the next Ctrl+K, and Claude — the default harness — has only the cwd standing between it
   and that. It also clears OpenCode's config variables **before** setting ours, the order the session
   path states in a comment and this one had backwards, and clears them unconditionally rather than
-  behind `harness == Harness::OpenCode`.
+  behind `harness == Harness::OpenCode`. **That list is `inherited_env_to_clear()` now, one function
+  both spawns call**: OpenCode's `env_remove` chained with Copilot's, so the one-shot and the chat
+  turn cannot come to clear different sets. It used to be OpenCode's list alone, which was complete
+  only while OpenCode was the only harness isolated by its environment.
+  `no_seal_variable_is_also_cleared` pins the disjointness the clear-then-set order leans on — no
+  lever (`XDG_CONFIG_HOME`, `OPENCODE_DISABLE_PROJECT_CONFIG`, `COPILOT_HOME`) is ever in the list,
+  since a lever there would strip its own harness's isolation while the panel reported it sealed —
+  and that both lists are in it, not only the first. (A comment here already cited that test by
+  name before it existed; it exists now.)
+  **Which environment is built is `inline_env(harness)`, and it asks `env_seal` and then matches the
+  harness exhaustively.** It used to be `match harness.env_seal() { true =>
+  OpenCodeConfig::write_inline() … }` — the capability asked, then one harness's writer assumed — so
+  the moment a second harness answered `true` it would have been "isolated" by OpenCode's config and
+  nothing of its own. Now OpenCode gets `OpenCodeConfig::write_inline`, Copilot gets
+  `CopilotHome::write_inline`, and a failure to write either **refuses the generation** rather than
+  running it bare, each for its own reason: OpenCode's `--agent` would fall back to `build` and its
+  `bash`, Copilot would start the user's MCP servers and load their hooks. The arms for the
+  harnesses whose `env_seal` is false **refuse too** rather than return an empty environment — they
+  are reached only if one is flipped to `true` without a writer here, and that has to fail closed
+  instead of running unisolated. `a_harness_not_isolated_by_its_environment_gets_an_empty_one` is
+  named for the half it covers — the empty environment for the harnesses whose `env_seal` is false —
+  because the other half needs the real config directory to exercise; what holds the refusing shape
+  is the exhaustive `match`, not a test.
+  **Where the one-shot runs is `inline_cwd(harness)`, the same shape one question over.** It asks
+  `restricts_by_workspace_rules`: for every harness that answers `false` it is a fresh
+  `session_cwd()`, as before, and for Cursor it is `CursorWorkspace::write_inline()`'s root — or a
+  **refusal**, never a bare private directory, because without the permissions file a headless run
+  writes files unprompted. The arms for the other harnesses refuse, so one flipped to `true` with no
+  writer here fails closed. `inline_plan` asks it after the size check, and a refusal there removes
+  the reply file as the size refusal does.
   **What comes back is gated, not trusted**: `inline_outcome` runs `extract_sql` (fences off) and
   then `intel::sql_reply` (the parse gate above), and a reply that will not parse becomes
   `Failed("The model did not return SQL")` rather than an edit. It takes the runner's
   `Result<String, String>` rather than the raw `(success, stdout, stderr)` it used to, because reading
-  the reply is no longer one thing — three harnesses answer on stdout and Codex answers in a file —
+  the reply is no longer one thing — five harnesses answer on stdout and Codex answers in a file —
   and that decision belongs with the argv that made it. The composition is what the caller
   relies on, so it is pinned *here* as well as in `intel` —
   `inline_outcome_drops_a_tool_diagnostic_riding_on_the_sql` puts the chatter inside the fences,
@@ -18718,8 +19150,8 @@ existing prose was left alone.
   keyring-backed `SecretStore` behind `core::secrets`.
   - `agent_cli.rs` — finding the agent CLI, and asking it what it accepts. It was `claude_cli.rs`
     until the settings gained a harness, and the rename is not cosmetic: the module now looks for
-    four binaries and interrogates whichever one is selected, so leaving it named for one of them
-    while it probes the other three is the drift this document exists to catch.
+    six binaries and interrogates whichever one is selected, so leaving it named for one of them
+    while it probes the other five is the drift this document exists to catch.
     `detect_bin(h)` asks three sources in order — `$SCHEMAIC_<HARNESS>_BIN` (Claude keeps
     `SCHEMAIC_CLAUDE_BIN`, which shipped before any other harness existed and someone's launcher may
     still set it), then that harness's **known install locations**, then a `PATH` search honouring
@@ -18729,14 +19161,57 @@ existing prose was left alone.
     panel would have said so. The locations are Claude `~/.local/bin`, Codex
     `%LOCALAPPDATA%\Programs\OpenAI\Codex\bin` and `~/.codex/bin`, Antigravity
     `%LOCALAPPDATA%\agy\bin` and `~/.local/bin`, OpenCode `%APPDATA%\npm\node_modules\opencode-ai\bin`,
-    `~/.opencode/bin`, `~/.local/bin` and `~/.npm-global/lib/node_modules/opencode-ai/bin` — and each
-    candidate ends in that harness's own executable
+    `~/.opencode/bin`, `~/.local/bin` and `~/.npm-global/lib/node_modules/opencode-ai/bin`, Copilot
+    `%APPDATA%\npm\node_modules\@github\copilot\node_modules\@github\copilot-win32-<x64|arm64>` and
+    `~/.local/bin`, Cursor `%LOCALAPPDATA%\cursor-agent\cursor-agent.cmd` on Windows and
+    `~/.local/bin/cursor-agent` elsewhere — and each candidate ends in that harness's own executable
     (`a_known_location_ends_in_the_harnesss_own_executable`, which also holds the Windows
-    extension on). **For OpenCode the middle step is doing a second job**, and it is a Windows one: a
+    extension on, `.exe` for every harness but Cursor, whose installer writes no executable of its
+    own there — only the launcher script, which `launch` below looks behind). Cursor's `bin` is
+    `cursor-agent` and not the shorter `agent` its installer also puts on `PATH`, because `agent` is
+    a word other tools claim and a `PATH` search for it can find somebody else's.
+    **For OpenCode the middle step is doing a second job**, and it is a Windows one: a
     global `npm i -g opencode-ai` puts an `opencode.cmd` shim on `PATH` beside the real
     `opencode.exe` it calls, `which_on_path` honours `PATHEXT`, and a `.cmd` needs a shell rather than
     the `Command::new` this spawns with. Listing the real binary first is what makes it win before the
-    shim is ever found. `harness_bin(h, override)` and `harness_reachable(h, path)` are the former
+    shim is ever found. **Copilot's is the same job one layer deeper**: `npm i -g @github/copilot`
+    puts `copilot.cmd` on `PATH`, which runs `npm-loader.js` under node, which spawns the real
+    binary out of a per-platform package beside it — `@github/copilot-win32-x64/copilot.exe`,
+    measured on 1.0.88 — so the known location is that nested path, its architecture component read
+    off `std::env::consts::ARCH` (`aarch64` → `arm64`, anything else → `x64`), and the shim, which
+    would refuse every multi-line argument, is never what is spawned when the real file is there.
+    `copilot_looks_behind_npm_s_shim_for_the_real_binary` pins it, and returns early off Windows or
+    without `APPDATA`, so it asserts nothing on any other platform. **A shim found anywhere else is
+    looked behind too**, by `launch`: under a non-default npm prefix — or named by a path override —
+    `copilot.cmd` would otherwise be spawned through `cmd.exe`, and ending `cmd.exe` leaves node and
+    `copilot.exe` running the turn, Cursor's hazard below. The package sits beside the shim, so
+    `copilot_native_behind` looks for it relative to the shim's own directory, through the same
+    `copilot_native_path` the default location is built from
+    (`copilot_s_binary_is_found_beside_whichever_npm_prefix_holds_the_shim`).
+    **Cursor's is not a shim to look past but a chain to start behind, and that is `launch(h, bin)
+    -> Launch { program, prefix }`.** Its Windows installer writes `cursor-agent.cmd`, which runs a
+    PowerShell script, which runs `versions\<newest>\node.exe index.js` — and ending a `.cmd` ends
+    `cmd.exe` and leaves node running, so Stop and a dropped session's `kill_on_drop` would have
+    stopped the panel waiting while the turn went on spending the user's quota. The launcher does
+    nothing but pick the version and pass its arguments through, so `cursor_node_launch` does the
+    same and Schemaic starts that `node.exe` with `index.js` as the prefix: one process, which dies
+    when told to. Measured: a turn, a resume and `mcp enable` all ran identically started that way.
+    The version is chosen by the launcher's own rule, `newest_cursor_version` — `YYYY.M.D-<hex>` or
+    `YYYY.M.D-HH-MM-SS-<hex>`, dates compared as numbers, the build time breaking a tie the script
+    leaves to directory order, anything else in `versions\` ignored
+    (`the_newest_cursor_version_is_picked_by_the_launcher_s_rule`). Anything that is not that layout
+    is started as it is — an override pointing straight at a `node.exe`, a Unix install whose link is
+    a real executable — and no harness but these two is rewritten at all
+    (`a_launcher_is_rewritten_only_to_something_that_exists`, which also holds a `.cmd` with nothing
+    behind it to `Launch::direct` rather than an invented path, for both). The layout itself — the `.cmd` resolving to
+    a real install's newest `node.exe index.js` — was measured rather than tested, because a test
+    reading the installed directory would break the suite's no-filesystem rule. `launch` is
+    an exhaustive `match`, so the next harness decides rather than defaults, and the per-turn loop,
+    the one-shot, `cursor::approve` and `help_command` all go through it — the last because probing
+    the `.cmd` would answer for the chain rather than for the node the session will start. **The
+    persistent branch does not**: it spawns `bin` directly, which is right only because `launch`
+    answers `direct` for Claude and Antigravity, the two harnesses that reach it.
+    `harness_bin(h, override)` and `harness_reachable(h, path)` are the former
     `claude_bin`/`claude_reachable` with the harness passed in rather than assumed — the first
     resolves what to spawn, the second answers the settings modal's "is this reachable".
     **`pick_executable` is `which_on_path`'s per-directory half, pure so it can be tested, and on
@@ -19127,7 +19602,7 @@ existing prose was left alone.
     `Sealed`. `write`'s contract is that a failure to seal must **refuse**, and it is honoured for a
     failed write and for a missing `private_dir`; a root that could not survive a `String` round trip
     was the one way past it. `Command::env` takes `AsRef<OsStr>`, so the round trip was imposed by
-    the signature alone. `ai.rs`'s `InlinePlan::env` and `oc_env` carry the same type, and
+    the signature alone. `ai.rs`'s `InlinePlan::env` and the per-turn `seal_env` carry the same type, and
     `nothing_the_seal_depends_on_is_cleared_by_accident` now also asserts that the value reaching the
     child is the root path itself rather than a rendering of it.
     Three further details in it are load-bearing. **Only `XDG_CONFIG_HOME`, never `XDG_DATA_HOME`** — the two
@@ -19165,7 +19640,12 @@ existing prose was left alone.
     with its credentials and its access level, while the first window's panel, transcript and deltas
     all named the first connection. `instance_root(kind)` is
     `persist::private_dir(kind)?.join(instance_tag())` with `instance_tag()` = `pid-<pid>`, and both
-    `write` and `write_inline` go through it. One correction worth keeping, because the first telling
+    `write` and `write_inline` go through it — and so do `app/copilot.rs`'s two homes and
+    `app/cursor.rs`'s two workspaces, which is why
+    `instance_root`, `instance_path_in` and `instance_tag` are `pub(crate)`: a `COPILOT_HOME` carries
+    a per-connection path too and is read by a process per turn, so it needs the same boundary for
+    the same two reasons, and so does a Cursor workspace's `mcp.json` and permissions file.
+    One correction worth keeping, because the first telling
     of this got it wrong: the file was under `persist::private_dir` throughout, so it was per-*user*
     and never machine-wide, which is why the fix is a per-instance subdirectory rather than a move
     out of a shared location. The pid is the discriminator because that is what a running instance has and a
@@ -19181,9 +19661,17 @@ existing prose was left alone.
     `opencode/` directory an older build left directly under the base. And it removes
     **recursively**, unlike `ai`'s session working directories, which is stated rather than assumed:
     everything under a root here was written by Schemaic or by an OpenCode bootstrap into a directory
-    Schemaic made for it, and nothing here is a credential.
-    **`write` returning `None` must refuse the session, and `ai::start_ai_session` does.** This is the
-    one harness where a missing config does not fail closed: `--agent schemaic` naming an agent that
+    Schemaic made for it, and nothing here is a credential. The walk itself is
+    `sweep_instances(kinds)`; `sweep` is that over `opencode` and `opencode-inline`, and
+    `copilot::sweep` calls it over its own two kinds, the recursive-removal argument carrying over
+    unchanged because what is under a Copilot home was likewise written by Schemaic or by the CLI into
+    a directory Schemaic made for it. `cursor::sweep` calls it over `cursor` and `cursor-inline` on
+    the same argument — only after its own walk of the user's Cursor directory, described there.
+    (The legacy `opencode/` clean-up runs for every kind it is
+    given; under a Copilot or Cursor base there is no such directory to find.)
+    **`write` returning `None` must refuse the session, and `ai::start_ai_session` does.** This was
+    the first harness where a missing config does not fail closed (Cursor is the second, see
+    `cursor.rs`): `--agent schemaic` naming an agent that
     does not exist leaves the run on OpenCode's own `build` agent, which has `bash`. So there is no
     degraded mode here of the kind the Codex path takes with `codex_isolation_only` — the user gets a
     message saying the assistant is disabled because the file that restricts it could not be written.
@@ -19197,6 +19685,159 @@ existing prose was left alone.
     `--agent`'s value out of `turn_args` and back into the document: both sides read `OPENCODE_AGENT`
     so a rename can never break the lookup, but the JSON growing a different shape around the name
     can, and that failure is silent.
+  - `copilot.rs` — the `COPILOT_HOME` a GitHub Copilot session runs under, and the MCP config inside
+    it that gives the session our server. `CopilotHome::write(exe, Some(endpoint_file))` writes
+    `harness::copilot_mcp_config_json` into `instance_root("copilot")` as `schemaic-mcp.json` and
+    hands back the home (`write(exe, None)` hands back the same root with no config); `write_inline` makes `instance_root("copilot-inline")` and writes nothing
+    into it; `mcp_config()` is the path `turn_args` puts behind `--additional-mcp-config=@`; `env()`
+    is the one variable the child gets and `env_remove()` the three it must not inherit. `sweep`
+    collects the homes of instances that are gone, through `opencode::sweep_instances`, called from
+    `main.rs` beside `opencode::sweep` on the same background thread.
+    **The seal is a flag; the isolation is this directory, and that is the whole reason the module
+    exists.** Copilot's built-in tools are shut off on its own command line by `--available-tools`
+    (see `harness.rs`). What that flag does *not* do is stop the CLI loading the user's own
+    configuration — `~/.copilot/mcp-config.json`, whose servers it **starts** whether or not their
+    tools are then visible, their skills, their plugins and their hooks, and a hook is a command. The
+    flag that adds our server cannot displace any of that either: `--additional-mcp-config` says of
+    itself that it "augments config from ~/.copilot/mcp-config.json". `COPILOT_HOME` can — "override
+    the directory where configuration and state files are stored; defaults to `$HOME/.copilot`" —
+    and pointed at a directory Schemaic owns, none of the user's configuration exists for the
+    session. It is OpenCode's `XDG_CONFIG_HOME` again, and like that it edits nothing of the user's.
+    **Moving a CLI's home can log the user out, and off Windows this one would have.** Measured on
+    1.0.88 under Windows with an empty directory, a turn authenticated and answered — the token was
+    in the OS credential store. But `copilot login --help` says where it goes otherwise: *"If a
+    credential store is not found or there is an issue using it, the token will be stored in a plain
+    text config file under ~/.copilot/"*, which is every headless Linux box with no Secret Service.
+    So both `write` and `write_inline` call `carry_login`, which copies the user's `config.json` —
+    the file the CLI heads "This file is managed automatically", holding the login and nothing it
+    reads as configuration — from their own Copilot home (`user_copilot_home`: their `COPILOT_HOME`,
+    else the platform home's `.copilot`) into ours; settings, MCP servers, skills and hooks live in
+    other files and stay behind (`only_the_login_is_carried_into_the_home`,
+    `the_login_is_read_from_where_the_user_s_copilot_keeps_it`). It is best-effort: nothing to copy
+    leaves the CLI's own authentication error to surface on the first turn. A Windows home seeded this
+    way was measured to answer as the empty one did; the keychain-less path itself was not measured.
+    `env_remove()` is written to the variables:
+    `COPILOT_ALLOW_ALL` (auto-approves every tool, and its exact value `"true"` also trusts the
+    working directory, loading that directory's skills, plugins, MCP servers and hooks),
+    `COPILOT_ASSISTED_APPROVAL` (swaps the approval policy for a model's judgement) and
+    `COPILOT_CUSTOM_INSTRUCTIONS_DIRS` (adds the instruction directories `--no-custom-instructions`
+    is there to keep out) are cleared, each because it reopens something the argv closed; the
+    `COPILOT_PROVIDER_*` and token variables are deliberately **not**, because they are how a user
+    authenticates or brings their own model and clearing them would log the session out rather than
+    isolate it. `ai::inherited_env_to_clear` chains this list after OpenCode's and every harness's
+    child is cleared of both. `every_variable_that_widens_a_session_is_cleared` asserts the whole
+    slice, for the reason `OpenCodeConfig`'s own test gives — a sample lets one entry be dropped with
+    the suite green — `authentication_survives_the_isolation` holds `COPILOT_GITHUB_TOKEN`,
+    `GH_TOKEN`, `GITHUB_TOKEN`, the provider variables, `HOME` and `USERPROFILE` out of it, and
+    `the_home_is_the_lever_and_is_never_also_cleared` holds `COPILOT_HOME` itself out of it.
+    **Reused within an instance, because the session lives in it.** Copilot is a process per turn and
+    each turn resumes the previous one by id, from state the CLI keeps under `COPILOT_HOME`
+    (`session-state/`, `session-store.db`). A home per *session* would work; a home per *turn* would
+    forget every conversation after one question. So the root is per instance, from
+    `opencode::instance_root`, for the reason that function gives: the config carries the endpoint
+    file's path, which differs per connection, and a second window must not re-point the first one's
+    next turn. The consequence is OpenCode's too — the directory outlives the session, so the config
+    names the per-session endpoint file by *path* and the credential never enters it. The file is
+    written plainly, since it holds no secret and is rewritten per session. It is named
+    `schemaic-mcp.json` and not `mcp-config.json`, the name Copilot reads *by default* from its
+    home: naming ours by flag keeps "which servers does this session have" a question the argv
+    answers, rather than one that depends on which file a build happens to look for.
+    **A one-shot gets a home of its own, and it holds nothing.** `copilot-inline` is a separate root
+    for OpenCode's reason, a session's configuration and a one-shot's must not be one directory
+    whichever wrote last: there is no config file on the inline side at all, but a one-shot running
+    in the session's home would find that session's `schemaic-mcp.json` lying there, and a build
+    that read it by default would hand a server to the one path with nowhere to show a tool call.
+    `a_session_and_a_one_shot_never_share_a_home` asks it of `instance_path_in` over a fixture path,
+    never of `instance_root`, which creates directories under the real `config_dir()` — and holds
+    both apart from OpenCode's `opencode` root as well.
+    **`write` returning `None` refuses the session, as OpenCode's does, but for a reason of this
+    harness's own.** The allowlist is on the command line and would still hide every foreign tool
+    without the home; what does not survive is the isolation, and without it the CLI starts every
+    server in the user's `mcp-config.json` and loads their hooks, which is nothing a SQL assistant
+    should do on their behalf. So `ai::start_ai_session` refuses (through `refuse_every_turn`, like
+    the other non-spawning returns) and `ai::inline_env` refuses a one-shot whose `write_inline`
+    fails. Where the *endpoint file* is what could not be written, the session is not refused: it
+    runs with a server-less home and says it has no database tools — Codex's shape rather than
+    OpenCode's, since here the seal does not depend on the file that is missing. That home is the
+    *session's* root, `write(exe, None)`, not `write_inline`'s: a session with no tools is still a
+    conversation to resume next turn, and `copilot-inline` exists so the two never share a
+    directory. An earlier session's `schemaic-mcp.json` may still be lying in the root; nothing reads
+    it, because the file is named only by the flag and the flag is not passed without a config.
+  - `cursor.rs` — the working directory a Cursor session runs in, the two files in it that restrict
+    and configure the session, the one approval the CLI needs before it will load our server, and
+    the sweep that takes back what the CLI keeps about that directory in the user's own Cursor
+    config. `CursorWorkspace::write(exe, Some(endpoint_file), allowed)` writes
+    `harness::cursor_permissions_json(allowed)` as `.cursor/cli.json` and
+    `harness::cursor_mcp_config_json` as `.cursor/mcp.json` under `instance_root("cursor")`;
+    `write(exe, None, allowed)` writes the permissions file alone and removes any `mcp.json` an
+    earlier session left, so the CLI is not handed a server pointing at a file that no longer
+    exists; `write_inline` writes the same denials with nothing allowed and no server under
+    `instance_root("cursor-inline")`. `root()` is where the child is started and `has_server()`
+    whether `approve` is owed. `sweep` runs from `main.rs` after `copilot::sweep`, on the same
+    background thread.
+    **The restriction is a file, and a missing file fails open.** Cursor has no flag that empties its
+    tools and no sandbox measured to hold headless; what holds is the project permissions file, and
+    what it holds and what it does not is under `harness.rs`. Measured on the 2026.09.23 build: with
+    no file at all a headless turn refused its shell and every MCP call, and **wrote a file
+    unprompted**. So `write` returning `None` refuses the session in `ai::start_ai_session` (through
+    `refuse_every_turn`, like the other non-spawning returns), and `ai::inline_cwd` refuses a
+    one-shot whose `write_inline` fails — OpenCode's position, for a more literal reason: there the
+    missing file leaves a shell, here it lets the writers through. Where only the *endpoint
+    file* is missing the session is not refused, because the permissions file is still written.
+    **The working directory is the configuration.** Both files are *project* files, found from the
+    directory the CLI is started in, so the child's `current_dir` is not only a guard against a
+    planted file here, as it is for the others, but the lever itself — which is why `ai.rs` starts
+    this harness somewhere other than `session_cwd`, and why `env_seal` is false for it. **Per
+    instance and reused, because the conversation lives in it**: the CLI keys a conversation's saved state by the directory it ran in
+    and each turn resumes the last, so a directory per *turn* would lose the conversation and one per
+    session would scatter entries across the user's Cursor config. The root comes
+    from `opencode::instance_root` for that function's reason — the files carry a per-connection
+    endpoint path and the access level's tools, and a second window must not re-point the first
+    one's next turn — and the consequence is OpenCode's too: the directory outlives the session, so
+    `mcp.json` names the endpoint file by path and the credential never enters it. The one-shot's
+    root is separate for Copilot's reason, so a live session's `mcp.json` is never lying in a
+    one-shot's directory (`a_session_and_a_one_shot_never_share_a_workspace`, over
+    `instance_path_in` and a fixture path).
+    **One approval, and only ours.** A project MCP server loads only once approved — measured, *"not
+    loaded (needs approval)"* and every call refused until then. `approve(launch, workspace)` runs
+    `cursor-agent mcp enable schemaic` in the workspace, through `agent_cli::Launch` like every other
+    spawn of this CLI, with stdin null and a 60-second ceiling (`APPROVE_TIMEOUT` — the measured runs
+    took a few seconds, and a hung one must not hold the session). The record it writes is keyed by
+    a hash of the config's contents — changing the endpoint path read *"needs approval"* again — so it
+    is asked again every session. **`--approve-mcps` is the lever that looks like the answer and is
+    never passed**: it approves every server in reach, a user's plugins' among them, where this
+    approves ours by name. A failure is a session with no database tools that says so, Antigravity's
+    shape for a registration that failed.
+    **What the CLI keeps is Antigravity's position, and the sweep is `antigravity::sweep`'s analogue
+    with one difference that makes it safe.** The approval record and the conversations land in the
+    user's own Cursor config directory, resolved by the CLI's own rule read out of its bundle —
+    `CURSOR_CONFIG_DIR`, else `$XDG_CONFIG_HOME/cursor`, else `<home>/.cursor` (`cursor_config_dir`):
+    `projects/<slug>/`, whose `.workspace-trusted` records the `workspacePath` and which holds the
+    approvals and transcripts, and `chats/<hash>/<chat>/`, whose `meta.json` records the `cwd`. That
+    is global state outliving the process, entries for every instance that ever ran for as long as
+    nothing takes them back. **Every entry is found by its content naming one of Schemaic's own
+    directories, never by recomputing the CLI's slug or hash**: `workspace_pid` accepts a recorded
+    path only when it is exactly `<the cursor or cursor-inline base>/pid-<n>` — compared
+    case-insensitively on Windows, where the CLI records whatever its process reports — so nothing
+    of the user's own can match, not even a project of theirs named `pid-42` or one they put *under*
+    our directory (`only_our_own_workspaces_are_recognised`, which also holds OpenCode's roots out
+    of it). The entry then goes only when that pid has no live process — `opencode::sweep`'s rule,
+    any process on the pid, and not `antigravity.rs`'s start-time claim — so a recycled pid keeps an
+    entry until that process ends. The trade is OpenCode's, leftovers kept longer rather than a live
+    session broken, and what is kept is state recorded against a directory of Schemaic's rather than
+    a grant in the user's own settings. A `chats` group directory is removed only if empty and only
+    where this sweep emptied it; each removal is best-effort, leaving a failure for the next launch.
+    Then `opencode::sweep_instances` collects the workspaces themselves. **The user's directory is
+    walked only when one of ours is dead**: `chats/` holds one entry per conversation the user has
+    ever had with the CLI, so the sweep first lists its own bases and returns before opening a single
+    `meta.json` unless some `pid-<n>` there has no live process. That is sound because an entry of
+    ours outlives its workspace only if this sweep failed to remove it, the state being removed first
+    and the workspace second.
+    **And what cannot be closed.** The user's `~/.cursor/mcp.json` is read from a path the CLI
+    hard-codes to the home directory, and moving the home would move their login with it on macOS and
+    Linux; its servers need no approval and are started on every turn. Their tools are refused
+    unless the user's own settings allow them, because no allow rule here names them — which is
+    `isolates_mcp_servers` false, and the notice saying so.
   - `conn_sources.rs` — the I/O half of connection import: which paths on *this* machine are worth
     opening, and reading them. Deliberately only that half — nothing here interprets the bytes,
     which is what keeps `core::conn_import` unit-tested and leaves the part that cannot be (a walk
@@ -19922,9 +20563,9 @@ existing prose was left alone.
     write to stdout ahead of it. The two flag sets never co-occur: `--veloapp-*` comes from the
     installer or the updater, and `--mcp-serve` comes from **whichever agent CLI the user picked** —
     Claude spawning this binary out of the `--mcp-config` file Schemaic writes it, and Codex,
-    Antigravity and OpenCode out of their own configuration with `--endpoint-file` beside it. So the
-    ordering between them is free, and this way the protocol stream stays clean whichever of the
-    four opened it.
+    Antigravity, OpenCode, Copilot and Cursor out of their own configuration with `--endpoint-file`
+    beside it. So the ordering between them is free, and this way the protocol stream stays clean
+    whichever of the six opened it.
     **The headless-CLI branch sits between those two, and being *before* Velopack is the load-bearing
     part.** `schemaic list`/`databases`/`ping`/`tables`/`describe`/`query`/`exec`/`mcp`/`version` return from `main` ahead of the hook, the file
     logger, the fonts and Floem: none of that belongs in a one-shot command, and `auto_apply_on_startup` is free
@@ -21298,7 +21939,7 @@ Re-introducing the anti-patterns these guard against is a regression:
   `schemaic_ai::build_session_args` and `inline_args` close that with `--tools ""` on a `claude`
   whose `--help` advertises the flag, and fall back to the twenty-nine-name denylist on one that
   does not rather than dying on an unknown option — see `schemaic-ai`, which is also where the
-  reason the denylist could not do it on its own is written down. The other three harnesses close it
+  reason the denylist could not do it on its own is written down. The other five harnesses close it
   by their own mechanism rather than by that flag, on the session path through `harness::turn_args`
   and on the one-shot path through `harness::inline_argv`, and how far each gets is `Constraint`.
 - **One SQL boundary lexer.** Any code scanning SQL for string / `-- ` / `#` / `/* */` / backtick /

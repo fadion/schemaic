@@ -196,7 +196,15 @@ fn endpoint_plumbing(harness: Harness) -> EndpointPlumbing {
             mcp_config: true,
             endpoint_file: false,
         },
-        Harness::Codex | Harness::Antigravity | Harness::OpenCode => EndpointPlumbing {
+        // Copilot's MCP config *is* a file, but it lives in a home directory
+        // reused across sessions — so, like OpenCode's, it carries only the
+        // endpoint file's path, and the endpoint file is what this session owns.
+        // Cursor's `mcp.json` is in a reused workspace too, and holds the path.
+        Harness::Codex
+        | Harness::Antigravity
+        | Harness::OpenCode
+        | Harness::Copilot
+        | Harness::Cursor => EndpointPlumbing {
             mcp_config: false,
             endpoint_file: true,
         },
@@ -900,19 +908,7 @@ pub(crate) fn inline_plan(
         ),
         schemaic_ai::harness::InlineOutput::Stdout => None,
     };
-    // OpenCode's seal is a config directory, so a failure to write it is a
-    // refusal rather than a degradation: `--agent` naming an agent that is not
-    // defined runs on `build`, which has every built-in including `bash`.
-    let env = match harness.env_seal() {
-        true => crate::opencode::OpenCodeConfig::write_inline()
-            .ok_or_else(|| {
-                "Couldn't write OpenCode's configuration, so the generation was not started \
-                 (without it the CLI would run with its own tools enabled)."
-                    .to_string()
-            })?
-            .env(),
-        false => Vec::new(),
-    };
+    let env = inline_env(harness)?;
     let spec = schemaic_ai::harness::InlineSpec {
         intent: intent.to_string(),
         system: system.to_string(),
@@ -928,6 +924,12 @@ pub(crate) fn inline_plan(
             .unwrap_or_default(),
     };
     let args = schemaic_ai::harness::inline_argv(harness, &spec);
+    // What is actually started — Cursor's launcher script becomes the node it
+    // runs — resolved before the size check below, so the check measures the
+    // argv and the program that will really be spawned.
+    let launch = crate::agent_cli::launch(harness, &bin);
+    let args: Vec<String> = launch.prefix.iter().cloned().chain(args).collect();
+    let bin = launch.program;
     // See `Harness::prompt_on_stdin`: on a harness that takes it there, the
     // prompt is absent from `args` above and travels here instead.
     let stdin_prompt = harness.inline_stdin_prompt(&spec);
@@ -948,11 +950,14 @@ pub(crate) fn inline_plan(
         }
         return Err(why);
     }
-    let Some(cwd) = session_cwd() else {
-        if let Some(p) = &last_message {
-            let _ = std::fs::remove_file(p);
+    let cwd = match inline_cwd(harness) {
+        Ok(c) => c,
+        Err(why) => {
+            if let Some(p) = &last_message {
+                let _ = std::fs::remove_file(p);
+            }
+            return Err(why);
         }
-        return Err(NO_CWD.to_string());
     };
     Ok(InlinePlan {
         bin,
@@ -964,6 +969,97 @@ pub(crate) fn inline_plan(
         cwd,
         env,
     })
+}
+
+/// The environment a one-shot's isolation needs, written and ready — or why it
+/// could not be, in which case the generation is **refused**.
+///
+/// A failure is a refusal rather than a degradation on both harnesses that
+/// have one, each for its own reason. OpenCode's is its seal: `--agent`
+/// naming an agent that is not defined runs on `build`, which has every
+/// built-in including `bash`. Copilot's is its isolation: without its own
+/// `COPILOT_HOME` the CLI starts the user's MCP servers and loads their hooks.
+///
+/// **Asked through `env_seal`, then matched exhaustively.** It used to be
+/// `match harness.env_seal() { true => OpenCodeConfig::write_inline() … }` —
+/// the capability asked, and then one harness's writer assumed, so a second
+/// harness answering `true` would have been isolated by OpenCode's config and
+/// nothing of its own. The arms for harnesses whose `env_seal` is false refuse
+/// rather than return an empty environment: a harness flipped to `true` with
+/// no writer here then fails closed instead of running unisolated.
+fn inline_env(harness: Harness) -> Result<Vec<(std::ffi::OsString, std::ffi::OsString)>, String> {
+    if !harness.env_seal() {
+        return Ok(Vec::new());
+    }
+    match harness {
+        Harness::OpenCode => crate::opencode::OpenCodeConfig::write_inline()
+            .map(|c| c.env())
+            .ok_or_else(|| {
+                "Couldn't write OpenCode's configuration, so the generation was not started \
+                 (without it the CLI would run with its own tools enabled)."
+                    .to_string()
+            }),
+        Harness::Copilot => crate::copilot::CopilotHome::write_inline()
+            .map(|h| h.env())
+            .ok_or_else(|| {
+                "Couldn't create GitHub Copilot's private home directory, so the generation \
+                 was not started (without it the CLI would load your own Copilot \
+                 configuration, including its MCP servers and hooks)."
+                    .to_string()
+            }),
+        Harness::Claude | Harness::Codex | Harness::Antigravity | Harness::Cursor => Err(format!(
+            "{} is marked as isolated by its environment, but Schemaic has no way to \
+             set that environment up, so the generation was not started.",
+            harness.label()
+        )),
+    }
+}
+
+/// The working directory a one-shot runs in — or why it cannot run.
+///
+/// **For Cursor the directory is the restriction.** Its permissions file is a
+/// project file found from the working directory, and without it a headless
+/// run writes files unprompted, so a one-shot that cannot have its workspace is
+/// refused, never run in a bare private directory. Every other harness gets a
+/// fresh private directory, as before. Asked through the capability and then
+/// matched, `inline_env`'s shape: the arms for harnesses that are not
+/// restricted this way refuse, so one flipped without a writer here fails
+/// closed.
+fn inline_cwd(harness: Harness) -> Result<PathBuf, String> {
+    if !harness.restricts_by_workspace_rules() {
+        return session_cwd().ok_or_else(|| NO_CWD.to_string());
+    }
+    match harness {
+        Harness::Cursor => crate::cursor::CursorWorkspace::write_inline()
+            .map(|w| w.root().to_path_buf())
+            .ok_or_else(|| {
+                "Couldn't write Cursor's permissions file, so the generation was not \
+                 started (without it the CLI writes files unprompted)."
+                    .to_string()
+            }),
+        Harness::Claude
+        | Harness::Codex
+        | Harness::Antigravity
+        | Harness::OpenCode
+        | Harness::Copilot => Err(format!(
+            "{} is marked as restricted by a permissions file, but Schemaic has no way \
+             to write one for it, so the generation was not started.",
+            harness.label()
+        )),
+    }
+}
+
+/// Every variable a harness child must **not** inherit, whichever harness it is.
+///
+/// Unconditional for the reason the turn loop gives: removing variables no other
+/// harness reads costs nothing, and a harness-identity check fails to the unsafe
+/// side for the next CLI added. One list, so the one-shot and the chat turn
+/// cannot come to clear different sets.
+fn inherited_env_to_clear() -> impl Iterator<Item = &'static str> {
+    crate::opencode::OpenCodeConfig::env_remove()
+        .iter()
+        .chain(crate::copilot::CopilotHome::env_remove())
+        .copied()
 }
 
 /// A private path for Codex's `-o`, named so the startup sweep collects it if
@@ -1015,7 +1111,7 @@ pub(crate) async fn run_inline(plan: InlinePlan) -> Result<String, String> {
     // the `build` agent with `bash` while the panel reported `Sealed`.
     // `no_seal_variable_is_also_cleared` pins the disjointness so the order
     // stays a belt beside a brace rather than the only thing holding it.
-    for k in crate::opencode::OpenCodeConfig::env_remove() {
+    for k in inherited_env_to_clear() {
         cmd.env_remove(k);
     }
     for (k, v) in &plan.env {
@@ -1450,7 +1546,12 @@ fn spawn_refusal(harness: Harness, constraint: Constraint) -> Option<String> {
     // off documentation, which dies on its first unknown flag and is reported as
     // an installation problem — the one thing that would not be wrong with it.
     match harness {
-        Harness::Claude | Harness::Codex | Harness::Antigravity | Harness::OpenCode => None,
+        Harness::Claude
+        | Harness::Codex
+        | Harness::Antigravity
+        | Harness::OpenCode
+        | Harness::Copilot
+        | Harness::Cursor => None,
     }
 }
 
@@ -1565,6 +1666,8 @@ pub(crate) fn start_ai_session(
         // persistent path above and never reaches this branch.
         let mut overrides = Vec::new();
         let mut oc_config: Option<crate::opencode::OpenCodeConfig> = None;
+        let mut copilot_home: Option<crate::copilot::CopilotHome> = None;
+        let mut cursor_ws: Option<crate::cursor::CursorWorkspace> = None;
         // See `TurnPump::note`: a session that cannot reach the database has to
         // say so, on every path that produces one.
         let mut degraded: Option<String> = None;
@@ -1609,43 +1712,134 @@ pub(crate) fn start_ai_session(
                 oc_config =
                     crate::opencode::OpenCodeConfig::write(&exe, &p.to_string_lossy(), &allowed);
             }
-            _ => {}
-        }
-        // **The one harness that refuses rather than degrading.** Every other
-        // path above has a meaningful reduced state — Codex keeps its isolation
-        // without our server, Antigravity runs with its tools denied and says so.
-        // OpenCode has none, because the file that would be missing is the same
-        // file that empties its built-in tools: `--agent schemaic` naming an
-        // agent that does not exist does not fail, it leaves the run on
-        // OpenCode's own `build` agent, which has `bash`. Refusing is the only
-        // direction that keeps `Constraint::Sealed` an honest answer.
-        let mut oc_env: Vec<(std::ffi::OsString, std::ffi::OsString)> = Vec::new();
-        match (harness, oc_config.as_ref()) {
-            (Harness::OpenCode, Some(c)) => {
-                tracing::debug!(dir = %c.root().display(), "opencode config written");
-                oc_env = c.env();
+            // Copilot's home is its isolation, and its MCP config lives in it.
+            (Harness::Copilot, Some(p)) => {
+                copilot_home = crate::copilot::CopilotHome::write(&exe, Some(&p.to_string_lossy()));
             }
-            (Harness::OpenCode, None) => {
-                let why = "Schemaic could not write the configuration that restricts \
-                           OpenCode, so the assistant is disabled — running it without \
-                           that file would give the session a shell. Check that the \
-                           app's data directory is writable."
-                    .to_string();
-                let _ = ai_tx.send(AiStreamMsg {
-                    segs: vec![schemaic_core::transcript::Seg::Text(why.clone())],
-                    done: true,
-                    is_error: true,
-                    stats: None,
-                    session,
-                });
-                // Same reason as the constraint refusal above: without a task
-                // holding `rx`, every question after this one is dropped in
-                // silence rather than told why.
-                refuse_every_turn(handle, rx, ai_tx, why, session);
-                return (tx, private);
+            // **Codex's shape, not OpenCode's**: no server, but still the
+            // isolation. The seal is the argv's allowlist, which holds without
+            // a config, so there is a meaningful reduced state — a session that
+            // says it has no database tools — and the home keeps the user's own
+            // servers from being started in its place. The *session's* home,
+            // not the one-shots': it is still a conversation to resume.
+            (Harness::Copilot, None) => {
+                copilot_home = crate::copilot::CopilotHome::write(&exe, None);
+                degraded = Some(no_tools_note(
+                    "Schemaic could not create the private file that tells the assistant \
+                     how to reach your database",
+                ));
+            }
+            // **Cursor's working directory is its restriction**: the
+            // permissions file that refuses its writers, and our server beside
+            // it. Without an endpoint file the rules are still written — they
+            // are the half that cannot be missing — and the session says it has
+            // no tools, Codex's shape.
+            (Harness::Cursor, ep) => {
+                let ep = ep.map(|p| p.to_string_lossy().into_owned());
+                let allowed: Vec<String> = allowed.iter().map(|t| t.to_string()).collect();
+                cursor_ws = crate::cursor::CursorWorkspace::write(&exe, ep.as_deref(), &allowed);
+                if ep.is_none() {
+                    degraded = Some(no_tools_note(
+                        "Schemaic could not create the private file that tells the assistant \
+                         how to reach your database",
+                    ));
+                }
             }
             _ => {}
         }
+        // **The three harnesses that refuse rather than degrading**, when what
+        // they cannot write is the directory that restricts or isolates them.
+        // Codex keeps its isolation without our server, Antigravity runs with
+        // its tools denied and says so, and Copilot and Cursor without an
+        // *endpoint* keep their directories and say they have no tools
+        // (above). Cursor without its *workspace* has no permissions file, and
+        // a missing one fails open for writes — see its arm below. OpenCode has no reduced
+        // state, because the file that would be missing is the same file that
+        // empties its built-in tools: `--agent schemaic` naming an agent that
+        // does not exist does not fail, it leaves the run on OpenCode's own
+        // `build` agent, which has `bash`. Copilot without its *home* is the
+        // same shape one layer out: the seal is on the argv and survives, the
+        // isolation does not — see its arm below.
+        let mut seal_env: Vec<(std::ffi::OsString, std::ffi::OsString)> = Vec::new();
+        let refused = match harness {
+            Harness::OpenCode => match oc_config.as_ref() {
+                Some(c) => {
+                    tracing::debug!(dir = %c.root().display(), "opencode config written");
+                    seal_env = c.env();
+                    None
+                }
+                None => Some(
+                    "Schemaic could not write the configuration that restricts \
+                     OpenCode, so the assistant is disabled — running it without \
+                     that file would give the session a shell. Check that the \
+                     app's data directory is writable.",
+                ),
+            },
+            // **Refused too, though the seal would hold.** The allowlist is on
+            // the command line and survives a missing home; what does not is
+            // the isolation, and without it the CLI starts every server in the
+            // user's own `mcp-config.json` and loads their hooks, which are
+            // commands.
+            Harness::Copilot => match copilot_home.as_ref() {
+                Some(h) => {
+                    seal_env = h.env();
+                    None
+                }
+                None => Some(
+                    "Schemaic could not create GitHub Copilot's private home \
+                     directory, so the assistant is disabled — without it the CLI \
+                     would load your own Copilot configuration, including its MCP \
+                     servers and hooks. Check that the app's data directory is \
+                     writable.",
+                ),
+            },
+            // **Refused, because a missing file fails open.** Measured: with no
+            // permissions file a headless Cursor turn wrote a file unprompted.
+            Harness::Cursor => match cursor_ws.as_ref() {
+                Some(_) => None,
+                None => Some(
+                    "Schemaic could not write the permissions file that keeps Cursor \
+                     from writing files and running commands, so the assistant is \
+                     disabled — without it Cursor writes files unprompted. Check that \
+                     the app's data directory is writable.",
+                ),
+            },
+            Harness::Claude | Harness::Codex | Harness::Antigravity => None,
+        };
+        if let Some(why) = refused {
+            let why = why.to_string();
+            let _ = ai_tx.send(AiStreamMsg {
+                segs: vec![schemaic_core::transcript::Seg::Text(why.clone())],
+                done: true,
+                is_error: true,
+                stats: None,
+                session,
+            });
+            // Same reason as the constraint refusal above: without a task
+            // holding `rx`, every question after this one is dropped in
+            // silence rather than told why.
+            refuse_every_turn(handle, rx, ai_tx, why, session);
+            return (tx, private);
+        }
+        // Copilot's per-turn argv names both of these; the others ignore them.
+        let copilot_mcp = copilot_home
+            .as_ref()
+            .and_then(|h| h.mcp_config())
+            .map(|p| p.to_string_lossy().into_owned());
+        let allowed_tools: Vec<String> = allowed.iter().map(|t| t.to_string()).collect();
+        // Where each turn's child runs: Cursor's workspace — the directory its
+        // permissions file is found from — and `cwd` for every other harness.
+        // *What* it is started as is resolved per turn, below.
+        let child_cwd: PathBuf = cursor_ws
+            .as_ref()
+            .map(|w| w.root().to_path_buf())
+            .unwrap_or_else(|| cwd.clone());
+        let cursor_approval = cursor_ws.as_ref().filter(|w| w.has_server()).map(|w| {
+            (
+                crate::agent_cli::launch(harness, &bin),
+                w.root().to_path_buf(),
+            )
+        });
         let isolate = checked.isolate_config;
         // **The level, not just the capability.** `supports_effort()` is true for
         // both Claude and Antigravity, so asking only that sent Claude's `xhigh`
@@ -1657,9 +1851,31 @@ pub(crate) fn start_ai_session(
             // No global state to hold here: the one harness that needed it —
             // Antigravity, whose configuration is a registration rather than a
             // flag — is spawned once per conversation now, so its
-            // `AgyRegistration` lives with the persistent task instead. Codex
-            // and OpenCode are configured entirely per invocation.
+            // `AgyRegistration` lives with the persistent task instead. Codex,
+            // OpenCode, Copilot and Cursor are configured per invocation — the
+            // last three by directories Schemaic owns. Cursor alone also leaves
+            // state in the user's own config (its approval and conversations),
+            // which `crate::cursor::sweep` takes back at the next startup.
             let mut pump = TurnPump::new(ai_tx, session);
+            let mut degraded = degraded;
+            // **Cursor's one approval, before the first turn.** Our project
+            // server loads only once approved, and the record is keyed by the
+            // config's contents, so it is asked per session. Two node starts'
+            // worth of blocking work, so off the async workers, as
+            // Antigravity's registration is. A failure is a session with no
+            // database tools that says so — the calls would be refused anyway.
+            if let Some((launch, ws)) = cursor_approval {
+                let approved =
+                    tokio::task::spawn_blocking(move || crate::cursor::approve(&launch, &ws))
+                        .await
+                        .unwrap_or_else(|e| Err(e.to_string()));
+                if let Err(e) = approved {
+                    tracing::warn!("could not approve the Schemaic MCP server with Cursor: {e}");
+                    degraded = Some(no_tools_note(&format!(
+                        "Schemaic could not approve its database tools with Cursor ({e})"
+                    )));
+                }
+            }
             if let Some(why) = degraded {
                 pump.note(why);
             }
@@ -1680,14 +1896,27 @@ pub(crate) fn start_ai_session(
                     model: model.clone(),
                     effort: effort_arg.clone(),
                     resume: thread.clone(),
-                    // Antigravity's server is registered globally rather than
-                    // named per invocation, so neither of these carries a path
-                    // for it — see `crate::antigravity`.
-                    mcp_config: None,
+                    // Copilot's, from its home; `None` for the rest, which are
+                    // told about the server by `-c` (Codex) or by a config
+                    // directory (OpenCode).
+                    mcp_config: copilot_mcp.clone(),
                     mcp_overrides: overrides.clone(),
                     isolate_config: isolate,
+                    // The same list every harness's access gate is built from.
+                    allowed_tools: allowed_tools.clone(),
                 };
-                let args = schemaic_ai::harness::turn_args(harness, &spec);
+                // **Per turn, not per session.** Cursor's launcher is the
+                // newest `versions\<v>\` directory, and the CLI updates itself
+                // into a new one; a path resolved when the session opened can
+                // name a version the updater has since replaced. One directory
+                // read per turn keeps every spawn on the version that is there.
+                let launch = crate::agent_cli::launch(harness, &bin);
+                let args: Vec<String> = launch
+                    .prefix
+                    .iter()
+                    .cloned()
+                    .chain(schemaic_ai::harness::turn_args(harness, &spec))
+                    .collect();
                 // The prompt, when this harness takes it on stdin instead of in
                 // argv — see `Harness::prompt_on_stdin`. Built before the size
                 // check below deliberately: what leaves argv is exactly what no
@@ -1695,7 +1924,7 @@ pub(crate) fn start_ai_session(
                 let turn_stdin = harness.turn_stdin_prompt(&spec);
                 if let Some(why) = schemaic_ai::spawn_refusal(
                     harness,
-                    &bin,
+                    &launch.program,
                     &args,
                     schemaic_ai::arg_limit(),
                     schemaic_ai::SCHEMA_AND_QUERY_LEVERS,
@@ -1703,7 +1932,7 @@ pub(crate) fn start_ai_session(
                     pump.fail(why);
                     continue;
                 }
-                let mut cmd = Command::new(&bin);
+                let mut cmd = Command::new(&launch.program);
                 cmd.args(&args);
                 // **Clear before set.** A child inherits our environment, so
                 // `OPENCODE_CONFIG` exported in the user's shell merges their
@@ -1712,20 +1941,23 @@ pub(crate) fn start_ai_session(
                 // `crate::opencode` rejected for merging.
                 //
                 // Unconditional, where it used to sit behind
-                // `harness == Harness::OpenCode`: removing three variables no
-                // other harness reads costs nothing, and a harness-identity
-                // check that fails to the *unsafe* side for the next CLI added
-                // is worth less than the three lines it saves. `oc_env` is empty
-                // for every harness whose configuration is flags, so the set
-                // half needs no condition either.
-                for k in crate::opencode::OpenCodeConfig::env_remove() {
+                // `harness == Harness::OpenCode`: removing variables no other
+                // harness reads costs nothing, and a harness-identity check that
+                // fails to the *unsafe* side for the next CLI added is worth
+                // less than the lines it saves. The list is every
+                // environment-isolated harness's — `inherited_env_to_clear` —
+                // so Copilot's `COPILOT_ALLOW_ALL` goes too. `seal_env` is
+                // empty for every harness whose configuration is flags, so the
+                // set half needs no condition either.
+                for k in inherited_env_to_clear() {
                     cmd.env_remove(k);
                 }
-                cmd.envs(oc_env.iter().map(|(k, v)| (k, v)));
-                cmd.current_dir(&cwd);
+                cmd.envs(seal_env.iter().map(|(k, v)| (k, v)));
+                cmd.current_dir(&child_cwd);
                 let child = cmd
                     // **Piped exactly when the prompt travels on it**, which is
-                    // `Harness::prompt_on_stdin` — Codex today, whose own help
+                    // `Harness::prompt_on_stdin` — Codex, Copilot and Cursor,
+                    // each measured to take a piped prompt; Codex's own help
                     // says the instructions are read from stdin when no
                     // positional is given.
                     //
@@ -4526,6 +4758,56 @@ mod tests {
             assert_eq!(private.files, vec![carrier], "{h:?} leaks its endpoint");
             assert!(private.cwd.is_some());
         }
+    }
+
+    /// **Clearing runs for every harness, so it must never clear any
+    /// harness's own lever.** The removal list is unconditional and spans every
+    /// harness whose isolation is an environment; each spawn clears first and
+    /// sets second, so the order already protects the child — this pins the
+    /// disjointness itself, so the order is a belt beside a brace rather than
+    /// the only thing holding it. A lever that landed in the list would strip
+    /// its own harness's isolation: OpenCode on its `build` agent, or Copilot
+    /// reading the user's `~/.copilot`, while the panel reports the session
+    /// sealed.
+    ///
+    /// Named literally, because both harnesses' `env()` need a directory to
+    /// build and the suite touches no filesystem.
+    #[test]
+    fn no_seal_variable_is_also_cleared() {
+        let cleared: Vec<&str> = inherited_env_to_clear().collect();
+        for lever in [
+            "XDG_CONFIG_HOME",
+            "OPENCODE_DISABLE_PROJECT_CONFIG",
+            "COPILOT_HOME",
+        ] {
+            assert!(!cleared.contains(&lever), "{lever} is cleared");
+        }
+        // Both harnesses' lists are in it, not only the one that came first.
+        assert!(cleared.contains(&"OPENCODE_CONFIG"), "{cleared:?}");
+        assert!(cleared.contains(&"COPILOT_ALLOW_ALL"), "{cleared:?}");
+    }
+
+    /// The harnesses whose isolation is *not* an environment get an empty one,
+    /// and nothing is written for them.
+    ///
+    /// **Half of `inline_env`'s rule, and named for that half.** The other half
+    /// — an `env_seal` harness gets its own environment or a refusal, never an
+    /// empty one — needs the real config directory to exercise, which the suite
+    /// does not touch; what holds it is the exhaustive `match`, whose arms for
+    /// the harnesses answered here refuse rather than return empty.
+    #[test]
+    fn a_harness_not_isolated_by_its_environment_gets_an_empty_one() {
+        let mut asked = 0;
+        for h in Harness::ALL {
+            if h.env_seal() {
+                continue;
+            }
+            assert_eq!(inline_env(h), Ok(Vec::new()), "{h:?}");
+            asked += 1;
+        }
+        // The floor: every harness flipping to `env_seal` would leave this
+        // asserting nothing.
+        assert!(asked > 0);
     }
 
     use schemaic_core::schema::{ColumnInfo, TableInfo};

@@ -76,7 +76,11 @@ use std::path::{Path, PathBuf};
 /// still a directory the CLI has usually seen before within that instance's
 /// life, and the plugin bootstrap `--pure` skips is paid at most once per
 /// instance rather than once per turn.
-fn instance_root(kind: &str) -> Option<PathBuf> {
+///
+/// **`crate::copilot` roots its `COPILOT_HOME` here too**, for the same two
+/// reasons: the directory carries a per-connection path, and the CLI is a
+/// process per turn that has to find the previous turn's session in it.
+pub(crate) fn instance_root(kind: &str) -> Option<PathBuf> {
     // The per-kind base is created owner-only by `private_dir`; the instance
     // directory under it inherits that. The *path* comes from
     // `instance_path_in` rather than being spelled a second time here, so the
@@ -97,12 +101,12 @@ fn instance_root(kind: &str) -> Option<PathBuf> {
 /// `opencode-inline/`; 275 of each had accumulated here before anyone looked.
 /// `sweep` does collect them, but only when the app next starts, and the
 /// suite is supposed to touch no filesystem at all.
-fn instance_path_in(config: &Path, kind: &str) -> PathBuf {
+pub(crate) fn instance_path_in(config: &Path, kind: &str) -> PathBuf {
     schemaic_core::persist::private_dir_in(config, kind).join(instance_tag())
 }
 
 /// This process's name for its own config roots.
-fn instance_tag() -> String {
+pub(crate) fn instance_tag() -> String {
     format!("pid-{}", std::process::id())
 }
 
@@ -116,7 +120,16 @@ fn instance_tag() -> String {
 /// every file under a root here was written by Schemaic or by an OpenCode
 /// bootstrap into a directory Schemaic made for it.
 pub(crate) fn sweep() {
-    for kind in ["opencode", "opencode-inline"] {
+    sweep_instances(&["opencode", "opencode-inline"]);
+}
+
+/// Remove the [`instance_root`]s of `kinds` whose instance is gone.
+///
+/// Shared with `crate::copilot`, whose homes are rooted the same way; the
+/// argument for recursive removal is the same there — everything under a root
+/// was written by Schemaic or by the CLI into a directory Schemaic made for it.
+pub(crate) fn sweep_instances(kinds: &[&str]) {
+    for &kind in kinds {
         let Some(base) = schemaic_core::persist::private_dir(kind) else {
             continue;
         };

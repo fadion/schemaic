@@ -67,6 +67,8 @@ fn env_vars(h: Harness) -> &'static [&'static str] {
         Harness::Codex => &["SCHEMAIC_CODEX_BIN"],
         Harness::Antigravity => &["SCHEMAIC_ANTIGRAVITY_BIN"],
         Harness::OpenCode => &["SCHEMAIC_OPENCODE_BIN"],
+        Harness::Copilot => &["SCHEMAIC_COPILOT_BIN"],
+        Harness::Cursor => &["SCHEMAIC_CURSOR_BIN"],
     }
 }
 
@@ -170,8 +172,238 @@ fn known_locations(h: Harness) -> Vec<std::path::PathBuf> {
                 );
             }
         }
+        // **npm again, and one layer deeper.** `npm i -g @github/copilot` puts
+        // `copilot.cmd` on `PATH`, which runs `npm-loader.js` under node, which
+        // spawns the real binary from a per-platform package beside it —
+        // `@github/copilot-win32-x64/copilot.exe`, measured on 1.0.88. Listed
+        // first for OpenCode's reason: the shim needs a shell, and the loader
+        // does nothing but forward its argv to this file.
+        Harness::Copilot => {
+            if cfg!(windows)
+                && let Some(dir) = std::env::var_os("APPDATA")
+            {
+                out.push(copilot_native_path(
+                    &std::path::PathBuf::from(dir).join("npm"),
+                ));
+            }
+            if let Some(home) = home {
+                // The install script's location.
+                out.push(
+                    std::path::PathBuf::from(home)
+                        .join(".local")
+                        .join("bin")
+                        .join(exe("copilot")),
+                );
+            }
+        }
+        // **No executable of its own on Windows.** The installer writes
+        // `%LOCALAPPDATA%\cursor-agent\cursor-agent.cmd`, which runs a
+        // PowerShell script, which runs `versions\<newest>\node.exe index.js`.
+        // The `.cmd` is what is *found*; what is *started* is decided by
+        // [`launch`], which goes straight to that node. Elsewhere the install
+        // script links `~/.local/bin/cursor-agent`.
+        Harness::Cursor => {
+            if cfg!(windows) {
+                if let Some(local) = local {
+                    out.push(
+                        std::path::PathBuf::from(local)
+                            .join("cursor-agent")
+                            .join("cursor-agent.cmd"),
+                    );
+                }
+            } else if let Some(home) = home {
+                out.push(
+                    std::path::PathBuf::from(home)
+                        .join(".local")
+                        .join("bin")
+                        .join("cursor-agent"),
+                );
+            }
+        }
     }
     out
+}
+
+/// What has to be started to run a harness's binary.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Launch {
+    /// The program handed to `Command::new`.
+    pub(crate) program: String,
+    /// Arguments that go before the harness's own.
+    pub(crate) prefix: Vec<String>,
+}
+
+impl Launch {
+    fn direct(bin: &str) -> Self {
+        Self {
+            program: bin.to_string(),
+            prefix: Vec::new(),
+        }
+    }
+
+    /// The launch as a `std` command, prefix included, harness arguments to
+    /// follow.
+    pub(crate) fn std_command(&self) -> std::process::Command {
+        let mut c = std::process::Command::new(&self.program);
+        c.args(&self.prefix);
+        c
+    }
+}
+
+/// Resolve `bin` into what is actually started.
+///
+/// **Cursor's Windows launcher is a chain, and killing the head of it kills
+/// nothing.** `cursor-agent.cmd` runs PowerShell, which runs node; ending a
+/// `.cmd` ends `cmd.exe` and leaves node running, so Stop — and a dropped
+/// session's `kill_on_drop` — would stop the panel waiting while the turn went
+/// on spending the user's quota. The launcher does nothing but pick the newest
+/// `versions\<v>\` and run `node.exe index.js` with its arguments, so that is
+/// what is started instead: one process, which dies when told to. (Measured: a
+/// turn, a resume and `mcp enable` all ran identically started this way.)
+///
+/// Anything that is not that layout is started as it is — an override pointing
+/// straight at a `node.exe`, a Unix install whose link is a real executable.
+/// Exhaustive, so a harness added later decides rather than defaults.
+///
+/// **Copilot's npm shim is the same hazard one layer shallower.** `copilot.cmd`
+/// runs node, which runs the platform binary; `known_locations` finds that
+/// binary under the default npm prefix, but a shim found on `PATH` under any
+/// other prefix — or named by a path override — would be spawned through
+/// `cmd.exe` and outlive Stop the same way. The package sits beside the shim, so
+/// the binary is found from it.
+pub(crate) fn launch(h: Harness, bin: &str) -> Launch {
+    match h {
+        Harness::Cursor => cursor_node_launch(bin).unwrap_or_else(|| Launch::direct(bin)),
+        Harness::Copilot => match copilot_native_behind(bin) {
+            Some(exe) => Launch::direct(&exe.to_string_lossy()),
+            None => Launch::direct(bin),
+        },
+        Harness::Claude | Harness::Codex | Harness::Antigravity | Harness::OpenCode => {
+            Launch::direct(bin)
+        }
+    }
+}
+
+/// The per-platform package npm installs the real Copilot binary in, as its
+/// loader names it: `copilot-win32-x64`, `copilot-win32-arm64`.
+fn copilot_platform_package() -> String {
+    let arch = match std::env::consts::ARCH {
+        "aarch64" => "arm64",
+        _ => "x64",
+    };
+    format!("copilot-win32-{arch}")
+}
+
+/// Where an npm Copilot shim's real binary sits, relative to the shim's own
+/// directory — the npm prefix, whose `node_modules` holds the package.
+fn copilot_native_path(shim_dir: &std::path::Path) -> std::path::PathBuf {
+    shim_dir
+        .join("node_modules")
+        .join("@github")
+        .join("copilot")
+        .join("node_modules")
+        .join("@github")
+        .join(copilot_platform_package())
+        .join("copilot.exe")
+}
+
+/// The native binary behind `bin`, when `bin` is npm's Copilot shim and the
+/// binary is where npm puts it.
+fn copilot_native_behind(bin: &str) -> Option<std::path::PathBuf> {
+    let path = std::path::Path::new(bin);
+    let ext = path
+        .extension()
+        .map(|e| e.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default();
+    if !matches!(ext.as_str(), "cmd" | "ps1") {
+        return None;
+    }
+    let exe = copilot_native_path(path.parent()?);
+    exe.is_file().then_some(exe)
+}
+
+/// `node.exe index.js` for a Cursor launcher script, when `bin` is one.
+///
+/// Two layouts, both the launcher's own: the script at the install root, which
+/// picks the newest `versions\<v>\`, and the copy of it inside a version
+/// directory, which runs the `node.exe` beside it.
+fn cursor_node_launch(bin: &str) -> Option<Launch> {
+    let path = std::path::Path::new(bin);
+    let ext = path
+        .extension()
+        .map(|e| e.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default();
+    if !matches!(ext.as_str(), "cmd" | "ps1") {
+        return None;
+    }
+    let dir = path.parent()?;
+    let pair = |d: &std::path::Path| {
+        let node = d.join("node.exe");
+        let index = d.join("index.js");
+        (node.is_file() && index.is_file()).then(|| Launch {
+            program: node.to_string_lossy().into_owned(),
+            prefix: vec![index.to_string_lossy().into_owned()],
+        })
+    };
+    if let Some(l) = pair(dir) {
+        return Some(l);
+    }
+    let versions = dir.join("versions");
+    let names: Vec<String> = std::fs::read_dir(&versions)
+        .ok()?
+        .flatten()
+        .filter(|e| e.path().is_dir())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    let newest = newest_cursor_version(names.iter().map(String::as_str))?;
+    pair(&versions.join(newest))
+}
+
+/// The newest of Cursor's version directory names, by the launcher's own rule.
+///
+/// Its script matches `YYYY.M.D-<hex>` or `YYYY.M.D-HH-MM-SS-<hex>` and sorts by
+/// the date; the build time, when present, is used here to break a tie the
+/// script leaves to directory order. Anything else in `versions\` is not a
+/// version and is ignored.
+pub(crate) fn newest_cursor_version<'a>(names: impl Iterator<Item = &'a str>) -> Option<&'a str> {
+    fn key(name: &str) -> Option<[u32; 6]> {
+        let (date, rest) = name.split_once('-')?;
+        let mut d = date.split('.');
+        let (y, m, day) = (d.next()?, d.next()?, d.next()?);
+        if d.next().is_some()
+            || y.len() != 4
+            || m.is_empty()
+            || m.len() > 2
+            || day.is_empty()
+            || day.len() > 2
+        {
+            return None;
+        }
+        let num = |s: &str| {
+            s.bytes()
+                .all(|b| b.is_ascii_digit())
+                .then(|| s.parse::<u32>().ok())
+                .flatten()
+        };
+        let parts: Vec<&str> = rest.split('-').collect();
+        let hex = |s: &str| {
+            !s.is_empty()
+                && s.bytes()
+                    .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+        };
+        let time = match parts.as_slice() {
+            [c] if hex(c) => [0, 0, 0],
+            [h, mi, s, c] if hex(c) && [h, mi, s].iter().all(|x| x.len() == 2) => {
+                [num(h)?, num(mi)?, num(s)?]
+            }
+            _ => return None,
+        };
+        Some([num(y)?, num(m)?, num(day)?, time[0], time[1], time[2]])
+    }
+    names
+        .filter_map(|n| key(n).map(|k| (k, n)))
+        .max_by_key(|(k, _)| *k)
+        .map(|(_, n)| n)
 }
 
 /// Executable extensions to try on Windows (so an npm-installed `claude.cmd` is
@@ -444,8 +676,11 @@ pub(crate) fn probe(h: Harness, bin: &str) -> Probe {
 /// future edit spawning its own `Command` — so the value of the extraction is
 /// that the revert now has to be made in two places, and the second is here,
 /// where the comment is.
+///
+/// Through [`launch`], like every spawn: probing Cursor's `.cmd` would answer
+/// for the chain rather than for the node the session will start.
 fn help_command(h: Harness, bin: &str) -> std::process::Command {
-    let mut c = std::process::Command::new(bin);
+    let mut c = launch(h, bin).std_command();
     c.args(h.help_args());
     c
 }
@@ -565,6 +800,25 @@ mod tests {
         }
     }
 
+    /// **The shim is on `PATH` and the binary is not.** An npm install of
+    /// Copilot puts `copilot.cmd` on `PATH`; `which_on_path` would find that,
+    /// and a batch shim is refused for any multi-line argument. The real
+    /// executable npm installed behind it has to be looked for by name.
+    #[test]
+    fn copilot_looks_behind_npm_s_shim_for_the_real_binary() {
+        if !cfg!(windows) || std::env::var_os("APPDATA").is_none() {
+            return;
+        }
+        let found = known_locations(Harness::Copilot);
+        assert!(
+            found.iter().any(|p| {
+                let s = p.to_string_lossy();
+                s.contains("copilot-win32-") && s.ends_with("copilot.exe")
+            }),
+            "{found:?}"
+        );
+    }
+
     #[test]
     fn a_known_location_ends_in_the_harnesss_own_executable() {
         for h in Harness::ALL {
@@ -576,10 +830,94 @@ mod tests {
                     h.bin()
                 );
                 if cfg!(windows) {
-                    assert!(name.ends_with(".exe"), "{name} needs an extension");
+                    // Cursor's is its launcher script, which is all its
+                    // installer writes there; `launch` starts the node behind
+                    // it. That resolution reads the install directory, so what
+                    // is tested here is the version pick
+                    // (`the_newest_cursor_version_is_picked_by_the_launcher_s_rule`)
+                    // and the pass-through; the layout was measured, and a
+                    // test reading the real one would break the no-filesystem
+                    // rule.
+                    let script_ok = h == Harness::Cursor && name.ends_with(".cmd");
+                    assert!(
+                        name.ends_with(".exe") || script_ok,
+                        "{name} needs an extension"
+                    );
                 }
             }
         }
+    }
+
+    #[test]
+    fn the_newest_cursor_version_is_picked_by_the_launcher_s_rule() {
+        let names = [
+            "2026.09.23-86fc751",
+            "2026.9.30-abc123",
+            "2026.09.30-10-00-00-def456",
+            "2026.09.30-09-59-59-0a1b2c",
+            "not-a-version",
+            "2026.09.31-UPPER",
+            "2027.1-abc",
+        ];
+        assert_eq!(
+            newest_cursor_version(names.iter().copied()),
+            Some("2026.09.30-10-00-00-def456")
+        );
+        // The dates compare as numbers, not strings: 9 is before 10.
+        assert_eq!(
+            newest_cursor_version(["2026.9.1-a", "2026.10.1-b"].into_iter()),
+            Some("2026.10.1-b")
+        );
+        assert_eq!(newest_cursor_version(["x", "readme"].into_iter()), None);
+    }
+
+    /// A launcher script is rewritten only when what it launches is really
+    /// there; anything else is started as it is — no invented node, no
+    /// invented binary.
+    #[test]
+    fn a_launcher_is_rewritten_only_to_something_that_exists() {
+        for h in Harness::ALL {
+            assert_eq!(
+                launch(h, "/nonexistent/zz-cli"),
+                Launch::direct("/nonexistent/zz-cli"),
+                "{h:?}"
+            );
+        }
+        // A `.cmd` with nothing behind it is left alone, for both harnesses
+        // whose shims are rewritten.
+        for (h, shim) in [
+            (Harness::Cursor, r"C:\nonexistent\cursor-agent.cmd"),
+            (Harness::Copilot, r"C:\nonexistent\npm\copilot.cmd"),
+        ] {
+            assert_eq!(launch(h, shim), Launch::direct(shim), "{h:?}");
+        }
+    }
+
+    /// The binary behind an npm Copilot shim is found from the shim's own
+    /// directory — the npm prefix — so a prefix other than the default one is
+    /// covered too, and `known_locations` asks the same function for the
+    /// default one rather than spelling the path a second time.
+    #[test]
+    fn copilot_s_binary_is_found_beside_whichever_npm_prefix_holds_the_shim() {
+        let p = copilot_native_path(std::path::Path::new("/prefix"));
+        let rel: Vec<String> = p
+            .strip_prefix("/prefix")
+            .expect("under the prefix")
+            .components()
+            .map(|c| c.as_os_str().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            &rel[..5],
+            &[
+                "node_modules",
+                "@github",
+                "copilot",
+                "node_modules",
+                "@github"
+            ]
+        );
+        assert!(rel[5].starts_with("copilot-win32-"), "{rel:?}");
+        assert_eq!(rel[6], "copilot.exe");
     }
 
     #[test]

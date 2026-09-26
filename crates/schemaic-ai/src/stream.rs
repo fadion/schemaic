@@ -1,4 +1,4 @@
-//! One transcript vocabulary, four CLI dialects.
+//! One transcript vocabulary, five CLI dialects.
 //!
 //! Schemaic drives whichever agent CLI the user has installed, and each one
 //! reports a turn in its own JSONL shape. The panel renders exactly one:
@@ -6,13 +6,16 @@
 //! dialect stops here — every harness decodes into the same [`StreamEvent`]s,
 //! and nothing downstream learns which CLI produced them.
 //!
-//! **They do not even agree on where the discriminator lives.** Claude, Codex
-//! and OpenCode tag a line with `type`; Antigravity tags it with `event` and
-//! nests the payload under a key of the same name. That is measured, not
-//! documented — see the captured fixtures in the tests.
+//! **They do not even agree on where the discriminator lives.** Claude, Codex,
+//! OpenCode and Copilot tag a line with `type` (Copilot nesting the rest under
+//! `data`); Antigravity tags it with `event` and nests the payload under a key
+//! of the same name. That is measured, not documented — see the captured
+//! fixtures in the tests.
 //!
-//! **One of them never says a turn is over.** Claude, Codex and Antigravity each
-//! emit a terminal event. OpenCode's printer simply stops writing when the
+//! **One of them never says a turn is over.** Claude, Codex, Antigravity and
+//! Copilot each emit a terminal event — Copilot's being the one line with no
+//! `data`, after several `assistant.turn_end`s that are not it. OpenCode's
+//! printer simply stops writing when the
 //! session goes idle, so the close is inferred from `step_finish.reason` —
 //! `tool-calls` means another step follows, anything else ends the turn. That
 //! inference is load-bearing in both directions: end early and the answer is
@@ -20,7 +23,8 @@
 //! a working turn as "ended unexpectedly".
 //!
 //! **And one of them streams nothing.** Claude and Antigravity send deltas,
-//! Codex sends cumulative restatements, and OpenCode sends whole finished parts
+//! Codex sends cumulative restatements, Copilot sends deltas *and then* the
+//! whole message again, and OpenCode sends whole finished parts
 //! — its printer emits a text part only once `time.end` is set. There is no
 //! partial text to decode, which is why [`Harness::streams_deltas`] is false for
 //! it and no amount of coalescing would change that.
@@ -123,6 +127,24 @@ impl Coalescer {
                 (!full.is_empty()).then(|| full.to_string())
             }
         }
+    }
+
+    /// Record a true delta for `key` as sent, and hand it back.
+    ///
+    /// **For the dialect that sends both shapes.** Copilot streams
+    /// `assistant.message_delta`s and then restates the whole message in one
+    /// `assistant.message`; the restatement is fed to [`Coalescer::advance`],
+    /// which can only answer "nothing new" if the deltas were recorded here
+    /// first.
+    fn extend(&mut self, key: &str, delta: &str) -> Option<String> {
+        if delta.is_empty() {
+            return None;
+        }
+        self.sent
+            .entry(key.to_string())
+            .or_default()
+            .push_str(delta);
+        Some(delta.to_string())
     }
 
     /// Drop the accumulated text for `key` so a later run starts clean.
@@ -228,6 +250,139 @@ fn opencode_tool_name(raw: &str) -> String {
             format!("mcp__{}__{bare}", crate::harness::MCP_SERVER)
         }
         _ => raw.to_string(),
+    }
+}
+
+/// The qualified name of one Copilot tool call.
+///
+/// **Rebuilt from the fields, not unflattened from the name.** Copilot reports
+/// `toolName: "schemaic-list_schema"` *and* `mcpServerName`/`mcpToolName`
+/// beside it, so this is Codex's rebuild rather than OpenCode's prefix-strip:
+/// splitting `schemaic-list_schema` on its dash would misread any server whose
+/// own name has one. A built-in carries no server field and keeps its own name,
+/// for the module docs' reason — it should never run here, and if it does the
+/// user should see it under the name it really has.
+fn copilot_tool_name(d: &serde_json::Value) -> String {
+    let s = |k: &str| d.get(k).and_then(|x| x.as_str()).unwrap_or("");
+    match (s("mcpServerName"), s("mcpToolName")) {
+        (server, tool) if !server.is_empty() && !tool.is_empty() => {
+            format!("mcp__{server}__{tool}")
+        }
+        // A completion carries neither field; its chip still needs a label.
+        _ => match s("toolName") {
+            "" => "tool".to_string(),
+            name => name.to_string(),
+        },
+    }
+}
+
+/// The text of a Copilot `tool.execution_complete`.
+///
+/// `result.content` is the flattened text; `result.contents` is the MCP blocks
+/// it was flattened from, read only when the flat form is missing.
+///
+/// **Only successes were captured.** `error.message` is read first on the
+/// assumption that a failure names itself the way Codex's does, and nothing
+/// depends on it being right: `success: false` is what marks the chip as an
+/// error, and a failure shaped some other way shows an empty result rather than
+/// a wrong one.
+fn copilot_result_text(d: &serde_json::Value) -> String {
+    if let Some(m) = d.pointer("/error/message").and_then(|m| m.as_str()) {
+        return m.to_string();
+    }
+    if let Some(t) = d.pointer("/result/content").and_then(|c| c.as_str()) {
+        return t.to_string();
+    }
+    d.pointer("/result/contents")
+        .and_then(|c| c.as_array())
+        .map(|blocks| {
+            blocks
+                .iter()
+                .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .unwrap_or_default()
+}
+
+/// The chip name for one Cursor tool call.
+///
+/// An MCP call is rebuilt from `args.providerIdentifier` (or
+/// `serverIdentifier`) and `args.toolName`, not split out of `args.name`
+/// (`schemaic-run_query`), for Copilot's reason: a server name with a dash
+/// would split wrong. A built-in is its kind with the `ToolCall` suffix off —
+/// `read`, `grep`, `shell`, `edit`. A refused MCP completion carries no `args`
+/// at all (measured), so a call first seen that way is labelled `mcp` rather
+/// than guessed.
+fn cursor_tool_name(kind: &str, body: &serde_json::Value) -> String {
+    if kind == "mcpToolCall" {
+        let a = |k: &str| body.pointer(&format!("/args/{k}")).and_then(|x| x.as_str());
+        if let (Some(server), Some(tool)) = (
+            a("providerIdentifier").or_else(|| a("serverIdentifier")),
+            a("toolName"),
+        ) && !server.is_empty()
+            && !tool.is_empty()
+        {
+            return format!("mcp__{server}__{tool}");
+        }
+    }
+    kind.strip_suffix("ToolCall").unwrap_or(kind).to_string()
+}
+
+/// The text and the verdict of a Cursor tool call's `result`.
+///
+/// `success` is the only key that is not a refusal. Its text is `content`: a
+/// string for the built-ins, an array of `{"text": {"text": …}}` blocks for an
+/// MCP call (measured — the text is nested one level deeper than MCP's own
+/// shape), and an MCP result can still say `isError`. Every other key names a
+/// refusal, and its text is whichever reason field it carries.
+fn cursor_result(r: Option<&serde_json::Value>) -> (String, bool) {
+    let Some((key, val)) = r.and_then(|r| r.as_object()).and_then(|o| o.iter().next()) else {
+        return (String::new(), false);
+    };
+    if key != "success" {
+        let why = ["reason", "error", "errorMessage", "clientVisibleError"]
+            .iter()
+            .filter_map(|k| val.get(*k).and_then(|x| x.as_str()))
+            .find(|s| !s.is_empty())
+            .unwrap_or(key.as_str());
+        return (why.to_string(), true);
+    }
+    let text = match val.get("content") {
+        Some(serde_json::Value::String(s)) => s.clone(),
+        Some(serde_json::Value::Array(blocks)) => blocks
+            .iter()
+            .filter_map(|b| match b.get("text") {
+                Some(serde_json::Value::String(s)) => Some(s.as_str()),
+                Some(t) => t.get("text").and_then(|x| x.as_str()),
+                None => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => String::new(),
+    };
+    let is_error = val.get("isError").and_then(|e| e.as_bool()) == Some(true);
+    (text, is_error)
+}
+
+/// A Cursor turn's numbers, from its `result`.
+///
+/// **Cached input is input.** `usage` partitions the prompt: a resumed second
+/// turn reported 287 `inputTokens` beside 24,960 `cacheReadTokens` — 287 alone
+/// cannot be a prompt carrying the first turn's context — so the footer adds
+/// the two, as OpenCode's does. `cacheWriteTokens` is left out, for OpenCode's
+/// reason and with less evidence: it was 0 in every measured turn, so whether it
+/// is a part of the prompt or a count within one is unknown.
+fn cursor_stats(v: &serde_json::Value) -> TurnStats {
+    let at = |k: &str| v.pointer(&format!("/usage/{k}")).and_then(|n| n.as_u64());
+    let input = match (at("inputTokens"), at("cacheReadTokens")) {
+        (None, None) => None,
+        (a, b) => Some(a.unwrap_or(0) + b.unwrap_or(0)),
+    };
+    TurnStats {
+        duration_ms: v.get("duration_ms").and_then(|d| d.as_u64()),
+        input_tokens: input,
+        output_tokens: at("outputTokens"),
     }
 }
 
@@ -367,6 +522,8 @@ impl StreamParser {
             Harness::Codex => self.push_codex(&v),
             Harness::Antigravity => self.push_antigravity(&v),
             Harness::OpenCode => self.push_opencode(&v),
+            Harness::Copilot => self.push_copilot(&v),
+            Harness::Cursor => self.push_cursor(&v),
         };
         // **A turn boundary clears the per-turn state, and it has to now that a
         // stream can hold more than one turn.** `seen_tools` is keyed by whatever
@@ -685,6 +842,257 @@ impl StreamParser {
             }
             _ => Vec::new(),
         }
+    }
+
+    /// `copilot --output-format json` (GitHub Copilot CLI).
+    ///
+    /// **Its ending is the one event that is shaped differently.** Every event
+    /// nests its payload under `data`; `result` carries `sessionId` and
+    /// `exitCode` at the top level instead, and it is the only turn-completion
+    /// event there is. `assistant.turn_end` is not one: it closes a single model
+    /// call, and a measured turn with two tool calls emitted three.
+    ///
+    /// **The session id arrives last, not first**, so it is emitted beside the
+    /// `TurnDone` rather than at the start of the turn — ahead of it in the same
+    /// batch, so the app has kept it before the turn is closed. A turn stopped
+    /// before `result` leaves no id behind, and the next one opens a fresh
+    /// conversation; `turn_system` then sends the schema again, which is the
+    /// right thing for a conversation that has never seen it.
+    ///
+    /// **Text arrives twice**: `assistant.message_delta`s, then the whole
+    /// message again in `assistant.message`. Both are fed through the coalescer
+    /// under the message's id, so the restatement prints only what the deltas
+    /// never sent — nothing, when streaming is on, and the whole message when it
+    /// is not.
+    fn push_copilot(&mut self, v: &serde_json::Value) -> Vec<StreamEvent> {
+        let ty = v.get("type").and_then(|t| t.as_str()).unwrap_or("");
+        let d = v.get("data").unwrap_or(&serde_json::Value::Null);
+        let s = |k: &str| d.get(k).and_then(|x| x.as_str()).unwrap_or("");
+        match ty {
+            "assistant.message_delta" => self
+                .text
+                .extend(s("messageId"), s("deltaContent"))
+                .map(|t| vec![StreamEvent::TextDelta(t)])
+                .unwrap_or_default(),
+            "assistant.message" => {
+                let id = s("messageId");
+                let out = self
+                    .text
+                    .advance(id, s("content"))
+                    .map(|t| vec![StreamEvent::TextDelta(t)])
+                    .unwrap_or_default();
+                self.text.clear(id);
+                out
+            }
+            "tool.execution_start" => {
+                let id = s("toolCallId").to_string();
+                if !self.first_sight(&id) {
+                    return Vec::new();
+                }
+                let sql = d
+                    .pointer("/arguments/sql")
+                    .or_else(|| d.pointer("/arguments/query"))
+                    .and_then(|x| x.as_str())
+                    .map(|x| x.to_string());
+                vec![StreamEvent::ToolUse {
+                    name: copilot_tool_name(d),
+                    sql,
+                    id: Some(id),
+                }]
+            }
+            "tool.execution_complete" => {
+                let id = s("toolCallId").to_string();
+                let mut out = Vec::new();
+                // **A completion nothing announced opens its own chip.** Every
+                // captured call had its `execution_start`, but a result with no
+                // chip to land in is attached by `TurnState::apply` to *the most
+                // recent call still awaiting one* — another call's chip — which
+                // is the defect `side_effect` records for Codex. The completion
+                // carries no tool name, so the chip is labelled by what it has.
+                if self.first_sight(&id) {
+                    out.push(StreamEvent::ToolUse {
+                        name: copilot_tool_name(d),
+                        sql: None,
+                        id: Some(id.clone()),
+                    });
+                }
+                // Keyed apart from the announcement, as every per-turn dialect
+                // here keys it: one id announces once and resolves once.
+                if self.first_sight(&format!("{id}\u{0}done")) {
+                    let ok = d.get("success").and_then(|x| x.as_bool()) == Some(true);
+                    out.push(StreamEvent::ToolResult {
+                        text: copilot_result_text(d),
+                        is_error: !ok,
+                        id: Some(id),
+                    });
+                }
+                out
+            }
+            "result" => {
+                let mut out = Vec::new();
+                if let Some(id) = v.get("sessionId").and_then(|x| x.as_str())
+                    && !id.is_empty()
+                {
+                    out.push(StreamEvent::SessionStarted { id: id.to_string() });
+                }
+                // An absent code is not a failure: nothing has ever omitted it,
+                // and reading its absence as one would paint an ordinary answer
+                // as an error — `opencode_is_failure`'s reasoning.
+                let code = v.get("exitCode").and_then(|x| x.as_i64()).unwrap_or(0);
+                out.push(StreamEvent::TurnDone {
+                    is_error: code != 0,
+                    // **No numbers, rather than wrong ones.** `usage` carries
+                    // `sessionDurationMs`, `totalApiDurationMs` and
+                    // `premiumRequests`, and all three are *per session*:
+                    // measured across a resumed pair, the second turn reported
+                    // 6,500 ms against the first's 1,992 and two premium
+                    // requests against one. No field in `result` is this
+                    // turn's, and the panel's own live counter already shows
+                    // its elapsed time.
+                    stats: TurnStats::default(),
+                });
+                out
+            }
+            // `session.*` (MCP status, the disabled-tool list, usage
+            // checkpoints), `assistant.turn_start`/`turn_end`,
+            // `assistant.reasoning`, `tool_call_delta`, `user.message`: none is
+            // transcript. Reasoning is dropped for the reason Codex's is.
+            _ => Vec::new(),
+        }
+    }
+
+    /// `cursor-agent -p --output-format stream-json --stream-partial-output`.
+    ///
+    /// **Three shapes of `assistant`, told apart by their fields.** Measured on
+    /// the 2026-09-23 build, one turn with a tool call in the middle wrote:
+    ///
+    /// - deltas — `timestamp_ms` and no `model_call_id` — one per few tokens;
+    /// - before the tool call, the segment so far **restated whole**, carrying
+    ///   `timestamp_ms` *and* `model_call_id`;
+    /// - at the end, the last segment restated whole with **no** `timestamp_ms`.
+    ///
+    /// So "timestamped means delta" would print the pre-tool segment twice. A
+    /// delta is `timestamp_ms` without `model_call_id`; anything else is a
+    /// restatement, fed through the coalescer against what that segment's
+    /// deltas already sent, so it prints only an unseen tail — nothing when
+    /// streaming, the whole segment when not. A tool call starts a new segment,
+    /// which is what makes each restatement comparable to its own deltas and
+    /// not the turn's.
+    ///
+    /// **The session id comes first**, on `system`/`init`, as Codex's does; the
+    /// next turn resumes with it.
+    fn push_cursor(&mut self, v: &serde_json::Value) -> Vec<StreamEvent> {
+        const SEG: &str = "cursor-segment";
+        let ty = v.get("type").and_then(|t| t.as_str()).unwrap_or("");
+        match ty {
+            "system" => match v.get("subtype").and_then(|s| s.as_str()) {
+                Some("init") => v
+                    .get("session_id")
+                    .and_then(|s| s.as_str())
+                    .filter(|s| !s.is_empty())
+                    .map(|id| vec![StreamEvent::SessionStarted { id: id.to_string() }])
+                    .unwrap_or_default(),
+                _ => Vec::new(),
+            },
+            "assistant" => {
+                let text: String = v
+                    .pointer("/message/content")
+                    .and_then(|c| c.as_array())
+                    .map(|blocks| {
+                        blocks
+                            .iter()
+                            .filter(|b| b.get("type").and_then(|t| t.as_str()) == Some("text"))
+                            .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let delta = v.get("timestamp_ms").is_some() && v.get("model_call_id").is_none();
+                let out = match delta {
+                    true => self.text.extend(SEG, &text),
+                    false => {
+                        let tail = self.text.advance(SEG, &text);
+                        self.text.clear(SEG);
+                        tail
+                    }
+                };
+                out.map(|t| vec![StreamEvent::TextDelta(t)])
+                    .unwrap_or_default()
+            }
+            "tool_call" => {
+                self.text.clear(SEG);
+                self.cursor_tool(v)
+            }
+            "result" => {
+                let failed = v.get("is_error").and_then(|e| e.as_bool()) == Some(true)
+                    || v.get("subtype")
+                        .and_then(|s| s.as_str())
+                        .is_some_and(|s| s != "success");
+                vec![StreamEvent::TurnDone {
+                    is_error: failed,
+                    stats: cursor_stats(v),
+                }]
+            }
+            // `thinking` (reasoning, dropped as every dialect's is) and `user`
+            // (our prompt echoed back).
+            _ => Vec::new(),
+        }
+    }
+
+    /// One `tool_call` event, `started` or `completed`.
+    ///
+    /// **The kind is a key, not a field**: the payload sits under
+    /// `tool_call.<kind>ToolCall` — `mcpToolCall`, `readToolCall`,
+    /// `shellToolCall` — and the verdict under its `result` as a key too:
+    /// `success`, or one of several refusals (`rejected`, `permissionDenied`,
+    /// `writePermissionDenied`, `readPermissionDenied`, `error`, all measured).
+    ///
+    /// `getMcpToolsToolCall` is dropped: it is the CLI looking up which MCP
+    /// tools exist, which the model does before nearly every call, and a chip
+    /// for it would sit beside every real one saying nothing. Every other
+    /// built-in is shown under its own name, for the module docs' reason —
+    /// this harness's readers run unprompted, so they are exactly what the user
+    /// needs to see, and a refused writer is shown refused.
+    ///
+    /// Both halves guarded, keyed by `call_id`, and a completion with no start
+    /// still opens its chip — the rule `side_effect` states for Codex.
+    fn cursor_tool(&mut self, v: &serde_json::Value) -> Vec<StreamEvent> {
+        let Some(tc) = v.get("tool_call").and_then(|t| t.as_object()) else {
+            return Vec::new();
+        };
+        let Some((kind, body)) = tc.iter().find(|(k, _)| k.ends_with("ToolCall")) else {
+            return Vec::new();
+        };
+        if kind == "getMcpToolsToolCall" {
+            return Vec::new();
+        }
+        let id = v
+            .get("call_id")
+            .and_then(|c| c.as_str())
+            .unwrap_or_default()
+            .to_string();
+        let completed = v.get("subtype").and_then(|s| s.as_str()) == Some("completed");
+        let mut out = Vec::new();
+        if self.first_sight(&id) {
+            let sql = body
+                .pointer("/args/args/sql")
+                .or_else(|| body.pointer("/args/args/query"))
+                .and_then(|s| s.as_str())
+                .map(|s| s.to_string());
+            out.push(StreamEvent::ToolUse {
+                name: cursor_tool_name(kind, body),
+                sql,
+                id: Some(id.clone()),
+            });
+        }
+        if completed && self.first_sight(&format!("{id}\u{0}done")) {
+            let (text, is_error) = cursor_result(body.get("result"));
+            out.push(StreamEvent::ToolResult {
+                text,
+                is_error,
+                id: Some(id),
+            });
+        }
+        out
     }
 
     /// `codex exec --json` — see `codex-rs/exec/src/exec_events.rs`.
@@ -2474,5 +2882,528 @@ mod tests {
             ],
         );
         assert_eq!(text_of(&out), "hello");
+    }
+}
+
+#[cfg(test)]
+mod copilot_tests {
+    use super::*;
+
+    fn drive(lines: &[&str]) -> Vec<StreamEvent> {
+        let mut p = StreamParser::new(Harness::Copilot);
+        lines.iter().flat_map(|l| p.push(l)).collect()
+    }
+
+    fn text_of(evs: &[StreamEvent]) -> String {
+        evs.iter()
+            .filter_map(|e| match e {
+                StreamEvent::TextDelta(t) => Some(t.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A real turn — GitHub Copilot CLI 1.0.88, `--output-format json`, told to
+    /// call `list_schema` and then `run_query` — with the fields nothing reads
+    /// (`id`, `parentId`, `timestamp`, `interactionId`, `apiCallId`, the tool
+    /// schemas) cut, and every line's shape otherwise as it was written. The
+    /// `session.*` lines and the three `assistant.turn_end`s are kept because
+    /// the decoder has to walk past them: the first `turn_end` arrives before
+    /// any answer exists.
+    const COPILOT_REAL_TURN: &[&str] = &[
+        r#"{"type":"session.mcp_server_status_changed","data":{"serverName":"schemaic","status":"connected"},"ephemeral":true}"#,
+        r#"{"type":"session.info","data":{"infoType":"configuration","message":"Disabled tools: create, edit, glob, grep, powershell, view, web_fetch"},"ephemeral":true}"#,
+        r#"{"type":"session.mcp_servers_loaded","data":{"servers":[{"name":"github-mcp-server","status":"disabled","source":"builtin"},{"name":"schemaic","status":"connected"}]},"ephemeral":true}"#,
+        r#"{"type":"user.message","data":{"content":"Call list_schema, then run_query with sql 'select 1'.","turnId":"0"}}"#,
+        r#"{"type":"assistant.turn_start","data":{"turnId":"0"}}"#,
+        r#"{"type":"assistant.tool_call_delta","data":{"toolCallId":"call_A","toolName":"schemaic-list_schema","toolType":"function","inputDelta":"{}"},"ephemeral":true}"#,
+        r#"{"type":"assistant.message","data":{"messageId":"m0","content":"","toolRequests":[{"toolCallId":"call_A","name":"schemaic-list_schema","arguments":{},"type":"function","mcpServerName":"schemaic","mcpToolName":"list_schema"}],"turnId":"0","phase":"final_answer"}}"#,
+        r#"{"type":"tool.execution_start","data":{"toolCallId":"call_A","toolName":"schemaic-list_schema","arguments":{},"turnId":"0","mcpServerName":"schemaic","mcpToolName":"list_schema"}}"#,
+        r#"{"type":"tool.execution_complete","data":{"toolCallId":"call_A","turnId":"0","success":true,"result":{"content":"tables: customers(id, name)","detailedContent":"tables: customers(id, name)","contents":[{"type":"text","text":"tables: customers(id, name)"}]}}}"#,
+        r#"{"type":"assistant.turn_end","data":{"turnId":"0"}}"#,
+        r#"{"type":"assistant.turn_start","data":{"turnId":"1"}}"#,
+        r#"{"type":"assistant.message","data":{"messageId":"m1","content":"","toolRequests":[{"toolCallId":"call_B","name":"schemaic-run_query","arguments":{"sql":"select 1"},"mcpServerName":"schemaic","mcpToolName":"run_query"}],"turnId":"1"}}"#,
+        r#"{"type":"tool.execution_start","data":{"toolCallId":"call_B","toolName":"schemaic-run_query","arguments":{"sql":"select 1"},"turnId":"1","mcpServerName":"schemaic","mcpToolName":"run_query"}}"#,
+        r#"{"type":"tool.execution_complete","data":{"toolCallId":"call_B","turnId":"1","success":true,"result":{"content":"id | name\n1 | ZEBRA","contents":[{"type":"text","text":"id | name\n1 | ZEBRA"}]}}}"#,
+        r#"{"type":"assistant.turn_end","data":{"turnId":"1"}}"#,
+        r#"{"type":"assistant.turn_start","data":{"turnId":"2"}}"#,
+        r#"{"type":"assistant.message_start","data":{"messageId":"m2","phase":"final_answer"},"ephemeral":true}"#,
+        r#"{"type":"assistant.message_delta","data":{"messageId":"m2","deltaContent":"Both "},"ephemeral":true}"#,
+        r#"{"type":"assistant.message_delta","data":{"messageId":"m2","deltaContent":"returned."},"ephemeral":true}"#,
+        r#"{"type":"assistant.message","data":{"messageId":"m2","content":"Both returned.","toolRequests":[],"turnId":"2","phase":"final_answer"}}"#,
+        r#"{"type":"assistant.turn_end","data":{"turnId":"2"}}"#,
+        r#"{"type":"session.usage_checkpoint","data":{"totalPremiumRequests":1},"ephemeral":true}"#,
+        r#"{"type":"assistant.idle","data":{},"ephemeral":true}"#,
+        r#"{"type":"result","timestamp":"2026-09-26T00:07:09.000Z","sessionId":"04765e2f-d530-4495-847b-c339fd860b4a","exitCode":0,"usage":{"premiumRequests":1,"totalApiDurationMs":929,"sessionDurationMs":1992}}"#,
+    ];
+
+    fn uses(out: &[StreamEvent]) -> Vec<(String, Option<String>, Option<String>)> {
+        out.iter()
+            .filter_map(|e| match e {
+                StreamEvent::ToolUse { name, sql, id } => {
+                    Some((name.clone(), sql.clone(), id.clone()))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn results(out: &[StreamEvent]) -> Vec<(String, bool, Option<String>)> {
+        out.iter()
+            .filter_map(|e| match e {
+                StreamEvent::ToolResult { text, is_error, id } => {
+                    Some((text.clone(), *is_error, id.clone()))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_real_copilot_tool_cycle_fills_two_chips_and_answers() {
+        let out = drive(COPILOT_REAL_TURN);
+        assert_eq!(
+            uses(&out),
+            vec![
+                (
+                    "mcp__schemaic__list_schema".to_string(),
+                    None,
+                    Some("call_A".to_string())
+                ),
+                (
+                    "mcp__schemaic__run_query".to_string(),
+                    Some("select 1".to_string()),
+                    Some("call_B".to_string())
+                ),
+            ]
+        );
+        let r = results(&out);
+        assert_eq!(r.len(), 2, "{r:?}");
+        assert_eq!(
+            r[0],
+            (
+                "tables: customers(id, name)".to_string(),
+                false,
+                Some("call_A".to_string())
+            )
+        );
+        assert_eq!(r[1].0, "id | name\n1 | ZEBRA");
+        // The answer once — the deltas, and the restating `assistant.message`
+        // adding nothing to them.
+        assert_eq!(text_of(&out), "Both returned.");
+    }
+
+    /// **The composition**, which the other dialects' captures are held to: a
+    /// parser that decodes perfectly into a `TurnState` that renders nothing is a
+    /// turn the user reads as empty. Two chips, each resolved with its own
+    /// query's answer — not the second's answer stapled to the first — and the
+    /// prose once, after them.
+    #[test]
+    fn a_real_copilot_turn_renders_two_filled_chips_then_the_answer() {
+        let mut st = crate::TurnState::default();
+        for ev in &drive(COPILOT_REAL_TURN) {
+            st.apply(ev);
+        }
+        let segs = st.segments();
+        let chips: Vec<_> = segs
+            .iter()
+            .filter_map(|s| match s {
+                schemaic_core::transcript::Seg::Tool(t) => Some(t),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(chips.len(), 2, "{segs:?}");
+        assert_eq!(chips[0].name, "mcp__schemaic__list_schema");
+        assert_eq!(
+            chips[0].result.as_deref(),
+            Some("tables: customers(id, name)")
+        );
+        assert_eq!(chips[1].name, "mcp__schemaic__run_query");
+        assert_eq!(chips[1].result.as_deref(), Some("id | name\n1 | ZEBRA"));
+        assert!(chips.iter().all(|c| !c.is_error), "{chips:?}");
+        assert_eq!(
+            segs.last(),
+            Some(&schemaic_core::transcript::Seg::Text(
+                "Both returned.".to_string()
+            )),
+            "{segs:?}"
+        );
+    }
+
+    /// **`assistant.turn_end` is not the end of the turn.** It closes one model
+    /// call; the measured turn emitted three. Ending on the first would close
+    /// the panel's turn before either query ran, and every event after it would
+    /// land in a turn the app considers finished.
+    #[test]
+    fn only_result_ends_a_copilot_turn() {
+        let mut p = StreamParser::new(Harness::Copilot);
+        let mut done_at = Vec::new();
+        for (i, l) in COPILOT_REAL_TURN.iter().enumerate() {
+            if p.push(l)
+                .iter()
+                .any(|e| matches!(e, StreamEvent::TurnDone { .. }))
+            {
+                done_at.push(i);
+            }
+        }
+        assert_eq!(done_at, vec![COPILOT_REAL_TURN.len() - 1]);
+    }
+
+    /// The id arrives on the last line, and the app keeps it only if it sees it
+    /// before the turn closes — `ai.rs` scans a batch for `SessionStarted` and
+    /// then hands the batch to a pump that stops at `TurnDone`.
+    #[test]
+    fn the_session_id_is_emitted_ahead_of_the_turn_closing() {
+        let out = drive(COPILOT_REAL_TURN);
+        let started = out
+            .iter()
+            .position(|e| {
+                matches!(e, StreamEvent::SessionStarted { id }
+                    if id == "04765e2f-d530-4495-847b-c339fd860b4a")
+            })
+            .expect("the session id");
+        let done = out
+            .iter()
+            .position(|e| matches!(e, StreamEvent::TurnDone { .. }))
+            .expect("the turn closes");
+        assert!(started < done, "{out:?}");
+    }
+
+    /// **No numbers rather than per-session ones.** `usage` is cumulative over
+    /// the session — a resumed second turn reported 6,500 ms and two premium
+    /// requests against the first's 1,992 and one — so a footer reading it
+    /// would grow with every question.
+    #[test]
+    fn a_copilot_turn_reports_no_session_wide_numbers_as_its_own() {
+        let out = drive(COPILOT_REAL_TURN);
+        let (stats, is_error) = out
+            .iter()
+            .find_map(|e| match e {
+                StreamEvent::TurnDone { stats, is_error } => Some((*stats, *is_error)),
+                _ => None,
+            })
+            .expect("TurnDone");
+        assert!(!is_error);
+        assert_eq!(stats.duration_ms, None);
+        assert_eq!(stats.input_tokens, None);
+        assert_eq!(stats.output_tokens, None);
+    }
+
+    #[test]
+    fn a_nonzero_exit_code_is_a_failed_turn() {
+        let out = drive(&[r#"{"type":"result","sessionId":"s","exitCode":1}"#]);
+        assert!(
+            out.iter()
+                .any(|e| matches!(e, StreamEvent::TurnDone { is_error: true, .. })),
+            "{out:?}"
+        );
+    }
+
+    /// **Streaming off must not mean silence.** The restatement carries the
+    /// whole message; with no deltas before it, it is the only copy there is.
+    #[test]
+    fn a_message_with_no_deltas_is_printed_from_its_restatement() {
+        let out = drive(&[
+            r#"{"type":"assistant.message","data":{"messageId":"m9","content":"Just this.","toolRequests":[]}}"#,
+        ]);
+        assert_eq!(text_of(&out), "Just this.");
+    }
+
+    /// And a restatement that carries more than the deltas did prints only the
+    /// part never sent — not the whole again.
+    #[test]
+    fn a_restatement_longer_than_its_deltas_adds_only_the_tail() {
+        let out = drive(&[
+            r#"{"type":"assistant.message_delta","data":{"messageId":"m","deltaContent":"Hel"}}"#,
+            r#"{"type":"assistant.message","data":{"messageId":"m","content":"Hello"}}"#,
+        ]);
+        assert_eq!(text_of(&out), "Hello");
+    }
+
+    #[test]
+    fn a_failed_tool_call_is_flagged_on_its_chip() {
+        let out = drive(&[
+            r#"{"type":"tool.execution_start","data":{"toolCallId":"c","toolName":"schemaic-run_query","arguments":{"sql":"select x"},"mcpServerName":"schemaic","mcpToolName":"run_query"}}"#,
+            r#"{"type":"tool.execution_complete","data":{"toolCallId":"c","success":false,"error":{"message":"Unknown column 'x'"}}}"#,
+        ]);
+        assert_eq!(
+            results(&out),
+            vec![(
+                "Unknown column 'x'".to_string(),
+                true,
+                Some("c".to_string())
+            )]
+        );
+    }
+
+    /// **A completion with no start fills its own chip, not another's.** With
+    /// one call still running, a bare completion for a second id used to emit a
+    /// loose result, which `TurnState` attaches to the running call's chip.
+    #[test]
+    fn a_completion_nothing_announced_does_not_resolve_another_call() {
+        let mut st = crate::TurnState::default();
+        for ev in &drive(&[
+            r#"{"type":"tool.execution_start","data":{"toolCallId":"a","toolName":"schemaic-run_query","arguments":{"sql":"select 1"},"mcpServerName":"schemaic","mcpToolName":"run_query"}}"#,
+            r#"{"type":"tool.execution_complete","data":{"toolCallId":"b","success":true,"result":{"content":"b's answer"}}}"#,
+        ]) {
+            st.apply(ev);
+        }
+        let chips: Vec<_> = st
+            .segments()
+            .iter()
+            .filter_map(|s| match s {
+                schemaic_core::transcript::Seg::Tool(t) => Some(t.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(chips.len(), 2, "{chips:?}");
+        assert_eq!(chips[0].name, "mcp__schemaic__run_query");
+        assert_eq!(chips[0].result, None, "a's chip took b's result");
+        assert_eq!(chips[1].result.as_deref(), Some("b's answer"));
+    }
+
+    /// A restated start or completion is one chip, resolved once — the rule
+    /// `seen_tools` states for every per-turn dialect.
+    #[test]
+    fn a_restated_copilot_tool_call_announces_and_resolves_once() {
+        let start = r#"{"type":"tool.execution_start","data":{"toolCallId":"c","toolName":"schemaic-list_schema","mcpServerName":"schemaic","mcpToolName":"list_schema"}}"#;
+        let done = r#"{"type":"tool.execution_complete","data":{"toolCallId":"c","success":true,"result":{"content":"t"}}}"#;
+        let out = drive(&[start, start, done, done]);
+        assert_eq!((uses(&out).len(), results(&out).len()), (1, 1), "{out:?}");
+    }
+
+    /// A built-in has no server fields and keeps the name it really has — it
+    /// should never run under the seal, and if it does the user sees it as
+    /// what it is rather than dressed as a database call.
+    #[test]
+    fn a_builtin_tool_is_reported_under_its_own_name() {
+        let out = drive(&[
+            r#"{"type":"tool.execution_start","data":{"toolCallId":"c","toolName":"powershell","arguments":{"command":"dir"}}}"#,
+        ]);
+        assert_eq!(uses(&out)[0].0, "powershell");
+    }
+}
+
+#[cfg(test)]
+mod cursor_tests {
+    use super::*;
+    use schemaic_core::transcript::Seg;
+
+    fn drive(lines: &[&str]) -> Vec<StreamEvent> {
+        let mut p = StreamParser::new(Harness::Cursor);
+        lines.iter().flat_map(|l| p.push(l)).collect()
+    }
+
+    fn text_of(evs: &[StreamEvent]) -> String {
+        evs.iter()
+            .filter_map(|e| match e {
+                StreamEvent::TextDelta(t) => Some(t.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A real turn — Cursor CLI 2026.09.23, `-p --output-format stream-json
+    /// --stream-partial-output`, against Schemaic's own `--mcp-serve` over a
+    /// SQLite endpoint — **trimmed**: most of the one-token deltas are merged
+    /// into three per segment, the `getMcpTools` result is cut to its opening,
+    /// and `hookAdditionalContexts`, `startedAtMs`, `request_id` and the
+    /// session id on every line after the first are dropped. What is kept is
+    /// every field the decoder reads or tells shapes apart by, on every line:
+    /// in particular the pre-tool restatement's `timestamp_ms` *and*
+    /// `model_call_id`, and the final restatement's lack of both.
+    const CURSOR_REAL_TURN: &[&str] = &[
+        r#"{"type":"system","subtype":"init","apiKeySource":"login","cwd":"C:\\cfg\\cursor\\pid-1","session_id":"470de677-c5df-45ab-9d87-190a6fb230f3","model":"Auto","permissionMode":"default"}"#,
+        r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"What is the name of the customer with id 1?"}]}}"#,
+        r#"{"type":"thinking","subtype":"delta","text":"Looking up","timestamp_ms":1790388081000}"#,
+        r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"I'll look up"}]},"timestamp_ms":1790388082000}"#,
+        r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":" the customer"}]},"timestamp_ms":1790388082010}"#,
+        r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":" with id 1."}]},"timestamp_ms":1790388082020}"#,
+        r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"I'll look up the customer with id 1."}]},"model_call_id":"92b929ea-0-kjrn","timestamp_ms":1790388082030}"#,
+        r#"{"type":"tool_call","subtype":"started","call_id":"call-0\nfc_0","tool_call":{"getMcpToolsToolCall":{"args":{"server":"schemaic"}}},"model_call_id":"92b929ea-0-kjrn","timestamp_ms":1790388082305}"#,
+        r#"{"type":"tool_call","subtype":"completed","call_id":"call-0\nfc_0","tool_call":{"getMcpToolsToolCall":{"args":{"server":"schemaic"},"result":{"success":{"content":"{\"mode\":\"namespace\",\"namespace\":\"schemaic\"}"}}}},"model_call_id":"92b929ea-0-kjrn","timestamp_ms":1790388082400}"#,
+        r#"{"type":"tool_call","subtype":"started","call_id":"call-1\nfc_1","tool_call":{"mcpToolCall":{"args":{"name":"schemaic-run_query","args":{"sql":"SELECT name FROM customers WHERE id = 1"},"providerIdentifier":"schemaic","toolName":"run_query","smartModeApprovalOnly":false,"skipApproval":false,"serverIdentifier":"schemaic"},"description":"Look up the name of customer id 1"}},"model_call_id":"92b929ea-1-8ah8","timestamp_ms":1790388083914}"#,
+        r#"{"type":"tool_call","subtype":"completed","call_id":"call-1\nfc_1","tool_call":{"mcpToolCall":{"args":{"name":"schemaic-run_query","args":{"sql":"SELECT name FROM customers WHERE id = 1"},"providerIdentifier":"schemaic","toolName":"run_query","serverIdentifier":"schemaic"},"result":{"success":{"content":[{"text":{"text":"| name |\n| --- |\n| ZEBRA-9 |\n\n(1 rows)"}}],"isError":false}},"description":"Look up the name of customer id 1"}},"model_call_id":"92b929ea-1-8ah8","timestamp_ms":1790388083966}"#,
+        r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"The customer"}]},"timestamp_ms":1790388084100}"#,
+        r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":" with id 1 is named"}]},"timestamp_ms":1790388084110}"#,
+        r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":" **ZEBRA-9**."}]},"timestamp_ms":1790388084120}"#,
+        r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"The customer with id 1 is named **ZEBRA-9**."}]}}"#,
+        r#"{"type":"result","subtype":"success","duration_ms":6413,"duration_api_ms":6413,"is_error":false,"result":"I'll look up the customer with id 1.The customer with id 1 is named **ZEBRA-9**.","usage":{"inputTokens":9747,"outputTokens":215,"cacheReadTokens":26240,"cacheWriteTokens":0}}"#,
+    ];
+
+    /// **Each segment once**, though each is written twice: deltas, then a
+    /// restatement — the pre-tool one timestamped like a delta. Printing by
+    /// "has `timestamp_ms`" alone doubles the first sentence.
+    #[test]
+    fn a_real_cursor_turn_prints_each_segment_once() {
+        let out = drive(CURSOR_REAL_TURN);
+        assert_eq!(
+            text_of(&out),
+            "I'll look up the customer with id 1.The customer with id 1 is named **ZEBRA-9**."
+        );
+    }
+
+    /// The composition: one chip — the catalogue lookup is not one — filled
+    /// with the server's answer, between the two segments of prose.
+    #[test]
+    fn a_real_cursor_turn_renders_prose_a_filled_chip_and_prose() {
+        let mut st = crate::TurnState::default();
+        for ev in &drive(CURSOR_REAL_TURN) {
+            st.apply(ev);
+        }
+        let segs = st.segments();
+        let chips: Vec<_> = segs
+            .iter()
+            .filter_map(|s| match s {
+                Seg::Tool(t) => Some(t),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(chips.len(), 1, "{segs:?}");
+        assert_eq!(chips[0].name, "mcp__schemaic__run_query");
+        assert_eq!(
+            chips[0].sql.as_deref(),
+            Some("SELECT name FROM customers WHERE id = 1")
+        );
+        assert_eq!(
+            chips[0].result.as_deref(),
+            Some("| name |\n| --- |\n| ZEBRA-9 |\n\n(1 rows)")
+        );
+        assert!(!chips[0].is_error);
+        assert_eq!(
+            segs.first(),
+            Some(&Seg::Text(
+                "I'll look up the customer with id 1.".to_string()
+            ))
+        );
+        assert_eq!(
+            segs.last(),
+            Some(&Seg::Text(
+                "The customer with id 1 is named **ZEBRA-9**.".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn the_session_id_arrives_first_and_the_turn_ends_on_result() {
+        let mut p = StreamParser::new(Harness::Cursor);
+        let first = p.push(CURSOR_REAL_TURN[0]);
+        assert!(matches!(
+            first.as_slice(),
+            [StreamEvent::SessionStarted { id }] if id == "470de677-c5df-45ab-9d87-190a6fb230f3"
+        ));
+        let mut done_at = Vec::new();
+        for (i, l) in CURSOR_REAL_TURN.iter().enumerate().skip(1) {
+            if p.push(l)
+                .iter()
+                .any(|e| matches!(e, StreamEvent::TurnDone { .. }))
+            {
+                done_at.push(i);
+            }
+        }
+        assert_eq!(done_at, vec![CURSOR_REAL_TURN.len() - 1]);
+    }
+
+    /// Cached input is input: the prompt is `inputTokens` plus
+    /// `cacheReadTokens`, and `duration_ms` is this turn's own (a resumed turn
+    /// reported less than the first, so it is not cumulative).
+    #[test]
+    fn a_cursor_turn_counts_its_cached_input() {
+        let out = drive(CURSOR_REAL_TURN);
+        let stats = out
+            .iter()
+            .find_map(|e| match e {
+                StreamEvent::TurnDone { stats, is_error } => {
+                    assert!(!is_error);
+                    Some(*stats)
+                }
+                _ => None,
+            })
+            .expect("TurnDone");
+        assert_eq!(stats.duration_ms, Some(6413));
+        assert_eq!(stats.input_tokens, Some(9747 + 26240));
+        assert_eq!(stats.output_tokens, Some(215));
+    }
+
+    /// Without `--stream-partial-output` there are no deltas, and the
+    /// restatement is the only copy of the text there is.
+    #[test]
+    fn a_segment_with_no_deltas_is_printed_from_its_restatement() {
+        let out = drive(&[
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"Just this."}]}}"#,
+        ]);
+        assert_eq!(text_of(&out), "Just this.");
+    }
+
+    /// Refusals are shaped as keys, and each is a refused chip carrying its
+    /// reason — the measured `rejected` (no allow rule) and `permissionDenied`
+    /// (a deny rule, whose completion carries no `args`).
+    #[test]
+    fn a_refused_call_is_a_refused_chip_with_its_reason() {
+        let out = drive(&[
+            r#"{"type":"tool_call","subtype":"completed","call_id":"a","tool_call":{"mcpToolCall":{"result":{"rejected":{"reason":"User rejected MCP: schemaic-run_query","isReadonly":false}}}}}"#,
+            r#"{"type":"tool_call","subtype":"completed","call_id":"b","tool_call":{"shellToolCall":{"result":{"permissionDenied":{"command":"ls","error":"Command blocked by permissions configuration","isReadonly":false}}}}}"#,
+        ]);
+        let results: Vec<_> = out
+            .iter()
+            .filter_map(|e| match e {
+                StreamEvent::ToolResult { text, is_error, .. } => Some((text.clone(), *is_error)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            results,
+            vec![
+                ("User rejected MCP: schemaic-run_query".to_string(), true),
+                (
+                    "Command blocked by permissions configuration".to_string(),
+                    true
+                ),
+            ]
+        );
+        // A completion with no start still opens its chip, and names what it
+        // can: the built-in by its kind, the arg-less MCP call as `mcp`.
+        let names: Vec<_> = out
+            .iter()
+            .filter_map(|e| match e {
+                StreamEvent::ToolUse { name, .. } => Some(name.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(names, vec!["mcp", "shell"]);
+    }
+
+    /// A reader runs unprompted on this harness — measured — so it is shown
+    /// under its own name rather than dropped with the catalogue lookup.
+    #[test]
+    fn a_builtin_reader_is_shown_and_the_catalogue_lookup_is_not() {
+        let out = drive(&[
+            r#"{"type":"tool_call","subtype":"started","call_id":"g","tool_call":{"getMcpToolsToolCall":{"args":{}}}}"#,
+            r#"{"type":"tool_call","subtype":"started","call_id":"r","tool_call":{"grepToolCall":{"args":{"pattern":"."}}}}"#,
+            r#"{"type":"tool_call","subtype":"completed","call_id":"r","tool_call":{"grepToolCall":{"args":{"pattern":"."},"result":{"success":{"content":"x"}}}}}"#,
+        ]);
+        let names: Vec<_> = out
+            .iter()
+            .filter_map(|e| match e {
+                StreamEvent::ToolUse { name, .. } => Some(name.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(names, vec!["grep"]);
+    }
+
+    #[test]
+    fn a_result_that_is_not_success_fails_the_turn() {
+        for line in [
+            r#"{"type":"result","subtype":"error","is_error":true}"#,
+            r#"{"type":"result","subtype":"error"}"#,
+        ] {
+            assert!(
+                drive(&[line])
+                    .iter()
+                    .any(|e| matches!(e, StreamEvent::TurnDone { is_error: true, .. })),
+                "{line}"
+            );
+        }
     }
 }

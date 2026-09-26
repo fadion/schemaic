@@ -141,15 +141,46 @@ pub enum Harness {
     /// [`crate::stream::StreamParser`] — because the alternative is a stream that
     /// simply stops, which the app reports as "ended unexpectedly".
     OpenCode,
+    /// `copilot --output-format json` — GitHub Copilot CLI, `type`-tagged
+    /// `session.*` / `assistant.*` / `tool.*` events, one process per turn.
+    ///
+    /// **The only one whose turn ends on a line with no `data`.** Every event
+    /// nests its payload under `data` except the last, `result`, which carries
+    /// `sessionId` and `exitCode` at the top level — and that is also the *only*
+    /// place the session id appears. `assistant.turn_end` looks like the ending
+    /// and is not: it closes one model call, and a turn with two tool calls
+    /// emits three of them.
+    ///
+    /// It also advertises a persistent mode, `--acp` (the Agent Client
+    /// Protocol), which is not what is driven, for the reason Antigravity's
+    /// bidirectional mode waited: it is not what was measured.
+    Copilot,
+    /// `cursor-agent -p --output-format stream-json` — the Cursor CLI, one
+    /// process per turn.
+    ///
+    /// **Claude's envelope and not Claude's stream.** It opens with
+    /// `{"type":"system","subtype":"init","session_id":…}` and closes with a
+    /// `result`, as Claude's does, but its text arrives as `assistant` events
+    /// that are deltas, *and* as `assistant` events that restate a whole
+    /// segment — and the two are told apart by fields, not by type. See
+    /// `StreamParser::push_cursor`.
+    ///
+    /// **The weakest constraint here, and it says so.** Nothing empties its
+    /// built-in tools and it has no sandbox that holds headless: what keeps it
+    /// read-only is a permissions file in its working directory. See
+    /// [`Harness::restricts_by_workspace_rules`].
+    Cursor,
 }
 
 impl Harness {
     /// Every harness, in the order the settings UI offers them.
-    pub const ALL: [Harness; 4] = [
+    pub const ALL: [Harness; 6] = [
         Harness::Claude,
         Harness::Codex,
         Harness::Antigravity,
         Harness::OpenCode,
+        Harness::Copilot,
+        Harness::Cursor,
     ];
 
     /// The stable string form, matched back by [`Harness::from_key`].
@@ -170,6 +201,8 @@ impl Harness {
             Harness::Codex => "codex",
             Harness::Antigravity => "antigravity",
             Harness::OpenCode => "opencode",
+            Harness::Copilot => "copilot",
+            Harness::Cursor => "cursor",
         }
     }
 
@@ -181,16 +214,20 @@ impl Harness {
             Harness::Codex => "Codex",
             Harness::Antigravity => "Antigravity",
             Harness::OpenCode => "OpenCode",
+            Harness::Copilot => "GitHub Copilot",
+            Harness::Cursor => "Cursor",
         }
     }
 
     /// Who a reply in the transcript is *from*, as opposed to which product the
     /// settings dropdown is offering.
     ///
-    /// The two differ in exactly one place and deliberately: [`Harness::label`]
+    /// The two differ in exactly two places, both deliberately. [`Harness::label`]
     /// is "Claude Code", the thing you install and point a path at, while a
-    /// header over an answer is naming a speaker and reads "CLAUDE". That is
-    /// also the name that header carried before it learned to vary, so an
+    /// header over an answer is naming a speaker and reads "CLAUDE"; and the
+    /// dropdown's "GitHub Copilot" is "COPILOT" over an answer, where the vendor
+    /// prefix would read as a heading. Claude's is also the name that header
+    /// carried before it learned to vary, so an
     /// existing transcript does not appear to change its mind about who wrote
     /// it.
     ///
@@ -206,6 +243,10 @@ impl Harness {
             Harness::Codex => "Codex",
             Harness::Antigravity => "Antigravity",
             Harness::OpenCode => "OpenCode",
+            // The speaker is the assistant, not the vendor: "GITHUB COPILOT" over
+            // every answer reads as a heading rather than a name.
+            Harness::Copilot => "Copilot",
+            Harness::Cursor => "Cursor",
         }
     }
 
@@ -231,7 +272,14 @@ impl Harness {
     pub fn help_args(self) -> &'static [&'static str] {
         match self {
             Harness::Codex => &["exec", "--help"],
-            Harness::Claude | Harness::Antigravity | Harness::OpenCode => &["--help"],
+            // Copilot's top-level page lists every flag the grade and the argv
+            // depend on — `--available-tools`, `--additional-mcp-config`,
+            // `--disable-builtin-mcps` — so it needs no subcommand.
+            Harness::Claude
+            | Harness::Antigravity
+            | Harness::OpenCode
+            | Harness::Copilot
+            | Harness::Cursor => &["--help"],
         }
     }
 
@@ -243,6 +291,11 @@ impl Harness {
             // Not "antigravity" — the binary is `agy`.
             Harness::Antigravity => "agy",
             Harness::OpenCode => "opencode",
+            Harness::Copilot => "copilot",
+            // Its installer puts two names on `PATH`, `agent` and
+            // `cursor-agent`. The longer one: `agent` is a word other tools
+            // claim, and a `PATH` search for it can find somebody else's.
+            Harness::Cursor => "cursor-agent",
         }
     }
 
@@ -330,6 +383,25 @@ impl Constraint {
                               available to this session, and Schemaic cannot restrict them.",
                 }
             )),
+            // **Neither a sandbox nor a flag: rules in a file.** Cursor's
+            // writers and shell are refused by a permissions file Schemaic
+            // writes into its working directory — measured to hold, including
+            // through a subagent — while its readers stay live, and not by
+            // choice: `Grep` returned a file's contents with both `Read` and
+            // `Grep` denied. The sentence says who is enforcing it, because
+            // "sandboxed" would promise an OS boundary nothing provides.
+            Constraint::Restricted if h.restricts_by_workspace_rules() => Some(format!(
+                "{} is kept to answering by a permissions file Schemaic writes for this \
+                 session, not by a sandbox: its own tools are refused writing files and \
+                 running commands, but they can still read files on this machine.{}",
+                h.label(),
+                match h.isolates_mcp_servers() {
+                    true => "",
+                    false =>
+                        " MCP servers you have registered with it also start with this \
+                              session; their tools are refused unless your own settings allow them.",
+                }
+            )),
             Constraint::Restricted if h.seals_by_flag() => Some(format!(
                 "This {} build does not accept the flag that empties its built-in \
                  tools, so they are held back by a denylist instead — weaker, and \
@@ -373,7 +445,12 @@ impl Harness {
     /// build could not be selected at all".
     pub fn supports_model_choice(self) -> bool {
         match self {
-            Harness::Claude | Harness::Codex | Harness::Antigravity | Harness::OpenCode => true,
+            Harness::Claude
+            | Harness::Codex
+            | Harness::Antigravity
+            | Harness::OpenCode
+            | Harness::Copilot
+            | Harness::Cursor => true,
         }
     }
 
@@ -407,6 +484,17 @@ impl Harness {
                 "opencode/gpt-5",
                 "opencode/gemini-3.1-pro",
             ],
+            // **Only the router, because the catalogue is the account's.**
+            // Which models `--model` accepts depends on the Copilot plan: on the
+            // account this was measured with, every named id — including the
+            // ones `copilot help config` lists as examples — was refused with
+            // `Model "…" from --model flag is not available`, and only `auto`
+            // ran. A named suggestion is a chip that fails the turn for someone;
+            // `auto` is the one id every plan takes.
+            Harness::Copilot => &["auto"],
+            // `agent models` lists the account's catalogue, and it is long and
+            // plan-specific; `auto` is the default every account has.
+            Harness::Cursor => &["auto"],
         }
     }
 
@@ -444,6 +532,19 @@ impl Harness {
             // this list, so a level carried over from another harness sends no
             // flag rather than an invented one.
             Harness::OpenCode => &["minimal", "high", "max"],
+            // **It has the flag and it is not offered, because the flag fails
+            // the turn on the default model.** `--reasoning-effort` is real, but
+            // with no `--model` Copilot routes through `auto`, which refuses it
+            // outright — `Error: Model "auto" does not support reasoning effort
+            // configuration (requested: "high")`, exit 1, no answer. Whether a
+            // *named* model takes it could not be measured: no named model was
+            // available on the account this was measured with. A control that
+            // kills the turn on the default setting is worse than no control.
+            Harness::Copilot => &[],
+            // No flag at all: effort is part of the model id here, either a
+            // named variant (`gpt-5.3-codex-high`) or a bracket parameter
+            // (`…[effort=high]`), both of which the model field passes through.
+            Harness::Cursor => &[],
         }
     }
 
@@ -481,8 +582,36 @@ impl Harness {
             Harness::Codex | Harness::Antigravity => true,
             // Claude's `Restricted` is the denylist fallback when `--tools` is
             // absent; OpenCode has no sandbox lever at all — it seals with a
-            // `tools` map or not at all.
-            Harness::Claude | Harness::OpenCode => false,
+            // `tools` map or not at all. Copilot's sandbox is experimental,
+            // covers its shell alone, and is not what restricts it here.
+            // Cursor has a `--sandbox` flag, and it is not what restricts it:
+            // what holds is a permissions file — see
+            // `restricts_by_workspace_rules`.
+            Harness::Claude | Harness::OpenCode | Harness::Copilot | Harness::Cursor => false,
+        }
+    }
+
+    /// When this harness is graded [`Constraint::Restricted`], is that a
+    /// **permissions file in its working directory** doing the restricting?
+    ///
+    /// Cursor alone. Measured on its CLI (2026-09-23 build): with no
+    /// permissions file at all, a headless `-p` turn refused its shell and any
+    /// MCP call, but **wrote a file unprompted** — so a missing file does not
+    /// fail closed. A project `.cursor/cli.json` whose `deny` names `Write`,
+    /// `Shell` and `WebFetch` refused writes, deletes and commands, including
+    /// through a `Task` subagent, and overrode an allow in the user's own global
+    /// config. Its readers are the part no rule closes: `Read(**)` denied the
+    /// `Read` tool, and `Grep` still returned a file's contents. Its `--mode
+    /// ask` is not a lever either — told the tool still worked, the model wrote
+    /// the file.
+    pub fn restricts_by_workspace_rules(self) -> bool {
+        match self {
+            Harness::Cursor => true,
+            Harness::Claude
+            | Harness::Codex
+            | Harness::Antigravity
+            | Harness::OpenCode
+            | Harness::Copilot => false,
         }
     }
 
@@ -492,10 +621,19 @@ impl Harness {
     /// True only for Claude (`--tools`). OpenCode also reaches [`Constraint::Sealed`]
     /// but does it by configuration, so "updating the CLI restores the full seal"
     /// would be advice that fixes nothing there.
+    ///
+    /// **Copilot seals by a flag too, and is still false**, because the question
+    /// is about the *weaker grade*: a Copilot without `--available-tools` has
+    /// no denylist to fall back on and grades [`Constraint::Unknown`], never
+    /// `Restricted`, so it never reaches the sentence this answers for.
     pub fn seals_by_flag(self) -> bool {
         match self {
             Harness::Claude => true,
-            Harness::Codex | Harness::Antigravity | Harness::OpenCode => false,
+            Harness::Codex
+            | Harness::Antigravity
+            | Harness::OpenCode
+            | Harness::Copilot
+            | Harness::Cursor => false,
         }
     }
 
@@ -515,10 +653,20 @@ impl Harness {
     /// and keep the user's config-redirection variables while the panel reported
     /// `Sealed`. The exhaustive `match` below is the point: a fifth harness is a
     /// compile error here rather than a silent default there.
+    ///
+    /// **Copilot is the second**, and the reason is the same shape: its user
+    /// configuration — `mcp-config.json`, skills, plugins, hooks — lives under
+    /// one directory, `COPILOT_HOME`, and `--additional-mcp-config` *augments*
+    /// that file rather than replacing it. Its seal is a flag
+    /// (`--available-tools`); its **isolation** is this variable.
     pub fn env_seal(self) -> bool {
         match self {
-            Harness::OpenCode => true,
-            Harness::Claude | Harness::Codex | Harness::Antigravity => false,
+            Harness::OpenCode | Harness::Copilot => true,
+            // Cursor's restriction is a *directory* too, but one it finds by
+            // being started in it — its working directory — not one an
+            // environment variable points at. See
+            // `restricts_by_workspace_rules`.
+            Harness::Claude | Harness::Codex | Harness::Antigravity | Harness::Cursor => false,
         }
     }
 
@@ -533,7 +681,12 @@ impl Harness {
     pub fn isolates_config_by_flag(self) -> bool {
         match self {
             Harness::Codex => true,
-            Harness::Claude | Harness::Antigravity | Harness::OpenCode => false,
+            // Copilot's is `COPILOT_HOME` — see `env_seal`.
+            Harness::Claude
+            | Harness::Antigravity
+            | Harness::OpenCode
+            | Harness::Copilot
+            | Harness::Cursor => false,
         }
     }
 
@@ -559,10 +712,25 @@ impl Harness {
     /// [`Constraint::notice`] promised "cannot write files or run commands" as a
     /// flat assurance on a harness this module's own header records as having no
     /// MCP isolation at all.
+    ///
+    /// **Copilot displaces them twice over.** `COPILOT_HOME` pointed at a
+    /// directory Schemaic owns means the user's `~/.copilot/mcp-config.json` is
+    /// never read, `--disable-builtin-mcps` turns off the bundled GitHub server
+    /// (measured: its status reads `disabled`), and `--available-tools` would
+    /// hide any tool that got past both.
+    ///
+    /// **Cursor cannot, and the reason is a hard-coded path.** Its user-level
+    /// MCP config is read from `<home>/.cursor/mcp.json` whatever
+    /// `CURSOR_CONFIG_DIR` says (read out of the CLI's bundle), and moving the
+    /// home would move its login with it on macOS and Linux. Measured: a
+    /// user-level server is "ready" without any approval and is *started* on
+    /// every turn. Its tools are listed to the model but refused when called,
+    /// because nothing in Schemaic's permissions file allows them — unless the
+    /// user's own settings do.
     pub fn isolates_mcp_servers(self) -> bool {
         match self {
-            Harness::Claude | Harness::Codex | Harness::OpenCode => true,
-            Harness::Antigravity => false,
+            Harness::Claude | Harness::Codex | Harness::OpenCode | Harness::Copilot => true,
+            Harness::Antigravity | Harness::Cursor => false,
         }
     }
 
@@ -583,13 +751,18 @@ impl Harness {
     /// started'" — was not true of any code: the panel decides that from
     /// `m.pending && m.segs.is_empty()`, which is a better rule anyway, since it
     /// answers correctly for the harness that streams nothing. Kept because it
-    /// is a fact about the four CLIs that the parser's own design rests on, and
+    /// is a fact about the CLIs that the parser's own design rests on, and
     /// deleting a documented measurement to satisfy a dead-code warning is how a
     /// measurement gets taken twice. Its *doc* now says what it is: a record,
     /// not a lever.
     pub fn streams_deltas(self) -> bool {
         match self {
-            Harness::Claude | Harness::Antigravity => true,
+            // Copilot's `assistant.message_delta` carries only what is new, and
+            // is then followed by an `assistant.message` restating the whole
+            // text — which the parser has to not print twice.
+            // Cursor's `--stream-partial-output` deltas, followed by segment
+            // restatements the parser must not print twice.
+            Harness::Claude | Harness::Antigravity | Harness::Copilot | Harness::Cursor => true,
             Harness::Codex | Harness::OpenCode => false,
         }
     }
@@ -610,7 +783,9 @@ impl Harness {
     pub fn is_persistent(self) -> bool {
         match self {
             Harness::Claude | Harness::Antigravity => true,
-            Harness::Codex | Harness::OpenCode => false,
+            // Copilot's `--acp` is a persistent protocol; it is not the one
+            // measured. See the variant's doc.
+            Harness::Codex | Harness::OpenCode | Harness::Copilot | Harness::Cursor => false,
         }
     }
 
@@ -678,9 +853,22 @@ impl Harness {
     /// on Linux, so a one-shot turn's whole prompt — including any grid rows the
     /// user attached and Fill/Seed's sample — is visible to every local account
     /// for the life of the process.
+    ///
+    /// **Copilot is the second, measured on 1.0.88 (2026-09-26).** With stdin
+    /// piped and no `-p`, the piped text *is* the prompt: the `user.message`
+    /// event echoed it back as its `content`, on both the `--output-format
+    /// json` turn and the `-s` one-shot. Its help says as much — `--fleet`
+    /// combines "with -i, -p, or piped stdin". It matters more here than for
+    /// Codex on Windows, where an npm install puts `copilot.cmd` on `PATH` and a
+    /// multi-line argv through that shim is refused outright (see
+    /// `batch_shim_reason`).
+    ///
+    /// **Cursor is the third** (measured 2026-09-26): `-p` with no value and
+    /// the prompt piped in answered the piped text, on both `stream-json` and
+    /// `text` output.
     pub fn prompt_on_stdin(self) -> bool {
         match self {
-            Harness::Codex => true,
+            Harness::Codex | Harness::Copilot | Harness::Cursor => true,
             Harness::Claude | Harness::Antigravity | Harness::OpenCode => false,
         }
     }
@@ -700,7 +888,11 @@ impl Harness {
             // The pipe is the continuity, and Stop is a control message that
             // leaves the process running.
             Harness::Claude => false,
-            Harness::Codex | Harness::OpenCode | Harness::Antigravity => true,
+            Harness::Codex
+            | Harness::OpenCode
+            | Harness::Antigravity
+            | Harness::Copilot
+            | Harness::Cursor => true,
         }
     }
 
@@ -724,7 +916,9 @@ impl Harness {
                 });
                 format!("{v}\n")
             }
-            Harness::Codex | Harness::OpenCode => String::new(),
+            Harness::Codex | Harness::OpenCode | Harness::Copilot | Harness::Cursor => {
+                String::new()
+            }
         }
     }
 
@@ -739,7 +933,11 @@ impl Harness {
     pub fn session_interrupt(self) -> Option<String> {
         match self {
             Harness::Claude => Some(crate::interrupt_line("stop")),
-            Harness::Antigravity | Harness::Codex | Harness::OpenCode => None,
+            Harness::Antigravity
+            | Harness::Codex
+            | Harness::OpenCode
+            | Harness::Copilot
+            | Harness::Cursor => None,
         }
     }
 
@@ -753,7 +951,11 @@ impl Harness {
     pub fn session_system_in_first_turn(self) -> bool {
         match self {
             Harness::Antigravity => true,
-            Harness::Claude | Harness::Codex | Harness::OpenCode => false,
+            Harness::Claude
+            | Harness::Codex
+            | Harness::OpenCode
+            | Harness::Copilot
+            | Harness::Cursor => false,
         }
     }
 }
@@ -830,6 +1032,48 @@ pub fn constraint_from_help(h: Harness, help: &str) -> Constraint {
                 Constraint::Unknown
             }
         }
+        // **`--available-tools` is the seal, and it is an allowlist of the tool
+        // set the model is shown** — "Only these tools will be available to the
+        // model". Measured on 1.0.88: given `schemaic-list_schema,
+        // schemaic-run_query`, the tool list the CLI sent the model (reported in
+        // its own `session.usage_checkpoint`) was exactly those two, its
+        // `session.info` listed every built-in as disabled, and a turn told to
+        // read a file "using any tool you have" answered that it could not and
+        // named only the two. That is `Sealed` in the sense `claude --tools ""`
+        // is: nothing built-in left, rather than a sandbox around what is.
+        //
+        // **With a hazard the grade does not show and `copilot_available_tools`
+        // exists for**: the flag with an *empty* value fails open — measured,
+        // all 24 tools, `powershell`, `create` and `edit` among them.
+        //
+        // No `Restricted` fallback, unlike Claude's: without the flag there is
+        // no denylist to fall back on, so a binary that does not advertise it
+        // is refused.
+        Harness::Copilot => {
+            if crate::mentions_flag(help, "--available-tools") {
+                Constraint::Sealed
+            } else {
+                Constraint::Unknown
+            }
+        }
+        // **Never `Sealed`, and not a sandbox either.** What restricts Cursor
+        // is a permissions file Schemaic writes into its working directory
+        // (`cursor_permissions_json`), which `--help` cannot confirm — so, as
+        // OpenCode's arm does, this greps for a flag that is passed on every
+        // turn and that the rest of the mechanism was measured alongside.
+        // `--trust` is that flag: without it a headless run in a directory the
+        // CLI has not seen before exits at a trust prompt, so a build lacking
+        // it is not one whose behaviour here was measured. The rest of the
+        // grade is enforced where the file is written — `ai::start_ai_session`
+        // refuses the session if it cannot be, because a missing file fails
+        // *open* for writes.
+        Harness::Cursor => {
+            if crate::mentions_flag(help, "--trust") {
+                Constraint::Restricted
+            } else {
+                Constraint::Unknown
+            }
+        }
     }
 }
 
@@ -883,13 +1127,22 @@ pub struct TurnSpec {
     /// running degraded. It does **not** decide the [`Constraint`] grade — the
     /// sandbox does — exactly as Claude's grade turns only on `--tools`.
     pub isolate_config: bool,
+    /// The fully-qualified MCP tools this connection's access level offers
+    /// (`mcp__schemaic__run_query`), for a harness whose per-turn argv has to
+    /// name them.
+    ///
+    /// Copilot's today: its seal is an allowlist *on its own command line*, so
+    /// the list travels with every turn where Claude's `--allowedTools` is
+    /// given once at spawn and Codex's approvals ride in `mcp_overrides`.
+    pub allowed_tools: Vec<String>,
 }
 
 /// The argv for one turn on a non-persistent harness.
 ///
 /// Claude's is [`crate::build_session_args`]: it is spawned once per
-/// *conversation*, not per turn, and its prompt arrives later on stdin. These
-/// two are spawned per turn with the prompt in argv.
+/// *conversation*, not per turn, and its prompt arrives later on stdin. The
+/// harnesses built here are spawned per turn; where the prompt travels is
+/// [`Harness::prompt_on_stdin`]'s answer, not this function's.
 pub fn turn_args(h: Harness, spec: &TurnSpec) -> Vec<String> {
     // **Trimmed, because the field it comes from is free text the user can
     // clear.** Typing a space and closing the settings modal leaves `" "`, which
@@ -1043,7 +1296,241 @@ pub fn turn_args(h: Harness, spec: &TurnSpec) -> Vec<String> {
             a.push(prefixed_prompt(turn_system(spec), &spec.prompt));
             a
         }
+        Harness::Copilot => {
+            // **Every value is joined with `=`, and that is not style.**
+            // `--available-tools`, `--allow-tool` and their siblings are
+            // variadic (`[<tools>...]`) and `--resume` takes an optional value,
+            // so a space-separated value is one parse decision away from
+            // swallowing the flag after it. The `=` form binds exactly one.
+            let mut a: Vec<String> = vec![
+                "--output-format".into(),
+                "json".into(),
+                // On by default in this mode; named because the parser is built
+                // for deltas, and a default that moved would still decode —
+                // from the restating `assistant.message` — but only once each
+                // message was whole.
+                "--stream".into(),
+                "on".into(),
+                // The seal — see `copilot_available_tools` for why it is never
+                // empty.
+                copilot_available_tools(&spec.allowed_tools),
+                // The bundled GitHub server: network tools this assistant has
+                // no use for. Hidden by the allowlist anyway; not *started* is
+                // the stronger statement.
+                "--disable-builtin-mcps".into(),
+                // `AGENTS.md` and friends from the working directory. That
+                // directory is Schemaic's own and empty, so this is defence in
+                // depth, as Claude's `--setting-sources` is.
+                "--no-custom-instructions".into(),
+                // Run the build that was probed, not one downloaded mid-session
+                // whose flags nobody has read.
+                "--no-auto-update".into(),
+                // There is nobody to answer a question mid-turn.
+                "--no-ask-user".into(),
+            ];
+            if let Some(cfg) = spec.mcp_config.as_deref().filter(|c| !c.is_empty()) {
+                // A file rather than inline JSON: the argv is world-readable,
+                // and although this file holds only the endpoint file's *path*,
+                // one rule for every harness is easier to keep than a reason
+                // for each exception.
+                a.push(format!("--additional-mcp-config=@{cfg}"));
+                // **Approval, separate from visibility.** `--available-tools`
+                // decides what the model can see; this decides what runs
+                // without a prompt, and headless there is no prompt. It names
+                // the server, so it can only ever approve tools the allowlist
+                // above already let through. Measured: without it the call is
+                // not made; with it, `--allow-all-tools` — which the help calls
+                // "required for non-interactive mode" — is not needed.
+                a.push(format!("--allow-tool={MCP_SERVER}"));
+            }
+            if !model.is_empty() {
+                // Two entries, as every other harness passes it: `--model`
+                // takes exactly one value, so it has no swallowing to guard
+                // against.
+                a.push("--model".into());
+                a.push(model.to_string());
+            }
+            // No `--reasoning-effort`: see `effort_levels`, which is empty here,
+            // so `effort_arg` could never produce a level to send.
+            if let Some(id) = spec.resume.as_deref().filter(|s| !s.is_empty()) {
+                // `--resume`, not `--session-id`, though both continue a session
+                // (measured). `--session-id` also *creates* one when the id is
+                // unknown, so a session whose state had gone would silently
+                // restart with no memory — and `turn_system` has already dropped
+                // the schema outline for a resumed turn. A resume that fails is
+                // a turn that says so.
+                a.push(format!("--resume={id}"));
+            }
+            // The prompt is on stdin — `Harness::prompt_on_stdin`.
+            if !h.prompt_on_stdin() {
+                a.push(prefixed_prompt(turn_system(spec), &spec.prompt));
+            }
+            a
+        }
+        Harness::Cursor => {
+            let mut a: Vec<String> = vec![
+                // `-p` with no value: the prompt is on stdin.
+                "-p".into(),
+                "--output-format".into(),
+                "stream-json".into(),
+                // Deltas as they arrive, rather than each segment once it is
+                // whole. The parser handles both.
+                "--stream-partial-output".into(),
+                // The working directory is Schemaic's own and holds nothing but
+                // the two files that restrict and configure the session;
+                // trusting it grants nothing, and without it a headless run
+                // stops at a trust prompt and exits.
+                "--trust".into(),
+                // **A prompt, not a lever**, and passed as one. Ask mode tells
+                // the model it is read-only, which it mostly honours; told a
+                // tool still worked, it wrote a file anyway (measured). The
+                // permissions file is what refuses the write. This is what
+                // makes it rarely try.
+                "--mode".into(),
+                "ask".into(),
+            ];
+            if !model.is_empty() {
+                a.push("--model".into());
+                a.push(model.to_string());
+            }
+            // **Never `--approve-mcps`, `--force`, `--yolo` or
+            // `--auto-review`.** The first approves every MCP server in reach,
+            // plugins' included, where Schemaic approves its own by name; the
+            // rest approve tool calls the permissions file exists to refuse.
+            //
+            // `--resume` last: its value is optional, so nothing may follow it
+            // that could be read as the id. The measured form is the
+            // space-separated one.
+            if let Some(id) = spec.resume.as_deref().filter(|s| !s.is_empty()) {
+                a.push("--resume".into());
+                a.push(id.into());
+            }
+            if !h.prompt_on_stdin() {
+                a.push(prefixed_prompt(turn_system(spec), &spec.prompt));
+            }
+            a
+        }
     }
+}
+
+/// What Cursor's permissions file denies, whatever the access level.
+///
+/// `Write`, `Shell` and `WebFetch` are the rules measured to hold — writes,
+/// deletes and commands refused, including through a `Task` subagent, and
+/// winning over an allow in the user's own global config. `Read` and `Grep` are
+/// denied too and are **not** a seal: `Read(**)` refused the `Read` tool while
+/// `Grep` still returned a file's contents. They stay because they cost nothing
+/// and close the obvious route; the notice is written to the route they do not
+/// close.
+pub const CURSOR_DENY: &[&str] = &[
+    "Write(**)",
+    "Shell(*)",
+    "WebFetch(*)",
+    "Read(**)",
+    "Grep(**)",
+];
+
+/// The project `.cursor/cli.json` that restricts a Cursor session.
+///
+/// `allowed` is the connection's own list, the one every harness's access gate
+/// is built from, and each tool becomes `Mcp(schemaic:<tool>)` — the rule form
+/// the CLI itself builds, `Mcp(<server>:<tool>)`. **Allowing is required, not
+/// merely permitted**: measured, an MCP call with no allow rule is refused in a
+/// headless run ("User rejected MCP"). So a schema-only connection's model can
+/// see `run_query` in Cursor's catalogue and is refused when it calls it.
+///
+/// An empty `allowed` is an empty allow list — unlike Copilot's allowlist,
+/// Cursor's *allow* rules only approve, so nothing opens when there are none.
+pub fn cursor_permissions_json(allowed: &[String]) -> String {
+    let allow: Vec<String> = allowed
+        .iter()
+        .map(|t| format!("Mcp({MCP_SERVER}:{})", bare_tool_name(t)))
+        .collect();
+    serde_json::json!({
+        "permissions": {
+            "allow": allow,
+            "deny": CURSOR_DENY,
+        }
+    })
+    .to_string()
+}
+
+/// The project `.cursor/mcp.json` that gives a Cursor session our server.
+///
+/// By path, never the endpoint itself: the directory is reused across sessions,
+/// for the reason `copilot_mcp_config_json` gives. A project server still needs
+/// approval before it loads — `agent mcp enable schemaic`, whose record is keyed
+/// by a hash of this file's contents, so it is asked again whenever the endpoint
+/// path changes (measured: a changed path read "not loaded (needs approval)").
+pub fn cursor_mcp_config_json(exe: &str, endpoint_file: &str) -> String {
+    serde_json::json!({
+        "mcpServers": {
+            MCP_SERVER: {
+                "command": exe,
+                "args": ["--mcp-serve", "--endpoint-file", endpoint_file],
+            }
+        }
+    })
+    .to_string()
+}
+
+/// The `--available-tools` argument for a Copilot turn: the offered tools, in
+/// the `<server>-<tool>` form Copilot names MCP tools by.
+///
+/// **Never empty, because empty is not "no tools".** Measured on 1.0.88: the
+/// flag with no value — or with `=` and nothing after it — sent the model every
+/// tool it has, 24 of them, `powershell`, `create`, `edit` and `web_fetch`
+/// among them. An access level offering nothing, or a one-shot that should have
+/// no tools at all, would have opened the whole shell in the one place the list
+/// was supposed to be tightest.
+///
+/// So an empty list names [`COPILOT_NO_TOOLS`] instead — a tool no server
+/// provides. Measured, too: that allowlist resolved to **zero** tools.
+pub fn copilot_available_tools(allowed: &[String]) -> String {
+    let names: Vec<String> = allowed
+        .iter()
+        .map(|t| format!("{MCP_SERVER}-{}", bare_tool_name(t)))
+        .collect();
+    match names.is_empty() {
+        true => format!("--available-tools={COPILOT_NO_TOOLS}"),
+        false => format!("--available-tools={}", names.join(",")),
+    }
+}
+
+/// A Copilot tool name nothing provides, for an allowlist that must allow
+/// nothing — see [`copilot_available_tools`].
+///
+/// In our own server's namespace, so it can only ever collide with a tool
+/// Schemaic itself adds, and that is a name chosen here.
+pub const COPILOT_NO_TOOLS: &str = "schemaic-no_tools";
+
+/// The file `--additional-mcp-config=@…` names: our server, and only ours.
+///
+/// **It augments rather than replaces**, per its own help ("augments config from
+/// ~/.copilot/mcp-config.json for this session"), which is why the session also
+/// runs under a `COPILOT_HOME` of Schemaic's own — see [`Harness::env_seal`].
+/// This file is what puts our server in; the home directory is what keeps
+/// everyone else's out.
+///
+/// The endpoint is not here, for the reason it is not in Codex's `-c` override:
+/// the file lives in a directory reused across sessions, and it carries only the
+/// *path* of the per-session endpoint file.
+///
+/// `"tools": ["*"]` is the server's own filter and is left open: the allowlist
+/// on the command line is the one that was measured to hold, and a second list
+/// here would be a second place for the access level to disagree with itself.
+pub fn copilot_mcp_config_json(exe: &str, endpoint_file: &str) -> String {
+    serde_json::json!({
+        "mcpServers": {
+            MCP_SERVER: {
+                "type": "local",
+                "command": exe,
+                "args": ["--mcp-serve", "--endpoint-file", endpoint_file],
+                "tools": ["*"],
+            }
+        }
+    })
+    .to_string()
 }
 
 /// The argv for a **persistent** session — one process for the whole
@@ -1108,7 +1595,7 @@ pub fn session_args(
             }
             a
         }
-        Harness::Codex | Harness::OpenCode => Vec::new(),
+        Harness::Codex | Harness::OpenCode | Harness::Copilot | Harness::Cursor => Vec::new(),
     }
 }
 
@@ -1276,8 +1763,8 @@ pub struct InlineSpec {
     pub seal: crate::CliSeal,
     /// Pass Codex's `--ignore-user-config`, when the probe saw it.
     pub isolate_config: bool,
-    /// Where Codex should write its last message. Ignored by the three
-    /// harnesses whose [`inline_output`] is [`InlineOutput::Stdout`].
+    /// Where Codex should write its last message. Ignored by every harness
+    /// whose [`inline_output`] is [`InlineOutput::Stdout`].
     pub last_message: String,
 }
 
@@ -1285,7 +1772,15 @@ pub struct InlineSpec {
 pub fn inline_output(h: Harness) -> InlineOutput {
     match h {
         Harness::Codex => InlineOutput::LastMessageFile,
-        Harness::Claude | Harness::Antigravity | Harness::OpenCode => InlineOutput::Stdout,
+        // Copilot's `-s` is "output only the agent response (no stats)", and
+        // measured it is exactly that: one line of SQL and nothing else.
+        // Cursor's `--output-format text` is the answer alone (measured: a
+        // fenced SQL block, which `extract_sql` unwraps).
+        Harness::Claude
+        | Harness::Antigravity
+        | Harness::OpenCode
+        | Harness::Copilot
+        | Harness::Cursor => InlineOutput::Stdout,
     }
 }
 
@@ -1301,8 +1796,8 @@ pub fn inline_output(h: Harness) -> InlineOutput {
 /// (`no_inline_generation_is_given_a_server_or_a_session`).
 ///
 /// **Claude's is [`crate::inline_args`], unchanged.** It was the only one of
-/// these for as long as the other three spawned Claude regardless of the
-/// picker; it is now one arm of four rather than the path all of them took.
+/// these for as long as the other harnesses spawned Claude regardless of the
+/// picker; it is now one arm among them rather than the path all of them took.
 pub fn inline_argv(h: Harness, spec: &InlineSpec) -> Vec<String> {
     // Trimmed for the reason `turn_args` trims: the field is free text the user
     // can clear, and `--model " "` dies as an unknown model under "couldn't
@@ -1420,6 +1915,54 @@ pub fn inline_argv(h: Harness, spec: &InlineSpec) -> Vec<String> {
                 a.push(effort.to_string());
             }
             a.push(prefixed_prompt(&spec.system, &spec.intent));
+            a
+        }
+        Harness::Copilot => {
+            let mut a: Vec<String> = vec![
+                // The reply alone on stdout — see `inline_output`.
+                "-s".into(),
+                // `text` is the default and is named for Antigravity's reason:
+                // the session path asks this binary for `json`.
+                "--output-format".into(),
+                "text".into(),
+                "--no-color".into(),
+                // **An allowlist that allows nothing** — not an absent one. See
+                // `copilot_available_tools`: the empty form is every tool.
+                copilot_available_tools(&[]),
+                "--disable-builtin-mcps".into(),
+                "--no-custom-instructions".into(),
+                "--no-auto-update".into(),
+                "--no-ask-user".into(),
+            ];
+            if !model.is_empty() {
+                a.push("--model".into());
+                a.push(model.to_string());
+            }
+            // No effort, for `effort_levels`' reason; the prompt is on stdin.
+            if !h.prompt_on_stdin() {
+                a.push(prefixed_prompt(&spec.system, &spec.intent));
+            }
+            a
+        }
+        // The session's argv without the stream: `text`, no resume. Its
+        // restriction is the permissions file in the one-shot's own working
+        // directory, which allows nothing and configures no server.
+        Harness::Cursor => {
+            let mut a: Vec<String> = vec![
+                "-p".into(),
+                "--output-format".into(),
+                "text".into(),
+                "--trust".into(),
+                "--mode".into(),
+                "ask".into(),
+            ];
+            if !model.is_empty() {
+                a.push("--model".into());
+                a.push(model.to_string());
+            }
+            if !h.prompt_on_stdin() {
+                a.push(prefixed_prompt(&spec.system, &spec.intent));
+            }
             a
         }
     }
@@ -1880,18 +2423,23 @@ mod tests {
             Harness::Codex => "Usage: codex\n  --sandbox <s>\n  --help\n",
             Harness::Antigravity => "Usage: agy\n  --sandbox\n  --help\n",
             Harness::OpenCode => "Usage: opencode\n  --pure\n  --help\n",
+            Harness::Copilot => "Usage: copilot\n  --available-tools [<tools>...]\n  --help\n",
+            Harness::Cursor => "Usage: agent\n  --trust\n  --help\n",
         };
         for h in Harness::ALL {
             let got = constraint_from_help(h, best(h));
             let want = match h {
-                // Empties the built-in set: `--tools ""` and an agent whose
-                // `tools` map is all false.
-                Harness::Claude | Harness::OpenCode => Constraint::Sealed,
+                // Empties the built-in set: `--tools ""`, an agent whose
+                // `tools` map is all false, and an allowlist naming only ours.
+                Harness::Claude | Harness::OpenCode | Harness::Copilot => Constraint::Sealed,
                 // A sandbox blocks side effects and leaves the readers live.
                 // There is no flag on either that empties the tool set, so
                 // neither can ever be `Sealed` — the claim this test exists to
                 // hold.
                 Harness::Codex | Harness::Antigravity => Constraint::Restricted,
+                // Rules in a file refuse the writers and leave the readers
+                // live — `Grep` read through a `Read(**)` deny. Never `Sealed`.
+                Harness::Cursor => Constraint::Restricted,
             };
             assert_eq!(got, want, "{h:?}");
         }
@@ -3217,6 +3765,507 @@ Options:
 }
 
 #[cfg(test)]
+mod copilot_tests {
+    use super::*;
+
+    const LIST: &str = "mcp__schemaic__list_schema";
+    const QUERY: &str = "mcp__schemaic__run_query";
+
+    fn spec() -> TurnSpec {
+        TurnSpec {
+            prompt: "count rows".into(),
+            system: "tables: users(id)".into(),
+            mcp_config: Some(r"C:\cfg\copilot\schemaic-mcp.json".into()),
+            allowed_tools: vec![LIST.into(), QUERY.into()],
+            ..Default::default()
+        }
+    }
+
+    fn args_of(s: &TurnSpec) -> Vec<String> {
+        turn_args(Harness::Copilot, s)
+    }
+
+    /// The value of a `--flag=value` argument, which is the only form the
+    /// variadic ones may take.
+    fn eq_value(args: &[String], flag: &str) -> Option<String> {
+        let p = format!("{flag}=");
+        args.iter()
+            .find_map(|a| a.strip_prefix(&p).map(|v| v.to_string()))
+    }
+
+    /// **The measured fail-open, pinned.** `--available-tools` with no value —
+    /// or with `=` and nothing after it — handed the model all 24 of Copilot's
+    /// tools, `powershell` among them. An access level that offers nothing is
+    /// exactly when the list is empty, so the empty case must still name
+    /// something, and that something must be a tool nothing provides.
+    #[test]
+    fn an_empty_allowlist_is_never_an_empty_flag() {
+        let a = copilot_available_tools(&[]);
+        assert_eq!(a, format!("--available-tools={COPILOT_NO_TOOLS}"));
+        assert_ne!(a, "--available-tools");
+        assert_ne!(a, "--available-tools=");
+        // …through the argv builders too, which is where it would have to hold.
+        let mut s = spec();
+        s.allowed_tools.clear();
+        assert_eq!(
+            eq_value(&args_of(&s), "--available-tools").as_deref(),
+            Some(COPILOT_NO_TOOLS)
+        );
+        let inline = inline_argv(
+            Harness::Copilot,
+            &InlineSpec {
+                intent: "x".into(),
+                system: String::new(),
+                model: String::new(),
+                effort: String::new(),
+                seal: crate::CliSeal::ALL,
+                isolate_config: false,
+                last_message: String::new(),
+            },
+        );
+        assert_eq!(
+            eq_value(&inline, "--available-tools").as_deref(),
+            Some(COPILOT_NO_TOOLS)
+        );
+        // No bare `--available-tools` anywhere, on either path.
+        for a in args_of(&s).iter().chain(inline.iter()) {
+            assert_ne!(a, "--available-tools", "{a}");
+        }
+    }
+
+    #[test]
+    fn the_allowlist_names_our_tools_the_way_copilot_does_and_follows_the_access_level() {
+        assert_eq!(
+            eq_value(&args_of(&spec()), "--available-tools").as_deref(),
+            Some("schemaic-list_schema,schemaic-run_query")
+        );
+        // A schema-only connection is not offered `run_query`, so the model
+        // never sees it — the allowlist is visibility, not just approval.
+        let mut s = spec();
+        s.allowed_tools = vec![LIST.into()];
+        let v = eq_value(&args_of(&s), "--available-tools").expect("allowlist");
+        assert_eq!(v, "schemaic-list_schema");
+        assert!(!v.contains("run_query"), "{v}");
+    }
+
+    /// Variadic flags take one value only in the `=` form; a space-separated
+    /// value is one parse decision from swallowing the next argument.
+    #[test]
+    fn every_variadic_value_is_bound_with_an_equals_sign() {
+        let mut s = spec();
+        s.resume = Some("04765e2f".into());
+        let a = args_of(&s);
+        for flag in [
+            "--available-tools",
+            "--allow-tool",
+            "--additional-mcp-config",
+            "--resume",
+        ] {
+            assert!(
+                !a.contains(&flag.to_string()),
+                "{flag} stands alone in {a:?}"
+            );
+            assert!(eq_value(&a, flag).is_some(), "{flag} missing from {a:?}");
+        }
+    }
+
+    #[test]
+    fn our_server_is_configured_by_file_and_approved_by_name() {
+        let a = args_of(&spec());
+        assert_eq!(
+            eq_value(&a, "--additional-mcp-config").as_deref(),
+            Some(r"@C:\cfg\copilot\schemaic-mcp.json")
+        );
+        assert_eq!(eq_value(&a, "--allow-tool").as_deref(), Some(MCP_SERVER));
+        assert!(a.contains(&"--disable-builtin-mcps".to_string()), "{a:?}");
+        // No config, no server to approve: an approval naming a server that is
+        // not there would be a grant waiting for whatever takes the name.
+        let mut s = spec();
+        s.mcp_config = None;
+        let a = args_of(&s);
+        assert_eq!(eq_value(&a, "--additional-mcp-config"), None);
+        assert_eq!(eq_value(&a, "--allow-tool"), None);
+    }
+
+    #[test]
+    fn nothing_that_widens_the_seal_is_ever_passed() {
+        let mut s = spec();
+        s.model = "auto".into();
+        s.resume = Some("x".into());
+        let inline = inline_argv(
+            Harness::Copilot,
+            &InlineSpec {
+                intent: "x".into(),
+                system: String::new(),
+                model: "auto".into(),
+                effort: "high".into(),
+                seal: crate::CliSeal::ALL,
+                isolate_config: true,
+                last_message: String::new(),
+            },
+        );
+        for a in args_of(&s).iter().chain(inline.iter()) {
+            for bad in [
+                "--allow-all-tools",
+                "--allow-all",
+                "--yolo",
+                "--allow-all-paths",
+                "--allow-all-urls",
+                "--autopilot",
+                "--excluded-tools",
+                "--enable-all-github-mcp-tools",
+                "--allow-all-mcp-server-instructions",
+            ] {
+                assert!(
+                    a != bad && !a.starts_with(&format!("{bad}=")),
+                    "{bad} in {a}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_resumed_turn_resumes_and_drops_the_outline() {
+        let mut s = spec();
+        s.resume = Some("04765e2f-d530".into());
+        let a = args_of(&s);
+        // `--resume`, not `--session-id`, which would silently start a new,
+        // context-free session when the id is unknown.
+        assert_eq!(eq_value(&a, "--resume").as_deref(), Some("04765e2f-d530"));
+        assert_eq!(eq_value(&a, "--session-id"), None);
+        let payload = Harness::Copilot.turn_stdin_prompt(&s).expect("stdin");
+        assert_eq!(payload, "count rows");
+        // The first turn carries it.
+        let first = Harness::Copilot.turn_stdin_prompt(&spec()).expect("stdin");
+        assert!(first.starts_with("tables: users(id)"), "{first}");
+        // An empty id is no resume at all.
+        let mut s = spec();
+        s.resume = Some(String::new());
+        assert_eq!(eq_value(&args_of(&s), "--resume"), None);
+    }
+
+    #[test]
+    fn the_prompt_never_reaches_the_command_line() {
+        // Piped stdin *is* the prompt (measured), and `-p` would put it in argv:
+        // world-readable, and refused through npm's `copilot.cmd` shim.
+        let a = args_of(&spec());
+        assert!(!a.iter().any(|x| x.contains("count rows")), "{a:?}");
+        assert!(!a.contains(&"-p".to_string()), "{a:?}");
+        assert!(!a.contains(&"--prompt".to_string()), "{a:?}");
+    }
+
+    #[test]
+    fn a_turn_asks_for_the_json_stream_and_a_one_shot_for_the_answer_alone() {
+        let a = args_of(&spec());
+        let i = a
+            .iter()
+            .position(|x| x == "--output-format")
+            .expect("format");
+        assert_eq!(a[i + 1], "json");
+        let inline = inline_argv(
+            Harness::Copilot,
+            &InlineSpec {
+                intent: "x".into(),
+                system: String::new(),
+                model: String::new(),
+                effort: String::new(),
+                seal: crate::CliSeal::ALL,
+                isolate_config: false,
+                last_message: String::new(),
+            },
+        );
+        assert!(inline.contains(&"-s".to_string()), "{inline:?}");
+        let i = inline
+            .iter()
+            .position(|x| x == "--output-format")
+            .expect("format");
+        assert_eq!(inline[i + 1], "text");
+        assert_eq!(inline_output(Harness::Copilot), InlineOutput::Stdout);
+    }
+
+    #[test]
+    fn the_grade_is_read_off_the_flag_the_seal_is() {
+        // Rows copied from `copilot --help` (1.0.88), with enough around them
+        // for `looks_like_help`.
+        let help = "\
+Usage: copilot [OPTIONS] [COMMAND]
+
+Options:
+      --model <model>
+          Set the AI model to use (use 'auto' to let Copilot pick
+          automatically)
+      --available-tools [<tools>...]
+          Only these tools will be available to the model
+  -h, --help
+          Print help
+";
+        assert_eq!(
+            constraint_from_help(Harness::Copilot, help),
+            Constraint::Sealed
+        );
+        // Without it there is no denylist to fall back on: refused, not
+        // downgraded.
+        let older = help.replace("--available-tools", "--excluded-tools");
+        assert_eq!(
+            constraint_from_help(Harness::Copilot, &older),
+            Constraint::Unknown
+        );
+    }
+
+    #[test]
+    fn the_capability_answers_match_what_was_measured() {
+        let h = Harness::Copilot;
+        assert!(!h.is_persistent());
+        assert!(h.supports_resume());
+        assert!(h.streams_deltas());
+        assert!(h.prompt_on_stdin());
+        assert!(h.env_seal());
+        assert!(h.isolates_mcp_servers());
+        assert!(!h.restricted_means_sandbox());
+        // The flag exists and the default model refuses it.
+        assert!(!h.supports_effort());
+        assert_eq!(h.suggested_models(), &["auto"]);
+        assert_eq!(Harness::from_key("copilot"), Some(h));
+    }
+
+    #[test]
+    fn the_mcp_config_names_our_server_by_path_and_nothing_else() {
+        let v: serde_json::Value = serde_json::from_str(&copilot_mcp_config_json(
+            r"C:\Program Files\schemaic\schemaic.exe",
+            r"C:\tmp\schemaic-mcp-ep-abc.json",
+        ))
+        .expect("json");
+        let servers = v["mcpServers"].as_object().expect("servers");
+        assert_eq!(servers.keys().collect::<Vec<_>>(), vec![MCP_SERVER]);
+        let s = &servers[MCP_SERVER];
+        assert_eq!(s["command"], r"C:\Program Files\schemaic\schemaic.exe");
+        assert_eq!(
+            s["args"],
+            serde_json::json!([
+                "--mcp-serve",
+                "--endpoint-file",
+                r"C:\tmp\schemaic-mcp-ep-abc.json"
+            ])
+        );
+        // The path, never the blob: this file lives in a reused directory.
+        assert!(s.get("env").is_none(), "{s}");
+    }
+}
+
+#[cfg(test)]
+mod cursor_tests {
+    use super::*;
+
+    fn spec() -> TurnSpec {
+        TurnSpec {
+            prompt: "count rows".into(),
+            system: "tables: users(id)".into(),
+            ..Default::default()
+        }
+    }
+
+    fn args_of(s: &TurnSpec) -> Vec<String> {
+        turn_args(Harness::Cursor, s)
+    }
+
+    fn inline() -> Vec<String> {
+        inline_argv(
+            Harness::Cursor,
+            &InlineSpec {
+                intent: "x".into(),
+                system: String::new(),
+                model: "auto".into(),
+                effort: "high".into(),
+                seal: crate::CliSeal::ALL,
+                isolate_config: true,
+                last_message: String::new(),
+            },
+        )
+    }
+
+    fn perms(allowed: &[&str]) -> serde_json::Value {
+        let allowed: Vec<String> = allowed.iter().map(|s| s.to_string()).collect();
+        serde_json::from_str(&cursor_permissions_json(&allowed)).expect("json")
+    }
+
+    #[test]
+    fn a_turn_asks_for_the_stream_in_a_trusted_directory() {
+        let a = args_of(&spec());
+        assert_eq!(a[0], "-p", "{a:?}");
+        let i = a
+            .iter()
+            .position(|x| x == "--output-format")
+            .expect("format");
+        assert_eq!(a[i + 1], "stream-json");
+        for flag in ["--stream-partial-output", "--trust"] {
+            assert!(a.contains(&flag.to_string()), "{flag} missing: {a:?}");
+        }
+        let i = a.iter().position(|x| x == "--mode").expect("mode");
+        assert_eq!(a[i + 1], "ask");
+    }
+
+    /// The prompt is on stdin, and `-p` must not take the next flag as it:
+    /// `-p` is followed by a flag, never by text.
+    #[test]
+    fn the_prompt_never_reaches_the_command_line() {
+        let a = args_of(&spec());
+        assert!(!a.iter().any(|x| x.contains("count rows")), "{a:?}");
+        assert!(a[1].starts_with("--"), "{a:?}");
+        let piped = Harness::Cursor.turn_stdin_prompt(&spec()).expect("stdin");
+        assert!(piped.starts_with("tables: users(id)"), "{piped}");
+        assert!(piped.ends_with("count rows"), "{piped}");
+    }
+
+    #[test]
+    fn a_resumed_turn_names_its_chat_last_and_drops_the_outline() {
+        let mut s = spec();
+        s.resume = Some("470de677".into());
+        let a = args_of(&s);
+        assert_eq!(
+            &a[a.len() - 2..],
+            &["--resume".to_string(), "470de677".to_string()]
+        );
+        assert_eq!(
+            Harness::Cursor.turn_stdin_prompt(&s).as_deref(),
+            Some("count rows")
+        );
+        s.resume = Some(String::new());
+        assert!(!args_of(&s).contains(&"--resume".to_string()));
+    }
+
+    #[test]
+    fn nothing_that_approves_what_the_rules_refuse_is_ever_passed() {
+        let mut s = spec();
+        s.model = "auto".into();
+        s.resume = Some("x".into());
+        for a in args_of(&s).iter().chain(inline().iter()) {
+            for bad in [
+                "--approve-mcps",
+                "--force",
+                "-f",
+                "--yolo",
+                "--auto-review",
+                "--sandbox",
+            ] {
+                assert_ne!(a, bad, "{bad} passed");
+            }
+        }
+    }
+
+    /// Each allowed tool becomes a rule in the CLI's own form, and the access
+    /// level decides which: an MCP call with no allow rule is refused headless.
+    #[test]
+    fn the_rules_allow_exactly_the_connection_s_tools() {
+        let v = perms(&["mcp__schemaic__list_schema", "mcp__schemaic__run_query"]);
+        assert_eq!(
+            v["permissions"]["allow"],
+            serde_json::json!(["Mcp(schemaic:list_schema)", "Mcp(schemaic:run_query)"])
+        );
+        let v = perms(&["mcp__schemaic__list_schema"]);
+        assert!(!v.to_string().contains("run_query"), "{v}");
+        // Nothing offered is nothing allowed, not "no rule".
+        assert_eq!(perms(&[])["permissions"]["allow"], serde_json::json!([]));
+    }
+
+    /// **The writers are denied at every access level**, and those are the
+    /// three rules measured to hold. A missing deny is not a narrower session:
+    /// with no rule, a headless turn wrote a file unprompted.
+    #[test]
+    fn the_rules_deny_the_writers_whatever_is_allowed() {
+        for allowed in [&[][..], &["mcp__schemaic__run_query"][..]] {
+            let deny = perms(allowed)["permissions"]["deny"].clone();
+            for must in ["Write(**)", "Shell(*)", "WebFetch(*)"] {
+                assert!(
+                    deny.as_array().is_some_and(|d| d.iter().any(|x| x == must)),
+                    "{must} not denied: {deny}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_server_is_configured_by_path_and_nothing_else() {
+        let v: serde_json::Value = serde_json::from_str(&cursor_mcp_config_json(
+            r"C:\Program Files\schemaic\schemaic.exe",
+            r"C:\tmp\schemaic-mcp-ep-abc.json",
+        ))
+        .expect("json");
+        let servers = v["mcpServers"].as_object().expect("servers");
+        assert_eq!(servers.keys().collect::<Vec<_>>(), vec![MCP_SERVER]);
+        assert_eq!(
+            servers[MCP_SERVER]["args"],
+            serde_json::json!([
+                "--mcp-serve",
+                "--endpoint-file",
+                r"C:\tmp\schemaic-mcp-ep-abc.json"
+            ])
+        );
+        assert!(servers[MCP_SERVER].get("env").is_none());
+    }
+
+    #[test]
+    fn the_grade_is_restricted_at_best_and_read_off_trust() {
+        // Rows copied from `agent --help` (2026.09.23).
+        let help = "\
+Usage: agent [options] [command] [prompt...]
+
+Options:
+  -p, --print                 Print responses to console (for scripts or
+                              non-interactive use).
+  --model <model>             Model to use (e.g., gpt-5, sonnet-4-thinking).
+  --trust                     Trust the current workspace without prompting
+                              (default: false)
+  -h, --help                  Display help for command
+";
+        assert_eq!(
+            constraint_from_help(Harness::Cursor, help),
+            Constraint::Restricted
+        );
+        assert_eq!(
+            constraint_from_help(Harness::Cursor, &help.replace("--trust", "--trusty-no")),
+            Constraint::Unknown
+        );
+    }
+
+    #[test]
+    fn a_one_shot_asks_for_text_and_carries_no_session() {
+        let a = inline();
+        let i = a
+            .iter()
+            .position(|x| x == "--output-format")
+            .expect("format");
+        assert_eq!(a[i + 1], "text");
+        assert!(a.contains(&"--trust".to_string()), "{a:?}");
+        assert!(!a.contains(&"--resume".to_string()), "{a:?}");
+        assert_eq!(inline_output(Harness::Cursor), InlineOutput::Stdout);
+    }
+
+    #[test]
+    fn the_capability_answers_match_what_was_measured() {
+        let h = Harness::Cursor;
+        assert!(!h.is_persistent());
+        assert!(h.supports_resume());
+        assert!(h.streams_deltas());
+        assert!(h.prompt_on_stdin());
+        assert!(h.restricts_by_workspace_rules());
+        assert!(!h.isolates_mcp_servers());
+        assert!(!h.restricted_means_sandbox());
+        assert!(!h.env_seal());
+        assert!(!h.supports_effort());
+        assert_eq!(h.bin(), "cursor-agent");
+        assert_eq!(Harness::from_key("cursor"), Some(h));
+        // The only harness restricted by a rules file.
+        for other in Harness::ALL {
+            assert_eq!(
+                other.restricts_by_workspace_rules(),
+                other == h,
+                "{other:?}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
 mod speaker_label_tests {
     use super::*;
 
@@ -3239,8 +4288,14 @@ mod speaker_label_tests {
         // a second gratuitous difference fails here.
         assert_eq!(Harness::Claude.label(), "Claude Code");
         assert_eq!(Harness::Claude.speaker_name(), "Claude");
+        // The second, and just as deliberate: the settings box names the
+        // product a user installs — *GitHub* Copilot, not some other Copilot —
+        // and a header reading "GITHUB COPILOT" over every answer reads as a
+        // heading rather than a speaker.
+        assert_eq!(Harness::Copilot.label(), "GitHub Copilot");
+        assert_eq!(Harness::Copilot.speaker_name(), "Copilot");
         for h in Harness::ALL {
-            if h == Harness::Claude {
+            if matches!(h, Harness::Claude | Harness::Copilot) {
                 continue;
             }
             assert_eq!(h.speaker_name(), h.label(), "{h:?}");
@@ -3448,10 +4503,30 @@ Options:
                 // Seals by configuration or not at all. No sandbox to promise,
                 // and no CLI update that would help.
                 Harness::OpenCode => (false, false, false),
+                // Seals by `--available-tools` or grades `Unknown`; never
+                // reaches this grade, and is worded to promise nothing if it
+                // ever does.
+                Harness::Copilot => (false, false, false),
+                // Rules in a file: no sandbox to promise, no update that
+                // would help, and the user's own servers start with it.
+                Harness::Cursor => (false, false, true),
             };
             assert_eq!(says_sandbox, want_sandbox, "{h:?}: {notice}");
             assert_eq!(says_update, want_update, "{h:?}: {notice}");
             assert_eq!(says_other_servers, want_other_servers, "{h:?}: {notice}");
+            // **And the mechanism named is the one that holds.** A rules-file
+            // harness says it is a permissions file and not a sandbox, and that
+            // its readers are live — the part no rule closed.
+            let says_rules =
+                notice.contains("permissions file") && notice.contains("not by a sandbox");
+            assert_eq!(
+                says_rules,
+                h.restricts_by_workspace_rules(),
+                "{h:?}: {notice}"
+            );
+            if says_rules {
+                assert!(notice.contains("can still read files"), "{h:?}: {notice}");
+            }
             // Whatever it says, it names itself and no one else.
             assert!(notice.contains(h.label()), "{h:?}: {notice}");
             for other in Harness::ALL {
@@ -3479,16 +4554,27 @@ Options:
                     "{h:?} promises more than the sandbox covers: {notice}"
                 );
             }
+            // The phrase both wordings share: Antigravity's says Schemaic cannot
+            // restrict those servers, Cursor's says they start and their tools
+            // are refused unless the user's settings allow them — different
+            // facts, measured on each, and the same admission that they are in.
             assert_eq!(
-                notice.contains("Schemaic cannot restrict them"),
+                notice.contains("MCP servers you have registered"),
                 !h.isolates_mcp_servers(),
                 "{h:?}: {notice}"
             );
         }
         // And the capability itself is the measured one, spelled out rather than
         // read back off the notice.
-        assert!(!Harness::Antigravity.isolates_mcp_servers());
-        for h in [Harness::Claude, Harness::Codex, Harness::OpenCode] {
+        for h in [Harness::Antigravity, Harness::Cursor] {
+            assert!(!h.isolates_mcp_servers(), "{h:?}");
+        }
+        for h in [
+            Harness::Claude,
+            Harness::Codex,
+            Harness::OpenCode,
+            Harness::Copilot,
+        ] {
             assert!(h.isolates_mcp_servers(), "{h:?}");
         }
     }
@@ -3778,7 +4864,22 @@ mod inline_tests {
                         "{a:?}"
                     )
                 }
-                _ => assert_eq!(flag_value(&a, "--effort").as_deref(), Some("high"), "{a:?}"),
+                // Has a flag and does not offer it: the default model refuses
+                // it and kills the turn. See `effort_levels`.
+                Harness::Copilot => assert!(
+                    !a.iter().any(|x| x.starts_with("--reasoning-effort")),
+                    "Copilot was sent an effort its default model refuses: {a:?}"
+                ),
+                // Effort is part of the model id here; there is no flag.
+                Harness::Cursor => assert!(
+                    !a.iter().any(|x| x.contains("effort")),
+                    "Cursor was sent an effort flag it does not have: {a:?}"
+                ),
+                // Named rather than `_`: a wildcard here sorted a new harness
+                // onto the `--effort` side without anyone deciding it.
+                Harness::Claude | Harness::Antigravity => {
+                    assert_eq!(flag_value(&a, "--effort").as_deref(), Some("high"), "{a:?}")
+                }
             }
         }
     }

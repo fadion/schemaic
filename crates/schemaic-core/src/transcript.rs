@@ -288,10 +288,11 @@ impl ChatMessage {
                 // length because the strings only ever *grow*; a harness key is
                 // swapped whole, so two keys of equal length would fingerprint
                 // identically and the bubble would keep its old speaker name —
-                // the exact bug this field exists to fix. Today's four keys have
-                // distinct lengths, which is luck, not a design: a fifth named
-                // `crush` or `cline` collides with `codex` on length alone.
-                // Keys are a handful of bytes; this costs nothing.
+                // the exact bug this field exists to fix. It stopped being
+                // hypothetical with the sixth harness: `cursor` and `claude` are
+                // both six bytes, so a length-only fold would keep "CLAUDE" over
+                // a Cursor answer. Keys are a handful of bytes; this costs
+                // nothing.
                 for b in h.as_bytes() {
                     mix(*b as u64);
                 }
@@ -985,10 +986,11 @@ mod tests {
         );
     }
 
-    /// **"The bytes, not just the length" cannot be tested with real keys**, and
-    /// that is the whole reason this test exists separately: `claude`, `codex`,
-    /// `antigravity` and `opencode` are 6, 5, 11 and 8 bytes, so any test
-    /// written against today's four passes with a length-only fold. The property
+    /// **"The bytes, not just the length"**, which for four harnesses could not be
+    /// tested with real keys — `claude`, `codex`, `antigravity` and `opencode`
+    /// are 6, 5, 11 and 8 bytes, so a test written against them passed with a
+    /// length-only fold. `cursor` is 6 bytes, so the shipped pair is now tested
+    /// first; the synthetic ones stay for the next harness. The property
     /// the field's own fifteen-line comment defends needs keys that collide on
     /// length — a fifth harness named `crush` or `cline` is exactly that against
     /// `codex`, and the bug it would produce is a bubble keeping the previous
@@ -1000,7 +1002,10 @@ mod tests {
             m.harness = Some(key.to_string());
             m.fingerprint()
         };
-        // Synthetic on purpose: no pair among the shipped four is equal-length.
+        // **The shipped pair**: `claude` and `cursor` are both six bytes.
+        assert_eq!("claude".len(), "cursor".len());
+        assert_ne!(with("claude"), with("cursor"), "claude and cursor collided");
+        // And synthetic ones, for the next harness.
         assert_eq!("codex".len(), "crush".len());
         assert_ne!(with("codex"), with("crush"), "equal-length keys collided");
         assert_ne!(with("codex"), with("cline"));

@@ -15,6 +15,8 @@ mod agent_cli;
 mod ai;
 mod antigravity;
 mod conn_sources;
+mod copilot;
+mod cursor;
 mod dump;
 mod heap;
 mod history_store;
@@ -157,8 +159,10 @@ fn main() -> std::process::ExitCode {
     // `$SCHEMAIC_MCP_ENDPOINT`, which is what a harness configured by a file we
     // write sets for us (Claude); or read from the path given as
     // `--endpoint-file`, for Codex, whose only configuration lever is `-c`
-    // overrides and those *are* argv, and for Antigravity, whose `agy mcp add`
-    // takes the child's argv the same way. The path is not a credential; what it
+    // overrides and those *are* argv, for Antigravity, whose `agy mcp add`
+    // takes the child's argv the same way, and for OpenCode, Copilot and
+    // Cursor, whose config files live in directories reused across sessions and
+    // so may hold a path but never the endpoint. The path is not a credential; what it
     // points at is, which is the whole reason it is not inlined. No credential
     // URL is involved either way.
     if std::env::args().any(|a| a == "--mcp-serve") {
@@ -2230,6 +2234,11 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             // forever. Same thread, because both shell out or walk the disk and
             // neither is wanted on the UI thread.
             opencode::sweep();
+            // Copilot's homes are rooted the same way and collected the same way.
+            copilot::sweep();
+            // Cursor's workspaces too — and, like Antigravity's registration,
+            // what the CLI kept about them in the user's own `~/.cursor`.
+            cursor::sweep();
         });
     }
     // **A path override belongs to the harness it was typed for.** `ai_cli_path`
