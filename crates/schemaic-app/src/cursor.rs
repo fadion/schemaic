@@ -156,27 +156,71 @@ pub(crate) fn approve(launch: &crate::agent_cli::Launch, workspace: &Path) -> Re
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
     let mut child = c.spawn().map_err(|e| e.to_string())?;
+    // **Both pipes drained while it runs**, each on its own thread. A child
+    // writes into a pipe only as far as the OS buffer, then blocks until
+    // someone reads — and this loop used to read nothing until the child had
+    // exited, which a child blocked on a full pipe never does: a chatty
+    // failure hung to the timeout and its message, the one
+    // `cli_failure_message` is called to show, was thrown away.
+    let drain = |pipe: Option<Box<dyn std::io::Read + Send>>| {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            if let Some(mut p) = pipe {
+                let _ = p.read_to_end(&mut buf);
+            }
+            let _ = tx.send(buf);
+        });
+        rx
+    };
+    let out = drain(child.stdout.take().map(|p| Box::new(p) as _));
+    let err = drain(child.stderr.take().map(|p| Box::new(p) as _));
     let started = std::time::Instant::now();
-    loop {
+    let status = loop {
         match child.try_wait() {
-            Ok(Some(_)) => break,
+            Ok(Some(s)) => break Some(s),
             Ok(None) if started.elapsed() > APPROVE_TIMEOUT => {
                 let _ = child.kill();
                 let _ = child.wait();
-                return Err("`mcp enable` did not finish".to_string());
+                break None;
             }
             Ok(None) => std::thread::sleep(std::time::Duration::from_millis(50)),
             Err(e) => return Err(e.to_string()),
         }
-    }
-    let out = child.wait_with_output().map_err(|e| e.to_string())?;
-    match out.status.success() {
-        true => Ok(()),
-        false => Err(schemaic_ai::cli_failure_message(
+    };
+    // After the exit, so both reach end-of-file — unless a grandchild (the
+    // `.cmd` fallback's node) still holds the write end, which a bounded wait
+    // does not let hold the session; the reader thread then ends with it.
+    let text = |rx: std::sync::mpsc::Receiver<Vec<u8>>| {
+        rx.recv_timeout(std::time::Duration::from_secs(2))
+            .map(|b| String::from_utf8_lossy(&b).into_owned())
+            .unwrap_or_default()
+    };
+    let (stdout, stderr) = match status {
+        Some(_) => (text(out), text(err)),
+        None => (String::new(), String::new()),
+    };
+    approve_verdict(status.map(|s| (s.success(), s.code())), &stdout, &stderr)
+}
+
+/// What [`approve`] reports, given how `mcp enable` ended: `None` for a run
+/// killed at the timeout, else whether it succeeded and its exit code.
+///
+/// Pure, so the one part of the approval a test can reach — that a failure's
+/// own words reach the `Err` — is pinned without a child process.
+fn approve_verdict(
+    ended: Option<(bool, Option<i32>)>,
+    stdout: &str,
+    stderr: &str,
+) -> Result<(), String> {
+    match ended {
+        None => Err("`mcp enable` did not finish".to_string()),
+        Some((true, _)) => Ok(()),
+        Some((false, code)) => Err(schemaic_ai::cli_failure_message(
             schemaic_ai::harness::Harness::Cursor,
-            out.status.code(),
-            &String::from_utf8_lossy(&out.stdout),
-            &String::from_utf8_lossy(&out.stderr),
+            code,
+            stdout,
+            stderr,
         )),
     }
 }
@@ -185,19 +229,31 @@ pub(crate) fn approve(launch: &crate::agent_cli::Launch, workspace: &Path) -> Re
 /// rule (read out of its bundle): `CURSOR_CONFIG_DIR`, else
 /// `$XDG_CONFIG_HOME/cursor`, else `<home>/.cursor`.
 fn cursor_config_dir() -> Option<PathBuf> {
-    let set = |k: &str| std::env::var_os(k).filter(|v| !v.to_string_lossy().trim().is_empty());
-    if let Some(d) = set("CURSOR_CONFIG_DIR") {
-        return Some(PathBuf::from(d));
-    }
-    if let Some(x) = set("XDG_CONFIG_HOME") {
-        return Some(PathBuf::from(x).join("cursor"));
-    }
+    let var = |k: &str| std::env::var_os(k);
     // Node's `os.homedir()`: `USERPROFILE` on Windows, `HOME` elsewhere.
     let home = match cfg!(windows) {
-        true => set("USERPROFILE"),
-        false => set("HOME"),
-    }?;
-    Some(PathBuf::from(home).join(".cursor"))
+        true => var("USERPROFILE"),
+        false => var("HOME"),
+    };
+    cursor_config_dir_from(var("CURSOR_CONFIG_DIR"), var("XDG_CONFIG_HOME"), home)
+}
+
+/// [`cursor_config_dir`] over the three values it reads, so the precedence —
+/// which decides whose directory the sweep removes entries from — has a test,
+/// as `copilot::user_copilot_home`'s does. A blank value is unset.
+fn cursor_config_dir_from(
+    cursor: Option<std::ffi::OsString>,
+    xdg: Option<std::ffi::OsString>,
+    home: Option<std::ffi::OsString>,
+) -> Option<PathBuf> {
+    let set = |v: Option<std::ffi::OsString>| v.filter(|v| !v.to_string_lossy().trim().is_empty());
+    if let Some(d) = set(cursor) {
+        return Some(PathBuf::from(d));
+    }
+    if let Some(x) = set(xdg) {
+        return Some(PathBuf::from(x).join("cursor"));
+    }
+    Some(PathBuf::from(set(home)?).join(".cursor"))
 }
 
 /// The instance pid of a Schemaic Cursor workspace, when `path` is one.
@@ -206,7 +262,17 @@ fn cursor_config_dir() -> Option<PathBuf> {
 /// directory is removed only when the path it records is exactly
 /// `<one of our bases>/pid-<n>`. Compared case-insensitively on Windows, where
 /// the CLI records whatever its process reports as the working directory.
+///
+/// A recorded path spelled with the other separator, or with a trailing one,
+/// does not match — the fail-safe direction: its entry is left, never someone
+/// else's removed.
 fn workspace_pid(path: &str, bases: &[PathBuf]) -> Option<u32> {
+    workspace_pid_folding(path, bases, cfg!(windows))
+}
+
+/// [`workspace_pid`] with the case rule as an argument, so the Windows branch
+/// is exercised on every platform's test run.
+fn workspace_pid_folding(path: &str, bases: &[PathBuf], fold_case: bool) -> Option<u32> {
     let p = Path::new(path);
     let pid = p
         .file_name()?
@@ -215,7 +281,7 @@ fn workspace_pid(path: &str, bases: &[PathBuf]) -> Option<u32> {
         .parse::<u32>()
         .ok()?;
     let parent = p.parent()?;
-    let same = |a: &Path, b: &Path| match cfg!(windows) {
+    let same = |a: &Path, b: &Path| match fold_case {
         true => a.to_string_lossy().to_lowercase() == b.to_string_lossy().to_lowercase(),
         false => a == b,
     };
@@ -231,8 +297,13 @@ fn recorded_workspace(file: &Path, field: &str) -> Option<String> {
 /// Remove the workspaces of instances that are gone, and what the CLI keeps
 /// about them in the user's Cursor directory. See the module docs.
 ///
-/// Called at startup beside the other sweeps. Each removal is best-effort: a
-/// failure leaves an entry for the next launch, never touches anything else.
+/// Called at startup beside the other sweeps. Each removal is best-effort, and
+/// a failure never touches anything else — but it is **not** retried at the
+/// next launch: the workspace directory goes regardless
+/// (`opencode::sweep_instances` below), and the walk runs only while a dead
+/// workspace remains, so a failed entry waits for some later instance's
+/// workspace to be found dead at startup, which for a user who stops picking
+/// Cursor is never.
 pub(crate) fn sweep() {
     let bases: Vec<PathBuf> = KINDS
         .iter()
@@ -327,6 +398,60 @@ mod tests {
         )
         .join("pid-42");
         assert_eq!(workspace_pid(&oc.to_string_lossy(), &bases()), None);
+    }
+
+    /// The Windows rule: the CLI records the working directory as its process
+    /// reports it, which need not be the case our base was built in.
+    #[test]
+    fn a_workspace_recorded_in_another_case_matches_only_where_case_folds() {
+        let shouted = PathBuf::from(bases()[0].to_string_lossy().to_uppercase())
+            .join("pid-42")
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(workspace_pid_folding(&shouted, &bases(), true), Some(42));
+        assert_eq!(workspace_pid_folding(&shouted, &bases(), false), None);
+        // Folding widens the base match and nothing else: the leaf is still
+        // exactly `pid-<n>`.
+        let leaf = PathBuf::from(bases()[0].to_string_lossy().to_uppercase())
+            .join("PID-42")
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(workspace_pid_folding(&leaf, &bases(), true), None);
+    }
+
+    /// Whose directory the sweep removes entries from, in the CLI's own
+    /// order; a blank value is unset rather than the current directory.
+    #[test]
+    fn the_cursor_directory_is_found_where_the_cli_looks_for_it() {
+        let os = |s: &str| Some(std::ffi::OsString::from(s));
+        assert_eq!(
+            cursor_config_dir_from(os("/c"), os("/x"), os("/h")),
+            Some(PathBuf::from("/c"))
+        );
+        assert_eq!(
+            cursor_config_dir_from(None, os("/x"), os("/h")),
+            Some(PathBuf::from("/x").join("cursor"))
+        );
+        assert_eq!(
+            cursor_config_dir_from(os("  "), os(""), os("/h")),
+            Some(PathBuf::from("/h").join(".cursor"))
+        );
+        assert_eq!(cursor_config_dir_from(None, None, os(" ")), None);
+        assert_eq!(cursor_config_dir_from(None, None, None), None);
+    }
+
+    /// A failed approval says what the CLI said; a timed-out one says it did
+    /// not finish; a success is `Ok` whatever it printed.
+    #[test]
+    fn a_failed_approval_carries_the_clis_own_words() {
+        let e = approve_verdict(Some((false, Some(1))), "", "Error: no such server")
+            .expect_err("a failed exit");
+        assert!(e.contains("no such server"), "{e}");
+        assert_eq!(
+            approve_verdict(None, "", "").unwrap_err(),
+            "`mcp enable` did not finish"
+        );
+        assert!(approve_verdict(Some((true, Some(0))), "chatter", "warn").is_ok());
     }
 
     #[test]

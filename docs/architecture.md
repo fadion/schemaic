@@ -7394,8 +7394,8 @@ existing prose was left alone.
       using real harness keys could catch this**: `claude`/`codex`/`antigravity`/`opencode`/`copilot`
       are 6, 5, 11, 8 and 7 bytes, so a length-only fold passed against all five. It holds `codex`
       apart from `crush` and `cline`, neither of which is a harness, and apart from an absent key and
-      an empty one. It has not gained the real `claude`/`cursor` pair, and its own comments still
-      speak of four keys.
+      an empty one. `cursor` is six bytes, like `claude`, so the shipped pair is now asserted first,
+      and the synthetic keys stay for the next harness.
     - `chat.rs` — per-connection conversations persisted to `chats.json`. `ChatFile::of` replaces
       every tool `result` with `RESULT_OMITTED` before it reaches disk — a `run_query` result is up
       to 200 rows of real table data, and writing it verbatim exported user data to a plaintext
@@ -14130,9 +14130,10 @@ existing prose was left alone.
     `popup_anchor` and `date_pick` — the very channels they police. Checked at the time: no such
     opener existed there, so the gap was structural rather than live, and all four stay green over
     the wider corpus.
-    **And the nine surviving `split("#[cfg(test)]")` cuts go through `production_code` now** — in
-    `app/main.rs`, `app/mcp.rs` (whose gates are this module's own now, `mcp_deadline_gate` below) and
-    `ui/erd_view.rs`, the last places still doing it by hand. That
+    **And the surviving `split("#[cfg(test)]")` cuts go through `production_code` now** — in
+    `app/main.rs` and `ui/erd_view.rs`, and in what was `app/mcp.rs`, whose two are this module's
+    own `mcp_deadline_gate` below now, over `schemaic-cli/mcp.rs`: the last places still doing it by
+    hand. That
     cut is positional, so a file with an inline test-only `fn` above its test module loses everything
     after it, which is how `widgets.rs` lost 87% of itself; and it is not comment-aware, so a `///`
     line that merely *mentions* the attribute cuts there — several of the gates behind those cuts are
@@ -20008,7 +20009,13 @@ existing prose was left alone.
     loaded (needs approval)"* and every call refused until then. `approve(launch, workspace)` runs
     `cursor-agent mcp enable schemaic` in the workspace, through `agent_cli::Launch` like every other
     spawn of this CLI, with stdin null and a 60-second ceiling (`APPROVE_TIMEOUT` — the measured runs
-    took a few seconds, and a hung one must not hold the session). The record it writes is keyed by
+    took a few seconds, and a hung one must not hold the session). **Both pipes are drained on
+    threads while it runs**: the first version read neither until the child exited, and a child
+    blocked on a full pipe never exits, so a chatty failure would have hung to the ceiling and lost
+    the message `cli_failure_message` is called to show. After the exit the output is waited for
+    two seconds at most, since the `.cmd` fallback's node can still hold a write end. What it
+    reports is `approve_verdict`, pure over how the run ended
+    (`a_failed_approval_carries_the_clis_own_words`). The record it writes is keyed by
     a hash of the config's contents — changing the endpoint path read *"needs approval"* again — so it
     is asked again every session. **`--approve-mcps` is the lever that looks like the answer and is
     never passed**: it approves every server in reach, a user's plugins' among them, where this
@@ -20032,13 +20039,23 @@ existing prose was left alone.
     entry until that process ends. The trade is OpenCode's, leftovers kept longer rather than a live
     session broken, and what is kept is state recorded against a directory of Schemaic's rather than
     a grant in the user's own settings. A `chats` group directory is removed only if empty and only
-    where this sweep emptied it; each removal is best-effort, leaving a failure for the next launch.
+    where this sweep emptied it; each removal is best-effort and never touches anything else.
     Then `opencode::sweep_instances` collects the workspaces themselves. **The user's directory is
     walked only when one of ours is dead**: `chats/` holds one entry per conversation the user has
     ever had with the CLI, so the sweep first lists its own bases and returns before opening a single
-    `meta.json` unless some `pid-<n>` there has no live process. That is sound because an entry of
-    ours outlives its workspace only if this sweep failed to remove it, the state being removed first
-    and the workspace second.
+    `meta.json` unless some `pid-<n>` there has no live process. An entry of ours outlives its
+    workspace only if this sweep failed to remove it, the state being removed first and the
+    workspace second — and **such an entry is not retried at the next launch**: the workspace goes
+    regardless, so the walk that would find the entry again runs only when some later instance's
+    workspace is found dead at startup, which for a user who stops picking Cursor is never. The cost
+    is a conversation directory left in the user's Cursor config after a removal failed (a file held
+    open by a still-running `cursor-agent`, a scanner); keeping the unswept workspace to force the
+    retry would change what the sweep deletes, and is left open. `cursor_config_dir`'s precedence is
+    `cursor_config_dir_from`, pure over its three values, and the Windows case rule is
+    `workspace_pid_folding`'s argument, so both are exercised on every platform
+    (`the_cursor_directory_is_found_where_the_cli_looks_for_it`,
+    `a_workspace_recorded_in_another_case_matches_only_where_case_folds`). A recorded path spelled
+    with the other separator or a trailing one does not match — the fail-safe direction.
     **And what cannot be closed.** The user's `~/.cursor/mcp.json` is read from a path the CLI
     hard-codes to the home directory, and moving the home would move their login with it on macOS and
     Linux; its servers need no approval and are started on every turn. Their tools are refused

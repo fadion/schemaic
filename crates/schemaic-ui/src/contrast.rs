@@ -449,7 +449,7 @@ pub const UI_PAIRINGS: &[Pairing<UiTheme>] = &[
     //
     // Two of those three sites are named in the `text_dim on bg_deepest` and
     // `text_dim on bg_panel` rows above rather than repeated here. **The unit is
-    // the pairing**, and `audit`/`check` key `baselined()` on
+    // the pairing**, and `check` keys `baselined()` on
     // `(theme, fg, bg, role)` — so a second row for a pairing the table already
     // holds measures the same two colours twice and reports the same failure
     // twice. What actually closed the hole this comment describes was the views
