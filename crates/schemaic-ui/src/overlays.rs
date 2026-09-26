@@ -5409,11 +5409,17 @@ pub(crate) fn error_modal_overlay(ui: Ui) -> impl IntoView {
             // the modal was opened on nothing at all, a state it can reach: a
             // live "Explain" would send the model the words "No error." to
             // account for.
+            //
+            // **And a kept (pinned) failure earns neither**, the bar's rule
+            // asked through the same function: both actions resolve against
+            // the current buffer, and a pin's message is a snapshot of a
+            // statement that may no longer be in it.
+            let kept = tab.is_some_and(|t| t.shown_frozen());
             let ErrorModalContent {
                 shown,
                 explain: explain_error,
                 fix: fixable_error,
-            } = ErrorModalContent::resolve(text_override.get_untracked(), tab_error);
+            } = ErrorModalContent::resolve_kept(text_override.get_untracked(), tab_error, kept);
             let msg = shown.unwrap_or_else(|| "No error.".to_string());
             let has_actions = explain_error.is_some() || fixable_error.is_some();
 

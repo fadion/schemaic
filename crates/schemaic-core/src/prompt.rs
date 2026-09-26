@@ -459,6 +459,15 @@ pub fn result_shape(
         QueryState::Idle => return None,
         QueryState::Running => "A query is running; no result yet.".to_string(),
         QueryState::Cancelled => "The last run was cancelled by the user.".to_string(),
+        // Schemaic's own note — a tunnel not up, the statement timeout, a run
+        // never sent, a Stop. No engine said it, and it quotes no stored value, so it
+        // is neither called the engine's nor redacted; still fenced, since a
+        // note can carry a path or a server setting.
+        QueryState::Failed(e) if e.source == crate::model::ErrorSource::App => format!(
+            "The last run FAILED. Schemaic's own note, not an error from the database \
+             engine:\n{}",
+            fenced(&e.text)
+        ),
         QueryState::Failed(e) if data.may_query() => format!(
             "The last run FAILED. The engine's error, verbatim:\n{}",
             fenced(&e.text)
@@ -826,6 +835,29 @@ mod tests {
         let out = result_shape(&QueryState::Loaded(std::sync::Arc::new(rs)), AiData::Full).unwrap();
         assert!(out.contains("3 rows affected"), "{out}");
         assert!(!out.contains("columns"), "{out}");
+    }
+
+    /// **Schemaic's own note is not the engine's error.** A run refused before
+    /// anything was sent — a tunnel not up yet, the statement timeout, a run
+    /// never dispatched — was introduced as *"The engine's error, verbatim"*,
+    /// so the model explained a server error nobody raised; and below `Full`
+    /// it went under the redaction note, telling the model values had been
+    /// withheld from a sentence that never held any.
+    #[test]
+    fn a_run_schemaic_refused_is_not_called_the_engines_error() {
+        let failed = QueryState::Failed(crate::model::ModalError::app(
+            "SSH tunnel is not established yet",
+        ));
+        for level in AiData::ALL {
+            let out = result_shape(&failed, level).unwrap();
+            assert!(!out.contains("engine's error"), "{level:?}: {out}");
+            assert!(!out.contains(REDACTION_NOTE), "{level:?}: {out}");
+            assert!(
+                out.contains("SSH tunnel is not established yet"),
+                "{level:?}: {out}"
+            );
+            assert!(out.contains("Schemaic's own note"), "{level:?}: {out}");
+        }
     }
 
     #[test]

@@ -5152,7 +5152,10 @@ pub(crate) async fn enforce_session(
     conn: &mut Conn,
     enforce: crate::Enforce,
 ) -> Result<(), DbError> {
-    let qerr = |e: mysql_async::Error| DbError::Query(e.to_string());
+    // The server's words about Schemaic's own set-up statements, not about the
+    // user's, which has not been sent: `Connect`, so the bar offers no *AI fix*.
+    let qerr =
+        |e: mysql_async::Error| DbError::Connect(format!("could not prepare the session: {e}"));
     let mode: Option<String> = conn
         .query_first("SELECT @@SESSION.sql_mode")
         .await
@@ -5165,12 +5168,9 @@ pub(crate) async fn enforce_session(
         .query_first("SELECT @@SESSION.sql_mode")
         .await
         .map_err(qerr)?;
-    if !schemaic_core::sql::mysql_mode_is_lexed_like_the_gate(back.as_deref().unwrap_or("")) {
-        return Err(DbError::Query(format!(
-            "refused: the server's sql_mode ({}) reads quotes differently from the \
-             statement check, and could not be changed for this session",
-            back.unwrap_or_default()
-        )));
+    let back = back.unwrap_or_default();
+    if !schemaic_core::sql::mysql_mode_is_lexed_like_the_gate(&back) {
+        return Err(unpinnable_mode(&back));
     }
     if enforce == crate::Enforce::ReadOnly {
         conn.query_drop("SET SESSION TRANSACTION READ ONLY")
@@ -5178,6 +5178,14 @@ pub(crate) async fn enforce_session(
             .map_err(qerr)?;
     }
     Ok(())
+}
+
+/// [`enforce_session`]'s refusal when the server put a quote-moving mode back.
+fn unpinnable_mode(back: &str) -> DbError {
+    DbError::Refused(format!(
+        "refused: the server's sql_mode ({back}) reads quotes differently from the \
+         statement check, and could not be changed for this session"
+    ))
 }
 
 /// `DbError` isn't `Clone`; this reproduces one for the "connect failed"
@@ -5193,6 +5201,7 @@ fn err_clone(e: &DbError) -> DbError {
         DbError::Connect(s) => DbError::Connect(s.clone()),
         DbError::Query(s) => DbError::Query(s.clone()),
         DbError::Cancelled => DbError::Cancelled,
+        DbError::Refused(s) => DbError::Refused(s.clone()),
     }
 }
 
@@ -5683,7 +5692,7 @@ mod explain_tests {
 fn cancelled_import(undone: Rollback) -> DbError {
     match undone {
         Rollback::Complete => DbError::Cancelled,
-        undone => DbError::Query(format!("Import cancelled{}", undone.note())),
+        undone => DbError::Refused(format!("Import cancelled{}", undone.note())),
     }
 }
 
@@ -5696,7 +5705,7 @@ fn cancelled_import(undone: Rollback) -> DbError {
 fn cancelled_write(undone: Rollback) -> DbError {
     match undone {
         Rollback::Complete => DbError::Cancelled,
-        undone => DbError::Query(format!("Commit cancelled{}", undone.note())),
+        undone => DbError::Refused(format!("Commit cancelled{}", undone.note())),
     }
 }
 
@@ -7212,7 +7221,7 @@ mod write_tests {
             DbError::Cancelled
         ));
         match cancelled_write(Rollback::Incomplete) {
-            DbError::Query(msg) => {
+            DbError::Refused(msg) => {
                 assert!(msg.starts_with("Commit cancelled"), "{msg}");
                 assert!(
                     msg.contains("remain"),
@@ -7226,6 +7235,31 @@ mod write_tests {
         assert!(
             !format!("{:?}", cancelled_write(Rollback::Incomplete)).contains("Import"),
             "a cancelled commit reported as a cancelled import"
+        );
+    }
+
+    /// **Schemaic's account of a Stop is not the statement's failure.** The
+    /// variant was read as provenance, and `Query` meant *AI fix* and *Explain*
+    /// on "Commit cancelled — …", a sentence about the user's own act.
+    #[test]
+    fn a_cancelled_write_or_import_is_schemaics_account_not_the_statements() {
+        use schemaic_core::model::ErrorSource;
+        for e in [
+            cancelled_write(Rollback::Incomplete),
+            cancelled_import(Rollback::Incomplete),
+        ] {
+            assert_eq!(e.modal_source(), ErrorSource::App, "{e}");
+        }
+    }
+
+    /// The editor's run on a read-only connection failing in the session set-up
+    /// — the user's `SELECT 1` was never sent, so there is nothing to fix.
+    #[test]
+    fn an_unpinnable_sql_mode_is_schemaics_refusal() {
+        use schemaic_core::model::ErrorSource;
+        assert_eq!(
+            unpinnable_mode("ANSI_QUOTES").modal_source(),
+            ErrorSource::App
         );
     }
 

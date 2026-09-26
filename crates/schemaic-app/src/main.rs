@@ -2933,8 +2933,11 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                     Err(e) => {
                         tracing::error!("query failed: {e}");
                         // A rejected statement or a refused connection — the
-                        // error's own variant says which.
-                        QueryState::Failed(ModalError::new(note(e.to_string()), e.modal_source()))
+                        // error's own variant says which, unless the session
+                        // saw the connection die under a statement that did
+                        // nothing wrong.
+                        let source = tx::run_error_source(e.modal_source(), stmt);
+                        QueryState::Failed(ModalError::new(note(e.to_string()), source))
                     }
                 };
                 send((state, stmt, started.elapsed().as_millis() as u64));
@@ -3336,8 +3339,12 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                         // a failed BEGIN aborts rather than running the batch
                         // outside the transaction the user asked for.
                         if let Err(e) = s.ensure_tx().await {
-                            // The BEGIN failed, not a statement of the user's.
-                            states[0] = QueryState::Failed(ModalError::server(e.to_string()));
+                            // The BEGIN failed, not a statement of the user's —
+                            // `Session::ensure_tx` already says so (`Connect`).
+                            states[0] = QueryState::Failed(ModalError::new(
+                                e.to_string(),
+                                e.modal_source(),
+                            ));
                             took[0] = clock.elapsed().as_millis() as u64;
                             send((states, outcomes, took));
                             return;
@@ -3363,7 +3370,10 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                             // half here.
                             if let Err(e) = s.ensure_tx().await {
                                 // As above: the BEGIN's failure, not statement i's.
-                                states[i] = QueryState::Failed(ModalError::server(e.to_string()));
+                                states[i] = QueryState::Failed(ModalError::new(
+                                    e.to_string(),
+                                    e.modal_source(),
+                                ));
                                 took[i] = clock.elapsed().as_millis() as u64;
                                 stopped = true;
                                 continue;
@@ -3414,7 +3424,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                                     stopped = true;
                                     QueryState::Failed(ModalError::new(
                                         tx::failed_message(&e.to_string(), out.stmt),
-                                        e.modal_source(),
+                                        tx::run_error_source(e.modal_source(), Some(out.stmt)),
                                     ))
                                 }
                             };
@@ -5003,14 +5013,11 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                     if let Err(e) = written {
                         tracing::error!("commit failed: {e}");
                         // The server's refusal, or the one-row net's account of
-                        // what it did — either way about the server's answer.
-                        // A cancel is the one that isn't: the user stopped it,
-                        // and "query cancelled" has nothing in it to explain.
-                        let failed = match e {
-                            DbError::Cancelled => ModalError::app(e.to_string()),
-                            _ => ModalError::server(e.to_string()),
-                        };
-                        finish(CommitDone::Failed(failed));
+                        // what it did — either way about the server's answer,
+                        // over SQL Schemaic wrote. A cancel, or a Stop that could
+                        // not undo everything, is Schemaic's account of the
+                        // user's own act, with nothing in it to explain.
+                        finish(CommitDone::Failed(e.modal_about_another_statement()));
                         return;
                     }
                     match refetch {
@@ -5108,15 +5115,15 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                     }
                     return;
                 };
-                let done = create_ext_action(cx, move |err: Option<String>| {
+                let done = create_ext_action(cx, move |err: Option<ModalError>| {
                     match err {
                         // Even a failed COMMIT/ROLLBACK leaves no usable
                         // transaction — the server has ended it or the connection
                         // is gone — so the state resets either way; the message is
                         // what the user acts on.
-                        Some(msg) => {
+                        Some(failed) => {
                             tab.tx.set(TxState::closed());
-                            error_modal_text.set(Some(ModalError::server(msg)));
+                            error_modal_text.set(Some(failed));
                             error_modal_open.set(true);
                         }
                         None => tab.tx.set(TxState::closed()),
@@ -5131,7 +5138,9 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                     } else {
                         session.rollback().await
                     };
-                    done(r.err().map(|e| e.to_string()));
+                    // `Session::commit`'s "already aborted" is its own report,
+                    // and was offered *Explain* while hard-coded as the server's.
+                    done(r.err().map(|e| e.modal_about_another_statement()));
                 });
             },
         )
@@ -5211,7 +5220,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                 connections.with_untracked(|cs| session_enforce(cs, tab.conn_id.get_untracked()));
             let sessions = sessions.clone();
             let closer = handle.clone();
-            let opened = create_ext_action(cx, move |res: Result<Arc<Session>, String>| {
+            let opened = create_ext_action(cx, move |res: Result<Arc<Session>, ModalError>| {
                 // Re-resolve the tab instead of reading the captured copy. An
                 // open is a full connect — seconds through a tunnel — and a tab
                 // closed meanwhile has had its scope disposed one tick later, so
@@ -5241,9 +5250,10 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                     Err(_) if mode.is_none() => {}
                     Err(e) => {
                         tab.tx_mode.set(TxMode::Auto);
-                        error_modal_text.set(Some(ModalError::server(format!(
-                            "couldn't open a transaction connection: {e}"
-                        ))));
+                        error_modal_text.set(Some(ModalError::new(
+                            format!("couldn't open a transaction connection: {}", e.text),
+                            e.source,
+                        )));
                         error_modal_open.set(true);
                     }
                 }
@@ -5252,7 +5262,10 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                 opened(
                     Session::open_enforced(&db, database.as_deref(), enforce)
                         .await
-                        .map_err(|e| e.to_string()),
+                        // Its own source: the SQLite backstop and an `sql_mode`
+                        // that would not pin are Schemaic's sentences, and were
+                        // offered *Explain* while this was hard-coded `server`.
+                        .map_err(|e| e.modal_about_another_statement()),
                 );
             });
         })
@@ -13206,6 +13219,76 @@ mod app_tests {
                 assert!(!r.contains(needle), "`{head}` still calls `{needle}`");
             }
         }
+    }
+
+    /// **A run's own notes reach the bar as Schemaic's words.** "Not sent",
+    /// the statement timeout and a Stop's disclosure are sentences this app
+    /// wrote, and `ModalError::app` is what withholds *AI fix* and *Explain*
+    /// on them. Which constructor each arm uses is a call-site choice the type
+    /// forces but nothing else pins: swapping one for `::statement` re-offered
+    /// a fix for "the statement was not sent" with every other test green.
+    #[test]
+    fn a_runs_own_notes_reach_the_bar_as_schemaics() {
+        let src = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("src")
+                .join("main.rs"),
+        )
+        .expect("this file's own source");
+        let body = schemaic_ui::source_gate::production_code(&src);
+        // Each `QueryState::Failed(…)`'s argument, to its matching `)`.
+        let mut notes = 0usize;
+        let mut from = 0usize;
+        while let Some(rel) = body[from..].find("QueryState::Failed(") {
+            let open = from + rel + "QueryState::Failed".len();
+            let mut depth = 0usize;
+            let mut end = open;
+            for (k, c) in body[open..].char_indices() {
+                match c {
+                    '(' => depth += 1,
+                    ')' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            end = open + k;
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let arg = body[open + 1..end].trim_start();
+            if arg.contains("not_sent_message(") || arg.contains("timeout_message(") {
+                notes += 1;
+                assert!(
+                    arg.starts_with("ModalError::app("),
+                    "a run's own note reaches the bar with a source other than \
+                     Schemaic's, so it is offered AI fix or Explain:\n{arg}"
+                );
+            }
+            from = end;
+        }
+        // run_query_core's not-sent and timeout, Run All's two on the session
+        // and the timeout on its own connection.
+        assert!(
+            notes >= 5,
+            "the needle stopped matching: {notes} notes found — a gate that scans \
+             nothing reports success"
+        );
+        // A Stop's disclosure is matched, then wrapped, one line on.
+        let mut stops = 0usize;
+        for (at, _) in body.match_indices("tx::cancelled_message(") {
+            stops += 1;
+            let after = &body[at..(at + 400).min(body.len())];
+            assert!(
+                after.contains("QueryState::Failed(ModalError::app(m))"),
+                "a Stop's disclosure reaches the bar as something other than \
+                 Schemaic's words:\n{after}"
+            );
+        }
+        assert!(
+            stops >= 2,
+            "the needle stopped matching: {stops} stops found"
+        );
     }
 
     /// **And the two builders own the tunnelled-TLS refusal**, rather than a

@@ -3268,8 +3268,11 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
     // behind *View* asks, so the bar and the modal cannot offer different ones:
     // a run refused before anything was sent is Schemaic's own words and gets
     // neither, a refused connection an explanation but no fix.
+    // A kept failure earns neither — see `ErrorModalContent::resolve_kept`.
     let bar_actions = move || match results.get_untracked() {
-        QueryState::Failed(err) => ErrorModalContent::resolve(None, Some(err)),
+        QueryState::Failed(err) => {
+            ErrorModalContent::resolve_kept(None, Some(err), results.frozen())
+        }
         _ => ErrorModalContent::default(),
     };
     let ai_fix: Rc<dyn Fn()> = {
@@ -4283,8 +4286,11 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                 let one_line = msg.text.split_whitespace().collect::<Vec<_>>().join(" ");
                 // Which of the two AI actions this error earns — the modal's
                 // own answer, so a run Schemaic refused before sending offers
-                // neither here either, and a refused connection no fix.
-                let offers = ErrorModalContent::resolve(None, Some(msg));
+                // neither here either, a refused connection no fix, and a kept
+                // result neither: both resolve against the *current* buffer,
+                // and a pin's message is a snapshot of a statement that may no
+                // longer be in it. *View* stays — the message is still true.
+                let offers = ErrorModalContent::resolve_kept(None, Some(msg), kept);
                 let (can_explain, can_fix) = (offers.explain.is_some(), offers.fix.is_some());
                 let ai_fix = ai_fix.clone();
                 let explain_error = explain_error.clone();
@@ -4328,13 +4334,8 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                     // hold all three with the message still readable. It is the
                     // one of the three that has a second home — the *View* modal
                     // offers the same explanation — so it is the one that can go.
-                    // **Withheld on a kept result**, along with *AI fix* below:
-                    // both resolve the bar's message against the *current*
-                    // buffer, and a pin's message is a snapshot of a statement
-                    // that may no longer be in it. *View* stays — it shows the
-                    // message itself, which is still true.
                     dyn_container(
-                        move || !kept && can_explain && error_bar_fits_explain(error_bar_w.get()),
+                        move || can_explain && error_bar_fits_explain(error_bar_w.get()),
                         {
                             let explain_error = explain_error.clone();
                             move |fits: bool| {
@@ -4360,10 +4361,10 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                             }
                         },
                     ),
-                    dyn_container(move || kept, {
+                    dyn_container(move || can_fix, {
                         let ai_fix = ai_fix.clone();
-                        move |kept: bool| {
-                            if kept || !can_fix {
+                        move |can_fix: bool| {
+                            if !can_fix {
                                 return empty().into_any();
                             }
                             let ai_fix = ai_fix.clone();

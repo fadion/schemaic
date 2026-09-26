@@ -236,16 +236,39 @@ existing prose was left alone.
     cancel or not-sent note, a failed `BEGIN` and a refused connection all land in the tab as its
     error, and every one of them was offered an AI fix and an explanation
     (`a_tab_refused_before_sending_offers_neither_action`). The run paths in `app/main.rs` now say
-    which at the point of failure: a `DbError` through `DbError::modal_source`, the not-sent, timeout
-    and cancel notes and the `db_for`/`session_for` refusals `App`, a failed `BEGIN` `Server` — the
-    server's words, but not about a statement of the user's. `ModalError::new(text, source)` is the
+    which at the point of failure: a `DbError` through `DbError::modal_source` and then
+    `core::tx::run_error_source`, the not-sent, timeout and cancel notes and the
+    `db_for`/`session_for` refusals `App`, a failed `BEGIN` `Server` — the server's words, but not
+    about a statement of the user's. **That makes the `DbError` variant the provenance, so
+    `schemaic-db` has to write the right one**: it wrote its own refusals and its own set-up
+    statements' failures as `Query`/`Connect`, so the single run folded a failed lazy `BEGIN` into
+    the statement's result and the bar offered *AI fix* over a healthy `SELECT` — while Run All,
+    which hard-coded `ModalError::server` for the same failure, did not. Both now take the source
+    `Session::ensure_tx` gives (`Connect` for a refused `BEGIN`), and opening a Manual tab's session
+    carries `Session::open_enforced`'s through `DbError::modal_about_another_statement` rather than
+    calling every failure the server's. `DbError::Refused` and the
+    `Connect` rule for set-up failures are under the `DbError` entry. The `App` notes' constructor
+    is a call-site choice the type forces and nothing else pinned — swapping one for `::statement`
+    re-offered a fix for "the statement was not sent" with every other test green — so
+    `app_tests::a_runs_own_notes_reach_the_bar_as_schemaics` reads `main.rs` for it: every
+    `QueryState::Failed(` built from `not_sent_message(`/`timeout_message(` opens with
+    `ModalError::app(`, and every `tx::cancelled_message(` lands as `Failed(ModalError::app(m))`,
+    with floors on both counts. `ModalError::new(text, source)` is the
     constructor for a producer already holding a source. The editor's error bar asks the same
-    `resolve(None, Some(err))` for its own *Explain* and *AI fix*, so bar and modal cannot offer
-    different ones. **`ModalError::about_another_statement` rewrites a source after the fact**,
-    for one caller: a grid filter/sort re-run's failure goes into `view_err` with `Statement`
-    turned to `Server`, because that SQL is one Schemaic built and the modal's *AI fix* would act on
-    the editor's buffer; `Server` and `App` pass through unchanged
-    (`about_another_statement_keeps_the_words_and_drops_the_fix`). **The
+    `resolve_kept(None, Some(err), kept)` for its own *Explain* and *AI fix* as the modal's
+    fallback does, so bar and modal cannot offer different ones — including on a **kept** (pinned)
+    failure, which earns neither: both actions resolve against the current buffer and a pin's
+    message is a snapshot of a statement that may no longer be in it. The bar used to withhold them
+    itself while its *View* opened a modal that asked plain `resolve` and offered both again
+    (`a_kept_failure_offers_no_fix_from_the_modal`). **`ModalError::about_another_statement` rewrites a source after the fact**,
+    for an error raised by SQL that is not the editor's: a grid filter/sort re-run's failure goes
+    into `view_err` with `Statement` turned to `Server`, because that SQL is one Schemaic built and
+    the modal's *AI fix* would act on the editor's buffer; `Server` and `App` pass through unchanged
+    (`about_another_statement_keeps_the_words_and_drops_the_fix`). A grid Commit and a Manual tab's
+    `COMMIT`/`ROLLBACK` (`end_tx`) reach it through `DbError::modal_about_another_statement`, which
+    is `modal_source` composed with it — the commit arm had restated that as "`Cancelled` is `App`,
+    everything else `Server`", and `end_tx` hard-coded `ModalError::server`, so both offered
+    *Explain* on Schemaic's own sentences. **The
     source rides with the text in one value because it used to be a separate flag**
     (`error_modal_fixable`): every surface had to remember to set it and the modal to clear it on
     close, or the next open inherited the last one's answer; now a surface cannot supply one
@@ -5578,6 +5601,13 @@ existing prose was left alone.
     being untouched but gaining no statement. It is reported **only** where a savepoint rollback was
     issued and accepted (`Session::classify_fenced`) — a cancellation with no fence around it is
     still `Cancelled`, because nothing then guarantees the transaction survived.
+    **`run_error_source` is what a failed run's outcome adds to its error's source.**
+    `DbError::modal_source` reads the variant, and a statement the server rejected and one whose
+    pinned connection died under it both arrive as `Query` — but the session reports
+    `StmtOutcome::ConnectionLost` beside the second, and that statement did nothing wrong. So
+    `Statement` + `ConnectionLost` is `Server` (explained, never "fixed" into the buffer) and every
+    other pair keeps what the error said. `run_query_core`'s generic error arm and Run All's session
+    loop both call it (`a_lost_connection_is_the_servers_failure_not_the_statements`).
     **And a read on the pinned connection must not report a transaction it never opened.**
     `TxState::on_statement` merges `Idle` with `Open` on the stated premise that the app issues
     `BEGIN` lazily, so the first statement lands as the first statement of a fresh transaction —
@@ -7058,6 +7088,16 @@ existing prose was left alone.
       error actionable — so dropping it bought no privacy and left a model told only *"the last run
       FAILED, the message is withheld"*, the level paying for its caution in usefulness rather than
       in exposure.
+      **Schemaic's own note is not the engine's error, and is not gated.** A `Failed` whose source
+      is `ErrorSource::App` — a tunnel not up, the statement timeout, a run never sent, a Stop's
+      disclosure — is introduced as *Schemaic's own note, not an error from the database engine*
+      and sent verbatim at every level, still fenced, since a note can carry a path or a server
+      setting. It used to go out as *"The engine's error, verbatim"*, so the model explained a server
+      error nobody raised, and below `Full` under the redaction note, telling it values had been
+      removed from a sentence that never held any
+      (`a_run_schemaic_refused_is_not_called_the_engines_error`). The exemption rests on the source
+      being right — it is sound because no `App` note quotes a stored value — which is one more
+      reason a producer must not write the server's words as `DbError::Refused`.
       **`redact_engine_error` is per-*family*, not a blunt quote-stripper and no longer
       per-template**, because engines quote identifiers in the same syntax as values (`for key
       'users.email'`, `constraint "users_email_key"`) and blanking every quoted run would destroy
@@ -8996,13 +9036,37 @@ existing prose was left alone.
   the variant, for the editor's error bar and the error modal behind it: `Query` is a statement's
   failure, with SQL for *AI fix* to rewrite; `Connect` is the server's words about no statement,
   explained and never fixed; `Cancelled` is the user's Stop or Schemaic's own watchdog and has
-  nothing to explain. `app/main.rs`'s run paths ask it of the `DbError` a run ends in rather than
+  nothing to explain; `Refused` is **Schemaic's own sentence** and has nothing to explain either.
+  `Refused` exists because the variant is the provenance and this crate had been writing its own
+  words as `Query`/`Connect`, so the bar and the modal offered *AI fix* or *Explain* on them. Its
+  producers are `sqlite::open_target`'s three refusals, SQLite's "the SQLite worker failed: …" (a
+  `Query` once), `Session::open`'s SQLite manual-mode backstop (a `Connect` once),
+  `mysql::unpinnable_mode` — `enforce_session`'s refusal when the server puts a quote-moving
+  `sql_mode` back — `session::aborted_commit`, which `Session::commit` answers over a block that was
+  already aborted, and the non-`Complete` arms of `mysql::cancelled_import`/`cancelled_write`
+  ("Import/Commit cancelled — …"). It renders **as written**, `#[error("{0}")]` with no prefix:
+  each is already the whole sentence, and "query failed:" in front of "Commit cancelled — …" named
+  a failure that was the user's own act. **The server refusing a statement Schemaic sent for
+  itself is `Connect`, not `Query`** — its words, but about SQL the user did not write, and theirs
+  was never sent: `enforce_session`'s "could not prepare the session: …",
+  `pg::read_only_setup_failed` ("could not make the session read-only: …", for `pg::fetch_query`'s
+  enforced path and `Session::open`'s PostgreSQL arm) and `session::begin_failed`, which rewrites a
+  lazy `BEGIN`'s `Query` from `Session::control_on` as "could not begin the transaction: …" and
+  passes anything else through. The `Connect` prefix does come with them, so these read
+  "connection failed: could not …". **`modal_about_another_statement`** is
+  `ModalError::new(to_string(), modal_source()).about_another_statement()`, for an error raised by
+  something that is not the editor's statement (a grid Commit, `end_tx`); it is one composition
+  because the commit arm had restated it by hand and got `Refused` wrong.
+  `app/main.rs`'s run paths ask it of the `DbError` a run ends in rather than
   choosing a source per site, which is how a refused connection stopped being offered a fix into
   the buffer. Those paths answer `Cancelled` in arms of their own first — the not-sent, timeout and
   cancel notes — so its `App` there is the answer for a caller that has not. **Named
   `modal_source`, not `source`**: `std::error::Error` already has a `source()`, and an inherent
   method shadowing it would answer a different question under the same name. One test per variant,
-  from `a_rejected_statement_is_the_statements_failure`.
+  from `a_rejected_statement_is_the_statements_failure`; `mod modal_source_tests` holds all four
+  together, the off-editor composition and `a_refusal_renders_as_written`, and `session.rs` pins
+  its two producers (`a_failed_begin_is_not_the_statements_failure`,
+  `an_aborted_commit_is_schemaics_report`).
   `fetch_query`/`fetch_query_enforced`/`stream_query`/`stream_query_enforced`/`run_batch`/
   `run_batch_enforced`/`fetch_schema`/`ping`/
   `commit_writes`/`refetch_rows`/`prepare_check`
@@ -18771,7 +18835,8 @@ existing prose was left alone.
   the elapsed time ride on every turn, and *no cell value ever does*. A failed run's error text rides
   on every level, but **verbatim only where the connection's `AiData` allows it**: the server quotes
   stored values into its messages, so below `Full` `core::prompt::redact_engine_error` takes those
-  out and the rest of the message still goes; `ai_context` passes the level in beside the dialect. It is
+  out and the rest of the message still goes, while a note of Schemaic's own, which quotes none,
+  goes verbatim at every level (`core::prompt`'s entry); `ai_context` passes the level in beside the dialect. It is
   diffed like the rest of the context, and a cleared panel is reported as cleared rather than
   omitted: a stale shape would have the model explaining an error the user has already fixed. The
   same snapshot sends the editor **selection** in place of the whole buffer when there is one
@@ -22617,7 +22682,12 @@ Re-introducing the anti-patterns these guard against is a regression:
   row count right so nothing downstream even has a reason to look. Both fixes were cheap for the
   same reason: the oracle already existed and a type was throwing it away. Where a reading is
   available only at the point the data is produced, produce it there and carry it — a downstream
-  re-derivation from rendered text is the bug, not the fallback.
+  re-derivation from rendered text is the bug, not the fallback. **Carrying it means carrying it
+  truthfully**: `DbError::modal_source` reads whose words an error is off the variant, and
+  `schemaic-db` wrote its own refusals and the failures of its own set-up statements as
+  `Query`/`Connect`, so the carried fact was wrong at the source and the editor bar offered
+  *AI fix* on Schemaic's sentences. `DbError::Refused` is the variant that lets the producer say
+  so (`schemaic-db`'s `DbError` entry).
 - **Generated DDL is never run silently, and never emitted from a second differ.** Every
   schema edit goes `TableDraft`/`ViewDraft` → `ddl::diff`/`diff_view` → `ChangeSet::emit` →
   the preview modal → `Db::run_ddl`. **`Db::run_server_ddl` is on the same rule, not beside it**:
@@ -26970,7 +27040,10 @@ this bundle's.
   `QueryState::Failed` once `ModalError::about_another_statement` has turned a `Statement` into
   one: the re-run's SQL is Schemaic's, and a fix from the modal would land in the editor's buffer
   (a re-run's own `App` note, a timeout say, stays `App`). `App`: a `commit_writes` that ended in `DbError::Cancelled` (the user
-  stopped it, and "query cancelled" has nothing in it to explain), a paste that landed nothing,
+  stopped it, and "query cancelled" has nothing in it to explain) or in `DbError::Refused` — "Commit
+  cancelled — …", this crate's account of a Stop whose rollback did not undo everything, which the
+  arm's hand-written "`Cancelled` is `App`, everything else `Server`" had offered *Explain* on; the
+  arm now asks `DbError::modal_about_another_statement` instead — a paste that landed nothing,
   the row panel's and the JSON editor's
   refusals, AI fill/seed failures, the filter row's three refusals (a `BadCondition` is
   `sqlparser`'s reading of the typed condition, not the database's), the `db_for`/`session_for`

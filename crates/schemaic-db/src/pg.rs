@@ -447,7 +447,7 @@ pub(crate) async fn fetch_query(
         client
             .batch_execute("SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY")
             .await
-            .map_err(|e| db_err(&e))?;
+            .map_err(|e| read_only_setup_failed(&e))?;
     }
     // A connection of its own, opened three lines up: no transaction to fence.
     run_statement(
@@ -575,6 +575,17 @@ fn pg_message(message: &str, detail: Option<&str>, hint: Option<&str>) -> String
 /// keeps its cause in `source()`.
 fn db_err(e: &tokio_postgres::Error) -> DbError {
     DbError::Query(db_text(e))
+}
+
+/// The server refusing the `SET` that makes a session read-only — its words,
+/// but about Schemaic's statement rather than the user's, which was never sent.
+/// `Connect`, not [`db_err`]'s `Query`: a `Query` is offered *AI fix* over the
+/// buffer, and there is nothing in it to fix.
+pub(crate) fn read_only_setup_failed(e: &tokio_postgres::Error) -> DbError {
+    DbError::Connect(format!(
+        "could not make the session read-only: {}",
+        db_text(e)
+    ))
 }
 
 /// [`db_err`]'s text, for the paths that carry a bare `String` rather than a

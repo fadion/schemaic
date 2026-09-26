@@ -257,10 +257,10 @@ fn open(db: &Db) -> Result<SqliteConn, DbError> {
 /// `cfg` block so that both answers are reachable from a test.
 fn open_target(file: &str, allow_uri: bool) -> Result<&str, DbError> {
     if file.trim().is_empty() {
-        return Err(DbError::Connect("no database file is set".to_string()));
+        return Err(DbError::Refused("no database file is set".to_string()));
     }
     if file == ":memory:" {
-        return Err(DbError::Connect(
+        return Err(DbError::Refused(
             ":memory: is not a database file — SQLite keeps an in-memory database only for as \
              long as the connection that made it, and this app opens a new connection per \
              operation, so every write would be reported as saved and then discarded. Give the \
@@ -269,7 +269,7 @@ fn open_target(file: &str, allow_uri: bool) -> Result<&str, DbError> {
         ));
     }
     if !allow_uri && rejects_uri_filename(file) {
-        return Err(DbError::Connect(format!(
+        return Err(DbError::Refused(format!(
             "{file}: this is a URI, not a database file — SQLite would read the part after `?` \
              as open options, and `?mode=memory` opens a scratch database that accepts every \
              write and keeps none. Give the path to the file itself."
@@ -329,7 +329,7 @@ where
         f(&mut conn)
     })
     .await
-    .map_err(|e| DbError::Query(format!("worker failed: {e}")))?
+    .map_err(|e| DbError::Refused(format!("the SQLite worker failed: {e}")))?
 }
 
 /// One reachability probe at a time, per file.
@@ -895,7 +895,7 @@ pub(crate) async fn fetch_query(
     // own result is, so it is simply awaited.
     let interrupt = rx.await.ok();
     let outcome = tokio::select! {
-        r = work => Some(r.map_err(|e| DbError::Query(format!("worker failed: {e}")))?),
+        r = work => Some(r.map_err(|e| DbError::Refused(format!("the SQLite worker failed: {e}")))?),
         _ = cancel.cancelled() => {
             if let Some(h) = interrupt {
                 h.interrupt();
@@ -1209,7 +1209,7 @@ pub(crate) async fn commit_writes(
 
     let interrupt = rx.await.ok();
     tokio::select! {
-        r = work => r.map_err(|e| DbError::Query(format!("worker failed: {e}")))?,
+        r = work => r.map_err(|e| DbError::Refused(format!("the SQLite worker failed: {e}")))?,
         _ = cancel.cancelled() => {
             if let Some(h) = interrupt { h.interrupt(); }
             Err(DbError::Cancelled)
@@ -1345,7 +1345,7 @@ pub(crate) async fn fetch_blob(
 
     let interrupt = rx.await.ok();
     tokio::select! {
-        res = work => res.map_err(|e| DbError::Query(format!("worker failed: {e}")))?,
+        res = work => res.map_err(|e| DbError::Refused(format!("the SQLite worker failed: {e}")))?,
         _ = cancel.cancelled() => {
             if let Some(h) = interrupt { h.interrupt(); }
             Err(DbError::Cancelled)
@@ -1418,7 +1418,7 @@ pub(crate) async fn refetch_rows(
 
     let interrupt = rx.await.ok();
     tokio::select! {
-        r = work => r.map_err(|e| DbError::Query(format!("worker failed: {e}")))?,
+        r = work => r.map_err(|e| DbError::Refused(format!("the SQLite worker failed: {e}")))?,
         _ = cancel.cancelled() => {
             if let Some(h) = interrupt { h.interrupt(); }
             Err(DbError::Cancelled)
@@ -2209,7 +2209,7 @@ pub(crate) async fn count_rows(
     });
     let interrupt = rx.await.ok();
     tokio::select! {
-        r = work => r.map_err(|e| DbError::Query(format!("worker failed: {e}")))?,
+        r = work => r.map_err(|e| DbError::Refused(format!("the SQLite worker failed: {e}")))?,
         _ = cancel.cancelled() => {
             if let Some(h) = interrupt { h.interrupt(); }
             Err(DbError::Cancelled)
@@ -4947,6 +4947,21 @@ mod tests {
         assert!(!rejects_uri_filename("./file:weird.sqlite"));
         assert!(!rejects_uri_filename("db.sqlite"));
         assert!(!rejects_uri_filename(""));
+    }
+
+    /// `open_target`'s refusals are Schemaic's sentences about a path, written
+    /// before any file is opened — nothing for *Explain* to explain.
+    #[test]
+    fn open_target_refusals_are_schemaics_words_not_the_servers() {
+        use schemaic_core::model::ErrorSource;
+        for (file, uri) in [
+            ("", false),
+            (":memory:", true),
+            ("file:x?mode=memory", false),
+        ] {
+            let e = open_target(file, uri).expect_err(file);
+            assert_eq!(e.modal_source(), ErrorSource::App, "{e}");
+        }
     }
 
     /// **The whole of `open`'s boundary, including its wiring.**

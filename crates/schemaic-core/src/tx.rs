@@ -774,6 +774,25 @@ pub fn timeout_reached(stmt: Option<StmtOutcome>, timed_out: bool) -> bool {
     timed_out && stmt != Some(StmtOutcome::NotSent)
 }
 
+/// Whose words a failed run's error is, given what the run knows beside it.
+///
+/// The error's own variant answers first (`DbError::modal_source`), but it
+/// cannot tell a statement the server rejected from one whose **pinned
+/// connection died** under it — both arrive as a query failure — and the
+/// session *does* know: it reports [`StmtOutcome::ConnectionLost`] right beside
+/// the error. That statement did nothing wrong, so it is the server's words
+/// about no statement the user can rewrite: explained, never "fixed".
+pub fn run_error_source(
+    source: crate::model::ErrorSource,
+    stmt: Option<StmtOutcome>,
+) -> crate::model::ErrorSource {
+    use crate::model::ErrorSource;
+    match (source, stmt) {
+        (ErrorSource::Statement, Some(StmtOutcome::ConnectionLost)) => ErrorSource::Server,
+        (source, _) => source,
+    }
+}
+
 /// What to say about a run whose statement never left the client.
 ///
 /// It names the clock only when the clock is why (`timed_out`), and it says the
@@ -1000,6 +1019,31 @@ mod tests {
 
     const MY: TxEngine = TxEngine::MySql;
     const PG: TxEngine = TxEngine::Postgres;
+
+    /// A statement whose connection died did nothing wrong; the bar offered
+    /// *AI fix* over a healthy `SELECT` for it.
+    #[test]
+    fn a_lost_connection_is_the_servers_failure_not_the_statements() {
+        use crate::model::ErrorSource::*;
+        assert_eq!(
+            run_error_source(Statement, Some(StmtOutcome::ConnectionLost)),
+            Server
+        );
+        // Everything else keeps what the error said.
+        assert_eq!(
+            run_error_source(Statement, Some(StmtOutcome::Failed)),
+            Statement
+        );
+        assert_eq!(run_error_source(Statement, None), Statement);
+        assert_eq!(
+            run_error_source(App, Some(StmtOutcome::ConnectionLost)),
+            App
+        );
+        assert_eq!(
+            run_error_source(Server, Some(StmtOutcome::ConnectionLost)),
+            Server
+        );
+    }
 
     fn ok(state: TxState, engine: TxEngine, sql: &str) -> TxState {
         state.on_statement(engine, sql, StmtOutcome::Ok)

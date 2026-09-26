@@ -104,6 +104,21 @@ pub enum DbError {
     Query(String),
     #[error("query cancelled")]
     Cancelled,
+    /// **Schemaic's own sentence**, not the server's — a refusal written before
+    /// anything was sent (`sqlite::open_target`, the SQLite manual-mode
+    /// backstop, an `sql_mode` that would not pin), or this crate's account of
+    /// what an operation did (a Stop that could not undo everything, a Commit
+    /// that found the block aborted). Rendered as written: it is already the
+    /// whole sentence, and "query failed:" in front of "Commit cancelled — …"
+    /// named a failure that was the user's own act.
+    ///
+    /// The variant exists because [`DbError::modal_source`] reads provenance
+    /// off it, and `Query`/`Connect` carried these sentences too — so the bar
+    /// offered *AI fix* on a `SELECT 1` whose session set-up had refused, and
+    /// the modal *Explain* on a Stop. The producer is the one place that knows
+    /// whose words these are, so it says so here.
+    #[error("{0}")]
+    Refused(String),
 }
 
 impl DbError {
@@ -111,7 +126,8 @@ impl DbError {
     /// bar ([`ErrorSource`]). A rejected statement is the statement's failure —
     /// "AI fix" has SQL to rewrite. A refused connection is the server's words
     /// but about no statement, so it is explained and never fixed. A cancel is
-    /// the user's own act, or Schemaic's watchdog, and has nothing to explain.
+    /// the user's own act, or Schemaic's watchdog, and has nothing to explain;
+    /// nor has a [`DbError::Refused`], which is Schemaic's own sentence.
     ///
     /// Not `source()`: `std::error::Error` already has one, and an inherent
     /// method shadowing it would answer a different question under the same
@@ -120,8 +136,65 @@ impl DbError {
         match self {
             DbError::Query(_) => ErrorSource::Statement,
             DbError::Connect(_) => ErrorSource::Server,
-            DbError::Cancelled => ErrorSource::App,
+            DbError::Cancelled | DbError::Refused(_) => ErrorSource::App,
         }
+    }
+
+    /// This error for the shared modal, raised by something that is **not** the
+    /// editor's statement — a grid Commit, a Manual tab's `COMMIT`/`ROLLBACK`.
+    /// Its SQL is Schemaic's, so a statement's failure is explained and never
+    /// "fixed" into the buffer; a cancel or a refusal of Schemaic's own is
+    /// offered neither.
+    ///
+    /// **One composition, where the commit arm restated it** as "`Cancelled` is
+    /// `App`, everything else `Server`" — which offered *Explain* on "Commit
+    /// cancelled — …", this crate's account of the user's own Stop.
+    pub fn modal_about_another_statement(&self) -> schemaic_core::model::ModalError {
+        schemaic_core::model::ModalError::new(self.to_string(), self.modal_source())
+            .about_another_statement()
+    }
+}
+
+#[cfg(test)]
+mod modal_source_tests {
+    use super::DbError;
+    use schemaic_core::model::ErrorSource;
+
+    #[test]
+    fn only_a_statements_failure_is_offered_a_fix() {
+        assert_eq!(
+            DbError::Query("x".into()).modal_source(),
+            ErrorSource::Statement
+        );
+        assert_eq!(
+            DbError::Connect("x".into()).modal_source(),
+            ErrorSource::Server
+        );
+        assert_eq!(DbError::Cancelled.modal_source(), ErrorSource::App);
+        assert_eq!(
+            DbError::Refused("x".into()).modal_source(),
+            ErrorSource::App
+        );
+    }
+
+    /// Off the editor, a statement's failure is the server's words about SQL
+    /// Schemaic wrote, and Schemaic's own sentences stay its own.
+    #[test]
+    fn off_the_editor_nothing_is_fixed_and_schemaics_words_are_not_explained() {
+        let src = |e: DbError| e.modal_about_another_statement().source;
+        assert_eq!(src(DbError::Query("x".into())), ErrorSource::Server);
+        assert_eq!(src(DbError::Connect("x".into())), ErrorSource::Server);
+        assert_eq!(src(DbError::Cancelled), ErrorSource::App);
+        assert_eq!(src(DbError::Refused("x".into())), ErrorSource::App);
+    }
+
+    /// A refusal is already the whole sentence; nothing is prefixed to it.
+    #[test]
+    fn a_refusal_renders_as_written() {
+        assert_eq!(
+            DbError::Refused("Commit cancelled — x".into()).to_string(),
+            "Commit cancelled — x"
+        );
     }
 }
 

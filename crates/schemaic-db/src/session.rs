@@ -123,6 +123,30 @@ pub struct Session {
     in_tx: AtomicBool,
 }
 
+/// What [`Session::commit`] answers when the block was already aborted, so the
+/// `COMMIT` would have been a `ROLLBACK`.
+fn aborted_commit() -> DbError {
+    DbError::Refused(
+        "the transaction was already aborted — a statement in it failed \
+         or was stopped, so committing discards the work rather than \
+         saving it. Nothing was committed."
+            .to_string(),
+    )
+}
+
+/// A lazy `BEGIN` the server refused — its words, about Schemaic's statement
+/// rather than the one the user ran, which was never sent. `Connect`, not the
+/// `Query` [`Session::control_on`] answers: the single run folded this into the
+/// statement's own result, and the bar offered *AI fix* over a healthy
+/// `SELECT` for a pinned connection that had gone away. Run All already called
+/// it the server's.
+fn begin_failed(e: DbError) -> DbError {
+    match e {
+        DbError::Query(m) => DbError::Connect(format!("could not begin the transaction: {m}")),
+        other => other,
+    }
+}
+
 impl Session {
     /// Open the pinned connection. No transaction is started yet —
     /// [`Session::ensure_tx`] opens one lazily on the tab's first statement, so
@@ -188,7 +212,9 @@ impl Session {
                     client
                         .batch_execute("SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY")
                         .await
-                        .map_err(|e| DbError::Query(e.to_string()))?;
+                        // The server's words about Schemaic's `SET`, not about
+                        // anything the user wrote: `Connect`, so no *AI fix*.
+                        .map_err(|e| pg::read_only_setup_failed(&e))?;
                 }
                 // Best effort — a session whose pid we failed to learn still
                 // works, it just can't be recognised as ours later.
@@ -212,7 +238,7 @@ impl Session {
             // offer the mode for a SQLite connection, and this is the backstop for
             // any path that reaches it anyway.
             Engine::Sqlite => {
-                return Err(DbError::Connect(
+                return Err(DbError::Refused(
                     "SQLite connections don't support manual transaction mode yet — \
                      statements run and commit as they are sent"
                         .to_string(),
@@ -283,7 +309,9 @@ impl Session {
         if self.in_tx.load(Ordering::SeqCst) {
             return Ok(());
         }
-        Session::control_on(&mut guard, "BEGIN").await?;
+        Session::control_on(&mut guard, "BEGIN")
+            .await
+            .map_err(begin_failed)?;
         self.in_tx.store(true, Ordering::SeqCst);
         Ok(())
     }
@@ -325,12 +353,7 @@ impl Session {
             // Leave the connection usable: the block has to end either way, and
             // `ROLLBACK` is the only statement that ends an aborted one.
             let _ = Session::control_on(&mut guard, "ROLLBACK").await;
-            Err(DbError::Query(
-                "the transaction was already aborted — a statement in it failed \
-                 or was stopped, so committing discards the work rather than \
-                 saving it. Nothing was committed."
-                    .to_string(),
-            ))
+            Err(aborted_commit())
         } else {
             Session::control_on(&mut guard, "COMMIT").await
         };
@@ -1127,9 +1150,13 @@ mod tests {
             .await
             .err()
             .expect("SQLite must not get a pinned session");
-        let DbError::Connect(msg) = err else {
-            panic!("expected a Connect error, got {err:?}");
-        };
+        // Schemaic's sentence, not the server's: the modal offers no Explain.
+        assert_eq!(
+            err.modal_source(),
+            schemaic_core::model::ErrorSource::App,
+            "{err:?}"
+        );
+        let msg = err.to_string();
         // The message is the user's whole explanation — the mode's control is
         // simply absent, so this string is the only place the reason appears.
         assert!(msg.to_lowercase().contains("sqlite"), "{msg}");
@@ -1152,8 +1179,35 @@ mod tests {
         );
         let err = Session::open(&db, None).await.err().expect("refused");
         assert!(
-            matches!(&err, DbError::Connect(m) if m.contains("manual transaction mode")),
+            err.to_string().contains("manual transaction mode"),
             "a connect attempt leaked through instead of the refusal: {err:?}"
+        );
+    }
+
+    /// A lazy `BEGIN` that failed is the server's words about no statement the
+    /// user wrote — the one they ran was never sent.
+    #[test]
+    fn a_failed_begin_is_not_the_statements_failure() {
+        use schemaic_core::model::ErrorSource;
+        let e = begin_failed(DbError::Query("server has gone away".into()));
+        assert_eq!(e.modal_source(), ErrorSource::Server);
+        assert!(e.to_string().contains("server has gone away"), "{e}");
+        // A cancel stays the user's own act.
+        assert_eq!(
+            begin_failed(DbError::Cancelled).modal_source(),
+            ErrorSource::App
+        );
+    }
+
+    /// A Commit that found the block already aborted is Schemaic's report of
+    /// what the server did, about no statement the user can fix — the commit
+    /// arm offered *Explain* on it while the fix offer was the only thing
+    /// withheld.
+    #[test]
+    fn an_aborted_commit_is_schemaics_report() {
+        assert_eq!(
+            aborted_commit().modal_source(),
+            schemaic_core::model::ErrorSource::App
         );
     }
 

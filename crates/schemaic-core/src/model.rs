@@ -1848,12 +1848,31 @@ impl ErrorModalContent {
     /// override always wins, and its own source alone decides the actions — the
     /// tab's error never stands in for one the override withheld.
     pub fn resolve(over: Option<ModalError>, tab_error: Option<ModalError>) -> Self {
+        Self::resolve_kept(over, tab_error, false)
+    }
+
+    /// [`Self::resolve`], told whether the tab's error is a **kept** (pinned)
+    /// result's. Both actions resolve against the *current* buffer, and a kept
+    /// failure is a snapshot of a statement that may no longer be in it — so
+    /// on the fallback neither is offered; the text is still shown, because it
+    /// is still true. An override is its surface's own error and is unaffected.
+    ///
+    /// **The bar and the modal both ask this**, with the same `kept`: the bar
+    /// withheld the two actions itself and its *View* opened a modal that asked
+    /// plain `resolve` and offered both again.
+    pub fn resolve_kept(
+        over: Option<ModalError>,
+        tab_error: Option<ModalError>,
+        kept: bool,
+    ) -> Self {
+        let kept = kept && over.is_none();
         let Some(ModalError { text, source }) = over.or(tab_error) else {
             return Self::default();
         };
         // A match, not `!= App`: a fourth source has to decide its own actions
         // rather than land on whichever side of a comparison it happens to fall.
         let (explain, fix) = match source {
+            _ if kept => (false, false),
             ErrorSource::Statement => (true, true),
             ErrorSource::Server => (true, false),
             ErrorSource::App => (false, false),
@@ -1871,6 +1890,34 @@ mod tests {
     use super::*;
 
     // ── the error modal's actions ───────────────────────────────────────────
+
+    /// **A kept failure is a snapshot of a statement that may no longer be in
+    /// the buffer**, and both actions resolve against the buffer: *AI fix* asked
+    /// the model to repair live SQL for a stale error, and *Explain* attached a
+    /// statement picked out of text the error was never about. The bar withheld
+    /// both; its *View* opened a modal that offered both again.
+    #[test]
+    fn a_kept_failure_offers_no_fix_from_the_modal() {
+        let c = ErrorModalContent::resolve_kept(
+            None,
+            Some(ModalError::statement("Unknown table 'userz'")),
+            true,
+        );
+        assert_eq!(c.shown.as_deref(), Some("Unknown table 'userz'"));
+        assert_eq!(c.explain, None);
+        assert_eq!(c.fix, None);
+        // Not kept, the same error earns both.
+        let c = ErrorModalContent::resolve_kept(None, Some(ModalError::statement("x")), false);
+        assert!(c.explain.is_some() && c.fix.is_some());
+        // An override is its surface's own error, not the pinned panel's, and
+        // decides for itself.
+        let c = ErrorModalContent::resolve_kept(
+            Some(ModalError::statement("near 'FORM'")),
+            Some(ModalError::statement("Unknown table 'userz'")),
+            true,
+        );
+        assert_eq!(c.fix.as_deref(), Some("near 'FORM'"));
+    }
 
     #[test]
     fn a_tab_whose_statement_failed_offers_both_actions() {
