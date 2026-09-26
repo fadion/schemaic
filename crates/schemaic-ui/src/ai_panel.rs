@@ -141,24 +141,22 @@ pub(crate) fn ai_panel(ui: Ui) -> impl IntoView {
                         true
                     }
                     schemaic_core::tabsel::TabScope::NoDatabase => {
-                        error_text.set(Some(
+                        error_text.set(Some(schemaic_core::model::ModalError::app(
                             "This tab has no database selected, so a statement run from \
                              here would have nowhere to go. Pick one for this connection \
                              first — if every database is hidden, the SCHEMA eye is where \
-                             to bring one back."
-                                .to_string(),
-                        ));
+                             to bring one back.",
+                        )));
                         error_open.set(true);
                         false
                     }
                     schemaic_core::tabsel::TabScope::OtherConnection => {
-                        error_text.set(Some(
+                        error_text.set(Some(schemaic_core::model::ModalError::app(
                             "This chat is about a tab on a different connection. A new tab \
                              would open on the connection selected in the tree, so the \
                              statement would run somewhere else — switch to that tab, or \
-                             select its connection in the tree, first."
-                                .to_string(),
-                        ));
+                             select its connection in the tree, first.",
+                        )));
                         error_open.set(true);
                         false
                     }

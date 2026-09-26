@@ -67,7 +67,9 @@ use schemaic_core::conn_import;
 use schemaic_core::connection::{ConnStatus, Connection};
 use schemaic_core::edit::analyze_edit;
 use schemaic_core::health;
-use schemaic_core::model::{CommitDone, GridWrite, QueryState, RefetchRequest, ResultSet};
+use schemaic_core::model::{
+    CommitDone, GridWrite, ModalError, QueryState, RefetchRequest, ResultSet,
+};
 use schemaic_core::monitor::{Snapshot, TickAction, diff_snapshots};
 
 /// Outcome of a background connect + schema-load task: `(tunnel port, tunnel
@@ -2345,9 +2347,9 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
     let find_open = RwSignal::new(false);
     let find_query = RwSignal::new(String::new());
     let error_modal_open = RwSignal::new(false);
-    let error_modal_text: RwSignal<Option<String>> = RwSignal::new(None);
-    // Whether that override is a *statement* failure — see `error_modal_fixable`.
-    let error_modal_fixable = RwSignal::new(false);
+    // Every surface names its error's source as it hands it over — see
+    // `ModalError`, which decides what the modal offers about it.
+    let error_modal_text: RwSignal<Option<ModalError>> = RwSignal::new(None);
     let conn_status = RwSignal::new(ConnStatus::Unknown);
     // Consecutive failed health checks of the active connection, folded by every
     // check (polled or manual). Drives the health poll's backoff so a server
@@ -5080,7 +5082,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                         // what the user acts on.
                         Some(msg) => {
                             tab.tx.set(TxState::closed());
-                            error_modal_text.set(Some(msg));
+                            error_modal_text.set(Some(ModalError::server(msg)));
                             error_modal_open.set(true);
                         }
                         None => tab.tx.set(TxState::closed()),
@@ -5163,7 +5165,9 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                 Ok(db) => db,
                 Err(e) => {
                     tab.tx_mode.set(TxMode::Auto);
-                    error_modal_text.set(Some(e));
+                    // `db_for`'s own refusal — a deleted connection, a tunnel
+                    // not up yet — not anything a server said.
+                    error_modal_text.set(Some(ModalError::app(e)));
                     error_modal_open.set(true);
                     return;
                 }
@@ -5203,8 +5207,9 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                     Err(_) if mode.is_none() => {}
                     Err(e) => {
                         tab.tx_mode.set(TxMode::Auto);
-                        error_modal_text
-                            .set(Some(format!("couldn't open a transaction connection: {e}")));
+                        error_modal_text.set(Some(ModalError::server(format!(
+                            "couldn't open a transaction connection: {e}"
+                        ))));
                         error_modal_open.set(true);
                     }
                 }
@@ -6730,7 +6735,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
     // a result: the shared error modal. A failed Open or Save has no grid and no
     // error bar of its own to land in, and silence is the one thing it must not be.
     let file_error: Rc<dyn Fn(String)> = Rc::new(move |msg: String| {
-        error_modal_text.set(Some(msg));
+        error_modal_text.set(Some(ModalError::app(msg)));
         error_modal_open.set(true);
     });
 
@@ -7636,11 +7641,11 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                 // `PlanState::Running` before the gate sees it, span for ever.
                 // `refused()` is what puts that state machine back.
                 if answer == CheckAnswer::ConnectionChanged {
-                    error_modal_text.set(Some(format!(
+                    error_modal_text.set(Some(ModalError::app(format!(
                         "Didn't run against {name} — you switched connection while \
                          Schemaic was checking that it was reachable. Switch back \
                          and try again."
-                    )));
+                    ))));
                     error_modal_open.set(true);
                     refused(Refusal::ConnectionChanged);
                     return;
@@ -7656,11 +7661,13 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                 } else {
                     // Still unreachable — say so, rather than letting the action
                     // silently do nothing.
-                    error_modal_text.set(Some(format!(
+                    // Schemaic's sentence, not the server's: it carries no
+                    // server text for "Explain" to work from.
+                    error_modal_text.set(Some(ModalError::app(format!(
                         "Not connected to {name}. The server didn't answer — check \
                          that it's running and that this connection's settings are \
                          right."
-                    )));
+                    ))));
                     error_modal_open.set(true);
                     refused(Refusal::NotConnected);
                 }
@@ -7717,13 +7724,12 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
     // the defect, and running *nothing* silently is how the defect went
     // unnoticed for as long as it did.
     let run_moved_on: Rc<dyn Fn()> = Rc::new(move || {
-        error_modal_text.set(Some(
+        error_modal_text.set(Some(ModalError::app(
             "You switched tabs while the connection was being re-checked, so the \
              statement was not run. It was checked against the tab it was typed \
              in, and running it here would run it somewhere else. Go back to that \
-             tab and run it again."
-                .to_string(),
-        ));
+             tab and run it again.",
+        )));
         error_modal_open.set(true);
     });
     // The connection-gated but *unguarded* pair. Only the two wrappers below and
@@ -9292,7 +9298,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
         // once per session, so a keyring that stays down does not raise a modal
         // on every read-only toggle.
         if let Some(notice) = secrets::save_connections(&file, saving) {
-            error_modal_text.set(Some(notice));
+            error_modal_text.set(Some(ModalError::app(notice)));
             error_modal_open.set(true);
         }
     };
@@ -11894,7 +11900,6 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             search_history,
             error_modal_open,
             error_modal_text,
-            error_modal_fixable,
             tx_prompt,
             confirm,
             plan_open,

@@ -1752,9 +1752,146 @@ pub enum QueryState {
     Cancelled,
 }
 
+/// Whose words an error in the shared error modal is, which decides what the
+/// modal may offer about it. "Explain" asks the model what the *server* meant;
+/// on a notice Schemaic wrote itself (a config file it recovered, a save that
+/// failed, a refusal to run) there is nothing to explain beyond what the notice
+/// already says, so it is offered for none of those.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ErrorSource {
+    /// A statement's own failure: the server's words about SQL the tab holds.
+    /// Explain, and "AI fix" — there is a statement to rewrite.
+    Statement,
+    /// The server's words about something that is not a statement the tab can
+    /// rewrite: a failed COMMIT, a connection it refused. Explain only.
+    Server,
+    /// Schemaic's own words. Neither action.
+    App,
+}
+
+/// An error a surface hands the shared error modal, with its [`ErrorSource`].
+///
+/// **The source rides with the text**, in one value, because it used to be a
+/// separate flag: every surface had to remember to set it and the modal had to
+/// remember to clear it, or the next open inherited the last one's answer. Now a
+/// surface cannot supply one without the other.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ModalError {
+    pub text: String,
+    pub source: ErrorSource,
+}
+
+impl ModalError {
+    pub fn statement(text: impl Into<String>) -> Self {
+        Self::new(text, ErrorSource::Statement)
+    }
+    pub fn server(text: impl Into<String>) -> Self {
+        Self::new(text, ErrorSource::Server)
+    }
+    pub fn app(text: impl Into<String>) -> Self {
+        Self::new(text, ErrorSource::App)
+    }
+    fn new(text: impl Into<String>, source: ErrorSource) -> Self {
+        Self {
+            text: text.into(),
+            source,
+        }
+    }
+}
+
+/// What the error modal shows and which actions it offers, each carrying the
+/// text it acts on — `None` withholds it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ErrorModalContent {
+    pub shown: Option<String>,
+    pub explain: Option<String>,
+    pub fix: Option<String>,
+}
+
+impl ErrorModalContent {
+    /// Resolve the surface's override against the active tab's error. With no
+    /// override the modal falls back to the tab's error (the editor bar's
+    /// "View"), which is a statement failure by construction. An override
+    /// always wins, and its own source alone decides the actions — the tab's
+    /// error never stands in for one the override withheld.
+    pub fn resolve(over: Option<ModalError>, tab_error: Option<String>) -> Self {
+        // The fallback is resolved *as* a statement error rather than beside
+        // one, so the two cannot drift apart.
+        let Some(ModalError { text, source }) = over.or(tab_error.map(ModalError::statement))
+        else {
+            return Self::default();
+        };
+        // A match, not `!= App`: a fourth source has to decide its own actions
+        // rather than land on whichever side of a comparison it happens to fall.
+        let (explain, fix) = match source {
+            ErrorSource::Statement => (true, true),
+            ErrorSource::Server => (true, false),
+            ErrorSource::App => (false, false),
+        };
+        Self {
+            explain: explain.then(|| text.clone()),
+            fix: fix.then(|| text.clone()),
+            shown: Some(text),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── the error modal's actions ───────────────────────────────────────────
+
+    #[test]
+    fn the_tab_fallback_is_a_statement_error_and_offers_both_actions() {
+        let c = ErrorModalContent::resolve(None, Some("near 'FORM'".into()));
+        assert_eq!(c.shown.as_deref(), Some("near 'FORM'"));
+        assert_eq!(c.explain.as_deref(), Some("near 'FORM'"));
+        assert_eq!(c.fix.as_deref(), Some("near 'FORM'"));
+    }
+
+    #[test]
+    fn a_modal_opened_on_nothing_shows_nothing_and_offers_nothing() {
+        assert_eq!(
+            ErrorModalContent::resolve(None, None),
+            ErrorModalContent::default()
+        );
+    }
+
+    #[test]
+    fn a_statement_override_offers_both_actions_on_its_own_text() {
+        let c = ErrorModalContent::resolve(
+            Some(ModalError::statement("stmt 2 failed")),
+            Some("the tab's older error".into()),
+        );
+        assert_eq!(c.shown.as_deref(), Some("stmt 2 failed"));
+        assert_eq!(c.explain.as_deref(), Some("stmt 2 failed"));
+        assert_eq!(c.fix.as_deref(), Some("stmt 2 failed"));
+    }
+
+    #[test]
+    fn a_server_error_is_explained_but_never_fixed() {
+        let c = ErrorModalContent::resolve(
+            Some(ModalError::server("Deadlock found")),
+            Some("the tab's error".into()),
+        );
+        assert_eq!(c.shown.as_deref(), Some("Deadlock found"));
+        assert_eq!(c.explain.as_deref(), Some("Deadlock found"));
+        assert_eq!(c.fix, None);
+    }
+
+    #[test]
+    fn schemaics_own_notice_offers_neither_action() {
+        // The tab's error must not leak into the actions either: the modal is
+        // showing the notice, and an "Explain" would be about something else.
+        let c = ErrorModalContent::resolve(
+            Some(ModalError::app("connections.json was missing.")),
+            Some("the tab's error".into()),
+        );
+        assert_eq!(c.shown.as_deref(), Some("connections.json was missing."));
+        assert_eq!(c.explain, None);
+        assert_eq!(c.fix, None);
+    }
 
     fn col(type_name: &str) -> Column {
         Column {

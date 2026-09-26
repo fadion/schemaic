@@ -215,6 +215,29 @@ existing prose was left alone.
     widening for the text paths that still speak `Option<String>`. One type the whole way down —
     `StagedEdits`, `RowEdit::set`, `RowInsert::cols`, `edit::DirtyCells` and the grid's `dirty` /
     `new_rows` all carry it — so there is no seam where bytes would have to be re-encoded to cross.
+    **`ErrorSource`, `ModalError` and `ErrorModalContent` decide what the shared error modal
+    offers**, and sit beside `QueryState` because the modal's fallback is that type's `Failed`. A
+    surface hands the modal a `ModalError` — the text and whose words it is, `Statement`, `Server`
+    or `App` — and `ErrorModalContent::resolve(override, tab_error)` answers what it shows and which
+    of *Explain* and *AI fix* it offers, each carrying the text it acts on: a statement's failure
+    gets both, the server's words about anything else (a failed `COMMIT`, a refused connection)
+    *Explain* alone, and Schemaic's own notices — a recovered `connections.json`, a failed `.sql`
+    save, a keyring notice, "Not connected to X" — neither. The modal used to offer *Explain* on
+    all of those, and there was nothing in them for a model to explain. The recovery notice's source
+    is pinned where it is chosen:
+    `diagram_layout_gate::a_recovery_notice_reaches_the_modal_as_schemaics_own` reads
+    `report_recoveries`' body for `ModalError::app`, and fails with `::server` in its place. With
+    no override it falls back to the active tab's run error, a statement's by construction, which
+    offers both — and it is resolved *as* a `ModalError::statement` through the same `match`, not
+    answered beside it, so the fallback and a `Statement` override cannot drift apart. **The
+    source rides with the text in one value because it used to be a separate flag**
+    (`error_modal_fixable`): every surface had to remember to set it and the modal to clear it on
+    close, or the next open inherited the last one's answer; now a surface cannot supply one
+    without the other. **An override's own source alone decides**, and the tab's error never
+    stands in for an action the override withheld — the modal is showing the notice, and an
+    *Explain* would be about something else (`schemaics_own_notice_offers_neither_action`). The
+    actions are a `match` rather than `!= App`, so a fourth source has to decide its own rather
+    than land on whichever side of a comparison it happens to fall.
   - `aggregate.rs` — what a multi-cell grid selection adds up to (`aggregate` → `Aggregates` +
     `summary`). The arithmetic is **fixed-point, not `f64`**, and that is the whole reason the
     module has substance: `Column::is_numeric` counts `DECIMAL`/`NUMERIC`, while `Value` leaves
@@ -15785,6 +15808,15 @@ existing prose was left alone.
     `the_scan_sees_the_export_submenu_in_all_three_arms` reads this file's own source for lines
     beginning `entries.push(export_submenu(` and `entries.extend(create_submenu(`, so changing what
     those two calls *take* costs nothing and re-wrapping how they are *written* blinds the gate.
+    **The error modal wears `modal_title("Error", …)` and its ✕**, where it used to have neither a
+    title row nor a close button and only click-away and Escape closed it. All three exits run the
+    one `close`, which is also what clears `error_modal_text` so the editor bar's next *View* falls
+    back to the tab's error. The ✕ joins the modal's ring, and on one of Schemaic's own notices it
+    is the **only** stop, since those offer no action (`core::model::ErrorModalContent`); the
+    actions row drops its top margin when it is empty. The body's padding sits on a body container
+    rather than on the panel, because the title row carries its own padding and a bottom border
+    that a padded panel would inset, and the scroll's `min_height` came down 160 → 120 to pay for
+    the row the title adds.
   - `schema_tree.rs` — SCHEMA sidebar (`schema_panel` + db/table/column/key row builders + keyboard
     nav).
     **`SchemaTreeCtx` names what the rows reach instead of carrying a `Ui`** — `conn`, `schema`,
@@ -16359,9 +16391,13 @@ existing prose was left alone.
     messages are re-derived when the entry runs, like every other action in this menu. Captured,
     they could outlive the text they described — a reload between the right-click and the click
     leaves `sql.get(lo..hi)` answering `None`, and the entry then does nothing with nothing said.
-    The modal's is the narrower case: it appears only when
-    the modal fell back to the tab's run error, never over an `error_modal_text` override, which is a
-    commit error or a server that didn't answer — nothing the editor can rewrite. It has to route
+    The modal's is the narrower case: it appears when the modal fell back to the tab's run error, or
+    over an `error_modal_text` override its surface marked `ErrorSource::Statement` — never over a
+    `Server` one (a commit error, a server that didn't answer) or an `App` notice, neither of which
+    is anything the editor can rewrite (`core::model::ErrorModalContent::resolve`). No surface
+    marks one `Statement` today — the grid bar hands the modal `ModalError::server` on both of its
+    errors, since a commit and a re-run are not statements in the buffer — so in practice the fix is
+    the fallback's alone. It has to route
     through a request signal at all because `CmdK` is created inside `query_pane` and never leaves
     it, so the workspace-level modal has no handle to reach it with — and that signal **carries the
     message**, because the modal shows the error it opened on while a run landing behind it moves
@@ -16394,10 +16430,12 @@ existing prose was left alone.
     (icon, gap, label) whose box ends past its last glyph. Unlike the fix it needs **no request
     signal**:
     the chat panel belongs to the workspace, so the modal can reach it directly, the way the schema
-    tree's own *AI Explain* does. It is also offered **wherever the fix is not** — over an
-    `error_modal_text` override, where there is no statement to rewrite but the words still deserve
-    an answer — and withheld only when the modal was opened on nothing at all, where it would ask
-    the model to account for the phrase "No error.".
+    tree's own *AI Explain* does. It is also offered **where the fix is not** — over a `Server`
+    override, where there is no statement to rewrite but the server's words still deserve an answer
+    — and withheld in two places: over an `App` override, Schemaic's own notice, which already says
+    everything a model could (it used to be offered there too, on "connections.json was missing"
+    and "Not connected to X" alike); and when the modal was opened on nothing at all, where it
+    would ask the model to account for the phrase "No error.".
     `inline_footer_y` is the other end's geometry, and it is deliberately not `points_of_offset` at
     the anchor line's end: that offset maps to a column *before* the phantom rows, so its `bot` is
     the bottom of the line's own row. The **next** document line's top is the honest answer — the
@@ -18560,7 +18598,8 @@ existing prose was left alone.
   and reading a disposed signal would panic. A save snapshots the text *before* the write, so typing
   during it correctly leaves the tab modified afterwards. Failures land in the shared error modal
   (`error_modal_text` + `error_modal_open`), because a failed Open or Save has no grid and no error
-  bar of its own to land in and silence is the one thing it must not be. Open activates an
+  bar of its own to land in and silence is the one thing it must not be. It goes as a
+  `ModalError::app` — a file error, not the server's words, so the modal offers neither AI action. Open activates an
   already-open tab on the same connection rather than opening one file twice — two tabs saving over
   each other is a lost edit — and otherwise places the new tab through `place_tab`, whose blank-slate
   predicate gained `path.is_none()`: a tab bound to a file is not a blank slate even when the file
@@ -26789,7 +26828,10 @@ this bundle's.
   a batch with no editor bar to fall back on. Once **every** result became a panel the two were the
   same value, and the pair drew the same error twice — so `batch_err` is gone and `grid_error_bar`
   now reports only on what the *grid* did: a commit, a filter re-run, an export. None of those is a
-  statement in the buffer, which is why nothing it carries is `fixable` any more.
+  statement in the buffer, which is why `BarState::Error` no longer carries a `fixable` flag — it
+  was `false` on every error once the batch arm left — and its **View** shows only when
+  `text::hides_detail` says one-lining hid something, and always hands the modal
+  `ModalError::server`.
   The editor bar keys on a `Memo<Option<String>>` of the message rather than on the `QueryState`
   itself: the shown result is derived from the panel list, so every write to it — each statement of
   a batch landing, a pin, a filter re-run restating its panel — reaches that container, and

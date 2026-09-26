@@ -4722,6 +4722,26 @@ mod diagram_layout_gate {
              empty file over the recovered nothing, and the notice with it"
         );
     }
+
+    /// **A recovery notice is Schemaic's own words, so the modal offers no
+    /// "Explain" on it.** "connections.json was missing — recovered from the
+    /// `.bak`" already says everything a model could, and the modal used to
+    /// offer to explain it anyway. `ErrorModalContent::resolve` is tested in
+    /// core; this pins the one call site that decides which source it is given.
+    #[test]
+    fn a_recovery_notice_reaches_the_modal_as_schemaics_own() {
+        let src = crate::source_gate::production_code(include_str!("lib.rs"));
+        let at = src
+            .find("pub fn report_recoveries(")
+            .expect("the recovery reporter");
+        let end = crate::source_gate::item_end(&src, at).expect("no end to the reporter");
+        let body = &src[at..end];
+        assert!(
+            body.contains(&["ModalError::", "app("].concat()),
+            "`report_recoveries` must hand the modal a `ModalError::app` — any \
+             other source offers \"Explain\" on a notice about Schemaic's own files"
+        );
+    }
 }
 
 /// **A text box's width moves with the interface scale, or the text outgrows
@@ -6077,19 +6097,14 @@ pub struct OverlayUi {
     /// Per-connection Find-Anywhere search history (recorded on activation, shown
     /// on open with an empty query). Persisted to `search_history.json` by the app.
     pub search_history: RwSignal<Vec<schemaic_core::search_history::SearchEntry>>,
-    /// "View" modal for an error bar. When `error_modal_text` is `Some`, the modal
-    /// shows that text (the grid's commit error); otherwise it falls back to the
-    /// active tab's full query error (the editor error bar).
+    /// The shared error modal. When `error_modal_text` is `Some`, the modal shows
+    /// that error, and its [`ModalError::source`] decides whether "Explain" and
+    /// "AI fix" are offered; otherwise it falls back to the active tab's full
+    /// query error (the editor error bar), which offers both.
+    ///
+    /// [`ModalError::source`]: schemaic_core::model::ModalError
     pub error_modal_open: RwSignal<bool>,
-    pub error_modal_text: RwSignal<Option<String>>,
-    /// Whether the text in `error_modal_text` is a **statement** failure — a
-    /// Run-Everything statement's own error — as opposed to a commit error, a
-    /// failed export or a server that never answered. It decides whether the
-    /// modal may offer "AI fix" and "Explain": those act on a statement, and an
-    /// override was treated as "not one" across the board, which left the single
-    /// case `intel::error_fix_range` exists for with no fix affordance anywhere.
-    /// Cleared alongside the text.
-    pub error_modal_fixable: RwSignal<bool>,
+    pub error_modal_text: RwSignal<Option<schemaic_core::model::ModalError>>,
     /// Pending "you have an open transaction" prompt, or `None`. Set by any
     /// action that would strand a transaction — switching back to Auto-commit,
     /// closing the tab, disconnecting, or changing the tab's database — and
@@ -8141,12 +8156,18 @@ pub(crate) fn reveal_ai_panel(right_panel: RwSignal<RightPanel>) {
 /// Takes the two signals rather than [`OverlayUi`] because the app's own lazy
 /// load — the layout prune inside `delete_conn_now` — runs in a closure built
 /// long before the `Ui` literal exists.
-pub fn report_recoveries(text: RwSignal<Option<String>>, open: RwSignal<bool>) {
+pub fn report_recoveries(
+    text: RwSignal<Option<schemaic_core::model::ModalError>>,
+    open: RwSignal<bool>,
+) {
     let notices = schemaic_core::persist::take_recoveries();
     if notices.is_empty() {
         return;
     }
-    text.set(Some(notices.join("\n\n")));
+    // Schemaic's own notice about its own files — nothing for "Explain" to add.
+    text.set(Some(schemaic_core::model::ModalError::app(
+        notices.join("\n\n"),
+    )));
     open.set(true);
 }
 
@@ -8173,7 +8194,7 @@ pub fn report_recoveries(text: RwSignal<Option<String>>, open: RwSignal<bool>) {
 /// reason — the app's prune runs in a closure built long before the `Ui` literal
 /// exists.
 pub fn load_diagram_layouts(
-    text: RwSignal<Option<String>>,
+    text: RwSignal<Option<schemaic_core::model::ModalError>>,
     open: RwSignal<bool>,
 ) -> schemaic_core::erd::DiagramLayoutsFile {
     let layouts = schemaic_core::persist::load_json("diagrams.json");
@@ -8642,7 +8663,6 @@ fn center(ui: Ui) -> impl IntoView {
     let inline_ai_cancel = ui.ai_actions.inline_cancel.clone();
     let error_modal_open = ui.overlay.error_modal_open;
     let error_modal_text = ui.overlay.error_modal_text;
-    let error_modal_fixable = ui.overlay.error_modal_fixable;
     let schema_visible = ui.layout.schema_visible;
     let right_panel = ui.layout.right_panel;
     let ai_send = ui.ai_actions.send.clone();
@@ -9029,7 +9049,6 @@ fn center(ui: Ui) -> impl IntoView {
                     rollback_tx: rollback_tx.clone(),
                     error_open: error_modal_open,
                     error_text: error_modal_text,
-                    error_fixable: error_modal_fixable,
                 },
             )
             .into_any(),
@@ -9111,7 +9130,6 @@ fn results_section(
     let (goto_open, goto_query, goto_step) = (gctx.goto_open, gctx.goto_query, gctx.goto_step);
     let sel_summary = gctx.sel_summary;
     let (commit_err, error_open, error_text) = (gctx.commit_err, gctx.error_open, gctx.error_text);
-    let error_fixable = gctx.error_fixable;
     let commit_note = gctx.commit_note;
     let (commit_wait, rollback_tx) = (gctx.commit_wait, gctx.rollback_tx.clone());
     let view_err = gctx.view_err;
@@ -9277,7 +9295,7 @@ fn results_section(
             find_open, find_query, find_step, find_total, find_pos, find_more,
         ),
         grid_goto_bar(goto_open, goto_query, goto_step),
-        grid_error_bar(bars, rollback_tx, error_open, error_text, error_fixable),
+        grid_error_bar(bars, rollback_tx, error_open, error_text),
         // Last, so it paints over the panel — and it lifts itself above the
         // bottom bar when that one is up, through the **same** predicate
         // `grid_error_bar` decides its own visibility with. It used to be a

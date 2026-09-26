@@ -39,8 +39,8 @@ use schemaic_core::format::{self, ColumnFormat, ColumnFormatRule};
 use schemaic_core::intel::SqlDialect;
 use schemaic_core::jsontree::{JsonNode, PathSeg, RowKind, TreeRow};
 use schemaic_core::model::{
-    CellEdit, CellRef, CellTag, Column, CommitDone, GridWrite, QueryState, RefetchRequest,
-    RefetchRow, ResultSet, RowDelete, RowEdit, RowInsert, Value, drop_committed,
+    CellEdit, CellRef, CellTag, Column, CommitDone, GridWrite, ModalError, QueryState,
+    RefetchRequest, RefetchRow, ResultSet, RowDelete, RowEdit, RowInsert, Value, drop_committed,
 };
 use schemaic_core::rowjson::{self, ColSpec};
 use schemaic_core::schema::{DbSchema, ForeignKeyInfo, SchemaState, TableInfo, TableSource};
@@ -3744,10 +3744,7 @@ pub(crate) struct GridCtx {
     /// reveals it; the grid's "View" first sets `error_text` to the full commit
     /// error so the modal shows that instead of the tab's query error.
     pub(crate) error_open: RwSignal<bool>,
-    pub(crate) error_text: RwSignal<Option<String>>,
-    /// Whether the override in `error_text` is a *statement* failure. See
-    /// [`BarState::Error`].
-    pub(crate) error_fixable: RwSignal<bool>,
+    pub(crate) error_text: RwSignal<Option<ModalError>>,
 }
 
 /// The grid's commit-status bar, rendered at the RESULTS-panel level so it pins to
@@ -3782,8 +3779,7 @@ pub(crate) fn grid_error_bar(
     bars: BarSignals,
     rollback_tx: Rc<dyn Fn(usize)>,
     error_open: RwSignal<bool>,
-    error_text: RwSignal<Option<String>>,
-    error_fixable: RwSignal<bool>,
+    error_text: RwSignal<Option<ModalError>>,
 ) -> impl IntoView {
     // Destructured **exhaustively**, with no `..`: the struct's own doc says
     // that is what it is for, and a rest pattern re-opens the exact failure it
@@ -3808,13 +3804,10 @@ pub(crate) fn grid_error_bar(
     // describes one still in flight (and every path clears the note before
     // reporting a failure anyway).
     let current = move || {
-        // Neither of these is a *statement* error, so neither is fixable:
-        // `error_fix_range` scopes a fix to a statement in the buffer, and a
-        // commit and a filter re-run are neither of them that.
         commit_err
             .get()
-            .map(|m| BarState::Error(m, false))
-            .or_else(|| view_err.get().map(|m| BarState::Error(m, false)))
+            .map(BarState::Error)
+            .or_else(|| view_err.get().map(BarState::Error))
             .or_else(|| commit_wait.get().map(BarState::Wait))
             .or_else(|| commit_note.get().map(BarState::Note))
     };
@@ -3823,27 +3816,23 @@ pub(crate) fn grid_error_bar(
             None => return empty().into_any(),
             Some(BarState::Wait(note)) => return wait_bar(note, rollback_tx.clone()).into_any(),
             Some(BarState::Note(m)) => return note_bar(m).into_any(),
-            Some(BarState::Error(msg, fixable)) => (msg, fixable),
+            Some(BarState::Error(msg)) => msg,
         };
-        let (msg, fixable) = msg;
         // Collapse to a single line (a multi-line server error would spill out
         // the top); the full text stays available in the View modal.
         let one_line = msg.split_whitespace().collect::<Vec<_>>().join(" ");
         let full = msg;
-        // View when the bar is hiding something — a server error with a DETAIL
-        // under it — **or when the modal has an action this bar does not.** On a
-        // short one-liner it would otherwise open a modal repeating the same
-        // words; on a *statement* failure the modal is where "AI fix" and
-        // "Explain" live, so `Unknown column 'x' in 'field list'` offered nothing
-        // at all on the one surface those actions exist for.
-        let view: AnyView = if fixable || hides_detail(&full, BAR_ONE_LINE_CHARS) {
+        // View only when the bar is hiding something — a server error with a
+        // DETAIL under it. On a short one-liner it would open a modal repeating
+        // the same words: neither error here is a statement in the buffer, so
+        // the modal has no "AI fix" this bar lacks.
+        let view: AnyView = if hides_detail(&full, BAR_ONE_LINE_CHARS) {
             text("View")
                 .on_click_stop(move |_| {
-                    // The flag rides with the text: the modal reads an override
-                    // as "not a statement", which is right for a commit error and
-                    // wrong for this one.
-                    error_fixable.set(fixable);
-                    error_text.set(Some(full.clone()));
+                    // A commit or a re-run failed on the server, so Explain has
+                    // something to explain; neither is a statement in the buffer
+                    // (`error_fix_range` scopes a fix to one), so no "AI fix".
+                    error_text.set(Some(ModalError::server(full.clone())));
                     error_open.set(true);
                 })
                 .style(|s| {
@@ -3905,9 +3894,9 @@ pub(crate) fn grid_error_bar(
 /// dismissal — and what is left here is uniformly the tail of something that
 /// has already happened.
 enum BarState {
-    /// The message, and whether it is a **statement** failure — the batch arm —
-    /// which is what decides whether the modal behind "View" may offer a fix.
-    Error(String, bool),
+    /// A commit's or a re-run's failure. Never a statement's own — that is the
+    /// editor bar's — so the modal behind "View" offers no fix for it.
+    Error(String),
     Wait(WaitNote),
     Note(String),
 }

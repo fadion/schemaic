@@ -970,7 +970,7 @@ fn save_log(
     export_err: RwSignal<Option<String>>,
     exported: RwSignal<bool>,
     open: RwSignal<bool>,
-    fallback_err: RwSignal<Option<String>>,
+    fallback_err: RwSignal<Option<schemaic_core::model::ModalError>>,
     fallback_open: RwSignal<bool>,
     export_file: crate::ExportFn,
     format: ExportFormat,
@@ -1059,7 +1059,10 @@ fn save_log(
                     if open.try_get_untracked() == Some(true) {
                         export_err.try_update(|v| *v = Some(e));
                     } else {
-                        fallback_err.try_update(|v| *v = Some(e));
+                        // A file that couldn't be written — Schemaic's own
+                        // report, so the modal offers no "Explain".
+                        fallback_err
+                            .try_update(|v| *v = Some(schemaic_core::model::ModalError::app(e)));
                         fallback_open.try_update(|v| *v = true);
                     }
                 }

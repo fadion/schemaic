@@ -16,7 +16,7 @@ use floem::prelude::*;
 use floem::reactive::{Memo, create_effect, create_memo};
 
 use schemaic_core::connection::Connection;
-use schemaic_core::model::QueryState;
+use schemaic_core::model::{ErrorModalContent, QueryState};
 use schemaic_core::schema::{SchemaState, TableSource, db_visible};
 use schemaic_core::skeleton::{delete_skeleton, insert_skeleton, update_skeleton};
 
@@ -26,7 +26,7 @@ use crate::widgets::{
     ACTION_TAB, CURSOR_MENU_GAP, MenuEntry, autohide, box_menu_inset, cursor_menu_insets,
     dialog_button, first_enabled, focus_root, list_step_enabled, measure_text_px_at,
     menu_drawn_height, menu_inset, menu_item_style, menu_panel, menu_panel_width, modal_body_h,
-    modal_w, panel_style, window_size,
+    modal_title, modal_w, panel_style, window_size,
 };
 use crate::{
     ActivityUi, Confirm, ConnNode, ConnUi, CtxKind, CtxMenu, DdlUi, LayoutUi, OverlayUi,
@@ -5362,18 +5362,21 @@ pub(crate) fn confirm_overlay(confirm: RwSignal<Option<Confirm>>) -> impl IntoVi
     })
 }
 
-/// "View" modal for an error too long for the surface that raised it: same
-/// backdrop + panel chrome as `find_overlay`, but no input — the full text,
-/// centered and scrollable. Click-away or Escape closes.
+/// The shared error modal: the full text of an error too long for the surface
+/// that raised it, or of one with no surface of its own (a failed save, a
+/// recovered config file, a refusal to run). The standard titled panel with its
+/// ✕, the text centered and scrollable; the ✕, click-away and Escape all close.
 ///
-/// Three surfaces reach it now: the editor error bar (which supplies no text and
-/// falls back to the active tab's error), the grid's commit error, and the
-/// schema tree's failed database — each with a row too narrow to print a server
-/// error in.
+/// The editor error bar supplies no text and falls back to the active tab's
+/// error; every other surface hands over a [`ModalError`], whose source decides
+/// which of "Explain" and "AI fix" the footer offers
+/// ([`ErrorModalContent::resolve`]).
+///
+/// [`ModalError`]: schemaic_core::model::ModalError
+/// [`ErrorModalContent::resolve`]: schemaic_core::model::ErrorModalContent::resolve
 pub(crate) fn error_modal_overlay(ui: Ui) -> impl IntoView {
     let open = ui.overlay.error_modal_open;
     let text_override = ui.overlay.error_modal_text;
-    let override_is_statement = ui.overlay.error_modal_fixable;
     let tabs = ui.tabs_ui.tabs;
     let active = ui.tabs_ui.active;
     // "Explain" goes straight to the chat panel — no request signal, unlike the
@@ -5397,36 +5400,27 @@ pub(crate) fn error_modal_overlay(ui: Ui) -> impl IntoView {
                 QueryState::Failed(m) => Some(m),
                 _ => None,
             });
-            let override_text = text_override.get_untracked();
-            // "AI fix" belongs to a **statement** error. Most overrides are not
-            // one — a commit error, a failed export, a server that didn't answer —
-            // and fixing on those would silently act on whatever the active tab
-            // last ran instead. But a *Run-Everything statement failure* is
-            // routed here as an override too, and it is precisely the case
-            // `intel::error_fix_range` was added to scope: refusing it left the
-            // one multi-statement run error in the app with no fix affordance on
-            // any surface. `error_modal_fixable` is the bar's answer to which
-            // kind this is.
-            let fixable_error = match &override_text {
-                None => tab_error.clone(),
-                Some(m) if override_is_statement.get_untracked() => Some(m.clone()),
-                Some(_) => None,
-            };
-            // `None` when the modal was opened on nothing at all — a state it can
-            // reach, and one where both actions have to go: there is no error to
-            // explain and nothing to fix, and a live "Explain" would send the
-            // model the words "No error." to account for.
-            let error = override_text.or(tab_error);
-            let msg = error.clone().unwrap_or_else(|| "No error.".to_string());
+            // "AI fix" belongs to a **statement** error and "Explain" to the
+            // server's words; Schemaic's own notices get neither. Which one an
+            // override is, its surface said when it handed it over; the tab
+            // fallback is a statement's failure by construction, and it is the
+            // one `intel::error_fix_range` scopes. Every action is withheld when
+            // the modal was opened on nothing at all, a state it can reach: a
+            // live "Explain" would send the model the words "No error." to
+            // account for.
+            let ErrorModalContent {
+                shown,
+                explain: explain_error,
+                fix: fixable_error,
+            } = ErrorModalContent::resolve(text_override.get_untracked(), tab_error);
+            let msg = shown.unwrap_or_else(|| "No error.".to_string());
+            let has_actions = explain_error.is_some() || fixable_error.is_some();
 
             // Closing clears the text override so the next open (e.g. the editor's
             // "View") falls back to the tab error again.
             let close = move || {
                 open.set(false);
                 text_override.set(None);
-                // The flag is part of the override and goes with it, or the next
-                // open would inherit this one's answer.
-                override_is_statement.set(false);
             };
 
             // The same "AI fix" the error bar offers, for the reader who opened
@@ -5469,15 +5463,16 @@ pub(crate) fn error_modal_overlay(ui: Ui) -> impl IntoView {
                 empty().into_any()
             };
 
-            // **Explain is offered for every error this modal shows**, where the
+            // **Explain is offered for every error the server raised**, where the
             // fix is offered for one kind. A fix needs a statement to rewrite; an
-            // explanation needs nothing but the words, and a commit error, a
-            // failed export or a server that never answered are exactly the ones
-            // whose modal is otherwise a wall of text with nothing to do about
-            // it. The statement rides along only when there is one, and it is
-            // `error_fix_range`'s choice of statement so the two actions are
-            // talking about the same one.
-            let explain = if let Some(explain_msg) = error {
+            // explanation needs nothing but the server's words, and a failed
+            // commit or a refused connection are exactly the ones whose modal is
+            // otherwise a wall of text with nothing to do about it. It is not
+            // offered on Schemaic's own notices — "connections.json was missing"
+            // already says everything a model could. The statement rides along
+            // only when there is one, and it is `error_fix_range`'s choice of
+            // statement so the two actions are talking about the same one.
+            let explain = if let Some(explain_msg) = explain_error {
                 let ai_send = ai_send.clone();
                 // The **tab's** connection decides how much of the error may leave
                 // the machine, not the active one — a tab keeps the connection it
@@ -5534,14 +5529,19 @@ pub(crate) fn error_modal_overlay(ui: Ui) -> impl IntoView {
             };
 
             let actions = container(h_stack((explain, fix)).style(|s| s.flex_row().items_center()))
-                .style(|s| s.width_full().justify_end().margin_top(theme::scaled(14.0)));
+                .style(move |s| {
+                    s.width_full()
+                        .justify_end()
+                        .apply_if(has_actions, |s| s.margin_top(theme::scaled(14.0)))
+                });
 
             // Fixed text width so the error wraps (a `scroll` gives its child
             // unbounded width otherwise). Must stay UNDER the scroll's content
-            // area = panel 500 − 40 padding − 2 border = 458; wider triggers a
-            // few-px horizontal scrollbar. `min_height` keeps the modal ~500×200
-            // for short errors; it grows to `max_height` then scrolls if long.
-            let panel = container(v_stack((
+            // area = panel 500 − 40 body padding − 2 border = 458; wider triggers
+            // a few-px horizontal scrollbar. `min_height` keeps the modal ~500×220
+            // for short errors, title row included; it grows to `max_height`
+            // then scrolls if long.
+            let body = v_stack((
                 autohide(scroll(text(msg).style(|s| {
                     s.width(theme::scaled(450.0))
                         .color(theme::error())
@@ -5550,18 +5550,22 @@ pub(crate) fn error_modal_overlay(ui: Ui) -> impl IntoView {
                 })))
                 .style(|s| {
                     s.width_full()
-                        .min_height(theme::scaled(160.0))
+                        .min_height(theme::scaled(120.0))
                         .max_height(modal_body_h(360.0))
                 }),
                 actions,
-            )))
-            .on_click_stop(|_| {})
-            .style(|s| {
-                panel_style(s)
-                    .width(modal_w(500.0))
-                    .padding(theme::scaled(20.0))
-                    .border_color(theme::modal_border())
-            });
+            ))
+            .style(|s| s.width_full().padding(theme::scaled(20.0)));
+            // The ✕ every other modal wears, closing through the same `close` as
+            // click-away and Escape so the three exits cannot disagree. It joins
+            // the ring, which on a notice with no actions makes it the only stop.
+            let panel = v_stack((modal_title("Error", Rc::new(close), ring.clone()), body))
+                .on_click_stop(|_| {})
+                .style(|s| {
+                    panel_style(s)
+                        .width(modal_w(500.0))
+                        .border_color(theme::modal_border())
+                });
             crate::widgets::focus_root_with_ring(
                 stack((crate::widgets::dismiss_layer(close), panel)),
                 ring,

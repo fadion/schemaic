@@ -1931,7 +1931,6 @@ fn db_node(conn: ConnNode, ctx: SchemaTreeCtx) -> impl IntoView {
     // needs no clone of the whole `Ui`.
     let err_open = node_overlay.error_modal_open;
     let err_text = node_overlay.error_modal_text;
-    let err_fixable = node_overlay.error_modal_fixable;
     let children = dyn_container(
         // Through `dedup_key`, or every write to the app-wide `expanded` set
         // rebuilds this whole database's subtree — see it.
@@ -1974,7 +1973,7 @@ fn db_node(conn: ConnNode, ctx: SchemaTreeCtx) -> impl IntoView {
                         .padding_vert(theme::scaled(3.0))
                 })
                 .into_any(),
-                SchemaState::Failed(e) => failed_row(e, err_open, err_text, err_fixable).into_any(),
+                SchemaState::Failed(e) => failed_row(e, err_open, err_text).into_any(),
                 SchemaState::Loaded(schema) => {
                     let db = database.clone();
                     let child_ctx = |indent_levels: u32| SchemaTreeCtx {
@@ -3288,8 +3287,7 @@ fn tree_row_static(s: floem::style::Style, pad_left: f64) -> floem::style::Style
 fn failed_row(
     msg: String,
     open: RwSignal<bool>,
-    detail: RwSignal<Option<String>>,
-    fixable: RwSignal<bool>,
+    detail: RwSignal<Option<schemaic_core::model::ModalError>>,
 ) -> impl IntoView {
     container(
         h_stack((
@@ -3297,11 +3295,9 @@ fn failed_row(
                 .style(|s| s.color(theme::error()).font_size(theme::font_label())),
             text("View")
                 .on_click_stop(move |_| {
-                    // Not a statement failure, so the modal offers no "AI fix" —
-                    // the flag rides with the text because the modal reads a
-                    // stale one otherwise.
-                    fixable.set(false);
-                    detail.set(Some(msg.clone()));
+                    // The server's refusal, so worth an "Explain" — but not a
+                    // statement failure, so no "AI fix".
+                    detail.set(Some(schemaic_core::model::ModalError::server(msg.clone())));
                     open.set(true);
                 })
                 .style(|s| {
