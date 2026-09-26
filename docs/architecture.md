@@ -263,7 +263,10 @@ existing prose was left alone.
     failure, which earns neither: both actions resolve against the current buffer and a pin's
     message is a snapshot of a statement that may no longer be in it. The bar used to withhold them
     itself while its *View* opened a modal that asked plain `resolve` and offered both again
-    (`a_kept_failure_offers_no_fix_from_the_modal`). **`ModalError::about_another_statement` rewrites a source after the fact**,
+    (`a_kept_failure_offers_no_fix_from_the_modal`). The statement *Explain* attaches is
+    `ErrorModalContent::explain_range` on both surfaces — `error_fix_range`'s choice, and only when
+    the error earns a fix — where each view had spelled that rule on its own
+    (`explain_attaches_a_statement_only_when_there_is_one_to_fix`). **`ModalError::about_another_statement` rewrites a source after the fact**,
     for an error raised by SQL that is not the editor's: a grid filter/sort re-run's failure goes
     into `view_err` with `Statement` turned to `Server`, because that SQL is one Schemaic built and
     the modal's *AI fix* would act on the editor's buffer; `Server` and `App` pass through unchanged

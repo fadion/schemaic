@@ -5415,11 +5415,13 @@ pub(crate) fn error_modal_overlay(ui: Ui) -> impl IntoView {
             // the current buffer, and a pin's message is a snapshot of a
             // statement that may no longer be in it.
             let kept = tab.is_some_and(|t| t.shown_frozen());
+            let offers =
+                ErrorModalContent::resolve_kept(text_override.get_untracked(), tab_error, kept);
             let ErrorModalContent {
                 shown,
                 explain: explain_error,
                 fix: fixable_error,
-            } = ErrorModalContent::resolve_kept(text_override.get_untracked(), tab_error, kept);
+            } = offers.clone();
             let msg = shown.unwrap_or_else(|| "No error.".to_string());
             let has_actions = explain_error.is_some() || fixable_error.is_some();
 
@@ -5494,8 +5496,8 @@ pub(crate) fn error_modal_overlay(ui: Ui) -> impl IntoView {
                         })
                     })
                     .unwrap_or_default();
-                let statement = fixable_error.and_then(|err| {
-                    let tab = tab?;
+                // The bar's rule, asked of the same method.
+                let statement = tab.and_then(|tab| {
                     let dialect = connections
                         .with_untracked(|cs| {
                             cs.iter()
@@ -5504,7 +5506,7 @@ pub(crate) fn error_modal_overlay(ui: Ui) -> impl IntoView {
                         })
                         .unwrap_or_default();
                     tab.query.with_untracked(|sql| {
-                        let (lo, hi) = schemaic_core::intel::error_fix_range(sql, &err, dialect);
+                        let (lo, hi) = offers.explain_range(sql, dialect)?;
                         sql.get(lo..hi).map(str::to_string)
                     })
                 });

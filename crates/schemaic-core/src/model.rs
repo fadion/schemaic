@@ -1883,6 +1883,21 @@ impl ErrorModalContent {
             shown: Some(text),
         }
     }
+
+    /// The statement in `sql` that *Explain* attaches — `intel::error_fix_range`'s
+    /// choice, so the two actions talk about the same one — and only when the
+    /// error earns a fix. A refused connection or a kept failure is about no
+    /// statement in the buffer, and attaching (and highlighting) one would say
+    /// otherwise. **One rule for both surfaces**: the bar and the modal each
+    /// spelled it, untested.
+    pub fn explain_range(
+        &self,
+        sql: &str,
+        dialect: crate::intel::SqlDialect,
+    ) -> Option<(usize, usize)> {
+        let err = self.fix.as_deref()?;
+        Some(crate::intel::error_fix_range(sql, err, dialect))
+    }
 }
 
 #[cfg(test)]
@@ -1917,6 +1932,23 @@ mod tests {
             true,
         );
         assert_eq!(c.fix.as_deref(), Some("near 'FORM'"));
+    }
+
+    /// Explain attaches a statement only when the error is a statement's —
+    /// and a live one, not a pin's.
+    #[test]
+    fn explain_attaches_a_statement_only_when_there_is_one_to_fix() {
+        use crate::intel::SqlDialect;
+        let sql = "SELECT 1;\nSELECT * FROM userz;";
+        let stmt = ErrorModalContent::resolve(None, Some(ModalError::statement("x")));
+        assert_eq!(
+            stmt.explain_range(sql, SqlDialect::MySql),
+            Some(crate::intel::error_fix_range(sql, "x", SqlDialect::MySql))
+        );
+        let server = ErrorModalContent::resolve(None, Some(ModalError::server("Access denied")));
+        assert_eq!(server.explain_range(sql, SqlDialect::MySql), None);
+        let kept = ErrorModalContent::resolve_kept(None, Some(ModalError::statement("x")), true);
+        assert_eq!(kept.explain_range(sql, SqlDialect::MySql), None);
     }
 
     #[test]

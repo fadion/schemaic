@@ -3297,15 +3297,14 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
     let explain_error: Rc<dyn Fn()> = {
         let ai_send = ai_send.clone();
         Rc::new(move || {
-            let ErrorModalContent { explain, fix, .. } = bar_actions();
-            let Some(err) = explain else {
+            let offers = bar_actions();
+            let Some(err) = offers.explain.clone() else {
                 return;
             };
             // The statement rides along only when the error is a statement's —
-            // the modal's rule too. A refused connection is about no statement,
-            // and highlighting one would say otherwise.
+            // the modal's rule too, asked of the same method.
             let sql = query.get_untracked();
-            let range = fix.map(|_| intel::error_fix_range(&sql, &err, dialect.get_untracked()));
+            let range = offers.explain_range(&sql, dialect.get_untracked());
             let Some(p) = prompt::explain_error_prompt(
                 range.and_then(|(lo, hi)| sql.get(lo..hi)),
                 &err,
