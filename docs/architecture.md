@@ -25200,12 +25200,12 @@ Re-introducing the anti-patterns these guard against is a regression:
   rule, because neither holds anything unique — the preview's plan is regenerated from the editor
   left open behind it, and its `exit` already ignores the one dangerous moment, an apply that
   cannot be cancelled; a replacement loaded into the blob viewer is staged into the grid's edit
-  buffer the moment it lands, so closing it only cancels a read. **One case is open, not settled
-  by this rule**: `account_editor.rs`'s account and grant editors share one shell that has a
-  click-away, though each holds a draft (name, password, grants). Their comment says the form
-  re-seeds from its target on open "so nothing is lost", but `close` resets the draft to its
-  default, so edits made since the open do go with a stray click. Whether that is acceptable is a
-  question for the user.
+  buffer the moment it lands, so closing it only cancels a read. `account_editor.rs`'s account and
+  grant editors are in the no-click-away set too, through the one `modal_shell` they share: each
+  holds a draft — a name, a password, grants — that `close` resets to its default, so a stray click
+  would discard everything typed since the open. The form does re-seed from its target on open,
+  and its comment once took that to mean "nothing is lost"; it is true of what was saved and not
+  of what was typed, so a re-seed is no argument for a click-away.
 - **An overlay's `inset(0.0)` style and its content must read the *same* predicate** — one closure,
   used twice, never two spellings of "is this showing". A dropdown whose content is conditional on
   more than its open flag (`open && !db_nodes.is_empty()`, the rule that keeps an empty menu off

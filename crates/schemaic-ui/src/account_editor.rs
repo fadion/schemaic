@@ -56,9 +56,9 @@ use schemaic_core::users::{
 
 use crate::table_designer::suggest_chevron;
 use crate::widgets::{
-    ACTION_TAB, ActionKind, FocusRing, action_button, action_gap, autohide, dismiss_layer,
-    focus_root_with_ring, form_gap, form_section, form_setting, modal_footer_split, modal_h,
-    modal_pad_h, modal_title_owned, modal_w, panel_style,
+    ACTION_TAB, ActionKind, FocusRing, action_button, action_gap, autohide, focus_root_with_ring,
+    form_gap, form_section, form_setting, modal_footer_split, modal_h, modal_pad_h,
+    modal_title_owned, modal_w, panel_style,
 };
 use crate::{
     AccountTarget, ConnUi, DdlUi, FieldCfg, GrantTarget, OverlayUi, UsersTarget, ddl_preview,
@@ -773,8 +773,10 @@ pub(crate) fn account_editor_overlay(d: DdlUi) -> impl IntoView {
     // **The draft goes with the form.** `account_draft` is app-lifetime, so
     // clearing only the target left the plaintext password in a signal for the
     // rest of the process — after Cancel as much as after Apply. The form
-    // re-seeds itself from its target on open, so nothing is lost. Same rule and
-    // same reason as `ddl_preview::close_peers`, which is the other door.
+    // re-seeds itself from its target on open, so nothing *saved* is lost — but
+    // what was typed since the open is, which is why the shell has no
+    // click-away (`modal_shell`). Same rule and same reason as
+    // `ddl_preview::close_peers`, which is the other door.
     let close = move || {
         d.account.set(None);
         d.account_draft.set(Default::default());
@@ -1380,6 +1382,11 @@ struct ShellSize {
 /// Title bar, body, footer, backdrop and the Escape handler — the parts both
 /// forms have identically, written once so they cannot drift into two modals
 /// that dismiss differently.
+///
+/// **No click-away, on purpose**: each form is a draft — a name, a password,
+/// grants — that `close` resets, so a stray click on the backdrop would throw
+/// away everything typed since the open. ✕ and Escape close it. See
+/// docs/architecture.md, *which modals close on a backdrop click*.
 fn modal_shell(
     title: String,
     parts: ShellParts,
@@ -1402,8 +1409,7 @@ fn modal_shell(
     .style(move |s| panel_style(s).width(width).height(modal_h(height)));
 
     let esc = close.clone();
-    let away = close.clone();
-    focus_root_with_ring(stack((dismiss_layer(move || (away)()), panel)), ring)
+    focus_root_with_ring(container(panel), ring)
         .on_key_down(Key::Named(NamedKey::Escape), |_| true, move |_| (esc)())
         .style(|s| {
             s.size_full()
