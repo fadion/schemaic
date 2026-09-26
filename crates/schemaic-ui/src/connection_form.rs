@@ -1628,8 +1628,11 @@ fn conn_form(
     // menu and the list on the left. Free text — a folder is only its name, and
     // exists while a connection names it (`connection::group_by_folder`). 17:
     // after the swatches (15), before the first toggle (20), where it sits.
+    // `conn_field_w`, like Database and User: a folder name is a short word, and
+    // a full-width box made it the widest field on the form. The hint below
+    // keeps the full width so it stays on one line.
     let folder_field = v_stack((
-        field("Folder", draft.folder, ring.clone(), 17),
+        field("Folder", draft.folder, ring.clone(), 17).style(|s| s.width(conn_field_w())),
         text("Optional. Connections with the same folder are listed together.").style(|s| {
             s.width_full()
                 .font_size(theme::font_hint())
