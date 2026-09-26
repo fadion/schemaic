@@ -86,7 +86,7 @@ use mysql_async::{Conn, OptsBuilder};
 use schemaic_core::activity::{self, KillKind, SessionInfo};
 use schemaic_core::blob::{BlobRef, BlobValue};
 use schemaic_core::model::{
-    GridWrite, RefetchRow, RefetchTemplate, ResultBuilder, ResultSet, Value,
+    ErrorSource, GridWrite, RefetchRow, RefetchTemplate, ResultBuilder, ResultSet, Value,
 };
 
 use schemaic_core::schema::{
@@ -104,6 +104,25 @@ pub enum DbError {
     Query(String),
     #[error("query cancelled")]
     Cancelled,
+}
+
+impl DbError {
+    /// Whose words this error is, for the error modal and the editor's error
+    /// bar ([`ErrorSource`]). A rejected statement is the statement's failure —
+    /// "AI fix" has SQL to rewrite. A refused connection is the server's words
+    /// but about no statement, so it is explained and never fixed. A cancel is
+    /// the user's own act, or Schemaic's watchdog, and has nothing to explain.
+    ///
+    /// Not `source()`: `std::error::Error` already has one, and an inherent
+    /// method shadowing it would answer a different question under the same
+    /// name.
+    pub fn modal_source(&self) -> ErrorSource {
+        match self {
+            DbError::Query(_) => ErrorSource::Statement,
+            DbError::Connect(_) => ErrorSource::Server,
+            DbError::Cancelled => ErrorSource::App,
+        }
+    }
 }
 
 /// One block of an export on its way from the server to the file — or the reason
@@ -2567,6 +2586,27 @@ pub(crate) fn parse_typed(s: String, type_name: &str) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_rejected_statement_is_the_statements_failure() {
+        assert_eq!(
+            DbError::Query("Unknown column 'x'".into()).modal_source(),
+            ErrorSource::Statement
+        );
+    }
+
+    #[test]
+    fn a_refused_connection_is_the_servers_words_but_no_statement_to_fix() {
+        assert_eq!(
+            DbError::Connect("Access denied".into()).modal_source(),
+            ErrorSource::Server
+        );
+    }
+
+    #[test]
+    fn a_cancel_is_nobody_elses_words() {
+        assert_eq!(DbError::Cancelled.modal_source(), ErrorSource::App);
+    }
 
     /// **A fourth engine variant is a compiler error; a fourth engine module is
     /// not.** [`ENGINE_ENTRY_POINTS`] is the interface the dispatcher expects by

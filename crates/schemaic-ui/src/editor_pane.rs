@@ -39,7 +39,7 @@ use schemaic_core::connection::ConnStatus;
 
 use schemaic_core::diff::{self, inline_plan, line_span};
 use schemaic_core::intel::{self, Diagnostic, Severity, SqlDialect};
-use schemaic_core::model::QueryState;
+use schemaic_core::model::{ErrorModalContent, QueryState};
 use schemaic_core::pairs::{self, PairAction};
 use schemaic_core::params;
 use schemaic_core::prompt::{self, FixOrigin};
@@ -3264,10 +3264,18 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
             (fix_with_ai)(range, vec![err], FixOrigin::Run);
         })
     };
+    // Both actions ask `ErrorModalContent::resolve`, the question the modal
+    // behind *View* asks, so the bar and the modal cannot offer different ones:
+    // a run refused before anything was sent is Schemaic's own words and gets
+    // neither, a refused connection an explanation but no fix.
+    let bar_actions = move || match results.get_untracked() {
+        QueryState::Failed(err) => ErrorModalContent::resolve(None, Some(err)),
+        _ => ErrorModalContent::default(),
+    };
     let ai_fix: Rc<dyn Fn()> = {
         let fix_error = fix_error.clone();
         Rc::new(move || {
-            let QueryState::Failed(err) = results.get_untracked() else {
+            let Some(err) = bar_actions().fix else {
                 return;
             };
             (fix_error)(err);
@@ -3286,19 +3294,27 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
     let explain_error: Rc<dyn Fn()> = {
         let ai_send = ai_send.clone();
         Rc::new(move || {
-            let QueryState::Failed(err) = results.get_untracked() else {
+            let ErrorModalContent { explain, fix, .. } = bar_actions();
+            let Some(err) = explain else {
                 return;
             };
+            // The statement rides along only when the error is a statement's —
+            // the modal's rule too. A refused connection is about no statement,
+            // and highlighting one would say otherwise.
             let sql = query.get_untracked();
-            let (lo, hi) = intel::error_fix_range(&sql, &err, dialect.get_untracked());
-            let Some(p) =
-                prompt::explain_error_prompt(sql.get(lo..hi), &err, ai_data.get_untracked())
-            else {
+            let range = fix.map(|_| intel::error_fix_range(&sql, &err, dialect.get_untracked()));
+            let Some(p) = prompt::explain_error_prompt(
+                range.and_then(|(lo, hi)| sql.get(lo..hi)),
+                &err,
+                ai_data.get_untracked(),
+            ) else {
                 return;
             };
             crate::reveal_ai_panel(right_panel);
             (ai_send)(p);
-            highlight_pick(&sql, lo, hi, highlight);
+            if let Some((lo, hi)) = range {
+                highlight_pick(&sql, lo, hi, highlight);
+            }
         })
     };
 
@@ -4240,8 +4256,9 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
     // of a batch landing, a pin, a filter re-run restating its panel, a close)
     // reaches this container; keyed on `QueryState`, which has no `PartialEq` to
     // dedup on, every one of them rebuilt the bar — including on each keystroke,
-    // since typing clears a stale error through the same signal. `Option<String>`
-    // dedups, so the bar is rebuilt when the message actually changes.
+    // since typing clears a stale error through the same signal. The
+    // `Option<ModalError>` dedups, so the bar is rebuilt when the message (or its
+    // source) actually changes.
     // **`ShownResult::bar_message`, not a `match` here.** This was
     // `shown_panel_error`, which had two tests; both went with it when the
     // decision moved inline into a file with no test module, and "only a failure
@@ -4263,7 +4280,12 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                 // Collapse to a single line: a multi-line error otherwise makes the
                 // text taller than the bar and spills out the top (`text_ellipsis`
                 // only trims one line). The full text is still in the View modal.
-                let one_line = msg.split_whitespace().collect::<Vec<_>>().join(" ");
+                let one_line = msg.text.split_whitespace().collect::<Vec<_>>().join(" ");
+                // Which of the two AI actions this error earns — the modal's
+                // own answer, so a run Schemaic refused before sending offers
+                // neither here either, and a refused connection no fix.
+                let offers = ErrorModalContent::resolve(None, Some(msg));
+                let (can_explain, can_fix) = (offers.explain.is_some(), offers.fix.is_some());
                 let ai_fix = ai_fix.clone();
                 let explain_error = explain_error.clone();
                 h_stack((
@@ -4312,7 +4334,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                     // that may no longer be in it. *View* stays — it shows the
                     // message itself, which is still true.
                     dyn_container(
-                        move || !kept && error_bar_fits_explain(error_bar_w.get()),
+                        move || !kept && can_explain && error_bar_fits_explain(error_bar_w.get()),
                         {
                             let explain_error = explain_error.clone();
                             move |fits: bool| {
@@ -4341,7 +4363,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                     dyn_container(move || kept, {
                         let ai_fix = ai_fix.clone();
                         move |kept: bool| {
-                            if kept {
+                            if kept || !can_fix {
                                 return empty().into_any();
                             }
                             let ai_fix = ai_fix.clone();

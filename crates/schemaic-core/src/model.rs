@@ -1750,7 +1750,11 @@ pub enum QueryState {
     Idle,
     Running,
     Loaded(Arc<ResultSet>),
-    Failed(String),
+    /// The run failed, with whose words the message is: the statement's
+    /// rejection, a server that refused the connection, or Schemaic's own
+    /// refusal to send it — which decides whether the error bar offers "AI fix"
+    /// and "Explain" (see [`ErrorModalContent::resolve`]).
+    Failed(ModalError),
     /// The query was cancelled by the user.
     Cancelled,
 }
@@ -1805,7 +1809,21 @@ impl ModalError {
         let c = ErrorModalContent::resolve(Some(self.clone()), None);
         c.explain.is_some() || c.fix.is_some() || crate::text::hides_detail(&self.text, fits_chars)
     }
-    fn new(text: impl Into<String>, source: ErrorSource) -> Self {
+    /// The same error, reported somewhere its statement is not the editor's —
+    /// a grid filter/sort re-run, whose SQL Schemaic built. A statement's
+    /// failure becomes the server's words about no statement the user can
+    /// rewrite, so it is explained but never "fixed" into the buffer; the other
+    /// sources already say that.
+    pub fn about_another_statement(self) -> Self {
+        match self.source {
+            ErrorSource::Statement => Self::server(self.text),
+            ErrorSource::Server | ErrorSource::App => self,
+        }
+    }
+    /// For a producer that already holds the source — a run's `DbError`
+    /// answers one (`schemaic_db::DbError::modal_source`) — rather than
+    /// knowing it as one of the three constructors.
+    pub fn new(text: impl Into<String>, source: ErrorSource) -> Self {
         Self {
             text: text.into(),
             source,
@@ -1825,14 +1843,12 @@ pub struct ErrorModalContent {
 impl ErrorModalContent {
     /// Resolve the surface's override against the active tab's error. With no
     /// override the modal falls back to the tab's error (the editor bar's
-    /// "View"), which is a statement failure by construction. An override
-    /// always wins, and its own source alone decides the actions — the tab's
-    /// error never stands in for one the override withheld.
-    pub fn resolve(over: Option<ModalError>, tab_error: Option<String>) -> Self {
-        // The fallback is resolved *as* a statement error rather than beside
-        // one, so the two cannot drift apart.
-        let Some(ModalError { text, source }) = over.or(tab_error.map(ModalError::statement))
-        else {
+    /// "View"), which carries its own source — a run refused before anything
+    /// was sent is not a statement's failure, and used to be taken for one. An
+    /// override always wins, and its own source alone decides the actions — the
+    /// tab's error never stands in for one the override withheld.
+    pub fn resolve(over: Option<ModalError>, tab_error: Option<ModalError>) -> Self {
+        let Some(ModalError { text, source }) = over.or(tab_error) else {
             return Self::default();
         };
         // A match, not `!= App`: a fourth source has to decide its own actions
@@ -1857,11 +1873,31 @@ mod tests {
     // ── the error modal's actions ───────────────────────────────────────────
 
     #[test]
-    fn the_tab_fallback_is_a_statement_error_and_offers_both_actions() {
-        let c = ErrorModalContent::resolve(None, Some("near 'FORM'".into()));
+    fn a_tab_whose_statement_failed_offers_both_actions() {
+        let c = ErrorModalContent::resolve(None, Some(ModalError::statement("near 'FORM'")));
         assert_eq!(c.shown.as_deref(), Some("near 'FORM'"));
         assert_eq!(c.explain.as_deref(), Some("near 'FORM'"));
         assert_eq!(c.fix.as_deref(), Some("near 'FORM'"));
+    }
+
+    /// **The fallback is not a statement's by construction.** A run refused
+    /// before anything was sent — the tab's connection deleted, its tunnel not
+    /// up — lands in the tab as its error, and the modal used to take every tab
+    /// error for a statement's, offering to fix and explain Schemaic's own words.
+    #[test]
+    fn a_tab_refused_before_sending_offers_neither_action() {
+        let c =
+            ErrorModalContent::resolve(None, Some(ModalError::app("connection no longer exists")));
+        assert_eq!(c.shown.as_deref(), Some("connection no longer exists"));
+        assert_eq!(c.explain, None);
+        assert_eq!(c.fix, None);
+    }
+
+    #[test]
+    fn a_tab_whose_connection_was_refused_is_explained_but_not_fixed() {
+        let c = ErrorModalContent::resolve(None, Some(ModalError::server("Access denied")));
+        assert_eq!(c.explain.as_deref(), Some("Access denied"));
+        assert_eq!(c.fix, None);
     }
 
     #[test]
@@ -1876,7 +1912,7 @@ mod tests {
     fn a_statement_override_offers_both_actions_on_its_own_text() {
         let c = ErrorModalContent::resolve(
             Some(ModalError::statement("stmt 2 failed")),
-            Some("the tab's older error".into()),
+            Some(ModalError::statement("the tab's older error")),
         );
         assert_eq!(c.shown.as_deref(), Some("stmt 2 failed"));
         assert_eq!(c.explain.as_deref(), Some("stmt 2 failed"));
@@ -1887,11 +1923,30 @@ mod tests {
     fn a_server_error_is_explained_but_never_fixed() {
         let c = ErrorModalContent::resolve(
             Some(ModalError::server("Deadlock found")),
-            Some("the tab's error".into()),
+            Some(ModalError::statement("the tab's error")),
         );
         assert_eq!(c.shown.as_deref(), Some("Deadlock found"));
         assert_eq!(c.explain.as_deref(), Some("Deadlock found"));
         assert_eq!(c.fix, None);
+    }
+
+    /// A filter re-run's statement is one Schemaic built, not the buffer's:
+    /// the server's words about it are explained, and no fix may land on the
+    /// editor's text for it. Schemaic's own refusal stays its own.
+    #[test]
+    fn about_another_statement_keeps_the_words_and_drops_the_fix() {
+        assert_eq!(
+            ModalError::statement("Unknown column 'x'").about_another_statement(),
+            ModalError::server("Unknown column 'x'")
+        );
+        assert_eq!(
+            ModalError::server("gone away").about_another_statement(),
+            ModalError::server("gone away")
+        );
+        assert_eq!(
+            ModalError::app("no tunnel").about_another_statement(),
+            ModalError::app("no tunnel")
+        );
     }
 
     #[test]
@@ -1918,7 +1973,7 @@ mod tests {
         // showing the notice, and an "Explain" would be about something else.
         let c = ErrorModalContent::resolve(
             Some(ModalError::app("connections.json was missing.")),
-            Some("the tab's error".into()),
+            Some(ModalError::statement("the tab's error")),
         );
         assert_eq!(c.shown.as_deref(), Some("connections.json was missing."));
         assert_eq!(c.explain, None);

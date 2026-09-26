@@ -5402,9 +5402,10 @@ pub(crate) fn error_modal_overlay(ui: Ui) -> impl IntoView {
             });
             // "AI fix" belongs to a **statement** error and "Explain" to the
             // server's words; Schemaic's own notices get neither. Which one an
-            // override is, its surface said when it handed it over; the tab
-            // fallback is a statement's failure by construction, and it is the
-            // one `intel::error_fix_range` scopes. Every action is withheld when
+            // override is, its surface said when it handed it over, and the tab
+            // fallback carries the source its run failed with — a rejected
+            // statement is the one `intel::error_fix_range` scopes, a run refused
+            // before sending is Schemaic's own. Every action is withheld when
             // the modal was opened on nothing at all, a state it can reach: a
             // live "Explain" would send the model the words "No error." to
             // account for.

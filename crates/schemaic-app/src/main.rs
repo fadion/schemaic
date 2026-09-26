@@ -2680,7 +2680,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             // replace.
             let fail = move |err: ModalError| match (is_view, panel) {
                 (true, _) => view_err.set(Some(err)),
-                (false, Some(id)) => tab.set_panel_state(id, QueryState::Failed(err.text)),
+                (false, Some(id)) => tab.set_panel_state(id, QueryState::Failed(err)),
                 (false, None) => {}
             };
             // Resolve this tab's own connection (not necessarily the active one).
@@ -2812,7 +2812,12 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                                 view_err.set(None);
                             }
                             // Error → keep the current table, show the message in the bar.
-                            QueryState::Failed(m) => view_err.set(Some(ModalError::server(m))),
+                            // The re-run's SQL is the one Schemaic built for the
+                            // filter, not the buffer's, so nothing may be "fixed"
+                            // into the editor for it.
+                            QueryState::Failed(m) => {
+                                view_err.set(Some(m.about_another_statement()))
+                            }
                             // Cancelled/superseded → leave the table + error untouched.
                             _ => {}
                         }
@@ -2900,13 +2905,14 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                     // first for that reason.
                     Err(DbError::Cancelled) if stmt == Some(StmtOutcome::NotSent) => {
                         tracing::info!("run cancelled before the statement was sent");
-                        QueryState::Failed(tx::not_sent_message(timed_out))
+                        QueryState::Failed(ModalError::app(tx::not_sent_message(timed_out)))
                     }
                     // A timeout and the Cancel button arrive as the same error,
                     // so the watchdog's flag is the only thing that can tell the
-                    // user which of the two stopped their query.
+                    // user which of the two stopped their query. Schemaic's own
+                    // watchdog, so its own words — like the two cancels here.
                     Err(DbError::Cancelled) if tx::timeout_reached(stmt, timed_out) => {
-                        QueryState::Failed(note(timeout_message(timeout_secs)))
+                        QueryState::Failed(ModalError::app(note(timeout_message(timeout_secs))))
                     }
                     // **A Stop is not a smaller timeout.** MySQL commits the
                     // open transaction before it runs a DDL statement, so
@@ -2917,7 +2923,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                     Err(DbError::Cancelled) => match tx::cancelled_message(stmt) {
                         Some(m) => {
                             tracing::info!("query cancelled after an implicit commit");
-                            QueryState::Failed(m)
+                            QueryState::Failed(ModalError::app(m))
                         }
                         None => {
                             tracing::info!("query cancelled");
@@ -2926,7 +2932,9 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                     },
                     Err(e) => {
                         tracing::error!("query failed: {e}");
-                        QueryState::Failed(note(e.to_string()))
+                        // A rejected statement or a refused connection — the
+                        // error's own variant says which.
+                        QueryState::Failed(ModalError::new(note(e.to_string()), e.modal_source()))
                     }
                 };
                 send((state, stmt, started.elapsed().as_millis() as u64));
@@ -3194,9 +3202,12 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             // failure** like any other, so the first statement carries the
             // message and the rest are cancelled — the same shape the run's own
             // early stop produces, rather than sixty chips repeating one error.
+            // Its two callers are `db_for`'s and `session_for`'s refusals —
+            // Schemaic's own words, before anything was sent.
             let fail_batch = {
                 let panels = panels.clone();
-                move |msg: String| {
+                move |refusal: String| {
+                    let msg = ModalError::app(refusal);
                     // One `update`, as above: sixty chips must not cost sixty
                     // rebuilds of the strip.
                     tab.set_panel_states(panels.iter().enumerate().map(|(i, id)| {
@@ -3325,7 +3336,8 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                         // a failed BEGIN aborts rather than running the batch
                         // outside the transaction the user asked for.
                         if let Err(e) = s.ensure_tx().await {
-                            states[0] = QueryState::Failed(e.to_string());
+                            // The BEGIN failed, not a statement of the user's.
+                            states[0] = QueryState::Failed(ModalError::server(e.to_string()));
                             took[0] = clock.elapsed().as_millis() as u64;
                             send((states, outcomes, took));
                             return;
@@ -3350,7 +3362,8 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                             // half of this (`tx_after`) and left the caller
                             // half here.
                             if let Err(e) = s.ensure_tx().await {
-                                states[i] = QueryState::Failed(e.to_string());
+                                // As above: the BEGIN's failure, not statement i's.
+                                states[i] = QueryState::Failed(ModalError::server(e.to_string()));
                                 took[i] = clock.elapsed().as_millis() as u64;
                                 stopped = true;
                                 continue;
@@ -3372,29 +3385,37 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                                 Ok(rs) => QueryState::Loaded(Arc::new(rs)),
                                 Err(DbError::Cancelled) if out.stmt == StmtOutcome::NotSent => {
                                     stopped = true;
-                                    QueryState::Failed(tx::not_sent_message(timed_out))
+                                    QueryState::Failed(ModalError::app(tx::not_sent_message(
+                                        timed_out,
+                                    )))
                                 }
+                                // The sources are `run_query_core`'s: a timeout
+                                // and a cancel are Schemaic's own words, a
+                                // failure is its error's.
                                 Err(DbError::Cancelled)
                                     if tx::timeout_reached(Some(out.stmt), timed_out) =>
                                 {
                                     stopped = true;
-                                    QueryState::Failed(tx::failed_message(
+                                    QueryState::Failed(ModalError::app(tx::failed_message(
                                         &timeout_message(timeout_secs),
                                         out.stmt,
-                                    ))
+                                    )))
                                 }
                                 // The same pair as `run_query_core`'s, and the
                                 // same hole: see `tx::cancelled_message`.
                                 Err(DbError::Cancelled) => {
                                     stopped = true;
                                     match tx::cancelled_message(Some(out.stmt)) {
-                                        Some(m) => QueryState::Failed(m),
+                                        Some(m) => QueryState::Failed(ModalError::app(m)),
                                         None => QueryState::Cancelled,
                                     }
                                 }
                                 Err(e) => {
                                     stopped = true;
-                                    QueryState::Failed(tx::failed_message(&e.to_string(), out.stmt))
+                                    QueryState::Failed(ModalError::new(
+                                        tx::failed_message(&e.to_string(), out.stmt),
+                                        e.modal_source(),
+                                    ))
                                 }
                             };
                         }
@@ -3420,11 +3441,14 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                                 clock = std::time::Instant::now();
                                 states[i] = match res {
                                     Ok(rs) => QueryState::Loaded(Arc::new(rs)),
-                                    Err(DbError::Cancelled) if timed_out => {
-                                        QueryState::Failed(timeout_message(timeout_secs))
-                                    }
+                                    Err(DbError::Cancelled) if timed_out => QueryState::Failed(
+                                        ModalError::app(timeout_message(timeout_secs)),
+                                    ),
                                     Err(DbError::Cancelled) => QueryState::Cancelled,
-                                    Err(e) => QueryState::Failed(e.to_string()),
+                                    Err(e) => QueryState::Failed(ModalError::new(
+                                        e.to_string(),
+                                        e.modal_source(),
+                                    )),
                                 };
                             },
                             enforce,

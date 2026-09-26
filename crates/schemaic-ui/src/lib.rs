@@ -2607,7 +2607,12 @@ impl ShownResult {
     /// warning) would put text in the red bar for a run that did not fail, and
     /// with it a *View*, an *AI fix* and an *Explain* that all act on an error
     /// there isn't one of.
-    pub fn bar_message(state: &QueryState) -> Option<String> {
+    ///
+    /// The whole [`ModalError`], not just its text: the bar offers *AI fix* and
+    /// *Explain* by its source, as the modal behind *View* does.
+    ///
+    /// [`ModalError`]: schemaic_core::model::ModalError
+    pub fn bar_message(state: &QueryState) -> Option<schemaic_core::model::ModalError> {
         match state {
             QueryState::Failed(m) => Some(m.clone()),
             _ => None,
@@ -6100,7 +6105,7 @@ pub struct OverlayUi {
     /// The shared error modal. When `error_modal_text` is `Some`, the modal shows
     /// that error, and its [`ModalError::source`] decides whether "Explain" and
     /// "AI fix" are offered; otherwise it falls back to the active tab's full
-    /// query error (the editor error bar), which offers both.
+    /// query error (the editor error bar), whose own source decides the same.
     ///
     /// [`ModalError::source`]: schemaic_core::model::ModalError
     pub error_modal_open: RwSignal<bool>,
@@ -13219,7 +13224,7 @@ mod field_layout_tests {
 mod result_strip_tests {
     use super::{PanelView, ResultPanel, shown_panel, shown_panel_loaded};
     use floem::reactive::Scope;
-    use schemaic_core::model::QueryState;
+    use schemaic_core::model::{ModalError, QueryState};
     use std::sync::Arc;
 
     fn panel(id: u64, state: QueryState) -> ResultPanel {
@@ -13250,7 +13255,10 @@ mod result_strip_tests {
     /// result nobody is looking at.
     #[test]
     fn a_stale_selection_reads_the_first_panel_as_the_body_does() {
-        let panels = vec![panel(1, QueryState::Failed("boom".into())), loaded(2)];
+        let panels = vec![
+            panel(1, QueryState::Failed(ModalError::statement("boom"))),
+            loaded(2),
+        ];
         assert_eq!(shown_panel(&panels, 77).map(|p| p.id), Some(1));
         assert!(!shown_panel_loaded(&panels, 77));
     }
@@ -13261,7 +13269,10 @@ mod result_strip_tests {
     /// since a wrong index is a *valid* index.
     #[test]
     fn a_panel_is_found_by_its_id_wherever_it_has_moved_to() {
-        let panels = vec![loaded(9), panel(4, QueryState::Failed("boom".into()))];
+        let panels = vec![
+            loaded(9),
+            panel(4, QueryState::Failed(ModalError::statement("boom"))),
+        ];
         assert_eq!(shown_panel(&panels, 4).map(|p| p.id), Some(4));
         assert!(shown_panel_loaded(&panels, 9));
     }
@@ -13279,7 +13290,10 @@ mod result_strip_tests {
     /// them.
     #[test]
     fn only_the_shown_statement_decides_whether_a_grid_is_mounted() {
-        let panels = vec![loaded(1), panel(2, QueryState::Failed("boom".into()))];
+        let panels = vec![
+            loaded(1),
+            panel(2, QueryState::Failed(ModalError::statement("boom"))),
+        ];
         assert!(shown_panel_loaded(&panels, 1));
         assert!(!shown_panel_loaded(&panels, 2));
     }
@@ -13304,7 +13318,7 @@ mod result_panel_tab_tests {
     use super::Tab;
     use floem::prelude::{SignalGet, SignalUpdate, SignalWith};
     use floem::reactive::Scope;
-    use schemaic_core::model::QueryState;
+    use schemaic_core::model::{ModalError, QueryState};
 
     fn tab() -> Tab {
         Tab::new(Scope::new(), 1, "", 7, None)
@@ -13379,7 +13393,7 @@ mod result_panel_tab_tests {
         // what puts the strip on screen with the run rather than with its rows.
         assert!(!t.results_untouched(), "a result is in flight here");
 
-        t.set_panel_state(first, QueryState::Failed("boom".into()));
+        t.set_panel_state(first, QueryState::Failed(ModalError::statement("boom")));
         assert!(!t.results_untouched(), "and a failed one still counts");
 
         // Back to one idle panel — and *that* is a blank slate again, which is
@@ -13458,7 +13472,7 @@ mod result_panel_tab_tests {
         let t = tab();
         let batch = t.begin_run(&["SELECT 1".to_string(), "SELECT 2".to_string()]);
         t.set_pinned(batch[1], true);
-        t.set_panel_state(batch[0], QueryState::Failed("boom".into()));
+        t.set_panel_state(batch[0], QueryState::Failed(ModalError::statement("boom")));
         let state = t
             .result_tabs
             .with_untracked(|v| v.iter().find(|p| p.id == batch[1]).map(|p| p.state.clone()));
@@ -13489,9 +13503,9 @@ mod result_panel_tab_tests {
         t.close_panels(&[batch[1]]);
 
         t.set_panel_states([
-            (batch[0], QueryState::Failed("one".into())),
-            (batch[1], QueryState::Failed("two".into())),
-            (batch[2], QueryState::Failed("three".into())),
+            (batch[0], QueryState::Failed(ModalError::statement("one"))),
+            (batch[1], QueryState::Failed(ModalError::statement("two"))),
+            (batch[2], QueryState::Failed(ModalError::statement("three"))),
         ]);
 
         let state = |id: u64| {
@@ -13499,10 +13513,10 @@ mod result_panel_tab_tests {
                 .with_untracked(|v| v.iter().find(|p| p.id == id).map(|p| p.state.clone()))
         };
         assert!(
-            matches!(state(batch[0]), Some(QueryState::Failed(ref m)) if m == "one"),
+            matches!(state(batch[0]), Some(QueryState::Failed(ref m)) if m.text == "one"),
             "reordering must not move a result"
         );
-        assert!(matches!(state(batch[2]), Some(QueryState::Failed(ref m)) if m == "three"));
+        assert!(matches!(state(batch[2]), Some(QueryState::Failed(ref m)) if m.text == "three"));
         assert!(state(batch[1]).is_none(), "a closed panel takes nothing");
     }
 
@@ -13517,8 +13531,15 @@ mod result_panel_tab_tests {
     #[test]
     fn only_a_failed_result_reaches_the_error_bar() {
         assert_eq!(
-            super::ShownResult::bar_message(&QueryState::Failed("boom".into())).as_deref(),
-            Some("boom")
+            super::ShownResult::bar_message(&QueryState::Failed(ModalError::statement("boom"))),
+            Some(ModalError::statement("boom"))
+        );
+        // **With its source**, which is what the bar's AI actions are offered
+        // by: a run refused before sending reached the bar as bare text and was
+        // offered a fix and an explanation of Schemaic's own words.
+        assert_eq!(
+            super::ShownResult::bar_message(&QueryState::Failed(ModalError::app("no tunnel"))),
+            Some(ModalError::app("no tunnel"))
         );
         assert!(super::ShownResult::bar_message(&QueryState::Idle).is_none());
         assert!(super::ShownResult::bar_message(&QueryState::Running).is_none());
@@ -13527,10 +13548,10 @@ mod result_panel_tab_tests {
         // truncated or that wrote nothing, which are outcomes and not errors.
         let t = tab();
         let id = t.begin_run(&["SELECT 1".to_string()])[0];
-        t.set_panel_state(id, QueryState::Failed("boom".into()));
+        t.set_panel_state(id, QueryState::Failed(ModalError::statement("boom")));
         assert_eq!(
-            super::ShownResult::bar_message(&t.shown_result()).as_deref(),
-            Some("boom"),
+            super::ShownResult::bar_message(&t.shown_result()).map(|m| m.text),
+            Some("boom".to_string()),
             "and it is the shown panel's own message"
         );
     }
@@ -13543,7 +13564,7 @@ mod result_panel_tab_tests {
         let t = tab();
         let batch = t.begin_run(&["SELECT 1".to_string(), "SELECT 2".to_string()]);
         t.close_panels(&[batch[0]]);
-        t.set_panel_state(batch[0], QueryState::Failed("boom".into()));
+        t.set_panel_state(batch[0], QueryState::Failed(ModalError::statement("boom")));
         assert_eq!(ids(&t), vec![batch[1]]);
     }
 
@@ -13653,12 +13674,12 @@ mod result_panel_tab_tests {
     fn typing_clears_a_live_failure_but_never_a_kept_one() {
         let t = tab();
         let live = t.begin_run(&["SELECT 1".to_string()])[0];
-        t.set_panel_state(live, QueryState::Failed("boom".into()));
+        t.set_panel_state(live, QueryState::Failed(ModalError::statement("boom")));
         t.shown().dismiss_error();
         assert!(matches!(t.shown_result(), QueryState::Idle));
 
         let kept = t.begin_run(&["SELECT 2".to_string()])[0];
-        t.set_panel_state(kept, QueryState::Failed("boom".into()));
+        t.set_panel_state(kept, QueryState::Failed(ModalError::statement("boom")));
         t.set_pinned(kept, true);
         t.shown().dismiss_error();
         assert!(
@@ -13710,7 +13731,7 @@ mod result_panel_tab_tests {
         );
 
         // A real failure is dismissed, and that is news — once.
-        t.set_panel_state(live, QueryState::Failed("boom".into()));
+        t.set_panel_state(live, QueryState::Failed(ModalError::statement("boom")));
         let before = runs.get();
         t.shown().dismiss_error();
         assert_eq!(
@@ -13730,7 +13751,7 @@ mod result_panel_tab_tests {
         // A *kept* failure is a record, not a stale bar — so it is not news
         // either, and must not be republished on every keystroke.
         let kept = t.begin_run(&["SELECT 2".to_string()])[0];
-        t.set_panel_state(kept, QueryState::Failed("boom".into()));
+        t.set_panel_state(kept, QueryState::Failed(ModalError::statement("boom")));
         t.set_pinned(kept, true);
         let pinned = runs.get();
         for _ in 0..5 {

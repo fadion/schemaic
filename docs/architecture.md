@@ -227,9 +227,25 @@ existing prose was left alone.
     is pinned where it is chosen:
     `diagram_layout_gate::a_recovery_notice_reaches_the_modal_as_schemaics_own` reads
     `report_recoveries`' body for `ModalError::app`, and fails with `::server` in its place. With
-    no override it falls back to the active tab's run error, a statement's by construction, which
-    offers both — and it is resolved *as* a `ModalError::statement` through the same `match`, not
-    answered beside it, so the fallback and a `Statement` override cannot drift apart. **The
+    no override it falls back to the active tab's run error, and **that fallback carries its own
+    source**: `QueryState::Failed` holds a `ModalError`, `resolve` takes `over.or(tab_error)`, and
+    both go through the one `match`, so the fallback and an override cannot drift apart. It used to
+    be `Failed(String)`, resolved *as* a `ModalError::statement` — a statement's failure by
+    construction, which it was not: a run refused before anything was sent (`db_for`'s "connection
+    no longer exists", "SSH tunnel is not established yet", `session_for`'s refusals), a timeout, a
+    cancel or not-sent note, a failed `BEGIN` and a refused connection all land in the tab as its
+    error, and every one of them was offered an AI fix and an explanation
+    (`a_tab_refused_before_sending_offers_neither_action`). The run paths in `app/main.rs` now say
+    which at the point of failure: a `DbError` through `DbError::modal_source`, the not-sent, timeout
+    and cancel notes and the `db_for`/`session_for` refusals `App`, a failed `BEGIN` `Server` — the
+    server's words, but not about a statement of the user's. `ModalError::new(text, source)` is the
+    constructor for a producer already holding a source. The editor's error bar asks the same
+    `resolve(None, Some(err))` for its own *Explain* and *AI fix*, so bar and modal cannot offer
+    different ones. **`ModalError::about_another_statement` rewrites a source after the fact**,
+    for one caller: a grid filter/sort re-run's failure goes into `view_err` with `Statement`
+    turned to `Server`, because that SQL is one Schemaic built and the modal's *AI fix* would act on
+    the editor's buffer; `Server` and `App` pass through unchanged
+    (`about_another_statement_keeps_the_words_and_drops_the_fix`). **The
     source rides with the text in one value because it used to be a separate flag**
     (`error_modal_fixable`): every surface had to remember to set it and the modal to clear it on
     close, or the next open inherited the last one's answer; now a surface cannot supply one
@@ -8946,6 +8962,17 @@ existing prose was left alone.
   can reach — the same reason `error_chain`'s tests use a synthetic chain. Live:
   `a_refused_write_says_which_value_the_server_refused`, with `Target::error_names_the_value`
   recording which engines carry a separate detail field at all.
+  **`DbError::modal_source` answers whose words an error is** (`core::model::ErrorSource`), read off
+  the variant, for the editor's error bar and the error modal behind it: `Query` is a statement's
+  failure, with SQL for *AI fix* to rewrite; `Connect` is the server's words about no statement,
+  explained and never fixed; `Cancelled` is the user's Stop or Schemaic's own watchdog and has
+  nothing to explain. `app/main.rs`'s run paths ask it of the `DbError` a run ends in rather than
+  choosing a source per site, which is how a refused connection stopped being offered a fix into
+  the buffer. Those paths answer `Cancelled` in arms of their own first — the not-sent, timeout and
+  cancel notes — so its `App` there is the answer for a caller that has not. **Named
+  `modal_source`, not `source`**: `std::error::Error` already has a `source()`, and an inherent
+  method shadowing it would answer a different question under the same name. One test per variant,
+  from `a_rejected_statement_is_the_statements_failure`.
   `fetch_query`/`fetch_query_enforced`/`stream_query`/`stream_query_enforced`/`run_batch`/
   `run_batch_enforced`/`fetch_schema`/`ping`/
   `commit_writes`/`refetch_rows`/`prepare_check`
@@ -16403,13 +16430,16 @@ existing prose was left alone.
     messages are re-derived when the entry runs, like every other action in this menu. Captured,
     they could outlive the text they described — a reload between the right-click and the click
     leaves `sql.get(lo..hi)` answering `None`, and the entry then does nothing with nothing said.
-    The modal's is the narrower case: it appears when the modal fell back to the tab's run error, or
-    over an `error_modal_text` override its surface marked `ErrorSource::Statement` — never over a
+    The modal's is the narrower case: it appears over an error marked `ErrorSource::Statement` —
+    the tab's run error it falls back to, or an `error_modal_text` override — never over a
     `Server` one (a commit error, a server that didn't answer) or an `App` notice, neither of which
     is anything the editor can rewrite (`core::model::ErrorModalContent::resolve`). No surface
-    marks one `Statement` today — the grid bar hands the modal `Server` for a failed commit or
-    re-run and `App` for its own notices, since neither a commit nor a re-run is a statement in the
-    buffer — so in practice the fix is the fallback's alone. It has to route
+    marks an override `Statement` today — the grid bar hands the modal `Server` for a failed commit
+    or re-run and `App` for its own notices, since neither a commit nor a re-run is a statement in
+    the buffer — so in practice the fix is the fallback's alone, and only when the run's own
+    failure was a rejected statement: the fallback is no longer a statement's by construction (the
+    `core::model` entry has what used to reach it). The bar's *AI fix* follows the same answer. It
+    has to route
     through a request signal at all because `CmdK` is created inside `query_pane` and never leaves
     it, so the workspace-level modal has no handle to reach it with — and that signal **carries the
     message**, because the modal shows the error it opened on while a run landing behind it moves
@@ -16422,8 +16452,11 @@ existing prose was left alone.
     makes between its own *Explain* and *Optimize*. It reveals the panel before sending, because a
     message into a hidden panel reads as a button doing nothing, and it highlights the statement it
     asked about, so the answer and the SQL it is about are visibly the same statement. Both the error
-    bar and the modal offer it. On the bar the two AI actions sit **together at the far edge**, which
-    is what the sparkle marks — *View* opens a window, those two reach a model — and the bar is
+    bar and the modal offer it, on the same `ErrorModalContent::resolve` answer, and both send a
+    statement with the question only when the error also earns a fix — the modal's rule, which the
+    bar's `explain_error` now shares, so over a refused connection the bar neither sends nor
+    highlights a statement the error is not about. On the bar the two AI actions sit **together at
+    the far edge**, which is what the sparkle marks — *View* opens a window, those two reach a model — and the bar is
     **responsive about them**: `error_bar_fits_explain` measures every gap and label to the right of
     the message and asks whether they fit in the share the message's own `max_width_pct` leaves them
     (`ERROR_BAR_MSG_PCT`, 60/40), dropping *Explain* when they don't. It is the one of the three that
@@ -16443,11 +16476,14 @@ existing prose was left alone.
     signal**:
     the chat panel belongs to the workspace, so the modal can reach it directly, the way the schema
     tree's own *AI Explain* does. It is also offered **where the fix is not** — over a `Server`
-    override, where there is no statement to rewrite but the server's words still deserve an answer
-    — and withheld in two places: over an `App` override, Schemaic's own notice, which already says
-    everything a model could (it used to be offered there too, on "connections.json was missing"
-    and "Not connected to X" alike); and when the modal was opened on nothing at all, where it
-    would ask the model to account for the phrase "No error.".
+    error, an override or a tab whose connection was refused, where there is no statement to
+    rewrite but the server's words still deserve an answer — and withheld in two places: over an
+    `App` error, Schemaic's own notice or a run it refused to send, which already says everything a
+    model could (it used to be offered there too, on "connections.json was missing", "Not
+    connected to X" and, from the tab, "connection no longer exists" alike); and when the modal was
+    opened on nothing at all, where it would ask the model to account for the phrase "No error.".
+    The bar withholds both buttons on the same answer, and both on a kept result as well
+    (`ShownResult::frozen`); *View* it always shows, since the message itself is still true.
     `inline_footer_y` is the other end's geometry, and it is deliberately not `points_of_offset` at
     the anchor line's end: that offset maps to a column *before* the phantom rows, so its `bot` is
     the bottom of the line's own row. The **next** document line's top is the honest answer — the
@@ -26839,7 +26875,9 @@ this bundle's.
   across the middle of the window and out over the schema sidebar. The message goes under the SQL
   that produced it, beside the **Explain** and **AI fix** that act on it (`intel::error_fix_range`
   scopes the fix to the failing statement, so this works for one statement of a script as well as
-  for a whole run). It used to be split: a single run's went to the editor bar and a batch
+  for a whole run) — each offered only as far as the error's `ErrorSource` earns it, which is why
+  `ShownResult::bar_message` hands the bar the whole `ModalError` rather than its text
+  (`only_a_failed_result_reaches_the_error_bar` checks the source survives). It used to be split: a single run's went to the editor bar and a batch
   statement's to the panel bar (`batch_err`), because `run_all` cleared the tab's `results` and left
   a batch with no editor bar to fall back on. Once **every** result became a panel the two were the
   same value, and the pair drew the same error twice — so `batch_err` is gone and `grid_error_bar`
@@ -26852,7 +26890,9 @@ this bundle's.
   `view_err` (`RwSignal<Option<ModalError>>` on `GridState`, `GridCtx`, `BarSignals` and
   `Tab::view_err`) carry both speakers. `Server`: `commit_writes`' error — the one-row net's
   verdict included, which describes the server's answer — and a view re-run's
-  `QueryState::Failed`. `App`: a `commit_writes` that ended in `DbError::Cancelled` (the user
+  `QueryState::Failed` once `ModalError::about_another_statement` has turned a `Statement` into
+  one: the re-run's SQL is Schemaic's, and a fix from the modal would land in the editor's buffer
+  (a re-run's own `App` note, a timeout say, stays `App`). `App`: a `commit_writes` that ended in `DbError::Cancelled` (the user
   stopped it, and "query cancelled" has nothing in it to explain), a paste that landed nothing,
   the row panel's and the JSON editor's
   refusals, AI fill/seed failures, the filter row's three refusals (a `BadCondition` is
@@ -26862,7 +26902,7 @@ this bundle's.
   them, so *Explain* was offered on Schemaic's own notices, while its *View* keyed on
   `hides_detail` alone kept a one-line commit failure — the error *Explain* is for — out of the
   modal entirely.
-  The editor bar keys on a `Memo<Option<String>>` of the message rather than on the `QueryState`
+  The editor bar keys on a `Memo<Option<ModalError>>` of the message rather than on the `QueryState`
   itself: the shown result is derived from the panel list, so every write to it — each statement of
   a batch landing, a pin, a filter re-run restating its panel — reaches that container, and
   `QueryState` has no `PartialEq` to dedup on. Keyed on the state it rebuilt the bar on all of them,
