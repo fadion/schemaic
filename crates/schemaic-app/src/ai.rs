@@ -279,12 +279,14 @@ pub(crate) fn mcp_endpoint_from_env() -> Result<McpEndpoint, String> {
     // A harness whose MCP config is a *file* we write puts the endpoint in that
     // file's `env` map. Codex's only lever is `-c` overrides, which are argv —
     // world-readable — so it gets a path instead and the endpoint stays in a
-    // file of its own. The path is not a secret; what it points at is.
-    let v = endpoint_blob(
+    // file of its own. Neither holds the password any more: the blob names the
+    // saved connection, and `resolve_password` reads it from the keyring.
+    let mut v = endpoint_blob(
         endpoint_file_arg(&std::env::args().collect::<Vec<_>>()).as_deref(),
         |p| std::fs::read_to_string(p).map_err(|e| e.to_string()),
         std::env::var("SCHEMAIC_MCP_ENDPOINT").ok().as_deref(),
     )?;
+    resolve_password(&mut v, keyring_password)?;
     Ok(endpoint_from_value(&v))
 }
 
@@ -320,6 +322,54 @@ fn endpoint_blob(
         return Err("the database endpoint is not a JSON object".to_string());
     }
     Ok(v)
+}
+
+/// Put the connection's password into the endpoint blob `v`, read by the id it
+/// names through `lookup` — the OS keyring, for the real subprocess.
+///
+/// **The blob never carries it** ([`endpoint_json`]): the file it rides is
+/// owner-private, which guards against other accounts and not against the
+/// agent, which runs as the user and whose built-in readers — Cursor's `Grep`,
+/// Codex's read-only sandbox, Antigravity's `view_file` — read a file whose
+/// path the model has been given. The keyring is out of their reach, and this
+/// process is the app's own binary, so it reads the secret the way
+/// `schemaic mcp` does. A failed lookup is a refusal: an empty password would
+/// come back from the server as *Access denied*, a cause that is not the one.
+///
+/// A blob with no `conn_id` names nothing to look up and is left as it is.
+fn resolve_password(
+    v: &mut serde_json::Value,
+    lookup: impl Fn(u64) -> Result<String, String>,
+) -> Result<(), String> {
+    let Some(id) = v.get("conn_id").and_then(|x| x.as_u64()) else {
+        return Ok(());
+    };
+    let pass = lookup(id)?;
+    v["pass"] = serde_json::Value::String(pass);
+    Ok(())
+}
+
+/// [`resolve_password`]'s real lookup: the saved connection `id`, hydrated from
+/// the keyring **read-only** — never the app's self-healing load, which may
+/// rewrite `connections.json` under the running app — and only its own
+/// secrets. What the hydration has to say goes to stderr, stdout being the
+/// JSON-RPC stream.
+fn keyring_password(id: u64) -> Result<String, String> {
+    let file = schemaic_conn::secrets::load_connections_readonly()
+        .map_err(|e| format!("the saved connections could not be read: {e}"))?;
+    let mut conn = file
+        .connections
+        .into_iter()
+        .find(|c| c.id == id)
+        .ok_or_else(|| format!("connection {id} is not among the saved connections"))?;
+    // The DB password only: the tunnel is the app's, so the SSH secrets are
+    // never read into this process — `supplied` is what not to ask for.
+    use schemaic_core::secrets::SecretKind;
+    let skip = [SecretKind::SshPassword, SecretKind::SshPassphrase];
+    for note in schemaic_conn::secrets::hydrate_for_cli(&mut conn, &skip) {
+        eprintln!("schemaic --mcp-serve: {note}");
+    }
+    Ok(conn.password)
 }
 
 /// The path given as `--endpoint-file <path>`, if any.
@@ -408,26 +458,30 @@ fn endpoint_from_value(v: &serde_json::Value) -> McpEndpoint {
     }
 }
 
-/// Serialize a DB endpoint (host/port/user/pass + default database + the
-/// sample-rows permission) as the JSON blob handed to the MCP subprocess via its
-/// environment.
+/// Serialize a DB endpoint (host/port/user, the saved connection's id + default
+/// database + the sample-rows permission) as the JSON blob handed to the MCP
+/// subprocess — **never the password**, which it reads from the keyring.
 fn endpoint_json(
     db: &Db,
+    conn_id: u64,
     database: Option<&str>,
     samples: bool,
     schema: bool,
     hidden: &HashSet<String>,
 ) -> String {
-    let (host, port, user, pass, file) = db.parts();
+    // **Every part but the password**, which the subprocess reads from the OS
+    // keyring by `conn_id` — see `resolve_password`. Host and port are the
+    // app's own tunnel for an SSH connection, so no SSH secret is needed there.
+    let (host, port, user, _, file) = db.parts();
     // Sorted, so the blob is stable for a given set rather than reshuffling with
     // the hash seed on every spawn.
     let mut hidden: Vec<&str> = hidden.iter().map(String::as_str).collect();
     hidden.sort_unstable();
     serde_json::json!({
-        "host": host, "port": port, "user": user, "pass": pass, "file": file,
+        "host": host, "port": port, "user": user, "file": file,
         "database": database, "engine": db.engine().as_str(), "samples": samples,
         "schema": schema, "hidden": hidden, "tls": db.tls_plan(),
-        "connection_database": db.database()
+        "connection_database": db.database(), "conn_id": conn_id
     })
     .to_string()
 }
@@ -1274,6 +1328,9 @@ pub(crate) fn next_session_id() -> u64 {
 pub(crate) struct StartAiParams {
     pub system_context: String,
     pub db: Db,
+    /// The saved connection `db` was built from. The MCP subprocess reads the
+    /// password from the OS keyring by it, so no file it is handed holds one.
+    pub conn_id: u64,
     pub database: Option<String>,
     pub ai_tx: crossbeam_channel::Sender<AiStreamMsg>,
     /// Which agent CLI to drive.
@@ -1622,6 +1679,7 @@ pub(crate) fn start_ai_session(
     let StartAiParams {
         system_context,
         db,
+        conn_id,
         database,
         ai_tx,
         harness,
@@ -1681,6 +1739,7 @@ pub(crate) fn start_ai_session(
 
     let endpoint = endpoint_json(
         &db,
+        conn_id,
         database.as_deref(),
         data.may_query(),
         schema_scope != SchemaScope::None,
@@ -4359,21 +4418,71 @@ mod tests {
             "p".into(),
             String::new(),
         );
-        let out = endpoint_json(&db, Some("shop"), true, true, &HashSet::new());
+        let out = endpoint_json(&db, 7, Some("shop"), true, true, &HashSet::new());
         let v: serde_json::Value = serde_json::from_str(&out).unwrap();
         assert_eq!(v["host"], "h");
         assert_eq!(v["port"], 3307);
         assert_eq!(v["user"], "u");
-        assert_eq!(v["pass"], "p");
+        assert_eq!(v["conn_id"], 7);
         assert_eq!(v["database"], "shop");
         assert_eq!(v["engine"], "postgres"); // engine tag serialized
         assert_eq!(v["samples"], true);
         // No default database → JSON null.
-        let out = endpoint_json(&db, None, false, true, &HashSet::new());
+        let out = endpoint_json(&db, 7, None, false, true, &HashSet::new());
         let v: serde_json::Value = serde_json::from_str(&out).unwrap();
         assert!(v["database"].is_null());
         // Queries off → the subprocess is told to withhold sample rows.
         assert_eq!(v["samples"], false);
+    }
+
+    /// **No file handed to an agent holds the database password.** The endpoint
+    /// file is owner-private, which guards against other accounts and not
+    /// against the agent, which runs as the user: Cursor's `Grep`, Codex's
+    /// read-only sandbox and Antigravity's `view_file` all read files the model
+    /// is pointed at, and Cursor's `.cursor/mcp.json` names this one inside the
+    /// model's own working directory. So the blob names the saved connection,
+    /// and the subprocess reads the password from the OS keyring — which no
+    /// file reader reaches. The same blob rides Claude's config, so it holds
+    /// there too.
+    #[test]
+    fn the_endpoint_names_the_connection_and_never_its_password() {
+        let db = Db::from_parts(
+            schemaic_db::Engine::MySql,
+            "h".into(),
+            3306,
+            "root".into(),
+            "hunter2".into(),
+            String::new(),
+        );
+        let json = endpoint_json(&db, 42, Some("shop"), true, true, &HashSet::new());
+        assert!(!json.contains("hunter2"), "{json}");
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(v.get("pass").is_none(), "{json}");
+        assert_eq!(v["conn_id"], 42);
+    }
+
+    /// The subprocess's half: the password comes back by the connection id,
+    /// and a failed lookup is a refusal rather than an empty password — which
+    /// would read to the user as the server's *Access denied*.
+    #[test]
+    fn the_subprocess_reads_the_password_by_the_connection_id() {
+        let mut v = serde_json::json!({ "host": "h", "conn_id": 42 });
+        resolve_password(&mut v, |id| match id {
+            42 => Ok("s3cret".to_string()),
+            _ => Err("no such connection".to_string()),
+        })
+        .unwrap();
+        assert_eq!(v["pass"], "s3cret");
+        assert_eq!(endpoint_from_value(&v).db.parts().3, "s3cret");
+
+        let mut v = serde_json::json!({ "host": "h", "conn_id": 9 });
+        assert!(resolve_password(&mut v, |_| Err("no such connection".into())).is_err());
+
+        // A blob that names no connection has nothing to look up: an older
+        // blob that still carries its password keeps it.
+        let mut v = serde_json::json!({ "host": "h", "pass": "old" });
+        resolve_password(&mut v, |_| panic!("looked up without an id")).unwrap();
+        assert_eq!(v["pass"], "old");
     }
 
     #[test]
@@ -4386,7 +4495,7 @@ mod tests {
             "p".into(),
             String::new(),
         );
-        let json = endpoint_json(&db, Some("shop"), false, true, &HashSet::new());
+        let json = endpoint_json(&db, 7, Some("shop"), false, true, &HashSet::new());
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert!(!endpoint_from_value(&v).samples);
         // An older blob with no flag → samples on (nothing then read rows).
@@ -4431,7 +4540,7 @@ mod tests {
             "hunter2".into(),
             String::new(),
         );
-        let endpoint = endpoint_json(&db, Some("shop"), false, true, &HashSet::new());
+        let endpoint = endpoint_json(&db, 7, Some("shop"), false, true, &HashSet::new());
         let overrides = schemaic_ai::harness::codex_mcp_overrides(
             "/usr/bin/schemaic",
             "/tmp/ep.json",
@@ -4455,7 +4564,7 @@ mod tests {
             String::new(),
         );
         let hidden: HashSet<String> = ["archive".to_string()].into_iter().collect();
-        let json = endpoint_json(&db, Some("shop"), true, true, &hidden);
+        let json = endpoint_json(&db, 7, Some("shop"), true, true, &hidden);
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(v["hidden"], serde_json::json!(["archive"]));
         assert_eq!(endpoint_from_value(&v).hidden, hidden);
@@ -4477,10 +4586,12 @@ mod tests {
             "pw".into(),
             String::new(),
         );
-        let json = endpoint_json(&db, Some("db1"), true, true, &HashSet::new());
+        let json = endpoint_json(&db, 7, Some("db1"), true, true, &HashSet::new());
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         let parsed = endpoint_from_value(&v);
-        assert_eq!(parsed.db.parts(), ("host", 3306, "user", "pw", ""));
+        // Everything but the password, which the subprocess reads from the
+        // keyring (`resolve_password`).
+        assert_eq!(parsed.db.parts(), ("host", 3306, "user", "", ""));
         assert_eq!(parsed.db.engine(), schemaic_db::Engine::Postgres);
         assert_eq!(parsed.database.as_deref(), Some("db1"));
     }
@@ -4511,7 +4622,7 @@ mod tests {
         )
         .with_tls(plan.clone());
 
-        let json = endpoint_json(&db, Some("db1"), true, true, &HashSet::new());
+        let json = endpoint_json(&db, 7, Some("db1"), true, true, &HashSet::new());
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         let parsed = endpoint_from_value(&v);
         assert_eq!(parsed.db.tls_plan(), plan.as_ref());
@@ -4536,7 +4647,7 @@ mod tests {
         )
         .with_database(Some("defaultdb"));
 
-        let json = endpoint_json(&db, Some("shop"), true, true, &HashSet::new());
+        let json = endpoint_json(&db, 7, Some("shop"), true, true, &HashSet::new());
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         let parsed = endpoint_from_value(&v);
         assert_eq!(parsed.db.database(), Some("defaultdb"));
@@ -4578,7 +4689,7 @@ mod tests {
             String::new(),
             "/data/app.db".into(),
         );
-        let json = endpoint_json(&db, None, true, true, &HashSet::new());
+        let json = endpoint_json(&db, 7, None, true, true, &HashSet::new());
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         let parsed = endpoint_from_value(&v);
         assert_eq!(parsed.db.file(), "/data/app.db");

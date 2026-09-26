@@ -10584,6 +10584,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                         StartAiParams {
                             system_context: context,
                             db,
+                            conn_id: active_id,
                             database,
                             ai_tx: ai_tx.clone(),
                             harness: ai_harness.get_untracked(),

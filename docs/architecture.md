@@ -8504,7 +8504,8 @@ existing prose was left alone.
     reports instead of repairing.** The app's load self-heals — a `connections.json` still carrying
     legacy plaintext is migrated into the keyring and the on-disk copy rewritten blanked — which a
     one-shot `schemaic query` must not do as a side effect while the GUI may be running and about to
-    save its own copy. So it reads through `persist::read_connections_unrecovered` (for that
+    save its own copy — nor the AI panel's `--mcp-serve` subprocess, which runs *while* the GUI is,
+    and reads its connection's password this way (`app::ai::keyring_password`). So it reads through `persist::read_connections_unrecovered` (for that
     function's own reasons) and hands back the `ConnectionsFile` **unhydrated** — `list` shows no
     secret — and `hydrate_for_cli(conn, supplied)` fills in only the one connection a command runs
     against, and only the secrets it will use, through `core::secrets::hydrate_connection`, returning the strings the caller puts on
@@ -11176,9 +11177,10 @@ existing prose was left alone.
   list). **That the flag is handed a *path* is an invariant, not a call-site habit**, and this crate
   used to specify the other thing: `build_session_args`' parameter was `mcp_config_json`, its doc
   said "passed to `--mcp-config`", and the test pinning the flag asserted inline JSON as the
-  expected argv value. The CLI accepts either form, and the config Schemaic hands it carries the
-  already-tunnelled database endpoint with its password — so the shape this crate documented was the
-  credential-carrying one, on argv, readable by every process listing on the machine. `app/ai.rs`
+  expected argv value. The CLI accepts either form, and the config Schemaic hands it carried the
+  already-tunnelled database endpoint with its password (it names the saved connection now, and the
+  subprocess reads the password from the keyring — see `app/ai.rs`) — so the shape this crate
+  documented was the credential-carrying one, on argv, readable by every process listing on the machine. `app/ai.rs`
   writes an owner-only private file and passes the file name for exactly that reason, and said so
   only at its own call site; the parameter is `mcp_config_path`, and the doc and the fixtures say
   path too. No behaviour changed — the one caller always passed a `PathBuf`.
@@ -11854,7 +11856,8 @@ existing prose was left alone.
     lever is `-c key=value`, and those *are* argv — readable by every process listing on the
     machine — so the DB endpoint could not travel that way without undoing review C6. The override
     names an endpoint *file* instead: `schemaic --mcp-serve --endpoint-file <path>`, where the path
-    is not the credential and what it points at is
+    is not the credential and what it points at was, until the endpoint named its saved connection
+    in place of the password (`app/ai.rs`)
     (`the_endpoint_never_reaches_a_codex_command_line` drives a real `mysql://root:hunter2@…`
     through it). **Claude is the only harness left carrying the endpoint itself** — it is configured
     by a file Schemaic writes *per session*, so the endpoint still travels in that file's `env` map,
@@ -19121,9 +19124,9 @@ existing prose was left alone.
   per-session `--mcp-config` file (removed on drop) — never argv, so credentials don't leak
   to other same-user processes. **That file, and every other per-session file carrying the endpoint,
   lives in `ai::mcp_dir()` — `persist::private_dir("ai-mcp")` — and not in the shared temp
-  directory.** They hold the DB host, user and **plaintext password**, and in a directory every
-  account on the machine can list the only thing between them and another user was `O_EXCL` plus a
-  random name. `private_dir` is `0o700` on Unix and ACL-scoped to the profile on Windows;
+  directory.** They held the DB host, user and **plaintext password** — the password is no longer
+  among them, see *the endpoint names its connection* below — and in a directory every account on
+  the machine can list the only thing between them and another user was `O_EXCL` plus a random name. `private_dir` is `0o700` on Unix and ACL-scoped to the profile on Windows;
   `private_dir_in` is its pure half, separate so the *choice* of root is the part a test can pin.
   `O_EXCL` is kept anyway, in the one `create_private(kind, ext, bytes)` that `write_mcp_config`,
   `write_endpoint_file` and `inline_reply_path` all now go through: it refuses an existing path and
@@ -19132,7 +19135,7 @@ existing prose was left alone.
   instead of the blob, and still never the credential.** Codex's only configuration lever is
   `-c key=value` and those are argv, so `mcp_endpoint_from_env` now prefers the file named by
   `--endpoint-file <path>` and falls back to `$SCHEMAIC_MCP_ENDPOINT`; the path is not the secret,
-  what it points at is (`harness::codex_mcp_overrides` builds that override, and `main.rs`'s
+  what it points at was (`harness::codex_mcp_overrides` builds that override, and `main.rs`'s
   `--mcp-serve` comment block states both routes and why neither is a plain argument).
   `endpoint_file_arg` is the pure half, split out and tested because "the flag came last with
   nothing after it" is the case that would otherwise read as a path and leave the server pointed at
@@ -19170,7 +19173,7 @@ existing prose was left alone.
   `match harness` sites — one in each of `start_ai_session`'s branches — and that is precisely how
   the two came to disagree. The persistent branch handed back `mcp_cfg`, which is `write_mcp_config`
   for Claude and `None` for every other harness, so when Antigravity became persistent its endpoint
-  file (host, user, plaintext password) had nothing to unlink it and accumulated one per session for
+  file (host, user and, then, plaintext password) had nothing to unlink it and accumulated one per session for
   the life of the machine. What a session hands back is a `SessionPrivate { files: Vec<PathBuf>, cwd:
   Option<PathBuf> }` rather than an `Option<PathBuf>`, gathered by a single `SessionPrivate::of` call
   so neither carrier can be the one left out, and `AiSession`'s `Drop` unlinks every file and removes
@@ -19217,6 +19220,36 @@ existing prose was left alone.
   exits 2 so the launching CLI surfaces the server as failed
   (`an_endpoint_file_that_cannot_be_read_refuses_rather_than_defaulting`, which also pins that it
   does *not* fall through to the environment, and `a_blob_that_is_not_a_json_object_refuses`).
+  **The endpoint names its connection and never its password.** `endpoint_json(db, conn_id, …)`
+  writes `"conn_id"` — the saved connection the `Db` was built from, which `StartAiParams::conn_id`
+  carries from `main.rs`'s active connection — and no `"pass"`; the subprocess puts the password
+  back itself, `mcp_endpoint_from_env` calling `resolve_password(&mut blob, keyring_password)`
+  before `endpoint_from_value`. It used to write the password, and owner-private was the whole of
+  its protection — which guards against other accounts and not against the agent, which runs *as*
+  the user. The harnesses whose built-in readers stay live could be steered to read the file and put
+  the plaintext DB password into the conversation, at every AI data level: Cursor's `Grep`, with
+  the path sitting in `.cursor/mcp.json` inside the model's own working directory; Codex's read-only
+  sandbox; Antigravity's `view_file`. The keyring is out of a file reader's reach, and since the
+  same blob rides Claude's config `env` map, that no longer holds the password either.
+  `resolve_password` is pure with the lookup injected; `keyring_password(id)` is the real one —
+  `conn::secrets::load_connections_readonly`, **never** the app's self-healing load, which may
+  rewrite `connections.json` under the running app; the connection found by id; `hydrate_for_cli`,
+  whose notices go to stderr because stdout is the JSON-RPC stream. Host and port are still the
+  app's own SSH tunnel, so no SSH secret is needed on this side. An unreadable connections file or
+  an id not among the saved connections is an `Err`, and so the same stderr-and-exit-2 refusal as
+  above — an empty password would come back as the server's *Access denied*, which names the wrong
+  cause. A keyring that will not answer is **not** one of those: `hydrate_for_cli` reports it as a
+  notice and leaves the field empty, so that case still reaches the server with an empty password
+  and the reason is on stderr only. A blob with no `conn_id` is left alone, so an older blob's
+  `pass` still parses (`the_endpoint_names_the_connection_and_never_its_password`,
+  `the_subprocess_reads_the_password_by_the_connection_id`). **What this does not cover**: a
+  harness that can *execute* commands as the user can still reach the keyring — Windows Credential
+  Manager answers any process of the user — so this closes the file-reader path and not that one;
+  and on a machine with no working keyring the password is in `connections.json` as plaintext
+  already, the documented fallback, which is what `hydrate_for_cli` then reads. Two alternatives
+  were rejected: the password in each harness config's `env` map (Cursor's `mcp.json` is inside the
+  model's working directory, and Codex's only lever is argv), and a local credential broker handing
+  out a one-time token (the per-turn harnesses respawn the MCP server every turn).
   **The sweep that collects what a crash left behind asks liveness, not age.**
   `stale_mcp_file(name, owner_live, age)` and `stale_run_dir` both parse an `Owner` out of the name —
   one parser, `owner_in(name, prefix)`, since the owner sits immediately after the prefix in both
@@ -19731,8 +19764,8 @@ existing prose was left alone.
   - `liveness.rs` — **is the process that left this behind still running?**, asked once for the
     whole app. Two unrelated sweeps asked it and answered it two different ways, each wrong in one
     direction: `antigravity::sweep` read a pid marker and special-cased its own pid, while `ai`'s
-    temp sweep — which deletes MCP config and endpoint files, and those carry the database password
-    — answered with a 24-hour mtime, so a session older than a day plus a second window was enough
+    temp sweep — which deletes MCP config and endpoint files, and those carried the database
+    password until the endpoint named its connection instead — answered with a 24-hour mtime, so a session older than a day plus a second window was enough
     to delete a *live* instance's endpoint file, and abandoned siblings with the wrong suffix were
     never collected at all. An `Owner` is a pid **and** the start time of the process that held it,
     because pids are reissued: a crashed instance's claim eventually names some unrelated live
@@ -22494,9 +22527,12 @@ Re-introducing the anti-patterns these guard against is a regression:
   `--endpoint-file` route carries Antigravity, whose registration writes that command line into the
   CLI's **own config**: a path there outlives the process, which is one of the two reasons
   `antigravity::sweep` exists. **Both files live in `ai::mcp_dir()`, which is ours and `0o700`,
-  rather than the shared temp directory they used to**: they hold a plaintext password, and in a
+  rather than the shared temp directory they used to**: they held a plaintext password, and in a
   directory every account on the machine can list, `O_EXCL` plus a random name was the whole of the
-  defence. And a subprocess that cannot read the file it was pointed at **refuses** rather than
+  defence. **They no longer hold it at all** — owner-private stops another account, not the agent,
+  which runs as the user and whose file readers can be pointed at the file — so the endpoint names
+  its saved connection and `ai::resolve_password` reads the password from the keyring (the `ai.rs`
+  entry has the whole of it, including the executing harness it does not stop). And a subprocess that cannot read the file it was pointed at **refuses** rather than
   defaulting — `ai::mcp_endpoint_from_env` returns `Err`, because the fallback was a
   `127.0.0.1:3306` endpoint with every access gate back on. Don't add new plaintext-secret surfaces.
   **"Never in a log" includes a log the environment asked for.** `app::logging`'s
@@ -22547,7 +22583,9 @@ Re-introducing the anti-patterns these guard against is a regression:
   keyring-backed store; the JSON on disk is blanked and hydrated on load. All connection saves route
   through `conn::secrets::{load,save}_connections`/`forget_connection` (which wrap
   `persist::{load,save}_connections`) — never call `persist::save_connections` directly from a front
-  end, or you reintroduce plaintext. Plaintext in the JSON is a *fallback only* for a machine with no
+  end, or you reintroduce plaintext. **Nor does the AI panel's MCP endpoint carry one** — it
+  names the saved connection (`conn_id`) and its subprocess reads the password from the keyring (`ai::resolve_password`), because an owner-private file is still one the
+  agent's own file readers can open. Plaintext in the JSON is a *fallback only* for a machine with no
   working keyring — **and the app now says so when it happens**, rather than letting a stated
   invariant be quietly false on someone's machine: `Sanitized::notice` names the file the passwords
   landed in and the button that opens its folder, `Hydration::notice` names a keyring that would not
