@@ -632,6 +632,71 @@ mod no_continuation_typed_as_newline_gate {
     }
 }
 
+/// The headless read path's session gate — over `schemaic-cli`, here for the
+/// reason [`mcp_deadline_gate`] is: the walk is here, and that crate is
+/// Floem-free.
+#[cfg(test)]
+mod headless_read_session_gate {
+    /// **The headless read path's session half, pinned where it is spelled.**
+    ///
+    /// `read_only_reason` is a text gate and a head is a spelling:
+    /// `SELECT setval('s', 1000)` passes it and writes on PostgreSQL. What stops
+    /// that is the session the read runs on — `Enforce::ReadOnly` — and changing
+    /// it to `Enforce::None` in `query::read_only_query` (the one read both
+    /// `schemaic query` and the MCP server's `run_query` go through) or in
+    /// `describe_table`'s sample passed the whole suite. No behavioural test can
+    /// be red here: in-memory SQLite has no statement that passes its gate and
+    /// writes. So the subject is the source, as it is for the editor's
+    /// `session_enforce` gate.
+    #[test]
+    fn every_headless_read_runs_on_a_read_only_session() {
+        for file in ["schemaic-cli/query.rs", "schemaic-cli/mcp.rs"] {
+            let body = super::workspace_source(file);
+            assert!(
+                !body.contains(".fetch_query("),
+                "{file} calls plain `fetch_query`, which runs on a session that \
+                 refuses nothing — a headless read must go through \
+                 `fetch_query_enforced(…, Enforce::ReadOnly)`"
+            );
+            let mut calls = 0usize;
+            let mut from = 0usize;
+            while let Some(rel) = body[from..].find(".fetch_query_enforced(") {
+                let open = from + rel + ".fetch_query_enforced".len();
+                // The argument list, to its matching `)`.
+                let mut depth = 0usize;
+                let mut end = open;
+                for (k, c) in body[open..].char_indices() {
+                    match c {
+                        '(' => depth += 1,
+                        ')' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                end = open + k;
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                let args = &body[open..end];
+                assert!(
+                    args.contains("Enforce::ReadOnly"),
+                    "{file}: a headless read runs on a session that is not read-only — \
+                     the text gate passes `SELECT setval(…)`, so only the session stops \
+                     it writing:\n{args}"
+                );
+                calls += 1;
+                from = end;
+            }
+            assert!(
+                calls >= 1,
+                "the needle stopped matching: no `fetch_query_enforced(` in {file} — a \
+                 gate that scans nothing reports success"
+            );
+        }
+    }
+}
+
 /// The MCP server's deadline gates — over `schemaic-cli/mcp.rs`, whose own
 /// tests they were until the server moved into that crate.
 ///

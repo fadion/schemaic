@@ -361,9 +361,10 @@ existing prose was left alone.
     retrying. It is also what the MCP server builds `run_query`'s advertised description from, so
     the tool text and the gate can't drift
     (`the_read_only_heads_are_the_ones_the_engine_actually_has`,
-    `the_rejection_lists_only_this_engines_heads`). Only the head list is per dialect: the
-    single-statement check and the `DENY_KEYWORDS` scan — which is what refuses a write hidden
-    behind a `WITH` head — apply the same everywhere.
+    `the_rejection_lists_only_this_engines_heads`). The single-statement check applies the same
+    everywhere; the deny scan — which is what refuses a write hidden behind a `WITH` head — is
+    `DENY_ANY_ENGINE` for every engine plus `deny_keywords_for`'s per-dialect half, since each
+    engine's file, sleep and lock primitives share nothing but their effect.
     **The gate has two front ends now, so its wording names neither.** It was the AI's alone and its
     refusals said so; `schemaic query` runs the same function, and a person typing a `SLEEP()` at a
     prompt being told it *"is not permitted in an AI query"* is being answered about somebody else's
@@ -378,7 +379,8 @@ existing prose was left alone.
     `Enforce::ReadOnly`, under `schemaic-db`) — and the editor's `run_verdict` reads the same kind of
     text, so a read-only connection's editor runs take that session too (the write-guard invariant
     lists the five paths); the gate stays in front for the one-statement count and
-    for what a read-only session still allows — sleeps, locks, server-side file reads. **And the
+    for what a read-only session still allows — sleeps, locks, server-side file reads, and on
+    PostgreSQL the writes that are not transactional (below). **And the
     one-statement count is only as good as the server's agreement about where a statement ends.**
     `skip_noncode` assumes `\` escapes inside every quote, which a MySQL/MariaDB server stops doing
     under `NO_BACKSLASH_ESCAPES`, and under `ANSI_QUOTES` it reads `"a\"` as an identifier with no
@@ -412,6 +414,30 @@ existing prose was left alone.
     string or a quoted identifier — code rather than a gap — stops the scan. The repair is inside
     `word_tokens`, so `contains_write`'s read-only gate, which had the identical door, closed with
     it.
+    **A read-only session does not refuse a write that is not transactional, so on PostgreSQL the
+    deny list carries those too.** Replication slots and origins, statistics resets, WAL switches,
+    restore points, backup markers, `pg_promote` and WAL-replay pause never call
+    `PreventCommandIfReadOnly`, and live on PostgreSQL 16.15, under exactly the `SET SESSION
+    CHARACTERISTICS AS TRANSACTION READ ONLY` session the headless read path runs on,
+    `pg_drop_replication_slot`, `pg_create_*_replication_slot` and `pg_stat_reset` all ran. A dropped
+    slot takes a CDC consumer's position with it; a created one pins WAL until the disk fills. They
+    are in `deny_keywords_for(SqlDialect::Postgres)` now, beside `adminpack`'s `pg_file_*` writers
+    and the `pg_ls_*dir` listings `pg_ls_dir` already stood for
+    (`the_gate_refuses_postgres_admin_writes_a_read_only_session_allows`). The `_get_` forms of
+    `pg_logical_slot_*_changes` consume the slot and are denied; the `_peek_` forms leave it where it
+    was and stay reads — the test pins that half too. **A function that takes SQL text is an eval,
+    and is denied by name for that alone.** `word_tokens` skips a string literal whole, so every name
+    on the list was one quoted argument from reachable: `query_to_xml('select
+    pg_read_file(''PG_VERSION'')', …)` returned the file on the same server while the bare
+    `pg_read_file` was refused. The three `query_to_xml*` functions, `ts_stat`, `ts_rewrite`, the
+    `dblink` family — whose own connection is not the read-only session, so it writes as well — and
+    `tablefunc`'s `crosstab`, `crosstab2`–`crosstab4` and `connectby` are refused
+    (`a_function_that_evaluates_sql_text_is_refused`); `table_to_xml` and its siblings take a
+    relation rather than SQL and stay reads. **This is an enumeration, and it fails open**: a new
+    PostgreSQL release or an extension can add a function of either kind and nothing here will
+    notice. The durable answer is an allowlist of PostgreSQL functions rather than a deny list, and
+    that is still open. Reach is why it matters — `schemaic mcp` puts this gate in front of any MCP
+    client, behind tools that all advertise `readOnlyHint: true`.
     **`/*! … */` is two questions about the same bytes, and both answers now exist.**
     `SqlDialect::executable_comment` is the capability — MySQL and MariaDB *run* what is inside one,
     and a bare `/*!`, a versioned `/*!50000` and MariaDB's `/*M!` are all treated as code, a lexer
@@ -9209,7 +9235,10 @@ existing prose was left alone.
   it to sit inside. None of the three can be lifted by the statement it guards: PostgreSQL refuses
   `transaction_read_only` once a transaction has taken its snapshot, which a `SELECT` has; a MySQL
   transaction's access mode cannot change while it runs, so a stored function cannot undo it from
-  inside; and a `SELECT` cannot set a pragma. **`Enforce::AsJudged` is the lexer the gate
+  inside; and a `SELECT` cannot set a pragma. **What it refuses is a transactional write, and no
+  more**: on PostgreSQL a function that never calls `PreventCommandIfReadOnly` — a replication slot
+  dropped or created, `pg_stat_reset` — ran on this very session live on 16.15, so those are the
+  text gate's to refuse (`core::sql`'s entry). **`Enforce::AsJudged` is the lexer the gate
   assumed.** On a MySQL/MariaDB server whose `sql_mode` carries `NO_BACKSLASH_ESCAPES` or
   `ANSI_QUOTES`, `SELECT 'a\'; DELETE FROM t; -- '` is one `SELECT` to the gate and three statements
   to the server, and the `DELETE` runs, because `mysql_async` sends multi-statement text whether the
@@ -14096,6 +14125,16 @@ existing prose was left alone.
     that one file directly — `crates/<crate>/src/<rel>`, then `production_code` — and panics naming
     it when it is not there, so a gate over a file that moves fails rather than scanning nothing. It
     used to walk the whole census to keep one entry, every crate's source read and cut for nothing.
+    **`headless_read_session_gate` is the same arrangement for the other half of the headless read
+    guard.** `every_headless_read_runs_on_a_read_only_session` asserts that every
+    `.fetch_query_enforced(` in `schemaic-cli/query.rs` and `schemaic-cli/mcp.rs` carries
+    `Enforce::ReadOnly` within its own argument list — cut at the matching `)`, so an
+    `Enforce::ReadOnly` elsewhere in the file cannot answer for a call without one — and that neither
+    file calls plain `.fetch_query(`, with a floor of one call per file so a needle that stops
+    matching fails. It is a source gate because nothing else could be red: changing
+    `read_only_query`'s `Enforce::ReadOnly` to `Enforce::None` passed the whole suite, since
+    in-memory SQLite has no statement that passes its text gate and writes. The editor's twin is
+    `every_editor_sql_path_runs_on_a_session_enforcing_read_only`.
   - `stored.rs` — `Stored<T>`, **a persisted store the UI can read freely and write only by
     saving**. `formats`, `db_colors`, `table_colors` and `db_favorites` used to sit on `Ui` as public
     `RwSignal`s beside three public save closures (`save_formats`, `save_db_colors`,
@@ -20962,7 +21001,12 @@ existing prose was left alone.
     the statement runs through `Db::fetch_query_enforced` with `Enforce::ReadOnly`, a session that
     refuses a write by its effect — and on MySQL/MariaDB one whose `sql_mode` is pinned to the lexer
     the gate counted statements with — while the gate stays in front for what such a session still
-    allows: sleeps, locks, server-side file reads. A **locking read** (`FOR UPDATE`, `FOR NO KEY
+    allows: sleeps, locks, server-side file reads, PostgreSQL's non-transactional writers
+    (`core::sql`'s entry). **Nothing behavioural pins the session half**: changing
+    `read_only_query`'s `Enforce::ReadOnly` to `Enforce::None` passed the whole suite, because
+    in-memory SQLite has no statement that passes its gate and writes. So
+    `ui/source_gate.rs`'s `every_headless_read_runs_on_a_read_only_session` reads this file and
+    `mcp.rs` instead. A **locking read** (`FOR UPDATE`, `FOR NO KEY
     UPDATE`, `LOCK IN SHARE MODE`, and the shared `FOR SHARE`/`FOR KEY SHARE` no deny-list word
     catches, which a MySQL 8 read-only session runs, locks held) is refused by naming the clause and
     the lock (`sql::locking_clause`, `shared_locks`); it used to answer "`UPDATE` is not permitted",
@@ -21892,9 +21936,12 @@ Re-introducing the anti-patterns these guard against is a regression:
   shown live on PostgreSQL 16 and MariaDB 10.11. A text gate cannot see what a function does, so
   `read_only_query` now runs the statement through `Db::fetch_query_enforced` with
   `Enforce::ReadOnly`, a session that refuses a write by its effect, and the gate stays in front for
-  what that session still allows (sleeps, locks, server-side file reads) and for the one-statement
+  what that session still allows (sleeps, locks, server-side file reads, PostgreSQL's writes that
+  are not transactional — `core::sql`'s entry) and for the one-statement
   count — which that session also pins, on MySQL/MariaDB, to the lexer the gate counted with (see
-  `schemaic-db`'s entry for the `sql_mode` smuggle that closed). **`read_only_reason` has no minted
+  `schemaic-db`'s entry for the `sql_mode` smuggle that closed). That session half is pinned by
+  source, as the editor's is — `every_headless_read_runs_on_a_read_only_session` — since dropping
+  it to `Enforce::None` kept every behavioural test green. **`read_only_reason` has no minted
   request**: it is enforced inside `read_only_query` itself, and the refusals and the requests are
   two separate lists. `schemaic query` also asks it once *earlier*, through `query::gate`, before
   the keyring is read or a tunnel opened — as `schemaic exec` runs `ExecRequest::approved` before

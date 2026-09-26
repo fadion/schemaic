@@ -2049,6 +2049,78 @@ fn deny_keywords_for(dialect: SqlDialect) -> &'static [&'static str] {
             "PG_RELOAD_CONF",
             "PG_ROTATE_LOGFILE",
             "COPY",
+            // Directory listings, beside `PG_LS_DIR`; `adminpack`'s writers.
+            "PG_LS_LOGDIR",
+            "PG_LS_WALDIR",
+            "PG_LS_TMPDIR",
+            "PG_LS_ARCHIVE_STATUSDIR",
+            "PG_FILE_WRITE",
+            "PG_FILE_RENAME",
+            "PG_FILE_UNLINK",
+            "PG_FILE_SYNC",
+            // **Non-transactional writes**: none of these calls
+            // `PreventCommandIfReadOnly`, so the read-only session that stops a
+            // `setval` runs every one of them. A dropped slot takes a CDC
+            // consumer's position with it; a created one pins WAL until the
+            // disk fills. `_PEEK_` changes stays a read — it leaves the slot.
+            "PG_CREATE_PHYSICAL_REPLICATION_SLOT",
+            "PG_CREATE_LOGICAL_REPLICATION_SLOT",
+            "PG_DROP_REPLICATION_SLOT",
+            "PG_COPY_PHYSICAL_REPLICATION_SLOT",
+            "PG_COPY_LOGICAL_REPLICATION_SLOT",
+            "PG_REPLICATION_SLOT_ADVANCE",
+            "PG_LOGICAL_SLOT_GET_CHANGES",
+            "PG_LOGICAL_SLOT_GET_BINARY_CHANGES",
+            "PG_REPLICATION_ORIGIN_CREATE",
+            "PG_REPLICATION_ORIGIN_DROP",
+            "PG_REPLICATION_ORIGIN_ADVANCE",
+            "PG_REPLICATION_ORIGIN_SESSION_SETUP",
+            "PG_REPLICATION_ORIGIN_SESSION_RESET",
+            "PG_REPLICATION_ORIGIN_XACT_SETUP",
+            "PG_REPLICATION_ORIGIN_XACT_RESET",
+            "PG_LOGICAL_EMIT_MESSAGE",
+            "PG_STAT_RESET",
+            "PG_STAT_RESET_SHARED",
+            "PG_STAT_RESET_SINGLE_TABLE_COUNTERS",
+            "PG_STAT_RESET_SINGLE_FUNCTION_COUNTERS",
+            "PG_STAT_RESET_SLRU",
+            "PG_STAT_RESET_REPLICATION_SLOT",
+            "PG_STAT_RESET_SUBSCRIPTION_STATS",
+            "PG_STAT_STATEMENTS_RESET",
+            "PG_SWITCH_WAL",
+            "PG_SWITCH_XLOG",
+            "PG_CREATE_RESTORE_POINT",
+            "PG_BACKUP_START",
+            "PG_BACKUP_STOP",
+            "PG_START_BACKUP",
+            "PG_STOP_BACKUP",
+            "PG_PROMOTE",
+            "PG_WAL_REPLAY_PAUSE",
+            "PG_WAL_REPLAY_RESUME",
+            "PG_LOG_BACKEND_MEMORY_CONTEXTS",
+            // **A function that takes SQL text is an eval.** This scan skips a
+            // string literal whole, so every name above is one quoted argument
+            // from reachable: `query_to_xml('select pg_read_file(…)', …)` read
+            // a server file live on PG 16.15 while the bare call was refused.
+            // `dblink`'s own connection is not the read-only session, so it
+            // writes as well. `table_to_xml` and friends take a *relation*,
+            // not SQL, and stay reads.
+            "QUERY_TO_XML",
+            "QUERY_TO_XMLSCHEMA",
+            "QUERY_TO_XML_AND_XMLSCHEMA",
+            "TS_STAT",
+            "TS_REWRITE",
+            "DBLINK",
+            "DBLINK_EXEC",
+            "DBLINK_OPEN",
+            "DBLINK_SEND_QUERY",
+            "DBLINK_CONNECT",
+            "DBLINK_CONNECT_U",
+            "CROSSTAB",
+            "CROSSTAB2",
+            "CROSSTAB3",
+            "CROSSTAB4",
+            "CONNECTBY",
         ],
         // `ATTACH` is the SQLite hole that has no analogue: it opens *another*
         // database file by path, so a model that may `SELECT` can read any
@@ -4322,6 +4394,72 @@ mod tests {
         ];
         for (d, sql) in cases {
             assert!(gate(sql, *d).is_err(), "{d:?} passed `{sql}`");
+        }
+    }
+
+    /// **A read-only transaction does not refuse a non-transactional write.**
+    /// Replication slots, statistics resets, WAL switches and backup markers
+    /// never call `PreventCommandIfReadOnly`, so the session half of the gate
+    /// waves them through — measured live on PG 16.15 under exactly the
+    /// `SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY` the headless read
+    /// path runs, where `pg_drop_replication_slot` removed a slot a CDC consumer
+    /// would have lost its place with. Only the text half can stop them.
+    #[test]
+    fn the_gate_refuses_postgres_admin_writes_a_read_only_session_allows() {
+        use super::read_only_reason as gate;
+        for sql in [
+            "SELECT pg_drop_replication_slot('debezium')",
+            "SELECT pg_create_physical_replication_slot('s')",
+            "SELECT pg_create_logical_replication_slot('s', 'pgoutput')",
+            "SELECT pg_copy_logical_replication_slot('a', 'b')",
+            "SELECT pg_replication_slot_advance('s', '0/0')",
+            "SELECT * FROM pg_logical_slot_get_changes('s', NULL, NULL)",
+            "SELECT pg_replication_origin_create('o')",
+            "SELECT pg_stat_reset()",
+            "SELECT pg_stat_reset_shared('bgwriter')",
+            "SELECT pg_stat_statements_reset()",
+            "SELECT pg_switch_wal()",
+            "SELECT pg_create_restore_point('r')",
+            "SELECT pg_backup_start('b')",
+            "SELECT pg_promote()",
+            "SELECT pg_wal_replay_pause()",
+            "SELECT pg_logical_emit_message(false, 'p', 'm')",
+            "SELECT pg_file_write('f', 'x', false)",
+            "SELECT pg_ls_waldir()",
+        ] {
+            assert!(gate(sql, SqlDialect::Postgres).is_err(), "passed `{sql}`");
+        }
+        // The peek is a read: it leaves the slot where it was.
+        assert!(
+            gate(
+                "SELECT * FROM pg_logical_slot_peek_changes('s', NULL, NULL)",
+                SqlDialect::Postgres
+            )
+            .is_ok()
+        );
+    }
+
+    /// **A function that takes SQL text is an eval, and the deny scan cannot see
+    /// inside a string.** `query_to_xml('select pg_read_file(…)', …)` returned
+    /// a server file's contents live on PG 16.15 while the bare
+    /// `pg_read_file` was refused — every name on the list was one string
+    /// literal from reachable. `dblink_exec` is worse: dblink's own connection
+    /// is not the read-only session, so it writes.
+    #[test]
+    fn a_function_that_evaluates_sql_text_is_refused() {
+        use super::read_only_reason as gate;
+        for sql in [
+            "SELECT query_to_xml('select pg_read_file(''PG_VERSION'')', true, true, '')",
+            "SELECT query_to_xmlschema('select 1', true, true, '')",
+            "SELECT query_to_xml_and_xmlschema('select 1', true, true, '')",
+            "SELECT * FROM ts_stat('select pg_sleep(30)')",
+            "SELECT ts_rewrite('a'::tsquery, 'select 1')",
+            "SELECT dblink_exec('dbname=x', 'DELETE FROM t')",
+            "SELECT * FROM dblink('dbname=x', 'select 1') AS t(a int)",
+            "SELECT dblink_send_query('c', 'select 1')",
+            "SELECT * FROM crosstab('select 1, 2, 3') AS t(a int, b int)",
+        ] {
+            assert!(gate(sql, SqlDialect::Postgres).is_err(), "passed `{sql}`");
         }
     }
 
