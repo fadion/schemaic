@@ -25351,15 +25351,22 @@ Re-introducing the anti-patterns these guard against is a regression:
   `close` sets the target to `None` and the next open reseeds the draft, and
   `snippet_edit`, whose name, abbreviation and body are saved only by Save; **selections nothing
   else holds** — `connection_import`'s ticked list, of which nothing is written until Import; a
+  **record nothing else holds** — `monitor_view`, whose change log is the one copy of what a
+  deleted row held, and which reopening starts afresh, so a stray click discarded it without the
+  confirmation its own Clear asks for (`discard_needs_asking`); a
   **running operation a close would cancel** — `dump_view::dump_overlay` and `script_view`, and
   `import_view`, which holds a column mapping as well; and the transaction prompt above.
   `dump_view::export_progress_overlay` has neither a title row nor a click-away **by design**: it
   is a one-button progress box whose only exit is its Stop/Close decision, and Escape routes
   through that same decision. `ddl_preview` and `blob_view` were *given* a click-away under this
-  rule, because neither holds anything unique — the preview's plan is regenerated from the editor
-  left open behind it, and its `exit` already ignores the one dangerous moment, an apply that
-  cannot be cancelled; a replacement loaded into the blob viewer is staged into the grid's edit
-  buffer the moment it lands, so closing it only cancels a read. `account_editor.rs`'s account and
+  rule: a replacement loaded into the blob viewer is staged into the grid's edit buffer the moment
+  it lands, so closing it only cancels a read. **The preview's is narrower than its `exit`**: an idle
+  plan is regenerated from the editor left open behind it, but the first spelling routed the
+  backdrop through `exit`, so on PostgreSQL and SQLite a stray click mid-apply was a Stop that
+  rolled the apply back, and after a failed MySQL apply it closed the only copy of "statement 3 of
+  5 failed, 2 already committed". `backdrop_action` closes only an idle preview with no error on
+  screen; ✕, Escape and Stop keep `exit`
+  (`the_backdrop_closes_only_an_idle_preview_with_nothing_to_report`). `account_editor.rs`'s account and
   grant editors are in the no-click-away set too, through the one `modal_shell` they share: each
   holds a draft — a name, a password, grants — that `close` resets to its default, so a stray click
   would discard everything typed since the open. The form does re-seed from its target on open,

@@ -655,25 +655,23 @@ pub(crate) fn monitor_overlay(o: OverlayUi, tab_actions: Rc<TabsActions>) -> imp
                         .border_color(theme::modal_border())
                 });
 
-            let close_bg = close.clone();
-            // On a sibling behind the panel, never on the focus root: Space is
-            // the reflex for "scroll this log", and floem fires `Click` on the
-            // focused view for it — which closed the modal, stopped the poll and
-            // emptied the change log, deletes included. See
-            // `widgets::dismiss_layer`.
-            crate::widgets::focus_root_with_ring(
-                stack((crate::widgets::dismiss_layer(move || (close_bg)()), panel)),
-                ring,
-            )
-            .on_key_down(Key::Named(NamedKey::Escape), |_| true, move |_| (close)())
-            .style(|s| {
-                s.size_full()
-                    .flex_col()
-                    .items_center()
-                    .justify_center()
-                    .background(theme::modal_backdrop())
-            })
-            .into_any()
+            // **No click-away.** The change log is the one record of what a
+            // deleted row held, and reopening the monitor starts a fresh log —
+            // so a stray backdrop click threw it away without the confirmation
+            // Clear asks for (`discard_needs_asking`). ✕ and Escape are
+            // deliberate and stay. Nor a click handler on the focus root:
+            // floem fires `Click` on the focused view for Space, the reflex for
+            // "scroll this log" — see `widgets::dismiss_layer`.
+            crate::widgets::focus_root_with_ring(stack((panel,)), ring)
+                .on_key_down(Key::Named(NamedKey::Escape), |_| true, move |_| (close)())
+                .style(|s| {
+                    s.size_full()
+                        .flex_col()
+                        .items_center()
+                        .justify_center()
+                        .background(theme::modal_backdrop())
+                })
+                .into_any()
         },
     )
     .style(move |s| {

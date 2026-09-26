@@ -862,6 +862,24 @@ fn exit_cancellable(dialect: Option<SqlDialect>) -> bool {
     dialect.is_some_and(schemaic_core::ddl::ddl_rolls_back_as_a_whole)
 }
 
+/// What a **backdrop click** does — never [`exit_action`]'s `Cancel`.
+///
+/// The click-away went through `exit`, which answers a deliberate ✕ or Escape:
+/// on PostgreSQL and SQLite a stray click mid-apply was a Stop, and the apply
+/// rolled back — the footer offers that only as a red **Stop** button. And once
+/// an apply had failed, a click closed the modal and with it `d.error`, the one
+/// copy of "statement 3 of 5 failed, 2 already committed". So the backdrop
+/// closes only an idle preview with nothing to report; ✕, Escape and Stop keep
+/// `exit`.
+///
+/// [`exit_action`]: crate::widgets::exit_action
+fn backdrop_action(applying: bool, has_error: bool) -> ExitAction {
+    match applying || has_error {
+        true => ExitAction::Ignore,
+        false => ExitAction::Close,
+    }
+}
+
 pub(crate) fn ddl_preview_overlay(
     d: DdlUi,
     conn: ConnUi,
@@ -1240,14 +1258,16 @@ pub(crate) fn ddl_preview_overlay(
             .on_click_stop(|_| {})
             .style(|s| panel_style(s).width(panel_w()).height(modal_h(PANEL_H)));
 
-            // **Click-away closes it**, unlike the editors it previews: nothing
-            // here is the only copy of anything — the plan is regenerated from
-            // the editor left open behind it — and `exit` already ignores the
-            // one dangerous moment, an apply that cannot be cancelled.
-            let dismiss = {
-                let exit = exit.clone();
-                crate::widgets::dismiss_layer(move || exit())
-            };
+            // **Click-away closes it only while it holds nothing**, unlike the
+            // editors it previews, which have none: an idle plan is regenerated
+            // from the editor left open behind it. Not `exit`, which answers a
+            // deliberate ✕ or Escape — see `backdrop_action`.
+            let dismiss = crate::widgets::dismiss_layer(move || {
+                let has_error = d.error.with_untracked(Option::is_some);
+                if backdrop_action(d.applying.get_untracked(), has_error) == ExitAction::Close {
+                    close_preview(d);
+                }
+            });
             focus_root_with_ring(stack((dismiss, panel)), root_ring)
                 .on_key_down(Key::Named(NamedKey::Escape), |_| true, {
                     let exit = exit.clone();
@@ -2154,6 +2174,20 @@ mod tests {
                 "{d:?}"
             );
         }
+    }
+
+    /// **A stray click is not a Stop, and not a dismissal of the only report.**
+    /// The backdrop went through `exit`, so on PostgreSQL and SQLite a click
+    /// mid-apply was `Cancel` — the apply rolled back — and on MySQL a click
+    /// after a partial failure closed "statement 3 of 5 failed, 2 committed",
+    /// which nothing else holds.
+    #[test]
+    fn the_backdrop_closes_only_an_idle_preview_with_nothing_to_report() {
+        use crate::widgets::ExitAction;
+        assert_eq!(super::backdrop_action(true, false), ExitAction::Ignore);
+        assert_eq!(super::backdrop_action(true, true), ExitAction::Ignore);
+        assert_eq!(super::backdrop_action(false, true), ExitAction::Ignore);
+        assert_eq!(super::backdrop_action(false, false), ExitAction::Close);
     }
 }
 /// **Which connection a plan with no table is built against.**
