@@ -239,7 +239,10 @@ existing prose was left alone.
     which at the point of failure: a `DbError` through `DbError::modal_source` and then
     `core::tx::run_error_source`, the not-sent, timeout and cancel notes and the
     `db_for`/`session_for` refusals `App`, a failed `BEGIN` `Server` — the server's words, but not
-    about a statement of the user's. **That makes the `DbError` variant the provenance, so
+    about a statement of the user's. The schema tree's per-database Refresh raises its `db_for`
+    refusal as `ModalError::app` too, rather than writing it into the node's `SchemaState::Failed`,
+    whose row labels every failure the server's (it holds a bare `String`, fed by the fetch's error
+    as well) and so offered *Explain* on "SSH tunnel is not established yet". **That makes the `DbError` variant the provenance, so
     `schemaic-db` has to write the right one**: it wrote its own refusals and its own set-up
     statements' failures as `Query`/`Connect`, so the single run folded a failed lazy `BEGIN` into
     the statement's result and the bar offered *AI fix* over a healthy `SELECT` — while Run All,

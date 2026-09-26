@@ -8290,7 +8290,15 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                 // Keeps the rows on screen while the fetch is out; see
                 // `start_fetch`.
                 Ok(db) => (start_fetch)(&node, db),
-                Err(e) => node.schema.set(SchemaState::Failed(e)),
+                // **Schemaic's own refusal, said as one** — "SSH tunnel is not
+                // established yet", "connection no longer exists" — not
+                // written into the node, whose `Failed` row labels every
+                // failure the server's and offered *Explain* on this sentence.
+                // The rows on screen stay; nothing was fetched to replace them.
+                Err(e) => {
+                    error_modal_text.set(Some(ModalError::app(e)));
+                    error_modal_open.set(true);
+                }
             }
         })
     };
