@@ -147,6 +147,22 @@ impl Coalescer {
         Some(delta.to_string())
     }
 
+    /// Reconcile a **restatement** of `key` with the deltas [`Coalescer::extend`]
+    /// already sent — the tail it adds, or `None`.
+    ///
+    /// **Not [`Coalescer::advance`]**, whose non-extension arm is Codex's: a
+    /// cumulative restatement that is not a prefix really is new text. For the
+    /// dialects that stream deltas *and then* restate the message (Copilot,
+    /// Cursor), the restatement is a copy of text already on screen, so one that
+    /// is shorter, trimmed or normalised adds nothing — sending it whole printed
+    /// the answer twice. With no deltas first it is the only copy, and is sent.
+    fn settle(&mut self, key: &str, full: &str) -> Option<String> {
+        match self.sent.get(key) {
+            Some(p) if !full.starts_with(p.as_str()) => None,
+            _ => self.advance(key, full),
+        }
+    }
+
     /// Drop the accumulated text for `key` so a later run starts clean.
     fn clear(&mut self, key: &str) {
         self.sent.remove(key);
@@ -336,8 +352,16 @@ fn cursor_tool_name(kind: &str, body: &serde_json::Value) -> String {
 /// MCP call (measured — the text is nested one level deeper than MCP's own
 /// shape), and an MCP result can still say `isError`. Every other key names a
 /// refusal, and its text is whichever reason field it carries.
+///
+/// **`success` is looked up, not taken as the first key.** The workspace's
+/// `serde_json` has no `preserve_order`, so a map iterates alphabetically, and
+/// any sibling sorting before `success` (`isBackground`, `metadata`) turned a
+/// successful call into a refusal named after that sibling.
 fn cursor_result(r: Option<&serde_json::Value>) -> (String, bool) {
-    let Some((key, val)) = r.and_then(|r| r.as_object()).and_then(|o| o.iter().next()) else {
+    let Some(o) = r.and_then(|r| r.as_object()) else {
+        return (String::new(), false);
+    };
+    let Some((key, val)) = o.get_key_value("success").or_else(|| o.iter().next()) else {
         return (String::new(), false);
     };
     if key != "success" {
@@ -878,7 +902,7 @@ impl StreamParser {
                 let id = s("messageId");
                 let out = self
                     .text
-                    .advance(id, s("content"))
+                    .settle(id, s("content"))
                     .map(|t| vec![StreamEvent::TextDelta(t)])
                     .unwrap_or_default();
                 self.text.clear(id);
@@ -1010,7 +1034,7 @@ impl StreamParser {
                 let out = match delta {
                     true => self.text.extend(SEG, &text),
                     false => {
-                        let tail = self.text.advance(SEG, &text);
+                        let tail = self.text.settle(SEG, &text);
                         self.text.clear(SEG);
                         tail
                     }
@@ -3120,6 +3144,19 @@ mod copilot_tests {
         assert_eq!(text_of(&out), "Hello");
     }
 
+    /// **A restatement that is not an extension of its deltas is a copy of
+    /// text already printed**, not a rewrite. `advance`'s "rewritten" arm is
+    /// Codex's, whose restatements are cumulative; here it sent the whole
+    /// message again, so a trimmed newline printed the answer twice.
+    #[test]
+    fn a_restatement_shorter_than_its_deltas_adds_nothing() {
+        let out = drive(&[
+            r#"{"type":"assistant.message_delta","data":{"messageId":"m","deltaContent":"Done.\n"}}"#,
+            r#"{"type":"assistant.message","data":{"messageId":"m","content":"Done."}}"#,
+        ]);
+        assert_eq!(text_of(&out), "Done.\n");
+    }
+
     #[test]
     fn a_failed_tool_call_is_flagged_on_its_chip() {
         let out = drive(&[
@@ -3241,6 +3278,27 @@ mod cursor_tests {
             text_of(&out),
             "I'll look up the customer with id 1.The customer with id 1 is named **ZEBRA-9**."
         );
+    }
+
+    /// A final restatement that trims what the deltas sent is the same text,
+    /// already on screen — not a second copy to print.
+    #[test]
+    fn a_trimmed_final_restatement_is_not_printed_again() {
+        let out = drive(&[
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Done."}]},"timestamp_ms":1}"#,
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"\n"}]},"timestamp_ms":2}"#,
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Done."}]}}"#,
+        ]);
+        assert_eq!(text_of(&out), "Done.\n");
+    }
+
+    /// `serde_json`'s map here is a `BTreeMap`, so "the first key" is the
+    /// alphabetically first — and any sibling sorting before `success` made a
+    /// successful call a refused chip named after that sibling.
+    #[test]
+    fn a_success_beside_another_key_is_still_a_success() {
+        let r = serde_json::json!({"success": {"content": "x"}, "isBackground": false});
+        assert_eq!(cursor_result(Some(&r)), ("x".to_string(), false));
     }
 
     /// The composition: one chip — the catalogue lookup is not one — filled

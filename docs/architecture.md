@@ -12427,20 +12427,26 @@ existing prose was left alone.
     **Copilot sends both shapes, which is why `Coalescer::extend` exists.** Its
     `assistant.message_delta`s are true deltas, and then `assistant.message` restates the whole
     message. `extend` records each delta against the message id as sent, so that when the
-    restatement is fed to `advance` under the same id it answers "nothing new" — or only the tail the
+    restatement is fed to `settle` under the same id it answers "nothing new" — or only the tail the
     deltas never carried — and the key is cleared once the whole message has been seen. Printing the
     deltas and ignoring the restatement would be silence with `--stream` off; printing both would be
     the answer twice (`a_message_with_no_deltas_is_printed_from_its_restatement`,
-    `a_restatement_longer_than_its_deltas_adds_only_the_tail`).
+    `a_restatement_longer_than_its_deltas_adds_only_the_tail`). **`settle`, not `advance`**, because
+    `advance`'s non-extension arm is Codex's — a cumulative restatement that is not a prefix really is
+    new text, and is sent whole. For a dialect whose restatement is a *copy* of text already on
+    screen, one that is shorter, trimmed or normalised adds nothing, and sending it whole printed the
+    answer twice when a restatement dropped the deltas' trailing newline
+    (`a_restatement_shorter_than_its_deltas_adds_nothing`).
     **Cursor sends both as well, in three shapes of one event, and the obvious rule for telling them
     apart was watched failing.** Under `--stream-partial-output` every piece of prose is an
     `assistant` event: deltas carrying `timestamp_ms` and no `model_call_id`; before a tool call, the
     segment so far **restated whole**, carrying `timestamp_ms` *and* `model_call_id`; and at the end
     the last segment restated whole with neither. "Timestamped means delta" prints the pre-tool
     sentence twice. So `push_cursor` calls a line a delta only when it has `timestamp_ms` *without*
-    `model_call_id` and feeds it to `extend`; anything else is a restatement, fed to `advance` under
+    `model_call_id` and feeds it to `extend`; anything else is a restatement, fed to `settle` under
     the same key and then cleared, so it prints only a tail the deltas never carried — nothing when
-    streaming, the whole segment when not (`a_segment_with_no_deltas_is_printed_from_its_restatement`).
+    streaming, the whole segment when not (`a_segment_with_no_deltas_is_printed_from_its_restatement`,
+    `a_trimmed_final_restatement_is_not_printed_again`).
     **The key is a segment, not a message**: Cursor gives prose no id, so a `tool_call` clears the one
     key `cursor-segment` and starts the next, which is what makes each restatement comparable with
     its own deltas rather than the turn's (`a_real_cursor_turn_prints_each_segment_once`).
@@ -12512,7 +12518,10 @@ existing prose was left alone.
     fields**: the payload sits under `tool_call.<kind>ToolCall` (`mcpToolCall`, `readToolCall`,
     `shellToolCall`…), and the verdict under its `result` is a key too — `success`, or one of the
     refusals `rejected`, `permissionDenied`, `writePermissionDenied`, `readPermissionDenied` and
-    `error`, all measured. `cursor_result` treats every key but `success` as a refusal and shows
+    `error`, all measured. `cursor_result` looks `success` up — the workspace's `serde_json` has no
+    `preserve_order`, so "the first key" is the alphabetically first, and a sibling such as
+    `isBackground` made a success a refusal named after it
+    (`a_success_beside_another_key_is_still_a_success`) — treats any other key as a refusal and shows
     whichever reason field it carries, and reads an MCP result's text one level deeper than MCP's own
     shape, `{"text":{"text":…}}` (`a_refused_call_is_a_refused_chip_with_its_reason`).
     `cursor_tool_name` rebuilds an MCP call's name from `providerIdentifier` (or `serverIdentifier`)
