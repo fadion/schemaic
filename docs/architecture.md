@@ -388,9 +388,11 @@ existing prose was left alone.
     so the read-only gate's one-statement count and every word scan after it were bypassed, and
     whatever sat between the two names ran. `scan_dollar` now asks about one byte, the one before
     the `$`, through `continues_dollar_name` (`is_word_byte` or `$`), and answers `None` when it
-    continues a name; `noncode_kind` asks `scan_dollar` too, so the two still agree. **One byte
-    rather than the run is load-bearing**: a walk back over the whole name before every `$` would
-    rescan everything before each one on `a$a$a$…` — quadratic, on text a model can send to
+    continues a name. `noncode_kind` asks `scan_dollar` too, so the two still agree, and
+    `call_tokens` asks the same predicate where a name ends, so the function gate's tokens and the
+    lexer cannot disagree about it — the disagreement the smuggle lived in. **One byte rather than
+    the run is load-bearing**: the first spelling walked back over the whole name before every `$`,
+    so `a$a$a$…` rescanned everything before each one — quadratic, on text a model can send to
     `run_query` and the editor splits on every keystroke (`pg_a_dollar_dense_name_lexes_in_one_pass`).
     The byte rule also opens nothing after a digit or a closing dollar-quote tag (`1$$x$$`,
     `$a$x$a$$b$`); a quote opening straight after either does not parse, so the difference can only
@@ -412,7 +414,8 @@ existing prose was left alone.
     `the_rejection_lists_only_this_engines_heads`). The single-statement check applies the same
     everywhere; the deny scan — which is what refuses a write hidden behind a `WITH` head — is
     `DENY_ANY_ENGINE` for every engine plus `deny_keywords_for`'s per-dialect half, since each
-    engine's file, sleep and lock primitives share nothing but their effect.
+    engine's file, sleep and lock primitives share nothing but their effect — MySQL's and SQLite's,
+    that is: PostgreSQL's are function calls, and are answered by an allowlist instead (below).
     **The gate has two front ends now, so its wording names neither.** It was the AI's alone and its
     refusals said so; `schemaic query` runs the same function, and a person typing a `SLEEP()` at a
     prompt being told it *"is not permitted in an AI query"* is being answered about somebody else's
@@ -463,29 +466,120 @@ existing prose was left alone.
     `word_tokens`, so `contains_write`'s read-only gate, which had the identical door, closed with
     it.
     **A read-only session does not refuse a write that is not transactional, so on PostgreSQL the
-    deny list carries those too.** Replication slots and origins, statistics resets, WAL switches,
-    restore points, backup markers, `pg_promote` and WAL-replay pause never call
+    text gate has to judge functions.** Replication slots and origins, statistics resets, WAL
+    switches, restore points, backup markers, `pg_promote` and WAL-replay pause never call
     `PreventCommandIfReadOnly`, and live on PostgreSQL 16.15, under exactly the `SET SESSION
     CHARACTERISTICS AS TRANSACTION READ ONLY` session the headless read path runs on,
     `pg_drop_replication_slot`, `pg_create_*_replication_slot` and `pg_stat_reset` all ran. A dropped
-    slot takes a CDC consumer's position with it; a created one pins WAL until the disk fills. They
-    are in `deny_keywords_for(SqlDialect::Postgres)` now, beside `adminpack`'s `pg_file_*` writers
-    and the `pg_ls_*dir` listings `pg_ls_dir` already stood for
-    (`the_gate_refuses_postgres_admin_writes_a_read_only_session_allows`). The `_get_` forms of
-    `pg_logical_slot_*_changes` consume the slot and are denied; the `_peek_` forms leave it where it
-    was and stay reads — the test pins that half too. **A function that takes SQL text is an eval,
-    and is denied by name for that alone.** `word_tokens` skips a string literal whole, so every name
-    on the list was one quoted argument from reachable: `query_to_xml('select
-    pg_read_file(''PG_VERSION'')', …)` returned the file on the same server while the bare
-    `pg_read_file` was refused. The three `query_to_xml*` functions, `ts_stat`, `ts_rewrite`, the
-    `dblink` family — whose own connection is not the read-only session, so it writes as well — and
-    `tablefunc`'s `crosstab`, `crosstab2`–`crosstab4` and `connectby` are refused
-    (`a_function_that_evaluates_sql_text_is_refused`); `table_to_xml` and its siblings take a
-    relation rather than SQL and stay reads. **This is an enumeration, and it fails open**: a new
-    PostgreSQL release or an extension can add a function of either kind and nothing here will
-    notice. The durable answer is an allowlist of PostgreSQL functions rather than a deny list, and
-    that is still open. Reach is why it matters — `schemaic mcp` puts this gate in front of any MCP
-    client, behind tools that all advertise `readOnlyHint: true`.
+    slot takes a CDC consumer's position with it; a created one pins WAL until the disk fills
+    (`the_gate_refuses_postgres_admin_writes_a_read_only_session_allows`, which also pins that the
+    `_peek_` forms of `pg_logical_slot_*_changes` leave the slot where it was and stay reads, while
+    the `_get_` forms consume it). **A function that takes SQL text is an eval**, and a string literal
+    is skipped whole, so every refused name was one quoted argument from reachable:
+    `query_to_xml('select pg_read_file(''PG_VERSION'')', …)` returned the file on the same server
+    while the bare `pg_read_file` was refused. The `query_to_xml*` functions, `ts_stat`,
+    `ts_rewrite`, the `dblink` family — whose own connection is not the read-only session, so it
+    writes as well — and `tablefunc`'s `crosstab*` and `connectby` are that door
+    (`a_function_that_evaluates_sql_text_is_refused`). `table_to_xml` and its siblings take a
+    relation rather than SQL, and the deny list left them as reads; they are not on the allowlist
+    below either, so they are refused now — a refusal, not a finding that they act.
+    **All of that used to be a deny list in `deny_keywords_for(SqlDialect::Postgres)`, and an
+    enumeration of writers fails open**: a new release or an extension adds a function of either kind
+    and nothing notices, and no list can name a function the database's own owner wrote. So that arm
+    now names **no function at all** — only `COPY`, which on PostgreSQL reads and writes server-side
+    files, and `UESCAPE`, which puts a string literal between a quoted name and its `(` and rewrites
+    the name the allowlist would have compared (`a_unicode_escaped_name_is_refused_on_postgres`) —
+    and every PostgreSQL call is asked of an **allowlist**, `PG_READ_FUNCTIONS`: builtins every
+    overload of which only reads (no file, sleep, lock, signal to another backend, session state,
+    sequence, large object, evaluated SQL text or write the session cannot see). A name not on it is
+    refused, and that is every extension function and every function the owner defined *under a name
+    of its own* — the gate cannot read a body, and a function's `STABLE` is its author's claim; an
+    owner's overload of a listed name is another matter (below). `read_function_allowlist` picks the list by an exhaustive match — `Some` for
+    PostgreSQL, `None` for MySQL and SQLite, whose builtin sets are small and closed and keep their
+    deny lists. The refusal's `writes` is `false`, since the fix is not `exec`
+    (`a_postgres_function_off_the_read_list_is_refused`). In `read_only_refusal` it comes **after**
+    the denied words, so a deleting CTE is still named as its `DELETE`, and **before** the locks,
+    whose "drop the clause" retry it would otherwise refuse a second time.
+    **Finding the calls is `call_tokens` and `unlisted_call`.** `call_tokens` is a token stream on
+    `skip_noncode`/`noncode_kind` boundaries which, unlike `word_tokens`, keeps punctuation, drops
+    comments, and keeps a quoted identifier's name case-sensitive, as PostgreSQL does — `"LOWER"` is
+    not `lower` — so the quoted-name and comment doors above stay shut for it by construction. A call
+    is a name before a `(`, quoted or not; a **qualified** call is listed only under `pg_catalog`,
+    since `public.lower` is whatever the owner defined under that name
+    (`a_schema_qualified_call_is_listed_only_in_pg_catalog`); and — PostgreSQL's own — a name after a
+    closing `)` or `]` and a `.`, because field selection on a value that is not a row *is* a call,
+    with no parentheses at all: on PG 16.15 `SELECT ('1'::float8).pg_sleep` slept, and
+    `(ARRAY[…])[1].f`, `(x) . "f"` and `(x)./*c*/f` all ran
+    (`a_field_selection_on_a_parenthesised_value_is_a_call`). `alias.f` and `alias.col.f` were
+    measured *not* to reach a function taking text ("column does not exist", "missing FROM-clause
+    entry"), so a dot after a name is left alone. **It is a token scan rather than `core::intel`'s
+    AST, against the rule that structure goes through the parser, and deliberately**: a refusal gate
+    has to fail closed, and here anything *spelled* as a call is asked about unless a named grammar
+    position says otherwise, so a construct nobody anticipated is refused. An AST visitor fails the
+    other way — it collects calls from the node shapes it knows (`Expr::Function`, a table function,
+    `UNNEST`), and a shape it misses is a call nobody asked about, which is the enumeration the
+    allowlist replaced. And the parser is not PostgreSQL's: a statement it rejects would be refused
+    outright, and one it reads differently from the server is the disagreement every text gate here
+    has been bypassed through.
+    **What is *not* a call is where the list's usability lives, and every rule is a name the
+    allowlist never sees**, so each is written to be sound rather than generous. `PG_PAREN_KEYWORDS`
+    holds only PostgreSQL's *reserved* and *column-name* keywords that the grammar puts before a `(`
+    — `IN`, `EXISTS`, `AS`, `GROUP`, `VALUES` — because those are the words it never accepts as an
+    unquoted function name. The first spelling also held `EXPLAIN`, `JOIN`, `ILIKE` and `SIMILAR`,
+    and PostgreSQL takes all four as function names (`EXPLAIN` is unreserved, the other three are
+    `type_func_name` keywords), so an owner's `join(1)` passed untouched
+    (`a_keyword_that_can_name_a_function_is_asked_about_as_a_call`).
+    `no_word_skipped_before_a_paren_names_an_unlisted_builtin` holds the builtin half of that line —
+    it fails on a skipped word that is also a builtin off the list, and caught `like` and
+    `overlaps`, which moved to the allowlist; the keyword categories are PostgreSQL's appendix C, and
+    no test holds that half. `pg_paren_is_grammar` adds the positional rules: any name after `AS`,
+    after `::` (a type's modifier), after `TABLESAMPLE`, or straight after a **value** — a `)`, a
+    `]`, a literal or number, a quoted name. The grammar never juxtaposes a value and a call, so there
+    it is an alias's column list (`(VALUES (1)) v(n)`, `FROM "t" x(a, b)`) or `OVER`/`FILTER` —
+    **except `OPERATOR`**, which stands exactly there and reaches an operator in any schema, so
+    `OPERATOR(…)` is refused wherever it stands; the rule when it knew only `)` had waved it through
+    after a parenthesis while refusing it after a literal
+    (`a_qualified_operator_is_refused_wherever_it_stands`). Then the words that are keywords only
+    where they stand: `BY` after `ORDER`/`GROUP`/`PARTITION`, `SETS` after `GROUPING`, `VARYING`
+    after `CHARACTER`/`CHAR`/`BIT`, `FIRST`/`NEXT` after `FETCH`, `MATERIALIZED` after `NOT`,
+    `EXPLAIN` only at the head, and `JOIN` only after a join-type word
+    (`INNER`/`OUTER`/`LEFT`/`RIGHT`/`FULL`/`CROSS`/`NATURAL`) or before a relation —
+    `opens_a_relation`, which asks whether the group opens with `SELECT`/`VALUES`/`WITH`/`TABLE`,
+    as no argument list can, or holds a top-level `JOIN` of its own, as a parenthesised join does.
+    Asking the word alone would let a function of that name through everywhere else.
+    `cte_column_list_names` marks a CTE declared with a column list only
+    when the whole `WITH [RECURSIVE] name(…) AS [NOT] [MATERIALIZED] (` header matches, and marks
+    that *position*, so a CTE named after an unlisted function does not open the function elsewhere
+    in the statement (`a_declared_name_is_not_a_call_but_does_not_open_the_function`).
+    `ordinary_postgres_reads_pass_the_function_allowlist` is the other side of it — the reads a model
+    writes every day, which these rules exist to keep passing.
+    **Two tests hold the lists themselves.** `every_listed_function_is_a_postgres_builtin` checks
+    each name against `pg_builtins::PG_FUNCTIONS` plus a documented grammar-only set (`rollup`,
+    `cube`, a type written with its modifier, a `TABLESAMPLE` method, and `xmltable`,
+    `xmlattributes` and `xmlnamespaces`, which have no `pg_proc` row), since a misspelt entry is a
+    function nobody can call; `every_function_the_deny_list_named_is_still_refused` asserts that every
+    retired entry is refused now, bare and quoted, because that list was the record of what had been
+    found to act. A name the allowlist lacks costs a refusal, never a write.
+    **The known over-blocks are all in the safe direction**: a table alias with a column list but no
+    `AS` after an unquoted table name (`FROM t x(a, b)`; after a quoted one it passes), a composite
+    field read through parentheses (`(x).key`), and `replace(…)` — which predates the allowlist and
+    is listed on it, because `REPLACE` is in `DENY_ANY_ENGINE` for MySQL's `REPLACE INTO`. **What the
+    text cannot see rests on `Enforce::ReadOnly`**: a view's body, a trigger, an operator's function,
+    the whole-row `alias.f` form, which reaches only a function taking a row or `any` — in
+    `pg_catalog` all formatters (`row_to_json`, `to_json`, `pg_typeof`, measured through `pg_proc`)
+    — and **the gap between a name and a function**. The list holds names, and PostgreSQL picks the
+    overload whose argument types match best across the whole search path: on PG 16.15, with an
+    owner-defined `public.lower(integer)` in place inside a rolled-back transaction, `SELECT
+    lower(1)` returned the owner function's value though `lower` is listed. An owner's implicit cast
+    likewise calls its function with no name in the text at all. That session does not refuse the
+    non-transactional writers above, so one of them reached any of these ways — behind a view, say —
+    is out of both halves' sight; that follows from the two measured facts rather than being
+    measured itself. Of the writes this entry lists as passing the gate, the three that are calls —
+    `setval`, `lo_unlink`, an owner's function under a name of its own — are refused by it on
+    PostgreSQL now; `SELECT 1 INTO newtable` still passes, as does a function on
+    MySQL/MariaDB, and the session is what refuses those. Reach is why the direction matters —
+    `schemaic mcp` puts this gate in front of any MCP client, behind tools that all advertise
+    `readOnlyHint: true`.
     **`/*! … */` is two questions about the same bytes, and both answers now exist.**
     `SqlDialect::executable_comment` is the capability — MySQL and MariaDB *run* what is inside one,
     and a bare `/*!`, a versioned `/*!50000` and MariaDB's `/*M!` are all treated as code, a lexer
@@ -9319,8 +9413,10 @@ existing prose was left alone.
   `None` is what every other caller passes, and each variant answers one thing a gate that reads
   text cannot know. **`Enforce::ReadOnly` is the effect the text does not show**: `SELECT setval(…)`,
   `SELECT lo_unlink(…)`, PostgreSQL's `SELECT 1 INTO newtable` and a `SELECT` of a function whose body
-  deletes all pass `sql::read_only_reason` and all wrote through the headless read path (see
-  `core::sql`). So the session refuses writes — `SET SESSION CHARACTERISTICS AS TRANSACTION READ
+  deletes all passed `sql::read_only_reason` and all wrote through the headless read path (see
+  `core::sql`). PostgreSQL's function allowlist now refuses the three that are calls there, but
+  `SELECT 1 INTO newtable` still passes, and so does such a function on MySQL/MariaDB, and nothing
+  that reads text sees a view's body or a trigger. So the session refuses writes — `SET SESSION CHARACTERISTICS AS TRANSACTION READ
   ONLY` on PostgreSQL, `SET SESSION TRANSACTION READ ONLY` on MySQL/MariaDB, `PRAGMA query_only = ON`
   on SQLite. On PostgreSQL it is the session default rather than a `BEGIN READ ONLY`, so the
   statement's own implicit transaction is the read-only one and there is no transaction of ours for
@@ -21150,10 +21246,13 @@ existing prose was left alone.
     reason to drift — same gate, same timeout, same normalisation, and only one of them getting the
     next fix. The gate is
     `core::sql::read_only_reason` and is strictly stronger than the editor's `run_verdict`: an
-    allowlist of read-only statement *heads* per dialect plus a deny-list of keywords anywhere, with
-    no confirm arm to say yes to, which is the right shape when there is nobody at the keyboard.
+    allowlist of read-only statement *heads* per dialect plus a deny-list of keywords anywhere —
+    and, on PostgreSQL, an allowlist of the functions a statement may call — with no confirm arm to
+    say yes to, which is the right shape when there is nobody at the keyboard.
     **It is not what makes the statement read-only**, and this entry used to say it was: a head is a
-    spelling, and `SELECT setval(…)` or a `SELECT` of a function that deletes passes it and writes. So
+    spelling, and `SELECT setval(…)` or a `SELECT` of a function that deletes passed it and wrote —
+    PostgreSQL's function allowlist refuses both there now, but not a `SELECT … INTO newtable`, a
+    view's body, or a function on MySQL/MariaDB (`core::sql`'s entry). So
     the statement runs through `Db::fetch_query_enforced` with `Enforce::ReadOnly`, a session that
     refuses a write by its effect — and on MySQL/MariaDB one whose `sql_mode` is pinned to the lexer
     the gate counted statements with — while the gate stays in front for what such a session still
@@ -22046,8 +22145,9 @@ Re-introducing the anti-patterns these guard against is a regression:
   a `read_only_reason` filter followed by a bare `(run)(sql)` — a step the launcher had to remember,
   which is the shape this invariant exists to forbid. It ends in a `RerunRequest` now, with the
   filter kept in front of the mint because neither question implies the other: `read_only_reason` is
-  narrower on three axes (one statement, a read head this engine really has, no denied word, so a
-  `SELECT SLEEP(600)` or a second statement appended to the base is refused), while `OUTFILE` /
+  narrower on three axes, four on PostgreSQL (one statement, a read head this engine really has, no
+  denied word, and there no function off its read list — so a `SELECT SLEEP(600)` or a second statement
+  appended to the base is refused), while `OUTFILE` /
   `DUMPFILE` are in `WRITE_KEYWORDS` and, outside MySQL, in no deny list — so the composition is
   stronger than either half. The census that was meant to notice took lines beginning `run(`, and
   this site spells its call `(run)(sql);`, which begins with `(`: the one caller not taking its SQL
@@ -22088,8 +22188,8 @@ Re-introducing the anti-patterns these guard against is a regression:
   the defect living, as ever here, at its composition with the caller.
   **The headless CLI is the fourth path, and it splits the question in two rather than adding a
   gate.** `schemaic query` runs `cli/query.rs`'s `read_only_query`, whose gate is
-  `sql::read_only_reason` — an allowlist of read heads per dialect plus a keyword deny-list, with
-  **no `Confirm` arm to say yes to**, which is the right shape when there is nobody at the keyboard,
+  `sql::read_only_reason` — an allowlist of read heads per dialect plus a keyword deny-list, and on
+  PostgreSQL an allowlist of functions, with **no `Confirm` arm to say yes to**, which is the right shape when there is nobody at the keyboard,
   and stronger than the verdict on the same axis `rerunnable_for_export` is. That function is the
   one headless read path: the MCP server's `run_query` calls it too, rather than the CLI writing a
   second copy of the gate beside the one `mcp.rs` already had. Both live in `schemaic-cli` now, and
@@ -22437,6 +22537,10 @@ Re-introducing the anti-patterns these guard against is a regression:
   **Read AST identifiers unquoted** — `Ident`/`ObjectNamePart`'s `Display` re-adds the quoting, so a
   `` `t` ``/`"t"` name comes back quote-wrapped and never matches the catalog (which is keyed on bare
   names). Go through `intel::object_name_parts`, or `Ident::value` for a lone identifier.
+  **One refusal gate is a token scan on purpose**: `sql::unlisted_call`, PostgreSQL's function
+  allowlist in the read-only gate, asks about anything *spelled* as a call, where an AST visitor
+  would ask only about the node shapes it knows and fail open on the rest — `core::sql`'s entry
+  gives the reason in full. It is a refusal, never analysis a feature reads.
 - **One connection per operation — except a Manual-mode tab, and a running script.** Every `Db` method opens a fresh
   connection, runs, and disconnects; that statelessness is why a dropped connection is never a
   problem. The *first* exception is manual-transaction mode: a tab set to `TxMode::Manual` pins one

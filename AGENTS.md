@@ -71,9 +71,10 @@ substitute for the statement, and none of these is a style preference.
   *strictly stronger* than it. There are **three** such refusals now:
   `sql::rerunnable_for_export`, which has no `Confirm` arm; `sql::script_verdict`, which treats
   a whole `.sql` file as a write without reading it; and `sql::read_only_reason`, a per-dialect
-  allowlist of read-only statement *heads* plus a keyword deny-list, with no confirm arm at all,
+  allowlist of read-only statement *heads* plus a keyword deny-list — and, on PostgreSQL, an
+  allowlist of the functions a read may call — with no confirm arm at all,
   which is the gate for both paths that run SQL with nobody at the keyboard — the MCP server's
-  `run_query` tool and `schemaic query`. **A head is a spelling, not a read**: `SELECT setval(…)`
+  `run_query` tool and `schemaic query`. **A head is a spelling, not a read**: `SELECT … INTO t`
   passes it and writes, so those paths also run on a session that refuses writes by their effect
   (`Db::fetch_query_enforced` with `Enforce::ReadOnly`), and the text gate stays in front for what
   such a session still allows. **So does the editor on a read-only connection** — its run, Run All,
@@ -93,7 +94,8 @@ substitute for the statement, and none of these is a style preference.
 - **One SQL boundary lexer** — everything scanning SQL for string/comment/quote boundaries builds
   on `core::sql::skip_noncode`, and it is dialect-aware.
 - **Structure-aware SQL analysis goes through `core::intel`** (a real per-dialect AST), not a new
-  hand-rolled scanner. The DB stays the semantic authority.
+  hand-rolled scanner. The DB stays the semantic authority. One stated exception: the read-only
+  gate's PostgreSQL function scan, which has to fail closed where an AST visitor fails open.
 - **One connection per operation** — every `Db` method connects, runs, disconnects. **Two**
   exceptions, both because their statements are not independent: a `TxMode::Manual` tab's pinned
   `Session`, and `Db::run_script`, which holds one connection for a whole `.sql` file (a dump's

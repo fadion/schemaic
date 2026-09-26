@@ -417,9 +417,10 @@ pub fn is_word_start(b: u8) -> bool {
 /// Can this byte continue a PostgreSQL name, where `a$$` is one identifier?
 ///
 /// [`is_word_byte`] plus `$` — a continuation only, since `$` begins no name
-/// and `$1` is a parameter. One definition so anything asking where a name
-/// ends agrees with the lexer's dollar quote ([`scan_dollar`]), which is the
-/// disagreement the `a$$ … b$$` smuggle lived in.
+/// and `$1` is a parameter. One definition so the lexer's dollar quote
+/// ([`scan_dollar`]) and the function gate's tokens ([`call_tokens`]) cannot
+/// disagree about where a name ends, which is the disagreement the
+/// `a$$ … b$$` smuggle lived in.
 fn continues_dollar_name(b: u8) -> bool {
     is_word_byte(b) || b == b'$'
 }
@@ -2052,101 +2053,18 @@ fn deny_keywords_for(dialect: SqlDialect) -> &'static [&'static str] {
             "GET_LOCK",
             "RELEASE_LOCK",
         ],
-        // `COPY` is here rather than in the shared list because on PostgreSQL it
-        // reads *and writes* server-side files (`COPY t FROM '/etc/passwd'`),
-        // while MySQL has no such statement and SQLite's is a shell dot-command.
-        SqlDialect::Postgres => &[
-            "PG_READ_FILE",
-            "PG_READ_BINARY_FILE",
-            "PG_LS_DIR",
-            "PG_STAT_FILE",
-            "LO_IMPORT",
-            "LO_EXPORT",
-            "PG_SLEEP",
-            "PG_SLEEP_FOR",
-            "PG_SLEEP_UNTIL",
-            "PG_ADVISORY_LOCK",
-            "PG_ADVISORY_LOCK_SHARED",
-            "PG_ADVISORY_XACT_LOCK",
-            "PG_ADVISORY_XACT_LOCK_SHARED",
-            "PG_TERMINATE_BACKEND",
-            "PG_CANCEL_BACKEND",
-            "PG_RELOAD_CONF",
-            "PG_ROTATE_LOGFILE",
-            "COPY",
-            // Directory listings, beside `PG_LS_DIR`; `adminpack`'s writers.
-            "PG_LS_LOGDIR",
-            "PG_LS_WALDIR",
-            "PG_LS_TMPDIR",
-            "PG_LS_ARCHIVE_STATUSDIR",
-            "PG_FILE_WRITE",
-            "PG_FILE_RENAME",
-            "PG_FILE_UNLINK",
-            "PG_FILE_SYNC",
-            // **Non-transactional writes**: none of these calls
-            // `PreventCommandIfReadOnly`, so the read-only session that stops a
-            // `setval` runs every one of them. A dropped slot takes a CDC
-            // consumer's position with it; a created one pins WAL until the
-            // disk fills. `_PEEK_` changes stays a read — it leaves the slot.
-            "PG_CREATE_PHYSICAL_REPLICATION_SLOT",
-            "PG_CREATE_LOGICAL_REPLICATION_SLOT",
-            "PG_DROP_REPLICATION_SLOT",
-            "PG_COPY_PHYSICAL_REPLICATION_SLOT",
-            "PG_COPY_LOGICAL_REPLICATION_SLOT",
-            "PG_REPLICATION_SLOT_ADVANCE",
-            "PG_LOGICAL_SLOT_GET_CHANGES",
-            "PG_LOGICAL_SLOT_GET_BINARY_CHANGES",
-            "PG_REPLICATION_ORIGIN_CREATE",
-            "PG_REPLICATION_ORIGIN_DROP",
-            "PG_REPLICATION_ORIGIN_ADVANCE",
-            "PG_REPLICATION_ORIGIN_SESSION_SETUP",
-            "PG_REPLICATION_ORIGIN_SESSION_RESET",
-            "PG_REPLICATION_ORIGIN_XACT_SETUP",
-            "PG_REPLICATION_ORIGIN_XACT_RESET",
-            "PG_LOGICAL_EMIT_MESSAGE",
-            "PG_STAT_RESET",
-            "PG_STAT_RESET_SHARED",
-            "PG_STAT_RESET_SINGLE_TABLE_COUNTERS",
-            "PG_STAT_RESET_SINGLE_FUNCTION_COUNTERS",
-            "PG_STAT_RESET_SLRU",
-            "PG_STAT_RESET_REPLICATION_SLOT",
-            "PG_STAT_RESET_SUBSCRIPTION_STATS",
-            "PG_STAT_STATEMENTS_RESET",
-            "PG_SWITCH_WAL",
-            "PG_SWITCH_XLOG",
-            "PG_CREATE_RESTORE_POINT",
-            "PG_BACKUP_START",
-            "PG_BACKUP_STOP",
-            "PG_START_BACKUP",
-            "PG_STOP_BACKUP",
-            "PG_PROMOTE",
-            "PG_WAL_REPLAY_PAUSE",
-            "PG_WAL_REPLAY_RESUME",
-            "PG_LOG_BACKEND_MEMORY_CONTEXTS",
-            // **A function that takes SQL text is an eval.** This scan skips a
-            // string literal whole, so every name above is one quoted argument
-            // from reachable: `query_to_xml('select pg_read_file(…)', …)` read
-            // a server file live on PG 16.15 while the bare call was refused.
-            // `dblink`'s own connection is not the read-only session, so it
-            // writes as well. `table_to_xml` and friends take a *relation*,
-            // not SQL, and stay reads.
-            "QUERY_TO_XML",
-            "QUERY_TO_XMLSCHEMA",
-            "QUERY_TO_XML_AND_XMLSCHEMA",
-            "TS_STAT",
-            "TS_REWRITE",
-            "DBLINK",
-            "DBLINK_EXEC",
-            "DBLINK_OPEN",
-            "DBLINK_SEND_QUERY",
-            "DBLINK_CONNECT",
-            "DBLINK_CONNECT_U",
-            "CROSSTAB",
-            "CROSSTAB2",
-            "CROSSTAB3",
-            "CROSSTAB4",
-            "CONNECTBY",
-        ],
+        // **No function is named here**: PostgreSQL's calls are answered by an
+        // allowlist, [`PG_READ_FUNCTIONS`], because an enumeration of the
+        // writers failed open with every release and every extension. What
+        // is left is what is not a call.
+        //
+        // `COPY` because on PostgreSQL it reads *and writes* server-side files
+        // (`COPY t FROM '/etc/passwd'`), while MySQL has no such statement and
+        // SQLite's is a shell dot-command. `UESCAPE` because it puts a string
+        // literal between a quoted name and its `(` — `U&"…" UESCAPE '!' (1)`
+        // is one identifier and a call to the server — and rewrites the name
+        // the allowlist would have compared.
+        SqlDialect::Postgres => &["COPY", "UESCAPE"],
         // `ATTACH` is the SQLite hole that has no analogue: it opens *another*
         // database file by path, so a model that may `SELECT` can read any
         // SQLite file on the machine and — with a writable page — create one.
@@ -2169,6 +2087,921 @@ fn deny_keywords_for(dialect: SqlDialect) -> &'static [&'static str] {
 /// and miss the other.
 fn is_denied(word: &str, dialect: SqlDialect) -> bool {
     DENY_ANY_ENGINE.contains(&word) || deny_keywords_for(dialect).contains(&word)
+}
+
+/// The functions a read-only query may call on `dialect`, or `None` where the
+/// engine's calls are answered by its deny list instead.
+///
+/// **An allowlist where the function set is open.** MySQL's and SQLite's
+/// builtins are small closed sets and their deny lists name the few that act;
+/// PostgreSQL's are neither, and a deny list of its writers — file readers,
+/// sleeps, advisory locks, replication slots, statistics resets, the functions
+/// that evaluate SQL text — failed open with every release and every extension,
+/// and could not speak about a function the database's own owner had written.
+fn read_function_allowlist(dialect: SqlDialect) -> Option<&'static [&'static str]> {
+    match dialect {
+        SqlDialect::Postgres => Some(PG_READ_FUNCTIONS),
+        SqlDialect::MySql | SqlDialect::Sqlite => None,
+    }
+}
+
+/// PostgreSQL builtins known to only read, lower-case as `pg_catalog` stores
+/// them.
+///
+/// **What earns a place**: every overload reads — no file, no sleep or wait, no
+/// lock, no signal to another backend, no session state (`set_config`,
+/// `setseed`), no sequence (`nextval`), no large object, no SQL text evaluated
+/// (`query_to_xml`, `ts_stat`, `ts_rewrite`, `dblink`, `crosstab`) and no write
+/// the read-only session cannot see (replication slots, `pg_stat_reset`, WAL
+/// switches). A name that is not here is refused, which includes every
+/// function an extension or the database's owner defined *under a name of its
+/// own* — the text gate cannot read a body, and a function's `STABLE` label is
+/// its author's claim.
+///
+/// **A name is not a function**, and this is a list of names. PostgreSQL picks
+/// the overload whose argument types match best across the whole search path,
+/// so an owner's `public.lower(integer)` answers `SELECT lower(1)` though
+/// `lower` is listed — measured on PG 16.15 — and an owner's implicit cast
+/// calls its function with no name in the text at all. Both rest on the
+/// read-only session, as a view's body does.
+///
+/// **Adding a name** needs only that claim checked against the documentation;
+/// `every_listed_function_is_a_postgres_builtin` catches a misspelling, and a
+/// name the list lacks costs a refusal, never a write.
+///
+/// A few entries are grammar rather than `pg_proc` rows — a type written with
+/// its modifier (`character(10)`), `ROLLUP (…)`, a `TABLESAMPLE` method — and
+/// are here because they sit before a `(` exactly as a call does.
+const PG_READ_FUNCTIONS: &[&str] = &[
+    // Aggregates.
+    "count",
+    "sum",
+    "avg",
+    "min",
+    "max",
+    "array_agg",
+    "string_agg",
+    "json_agg",
+    "jsonb_agg",
+    "json_agg_strict",
+    "jsonb_agg_strict",
+    "json_object_agg",
+    "jsonb_object_agg",
+    "json_object_agg_strict",
+    "json_object_agg_unique",
+    "json_object_agg_unique_strict",
+    "jsonb_object_agg_strict",
+    "jsonb_object_agg_unique",
+    "jsonb_object_agg_unique_strict",
+    "bool_and",
+    "bool_or",
+    "every",
+    "bit_and",
+    "bit_or",
+    "bit_xor",
+    "stddev",
+    "stddev_pop",
+    "stddev_samp",
+    "variance",
+    "var_pop",
+    "var_samp",
+    "corr",
+    "covar_pop",
+    "covar_samp",
+    "regr_avgx",
+    "regr_avgy",
+    "regr_count",
+    "regr_intercept",
+    "regr_r2",
+    "regr_slope",
+    "regr_sxx",
+    "regr_sxy",
+    "regr_syy",
+    "percentile_cont",
+    "percentile_disc",
+    "mode",
+    "rank",
+    "dense_rank",
+    "percent_rank",
+    "cume_dist",
+    "range_agg",
+    "range_intersect_agg",
+    "xmlagg",
+    "any_value",
+    // Window functions.
+    "row_number",
+    "ntile",
+    "lag",
+    "lead",
+    "first_value",
+    "last_value",
+    "nth_value",
+    // Grammar call forms.
+    "cast",
+    "treat",
+    "coalesce",
+    "nullif",
+    "greatest",
+    "least",
+    "row",
+    "grouping",
+    "rollup",
+    "cube",
+    "extract",
+    "overlay",
+    "position",
+    "substring",
+    "trim",
+    "normalize",
+    "current_time",
+    "current_timestamp",
+    "localtime",
+    "localtimestamp",
+    // Types written with a modifier, or called as a cast.
+    "numeric",
+    "decimal",
+    "dec",
+    "float",
+    "float4",
+    "float8",
+    "int2",
+    "int4",
+    "int8",
+    "char",
+    "character",
+    "bpchar",
+    "varchar",
+    "text",
+    "name",
+    "bit",
+    "varbit",
+    "time",
+    "timetz",
+    "timestamp",
+    "timestamptz",
+    "interval",
+    "date",
+    "bool",
+    "cidr",
+    "regclass",
+    "oid",
+    // Operators with a function of the same name, which `LIKE (…)` reaches.
+    "like",
+    "overlaps",
+    // `TABLESAMPLE` methods.
+    "bernoulli",
+    "system",
+    // Strings.
+    "ascii",
+    "bit_length",
+    "btrim",
+    "char_length",
+    "character_length",
+    "chr",
+    "concat",
+    "concat_ws",
+    "convert",
+    "convert_from",
+    "convert_to",
+    "decode",
+    "encode",
+    "format",
+    "initcap",
+    "left",
+    "length",
+    "lower",
+    "lpad",
+    "ltrim",
+    "md5",
+    "octet_length",
+    "parse_ident",
+    "quote_ident",
+    "quote_literal",
+    "quote_nullable",
+    "regexp_count",
+    "regexp_instr",
+    "regexp_like",
+    "regexp_match",
+    "regexp_matches",
+    "regexp_replace",
+    "regexp_split_to_array",
+    "regexp_split_to_table",
+    "regexp_substr",
+    "repeat",
+    "replace",
+    "reverse",
+    "right",
+    "rpad",
+    "rtrim",
+    "split_part",
+    "starts_with",
+    "string_to_array",
+    "string_to_table",
+    "strpos",
+    "substr",
+    "to_ascii",
+    "to_hex",
+    "translate",
+    "unistr",
+    "upper",
+    "sha224",
+    "sha256",
+    "sha384",
+    "sha512",
+    "get_bit",
+    "get_byte",
+    "bit_count",
+    "to_char",
+    "to_number",
+    "to_date",
+    "to_timestamp",
+    // Numbers.
+    "abs",
+    "cbrt",
+    "ceil",
+    "ceiling",
+    "degrees",
+    "div",
+    "exp",
+    "factorial",
+    "floor",
+    "gcd",
+    "lcm",
+    "ln",
+    "log",
+    "log10",
+    "min_scale",
+    "mod",
+    "pi",
+    "power",
+    "radians",
+    "round",
+    "scale",
+    "sign",
+    "sqrt",
+    "trim_scale",
+    "trunc",
+    "width_bucket",
+    "random",
+    "random_normal",
+    "acos",
+    "acosd",
+    "asin",
+    "asind",
+    "atan",
+    "atand",
+    "atan2",
+    "atan2d",
+    "cos",
+    "cosd",
+    "cot",
+    "cotd",
+    "sin",
+    "sind",
+    "tan",
+    "tand",
+    "sinh",
+    "cosh",
+    "tanh",
+    "asinh",
+    "acosh",
+    "atanh",
+    "erf",
+    "erfc",
+    // Dates and times.
+    "age",
+    "clock_timestamp",
+    "date_add",
+    "date_bin",
+    "date_part",
+    "date_subtract",
+    "date_trunc",
+    "isfinite",
+    "justify_days",
+    "justify_hours",
+    "justify_interval",
+    "make_date",
+    "make_interval",
+    "make_time",
+    "make_timestamp",
+    "make_timestamptz",
+    "now",
+    "statement_timestamp",
+    "timeofday",
+    "transaction_timestamp",
+    "timezone",
+    // Networks.
+    "abbrev",
+    "broadcast",
+    "family",
+    "host",
+    "hostmask",
+    "masklen",
+    "netmask",
+    "network",
+    "set_masklen",
+    // JSON.
+    "to_json",
+    "to_jsonb",
+    "array_to_json",
+    "row_to_json",
+    "json_build_array",
+    "json_build_object",
+    "jsonb_build_array",
+    "jsonb_build_object",
+    "json_object",
+    "jsonb_object",
+    "json_array_elements",
+    "json_array_elements_text",
+    "jsonb_array_elements",
+    "jsonb_array_elements_text",
+    "json_array_length",
+    "jsonb_array_length",
+    "json_each",
+    "json_each_text",
+    "jsonb_each",
+    "jsonb_each_text",
+    "json_extract_path",
+    "json_extract_path_text",
+    "jsonb_extract_path",
+    "jsonb_extract_path_text",
+    "json_object_keys",
+    "jsonb_object_keys",
+    "json_populate_record",
+    "jsonb_populate_record",
+    "json_populate_recordset",
+    "jsonb_populate_recordset",
+    "json_to_record",
+    "jsonb_to_record",
+    "json_to_recordset",
+    "jsonb_to_recordset",
+    "json_strip_nulls",
+    "jsonb_strip_nulls",
+    "jsonb_set",
+    "jsonb_set_lax",
+    "jsonb_insert",
+    "jsonb_pretty",
+    "json_typeof",
+    "jsonb_typeof",
+    "jsonb_path_exists",
+    "jsonb_path_match",
+    "jsonb_path_query",
+    "jsonb_path_query_array",
+    "jsonb_path_query_first",
+    "jsonb_path_exists_tz",
+    "jsonb_path_match_tz",
+    "jsonb_path_query_tz",
+    "jsonb_path_query_array_tz",
+    "jsonb_path_query_first_tz",
+    "json",
+    "json_array",
+    "json_arrayagg",
+    "json_objectagg",
+    // Arrays and sets.
+    "array_append",
+    "array_cat",
+    "array_dims",
+    "array_fill",
+    "array_length",
+    "array_lower",
+    "array_ndims",
+    "array_position",
+    "array_positions",
+    "array_prepend",
+    "array_remove",
+    "array_replace",
+    "array_sample",
+    "array_shuffle",
+    "array_to_string",
+    "array_upper",
+    "cardinality",
+    "trim_array",
+    "unnest",
+    "generate_subscripts",
+    "generate_series",
+    // Ranges.
+    "isempty",
+    "lower_inc",
+    "upper_inc",
+    "lower_inf",
+    "upper_inf",
+    "range_merge",
+    "int4range",
+    "int8range",
+    "numrange",
+    "tsrange",
+    "tstzrange",
+    "daterange",
+    "int4multirange",
+    "int8multirange",
+    "nummultirange",
+    "tsmultirange",
+    "tstzmultirange",
+    "datemultirange",
+    "multirange",
+    // Text search — not `ts_stat` or `ts_rewrite`, which take SQL text.
+    "to_tsvector",
+    "to_tsquery",
+    "plainto_tsquery",
+    "phraseto_tsquery",
+    "websearch_to_tsquery",
+    "ts_rank",
+    "ts_rank_cd",
+    "ts_headline",
+    "setweight",
+    "strip",
+    "numnode",
+    "querytree",
+    "tsvector_to_array",
+    "array_to_tsvector",
+    "ts_delete",
+    "ts_filter",
+    "get_current_ts_config",
+    // XML — not `query_to_xml` and its siblings, which take SQL text.
+    "xmlcomment",
+    "xmlconcat",
+    "xmlelement",
+    "xmlforest",
+    "xmlpi",
+    "xmlroot",
+    "xmlparse",
+    "xmlserialize",
+    "xmlexists",
+    "xmltable",
+    "xmlattributes",
+    "xmlnamespaces",
+    "xml_is_well_formed",
+    "xml_is_well_formed_document",
+    "xml_is_well_formed_content",
+    "xpath",
+    "xpath_exists",
+    // Enums, UUIDs, nulls.
+    "enum_first",
+    "enum_last",
+    "enum_range",
+    "gen_random_uuid",
+    "num_nulls",
+    "num_nonnulls",
+    // The session and server, read.
+    "current_database",
+    "current_schema",
+    "current_schemas",
+    "current_setting",
+    "current_query",
+    "version",
+    "pg_backend_pid",
+    "pg_blocking_pids",
+    "pg_safe_snapshot_blocking_pids",
+    "pg_conf_load_time",
+    "pg_postmaster_start_time",
+    "pg_is_in_recovery",
+    "pg_is_wal_replay_paused",
+    "pg_current_wal_lsn",
+    "pg_current_wal_insert_lsn",
+    "pg_current_wal_flush_lsn",
+    "pg_last_wal_receive_lsn",
+    "pg_last_wal_replay_lsn",
+    "pg_last_xact_replay_timestamp",
+    "pg_wal_lsn_diff",
+    "pg_walfile_name",
+    "pg_jit_available",
+    "pg_trigger_depth",
+    "inet_client_addr",
+    "inet_client_port",
+    "inet_server_addr",
+    "inet_server_port",
+    "pg_my_temp_schema",
+    "pg_is_other_temp_schema",
+    "pg_listening_channels",
+    "pg_notification_queue_usage",
+    "pg_client_encoding",
+    "getdatabaseencoding",
+    "pg_encoding_to_char",
+    "pg_char_to_encoding",
+    "pg_input_is_valid",
+    "pg_input_error_info",
+    "pg_current_snapshot",
+    // The catalog, read. `pg_logical_slot_peek_changes` leaves the slot where it was.
+    "pg_typeof",
+    "pg_column_size",
+    "pg_column_compression",
+    "pg_collation_for",
+    "format_type",
+    "to_regclass",
+    "to_regtype",
+    "to_regproc",
+    "to_regprocedure",
+    "to_regnamespace",
+    "to_regrole",
+    "to_regoper",
+    "to_regoperator",
+    "to_regcollation",
+    "pg_get_viewdef",
+    "pg_get_functiondef",
+    "pg_get_function_arguments",
+    "pg_get_function_identity_arguments",
+    "pg_get_function_result",
+    "pg_get_indexdef",
+    "pg_get_constraintdef",
+    "pg_get_triggerdef",
+    "pg_get_ruledef",
+    "pg_get_expr",
+    "pg_get_serial_sequence",
+    "pg_get_statisticsobjdef",
+    "pg_get_partkeydef",
+    "pg_get_partition_constraintdef",
+    "pg_get_keywords",
+    "pg_get_userbyid",
+    "pg_options_to_table",
+    "pg_index_column_has_property",
+    "pg_index_has_property",
+    "pg_indexam_has_property",
+    "obj_description",
+    "col_description",
+    "shobj_description",
+    "pg_describe_object",
+    "pg_identify_object",
+    "pg_identify_object_as_address",
+    "pg_table_is_visible",
+    "pg_type_is_visible",
+    "pg_function_is_visible",
+    "has_table_privilege",
+    "has_column_privilege",
+    "has_any_column_privilege",
+    "has_database_privilege",
+    "has_schema_privilege",
+    "has_function_privilege",
+    "has_sequence_privilege",
+    "has_type_privilege",
+    "has_tablespace_privilege",
+    "has_foreign_data_wrapper_privilege",
+    "has_server_privilege",
+    "has_language_privilege",
+    "has_parameter_privilege",
+    "pg_has_role",
+    "row_security_active",
+    "pg_database_size",
+    "pg_indexes_size",
+    "pg_relation_size",
+    "pg_table_size",
+    "pg_total_relation_size",
+    "pg_tablespace_size",
+    "pg_size_pretty",
+    "pg_size_bytes",
+    "pg_partition_tree",
+    "pg_partition_root",
+    "pg_partition_ancestors",
+    "pg_logical_slot_peek_changes",
+    "pg_logical_slot_peek_binary_changes",
+];
+
+/// Unquoted words PostgreSQL's grammar puts before a `(` that is not a call's.
+///
+/// **Only words that cannot name a function**: PostgreSQL's *reserved* and
+/// *column-name* keywords, which its grammar never accepts as an unquoted
+/// function name. Each one skipped here is a name the allowlist never sees, so
+/// a word that can also name one — the unreserved `EXPLAIN`, the
+/// `type_func_name` keywords `JOIN`, `ILIKE`, `SIMILAR`, `LEFT` — is not here:
+/// a builtin of that name belongs in [`PG_READ_FUNCTIONS`], and the rest are
+/// grammar only where [`pg_paren_is_grammar`] finds them in place, since an
+/// owner's `join(1)` is a call like any other.
+/// `no_word_skipped_before_a_paren_names_an_unlisted_builtin` holds the builtin
+/// half of that line; the keyword categories are PostgreSQL's appendix C.
+const PG_PAREN_KEYWORDS: &[&str] = &[
+    "ALL",
+    "AND",
+    "ANY",
+    "ARRAY",
+    "AS",
+    "BETWEEN",
+    "BOTH",
+    "CASE",
+    "DISTINCT",
+    "ELSE",
+    "EXCEPT",
+    "EXISTS",
+    "FOR",
+    "FROM",
+    "GROUP",
+    "HAVING",
+    "IN",
+    "INTERSECT",
+    "LATERAL",
+    "LEADING",
+    "LIMIT",
+    "NOT",
+    "OFFSET",
+    "ON",
+    "ONLY",
+    "OR",
+    "SELECT",
+    "SOME",
+    "SYMMETRIC",
+    "ASYMMETRIC",
+    "THEN",
+    "TO",
+    "TRAILING",
+    "UNION",
+    "USING",
+    "VALUES",
+    "VARIADIC",
+    "WHEN",
+    "WHERE",
+];
+
+/// One code token of a statement, for [`unlisted_call`]: what the word scan
+/// has, plus the punctuation it throws away.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CallTok<'a> {
+    /// An unquoted word, as written.
+    Word(&'a str),
+    /// A quoted identifier's name — case kept, because PostgreSQL does.
+    Quoted(String),
+    /// One byte of punctuation.
+    Punct(u8),
+    /// A literal or a number.
+    Other,
+}
+
+impl CallTok<'_> {
+    fn is_word(&self, upper: &str) -> bool {
+        matches!(self, CallTok::Word(w) if w.eq_ignore_ascii_case(upper))
+    }
+    fn is_name(&self) -> bool {
+        matches!(self, CallTok::Word(_) | CallTok::Quoted(_))
+    }
+}
+
+/// `sql` as [`CallTok`]s, comments dropped, on [`skip_noncode`]'s boundaries.
+fn call_tokens(sql: &str, dialect: SqlDialect) -> Vec<CallTok<'_>> {
+    let b = sql.as_bytes();
+    let mut toks = Vec::new();
+    let mut i = 0;
+    while i < b.len() {
+        let c = b[i];
+        if c.is_ascii_whitespace() {
+            i += 1;
+        } else if let Some(j) = skip_noncode(b, i, dialect).filter(|&j| j > i) {
+            match noncode_kind(b, i, dialect) {
+                Some(NonCode::Comment) => {}
+                Some(NonCode::Identifier) => toks.push(CallTok::Quoted(
+                    ident_at(sql, i, dialect).0.unwrap_or_default(),
+                )),
+                _ => toks.push(CallTok::Other),
+            }
+            i = j;
+        } else if is_word_byte(c) {
+            // `$` continues a name — `lower$(1)` calls `lower$` — which is why
+            // `scan_dollar` opens no quote there; a number does not take one.
+            let start = i;
+            let continues = if is_word_start(c) {
+                continues_dollar_name
+            } else {
+                is_word_byte
+            };
+            while i < b.len() && continues(b[i]) {
+                i += 1;
+            }
+            toks.push(if is_word_start(c) {
+                CallTok::Word(&sql[start..i])
+            } else {
+                CallTok::Other
+            });
+        } else {
+            toks.push(CallTok::Punct(c));
+            i += 1;
+        }
+    }
+    toks
+}
+
+/// The index of the `)` that closes the `(` at `open`, if the statement has one.
+fn closing_paren(t: &[CallTok], open: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    for (k, tok) in t.iter().enumerate().skip(open) {
+        match tok {
+            CallTok::Punct(b'(') => depth += 1,
+            CallTok::Punct(b')') => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    return Some(k);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// The indices of every CTE name declared with a column list — `x` in
+/// `WITH x(a, b) AS (…)` — which is a `name(` that declares rather than calls.
+///
+/// **Marked only when the whole header is there**: name, column list, `AS`,
+/// an optional `[NOT] MATERIALIZED`, and the body's `(`. `WITH ORDINALITY AS
+/// u(v, i)` and `WITH TIME ZONE` fail it at the step after `AS`, and a CTE
+/// named after a function marks that position alone — the name called
+/// elsewhere in the statement is still asked about.
+fn cte_column_list_names(t: &[CallTok]) -> Vec<usize> {
+    let mut names = Vec::new();
+    for k in (0..t.len()).filter(|&k| t[k].is_word("WITH")) {
+        let mut j = k + 1;
+        if t.get(j).is_some_and(|x| x.is_word("RECURSIVE")) {
+            j += 1;
+        }
+        while t.get(j).is_some_and(CallTok::is_name) {
+            let mut m = j + 1;
+            let listed = t.get(m) == Some(&CallTok::Punct(b'('));
+            if listed {
+                let Some(close) = closing_paren(t, m) else {
+                    break;
+                };
+                m = close + 1;
+            }
+            if !t.get(m).is_some_and(|x| x.is_word("AS")) {
+                break;
+            }
+            m += 1;
+            if t.get(m).is_some_and(|x| x.is_word("NOT")) {
+                m += 1;
+            }
+            if t.get(m).is_some_and(|x| x.is_word("MATERIALIZED")) {
+                m += 1;
+            }
+            if t.get(m) != Some(&CallTok::Punct(b'(')) {
+                break;
+            }
+            if listed {
+                names.push(j);
+            }
+            let Some(close) = closing_paren(t, m) else {
+                break;
+            };
+            if t.get(close + 1) != Some(&CallTok::Punct(b',')) {
+                break;
+            }
+            j = close + 2;
+        }
+    }
+    names
+}
+
+/// Is the name at `t[k]`, which a `(` follows, grammar rather than a call?
+///
+/// Four positions declare or type rather than call, whatever the word: after
+/// `AS` (an alias's column list, `CAST(x AS numeric(10,2))`), after `::` (a
+/// type's modifier), after `TABLESAMPLE` (the method is a handler that only
+/// samples), and straight after a value — a `)`, a `]`, a literal or a quoted
+/// name. The grammar never juxtaposes a value and a call, so there it is an
+/// alias's column list (`(VALUES (1)) v(n)`, `"t" x(a)`) or a clause on an
+/// aggregate (`OVER (…)`, `FILTER (…)`) — **except `OPERATOR(s.op)`**, which
+/// stands exactly there and reaches an operator in any schema. The rest are
+/// keywords only where they stand — `BY` after `ORDER`, `EXPLAIN` at the head,
+/// `JOIN (` before a relation — so asking the word alone would have let a
+/// function of that name through everywhere else.
+fn pg_paren_is_grammar(t: &[CallTok], k: usize) -> bool {
+    if t[k].is_word("OPERATOR") {
+        return false;
+    }
+    let prev = k.checked_sub(1).map(|p| &t[p]);
+    let prev2 = k.checked_sub(2).map(|p| &t[p]);
+    let after = |w: &str| prev.is_some_and(|p| p.is_word(w));
+    if after("AS")
+        || after("TABLESAMPLE")
+        || matches!(
+            prev,
+            Some(CallTok::Punct(b')' | b']') | CallTok::Other | CallTok::Quoted(_))
+        )
+        || (prev == Some(&CallTok::Punct(b':')) && prev2 == Some(&CallTok::Punct(b':')))
+    {
+        return true;
+    }
+    let CallTok::Word(w) = &t[k] else {
+        return false;
+    };
+    let w = w.to_ascii_uppercase();
+    PG_PAREN_KEYWORDS.contains(&w.as_str())
+        || match w.as_str() {
+            "BY" => after("ORDER") || after("GROUP") || after("PARTITION"),
+            "SETS" => after("GROUPING"),
+            "VARYING" => after("CHARACTER") || after("CHAR") || after("BIT"),
+            "FIRST" | "NEXT" => after("FETCH"),
+            "MATERIALIZED" => after("NOT"),
+            "EXPLAIN" => k == 0,
+            "JOIN" => {
+                [
+                    "INNER", "OUTER", "LEFT", "RIGHT", "FULL", "CROSS", "NATURAL",
+                ]
+                .iter()
+                .any(|j| after(j))
+                    || opens_a_relation(t, k + 1)
+            }
+            _ => false,
+        }
+}
+
+/// Does the `(` at `open` hold a relation — a subquery or a parenthesised join
+/// — rather than an argument list?
+///
+/// What makes `JOIN (` grammar after a table's name, where `join(` after a
+/// keyword would be a call. A subquery opens with a query's head, which no
+/// argument list can (`f(SELECT 1)` does not parse), and a parenthesised join
+/// holds a `JOIN` of its own at its top level, which an argument list cannot
+/// either: the word names no column, and a nested `join(…)` there is asked
+/// about in its own right.
+fn opens_a_relation(t: &[CallTok], open: usize) -> bool {
+    if t.get(open + 1).is_some_and(|x| {
+        ["SELECT", "VALUES", "WITH", "TABLE"]
+            .iter()
+            .any(|h| x.is_word(h))
+    }) {
+        return true;
+    }
+    let Some(close) = closing_paren(t, open) else {
+        return false;
+    };
+    let mut depth = 0usize;
+    for tok in &t[open + 1..close] {
+        match tok {
+            CallTok::Punct(b'(') => depth += 1,
+            CallTok::Punct(b')') => depth = depth.saturating_sub(1),
+            tok if depth == 0 && tok.is_word("JOIN") => return true,
+            _ => {}
+        }
+    }
+    false
+}
+
+/// The first call in `sql` to a function `allowed` does not list, as the
+/// refusal should show it — `None` when every call is listed.
+///
+/// A call is a name before a `(`, quoted or not, and — PostgreSQL's own — a
+/// name after a closing `)` or `]` and a `.`: field selection on a value that
+/// is not a row is a call with no parentheses, and `('1'::float8).pg_sleep`
+/// slept on PG 16.15. A **qualified** call is listed only in `pg_catalog`,
+/// since `public.lower` is whatever the owner defined under that name.
+///
+/// **What it cannot see** is a call the text does not spell: a view's body, a
+/// trigger, an operator's function, an implicit cast's, an owner's overload of
+/// a listed name (see [`PG_READ_FUNCTIONS`]), and `alias.f` — `f` applied to a
+/// whole row, which reaches only a function taking a row, all of them
+/// `pg_catalog` formatters. Those rest on the read-only session.
+///
+/// **A token scan, not `core::intel`'s AST**, against the rule that structure
+/// goes through the parser — and deliberately. A refusal gate has to fail
+/// closed: here anything *spelled* as a call is asked about unless a named
+/// grammar position says otherwise, so an unrecognised construct is refused.
+/// An AST visitor fails the other way — it collects calls from the node shapes
+/// it knows (`Expr::Function`, a table function, `UNNEST`, …), and a shape it
+/// misses is a call nobody asked about, which is the enumeration this list
+/// replaced. The parser is also not PostgreSQL's: a statement it rejects would
+/// be refused outright, and one it reads differently from the server is the
+/// disagreement every text gate here has been bypassed through.
+fn unlisted_call(sql: &str, dialect: SqlDialect, allowed: &[&str]) -> Option<String> {
+    let t = call_tokens(sql, dialect);
+    let ctes = cte_column_list_names(&t);
+    let listed = |tok: &CallTok| match tok {
+        CallTok::Word(w) => allowed.contains(&w.to_ascii_lowercase().as_str()),
+        CallTok::Quoted(q) => allowed.contains(&q.as_str()),
+        _ => false,
+    };
+    let shown = |tok: &CallTok| match tok {
+        CallTok::Word(w) => w.to_string(),
+        CallTok::Quoted(q) => format!("\"{q}\""),
+        _ => String::new(),
+    };
+    for k in 0..t.len() {
+        if !t[k].is_name() {
+            continue;
+        }
+        let called = t.get(k + 1) == Some(&CallTok::Punct(b'('));
+        let dotted = k >= 1 && t[k - 1] == CallTok::Punct(b'.');
+        let before_dot = k.checked_sub(2).map(|p| &t[p]);
+        if dotted && !called {
+            if matches!(before_dot, Some(CallTok::Punct(b')' | b']'))) && !listed(&t[k]) {
+                return Some(format!("(…).{}", shown(&t[k])));
+            }
+            continue;
+        }
+        if !called {
+            continue;
+        }
+        if dotted && let Some(schema) = before_dot.filter(|q| q.is_name()) {
+            let in_catalog = match schema {
+                CallTok::Word(w) => w.eq_ignore_ascii_case("pg_catalog"),
+                CallTok::Quoted(q) => q == "pg_catalog",
+                _ => false,
+            };
+            if !in_catalog || !listed(&t[k]) {
+                return Some(format!("{}.{}", shown(schema), shown(&t[k])));
+            }
+            continue;
+        }
+        if ctes.contains(&k) || (!dotted && pg_paren_is_grammar(&t, k)) || listed(&t[k]) {
+            continue;
+        }
+        return Some(shown(&t[k]));
+    }
+    None
 }
 
 /// The first byte at or after `i` that is neither whitespace nor inside a
@@ -2357,6 +3190,20 @@ pub fn read_only_refusal(sql: &str, dialect: SqlDialect) -> Result<(), ReadRefus
         return refuse(
             format!("`{}` is not permitted in a read-only query", words[k]),
             WRITE_KEYWORDS.contains(&words[k].as_str()),
+        );
+    }
+    // After a write, so a deleting CTE is still named as the `DELETE`; before a
+    // lock, whose "drop the clause" retry this would refuse again.
+    if let Some(allowed) = read_function_allowlist(dialect)
+        && let Some(name) = unlisted_call(sql, dialect, allowed)
+    {
+        return refuse(
+            format!(
+                "`{name}` is not a function known to be read-only, so it is not permitted \
+                 in a read-only query; functions from extensions or defined in the database \
+                 are refused too"
+            ),
+            false,
         );
     }
     let lock = denied
@@ -4529,6 +5376,399 @@ mod tests {
             "SELECT * FROM crosstab('select 1, 2, 3') AS t(a int, b int)",
         ] {
             assert!(gate(sql, SqlDialect::Postgres).is_err(), "passed `{sql}`");
+        }
+    }
+
+    // ── PostgreSQL's function allowlist ──────────────────────────────────────
+
+    /// **A function off the read list is refused, whoever wrote it.** The deny
+    /// list this replaced named the writers it knew of, so a function added by
+    /// a newer server, an extension or the database's owner passed unless
+    /// somebody had thought to list it. The allowlist fails the other way.
+    #[test]
+    fn a_postgres_function_off_the_read_list_is_refused() {
+        use super::read_only_reason as gate;
+        for sql in [
+            "SELECT my_func(1)",
+            "SELECT * FROM t WHERE audit_and_return(id) > 0",
+            "SELECT * FROM some_srf(1) AS s(a int)",
+            "SELECT \"MyFunc\"(1)",
+            // The case the enumeration could not see coming: a name it never had.
+            "SELECT pg_brand_new_admin_function()",
+            // Quoted exactly: `"LOWER"` is a different function from `lower`.
+            "SELECT \"LOWER\"('a')",
+            // `$` continues a name, so this is `lower$`, not `lower` and a `$`.
+            "SELECT lower$(1)",
+            "SELECT my$func(1)",
+        ] {
+            assert!(gate(sql, SqlDialect::Postgres).is_err(), "passed `{sql}`");
+        }
+        // Not a write: the fix is not `schemaic exec`.
+        let refusal = super::read_only_refusal("SELECT my_func(1)", SqlDialect::Postgres)
+            .expect_err("unlisted");
+        assert!(!refusal.writes, "{refusal:?}");
+        assert!(refusal.reason.contains("my_func"), "{}", refusal.reason);
+        // The other two engines keep their deny lists; this is PostgreSQL's alone.
+        assert!(gate("SELECT my_func(1)", SqlDialect::MySql).is_ok());
+        assert!(gate("SELECT my_func(1)", SqlDialect::Sqlite).is_ok());
+    }
+
+    /// **A read the model writes every day must still pass.** The allowlist is
+    /// only as usable as the grammar around it is understood: every keyword
+    /// PostgreSQL puts before a `(` — `IN`, `OVER`, `FILTER`, a type's
+    /// modifier, a CTE's column list — is a `name(` that is not a call.
+    #[test]
+    fn ordinary_postgres_reads_pass_the_function_allowlist() {
+        use super::read_only_reason as gate;
+        for sql in [
+            "SELECT count(*), sum(x), avg(x), min(x), max(x) FROM t",
+            "SELECT count(*) FILTER (WHERE x > 0) OVER (PARTITION BY (y) ORDER BY z) FROM t",
+            "SELECT row_number() OVER (ORDER BY (a)), lag(a, 1) OVER w FROM t WINDOW w AS (ORDER BY a)",
+            "SELECT mode() WITHIN GROUP (ORDER BY x), percentile_cont(0.5) WITHIN GROUP (ORDER BY x) FROM t",
+            "SELECT string_agg(x, ',' ORDER BY x), array_agg(DISTINCT x) FROM t",
+            "SELECT CAST(x AS numeric(10,2)), x::varchar(20), y::character varying(5) FROM t",
+            "SELECT coalesce(a, b), nullif(a, 0), greatest(a, b), least(a, b) FROM t",
+            "SELECT EXTRACT(YEAR FROM d), date_trunc('month', d), to_char(now(), 'YYYY') FROM t",
+            "SELECT SUBSTRING(x FROM 1 FOR 2), TRIM(BOTH ' ' FROM x), POSITION('a' IN x) FROM t",
+            "SELECT lower(x), upper(x), length(x), translate(x, 'a', 'b'), split_part(x, ',', 1) FROM t",
+            "SELECT jsonb_build_object('a', 1), doc->>'k', jsonb_array_length(doc) FROM t",
+            "SELECT * FROM jsonb_each('{}'::jsonb)",
+            "SELECT (jsonb_each(doc)).* FROM t",
+            "SELECT * FROM t WHERE id IN (SELECT id FROM u) AND EXISTS (SELECT 1)",
+            "SELECT * FROM t WHERE x = ANY(ARRAY[1, 2]) AND NOT (a AND (b OR c))",
+            "SELECT CASE WHEN (x) THEN (y) ELSE (z) END FROM t",
+            "SELECT DISTINCT ON (a) a, b FROM t ORDER BY a",
+            "SELECT * FROM ONLY (t) LIMIT (5) OFFSET (1)",
+            "SELECT * FROM t JOIN (SELECT 1 AS id) s USING (id)",
+            "SELECT * FROM t, LATERAL (SELECT 1) l",
+            "SELECT * FROM (VALUES (1), (2)) v(n)",
+            "SELECT ARRAY(SELECT 1), ROW(1, 2)",
+            "SELECT * FROM generate_series(1, 3) AS g(n)",
+            "SELECT * FROM unnest(ARRAY[1]) WITH ORDINALITY AS u(v, i)",
+            "SELECT * FROM t TABLESAMPLE BERNOULLI (10) REPEATABLE (1)",
+            "SELECT a, b, count(*) FROM t GROUP BY GROUPING SETS ((a), (b))",
+            "SELECT a, count(*) FROM t GROUP BY ROLLUP (a)",
+            "SELECT * FROM t ORDER BY a FETCH FIRST (5) ROWS ONLY",
+            "SELECT * FROM t WHERE x BETWEEN (1) AND (2) OR y LIKE (z)",
+            "SELECT 1 UNION (SELECT 2)",
+            "WITH t(a, b) AS (SELECT 1, 2) SELECT * FROM t",
+            "WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r WHERE n < 3) SELECT * FROM r",
+            "WITH a AS (SELECT 1), b(x) AS NOT MATERIALIZED (SELECT 2), c AS MATERIALIZED (SELECT 3) SELECT 1",
+            "EXPLAIN (FORMAT JSON) SELECT 1",
+            "SELECT pg_size_pretty(pg_total_relation_size('t')), current_setting('search_path')",
+            "SELECT has_table_privilege('t', 'SELECT'), pg_get_viewdef('v'::regclass), version()",
+            "SELECT pg_catalog.lower('A'), \"pg_catalog\".\"lower\"('A')",
+            "SELECT ('abc'::text).upper",
+            "SELECT xmlelement(name a, xmlattributes(id AS x)) FROM t",
+            "SELECT * FROM XMLTABLE(XMLNAMESPACES('u' AS n), '/r' PASSING d COLUMNS a numeric(10,2) PATH 'a')",
+        ] {
+            assert!(
+                gate(sql, SqlDialect::Postgres).is_ok(),
+                "refused `{sql}`: {:?}",
+                gate(sql, SqlDialect::Postgres)
+            );
+        }
+    }
+
+    /// **PostgreSQL calls a function with no parentheses at all.** `(x).f` is
+    /// field selection, and on a value that is not a row it is `f(x)` —
+    /// measured on PG 16.15, where `SELECT ('1'::float8).pg_sleep` slept. A scan
+    /// that only asks about `name(` never sees it, so a word after a closing
+    /// `)` or `]` and a `.` is asked about as a call.
+    #[test]
+    fn a_field_selection_on_a_parenthesised_value_is_a_call() {
+        use super::read_only_reason as gate;
+        for sql in [
+            "SELECT ('1'::float8).pg_sleep",
+            "SELECT (ARRAY['1'::float8])[1].pg_sleep",
+            "SELECT ('1'::float8) . \"pg_sleep\"",
+            "SELECT ('1'::float8)./*c*/pg_sleep",
+            "SELECT ('/etc/passwd'::text).pg_read_file",
+            "SELECT (123).pg_terminate_backend",
+        ] {
+            assert!(gate(sql, SqlDialect::Postgres).is_err(), "passed `{sql}`");
+        }
+        // A column reference through an alias is not one: `t.pg_sleep` cannot
+        // reach `pg_sleep(t)`, which takes no row (measured: "column does not
+        // exist").
+        assert!(gate("SELECT t.pg_sleep FROM t", SqlDialect::Postgres).is_ok());
+    }
+
+    /// **A name followed by `(` after `WITH` or `AS` is being declared, not
+    /// called** — a CTE's column list, an alias's — and a CTE that borrows an
+    /// unlisted function's name does not make the function callable.
+    #[test]
+    fn a_declared_name_is_not_a_call_but_does_not_open_the_function() {
+        use super::read_only_reason as gate;
+        assert!(
+            gate(
+                "WITH pg_sleep(x) AS (SELECT 1) SELECT pg_sleep(5)",
+                SqlDialect::Postgres
+            )
+            .is_err()
+        );
+        assert!(
+            gate(
+                "WITH a AS (SELECT 1), my_func(x) AS (SELECT 2) SELECT my_func(1)",
+                SqlDialect::Postgres
+            )
+            .is_err()
+        );
+        assert!(
+            gate(
+                "WITH a AS (SELECT 1), my_func(x) AS (SELECT 2) SELECT * FROM my_func",
+                SqlDialect::Postgres
+            )
+            .is_ok()
+        );
+    }
+
+    /// **A keyword PostgreSQL also accepts as a function's name is not skipped
+    /// as a keyword.** `EXPLAIN` is unreserved and `JOIN`, `ILIKE` and `SIMILAR`
+    /// may name a function, so a word list that skipped them before any `(`
+    /// passed an owner's `join(1)` untouched. Each is grammar only where the
+    /// grammar puts it: `EXPLAIN` at the head, `JOIN (` before a subquery, a
+    /// parenthesised join, or after a join's own keywords.
+    #[test]
+    fn a_keyword_that_can_name_a_function_is_asked_about_as_a_call() {
+        use super::read_only_reason as gate;
+        for sql in [
+            "SELECT explain(1)",
+            "SELECT join(1)",
+            "SELECT * FROM t WHERE join(t.id) > 0",
+            "SELECT ilike('a', 'b')",
+            "SELECT similar(1)",
+            "SELECT * FROM t WHERE x = 1 AND join((SELECT 1)) > 0",
+        ] {
+            assert!(gate(sql, SqlDialect::Postgres).is_err(), "passed `{sql}`");
+        }
+        for sql in [
+            "EXPLAIN (FORMAT JSON) SELECT 1",
+            "SELECT * FROM t JOIN (SELECT 1 AS id) s USING (id)",
+            "SELECT * FROM t a JOIN (VALUES (1)) v(id) ON true",
+            "SELECT * FROM t LEFT JOIN (SELECT 1) s ON true",
+            "SELECT * FROM t JOIN (u JOIN w ON true) ON true",
+            "SELECT * FROM \"t\" JOIN (SELECT 1) s ON true",
+            "SELECT * FROM \"t\" x(a, b)",
+        ] {
+            assert!(
+                gate(sql, SqlDialect::Postgres).is_ok(),
+                "refused `{sql}`: {:?}",
+                gate(sql, SqlDialect::Postgres)
+            );
+        }
+    }
+
+    /// **`OPERATOR(schema.op)` reaches an operator in any schema**, and the
+    /// rule that a name straight after a `)` is an alias waved it through
+    /// there while refusing it after a literal.
+    #[test]
+    fn a_qualified_operator_is_refused_wherever_it_stands() {
+        use super::read_only_reason as gate;
+        for sql in [
+            "SELECT (1) OPERATOR(app.===) 2",
+            "SELECT 1 OPERATOR(app.===) 2",
+            "SELECT 'a' OPERATOR(app.===) 'b'",
+        ] {
+            assert!(gate(sql, SqlDialect::Postgres).is_err(), "passed `{sql}`");
+        }
+    }
+
+    /// **A qualified name is listed only in `pg_catalog`.** `public.lower` is
+    /// whatever the database's owner defined under that name.
+    #[test]
+    fn a_schema_qualified_call_is_listed_only_in_pg_catalog() {
+        use super::read_only_reason as gate;
+        assert!(gate("SELECT pg_catalog.lower('A')", SqlDialect::Postgres).is_ok());
+        for sql in [
+            "SELECT public.lower('A')",
+            "SELECT \"public\".lower('A')",
+            "SELECT pg_catalog.pg_sleep(1)",
+            "SELECT \"pg_catalog\".\"pg_sleep\"(1)",
+            "SELECT app.pg_catalog.pg_sleep(1)",
+        ] {
+            assert!(gate(sql, SqlDialect::Postgres).is_err(), "passed `{sql}`");
+        }
+    }
+
+    /// **`UESCAPE` puts a string between a quoted name and its `(`.**
+    /// `U&"…" UESCAPE '!'` is one identifier to the server, so the call's `(`
+    /// follows a literal the scan cannot see through — and the escape character
+    /// rewrites the name the allowlist would have compared.
+    #[test]
+    fn a_unicode_escaped_name_is_refused_on_postgres() {
+        use super::read_only_reason as gate;
+        for sql in [
+            "SELECT U&\"pg_sleep\" UESCAPE '!' (1)",
+            "SELECT U&\"\\0070g_sleep\"(1)",
+        ] {
+            assert!(gate(sql, SqlDialect::Postgres).is_err(), "passed `{sql}`");
+        }
+    }
+
+    /// **A misspelt entry is a function nobody can call**, so every name on the
+    /// list must be one PostgreSQL 16.15 reports — or one of the grammar forms
+    /// the list documents as sitting before a `(` without a `pg_proc` row.
+    #[test]
+    fn every_listed_function_is_a_postgres_builtin() {
+        const GRAMMAR_ONLY: &[&str] = &[
+            "rollup",
+            "cube",
+            "decimal",
+            "dec",
+            "float",
+            "character",
+            "bernoulli",
+            "system",
+            "xmltable",
+            "xmlattributes",
+            "xmlnamespaces",
+        ];
+        let unknown: Vec<_> = super::PG_READ_FUNCTIONS
+            .iter()
+            .filter(|name| {
+                !crate::pg_builtins::PG_FUNCTIONS
+                    .iter()
+                    .any(|f| f.name == **name)
+                    && !GRAMMAR_ONLY.contains(name)
+            })
+            .collect();
+        assert!(unknown.is_empty(), "not PostgreSQL builtins: {unknown:?}");
+        for name in super::PG_READ_FUNCTIONS {
+            assert_eq!(*name, name.to_ascii_lowercase(), "stored lower-case");
+        }
+        let mut sorted = super::PG_READ_FUNCTIONS.to_vec();
+        sorted.sort_unstable();
+        let before = sorted.len();
+        sorted.dedup();
+        assert_eq!(before, sorted.len(), "a name is listed twice");
+    }
+
+    /// **A skipped word is one the allowlist never sees**, so none may be the
+    /// name of a builtin the list does not hold — `left(x, 1)` is a call, and a
+    /// `LEFT` in the keyword list would have waved every function of that name
+    /// through.
+    #[test]
+    fn no_word_skipped_before_a_paren_names_an_unlisted_builtin() {
+        let contextual = ["BY", "SETS", "VARYING", "FIRST", "NEXT", "MATERIALIZED"];
+        let builtins: Vec<_> = super::PG_PAREN_KEYWORDS
+            .iter()
+            .chain(contextual.iter())
+            .filter(|w| {
+                let lower = w.to_ascii_lowercase();
+                crate::pg_builtins::PG_FUNCTIONS
+                    .iter()
+                    .any(|f| f.name == lower)
+                    && !super::PG_READ_FUNCTIONS.contains(&lower.as_str())
+            })
+            .collect();
+        assert!(
+            builtins.is_empty(),
+            "skipped before `(` but builtins: {builtins:?}"
+        );
+    }
+
+    /// **Every name the retired deny list held is still refused** — by the
+    /// allowlist now, and quoted as well as bare. The list was the record of
+    /// what had been found to act, each entry measured or read off the source;
+    /// replacing it must not quietly re-admit one.
+    #[test]
+    fn every_function_the_deny_list_named_is_still_refused() {
+        for name in [
+            "pg_read_file",
+            "pg_read_binary_file",
+            "pg_ls_dir",
+            "pg_stat_file",
+            "lo_import",
+            "lo_export",
+            "pg_sleep",
+            "pg_sleep_for",
+            "pg_sleep_until",
+            "pg_advisory_lock",
+            "pg_advisory_lock_shared",
+            "pg_advisory_xact_lock",
+            "pg_advisory_xact_lock_shared",
+            "pg_terminate_backend",
+            "pg_cancel_backend",
+            "pg_reload_conf",
+            "pg_rotate_logfile",
+            "pg_ls_logdir",
+            "pg_ls_waldir",
+            "pg_ls_tmpdir",
+            "pg_ls_archive_statusdir",
+            "pg_file_write",
+            "pg_file_rename",
+            "pg_file_unlink",
+            "pg_file_sync",
+            "pg_create_physical_replication_slot",
+            "pg_create_logical_replication_slot",
+            "pg_drop_replication_slot",
+            "pg_copy_physical_replication_slot",
+            "pg_copy_logical_replication_slot",
+            "pg_replication_slot_advance",
+            "pg_logical_slot_get_changes",
+            "pg_logical_slot_get_binary_changes",
+            "pg_replication_origin_create",
+            "pg_replication_origin_drop",
+            "pg_replication_origin_advance",
+            "pg_replication_origin_session_setup",
+            "pg_replication_origin_session_reset",
+            "pg_replication_origin_xact_setup",
+            "pg_replication_origin_xact_reset",
+            "pg_logical_emit_message",
+            "pg_stat_reset",
+            "pg_stat_reset_shared",
+            "pg_stat_reset_single_table_counters",
+            "pg_stat_reset_single_function_counters",
+            "pg_stat_reset_slru",
+            "pg_stat_reset_replication_slot",
+            "pg_stat_reset_subscription_stats",
+            "pg_stat_statements_reset",
+            "pg_switch_wal",
+            "pg_switch_xlog",
+            "pg_create_restore_point",
+            "pg_backup_start",
+            "pg_backup_stop",
+            "pg_start_backup",
+            "pg_stop_backup",
+            "pg_promote",
+            "pg_wal_replay_pause",
+            "pg_wal_replay_resume",
+            "pg_log_backend_memory_contexts",
+            "query_to_xml",
+            "query_to_xmlschema",
+            "query_to_xml_and_xmlschema",
+            "ts_stat",
+            "ts_rewrite",
+            "dblink",
+            "dblink_exec",
+            "dblink_open",
+            "dblink_send_query",
+            "dblink_connect",
+            "dblink_connect_u",
+            "crosstab",
+            "crosstab2",
+            "crosstab3",
+            "crosstab4",
+            "connectby",
+            // Never on it, and as much a write: the session state and sequences.
+            "set_config",
+            "setseed",
+            "nextval",
+            "setval",
+            "pg_notify",
+            "txid_current",
+        ] {
+            assert!(
+                !super::PG_READ_FUNCTIONS.contains(&name),
+                "`{name}` is listed"
+            );
+            for sql in [format!("SELECT {name}(1)"), format!("SELECT \"{name}\"(1)")] {
+                assert!(
+                    super::read_only_reason(&sql, SqlDialect::Postgres).is_err(),
+                    "passed `{sql}`"
+                );
+            }
         }
     }
 

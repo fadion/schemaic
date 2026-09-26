@@ -5,8 +5,10 @@
 //! opens with a read head and names no denied keyword — and
 //! `SELECT purge_all()` is exactly that, while `purge_all()` deletes a table. On an ordinary session it
 //! runs, which is how the MCP server's `run_query` and `schemaic query` were
-//! shown deleting rows through a gate documented as read-only. These tests are
-//! the session's half of the guard, on every server leg.
+//! shown deleting rows through a gate documented as read-only. PostgreSQL's
+//! gate now refuses the call itself, since `purge_all` is on no list of reads,
+//! but a view's body or a trigger is out of any text gate's sight on every
+//! engine. These tests are the session's half of the guard, on every server leg.
 //!
 //! [`Db::fetch_query_enforced`]: schemaic_db::Db::fetch_query_enforced
 
@@ -55,14 +57,23 @@ async fn rows_left(scratch: &Scratch, t: &str) -> String {
 }
 
 /// **A write a `SELECT` hides is refused by the session.** The gate is asked
-/// first and passes it — that composition is the bug — and the rows are
-/// counted afterwards, because an error alone could be a session that refuses
-/// everything.
+/// first and, where calls are answered by a deny list, passes it — that
+/// composition is the bug — and the rows are counted afterwards, because an
+/// error alone could be a session that refuses everything. PostgreSQL's gate
+/// refuses the call by its function allowlist; the session is asked there all
+/// the same, as it is what stands behind a view.
 pub async fn a_read_only_session_refuses_a_write_a_select_hides(target: &'static Target) {
+    use schemaic_core::intel::SqlDialect;
     let (scratch, t) = seeded(target, "enforce_ro").await;
-    assert!(
-        schemaic_core::sql::read_only_reason("SELECT purge_all()", scratch.dialect()).is_ok(),
-        "{}: the text gate is expected to pass this — the session is what refuses it",
+    let gate = schemaic_core::sql::read_only_reason("SELECT purge_all()", scratch.dialect());
+    let gate_refuses_the_call = match scratch.dialect() {
+        SqlDialect::Postgres => true,
+        SqlDialect::MySql | SqlDialect::Sqlite => false,
+    };
+    assert_eq!(
+        gate.is_err(),
+        gate_refuses_the_call,
+        "{}: the text gate answered {gate:?}",
         target.name
     );
 
