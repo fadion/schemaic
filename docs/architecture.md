@@ -19153,7 +19153,12 @@ existing prose was left alone.
   reason: the permissions file is written regardless, because that is the half that cannot be
   missing, and `mcp.json` is not (one an earlier session left is removed), so the session runs
   with no server and says so. It is refused only when the workspace itself cannot be written, since
-  a missing permissions file fails open for writes.
+  a missing permissions file fails open for writes. **The refusing half is `isolation_refusal(harness,
+  wrote)`**, pure: the harnesses that refuse when their directory could not be written are exactly
+  those whose restriction *is* a directory of ours — `env_seal` or `restricts_by_workspace_rules`
+  — and `a_harness_restricted_by_a_directory_refuses_without_it` holds that over `Harness::ALL`.
+  It was decided inline beside the three degrading arms, and turning Cursor's refusal into one of
+  them kept every test green.
   **Which of those two routes a harness takes is one decision, `endpoint_plumbing(harness) ->
   EndpointPlumbing { mcp_config, endpoint_file }`**, because it used to be two independent
   `match harness` sites — one in each of `start_ai_session`'s branches — and that is precisely how

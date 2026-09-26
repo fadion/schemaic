@@ -1495,6 +1495,54 @@ fn no_tools_note(cause: &str) -> String {
     )
 }
 
+/// Why a session of `harness` must not start, when the directory that
+/// restricts or isolates it could not be written (`wrote` false) — `None`
+/// when it may.
+///
+/// **Pure, and the fail-closed half of the matrix in one place.** It was
+/// decided inline in `start_ai_session`, beside three near-identical arms that
+/// *degrade* when only the endpoint is missing; turning Cursor's refusal into
+/// one of those spawned it with no permissions file, which is measured to
+/// write files unprompted, and every test stayed green. The harnesses that
+/// refuse are exactly those whose restriction is a directory of ours —
+/// [`Harness::env_seal`] or [`Harness::restricts_by_workspace_rules`] — and
+/// `a_harness_restricted_by_a_directory_refuses_without_it` holds that over
+/// every harness.
+fn isolation_refusal(harness: Harness, wrote: bool) -> Option<&'static str> {
+    if wrote {
+        return None;
+    }
+    match harness {
+        Harness::OpenCode => Some(
+            "Schemaic could not write the configuration that restricts \
+             OpenCode, so the assistant is disabled — running it without \
+             that file would give the session a shell. Check that the \
+             app's data directory is writable.",
+        ),
+        // **Refused too, though the seal would hold.** The allowlist is on
+        // the command line and survives a missing home; what does not is
+        // the isolation, and without it the CLI starts every server in the
+        // user's own `mcp-config.json` and loads their hooks, which are
+        // commands.
+        Harness::Copilot => Some(
+            "Schemaic could not create GitHub Copilot's private home \
+             directory, so the assistant is disabled — without it the CLI \
+             would load your own Copilot configuration, including its MCP \
+             servers and hooks. Check that the app's data directory is \
+             writable.",
+        ),
+        // **Refused, because a missing file fails open.** Measured: with no
+        // permissions file a headless Cursor turn wrote a file unprompted.
+        Harness::Cursor => Some(
+            "Schemaic could not write the permissions file that keeps Cursor \
+             from writing files and running commands, so the assistant is \
+             disabled — without it Cursor writes files unprompted. Check that \
+             the app's data directory is writable.",
+        ),
+        Harness::Claude | Harness::Codex | Harness::Antigravity => None,
+    }
+}
+
 /// Does a respawned persistent session owe its system context again?
 ///
 /// **Because the one chance to deliver it is spent per *conversation*, not per
@@ -1761,51 +1809,17 @@ pub(crate) fn start_ai_session(
         // same shape one layer out: the seal is on the argv and survives, the
         // isolation does not — see its arm below.
         let mut seal_env: Vec<(std::ffi::OsString, std::ffi::OsString)> = Vec::new();
-        let refused = match harness {
-            Harness::OpenCode => match oc_config.as_ref() {
-                Some(c) => {
-                    tracing::debug!(dir = %c.root().display(), "opencode config written");
-                    seal_env = c.env();
-                    None
-                }
-                None => Some(
-                    "Schemaic could not write the configuration that restricts \
-                     OpenCode, so the assistant is disabled — running it without \
-                     that file would give the session a shell. Check that the \
-                     app's data directory is writable.",
-                ),
-            },
-            // **Refused too, though the seal would hold.** The allowlist is on
-            // the command line and survives a missing home; what does not is
-            // the isolation, and without it the CLI starts every server in the
-            // user's own `mcp-config.json` and loads their hooks, which are
-            // commands.
-            Harness::Copilot => match copilot_home.as_ref() {
-                Some(h) => {
-                    seal_env = h.env();
-                    None
-                }
-                None => Some(
-                    "Schemaic could not create GitHub Copilot's private home \
-                     directory, so the assistant is disabled — without it the CLI \
-                     would load your own Copilot configuration, including its MCP \
-                     servers and hooks. Check that the app's data directory is \
-                     writable.",
-                ),
-            },
-            // **Refused, because a missing file fails open.** Measured: with no
-            // permissions file a headless Cursor turn wrote a file unprompted.
-            Harness::Cursor => match cursor_ws.as_ref() {
-                Some(_) => None,
-                None => Some(
-                    "Schemaic could not write the permissions file that keeps Cursor \
-                     from writing files and running commands, so the assistant is \
-                     disabled — without it Cursor writes files unprompted. Check that \
-                     the app's data directory is writable.",
-                ),
-            },
-            Harness::Claude | Harness::Codex | Harness::Antigravity => None,
-        };
+        let wrote = match harness {
+            Harness::OpenCode => oc_config.as_ref().map(|c| {
+                tracing::debug!(dir = %c.root().display(), "opencode config written");
+                seal_env = c.env();
+            }),
+            Harness::Copilot => copilot_home.as_ref().map(|h| seal_env = h.env()),
+            Harness::Cursor => cursor_ws.as_ref().map(|_| ()),
+            Harness::Claude | Harness::Codex | Harness::Antigravity => Some(()),
+        }
+        .is_some();
+        let refused = isolation_refusal(harness, wrote);
         if let Some(why) = refused {
             let why = why.to_string();
             let _ = ai_tx.send(AiStreamMsg {
@@ -3723,6 +3737,23 @@ mod session_tests {
                 !super::tools_missing(&p, p.mcp_config, p.endpoint_file),
                 "{harness:?} reports a file it does not use"
             );
+        }
+    }
+
+    /// **Every harness whose restriction is a directory of ours refuses to
+    /// start without it**, and no harness refuses once it is written. An
+    /// exhaustive `match` forces a new harness to be decided, not decided
+    /// correctly; this is what checks the answer.
+    #[test]
+    fn a_harness_restricted_by_a_directory_refuses_without_it() {
+        for harness in Harness::ALL {
+            let by_dir = harness.env_seal() || harness.restricts_by_workspace_rules();
+            assert_eq!(
+                super::isolation_refusal(harness, false).is_some(),
+                by_dir,
+                "{harness:?}"
+            );
+            assert_eq!(super::isolation_refusal(harness, true), None, "{harness:?}");
         }
     }
 
