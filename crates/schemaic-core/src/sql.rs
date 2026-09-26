@@ -343,7 +343,22 @@ fn scan_quoted(b: &[u8], i: usize, q: u8, backslash: bool) -> usize {
 /// the statement splitter then cut a PL/pgSQL body at its internal semicolons.
 /// Asking [`is_word_start`] for the first byte also closes the over-read on the
 /// other side: `$1$` is two positional parameters, not the tag `1`.
+///
+/// **A `$` that continues a name opens nothing.** PostgreSQL lets an unquoted
+/// identifier carry `$` after its first character, so `a$$` is one name and a
+/// dollar quote opens only where a token starts. Opening one after `a` read
+/// `SELECT 1 AS a$$; SELECT pg_sleep(100); SELECT 1 AS b$$` as a single
+/// statement holding a string, where the server runs three.
+///
+/// **Asked of the one byte before, not the run.** A `$` after a word byte or
+/// another `$` opens nothing. That byte also ends a number (`1$$x$$`) or a
+/// closing quote (`$a$x$a$$b$`) — but a quote opening straight after either
+/// does not parse, so the difference can only over-block. Walking back to the
+/// run's start instead made every `$` of `a$a$a$…` rescan the text before it.
 fn scan_dollar(b: &[u8], i: usize) -> Option<usize> {
+    if i > 0 && continues_dollar_name(b[i - 1]) {
+        return None;
+    }
     let n = b.len();
     let mut j = i + 1;
     if j < n && b[j] != b'$' && !is_word_start(b[j]) {
@@ -397,6 +412,16 @@ pub fn is_word_byte(b: u8) -> bool {
 /// copy rather than comparing two.
 pub fn is_word_start(b: u8) -> bool {
     b.is_ascii_alphabetic() || b == b'_' || b >= 0x80
+}
+
+/// Can this byte continue a PostgreSQL name, where `a$$` is one identifier?
+///
+/// [`is_word_byte`] plus `$` — a continuation only, since `$` begins no name
+/// and `$1` is a parameter. One definition so anything asking where a name
+/// ends agrees with the lexer's dollar quote ([`scan_dollar`]), which is the
+/// disagreement the `a$$ … b$$` smuggle lived in.
+fn continues_dollar_name(b: u8) -> bool {
+    is_word_byte(b) || b == b'$'
 }
 
 /// Is the `'` at `i` preceded by a standalone `E`/`e` prefix (not the tail of a
@@ -3878,6 +3903,50 @@ mod tests {
         let s = "$t1$a;b$t1$";
         let end = super::skip_noncode(s.as_bytes(), 0, PG).unwrap();
         assert_eq!(&s[..end], s);
+    }
+
+    /// **Asked of one byte, so a `$`-dense statement lexes in one pass.** The
+    /// first spelling walked back over the whole name before every `$`, and
+    /// `a$a$a$…` rescanned everything before each one — a statement a model
+    /// can send to `run_query`, and text the editor splits on every keystroke.
+    #[test]
+    fn pg_a_dollar_dense_name_lexes_in_one_pass() {
+        let sql = format!("SELECT {}1", "a$".repeat(200_000));
+        assert_eq!(super::statement_ranges(&sql, PG).len(), 1);
+        assert!(super::read_only_reason(&sql, PG).is_ok());
+    }
+
+    /// **A `$` inside a name continues the name**, and the lexer opened a
+    /// dollar quote there. PostgreSQL's identifiers may carry `$` after their
+    /// first character, so `a$$` is one name — measured on PG 16.15, where
+    /// `SELECT 1 AS a$$; SELECT 2; SELECT 3 AS b$$` returned three result sets
+    /// with columns `a$$` and `b$$`. The lexer read `$$; SELECT 2; SELECT 3 AS
+    /// b$$` as one string, so the read-only gate saw a single `SELECT` and the
+    /// server ran whatever sat between the two names — through
+    /// `simple_query_raw`, which takes several statements.
+    #[test]
+    fn pg_a_dollar_inside_a_name_opens_no_quote() {
+        let smuggle = "SELECT 1 AS a$$; SELECT pg_sleep(100); SELECT 1 AS b$$";
+        let err = super::read_only_reason(smuggle, PG).expect_err("three statements");
+        assert!(err.contains("single statement"), "{err}");
+        assert_eq!(super::statement_ranges(smuggle, PG).len(), 3);
+        assert!(super::contains_write(
+            "SELECT 1 AS a$$; DELETE FROM t; SELECT 1 AS b$$",
+            PG
+        ));
+        // A name is a name however many dollars it carries, and a keyword is
+        // lexed as one too: `SELECT$$x$$` is the identifier `select$$x$$`.
+        assert_eq!(super::skip_noncode(b"a$$$$", 1, PG), None);
+        assert_eq!(super::skip_noncode(b"SELECT$$x$$", 6, PG), None);
+        // A dollar quote still opens wherever a token starts.
+        for sql in [
+            "SELECT $$a;b$$",
+            "SELECT f($$a;b$$)",
+            "SELECT x=$$a;b$$",
+            "SELECT 'q'$$a;b$$",
+        ] {
+            assert_eq!(super::statement_ranges(sql, PG).len(), 1, "{sql}");
+        }
     }
 
     #[test]

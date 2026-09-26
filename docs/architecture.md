@@ -379,6 +379,25 @@ existing prose was left alone.
     where it is a name. The highlighter's own field doc promised the opposite — the `#` half worked
     and the `$tag$` half was exactly inverted. `None` exactly where `skip_noncode` answers `None`,
     which is what makes a `$` opening no valid tag ordinary punctuation on both sides.
+    **A `$` that continues a name opens nothing.** PostgreSQL lets an unquoted identifier carry `$`
+    after its first character, so `a$$` is one name and a dollar quote opens only where a token
+    starts. `scan_dollar` opened one after the `a`, so `SELECT 1 AS a$$; SELECT pg_sleep(100); SELECT
+    1 AS b$$` lexed as a single statement holding a string — while PostgreSQL 16.15 answered the same
+    shape (`SELECT 1 AS a$$; SELECT 2; SELECT 3 AS b$$`) with three result sets, columns `a$$` and
+    `b$$`. The headless read path sends through `simple_query_raw`, which takes several statements,
+    so the read-only gate's one-statement count and every word scan after it were bypassed, and
+    whatever sat between the two names ran. `scan_dollar` now asks about one byte, the one before
+    the `$`, through `continues_dollar_name` (`is_word_byte` or `$`), and answers `None` when it
+    continues a name; `noncode_kind` asks `scan_dollar` too, so the two still agree. **One byte
+    rather than the run is load-bearing**: a walk back over the whole name before every `$` would
+    rescan everything before each one on `a$a$a$…` — quadratic, on text a model can send to
+    `run_query` and the editor splits on every keystroke (`pg_a_dollar_dense_name_lexes_in_one_pass`).
+    The byte rule also opens nothing after a digit or a closing dollar-quote tag (`1$$x$$`,
+    `$a$x$a$$b$`); a quote opening straight after either does not parse, so the difference can only
+    over-block. A keyword is a name to this rule like any other — `SELECT$$x$$` is the identifier
+    `select$$x$$` — and
+    `pg_a_dollar_inside_a_name_opens_no_quote` pins both halves: the smuggle is three statements to
+    the gate and the splitter, and a quote still opens after a space, a `(`, an `=` and a string.
     **The unattended read-only gate's allowed heads are a per-dialect list too** — `read_only_heads`,
     which `read_only_reason` both tests against and builds its rejection message from:
     `SELECT/SHOW/DESCRIBE/DESC/EXPLAIN/WITH` on MySQL, `SELECT/SHOW/EXPLAIN/WITH` on PostgreSQL
@@ -483,7 +502,9 @@ existing prose was left alone.
     The tests read `EVERY_DIALECT` rather than the module's MySQL-binding helper, and three
     (`the_gate_reads_this_engines_string_escape` / `…_comment_rule` / `…_identifier_quoting`) assert
     that the engines' answers *differ*, so a mis-paired dialect fails instead of passing by
-    coincidence.
+    coincidence. A dollar quote opened inside a name was the same kind of bypass on PostgreSQL alone
+    — `a$$ … b$$` lexed as one string what the server ran as three statements — and is the lexer's
+    to answer (above).
     **`scan_bounds` is the one walk both `statement_bounds` and `statement_bounds_open` are, and its
     `until` is what keeps the caret off it.** With `Some(offset)` the walk stops once a boundary
     *past* that offset has been recorded — everything after belongs to statements the caller has
