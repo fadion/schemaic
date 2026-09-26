@@ -1028,8 +1028,8 @@ fn looks_like_drive_path(s: &str) -> bool {
 /// optional here, and a connection with nothing usable in it is [`Skipped`] by
 /// name rather than dropped silently.
 ///
-/// Folders are ignored — DBeaver groups connections, this app doesn't.
-/// Credentials live encrypted in the sibling `credentials-config.json`, which
+/// A connection's `folder` carries over as its [`Connection::folder`], the
+/// heading it lists under. Credentials live encrypted in the sibling `credentials-config.json`, which
 /// this deliberately does not touch.
 pub fn parse_dbeaver(json: &str) -> ImportScan {
     let mut out = ImportScan::default();
@@ -1093,6 +1093,9 @@ pub fn parse_dbeaver(json: &str) -> ImportScan {
         } else {
             name
         };
+        // The folder DBeaver files it under, by the name it shows — which is all
+        // a folder is here (`Connection::folder`), so the heading carries over.
+        overlay(&mut c.folder, str_at(entry, "folder"));
         out.found.push(imported(c, ImportSource::DBeaver));
     }
     // DBeaver keys its connections by an internal id, so "the order in the file"
@@ -2901,6 +2904,7 @@ mod tests {
       "connections": {
         "mysql-1": {
           "provider": "mysql", "driver": "mysql8", "name": "Shop (prod)",
+          "folder": "Work",
           "configuration": {
             "host": "shop.example", "port": "3306", "database": "shop",
             "user": "app",
@@ -2969,6 +2973,16 @@ mod tests {
             scan.skipped[0].reason,
             SkipReason::UnsupportedEngine("oracle_thin".to_string())
         );
+    }
+
+    /// A connection DBeaver files under a folder lands under the same heading
+    /// here — the folder is its name, which is all `Connection::folder` is — and
+    /// one filed nowhere stays ungrouped.
+    #[test]
+    fn dbeaver_carries_the_folder_across() {
+        let scan = parse_dbeaver(DBEAVER);
+        assert_eq!(row(&scan, "Shop (prod)").folder, "Work");
+        assert_eq!(row(&scan, "Analytics").folder, "");
     }
 
     #[test]

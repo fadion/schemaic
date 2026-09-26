@@ -5793,8 +5793,12 @@ existing prose was left alone.
     honest omission, and the modal says how many were left behind. DBeaver names its engine twice
     and only the *driver* distinguishes MariaDB (it ships under the `mysql` provider); its rows are
     sorted by name because the file is a JSON object keyed by internal ids, so "the order in the
-    file" is not an order anyone chose. Its `folders` are not read yet: every DBeaver row arrives
-    ungrouped (`blank` sets `folder` empty), which is future work rather than a decision. The
+    file" is not an order anyone chose. **A connection's `folder` key carries over as its heading**,
+    verbatim through `overlay`, so a blank or missing one leaves the row ungrouped
+    (`dbeaver_carries_the_folder_across`). The file's top-level `folders` map is not read: a folder
+    here is only its name (`Connection::folder`), and the key already is that name. A nested DBeaver
+    folder arrives as one heading spelled however DBeaver writes its path in the key — this app has
+    no nesting to put it in — and trimming is left to `Connection::sanitized` on save. The
     DataGrip reader is a narrow element scan
     (`<data-source>`'s `name` and `uuid`, `<jdbc-url>`, `<user-name>`, `<driver-ref>`) rather than a
     real XML parse — `schemaic-core` has no XML dependency, and if JetBrains ever moves that shape
