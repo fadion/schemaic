@@ -356,7 +356,7 @@ struct GridState {
     /// The window's confirmation modal — what [`clone_rows`] asks through when
     /// the selection is large enough to be worth a question.
     confirm: RwSignal<Option<crate::Confirm>>,
-    /// The result's source `(database, table)` — for the cell "AI Summary" context.
+    /// The result's source `(database, table)` — for the cell "AI summary" context.
     source: RwSignal<Option<TableSource>>,
     /// Callbacks wrapped in signals so `GridState` stays `Copy`. `summarize`
     /// reveals the AI panel + sends a message; `dismiss` closes any open menu;
@@ -3593,7 +3593,7 @@ pub(crate) struct GridCtx {
     pub(crate) last_mouse: RwSignal<(f64, f64)>,
     /// The window's confirmation modal — see [`GridState::confirm`].
     pub(crate) confirm: RwSignal<Option<crate::Confirm>>,
-    /// Reveal the AI panel + send a message (used for the cell "AI Summary").
+    /// Reveal the AI panel + send a message (used for the cell "AI summary").
     pub(crate) summarize: Rc<dyn Fn(String)>,
     /// Stage result rows as an attachment on the AI panel's next question.
     pub(crate) attach: crate::AttachFn,
@@ -8964,7 +8964,7 @@ fn grid_toolbar(
     // AI seed-data menu → purple-sparkle actions (Fill Value / Insert Row / Seed
     // Table). Gated on a single writable table, like the row actions above. The
     // trigger is a neutral toolbar sparkle (same styling as the copy icon); the
-    // *menu items* carry the purple sparkle, matching "AI Summary" / "Ask AI". The
+    // *menu items* carry the purple sparkle, matching "AI summary" / "Ask AI". The
     // menu anchors below the icon via the shared `ui.popup_menu` channel. Actions
     // are stubbed pending the one-shot AI pipeline.
     let ai_menu = dyn_container(
@@ -9924,7 +9924,7 @@ fn header_cell(
             } else {
                 MenuEntry::action("Freeze", move || gs.frozen.set(Some(ci)))
             };
-            // "AI Summary" for the whole column: what is this field *for*? The
+            // "AI summary" for the whole column: what is this field *for*? The
             // prompt carries a sample of the loaded values, which usually settles
             // it where the name alone wouldn't. Sampled from what's on screen —
             // no query, so the menu stays instant.
@@ -10955,7 +10955,7 @@ fn data_cell(
             // Both of these send *values* — the summary prompt carries this
             // cell, its row and a sample of its column — so both are absent
             // entirely on a connection set to schema-only. Absent rather than
-            // disabled: a greyed "AI Summary" invites a hunt for the reason,
+            // disabled: a greyed "AI summary" invites a hunt for the reason,
             // while the connection form is where the answer lives.
             if ai_data_of(gs).may_attach() {
                 // Set off from the row actions above it — asking about a value is a

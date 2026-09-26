@@ -1033,6 +1033,9 @@ pub(crate) fn dump_overlay(ctx: DumpCtx) -> impl IntoView {
             .on_click_stop(|_| {})
             .style(move |s| panel_style(s).width(panel_w()).height(panel_h()));
 
+            // **No click-away, on purpose**: while the dump runs a close cancels
+            // it, which is not for a stray click. ✕ and Escape close it. See
+            // docs/architecture.md, *which modals close on a backdrop click*.
             focus_root_with_ring(container(panel), ring)
                 .on_key_down(
                     Key::Named(NamedKey::Escape),
@@ -1256,6 +1259,9 @@ pub(crate) fn export_progress_overlay(e: ExportUi, cancel: Rc<dyn Fn()>) -> impl
             // Escape routes through the **same** decision as the button, so it
             // stops a running export and dismisses a finished one — never the
             // other way round, and never a close that abandons a live write.
+            // **No title row and no click-away, by design**: a one-button
+            // progress box whose only exit is that decision. See
+            // docs/architecture.md, *which modals close on a backdrop click*.
             focus_root_with_ring(container(panel), ring)
                 .on_key_down(
                     Key::Named(NamedKey::Escape),

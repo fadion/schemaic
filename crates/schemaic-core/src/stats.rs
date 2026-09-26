@@ -136,7 +136,7 @@ impl Freshness {
         match self {
             Freshness::Unknown => None,
             Freshness::Analyzed(None) => Some(
-                "This table has never been analyzed, so the server has no row estimate for it. \
+                "This table has never been analysed, so the server has no row estimate for it. \
                  Run ANALYZE, or count the rows."
                     .to_string(),
             ),

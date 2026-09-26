@@ -13,8 +13,8 @@
 //! them. So the unit under test is the **pairing**, not the literal.
 //!
 //! [`UI_PAIRINGS`] therefore names one (foreground, background) combination per
-//! real site, [`audit_ui`] measures each against the floor its role earns, and
-//! the tests below run that over every built-in palette. A new theme is gated by
+//! real site, and the tests below measure each against the floor its role
+//! earns in every built-in palette (`check`). A new theme is gated by
 //! construction; a new *pairing* has to be added here, which is the one-time cost
 //! of the approach.
 //!
@@ -135,52 +135,6 @@ impl<T> Pairing<T> {
     pub fn ratio(&self, theme: &T) -> f64 {
         contrast_ratio((self.fg_of)(theme), (self.bg_of)(theme))
     }
-}
-
-/// A pairing that came in under its floor, with the number it managed.
-#[derive(Debug)]
-pub struct Failure {
-    pub fg: &'static str,
-    pub bg: &'static str,
-    pub site: &'static str,
-    pub ratio: f64,
-    pub floor: f64,
-}
-
-impl std::fmt::Display for Failure {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "{} on {} = {:.2}:1 (needs {:.1}:1) — {}",
-            self.fg, self.bg, self.ratio, self.floor, self.site
-        )
-    }
-}
-
-fn audit<T>(pairings: &'static [Pairing<T>], theme: &T) -> Vec<Failure> {
-    pairings
-        .iter()
-        .filter_map(|p| {
-            let ratio = p.ratio(theme);
-            (ratio < p.role.floor()).then_some(Failure {
-                fg: p.fg,
-                bg: p.bg,
-                site: p.site,
-                ratio,
-                floor: p.role.floor(),
-            })
-        })
-        .collect()
-}
-
-/// Every [`UI_PAIRINGS`] entry that misses its floor in `theme`.
-pub fn audit_ui(theme: &UiTheme) -> Vec<Failure> {
-    audit(UI_PAIRINGS, theme)
-}
-
-/// Every [`EDITOR_PAIRINGS`] entry that misses its floor in `theme`.
-pub fn audit_editor(theme: &EditorTheme) -> Vec<Failure> {
-    audit(EDITOR_PAIRINGS, theme)
 }
 
 /// `pair!(text on bg_panel, Body, "where")` — the common case, both sides being
@@ -370,7 +324,7 @@ pub const UI_PAIRINGS: &[Pairing<UiTheme>] = &[
     // another name. Two roles paint on it and neither had a row, so a palette
     // edit could have moved either silently, which is the one thing this table
     // exists to stop.
-    pair!(text on erd_canvas, Body, "in-form buttons: Choose file…, Add value"),
+    pair!(text on erd_canvas, Body, "in-form buttons: Choose a file…, Add value"),
     pair!(text_faint on erd_canvas, Recessive, "an in-form button with nothing to act on"),
     // The type-aware cell editors paint on the same surface: a held `SET` chip, a
     // cell open on its picker. So does the scale picker's selected segment, which

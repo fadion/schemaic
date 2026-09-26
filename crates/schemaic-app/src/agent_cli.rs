@@ -450,7 +450,7 @@ pub(crate) fn pathext() -> Vec<String> {
 /// it, and every prompt this app builds is multi-line by construction
 /// (`harness::prefixed_prompt` joins with `\n\n`), so a harness resolved to a
 /// `.cmd` answers `InvalidInput: batch file arguments are invalid` for *every*
-/// generation — Ctrl+K, Optimize, Fix with AI and each chat turn, reported as a
+/// generation — Ctrl+K, Optimise, Fix with AI and each chat turn, reported as a
 /// batch-file problem rather than a prompt one. A default `PATHEXT` lists `.EXE`
 /// before `.CMD` and hid this; the variable is editable and installers edit it.
 /// The shim is still taken when it is the only candidate, which is npm's layout

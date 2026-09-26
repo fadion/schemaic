@@ -1,6 +1,6 @@
 //! The read-only ER-diagram modal (roadmap #9).
 //!
-//! Opened from the schema tree's "ER Diagram" (a database → whole-DB view, a
+//! Opened from the schema tree's "ER diagram" (a database → whole-DB view, a
 //! table → its FK neighbourhood), it renders `schemaic_core::erd`'s graph +
 //! deterministic layout as a canvas of table cards joined by crow's-foot FK
 //! edges. All the *what to draw* logic (graph, layout, density, edge geometry)
@@ -2918,7 +2918,7 @@ fn modal_frame(
     // walks out of the modal.
     let ring = crate::widgets::FocusRing::new();
     let panel = v_stack((
-        modal_title_borderless("ER Diagram", close.clone(), ring.clone()),
+        modal_title_borderless("ER diagram", close.clone(), ring.clone()),
         toolbar,
         body,
     ))

@@ -1526,11 +1526,11 @@ fn conn_form(
     )
     .style(|s| s.width_full());
 
-    // "Prominent color in editor" — when on, the identity colour frames the
+    // "Prominent colour in editor" — when on, the identity colour frames the
     // query+results editor (a guard-rail for e.g. production connections). Uses
     // the same themed switch as the AI/terminal settings toggles.
     let prominent_toggle = focusable_toggle_row(
-        "Prominent color in editor",
+        "Prominent colour in editor",
         "Frame the query editor in this connection's colour.",
         draft.prominent_color,
         ring.clone(),
@@ -1544,13 +1544,15 @@ fn conn_form(
         ring.clone(),
         30,
     );
-    // Whether `schemaic query` / `exec` may reach this connection at all. Off
-    // for every connection until the user turns it on here, including ones
-    // saved before the setting existed — the CLI runs with nobody watching, so
-    // exposure is granted one connection at a time and never inherited.
+    // Whether `schemaic query` / `exec` — and `schemaic mcp`, which is how an
+    // outside AI agent reaches it — may use this connection at all. Off for
+    // every connection until the user turns it on here, including ones saved
+    // before the setting existed — the CLI runs with nobody watching, so
+    // exposure is granted one connection at a time and never inherited. The
+    // hint names the agents because this is their consent switch too.
     let cli_access_toggle = focusable_toggle_row(
         "CLI access",
-        "Let the schemaic command line use this connection.",
+        "Let the schemaic command line, and AI agents through schemaic mcp, use this connection.",
         draft.cli_access,
         ring.clone(),
         33,

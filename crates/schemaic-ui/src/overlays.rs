@@ -1482,7 +1482,7 @@ pub(crate) fn schema_settings_overlay(
 }
 
 // The schema right-click menu, anchored 3px below-right of the click. Rows vary
-// by target kind; every kind ends with an "AI Explain" row (sparkles + prompt).
+// by target kind; every kind ends with an "AI explain" row (sparkles + prompt).
 // Same styling as the other dropdowns.
 pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
     let ctx = ui.overlay.context_menu;
@@ -1525,13 +1525,13 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
     //
     //   1. Open        — what a double-click would have done
     //   2. Read        — Copy name, Copy qualified name, then what the node can
-    //                    show you (Properties, ER Diagram, Generate DDL),
+    //                    show you (Properties, ER diagram, Generate DDL),
     //                    closing with Refresh
-    //   3. Tree state  — Favorite, Colour, Hide: the row, not the object
+    //   3. Tree state  — Favourite, Colour, Hide: the row, not the object
     //   4. Write       — Create / Edit / Import / Triggers, with the entries
     //                    that can't be taken back **last** inside the group and
     //                    coloured `theme::error`
-    //   5. AI Explain  — appended to every menu, outside the `match`
+    //   5. AI explain  — appended to every menu, outside the `match`
     //
     // Group 4's rule is the load-bearing one: Drop is always the last thing in
     // its menu, so the row the cursor lands on after a right-click is never the
@@ -1584,7 +1584,7 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                     }
                     // ER diagram of the whole database (every related table).
                     let edb = menu.name.clone();
-                    entries.push(MenuEntry::action("ER Diagram", move || {
+                    entries.push(MenuEntry::action("ER diagram", move || {
                         erd.set(Some(crate::ErdTarget {
                             conn_id: active_conn.get_untracked(),
                             database: edb.clone(),
@@ -1646,7 +1646,7 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                             dbc.update(|r| schemaic_core::db_color::upsert(r, cid, &db, None));
                         }));
                     }
-                    // Favorite / unfavorite: a favorited database gets a gold star
+                    // Favourite / unfavourite: a favourited database gets a gold star
                     // and sorts to the top of the tree (oldest favorite highest).
                     // `with_untracked`, not `get_untracked`: the predicate only
                     // borrows the rules, and `get` clones the whole
@@ -1664,7 +1664,7 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                     {
                         let dbf = db_favorites;
                         let db = menu.name.clone();
-                        let label = if fav_now { "Unfavorite" } else { "Favorite" };
+                        let label = if fav_now { "Unfavourite" } else { "Favourite" };
                         entries.push(MenuEntry::action(label, move || {
                             let cid = active_conn.get_untracked();
                             dbf.update(|r| {
@@ -2198,7 +2198,7 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                         // name — so a table outside `public` seeds `sales.orders`
                         // and can't be confused with a same-named one elsewhere.
                         let seed_id = source.display();
-                        entries.push(MenuEntry::action("ER Diagram", move || {
+                        entries.push(MenuEntry::action("ER diagram", move || {
                             erd.set(Some(crate::ErdTarget {
                                 conn_id: active_conn.get_untracked(),
                                 database: db.clone(),
@@ -2323,7 +2323,7 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                         }
                         entries.push(MenuEntry::sub("Colour", swatches));
                     }
-                    // Its own group, just above AI Explain: everything that
+                    // Its own group, just above AI explain: everything that
                     // *writes* — import and schema editing — reads as one set
                     // rather than trailing off the end of the read-only ones,
                     // with the two that can't be taken back last inside it.
@@ -2878,7 +2878,7 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
             let ai = ai_send.clone();
             let prompt = menu.ai_prompt.clone();
             entries.push(MenuEntry::action_icon(
-                "AI Explain",
+                "AI explain",
                 (icons::SPARKLES, theme::key_foreign),
                 // Reveal, then send — as the palette's Ask AI and the grid's AI
                 // Summary already did. Without it, with the right column showing
@@ -2928,7 +2928,7 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
     )
     // Open at the cursor, flipping to the other side of it at a window edge — the
     // same rule as the grid's menus. Without it, a right-click low in a full tree
-    // ran Truncate, Drop and AI Explain off the bottom of the window, with no cue
+    // ran Truncate, Drop and AI explain off the bottom of the window, with no cue
     // that they were there.
     .style(move |s| {
         let Some(menu) = ctx.get() else {
@@ -5381,7 +5381,7 @@ pub(crate) fn error_modal_overlay(ui: Ui) -> impl IntoView {
     let active = ui.tabs_ui.active;
     // "Explain" goes straight to the chat panel — no request signal, unlike the
     // fix: the panel is the workspace's, not the editor pane's, so this overlay
-    // can reach it the same way the schema tree's own AI Explain does.
+    // can reach it the same way the schema tree's own AI explain does.
     let ai_send = ui.ai_actions.send.clone();
     let right_panel = ui.layout.right_panel;
     let connections = ui.conn.connections;
@@ -7173,7 +7173,7 @@ mod sqlite_create_menu_tests {
 /// **The irreversible entry is last in its group, in every context menu.**
 ///
 /// `8a85fa1`'s whole subject is one menu order — Open · Read · Tree state ·
-/// Write (irreversible last, coloured `theme::error`) · AI Explain — written out
+/// Write (irreversible last, coloured `theme::error`) · AI explain — written out
 /// above [`context_menu_overlay`]'s builder. Its commit message records that the
 /// six menus had already drifted into six orderings once, and that the key row
 /// *"opened straight onto Drop index"*: the row the cursor lands on after a
@@ -7331,7 +7331,7 @@ fn ",
     /// order, tagged with the `CtxKind` arm it sits in.
     ///
     /// The scan is bounded by the builder's own two landmarks: it starts at the
-    /// `let build:` binding and stops at the `AI Explain` row, which is pushed
+    /// `let build:` binding and stops at the `AI explain` row, which is pushed
     /// *outside* the `match` and is therefore the fixed tail of every menu — the
     /// one entry that legitimately follows a Drop.
     ///
@@ -7343,7 +7343,7 @@ fn ",
     fn built_entries(src: &str) -> Vec<Built> {
         let lines: Vec<&str> = src.lines().collect();
         // Both landmarks are searched *forward*, and the second from the first:
-        // the module comment above the builder quotes "AI Explain" too, and
+        // the module comment above the builder quotes "AI explain" too, and
         // taking that one made the range empty and the whole gate vacuous — it
         // passed by finding nothing, which is why the counts below are asserted.
         let find_from = |at: usize, needle: &str| {
@@ -7355,7 +7355,7 @@ fn ",
                 .unwrap_or_else(|| panic!("the builder's landmark is gone: {needle}"))
         };
         let start = find_from(0, "let build: Rc<dyn Fn(CtxMenu)");
-        let end = find_from(start, "\"AI Explain\"");
+        let end = find_from(start, "\"AI explain\"");
 
         let mut out = Vec::new();
         let mut arm = "(before the match)".to_string();
@@ -7421,11 +7421,11 @@ fn ",
             // makes the wider window safe — a literal in a closure body is not a
             // label, and mistaking one for a label is how this would pass.
             let head: String = span(i, 12);
-            // The AI Explain row is pushed *outside* the `match` and is the fixed
+            // The AI explain row is pushed *outside* the `match` and is the fixed
             // tail of every menu — the one entry that legitimately follows a
             // Drop. Its constructor sits one line above its label, so bounding
             // the scan by the label alone still catches it.
-            if head.contains("\"AI Explain\"") {
+            if head.contains("\"AI explain\"") {
                 continue;
             }
             let first_literal = |span: &str| {
@@ -7439,7 +7439,7 @@ fn ",
                 .and_then(|(_, r)| first_literal(r))
                 .unwrap_or_default();
             // Two entries name themselves through a `let label = if … { "A" }
-            // else { "B" }` above the constructor (Favorite/Unfavorite, and the
+            // else { "B" }` above the constructor (Favourite/Unfavourite, and the
             // key row's Edit, which is named for what the row *is*). The binding
             // holds every alternative and they all belong to the same group, so
             // the first is enough to place the entry — and leaving the label empty
@@ -7480,7 +7480,7 @@ fn ",
     /// **The skeleton as data.** Which group of the ordering comment above `build`
     /// each entry belongs to — 1 Open, 2 Read, 3 Tree state, 4 Write — so "every
     /// menu is a subsequence of one skeleton" becomes an assertion instead of a
-    /// paragraph. `AI Explain` is group 5 and is pushed outside the `match`, so it
+    /// paragraph. `AI explain` is group 5 and is pushed outside the `match`, so it
     /// never reaches this table.
     ///
     /// An unknown label **fails** the gate rather than being skipped, and that is
@@ -7501,7 +7501,7 @@ fn ",
             | "Copy qualified name"
             | "Properties"
             | "Live monitor"
-            | "ER Diagram"
+            | "ER diagram"
             // **Group 2, beside the ER diagram, and not the writing group.** A
             // comparison reads two databases and emits nothing: the plan it
             // builds goes to the DDL preview, where Apply lives and where the
@@ -7523,7 +7523,7 @@ fn ",
             | "Refresh"
             | "Collapse all" => 2,
             // 3. Tree state — the row, not the object.
-            "Favorite" | "Unfavorite" | "Colour" | "Hide" => 3,
+            "Favourite" | "Unfavourite" | "Colour" | "Hide" => 3,
             // 4. Write, with the irreversible entries last inside it. The order
             //    *within* the group is not checked: the table arm ships
             //    Import → Edit table → Triggers where the skeleton lists
@@ -7659,7 +7659,7 @@ fn ",
     /// The one position in the skeleton that is not a matter of taste: the row the
     /// cursor lands on after a right-click must never be the irreversible one, so
     /// every Drop is the **last** entry its own menu contributes, and the only
-    /// thing that follows it is the `AI Explain` row pushed outside the `match`.
+    /// thing that follows it is the `AI explain` row pushed outside the `match`.
     #[test]
     fn drop_is_the_last_entry_before_ai_explain() {
         let src = std::fs::read_to_string(this_file()).expect("this file");
@@ -7708,7 +7708,7 @@ fn ",
             "which menus carry a Drop has changed"
         );
 
-        // Nothing but `AI Explain` follows the `match` — the tail every menu
+        // Nothing but `AI explain` follows the `match` — the tail every menu
         // shares, and the reason a Drop being last in its arm is a Drop being last
         // in the menu.
         let lines: Vec<&str> = src.lines().collect();
@@ -7717,8 +7717,8 @@ fn ",
             .position(|l| l.contains("let build: Rc<dyn Fn(CtxMenu)"))
             .expect("the builder");
         let ai_at = (build_at..lines.len())
-            .find(|&i| lines[i].contains("\"AI Explain\""))
-            .expect("the AI Explain row");
+            .find(|&i| lines[i].contains("\"AI explain\""))
+            .expect("the AI explain row");
         let close_at = (ai_at..lines.len())
             .find(|&i| lines[i].trim() == "});")
             .expect("the builder's close");
@@ -7728,7 +7728,7 @@ fn ",
             .collect();
         assert!(
             after.is_empty(),
-            "an entry was added after `AI Explain`, which every menu ends on:\n{}",
+            "an entry was added after `AI explain`, which every menu ends on:\n{}",
             after.join("\n")
         );
     }

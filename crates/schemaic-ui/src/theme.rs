@@ -230,7 +230,7 @@ pub fn field_border() -> Color {
 pub fn field_border_active() -> Color {
     ui().field_border_active
 }
-/// Border around the picked statement (Explain/Optimize/Run Current).
+/// Border around the picked statement (Explain/Optimise/Run Current).
 pub fn query_highlight() -> Color {
     ui().query_highlight
 }

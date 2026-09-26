@@ -529,21 +529,11 @@ mod tests {
                 "{m} -> {out}"
             );
         }
-        // A newline would end the command and start another.
-        assert_eq!(
-            shell_message_text(
-                "one
-two"
-            ),
-            "one two"
-        );
-        assert_eq!(
-            shell_message_text(
-                "one
-two"
-            ),
-            "one two"
-        );
+        // A newline would end the command and start another — a bare LF and a
+        // Windows CRLF alike. (These were two copies of the LF case, written as
+        // raw line breaks in the source, so the CRLF one was never tested.)
+        assert_eq!(shell_message_text("one\ntwo"), "one two");
+        assert_eq!(shell_message_text("one\r\ntwo"), "one two");
         // Ordinary text survives, including the punctuation a real sentence
         // needs, and a stripped run leaves one space rather than a gap.
         assert_eq!(

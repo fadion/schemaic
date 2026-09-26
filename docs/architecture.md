@@ -11344,9 +11344,9 @@ existing prose was left alone.
   which for `CreateProcessW` means UTF-16 units: a CJK schema outline costs three bytes and one unit
   per character, so a ~12,000-character outline was refused at "36,0xx characters" when the real
   command line was ~12,000 units. Conservative in direction, but the number in the refusal was wrong
-  by 3× and the one lever it suggests — narrowing the AI schema scope — could not close a gap that
-  was not there. Elsewhere `MAX_ARG_STRLEN` really is bytes and `str::len()` is exact, which is why
-  this is a per-platform answer rather than one unit for both
+  by 3× and the one lever it suggests — narrowing *Settings → AI → Schema context* — could not
+  close a gap that was not there. Elsewhere `MAX_ARG_STRLEN` really is bytes and `str::len()` is
+  exact, which is why this is a per-platform answer rather than one unit for both
   (`an_argument_is_measured_in_the_units_the_platform_caps`).
   **The refusal names that unit too, and fixing only the measurement left the wording behind.** The
   message said *"({total} characters; this platform allows about {limit})"* on every platform, so
@@ -11359,9 +11359,11 @@ existing prose was left alone.
   the other in the same edit.
   **And the lever the refusal names is the caller's, because it is not the same everywhere.**
   `oversize_reason` and `spawn_refusal` take `levers: &str`, of which there are two constants:
-  `SCHEMA_AND_QUERY_LEVERS` (narrow the AI schema scope, or shorten the query in the editor) for a
-  chat turn or a Ctrl+K generation, and `SAMPLE_LEVERS` (lower this connection's AI data access below
-  Full, which stops the row sample being sent) for AI Fill and Seed. Those two are grid context
+  `SCHEMA_AND_QUERY_LEVERS` (narrow *Settings → AI → Schema context*, or shorten the query in the
+  editor) for a chat turn or a Ctrl+K generation, and `SAMPLE_LEVERS` (lower this connection's AI
+  data access below *"Let it read data"*, which stops the row sample being sent, or narrow the same
+  *Schema context*) for AI Fill and Seed — each naming a setting in its own on-screen words, so the
+  reader can find it. Those two are grid context
   menus: there is no editor and no query, so the chat wording gave the user nothing to act on while
   the one thing that would have worked went unnamed. `ai::inline_plan` threads the argument through
   to the one-shot paths, and `an_oversize_refusal_names_the_levers_its_caller_has` asserts both
@@ -13556,8 +13558,8 @@ existing prose was left alone.
     it is the only one anywhere: nothing else in the app sets the flag. It sits at tabindex 33,
     between Read-only (30) and AI data access (35), which is where it sits on screen — a Tab order
     that disagrees with the eye makes the keyboard skip a control and come back to it, the reason
-    already written beside the AI picker. Its hint is *"Let the schemaic command line use this
-    connection."*, and the three guard-rails read as one group on purpose, being the same kind of
+    already written beside the AI picker. Its hint is *"Let the schemaic command line, and AI agents
+    through schemaic mcp, use this connection."*, and the three guard-rails read as one group on purpose, being the same kind of
     per-connection answer. `DraftSignals::cli_access` is threaded through create, load, reset and
     `to_connection` exactly as `read_only` is, and that is the part worth pinning: a hardcoded
     `false` at `to_connection` would have compiled and silently cleared the flag every time a user
@@ -16376,9 +16378,9 @@ existing prose was left alone.
     gestures they already have. The bar is anchored at the **end** of the acted-on range rather than
     at the caret, so it sits under the whole statement instead of splitting one in two, and every
     entry point goes through `anchor_cmdk` to do it.
-    **That sentence was not true of *Optimize*, and `cmdk_open_gate` is what makes it a fact rather
-    than an intention.** Four entry points open the bar — the key, *Ask AI*, *Optimize*, and
-    `fix_with_ai`'s three menus — each written separately, and *Optimize* selected nothing and
+    **That sentence was not true of *Optimise*, and `cmdk_open_gate` is what makes it a fact rather
+    than an intention.** Four entry points open the bar — the key, *Ask AI*, *Optimise*, and
+    `fix_with_ai`'s three menus — each written separately, and *Optimise* selected nothing and
     anchored nothing. The two symptoms did not look like one bug. With no selection, the in-flight
     fade over the acted-on lines was the only sign of what was about to be rewritten, so the gesture
     that reads as "this statement" everywhere else read as *the editor going dim*. With no anchor,
@@ -16449,7 +16451,7 @@ existing prose was left alone.
     `focus_root` afterwards.
     **`Explain` is the fix's pair, and it deliberately goes somewhere else**: a fix is a diff in the
     editor, an explanation is prose in the chat panel — the same split the right-click menu already
-    makes between its own *Explain* and *Optimize*. It reveals the panel before sending, because a
+    makes between its own *Explain* and *Optimise*. It reveals the panel before sending, because a
     message into a hidden panel reads as a button doing nothing, and it highlights the statement it
     asked about, so the answer and the SQL it is about are visibly the same statement. Both the error
     bar and the modal offer it, on the same `ErrorModalContent::resolve` answer, and both send a
@@ -16475,7 +16477,7 @@ existing prose was left alone.
     (icon, gap, label) whose box ends past its last glyph. Unlike the fix it needs **no request
     signal**:
     the chat panel belongs to the workspace, so the modal can reach it directly, the way the schema
-    tree's own *AI Explain* does. It is also offered **where the fix is not** — over a `Server`
+    tree's own *AI explain* does. It is also offered **where the fix is not** — over a `Server`
     error, an override or a tab whose connection was refused, where there is no statement to
     rewrite but the server's words still deserve an answer — and withheld in two places: over an
     `App` error, Schemaic's own notice or a run it refused to send, which already says everything a
@@ -16518,7 +16520,7 @@ existing prose was left alone.
     **Which states the editor answers for is `cmdk_editor_keys`, and Escape's are not Enter's.**
     Enter belongs to `Ready` alone — there is nothing to accept before the suggestion lands — but
     Escape also takes down a request that is still `Busy`. A request is not always started from the
-    prompt field: *Optimize* and the three ways to ask for an AI fix open the bar already `Busy`
+    prompt field: *Optimise* and the three ways to ask for an AI fix open the bar already `Busy`
     from a menu the user clicked, so the editor never gave the keyboard up. Gating the branch on
     `Ready` therefore left Escape doing nothing for the whole of a running request — it closed the
     bar while prompting (the field's own `on_escape`) and while previewing a diff, and not in
@@ -17367,7 +17369,7 @@ existing prose was left alone.
     this app, `Tab`/`SavedTab` being query tabs — so it is the sixth entry of the modal layer's
     **workspace** group, beside the ERD and the binary-cell panel, and counted by
     `workspace_modals_up`. `open_compare(o, conn_id, database)` is the way in, from a database row's
-    **Compare with** (beside ER Diagram in `overlays.rs`): it returns every signal the modal owns to
+    **Compare with** (beside ER diagram in `overlays.rs`): it returns every signal the modal owns to
     its opening value through `reset` — the one door `close` goes through too, since two paths
     writing their own subsets is what left `show_same` cleared on open and not on close — and fixes
     the **left** side, the right one being the question the modal is open to ask. It decides nothing
@@ -18117,14 +18119,14 @@ existing prose was left alone.
     return when the **window** widened, which is why `footer_seg_edge` also reads a shared `left_edge`
     — a neighbour getting shorter is the ordinary way room appears: commit a transaction and the Tx
     pill, Commit and Rollback all go at once, freeing ~150px; switch to a SQLite connection and
-    `mode_seg` disappears outright; "Write mode" becomes "Read only". **That prediction had no
+    `mode_seg` disappears outright; "Write mode" becomes "Read-only". **That prediction had no
     ordering term, and the order is the premise everything else rests on.** Segments hide
     right-to-left, so the hidden set is a *suffix* — which is what `footer_seg_edge` means by "the
     right edge of the nearest **shown** segment to this one's left" — yet every hidden segment read
     the same `left_edge`, so they came back in order of **width** instead of position. Narrow the
     window until the Tx pill, Commit, Rollback, CPU and RAM have all gone, then shorten anything to
     their left and `left_edge` drops ~60px: Commit predicts `L+57` and fits, the Tx pill predicts
-    `L+130` and does not, and the footer settles at `… Read only Commit` — a lone commit action with
+    `L+130` and does not, and the footer settles at `… Read-only Commit` — a lone commit action with
     no pill saying a transaction is open and no Rollback beside it. It is *stable* rather than a
     flicker, because once Commit is drawn the pill re-predicts `L+187` and still does not fit.
     `footer_seg_may_return(measured, shown, left_shown)` is the missing term: `collapsing_seg` takes
@@ -19318,7 +19320,7 @@ existing prose was left alone.
     refuses any argument it cannot escape for it, and every prompt this app builds is multi-line by
     construction (`harness::prefixed_prompt` joins with `\n\n`), so a harness resolved to a `.cmd`
     answered `InvalidInput: batch file arguments are invalid` for *every* generation — Ctrl+K,
-    Optimize, Fix with AI and each chat turn — reported as a batch-file problem rather than a prompt
+    Optimise, Fix with AI and each chat turn — reported as a batch-file problem rather than a prompt
     one. A default `PATHEXT` lists `.EXE` before `.CMD` and hid it; the variable is editable and
     installers edit it. The shim is still taken when it is the only candidate, which is npm's layout.
     Off Windows `exts` is empty and
@@ -20266,7 +20268,7 @@ existing prose was left alone.
     deliberately *not* the sibling of the two above — the difference is what this entry is for.**
     Those two own their mutators, so each can hold the rule *every mutation is followed by the right
     kind of save* and gate it exactly. These three cannot: every mutation is in `schemaic-ui` — the
-    grid's "Format as" menu, the schema tree's Colour swatches and Favorite/Unfavorite — so the rule
+    grid's "Format as" menu, the schema tree's Colour swatches and Favourite/Unfavourite — so the rule
     lives in the type they are handed as instead, `ui/stored.rs`'s `Stored`, whose only writers
     save. **This module is the one place a writable signal for them exists**, and only for as long
     as it takes to build the savers that read it: `wire()` makes each `RwSignal` and its saver and
@@ -24977,7 +24979,7 @@ Re-introducing the anti-patterns these guard against is a regression:
   **And a deferred hand-back stands down for a claim taken after it** — `widgets::claim_keyboard`,
   quoted back through `keyboard_claim` / `keyboard_claim_unchanged`. Being deferred is what put
   `refocus_grid` in a race with the *other* immediate timer the same gesture schedules:
-  `edit_field`'s autofocus. Pick **Optimize** (or any of the three AI fixes) off the editor's
+  `edit_field`'s autofocus. Pick **Optimise** (or any of the three AI fixes) off the editor's
   right-click menu and one update pass opens the Ctrl+K bar — queueing its prompt field's autofocus
   — and tears the menu panel down, whose `focus_root` cleanup calls `hand_keyboard_back`, which
   finds no other overlay and queues the workspace's home. Two timers due immediately, scheduled
@@ -25176,6 +25178,30 @@ Re-introducing the anti-patterns these guard against is a regression:
   The layer is an absolutely-positioned sibling built *before* the panel, so the panel stays on top
   of it. The transaction prompt deliberately has none: clicking away from a question about
   uncommitted writes is not an answer.
+  **Which modals close on a backdrop click** is the user's decision, written here so it is not
+  asked again: **a modal that could lose data on a stray click has no click-away** — only its ✕
+  and Escape close it — and every other modal closes on a backdrop click through `dismiss_layer`.
+  Escape stays in both because pressing it is deliberate; a click on the backdrop often is not.
+  Each root in the no-click-away set carries a one-line comment pointing at this passage, and each
+  is there for a named reason: a **draft with no other copy** — `table_designer`, `view_editor`,
+  `trigger_editor`, `routine_editor`, `event_editor`, `object_editor` and `database_editor`, whose
+  `close` sets the target to `None` and the next open reseeds the draft, and
+  `snippet_edit`, whose name, abbreviation and body are saved only by Save; **selections nothing
+  else holds** — `connection_import`'s ticked list, of which nothing is written until Import; a
+  **running operation a close would cancel** — `dump_view::dump_overlay` and `script_view`, and
+  `import_view`, which holds a column mapping as well; and the transaction prompt above.
+  `dump_view::export_progress_overlay` has neither a title row nor a click-away **by design**: it
+  is a one-button progress box whose only exit is its Stop/Close decision, and Escape routes
+  through that same decision. `ddl_preview` and `blob_view` were *given* a click-away under this
+  rule, because neither holds anything unique — the preview's plan is regenerated from the editor
+  left open behind it, and its `exit` already ignores the one dangerous moment, an apply that
+  cannot be cancelled; a replacement loaded into the blob viewer is staged into the grid's edit
+  buffer the moment it lands, so closing it only cancels a read. **One case is open, not settled
+  by this rule**: `account_editor.rs`'s account and grant editors share one shell that has a
+  click-away, though each holds a draft (name, password, grants). Their comment says the form
+  re-seeds from its target on open "so nothing is lost", but `close` resets the draft to its
+  default, so edits made since the open do go with a stray click. Whether that is acceptable is a
+  question for the user.
 - **An overlay's `inset(0.0)` style and its content must read the *same* predicate** — one closure,
   used twice, never two spellings of "is this showing". A dropdown whose content is conditional on
   more than its open flag (`open && !db_nodes.is_empty()`, the rule that keeps an empty menu off
@@ -25450,7 +25476,7 @@ renders the themed panel; the caller positions it absolutely. Used by the schema
   any entries — the column menu pushes one and then asks `field_entries` whether Edit column and
   Drop are offered, and on a **view's** column neither is — so the alternative is every conditional
   arm remembering to push its rule afterwards. It shipped as a rule with nothing under it: an empty
-  section between "Copy qualified name" and AI Explain.
+  section between "Copy qualified name" and AI explain.
 - **Nested submenus**: a `Sub` entry hover-expands a child `menu_stack` anchored to the parent row's
   right edge. The **keyboard** stops at one level (`MenuLevel`/`MenuSub`), which is as deep as any
   menu in the app goes; one flat pair of cursors is what lets `menu_key` drive whichever level is
@@ -25564,11 +25590,11 @@ renders the themed panel; the caller positions it absolutely. Used by the schema
   kind of row — and each arm emits the same five groups in the same order, separated by
   `MenuEntry::Separator`, so an action sits in the same place whatever was right-clicked:
   **Open** (what a double-click would have done), **Read** (`Copy name`, `Copy qualified name`,
-  then what the node can *show* you — `Properties`, `Live monitor`, `ER Diagram`, `Generate DDL` —
+  then what the node can *show* you — `Properties`, `Live monitor`, `ER diagram`, `Generate DDL` —
   closing with
-  `Refresh`), **Tree state** (`Favorite`, `Colour ▸`, `Hide`, which act on the row and not on the
+  `Refresh`), **Tree state** (`Favourite`, `Colour ▸`, `Hide`, which act on the row and not on the
   object), **Write** (`Create`/`Edit`/`Import`/`Triggers`, with the entries that can't be taken
-  back **last** inside the group and coloured `theme::error`), and the `AI Explain` row every menu
+  back **last** inside the group and coloured `theme::error`), and the `AI explain` row every menu
   ends with, appended outside the `match`. The write group's ordering is the load-bearing half: the
   row the cursor lands on after a right-click must never be the irreversible one, and two menus
   broke that before the skeleton was written down — the key/index menu opened straight onto
@@ -25579,7 +25605,7 @@ renders the themed panel; the caller positions it absolutely. Used by the schema
   block immediately above the closure: an arm is written and reviewed one arm at a time, and
   nothing else in the file says what the order is.
   **`overlays::menu_order_gate` holds the whole claim**, in four tests over the module's own source,
-  bounded by the `let build:` binding and the `AI Explain` row pushed outside the `match`. The
+  bounded by the `let build:` binding and the `AI explain` row pushed outside the `match`. The
   ordering can't be reached through `build` — it closes over a `Ui` — and it doesn't need to be: the
   order is a property of the *source*, because a dialect or a read-only connection can only **omit**
   an entry, never move one, so one pass covers every engine and every permission state at once,
@@ -25594,7 +25620,7 @@ renders the themed panel; the caller positions it absolutely. Used by the schema
   first, which is the drift the comment was written to stop and could not.
   `drop_is_the_last_entry_before_ai_explain` pins the one position that isn't a matter of taste, in
   both halves: every menu that writes ends on its `Drop` (`Database`, `Schema` and `ObjectGroup` have
-  nothing to drop, asserted by name), and nothing but `AI Explain` follows the `match`.
+  nothing to drop, asserted by name), and nothing but `AI explain` follows the `match`.
   The two deviations the shipped code already had stand, and the gate tolerates them **because they
   stay inside their group**, which is recorded at `group` rather than quietly excused: the database
   arm pushes `Collapse all` after `Refresh` where the skeleton closes the read group with `Refresh`,
@@ -25640,7 +25666,7 @@ renders the themed panel; the caller positions it absolutely. Used by the schema
   above the label, and the scan read the comment as the name); a label is read only from the span
   *before* `move ||`, which is what makes a twelve-line window safe; `let label = if … {"A"} else
   {"B"}` above a constructor is resolved backwards, since an empty label would have excused
-  `Favorite` and the key row's `Edit` from the group check; and only entries pushed into `entries`
+  `Favourite` and the key row's `Edit` from the group check; and only entries pushed into `entries`
   count, because the colour swatches are `MenuEntry`s too — with `entries.extend(create_submenu(…))`
   counted as the `Create ▸` entry it is, or the two arms that write through it would look as though
   they stop at the read group, and `entries.push(export_submenu(…))` counted the same way for the

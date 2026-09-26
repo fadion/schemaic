@@ -407,15 +407,17 @@ pub fn oversize_reason(
 
 /// The levers a chat turn or a Ctrl+K generation has: the schema outline in the
 /// system prompt, and the editor's own text.
-pub const SCHEMA_AND_QUERY_LEVERS: &str = "Narrow Settings → AI → schema scope to the active database (or None), or \
+pub const SCHEMA_AND_QUERY_LEVERS: &str = "Narrow Settings → AI → Schema context to the active database (or None), or \
      shorten the query in the editor.";
 
 /// The levers AI Fill and Seed rows have. Neither of the two above is one: the
 /// schema section is a `CREATE TABLE` skeleton and there is no editor in a grid
 /// context menu. What does work is the connection's data level, below which the
 /// row sample is not sent at all.
-pub const SAMPLE_LEVERS: &str = "Lower this connection's AI data access below Full, which stops the row \
-     sample being sent, or narrow Settings → AI → schema scope.";
+// The settings' own words — "Let it read data", "Schema context" — so the reader
+// can find what the sentence names.
+pub const SAMPLE_LEVERS: &str = "Lower this connection's AI data access below \"Let it read data\", which \
+     stops the row sample being sent, or narrow Settings → AI → Schema context.";
 
 /// **Why this spawn cannot happen, or `None`** — the one pre-spawn verdict, and
 /// what every call site asks.
@@ -480,7 +482,7 @@ pub fn batch_argv_refused(windows: bool, program: &str, args: &[String]) -> bool
 /// **Every prompt this app builds is multi-line by construction.**
 /// `harness::prefixed_prompt` joins the system text and the user's with `\n\n`,
 /// so a harness whose binary resolves to a shim refuses *every* generation:
-/// Ctrl+K, Optimize, Fix with AI and each chat turn.
+/// Ctrl+K, Optimise, Fix with AI and each chat turn.
 /// `a_prefixed_prompt_always_carries_the_newline_that_a_shim_refuses` pins that
 /// coupling, so the day the prompt stops being multi-line this refusal is known
 /// to be dead rather than quietly kept.
@@ -1684,7 +1686,9 @@ mod tests {
             SCHEMA_AND_QUERY_LEVERS,
         )
         .expect("must refuse");
-        assert!(why.contains("schema scope"), "{why}");
+        // The setting by the name its group wears in Settings → AI, so the
+        // reader can find it.
+        assert!(why.contains("Schema context"), "{why}");
         assert!(!why.contains("installed"), "{why}");
     }
 

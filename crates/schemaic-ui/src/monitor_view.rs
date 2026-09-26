@@ -218,8 +218,8 @@ pub(crate) fn monitor_overlay(o: OverlayUi, tab_actions: Rc<TabsActions>) -> imp
             // 14/10 padding, bottom separator) but with a dynamic title string.
             let heading = title
                 .get_untracked()
-                .map(|t| format!("Live Monitor — {t}"))
-                .unwrap_or_else(|| "Live Monitor".to_string());
+                .map(|t| format!("Live monitor — {t}"))
+                .unwrap_or_else(|| "Live monitor".to_string());
             let close_x = close.clone();
             let modal_header = h_stack((
                 text(heading).style(|s| {

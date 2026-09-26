@@ -344,7 +344,7 @@ fn source_step(ctx: &ImportCtx, ring: FocusRing) -> impl IntoView {
     // The first stop in the step, ahead of the Format picker at 10: without it a
     // keyboard user could reach every reading setting and never pick a file,
     // which is the one thing this step is for.
-    let pick = control_button("Choose file…", ring.clone(), 5, move || {
+    let pick = control_button("Choose a file…", ring.clone(), 5, move || {
         let ctx = ctx_pick.clone();
         floem::action::open_file(
             floem::file::FileDialogOptions::new().title("Import into table"),
@@ -1529,6 +1529,10 @@ pub(crate) fn import_overlay(ctx: ImportCtx) -> impl IntoView {
                 }))
             });
 
+            // **No click-away, on purpose**: it holds a column mapping, and while
+            // a load runs a close cancels it — neither is for a stray click. ✕
+            // and Escape close it. See docs/architecture.md, *which modals close
+            // on a backdrop click*.
             focus_root_with_ring(container(panel), root_ring)
                 .on_key_down(
                     Key::Named(NamedKey::Escape),

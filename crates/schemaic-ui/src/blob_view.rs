@@ -980,7 +980,14 @@ pub(crate) fn blob_overlay(b: BlobUi, tab_actions: Rc<TabsActions>) -> impl Into
             .on_click_stop(|_| {})
             .style(move |s| panel_style(s).width(panel_w()));
 
-            focus_root_with_ring(container(panel), ring)
+            // **Click-away closes it**: a loaded replacement is staged into the
+            // grid's own edit buffer the moment it lands, not held here until a
+            // Save, so closing the panel loses nothing — it only cancels a read.
+            let dismiss = {
+                let exit = exit_esc.clone();
+                crate::widgets::dismiss_layer(move || (exit)())
+            };
+            focus_root_with_ring(stack((dismiss, panel)), ring)
                 .on_key_down(
                     Key::Named(NamedKey::Escape),
                     |_| true,

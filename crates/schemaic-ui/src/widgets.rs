@@ -243,7 +243,7 @@ pub(crate) fn blur_dismisses_completion() -> bool {
 /// *deferred* one scheduled before it can tell that it has been overtaken.
 ///
 /// This exists because two of the app's focus moves are both `exec_after(ZERO)`
-/// and both get scheduled by the same gesture. Pick "Optimize" (or any AI fix)
+/// and both get scheduled by the same gesture. Pick "Optimise" (or any AI fix)
 /// off the editor's right-click menu and, in one update pass: the Ctrl+K bar
 /// opens and its prompt field queues [`crate::edit_field`]'s autofocus, and the
 /// menu panel — a [`focus_root`] — is torn down, whose cleanup calls
@@ -1481,7 +1481,8 @@ pub(crate) fn in_focus_ring_with<V: IntoView + 'static>(
 /// the one button in every modal that never joined one — and in the four
 /// footer-less modals (Settings, Terminal settings, AI settings, Shortcuts) it
 /// is the *only* button, so "every modal button goes through `in_ring_button`"
-/// was false in the chrome all fifteen of them wear.
+/// was false in the chrome every modal wears. (The shared error modal is a
+/// fifth when it shows one of Schemaic's own notices, which offers no action.)
 pub(crate) fn modal_title(
     title: &'static str,
     close: Rc<dyn Fn()>,
@@ -3862,7 +3863,7 @@ const MENU_PANEL_BORDER: f64 = 1.0;
 /// schema tree's column menu pushes one and then asks
 /// `overlays::field_entries` whether Edit column and Drop are offered at all — on a
 /// view's column neither is, and what shipped was a rule with nothing under it: an
-/// empty section between "Copy qualified name" and AI Explain. Every conditional
+/// empty section between "Copy qualified name" and AI explain. Every conditional
 /// group in that tree can reach the same shape, so this is the one place it is
 /// fixed.
 pub(crate) fn tidy_separators(entries: Vec<MenuEntry>) -> Vec<MenuEntry> {
@@ -5296,7 +5297,7 @@ pub(crate) fn centered_msg(
 pub(crate) const SPINNER_VERBS: &[&str] = &[
     "Accomplishing",
     "Actioning",
-    "Actualizing",
+    "Actualising",
     "Architecting",
     "Baking",
     "Beaming",
@@ -5313,7 +5314,7 @@ pub(crate) const SPINNER_VERBS: &[&str] = &[
     "Burrowing",
     "Calculating",
     "Canoodling",
-    "Caramelizing",
+    "Caramelising",
     "Cascading",
     "Catapulting",
     "Cerebrating",
@@ -5334,7 +5335,7 @@ pub(crate) const SPINNER_VERBS: &[&str] = &[
     "Crafting",
     "Creating",
     "Crunching",
-    "Crystallizing",
+    "Crystallising",
     "Cultivating",
     "Deciphering",
     "Deliberating",
@@ -5368,7 +5369,7 @@ pub(crate) const SPINNER_VERBS: &[&str] = &[
     "Gitifying",
     "Grooving",
     "Gusting",
-    "Harmonizing",
+    "Harmonising",
     "Hashing",
     "Hatching",
     "Herding",
@@ -5381,7 +5382,7 @@ pub(crate) const SPINNER_VERBS: &[&str] = &[
     "Incubating",
     "Inferring",
     "Infusing",
-    "Ionizing",
+    "Ionising",
     "Jitterbugging",
     "Julienning",
     "Kneading",
@@ -5398,7 +5399,7 @@ pub(crate) const SPINNER_VERBS: &[&str] = &[
     "Mulling",
     "Mustering",
     "Musing",
-    "Nebulizing",
+    "Nebulising",
     "Nesting",
     "Newspapering",
     "Noodling",
@@ -5420,7 +5421,7 @@ pub(crate) const SPINNER_VERBS: &[&str] = &[
     "Propagating",
     "Puttering",
     "Puzzling",
-    "Quantumizing",
+    "Quantumising",
     "Razzmatazzing",
     "Reticulating",
     "Roosting",
@@ -5446,7 +5447,7 @@ pub(crate) const SPINNER_VERBS: &[&str] = &[
     "Swirling",
     "Swooping",
     "Symbioting",
-    "Synthesizing",
+    "Synthesising",
     "Tempering",
     "Thinking",
     "Thundering",
@@ -8643,7 +8644,7 @@ mod menu_placement_tests {
             MenuEntry::action("Duplicate row", || {}),
             MenuEntry::action("Delete row", || {}),
             MenuEntry::Separator,
-            MenuEntry::action_icon("AI summarize", (icons::SPARKLES, theme::key_foreign), || {}),
+            MenuEntry::action_icon("AI summary", (icons::SPARKLES, theme::key_foreign), || {}),
             MenuEntry::action_icon(
                 "Attach 1 column to chat",
                 (icons::SPARKLES, theme::key_foreign),
@@ -9032,7 +9033,7 @@ mod menu_placement_tests {
 /// they open has any entries — the schema tree's column menu pushes one and then
 /// asks `field_entries` whether Edit column and Drop are offered at all, and on a
 /// view's column neither is. What shipped was a rule with nothing under it: an
-/// empty section between "Copy qualified name" and AI Explain. Every conditional
+/// empty section between "Copy qualified name" and AI explain. Every conditional
 /// group in that tree can reach the same shape, so the tidying belongs where rows
 /// become a panel rather than in each arm that might need it.
 #[cfg(test)]
@@ -9063,10 +9064,10 @@ mod menu_separator_tests {
                 act("Copy name"),
                 act("Copy qualified name"),
                 MenuEntry::Separator, // the write group — nothing was offered
-                MenuEntry::Separator, // AI Explain's group
-                act("AI Explain"),
+                MenuEntry::Separator, // AI explain's group
+                act("AI explain"),
             ]),
-            vec!["Copy name", "Copy qualified name", "—", "AI Explain"]
+            vec!["Copy name", "Copy qualified name", "—", "AI explain"]
         );
     }
 
@@ -9078,9 +9079,9 @@ mod menu_separator_tests {
                 MenuEntry::Separator,
                 act("Edit column"),
                 MenuEntry::Separator,
-                act("AI Explain"),
+                act("AI explain"),
             ]),
-            vec!["Copy name", "—", "Edit column", "—", "AI Explain"]
+            vec!["Copy name", "—", "Edit column", "—", "AI explain"]
         );
     }
 
@@ -9142,7 +9143,7 @@ mod menu_separator_tests {
             act("Copy name"),
             MenuEntry::Separator,
             MenuEntry::Separator,
-            act("AI Explain"),
+            act("AI explain"),
         ];
         assert_eq!(
             menu_panel_height(&untidy),
@@ -9557,7 +9558,7 @@ mod ring_tests {
 
     /// **The race the home half then lost.** The workspace's home is deferred
     /// (`grid::refocus_grid` is an `exec_after(ZERO)`), and so is the autofocus of
-    /// a field mounted by the very gesture that closed the overlay — so "Optimize"
+    /// a field mounted by the very gesture that closed the overlay — so "Optimise"
     /// off the editor's right-click menu queued both, and the grid won about one
     /// opening in three, leaving the Ctrl+K bar up with the keyboard behind it.
     ///

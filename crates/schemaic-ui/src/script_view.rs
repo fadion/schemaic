@@ -572,7 +572,7 @@ pub(crate) fn script_overlay(ctx: ScriptCtx) -> impl IntoView {
                 move |running| {
                     let pick_ctx = pick_ctx.clone();
                     crate::widgets::control_button_enabled(
-                        "Choose file…",
+                        "Choose a file…",
                         !running,
                         pick_ring.clone(),
                         TAB_PICK,
@@ -792,6 +792,9 @@ pub(crate) fn script_overlay(ctx: ScriptCtx) -> impl IntoView {
             .on_click_stop(|_| {})
             .style(move |st| panel_style(st).width(panel_w()).height(panel_h()));
 
+            // **No click-away, on purpose**: while the script runs a close
+            // cancels it, which is not for a stray click. ✕ and Escape close it.
+            // See docs/architecture.md, *which modals close on a backdrop click*.
             focus_root_with_ring(container(panel), ring)
                 .on_key_down(
                     Key::Named(NamedKey::Escape),

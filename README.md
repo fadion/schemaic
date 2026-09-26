@@ -109,7 +109,7 @@ intelligence, built to feel instant.
 - **Import** — load CSV / TSV / JSON (array or JSON Lines) / Excel `.xlsx` into a
   table, with column mapping and a full validation pass that reports every
   problem, with its line number, before a single row is written.
-- **Navigate** — schema browser with favorites, table sizes and a properties panel
+- **Navigate** — schema browser with favourites, table sizes and a properties panel
   that marks an estimate as an estimate rather than dressing it up as a count (the
   two server engines; SQLite keeps no such statistics), query history, `EXPLAIN`
   query plans, and a global "find anywhere" for schema objects. The ER diagram
@@ -122,7 +122,7 @@ intelligence, built to feel instant.
   TLS from *prefer* through *verify-full* (client certificates included, verified
   against the OS trust store rather than a root set compiled in years ago), and
   SQLite by picking a file (no server, so no host, credentials or tunnel to fill
-  in). Per-connection colors, environment badges, and a read-only guard-rail on
+  in). Per-connection colours, environment badges, and a read-only guard-rail on
   all of them. Coming from another client, you can import the servers you already
   have — a pasted URL or DSN, DBeaver, DataGrip, `~/.my.cnf`, `~/.pgpass`,
   `~/.pg_service.conf` — as a proposal you review row by row. Where a source keeps
@@ -135,18 +135,20 @@ intelligence, built to feel instant.
   and `.read` land where you'd expect.
 - **AI assistant** — an agent-CLI session wired into the app rather than bolted
   beside it, driving **your own** installed CLI — Claude Code, Codex,
-  Antigravity or OpenCode — picked in Settings → AI with the model id and
-  reasoning effort, and never started on a binary Schemaic could not confirm it
-  can restrict. Fix a failed query from its error, rewrite the statement under
+  Antigravity, OpenCode, GitHub Copilot or Cursor — picked in Settings → AI with
+  the model id and reasoning effort, and never started on a binary Schemaic
+  could not confirm it can restrict. (Cursor is held by a permissions file
+  Schemaic writes rather than a sandbox, and the panel says so.) Fix a failed
+  query from its error, rewrite the statement under
   the caret and accept or reject the diff (Ctrl+K, Cmd+K on macOS), explain or
-  optimize it, ask about an `EXPLAIN` plan, summarize a column or a value, or
+  optimise it, ask about an `EXPLAIN` plan, summarise a column or a value, or
   generate realistic rows for a table from the shape of the data already in it.
   A built-in MCP server lets it read your schema and query the database, so
   answers are about your data rather than a generic guess — and it proposes a
   table change as a patch that lands in the same preview any hand edit does,
   never as SQL run behind your back. How much it may see is set **per
   connection**: schema only, on request, or full.
-- **Themeable** — dark / light UI themes, multiple editor color schemes, and an
+- **Themeable** — dark / light UI themes, multiple editor colour schemes, and an
   interface scale (80% / 100% / 130% / 160%) for the app's own text and rows.
 
 ### Accessibility
@@ -443,7 +445,7 @@ Arch:
 sudo pacman -S --needed libxkbcommon wayland libxcb libx11 pkgconf
 ```
 
-## License
+## Licence
 
 MIT — see [LICENSE](LICENSE). Third-party notices are in
 [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md).

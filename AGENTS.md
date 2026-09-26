@@ -234,6 +234,15 @@ start with a failing test, then the code that makes it pass.
   odd one out, which is why it kept having to be corrected after the fact.
   `source_gate::no_menu_label_ends_in_an_ellipsis` now fails on a literal label that carries one;
   a label built at run time it cannot see.
+- **British spelling in everything a user reads** — labels, menus, hints, notices, prompts the app
+  sends as the user's message, README: *colour*, *favourite*, *optimise*, *summarise*, *analysed*,
+  *licence* (the noun). Mixed spelling was reported as confusing. Three things keep the US form on
+  purpose: a **SQL keyword** (`ANALYZE`, `OPTIMIZE`, `MATERIALIZED`, and the plan modal's
+  *Analyze* toggle that names `EXPLAIN ANALYZE`); **third-party text** quoted verbatim (PostgreSQL's
+  function descriptions in `pg_builtins.rs`, which a live test compares to the server's; SQLite's
+  *tokenizer*); and **persisted names** — serde keys and file names like `color`,
+  `prominent_color`, `favorites.json`, `db_colors.json` — which saved data already uses.
+  Identifiers are code, not prose, and keep whatever they have.
 
 ## Never bulk-rewrite source with a script
 

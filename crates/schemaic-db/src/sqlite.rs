@@ -200,8 +200,8 @@ fn is_lock_failure(e: &rusqlite::Error) -> bool {
 /// test can reach.
 fn open(db: &Db) -> Result<SqliteConn, DbError> {
     // The `cfg` is an **argument**, not a branch. The refusal used to sit in a
-    // `#[cfg(not(test))]` block, and `schemaic-db` has no `tests/` directory —
-    // so no build in the workspace contained the guard, and deleting it left the
+    // `#[cfg(not(test))]` block, and `schemaic-db` had no `tests/` directory then
+    // — so no build in the workspace contained the guard, and deleting it left the
     // suite green. See [`open_target`].
     let target = open_target(&db.file, cfg!(test))?;
     #[allow(unused_mut)]
@@ -4952,7 +4952,7 @@ mod tests {
     /// **The whole of `open`'s boundary, including its wiring.**
     ///
     /// The URI refusal used to live in a `#[cfg(not(test))]` block, and
-    /// `schemaic-db` has no `tests/` directory — so there was no build anywhere
+    /// `schemaic-db` had no `tests/` directory then — so there was no build anywhere
     /// in the workspace in which `open` contained the guard. Deleting the four
     /// lines left the suite green and the app back to opening
     /// `file:vanish?mode=memory` as a scratch database that accepts every write

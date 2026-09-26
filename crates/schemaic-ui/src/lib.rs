@@ -8121,7 +8121,7 @@ pub fn right_panel_visible() -> bool {
 }
 
 /// Reveal the AI panel before sending it a message — every "Ask AI" / "AI
-/// Explain" / "AI Summary" entry point goes through here.
+/// explain" / "AI summary" entry point goes through here.
 ///
 /// Two things it gets right that a bare `set(Ai)` does not. **`RwSignal::set`
 /// never dedups**, so setting `Ai` while the AI panel is *already* open notifies
@@ -8131,7 +8131,7 @@ pub fn right_panel_visible() -> bool {
 /// narrow for the right column the panel is locked away, so revealing it means
 /// changing a signal that nothing will show.
 ///
-/// The schema tree's **AI Explain** didn't reveal at all: with the right column
+/// The schema tree's **AI explain** didn't reveal at all: with the right column
 /// on Terminal, History or closed, it sent the prompt into a panel the user
 /// couldn't see and looked like it had done nothing.
 pub(crate) fn reveal_ai_panel(right_panel: RwSignal<RightPanel>) {
@@ -8749,7 +8749,7 @@ fn center(ui: Ui) -> impl IntoView {
         }
         (id, failed)
     });
-    // Reveal the AI panel + send a message (the grid cell "AI Summary" builds a
+    // Reveal the AI panel + send a message (the grid cell "AI summary" builds a
     // context-rich prompt itself, so this just reveals + forwards).
     let summarize: Rc<dyn Fn(String)> = {
         let ai = ai_send.clone();
@@ -9261,7 +9261,7 @@ fn results_section(
                 (open_monitor)(monitor_conn.get_untracked(), src);
             }
         })
-        .tooltip(|| text("Live Monitor…").style(widgets::tooltip_style))
+        .tooltip(|| text("Live monitor…").style(widgets::tooltip_style))
     };
     let toggle_btn = dyn_container(
         move || editor_collapsed.get(),
@@ -11912,7 +11912,7 @@ fn footer_seg_fits(edge: f64, ai_x: f64, gap: f64) -> bool {
 /// pill, Commit and Rollback all vanish, freeing ~150px, while CPU and RAM stay
 /// hidden against an edge frozen at a layout that no longer exists. Switching to
 /// a SQLite connection (which hides `mode_seg` outright) and any left-hand
-/// segment that narrows — "Write mode" → "Read only", "Spaces: 4" → "Tabs: 4" —
+/// segment that narrows — "Write mode" → "Read-only", "Spaces: 4" → "Tabs: 4" —
 /// are the same way in.
 /// May a hidden segment re-predict its edge and come back?
 ///
@@ -12393,7 +12393,7 @@ fn footer(ui: Ui) -> impl IntoView {
     let ro_seg = dyn_container(
         move || read_only.get(),
         move |ro| {
-            text(if ro { "Read only" } else { "Write mode" })
+            text(if ro { "Read-only" } else { "Write mode" })
                 .style(|s| s.font_size(theme::font_status()))
                 .into_any()
         },

@@ -92,6 +92,10 @@ pub(crate) fn conn_import_overlay(
             .on_click_stop(|_| {})
             .style(|s| panel_style(s).width(modal_w(560.0)).height(modal_h(520.0)));
 
+            // **No click-away, on purpose**: the ticked list is the user's work
+            // and nothing is written until Import, so a stray click must not
+            // discard it — ✕ and Escape close it. See docs/architecture.md,
+            // *which modals close on a backdrop click*.
             focus_root_with_ring(container(panel), ring)
                 .on_key_down(
                     Key::Named(NamedKey::Escape),

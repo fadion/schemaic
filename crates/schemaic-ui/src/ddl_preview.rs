@@ -1240,7 +1240,15 @@ pub(crate) fn ddl_preview_overlay(
             .on_click_stop(|_| {})
             .style(|s| panel_style(s).width(panel_w()).height(modal_h(PANEL_H)));
 
-            focus_root_with_ring(container(panel), root_ring)
+            // **Click-away closes it**, unlike the editors it previews: nothing
+            // here is the only copy of anything — the plan is regenerated from
+            // the editor left open behind it — and `exit` already ignores the
+            // one dangerous moment, an apply that cannot be cancelled.
+            let dismiss = {
+                let exit = exit.clone();
+                crate::widgets::dismiss_layer(move || exit())
+            };
+            focus_root_with_ring(stack((dismiss, panel)), root_ring)
                 .on_key_down(Key::Named(NamedKey::Escape), |_| true, {
                     let exit = exit.clone();
                     move |_| exit()

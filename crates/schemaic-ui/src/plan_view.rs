@@ -470,7 +470,7 @@ fn ask_ai(
     let engine = dialect.engine_label();
     let msg = format!(
         "Here is the {engine} EXPLAIN plan for a query. Explain what it's \
-         doing, then suggest concrete optimizations — indexes to add, or query \
+         doing, then suggest concrete optimisations — indexes to add, or query \
          rewrites — to make it faster.\n\nQuery:\n```sql\n{sql}\n```\n\nEXPLAIN \
          output:\n```\n{}\n```",
         plan.to_prompt_text()

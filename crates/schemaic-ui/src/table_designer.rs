@@ -2435,6 +2435,9 @@ pub(crate) fn table_designer_overlay(d: DdlUi, overlay_ui: OverlayUi) -> impl In
             .on_click_stop(|_| {})
             .style(|s| panel_style(s).width(panel_w()).height(modal_h(PANEL_H)));
 
+            // **No click-away, on purpose**: the draft has no other copy, and a
+            // stray click must not discard it — ✕ and Escape close it. See
+            // docs/architecture.md, *which modals close on a backdrop click*.
             focus_root_with_ring(container(panel), root_ring)
                 .on_key_down(Key::Named(NamedKey::Escape), |_| true, move |_| close())
                 .style(|s| {

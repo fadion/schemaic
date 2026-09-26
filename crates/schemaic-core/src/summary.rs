@@ -115,7 +115,7 @@ pub fn cell_prompt(
     // own ``` can't close the block and continue as prose, and labelled so the
     // assistant knows which parts are data rather than instruction.
     let mut out = format!(
-        "Summarize this value from the `{column}` column{from} (type `{type_name}`). \
+        "Summarise this value from the `{column}` column{from} (type `{type_name}`). \
          {}\n{}",
         prompt::UNTRUSTED_NOTE,
         prompt::fenced(value)

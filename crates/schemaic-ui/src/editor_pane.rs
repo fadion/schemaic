@@ -856,7 +856,7 @@ fn cmdk_popup(
         })
 }
 
-/// What "Optimize" actually asks the model, as opposed to the two-word label the
+/// What "Optimise" actually asks the model, as opposed to the two-word label the
 /// prompt box shows. One constant, because the launch and a **retry** of it have
 /// to send the same thing — see [`CmdK::intent`].
 const OPTIMIZE_INTENT: &str = "Rewrite this SQL query to be more efficient and readable while \
@@ -1163,7 +1163,7 @@ pub(crate) struct CmdkEditorKeys {
 /// the editor's own lines anyway.
 ///
 /// `Busy` is the one this used to miss. A request is not always started from the
-/// field — "Optimize", and the error bar's *Fix with AI*, open the bar already
+/// field — "Optimise", and the error bar's *Fix with AI*, open the bar already
 /// `Busy` from a menu the user clicked, and the editor keeps the keyboard. So
 /// Escape reached this handler, matched no branch, and the only way out of a
 /// running request was the mouse: it closed the bar while prompting (the field
@@ -2214,7 +2214,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
     // off the bottom of the pane. Declared up here because the editor's own key
     // handler — built below — needs it to scroll the prompt into view.
     let area_h: RwSignal<f64> = RwSignal::new(EDITOR_H);
-    // Right-click editor menu (Ask AI / Explain / Optimize). It's routed through
+    // Right-click editor menu (Ask AI / Explain / Optimise). It's routed through
     // the app-wide `popup_menu` overlay (rendered at the workspace root) so it
     // floats *over* the results pane instead of being clipped by the editor area,
     // and only edge-flips against the window. `menu_offset` is the caret offset
@@ -2256,7 +2256,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
         }
     });
 
-    // The DataGrip-style border around the statement picked by Explain / Optimize
+    // The DataGrip-style border around the statement picked by Explain / Optimise
     // / Run Current: the byte range of that statement, or None. Cleared on any
     // edit or click in the editor (see below). Defined here (above the editor) so
     // the Ctrl+Enter key handler can set it.
@@ -3334,7 +3334,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
         });
     }
 
-    // Builds the right-click menu entries (Ask AI / Explain / Optimize) for the
+    // Builds the right-click menu entries (Ask AI / Explain / Optimise) for the
     // app-wide `popup_menu` overlay. Rebuilt per right-click; each action reads
     // `menu_offset` (the caret the right-click landed on) lazily, so it scopes to
     // the statement there. `menu_panel` auto-closes after an action runs.
@@ -3435,7 +3435,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                     },
                 ),
                 MenuEntry::action_icon(
-                    "Optimize",
+                    "Optimise",
                     (icons::SPARKLES, theme::key_foreign),
                     move || {
                         let sql = query.get_untracked();
@@ -3463,11 +3463,11 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                                 .cursor
                                 .update(|cc| cc.set_insert(Selection::region(lo, hi)));
                             anchor_cmdk(&ed_opt, cmdk, hi, area_h);
-                            cmdk.input.set("Optimize this query".to_string());
+                            cmdk.input.set("Optimise this query".to_string());
                             // The box shows a label; the instruction below is
                             // what the model is actually sent, retry included.
                             cmdk.intent.set(Some((
-                                "Optimize this query".to_string(),
+                                "Optimise this query".to_string(),
                                 OPTIMIZE_INTENT.to_string(),
                             )));
                             inline_ai.set(InlineAiState::Busy);
@@ -4685,7 +4685,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
         })
     };
 
-    // DataGrip-style border around the statement picked by Explain/Optimize.
+    // DataGrip-style border around the statement picked by Explain/Optimise.
     // Click-through (`pointer_events(false)`) so clicks reach the editor (which
     // clears the highlight); a thin absolute box per line the statement touches.
     // The two strips finishing the diff's bands — over the gutter and over the
@@ -6264,7 +6264,7 @@ mod inline_pane_tests {
         assert!(landed.draw && landed.freeze && landed.focus);
     }
 
-    /// **The reported bug.** "Optimize" and *Fix with AI* open the bar already
+    /// **The reported bug.** "Optimise" and *Fix with AI* open the bar already
     /// `Busy` from a menu click, so the editor still holds the keyboard — and the
     /// editor's Escape branch was gated on `Ready`. Escape closed the bar while
     /// prompting and while previewing a diff, and did nothing at all in between,
@@ -7205,11 +7205,11 @@ mod geometry_tests {
 /// What it pins is what every way of opening the Ctrl+K bar owes the user before
 /// it opens: the range it is about, **selected**, and the bar **anchored** under
 /// that range. There are four entry points — the key itself, *Ask AI*,
-/// *Optimize*, and `fix_with_ai` (three menus of its own) — and each was written
+/// *Optimise*, and `fix_with_ai` (three menus of its own) — and each was written
 /// separately, which is exactly the shape the doc's own warning about
 /// `set_menu_return` describes.
 ///
-/// *Optimize* is why it is here. It set neither, and the two symptoms did not
+/// *Optimise* is why it is here. It set neither, and the two symptoms did not
 /// look like one bug: with nothing selected, the in-flight fade over the acted-on
 /// lines was the only sign of what was about to be rewritten — so the same
 /// gesture that reads as "this statement" everywhere else read as "the editor has
