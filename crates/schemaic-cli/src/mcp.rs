@@ -269,8 +269,32 @@ where
         if line.is_empty() {
             continue;
         }
-        let Ok(req) = serde_json::from_str::<Value>(line) else {
-            continue;
+        // **Not a request is still owed an answer.** A line that does not
+        // parse, or parses to something other than an object (a batch — no
+        // served revision accepts one), got nothing at all, and the client
+        // waited on its id to its own timeout. JSON-RPC's reply has a null id,
+        // since none could be read; the session goes on.
+        let refused = match serde_json::from_str::<Value>(line) {
+            Ok(req) if req.is_object() => Ok(req),
+            Ok(_) => Err((
+                INVALID_REQUEST,
+                "Invalid Request: expected one JSON-RPC object",
+            )),
+            Err(_) => Err((PARSE_ERROR, "Parse error: the line is not JSON")),
+        };
+        let req = match refused {
+            Ok(req) => req,
+            Err((code, message)) => {
+                eprintln!("schemaic mcp: {message}");
+                let msg = json!({
+                    "jsonrpc": "2.0",
+                    "id": Value::Null,
+                    "error": { "code": code, "message": message }
+                });
+                let _ = stdout.write_all(format!("{msg}\n").as_bytes()).await;
+                let _ = stdout.flush().await;
+                continue;
+            }
         };
         let id = req.get("id").cloned();
         let method = req.get("method").and_then(|m| m.as_str()).unwrap_or("");
@@ -335,6 +359,10 @@ where
 
 /// JSON-RPC 2.0's code for a method the server does not implement.
 const METHOD_NOT_FOUND: i64 = -32601;
+/// JSON-RPC's code for a line that is not JSON.
+const PARSE_ERROR: i64 = -32700;
+/// JSON-RPC's code for JSON that is not one request object.
+const INVALID_REQUEST: i64 = -32600;
 
 /// The tools this server offers — **the set, as a type**.
 ///
@@ -1779,9 +1807,13 @@ mod tests {
     /// Drive the real serve loop over `input`, and parse every line it wrote.
     /// No request here reaches the database, so the handle is never dialled.
     async fn exchange(input: &[u8]) -> Vec<serde_json::Value> {
-        let endpoint = standalone(None);
+        exchange_on(&standalone(None), input).await
+    }
+
+    /// [`exchange`] against a given endpoint.
+    async fn exchange_on(endpoint: &super::Endpoint, input: &[u8]) -> Vec<serde_json::Value> {
         let mut out = Vec::new();
-        super::serve_on(&endpoint, input, &mut out).await;
+        super::serve_on(endpoint, input, &mut out).await;
         String::from_utf8(out)
             .expect("the server writes UTF-8")
             .lines()
@@ -1808,6 +1840,104 @@ mod tests {
         assert!(got[0].get("result").is_none(), "{}", got[0]);
         assert_eq!(got[1]["id"], 8);
         assert_eq!(got[1]["result"], serde_json::json!({}));
+    }
+
+    /// **A line that is not a request is answered, not swallowed.** A
+    /// truncated line and a batch (neither served revision accepts one) got
+    /// no reply at all, so the client waited on its id to its own timeout and
+    /// then marked the server failed, with nothing on stderr to say why.
+    /// JSON-RPC's answer is an error with a null id; the session goes on.
+    #[tokio::test]
+    async fn a_line_that_is_not_a_request_is_answered_with_an_error() {
+        let got = exchange(
+            b"{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/list\"\n\
+              [{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}]\n\
+              {\"jsonrpc\":\"2.0\",\"id\":9,\"method\":\"ping\"}\n",
+        )
+        .await;
+        assert_eq!(got.len(), 3, "{got:?}");
+        assert_eq!(got[0]["error"]["code"], -32700, "{}", got[0]);
+        assert_eq!(got[0]["id"], serde_json::Value::Null);
+        assert_eq!(got[1]["error"]["code"], -32600, "{}", got[1]);
+        assert_eq!(got[1]["id"], serde_json::Value::Null);
+        assert_eq!(got[2]["id"], 9);
+        assert_eq!(got[2]["result"], serde_json::json!({}));
+    }
+
+    /// An endpoint on a SQLite file that does not exist: a call the gate
+    /// wrongly lets through fails at once on the missing file, rather than
+    /// dialling a server.
+    fn unreachable(samples: bool, schema: bool, host: super::Host) -> super::Endpoint {
+        let db = schemaic_db::Db::from_parts(
+            schemaic_db::Engine::Sqlite,
+            String::new(),
+            0,
+            String::new(),
+            String::new(),
+            "no-such-file-5e1b9c.sqlite".to_string(),
+        );
+        super::Endpoint {
+            db,
+            database: None,
+            samples,
+            hidden: Default::default(),
+            schema,
+            host,
+        }
+    }
+
+    /// One `tools/call`'s text and `isError`, through the real serve loop.
+    async fn call(endpoint: &super::Endpoint, tool: &str, args: &str) -> (String, bool) {
+        let line = format!(
+            "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\
+             \"params\":{{\"name\":\"{tool}\",\"arguments\":{args}}}}}\n"
+        );
+        let got = exchange_on(endpoint, line.as_bytes()).await;
+        assert_eq!(got.len(), 1, "{got:?}");
+        let r = &got[0]["result"];
+        (
+            r["content"][0]["text"].as_str().unwrap_or("").to_string(),
+            r["isError"].as_bool().unwrap_or(false),
+        )
+    }
+
+    /// **The gate on the call, through the call.** `refusal_for` is tested on
+    /// its own; its composition with `call_tool` — which endpoint field is
+    /// passed as which argument, and the `Host` — was not, so forcing
+    /// `Host::Panel` at the call site kept the suite green while a standalone
+    /// client working from a stale tool list reached `propose_table_change`.
+    #[tokio::test]
+    async fn a_standalone_call_to_a_withheld_tool_is_refused_by_the_server() {
+        let ep = unreachable(false, true, super::Host::Standalone);
+        assert_eq!(
+            call(&ep, "run_query", r#"{"sql":"SELECT 1"}"#).await,
+            (super::NO_DATA_ACCESS_STANDALONE.to_string(), true)
+        );
+        assert_eq!(
+            call(
+                &ep,
+                "propose_table_change",
+                r#"{"table":"t","request":"x"}"#
+            )
+            .await,
+            (super::NO_PANEL.to_string(), true)
+        );
+    }
+
+    /// And the two levels are not crossed on the way in: a panel endpoint
+    /// that may read rows but not schema refuses the schema tool.
+    #[tokio::test]
+    async fn a_call_is_gated_by_its_own_level_not_the_others() {
+        let ep = unreachable(true, false, super::Host::Panel);
+        assert_eq!(
+            call(&ep, "list_schema", "{}").await,
+            (super::NO_SCHEMA_ACCESS.to_string(), true)
+        );
+        let ep = unreachable(false, true, super::Host::Panel);
+        assert_eq!(
+            call(&ep, "run_query", r#"{"sql":"SELECT 1"}"#).await,
+            (super::NO_DATA_ACCESS.to_string(), true)
+        );
     }
 
     /// **A line that is not UTF-8 is skipped, not the end of the session.**

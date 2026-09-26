@@ -21765,7 +21765,18 @@ existing prose was left alone.
     (`METHOD_NOT_FOUND`, "Method not found: <method>") when the request carries an id, and nothing
     at all for a notification. It was `{"result": {}}`, which reads as success: `resources/list`
     answered that way has no `resources`, and a strict client fails its own schema check and marks
-    the whole server broken (`an_unknown_method_is_method_not_found`). **The handshake speaks
+    the whole server broken (`an_unknown_method_is_method_not_found`). **A line that is not a
+    request is answered too**: one that does not parse is `-32700` and JSON that is not one object —
+    a batch among it — is `-32600`, each with a null id (none could be read) and a note on stderr,
+    and the session goes on. Both got no reply at all, so the client waited on its id to its own
+    timeout and marked the server failed with nothing to say why
+    (`a_line_that_is_not_a_request_is_answered_with_an_error`). **The call is gated by the server,
+    not only the listing**, and that composition has tests of its own through the serve loop —
+    `a_standalone_call_to_a_withheld_tool_is_refused_by_the_server` and
+    `a_call_is_gated_by_its_own_level_not_the_others`, on an endpoint whose SQLite file does not
+    exist so a call wrongly let through fails at once — because `refusal_for` alone was tested, and
+    forcing `Host::Panel` or swapping the two levels at `call_tool`'s call site kept the suite
+    green. **The handshake speaks
     `2025-06-18` and `2024-11-05`** (`SUPPORTED_PROTOCOLS`, newest first). The newer one costs a
     stdio, tools-only server nothing: its breaking changes are HTTP's and the removal of batching,
     and all it adds is optional. `2025-03-26` is left out on purpose — it *requires* accepting
