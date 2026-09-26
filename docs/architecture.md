@@ -238,6 +238,18 @@ existing prose was left alone.
     *Explain* would be about something else (`schemaics_own_notice_offers_neither_action`). The
     actions are a `match` rather than `!= App`, so a fourth source has to decide its own rather
     than land on whichever side of a comparison it happens to fall.
+    **`ModalError::worth_viewing(fits_chars)` is the grid bar's *View* condition**: offered when
+    one-lining to `fits_chars` hid something (`text::hides_detail`) *or* when the modal has an
+    action the bar does not — and the second half is asked of `resolve` rather than restated, so
+    the bar and the modal cannot disagree about what the modal offers. It used to be `hides_detail`
+    alone, so a one-line commit failure — the server's words, which the modal offers *Explain* on —
+    had no way into the modal at all; a short notice of Schemaic's own still gets no *View*, since
+    it would open a modal repeating the bar with nothing to do about it
+    (`a_short_notice_of_schemaics_own_is_not_worth_viewing`). **`CommitDone::Failed` carries a
+    `ModalError`, not a `String`**, because the one channel carries both the server's refusal and
+    Schemaic's own ("Not connected — the commit was not attempted") and only the producer knows
+    which; `settle_after_switch` passes it through untouched, source and all
+    (`a_failure_survives_a_switch_unchanged` checks both).
   - `aggregate.rs` — what a multi-cell grid selection adds up to (`aggregate` → `Aggregates` +
     `summary`). The arithmetic is **fixed-point, not `f64`**, and that is the whole reason the
     module has substance: `Column::is_numeric` counts `DECIMAL`/`NUMERIC`, while `Value` leaves
@@ -16395,9 +16407,9 @@ existing prose was left alone.
     over an `error_modal_text` override its surface marked `ErrorSource::Statement` — never over a
     `Server` one (a commit error, a server that didn't answer) or an `App` notice, neither of which
     is anything the editor can rewrite (`core::model::ErrorModalContent::resolve`). No surface
-    marks one `Statement` today — the grid bar hands the modal `ModalError::server` on both of its
-    errors, since a commit and a re-run are not statements in the buffer — so in practice the fix is
-    the fallback's alone. It has to route
+    marks one `Statement` today — the grid bar hands the modal `Server` for a failed commit or
+    re-run and `App` for its own notices, since neither a commit nor a re-run is a statement in the
+    buffer — so in practice the fix is the fallback's alone. It has to route
     through a request signal at all because `CmdK` is created inside `query_pane` and never leaves
     it, so the workspace-level modal has no handle to reach it with — and that signal **carries the
     message**, because the modal shows the error it opened on while a run landing behind it moves
@@ -26537,9 +26549,12 @@ this bundle's.
   didn't happen looked like one that did nothing. The JSON tree's own parse errors go the same way,
   and it keeps a **red outline** on the box meanwhile: the bar says what, the outline says *which
   field* — which is also why that editor still owns the error signal it mirrors into the bar (and
-  takes back only its own message). The bar's **View** is offered per `text::hides_detail`, i.e.
+  takes back only its own message). The bar's **View** is offered per `ModalError::worth_viewing`,
+  and both of this panel's own refusals — a value `rowjson::update_changes` can't read, the JSON
+  tree's parse error — are `ModalError::app`, for which that comes down to `text::hides_detail`:
   only when one-lining actually hid something; a parse error repeated verbatim in a modal is a
-  button that does nothing. The panel is capped at **70% of the results area**
+  button that does nothing. A save the server refused is its `Server` words and gets **View** for
+  the modal's *Explain*. The panel is capped at **70% of the results area**
   (`edit_row_max`, measured on resize) and that cap sits on the panel's own column, so the field
   list is what shrinks and scrolls; the grid above drops its `min_height` floor while the panel is
   open, since flexbox honours a min-height over a sibling's size and the two together overflowed the
@@ -26551,7 +26566,8 @@ this bundle's.
   **Save commits immediately** (its own path, not the staged `dirty` batch): `flush_fields` →
   `field_state` → `rowjson::update_changes` → `build_row_edits` (one `RowEdit` per base table, WHERE
   key from the *original* row) + a single-row `build_row_refetch` → the existing `CommitFn`; on
-  success the row splices in place and the panel closes, on failure the message stays inline.
+  success the row splices in place and the panel closes, on failure the panel stays open and the
+  message goes to `commit_err`, the bottom bar, like the panel's other errors (above).
   **`flush_fields` is not optional**: clicking Save doesn't blur the field being typed into (floem
   moves focus on a pointer-down only for a `keyboard_navigable` view), so an editor holding a buffer
   of its own — the JSON tree's open leaf — has to be asked to commit before the write is assembled;
@@ -26827,11 +26843,25 @@ this bundle's.
   statement's to the panel bar (`batch_err`), because `run_all` cleared the tab's `results` and left
   a batch with no editor bar to fall back on. Once **every** result became a panel the two were the
   same value, and the pair drew the same error twice — so `batch_err` is gone and `grid_error_bar`
-  now reports only on what the *grid* did: a commit, a filter re-run, an export. None of those is a
+  now reports only on what the *grid* did: a commit, a filter re-run (an export's state moved to
+  the export modal — see the export bullet below). None of those is a
   statement in the buffer, which is why `BarState::Error` no longer carries a `fixable` flag — it
-  was `false` on every error once the batch arm left — and its **View** shows only when
-  `text::hides_detail` says one-lining hid something, and always hands the modal
-  `ModalError::server`.
+  was `false` on every error once the batch arm left — and its **View** shows when
+  `ModalError::worth_viewing` says so and hands the modal the `ModalError` exactly as it was set.
+  **The source is chosen where each error is produced, not by the bar**, because `commit_err` and
+  `view_err` (`RwSignal<Option<ModalError>>` on `GridState`, `GridCtx`, `BarSignals` and
+  `Tab::view_err`) carry both speakers. `Server`: `commit_writes`' error — the one-row net's
+  verdict included, which describes the server's answer — and a view re-run's
+  `QueryState::Failed`. `App`: a `commit_writes` that ended in `DbError::Cancelled` (the user
+  stopped it, and "query cancelled" has nothing in it to explain), a paste that landed nothing,
+  the row panel's and the JSON editor's
+  refusals, AI fill/seed failures, the filter row's three refusals (a `BadCondition` is
+  `sqlparser`'s reading of the typed condition, not the database's), the `db_for`/`session_for`
+  refusals in the commit path and in the view re-run's `fail` closure, and the "Not connected —
+  the commit was not attempted" gate. The bar used to hard-code `ModalError::server` on all of
+  them, so *Explain* was offered on Schemaic's own notices, while its *View* keyed on
+  `hides_detail` alone kept a one-line commit failure — the error *Explain* is for — out of the
+  modal entirely.
   The editor bar keys on a `Memo<Option<String>>` of the message rather than on the `QueryState`
   itself: the shown result is derived from the panel list, so every write to it — each statement of
   a batch landing, a pin, a filter re-run restating its panel — reaches that container, and

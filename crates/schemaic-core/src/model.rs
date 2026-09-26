@@ -1709,7 +1709,10 @@ pub enum CommitDone {
     /// failed) — the grid is being rebuilt from fresh results, so it does nothing.
     FullReran,
     /// The commit failed; the message is shown and the staged edits are kept.
-    Failed(String),
+    /// A [`ModalError`] because the same channel carries the server's refusal
+    /// and Schemaic's own ("Not connected — the commit was not attempted"),
+    /// and only the producer knows which.
+    Failed(ModalError),
 }
 
 /// What a commit reports once the tab it targeted may have moved on, and
@@ -1790,6 +1793,17 @@ impl ModalError {
     }
     pub fn app(text: impl Into<String>) -> Self {
         Self::new(text, ErrorSource::App)
+    }
+    /// Whether a one-line bar showing this error should offer "View": when
+    /// cutting it to `fits_chars` on one line hid something, **or** when the
+    /// modal has an action the bar does not. Asked of
+    /// [`ErrorModalContent::resolve`] rather than restated, so the bar and the
+    /// modal cannot disagree about what the modal offers. On one of Schemaic's
+    /// own short notices it would open a modal repeating the bar's words with
+    /// nothing to do about them.
+    pub fn worth_viewing(&self, fits_chars: usize) -> bool {
+        let c = ErrorModalContent::resolve(Some(self.clone()), None);
+        c.explain.is_some() || c.fix.is_some() || crate::text::hides_detail(&self.text, fits_chars)
     }
     fn new(text: impl Into<String>, source: ErrorSource) -> Self {
         Self {
@@ -1878,6 +1892,24 @@ mod tests {
         assert_eq!(c.shown.as_deref(), Some("Deadlock found"));
         assert_eq!(c.explain.as_deref(), Some("Deadlock found"));
         assert_eq!(c.fix, None);
+    }
+
+    #[test]
+    fn a_short_server_error_is_worth_viewing_for_its_explain() {
+        assert!(ModalError::server("Deadlock found").worth_viewing(80));
+    }
+
+    #[test]
+    fn a_short_notice_of_schemaics_own_is_not_worth_viewing() {
+        // The modal would repeat the bar's words with nothing to do about them.
+        assert!(!ModalError::app("Pasted nothing.").worth_viewing(80));
+    }
+
+    #[test]
+    fn a_notice_the_bar_has_to_cut_is_worth_viewing_for_its_text() {
+        assert!(ModalError::app("line one\nline two").worth_viewing(80));
+        assert!(ModalError::app("x".repeat(81)).worth_viewing(80));
+        assert!(!ModalError::app("x".repeat(80)).worth_viewing(80));
     }
 
     #[test]
@@ -3336,16 +3368,21 @@ mod tests {
     }
 
     /// A failure is a failure whether or not the user switched: the message is
-    /// still true and the staged edits are still there to retry.
+    /// still true and the staged edits are still there to retry. Its source
+    /// comes through too, or the modal behind the bar would answer for the
+    /// wrong speaker.
     #[test]
     fn a_failure_survives_a_switch_unchanged() {
         for still_active in [true, false] {
-            let (refetch, out) = settle_after_switch(
-                still_active,
-                CommitDone::Failed("deadlock found".to_string()),
-            );
-            assert!(!refetch);
-            assert!(matches!(out, CommitDone::Failed(m) if m == "deadlock found"));
+            for failed in [
+                ModalError::server("deadlock found"),
+                ModalError::app("Not connected — the commit was not attempted."),
+            ] {
+                let (refetch, out) =
+                    settle_after_switch(still_active, CommitDone::Failed(failed.clone()));
+                assert!(!refetch);
+                assert!(matches!(out, CommitDone::Failed(m) if m == failed));
+            }
         }
     }
 
@@ -3357,7 +3394,7 @@ mod tests {
         let every = [
             CommitDone::FullReran,
             spliced(),
-            CommitDone::Failed("x".into()),
+            CommitDone::Failed(ModalError::server("x")),
         ];
         for outcome in every {
             let asks = settle_after_switch(true, outcome.clone()).0;

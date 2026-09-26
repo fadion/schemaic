@@ -2037,7 +2037,7 @@ pub struct Tab {
     /// A filter/sort re-run's DB error, shown as a dismissible bar at the bottom of
     /// the *table* (the previous results stay put — unlike a manual run, which
     /// replaces the grid with the error). Cleared on a table click / new run.
-    pub view_err: RwSignal<Option<String>>,
+    pub view_err: RwSignal<Option<schemaic_core::model::ModalError>>,
     /// True while a **view re-run** is in flight — the filter/sort splice, and the
     /// capped notice's "read all rows".
     ///
@@ -13342,7 +13342,8 @@ mod result_panel_tab_tests {
             q.sort = vec![("id".to_string(), true)];
         });
         t.row_cap_override.set(Some(1_000_000));
-        t.view_err.set(Some("stale".to_string()));
+        t.view_err
+            .set(Some(schemaic_core::model::ModalError::server("stale")));
 
         // Run Everything: no single base, and none of the previous result's
         // state carries over.

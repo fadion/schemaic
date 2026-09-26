@@ -2678,16 +2678,17 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             // manual run, and for a view re-run the bottom bar instead, which is
             // where a filter's error goes rather than over the table it failed to
             // replace.
-            let fail = move |msg: String| match (is_view, panel) {
-                (true, _) => view_err.set(Some(msg)),
-                (false, Some(id)) => tab.set_panel_state(id, QueryState::Failed(msg)),
+            let fail = move |err: ModalError| match (is_view, panel) {
+                (true, _) => view_err.set(Some(err)),
+                (false, Some(id)) => tab.set_panel_state(id, QueryState::Failed(err.text)),
                 (false, None) => {}
             };
             // Resolve this tab's own connection (not necessarily the active one).
+            // Both refusals below are Schemaic's own — nothing was sent yet.
             let db = match db_for(tab.conn_id.get_untracked()) {
                 Ok(db) => db,
                 Err(e) => {
-                    fail(e);
+                    fail(ModalError::app(e));
                     return;
                 }
             };
@@ -2696,7 +2697,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             let session = match session_for(&tab) {
                 Ok(s) => s,
                 Err(e) => {
-                    fail(e);
+                    fail(ModalError::app(e));
                     return;
                 }
             };
@@ -2811,7 +2812,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                                 view_err.set(None);
                             }
                             // Error → keep the current table, show the message in the bar.
-                            QueryState::Failed(m) => view_err.set(Some(m)),
+                            QueryState::Failed(m) => view_err.set(Some(ModalError::server(m))),
                             // Cancelled/superseded → leave the table + error untouched.
                             _ => {}
                         }
@@ -4831,10 +4832,11 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                 else {
                     return;
                 };
+                // Both refusals below are Schemaic's own — nothing was sent yet.
                 let db = match db_for(tab.conn_id.get_untracked()) {
                     Ok(db) => db,
                     Err(e) => {
-                        (done)(CommitDone::Failed(e));
+                        (done)(CommitDone::Failed(ModalError::app(e)));
                         return;
                     }
                 };
@@ -4843,7 +4845,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                 let session = match session_for(&tab) {
                     Ok(s) => s,
                     Err(e) => {
-                        (done)(CommitDone::Failed(e));
+                        (done)(CommitDone::Failed(ModalError::app(e)));
                         return;
                     }
                 };
@@ -4976,7 +4978,15 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                     };
                     if let Err(e) = written {
                         tracing::error!("commit failed: {e}");
-                        finish(CommitDone::Failed(e.to_string()));
+                        // The server's refusal, or the one-row net's account of
+                        // what it did — either way about the server's answer.
+                        // A cancel is the one that isn't: the user stopped it,
+                        // and "query cancelled" has nothing in it to explain.
+                        let failed = match e {
+                            DbError::Cancelled => ModalError::app(e.to_string()),
+                            _ => ModalError::server(e.to_string()),
+                        };
+                        finish(CommitDone::Failed(failed));
                         return;
                     }
                     match refetch {
@@ -11816,11 +11826,10 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                 Rc::new(move |w, r, done: schemaic_ui::CommitDoneFn| {
                     if conn_status.get_untracked().is_down() {
                         (g)(Rc::new(|| {}));
-                        done(schemaic_core::model::CommitDone::Failed(
+                        done(schemaic_core::model::CommitDone::Failed(ModalError::app(
                             "Not connected — the commit was not attempted. Staged \
-                             edits are kept."
-                                .into(),
-                        ));
+                             edits are kept.",
+                        )));
                         return;
                     }
                     f(w, r, done);

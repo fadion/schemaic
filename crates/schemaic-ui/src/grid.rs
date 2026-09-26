@@ -45,7 +45,7 @@ use schemaic_core::model::{
 use schemaic_core::rowjson::{self, ColSpec};
 use schemaic_core::schema::{DbSchema, ForeignKeyInfo, SchemaState, TableInfo, TableSource};
 use schemaic_core::summary;
-use schemaic_core::text::{hides_detail, plural};
+use schemaic_core::text::plural;
 use schemaic_core::text_ops::contains_ignore_ascii_case;
 use schemaic_core::tx::{WRITE_WAIT_MS, WaitNote, write_wait_note};
 
@@ -332,8 +332,10 @@ struct GridState {
     /// Which of the user's other tabs hold an open transaction that this tab's
     /// write could be queued behind — the wait note's subject.
     tx_holders: RwSignal<Option<TxHoldersFn>>,
-    /// Last commit error, shown in the toolbar until the next edit/commit.
-    commit_err: RwSignal<Option<String>>,
+    /// Last commit error, shown in the toolbar until the next edit/commit. With
+    /// its source, which only the setter knows: the same bar reports a server's
+    /// refusal and Schemaic's own (a paste that landed nothing, bad JSON).
+    commit_err: RwSignal<Option<ModalError>>,
     /// The same bar's **note** surface — see [`GridCtx::commit_note`]. Cleared
     /// alongside `commit_err` by [`GridState::clear_bar`].
     commit_note: RwSignal<Option<String>>,
@@ -429,8 +431,9 @@ struct GridState {
     apply_view: RwSignal<Option<ApplyViewFn>>,
     /// A filter/sort error — a bad WHERE fragment / un-rewritable base (client-side)
     /// or a live DB error from the re-run (tab-level). Rendered in the grid's bottom
-    /// bar; cleared on any table click (`dismiss_overlays`) or a new run.
-    view_err: RwSignal<Option<String>>,
+    /// bar; cleared on any table click (`dismiss_overlays`) or a new run. The
+    /// client-side ones are Schemaic's own words, the re-run's the server's.
+    view_err: RwSignal<Option<ModalError>>,
     /// True while a view re-run is in flight (tab-level) — see
     /// [`crate::Tab::view_busy`]. Read by the capped notice's read-more offer,
     /// which is the affordance most able to start a second one by accident.
@@ -822,14 +825,17 @@ impl GridState {
                         run(req);
                     }
                 }
-                None => self.view_err.set(Some(
-                    "Can't re-run this statement — it would write to the database".into(),
-                )),
+                // All three refusals are Schemaic's own, decided before anything
+                // reached a server — the last is `sqlparser`'s reading of the
+                // typed condition, not the database's.
+                None => self.view_err.set(Some(ModalError::app(
+                    "Can't re-run this statement — it would write to the database",
+                ))),
             },
-            Ok(None) => self.view_err.set(Some(
-                "Can't filter this query — not a simple single-table SELECT".into(),
-            )),
-            Err(FilterError::BadCondition(msg)) => self.view_err.set(Some(msg)),
+            Ok(None) => self.view_err.set(Some(ModalError::app(
+                "Can't filter this query — not a simple single-table SELECT",
+            ))),
+            Err(FilterError::BadCondition(msg)) => self.view_err.set(Some(ModalError::app(msg))),
         }
     }
 
@@ -2512,7 +2518,7 @@ fn paste_selection(gs: GridState) {
     match schemaic_core::edit::paste_report(counts, skipped_deleted, staged) {
         schemaic_core::edit::PasteReport::Clean => {}
         schemaic_core::edit::PasteReport::Notice(m) => gs.commit_note.set(Some(m)),
-        schemaic_core::edit::PasteReport::Failed(m) => gs.commit_err.set(Some(m)),
+        schemaic_core::edit::PasteReport::Failed(m) => gs.commit_err.set(Some(ModalError::app(m))),
     }
 }
 
@@ -3556,7 +3562,7 @@ pub(crate) struct GridCtx {
     pub(crate) row_cap_override: RwSignal<Option<usize>>,
     /// A filter/sort re-run's DB error (tab-level) — rendered in the grid's bottom
     /// bar so the current table stays put. Cleared on a table click / new run.
-    pub(crate) view_err: RwSignal<Option<String>>,
+    pub(crate) view_err: RwSignal<Option<ModalError>>,
     /// A view re-run is in flight (tab-level) — see [`crate::Tab::view_busy`].
     /// The capped notice's read-more offer reads it to stop offering itself twice.
     pub(crate) view_busy: RwSignal<bool>,
@@ -3720,7 +3726,7 @@ pub(crate) struct GridCtx {
     pub(crate) sel_summary: RwSignal<Option<String>>,
     /// Last commit error (grid write-back), shown in a bottom error bar at the
     /// panel level (like the find bar at the top). Cleared by the next edit/commit.
-    pub(crate) commit_err: RwSignal<Option<String>>,
+    pub(crate) commit_err: RwSignal<Option<ModalError>>,
     /// A **note** for the same bar, on the ordinary chrome rather than the red
     /// fill: something worth saying about an operation that *worked*.
     ///
@@ -3816,23 +3822,22 @@ pub(crate) fn grid_error_bar(
             None => return empty().into_any(),
             Some(BarState::Wait(note)) => return wait_bar(note, rollback_tx.clone()).into_any(),
             Some(BarState::Note(m)) => return note_bar(m).into_any(),
-            Some(BarState::Error(msg)) => msg,
+            Some(BarState::Error(err)) => err,
         };
         // Collapse to a single line (a multi-line server error would spill out
         // the top); the full text stays available in the View modal.
-        let one_line = msg.split_whitespace().collect::<Vec<_>>().join(" ");
-        let full = msg;
-        // View only when the bar is hiding something — a server error with a
-        // DETAIL under it. On a short one-liner it would open a modal repeating
-        // the same words: neither error here is a statement in the buffer, so
-        // the modal has no "AI fix" this bar lacks.
-        let view: AnyView = if hides_detail(&full, BAR_ONE_LINE_CHARS) {
+        let one_line = msg.text.split_whitespace().collect::<Vec<_>>().join(" ");
+        // View when the bar is hiding something — a server error with a DETAIL
+        // under it — **or when the modal has an action this bar does not**: the
+        // server's words get "Explain" there. See `ModalError::worth_viewing`.
+        let view: AnyView = if msg.worth_viewing(BAR_ONE_LINE_CHARS) {
+            let full = msg;
             text("View")
                 .on_click_stop(move |_| {
-                    // A commit or a re-run failed on the server, so Explain has
-                    // something to explain; neither is a statement in the buffer
-                    // (`error_fix_range` scopes a fix to one), so no "AI fix".
-                    error_text.set(Some(ModalError::server(full.clone())));
+                    // The source rides through as its setter chose it: a failed
+                    // commit is the server's, a paste that landed nothing or a
+                    // bad JSON value is Schemaic's own.
+                    error_text.set(Some(full.clone()));
                     error_open.set(true);
                 })
                 .style(|s| {
@@ -3894,9 +3899,9 @@ pub(crate) fn grid_error_bar(
 /// dismissal — and what is left here is uniformly the tail of something that
 /// has already happened.
 enum BarState {
-    /// A commit's or a re-run's failure. Never a statement's own — that is the
-    /// editor bar's — so the modal behind "View" offers no fix for it.
-    Error(String),
+    /// A commit's or a re-run's failure, with whose words it is. Never a
+    /// statement's own — that is the editor bar's.
+    Error(ModalError),
     Wait(WaitNote),
     Note(String),
 }
@@ -3912,9 +3917,9 @@ enum BarState {
 /// thinks it isn't is the two of them drawn on top of each other.
 #[derive(Clone, Copy)]
 pub(crate) struct BarSignals {
-    pub(crate) commit_err: RwSignal<Option<String>>,
+    pub(crate) commit_err: RwSignal<Option<ModalError>>,
     pub(crate) commit_note: RwSignal<Option<String>>,
-    pub(crate) view_err: RwSignal<Option<String>>,
+    pub(crate) view_err: RwSignal<Option<ModalError>>,
     pub(crate) commit_wait: RwSignal<Option<WaitNote>>,
 }
 
@@ -5708,7 +5713,8 @@ fn commit_row_update(
     let changes = match rowjson::update_changes(cols, &state) {
         Ok(c) => c,
         Err(msg) => {
-            gs.commit_err.set(Some(msg));
+            // A value the row panel could not read — nothing reached a server.
+            gs.commit_err.set(Some(ModalError::app(msg)));
             return;
         }
     };
@@ -6156,7 +6162,9 @@ fn ai_fill_value(gs: GridState) {
         match res {
             crate::AiFillResult::Value(v) => stage_fill(gs, target, Some(v)),
             crate::AiFillResult::Null => stage_fill(gs, target, None),
-            crate::AiFillResult::Failed(e) => gs.commit_err.set(Some(e)),
+            // The harness's failure or an unreadable reply — Schemaic's own
+            // report, and an "Explain" would ask the model about itself.
+            crate::AiFillResult::Failed(e) => gs.commit_err.set(Some(ModalError::app(e))),
         }
     });
     (cb)(req, done);
@@ -6267,7 +6275,8 @@ fn ai_seed_rows(gs: GridState, count: usize) {
             }
             crate::AiSeedResult::Failed(e) => {
                 remove_pending_rows(gs, &pidxs);
-                gs.commit_err.set(Some(e));
+                // As the fill's: the harness's words, not a server's.
+                gs.commit_err.set(Some(ModalError::app(e)));
             }
         }
     });
@@ -6976,7 +6985,7 @@ fn json_row_view(
 /// Every committed edit re-serialises the tree back into the field buffer, so Save
 /// writes the updated JSON. Falls back to a raw-text field if the value isn't valid
 /// JSON.
-fn json_editor(f: FieldSig, sink: RwSignal<Option<String>>) -> AnyView {
+fn json_editor(f: FieldSig, sink: RwSignal<Option<ModalError>>) -> AnyView {
     let Ok(root) = JsonNode::parse(&f.buf.get_untracked()) else {
         // The raw fallback is bound straight to `f.buf`, so there is nothing to
         // flush — and leaving a previous editor's flush installed would call into
@@ -7008,9 +7017,12 @@ fn json_editor(f: FieldSig, sink: RwSignal<Option<String>>) -> AnyView {
     //
     // `pushed` is what was last handed over, so clearing takes back only our own
     // message — by then the bar may be showing a failed write instead.
-    let pushed: RwSignal<Option<String>> = RwSignal::new(None);
+    //
+    // Handed over as Schemaic's own: a value that won't parse as JSON never
+    // reached a server.
+    let pushed: RwSignal<Option<ModalError>> = RwSignal::new(None);
     create_effect(move |_| {
-        let now = err.get();
+        let now = err.get().map(ModalError::app);
         match &now {
             Some(msg) => sink.set(Some(msg.clone())),
             None => {
@@ -7145,7 +7157,7 @@ fn json_field(
     nullable: bool,
     autofocus: bool,
     f: FieldSig,
-    sink: RwSignal<Option<String>>,
+    sink: RwSignal<Option<ModalError>>,
 ) -> AnyView {
     if !nullable {
         return json_editor(f, sink);
