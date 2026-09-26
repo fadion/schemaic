@@ -56,7 +56,21 @@ const MCP_ROW_CAP: usize = 200;
 const MCP_CELL_CHARS: usize = 60;
 
 /// The MCP protocol revisions this server actually implements, newest first.
-const SUPPORTED_PROTOCOLS: &[&str] = &["2024-11-05"];
+///
+/// **`2025-06-18` costs a stdio, tools-only server nothing it did not already
+/// do**: its breaking changes are HTTP's (OAuth, the version header) and the
+/// removal of batching, and everything it adds — structured output,
+/// elicitation, resource links, `title`, `_meta` — is optional. The one thing
+/// taken from it is tool `annotations` ([`annotated`]).
+///
+/// **`2025-03-26` is deliberately absent**: it *requires* accepting JSON-RPC
+/// batches, which this server does not, and the next revision removed them
+/// again. [`negotiate_protocol`] answers a client asking for it with
+/// `2024-11-05`.
+const SUPPORTED_PROTOCOLS: &[&str] = &["2025-06-18", "2024-11-05"];
+
+/// The first revision whose tools carry `annotations`.
+const ANNOTATIONS_SINCE: &str = "2025-03-26";
 
 /// Answer the `initialize` handshake with a version this server really speaks.
 ///
@@ -69,12 +83,57 @@ const SUPPORTED_PROTOCOLS: &[&str] = &["2024-11-05"];
 ///
 /// Per the MCP spec the server replies with a version it supports; if that isn't
 /// the one requested, the client decides whether to proceed. So an unknown
-/// request gets our newest rather than an error — the client can still walk away,
-/// and it is told the truth either way.
+/// request gets an answer rather than an error — the client can still walk
+/// away, and it is told the truth either way.
+///
+/// **Which answer, once there are two.** A client names the newest revision it
+/// speaks, so one of ours that is *newer* than the request is one it cannot
+/// know, and the spec tells it to disconnect. So: the newest we speak that is
+/// not newer than the request; our oldest when the request predates them all
+/// (the nearest); our newest when it is newer than them all, or names no
+/// revision. Revisions are `YYYY-MM-DD`, which compare as strings.
 fn negotiate_protocol(requested: Option<&str>) -> &'static str {
-    requested
-        .and_then(|r| SUPPORTED_PROTOCOLS.iter().find(|s| **s == r).copied())
-        .unwrap_or(SUPPORTED_PROTOCOLS[0])
+    let newest = SUPPORTED_PROTOCOLS[0];
+    let oldest = SUPPORTED_PROTOCOLS[SUPPORTED_PROTOCOLS.len() - 1];
+    let Some(r) = requested.filter(|r| is_revision(r)) else {
+        return newest;
+    };
+    SUPPORTED_PROTOCOLS
+        .iter()
+        .copied()
+        .find(|s| *s <= r)
+        .unwrap_or(oldest)
+}
+
+/// Is this shaped like a revision (`YYYY-MM-DD`), so that comparing it with
+/// ours as a string means comparing dates?
+fn is_revision(s: &str) -> bool {
+    let b = s.as_bytes();
+    b.len() == 10
+        && b.iter().enumerate().all(|(i, c)| match i {
+            4 | 7 => *c == b'-',
+            _ => c.is_ascii_digit(),
+        })
+}
+
+/// `tools` as a session on `protocol` should see them: with each tool's
+/// `annotations` from a revision that defines them, and exactly as before for
+/// `2024-11-05`, whose strict clients have no field by that name.
+///
+/// Only `readOnlyHint`, from [`McpTool::read_only`] — the one claim every tool
+/// here can make without qualification, and the one a client may use to decide
+/// whether a call needs the user's say-so.
+fn annotated(mut tools: Value, protocol: &str) -> Value {
+    if protocol < ANNOTATIONS_SINCE {
+        return tools;
+    }
+    for t in tools.as_array_mut().into_iter().flatten() {
+        let Some(tool) = McpTool::from_name(t["name"].as_str().unwrap_or("")) else {
+            continue;
+        };
+        t["annotations"] = json!({ "readOnlyHint": tool.read_only() });
+    }
+    tools
 }
 
 /// Who started this server — and so where a tool's result can lead.
@@ -184,6 +243,9 @@ where
 {
     let mut input = input;
     let mut raw = Vec::new();
+    // What `initialize` agreed on. The oldest until then: a client that lists
+    // tools before the handshake gets nothing it might not understand.
+    let mut protocol = SUPPORTED_PROTOCOLS[SUPPORTED_PROTOCOLS.len() - 1];
     loop {
         // **Bytes, then UTF-8, one line at a time.** `lines()` returns an
         // error for a line that is not UTF-8, and `while let Ok(Some(..))`
@@ -215,22 +277,25 @@ where
 
         let result: Option<Value> = match method {
             "initialize" => {
-                let ver = negotiate_protocol(
+                protocol = negotiate_protocol(
                     req.pointer("/params/protocolVersion")
                         .and_then(|v| v.as_str()),
                 );
                 Some(json!({
-                    "protocolVersion": ver,
+                    "protocolVersion": protocol,
                     "capabilities": { "tools": {} },
                     "serverInfo": { "name": "schemaic", "version": env!("CARGO_PKG_VERSION") }
                 }))
             }
             "tools/list" => Some(json!({
-                "tools": tools_list(
-                    endpoint.db.engine(),
-                    endpoint.samples,
-                    endpoint.schema,
-                    endpoint.host,
+                "tools": annotated(
+                    tools_list(
+                        endpoint.db.engine(),
+                        endpoint.samples,
+                        endpoint.schema,
+                        endpoint.host,
+                    ),
+                    protocol,
                 )
             })),
             "tools/call" => {
@@ -366,6 +431,22 @@ impl McpTool {
         match self {
             McpTool::RunQuery => false,
             McpTool::ListSchema | McpTool::DescribeTable | McpTool::ProposeTableChange => true,
+        }
+    }
+
+    /// Does this tool leave the database exactly as it found it — the
+    /// `readOnlyHint` a `2025` session is told ([`annotated`])?
+    ///
+    /// All four do, and that is the server's whole shape rather than a
+    /// coincidence: `run_query` goes through `read_only_query` on a read-only
+    /// session, and `propose_table_change` runs nothing — its DDL goes to the
+    /// user's preview. Asked per tool all the same, so a fifth has to answer.
+    pub fn read_only(self) -> bool {
+        match self {
+            McpTool::RunQuery
+            | McpTool::ListSchema
+            | McpTool::DescribeTable
+            | McpTool::ProposeTableChange => true,
         }
     }
 
@@ -2394,6 +2475,69 @@ mod tests {
         assert_eq!(negotiate_protocol(Some("")), SUPPORTED_PROTOCOLS[0]);
         // A client that names no version gets the same answer.
         assert_eq!(negotiate_protocol(None), SUPPORTED_PROTOCOLS[0]);
+    }
+
+    /// **Two revisions, and the answer is the newest one the client can
+    /// have heard of.** A client names the latest it speaks, so anything
+    /// newer is one it does not — answering `2025-03-26` (which this server
+    /// does not speak: it requires accepting JSON-RPC batches) with
+    /// `2025-06-18` would hand an older client a version it must walk away
+    /// from, where `2024-11-05` is one it certainly knows.
+    #[test]
+    fn the_answer_is_the_newest_version_the_client_can_know() {
+        assert_eq!(negotiate_protocol(Some("2025-06-18")), "2025-06-18");
+        assert_eq!(negotiate_protocol(Some("2024-11-05")), "2024-11-05");
+        // Between ours: the newest we speak that is not newer than asked.
+        assert_eq!(negotiate_protocol(Some("2025-03-26")), "2024-11-05");
+        // Newer than anything we speak: our newest, for the client to judge.
+        assert_eq!(negotiate_protocol(Some("2025-11-25")), "2025-06-18");
+        // Older than everything we speak: the nearest, our oldest.
+        assert_eq!(negotiate_protocol(Some("2024-10-07")), "2024-11-05");
+        // Not a revision at all: our newest.
+        assert_eq!(negotiate_protocol(Some("latest")), "2025-06-18");
+    }
+
+    /// The version a session agreed on, read off the real handshake, and the
+    /// tool list that session is then given.
+    async fn session(protocol: &str) -> (String, Vec<serde_json::Value>) {
+        let input = format!(
+            "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\
+             \"params\":{{\"protocolVersion\":\"{protocol}\"}}}}\n\
+             {{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\"}}\n"
+        );
+        let got = exchange(input.as_bytes()).await;
+        let agreed = got[0]["result"]["protocolVersion"]
+            .as_str()
+            .expect("a version")
+            .to_string();
+        let tools = got[1]["result"]["tools"]
+            .as_array()
+            .expect("a list")
+            .clone();
+        (agreed, tools)
+    }
+
+    /// **Every tool says it is read-only — to a session that can hear it.**
+    /// `annotations` arrived in `2025-03-26`; a `2024-11-05` session gets the
+    /// list exactly as it always did, since a strict client of that revision
+    /// has no field by that name.
+    #[tokio::test]
+    async fn a_2025_session_is_told_every_tool_is_read_only() {
+        let (agreed, tools) = session("2025-06-18").await;
+        assert_eq!(agreed, "2025-06-18");
+        assert!(!tools.is_empty());
+        for t in &tools {
+            assert_eq!(
+                t["annotations"]["readOnlyHint"],
+                serde_json::json!(true),
+                "{t}"
+            );
+        }
+        let (agreed, tools) = session("2024-11-05").await;
+        assert_eq!(agreed, "2024-11-05");
+        for t in &tools {
+            assert!(t.get("annotations").is_none(), "{t}");
+        }
     }
 
     #[test]

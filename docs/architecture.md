@@ -20896,10 +20896,22 @@ existing prose was left alone.
     (`METHOD_NOT_FOUND`, "Method not found: <method>") when the request carries an id, and nothing
     at all for a notification. It was `{"result": {}}`, which reads as success: `resources/list`
     answered that way has no `resources`, and a strict client fails its own schema check and marks
-    the whole server broken (`an_unknown_method_is_method_not_found`). The handshake still speaks
-    one revision — `SUPPORTED_PROTOCOLS` is `2024-11-05` alone, a known limit left as it is — and
-    `negotiate_protocol` answers a client asking for another with that one, leaving the client to
-    decide whether to go on.
+    the whole server broken (`an_unknown_method_is_method_not_found`). **The handshake speaks
+    `2025-06-18` and `2024-11-05`** (`SUPPORTED_PROTOCOLS`, newest first). The newer one costs a
+    stdio, tools-only server nothing: its breaking changes are HTTP's and the removal of batching,
+    and all it adds is optional. `2025-03-26` is left out on purpose — it *requires* accepting
+    JSON-RPC batches, which this server does not. `negotiate_protocol` echoes a revision it speaks,
+    and otherwise answers with **the newest it speaks that is not newer than the request** (our
+    oldest if the request predates them all, our newest if it is newer than them all or no
+    `YYYY-MM-DD` at all): a client names the latest revision it knows, so a newer answer is one the
+    spec tells it to walk away from, and `2025-03-26` is answered `2024-11-05`
+    (`the_answer_is_the_newest_version_the_client_can_know`). The loop keeps what was agreed, and
+    `tools/list` goes through `annotated`: from `2025-03-26` on — the revision that introduced
+    them — every tool carries `annotations: {readOnlyHint}` from `McpTool::read_only`, an
+    exhaustive match that answers `true` for all four (`run_query` runs on a read-only session,
+    `propose_table_change` runs nothing). A `2024-11-05` session, or a `tools/list` sent before the
+    handshake, gets the list as it always was
+    (`a_2025_session_is_told_every_tool_is_read_only`).
     `propose_table_change` is the odd one out and stays read-only like the rest: it takes a
     `core::propose::Proposal`, introspects the table, runs `propose::apply` → `ddl::diff` → `emit`,
     and hands the model back the change list in the *preview's own words* plus the SQL and anything
