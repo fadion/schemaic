@@ -33,9 +33,12 @@ thiserror = { workspace = true }
 mysql_async = { workspace = true }
 tokio-postgres = { workspace = true }
 rusqlite = { workspace = true }
+tiberius = { workspace = true }
 futures-util = { workspace = true }
-tokio = { workspace = true }
-tokio-util = { workspace = true }
+tokio = { workspace = true, features = ["net"] }
+# `compat`: tiberius speaks `futures` I/O, and the socket it is handed is
+# tokio's.
+tokio-util = { workspace = true, features = ["compat"] }
 russh = { workspace = true }
 rustls = { workspace = true }
 rustls-pki-types = { workspace = true }

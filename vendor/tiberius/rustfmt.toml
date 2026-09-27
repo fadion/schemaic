@@ -1,0 +1,4 @@
+# Vendored: upstream's formatting, not ours. `cargo fmt --all` also formats
+# local path dependencies, so without this it would rewrite the crate and CI's
+# `--check` would fail on code this repository does not own.
+disable_all_formatting = true

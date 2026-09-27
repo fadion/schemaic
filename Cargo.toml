@@ -159,6 +159,14 @@ rustls-pki-types = "1"
 rustls-native-certs = "0.8"
 webpki-roots = "1"
 tokio-postgres-rustls = "0.14"
+# SQL Server (fourth engine), over TDS. **Vendored and patched** (see
+# `vendor/tiberius/PATCHES.md`): upstream's rustls backend hard-codes aws-lc-rs,
+# and offers no way to hand it the rustls configuration `db::tls` builds for the
+# other two networked engines. `tds80` is TDS 8.0 strict encryption, which Azure
+# SQL and SQL Server 2022 can require. No `chrono`/`time`: values are rendered
+# to text by `db::mssql::cell_value` from the wire types, like the other engines' text
+# paths, so there is no conversion layer in between to lose precision.
+tiberius = { version = "0.13", default-features = false, features = ["tds80", "rustls"] }
 # SSH tunnelling. Use the `ring` crypto backend instead of the default
 # `aws-lc-rs` to avoid the aws-lc-sys C/cmake build.
 russh = { version = "0.62", default-features = false, features = ["ring", "flate2", "rsa"] }
@@ -333,3 +341,6 @@ debug = "line-tables-only"
 # re-vendor it and re-apply the list, or drop this once upstream has the change.
 [patch.crates-io]
 floem = { path = "vendor/floem" }
+# **tiberius 0.13.0, vendored and patched**, on the same terms as Floem above —
+# `vendor/tiberius/PATCHES.md` lists every change.
+tiberius = { path = "vendor/tiberius" }
