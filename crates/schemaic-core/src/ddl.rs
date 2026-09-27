@@ -3997,7 +3997,9 @@ impl ChangeSet {
     /// something and it isn't in the script, and a preview that didn't mention
     /// it would be the dishonest half of a destructive operation.
     ///
-    /// Only SQLite ever produces one today — see [`supports_change`].
+    /// SQLite and SQL Server produce them — see [`supports_change`]; on SQL
+    /// Server an identity switched on or off, or a computed column changed, is
+    /// the ordinary case.
     pub fn unsupported(&self) -> Vec<String> {
         // A rebuild performs the whole set — it writes the table the draft
         // describes — so nothing beside it is withheld, however little of it has
@@ -4062,28 +4064,190 @@ impl ChangeSet {
     /// `RENAME TABLE` went into the plan in MySQL's grammar — the preview
     /// listed it as refused, but the script carried it. Each admitted change's
     /// T-SQL is the dialect-taking helper the other emitters share.
+    ///
+    /// **An edit of an existing table runs in phases**, each of which names the
+    /// columns as the one before it left them: first what covers columns is
+    /// dropped — foreign keys, checks, the primary key, index and unique
+    /// constraints — since T-SQL will not rename a column a check depends on;
+    /// then the column renames (`sp_rename`), so every later statement names
+    /// the new column; then the dropped columns, each default first; then the
+    /// columns are altered and added; then the keys, checks and indexes over
+    /// them; the table's own rename last, so every earlier statement names the
+    /// table as it was.
     fn emit_mssql(&self) -> Vec<String> {
         let d = self.dialect;
+        let q = self.qname();
+        let ident = |s: &str| ddl_ident_in(s, d);
+        let admitted: Vec<&Change> = self
+            .changes
+            .iter()
+            .filter(|c| supports_change(d, c))
+            .collect();
         let mut out = Vec::new();
-        for c in self.changes.iter().filter(|c| supports_change(d, c)) {
+        // Whole objects.
+        for c in &admitted {
             match c {
                 Change::CreateTable(t) => out.extend(create_table_sql(t, d)),
-                Change::DropTable => out.push(format!("DROP TABLE {};", self.qname())),
-                Change::DropView { materialized } => {
-                    out.push(drop_view_sql(&self.qname(), *materialized));
-                }
+                Change::DropTable => out.push(format!("DROP TABLE {q};")),
+                Change::TruncateTable => out.push(format!("TRUNCATE TABLE {q};")),
+                Change::DropView { materialized } => out.push(drop_view_sql(&q, *materialized)),
                 Change::DropRoutine(f) => out.push(format!(
                     "DROP {} {};",
                     f.kind.sql_keyword(),
                     f.signature_sql(d)
                 )),
-                // Admitted by `supports_change` and not written here would be a
-                // change the plan silently drops; the test that walks both
-                // (`sql_server_supports_drop_and_create_table_and_nothing_else`)
-                // is what keeps the two lists one.
                 _ => {}
             }
         }
+        // What covers the columns, before the columns — foreign keys first, of
+        // everything: one that references this table's own key blocks the
+        // key's drop.
+        for c in &admitted {
+            if let Change::DropForeignKey { name } = c {
+                out.push(format!("ALTER TABLE {q} DROP CONSTRAINT {};", ident(name)));
+            }
+        }
+        for c in &admitted {
+            match c {
+                Change::DropCheck { name } => {
+                    out.push(format!("ALTER TABLE {q} DROP CONSTRAINT {};", ident(name)));
+                }
+                Change::PrimaryKey {
+                    from,
+                    drop_constraint: Some(k),
+                    ..
+                } if !from.is_empty() => {
+                    out.push(format!("ALTER TABLE {q} DROP CONSTRAINT {};", ident(k)));
+                }
+                _ => {}
+            }
+        }
+        for c in &admitted {
+            match c {
+                Change::DropIndex {
+                    constraint: Some(k),
+                    ..
+                } => out.push(format!("ALTER TABLE {q} DROP CONSTRAINT {};", ident(k))),
+                Change::DropIndex {
+                    name,
+                    constraint: None,
+                    ..
+                } => out.push(format!("DROP INDEX {} ON {q};", ident(name))),
+                _ => {}
+            }
+        }
+        // Dropped columns, each default first: T-SQL refuses to drop a column
+        // a default constraint still names. Before the renames, whose names
+        // they cannot share: a rename onto the name of a column this plan
+        // drops would otherwise collide with it (Msg 15335).
+        for c in &admitted {
+            if let Change::DropColumn { name, .. } = c {
+                out.push(tsql_drop_default(&q, name));
+                out.push(format!("ALTER TABLE {q} DROP COLUMN {};", ident(name)));
+            }
+        }
+        // Column renames, once nothing being dropped still names the column:
+        // T-SQL refuses to rename one a check depends on (Msg 15336), and a
+        // check the edit replaces — or `diff` re-points around the rename — is
+        // gone by here.
+        for c in &admitted {
+            if let Change::AlterColumn { from, to, .. } = c
+                && from.name != to.name
+            {
+                out.push(tsql_rename(
+                    &format!("{q}.{}", ident(&from.name)),
+                    &to.name,
+                    Some("COLUMN"),
+                ));
+            }
+        }
+        // Altered columns, by their new names.
+        for c in &admitted {
+            if let Change::AlterColumn { from, to, .. } = c {
+                out.extend(tsql_alter_column(&q, from, to));
+            }
+        }
+        for c in &admitted {
+            if let Change::AddColumn { column, .. } = c {
+                // **`WITH VALUES` fills the existing rows**, as the same edit
+                // does on MySQL and PostgreSQL; without it SQL Server leaves a
+                // nullable column `NULL` in every row already there and gives
+                // only new rows the default. A `NOT NULL` column is filled
+                // either way.
+                let with_values =
+                    if column.nullable && norm_default(column.default.as_deref()).is_some() {
+                        " WITH VALUES"
+                    } else {
+                        ""
+                    };
+                out.push(format!(
+                    "ALTER TABLE {q} ADD {}{with_values};",
+                    column.definition_sql(d)
+                ));
+            }
+        }
+        // The keys, checks and indexes over the columns as they now are.
+        for c in &admitted {
+            match c {
+                // Under the name it had, when it had one: T-SQL invents
+                // `PK__t__3213E83F…` for an unnamed key, and scripts, hints and
+                // a schema compare name the old one.
+                Change::PrimaryKey {
+                    to,
+                    drop_constraint,
+                    ..
+                } if !to.is_empty() => {
+                    let named = drop_constraint
+                        .as_deref()
+                        .map(|k| format!("CONSTRAINT {} ", ident(k)))
+                        .unwrap_or_default();
+                    out.push(format!(
+                        "ALTER TABLE {q} ADD {named}PRIMARY KEY ({});",
+                        self.key_list(to)
+                    ));
+                }
+                Change::AddForeignKey(fk) => {
+                    out.push(format!("ALTER TABLE {q} ADD {};", fk_clause(fk, d)));
+                }
+                // A check keeps what it was: one added `WITH NOCHECK` (not
+                // trusted) is re-added so, sparing the rows already there, and
+                // a disabled one is disabled again — re-adding either as an
+                // ordinary check would validate every row and enforce it.
+                Change::AddCheck(ck) => {
+                    let nocheck = if !ck.validated || !ck.enforced {
+                        "WITH NOCHECK "
+                    } else {
+                        ""
+                    };
+                    out.push(format!(
+                        "ALTER TABLE {q} {nocheck}ADD {};",
+                        ck.clause_sql(d)
+                    ));
+                    if !ck.enforced && !ck.name.is_empty() {
+                        out.push(format!(
+                            "ALTER TABLE {q} NOCHECK CONSTRAINT {};",
+                            ident(&ck.name)
+                        ));
+                    }
+                }
+                _ => {}
+            }
+        }
+        for c in &admitted {
+            if let Change::AddIndex(ix) = c {
+                out.push(create_index_sql(ix, &q, d));
+            }
+        }
+        for c in &admitted {
+            if let Change::RenameTable { to } = c {
+                out.push(tsql_rename(&q, to, None));
+            }
+        }
+        // Every admitted change is written by one of the phases above, bar
+        // `KeepLossyIndex`, whose statement is none. Admitted and not written
+        // would be a change the plan silently drops; the test that walks both
+        // (`sql_server_admits_the_table_changes_it_can_write`) keeps the two
+        // lists one.
         out
     }
 
@@ -5934,7 +6098,17 @@ fn plural(n: usize) -> &'static str {
 /// A table (or index) name, schema-qualified when the namespace isn't the one
 /// the server resolves to anyway.
 fn qualified(name: &str, schema: Option<&str>, dialect: SqlDialect) -> String {
-    match sql_qualifier(schema) {
+    // **Only PostgreSQL's `public` resolves unqualified.** `sql_qualifier` drops
+    // it whatever the engine; elsewhere the name is an ordinary one, and a
+    // statement naming the table alone resolves through the connection's
+    // default — so the emitter writes every schema it is given there.
+    let schema = match dialect {
+        SqlDialect::Postgres => sql_qualifier(schema),
+        SqlDialect::MySql | SqlDialect::Sqlite | SqlDialect::MsSql => {
+            schema.filter(|s| !s.is_empty())
+        }
+    };
+    match schema {
         Some(s) => format!(
             "{}.{}",
             ddl_ident_in(s, dialect),
@@ -6198,6 +6372,110 @@ fn declares_sqlite_autoincrement(d: &TableDraft) -> bool {
             .iter()
             .any(|c| c.info.name == k && c.info.sqlite_autoincrement)
     })
+}
+
+/// A T-SQL `N'…'` literal — national always, since a name need not be ASCII.
+/// The one literal rule, `ddl_string`'s, under a name that says which grammar.
+fn tsql_n(s: &str) -> String {
+    ddl_string(s, SqlDialect::MsSql)
+}
+
+/// `EXEC sp_rename`: T-SQL's only rename of a table or a column. `object` is
+/// the qualified, bracketed current name; `to` is the bare new name — the
+/// procedure takes it literally, so brackets would become part of it.
+fn tsql_rename(object: &str, to: &str, kind: Option<&str>) -> String {
+    match kind {
+        Some(k) => format!(
+            "EXEC sp_rename {}, {}, {};",
+            tsql_n(object),
+            tsql_n(to),
+            tsql_n(k)
+        ),
+        None => format!("EXEC sp_rename {}, {};", tsql_n(object), tsql_n(to)),
+    }
+}
+
+/// Drop `column`'s default constraint, if it has one, **by looking its name up
+/// as the plan runs**. T-SQL drops a default only by its constraint's name,
+/// which the catalogue holds and the column model does not; read here, it
+/// cannot be stale.
+///
+/// **One statement with no `;` inside** — `DECLARE` and `IF` side by side,
+/// which T-SQL parses — because the preview's Copy and Open in editor split a
+/// script at semicolons, and a `DECLARE` cut from its use is an undeclared
+/// variable.
+fn tsql_drop_default(qtable: &str, column: &str) -> String {
+    // Quoted as it is read: `EXEC (…)` concatenates literals and variables
+    // only, and refuses a function call such as `QUOTENAME(@df)` there.
+    let t = tsql_n(qtable);
+    format!(
+        "DECLARE @df nvarchar(258) = (SELECT QUOTENAME(name) FROM sys.default_constraints \
+         WHERE parent_object_id = OBJECT_ID({t}) \
+         AND parent_column_id = COLUMNPROPERTY(OBJECT_ID({t}), {}, 'ColumnId')) \
+         IF @df IS NOT NULL EXEC ({} + @df);",
+        tsql_n(column),
+        tsql_n(&format!("ALTER TABLE {qtable} DROP CONSTRAINT ")),
+    )
+}
+
+/// One column's `AlterColumn` in T-SQL, after its rename (so by `to.name`).
+///
+/// **`ALTER COLUMN` restates type and nullability together**, since T-SQL
+/// resets whatever it is not told — a retype that left `NOT NULL` off would
+/// make the column nullable — and an identity is `NOT NULL` whatever the draft
+/// says, as `tsql_definition` writes it.
+///
+/// **The default is a constraint of its own**, dropped and re-added when it
+/// changes and around a retype or a new collation, which a default constraint
+/// blocks. When one is dropped and another added, **the same statement does
+/// both and keeps its name**: the name is looked up as the plan runs and given
+/// to the new one, so `df_qty` stays `df_qty` rather than becoming the
+/// server's `DF__t__qty__5EBF139D` — a name scripts and a schema compare use.
+fn tsql_alter_column(q: &str, from: &ColumnInfo, to: &ColumnInfo) -> Vec<String> {
+    let d = SqlDialect::MsSql;
+    let col = ddl_ident_in(&to.name, d);
+    let null_of = |c: &ColumnInfo| c.nullable && !c.auto_increment;
+    let retyped = !types_equal(&from.type_name, &to.type_name, d) || from.collation != to.collation;
+    let altered = retyped || null_of(from) != null_of(to);
+    let old = norm_default(from.default.as_deref());
+    let new = norm_default(to.default.as_deref());
+    let redo = !defaults_equal(old.as_deref(), new.as_deref()) || (retyped && old.is_some());
+    let alter = altered.then(|| {
+        let collate = to
+            .collation
+            .as_deref()
+            .map(|c| format!(" COLLATE {c}"))
+            .unwrap_or_default();
+        let null = if null_of(to) { "NULL" } else { "NOT NULL" };
+        format!(
+            "ALTER TABLE {q} ALTER COLUMN {col} {}{collate} {null}",
+            to.type_name
+        )
+    });
+    let mut out = Vec::new();
+    match (redo, old.is_some(), new) {
+        (true, true, Some(v)) => {
+            // One statement, no `;` inside — see `tsql_drop_default`.
+            let lookup = tsql_drop_default(q, &to.name);
+            let lookup = lookup.trim_end_matches(';');
+            let alter = alter.map(|a| format!(" {a}")).unwrap_or_default();
+            out.push(format!(
+                "{lookup}{alter} DECLARE @add nvarchar(max) = {} + ISNULL(N'CONSTRAINT ' + @df + N' ', N'') + {} EXEC (@add);",
+                tsql_n(&format!("ALTER TABLE {q} ADD ")),
+                tsql_n(&format!("DEFAULT ({v}) FOR {col}")),
+            ));
+        }
+        (true, true, None) => {
+            out.push(tsql_drop_default(q, &to.name));
+            out.extend(alter.map(|a| format!("{a};")));
+        }
+        (true, false, Some(v)) => {
+            out.extend(alter.map(|a| format!("{a};")));
+            out.push(format!("ALTER TABLE {q} ADD DEFAULT ({v}) FOR {col};"));
+        }
+        _ => out.extend(alter.map(|a| format!("{a};"))),
+    }
+    out
 }
 
 /// Can `dialect` declare a non-key index inside its `CREATE TABLE`? MySQL's
@@ -7406,6 +7684,13 @@ fn norm_check_expr(s: &str, dialect: SqlDialect) -> String {
 /// none of it — `statement_bounds` knows a SQLite trigger's body runs to the `;`
 /// after its `END`.
 pub fn client_script(stmts: &[String], dialect: SqlDialect) -> String {
+    // **On SQL Server each statement closes its batch with `GO`**, as
+    // `join_scripts` does for whole scripts. Its tools run a paste as one batch
+    // otherwise, and two statements declaring the same variable — two dropped
+    // columns' default lookups, say — are Msg 134 before anything runs.
+    if dialect.batch_separator() {
+        return join_scripts(stmts.iter().map(|s| terminated(s)), dialect);
+    }
     if dialect != SqlDialect::MySql || !stmts.iter().any(|s| needs_delimiter(s, dialect)) {
         return stmts
             .iter()
@@ -7497,7 +7782,13 @@ fn needs_delimiter(stmt: &str, dialect: SqlDialect) -> bool {
 /// Schemaic runs, and the new name is whatever the user typed in the designer.
 fn repoint_check_column(expr: &str, from: &str, to: &str, dialect: SqlDialect) -> Option<String> {
     let pg = dialect == SqlDialect::Postgres;
-    let quote = if pg { b'"' } else { b'`' };
+    // SQL Server's is the one quoted name that opens and closes differently —
+    // `[qty]` — and it is how it prints every check's predicate.
+    let (quote, close) = match dialect {
+        SqlDialect::Postgres => (b'"', b'"'),
+        SqlDialect::MySql | SqlDialect::Sqlite => (b'`', b'`'),
+        SqlDialect::MsSql => (b'[', b']'),
+    };
     let same = |s: &str| {
         if pg {
             s == from
@@ -7514,9 +7805,9 @@ fn repoint_check_column(expr: &str, from: &str, to: &str, dialect: SqlDialect) -
             // Only a *quoted identifier* is a name; a string or comment that
             // reads like one isn't.
             let run = &expr[i..j];
-            let q = quote as char;
-            // A doubled quote inside the run is one literal quote.
-            let inner = (b[i] == quote && j - i >= 2 && b[j - 1] == quote)
+            let q = close as char;
+            // A doubled closing quote inside the run is one literal one.
+            let inner = (b[i] == quote && j - i >= 2 && b[j - 1] == close)
                 .then(|| run[1..run.len() - 1].replace(&format!("{q}{q}"), &q.to_string()));
             match inner {
                 Some(name) if same(&name) => {
@@ -8731,8 +9022,26 @@ fn sqlite_index_replay<'a>(
 ///   two preview entries that emit nothing and no repair at all, and the rebuild
 ///   then emitted a `CHECK` naming the column the plan had just renamed away,
 ///   which SQLite refuses outright (`no such column: q`).
+/// - **SQL Server** is MySQL 8's case: `sp_rename` refuses a column a check
+///   depends on (Msg 15336, measured), so the check comes off and goes back
+///   on re-pointed — MySQL 8's arm, since SQL Server has no MariaDB flavour,
+///   and `emit_mssql` already drops checks before the renames and adds them
+///   after.
 pub fn alter_column_disturbs_checks(dialect: SqlDialect) -> bool {
-    matches!(dialect, SqlDialect::MySql)
+    match dialect {
+        SqlDialect::MySql | SqlDialect::MsSql => true,
+        SqlDialect::Postgres | SqlDialect::Sqlite => false,
+    }
+}
+
+/// Does a primary key make its columns `NOT NULL` on `dialect` of its own
+/// accord? MySQL, PostgreSQL and SQLite do; SQL Server refuses a key over a
+/// nullable column (Msg 8111), so [`diff`] makes the columns `NOT NULL` itself.
+pub fn primary_key_implies_not_null(dialect: SqlDialect) -> bool {
+    match dialect {
+        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => true,
+        SqlDialect::MsSql => false,
+    }
 }
 
 /// Must every `CHECK` constraint this engine holds carry a name?
@@ -9457,31 +9766,12 @@ pub fn sqlite_rebuild_sql(current: &TableInfo, draft: &TableDraft) -> Vec<String
 /// absent, and the emitter honours it so a change that slipped through emits
 /// nothing rather than MySQL's spelling of it.
 pub fn supports_change(dialect: SqlDialect, change: &Change) -> bool {
-    // **SQL Server: four changes, and the rest is unfinished work.** T-SQL
-    // differs from the other engines at nearly every change — `sp_rename` for a
-    // rename, a named `DEFAULT` constraint to drop before a column can change,
-    // `CREATE OR ALTER` for a redefinition, no `ALTER COLUMN … SET DEFAULT` —
-    // and what it has so far is a new table and the three drops, whose
-    // statements are T-SQL already once quoted (`create_table_sql` and
-    // `ColumnInfo::definition_sql` carry its arm). Everything else answers no
-    // here, first, which is what keeps every editor off: the table designer
-    // probes `AlterColumn`/`RebuildTable`, and the view, trigger and routine
-    // editors need a `Create` and a `Replace` besides their drop. The arms
-    // below answer for SQL Server only because they must compile; none of them
-    // is reached for it. A `match`, not an `==`, so the next engine has to say
+    // **SQL Server answers for itself, first** — see `tsql_supports`. The arms
+    // below answer for it only because they must compile; none of them is
+    // reached for it. A `match`, not an `==`, so the next engine has to say
     // which side of this it is on.
     match dialect {
-        SqlDialect::MsSql => {
-            return matches!(
-                change,
-                Change::CreateTable(_)
-                    | Change::DropTable
-                    | Change::DropView {
-                        materialized: false
-                    }
-                    | Change::DropRoutine(_)
-            );
-        }
+        SqlDialect::MsSql => return tsql_supports(change),
         SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => {}
     }
     // **The one family that is narrower than "everything but SQLite".** A
@@ -9687,6 +9977,74 @@ pub fn supports_change(dialect: SqlDialect, change: &Change) -> bool {
     )
 }
 
+/// [`supports_change`] for SQL Server: the table's own changes, which
+/// [`ChangeSet::emit_mssql`] writes, and nothing the other editors need.
+///
+/// **Refused, and each is a fact about `ALTER COLUMN` rather than unfinished
+/// work:** switching an identity on or off (T-SQL cannot — the column is
+/// dropped and re-added, which loses its values), and changing a computed
+/// column or turning a column into or out of one (the same). Also refused, as
+/// unfinished work: a comment (T-SQL keeps them as extended properties, not
+/// written yet — `supports_comments`), a column's position (T-SQL has no
+/// reorder), MariaDB's inline check, a primary key whose constraint name was
+/// not read (T-SQL drops it by name), and an unnamed check (the same). The
+/// view, trigger and routine editors need a `Create` and a `Replace` besides
+/// their drop, so they stay off.
+fn tsql_supports(change: &Change) -> bool {
+    match change {
+        Change::CreateTable(_)
+        | Change::DropTable
+        | Change::TruncateTable
+        | Change::DropView {
+            materialized: false,
+        }
+        | Change::DropRoutine(_)
+        | Change::RenameTable { .. }
+        | Change::DropColumn { .. }
+        | Change::AddIndex(_)
+        | Change::DropIndex { .. }
+        | Change::KeepLossyIndex { .. }
+        | Change::AddForeignKey(_)
+        | Change::DropForeignKey { .. }
+        | Change::AddCheck(_) => true,
+        Change::AddColumn { position, .. } => position.is_none(),
+        Change::DropCheck { name } => !name.is_empty(),
+        Change::PrimaryKey {
+            from,
+            drop_constraint,
+            ..
+        } => from.is_empty() || drop_constraint.is_some(),
+        // **Admitted when everything that differs is something the emitter
+        // writes** — the rename, and `tsql_alter_column`'s type, collation,
+        // nullability and default — asked of `columns_equal`, the comparison
+        // that raised the change. A denylist of the fields it cannot write
+        // would admit the next one nobody listed (`identity_always`,
+        // `on_update`, …) as a change that emits nothing and never converges.
+        Change::AlterColumn {
+            from,
+            to,
+            position,
+            inline_check,
+        } => {
+            let written = ColumnInfo {
+                name: to.name.clone(),
+                type_name: to.type_name.clone(),
+                nullable: to.nullable,
+                collation: to.collation.clone(),
+                default: to.default.clone(),
+                primary_key: to.primary_key,
+                ..(**from).clone()
+            };
+            position.is_none()
+                && inline_check.is_none()
+                && from.generated.is_none()
+                && to.generated.is_none()
+                && columns_equal(&written, to, SqlDialect::MsSql)
+        }
+        _ => false,
+    }
+}
+
 /// Everything that has to happen to turn `current` into `draft`.
 ///
 /// Diffing a table against [`TableDraft::from_table`] of itself must produce
@@ -9695,6 +10053,25 @@ pub fn supports_change(dialect: SqlDialect, change: &Change) -> bool {
 pub fn diff(current: &TableInfo, draft: &TableDraft, target: impl Into<Target>) -> ChangeSet {
     let Target { dialect, flavour } = target.into();
     let mut changes: Vec<Change> = Vec::new();
+    // **A key column is `NOT NULL`, and one engine will not make it so itself.**
+    // MySQL and PostgreSQL turn a column `NOT NULL` when a primary key takes
+    // it in; SQL Server refuses the key instead (Msg 8111), and neither the
+    // designer's Primary key toggle nor validation clears Nullable. So there
+    // the draft's key columns are read as `NOT NULL`, and the plan alters them
+    // before the key is added — which is also what the server reads back.
+    let keyed;
+    let draft = if primary_key_implies_not_null(dialect) {
+        draft
+    } else {
+        let mut d = draft.clone();
+        for c in d.columns.iter_mut() {
+            if d.primary_key.contains(&c.info.name) {
+                c.info.nullable = false;
+            }
+        }
+        keyed = d;
+        &keyed
+    };
 
     // Which server-side columns the draft still claims, and under what name.
     let mut renamed: HashMap<String, String> = HashMap::new();
@@ -12661,69 +13038,717 @@ mod tests {
         }
     }
 
-    /// **Exactly four schema changes are SQL Server's so far**, and none of the
-    /// editors computed from `supports_change` comes on with them: the table
-    /// designer probes `AlterColumn`/`RebuildTable`, and the view, trigger and
-    /// routine editors need their `Create`s too.
+    /// An `AlterColumn` on SQL Server from `from` to `to`.
+    fn ms_alter(from: ColumnInfo, to: ColumnInfo) -> Change {
+        Change::AlterColumn {
+            from: Box::new(from),
+            to: Box::new(to),
+            position: None,
+            inline_check: None,
+        }
+    }
+
+    fn ms_col(name: &str, ty: &str) -> ColumnInfo {
+        ColumnInfo {
+            name: name.into(),
+            type_name: ty.into(),
+            nullable: true,
+            ..Default::default()
+        }
+    }
+
+    /// **SQL Server's table changes, and the ones T-SQL cannot make in place.**
+    /// Every admitted change emits something — admitted and not written would
+    /// be a change the plan silently drops — except `KeepLossyIndex`, whose
+    /// whole point is a risk line and no statement. Refused: an identity
+    /// switched on or off and a computed column changed (T-SQL's `ALTER COLUMN`
+    /// can do neither), a comment (extended properties, not written yet), a
+    /// materialized view, and the editors that need a `Create` and a `Replace`.
     #[test]
-    fn sql_server_supports_drop_and_create_table_and_nothing_else() {
+    fn sql_server_admits_the_table_changes_it_can_write() {
         let yes = [
             Change::DropTable,
+            Change::TruncateTable,
             Change::DropView {
                 materialized: false,
             },
             Change::DropRoutine(Box::default()),
             Change::CreateTable(Box::default()),
+            Change::RenameTable { to: "u".into() },
+            Change::AddColumn {
+                column: Box::new(ms_col("c", "int")),
+                position: None,
+            },
+            Change::DropColumn {
+                name: "c".into(),
+                type_name: "int".into(),
+            },
+            ms_alter(ms_col("c", "int"), ms_col("c", "bigint")),
+            Change::PrimaryKey {
+                from: vec!["a".into()],
+                to: vec!["a".into(), "b".into()],
+                drop_constraint: Some("pk_t".into()),
+            },
+            Change::AddIndex(Box::default()),
+            Change::DropIndex {
+                name: "ix".into(),
+                constraint: None,
+                unique: false,
+            },
+            Change::AddForeignKey(Box::default()),
+            Change::DropForeignKey { name: "fk".into() },
+            Change::AddCheck(Box::default()),
+            Change::DropCheck { name: "ck".into() },
         ];
         for c in &yes {
             assert!(supports_change(MsSql, c), "{c:?}");
-            // And `emit_mssql` writes each one: admitted and not written would
-            // be a change the plan silently drops.
             assert!(
                 !single("t", Some("dbo"), MsSql, c.clone()).emit().is_empty(),
                 "{c:?} is admitted but emits nothing"
             );
         }
+        assert!(supports_change(
+            MsSql,
+            &Change::KeepLossyIndex { name: "ix".into() }
+        ));
+
+        let identity = ColumnInfo {
+            auto_increment: true,
+            nullable: false,
+            ..ms_col("id", "int")
+        };
+        let computed = ColumnInfo {
+            generated: Some("[a] * 2".into()),
+            ..ms_col("c", "int")
+        };
         let no = [
-            Change::DropView { materialized: true },
-            Change::TruncateTable,
-            Change::RenameTable { to: "x".into() },
-            Change::DropColumn {
-                name: String::new(),
-                type_name: String::new(),
+            ms_alter(ms_col("id", "int"), identity.clone()),
+            ms_alter(
+                identity.clone(),
+                ColumnInfo {
+                    auto_increment: false,
+                    ..identity
+                },
+            ),
+            ms_alter(
+                computed.clone(),
+                ColumnInfo {
+                    generated: Some("[a] * 3".into()),
+                    ..computed.clone()
+                },
+            ),
+            ms_alter(ms_col("c", "int"), computed),
+            ms_alter(
+                ms_col("c", "int"),
+                ColumnInfo {
+                    comment: Some("counted".into()),
+                    ..ms_col("c", "int")
+                },
+            ),
+            Change::PrimaryKey {
+                from: vec!["a".into()],
+                to: vec!["b".into()],
+                drop_constraint: None,
             },
+            Change::DropCheck {
+                name: String::new(),
+            },
+            Change::TableOptions {
+                engine: None,
+                collation: None,
+                comment: Some("people".into()),
+            },
+            Change::DropView { materialized: true },
             Change::CreateView(Box::default()),
             Change::CreateRoutine(Box::default()),
             Change::DropDatabase { name: "d".into() },
         ];
         for c in &no {
             assert!(!supports_change(MsSql, c), "{c:?}");
+            // And a refused change writes nothing — not MySQL's spelling of it,
+            // which is what the old `_` arm into `emit_mysql` wrote.
+            assert_eq!(
+                single("t", Some("dbo"), MsSql, c.clone()).emit(),
+                Vec::<String>::new(),
+                "{c:?}"
+            );
         }
-        assert!(!supports_table_design(MsSql));
+        assert!(supports_table_design(MsSql));
+        assert!(!supports_column_reorder(MsSql));
         assert!(!supports_view_editing(MsSql));
         assert!(!supports_routine_editing(MsSql));
         assert!(!supports_trigger_editing(MsSql));
     }
 
-    /// **A change SQL Server does not admit emits nothing** — not MySQL's
-    /// spelling of it. SQL Server once reached `emit_mysql` through a `_` arm,
-    /// whose whole-table loop asks no capability, so a `TRUNCATE` or a `RENAME
-    /// TABLE` went into the plan in MySQL's grammar for the preview to list and
-    /// the script to carry.
+    /// **One column renamed, retyped, made `NOT NULL` and given a new default,
+    /// in T-SQL's order.** The rename first, so every later statement names the
+    /// new column; the old default dropped *before* the retype, since a default
+    /// constraint blocks one; `ALTER COLUMN` restating type **and** nullability,
+    /// since T-SQL resets whatever it is not told; the new default last, **under
+    /// the old one's name**.
+    ///
+    /// The default is dropped by looking its name up as the plan runs: T-SQL
+    /// needs the constraint's name, the catalogue is where it lives, and a name
+    /// read when the designer opened could be stale by Apply. The lookup, the
+    /// drop, the retype and the re-add are **one statement, with no `;` inside**,
+    /// so the name survives from the drop to the add and the preview's Open in
+    /// editor — which splits at semicolons — keeps it whole.
     #[test]
-    fn sql_server_emits_nothing_it_does_not_admit() {
-        for c in [
-            Change::TruncateTable,
-            Change::RenameTable { to: "x".into() },
-            Change::DropColumn {
-                name: "c".into(),
-                type_name: "int".into(),
-            },
-            Change::DropView { materialized: true },
-        ] {
-            let cs = single("t", Some("dbo"), MsSql, c.clone());
-            assert_eq!(cs.emit(), Vec::<String>::new(), "{c:?}");
+    fn sql_server_alters_a_column_in_t_sqls_order() {
+        let from = ColumnInfo {
+            default: Some("0".into()),
+            ..ms_col("qty", "int")
+        };
+        let to = ColumnInfo {
+            nullable: false,
+            default: Some("1".into()),
+            ..ms_col("amount", "bigint")
+        };
+        let cs = single("orders", Some("sales"), MsSql, ms_alter(from, to));
+        let stmts = cs.emit();
+        assert_eq!(
+            stmts,
+            vec![
+                "EXEC sp_rename N'[sales].[orders].[qty]', N'amount', N'COLUMN';".to_string(),
+                "DECLARE @df nvarchar(258) = (SELECT QUOTENAME(name) FROM sys.default_constraints \
+                 WHERE parent_object_id = OBJECT_ID(N'[sales].[orders]') \
+                 AND parent_column_id = COLUMNPROPERTY(OBJECT_ID(N'[sales].[orders]'), N'amount', 'ColumnId')) \
+                 IF @df IS NOT NULL EXEC (N'ALTER TABLE [sales].[orders] DROP CONSTRAINT ' + @df) \
+                 ALTER TABLE [sales].[orders] ALTER COLUMN [amount] bigint NOT NULL \
+                 DECLARE @add nvarchar(max) = N'ALTER TABLE [sales].[orders] ADD ' \
+                 + ISNULL(N'CONSTRAINT ' + @df + N' ', N'') + N'DEFAULT (1) FOR [amount]' EXEC (@add);"
+                    .to_string(),
+            ]
+        );
+        for s in &stmts {
+            assert_eq!(s.matches(';').count(), 1, "one statement: {s}");
         }
+    }
+
+    /// Only the default changed: no `ALTER COLUMN`. Only the type changed on a
+    /// column without a default: no default statements. A collation is
+    /// restated with the type.
+    #[test]
+    fn sql_server_writes_only_the_statements_a_column_change_needs() {
+        let with_default = |d: Option<&str>| ColumnInfo {
+            default: d.map(str::to_string),
+            ..ms_col("qty", "int")
+        };
+        let stmts = single(
+            "t",
+            None,
+            MsSql,
+            ms_alter(with_default(Some("0")), with_default(Some("5"))),
+        )
+        .emit();
+        assert_eq!(stmts.len(), 1, "{stmts:?}");
+        assert!(stmts[0].starts_with("DECLARE @df"), "{stmts:?}");
+        assert!(stmts[0].contains("N'DEFAULT (5) FOR [qty]'"), "{stmts:?}");
+        assert!(!stmts[0].contains("ALTER COLUMN"), "{stmts:?}");
+
+        // A nullability change alone leaves a default where it is.
+        let stmts = single(
+            "t",
+            None,
+            MsSql,
+            ms_alter(
+                with_default(Some("0")),
+                ColumnInfo {
+                    nullable: false,
+                    ..with_default(Some("0"))
+                },
+            ),
+        )
+        .emit();
+        assert_eq!(
+            stmts,
+            vec!["ALTER TABLE [t] ALTER COLUMN [qty] int NOT NULL;"]
+        );
+
+        // An identity is altered `NOT NULL` whatever the draft says.
+        let id = ColumnInfo {
+            auto_increment: true,
+            nullable: false,
+            ..ms_col("id", "int")
+        };
+        let stmts = single(
+            "t",
+            None,
+            MsSql,
+            ms_alter(
+                id.clone(),
+                ColumnInfo {
+                    type_name: "bigint".into(),
+                    nullable: true,
+                    ..id
+                },
+            ),
+        )
+        .emit();
+        assert_eq!(
+            stmts,
+            vec!["ALTER TABLE [t] ALTER COLUMN [id] bigint NOT NULL;"]
+        );
+
+        // An added default, where there was none, is added unnamed.
+        let stmts = single(
+            "t",
+            None,
+            MsSql,
+            ms_alter(with_default(None), with_default(Some("7"))),
+        )
+        .emit();
+        assert_eq!(stmts, vec!["ALTER TABLE [t] ADD DEFAULT (7) FOR [qty];"]);
+
+        let stmts = single(
+            "t",
+            None,
+            MsSql,
+            ms_alter(
+                ms_col("name", "nvarchar(50)"),
+                ColumnInfo {
+                    collation: Some("Latin1_General_CS_AS".into()),
+                    ..ms_col("name", "nvarchar(100)")
+                },
+            ),
+        )
+        .emit();
+        assert_eq!(
+            stmts,
+            vec![
+                "ALTER TABLE [t] ALTER COLUMN [name] nvarchar(100) COLLATE Latin1_General_CS_AS NULL;"
+            ]
+        );
+
+        // A default dropped altogether is only the drop.
+        let stmts = single(
+            "t",
+            None,
+            MsSql,
+            ms_alter(with_default(Some("0")), with_default(None)),
+        )
+        .emit();
+        assert_eq!(stmts.len(), 1, "{stmts:?}");
+        assert!(stmts[0].starts_with("DECLARE @df"), "{stmts:?}");
+    }
+
+    /// **A whole designer plan, in the order T-SQL can run it**: constraints
+    /// and indexes dropped before the columns they cover, a dropped column's
+    /// default before the column, columns added before the keys and indexes
+    /// over them, and the table renamed last so every earlier statement names
+    /// it as it was. A name with a quote in it is doubled inside `N'…'`.
+    #[test]
+    fn sql_server_orders_a_designer_plan() {
+        let cs = ChangeSet {
+            table: "o'k".into(),
+            schema: Some("dbo".into()),
+            dialect: MsSql,
+            flavour: ServerFlavour::Unknown,
+            changes: vec![
+                Change::RenameTable { to: "ok2".into() },
+                Change::AddIndex(Box::new(crate::schema::IndexInfo {
+                    name: "ix_b".into(),
+                    columns: vec![IndexColumn::plain("b")],
+                    ..Default::default()
+                })),
+                Change::AddColumn {
+                    column: Box::new(ms_col("b", "int")),
+                    position: None,
+                },
+                Change::DropColumn {
+                    name: "old".into(),
+                    type_name: "int".into(),
+                },
+                Change::PrimaryKey {
+                    from: vec!["a".into()],
+                    to: vec!["a".into(), "b".into()],
+                    drop_constraint: Some("pk_ok".into()),
+                },
+                Change::DropIndex {
+                    name: "uq".into(),
+                    constraint: Some("uq_c".into()),
+                    unique: true,
+                },
+                Change::DropIndex {
+                    name: "ix_old".into(),
+                    constraint: None,
+                    unique: false,
+                },
+                Change::DropForeignKey {
+                    name: "fk_x".into(),
+                },
+                Change::AddCheck(Box::new(crate::schema::CheckInfo {
+                    name: "ck_b".into(),
+                    expression: "[b] > 0".into(),
+                    enforced: true,
+                    ..Default::default()
+                })),
+            ],
+        };
+        let q = "[dbo].[o'k]";
+        let stmts = cs.emit();
+        assert_eq!(
+            stmts,
+            vec![
+                format!("ALTER TABLE {q} DROP CONSTRAINT [fk_x];"),
+                format!("ALTER TABLE {q} DROP CONSTRAINT [pk_ok];"),
+                format!("ALTER TABLE {q} DROP CONSTRAINT [uq_c];"),
+                format!("DROP INDEX [ix_old] ON {q};"),
+                "DECLARE @df nvarchar(258) = (SELECT QUOTENAME(name) FROM sys.default_constraints \
+                 WHERE parent_object_id = OBJECT_ID(N'[dbo].[o''k]') \
+                 AND parent_column_id = COLUMNPROPERTY(OBJECT_ID(N'[dbo].[o''k]'), N'old', 'ColumnId')) \
+                 IF @df IS NOT NULL EXEC (N'ALTER TABLE [dbo].[o''k] DROP CONSTRAINT ' + @df);"
+                    .to_string(),
+                format!("ALTER TABLE {q} DROP COLUMN [old];"),
+                format!("ALTER TABLE {q} ADD [b] int NULL;"),
+                format!("ALTER TABLE {q} ADD CONSTRAINT [pk_ok] PRIMARY KEY ([a], [b]);"),
+                format!("ALTER TABLE {q} ADD CONSTRAINT [ck_b] CHECK ([b] > 0);"),
+                format!("CREATE INDEX [ix_b] ON {q} ([b]);"),
+                "EXEC sp_rename N'[dbo].[o''k]', N'ok2';".to_string(),
+            ]
+        );
+    }
+
+    /// **A SQL Server table diffs to nothing against its own draft** — the
+    /// round-trip gate, over the shapes introspection reads there: an identity
+    /// key under a named constraint, a normalised default, a persisted computed
+    /// column, a collation, a unique constraint, a check and an alias type.
+    #[test]
+    fn a_sql_server_table_round_trips_through_its_draft() {
+        let t = TableInfo {
+            name: "orders".into(),
+            schema: Some("sales".into()),
+            columns: vec![
+                ColumnInfo {
+                    name: "id".into(),
+                    type_name: "int".into(),
+                    nullable: false,
+                    primary_key: true,
+                    auto_increment: true,
+                    ..Default::default()
+                },
+                ColumnInfo {
+                    default: Some("getdate()".into()),
+                    nullable: false,
+                    ..ms_col("placed", "datetime2(7)")
+                },
+                ColumnInfo {
+                    collation: Some("Latin1_General_CS_AS".into()),
+                    ..ms_col("code", "nvarchar(20)")
+                },
+                ColumnInfo {
+                    generated: Some("[qty]*(2)".into()),
+                    generated_stored: true,
+                    ..ms_col("doubled", "int")
+                },
+                ms_col("qty", "smallint"),
+                ms_col("phone", "[dbo].[Phone]"),
+            ],
+            indexes: vec![
+                crate::schema::IndexInfo {
+                    name: "PRIMARY".into(),
+                    columns: vec![IndexColumn::plain("id")],
+                    unique: true,
+                    constraint: Some("PK_orders".into()),
+                    ..Default::default()
+                },
+                crate::schema::IndexInfo {
+                    name: "UQ_code".into(),
+                    columns: vec![IndexColumn::plain("code")],
+                    unique: true,
+                    constraint: Some("UQ_code".into()),
+                    ..Default::default()
+                },
+            ],
+            check_constraints: vec![crate::schema::CheckInfo {
+                name: "CK_qty".into(),
+                expression: "[qty]>=(0)".into(),
+                enforced: true,
+                validated: true,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let cs = diff(&t, &TableDraft::from_table(&t), MsSql);
+        assert!(cs.changes.is_empty(), "{:?}", cs.changes);
+    }
+
+    /// **Only PostgreSQL's `public` resolves unqualified.** Elsewhere the name
+    /// is an ordinary one and is written — on SQL Server it cannot be created
+    /// at all (the `public` role holds the name, measured), but a table named
+    /// by a schema the emitter drops resolves through the login's default one.
+    #[test]
+    fn a_sql_server_schema_named_public_is_still_named() {
+        assert_eq!(
+            single("orders", Some("public"), MsSql, Change::TruncateTable).emit(),
+            vec!["TRUNCATE TABLE [public].[orders];"]
+        );
+        assert_eq!(
+            single("orders", Some("public"), Postgres, Change::TruncateTable).emit(),
+            vec!["TRUNCATE TABLE \"orders\";"]
+        );
+    }
+
+    /// Two tables, as the diff sees them: `current`, and a draft of it.
+    fn ms_table(columns: Vec<ColumnInfo>, pk: &[&str]) -> TableInfo {
+        let mut indexes = Vec::new();
+        if !pk.is_empty() {
+            indexes.push(crate::schema::IndexInfo {
+                name: "PRIMARY".into(),
+                columns: pk.iter().map(|c| IndexColumn::plain(*c)).collect(),
+                unique: true,
+                constraint: Some("pk_t".into()),
+                ..Default::default()
+            });
+        }
+        TableInfo {
+            name: "t".into(),
+            schema: Some("dbo".into()),
+            columns,
+            indexes,
+            ..Default::default()
+        }
+    }
+
+    /// **A key column is made `NOT NULL` before the key is added on SQL
+    /// Server**, which refuses a key over a nullable column (Msg 8111) where
+    /// MySQL and PostgreSQL make the column `NOT NULL` themselves.
+    #[test]
+    fn a_nullable_column_keyed_on_sql_server_is_made_not_null_first() {
+        let a = ColumnInfo {
+            nullable: false,
+            primary_key: true,
+            ..ms_col("a", "int")
+        };
+        let t = ms_table(vec![a, ms_col("b", "int")], &["a"]);
+        let mut d = TableDraft::from_table(&t);
+        d.primary_key = vec!["a".into(), "b".into()];
+        let stmts = diff(&t, &d, MsSql).emit();
+        let alter = stmts
+            .iter()
+            .position(|s| s == "ALTER TABLE [dbo].[t] ALTER COLUMN [b] int NOT NULL;")
+            .unwrap_or_else(|| panic!("{stmts:#?}"));
+        let key = stmts
+            .iter()
+            .position(|s| s.contains("ADD CONSTRAINT [pk_t] PRIMARY KEY ([a], [b])"))
+            .unwrap_or_else(|| panic!("{stmts:#?}"));
+        assert!(alter < key, "{stmts:#?}");
+        // MySQL does it itself, and its plan is only the key.
+        let my = diff(&t, &d, MySql);
+        assert!(
+            !my.changes
+                .iter()
+                .any(|c| matches!(c, Change::AlterColumn { .. })),
+            "{:?}",
+            my.changes
+        );
+    }
+
+    /// **A column dropped before another takes its name** — a rename onto the
+    /// name of a column the same plan drops would otherwise collide with it
+    /// (Msg 15335).
+    #[test]
+    fn a_dropped_column_goes_before_a_rename_takes_its_name() {
+        let cs = ChangeSet {
+            table: "t".into(),
+            schema: None,
+            dialect: MsSql,
+            flavour: ServerFlavour::Unknown,
+            changes: vec![
+                ms_alter(ms_col("qty", "int"), ms_col("old", "int")),
+                Change::DropColumn {
+                    name: "old".into(),
+                    type_name: "int".into(),
+                },
+            ],
+        };
+        let stmts = cs.emit();
+        let dropped = stmts
+            .iter()
+            .position(|s| s == "ALTER TABLE [t] DROP COLUMN [old];")
+            .expect("the drop");
+        let renamed = stmts
+            .iter()
+            .position(|s| s.starts_with("EXEC sp_rename"))
+            .expect("the rename");
+        assert!(dropped < renamed, "{stmts:#?}");
+    }
+
+    /// **A nullable column added with a default fills the rows already
+    /// there**, as the same edit does on MySQL and PostgreSQL; SQL Server
+    /// leaves them `NULL` without `WITH VALUES`.
+    #[test]
+    fn a_nullable_column_added_with_a_default_fills_existing_rows() {
+        let add = |c: ColumnInfo| {
+            single(
+                "t",
+                None,
+                MsSql,
+                Change::AddColumn {
+                    column: Box::new(c),
+                    position: None,
+                },
+            )
+            .emit()
+        };
+        let status = ColumnInfo {
+            default: Some("N'new'".into()),
+            ..ms_col("status", "nvarchar(10)")
+        };
+        assert_eq!(
+            add(status.clone()),
+            vec!["ALTER TABLE [t] ADD [status] nvarchar(10) NULL DEFAULT N'new' WITH VALUES;"]
+        );
+        // `NOT NULL` is filled anyway, and a column with no default has
+        // nothing to fill with.
+        assert!(
+            !add(ColumnInfo {
+                nullable: false,
+                ..status
+            })[0]
+                .contains("WITH VALUES")
+        );
+        assert!(!add(ms_col("n", "int"))[0].contains("WITH VALUES"));
+    }
+
+    /// **A check keeps what it was when it is re-added**: an untrusted one is
+    /// added `WITH NOCHECK`, sparing the rows already there, and a disabled
+    /// one is disabled again — re-adding either as an ordinary check would
+    /// validate every row and enforce it.
+    #[test]
+    fn a_re_added_sql_server_check_keeps_its_trust_and_its_state() {
+        let add = |validated: bool, enforced: bool| {
+            single(
+                "t",
+                None,
+                MsSql,
+                Change::AddCheck(Box::new(crate::schema::CheckInfo {
+                    name: "ck".into(),
+                    expression: "[a] > 0".into(),
+                    validated,
+                    enforced,
+                    ..Default::default()
+                })),
+            )
+            .emit()
+        };
+        assert_eq!(
+            add(true, true),
+            vec!["ALTER TABLE [t] ADD CONSTRAINT [ck] CHECK ([a] > 0);"]
+        );
+        assert_eq!(
+            add(false, true),
+            vec!["ALTER TABLE [t] WITH NOCHECK ADD CONSTRAINT [ck] CHECK ([a] > 0);"]
+        );
+        assert_eq!(
+            add(false, false),
+            vec![
+                "ALTER TABLE [t] WITH NOCHECK ADD CONSTRAINT [ck] CHECK ([a] > 0);",
+                "ALTER TABLE [t] NOCHECK CONSTRAINT [ck];",
+            ]
+        );
+    }
+
+    /// **A copied SQL Server plan closes each statement's batch with `GO`.**
+    /// Its tools run a paste as one batch, and two statements declaring the
+    /// same variable — two dropped columns' default lookups — are Msg 134
+    /// before anything runs.
+    #[test]
+    fn a_copied_sql_server_plan_is_one_batch_a_statement() {
+        let cs = ChangeSet {
+            table: "t".into(),
+            schema: None,
+            dialect: MsSql,
+            flavour: ServerFlavour::Unknown,
+            changes: vec![
+                Change::DropColumn {
+                    name: "a".into(),
+                    type_name: "int".into(),
+                },
+                Change::DropColumn {
+                    name: "b".into(),
+                    type_name: "int".into(),
+                },
+            ],
+        };
+        let script = client_script(&cs.emit(), MsSql);
+        assert_eq!(script.matches("\nGO").count(), 4, "{script}");
+        for batch in script.split("\nGO") {
+            assert!(batch.matches("DECLARE @df").count() <= 1, "{batch}");
+        }
+    }
+
+    /// SQL Server prints a check's column bracketed — `[qty]>=(0)` — so the
+    /// re-point has to read a bracket as the name's quote, and a doubled `]`
+    /// inside it as one.
+    #[test]
+    fn a_bracketed_column_in_a_check_is_repointed() {
+        assert_eq!(
+            repoint_check_column("[qty]>=(0)", "qty", "amount", MsSql).as_deref(),
+            Some("[amount]>=(0)")
+        );
+        assert_eq!(
+            repoint_check_column("[a]]b]>(0)", "a]b", "c", MsSql).as_deref(),
+            Some("[c]>(0)")
+        );
+        assert_eq!(repoint_check_column("[qtyx]>(0)", "qty", "q", MsSql), None);
+    }
+
+    /// **A column an unchanged check names is renamed around the check**: the
+    /// check comes off, the column is renamed and the check goes back on
+    /// re-pointed — the MySQL 8 repair, because `sp_rename` refuses a column a
+    /// check depends on (Msg 15336).
+    #[test]
+    fn a_sql_server_rename_under_an_unchanged_check_moves_the_check() {
+        let mut t = ms_table(vec![ms_col("qty", "int")], &[]);
+        t.check_constraints.push(crate::schema::CheckInfo {
+            name: "ck_qty".into(),
+            expression: "[qty]>=(0)".into(),
+            ..Default::default()
+        });
+        let mut d = TableDraft::from_table(&t);
+        d.columns[0].info.name = "amount".into();
+        let stmts = diff(&t, &d, MsSql).emit();
+        let at = |needle: &str| {
+            stmts
+                .iter()
+                .position(|s| s.contains(needle))
+                .unwrap_or_else(|| panic!("{needle} in {stmts:#?}"))
+        };
+        let dropped = at("DROP CONSTRAINT [ck_qty]");
+        let renamed = at("sp_rename");
+        let added = at("ADD CONSTRAINT [ck_qty] CHECK ([amount]>=(0))");
+        assert!(dropped < renamed && renamed < added, "{stmts:#?}");
+    }
+
+    /// **A column change is admitted exactly when the emitter writes all of
+    /// it.** One that differs only in a field `tsql_alter_column` does not
+    /// write — an identity's kind, here — is withheld rather than admitted as
+    /// a change with no statement; a comment blank on one side and absent on
+    /// the other is no difference, as `columns_equal` holds.
+    #[test]
+    fn a_sql_server_column_change_is_admitted_only_when_it_is_written() {
+        let id = ColumnInfo {
+            auto_increment: true,
+            nullable: false,
+            ..ms_col("id", "int")
+        };
+        let kind = ms_alter(
+            id.clone(),
+            ColumnInfo {
+                identity_always: true,
+                ..id
+            },
+        );
+        assert!(!supports_change(MsSql, &kind));
+        let renamed_with_blank_comment = ms_alter(
+            ms_col("a", "int"),
+            ColumnInfo {
+                comment: Some(String::new()),
+                ..ms_col("b", "int")
+            },
+        );
+        assert!(supports_change(MsSql, &renamed_with_blank_comment));
     }
 
     /// The drops were already T-SQL — bracketed, and a routine by bare name,
@@ -14021,7 +15046,7 @@ mod tests {
     /// the schema tree's menus were standing in for.
     #[test]
     fn table_design_is_offered_exactly_where_a_retype_emits() {
-        for dialect in [MySql, Postgres, Sqlite] {
+        for dialect in SqlDialect::ALL {
             let t = users();
             let mut d = TableDraft::from_table(&t);
             d.columns[2].info.type_name = "text".into();

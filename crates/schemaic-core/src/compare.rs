@@ -1585,9 +1585,9 @@ impl NameClash {
                 "One statement will be refused, which rolls the whole migration back."
             }
             SqlDialect::Sqlite => "One statement will be refused.",
-            // T-SQL DDL is transactional too. `mssql::run_ddl` is not written
-            // yet — it refuses, and no plan reaches it (`ddl::supports_change`)
-            // — and this is the promise it is to keep: one transaction a plan.
+            // T-SQL DDL is transactional too, and `mssql::run_ddl` keeps the
+            // promise: one `BEGIN TRANSACTION` around the plan, rolled back
+            // whole on a refusal.
             SqlDialect::MsSql => {
                 "One statement will be refused, which rolls the whole migration back."
             }

@@ -6193,25 +6193,27 @@ mod object_menu_tests {
         }
     }
 
-    /// **SQL Server is offered Drop and no other schema change from this
-    /// menu.** Drop was the one entry here not gated on a capability, and
+    /// **SQL Server's table menu is the table's own changes, and a view's is
+    /// Drop.** Drop was the one entry here not gated on a capability, and
     /// before SQL Server had a `DROP` it was a red enabled item that asked
-    /// "This can't be undone" and could only end in a refusal; it is offered
-    /// now because the statement is emitted — and still not for a materialized
-    /// view, which the engine does not have.
+    /// "This can't be undone" and could only end in a refusal. A table is
+    /// offered Edit table and Truncate now that `emit_mssql` writes them; a
+    /// view is not offered Edit view (no `CREATE OR ALTER VIEW` yet), nor
+    /// triggers, and a materialized view — which the engine does not have —
+    /// nothing at all. Import waits on `import_rows`.
     #[test]
-    fn sql_server_offers_drop_and_no_other_schema_change() {
+    fn sql_server_offers_its_table_changes_and_a_views_drop() {
         use schemaic_core::intel::SqlDialect::MsSql;
-        for shape in [Shape::Table, Shape::View] {
-            for materialized in [false, true] {
-                let e = object_entries(shape, MsSql, materialized);
-                assert!(
-                    !e.edit && !e.truncate && !e.triggers && !e.import && !e.refresh_view,
-                    "{shape:?} (materialized: {materialized}): {e:?}"
-                );
-                let dropped = !(shape == Shape::View && materialized);
-                assert_eq!(e.drop, dropped, "{shape:?} (materialized: {materialized})");
-            }
+        let t = object_entries(Shape::Table, MsSql, false);
+        assert!(t.edit && t.truncate && t.drop, "{t:?}");
+        assert!(!t.triggers && !t.import && !t.refresh_view, "{t:?}");
+        for materialized in [false, true] {
+            let v = object_entries(Shape::View, MsSql, materialized);
+            assert!(
+                !v.edit && !v.truncate && !v.triggers && !v.import && !v.refresh_view,
+                "view (materialized: {materialized}): {v:?}"
+            );
+            assert_eq!(v.drop, !materialized, "view (materialized: {materialized})");
         }
         // The premise: a MariaDB sequence is still dropped, so the gate is about
         // the engine's emitter and not about the shape.

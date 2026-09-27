@@ -1,11 +1,11 @@
 //! SQL Server's live leg, on its own terms.
 //!
 //! **Outside [`crate::suite`] and the `live_suite!` macro**, because the shared
-//! suite applies DDL and pins sessions, and SQL Server answers both with a
-//! refusal until they are written — and its write-back cases stand on the
-//! shared suite's `Target`, which this leg does not have. What is here is what
-//! the engine *does* do — connecting, the read path and its values, provenance,
-//! the read-only guard, validation, the schema, activity, the grid's write-back
+//! suite pins sessions, which SQL Server refuses until Manual mode is written,
+//! and its write-back and DDL cases stand on the shared suite's `Target`, which
+//! this leg does not have. What is here is what the engine *does* do —
+//! connecting, the read path and its values, provenance, the read-only guard,
+//! validation, the schema, activity, the grid's write-back, the table designer
 //! — plus the two catalogues only it has: its builtin functions, and its DMV
 //! snippets.
 //!
@@ -931,6 +931,355 @@ async fn a_table_a_view_and_a_procedure_are_dropped() {
             .await,
         "0"
     );
+}
+
+/// The table `name` in `dbo`, as introspection reads it.
+async fn read_table(s: &Scratch, name: &str) -> schemaic_core::schema::TableInfo {
+    let schema =
+        s.db.fetch_schema(&s.name, CancellationToken::new())
+            .await
+            .expect("the schema");
+    schema
+        .tables
+        .iter()
+        .find(|t| t.schema.as_deref() == Some("dbo") && t.name == name)
+        .unwrap_or_else(|| panic!("dbo.{name} in {:?}", schema.tables))
+        .clone()
+}
+
+/// Diff `draft` against `current`, refuse nothing, and apply it.
+async fn apply_draft(
+    s: &Scratch,
+    current: &schemaic_core::schema::TableInfo,
+    draft: &schemaic_core::ddl::TableDraft,
+) -> Vec<String> {
+    let cs = schemaic_core::ddl::diff(current, draft, MS);
+    assert!(
+        cs.unsupported().is_empty(),
+        "withheld: {:?}",
+        cs.unsupported()
+    );
+    let stmts = cs.emit();
+    s.db.run_ddl(&s.name, &stmts, CancellationToken::new())
+        .await
+        .unwrap_or_else(|e| panic!("{e}\n{}", stmts.join("\n")));
+    stmts
+}
+
+/// **The round-trip gate, against the server**: every table of the sample
+/// database diffs to nothing against its own draft, so opening the designer
+/// on one and applying without an edit is a plan with no statements. Skipped
+/// where the sample database is not installed (it is not in CI).
+#[tokio::test(flavor = "multi_thread")]
+async fn every_sample_table_diffs_to_nothing_against_its_own_draft() {
+    if !enabled() {
+        return;
+    }
+    let db = base_db();
+    // Asked of the catalogue first, so that an introspection that fails on a
+    // machine that has the sample is a failure and not a skip. A query rather
+    // than `fetch_databases`, whose ping-length connect bound is short for a
+    // leg running thirty tests at once.
+    let installed = db
+        .fetch_query(
+            None,
+            "SELECT COUNT(*) FROM sys.databases WHERE name = N'AdventureWorksLT'",
+            1,
+            CancellationToken::new(),
+        )
+        .await
+        .expect("the catalogue")
+        .cell(0, 0)
+        .is_some_and(|c| c.display() == "1");
+    if !installed {
+        eprintln!("AdventureWorksLT is not installed here; skipping the sample round trip");
+        return;
+    }
+    let schema = db
+        .fetch_schema("AdventureWorksLT", CancellationToken::new())
+        .await
+        .expect("the sample's schema");
+    assert!(!schema.tables.is_empty());
+    for t in &schema.tables {
+        let cs = schemaic_core::ddl::diff(t, &schemaic_core::ddl::TableDraft::from_table(t), MS);
+        assert!(
+            cs.changes.is_empty(),
+            "{}.{}: {:?}",
+            t.schema.as_deref().unwrap_or(""),
+            t.name,
+            cs.changes
+        );
+    }
+}
+
+/// **A whole designer edit lands.** One column renamed, retyped, made
+/// `NOT NULL` and given a new default — its old default dropped first, which
+/// a retype needs — a column with a default dropped, a column added, a check
+/// swapped, an index added and the table renamed, in one plan. Read back by
+/// introspection, the data kept, and the new default filling a new row.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_designer_edit_lands_as_drafted() {
+    use schemaic_core::ddl::{CheckDraft, ColumnDraft, IndexDraft, TableDraft};
+    use schemaic_core::schema::{CheckInfo, ColumnInfo, IndexColumn, IndexInfo};
+    if !enabled() {
+        return;
+    }
+    let s = Scratch::create("ddl_alter").await;
+    s.exec(
+        "CREATE TABLE dbo.t (id int IDENTITY(1,1) NOT NULL CONSTRAINT pk_t PRIMARY KEY, \
+         qty int NULL CONSTRAINT df_qty DEFAULT 0, old int NULL DEFAULT 9, \
+         CONSTRAINT ck_qty CHECK (qty >= 0)); \
+         INSERT dbo.t (qty) VALUES (5)",
+    )
+    .await;
+    let t = read_table(&s, "t").await;
+    let mut d = TableDraft::from_table(&t);
+    let qty = d
+        .columns
+        .iter_mut()
+        .find(|c| c.info.name == "qty")
+        .expect("qty");
+    qty.info.name = "amount".into();
+    qty.info.type_name = "bigint".into();
+    qty.info.nullable = false;
+    qty.info.default = Some("1".into());
+    d.columns.retain(|c| c.info.name != "old");
+    d.columns.push(ColumnDraft::new(ColumnInfo {
+        name: "note".into(),
+        type_name: "nvarchar(10)".into(),
+        nullable: true,
+        ..Default::default()
+    }));
+    d.check_constraints.clear();
+    d.check_constraints.push(CheckDraft::new(CheckInfo {
+        name: "ck_amount".into(),
+        expression: "[amount] >= (1)".into(),
+        enforced: true,
+        ..Default::default()
+    }));
+    d.indexes.push(IndexDraft::new(IndexInfo {
+        name: "ix_note".into(),
+        columns: vec![IndexColumn::plain("note")],
+        ..Default::default()
+    }));
+    d.name = "t2".into();
+    let stmts = apply_draft(&s, &t, &d).await;
+
+    let t2 = read_table(&s, "t2").await;
+    let c = |n: &str| t2.columns.iter().find(|x| x.name == n);
+    let amount = c("amount").unwrap_or_else(|| panic!("{stmts:#?}"));
+    assert_eq!(amount.type_name, "bigint");
+    assert!(!amount.nullable);
+    assert_eq!(amount.default.as_deref(), Some("1"));
+    assert!(c("old").is_none() && c("qty").is_none() && c("note").is_some());
+    assert_eq!(t2.check_constraints.len(), 1);
+    assert_eq!(t2.check_constraints[0].name, "ck_amount");
+    assert!(t2.indexes.iter().any(|i| i.name == "ix_note"));
+    assert_eq!(
+        s.scalar("SELECT amount FROM dbo.t2 WHERE id = 1").await,
+        "5",
+        "the data kept"
+    );
+    s.exec("INSERT dbo.t2 (note) VALUES (N'x')").await;
+    assert_eq!(
+        s.scalar("SELECT amount FROM dbo.t2 WHERE note = N'x'")
+            .await,
+        "1"
+    );
+    // And the table now round-trips as itself.
+    let again = schemaic_core::ddl::diff(&t2, &TableDraft::from_table(&t2), MS);
+    assert!(again.changes.is_empty(), "{:?}", again.changes);
+}
+
+/// A primary key widened to two columns: dropped by the constraint name
+/// introspection read, and added over both.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_primary_key_is_replaced() {
+    use schemaic_core::ddl::TableDraft;
+    if !enabled() {
+        return;
+    }
+    let s = Scratch::create("ddl_pk").await;
+    s.exec(
+        "CREATE TABLE dbo.t (a int NOT NULL, b int NOT NULL, CONSTRAINT pk_t PRIMARY KEY (a)); \
+         INSERT dbo.t VALUES (1, 1), (2, 2)",
+    )
+    .await;
+    let t = read_table(&s, "t").await;
+    let mut d = TableDraft::from_table(&t);
+    d.primary_key = vec!["a".into(), "b".into()];
+    let err = apply_draft_err_free(&s, &t, &d).await;
+    assert!(err.is_none(), "{err:?}");
+    let t2 = read_table(&s, "t").await;
+    let pk = t2
+        .indexes
+        .iter()
+        .find(|i| i.name == "PRIMARY")
+        .expect("a key");
+    assert_eq!(pk.column_names().collect::<Vec<_>>(), vec!["a", "b"]);
+}
+
+/// [`apply_draft`], answering the failure instead of panicking on it.
+async fn apply_draft_err_free(
+    s: &Scratch,
+    current: &schemaic_core::schema::TableInfo,
+    draft: &schemaic_core::ddl::TableDraft,
+) -> Option<String> {
+    let cs = schemaic_core::ddl::diff(current, draft, MS);
+    if !cs.unsupported().is_empty() {
+        return Some(format!("withheld: {:?}", cs.unsupported()));
+    }
+    s.db.run_ddl(&s.name, &cs.emit(), CancellationToken::new())
+        .await
+        .err()
+        .map(|e| e.to_string())
+}
+
+/// **What the review of the designer found, against the server.** A named
+/// default keeps its name across a retype and is untouched by a nullability
+/// change; a column an unchanged check names is renamed around the check;
+/// keying a nullable column makes it `NOT NULL` first; a nullable column
+/// added with a default fills the existing rows; and a disabled check that is
+/// edited comes back disabled.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_designer_edit_keeps_what_it_did_not_change() {
+    use schemaic_core::ddl::{ColumnDraft, TableDraft};
+    use schemaic_core::schema::ColumnInfo;
+    if !enabled() {
+        return;
+    }
+    let s = Scratch::create("ddl_keep").await;
+    s.exec(
+        "CREATE TABLE dbo.t (id int NOT NULL CONSTRAINT pk_t PRIMARY KEY, \
+         qty int NULL CONSTRAINT df_qty DEFAULT 0, \
+         n int NULL CONSTRAINT df_n DEFAULT 1, \
+         k int NULL, \
+         w int NULL CONSTRAINT ck_w CHECK (w > 0), \
+         CONSTRAINT ck_qty CHECK (qty >= 0)); \
+         ALTER TABLE dbo.t NOCHECK CONSTRAINT ck_w; \
+         INSERT dbo.t (id, qty, n, k) VALUES (1, 5, 2, 10)",
+    )
+    .await;
+    let t = read_table(&s, "t").await;
+    let mut d = TableDraft::from_table(&t);
+    let col = |d: &mut TableDraft, n: &str| -> usize {
+        d.columns.iter().position(|c| c.info.name == n).expect(n)
+    };
+    // Retype `qty`, and rename it though `ck_qty` still names it.
+    let i = col(&mut d, "qty");
+    d.columns[i].info.type_name = "bigint".into();
+    d.columns[i].info.name = "amount".into();
+    // Only nullability for `n`.
+    let i = col(&mut d, "n");
+    d.columns[i].info.nullable = false;
+    // Key `k` too, left nullable in the draft.
+    d.primary_key = vec!["id".into(), "k".into()];
+    // A disabled check's predicate edited.
+    let w = d
+        .check_constraints
+        .iter_mut()
+        .find(|c| c.info.name == "ck_w")
+        .expect("ck_w");
+    w.info.expression = "[w] > 1".into();
+    // A nullable column with a default, added.
+    d.columns.push(ColumnDraft::new(ColumnInfo {
+        name: "status".into(),
+        type_name: "nvarchar(10)".into(),
+        nullable: true,
+        default: Some("N'new'".into()),
+        ..Default::default()
+    }));
+    let stmts = apply_draft(&s, &t, &d).await;
+
+    let defaults = s
+        .scalar(
+            "SELECT STRING_AGG(CONCAT(c.name, '=', dc.name), ',') WITHIN GROUP (ORDER BY c.name) \
+             FROM sys.default_constraints dc JOIN sys.columns c \
+               ON c.object_id = dc.parent_object_id AND c.column_id = dc.parent_column_id \
+             WHERE dc.parent_object_id = OBJECT_ID(N'dbo.t') AND c.name IN ('amount', 'n')",
+        )
+        .await;
+    assert_eq!(defaults, "amount=df_qty,n=df_n", "{stmts:#?}");
+    assert_eq!(
+        s.scalar("SELECT definition FROM sys.check_constraints WHERE name = 'ck_qty'")
+            .await,
+        "([amount]>=(0))"
+    );
+    assert_eq!(
+        s.scalar("SELECT CAST(is_disabled AS int) FROM sys.check_constraints WHERE name = 'ck_w'")
+            .await,
+        "1",
+        "still disabled"
+    );
+    assert_eq!(
+        s.scalar("SELECT status FROM dbo.t WHERE id = 1").await,
+        "new"
+    );
+    let t2 = read_table(&s, "t").await;
+    let pk = t2
+        .indexes
+        .iter()
+        .find(|i| i.name == "PRIMARY")
+        .expect("a key");
+    assert_eq!(pk.constraint.as_deref(), Some("pk_t"), "kept its name");
+    assert_eq!(pk.column_names().collect::<Vec<_>>(), vec!["id", "k"]);
+    let again = schemaic_core::ddl::diff(&t2, &TableDraft::from_table(&t2), MS);
+    assert!(again.changes.is_empty(), "{:?}", again.changes);
+}
+
+/// **A clustered index other than the key's is kept as it is**, not
+/// recreated as a plain one — which would leave the table a heap. An edit to
+/// it is a `KeepLossyIndex` the preview names.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_clustered_index_is_left_alone() {
+    use schemaic_core::ddl::{Change, TableDraft};
+    use schemaic_core::schema::IndexColumn;
+    if !enabled() {
+        return;
+    }
+    let s = Scratch::create("ddl_cx").await;
+    s.exec(
+        "CREATE TABLE dbo.t (id int NOT NULL CONSTRAINT pk_t PRIMARY KEY NONCLUSTERED, d int); \
+         CREATE CLUSTERED INDEX cx ON dbo.t (d)",
+    )
+    .await;
+    let t = read_table(&s, "t").await;
+    assert!(t.indexes.iter().any(|i| i.name == "cx" && i.lossy));
+    let mut d = TableDraft::from_table(&t);
+    let cx = d
+        .indexes
+        .iter_mut()
+        .find(|i| i.info.name == "cx")
+        .expect("cx");
+    cx.info.columns.push(IndexColumn::plain("id"));
+    let cs = schemaic_core::ddl::diff(&t, &d, MS);
+    assert!(
+        cs.changes
+            .iter()
+            .any(|c| matches!(c, Change::KeepLossyIndex { .. })),
+        "{:?}",
+        cs.changes
+    );
+    assert!(cs.emit().is_empty(), "{:?}", cs.emit());
+}
+
+/// **An identity switched on is withheld, not applied** — T-SQL's `ALTER
+/// COLUMN` cannot, and the preview says so and keeps Apply closed rather
+/// than writing half the edit.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_identity_toggle_is_withheld() {
+    use schemaic_core::ddl::TableDraft;
+    if !enabled() {
+        return;
+    }
+    let s = Scratch::create("ddl_ident").await;
+    s.exec("CREATE TABLE dbo.t (id int NOT NULL)").await;
+    let t = read_table(&s, "t").await;
+    let mut d = TableDraft::from_table(&t);
+    d.columns[0].info.auto_increment = true;
+    let cs = schemaic_core::ddl::diff(&t, &d, MS);
+    assert_eq!(cs.unsupported().len(), 1, "{:?}", cs.unsupported());
+    assert!(cs.emit().is_empty(), "{:?}", cs.emit());
 }
 
 /// **A key finds its row whatever its type** — as the grid read it back: a

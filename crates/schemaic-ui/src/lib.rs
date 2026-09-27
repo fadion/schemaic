@@ -4170,20 +4170,21 @@ mod engine_comparison_gate {
         ),
         (
             "schemaic-core/ddl.rs",
-            23,
-            "Seven of the twenty-three are in the capability definitions the \
+            22,
+            "Six of the twenty-two are in the capability definitions the \
              rest of the app asks — `supports_view_rename`, \
-             `alter_column_disturbs_checks`, `requires_named_checks`, \
-             `requires_rowid_key`, `strict_type_allowed`, and two in \
-             `supports_change` — and a comparison is how they answer. The other \
-             sixteen are DDL grammar inside the emitters and validators \
-             (`create_view_sql`, `create_table_sql`, `client_script`'s \
-             `DELIMITER`, `repoint_check_column`, the drafts' `validate`), \
-             where the engines write genuinely different statements rather \
-             than one statement with a switch in it. 24 → 23: \
-             `supports_change`'s SQL Server answer is an exhaustive `match`, \
-             not an `== MsSql` a fifth engine would fall past; \
-             `supports_or_replace_view` became one when SQL Server arrived.",
+             `requires_named_checks`, `requires_rowid_key`, \
+             `strict_type_allowed`, and two in `supports_change` — and a \
+             comparison is how they answer. The other sixteen are DDL grammar \
+             inside the emitters and validators (`create_view_sql`, \
+             `create_table_sql`, `client_script`'s `DELIMITER`, \
+             `repoint_check_column`, the drafts' `validate`), where the engines \
+             write genuinely different statements rather than one statement \
+             with a switch in it. 24 → 23: `supports_change`'s SQL Server \
+             answer is an exhaustive `match`, not an `== MsSql` a fifth engine \
+             would fall past; `supports_or_replace_view` became one when SQL \
+             Server arrived. 23 → 22: `alter_column_disturbs_checks` is an \
+             exhaustive `match` now that SQL Server answers it too.",
         ),
         (
             "schemaic-core/filter.rs",
