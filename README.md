@@ -123,9 +123,9 @@ editing, and schema-aware intelligence, built to feel instant.
   against the OS trust store rather than a root set compiled in years ago), and
   SQLite by picking a file (no server, so no host, credentials or tunnel to fill
   in). **SQL Server and Azure SQL are in preview**: SQL Server logins, querying,
-  scripts with `GO`, browsing the schema, table DDL, exports, server activity and
-  the AI panel's read access work; editing rows, importing, query plans, manual
-  transactions and the schema editors are not offered there yet. Per-connection
+  scripts with `GO`, browsing the schema, table DDL, editing rows in the grid,
+  exports, server activity and the AI panel's read access work; importing, query
+  plans, manual transactions and the schema editors are not offered there yet. Per-connection
   colours, environment badges, and a read-only guard-rail on all of them — on SQL
   Server, which has no read-only session, a read runs in a transaction that is
   rolled back, and a login that can only read is the full guarantee. Coming from another client, you can import the servers you already

@@ -5,10 +5,10 @@
 //! engine is [`crate::Engine::MsSql`]. **A preview, not parity.** What is here:
 //! connect, list databases, run queries, batches and `.sql` scripts,
 //! non-executing validation (`prepare_check`), schema introspection, table
-//! statistics and server activity. The entry points that write (`commit_writes`,
-//! `import_rows`, `run_ddl`, `run_server_ddl`), the ones the grid's editing
-//! needs (`refetch_rows`, `fetch_blob`) and `explain` answer with a refusal
-//! naming SQL Server until they are written, so a caller that skips the
+//! statistics, server activity, and the grid's write-back (`commit_writes`,
+//! `refetch_rows`, `fetch_blob`). The other entry points that write
+//! (`import_rows`, `run_ddl`, `run_server_ddl`) and `explain` answer with a
+//! refusal naming SQL Server until they are written, so a caller that skips the
 //! capability gates is told so rather than handed another engine's SQL.
 //!
 //! **Values come over TDS typed**, not as text: an `int` arrives as an `i32`,
@@ -31,10 +31,12 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use futures_util::StreamExt;
+use schemaic_core::blob::{BlobRef, BlobValue, FETCH_CAP};
 use schemaic_core::intel::SqlDialect;
 use schemaic_core::model::{
-    Column, ColumnFlags, ColumnOrigin, ResultBuilder, ResultSet, Value, binary_display,
-    type_is_binary,
+    CellEdit, Column, ColumnFlags, ColumnOrigin, GridWrite, RefetchRow, RefetchTemplate,
+    ResultBuilder, ResultSet, Rollback, RowInsert, Value, WriteStep, binary_display,
+    one_row_verdict, type_is_binary,
 };
 use schemaic_core::schema::{DbSchema, TableInfo};
 use tiberius::{ColumnData, ColumnType, QueryItem};
@@ -479,8 +481,22 @@ async fn run_statement(
 /// server has only part of that request, runs none of it, and the caller
 /// drops the connection either way.
 async fn cancel_now(client: &mut MsClient) -> DbError {
-    let _ = tokio::time::timeout(crate::CANCEL_TIMEOUT, client.cancel_query()).await;
+    let _ = attention(client).await;
     DbError::Cancelled
+}
+
+/// Send the attention and answer whether the server **acknowledged** it.
+///
+/// Acknowledged, the driver has read the stream through the server's
+/// `DONE_ATTN` and discarded what the aborted request left, so the next
+/// request's replies are its own. Not acknowledged — refused, or past
+/// [`crate::CANCEL_TIMEOUT`] — nothing read off this connection afterwards can
+/// be trusted to answer the request that asked it.
+async fn attention(client: &mut MsClient) -> bool {
+    matches!(
+        tokio::time::timeout(crate::CANCEL_TIMEOUT, client.cancel_query()).await,
+        Ok(Ok(()))
+    )
 }
 
 // ── Describing a result ──────────────────────────────────────────────────────
@@ -1808,31 +1824,6 @@ pub(crate) async fn run_server_ddl(
     })
 }
 
-pub(crate) async fn commit_writes(
-    _db: &Db,
-    _write: &schemaic_core::model::GridWrite,
-    _cancel: CancellationToken,
-) -> Result<u64, DbError> {
-    Err(not_yet("Editing rows in the grid"))
-}
-
-pub(crate) async fn refetch_rows(
-    _db: &Db,
-    _template: &schemaic_core::model::RefetchTemplate,
-    _rows: &[schemaic_core::model::RefetchRow],
-    _cancel: CancellationToken,
-) -> Result<Vec<(usize, Vec<Value>)>, DbError> {
-    Err(not_yet("Re-reading edited rows"))
-}
-
-pub(crate) async fn fetch_blob(
-    _db: &Db,
-    _r: &schemaic_core::blob::BlobRef,
-    _cancel: CancellationToken,
-) -> Result<Option<schemaic_core::blob::BlobValue>, DbError> {
-    Err(not_yet("Opening a binary value"))
-}
-
 pub(crate) async fn import_rows(
     _db: &Db,
     _target: crate::ImportTarget<'_>,
@@ -1840,6 +1831,783 @@ pub(crate) async fn import_rows(
     _cancel: CancellationToken,
 ) -> Result<u64, DbError> {
     Err(not_yet("Importing rows"))
+}
+
+// ── Write-back ───────────────────────────────────────────────────────────────
+//
+// The grid's edits, re-reads and binary cells. The statements are built here,
+// as each engine builds its own; the order they run in and the verdict on each
+// are `core::model`'s (`GridWrite::plan`, `one_row_verdict`), shared with the
+// other three engines.
+
+/// `[name]`, through the one quoter.
+fn ident(name: &str) -> String {
+    schemaic_core::export::ident_sql(name, MS)
+}
+
+/// `[schema].[table]`, qualified whenever the schema is known — for
+/// `pg_qname`'s reason: the statement is never shown, so it must not depend on
+/// the login's default schema.
+fn qname(schema: Option<&str>, table: &str) -> String {
+    match schema {
+        Some(s) => format!("{}.{}", ident(s), ident(table)),
+        None => ident(table),
+    }
+}
+
+/// A statement and the values its `@P1`, `@P2`… placeholders stand for, in
+/// placeholder order.
+#[derive(Debug, Default, PartialEq)]
+struct Bound {
+    sql: String,
+    params: Vec<ColumnData<'static>>,
+}
+
+/// Add `v` as the next parameter and answer its placeholder.
+fn hole(params: &mut Vec<ColumnData<'static>>, v: ColumnData<'static>) -> String {
+    params.push(v);
+    format!("@P{}", params.len())
+}
+
+/// A key value as a parameter.
+///
+/// **A float goes as its text**, the digits the grid shows. A `real` column
+/// compared with an `f64` is widened to it, and `0.1` stored as a `real` is not
+/// `0.1` as an `f64` — the key would match nothing. Text is converted to the
+/// *column's* type instead (a string has the lowest precedence), which is the
+/// value the grid read. Everything else textual is already text: a `decimal`, a
+/// date, a `uniqueidentifier` all arrive as the server's own rendering of them
+/// and convert back exactly.
+fn key_param(v: &Value) -> ColumnData<'static> {
+    let text = |s: String| ColumnData::String(Some(s.into()));
+    match v {
+        Value::Int(i) => ColumnData::I64(Some(*i)),
+        Value::UInt(u) => {
+            i64::try_from(*u).map_or_else(|_| text(u.to_string()), |i| ColumnData::I64(Some(i)))
+        }
+        Value::Float(f) => text(f.to_string()),
+        Value::Str(s) => text(s.clone()),
+        // Never bound: `where_key` writes `IS NULL` for one.
+        Value::Null => ColumnData::String(None),
+    }
+}
+
+/// A staged cell as a parameter, or `None` for NULL — which is written as the
+/// literal, since a TDS parameter is typed and a NULL of one type is not a
+/// NULL of every other.
+fn cell_param(v: &CellEdit) -> Option<ColumnData<'static>> {
+    match v {
+        CellEdit::Null => None,
+        CellEdit::Text(t) => Some(ColumnData::String(Some(t.clone().into()))),
+        CellEdit::Bytes(b) => Some(ColumnData::Binary(Some(b.to_vec().into()))),
+    }
+}
+
+/// `[c] = @Pn` … ` AND ` …, with a NULL key value compared as `IS NULL`: T-SQL
+/// has no null-safe equality before 2022's `IS NOT DISTINCT FROM`, and `= NULL`
+/// is never true.
+fn where_key(key: &[(String, Value)], params: &mut Vec<ColumnData<'static>>) -> String {
+    key.iter()
+        .map(|(col, v)| {
+            if v.is_null() {
+                format!("{} IS NULL", ident(col))
+            } else {
+                format!("{} = {}", ident(col), hole(params, key_param(v)))
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" AND ")
+}
+
+/// The value side of one staged cell: its placeholder, or `NULL`.
+fn cell_sql(v: &CellEdit, params: &mut Vec<ColumnData<'static>>) -> String {
+    match cell_param(v) {
+        Some(p) => hole(params, p),
+        None => "NULL".to_string(),
+    }
+}
+
+/// The statement for one step of a [`GridWrite`]. The `SET` values bind before
+/// the `WHERE`'s, the order they appear in the text.
+fn statement_for(step: WriteStep<'_>) -> Bound {
+    let mut params = Vec::new();
+    let sql = match step {
+        WriteStep::Delete(d) => {
+            let w = where_key(&d.key, &mut params);
+            format!(
+                "DELETE FROM {} WHERE {w}",
+                qname(d.schema.as_deref(), &d.table)
+            )
+        }
+        WriteStep::Update(u) => {
+            let sets = u
+                .set
+                .iter()
+                .map(|(col, v)| format!("{} = {}", ident(col), cell_sql(v, &mut params)))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let w = where_key(&u.key, &mut params);
+            format!(
+                "UPDATE {} SET {sets} WHERE {w}",
+                qname(u.schema.as_deref(), &u.table)
+            )
+        }
+        WriteStep::Insert(i) => {
+            let table = qname(i.schema.as_deref(), &i.table);
+            if i.cols.is_empty() {
+                // Every column left to its default; `() VALUES ()` is not T-SQL.
+                format!("INSERT INTO {table} DEFAULT VALUES")
+            } else {
+                let cols = i.cols.iter().map(|(c, _)| ident(c)).collect::<Vec<_>>();
+                let vals = i
+                    .cols
+                    .iter()
+                    .map(|(_, v)| cell_sql(v, &mut params))
+                    .collect::<Vec<_>>();
+                format!(
+                    "INSERT INTO {table} ({}) VALUES ({})",
+                    cols.join(", "),
+                    vals.join(", ")
+                )
+            }
+        }
+    };
+    Bound { sql, params }
+}
+
+/// One re-read row's `SELECT`: key columns, then the confirming ones, the order
+/// `edit::refetch_key` builds the values in.
+fn refetch_statement(template: &RefetchTemplate, row: &RefetchRow) -> Bound {
+    let mut params = Vec::new();
+    let cols = template
+        .columns
+        .iter()
+        .map(|c| ident(c))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let key: Vec<(String, Value)> = template
+        .key_cols
+        .iter()
+        .chain(template.confirm_cols.iter())
+        .zip(&row.key)
+        .map(|(&ci, v)| (template.columns[ci].clone(), v.clone()))
+        .collect();
+    let w = where_key(&key, &mut params);
+    Bound {
+        sql: format!(
+            "SELECT TOP (1) {cols} FROM {} WHERE {w}",
+            qname(template.schema.as_deref(), &template.table)
+        ),
+        params,
+    }
+}
+
+/// One binary cell's length and its first [`FETCH_CAP`] bytes. `DATALENGTH`,
+/// not `LEN`: the second counts characters and trims trailing blanks.
+fn blob_statement(r: &BlobRef) -> Bound {
+    let mut params = Vec::new();
+    let col = ident(&r.column);
+    let w = where_key(&r.key, &mut params);
+    Bound {
+        sql: format!(
+            "SELECT TOP (1) DATALENGTH({col}), SUBSTRING({col}, 1, {FETCH_CAP}) FROM {} WHERE {w}",
+            qname(r.schema.as_deref(), &r.table)
+        ),
+        params,
+    }
+}
+
+/// What the write needs to know about a column that the grid does not carry.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ColumnFacts {
+    name: String,
+    /// The base type — an alias type's underlying one — lower case.
+    base_type: String,
+    identity: bool,
+}
+
+const COLUMN_FACTS: &str = "SELECT c.name, TYPE_NAME(c.system_type_id), c.is_identity \
+     FROM sys.columns c WHERE c.object_id = OBJECT_ID(@P1)";
+
+/// Does `base_type` hold text, so that an empty string is a value of it?
+fn holds_text(base_type: &str) -> bool {
+    matches!(
+        base_type,
+        "char" | "varchar" | "nchar" | "nvarchar" | "text" | "ntext" | "xml" | "sql_variant"
+    )
+}
+
+fn fact<'a>(facts: &'a [ColumnFacts], col: &str) -> Option<&'a ColumnFacts> {
+    facts.iter().find(|f| f.name.eq_ignore_ascii_case(col))
+}
+
+/// The refusal for a batch that would write an empty string where SQL Server
+/// converts one silently, or `None`.
+///
+/// **SQL Server does not refuse `''` for a number or a date — it converts it.**
+/// An `int` becomes `0`, a `datetime` `1900-01-01`, a `bit` `0`; PostgreSQL
+/// refuses the same statement. A cleared cell in the grid is `''`, so on this
+/// engine alone clearing a quantity would store zero and report success. Asked
+/// before anything runs, so nothing is written; a column the catalogue does not
+/// name is left to the server.
+fn blank_refusal(write: &GridWrite, facts: &[ColumnFacts]) -> Option<String> {
+    let staged = write
+        .updates
+        .iter()
+        .flat_map(|u| u.set.iter())
+        .chain(write.inserts.iter().flat_map(|i| i.cols.iter()));
+    for (col, v) in staged {
+        let CellEdit::Text(t) = v else { continue };
+        if !t.is_empty() {
+            continue;
+        }
+        if let Some(f) = fact(facts, col).filter(|f| !holds_text(&f.base_type)) {
+            return Some(format!(
+                "An empty value can't be written to {} ({}): SQL Server would store it as \
+                 0 or 1900-01-01 rather than refuse it. Set the cell to NULL, or type a value.",
+                col, f.base_type
+            ));
+        }
+    }
+    None
+}
+
+/// Does this insert give an identity column a value? SQL Server refuses one
+/// unless `IDENTITY_INSERT` is on for the table — and, once it is on, refuses
+/// an insert that *doesn't*, so it is switched per statement.
+fn sets_identity(ins: &RowInsert, facts: &[ColumnFacts]) -> bool {
+    ins.cols
+        .iter()
+        .any(|(c, _)| fact(facts, c).is_some_and(|f| f.identity))
+}
+
+/// The columns of the table a batch writes to.
+async fn column_facts(
+    client: &mut MsClient,
+    schema: Option<&str>,
+    table: &str,
+) -> Result<Vec<ColumnFacts>, DbError> {
+    let name = qname(schema, table);
+    let stream = client
+        .query(COLUMN_FACTS, &[&name.as_str()])
+        .await
+        .map_err(|e| db_err(&e))?;
+    let rows = stream.into_first_result().await.map_err(|e| db_err(&e))?;
+    Ok(rows
+        .iter()
+        .map(|r| ColumnFacts {
+            name: cell_text(r, 0).unwrap_or_default(),
+            base_type: cell_text(r, 1).unwrap_or_default().to_ascii_lowercase(),
+            identity: cell_text(r, 2).as_deref() == Some("1"),
+        })
+        .collect())
+}
+
+/// What running one write statement came to.
+#[derive(Debug)]
+enum Ran {
+    /// It finished, and this is its own row count.
+    Counted(u64),
+    /// Stop won and the attention was sent; `in_step` is whether the server
+    /// acknowledged it (see [`attention`]), and so whether a rollback sent
+    /// next on this connection reads its own answer.
+    Stopped { in_step: bool },
+}
+
+/// Run one statement for its row count, raced against Stop.
+///
+/// The statement's own count is the **last** one: a trigger's statements
+/// report theirs first, in the same batch.
+async fn execute_counted(
+    client: &mut MsClient,
+    b: &Bound,
+    cancel: &CancellationToken,
+) -> Result<Ran, DbError> {
+    let refs: Vec<&dyn tiberius::ToSql> =
+        b.params.iter().map(|p| p as &dyn tiberius::ToSql).collect();
+    let outcome = {
+        let step = client.execute(b.sql.as_str(), &refs);
+        tokio::select! {
+            r = step => Some(r),
+            _ = cancel.cancelled() => None,
+        }
+    };
+    match outcome {
+        None => Ok(Ran::Stopped {
+            in_step: attention(client).await,
+        }),
+        Some(r) => r
+            .map(|done| Ran::Counted(done.rows_affected().last().copied().unwrap_or(0)))
+            .map_err(|e| db_err(&e)),
+    }
+}
+
+/// Roll back, and say whether it is known to have happened.
+///
+/// **Complete whenever the server answered**, and there is no MySQL-style
+/// half-answer to read: every SQL Server table is transactional. `IF
+/// @@TRANCOUNT > 0` because some errors end the transaction themselves (a
+/// deadlock victim, a severe error), and a bare `ROLLBACK` after one fails.
+/// Unanswered is `Unknown` — the server rolls back a dropped connection's
+/// transaction, but this side did not see it do so.
+async fn rollback(client: &mut MsClient) -> Rollback {
+    match drain(client, "IF @@TRANCOUNT > 0 ROLLBACK TRANSACTION").await {
+        Ok(()) => Rollback::Complete,
+        Err(_) => Rollback::Unknown,
+    }
+}
+
+/// A cancelled commit: [`DbError::Cancelled`] when the rollback is known,
+/// otherwise the sentence saying it is not — MySQL's `cancelled_write`.
+fn cancelled_write(undone: Rollback) -> DbError {
+    match undone {
+        Rollback::Complete => DbError::Cancelled,
+        undone => DbError::Refused(format!("Commit cancelled{}", undone.note())),
+    }
+}
+
+/// An error's own sentence, without the variant's `query failed:` prefix — so
+/// wrapping it again with a rollback note does not say that twice.
+fn err_text(e: DbError) -> String {
+    match e {
+        DbError::Query(m) | DbError::Connect(m) | DbError::Refused(m) => m,
+        other => other.to_string(),
+    }
+}
+
+/// A failed step's error with what the rollback achieved appended.
+async fn failed(client: &mut MsClient, msg: String) -> DbError {
+    let undone = rollback(client).await;
+    DbError::Query(format!("{msg}{}", undone.note()))
+}
+
+/// Commit a batch of grid edits in one transaction, each statement required to
+/// affect exactly one row. Returns the rows written — equal to the statements
+/// run, by the 1-row guard.
+///
+/// A `GridWrite` is one table's by construction, so its database is read off
+/// the first step and the connection opened on it. Closing the connection is
+/// the backstop for every early return: the server rolls back what a closed
+/// connection left open.
+pub(crate) async fn commit_writes(
+    db: &Db,
+    write: &GridWrite,
+    cancel: CancellationToken,
+) -> Result<u64, DbError> {
+    let plan = write.plan();
+    let Some(first) = plan.first() else {
+        return Ok(0);
+    };
+    if cancel.is_cancelled() {
+        return Err(DbError::Cancelled);
+    }
+    let (database, schema, table) = match first {
+        WriteStep::Delete(d) => (&d.database, d.schema.as_deref(), &d.table),
+        WriteStep::Update(u) => (&u.database, u.schema.as_deref(), &u.table),
+        WriteStep::Insert(i) => (&i.database, i.schema.as_deref(), &i.table),
+    };
+    let mut client = connect(db, Some(database)).await?;
+    let facts = column_facts(&mut client, schema, table).await?;
+    if let Some(msg) = blank_refusal(write, &facts) {
+        return Err(DbError::Refused(msg));
+    }
+    drain(&mut client, "BEGIN TRANSACTION").await?;
+    let mut total = 0u64;
+    for step in plan {
+        if cancel.is_cancelled() {
+            return Err(cancelled_write(rollback(&mut client).await));
+        }
+        let identity = match step {
+            WriteStep::Insert(i) if sets_identity(i, &facts) => {
+                Some(qname(i.schema.as_deref(), &i.table))
+            }
+            _ => None,
+        };
+        if let Some(t) = &identity
+            && let Err(e) = drain(&mut client, &format!("SET IDENTITY_INSERT {t} ON")).await
+        {
+            return Err(failed(&mut client, err_text(e)).await);
+        }
+        let affected = match execute_counted(&mut client, &statement_for(step), &cancel).await {
+            Ok(Ran::Counted(n)) => n,
+            // **Only an acknowledged attention lets the rollback be believed.**
+            // The statement's future was dropped mid-reply; without the
+            // server's `DONE_ATTN` the stream is at an unknown point, and a
+            // `ROLLBACK` sent now could read the aborted request's leftovers as
+            // its own success — MySQL's desynchronised-stream defect, on this
+            // engine. So nothing is sent: the server rolls back when the
+            // connection closes, but this side did not see it.
+            Ok(Ran::Stopped { in_step }) => {
+                let undone = if in_step {
+                    rollback(&mut client).await
+                } else {
+                    Rollback::Unknown
+                };
+                return Err(cancelled_write(undone));
+            }
+            Err(e) => return Err(failed(&mut client, err_text(e)).await),
+        };
+        if let Some(t) = &identity
+            && let Err(e) = drain(&mut client, &format!("SET IDENTITY_INSERT {t} OFF")).await
+        {
+            return Err(failed(&mut client, err_text(e)).await);
+        }
+        if let Err(msg) = one_row_verdict(step, affected) {
+            return Err(failed(&mut client, msg).await);
+        }
+        total += affected;
+    }
+    if let Err(e) = drain(&mut client, "COMMIT TRANSACTION").await {
+        return Err(failed(&mut client, err_text(e)).await);
+    }
+    Ok(total)
+}
+
+/// Read one bound `SELECT`'s first row as the grid's values, raced against Stop.
+async fn first_row(
+    client: &mut MsClient,
+    b: &Bound,
+    cancel: &CancellationToken,
+) -> Result<Option<Vec<Value>>, DbError> {
+    let refs: Vec<&dyn tiberius::ToSql> =
+        b.params.iter().map(|p| p as &dyn tiberius::ToSql).collect();
+    let read = async {
+        let stream = client
+            .query(b.sql.as_str(), &refs)
+            .await
+            .map_err(|e| db_err(&e))?;
+        let row = stream.into_row().await.map_err(|e| db_err(&e))?;
+        Ok::<_, DbError>(row.map(|r| r.cells().map(|(_, d)| cell_value(d)).collect()))
+    };
+    let outcome = tokio::select! {
+        r = read => Some(r),
+        _ = cancel.cancelled() => None,
+    };
+    match outcome {
+        Some(r) => r,
+        None => Err(cancel_now(client).await),
+    }
+}
+
+/// Re-read the rows a commit changed, so the grid can splice them in place.
+/// Each cell is rendered by [`cell_value`], as the read that produced the grid
+/// rendered it. A row no longer there is skipped: a concurrent delete's right
+/// answer is "nothing to splice".
+pub(crate) async fn refetch_rows(
+    db: &Db,
+    template: &RefetchTemplate,
+    rows: &[RefetchRow],
+    cancel: CancellationToken,
+) -> Result<Vec<(usize, Vec<Value>)>, DbError> {
+    if rows.is_empty() {
+        return Ok(Vec::new());
+    }
+    if cancel.is_cancelled() {
+        return Err(DbError::Cancelled);
+    }
+    let mut client = connect(db, Some(&template.database)).await?;
+    let mut out = Vec::with_capacity(rows.len());
+    for row in rows {
+        if let Some(cells) =
+            first_row(&mut client, &refetch_statement(template, row), &cancel).await?
+        {
+            out.push((row.data_row, cells));
+        }
+    }
+    Ok(out)
+}
+
+/// Read one binary cell — its whole length and its first [`FETCH_CAP`] bytes.
+/// A NULL cell and a vanished row are the same answer, as on every engine.
+pub(crate) async fn fetch_blob(
+    db: &Db,
+    r: &BlobRef,
+    cancel: CancellationToken,
+) -> Result<Option<BlobValue>, DbError> {
+    if cancel.is_cancelled() {
+        return Err(DbError::Cancelled);
+    }
+    let mut client = connect(db, Some(&r.database)).await?;
+    let b = blob_statement(r);
+    let refs: Vec<&dyn tiberius::ToSql> =
+        b.params.iter().map(|p| p as &dyn tiberius::ToSql).collect();
+    let read = async {
+        let stream = client
+            .query(b.sql.as_str(), &refs)
+            .await
+            .map_err(|e| db_err(&e))?;
+        let Some(row) = stream.into_row().await.map_err(|e| db_err(&e))? else {
+            return Ok(None);
+        };
+        let mut cells = row.into_iter();
+        // `DATALENGTH` is an `int`, or a `bigint` for a `(max)` column.
+        let len = match cells.next() {
+            Some(ColumnData::I32(Some(n))) => i64::from(n),
+            Some(ColumnData::I64(Some(n))) => n,
+            _ => return Ok(None),
+        };
+        let bytes = match cells.next() {
+            Some(ColumnData::Binary(Some(b))) => b.into_owned(),
+            _ => Vec::new(),
+        };
+        Ok::<_, DbError>(Some(BlobValue {
+            bytes,
+            len: len.max(0) as u64,
+        }))
+    };
+    let outcome = tokio::select! {
+        v = read => Some(v),
+        _ = cancel.cancelled() => None,
+    };
+    match outcome {
+        Some(v) => v,
+        None => Err(cancel_now(&mut client).await),
+    }
+}
+
+#[cfg(test)]
+mod write_tests {
+    use super::*;
+    use schemaic_core::model::{RowDelete, RowEdit};
+
+    fn text(s: &str) -> ColumnData<'static> {
+        ColumnData::String(Some(s.to_string().into()))
+    }
+
+    fn edit(set: Vec<(&str, CellEdit)>, key: Vec<(&str, Value)>) -> RowEdit {
+        RowEdit {
+            database: "shop".into(),
+            schema: Some("dbo".into()),
+            table: "orders".into(),
+            set: set.into_iter().map(|(c, v)| (c.to_string(), v)).collect(),
+            key: key.into_iter().map(|(c, v)| (c.to_string(), v)).collect(),
+        }
+    }
+
+    fn insert(cols: Vec<(&str, CellEdit)>) -> RowInsert {
+        RowInsert {
+            database: "shop".into(),
+            schema: Some("dbo".into()),
+            table: "orders".into(),
+            cols: cols.into_iter().map(|(c, v)| (c.to_string(), v)).collect(),
+        }
+    }
+
+    fn facts(cols: &[(&str, &str, bool)]) -> Vec<ColumnFacts> {
+        cols.iter()
+            .map(|(n, t, id)| ColumnFacts {
+                name: n.to_string(),
+                base_type: t.to_string(),
+                identity: *id,
+            })
+            .collect()
+    }
+
+    /// The `SET` values bind before the `WHERE`'s, a NULL is the literal and
+    /// never a typed parameter, bytes bind as bytes, and a NULL key value is
+    /// `IS NULL` — `= NULL` would match no row, and the 1-row guard would then
+    /// report the wrong `WHERE` as a failed write.
+    #[test]
+    fn an_update_binds_in_text_order_and_writes_null_as_the_literal() {
+        let e = edit(
+            vec![
+                ("note", CellEdit::Text("hi".into())),
+                ("gone", CellEdit::Null),
+                ("photo", CellEdit::Bytes(Arc::from(&[1u8, 2][..]))),
+            ],
+            vec![("id", Value::Int(7)), ("region", Value::Null)],
+        );
+        let b = statement_for(WriteStep::Update(&e));
+        assert_eq!(
+            b.sql,
+            "UPDATE [dbo].[orders] SET [note] = @P1, [gone] = NULL, [photo] = @P2 \
+             WHERE [id] = @P3 AND [region] IS NULL"
+        );
+        assert_eq!(
+            b.params,
+            vec![
+                text("hi"),
+                ColumnData::Binary(Some(vec![1u8, 2].into())),
+                ColumnData::I64(Some(7)),
+            ]
+        );
+    }
+
+    #[test]
+    fn an_insert_with_nothing_set_takes_every_default() {
+        let i = insert(vec![]);
+        let b = statement_for(WriteStep::Insert(&i));
+        assert_eq!(b.sql, "INSERT INTO [dbo].[orders] DEFAULT VALUES");
+        assert!(b.params.is_empty());
+
+        let i = insert(vec![
+            ("qty", CellEdit::Text("3".into())),
+            ("note", CellEdit::Null),
+        ]);
+        let b = statement_for(WriteStep::Insert(&i));
+        assert_eq!(
+            b.sql,
+            "INSERT INTO [dbo].[orders] ([qty], [note]) VALUES (@P1, NULL)"
+        );
+        assert_eq!(b.params, vec![text("3")]);
+    }
+
+    #[test]
+    fn a_delete_names_its_whole_key() {
+        let d = RowDelete {
+            database: "shop".into(),
+            schema: Some("sales".into()),
+            table: "order lines".into(),
+            key: vec![
+                ("order_id".into(), Value::Int(1)),
+                ("line".into(), Value::Str("A".into())),
+            ],
+        };
+        let b = statement_for(WriteStep::Delete(&d));
+        assert_eq!(
+            b.sql,
+            "DELETE FROM [sales].[order lines] WHERE [order_id] = @P1 AND [line] = @P2"
+        );
+        assert_eq!(b.params, vec![ColumnData::I64(Some(1)), text("A")]);
+    }
+
+    /// Through the one quoter: a `]` in a name is doubled, and nothing else is
+    /// special inside brackets.
+    #[test]
+    fn a_bracket_in_a_name_is_doubled() {
+        let mut e = edit(
+            vec![("a]b", CellEdit::Text("x".into()))],
+            vec![("id", Value::Int(1))],
+        );
+        e.table = "t]1".into();
+        e.schema = None;
+        let b = statement_for(WriteStep::Update(&e));
+        assert_eq!(b.sql, "UPDATE [t]]1] SET [a]]b] = @P1 WHERE [id] = @P2");
+    }
+
+    /// A float key goes as its text, so the server converts it to the
+    /// column's own type — a `real` compared with an `f64` is widened, and
+    /// `0.1` stored as a `real` is not `0.1` as an `f64`. A `u64` past `i64`
+    /// goes as text too, rather than wrapping.
+    #[test]
+    fn a_float_key_is_compared_as_the_text_the_grid_shows() {
+        assert_eq!(key_param(&Value::Float(0.1)), text("0.1"));
+        assert_eq!(
+            key_param(&Value::UInt(u64::MAX)),
+            text(&u64::MAX.to_string())
+        );
+        assert_eq!(key_param(&Value::UInt(5)), ColumnData::I64(Some(5)));
+        assert_eq!(
+            key_param(&Value::Str("2008-06-01".into())),
+            text("2008-06-01")
+        );
+    }
+
+    #[test]
+    fn a_reread_selects_one_row_by_key_then_confirming_columns() {
+        let t = RefetchTemplate {
+            database: "shop".into(),
+            schema: Some("dbo".into()),
+            table: "orders".into(),
+            columns: vec!["id".into(), "qty".into(), "note".into()],
+            key_cols: vec![0],
+            confirm_cols: vec![1],
+        };
+        let row = RefetchRow {
+            data_row: 4,
+            key: vec![Value::Int(9), Value::Null],
+        };
+        let b = refetch_statement(&t, &row);
+        assert_eq!(
+            b.sql,
+            "SELECT TOP (1) [id], [qty], [note] FROM [dbo].[orders] WHERE [id] = @P1 AND [qty] IS NULL"
+        );
+        assert_eq!(b.params, vec![ColumnData::I64(Some(9))]);
+    }
+
+    /// `DATALENGTH`, never `LEN` — the second counts characters and trims
+    /// trailing blanks — and the read is capped at `FETCH_CAP`.
+    #[test]
+    fn a_binary_cell_is_read_by_its_byte_length_and_capped() {
+        let r = BlobRef {
+            database: "shop".into(),
+            schema: Some("SalesLT".into()),
+            table: "Product".into(),
+            column: "ThumbNailPhoto".into(),
+            key: vec![("ProductID".into(), Value::Int(680))],
+        };
+        let b = blob_statement(&r);
+        assert_eq!(
+            b.sql,
+            format!(
+                "SELECT TOP (1) DATALENGTH([ThumbNailPhoto]), SUBSTRING([ThumbNailPhoto], 1, {FETCH_CAP}) \
+                 FROM [SalesLT].[Product] WHERE [ProductID] = @P1"
+            )
+        );
+    }
+
+    /// **SQL Server converts `''` to a number or a date rather than refusing
+    /// it**, so a cleared cell would store 0 and report success. The batch is
+    /// refused before anything runs — for an update and for an insert — and
+    /// only where the column is not text.
+    #[test]
+    fn an_empty_value_is_refused_where_sql_server_would_convert_it() {
+        let f = facts(&[
+            ("qty", "int", false),
+            ("shipped", "datetime", false),
+            ("note", "nvarchar", false),
+        ]);
+        let blank = |col: &str| GridWrite {
+            updates: vec![edit(
+                vec![(col, CellEdit::Text(String::new()))],
+                vec![("id", Value::Int(1))],
+            )],
+            ..Default::default()
+        };
+        let msg = blank_refusal(&blank("qty"), &f).expect("an int refuses ''");
+        assert!(msg.contains("qty") && msg.contains("int"), "{msg}");
+        assert!(blank_refusal(&blank("shipped"), &f).is_some());
+        // Case-insensitive, as SQL Server's own names usually are.
+        assert!(blank_refusal(&blank("QTY"), &f).is_some());
+        // Text holds an empty string; the server decides for a column the
+        // catalogue did not name.
+        assert_eq!(blank_refusal(&blank("note"), &f), None);
+        assert_eq!(blank_refusal(&blank("mystery"), &f), None);
+        // An insert is refused the same way.
+        let ins = GridWrite {
+            inserts: vec![insert(vec![("qty", CellEdit::Text(String::new()))])],
+            ..Default::default()
+        };
+        assert!(blank_refusal(&ins, &f).is_some());
+        // A value, and a NULL, are not blanks.
+        let fine = GridWrite {
+            updates: vec![edit(
+                vec![
+                    ("qty", CellEdit::Text("0".into())),
+                    ("shipped", CellEdit::Null),
+                ],
+                vec![("id", Value::Int(1))],
+            )],
+            ..Default::default()
+        };
+        assert_eq!(blank_refusal(&fine, &f), None);
+    }
+
+    /// `IDENTITY_INSERT` is wanted exactly when an insert gives the identity
+    /// column a value: on, SQL Server refuses an insert that *doesn't*.
+    #[test]
+    fn identity_insert_is_wanted_only_for_an_insert_that_sets_the_identity() {
+        let f = facts(&[("id", "int", true), ("name", "nvarchar", false)]);
+        assert!(sets_identity(
+            &insert(vec![("ID", CellEdit::Text("5".into()))]),
+            &f
+        ));
+        assert!(!sets_identity(
+            &insert(vec![("name", CellEdit::Text("x".into()))]),
+            &f
+        ));
+        assert!(!sets_identity(&insert(vec![]), &f));
+    }
 }
 
 #[cfg(test)]

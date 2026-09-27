@@ -1,11 +1,13 @@
 //! SQL Server's live leg, on its own terms.
 //!
 //! **Outside [`crate::suite`] and the `live_suite!` macro**, because the shared
-//! suite writes rows back, applies DDL and pins sessions, and SQL Server answers
-//! all three with a refusal until they are written. What is here is what the
-//! engine *does* do — connecting, the read path and its values, provenance, the
-//! read-only guard, validation, the schema, activity — plus the two catalogues
-//! only it has: its builtin functions, and its DMV snippets.
+//! suite applies DDL and pins sessions, and SQL Server answers both with a
+//! refusal until they are written — and its write-back cases stand on the
+//! shared suite's `Target`, which this leg does not have. What is here is what
+//! the engine *does* do — connecting, the read path and its values, provenance,
+//! the read-only guard, validation, the schema, activity, the grid's write-back
+//! — plus the two catalogues only it has: its builtin functions, and its DMV
+//! snippets.
 //!
 //! | variable | default |
 //! |---|---|
@@ -19,8 +21,14 @@
 //! Each test makes its own `schemaic_it_*` database and drops it, under the same
 //! name guard as every other leg ([`crate::scratch::assert_scratch_name`]).
 
+use std::sync::Arc;
+
+use schemaic_core::blob::BlobRef;
 use schemaic_core::intel::SqlDialect;
-use schemaic_core::model::ResultSet;
+use schemaic_core::model::{
+    CellEdit, GridWrite, RefetchRow, RefetchTemplate, ResultSet, RowDelete, RowEdit, RowInsert,
+    Value,
+};
 use schemaic_db::{Db, DbError, Enforce, Engine};
 use tokio_util::sync::CancellationToken;
 
@@ -358,6 +366,428 @@ async fn a_write_reports_the_rows_it_touched() {
         Some(2)
     );
     assert_eq!(s.exec("DELETE FROM dbo.t").await.affected, Some(3));
+}
+
+// ── Grid write-back ──────────────────────────────────────────────────────────
+
+fn row_edit(s: &Scratch, table: &str, set: &[(&str, CellEdit)], key: &[(&str, Value)]) -> RowEdit {
+    RowEdit {
+        database: s.name.clone(),
+        schema: Some("dbo".into()),
+        table: table.into(),
+        set: set
+            .iter()
+            .map(|(c, v)| (c.to_string(), v.clone()))
+            .collect(),
+        key: key
+            .iter()
+            .map(|(c, v)| (c.to_string(), v.clone()))
+            .collect(),
+    }
+}
+
+fn row_insert(s: &Scratch, table: &str, cols: &[(&str, CellEdit)]) -> RowInsert {
+    RowInsert {
+        database: s.name.clone(),
+        schema: Some("dbo".into()),
+        table: table.into(),
+        cols: cols
+            .iter()
+            .map(|(c, v)| (c.to_string(), v.clone()))
+            .collect(),
+    }
+}
+
+fn row_delete(s: &Scratch, table: &str, key: &[(&str, Value)]) -> RowDelete {
+    RowDelete {
+        database: s.name.clone(),
+        schema: Some("dbo".into()),
+        table: table.into(),
+        key: key
+            .iter()
+            .map(|(c, v)| (c.to_string(), v.clone()))
+            .collect(),
+    }
+}
+
+fn txt(s: &str) -> CellEdit {
+    CellEdit::Text(s.into())
+}
+
+async fn commit(s: &Scratch, write: GridWrite) -> Result<u64, DbError> {
+    s.db.commit_writes(&write, CancellationToken::new()).await
+}
+
+/// **An edit lands on exactly its row**, a NULL is stored as NULL, bytes as
+/// bytes, and what the grid re-reads and opens is what was written.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_staged_edit_lands_on_its_row_and_reads_back() {
+    if !enabled() {
+        return;
+    }
+    let s = Scratch::create("wb_update").await;
+    s.exec(
+        "CREATE TABLE dbo.t (id int PRIMARY KEY, note nvarchar(20) NULL, qty int NULL, \
+         photo varbinary(max) NULL); \
+         INSERT dbo.t VALUES (1, N'one', 1, NULL), (2, N'two', 2, NULL)",
+    )
+    .await;
+    let n = commit(
+        &s,
+        GridWrite {
+            updates: vec![row_edit(
+                &s,
+                "t",
+                &[
+                    ("note", txt("Ωμέγα")),
+                    ("qty", CellEdit::Null),
+                    ("photo", CellEdit::Bytes(Arc::from(&[0u8, 1, 2, 255][..]))),
+                ],
+                &[("id", Value::Int(1))],
+            )],
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("the edit commits");
+    assert_eq!(n, 1);
+    assert_eq!(
+        s.scalar(
+            "SELECT CONCAT(note, '|', COALESCE(CAST(qty AS varchar), 'NULL'), '|', \
+                  CONVERT(varchar(20), photo, 1)) FROM dbo.t WHERE id = 1"
+        )
+        .await,
+        "Ωμέγα|NULL|0x000102FF"
+    );
+    assert_eq!(
+        s.scalar("SELECT note FROM dbo.t WHERE id = 2").await,
+        "two",
+        "only its row"
+    );
+
+    let template = RefetchTemplate {
+        database: s.name.clone(),
+        schema: Some("dbo".into()),
+        table: "t".into(),
+        columns: vec!["id".into(), "note".into(), "qty".into()],
+        key_cols: vec![0],
+        confirm_cols: vec![],
+    };
+    let again =
+        s.db.refetch_rows(
+            &template,
+            &[
+                RefetchRow {
+                    data_row: 0,
+                    key: vec![Value::Int(1)],
+                },
+                RefetchRow {
+                    data_row: 5,
+                    key: vec![Value::Int(99)],
+                },
+            ],
+            CancellationToken::new(),
+        )
+        .await
+        .expect("the re-read");
+    assert_eq!(
+        again,
+        vec![(
+            0,
+            vec![Value::Int(1), Value::Str("Ωμέγα".into()), Value::Null]
+        )],
+        "a vanished row is skipped"
+    );
+
+    let blob =
+        s.db.fetch_blob(
+            &BlobRef {
+                database: s.name.clone(),
+                schema: Some("dbo".into()),
+                table: "t".into(),
+                column: "photo".into(),
+                key: vec![("id".into(), Value::Int(1))],
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .expect("the blob read")
+        .expect("a value");
+    assert_eq!((blob.bytes, blob.len), (vec![0u8, 1, 2, 255], 4));
+}
+
+/// Inserts take the defaults they are not given, an explicit identity value
+/// goes in through `IDENTITY_INSERT` — which is on only for that statement —
+/// and a delete runs before an insert that reuses its key.
+#[tokio::test(flavor = "multi_thread")]
+async fn inserts_take_defaults_identities_and_a_deleted_key() {
+    if !enabled() {
+        return;
+    }
+    let s = Scratch::create("wb_insert").await;
+    s.exec(
+        "CREATE TABLE dbo.t (id int IDENTITY(1,1) PRIMARY KEY, \
+         code nvarchar(5) NOT NULL UNIQUE DEFAULT N'x', qty int NOT NULL DEFAULT 7); \
+         INSERT dbo.t (code) VALUES (N'old')",
+    )
+    .await;
+    let n = commit(
+        &s,
+        GridWrite {
+            deletes: vec![row_delete(&s, "t", &[("id", Value::Int(1))])],
+            inserts: vec![
+                row_insert(&s, "t", &[("code", txt("old"))]),
+                row_insert(&s, "t", &[("id", txt("50")), ("code", txt("id50"))]),
+                row_insert(&s, "t", &[]),
+            ],
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("the batch commits");
+    assert_eq!(n, 4);
+    assert_eq!(
+        s.scalar(
+            "SELECT STRING_AGG(CONCAT(id, ':', code, ':', qty), ',') \
+                  WITHIN GROUP (ORDER BY id) FROM dbo.t"
+        )
+        .await,
+        "2:old:7,50:id50:7,51:x:7"
+    );
+}
+
+/// **The 1-row net, both ways, and a failure part-way through.** A key that
+/// matches no row and one that matches two are refused, and so is a value the
+/// column cannot take — each after an earlier statement in the batch had
+/// already succeeded, and each leaving the table exactly as it was.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_batch_that_misses_is_rolled_back_whole() {
+    if !enabled() {
+        return;
+    }
+    let s = Scratch::create("wb_rollback").await;
+    s.exec(
+        "CREATE TABLE dbo.t (id int NOT NULL, grp int NOT NULL, qty int NULL); \
+         INSERT dbo.t VALUES (1, 1, 10), (2, 1, 20), (3, 2, 30)",
+    )
+    .await;
+    let first = row_edit(&s, "t", &[("qty", txt("99"))], &[("id", Value::Int(3))]);
+    let cases = [
+        (
+            row_edit(&s, "t", &[("qty", txt("0"))], &[("id", Value::Int(42))]),
+            "affected 0 rows",
+        ),
+        (
+            row_edit(&s, "t", &[("qty", txt("0"))], &[("grp", Value::Int(1))]),
+            "affected 2 rows",
+        ),
+        (
+            row_edit(&s, "t", &[("qty", txt("abc"))], &[("id", Value::Int(1))]),
+            "Msg 245",
+        ),
+    ];
+    for (bad, says) in cases {
+        let err = commit(
+            &s,
+            GridWrite {
+                updates: vec![first.clone(), bad],
+                ..Default::default()
+            },
+        )
+        .await
+        .expect_err("the batch fails");
+        let msg = err.to_string();
+        assert!(msg.contains(says), "{msg}");
+        assert!(msg.contains("rolled back all changes"), "{msg}");
+        assert!(!msg.contains("query failed: query failed"), "{msg}");
+        assert_eq!(
+            s.scalar(
+                "SELECT STRING_AGG(CAST(qty AS varchar), ',') WITHIN GROUP (ORDER BY id) FROM dbo.t"
+            )
+            .await,
+            "10,20,30",
+            "{says}: nothing survives"
+        );
+    }
+    assert_eq!(commit(&s, GridWrite::default()).await.expect("empty"), 0);
+}
+
+/// **An empty value is refused where SQL Server would convert it** — a cleared
+/// `int` would otherwise store 0 and report success — while an empty string in
+/// a text column is a value like any other.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_empty_value_is_not_written_as_zero() {
+    if !enabled() {
+        return;
+    }
+    let s = Scratch::create("wb_blank").await;
+    // Two batches: a table cannot name a type its own batch creates.
+    s.exec("CREATE TYPE dbo.Qty FROM int NULL").await;
+    s.exec(
+        "CREATE TABLE dbo.t (id int PRIMARY KEY, qty dbo.Qty, note nvarchar(5) NULL); \
+         INSERT dbo.t VALUES (1, 5, N'n')",
+    )
+    .await;
+    let err = commit(
+        &s,
+        GridWrite {
+            updates: vec![row_edit(
+                &s,
+                "t",
+                &[("qty", txt(""))],
+                &[("id", Value::Int(1))],
+            )],
+            ..Default::default()
+        },
+    )
+    .await
+    .expect_err("refused");
+    assert!(err.to_string().contains("empty value"), "{err}");
+    assert_eq!(
+        s.scalar("SELECT qty FROM dbo.t").await,
+        "5",
+        "an alias type is its base type"
+    );
+    commit(
+        &s,
+        GridWrite {
+            updates: vec![row_edit(
+                &s,
+                "t",
+                &[("note", txt(""))],
+                &[("id", Value::Int(1))],
+            )],
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("text takes an empty string");
+    assert_eq!(
+        s.scalar("SELECT CONCAT('[', note, ']') FROM dbo.t").await,
+        "[]"
+    );
+}
+
+/// **A trigger's own statements do not count as the edit's.** The statement's
+/// count is the last one TDS reports; a trigger that writes two audit rows
+/// reports its 2 first, and the edit is still 1.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_trigger_does_not_trip_the_one_row_guard() {
+    if !enabled() {
+        return;
+    }
+    let s = Scratch::create("wb_trigger").await;
+    s.exec(
+        "CREATE TABLE dbo.t (id int PRIMARY KEY, qty int); \
+         CREATE TABLE dbo.audit (at int); \
+         INSERT dbo.t VALUES (1, 1)",
+    )
+    .await;
+    s.exec(
+        "CREATE TRIGGER dbo.t_audit ON dbo.t AFTER UPDATE AS \
+         INSERT dbo.audit VALUES (1), (2)",
+    )
+    .await;
+    let n = commit(
+        &s,
+        GridWrite {
+            updates: vec![row_edit(
+                &s,
+                "t",
+                &[("qty", txt("2"))],
+                &[("id", Value::Int(1))],
+            )],
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("one row, whatever the trigger did");
+    assert_eq!(n, 1);
+    assert_eq!(s.scalar("SELECT COUNT(*) FROM dbo.audit").await, "2");
+}
+
+/// **Stop during a commit stops it on the server and undoes it.** A trigger
+/// holds the edit for five seconds; Stop answers well inside that, the
+/// attention ends the statement, and the rollback leaves the row as it was.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stopped_commit_is_undone() {
+    if !enabled() {
+        return;
+    }
+    let s = Scratch::create("wb_cancel").await;
+    s.exec("CREATE TABLE dbo.t (id int PRIMARY KEY, qty int); INSERT dbo.t VALUES (1, 1)")
+        .await;
+    s.exec("CREATE TRIGGER dbo.t_slow ON dbo.t AFTER UPDATE AS WAITFOR DELAY '00:00:05'")
+        .await;
+    let token = CancellationToken::new();
+    let stop = token.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        stop.cancel();
+    });
+    let started = std::time::Instant::now();
+    let err =
+        s.db.commit_writes(
+            &GridWrite {
+                updates: vec![row_edit(
+                    &s,
+                    "t",
+                    &[("qty", txt("2"))],
+                    &[("id", Value::Int(1))],
+                )],
+                ..Default::default()
+            },
+            token,
+        )
+        .await
+        .expect_err("stopped");
+    assert!(matches!(err, DbError::Cancelled), "{err}");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(3),
+        "Stop waited for the trigger: {:?}",
+        started.elapsed()
+    );
+    assert_eq!(s.scalar("SELECT qty FROM dbo.t").await, "1", "undone");
+}
+
+/// **A key finds its row whatever its type** — as the grid read it back: a
+/// `real` by its shortest digits (as an `f64` it is another number), a
+/// `datetime2`, a `uniqueidentifier` and a `decimal` by the text SQL Server
+/// printed, and a `bit` set from `true`.
+#[tokio::test(flavor = "multi_thread")]
+async fn keys_of_every_shape_find_their_row() {
+    if !enabled() {
+        return;
+    }
+    let s = Scratch::create("wb_keys").await;
+    s.exec(
+        "CREATE TABLE dbo.t (r real NOT NULL, at datetime2(7) NOT NULL, \
+         g uniqueidentifier NOT NULL, d decimal(10,2) NOT NULL, flag bit NULL, \
+         CONSTRAINT pk PRIMARY KEY (r, at, g, d)); \
+         INSERT dbo.t VALUES (0.1, '2026-09-27 12:50:53.1234567', \
+         '37ab5dac-1262-4372-82ba-caad1925cd9a', -0.05, 0)",
+    )
+    .await;
+    // The key values exactly as a read of the table renders them.
+    let rs = s.exec("SELECT r, at, g, d FROM dbo.t").await;
+    let key: Vec<(String, Value)> = ["r", "at", "g", "d"]
+        .iter()
+        .enumerate()
+        .map(|(i, c)| (c.to_string(), rs.cell(0, i).expect("a cell").to_value()))
+        .collect();
+    let mut e = row_edit(&s, "t", &[("flag", txt("true"))], &[]);
+    e.key = key;
+    let n = commit(
+        &s,
+        GridWrite {
+            updates: vec![e],
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("every key column matched");
+    assert_eq!(n, 1);
+    assert_eq!(s.scalar("SELECT CAST(flag AS int) FROM dbo.t").await, "1");
 }
 
 /// **A routine body keeps its semicolons, and `GO` is never sent.** What the

@@ -14,8 +14,8 @@ writes, imports and edits **tables** (through the twelve-step rebuild — `ddl::
 **views** and **triggers**, but has **no manual-transaction mode** — a statement about SQLite
 rather than unfinished work (`db::session::Session::open` carries the reason). **SQL Server is a
 preview** (`db::mssql`, on a vendored `tiberius` — `vendor/tiberius/PATCHES.md`): it reads,
-introspects and runs scripts, and each thing it does not do yet is a capability answering no —
-`ddl::supports_change`, `edit::supports_grid_writes`, `tx::supports_manual_mode`,
+introspects, runs scripts and writes grid edits back, and each thing it does not do yet is a
+capability answering no — `ddl::supports_change`, `tx::supports_manual_mode`,
 `plan::supports_plan`, `import::supports_import`, `dump::supports_dump`, `users::supports_users` —
 so it is absent from the UI rather than failing there; that one *is* unfinished work. What differs between the
 engines now lives in the *narrow* predicates that decide how an edit is performed rather than

@@ -550,14 +550,14 @@ pub fn analyze_edit(
 
 /// Can a result's rows be written back through the grid on `dialect`?
 ///
-/// Every engine but SQL Server, whose `commit_writes` and `refetch_rows` are
-/// not written yet — that is unfinished work, not a fact about the engine,
-/// and [`analyze_edit`] answering from it is what keeps the grid from
-/// offering an edit the commit would refuse.
+/// Every engine, now that SQL Server's `commit_writes`, `refetch_rows` and
+/// `fetch_blob` are written. **Kept as a `match` rather than deleted**: the
+/// next engine arrives without a write-back, and [`analyze_edit`] answering
+/// from this is what keeps the grid from offering an edit the commit would
+/// refuse — the exhaustive match makes that engine say which side it is on.
 pub fn supports_grid_writes(dialect: SqlDialect) -> bool {
     match dialect {
-        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => true,
-        SqlDialect::MsSql => false,
+        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::MsSql => true,
     }
 }
 
@@ -2386,11 +2386,11 @@ mod tests {
         }
     }
 
-    /// **A keyed result is not editable on SQL Server yet** — the same result
-    /// that is editable on MySQL offers nothing, so no cell stages an edit the
-    /// commit would refuse. What a cell holds is still said.
+    /// **A keyed result is editable on every engine, SQL Server included** —
+    /// the same result, the same model: its write-back is `db::mssql`'s
+    /// `commit_writes`. Binary stays a question of what the cell holds.
     #[test]
-    fn nothing_is_editable_where_the_engine_cannot_write_back() {
+    fn a_keyed_result_is_editable_on_every_engine() {
         let r = rs(vec![
             col("id", "INT", "t", true, false),
             col("photo", "varbinary(max)", "t", false, true),
@@ -2398,18 +2398,19 @@ mod tests {
         let schema = |_: &str, _: Option<&str>, t: &str| {
             (t == "t").then(|| schema_with_pk("t", &["id"], &[("id", "int"), ("photo", "blob")]))
         };
-        let my = super::analyze_edit(&r, SqlDialect::MySql, schema);
-        assert!(my.editable(0), "the control: MySQL writes it");
-        let ms = super::analyze_edit(&r, SqlDialect::MsSql, schema);
-        assert!(!ms.editable(0) && !ms.editable(1));
-        assert!(ms.binary(1), "a binary cell still says what it holds");
-        assert!(!supports_grid_writes(SqlDialect::MsSql));
+        for d in SqlDialect::ALL {
+            assert!(supports_grid_writes(d), "{d:?}");
+            let m = super::analyze_edit(&r, d, schema);
+            assert!(m.editable(0) && m.editable(1), "{d:?}");
+            assert!(m.binary(1) && !m.text_editable(1), "{d:?}");
+        }
     }
 
-    /// **The row entry's name follows the whole result.** On SQL Server the
-    /// grid's context menu said *Edit row* over a result it could not write,
-    /// and opened a viewer with no way to edit — so `any_editable` is what the
-    /// label asks, and it has to be false exactly where no column is writable.
+    /// **The row entry's name follows the whole result.** On SQL Server — before
+    /// its write-back — the grid's context menu said *Edit row* over a result it
+    /// could not write, and opened a viewer with no way to edit; a keyless table
+    /// is the same shape on every engine. So `any_editable` is what the label
+    /// asks, and it has to be false exactly where no column is writable.
     #[test]
     fn a_result_says_whether_anything_in_it_is_writable() {
         let r = rs(vec![
@@ -2420,7 +2421,7 @@ mod tests {
             (t == "t").then(|| schema_with_pk("t", &["id"], &[("id", "int"), ("name", "text")]))
         };
         assert!(super::analyze_edit(&r, SqlDialect::MySql, schema).any_editable());
-        assert!(!super::analyze_edit(&r, SqlDialect::MsSql, schema).any_editable());
+        assert!(super::analyze_edit(&r, SqlDialect::MsSql, schema).any_editable());
         // A keyless table on an engine that does write back: nothing either.
         let keyless = rs(vec![
             col("id", "INT", "t", false, false),

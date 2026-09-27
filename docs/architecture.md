@@ -7,8 +7,8 @@ has no manual-transaction mode — see `db::session`'s `Session::open` for what 
 statement about. All three engines now edit all three of those objects, and they get there
 differently, so ask the *narrow* capability (`ddl::supports_or_replace_view`,
 `ddl::supports_view_rename`) rather than the engine. **Microsoft SQL Server is a fourth, and a
-preview rather than a peer**: it connects, reads, validates, introspects and runs scripts, and
-every editor, the grid's write-back, import, dump, the plan and Manual mode are switched off by
+preview rather than a peer**: it connects, reads, validates, introspects, runs scripts and writes
+the grid's edits back, and every editor, import, dump, the plan and Manual mode are switched off by
 capability — see `db::mssql`.
 
 This is the project's reference document: the crate/module map, the architecture invariants, the
@@ -10369,13 +10369,13 @@ existing prose was left alone.
   gateway hands a client to the node that serves its database), `ping`, the database list,
   `fetch_query` and `run_batch` (with `Enforce`, above), `prepare_check`, `fetch_table_list` and
   `fetch_schema`, the monitor's `fetch_table`, `count_rows` (`COUNT_BIG`), table statistics from
-  `sys.dm_db_partition_stats`, Server Activity, and `run_script`. `explain`, `run_ddl`,
-  `run_server_ddl`, `commit_writes`, `refetch_rows`, `fetch_blob` and `import_rows` answer
+  `sys.dm_db_partition_stats`, Server Activity, `run_script`, and the grid's write-back —
+  `commit_writes`, `refetch_rows` and `fetch_blob` (below). `explain`, `run_ddl`, `run_server_ddl`
+  and `import_rows` answer
   `DbError::Refused("… is not available for SQL Server yet.")`, and so does `Session::open`, as it
   does for SQLite. **The refusals are the backstop, not the gate**: the app is kept off them by
   capabilities, each an exhaustive `match` with `MsSql` on `false`, asked at the UI site that
-  offers the thing — `edit::supports_grid_writes` inside `analyze_edit`, so no cell is
-  writable; `plan::supports_plan` for the editor's Plan entry; `import::supports_import` and
+  offers the thing — `plan::supports_plan` for the editor's Plan entry; `import::supports_import` and
   `dump::supports_dump` for the tree's *Import* and *Export ▸ SQL*; `tx::supports_manual_mode` for
   the footer's Auto/Manual segment, which used to ask `is_sqlite`; `users::supports_users`, since
   logins and the users mapped to them in each database are two catalogues the browser's one list
@@ -10395,7 +10395,11 @@ existing prose was left alone.
   `Change::CreateTable`, so on SQL Server that list is empty and `create_submenu` leaves the Create
   row out (`object_menu_tests::sql_server_offers_no_drop_or_any_other_schema_change`,
   `create_menu_tests::sql_server_is_offered_nothing_to_create`). Unlike SQLite's gaps, all
-  of these are **unfinished work**, not statements about the engine. Server Activity is the one
+  of these are **unfinished work**, not statements about the engine. `edit::supports_grid_writes`
+  was one of them and is the first to have come back: asked inside `analyze_edit`, it kept every
+  cell unwritable until the write-back below landed, and it answers `true` for all four engines now
+  — kept an exhaustive `match` rather than deleted, so the next engine, arriving without a
+  write-back, has to say which side of it it is on. Server Activity is the one
   split that *is* about the engine: `KILL` ends a session, but no T-SQL statement cancels another
   session's request and leaves the session standing — a cancel is an attention sent by the owner's
   own client — so `activity::supports_kill_kind` says no to *Cancel query* there and
@@ -10422,8 +10426,7 @@ existing prose was left alone.
   moment before it ran, so `result_columns` uses it **only when it agrees with the wire** about how
   many columns there are and what they are called: an `IF … SELECT … ELSE SELECT …` can describe
   one shape and return another, and every cell would sit under another column's name and type.
-  (Nothing writes back through that provenance yet — `supports_grid_writes` is `false` — but it is
-  what the grid's editing will stand on.) A read reports **one result set**: a second is logged and
+  That provenance is what the grid's write-back stands on (below). A read reports **one result set**: a second is logged and
   the read stops there. **`prepare_check` is the same DMF, and not `SET NOEXEC ON`**, which was the
   first version: `NOEXEC` compiles without resolving names, so `SELECT * FROM nope` came back clean
   on SQL Server 2022, and a missing table is the error validation exists to show. The describe
@@ -10432,7 +10435,15 @@ existing prose was left alone.
   **A cancel is TDS's attention, on the query's own connection** — `Client::cancel_query` aborts
   the running batch and waits for the server's acknowledgement, bounded by `CANCEL_TIMEOUT` — so
   there is no second connection and no transport to choose, which is why `pg_cancel_gate` skips
-  this file (below). **Every step of a read is raced against Stop, and every Stop sends the
+  this file (below). **That wait needed the driver patched** (patch 5, below): SQL Server finishes
+  its reply to the aborted request, ending that message, and sends the `DONE_ATTN` acknowledgement
+  as a message of its own, and upstream stopped at the first end-of-message with
+  `Protocol("Never got a DONE token acknowledging the Attention signal.")`. That is what a Stop of
+  the grid commit's statement held by a trigger was seen to get — the attention failed with that
+  error, every time — and the same patch is what query Stop's `cancel_now` waits through, though
+  nobody observed it failing there. `attention` sends it and answers whether the server acknowledged it; `cancel_now` ignores the
+  answer, since nothing further is sent on that connection after it, and the commit below cannot.
+  **Every step of a read is raced against Stop, and every Stop sends the
   attention** — `cancel_now`, which `fetch_schema` and `run_script` share. `run_statement` awaited
   its describe alone, and the describe compiles the statement, which waits behind another session's
   schema lock: Stop did nothing until the lock let go — 4.5 s on the live tier, measured before the
@@ -10444,6 +10455,58 @@ existing prose was left alone.
   (`core::sql`'s `batch_separator`), which is what SQL Server's own tools send. A failed T-SQL
   statement leaves its transaction usable, as MySQL's does, so `tx_engine_of` maps it to MySQL's
   model — unless the session set `XACT_ABORT ON`, which is its own choice to make.
+  **Grid write-back is this engine's arm of *Write-back is transactional…*** (*Architecture
+  invariants*). `commit_writes` connects to the batch's database — a `GridWrite` is one table's —
+  runs `GridWrite::plan` step by step inside `BEGIN TRANSACTION` through `execute` with `@P1…`
+  parameters, and holds each count to `one_row_verdict`. **The count is the *last* one TDS reports
+  for the statement**: a trigger's statements report theirs first, in the same batch
+  (`a_trigger_does_not_trip_the_one_row_guard`). The statements are `statement_for`,
+  `refetch_statement` and `blob_statement`, pure and pinned in `write_tests`: every name through
+  `export::ident_sql`, qualified `[schema].[table]` whenever the schema is known, for `pg_qname`'s
+  reason; a NULL written as the literal `NULL` and never a parameter, since a TDS parameter is
+  typed; a NULL key value compared as `IS NULL`, T-SQL having no null-safe equality before 2022's
+  `IS NOT DISTINCT FROM`; an insert that sets nothing as `DEFAULT VALUES`. **A float key is bound
+  as its text**: a `real` compared with an `f64` is widened to it, and `0.1` stored as a `real` is
+  not `0.1` as an `f64`, so the key would match nothing — text converts to the column's own type
+  instead, a string having the lowest precedence. A `u64` past `i64` goes as text too, other
+  integers as `bigint`, strings as `nvarchar` (`keys_of_every_shape_find_their_row`: `real`,
+  `datetime2`, `uniqueidentifier` and `decimal` keys, as the grid read them back). The re-read is
+  `SELECT TOP (1)` by key and confirming columns, rendered by the same `cell_value` as the read that
+  produced the grid; a binary cell is `DATALENGTH` plus a `SUBSTRING` to `FETCH_CAP` — `DATALENGTH`,
+  not `LEN`, which counts characters and trims trailing blanks.
+  **Two guards the other engines do not need**, both read off `sys.columns` before the transaction
+  opens (`COLUMN_FACTS` — the base type through `TYPE_NAME(system_type_id)`, so an alias type is
+  its base type, and `is_identity`). **SQL Server converts `''` where PostgreSQL refuses it** — `0`
+  for a number, `1900-01-01` for a date, `0` for a `bit` — and a cleared grid cell is `''`, so on
+  this engine alone clearing a quantity would store zero and report success. `blank_refusal`
+  refuses, with `DbError::Refused` and before anything runs, a batch that writes `''` to a column
+  whose base type does not hold text (`an_empty_value_is_not_written_as_zero`, an alias type
+  included); a column the catalogue does not name is left to the server. And an insert that gives
+  an identity column a value needs `IDENTITY_INSERT` on — which, once on, refuses an insert that
+  does *not* give one — so `sets_identity` has it switched on and off around that one statement,
+  never for the batch (`inserts_take_defaults_identities_and_a_deleted_key`).
+  **Every failure rolls back through `IF @@TRANCOUNT > 0 ROLLBACK TRANSACTION`**, the guard because
+  some errors — a deadlock victim, a severe error — end the transaction themselves, and a bare
+  `ROLLBACK` after one fails. The verdict is `Rollback::Complete` when the server answered and
+  `Unknown` when it did not, never `Incomplete`: every SQL Server table is transactional
+  (`a_batch_that_misses_is_rolled_back_whole` — 0 rows, 2 rows and a conversion error, each after
+  a statement that had already succeeded). Stop is raced on every statement and sends the
+  attention, and `execute_counted` answers `Ran::Stopped { in_step }` — whether the server
+  acknowledged it. **Only an acknowledged attention lets a rollback be sent and believed**: the
+  statement's future was dropped mid-reply, and without the `DONE_ATTN` the stream is at an unknown
+  point, so a `ROLLBACK` sent on it could read the aborted request's leftovers as its own success —
+  MySQL's desynchronised-stream defect, on this engine. Unacknowledged, nothing is sent and the
+  verdict is `Rollback::Unknown`; the server rolls back when the connection closes, but this side
+  did not see it. Either way the answer goes through this module's own `cancelled_write` — MySQL's
+  shape, `DbError::Cancelled` only for a confirmed rollback, a *Commit cancelled* sentence carrying
+  `Rollback::note` otherwise. **The first version rolled back after every Stop and reported
+  `Complete` off an attention that had never been acknowledged**: before patch 5 every such
+  attention failed (above), so each of those confirmations had been read off a stream nobody knew
+  the position of.
+  `a_stopped_commit_is_undone` pins it against a trigger that holds the edit five seconds — it
+  asserts `DbError::Cancelled`, the row unchanged and the whole commit under 3 s, and failed against
+  the unpatched driver. There is no `TxScope`: with no Manual mode, the write's own transaction
+  is the only case there is.
   **`DATABASE_LISTING` asks `HAS_DBACCESS` inside a `CASE`, and only of a multi-user database.**
   On one another session holds `SINGLE_USER`, that call took 2,174 ms against 150 ms (SQL Server
   2022 CU27) — what an administrator's maintenance window would cost every tree refresh — and a
@@ -10455,14 +10518,18 @@ existing prose was left alone.
   (`a_routine_is_shaped_by_its_padded_object_type`).
   **The driver is vendored and patched**, on the terms `vendor/floem/` is (*Floem 0.2 gotchas*):
   `vendor/tiberius/` is the published 0.13.0 through `[patch.crates-io]`, each change marked
-  `schemaic patch (PATCHES.md)`, and `vendor/tiberius/PATCHES.md` is the record. Four patches:
+  `schemaic patch (PATCHES.md)`, and `vendor/tiberius/PATCHES.md` is the record. Five patches:
   **`ring` instead of `aws-lc-rs`**, because the workspace keeps one rustls provider and upstream's
   default features bring a C/cmake/NASM build and a second provider rustls cannot choose between;
   **`Config::rustls_client_config`**, so `db::tls`'s configuration is the one that handshakes
   (`tls.rs`, below); **`QueryStream::rows_affected`**, since upstream skips every `DONE` token and
   the affected count lives only there — and `forward_to_metadata` must collect them as well, since
   `simple_query` calls it before handing the stream back, and for a statement with no result set
-  that is every token it produces; and **`money` as an exact `Numeric` at scale 4**. A re-vendor
+  that is every token it produces; **`money` as an exact `Numeric` at scale 4**; and
+  **`cancel_query` reading past the aborted request's reply to the acknowledgement** —
+  `flush_done_attention` answers `None` where a message ends without it, and `cancel_request`
+  loops over messages, clearing `flushed` between them, until it arrives. A server that never sends
+  one leaves it waiting, which is why every caller here bounds it with `CANCEL_TIMEOUT`. A re-vendor
   re-applies the list; when it is empty the directory and the `[patch]` entry go.
   The rest of the engine's surface is in `core`: `TableInfo::create_ddl` has a T-SQL arm
   (`tsql_create_ddl` — `IDENTITY(1,1)` with a comment that the seed and increment are not read,
@@ -10851,7 +10918,7 @@ existing prose was left alone.
   that brings a real builtin within edit distance fails here where no membership test can see it.
   **`mssql.rs` is SQL Server's whole leg, and it is outside the macro for the opposite reason**:
   not because its subject is a data file but because the shared suite writes rows back, applies
-  DDL and pins sessions, and SQL Server answers all three with a refusal until they are written.
+  DDL and pins sessions, and SQL Server still answers the last two with a refusal.
   So it tests what the engine does do, on its own terms — ping and the database list, every type
   `cell_value` renders against the text SQL Server's tools print, `SELECT *` provenance, the
   read-only rollback (`a_read_only_session_rolls_back_what_a_select_hides`: a `SELECT … INTO`
@@ -10860,7 +10927,9 @@ existing prose was left alone.
   nothing, a script split at `GO`, introspection, a table's generated DDL rebuilding the table it
   was read from (`a_tables_ddl_rebuilds_the_table_it_was_read_from`), a cancel (of a running
   statement, and of one still compiling behind another session's lock), activity (the poll's own
-  session absent from it), and the
+  session absent from it), the grid's write-back (seven tests, from
+  `a_staged_edit_lands_on_its_row_and_reads_back` to `a_stopped_commit_is_undone`, under
+  `mssql.rs` above), and the
   two catalogues only it has — `every_allowlisted_function_is_a_builtin` (the read gate's lists,
   by error 195) and `every_builtin_snippet_runs`. It is not a `Target`, so `endpoint.rs` carries
   `OUTSIDE_THE_SUITE` for it, `leg_enabled` to answer `SCHEMAIC_IT_ENGINES` for a leg with no
@@ -23375,8 +23444,9 @@ Re-introducing the anti-patterns these guard against is a regression:
   then abandoned. A column holding bytes is excluded from the confirming set because its cell is a
   `<n bytes>` placeholder and not the value, and the test for that is `edit::holds_bytes`, not the
   wire flag: a blob in a SQLite `TEXT`-declared column reads back as the same placeholder, and
-  comparing *it* refused every write to the table rather than only the misdirected ones. Its rollback, by contrast, is the one that needs no
-  hedging — there is no non-transactional table type. That
+  comparing *it* refused every write to the table rather than only the misdirected ones. Its rollback, by contrast, needs no
+  hedging — there is no non-transactional table type — and SQL Server's is the second that needs
+  none, answering `Complete` or `Unknown` and never `Incomplete` (`db::mssql`). That
   promise is MySQL-engine-dependent: `MyISAM`/`MEMORY`/`ARCHIVE`/`CSV` ignore `BEGIN`/`ROLLBACK`,
   and `ROLLBACK` *succeeds* there while raising warning 1196. So no write path may discard a
   rollback's outcome (`let _ = conn.query_drop("ROLLBACK")` was the bug): roll back through
@@ -23403,8 +23473,8 @@ Re-introducing the anti-patterns these guard against is a regression:
   becomes an error — with `cancelled_write` its twin for a cancelled **Commit**: the same rule
   (`DbError::Cancelled` only for `Rollback::Complete`, anything else carrying `Rollback::note`) in a
   sentence that names the right act, since "Import cancelled" over a write-back describes something
-  the user did not do. **And a cancelled write leaves through an explicit `ROLLBACK` on both engines
-  that have a connection to lose — MySQL and PostgreSQL — now**: SQLite's is a rusqlite
+  the user did not do. **And a cancelled write leaves through an explicit `ROLLBACK` on every engine
+  that has a connection to lose — MySQL, PostgreSQL and SQL Server — now**: SQLite's is a rusqlite
   `Transaction` whose drop aborts locally, holding no network lock and racing nothing, and its cancel
   is refused up front by `refuse_if_cancelled` rather than mid-flight, so there is no in-flight
   statement to leave behind. `pg::commit_writes`' cancel arm was the one exit resting on the client's drop, which does
@@ -27284,7 +27354,7 @@ this bundle's.
   otherwise it's a read-only row viewer) then Close (✕);
   a "Saving…" line shows while a save is in flight. **The entry is named for which of the two it
   will open.** It always read *Edit row*, so over a result with nothing writable — a SQL Server one
-  (no grid write-back yet, `edit::supports_grid_writes`), a keyless table, a join — the menu promised
+  before its write-back (`edit::supports_grid_writes`), a keyless table, a join — the menu promised
   an editor and opened a viewer. The action is the same either way; only the word follows the
   result, and the ✓'s gate asks the same question column by column, so the label and the icon cannot
   disagree (`a_result_says_whether_anything_in_it_is_writable`). The panel's **errors are not
