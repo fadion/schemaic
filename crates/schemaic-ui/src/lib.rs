@@ -4261,15 +4261,17 @@ mod engine_comparison_gate {
         ),
         (
             "table_designer.rs",
-            8,
-            "**Partly not clean.** `has_comments != Sqlite` (twice) and \
-             `has_on_update == MySql` are capability questions with no \
-             predicate — `ddl::supports_column_comments` and \
-             `supports_on_update_current_timestamp` are the two this file is \
-             waiting for. The Postgres ones (identity, `NOT ENFORCED`, the \
-             storage row) are per-engine column *grammar*. 9 → 8: a new \
-             column's placeholder type was an `== Postgres` here and is now \
-             `ddl::default_new_column_type`, answering for all three.",
+            5,
+            "**Partly not clean.** `has_on_update == MySql` is a capability \
+             question with no predicate — `supports_on_update_current_timestamp` \
+             is the one this file is waiting for. The others are per-engine \
+             *grammar*: MySQL's storage row, PostgreSQL's index method and \
+             partial-index fields, `NOT ENFORCED`, and the namespace a new \
+             table defaults to. 9 → 8: a new column's placeholder type is \
+             `ddl::default_new_column_type`. 8 → 5, with SQL Server's Create \
+             table: both comment fields ask `ddl::supports_comments`, the \
+             identity toggle `ddl::identity_wording`, and the index key hint \
+             `ddl::supports_index_prefix`.",
         ),
         (
             "trigger_editor.rs",

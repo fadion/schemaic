@@ -4049,8 +4049,42 @@ impl ChangeSet {
             // operation and has no `DROP INDEX` form, so MySQL's shapes are not
             // merely unidiomatic there — they are statements the engine refuses.
             SqlDialect::Sqlite => self.emit_sqlite(),
-            _ => self.emit_mysql(),
+            SqlDialect::MsSql => self.emit_mssql(),
+            SqlDialect::MySql => self.emit_mysql(),
         }
+    }
+
+    /// SQL Server's plan: the changes [`supports_change`] admits there, and
+    /// nothing else.
+    ///
+    /// **Its own arm, not MySQL's through a `_`.** It was, and `emit_mysql`'s
+    /// whole-table loop asks no capability, so a SQL Server `TRUNCATE` or
+    /// `RENAME TABLE` went into the plan in MySQL's grammar — the preview
+    /// listed it as refused, but the script carried it. Each admitted change's
+    /// T-SQL is the dialect-taking helper the other emitters share.
+    fn emit_mssql(&self) -> Vec<String> {
+        let d = self.dialect;
+        let mut out = Vec::new();
+        for c in self.changes.iter().filter(|c| supports_change(d, c)) {
+            match c {
+                Change::CreateTable(t) => out.extend(create_table_sql(t, d)),
+                Change::DropTable => out.push(format!("DROP TABLE {};", self.qname())),
+                Change::DropView { materialized } => {
+                    out.push(drop_view_sql(&self.qname(), *materialized));
+                }
+                Change::DropRoutine(f) => out.push(format!(
+                    "DROP {} {};",
+                    f.kind.sql_keyword(),
+                    f.signature_sql(d)
+                )),
+                // Admitted by `supports_change` and not written here would be a
+                // change the plan silently drops; the test that walks both
+                // (`sql_server_supports_drop_and_create_table_and_nothing_else`)
+                // is what keeps the two lists one.
+                _ => {}
+            }
+        }
+        out
     }
 
     /// What [`unsupported`](Self::unsupported) refused, as a `--` comment block
@@ -5959,8 +5993,8 @@ fn fk_clause(fk: &ForeignKeyInfo, dialect: SqlDialect) -> String {
 fn create_index_sql(ix: &IndexInfo, qtable: &str, dialect: SqlDialect) -> String {
     let uniq = if ix.unique { "UNIQUE " } else { "" };
     let using = match &ix.method {
-        Some(m) => format!(" USING {m}"),
-        None => String::new(),
+        Some(m) if writes_index_method(dialect) => format!(" USING {m}"),
+        _ => String::new(),
     };
     let filter = match &ix.predicate {
         Some(p) => format!(" WHERE {p}"),
@@ -6166,6 +6200,34 @@ fn declares_sqlite_autoincrement(d: &TableDraft) -> bool {
     })
 }
 
+/// Can `dialect` declare a non-key index inside its `CREATE TABLE`? MySQL's
+/// `KEY` clause alone; the others write each as a `CREATE INDEX` after it.
+fn inlines_indexes(dialect: SqlDialect) -> bool {
+    match dialect {
+        SqlDialect::MySql => true,
+        SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::MsSql => false,
+    }
+}
+
+/// Does `dialect`'s `CREATE TABLE` take MySQL's trailing table options —
+/// `ENGINE=`, `COLLATE=`, `COMMENT=`?
+fn takes_table_options(dialect: SqlDialect) -> bool {
+    match dialect {
+        SqlDialect::MySql => true,
+        SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::MsSql => false,
+    }
+}
+
+/// Does [`create_index_sql`] restate an index's access method as `USING …` on
+/// `dialect`? T-SQL has no such clause (its choice is `CLUSTERED`, a different
+/// question), so a method a draft carries is not written there.
+fn writes_index_method(dialect: SqlDialect) -> bool {
+    match dialect {
+        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => true,
+        SqlDialect::MsSql => false,
+    }
+}
+
 /// `CREATE TABLE` (plus, on PostgreSQL, the statements its `CREATE TABLE` can't
 /// carry: indexes and comments).
 fn create_table_sql(d: &TableDraft, dialect: SqlDialect) -> Vec<String> {
@@ -6173,7 +6235,11 @@ fn create_table_sql(d: &TableDraft, dialect: SqlDialect) -> Vec<String> {
     // SQLite sides with PostgreSQL on indexes — they are statements of their own,
     // there being no inline `KEY` — and has neither engine's table options.
     let sqlite = dialect == SqlDialect::Sqlite;
-    let separate_indexes = pg || sqlite;
+    // SQL Server sides with them too — T-SQL has no inline non-key index — and
+    // has none of MySQL's table options, nor a comment clause (its comments are
+    // extended properties, and `supports_comments` keeps the designer from
+    // taking one).
+    let separate_indexes = !inlines_indexes(dialect);
     let q = |s: &str| ddl_ident_in(s, dialect);
     let qname = qualified(&d.name, d.schema.as_deref(), dialect);
     // **SQLite's single-column primary key is spelled inline**, as `INTEGER
@@ -6258,8 +6324,8 @@ fn create_table_sql(d: &TableDraft, dialect: SqlDialect) -> Vec<String> {
     let mut head = format!("CREATE TABLE {qname} (\n{}\n)", lines.join(",\n"));
     // None of the three exists in SQLite: no storage engine to name, no table
     // collation (it is per column there), and no comments anywhere in the
-    // language.
-    if !pg && !sqlite {
+    // language. Nor in T-SQL, which collates per column and per database.
+    if takes_table_options(dialect) {
         if let Some(e) = d.engine.as_deref().filter(|e| !e.is_empty()) {
             head.push_str(&format!(" ENGINE={e}"));
         }
@@ -6489,6 +6555,57 @@ pub const FK_ACTIONS: [Option<&str>; 5] = [
     Some("SET NULL"),
     Some("SET DEFAULT"),
 ];
+
+/// The referential actions the designer offers on `dialect`, in menu order.
+///
+/// **SQL Server has no `RESTRICT`.** Its refusing action is `NO ACTION`, which
+/// is already the first entry; offering the other would be an entry whose every
+/// use is `Incorrect syntax near 'RESTRICT'`.
+pub fn fk_actions(dialect: SqlDialect) -> &'static [Option<&'static str>] {
+    const T_SQL: [Option<&str>; 4] = [None, Some("CASCADE"), Some("SET NULL"), Some("SET DEFAULT")];
+    match dialect {
+        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => &FK_ACTIONS,
+        SqlDialect::MsSql => &T_SQL,
+    }
+}
+
+/// Can an index key column carry a **prefix length** (`bio(20)`) on `dialect`?
+/// MySQL's alone; the designer's hint names the syntax only where it parses.
+pub fn supports_index_prefix(dialect: SqlDialect) -> bool {
+    match dialect {
+        SqlDialect::MySql => true,
+        SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::MsSql => false,
+    }
+}
+
+/// Can a table and its columns carry a comment the emitter writes on `dialect`?
+///
+/// The designer shows its comment fields exactly where this is true, so a
+/// comment is never typed into a field whose text nothing writes. SQLite has
+/// no comments in the language; SQL Server keeps them as extended properties
+/// (`sp_addextendedproperty`), a statement of its own not written yet.
+pub fn supports_comments(dialect: SqlDialect) -> bool {
+    match dialect {
+        SqlDialect::MySql | SqlDialect::Postgres => true,
+        SqlDialect::Sqlite | SqlDialect::MsSql => false,
+    }
+}
+
+/// The designer's server-assigned-key toggle: its label and its hint, naming
+/// the keyword [`ColumnInfo::definition_sql`] writes for it on `dialect`.
+pub fn identity_wording(dialect: SqlDialect) -> (&'static str, &'static str) {
+    match dialect {
+        SqlDialect::Postgres => (
+            "Identity",
+            "The server assigns the value (GENERATED BY DEFAULT AS IDENTITY).",
+        ),
+        SqlDialect::MsSql => ("Identity", "The server assigns the value (IDENTITY(1,1))."),
+        SqlDialect::MySql | SqlDialect::Sqlite => (
+            "Auto-increment",
+            "The server assigns the value (AUTO_INCREMENT).",
+        ),
+    }
+}
 
 /// Column types offered as a shortcut beside the free-form type field. A
 /// *shortcut*, not a picker: the field stays free text and the server stays the
@@ -9340,19 +9457,31 @@ pub fn sqlite_rebuild_sql(current: &TableInfo, draft: &TableDraft) -> Vec<String
 /// absent, and the emitter honours it so a change that slipped through emits
 /// nothing rather than MySQL's spelling of it.
 pub fn supports_change(dialect: SqlDialect, change: &Change) -> bool {
-    // **SQL Server: no generated DDL yet, and that is unfinished work.** The
-    // emitters below write MySQL's, PostgreSQL's and SQLite's statements, and
-    // T-SQL differs from all three at nearly every change — `sp_rename` for a
+    // **SQL Server: four changes, and the rest is unfinished work.** T-SQL
+    // differs from the other engines at nearly every change — `sp_rename` for a
     // rename, a named `DEFAULT` constraint to drop before a column can change,
-    // `CREATE OR ALTER` for a redefinition, no `ALTER COLUMN … SET DEFAULT`.
-    // Answering no here, first, is what switches every editor off together:
-    // `supports_view_editing`, `supports_trigger_editing`,
-    // `supports_routine_editing` and `supports_table_design` all compute from
-    // this. The arms below answer for SQL Server only because they must
-    // compile; none of them is reached for it. A `match`, not an `==`, so the
-    // next engine has to say which side of this it is on.
+    // `CREATE OR ALTER` for a redefinition, no `ALTER COLUMN … SET DEFAULT` —
+    // and what it has so far is a new table and the three drops, whose
+    // statements are T-SQL already once quoted (`create_table_sql` and
+    // `ColumnInfo::definition_sql` carry its arm). Everything else answers no
+    // here, first, which is what keeps every editor off: the table designer
+    // probes `AlterColumn`/`RebuildTable`, and the view, trigger and routine
+    // editors need a `Create` and a `Replace` besides their drop. The arms
+    // below answer for SQL Server only because they must compile; none of them
+    // is reached for it. A `match`, not an `==`, so the next engine has to say
+    // which side of this it is on.
     match dialect {
-        SqlDialect::MsSql => return false,
+        SqlDialect::MsSql => {
+            return matches!(
+                change,
+                Change::CreateTable(_)
+                    | Change::DropTable
+                    | Change::DropView {
+                        materialized: false
+                    }
+                    | Change::DropRoutine(_)
+            );
+        }
         SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => {}
     }
     // **The one family that is narrower than "everything but SQLite".** A
@@ -11226,7 +11355,7 @@ pub fn account(subject: &str, dialect: SqlDialect, change: Change) -> ChangeSet 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::intel::SqlDialect::{MySql, Postgres, Sqlite};
+    use crate::intel::SqlDialect::{MsSql, MySql, Postgres, Sqlite};
     use crate::schema::{IndexColumn, TriggerEnabled};
 
     fn col(name: &str, ty: &str) -> ColumnInfo {
@@ -12422,6 +12551,248 @@ mod tests {
                 .any(|s| s == "COMMENT ON COLUMN \"users\".\"email\" IS 'login';"),
             "{stmts:?}"
         );
+    }
+
+    /// A new table on SQL Server, as the designer drafts one.
+    fn mssql_draft() -> TableDraft {
+        let col = |name: &str, ty: &str| {
+            ColumnDraft::new(ColumnInfo {
+                name: name.into(),
+                type_name: ty.into(),
+                nullable: true,
+                ..Default::default()
+            })
+        };
+        let mut id = col("id", "int");
+        id.info.nullable = false;
+        id.info.auto_increment = true;
+        let mut email = col("email", "nvarchar(255)");
+        email.info.nullable = false;
+        email.info.collation = Some("Latin1_General_CI_AS".into());
+        let mut qty = col("qty", "int");
+        qty.info.default = Some("0".into());
+        let mut total = col("total", "int");
+        total.info.generated = Some("[qty] * 2".into());
+        total.info.generated_stored = true;
+        let mut shown = col("shown", "int");
+        shown.info.generated = Some("[qty] + 1".into());
+        TableDraft {
+            name: "people".into(),
+            schema: Some("sales".into()),
+            columns: vec![id, email, qty, total, shown, col("status_id", "int")],
+            primary_key: vec!["id".into()],
+            indexes: vec![IndexDraft::new(crate::schema::IndexInfo {
+                name: "email_uq".into(),
+                columns: vec![crate::schema::IndexColumn::plain("email")],
+                unique: true,
+                ..Default::default()
+            })],
+            foreign_keys: vec![ForeignKeyDraft::new(ForeignKeyInfo {
+                name: "fk_status".into(),
+                columns: vec!["status_id".into()],
+                ref_schema: Some("sales".into()),
+                ref_table: "status".into(),
+                ref_columns: vec!["id".into()],
+                on_delete: Some("CASCADE".into()),
+                ..Default::default()
+            })],
+            check_constraints: vec![CheckDraft::new(crate::schema::CheckInfo {
+                name: "qty_pos".into(),
+                expression: "[qty] >= 0".into(),
+                enforced: true,
+                ..Default::default()
+            })],
+            ..Default::default()
+        }
+    }
+
+    /// **T-SQL's `CREATE TABLE`, not MySQL's with brackets.** `IDENTITY(1,1)`
+    /// for the server-assigned key, an explicit `NULL` (a new column's
+    /// nullability otherwise follows the session's `ANSI_NULL_DFLT` settings),
+    /// a computed column as `AS (…)` with no type, `PERSISTED` for a stored one,
+    /// indexes as statements of their own, and none of MySQL's table options.
+    #[test]
+    fn create_table_on_sql_server_writes_t_sql() {
+        let stmts = create(&mssql_draft(), MsSql).emit();
+        assert_eq!(
+            stmts,
+            vec![
+                "CREATE TABLE [sales].[people] (\n  \
+                 [id] int IDENTITY(1,1) NOT NULL,\n  \
+                 [email] nvarchar(255) COLLATE Latin1_General_CI_AS NOT NULL,\n  \
+                 [qty] int NULL DEFAULT 0,\n  \
+                 [total] AS ([qty] * 2) PERSISTED,\n  \
+                 [shown] AS ([qty] + 1),\n  \
+                 [status_id] int NULL,\n  \
+                 PRIMARY KEY ([id]),\n  \
+                 CONSTRAINT [fk_status] FOREIGN KEY ([status_id]) REFERENCES [sales].[status] ([id]) ON DELETE CASCADE,\n  \
+                 CONSTRAINT [qty_pos] CHECK ([qty] >= 0)\n);"
+                    .to_string(),
+                "CREATE UNIQUE INDEX [email_uq] ON [sales].[people] ([email]);".to_string(),
+            ]
+        );
+    }
+
+    /// Nothing MySQL-only reaches a SQL Server statement even when the draft
+    /// carries it — an engine, a table collation, a comment, `ON UPDATE`,
+    /// `INVISIBLE`, an index method.
+    #[test]
+    fn create_table_on_sql_server_writes_no_mysql_options() {
+        let mut d = mssql_draft();
+        d.engine = Some("InnoDB".into());
+        d.collation = Some("utf8mb4_bin".into());
+        d.comment = Some("people".into());
+        d.columns[1].info.comment = Some("login".into());
+        d.columns[1].info.on_update = Some("CURRENT_TIMESTAMP".into());
+        d.columns[1].info.invisible = true;
+        d.indexes[0].info.method = Some("btree".into());
+        d.check_constraints[0].info.enforced = false;
+        let sql = create(&d, MsSql).emit().join("\n");
+        for word in [
+            "ENGINE",
+            "COMMENT",
+            "ON UPDATE",
+            "INVISIBLE",
+            "USING",
+            "utf8mb4",
+            "ENFORCED",
+        ] {
+            assert!(!sql.contains(word), "{word} in {sql}");
+        }
+    }
+
+    /// **Exactly four schema changes are SQL Server's so far**, and none of the
+    /// editors computed from `supports_change` comes on with them: the table
+    /// designer probes `AlterColumn`/`RebuildTable`, and the view, trigger and
+    /// routine editors need their `Create`s too.
+    #[test]
+    fn sql_server_supports_drop_and_create_table_and_nothing_else() {
+        let yes = [
+            Change::DropTable,
+            Change::DropView {
+                materialized: false,
+            },
+            Change::DropRoutine(Box::default()),
+            Change::CreateTable(Box::default()),
+        ];
+        for c in &yes {
+            assert!(supports_change(MsSql, c), "{c:?}");
+            // And `emit_mssql` writes each one: admitted and not written would
+            // be a change the plan silently drops.
+            assert!(
+                !single("t", Some("dbo"), MsSql, c.clone()).emit().is_empty(),
+                "{c:?} is admitted but emits nothing"
+            );
+        }
+        let no = [
+            Change::DropView { materialized: true },
+            Change::TruncateTable,
+            Change::RenameTable { to: "x".into() },
+            Change::DropColumn {
+                name: String::new(),
+                type_name: String::new(),
+            },
+            Change::CreateView(Box::default()),
+            Change::CreateRoutine(Box::default()),
+            Change::DropDatabase { name: "d".into() },
+        ];
+        for c in &no {
+            assert!(!supports_change(MsSql, c), "{c:?}");
+        }
+        assert!(!supports_table_design(MsSql));
+        assert!(!supports_view_editing(MsSql));
+        assert!(!supports_routine_editing(MsSql));
+        assert!(!supports_trigger_editing(MsSql));
+    }
+
+    /// **A change SQL Server does not admit emits nothing** — not MySQL's
+    /// spelling of it. SQL Server once reached `emit_mysql` through a `_` arm,
+    /// whose whole-table loop asks no capability, so a `TRUNCATE` or a `RENAME
+    /// TABLE` went into the plan in MySQL's grammar for the preview to list and
+    /// the script to carry.
+    #[test]
+    fn sql_server_emits_nothing_it_does_not_admit() {
+        for c in [
+            Change::TruncateTable,
+            Change::RenameTable { to: "x".into() },
+            Change::DropColumn {
+                name: "c".into(),
+                type_name: "int".into(),
+            },
+            Change::DropView { materialized: true },
+        ] {
+            let cs = single("t", Some("dbo"), MsSql, c.clone());
+            assert_eq!(cs.emit(), Vec::<String>::new(), "{c:?}");
+        }
+    }
+
+    /// The drops were already T-SQL — bracketed, and a routine by bare name,
+    /// since T-SQL has no overloading — once the gate let them through.
+    #[test]
+    fn sql_server_drops_read_as_t_sql() {
+        assert_eq!(
+            single("t", Some("dbo"), MsSql, Change::DropTable).emit(),
+            vec!["DROP TABLE [dbo].[t];"]
+        );
+        assert_eq!(
+            single(
+                "v",
+                Some("dbo"),
+                MsSql,
+                Change::DropView {
+                    materialized: false
+                }
+            )
+            .emit(),
+            vec!["DROP VIEW [dbo].[v];"]
+        );
+        let p = crate::schema::RoutineInfo {
+            schema: Some("dbo".into()),
+            name: "uspGet".into(),
+            kind: crate::schema::RoutineKind::Procedure,
+            ..Default::default()
+        };
+        assert_eq!(
+            drop_routine(&p, MsSql).emit(),
+            vec!["DROP PROCEDURE [dbo].[uspGet];"]
+        );
+    }
+
+    /// `RESTRICT` is not a T-SQL referential action — `NO ACTION` is the
+    /// only refusing one — so the designer does not offer it there.
+    #[test]
+    fn sql_server_is_offered_no_restrict() {
+        assert!(!fk_actions(MsSql).contains(&Some("RESTRICT")));
+        assert!(fk_actions(MsSql).contains(&Some("CASCADE")));
+        for d in [MySql, Postgres, Sqlite] {
+            assert_eq!(fk_actions(d), &FK_ACTIONS[..], "{d:?}");
+        }
+    }
+
+    /// Comments are written on the two engines whose `CREATE TABLE` can carry
+    /// them; SQL Server's live in extended properties, not written yet.
+    #[test]
+    fn only_mysql_is_told_about_prefix_lengths() {
+        assert!(supports_index_prefix(MySql));
+        for d in [Postgres, Sqlite, MsSql] {
+            assert!(!supports_index_prefix(d), "{d:?}");
+        }
+    }
+
+    #[test]
+    fn comments_are_offered_where_they_are_written() {
+        assert!(supports_comments(MySql) && supports_comments(Postgres));
+        assert!(!supports_comments(Sqlite) && !supports_comments(MsSql));
+    }
+
+    /// Each engine names its server-assigned key its own way.
+    #[test]
+    fn the_identity_toggle_names_each_engines_keyword() {
+        assert!(identity_wording(MsSql).1.contains("IDENTITY(1,1)"));
+        assert!(identity_wording(Postgres).1.contains("AS IDENTITY"));
+        assert!(identity_wording(MySql).1.contains("AUTO_INCREMENT"));
+        assert_eq!(identity_wording(MsSql).0, "Identity");
+        assert_eq!(identity_wording(MySql).0, "Auto-increment");
     }
 
     // ── shortcuts ───────────────────────────────────────────────────────────

@@ -5,11 +5,12 @@
 //! engine is [`crate::Engine::MsSql`]. **A preview, not parity.** What is here:
 //! connect, list databases, run queries, batches and `.sql` scripts,
 //! non-executing validation (`prepare_check`), schema introspection, table
-//! statistics, server activity, and the grid's write-back (`commit_writes`,
-//! `refetch_rows`, `fetch_blob`). The other entry points that write
-//! (`import_rows`, `run_ddl`, `run_server_ddl`) and `explain` answer with a
-//! refusal naming SQL Server until they are written, so a caller that skips the
-//! capability gates is told so rather than handed another engine's SQL.
+//! statistics, server activity, the grid's write-back (`commit_writes`,
+//! `refetch_rows`, `fetch_blob`) and the schema changes `ddl::supports_change`
+//! allows it (`run_ddl`). The other entry points that write (`import_rows`,
+//! `run_server_ddl`) and `explain` answer with a refusal naming SQL Server until
+//! they are written, so a caller that skips the capability gates is told so
+//! rather than handed another engine's SQL.
 //!
 //! **Values come over TDS typed**, not as text: an `int` arrives as an `i32`,
 //! a `decimal` as a scaled integer, a `datetime2` as a day count and a count of
@@ -1798,19 +1799,6 @@ pub(crate) async fn run_script(
 // refuses: no path in the app reaches them for SQL Server — the capability
 // gates above them answer no — and one that does is told so in a sentence.
 
-pub(crate) async fn run_ddl(
-    _db: &Db,
-    _database: &str,
-    _stmts: &[String],
-    _cancel: CancellationToken,
-) -> Result<(), crate::DdlError> {
-    Err(crate::DdlError {
-        message: not_yet("Applying a schema change").to_string(),
-        at: 0,
-        applied: 0,
-    })
-}
-
 pub(crate) async fn run_server_ddl(
     _db: &Db,
     _avoid: Option<&str>,
@@ -1831,6 +1819,66 @@ pub(crate) async fn import_rows(
     _cancel: CancellationToken,
 ) -> Result<u64, DbError> {
     Err(not_yet("Importing rows"))
+}
+
+// ── Schema changes ───────────────────────────────────────────────────────────
+
+/// The SQL Server half of [`Db::run_ddl`]: one transaction around the whole
+/// plan. T-SQL's `CREATE TABLE`, `CREATE INDEX` and `DROP` are transactional,
+/// as PostgreSQL's are, so a failure anywhere leaves the database as it was —
+/// which is why [`crate::DdlError::applied`] is always 0 on this path.
+///
+/// Stop sends the attention, and the rollback after it is sent only when the
+/// server acknowledged — `commit_writes`' rule, for its reason: on a stream at
+/// an unknown point a `ROLLBACK` can read another request's answer as its own.
+/// Unacknowledged, the connection's close is what rolls the plan back.
+pub(crate) async fn run_ddl(
+    db: &Db,
+    database: &str,
+    stmts: &[String],
+    cancel: CancellationToken,
+) -> Result<(), crate::DdlError> {
+    let fail = |at: usize, message: String| crate::DdlError {
+        message,
+        at,
+        applied: 0,
+    };
+    let mut client = connect(db, Some(database))
+        .await
+        .map_err(|e| fail(0, err_text(e)))?;
+    drain(&mut client, "BEGIN TRANSACTION")
+        .await
+        .map_err(|e| fail(0, err_text(e)))?;
+    // Best-effort, as on the other engines: a plan that waits behind another
+    // session's lock gives up rather than hanging the modal.
+    let _ = drain(&mut client, &crate::lock_wait_sql(crate::Engine::MsSql)).await;
+    for (i, sql) in stmts.iter().enumerate() {
+        let step = {
+            let run = drain(&mut client, sql);
+            tokio::select! {
+                r = run => Some(r),
+                _ = cancel.cancelled() => None,
+            }
+        };
+        match step {
+            Some(Ok(())) => {}
+            Some(Err(e)) => {
+                let _ = rollback(&mut client).await;
+                return Err(fail(i, err_text(e)));
+            }
+            None => {
+                if attention(&mut client).await {
+                    let _ = rollback(&mut client).await;
+                }
+                return Err(fail(i, "cancelled".to_string()));
+            }
+        }
+    }
+    if let Err(e) = drain(&mut client, "COMMIT TRANSACTION").await {
+        let _ = rollback(&mut client).await;
+        return Err(fail(stmts.len().saturating_sub(1), err_text(e)));
+    }
+    Ok(())
 }
 
 // ── Write-back ───────────────────────────────────────────────────────────────

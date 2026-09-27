@@ -7,9 +7,9 @@ has no manual-transaction mode — see `db::session`'s `Session::open` for what 
 statement about. All three engines now edit all three of those objects, and they get there
 differently, so ask the *narrow* capability (`ddl::supports_or_replace_view`,
 `ddl::supports_view_rename`) rather than the engine. **Microsoft SQL Server is a fourth, and a
-preview rather than a peer**: it connects, reads, validates, introspects, runs scripts and writes
-the grid's edits back, and every editor, import, dump, the plan and Manual mode are switched off by
-capability — see `db::mssql`.
+preview rather than a peer**: it connects, reads, validates, introspects, runs scripts, writes
+the grid's edits back, creates a table and drops a table, view or routine, and every editor,
+import, dump, the plan and Manual mode are switched off by capability — see `db::mssql`.
 
 This is the project's reference document: the crate/module map, the architecture invariants, the
 UI conventions, and the Floem hazards each subsystem is built on. `CLAUDE.md` at the repo root
@@ -3198,6 +3198,18 @@ existing prose was left alone.
     inside `table_designer::default_type`, which is gone;
     `a_new_column_starts_at_the_engines_own_string_type` asserts the literal strings rather than that
     they differ, since a test saying only "PostgreSQL is not MySQL" passes on any two values.
+    **Four more came with SQL Server's Create table**, each an exhaustive `match` the designer asks
+    where it had compared engines or asked nothing, and each for a field it offered and SQL Server
+    could not take.
+    `fk_actions(dialect)` is the action dropdown's list, `FK_ACTIONS` less `RESTRICT` on SQL Server,
+    whose refusing action is `NO ACTION` — already the first entry — so the other was an entry whose
+    every use is a syntax error. `supports_comments(dialect)` is MySQL's and PostgreSQL's: SQLite has
+    no comments in the language, and SQL Server keeps them as extended properties
+    (`sp_addextendedproperty`), a statement not written yet, so both comment fields are hidden there
+    rather than typed into and dropped. `identity_wording(dialect)` is the key toggle's label and
+    hint, naming the keyword `definition_sql` writes — it read *Auto-increment (AUTO_INCREMENT)* on
+    SQL Server. `supports_index_prefix(dialect)` is MySQL's alone, and the index key hint names the
+    `bio(20)` prefix syntax only there; it named it on every engine but PostgreSQL.
     **Three more answer for things outside the designer entirely.** `enforces_declared_byte_length`
     asks whether a column's *declared* type binds how many bytes a value in it may hold: MySQL's is a
     promise, enforced with `ERROR 1406: Data too long`; PostgreSQL's `bytea` declares no length to
@@ -3615,7 +3627,8 @@ existing prose was left alone.
     `inline_check.is_none()` and `is_rename_only` — which is the `ALTER TABLE … RENAME COLUMN` route
     the rebuild's refusal points at. It is false for everything else, where each false is
     the twelve-step rebuild in disguise: a foreign key or a constraint-backed index comes off only
-    by recreating the table around it. Every non-SQLite dialect answers true. It exists because the
+    by recreating the table around it. Every other dialect answers true but SQL Server, whose four
+    changes are an early arm of their own (under `db::mssql`). It exists because the
     per-row menus were built with **no** gate at all — not this one, not even `read_only` — so a
     column row's **Edit column** and a key row's edit entry opened the designer on a SQLite
     connection, ran `diff`, and reached a preview that only `Db::run_ddl` refused at the last
@@ -3782,7 +3795,17 @@ existing prose was left alone.
     permanently uneditable through the designer, and via Run all it landed with the table already
     dropped. It asks `sql::balanced_paren_span` now, which is the one-boundary-lexer invariant's own
     helper, so a paren inside a string literal is not a paren
-    (`a_parenthesised_pair_that_is_not_one_group_still_needs_wrapping`). Ordering
+    (`a_parenthesised_pair_that_is_not_one_group_still_needs_wrapping`).
+    **SQL Server's `create_table_sql` sides with PostgreSQL and SQLite on indexes** — T-SQL has no
+    inline non-key index, so each is a `CREATE [UNIQUE] INDEX` after the table, and
+    `create_index_sql` writes no `USING` there (`writes_index_method`), the method clause not being
+    T-SQL's — and it takes none of MySQL's `ENGINE=`/`COLLATE=`/`COMMENT=`. So the split is asked of
+    two private capabilities, `inlines_indexes` and `takes_table_options`, both MySQL's alone, where
+    it had been `!pg && !sqlite` — a test a fourth engine passes as MySQL. The columns are
+    `ColumnInfo::definition_sql`'s T-SQL arm (under `schema.rs`), and a check writes no
+    `NOT ENFORCED` there (`CheckInfo::clause_sql`, asking `writes_not_enforced`), T-SQL having no
+    such clause (`create_table_on_sql_server_writes_t_sql`,
+    `create_table_on_sql_server_writes_no_mysql_options`). Ordering
     is dependency-first (FKs and indexes off before the columns under them; keys back on
     after), and **the column clauses inside that are ordered by their dependencies rather than
     grouped by change kind** — `ColumnClause` carries the name a clause makes available and the name
@@ -4009,8 +4032,9 @@ existing prose was left alone.
     that left uncovered was never either predicate but their composition with the caller.
     `supports_change` gates
     the change to PostgreSQL exhaustively, and `view_statements` asks it again at the
-    emitter: `emit_sqlite`'s `supported()` filter is the only `supports_change` in any of
-    the three emitters, and this builder runs before even that one, so an engine with no
+    emitter: `emit_sqlite`'s `supported()` filter was the only `supports_change` in any of
+    the three emitters (`emit_mssql`, the fourth, filters the same way), and this builder runs
+    before even that one, so an engine with no
     materialized view would otherwise be handed a
     statement it has no word for. **Its `DropView` neighbour now asks the same question, and it
     needed it more**: `supports_change` distinguishes `DropView { materialized: false }` (SQLite
@@ -6320,6 +6344,14 @@ existing prose was left alone.
     IDENTITY` from `BY DEFAULT`/`serial`/MySQL `AUTO_INCREMENT`, because only the first **rejects**
     an explicit value — `is_server_assigned()` is that question (`generated.is_some() ||
     identity_always`) and is what a write path must ask before naming a column.
+    **On SQL Server `definition_sql` hands off to `tsql_definition` first**, T-SQL's column differing
+    from the shape the other arms share at most clauses. A computed column has no type —
+    `[c] AS (expr)`, `PERSISTED` for a stored one and `NOT NULL` only then, the server refusing it on
+    a column computed on read; an identity is `IDENTITY(1,1)` and always `NOT NULL`, whatever the
+    draft says; and **a nullable column is written `NULL` out loud**, because a new column's
+    nullability otherwise follows the session's `ANSI_NULL_DFLT_*` settings and the same statement
+    could make a different column from another client. `DEFAULT` goes through `is_bare_default`;
+    there is no `ON UPDATE`, inline comment or `INVISIBLE`, T-SQL having none of them.
     **`ColumnInfo::invisible` is `index_disabled_sql`'s argument one object down**: MySQL 8.0.23+
     and MariaDB 10.3+ mark a column `INVISIBLE`, which leaves it selectable by name and out of
     `SELECT *`, and that is the standard way to retire a column without breaking an application —
@@ -10370,8 +10402,8 @@ existing prose was left alone.
   `fetch_query` and `run_batch` (with `Enforce`, above), `prepare_check`, `fetch_table_list` and
   `fetch_schema`, the monitor's `fetch_table`, `count_rows` (`COUNT_BIG`), table statistics from
   `sys.dm_db_partition_stats`, Server Activity, `run_script`, and the grid's write-back —
-  `commit_writes`, `refetch_rows` and `fetch_blob` (below). `explain`, `run_ddl`, `run_server_ddl`
-  and `import_rows` answer
+  `commit_writes`, `refetch_rows` and `fetch_blob` (below) — and `run_ddl`, for the four changes
+  `supports_change` admits (below). `explain`, `run_server_ddl` and `import_rows` answer
   `DbError::Refused("… is not available for SQL Server yet.")`, and so does `Session::open`, as it
   does for SQLite. **The refusals are the backstop, not the gate**: the app is kept off them by
   capabilities, each an exhaustive `match` with `MsSql` on `false`, asked at the UI site that
@@ -10380,21 +10412,33 @@ existing prose was left alone.
   the footer's Auto/Manual segment, which used to ask `is_sqlite`; `users::supports_users`, since
   logins and the users mapped to them in each database are two catalogues the browser's one list
   fits neither half of; and
-  `ddl::supports_change`, which answers `false` for SQL Server before anything else and so turns
-  every editor off at once, the four editor predicates computing from it. Its early answer is an
+  `ddl::supports_change`, whose SQL Server answer comes before anything else and admits four
+  changes — `CreateTable`, `DropTable`, `DropView { materialized: false }` and `DropRoutine` — and
+  nothing more, which still turns every editor off at once, the four editor predicates computing
+  from it: `supports_table_design` probes `AlterColumn`/`RebuildTable`, and the view, trigger and
+  routine editors each want a `Create` and a `Replace` besides their drop
+  (`sql_server_supports_drop_and_create_table_and_nothing_else`). The three drops needed no emitter
+  change — `DROP TABLE`/`DROP VIEW` over `export::ident_sql`'s brackets were T-SQL already, and
+  `RoutineInfo::signature_sql` already had an `MsSql` arm, the bare name, T-SQL having no
+  overloading (`sql_server_drops_read_as_t_sql`); `CREATE TABLE` did, under `ddl.rs` and
+  `schema.rs`. Its early answer is an
   exhaustive `match` of its own ahead of the change arms; it was an `== SqlDialect::MsSql` guard,
   the one exception to "exhaustive" here, and a `match` makes the next engine say which side of it
   it is on. It turned off only what asked it, and three schema-tree entries asked nothing — the
   table/view **Drop**, a standalone object's **Drop**, and **Create ▸ Table**, under a comment
-  saying every engine can create a table — so each opened a confirm and a DDL preview whose Apply
-  could only end in `run_ddl`'s refusal. Each now asks `supports_change` of the statement it would
-  really build and is absent here, as Truncate already was: `ObjectEntries::drop` asks it of
-  `overlays::object_drop_change`, the one `Change` the menu action also sends; an object row asks
-  `overlays::object_drop_offered`, over the set `ddl::drop_item` builds — the set the entry opens —
-  and wants it non-empty as well as expressible; and `create_children`'s Table entry asks it of
-  `Change::CreateTable`, so on SQL Server that list is empty and `create_submenu` leaves the Create
-  row out (`object_menu_tests::sql_server_offers_no_drop_or_any_other_schema_change`,
-  `create_menu_tests::sql_server_is_offered_nothing_to_create`). Unlike SQLite's gaps, all
+  saying every engine can create a table — so while it answered `false` to everything each opened a
+  confirm and a DDL preview whose Apply could only end in `run_ddl`'s refusal. Each now asks
+  `supports_change` of the statement it would really build, as Truncate already did:
+  `ObjectEntries::drop` asks it of `overlays::object_drop_change`, the one `Change` the menu action
+  also sends; an object row asks `overlays::object_drop_offered`, over the set `ddl::drop_item`
+  builds — the set the entry opens — and wants it non-empty as well as expressible; and
+  `create_children`'s Table entry asks it of `Change::CreateTable`. **All three are offered on SQL
+  Server now, because their statements emit** — Drop on a table or a view but not a materialized
+  one, which the engine does not have; Drop on a routine row but not a type, whose statement is not
+  written; and *Table* as the Create menu's only child
+  (`object_menu_tests::sql_server_offers_drop_and_no_other_schema_change`,
+  `a_standalone_objects_drop_is_offered_only_where_its_statement_emits`,
+  `create_menu_tests::sql_server_is_offered_only_a_table`). Unlike SQLite's gaps, all
   of these are **unfinished work**, not statements about the engine. `edit::supports_grid_writes`
   was one of them and is the first to have come back: asked inside `analyze_edit`, it kept every
   cell unwritable until the write-back below landed, and it answers `true` for all four engines now
@@ -10507,6 +10551,31 @@ existing prose was left alone.
   asserts `DbError::Cancelled`, the row unchanged and the whole commit under 3 s, and failed against
   the unpatched driver. There is no `TxScope`: with no Manual mode, the write's own transaction
   is the only case there is.
+  **`run_ddl` wraps the whole plan in one `BEGIN TRANSACTION`**, since T-SQL's `CREATE TABLE`,
+  `CREATE INDEX` and `DROP` are transactional, as PostgreSQL's are: a best-effort
+  `lock_wait_sql(MsSql)` first, as on the other engines, then each statement raced against Stop. A
+  failure rolls back and reports `DdlError { at: i, applied: 0 }` — `applied` is always 0 here,
+  a half-applied plan being a state this path never leaves behind. Stop sends the attention and
+  rolls back **only if it was acknowledged**, `commit_writes`' rule for `commit_writes`' reason;
+  unacknowledged, the connection's close is what rolls the plan back. **The plan comes out of
+  `emit_mssql`**, `ChangeSet::emit`'s own arm for SQL Server in an exhaustive `match`, which walks
+  only the changes `supports_change` admits and writes each with the helper the other emitters
+  share — `create_table_sql`, `DROP TABLE`, `drop_view_sql`, `DROP {kind}` over `signature_sql` —
+  its catch-all arm writing nothing. **It was `emit_mysql` through a `_`**, whose whole-table loop
+  asks no capability, so a SQL Server Truncate went into the script as `TRUNCATE TABLE [dbo].[t];`
+  in MySQL's grammar while the preview listed it as refused
+  (`sql_server_emits_nothing_it_does_not_admit`: Truncate, a table rename, a column drop and a
+  materialized view's drop each emit nothing). The catch-all has the opposite hazard — an
+  admitted change it swallowed would vanish from the plan in silence — so
+  `sql_server_supports_drop_and_create_table_and_nothing_else` also asserts that every admitted
+  change emits something, keeping the two lists one. The live leg pins it three ways:
+  `a_designed_table_is_created_as_drafted` creates an identity key, a collation, a default, a persisted computed column, a check, a unique index and a cascading foreign key into
+  another schema, reads each back by introspection and has an insert fill the identity;
+  `a_failing_plan_is_rolled_back_whole` follows a `CREATE TABLE` with a `CREATE INDEX` on a missing
+  column and gets `at` 1, `applied` 0 and no table; `a_table_a_view_and_a_procedure_are_dropped`
+  is the three drops. Still not done: comments (extended properties), the designer on an existing
+  table (`ALTER`, and T-SQL's `sp_rename` and named `DEFAULT` constraints with it), and the view,
+  routine and trigger editors.
   **`DATABASE_LISTING` asks `HAS_DBACCESS` inside a `CASE`, and only of a multi-user database.**
   On one another session holds `SINGLE_USER`, that call took 2,174 ms against 150 ms (SQL Server
   2022 CU27) — what an administrator's maintenance window would cost every tree refresh — and a
@@ -10918,7 +10987,8 @@ existing prose was left alone.
   that brings a real builtin within edit distance fails here where no membership test can see it.
   **`mssql.rs` is SQL Server's whole leg, and it is outside the macro for the opposite reason**:
   not because its subject is a data file but because the shared suite writes rows back, applies
-  DDL and pins sessions, and SQL Server still answers the last two with a refusal.
+  DDL and pins sessions, and SQL Server still refuses the last and applies only a fraction of the
+  second.
   So it tests what the engine does do, on its own terms — ping and the database list, every type
   `cell_value` renders against the text SQL Server's tools print, `SELECT *` provenance, the
   read-only rollback (`a_read_only_session_rolls_back_what_a_select_hides`: a `SELECT … INTO`
@@ -10929,7 +10999,8 @@ existing prose was left alone.
   statement, and of one still compiling behind another session's lock), activity (the poll's own
   session absent from it), the grid's write-back (seven tests, from
   `a_staged_edit_lands_on_its_row_and_reads_back` to `a_stopped_commit_is_undone`, under
-  `mssql.rs` above), and the
+  `mssql.rs` above), `run_ddl` (three tests, from a designed table to a failing plan rolled back
+  whole, also under `mssql.rs`), and the
   two catalogues only it has — `every_allowlisted_function_is_a_builtin` (the read gate's lists,
   by error 195) and `every_builtin_snippet_runs`. It is not a `Target`, so `endpoint.rs` carries
   `OUTSIDE_THE_SUITE` for it, `leg_enabled` to answer `SCHEMAIC_IT_ENGINES` for a leg with no
@@ -15550,7 +15621,15 @@ existing prose was left alone.
     predicate.** The placeholder type a new column starts at was an `== Postgres` in this file's own
     `default_type`; it is `ddl::default_new_column_type` now — a value, not a capability — and the
     local function is gone, taking one of this file's admitted `engine_comparison_gate` comparisons
-    (9 → 8) with it.
+    (9 → 8) with it. **SQL Server's Create table took it 8 → 5**: both comment fields — table and
+    column — ask `ddl::supports_comments`, so SQL Server's are hidden rather than typed into and
+    dropped; the identity toggle asks `ddl::identity_wording`, having said *Auto-increment
+    (AUTO_INCREMENT)* there; the index key hint asks `ddl::supports_index_prefix`, having named
+    MySQL's `bio(20)` prefix on every engine but PostgreSQL. The foreign-key action dropdown lists
+    `ddl::fk_actions` besides, which has no `RESTRICT` on SQL Server. The designer reaches SQL Server
+    only for a **new** table — `supports_table_design` still answers no there, so nothing opens it on
+    an existing one — and a table created from a database row goes out unqualified, landing in the
+    login's default schema (usually `dbo`), because `default_schema` answers only for PostgreSQL.
     **Off `whole_ui_gate`'s list, 4 to zero, and the last four were the three opening paths and the
     overlay.** Those three write across `ddl`, `schema` and the peer editors, so they name all
     three — `open_for_table(ConnUi, SchemaUi, DdlUi, …)`, and the same for `preview_draft_edit` and
@@ -22889,7 +22968,9 @@ Re-introducing the anti-patterns these guard against is a regression:
   in `trigger_editor.rs`' own spelling, which is defence in depth today and divergence the moment
   one is edited — it wants a `ddl::supports_view_triggers`, which does not exist), and
   `table_designer.rs`'s column-comment and `ON UPDATE` availability, which want
-  `supports_column_comments` and `supports_on_update_current_timestamp`. Giving the predicates a
+  `supports_column_comments` and `supports_on_update_current_timestamp` — the first paid off since
+  as `ddl::supports_comments`, asked of the table's comment field too, when SQL Server's Create
+  table needed both hidden; `ON UPDATE` is still an `== MySql`. Giving the predicates a
   named home outside `ddl.rs` — which is legitimately per-dialect throughout, and long enough that
   a view author looking for one does not find it — is the half the gate does not do, and is open.
   `export::qualified_table` was the same sitting's other half: its per-engine `match` spells the
@@ -23383,10 +23464,11 @@ Re-introducing the anti-patterns these guard against is a regression:
   and all three **derive** that from `supports_change` rather than returning a literal, which is the
   only form of "always true" that isn't a constant with a function's name on it: the answer changes
   when the emitter's does, and a fourth engine gets whatever the change table says about it. SQL
-  Server is that fourth, and the derivation is what switched it off: `supports_change` answers
-  `false` for it before any arm is consulted — no emitter writes T-SQL yet (`sp_rename`, a named
-  `DEFAULT` constraint to drop first, `CREATE OR ALTER`) — and every editor predicate, the
-  routine editor's included, follows with no edit of its own. A menu
+  Server is that fourth, and the derivation is what switched it off: `supports_change` answers for
+  it before any arm is consulted, admitting only a new table and the table, view and routine drops
+  — no emitter writes T-SQL's edits yet (`sp_rename`, a named `DEFAULT` constraint to drop first,
+  `CREATE OR ALTER`) — and every editor predicate, the routine editor's included, follows with no
+  edit of its own. It held when those four came on: no editor probes only them, so none opened. A menu
   entry with **no** predicate is the same failure with nothing to grep for — the designer's three
   entries were exactly that until `supports_table_design` existed. **Keep asking them, and keep them
   apart**:

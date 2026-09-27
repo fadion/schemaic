@@ -750,6 +750,189 @@ async fn a_stopped_commit_is_undone() {
     assert_eq!(s.scalar("SELECT qty FROM dbo.t").await, "1", "undone");
 }
 
+// ── Schema changes ───────────────────────────────────────────────────────────
+
+/// **A designed table is created as it was drafted.** The designer's draft,
+/// through the emitter and `run_ddl`, read back by introspection: an identity
+/// key, a collation, a default, a persisted computed column, a check, a unique
+/// index and a cascading foreign key into another schema.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_designed_table_is_created_as_drafted() {
+    use schemaic_core::ddl::{
+        self, CheckDraft, ColumnDraft, ForeignKeyDraft, IndexDraft, TableDraft,
+    };
+    use schemaic_core::schema::{CheckInfo, ColumnInfo, ForeignKeyInfo, IndexColumn, IndexInfo};
+    if !enabled() {
+        return;
+    }
+    let s = Scratch::create("ddl_create").await;
+    s.exec("CREATE SCHEMA sales").await;
+    s.exec("CREATE TABLE dbo.status (id int PRIMARY KEY)").await;
+    let col = |name: &str, ty: &str| {
+        ColumnDraft::new(ColumnInfo {
+            name: name.into(),
+            type_name: ty.into(),
+            nullable: true,
+            ..Default::default()
+        })
+    };
+    let mut id = col("id", "int");
+    id.info.nullable = false;
+    id.info.auto_increment = true;
+    let mut email = col("email", "nvarchar(255)");
+    email.info.nullable = false;
+    email.info.collation = Some("Latin1_General_CS_AS".into());
+    let mut qty = col("qty", "int");
+    qty.info.default = Some("0".into());
+    let mut total = col("total", "int");
+    total.info.generated = Some("[qty] * 2".into());
+    total.info.generated_stored = true;
+    let draft = TableDraft {
+        name: "people".into(),
+        schema: Some("sales".into()),
+        columns: vec![id, email, qty, total, col("status_id", "int")],
+        primary_key: vec!["id".into()],
+        indexes: vec![IndexDraft::new(IndexInfo {
+            name: "email_uq".into(),
+            columns: vec![IndexColumn::plain("email")],
+            unique: true,
+            ..Default::default()
+        })],
+        foreign_keys: vec![ForeignKeyDraft::new(ForeignKeyInfo {
+            name: "fk_status".into(),
+            columns: vec!["status_id".into()],
+            ref_schema: Some("dbo".into()),
+            ref_table: "status".into(),
+            ref_columns: vec!["id".into()],
+            on_delete: Some("CASCADE".into()),
+            ..Default::default()
+        })],
+        check_constraints: vec![CheckDraft::new(CheckInfo {
+            name: "qty_pos".into(),
+            expression: "[qty] >= 0".into(),
+            enforced: true,
+            ..Default::default()
+        })],
+        ..Default::default()
+    };
+    let stmts = ddl::create(&draft, MS).emit();
+    s.db.run_ddl(&s.name, &stmts, CancellationToken::new())
+        .await
+        .unwrap_or_else(|e| panic!("{e}\n{}", stmts.join("\n")));
+
+    let schema =
+        s.db.fetch_schema(&s.name, CancellationToken::new())
+            .await
+            .expect("the schema");
+    let t = schema
+        .tables
+        .iter()
+        .find(|t| t.schema.as_deref() == Some("sales") && t.name == "people")
+        .expect("sales.people was created");
+    let c = |n: &str| t.columns.iter().find(|x| x.name == n).expect(n);
+    assert!(c("id").primary_key && c("id").auto_increment && !c("id").nullable);
+    assert_eq!(
+        c("email").collation.as_deref(),
+        Some("Latin1_General_CS_AS")
+    );
+    assert!(!c("email").nullable && c("qty").nullable);
+    assert_eq!(c("qty").default.as_deref(), Some("0"));
+    assert!(c("total").generated.is_some() && c("total").generated_stored);
+    assert!(t.indexes.iter().any(|i| i.name == "email_uq" && i.unique));
+    assert_eq!(t.check_constraints[0].name, "qty_pos");
+    let fk = &t.foreign_keys[0];
+    assert_eq!(
+        (
+            fk.name.as_str(),
+            fk.ref_schema.as_deref(),
+            fk.on_delete.as_deref()
+        ),
+        ("fk_status", Some("dbo"), Some("CASCADE"))
+    );
+    // And it is a table the grid can write: the identity fills itself in.
+    s.exec("INSERT sales.people (email, status_id) VALUES (N'a@b', NULL)")
+        .await;
+    assert_eq!(
+        s.scalar("SELECT CONCAT(id, ':', qty, ':', total) FROM sales.people")
+            .await,
+        "1:0:0"
+    );
+}
+
+/// **A plan that fails part-way leaves nothing behind.** T-SQL's DDL is
+/// transactional, so the table the first statement made is gone once the
+/// second — an index on a column that is not there — is refused, and the error
+/// says so: statement 2, nothing applied.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failing_plan_is_rolled_back_whole() {
+    if !enabled() {
+        return;
+    }
+    let s = Scratch::create("ddl_rollback").await;
+    let stmts = vec![
+        "CREATE TABLE [dbo].[t] (\n  [id] int NOT NULL,\n  PRIMARY KEY ([id])\n);".to_string(),
+        "CREATE INDEX [ix] ON [dbo].[t] ([nope]);".to_string(),
+    ];
+    let err =
+        s.db.run_ddl(&s.name, &stmts, CancellationToken::new())
+            .await
+            .expect_err("the index is refused");
+    assert_eq!((err.at, err.applied), (1, 0), "{err}");
+    assert!(err.message.contains("nope"), "{err}");
+    assert_eq!(
+        s.scalar("SELECT COUNT(*) FROM sys.tables WHERE name = 't'")
+            .await,
+        "0",
+        "the table went with it"
+    );
+}
+
+/// The three drops, each through its own change set, each gone afterwards —
+/// and a procedure by its bare name, T-SQL having no overloads to tell apart.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_table_a_view_and_a_procedure_are_dropped() {
+    use schemaic_core::ddl::{self, Change};
+    if !enabled() {
+        return;
+    }
+    let s = Scratch::create("ddl_drop").await;
+    s.exec("CREATE TABLE dbo.t (id int)").await;
+    s.exec("CREATE VIEW dbo.v AS SELECT id FROM dbo.t").await;
+    s.exec("CREATE PROCEDURE dbo.p AS SELECT 1").await;
+    let schema =
+        s.db.fetch_schema(&s.name, CancellationToken::new())
+            .await
+            .expect("the schema");
+    let p = schema
+        .routines
+        .iter()
+        .find(|r| r.name == "p")
+        .expect("the procedure is listed");
+    let plans = [
+        ddl::drop_routine(p, MS),
+        ddl::single(
+            "v",
+            Some("dbo"),
+            MS,
+            Change::DropView {
+                materialized: false,
+            },
+        ),
+        ddl::single("t", Some("dbo"), MS, Change::DropTable),
+    ];
+    for plan in plans {
+        let stmts = plan.emit();
+        s.db.run_ddl(&s.name, &stmts, CancellationToken::new())
+            .await
+            .unwrap_or_else(|e| panic!("{e}\n{}", stmts.join("\n")));
+    }
+    assert_eq!(
+        s.scalar("SELECT COUNT(*) FROM sys.objects WHERE name IN ('t', 'v', 'p')")
+            .await,
+        "0"
+    );
+}
+
 /// **A key finds its row whatever its type** — as the grid read it back: a
 /// `real` by its shortest digits (as an `f64` it is another number), a
 /// `datetime2`, a `uniqueidentifier` and a `decimal` by the text SQL Server

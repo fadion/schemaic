@@ -585,8 +585,8 @@ pub(crate) fn create_children(
 ) -> Vec<CreateEntry> {
     use schemaic_core::ddl::ObjectKind;
     // A table asks for the one statement a new table's designer emits — it was a
-    // literal "every engine can create a table" until SQL Server, which has no
-    // emitter yet. A view is a separate capability — see
+    // literal "every engine can create a table" until SQL Server arrived without
+    // an emitter. A view is a separate capability — see
     // `ddl::supports_view_editing` — and is absent rather than dimmed where the
     // emitter would write a statement the engine has no form of.
     let mut out = Vec::new();
@@ -6193,27 +6193,24 @@ mod object_menu_tests {
         }
     }
 
-    /// **SQL Server is offered no schema change from this menu**, Drop included.
-    ///
-    /// Drop was the one entry here not gated on a capability, so on SQL Server —
-    /// where `ddl::supports_change` answers no to everything — it was a red
-    /// enabled item that asked "This can't be undone", opened a preview, and
-    /// could only ever end in `db::mssql::run_ddl`'s refusal.
+    /// **SQL Server is offered Drop and no other schema change from this
+    /// menu.** Drop was the one entry here not gated on a capability, and
+    /// before SQL Server had a `DROP` it was a red enabled item that asked
+    /// "This can't be undone" and could only end in a refusal; it is offered
+    /// now because the statement is emitted — and still not for a materialized
+    /// view, which the engine does not have.
     #[test]
-    fn sql_server_offers_no_drop_or_any_other_schema_change() {
+    fn sql_server_offers_drop_and_no_other_schema_change() {
         use schemaic_core::intel::SqlDialect::MsSql;
         for shape in [Shape::Table, Shape::View] {
             for materialized in [false, true] {
                 let e = object_entries(shape, MsSql, materialized);
                 assert!(
-                    !e.drop
-                        && !e.edit
-                        && !e.truncate
-                        && !e.triggers
-                        && !e.import
-                        && !e.refresh_view,
+                    !e.edit && !e.truncate && !e.triggers && !e.import && !e.refresh_view,
                     "{shape:?} (materialized: {materialized}): {e:?}"
                 );
+                let dropped = !(shape == Shape::View && materialized);
+                assert_eq!(e.drop, dropped, "{shape:?} (materialized: {materialized})");
             }
         }
         // The premise: a MariaDB sequence is still dropped, so the gate is about
@@ -6222,8 +6219,9 @@ mod object_menu_tests {
     }
 
     /// **The standalone objects' Drop asks the same question.** A routine row on
-    /// SQL Server (whose routines the tree does list) offered Drop on the same
-    /// terms as a table did.
+    /// SQL Server (whose routines the tree does list) is offered Drop, since
+    /// `DROP PROCEDURE` is emitted there; a type is not, since the engine's
+    /// types are not in the tree and no statement for one is written.
     #[test]
     fn a_standalone_objects_drop_is_offered_only_where_its_statement_emits() {
         use schemaic_core::intel::SqlDialect::MsSql;
@@ -6232,8 +6230,7 @@ mod object_menu_tests {
             name: "f".into(),
             ..Default::default()
         }));
-        assert!(!super::object_drop_offered(&routine, MsSql));
-        for d in [MySql, Postgres] {
+        for d in [MySql, Postgres, MsSql] {
             assert!(super::object_drop_offered(&routine, d), "{d:?}");
         }
         let ty = ObjectItem::Enum(EnumInfo {
@@ -6283,17 +6280,17 @@ mod create_menu_tests {
         );
     }
 
+    /// **SQL Server is offered a table and nothing else** — the one Create whose
+    /// statement it emits. Its views, routines and containers wait on their own
+    /// `Create` arms, and are absent rather than dimmed.
+    #[test]
+    fn sql_server_is_offered_only_a_table() {
+        assert_eq!(labels(SqlDialect::MsSql), vec!["Table"]);
+    }
+
     /// SQLite has no stored routines at all — not an unfinished emitter, an
     /// engine where a function is registered by the host program rather than
     /// stored in the database.
-    /// **SQL Server is offered nothing to create**, not even a table: every entry
-    /// opens an editor whose Apply ends at `db::mssql::run_ddl`'s refusal. With
-    /// no children the Create row itself is left out (`create_submenu`).
-    #[test]
-    fn sql_server_is_offered_nothing_to_create() {
-        assert_eq!(labels(SqlDialect::MsSql), Vec::<&str>::new());
-    }
-
     #[test]
     fn sqlite_is_offered_no_routines() {
         let labels = labels(SqlDialect::Sqlite);

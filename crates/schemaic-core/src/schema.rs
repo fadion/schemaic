@@ -477,6 +477,12 @@ impl ColumnInfo {
     /// changing its type. One emitter shared between `CREATE` and `MODIFY` is
     /// what keeps the two from drifting apart.
     pub fn definition_sql(&self, dialect: crate::intel::SqlDialect) -> String {
+        match dialect {
+            crate::intel::SqlDialect::MsSql => return self.tsql_definition(),
+            crate::intel::SqlDialect::MySql
+            | crate::intel::SqlDialect::Postgres
+            | crate::intel::SqlDialect::Sqlite => {}
+        }
         let pg = dialect == crate::intel::SqlDialect::Postgres;
         // SQLite shares MySQL's shape for the parts it has — `COLLATE`, the
         // generated expression, `NOT NULL`, `DEFAULT` — and has none of the
@@ -595,6 +601,57 @@ impl ColumnInfo {
         // returning it again.
         if self.invisible && !pg && !sqlite {
             out.push_str(" INVISIBLE");
+        }
+        out
+    }
+
+    /// [`ColumnInfo::definition_sql`] in T-SQL, whose shape differs from the
+    /// MySQL one the other arms share at most clauses.
+    ///
+    /// - **A computed column has no type**: `[c] AS (expr)`, `PERSISTED` for a
+    ///   stored one, and `NOT NULL` only then (the server refuses it on a
+    ///   column it computes on read).
+    /// - **The key counter is `IDENTITY(1,1)`**, and an identity is never
+    ///   nullable, so it is written `NOT NULL` whatever the draft says.
+    /// - **`NULL` is written out.** A new column's nullability otherwise
+    ///   follows the session's `ANSI_NULL_DFLT_*` settings, so the same
+    ///   statement could make a different column from another client.
+    /// - No `ON UPDATE`, inline comment or `INVISIBLE`: T-SQL has none of them.
+    fn tsql_definition(&self) -> String {
+        let dialect = crate::intel::SqlDialect::MsSql;
+        let name = ddl_ident_in(&self.name, dialect);
+        if let Some(expr) = &self.generated {
+            let mut out = format!("{name} AS ({expr})");
+            if self.generated_stored {
+                out.push_str(" PERSISTED");
+                if !self.nullable {
+                    out.push_str(" NOT NULL");
+                }
+            }
+            return out;
+        }
+        let mut out = format!("{name} {}", self.type_name);
+        if let Some(col) = &self.collation {
+            out.push_str(&format!(" COLLATE {col}"));
+        }
+        if self.auto_increment {
+            out.push_str(" IDENTITY(1,1)");
+        }
+        out.push_str(if self.nullable && !self.auto_increment {
+            " NULL"
+        } else {
+            " NOT NULL"
+        });
+        // An identity carries its counter instead of a default, as on every
+        // engine here.
+        if let Some(d) = &self.default
+            && !self.auto_increment
+        {
+            if is_bare_default(d, dialect) {
+                out.push_str(&format!(" DEFAULT {d}"));
+            } else {
+                out.push_str(&format!(" DEFAULT ({d})"));
+            }
         }
         out
     }
@@ -1350,10 +1407,22 @@ impl CheckInfo {
             if !self.validated {
                 out.push_str(" NOT VALID");
             }
-        } else if !self.enforced {
+        } else if !self.enforced && Self::writes_not_enforced(dialect) {
             out.push_str(" NOT ENFORCED");
         }
         out
+    }
+
+    /// Does [`CheckInfo::clause_sql`] write `NOT ENFORCED` on `dialect`? Not
+    /// in T-SQL, which has no such clause: its nearest, `WITH NOCHECK`, exempts
+    /// only the rows already there, and is a clause of `ALTER TABLE`.
+    fn writes_not_enforced(dialect: crate::intel::SqlDialect) -> bool {
+        match dialect {
+            crate::intel::SqlDialect::MySql
+            | crate::intel::SqlDialect::Postgres
+            | crate::intel::SqlDialect::Sqlite => true,
+            crate::intel::SqlDialect::MsSql => false,
+        }
     }
 
     /// The same constraint written *inside* a column definition, as MariaDB
