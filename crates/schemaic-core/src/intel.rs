@@ -17,7 +17,7 @@
 //! cover the instant, catalog-only cases (unknown table/column); dialect-exact
 //! validation via PREPARE/EXPLAIN is a later, additive tier.
 
-use sqlparser::dialect::{Dialect, MySqlDialect, PostgreSqlDialect, SQLiteDialect};
+use sqlparser::dialect::{Dialect, MsSqlDialect, MySqlDialect, PostgreSqlDialect, SQLiteDialect};
 
 use crate::schema::ServerFlavour;
 use crate::sql::skip_noncode;
@@ -34,15 +34,29 @@ pub enum SqlDialect {
     MySql,
     Postgres,
     Sqlite,
+    /// Microsoft SQL Server and Azure SQL (T-SQL).
+    MsSql,
 }
 
 impl SqlDialect {
+    /// Every dialect this build speaks. A test whose expected answer does not
+    /// depend on the dialect loops over this, so a new engine joins every such
+    /// test by being added here. There were four copies of this list, in four
+    /// test modules, each three long.
+    pub const ALL: [SqlDialect; 4] = [
+        SqlDialect::MySql,
+        SqlDialect::Postgres,
+        SqlDialect::Sqlite,
+        SqlDialect::MsSql,
+    ];
+
     /// The `sqlparser` dialect backing this connection kind.
     pub(crate) fn parser(self) -> Box<dyn Dialect> {
         match self {
             SqlDialect::MySql => Box::new(MySqlDialect {}),
             SqlDialect::Postgres => Box::new(PostgreSqlDialect {}),
             SqlDialect::Sqlite => Box::new(SQLiteDialect {}),
+            SqlDialect::MsSql => Box::new(MsSqlDialect {}),
         }
     }
 
@@ -57,12 +71,13 @@ impl SqlDialect {
             SqlDialect::MySql => "MySQL/MariaDB",
             SqlDialect::Postgres => "PostgreSQL",
             SqlDialect::Sqlite => "SQLite",
+            SqlDialect::MsSql => "Microsoft SQL Server (T-SQL)",
         }
     }
 
     /// Map a saved connection's `db_type` label to a dialect. Anything not
-    /// recognizably Postgres or SQLite falls back to MySQL (the historical
-    /// default), so old saved connections keep parsing as before.
+    /// recognizably Postgres, SQLite or SQL Server falls back to MySQL (the
+    /// historical default), so old saved connections keep parsing as before.
     ///
     /// It **delegates** to [`crate::connection`]'s predicates rather than
     /// re-spelling the label match, which is what it used to do: the aliases were
@@ -74,6 +89,8 @@ impl SqlDialect {
             SqlDialect::Postgres
         } else if crate::connection::is_sqlite(db_type) {
             SqlDialect::Sqlite
+        } else if crate::connection::is_mssql(db_type) {
+            SqlDialect::MsSql
         } else {
             SqlDialect::MySql
         }
@@ -105,6 +122,10 @@ impl SqlDialect {
             SqlDialect::MySql => &[],
             SqlDialect::Postgres => &["ctid", "tableoid", "xmin", "xmax", "cmin", "cmax"],
             SqlDialect::Sqlite => &["rowid", "_rowid_", "oid"],
+            // `$IDENTITY` and `$ROWGUID` stand for a table's identity and
+            // row-GUID columns, but begin with a byte no name scan here reads
+            // as part of a word, so there is nothing to list.
+            SqlDialect::MsSql => &[],
         }
     }
 
@@ -2967,6 +2988,11 @@ pub(crate) fn builtin_catalog(dialect: SqlDialect) -> Option<&'static [SqlFuncti
         SqlDialect::MySql => Some(FUNCTIONS),
         SqlDialect::Sqlite => Some(SQLITE_FUNCTIONS),
         SqlDialect::Postgres => Some(crate::pg_builtins::PG_FUNCTIONS),
+        // **None yet**, which turns the misspelled-function checker off and
+        // offers no builtins — the reason this function returns an `Option`.
+        // A catalog belongs here once one can be checked against a server, as
+        // PostgreSQL's is.
+        SqlDialect::MsSql => None,
     }
 }
 
@@ -3166,10 +3192,12 @@ fn catalog_index(dialect: SqlDialect) -> Option<&'static CatalogIndex> {
     static MYSQL: std::sync::OnceLock<CatalogIndex> = std::sync::OnceLock::new();
     static SQLITE: std::sync::OnceLock<CatalogIndex> = std::sync::OnceLock::new();
     static POSTGRES: std::sync::OnceLock<CatalogIndex> = std::sync::OnceLock::new();
+    static MSSQL: std::sync::OnceLock<CatalogIndex> = std::sync::OnceLock::new();
     let cell = match dialect {
         SqlDialect::MySql => &MYSQL,
         SqlDialect::Sqlite => &SQLITE,
         SqlDialect::Postgres => &POSTGRES,
+        SqlDialect::MsSql => &MSSQL,
     };
     let catalog = builtin_catalog(dialect)?;
     Some(cell.get_or_init(|| CatalogIndex::build(dialect, catalog)))
@@ -3224,7 +3252,8 @@ pub(crate) fn offered_builtins(
 /// The flavour only ever *narrows* the list once it is known.
 pub(crate) fn is_offered_builtin(dialect: SqlDialect, flavour: ServerFlavour, name: &str) -> bool {
     match dialect {
-        SqlDialect::Sqlite => true,
+        // No catalog on SQL Server yet, so nothing reaches here to be offered.
+        SqlDialect::Sqlite | SqlDialect::MsSql => true,
         SqlDialect::Postgres => crate::pg_builtins::is_suggested(name),
         SqlDialect::MySql => {
             let up = name.to_ascii_uppercase();
@@ -3287,10 +3316,13 @@ fn static_words(dialect: SqlDialect) -> &'static std::collections::HashSet<Strin
         std::sync::OnceLock::new();
     static POSTGRES: std::sync::OnceLock<std::collections::HashSet<String>> =
         std::sync::OnceLock::new();
+    static MSSQL: std::sync::OnceLock<std::collections::HashSet<String>> =
+        std::sync::OnceLock::new();
     let cell = match dialect {
         SqlDialect::MySql => &MYSQL,
         SqlDialect::Sqlite => &SQLITE,
         SqlDialect::Postgres => &POSTGRES,
+        SqlDialect::MsSql => &MSSQL,
     };
     cell.get_or_init(|| {
         SQL_KEYWORDS
@@ -3404,6 +3436,9 @@ pub(crate) fn ident_quote(dialect: SqlDialect, open: u8) -> Option<(u8, bool)> {
         (SqlDialect::Sqlite, b'`') => Some((b'`', true)),
         // No escape exists inside `[…]`, so nothing is doubled.
         (SqlDialect::Sqlite, b'[') => Some((b']', false)),
+        // T-SQL doubles the `]` — `[a]]b]` is the name `a]b`.
+        (SqlDialect::MsSql, b'[') => Some((b']', true)),
+        (SqlDialect::MsSql, b'"') => Some((b'"', true)),
         _ => None,
     }
 }
@@ -5446,6 +5481,199 @@ const SQLITE_RESERVED: &[&str] = &[
     "WHERE",
 ];
 
+/// SQL Server's reserved keywords — the list in its documentation, which the
+/// engine refuses as an unbracketed identifier or alias. (`WITHIN GROUP` is
+/// listed there as a phrase; `WITHIN` alone is the word that is reserved.)
+/// T-SQL has no fallback like SQLite's, so the alias set and the identifier set
+/// are one list.
+const MSSQL_RESERVED: &[&str] = &[
+    "ADD",
+    "ALL",
+    "ALTER",
+    "AND",
+    "ANY",
+    "AS",
+    "ASC",
+    "AUTHORIZATION",
+    "BACKUP",
+    "BEGIN",
+    "BETWEEN",
+    "BREAK",
+    "BROWSE",
+    "BULK",
+    "BY",
+    "CASCADE",
+    "CASE",
+    "CHECK",
+    "CHECKPOINT",
+    "CLOSE",
+    "CLUSTERED",
+    "COALESCE",
+    "COLLATE",
+    "COLUMN",
+    "COMMIT",
+    "COMPUTE",
+    "CONSTRAINT",
+    "CONTAINS",
+    "CONTAINSTABLE",
+    "CONTINUE",
+    "CONVERT",
+    "CREATE",
+    "CROSS",
+    "CURRENT",
+    "CURRENT_DATE",
+    "CURRENT_TIME",
+    "CURRENT_TIMESTAMP",
+    "CURRENT_USER",
+    "CURSOR",
+    "DATABASE",
+    "DBCC",
+    "DEALLOCATE",
+    "DECLARE",
+    "DEFAULT",
+    "DELETE",
+    "DENY",
+    "DESC",
+    "DISK",
+    "DISTINCT",
+    "DISTRIBUTED",
+    "DOUBLE",
+    "DROP",
+    "DUMP",
+    "ELSE",
+    "END",
+    "ERRLVL",
+    "ESCAPE",
+    "EXCEPT",
+    "EXEC",
+    "EXECUTE",
+    "EXISTS",
+    "EXIT",
+    "EXTERNAL",
+    "FETCH",
+    "FILE",
+    "FILLFACTOR",
+    "FOR",
+    "FOREIGN",
+    "FREETEXT",
+    "FREETEXTTABLE",
+    "FROM",
+    "FULL",
+    "FUNCTION",
+    "GOTO",
+    "GRANT",
+    "GROUP",
+    "HAVING",
+    "HOLDLOCK",
+    "IDENTITY",
+    "IDENTITY_INSERT",
+    "IDENTITYCOL",
+    "IF",
+    "IN",
+    "INDEX",
+    "INNER",
+    "INSERT",
+    "INTERSECT",
+    "INTO",
+    "IS",
+    "JOIN",
+    "KEY",
+    "KILL",
+    "LEFT",
+    "LIKE",
+    "LINENO",
+    "LOAD",
+    "MERGE",
+    "NATIONAL",
+    "NOCHECK",
+    "NONCLUSTERED",
+    "NOT",
+    "NULL",
+    "NULLIF",
+    "OF",
+    "OFF",
+    "OFFSETS",
+    "ON",
+    "OPEN",
+    "OPENDATASOURCE",
+    "OPENQUERY",
+    "OPENROWSET",
+    "OPENXML",
+    "OPTION",
+    "OR",
+    "ORDER",
+    "OUTER",
+    "OVER",
+    "PERCENT",
+    "PIVOT",
+    "PLAN",
+    "PRECISION",
+    "PRIMARY",
+    "PRINT",
+    "PROC",
+    "PROCEDURE",
+    "PUBLIC",
+    "RAISERROR",
+    "READ",
+    "READTEXT",
+    "RECONFIGURE",
+    "REFERENCES",
+    "REPLICATION",
+    "RESTORE",
+    "RESTRICT",
+    "RETURN",
+    "REVERT",
+    "REVOKE",
+    "RIGHT",
+    "ROLLBACK",
+    "ROWCOUNT",
+    "ROWGUIDCOL",
+    "RULE",
+    "SAVE",
+    "SCHEMA",
+    "SECURITYAUDIT",
+    "SELECT",
+    "SEMANTICKEYPHRASETABLE",
+    "SEMANTICSIMILARITYDETAILSTABLE",
+    "SEMANTICSIMILARITYTABLE",
+    "SESSION_USER",
+    "SET",
+    "SETUSER",
+    "SHUTDOWN",
+    "SOME",
+    "STATISTICS",
+    "SYSTEM_USER",
+    "TABLE",
+    "TABLESAMPLE",
+    "TEXTSIZE",
+    "THEN",
+    "TO",
+    "TOP",
+    "TRAN",
+    "TRANSACTION",
+    "TRIGGER",
+    "TRUNCATE",
+    "TRY_CONVERT",
+    "TSEQUAL",
+    "UNION",
+    "UNIQUE",
+    "UNPIVOT",
+    "UPDATE",
+    "UPDATETEXT",
+    "USE",
+    "USER",
+    "VALUES",
+    "VARYING",
+    "VIEW",
+    "WAITFOR",
+    "WHEN",
+    "WHERE",
+    "WHILE",
+    "WITH",
+    "WITHIN",
+    "WRITETEXT",
+];
+
 /// A word that can't be a bare (unquoted) identifier/alias in `dialect` — reserved.
 /// Backs the alias diagnostic and the scope's alias resolution so they agree on what
 /// counts as a valid alias. See [`MYSQL_RESERVED`] / [`PG_RESERVED`] /
@@ -5465,6 +5693,7 @@ fn reserved_words(dialect: SqlDialect) -> &'static [&'static str] {
         SqlDialect::MySql => MYSQL_RESERVED,
         SqlDialect::Postgres => PG_RESERVED,
         SqlDialect::Sqlite => SQLITE_RESERVED,
+        SqlDialect::MsSql => MSSQL_RESERVED,
     }
 }
 
@@ -5500,7 +5729,7 @@ const NON_RESERVED_KEYWORDS: &[&str] = &["VALUE", "GROUPS", "NULLS"];
 /// questions come apart — see [`must_quote_ident`].
 fn alias_ok_but_unquotable(dialect: SqlDialect) -> &'static [&'static str] {
     match dialect {
-        SqlDialect::MySql | SqlDialect::Postgres => &[],
+        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::MsSql => &[],
         // `CAST(x AS t)`, `IF NOT EXISTS`, `RAISE(ABORT, …)` — each is a bare
         // keyword the parser commits to on sight in a name position, and each is
         // still accepted as an alias, where `AS` has already told it what follows.
@@ -8599,7 +8828,7 @@ mod tests {
     use super::*;
     use sqlparser::parser::Parser;
 
-    const DIALECTS: [SqlDialect; 3] = [SqlDialect::MySql, SqlDialect::Postgres, SqlDialect::Sqlite];
+    const DIALECTS: [SqlDialect; 4] = SqlDialect::ALL;
 
     /// **[`ident_quote`] and `SqlDialect`'s three predicates are two tables for
     /// one fact, and nothing said they agreed.**

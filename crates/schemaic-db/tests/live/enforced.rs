@@ -66,8 +66,10 @@ pub async fn a_read_only_session_refuses_a_write_a_select_hides(target: &'static
     use schemaic_core::intel::SqlDialect;
     let (scratch, t) = seeded(target, "enforce_ro").await;
     let gate = schemaic_core::sql::read_only_reason("SELECT purge_all()", scratch.dialect());
+    // SQL Server answers calls by an allowlist too; its leg is outside this
+    // suite (`crate::mssql`), and this is its answer should it join.
     let gate_refuses_the_call = match scratch.dialect() {
-        SqlDialect::Postgres => true,
+        SqlDialect::Postgres | SqlDialect::MsSql => true,
         SqlDialect::MySql | SqlDialect::Sqlite => false,
     };
     assert_eq!(

@@ -3524,6 +3524,13 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
             if let Some(fix) = fix_entry {
                 entries.insert(0, fix);
             }
+            // "Plan" only where the engine has one this build reads
+            // (`plan::supports_plan`) — absent rather than dimmed, like
+            // "Create view" below, because on such an engine it never will.
+            if !schemaic_core::plan::supports_plan(dialect.get_untracked()) {
+                entries
+                    .retain(|e| !matches!(e, MenuEntry::Action { label, .. } if label == "Plan"));
+            }
             // "Create view" only when there's a query to make one *out of* — the
             // statement the right-click landed on has to be something a view's
             // body may be (`can_be_view_body`, the same rule the editor's own

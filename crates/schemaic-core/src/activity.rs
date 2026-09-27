@@ -54,6 +54,25 @@ pub fn supports_kill(dialect: SqlDialect) -> bool {
     supports_activity(dialect)
 }
 
+/// Can this **kind** of kill be asked for here?
+///
+/// **The split [`supports_kill`] foresaw.** SQL Server lists its sessions and
+/// ends one with `KILL`, but has no statement that cancels another session's
+/// running request and leaves the session standing — its cancel is an
+/// attention sent by the session's own client. So *Kill session* is offered
+/// there and *Cancel query* is not, rather than being a `KILL` under a label
+/// that promises less.
+pub fn supports_kill_kind(dialect: SqlDialect, kind: KillKind) -> bool {
+    if !supports_kill(dialect) {
+        return false;
+    }
+    match (dialect, kind) {
+        (_, KillKind::Session) => true,
+        (SqlDialect::MsSql, KillKind::Query) => false,
+        (SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite, KillKind::Query) => true,
+    }
+}
+
 /// The most sessions the panel will hold. A pooled application server can sit at
 /// four figures of connections, and every one of them would become a live view in
 /// a list that re-renders on every poll.
@@ -1028,6 +1047,91 @@ pub fn from_pg_rows(rows: &[PgActivityRow]) -> Vec<SessionInfo> {
         .collect()
 }
 
+/// One SQL Server session, as `db::mssql`'s activity query projects it:
+/// `sys.dm_exec_sessions` joined to its current request, if it has one.
+///
+/// `request_status` is `None` for a session with no request — idle, or idle
+/// inside a transaction, which `open_transactions` tells apart.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct MsSessionRow {
+    pub session_id: i64,
+    pub login: String,
+    pub host: Option<String>,
+    pub database: Option<String>,
+    pub request_status: Option<String>,
+    pub open_transactions: i64,
+    /// `blocking_session_id`: 0 when nothing blocks it. Negative values are
+    /// the server's own markers (-2 an orphaned distributed transaction, -3 a
+    /// deferred recovery, -4 a latch owner it cannot name), not sessions.
+    pub blocking_session: i64,
+    pub sql: Option<String>,
+    pub seconds: Option<f64>,
+}
+
+/// A SQL Server session's [`SessionState`].
+///
+/// A request that is `running`, `runnable` or `suspended` is doing something;
+/// `suspended` on a lock is promoted to *Blocked* by the blocking id, as
+/// PostgreSQL's lock wait is by `pg_blocking_pids`. With no request, an open
+/// transaction is the state that holds locks while looking harmless.
+pub fn mssql_state(
+    request_status: Option<&str>,
+    open_transactions: i64,
+    blocked: bool,
+) -> SessionState {
+    if blocked {
+        return SessionState::Blocked;
+    }
+    match request_status.map(str::trim) {
+        Some(s) if !s.is_empty() && !s.eq_ignore_ascii_case("sleeping") => SessionState::Running,
+        _ if open_transactions > 0 => SessionState::IdleInTx,
+        _ => SessionState::Idle,
+    }
+}
+
+/// Fold SQL Server's activity rows into [`SessionInfo`]s.
+///
+/// A negative blocking id is the server naming something that is not a
+/// session, and becomes no edge: an edge to `-2` would draw a "Kill -2"
+/// under a row nobody can reach. Nor does the session's **own** id: a
+/// parallel query's threads waiting on one another are reported as the
+/// session blocking itself, which is no lock anyone else holds.
+pub fn from_mssql_rows(rows: &[MsSessionRow]) -> Vec<SessionInfo> {
+    rows.iter()
+        .map(|r| {
+            let blocked_by: Vec<i64> = (r.blocking_session > 0
+                && r.blocking_session != r.session_id)
+                .then_some(r.blocking_session)
+                .into_iter()
+                .collect();
+            SessionInfo {
+                id: r.session_id,
+                user: r.login.trim().to_string(),
+                client: r
+                    .host
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|h| !h.is_empty())
+                    .map(str::to_string),
+                database: r.database.clone().filter(|d| !d.is_empty()),
+                state: mssql_state(
+                    r.request_status.as_deref(),
+                    r.open_transactions,
+                    !blocked_by.is_empty(),
+                ),
+                sql: r
+                    .sql
+                    .as_ref()
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty()),
+                seconds: r.seconds.map(|s| s.max(0.0)),
+                blocked_by,
+                blocks: Vec::new(),
+            }
+        })
+        .collect()
+}
+
 /// Read a PostgreSQL `int[]` as rendered by `::text` — `{}`, `{1234}`,
 /// `{1234,5678}`. `simple_query` hands back every column as text, so the array
 /// arrives as its literal and there is no typed accessor to lean on.
@@ -1220,6 +1324,13 @@ fn cancel_transaction_note(dialect: SqlDialect) -> &'static str {
     match dialect {
         // The transaction survives intact; the client can retry the statement.
         SqlDialect::MySql | SqlDialect::Sqlite => "Any open transaction stays open.",
+        // An attention rolls back the statement, not the transaction — unless
+        // the session runs with `XACT_ABORT ON`, which rolls the whole of it
+        // back. Which one a session has is its own setting, not ours to know.
+        SqlDialect::MsSql => {
+            "Any open transaction stays open, unless the session runs with XACT_ABORT on, \
+             which rolls it back."
+        }
         // Open, but poisoned: `ERROR 25P02` on everything until a rollback.
         SqlDialect::Postgres => {
             "Any open transaction is left aborted — the client has to roll it back, \
@@ -2370,6 +2481,77 @@ mod tests {
             "the state word is the server's, so match it loosely"
         );
         assert_eq!(mysql_state(" sleep ", None), SessionState::Idle);
+    }
+
+    #[test]
+    fn sql_server_states_follow_the_request_and_the_transaction() {
+        assert_eq!(
+            mssql_state(Some("running"), 0, false),
+            SessionState::Running
+        );
+        assert_eq!(
+            mssql_state(Some("suspended"), 1, false),
+            SessionState::Running
+        );
+        assert_eq!(
+            mssql_state(Some("suspended"), 1, true),
+            SessionState::Blocked
+        );
+        assert_eq!(mssql_state(None, 1, false), SessionState::IdleInTx);
+        assert_eq!(mssql_state(None, 0, false), SessionState::Idle);
+        assert_eq!(mssql_state(Some("sleeping"), 0, false), SessionState::Idle);
+    }
+
+    /// Only a positive blocking id is a session to draw an edge to; the
+    /// server's negative markers are not killable rows.
+    #[test]
+    fn a_sql_server_blocker_is_an_edge_only_when_it_is_a_session() {
+        let row = |blocking| MsSessionRow {
+            session_id: 55,
+            login: " app ".into(),
+            host: Some(String::new()),
+            database: Some("shop".into()),
+            request_status: Some("suspended".into()),
+            open_transactions: 1,
+            blocking_session: blocking,
+            sql: Some("  UPDATE t SET a = 1  ".into()),
+            seconds: Some(-3.0),
+        };
+        let s = &from_mssql_rows(&[row(61)])[0];
+        assert_eq!(s.blocked_by, vec![61]);
+        assert_eq!(s.state, SessionState::Blocked);
+        assert_eq!(s.user, "app");
+        assert_eq!(s.client, None);
+        assert_eq!(s.sql.as_deref(), Some("UPDATE t SET a = 1"));
+        assert_eq!(
+            s.seconds,
+            Some(0.0),
+            "a clock step back is not a negative age"
+        );
+        for marker in [0, -2, -3, -4] {
+            let s = &from_mssql_rows(&[row(marker)])[0];
+            assert!(s.blocked_by.is_empty(), "{marker}");
+            assert_eq!(s.state, SessionState::Running);
+        }
+        // A parallel query's threads wait on one another, and the server
+        // reports that as the session blocking itself — which is no lock
+        // anybody else holds, and no edge to draw.
+        let own = &from_mssql_rows(&[row(55)])[0];
+        assert!(own.blocked_by.is_empty(), "{:?}", own.blocked_by);
+        assert_eq!(own.state, SessionState::Running);
+    }
+
+    /// SQL Server can end a session but not cancel another session's
+    /// statement, so only one of the two kills is offered there.
+    #[test]
+    fn sql_server_offers_kill_session_and_not_cancel_query() {
+        assert!(supports_kill_kind(SqlDialect::MsSql, KillKind::Session));
+        assert!(!supports_kill_kind(SqlDialect::MsSql, KillKind::Query));
+        for d in [SqlDialect::MySql, SqlDialect::Postgres] {
+            assert!(supports_kill_kind(d, KillKind::Query), "{d:?}");
+            assert!(supports_kill_kind(d, KillKind::Session), "{d:?}");
+        }
+        assert!(!supports_kill_kind(SqlDialect::Sqlite, KillKind::Session));
     }
 
     #[test]

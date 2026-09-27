@@ -677,7 +677,13 @@ pub fn count_rows_sql(schema: Option<&str>, table: &str, dialect: SqlDialect) ->
         ),
         None => crate::export::ident_sql(table, dialect),
     };
-    format!("SELECT COUNT(*) FROM {name}")
+    // `COUNT(*)` is an `int` on SQL Server and fails (Msg 8115) past
+    // 2,147,483,647 rows — exactly the tables someone asks this about.
+    let count = match dialect {
+        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => "COUNT(*)",
+        SqlDialect::MsSql => "COUNT_BIG(*)",
+    };
+    format!("SELECT {count} FROM {name}")
 }
 
 /// Where the `qualifier.table` a statement wrote sits in the catalogue:
@@ -702,7 +708,10 @@ pub fn catalogue_key(
 ) -> Option<(String, Option<String>)> {
     match dialect {
         SqlDialect::MySql => Some((qualifier.or(result_db)?.to_string(), None)),
-        SqlDialect::Postgres => Some((result_db?.to_string(), qualifier.map(str::to_string))),
+        // In one database with schemas inside it, as on PostgreSQL.
+        SqlDialect::Postgres | SqlDialect::MsSql => {
+            Some((result_db?.to_string(), qualifier.map(str::to_string)))
+        }
         SqlDialect::Sqlite => None,
     }
 }
@@ -1660,6 +1669,14 @@ mod tests {
         assert_eq!(
             count_rows_sql(None, "orders", SqlDialect::Sqlite),
             "SELECT COUNT(*) FROM \"orders\""
+        );
+    }
+
+    #[test]
+    fn a_sql_server_count_is_a_bigint() {
+        assert_eq!(
+            count_rows_sql(Some("dbo"), "orders", SqlDialect::MsSql),
+            "SELECT COUNT_BIG(*) FROM [dbo].[orders]"
         );
     }
 

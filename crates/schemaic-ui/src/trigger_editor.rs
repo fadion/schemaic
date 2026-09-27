@@ -428,6 +428,10 @@ fn blank_trigger(
         },
         SqlDialect::Sqlite => TriggerAction::Body(NEW_BODY_SQLITE.to_string()),
         SqlDialect::MySql => TriggerAction::Body(NEW_BODY.to_string()),
+        // Not reached: trigger editing is not offered on SQL Server yet
+        // (`ddl::supports_trigger_editing`). T-SQL takes an empty block as
+        // SQLite does not, so MySQL's placeholder is the closer of the two.
+        SqlDialect::MsSql => TriggerAction::Body(NEW_BODY.to_string()),
     };
     draft
 }

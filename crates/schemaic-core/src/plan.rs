@@ -14,6 +14,20 @@
 
 use crate::model::ResultSet;
 
+/// Can the editor show a query plan for `dialect`?
+///
+/// Not on SQL Server yet: its plan is `SET SHOWPLAN_XML ON`, an XML document
+/// this module does not read, so `Db::explain` refuses it there. The editor's
+/// *Plan* entry asks this and is absent where it is `false`, rather than
+/// opening a modal to report the refusal.
+pub fn supports_plan(dialect: crate::intel::SqlDialect) -> bool {
+    use crate::intel::SqlDialect;
+    match dialect {
+        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => true,
+        SqlDialect::MsSql => false,
+    }
+}
+
 /// A parsed EXPLAIN plan: the raw tabular output plus heuristic warnings.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct QueryPlan {

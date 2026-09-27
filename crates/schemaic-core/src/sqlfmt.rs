@@ -84,6 +84,8 @@ enum Kind {
     LineComment,
     BlockComment,
     Punct,
+    /// A client directive that owns its whole line — SQL Server's `GO`.
+    Directive,
 }
 
 use crate::sql::is_word_byte;
@@ -117,6 +119,13 @@ fn ops(dialect: SqlDialect) -> &'static [&'static str] {
         SqlDialect::Postgres => &["::", ":="],
         // No user-defined operators and a fixed set, so a table is complete.
         SqlDialect::Sqlite => &["->>", "->", ">=", "<=", "<>", "!=", "==", "||", "<<", ">>"],
+        // Fixed too: comparisons (including the old `!<`/`!>`), compound
+        // assignment, `::` before a CLR type's static method, and `||`
+        // concatenation (SQL Server 2025).
+        SqlDialect::MsSql => &[
+            ">=", "<=", "<>", "!=", "!<", "!>", "+=", "-=", "*=", "/=", "%=", "&=", "^=", "|=",
+            "::", "||",
+        ],
     }
 }
 
@@ -134,7 +143,7 @@ fn ops(dialect: SqlDialect) -> &'static [&'static str] {
 fn operators_are_composable(dialect: SqlDialect) -> bool {
     match dialect {
         SqlDialect::Postgres => true,
-        SqlDialect::MySql | SqlDialect::Sqlite => false,
+        SqlDialect::MySql | SqlDialect::Sqlite | SqlDialect::MsSql => false,
     }
 }
 
@@ -206,6 +215,19 @@ fn tokenize(sql: &str, dialect: SqlDialect) -> Vec<(Kind, &str)> {
         let c = b[i];
         if c.is_ascii_whitespace() {
             i += 1;
+            continue;
+        }
+        // **A `GO` line is the client's batch separator, not SQL**, and is one
+        // only on a line of its own: laid out as the ordinary word the arm
+        // below would make of it, it joined the line before and the script
+        // lost its batches. One verbatim token, count and comment included —
+        // `sql::go_directive` is the one definition, and answers `None` on
+        // every dialect but SQL Server's.
+        if crate::sql::at_line_start(b, i)
+            && let Some(end) = crate::sql::go_directive(sql, i, dialect)
+        {
+            toks.push((Kind::Directive, sql[i..end].trim_end()));
+            i = end;
             continue;
         }
         // **An executable comment is one verbatim slice here, `*/` included.**
@@ -659,6 +681,21 @@ impl<'a> Fmt<'a> {
                 Kind::BlockComment | Kind::Quoted => {
                     self.emit(kind, text, false);
                 }
+                Kind::Directive => {
+                    // On a line of its own at the margin, directly under the
+                    // batch it ends; the next batch starts afresh after a
+                    // blank line, as a statement does after its `;`.
+                    self.blank = false;
+                    self.break_to(0);
+                    self.emit(kind, text, false);
+                    self.base = 0;
+                    self.content = 0;
+                    self.parens.clear();
+                    self.suppress_and = false;
+                    self.prev = None;
+                    self.blank = true;
+                    self.break_to(0);
+                }
                 Kind::Word => {
                     let up = text.to_ascii_uppercase();
                     let in_expr = self.in_expr_paren();
@@ -936,7 +973,7 @@ mod tests {
             "SELECT ARRAY[:a, :b]",
             "my_loop:LOOP SELECT 1; END LOOP",
         ] {
-            for dialect in [SqlDialect::MySql, SqlDialect::Postgres, SqlDialect::Sqlite] {
+            for dialect in SqlDialect::ALL {
                 let before = crate::params::names(sql, dialect);
                 let after = crate::params::names(&super::format_sql(sql, IND, dialect), dialect);
                 assert_eq!(before, after, "{dialect:?} {sql:?}");
@@ -963,7 +1000,7 @@ mod tests {
             "/*!40000 ALTER TABLE `orders` DISABLE KEYS */;",
             "/*M!100000 SET @x = 1 */;",
         ] {
-            for dialect in [SqlDialect::MySql, SqlDialect::Postgres, SqlDialect::Sqlite] {
+            for dialect in SqlDialect::ALL {
                 let got = super::format_sql(sql, IND, dialect);
                 assert!(!got.contains("* /"), "{dialect:?} {sql:?} -> {got:?}");
                 assert_eq!(
@@ -1006,7 +1043,7 @@ mod tests {
     fn a_selection_inside_a_comment_or_a_string_is_not_formattable() {
         let full = "select 1 -- keep a, b\nfrom t";
         let inside = full.find("keep").unwrap();
-        for dialect in [SqlDialect::MySql, SqlDialect::Postgres, SqlDialect::Sqlite] {
+        for dialect in SqlDialect::ALL {
             assert_eq!(
                 super::formattable_range(full, inside, inside + "keep a, b".len(), dialect),
                 None,
@@ -1338,5 +1375,29 @@ mod tests {
             .find(|l| l.contains("-- hidden"))
             .expect("comment survived");
         assert!(!line.contains("select 2"), "{out:?}");
+    }
+
+    /// **A `GO` line is the client's batch separator and keeps a line of its
+    /// own.** Tokenized as a word it was laid out as one — `1 GO` on the
+    /// `SELECT`'s line — and the script lost every batch it had: the next
+    /// `CREATE PROCEDURE` swallowed whatever followed it.
+    #[test]
+    fn a_sql_server_go_line_survives_formatting() {
+        let d = SqlDialect::MsSql;
+        let sql = "SELECT 1\nGO\nCREATE PROCEDURE p AS SELECT 2\ngo 3 -- again\nSELECT 3\n";
+        let out = super::format_sql(sql, IND, d);
+        assert_eq!(
+            crate::sql::executable_statements(&out, d),
+            crate::sql::executable_statements(sql, d)
+                .iter()
+                .map(|s| super::format_sql(s, IND, d))
+                .collect::<Vec<_>>(),
+            "{out}"
+        );
+        assert!(out.lines().any(|l| l == "GO"), "{out}");
+        assert!(out.lines().any(|l| l == "go 3 -- again"), "{out}");
+        // Elsewhere `go` is only a word.
+        let mysql = super::format_sql("SELECT 1\nGO\n", IND, SqlDialect::MySql);
+        assert!(!mysql.lines().any(|l| l == "GO"), "{mysql}");
     }
 }

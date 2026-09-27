@@ -1,0 +1,2081 @@
+//! SQL Server backend (fourth engine), built on [`tiberius`] — vendored and
+//! patched, see `vendor/tiberius/PATCHES.md`.
+//!
+//! Dispatched to from [`crate::Db`]'s public methods when the connection's
+//! engine is [`crate::Engine::MsSql`]. **A preview, not parity.** What is here:
+//! connect, list databases, run queries, batches and `.sql` scripts,
+//! non-executing validation (`prepare_check`), schema introspection, table
+//! statistics and server activity. The entry points that write (`commit_writes`,
+//! `import_rows`, `run_ddl`, `run_server_ddl`), the ones the grid's editing
+//! needs (`refetch_rows`, `fetch_blob`) and `explain` answer with a refusal
+//! naming SQL Server until they are written, so a caller that skips the
+//! capability gates is told so rather than handed another engine's SQL.
+//!
+//! **Values come over TDS typed**, not as text: an `int` arrives as an `i32`,
+//! a `decimal` as a scaled integer, a `datetime2` as a day count and a count of
+//! ticks. [`cell_value`] renders each to the text SQL Server itself would show,
+//! and every decision in it is a pure function with a test — the equivalent of
+//! PostgreSQL's text protocol, done on this side of the wire.
+//!
+//! **Column provenance** — which base table and column a result column came
+//! from, which is what makes the grid editable — is not in TDS's column
+//! metadata. It comes from `sys.dm_exec_describe_first_result_set` in browse
+//! mode, which compiles the statement without running it and names each
+//! column's source, the analogue of PostgreSQL's `PREPARE` here.
+//!
+//! **Model note:** a SQL Server *database* maps onto the app's database tree
+//! level, as on PostgreSQL, and every table carries its schema — SQL Server
+//! qualifies with `schema.table`, and `dbo` is only the usual default.
+
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use futures_util::StreamExt;
+use schemaic_core::intel::SqlDialect;
+use schemaic_core::model::{
+    Column, ColumnFlags, ColumnOrigin, ResultBuilder, ResultSet, Value, binary_display,
+    type_is_binary,
+};
+use schemaic_core::schema::{DbSchema, TableInfo};
+use tiberius::{ColumnData, ColumnType, QueryItem};
+use tokio::net::TcpStream;
+use tokio_util::compat::{Compat, TokioAsyncWriteCompatExt};
+use tokio_util::sync::CancellationToken;
+
+use crate::{Db, DbError, RowDest};
+
+/// This module's dialect, once — the same convention `pg.rs` keeps.
+const MS: SqlDialect = SqlDialect::MsSql;
+
+/// A connected client. The socket is tokio's, and tiberius speaks `futures`
+/// I/O, hence the compat wrapper.
+pub(crate) type MsClient = tiberius::Client<Compat<TcpStream>>;
+
+/// What an unfinished entry point answers.
+fn not_yet(what: &str) -> DbError {
+    DbError::Refused(format!("{what} is not available for SQL Server yet."))
+}
+
+// ── Connecting ───────────────────────────────────────────────────────────────
+
+/// The driver's configuration for this endpoint, scoped to `database` or, with
+/// none, to the connection's own — and with no database at all, to the login's
+/// default one, which is SQL Server's own answer and usually `master`.
+fn config(db: &Db, database: Option<&str>) -> Result<tiberius::Config, DbError> {
+    let mut cfg = tiberius::Config::new();
+    cfg.host(&db.host);
+    cfg.port(db.port);
+    if let Some(d) = database.or(db.database()) {
+        cfg.database(d);
+    }
+    cfg.authentication(tiberius::AuthMethod::sql_server(&db.user, &db.pass));
+    cfg.application_name("Schemaic");
+    // **No per-response deadline.** The driver's default is thirty seconds,
+    // ADO.NET's `CommandTimeout`, which would end any query whose first row
+    // takes longer — an aggregate over a large table, an index build. Every
+    // caller here has a cancellation token, and a timeout is the caller's
+    // decision (`PING_TIMEOUT` wraps the ones that need it).
+    cfg.command_timeout(None);
+    cfg.encryption(crate::tls::mssql_encryption(db.tls_plan()));
+    cfg.rustls_client_config(crate::tls::mssql_client_config(db.tls_plan())?);
+    Ok(cfg)
+}
+
+/// Open a fresh connection. Follows one routing redirect, which is how Azure
+/// SQL's gateway hands a client to the node that serves its database.
+pub(crate) async fn connect(db: &Db, database: Option<&str>) -> Result<MsClient, DbError> {
+    let cfg = config(db, database)?;
+    match connect_with(cfg.clone()).await {
+        Err(tiberius::error::Error::Routing { host, port }) => {
+            let mut routed = cfg;
+            routed.host(&host);
+            routed.port(port);
+            connect_with(routed).await.map_err(|e| connect_err(&e))
+        }
+        other => other.map_err(|e| connect_err(&e)),
+    }
+}
+
+async fn connect_with(cfg: tiberius::Config) -> tiberius::Result<MsClient> {
+    let tcp = TcpStream::connect(cfg.get_addr()).await?;
+    tcp.set_nodelay(true)?;
+    tiberius::Client::connect(cfg, tcp.compat_write()).await
+}
+
+/// A failed connect, in the server's words when it gave any — a wrong
+/// password is `Login failed for user 'x'.` (18456), a missing database is
+/// `Cannot open database "x" requested by the login.` (4060).
+fn connect_err(e: &tiberius::error::Error) -> DbError {
+    DbError::Connect(ms_text(e))
+}
+
+/// A failed statement.
+fn db_err(e: &tiberius::error::Error) -> DbError {
+    DbError::Query(ms_text(e))
+}
+
+/// What SQL Server said, on one line: its message, then the error number and
+/// line in the form its own tools print them, which is how anybody searches
+/// for one. Anything that is not the server's is the driver's own sentence.
+fn ms_text(e: &tiberius::error::Error) -> String {
+    match e {
+        tiberius::error::Error::Server(t) => server_message(t.message(), t.code(), t.line()),
+        other => other.to_string(),
+    }
+}
+
+/// [`ms_text`]'s server arm without the driver's type, so it can be asserted.
+fn server_message(message: &str, code: u32, line: u32) -> String {
+    let message = message.trim();
+    if line > 0 {
+        format!("{message} (Msg {code}, line {line})")
+    } else {
+        format!("{message} (Msg {code})")
+    }
+}
+
+/// Lightweight reachability check bounded by `timeout`.
+pub(crate) async fn ping(db: &Db, timeout: Duration) -> Result<(), DbError> {
+    let check = async {
+        let mut client = connect(db, None).await?;
+        drain(&mut client, "SELECT 1").await
+    };
+    tokio::time::timeout(timeout, check)
+        .await
+        .map_err(|_| DbError::Connect("timed out".to_string()))?
+}
+
+/// The databases worth putting in the schema tree: online, open to this
+/// login, and not one of the four system databases (`master`, `tempdb`,
+/// `model`, `msdb` are ids 1–4, and on Azure SQL `master` is the only one).
+///
+/// `HAS_DBACCESS` is the catalogue saying whether *this* login may enter,
+/// which is what expanding the node will need — the same reason PostgreSQL's
+/// listing asks `has_database_privilege`.
+///
+/// **Asked only of a multi-user database, and inside a `CASE`.** On one that
+/// another session holds `SINGLE_USER`, `HAS_DBACCESS` takes about two
+/// seconds to answer (2,174 ms against 150 ms, SQL Server 2022 CU27) — what an
+/// administrator's maintenance window would cost every tree refresh — and a
+/// plain `AND user_access = 0` beside it does not stop it being evaluated,
+/// since T-SQL promises no order for `AND`. `CASE` does. Such a database could
+/// not be opened by this login anyway while it is held, so it is left out.
+const DATABASE_LISTING: &str = "SELECT name FROM sys.databases \
+     WHERE database_id > 4 AND state = 0 \
+       AND CASE WHEN user_access = 0 THEN HAS_DBACCESS(name) END = 1 \
+     ORDER BY name";
+
+/// List the user databases, sorted by name. Bounded by
+/// [`crate::PING_TIMEOUT`], as on every engine.
+pub(crate) async fn fetch_databases(db: &Db) -> Result<Vec<String>, DbError> {
+    let listing = async {
+        let mut client = connect(db, None).await?;
+        let rows = query_rows(&mut client, DATABASE_LISTING).await?;
+        Ok::<_, DbError>(rows.into_iter().map(|r| cell(&r, 0)).collect())
+    };
+    tokio::time::timeout(crate::PING_TIMEOUT, listing)
+        .await
+        .map_err(|_| DbError::Connect("timed out".to_string()))?
+}
+
+// ── Running statements ───────────────────────────────────────────────────────
+
+/// Connect and run one statement.
+///
+/// **`Enforce::ReadOnly` is a transaction that is always rolled back.** SQL
+/// Server has no read-only session or transaction to ask for — nothing like
+/// PostgreSQL's `default_transaction_read_only` or MySQL's `START TRANSACTION
+/// READ ONLY` — so the statement runs inside `BEGIN TRANSACTION` and the
+/// connection is closed without a commit, which the server rolls back. Its DDL
+/// is transactional, so a table a `SELECT … INTO` made goes too.
+///
+/// What that does **not** undo, and why the text gate
+/// (`sql::read_only_reason`) stays in front and refuses them by name: a
+/// procedure or extended procedure's effect outside the database (`EXEC`,
+/// `xp_cmdshell`), a sequence advanced by `NEXT VALUE FOR`, and anything sent
+/// to another server (`OPENQUERY`, `OPENROWSET`). A write inside the
+/// transaction is also briefly visible to a session reading uncommitted data.
+/// A login granted only `SELECT` is the one guard that sees everything; the
+/// connection form says so.
+///
+/// `AsJudged` needs nothing: the gate reads `"…"` as a name and T-SQL, under
+/// either `QUOTED_IDENTIFIER` setting, ends the span where the gate does.
+pub(crate) async fn fetch_query(
+    db: &Db,
+    database: Option<&str>,
+    sql: &str,
+    dest: &mut RowDest,
+    cancel: CancellationToken,
+    enforce: Option<crate::Enforce>,
+) -> Result<ResultSet, DbError> {
+    let mut client = connect(db, database).await?;
+    if enforce == Some(crate::Enforce::ReadOnly) {
+        drain(&mut client, "BEGIN TRANSACTION")
+            .await
+            .map_err(read_only_setup_failed)?;
+    }
+    // Dropped, not committed: the server rolls an open transaction back when
+    // its connection closes.
+    run_statement(&mut client, sql, dest, &cancel).await
+}
+
+/// The server refusing the statement that guards the session — about
+/// Schemaic's statement, not the user's, so `Connect` rather than `Query`, as
+/// `pg::read_only_setup_failed` explains.
+fn read_only_setup_failed(e: DbError) -> DbError {
+    DbError::Connect(format!("could not guard the session: {e}"))
+}
+
+/// Run several statements in order on ONE connection, so session state
+/// (`USE`, `SET`, temporary tables, a transaction) carries across them. Stops
+/// at the first failing statement; every one after it reports
+/// [`DbError::Cancelled`]. A `USE` moves `scope`, as MySQL's does.
+///
+/// Under `Enforce::ReadOnly` the whole batch is one transaction that is never
+/// committed — see [`fetch_query`].
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn run_batch(
+    db: &Db,
+    database: Option<&str>,
+    stmts: &[String],
+    row_cap: usize,
+    cancel: CancellationToken,
+    mut on_result: impl FnMut(usize, Result<ResultSet, DbError>),
+    scope: Arc<std::sync::Mutex<Option<String>>>,
+    enforce: Option<crate::Enforce>,
+) {
+    let opened = match connect(db, database).await {
+        Ok(mut c) if enforce == Some(crate::Enforce::ReadOnly) => {
+            match drain(&mut c, "BEGIN TRANSACTION").await {
+                Ok(()) => Ok(c),
+                Err(e) => Err(read_only_setup_failed(e)),
+            }
+        }
+        other => other,
+    };
+    let mut client = match opened {
+        Ok(c) => c,
+        Err(e) => {
+            let msg = e.to_string();
+            for i in 0..stmts.len() {
+                on_result(
+                    i,
+                    if i == 0 {
+                        Err(DbError::Connect(msg.clone()))
+                    } else {
+                        Err(DbError::Cancelled)
+                    },
+                );
+            }
+            return;
+        }
+    };
+    let mut stopped = false;
+    for (i, sql) in stmts.iter().enumerate() {
+        if stopped || cancel.is_cancelled() {
+            on_result(i, Err(DbError::Cancelled));
+            continue;
+        }
+        let outcome = run_statement(&mut client, sql, &mut RowDest::Capped(row_cap), &cancel).await;
+        if outcome.is_err() {
+            stopped = true;
+        }
+        if outcome.is_ok()
+            && schemaic_core::sql::leading_keyword(sql, MS).as_deref() == Some("USE")
+            && let Ok(mut scope) = scope.lock()
+        {
+            *scope = schemaic_core::sql::use_target(sql, MS);
+        }
+        on_result(i, outcome);
+    }
+}
+
+/// Validate `sql` **without executing it**, through
+/// `sys.dm_exec_describe_first_result_set`, which compiles the batch —
+/// syntax, and every table and column it names — and runs none of it.
+///
+/// **Not `SET NOEXEC ON`**, which was the first version of this: it compiles
+/// without resolving names, so `SELECT * FROM nope` came back clean on SQL
+/// Server 2022, and a missing table is the error this exists to show. The
+/// describe answers it as error 208 in a row rather than raising it.
+///
+/// The statement goes in as a parameter. What cannot be described — a
+/// temporary table the batch creates, dynamic SQL — is answered with a 115xx
+/// error of the describe's own, which is not a fault in the statement and
+/// passes ([`describe_error`]).
+pub(crate) async fn prepare_check(
+    db: &Db,
+    database: Option<&str>,
+    sql: &str,
+) -> Result<(), DbError> {
+    let stmt = sql.trim().trim_end_matches(';').trim_end();
+    if stmt.is_empty() {
+        return Ok(());
+    }
+    let mut client = connect(db, database).await?;
+    const CHECK: &str = "SELECT error_number, error_message \
+         FROM sys.dm_exec_describe_first_result_set(@P1, NULL, 0) \
+         WHERE error_number IS NOT NULL";
+    let rows = client
+        .query(CHECK, &[&stmt])
+        .await
+        .map_err(|e| db_err(&e))?
+        .into_first_result()
+        .await
+        .map_err(|e| db_err(&e))?;
+    let errors: Vec<(u32, String)> = rows
+        .iter()
+        .map(|r| {
+            (
+                cell_text(r, 0).and_then(|n| n.parse().ok()).unwrap_or(0),
+                cell_text(r, 1).unwrap_or_default(),
+            )
+        })
+        .collect();
+    match describe_error(&errors) {
+        Some(e) => Err(DbError::Query(e)),
+        None => Ok(()),
+    }
+}
+
+/// The error a describe's rows report about the statement, if any: the first
+/// that is not one of the describe's own 115xx answers ("uses a temp table",
+/// "every code path results in an error", "could not be analyzed"), which
+/// follow a real error or stand for "cannot say".
+fn describe_error(rows: &[(u32, String)]) -> Option<String> {
+    rows.iter()
+        .find(|(n, _)| !(11500..11600).contains(n))
+        .map(|(n, m)| server_message(m, *n, 0))
+}
+
+/// Run a statement for its side effect alone, reading its whole answer.
+async fn drain(client: &mut MsClient, sql: &str) -> Result<(), DbError> {
+    let mut stream = client.simple_query(sql).await.map_err(|e| db_err(&e))?;
+    while let Some(item) = stream.next().await {
+        item.map_err(|e| db_err(&e))?;
+    }
+    Ok(())
+}
+
+/// One statement on an open client, its rows into `dest`.
+///
+/// The columns come from [`describe`] when it can name them — types in full
+/// (`nvarchar(50)`, `decimal(10,2)`) and each column's source for the grid's
+/// editing — and otherwise from the wire's metadata, which has a base type and
+/// no source.
+///
+/// **One result set per read**, as the other engines report: a second
+/// announces itself with its own metadata, and the read stops there.
+///
+/// A cancel is TDS's own **attention**, on this connection: the driver's
+/// `cancel_query` aborts the running batch and waits for the server to
+/// acknowledge it, so nothing keeps running once Stop has answered.
+///
+/// **Every step is raced against Stop, and every Stop sends the attention.**
+/// The describe compiles the statement, and a compile waits behind another
+/// session's schema lock: awaited on its own, it left Stop doing nothing until
+/// that lock was released, however long that was. `simple_query` does not
+/// return until the statement's first result set — for an `UPDATE`, until it
+/// has finished — and a Stop there used to leave the stopping to the
+/// connection's close.
+async fn run_statement(
+    client: &mut MsClient,
+    sql: &str,
+    dest: &mut RowDest,
+    cancel: &CancellationToken,
+) -> Result<ResultSet, DbError> {
+    let row_cap = dest.cap();
+    let start = Instant::now();
+    let described = {
+        let step = describe(client, sql);
+        tokio::select! {
+            d = step => Some(d),
+            _ = cancel.cancelled() => None,
+        }
+    };
+    let Some(described) = described else {
+        return Err(cancel_now(client).await);
+    };
+    let chunk_capacity = dest.chunk_capacity();
+
+    let mut grid: Option<ResultBuilder> = None;
+    let mut truncated = false;
+    let mut cancelled = false;
+    let mut sets = 0usize;
+    // A block rather than an early return on a Stop: the stream borrows the
+    // client until the block ends, and the attention needs the client.
+    let affected = 'read: {
+        let opened = {
+            let step = client.simple_query(sql);
+            tokio::select! {
+                r = step => Some(r),
+                _ = cancel.cancelled() => None,
+            }
+        };
+        let Some(opened) = opened else {
+            cancelled = true;
+            break 'read 0;
+        };
+        let mut stream = opened.map_err(|e| db_err(&e))?;
+        loop {
+            let next = tokio::select! {
+                n = stream.next() => n,
+                _ = cancel.cancelled() => {
+                    cancelled = true;
+                    break;
+                }
+            };
+            let Some(item) = next else { break };
+            match item.map_err(|e| db_err(&e))? {
+                QueryItem::Metadata(meta) => {
+                    sets += 1;
+                    if sets > 1 {
+                        tracing::warn!(
+                            "batch returned more than one result set; reporting only the first"
+                        );
+                        break;
+                    }
+                    let columns = result_columns(meta.columns(), described.as_deref());
+                    grid = Some(ResultBuilder::with_capacity(columns, chunk_capacity));
+                }
+                QueryItem::Row(row) => {
+                    let Some(builder) = grid.as_mut() else {
+                        continue;
+                    };
+                    if builder.row_count() >= row_cap {
+                        truncated = true;
+                        break;
+                    }
+                    let cells: Vec<Value> = row.cells().map(|(_, d)| cell_value(d)).collect();
+                    builder.push_row(&cells);
+                    if dest.chunk_full(builder.row_count(), builder.text_bytes()) {
+                        let next = dest.chunk_capacity();
+                        dest.flush(builder, next).await?;
+                    }
+                }
+            }
+        }
+        // The statement's own count is the last one: a trigger's statements
+        // report theirs first, in the same batch.
+        stream.rows_affected().last().copied().unwrap_or(0)
+    };
+    if cancelled {
+        return Err(cancel_now(client).await);
+    }
+    let Some(mut builder) = grid else {
+        return Ok(ResultSet::affected_rows(Vec::new(), affected)
+            .with_elapsed(start.elapsed().as_millis()));
+    };
+    dest.flush(&mut builder, 0).await?;
+    builder.set_truncated(truncated);
+    builder.set_elapsed(start.elapsed().as_millis());
+    Ok(builder.finish())
+}
+
+/// Stop what this connection is running — the attention, bounded by
+/// [`crate::CANCEL_TIMEOUT`] — and answer [`DbError::Cancelled`].
+///
+/// A connection a dropped future left mid-write refuses the attention; the
+/// server has only part of that request, runs none of it, and the caller
+/// drops the connection either way.
+async fn cancel_now(client: &mut MsClient) -> DbError {
+    let _ = tokio::time::timeout(crate::CANCEL_TIMEOUT, client.cancel_query()).await;
+    DbError::Cancelled
+}
+
+// ── Describing a result ──────────────────────────────────────────────────────
+
+/// One column as `sys.dm_exec_describe_first_result_set` names it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Described {
+    name: String,
+    type_name: String,
+    /// `(database, schema, table, column)` of the base column, when the
+    /// column is one.
+    source: Option<(String, String, String, String)>,
+    /// Part of the key browse mode found for its table.
+    in_key: bool,
+    nullable: bool,
+    identity: bool,
+}
+
+/// The first result set of `sql`, described without running it — or `None`
+/// when the server cannot (a temporary table the batch makes itself, dynamic
+/// SQL), in which case the wire's metadata is all there is.
+///
+/// **Browse mode** (the third argument, `1`) is what names each column's base
+/// table and column. It also adds the key columns the select list left out,
+/// flagged `is_hidden`; those are not in the result and are dropped here.
+///
+/// The statement goes in as a parameter, never spliced into text.
+async fn describe(client: &mut MsClient, sql: &str) -> Option<Vec<Described>> {
+    const DESCRIBE: &str = "SELECT name, system_type_name, source_database, source_schema, \
+            source_table, source_column, is_part_of_unique_key, is_nullable, \
+            is_identity_column \
+         FROM sys.dm_exec_describe_first_result_set(@P1, NULL, 1) \
+         WHERE is_hidden = 0 \
+         ORDER BY column_ordinal";
+    let stream = client.query(DESCRIBE, &[&sql]).await.ok()?;
+    let rows = stream.into_first_result().await.ok()?;
+    let out: Vec<Described> = rows
+        .iter()
+        .map(|r| {
+            let text = |i: usize| -> Option<String> { cell_text(r, i) };
+            let flag = |i: usize| text(i).as_deref() == Some("1");
+            let source = match (text(2), text(3), text(4), text(5)) {
+                (Some(d), Some(s), Some(t), Some(c)) => Some((d, s, t, c)),
+                _ => None,
+            };
+            Described {
+                name: text(0).unwrap_or_default(),
+                type_name: text(1).unwrap_or_default(),
+                source,
+                in_key: flag(6),
+                nullable: flag(7),
+                identity: flag(8),
+            }
+        })
+        .collect();
+    (!out.is_empty()).then_some(out)
+}
+
+/// The columns a result set is read under: the description's when it agrees
+/// with the wire about how many there are and what they are called, and the
+/// wire's otherwise.
+///
+/// **Agreement is checked, not assumed.** The description is of the batch's
+/// *first* result set, compiled a moment before it ran; a batch whose first
+/// set comes from a branch the compiler could not see (`IF … SELECT … ELSE
+/// SELECT …`) can describe one shape and return another, and every cell would
+/// then sit under another column's name and type.
+fn result_columns(wire: &[tiberius::Column], described: Option<&[Described]>) -> Vec<Column> {
+    let agrees = described.is_some_and(|d| {
+        d.len() == wire.len()
+            && d.iter()
+                .zip(wire)
+                .all(|(d, w)| d.name.eq_ignore_ascii_case(w.name()))
+    });
+    match described {
+        Some(d) if agrees => d.iter().map(described_column).collect(),
+        _ => wire
+            .iter()
+            .map(|w| Column {
+                name: w.name().to_string(),
+                type_name: wire_type_name(w.column_type()).to_string(),
+                origin: None,
+            })
+            .collect(),
+    }
+}
+
+/// A described column as the grid's [`Column`]. The origin's key flags are
+/// what browse mode knows: that the column is in *a* key of its table, which
+/// is the question `analyze_edit` asks of it.
+fn described_column(d: &Described) -> Column {
+    let origin = d
+        .source
+        .as_ref()
+        .map(|(database, schema, table, column)| ColumnOrigin {
+            database: database.clone(),
+            schema: Some(schema.clone()),
+            table: table.clone(),
+            column: column.clone(),
+            flags: ColumnFlags {
+                primary_key: false,
+                unique_key: d.in_key,
+                not_null: !d.nullable,
+                auto_increment: d.identity,
+                no_default: false,
+            },
+            binary: type_is_binary(&d.type_name),
+            implicit_key: false,
+        });
+    Column {
+        name: d.name.clone(),
+        type_name: d.type_name.clone(),
+        origin,
+    }
+}
+
+/// A type name for a column the description could not name, from the wire's
+/// base type — no length, since the wire's is in bytes and not the declared
+/// one.
+fn wire_type_name(t: ColumnType) -> &'static str {
+    match t {
+        ColumnType::Null => "",
+        ColumnType::Bit | ColumnType::Bitn => "bit",
+        ColumnType::Int1 => "tinyint",
+        ColumnType::Int2 => "smallint",
+        ColumnType::Int4 => "int",
+        ColumnType::Int8 => "bigint",
+        ColumnType::Intn => "int",
+        ColumnType::Float4 => "real",
+        ColumnType::Float8 | ColumnType::Floatn => "float",
+        ColumnType::Money | ColumnType::Money4 => "money",
+        ColumnType::Datetime4 => "smalldatetime",
+        ColumnType::Datetime | ColumnType::Datetimen => "datetime",
+        ColumnType::Daten => "date",
+        ColumnType::Timen => "time",
+        ColumnType::Datetime2 => "datetime2",
+        ColumnType::DatetimeOffsetn => "datetimeoffset",
+        ColumnType::Guid => "uniqueidentifier",
+        ColumnType::Decimaln => "decimal",
+        ColumnType::Numericn => "numeric",
+        ColumnType::BigVarBin => "varbinary",
+        ColumnType::BigBinary => "binary",
+        ColumnType::Image => "image",
+        ColumnType::BigVarChar => "varchar",
+        ColumnType::BigChar => "char",
+        ColumnType::NVarchar => "nvarchar",
+        ColumnType::NChar => "nchar",
+        ColumnType::Text => "text",
+        ColumnType::NText => "ntext",
+        ColumnType::Xml => "xml",
+        ColumnType::Udt => "udt",
+        ColumnType::SSVariant => "sql_variant",
+    }
+}
+
+// ── Values ───────────────────────────────────────────────────────────────────
+
+/// One TDS value as the grid stores it — the text SQL Server's own tools show.
+///
+/// Integers and floats keep their numeric variants; everything else is exact
+/// text. **Nothing here is lossy**: a `decimal` is rendered from its scaled
+/// integer, never through a float; a `real` from its own shortest
+/// representation, not widened to `f64` first (which would show `0.1` as
+/// `0.10000000149011612`); bytes as [`binary_display`], as on every engine.
+fn cell_value(d: &ColumnData<'_>) -> Value {
+    match d {
+        ColumnData::U8(v) => v.map_or(Value::Null, |v| Value::Int(v.into())),
+        ColumnData::I16(v) => v.map_or(Value::Null, |v| Value::Int(v.into())),
+        ColumnData::I32(v) => v.map_or(Value::Null, |v| Value::Int(v.into())),
+        ColumnData::I64(v) => v.map_or(Value::Null, Value::Int),
+        ColumnData::F32(v) => v.map_or(Value::Null, real_value),
+        ColumnData::F64(v) => v.map_or(Value::Null, Value::Float),
+        ColumnData::Bit(v) => v.map_or(Value::Null, |b| Value::Int(b.into())),
+        ColumnData::String(v) => v
+            .as_ref()
+            .map_or(Value::Null, |s| Value::Str(s.to_string())),
+        ColumnData::Guid(v) => v.map_or(Value::Null, |g| Value::Str(guid_text(&g))),
+        ColumnData::Binary(v) => v
+            .as_ref()
+            .map_or(Value::Null, |b| Value::Str(binary_display(b.len()))),
+        ColumnData::Numeric(v) => v.map_or(Value::Null, |n| {
+            Value::Str(decimal_text(n.value(), n.scale()))
+        }),
+        ColumnData::Xml(v) => v
+            .as_ref()
+            .map_or(Value::Null, |x| Value::Str(x.to_string())),
+        ColumnData::DateTime(v) => v.map_or(Value::Null, |t| {
+            Value::Str(datetime_text(t.days(), t.seconds_fragments()))
+        }),
+        ColumnData::SmallDateTime(v) => v.map_or(Value::Null, |t| {
+            Value::Str(smalldatetime_text(t.days(), t.seconds_fragments()))
+        }),
+        ColumnData::Time(v) => v.map_or(Value::Null, |t| {
+            Value::Str(time_text(t.increments(), t.scale()))
+        }),
+        ColumnData::Date(v) => v.map_or(Value::Null, |d| Value::Str(date_text(d.days()))),
+        ColumnData::DateTime2(v) => v.map_or(Value::Null, |t| {
+            Value::Str(datetime2_text(
+                t.date().days(),
+                t.time().increments(),
+                t.time().scale(),
+            ))
+        }),
+        ColumnData::DateTimeOffset(v) => v.map_or(Value::Null, |t| {
+            let dt = t.datetime2();
+            Value::Str(datetimeoffset_text(
+                dt.date().days(),
+                dt.time().increments(),
+                dt.time().scale(),
+                t.offset(),
+            ))
+        }),
+    }
+}
+
+/// A `real` as the number it was written as: its own shortest decimal form,
+/// read back as the `f64` of that text.
+fn real_value(v: f32) -> Value {
+    format!("{v}")
+        .parse::<f64>()
+        .map_or(Value::Float(v.into()), Value::Float)
+}
+
+/// A `uniqueidentifier` in the upper case SQL Server prints it in.
+fn guid_text(g: &tiberius::Uuid) -> String {
+    g.hyphenated().to_string().to_ascii_uppercase()
+}
+
+/// A `decimal`/`numeric`/`money` from its scaled integer: `12345` at scale 2
+/// is `123.45`. A scale of 0 has no point — the driver's own formatting
+/// writes `123.` — and a negative value keeps its sign on a zero integer part
+/// (`-0.50`).
+fn decimal_text(value: i128, scale: u8) -> String {
+    let digits = value.unsigned_abs().to_string();
+    let sign = if value < 0 { "-" } else { "" };
+    let scale = usize::from(scale);
+    if scale == 0 {
+        return format!("{sign}{digits}");
+    }
+    let padded = format!("{digits:0>width$}", width = scale + 1);
+    let (int, frac) = padded.split_at(padded.len() - scale);
+    format!("{sign}{int}.{frac}")
+}
+
+/// Days since 1970-01-01 of SQL Server's two epochs.
+const EPOCH_1900: i64 = -25_567;
+const EPOCH_0001: i64 = -719_162;
+
+/// `YYYY-MM-DD` for a count of days since 1970-01-01.
+fn civil(days_since_1970: i64) -> String {
+    let (y, m, d) = schemaic_core::date::civil_from_days(days_since_1970);
+    format!("{y:04}-{m:02}-{d:02}")
+}
+
+/// `HH:MM:SS` for a count of seconds since midnight.
+fn clock(seconds: u64) -> String {
+    format!(
+        "{:02}:{:02}:{:02}",
+        seconds / 3600,
+        seconds / 60 % 60,
+        seconds % 60
+    )
+}
+
+/// A `date`: days since 0001-01-01.
+fn date_text(days: u32) -> String {
+    civil(EPOCH_0001 + i64::from(days))
+}
+
+/// A `time(scale)`: increments of 10^-scale seconds since midnight, with as
+/// many fraction digits as its scale — `time(7)` prints seven, `time(0)` none.
+fn time_text(increments: u64, scale: u8) -> String {
+    let per_second = 10u64.pow(u32::from(scale));
+    let whole = clock(increments / per_second);
+    if scale == 0 {
+        whole
+    } else {
+        let frac = increments % per_second;
+        format!("{whole}.{frac:0width$}", width = usize::from(scale))
+    }
+}
+
+/// A `datetime2(scale)`.
+fn datetime2_text(days: u32, increments: u64, scale: u8) -> String {
+    format!("{} {}", date_text(days), time_text(increments, scale))
+}
+
+/// A `datetimeoffset(scale)`, in the offset it was stored with.
+///
+/// **The wire carries the instant in UTC**, and the offset beside it (MS-TDS
+/// 2.2.5.5.1.8), so the local time is the UTC time moved by the offset — the
+/// value `2026-01-01 10:00 +02:00` arrives as 08:00 and +120.
+fn datetimeoffset_text(days: u32, increments: u64, scale: u8, offset_minutes: i16) -> String {
+    let per_second = 10u64.pow(u32::from(scale));
+    let per_day = 86_400 * per_second;
+    let shift = i128::from(offset_minutes) * 60 * i128::from(per_second);
+    let utc = i128::from(days) * i128::from(per_day) + i128::from(increments);
+    let local = utc + shift;
+    let (day, ticks) = (
+        local.div_euclid(i128::from(per_day)),
+        local.rem_euclid(i128::from(per_day)),
+    );
+    let sign = if offset_minutes < 0 { '-' } else { '+' };
+    let off = offset_minutes.unsigned_abs();
+    format!(
+        "{} {} {sign}{:02}:{:02}",
+        civil(EPOCH_0001 + day as i64),
+        time_text(ticks as u64, scale),
+        off / 60,
+        off % 60
+    )
+}
+
+/// A `datetime`: days since 1900-01-01 and three-hundredths of a second since
+/// midnight, printed to the millisecond as SQL Server prints it
+/// (`2026-09-27 12:50:53.730`) — so a value ending in `.997` still does.
+fn datetime_text(days: i32, fragments: u32) -> String {
+    let millis = (u64::from(fragments) * 1000 + 150) / 300;
+    format!(
+        "{} {}.{:03}",
+        civil(EPOCH_1900 + i64::from(days)),
+        clock(millis / 1000),
+        millis % 1000
+    )
+}
+
+/// A `smalldatetime`: days since 1900-01-01 and minutes since midnight.
+fn smalldatetime_text(days: u16, minutes: u16) -> String {
+    format!(
+        "{} {}",
+        civil(EPOCH_1900 + i64::from(days)),
+        clock(u64::from(minutes) * 60)
+    )
+}
+
+// ── Catalogue helpers ────────────────────────────────────────────────────────
+
+/// Every row of a catalogue query, each cell as its text. For the bounded
+/// reads — the database list, the schema — whose size is the catalogue's.
+async fn query_rows(client: &mut MsClient, sql: &str) -> Result<Vec<Vec<Option<String>>>, DbError> {
+    let rows = client
+        .simple_query(sql)
+        .await
+        .map_err(|e| db_err(&e))?
+        .into_first_result()
+        .await
+        .map_err(|e| db_err(&e))?;
+    Ok(rows
+        .iter()
+        .map(|r| (0..r.len()).map(|i| cell_text(r, i)).collect())
+        .collect())
+}
+
+/// A catalogue cell as text, or `None` for `NULL`.
+fn cell_text(row: &tiberius::Row, i: usize) -> Option<String> {
+    let (_, data) = row.cells().nth(i)?;
+    match cell_value(data) {
+        Value::Null => None,
+        Value::Int(v) => Some(v.to_string()),
+        Value::UInt(v) => Some(v.to_string()),
+        Value::Float(v) => Some(v.to_string()),
+        Value::Str(s) => Some(s),
+    }
+}
+
+/// A cell of a catalogue row, empty for `NULL`.
+fn cell(row: &[Option<String>], i: usize) -> String {
+    row.get(i).cloned().flatten().unwrap_or_default()
+}
+
+// ── The schema ───────────────────────────────────────────────────────────────
+
+/// The tables and views of every user schema, for the tree's first paint.
+const TABLE_LISTING: &str = "SELECT s.name, o.name, \
+            CASE o.type WHEN 'V' THEN 'VIEW' ELSE 'BASE TABLE' END \
+     FROM sys.objects o JOIN sys.schemas s ON s.schema_id = o.schema_id \
+     WHERE o.type IN ('U', 'V') AND o.is_ms_shipped = 0 \
+     ORDER BY s.name, o.name";
+
+/// The table list alone, without the catalogue reads a full fetch makes.
+pub(crate) async fn fetch_table_list(db: &Db, database: &str) -> Result<DbSchema, DbError> {
+    let mut client = connect(db, Some(database)).await?;
+    let tables = query_rows(&mut client, TABLE_LISTING)
+        .await?
+        .into_iter()
+        .map(|r| TableInfo {
+            schema: Some(cell(&r, 0)),
+            name: cell(&r, 1),
+            is_view: cell(&r, 2) == "VIEW",
+            ..Default::default()
+        })
+        .collect();
+    Ok(DbSchema {
+        tables,
+        ..Default::default()
+    })
+}
+
+/// Every column of every user table and view: `(schema, table, column, type,
+/// max_length, precision, scale, user-defined type, nullable, identity,
+/// computed definition, persisted, default definition, collation (when not the
+/// database's), description, is rowversion, the type's schema)`.
+const COLUMN_LISTING: &str = "SELECT s.name, o.name, c.name, ty.name, \
+            c.max_length, c.precision, c.scale, CAST(ty.is_user_defined AS int), \
+            CAST(c.is_nullable AS int), CAST(c.is_identity AS int), \
+            cc.definition, CAST(COALESCE(cc.is_persisted, 0) AS int), \
+            dc.definition, \
+            CASE WHEN c.collation_name <> CAST(DATABASEPROPERTYEX(DB_NAME(), 'Collation') \
+                 AS sysname) THEN c.collation_name END, \
+            CAST(ep.value AS nvarchar(4000)), \
+            CAST(CASE WHEN ty.name = 'timestamp' THEN 1 ELSE 0 END AS int), \
+            SCHEMA_NAME(ty.schema_id) \
+     FROM sys.columns c \
+     JOIN sys.objects o ON o.object_id = c.object_id \
+     JOIN sys.schemas s ON s.schema_id = o.schema_id \
+     JOIN sys.types ty ON ty.user_type_id = c.user_type_id \
+     LEFT JOIN sys.computed_columns cc \
+            ON cc.object_id = c.object_id AND cc.column_id = c.column_id \
+     LEFT JOIN sys.default_constraints dc ON dc.object_id = c.default_object_id \
+     LEFT JOIN sys.extended_properties ep \
+            ON ep.class = 1 AND ep.major_id = c.object_id AND ep.minor_id = c.column_id \
+           AND ep.name = 'MS_Description' \
+     WHERE o.type IN ('U', 'V') AND o.is_ms_shipped = 0 \
+     ORDER BY s.name, o.name, c.column_id";
+
+/// Every index's key columns, in key order: `(schema, table, index, unique,
+/// primary key, column, descending, filter, type, has included columns,
+/// constraint)`. The primary key's index is renamed `PRIMARY`, as PostgreSQL's
+/// is, so `IndexInfo::is_primary` and the DDL treat it the one way; its real
+/// name is kept as the constraint's.
+///
+/// **A columnstore index has no key columns** — its columns are listed with
+/// `key_ordinal` 0 and flagged as included — so it is read by its columns, in
+/// their order, or a key-only join drops it and the table's DDL left it out
+/// without the note every other index it cannot restate gets.
+const INDEX_LISTING: &str = "SELECT s.name, t.name, \
+            CASE WHEN i.is_primary_key = 1 THEN 'PRIMARY' ELSE i.name END, \
+            CAST(i.is_unique AS int), CAST(i.is_primary_key AS int), \
+            c.name, CAST(ic.is_descending_key AS int), i.filter_definition, i.type, \
+            CAST(CASE WHEN EXISTS (SELECT 1 FROM sys.index_columns x \
+                                    WHERE x.object_id = i.object_id \
+                                      AND x.index_id = i.index_id \
+                                      AND x.is_included_column = 1) \
+                 THEN 1 ELSE 0 END AS int), \
+            CASE WHEN i.is_primary_key = 1 OR i.is_unique_constraint = 1 THEN i.name END \
+     FROM sys.indexes i \
+     JOIN sys.tables t ON t.object_id = i.object_id \
+     JOIN sys.schemas s ON s.schema_id = t.schema_id \
+     JOIN sys.index_columns ic \
+            ON ic.object_id = i.object_id AND ic.index_id = i.index_id \
+           AND ((ic.is_included_column = 0 AND ic.key_ordinal > 0) OR i.type IN (5, 6)) \
+     JOIN sys.columns c ON c.object_id = ic.object_id AND c.column_id = ic.column_id \
+     WHERE t.is_ms_shipped = 0 AND i.index_id > 0 AND i.is_hypothetical = 0 \
+     ORDER BY s.name, t.name, i.name, ic.key_ordinal, ic.index_column_id";
+
+/// Every foreign key's column pairs, in key order, with its actions:
+/// `(schema, table, constraint, column, ref schema, ref table, ref column,
+/// delete action, update action)`.
+const FK_LISTING: &str = "SELECT s.name, t.name, fk.name, pc.name, rs.name, rt.name, rc.name, \
+            fk.delete_referential_action_desc, fk.update_referential_action_desc \
+     FROM sys.foreign_keys fk \
+     JOIN sys.tables t ON t.object_id = fk.parent_object_id \
+     JOIN sys.schemas s ON s.schema_id = t.schema_id \
+     JOIN sys.tables rt ON rt.object_id = fk.referenced_object_id \
+     JOIN sys.schemas rs ON rs.schema_id = rt.schema_id \
+     JOIN sys.foreign_key_columns k ON k.constraint_object_id = fk.object_id \
+     JOIN sys.columns pc ON pc.object_id = k.parent_object_id \
+                        AND pc.column_id = k.parent_column_id \
+     JOIN sys.columns rc ON rc.object_id = k.referenced_object_id \
+                        AND rc.column_id = k.referenced_column_id \
+     WHERE t.is_ms_shipped = 0 \
+     ORDER BY s.name, t.name, fk.name, k.constraint_column_id";
+
+/// Every view's stored `CREATE VIEW`: `(schema, view, definition)`. `NULL`
+/// for one created `WITH ENCRYPTION`, which the server will not show anyone.
+const VIEW_LISTING: &str = "SELECT s.name, v.name, m.definition \
+     FROM sys.views v \
+     JOIN sys.schemas s ON s.schema_id = v.schema_id \
+     LEFT JOIN sys.sql_modules m ON m.object_id = v.object_id \
+     WHERE v.is_ms_shipped = 0";
+
+/// Every table's `CHECK` constraints: `(schema, table, name, definition,
+/// column-level, disabled, not trusted)`.
+const CHECK_LISTING: &str = "SELECT s.name, t.name, ck.name, ck.definition, \
+            CAST(CASE WHEN ck.parent_column_id > 0 THEN 1 ELSE 0 END AS int), \
+            CAST(ck.is_disabled AS int), CAST(ck.is_not_trusted AS int) \
+     FROM sys.check_constraints ck \
+     JOIN sys.tables t ON t.object_id = ck.parent_object_id \
+     JOIN sys.schemas s ON s.schema_id = t.schema_id \
+     WHERE t.is_ms_shipped = 0 \
+     ORDER BY s.name, t.name, ck.name";
+
+/// Every DML trigger on a table or view, one row per event: `(schema,
+/// table, trigger, instead of, disabled, event, definition)`.
+const TRIGGER_LISTING: &str = "SELECT s.name, o.name, tr.name, \
+            CAST(tr.is_instead_of_trigger AS int), CAST(tr.is_disabled AS int), \
+            te.type_desc, m.definition \
+     FROM sys.triggers tr \
+     JOIN sys.objects o ON o.object_id = tr.parent_id \
+     JOIN sys.schemas s ON s.schema_id = o.schema_id \
+     JOIN sys.trigger_events te ON te.object_id = tr.object_id \
+     LEFT JOIN sys.sql_modules m ON m.object_id = tr.object_id \
+     WHERE tr.parent_class = 1 AND tr.is_ms_shipped = 0 \
+     ORDER BY s.name, o.name, tr.name, te.type";
+
+/// Every procedure and function written in T-SQL: `(schema, name, type,
+/// definition, deterministic, description)`. CLR routines have no module
+/// text and are left out.
+const ROUTINE_LISTING: &str = "SELECT s.name, o.name, o.type, m.definition, \
+            CAST(COALESCE(OBJECTPROPERTY(o.object_id, 'IsDeterministic'), 0) AS int), \
+            CAST(ep.value AS nvarchar(4000)) \
+     FROM sys.objects o \
+     JOIN sys.schemas s ON s.schema_id = o.schema_id \
+     JOIN sys.sql_modules m ON m.object_id = o.object_id \
+     LEFT JOIN sys.extended_properties ep \
+            ON ep.class = 1 AND ep.major_id = o.object_id AND ep.minor_id = 0 \
+           AND ep.name = 'MS_Description' \
+     WHERE o.type IN ('P', 'FN', 'IF', 'TF') AND o.is_ms_shipped = 0 \
+     ORDER BY s.name, o.name";
+
+/// Every routine parameter, in order: `(schema, routine, parameter, type,
+/// max_length, precision, scale, user-defined, output)`. Parameter 0 is a
+/// scalar function's return type.
+const PARAMETER_LISTING: &str = "SELECT s.name, o.name, p.name, ty.name, \
+            p.max_length, p.precision, p.scale, CAST(ty.is_user_defined AS int), \
+            CAST(p.is_output AS int), p.parameter_id, SCHEMA_NAME(ty.schema_id) \
+     FROM sys.parameters p \
+     JOIN sys.objects o ON o.object_id = p.object_id \
+     JOIN sys.schemas s ON s.schema_id = o.schema_id \
+     JOIN sys.types ty ON ty.user_type_id = p.user_type_id \
+     WHERE o.type IN ('P', 'FN', 'IF', 'TF') AND o.is_ms_shipped = 0 \
+     ORDER BY s.name, o.name, p.parameter_id";
+
+/// Table and view descriptions: `(schema, object, description)`.
+const TABLE_COMMENTS: &str = "SELECT s.name, o.name, CAST(ep.value AS nvarchar(4000)) \
+     FROM sys.extended_properties ep \
+     JOIN sys.objects o ON o.object_id = ep.major_id \
+     JOIN sys.schemas s ON s.schema_id = o.schema_id \
+     WHERE ep.class = 1 AND ep.minor_id = 0 AND ep.name = 'MS_Description' \
+       AND o.type IN ('U', 'V')";
+
+/// A type as it was declared, from `sys.types` and the column's own sizes —
+/// `nvarchar(50)`, `varbinary(max)`, `decimal(10,2)`, `datetime2(7)`.
+///
+/// `max_length` is in **bytes**, so an `nchar`/`nvarchar` length is half of
+/// it, and `-1` is `max`.
+///
+/// An alias type (`CREATE TYPE dbo.Name FROM nvarchar(50)`) is its own name,
+/// **qualified with its schema**: its sizes are its base type's, and the alias
+/// is what was written. `alias` carries that schema. Unqualified, `Name` in a
+/// `SalesLT` table's DDL resolves through the login's default schema — which
+/// is how AdventureWorks' `dbo.Name` came out as a type the script could not
+/// find.
+fn mssql_type_name(
+    name: &str,
+    max_length: i64,
+    precision: i64,
+    scale: i64,
+    alias: Option<&str>,
+) -> String {
+    if let Some(schema) = alias {
+        let q = |s: &str| schemaic_core::export::ident_sql(s, MS);
+        return format!("{}.{}", q(schema), q(name));
+    }
+    let n = name.to_ascii_lowercase();
+    let length = |bytes_per_char: i64| {
+        if max_length == -1 {
+            "max".to_string()
+        } else {
+            (max_length / bytes_per_char).to_string()
+        }
+    };
+    match n.as_str() {
+        "varchar" | "char" | "varbinary" | "binary" => format!("{n}({})", length(1)),
+        "nvarchar" | "nchar" => format!("{n}({})", length(2)),
+        "decimal" | "numeric" => format!("{n}({precision},{scale})"),
+        "datetime2" | "datetimeoffset" | "time" => format!("{n}({scale})"),
+        // `float` is `float(53)` unless it says otherwise; `float(24)` is a
+        // `real`, which `sys.types` names as such.
+        "float" if precision != 53 => format!("float({precision})"),
+        _ => n,
+    }
+}
+
+/// A stored expression without the parentheses SQL Server wraps it in:
+/// `((0))` is `0`, `(getdate())` is `getdate()`, `([a]>(0))` is `[a]>(0)`.
+///
+/// Only pairs that enclose the **whole** text are removed — `(a)+(b)` keeps
+/// both, since its first `(` closes before the end — and a parenthesis inside
+/// a string or a quoted name is not one.
+fn strip_outer_parens(expr: &str) -> String {
+    let mut s = expr.trim();
+    while s.starts_with('(') && encloses_whole(s) {
+        s = s[1..s.len() - 1].trim();
+    }
+    s.to_string()
+}
+
+/// Does the `(` at the start of `s` close at its very end?
+fn encloses_whole(s: &str) -> bool {
+    let b = s.as_bytes();
+    let mut depth = 0usize;
+    let mut i = 0;
+    while i < b.len() {
+        if let Some(j) = schemaic_core::sql::skip_noncode(b, i, MS) {
+            i = j;
+            continue;
+        }
+        match b[i] {
+            b'(' => depth += 1,
+            b')' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return i == b.len() - 1;
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    false
+}
+
+/// The `SELECT` a stored `CREATE VIEW` defines — everything after the `AS`
+/// that ends its header — or the whole text when there is no header to
+/// strip.
+///
+/// The header is `CREATE VIEW name [(columns)] [WITH options] AS`, so the
+/// first `AS` outside parentheses and outside strings, comments and quoted
+/// names is the one: a column list's names are inside its parentheses, and
+/// `WITH SCHEMABINDING` holds no `AS`.
+fn view_select_body(definition: &str) -> String {
+    let b = definition.as_bytes();
+    let mut depth = 0usize;
+    let mut i = 0;
+    while i < b.len() {
+        if let Some(j) = schemaic_core::sql::skip_noncode(b, i, MS) {
+            i = j;
+            continue;
+        }
+        let c = b[i];
+        if c == b'(' {
+            depth += 1;
+        } else if c == b')' {
+            depth = depth.saturating_sub(1);
+        } else if schemaic_core::sql::is_word_start(c) {
+            let start = i;
+            while i < b.len() && schemaic_core::sql::is_word_byte(b[i]) {
+                i += 1;
+            }
+            if depth == 0 && definition[start..i].eq_ignore_ascii_case("AS") {
+                return definition[i..]
+                    .trim()
+                    .trim_end_matches(';')
+                    .trim_end()
+                    .to_string();
+            }
+            continue;
+        }
+        i += 1;
+    }
+    definition.trim().to_string()
+}
+
+/// What a routine is, from its `sys.objects.type`, and what it returns, given
+/// a scalar function's declared return type (its parameter 0).
+///
+/// **The column is `char(2)`**, so a procedure's one-letter `P` arrives
+/// padded — `P ` — and is trimmed before it is compared.
+fn routine_shape(
+    object_type: &str,
+    scalar_returns: Option<String>,
+) -> (schemaic_core::schema::RoutineKind, String) {
+    use schemaic_core::schema::RoutineKind;
+    match object_type.trim() {
+        "P" => (RoutineKind::Procedure, String::new()),
+        "FN" => (RoutineKind::Function, scalar_returns.unwrap_or_default()),
+        "IF" | "TF" => (RoutineKind::Function, "TABLE".to_string()),
+        _ => (RoutineKind::Function, String::new()),
+    }
+}
+
+/// A referential action as the model spells it: `NO_ACTION` is the default
+/// and is left unwritten, the rest lose their underscore.
+fn fk_action(desc: &str) -> Option<String> {
+    match desc.trim() {
+        "" | "NO_ACTION" => None,
+        other => Some(other.replace('_', " ")),
+    }
+}
+
+/// The whole schema of `database`.
+///
+/// A dozen catalogue reads, raced against `cancel` as a whole — the shape
+/// `pg::fetch_schema` has, and for its reason: this is every column, index,
+/// key, view, check, trigger and routine, and a large database takes a while.
+pub(crate) async fn fetch_schema(
+    db: &Db,
+    database: &str,
+    cancel: CancellationToken,
+) -> Result<DbSchema, DbError> {
+    let mut client = connect(db, Some(database)).await?;
+    let outcome = {
+        let collect = collect_schema(&mut client);
+        tokio::select! {
+            r = collect => Some(r),
+            _ = cancel.cancelled() => None,
+        }
+    };
+    match outcome {
+        Some(r) => r,
+        None => Err(cancel_now(&mut client).await),
+    }
+}
+
+async fn collect_schema(client: &mut MsClient) -> Result<DbSchema, DbError> {
+    use crate::{ColRow, IdxRow, assemble_schema, group_by};
+    use schemaic_core::schema::{
+        CheckInfo, ColumnInfo, IndexColumn, RoutineInfo, TriggerAction, TriggerEnabled,
+        TriggerEvent, TriggerInfo, TriggerLevel, TriggerTiming,
+    };
+    use std::collections::{HashMap, HashSet};
+
+    let int = |r: &[Option<String>], i: usize| -> i64 { cell(r, i).parse().unwrap_or(0) };
+    let flag = |r: &[Option<String>], i: usize| cell(r, i) == "1";
+
+    let table_rows = query_rows(client, TABLE_LISTING).await?;
+    let idx_all = query_rows(client, INDEX_LISTING).await?;
+    let pk_set: HashSet<(String, String, String)> = idx_all
+        .iter()
+        .filter(|r| flag(r, 4))
+        .map(|r| (cell(r, 0), cell(r, 1), cell(r, 5)))
+        .collect();
+
+    let col_rows: Vec<(String, ColRow)> = query_rows(client, COLUMN_LISTING)
+        .await?
+        .into_iter()
+        .map(|r| {
+            let (ns, t, c) = (cell(&r, 0), cell(&r, 1), cell(&r, 2));
+            let generated = r.get(10).cloned().flatten().map(|d| strip_outer_parens(&d));
+            let column = ColumnInfo {
+                primary_key: pk_set.contains(&(ns.clone(), t.clone(), c.clone())),
+                name: c,
+                type_name: mssql_type_name(
+                    &cell(&r, 3),
+                    int(&r, 4),
+                    int(&r, 5),
+                    int(&r, 6),
+                    flag(&r, 7).then(|| cell(&r, 16)).as_deref(),
+                ),
+                nullable: flag(&r, 8),
+                // A computed column's value is its definition; a `rowversion`
+                // is the server's too, and like an identity no `INSERT`
+                // supplies it.
+                auto_increment: flag(&r, 9),
+                identity_always: flag(&r, 9) || flag(&r, 15),
+                generated_stored: flag(&r, 11),
+                generated,
+                default: r.get(12).cloned().flatten().map(|d| strip_outer_parens(&d)),
+                collation: r.get(13).cloned().flatten(),
+                comment: r.get(14).cloned().flatten(),
+                on_update: None,
+                sqlite_autoincrement: false,
+                invisible: false,
+            };
+            (ns, ColRow { table: t, column })
+        })
+        .collect();
+
+    let idx_rows: Vec<(String, IdxRow)> = idx_all
+        .iter()
+        .map(|r| {
+            let mut column = IndexColumn::plain(cell(r, 5));
+            column.descending = flag(r, 6);
+            // Heap, clustered and nonclustered rowstore (types 0–2) are what
+            // the model can say; a columnstore, XML or spatial index is not,
+            // and neither are included columns — which an edit would drop.
+            let lossy = int(r, 8) > 2 || flag(r, 9);
+            (
+                cell(r, 0),
+                IdxRow {
+                    table: cell(r, 1),
+                    index: cell(r, 2),
+                    unique: flag(r, 3),
+                    column,
+                    method: None,
+                    predicate: r.get(7).cloned().flatten().map(|p| strip_outer_parens(&p)),
+                    lossy,
+                    create_sql: None,
+                },
+            )
+        })
+        .collect();
+    let idx_constraints: HashMap<(String, String, String), String> = idx_all
+        .iter()
+        .filter_map(|r| {
+            let name = r.get(10).cloned().flatten()?;
+            Some(((cell(r, 0), cell(r, 1), cell(r, 2)), name))
+        })
+        .collect();
+
+    let fk_all = query_rows(client, FK_LISTING).await?;
+    let fk_rows: Vec<(String, crate::FkColRow)> = fk_all
+        .iter()
+        .map(|r| {
+            (
+                cell(r, 0),
+                (
+                    cell(r, 1),
+                    cell(r, 2),
+                    cell(r, 3),
+                    Some(cell(r, 4)),
+                    Some(cell(r, 5)),
+                    Some(cell(r, 6)),
+                ),
+            )
+        })
+        .collect();
+    // `(schema, table, constraint)` to `(on delete, on update)`.
+    type FkRules = HashMap<(String, String, String), (Option<String>, Option<String>)>;
+    let fk_rules: FkRules = fk_all
+        .iter()
+        .map(|r| {
+            (
+                (cell(r, 0), cell(r, 1), cell(r, 2)),
+                (fk_action(&cell(r, 7)), fk_action(&cell(r, 8))),
+            )
+        })
+        .collect();
+
+    let view_all = query_rows(client, VIEW_LISTING).await?;
+    let view_rows: Vec<(String, (String, String))> = view_all
+        .iter()
+        .map(|r| (cell(r, 0), (cell(r, 1), view_select_body(&cell(r, 2)))))
+        .collect();
+    let view_sources: HashMap<(String, String), String> = view_all
+        .iter()
+        .filter_map(|r| Some(((cell(r, 0), cell(r, 1)), r.get(2).cloned().flatten()?)))
+        .collect();
+
+    // Partition per schema before folding — `assemble_schema` keys on the
+    // table name alone, so one call would merge `dbo.orders` and
+    // `sales.orders`. `dbo` first, as PostgreSQL puts `public` first.
+    let mut namespaces: Vec<String> = table_rows.iter().map(|r| cell(r, 0)).collect();
+    namespaces.sort_by_key(|n| (n != "dbo", n.clone()));
+    namespaces.dedup();
+    let mut ns_tables = group_by(
+        table_rows
+            .iter()
+            .map(|r| (cell(r, 0), (cell(r, 1), cell(r, 2)))),
+    );
+    let mut ns_cols = group_by(col_rows);
+    let mut ns_fks = group_by(fk_rows);
+    let mut ns_idx = group_by(idx_rows);
+    let mut ns_views = group_by(view_rows);
+    let mut tables = Vec::new();
+    for ns in &namespaces {
+        let schema = assemble_schema(
+            Some(ns),
+            &ns_tables.remove(ns).unwrap_or_default(),
+            &ns_cols.remove(ns).unwrap_or_default(),
+            &ns_fks.remove(ns).unwrap_or_default(),
+            &ns_idx.remove(ns).unwrap_or_default(),
+            &ns_views.remove(ns).unwrap_or_default(),
+        );
+        tables.extend(schema.tables);
+    }
+
+    let checks = query_rows(client, CHECK_LISTING).await?;
+    let mut checks_by: HashMap<(String, String), Vec<CheckInfo>> = HashMap::new();
+    for r in &checks {
+        checks_by
+            .entry((cell(r, 0), cell(r, 1)))
+            .or_default()
+            .push(CheckInfo {
+                name: cell(r, 2),
+                expression: strip_outer_parens(&cell(r, 3)),
+                enforced: !flag(r, 5),
+                validated: !flag(r, 6),
+                inherited: false,
+                column_level: flag(r, 4),
+            });
+    }
+
+    // One row per event, folded into one trigger each.
+    let mut triggers_by: HashMap<(String, String), Vec<TriggerInfo>> = HashMap::new();
+    for r in query_rows(client, TRIGGER_LISTING).await? {
+        let (ns, table, name) = (cell(&r, 0), cell(&r, 1), cell(&r, 2));
+        let event = match cell(&r, 5).as_str() {
+            "INSERT" => TriggerEvent::Insert,
+            "UPDATE" => TriggerEvent::Update,
+            "DELETE" => TriggerEvent::Delete,
+            _ => continue,
+        };
+        let list = triggers_by.entry((ns.clone(), table.clone())).or_default();
+        if let Some(t) = list.iter_mut().find(|t| t.name == name) {
+            if !t.events.contains(&event) {
+                t.events.push(event);
+            }
+            continue;
+        }
+        list.push(TriggerInfo {
+            name,
+            schema: Some(ns),
+            table,
+            timing: if flag(&r, 3) {
+                TriggerTiming::InsteadOf
+            } else {
+                TriggerTiming::After
+            },
+            events: vec![event],
+            update_columns: Vec::new(),
+            // A T-SQL trigger fires once per statement, with the rows in
+            // `inserted` and `deleted`.
+            level: TriggerLevel::Statement,
+            condition: None,
+            // The whole stored `CREATE TRIGGER`, as SQL Server keeps it.
+            action: TriggerAction::Body(cell(&r, 6)),
+            definer: None,
+            order: None,
+            sql_mode: None,
+            charset_client: None,
+            collation_connection: None,
+            old_table: None,
+            new_table: None,
+            enabled: if flag(&r, 4) {
+                TriggerEnabled::Disabled
+            } else {
+                TriggerEnabled::Origin
+            },
+            constraint: false,
+        });
+    }
+
+    let comments: HashMap<(String, String), String> = query_rows(client, TABLE_COMMENTS)
+        .await?
+        .into_iter()
+        .filter_map(|r| Some(((cell(&r, 0), cell(&r, 1)), r.get(2).cloned().flatten()?)))
+        .collect();
+
+    for t in &mut tables {
+        let ns = t.schema.clone().unwrap_or_default();
+        let key = (ns.clone(), t.name.clone());
+        t.comment = comments.get(&key).cloned();
+        t.check_constraints = checks_by.remove(&key).unwrap_or_default();
+        t.triggers = triggers_by.remove(&key).unwrap_or_default();
+        if t.is_view {
+            t.create_sql = view_sources.get(&key).cloned();
+        }
+        for ix in &mut t.indexes {
+            ix.constraint = idx_constraints
+                .get(&(ns.clone(), t.name.clone(), ix.name.clone()))
+                .cloned();
+        }
+        for fk in &mut t.foreign_keys {
+            if let Some((on_delete, on_update)) =
+                fk_rules.get(&(ns.clone(), t.name.clone(), fk.name.clone()))
+            {
+                fk.on_delete = on_delete.clone();
+                fk.on_update = on_update.clone();
+            }
+        }
+    }
+
+    // Routines, with their parameters spelled as their `CREATE` has them.
+    let mut params: HashMap<(String, String), (Vec<String>, Option<String>)> = HashMap::new();
+    for r in query_rows(client, PARAMETER_LISTING).await? {
+        let ty = mssql_type_name(
+            &cell(&r, 3),
+            int(&r, 4),
+            int(&r, 5),
+            int(&r, 6),
+            flag(&r, 7).then(|| cell(&r, 10)).as_deref(),
+        );
+        let entry = params.entry((cell(&r, 0), cell(&r, 1))).or_default();
+        if cell(&r, 9) == "0" {
+            entry.1 = Some(ty);
+        } else {
+            let out = if flag(&r, 8) { " OUTPUT" } else { "" };
+            entry.0.push(format!("{} {ty}{out}", cell(&r, 2)));
+        }
+    }
+    let routines = query_rows(client, ROUTINE_LISTING)
+        .await?
+        .into_iter()
+        .map(|r| {
+            let (ns, name) = (cell(&r, 0), cell(&r, 1));
+            let (args, returns) = params
+                .remove(&(ns.clone(), name.clone()))
+                .unwrap_or_default();
+            let (kind, returns) = routine_shape(&cell(&r, 2), returns);
+            Arc::new(RoutineInfo {
+                name,
+                schema: Some(ns),
+                kind,
+                arguments: args.join(", "),
+                returns,
+                language: "SQL".to_string(),
+                // The whole stored `CREATE`, which is what
+                // `RoutineInfo::create_sql` hands back for SQL Server.
+                body: cell(&r, 3),
+                deterministic: flag(&r, 4),
+                comment: r.get(5).cloned().flatten(),
+                ..Default::default()
+            })
+        })
+        .collect();
+
+    Ok(DbSchema {
+        tables,
+        routines,
+        flavour: schemaic_core::schema::ServerFlavour::Unknown,
+        // Not needed, for PostgreSQL's reason: a foreign key's schema and a
+        // view's names are part of the object, not the database's address.
+        database: None,
+        ..Default::default()
+    })
+}
+
+// ── The entry points around a query ──────────────────────────────────────────
+
+/// Up to `limit` rows of one table for the Live Monitor, schema-qualified
+/// always, as the write paths name a table.
+pub(crate) async fn fetch_table(
+    db: &Db,
+    database: &str,
+    schema: Option<&str>,
+    table: &str,
+    order_by: Option<&[String]>,
+    limit: usize,
+    cancel: CancellationToken,
+) -> Result<ResultSet, DbError> {
+    let q = |n: &str| schemaic_core::export::ident_sql(n, MS);
+    let name = match schema {
+        Some(s) => format!("{}.{}", q(s), q(table)),
+        None => q(table),
+    };
+    let rest = format!(
+        "{name}{}",
+        crate::order_by_clause(order_by, |c| schemaic_core::export::ident_sql(c, MS))
+    );
+    let sql = schemaic_core::sql::limited_select(MS, "*", &rest, limit);
+    db.fetch_query(Some(database), &sql, limit, cancel).await
+}
+
+/// No plan yet: T-SQL's is `SET SHOWPLAN_XML ON` (or `STATISTICS XML` for the
+/// measured form), an XML document the plan panel does not read.
+pub(crate) async fn explain(
+    _db: &Db,
+    _database: Option<&str>,
+    _sql: &str,
+    _analyze: bool,
+    _read_only: bool,
+    _cancel: CancellationToken,
+) -> Result<ResultSet, DbError> {
+    Err(not_yet("The query plan"))
+}
+
+/// The exact row count, from `stats::count_rows_sql`'s `COUNT_BIG(*)`.
+/// Cancelled on the server by an attention, like a query.
+pub(crate) async fn count_rows(
+    db: &Db,
+    database: &str,
+    sql: &str,
+    cancel: CancellationToken,
+) -> Result<u64, DbError> {
+    let mut client = connect(db, Some(database)).await?;
+    let rs = run_statement(&mut client, sql, &mut RowDest::Capped(1), &cancel).await?;
+    let text = rs
+        .cell(0, 0)
+        .map(|c| c.text().to_string())
+        .unwrap_or_default();
+    text.parse()
+        .map_err(|_| DbError::Query(format!("the count came back as {text:?}, not a number")))
+}
+
+/// Rows and sizes per table, from `sys.dm_db_partition_stats` — what SSMS's
+/// *Disk usage by table* reads. The row count is the heap or clustered
+/// index's (index 0 or 1), summed over partitions; pages are 8 KiB.
+///
+/// The counts are the storage engine's own and kept current by it, not a
+/// sampled estimate like PostgreSQL's `reltuples` — but its documentation
+/// still calls them approximate, and they are reported as estimates.
+const TABLE_STATS: &str = "SELECT s.name, t.name, \
+            SUM(CASE WHEN p.index_id IN (0, 1) THEN p.row_count ELSE 0 END), \
+            SUM(CASE WHEN p.index_id IN (0, 1) THEN p.used_page_count ELSE 0 END) * 8192, \
+            SUM(CASE WHEN p.index_id > 1 THEN p.used_page_count ELSE 0 END) * 8192, \
+            SUM(p.reserved_page_count - p.used_page_count) * 8192, \
+            CONVERT(varchar(23), t.create_date, 121), \
+            CONVERT(varchar(23), t.modify_date, 121) \
+     FROM sys.tables t \
+     JOIN sys.schemas s ON s.schema_id = t.schema_id \
+     JOIN sys.dm_db_partition_stats p ON p.object_id = t.object_id \
+     WHERE t.is_ms_shipped = 0 \
+     GROUP BY s.name, t.name, t.object_id, t.create_date, t.modify_date";
+
+/// Each index's size and use, for the same properties surface.
+const INDEX_STATS: &str = "SELECT s.name, t.name, i.name, \
+            SUM(p.used_page_count) * 8192, \
+            MAX(COALESCE(u.user_seeks, 0) + COALESCE(u.user_scans, 0) \
+                + COALESCE(u.user_lookups, 0)), \
+            CAST(i.is_primary_key AS int), CAST(i.is_unique AS int) \
+     FROM sys.indexes i \
+     JOIN sys.tables t ON t.object_id = i.object_id \
+     JOIN sys.schemas s ON s.schema_id = t.schema_id \
+     JOIN sys.dm_db_partition_stats p ON p.object_id = i.object_id AND p.index_id = i.index_id \
+     LEFT JOIN sys.dm_db_index_usage_stats u \
+            ON u.object_id = i.object_id AND u.index_id = i.index_id \
+           AND u.database_id = DB_ID() \
+     WHERE t.is_ms_shipped = 0 AND i.index_id > 0 AND i.name IS NOT NULL \
+     GROUP BY s.name, t.name, i.name, i.is_primary_key, i.is_unique";
+
+pub(crate) async fn fetch_table_stats(
+    db: &Db,
+    database: &str,
+) -> Result<schemaic_core::stats::SchemaStats, DbError> {
+    use schemaic_core::stats::{Freshness, IndexStats, SchemaStats, TableStats};
+    let mut client = connect(db, Some(database)).await?;
+    let num = |r: &[Option<String>], i: usize| -> Option<u64> {
+        r.get(i)?.as_deref()?.split('.').next()?.parse().ok()
+    };
+    let mut by_table: std::collections::HashMap<(String, String), Vec<IndexStats>> =
+        std::collections::HashMap::new();
+    for r in query_rows(&mut client, INDEX_STATS).await? {
+        by_table
+            .entry((cell(&r, 0), cell(&r, 1)))
+            .or_default()
+            .push(IndexStats {
+                name: cell(&r, 2),
+                bytes: num(&r, 3),
+                cardinality: None,
+                // Reset by a restart, as PostgreSQL's `idx_scan` is by a stats
+                // reset: a count since then, not since the index was made.
+                scans: num(&r, 4),
+                is_primary: cell(&r, 5) == "1",
+                is_unique: cell(&r, 6) == "1",
+            });
+    }
+    let tables = query_rows(&mut client, TABLE_STATS)
+        .await?
+        .into_iter()
+        .map(|r| {
+            let (ns, name) = (cell(&r, 0), cell(&r, 1));
+            TableStats {
+                indexes: by_table
+                    .remove(&(ns.clone(), name.clone()))
+                    .unwrap_or_default(),
+                table: name,
+                schema: Some(ns),
+                rows: num(&r, 2),
+                exact_rows: None,
+                data_bytes: num(&r, 3),
+                index_bytes: num(&r, 4),
+                free_bytes: num(&r, 5),
+                dead_rows: None,
+                // `IDENT_CURRENT` is the last value handed out, not the next;
+                // the next is one increment on, which this cannot know without
+                // the increment, so the figure is left out rather than guessed.
+                auto_increment: None,
+                row_format: None,
+                engine: None,
+                created: r.get(6).cloned().flatten(),
+                updated: r.get(7).cloned().flatten(),
+                freshness: Freshness::Unknown,
+            }
+        })
+        .collect();
+    Ok(SchemaStats::new(tables))
+}
+
+/// Every user session, with the request it is running if any, projected in
+/// [`schemaic_core::activity::MsSessionRow`]'s order.
+///
+/// `VIEW SERVER STATE` (on Azure SQL Database, `VIEW DATABASE STATE`) is what
+/// shows other logins' sessions; without it the server returns only the
+/// caller's own, which is a shorter list rather than an error.
+///
+/// `session_id <> @@SPID` drops the poll itself, as PostgreSQL's
+/// `pg_backend_pid()` and MySQL's `CONNECTION_ID()` do: otherwise every refresh
+/// listed this query as a running session, with a *Kill session* under it.
+fn activity_sql(limit: usize) -> String {
+    format!(
+        "SELECT TOP ({limit}) s.session_id, s.login_name, s.host_name, \
+                DB_NAME(s.database_id), r.status, s.open_transaction_count, \
+                COALESCE(r.blocking_session_id, 0), LEFT(t.text, 1024), \
+                DATEDIFF_BIG(millisecond, \
+                    COALESCE(r.start_time, s.last_request_end_time, s.login_time), \
+                    SYSDATETIME()) / 1000.0 \
+         FROM sys.dm_exec_sessions s \
+         LEFT JOIN sys.dm_exec_requests r ON r.session_id = s.session_id \
+         OUTER APPLY sys.dm_exec_sql_text(r.sql_handle) t \
+         WHERE s.is_user_process = 1 AND s.session_id <> @@SPID \
+         ORDER BY s.session_id"
+    )
+}
+
+pub(crate) async fn fetch_sessions(
+    db: &Db,
+) -> Result<Vec<schemaic_core::activity::SessionInfo>, DbError> {
+    use schemaic_core::activity::{self, MsSessionRow};
+    let mut client = connect(db, None).await?;
+    let rows: Vec<MsSessionRow> =
+        query_rows(&mut client, &activity_sql(activity::MAX_SESSIONS + 1))
+            .await?
+            .into_iter()
+            .filter_map(|r| {
+                Some(MsSessionRow {
+                    session_id: cell(&r, 0).parse().ok()?,
+                    login: cell(&r, 1),
+                    host: r.get(2).cloned().flatten(),
+                    database: r.get(3).cloned().flatten(),
+                    request_status: r.get(4).cloned().flatten(),
+                    open_transactions: cell(&r, 5).parse().unwrap_or(0),
+                    blocking_session: cell(&r, 6).parse().unwrap_or(0),
+                    sql: r.get(7).cloned().flatten(),
+                    seconds: r.get(8).cloned().flatten().and_then(|s| s.parse().ok()),
+                })
+            })
+            .collect();
+    Ok(activity::from_mssql_rows(&rows))
+}
+
+/// `KILL <session>`, from a fresh connection. There is no statement that
+/// cancels another session's request and leaves the session standing, so a
+/// *Cancel query* is refused rather than performed as a `KILL` — see
+/// `activity::supports_kill_kind`.
+pub(crate) async fn kill_session(
+    db: &Db,
+    id: i64,
+    kind: schemaic_core::activity::KillKind,
+) -> Result<(), DbError> {
+    if !schemaic_core::activity::supports_kill_kind(MS, kind) {
+        return Err(DbError::Refused(
+            "SQL Server cannot cancel another session's statement without ending the \
+             session — use Kill session."
+                .to_string(),
+        ));
+    }
+    let mut client = connect(db, None).await?;
+    // An integer the panel read from `session_id`, formatted as one: there is
+    // no text of anybody's in this statement.
+    drain(&mut client, &format!("KILL {id}")).await
+}
+
+/// Run a `.sql` file's statements, one connection for the whole file — the
+/// second exception to one-connection-per-operation, as on every engine.
+///
+/// The splitter has already cut the file into batches at its `GO` lines and
+/// kept each routine's body whole (`sql::scan_bounds`), so a statement here
+/// is what SQL Server's own tools would send. A Stop is an attention on this
+/// connection: the server aborts the running statement and rolls it back, so
+/// a stopped one is not counted as run.
+pub(crate) async fn run_script(
+    db: &Db,
+    database: &str,
+    mut rx: tokio::sync::mpsc::Receiver<schemaic_core::script::Statement>,
+    cancel: CancellationToken,
+) -> (schemaic_core::script::ExecEnd, usize) {
+    use schemaic_core::script::ExecEnd;
+    let mut client = match connect(db, Some(database)).await {
+        Ok(c) => c,
+        Err(e) => return (ExecEnd::Connect(e.to_string()), 0),
+    };
+    let mut ran = 0usize;
+    let end = loop {
+        let next = tokio::select! {
+            s = rx.recv() => s,
+            _ = cancel.cancelled() => break ExecEnd::Cancelled,
+        };
+        let Some(st) = next else { break ExecEnd::Done };
+        let outcome = {
+            let step = drain(&mut client, &st.sql);
+            tokio::select! {
+                r = step => Some(r),
+                _ = cancel.cancelled() => None,
+            }
+        };
+        match outcome {
+            Some(Ok(())) => ran += 1,
+            Some(Err(e)) => {
+                break ExecEnd::Failed {
+                    message: e.to_string(),
+                    sql: st.sql,
+                    line: st.line,
+                };
+            }
+            None => {
+                cancel_now(&mut client).await;
+                break ExecEnd::Cancelled;
+            }
+        }
+    };
+    (end, ran)
+}
+
+// ── Not written yet ──────────────────────────────────────────────────────────
+//
+// Each answers the whole interface's name (`ENGINE_ENTRY_POINTS`), and each
+// refuses: no path in the app reaches them for SQL Server — the capability
+// gates above them answer no — and one that does is told so in a sentence.
+
+pub(crate) async fn run_ddl(
+    _db: &Db,
+    _database: &str,
+    _stmts: &[String],
+    _cancel: CancellationToken,
+) -> Result<(), crate::DdlError> {
+    Err(crate::DdlError {
+        message: not_yet("Applying a schema change").to_string(),
+        at: 0,
+        applied: 0,
+    })
+}
+
+pub(crate) async fn run_server_ddl(
+    _db: &Db,
+    _avoid: Option<&str>,
+    _stmts: &[String],
+    _cancel: CancellationToken,
+) -> Result<(), crate::DdlError> {
+    Err(crate::DdlError {
+        message: not_yet("Creating or dropping a database").to_string(),
+        at: 0,
+        applied: 0,
+    })
+}
+
+pub(crate) async fn commit_writes(
+    _db: &Db,
+    _write: &schemaic_core::model::GridWrite,
+    _cancel: CancellationToken,
+) -> Result<u64, DbError> {
+    Err(not_yet("Editing rows in the grid"))
+}
+
+pub(crate) async fn refetch_rows(
+    _db: &Db,
+    _template: &schemaic_core::model::RefetchTemplate,
+    _rows: &[schemaic_core::model::RefetchRow],
+    _cancel: CancellationToken,
+) -> Result<Vec<(usize, Vec<Value>)>, DbError> {
+    Err(not_yet("Re-reading edited rows"))
+}
+
+pub(crate) async fn fetch_blob(
+    _db: &Db,
+    _r: &schemaic_core::blob::BlobRef,
+    _cancel: CancellationToken,
+) -> Result<Option<schemaic_core::blob::BlobValue>, DbError> {
+    Err(not_yet("Opening a binary value"))
+}
+
+pub(crate) async fn import_rows(
+    _db: &Db,
+    _target: crate::ImportTarget<'_>,
+    _rows: crate::RowSource<'_>,
+    _cancel: CancellationToken,
+) -> Result<u64, DbError> {
+    Err(not_yet("Importing rows"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_decimal_is_rendered_from_its_scaled_integer() {
+        assert_eq!(decimal_text(12345, 2), "123.45");
+        assert_eq!(decimal_text(-5, 2), "-0.05");
+        assert_eq!(decimal_text(-50, 2), "-0.50");
+        assert_eq!(decimal_text(0, 3), "0.000");
+        // No trailing point at scale 0 — the driver's own `Display` writes one.
+        assert_eq!(decimal_text(123, 0), "123");
+        assert_eq!(decimal_text(-123, 0), "-123");
+        // `decimal(38, 0)`'s widest, which no float can hold.
+        let max = 10i128.pow(38) - 1;
+        assert_eq!(decimal_text(max, 0), "9".repeat(38));
+        assert_eq!(decimal_text(i128::MIN, 4).len(), 41);
+    }
+
+    #[test]
+    fn a_type_is_named_as_it_was_declared() {
+        let t = |n: &str, len: i64, p: i64, s: i64| mssql_type_name(n, len, p, s, None);
+        assert_eq!(t("nvarchar", 100, 0, 0), "nvarchar(50)");
+        assert_eq!(t("nvarchar", -1, 0, 0), "nvarchar(max)");
+        assert_eq!(t("varbinary", -1, 0, 0), "varbinary(max)");
+        assert_eq!(t("char", 10, 0, 0), "char(10)");
+        assert_eq!(t("decimal", 9, 10, 2), "decimal(10,2)");
+        assert_eq!(t("datetime2", 8, 27, 7), "datetime2(7)");
+        assert_eq!(t("time", 3, 8, 0), "time(0)");
+        assert_eq!(t("float", 8, 53, 0), "float");
+        assert_eq!(t("float", 4, 24, 0), "float(24)");
+        assert_eq!(t("int", 4, 10, 0), "int");
+        // An alias type is qualified with its own schema, which need not be
+        // the table's — AdventureWorks' `SalesLT` tables use `dbo.Name`.
+        assert_eq!(
+            mssql_type_name("Name", 100, 0, 0, Some("dbo")),
+            "[dbo].[Name]"
+        );
+    }
+
+    #[test]
+    fn a_stored_expression_loses_only_the_parentheses_around_all_of_it() {
+        assert_eq!(strip_outer_parens("((0))"), "0");
+        assert_eq!(strip_outer_parens("(getdate())"), "getdate()");
+        assert_eq!(strip_outer_parens("([a]>(0))"), "[a]>(0)");
+        assert_eq!(strip_outer_parens("(N'(x')"), "N'(x'");
+        assert_eq!(strip_outer_parens("(a)+(b)"), "(a)+(b)");
+        assert_eq!(strip_outer_parens("([x)]>(1))"), "[x)]>(1)");
+        assert_eq!(strip_outer_parens("0"), "0");
+    }
+
+    #[test]
+    fn a_view_body_is_what_follows_its_header() {
+        assert_eq!(
+            view_select_body("CREATE VIEW dbo.v AS SELECT a AS b FROM t"),
+            "SELECT a AS b FROM t"
+        );
+        assert_eq!(
+            view_select_body(
+                "create view [v AS x] (a, [AS]) with schemabinding\nAS\nSELECT 1 AS a;"
+            ),
+            "SELECT 1 AS a"
+        );
+        assert_eq!(
+            view_select_body("/* AS */ CREATE VIEW v AS -- AS\nSELECT 1"),
+            "-- AS\nSELECT 1"
+        );
+        assert_eq!(view_select_body("SELECT 1"), "SELECT 1");
+    }
+
+    /// **`sys.objects.type` is `char(2)`**, so a procedure's one-letter `P`
+    /// arrives padded, `P `, and compared bare every procedure read as a
+    /// function. The two-letter types fill the column and arrive as they are.
+    #[test]
+    fn a_routine_is_shaped_by_its_padded_object_type() {
+        use schemaic_core::schema::RoutineKind;
+        assert_eq!(
+            routine_shape("P ", None),
+            (RoutineKind::Procedure, String::new())
+        );
+        assert_eq!(
+            routine_shape("FN", Some("int".into())),
+            (RoutineKind::Function, "int".to_string())
+        );
+        assert_eq!(
+            routine_shape("IF", None),
+            (RoutineKind::Function, "TABLE".to_string())
+        );
+        assert_eq!(routine_shape("TF", None).1, "TABLE");
+    }
+
+    #[test]
+    fn a_referential_action_is_spelled_as_sql_and_the_default_is_left_out() {
+        assert_eq!(fk_action("NO_ACTION"), None);
+        assert_eq!(fk_action("CASCADE").as_deref(), Some("CASCADE"));
+        assert_eq!(fk_action("SET_NULL").as_deref(), Some("SET NULL"));
+        assert_eq!(fk_action("SET_DEFAULT").as_deref(), Some("SET DEFAULT"));
+    }
+
+    #[test]
+    fn a_date_counts_days_from_the_year_one() {
+        assert_eq!(date_text(0), "0001-01-01");
+        assert_eq!(date_text(3_652_058), "9999-12-31");
+        // 2026-09-27 is 739,885 days after 0001-01-01.
+        assert_eq!(date_text(739_885), "2026-09-27");
+    }
+
+    #[test]
+    fn a_time_prints_the_fraction_its_scale_declares() {
+        assert_eq!(time_text(0, 0), "00:00:00");
+        assert_eq!(time_text(86_399, 0), "23:59:59");
+        assert_eq!(time_text(462_537_336_813, 7), "12:50:53.7336813");
+        assert_eq!(time_text(46_253_700, 3), "12:50:53.700");
+        assert_eq!(time_text(5, 7), "00:00:00.0000005");
+    }
+
+    #[test]
+    fn a_datetime_counts_three_hundredths_from_1900() {
+        assert_eq!(datetime_text(0, 0), "1900-01-01 00:00:00.000");
+        // 23:59:59.997, the largest `datetime` fraction.
+        assert_eq!(datetime_text(0, 25_919_999), "1900-01-01 23:59:59.997");
+        // Before 1900 the day count is negative.
+        assert_eq!(datetime_text(-53_690, 0), "1753-01-01 00:00:00.000");
+        // 12:50:53.730, as the server printed it on 2026-09-27.
+        assert_eq!(datetime_text(46_290, 13_876_119), "2026-09-27 12:50:53.730");
+    }
+
+    #[test]
+    fn a_smalldatetime_counts_minutes() {
+        assert_eq!(smalldatetime_text(0, 0), "1900-01-01 00:00:00");
+        assert_eq!(smalldatetime_text(1, 1439), "1900-01-02 23:59:00");
+    }
+
+    /// The wire holds UTC; the value shown is the stored local time, with
+    /// its offset — including across midnight in either direction.
+    #[test]
+    fn a_datetimeoffset_is_shown_in_its_own_offset() {
+        let day = 739_616; // 2026-01-01
+        // Ticks at scale 7 are 10^-7 s; at scale 0, seconds.
+        let ticks7 = |h: u64| h * 3600 * 10_000_000;
+        let secs = |h: u64| h * 3600;
+        assert_eq!(
+            datetimeoffset_text(day, ticks7(8), 7, 120),
+            "2026-01-01 10:00:00.0000000 +02:00"
+        );
+        assert_eq!(
+            datetimeoffset_text(day, secs(23), 0, 90),
+            "2026-01-02 00:30:00 +01:30"
+        );
+        assert_eq!(
+            datetimeoffset_text(day, 0, 0, -300),
+            "2025-12-31 19:00:00 -05:00"
+        );
+        assert_eq!(
+            datetimeoffset_text(day, secs(12), 0, 0),
+            "2026-01-01 12:00:00 +00:00"
+        );
+    }
+
+    #[test]
+    fn a_real_is_the_number_it_was_written_as() {
+        assert_eq!(real_value(0.1), Value::Float(0.1));
+        assert_eq!(real_value(-2.5), Value::Float(-2.5));
+    }
+
+    /// The rows measured on SQL Server 2022 for four statements: a missing
+    /// table is reported with the describe's own follow-up after it, a temp
+    /// table the batch makes is the describe saying it cannot tell, and a
+    /// clean statement has no rows.
+    #[test]
+    fn a_describe_reports_the_statements_error_and_not_its_own() {
+        let missing = [
+            (208, "Invalid object name 'nope'.".to_string()),
+            (11529, "The metadata could not be determined …".to_string()),
+        ];
+        assert_eq!(
+            describe_error(&missing).as_deref(),
+            Some("Invalid object name 'nope'. (Msg 208)")
+        );
+        let column = [
+            (207, "Invalid column name 'nocol'.".to_string()),
+            (11501, "The batch could not be analyzed …".to_string()),
+        ];
+        assert!(describe_error(&column).is_some_and(|e| e.contains("207")));
+        let temp = [(11525, "… uses a temp table …".to_string())];
+        assert_eq!(describe_error(&temp), None);
+        assert_eq!(describe_error(&[]), None);
+    }
+
+    #[test]
+    fn a_server_error_names_its_number_and_line() {
+        assert_eq!(
+            server_message("Invalid object name 'x'. ", 208, 1),
+            "Invalid object name 'x'. (Msg 208, line 1)"
+        );
+        assert_eq!(
+            server_message("Login failed for user 'sa'.", 18456, 0),
+            "Login failed for user 'sa'. (Msg 18456)"
+        );
+    }
+
+    fn described(name: &str) -> Described {
+        Described {
+            name: name.to_string(),
+            type_name: "nvarchar(50)".to_string(),
+            source: Some(("app".into(), "dbo".into(), "t".into(), name.into())),
+            in_key: name == "id",
+            nullable: name != "id",
+            identity: false,
+        }
+    }
+
+    fn wire(names: &[&str]) -> Vec<tiberius::Column> {
+        names
+            .iter()
+            .map(|n| tiberius::Column::new(n.to_string(), ColumnType::NVarchar))
+            .collect()
+    }
+
+    /// The description is used only when it names the columns the wire
+    /// sent — a branch the compiler described differently from the one that
+    /// ran must not put every cell under another column's type.
+    #[test]
+    fn a_description_that_disagrees_with_the_wire_is_not_used() {
+        let d = vec![described("id"), described("name")];
+        let used = result_columns(&wire(&["id", "name"]), Some(&d));
+        assert_eq!(used[0].type_name, "nvarchar(50)");
+        assert!(used[0].origin.as_ref().is_some_and(|o| o.flags.unique_key));
+        assert!(used[1].origin.as_ref().is_some_and(|o| !o.flags.not_null));
+        for other in [wire(&["id"]), wire(&["id", "other"])] {
+            let used = result_columns(&other, Some(&d));
+            assert!(used.iter().all(|c| c.origin.is_none()), "{used:?}");
+            assert_eq!(used[0].type_name, "nvarchar");
+        }
+        assert!(result_columns(&wire(&["x"]), None)[0].origin.is_none());
+    }
+}

@@ -70,6 +70,18 @@ pub fn build_query(
     sort: &[(String, bool)],
     dialect: SqlDialect,
 ) -> Result<Option<String>, FilterError> {
+    // `sqlparser` writes a bracketed name back as `[value]` without doubling a
+    // `]` in it, so a name that holds one cannot make the round trip: `[a]]b]`
+    // would come back as `[a]b]`, a different statement. Refused rather than
+    // rewritten into one.
+    if spells_a_doubled_bracket(filter, dialect) {
+        return Err(FilterError::BadCondition(
+            "a name containing `]` cannot be filtered here".to_string(),
+        ));
+    }
+    if spells_a_doubled_bracket(base_sql, dialect) {
+        return Ok(None);
+    }
     // The base already ran against the DB, so a parse failure here just means
     // sqlparser can't model it — degrade to "not rewritable", never an error.
     let Ok(mut stmts) = Parser::parse_sql(&*dialect.parser(), base_sql) else {
@@ -128,11 +140,14 @@ pub fn build_query(
 
     // ORDER BY: replace with our sort spec when present; otherwise keep the base's.
     if !sort.is_empty() {
-        let q = quote_char(dialect);
+        // The name goes in **already quoted**, by the one quoter, as an
+        // unquoted `Ident` that renders verbatim. `Ident::with_quote` took a
+        // quote character and escaped it itself — correctly for `"` and `` ` ``,
+        // and not at all for `[`, which is SQL Server's.
         let exprs = sort
             .iter()
             .map(|(col, asc)| OrderByExpr {
-                expr: Expr::Identifier(Ident::with_quote(q, col.clone())),
+                expr: Expr::Identifier(Ident::new(quote_ident(col, dialect))),
                 options: OrderByOptions {
                     asc: Some(*asc),
                     nulls_first: None,
@@ -287,32 +302,31 @@ fn parse_condition(cond: &str, dialect: SqlDialect) -> Result<Expr, FilterError>
     Ok(expr)
 }
 
-/// Identifier quote character for the dialect — used when we emit an `ORDER BY`
-/// column via the AST, because `sqlparser`'s `Ident::with_quote` takes a `char`
-/// and cannot be handed a rendered string.
+/// Does `sql` spell a SQL Server bracketed name holding an escaped `]`?
 ///
-/// **Derived from [`crate::export::ident_sql`], not restated beside it.** This
-/// was a fourth per-dialect quote table, sitting outside
-/// `every_identifier_quoter_agrees_with_ident_sql` — the test whose own doc
-/// claims to cover every one — with its SQLite arm untested anywhere. The
-/// invariant is "one identifier quoter"; a `char` the authority cannot be asked
-/// for is the same drift with a narrower type. So it is asked: the first
-/// character of a quoted **empty** name is the opening quote, by construction.
-///
-/// The fallback cannot be reached (`ident_sql` always emits a quote pair), and
-/// `the_order_by_quote_is_ident_sqls_own` asserts that for all three engines.
-fn quote_char(dialect: SqlDialect) -> char {
-    crate::export::ident_sql("", dialect)
-        .chars()
-        .next()
-        .unwrap_or('"')
-}
-
-/// [`quote_char`], for the workspace-wide agreement test. Not a second
-/// implementation — it *is* the function above, which is the point.
-#[cfg(test)]
-pub(crate) fn order_by_quote_for_test(dialect: SqlDialect) -> char {
-    quote_char(dialect)
+/// Such a name cannot survive `sqlparser`'s round trip (see [`build_query`]).
+/// Always `false` where a bracketed name has no escape to hold one.
+fn spells_a_doubled_bracket(sql: &str, dialect: SqlDialect) -> bool {
+    if !dialect.bracket_doubles() {
+        return false;
+    }
+    let b = sql.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        match crate::sql::skip_noncode(b, i, dialect) {
+            Some(j) => {
+                // Inside the brackets: the span less its opener and its one
+                // closer, so `[a]]]` (the name `a]`) is still seen.
+                let inner = &sql[(i + 1).min(j)..j];
+                if b[i] == b'[' && inner.strip_suffix(']').unwrap_or(inner).contains("]]") {
+                    return true;
+                }
+                i = j.max(i + 1);
+            }
+            None => i += 1,
+        }
+    }
+    false
 }
 
 /// Quote an identifier as a string, doubling any embedded quote character.
@@ -334,12 +348,12 @@ pub(crate) fn quoted_ident_for_test(name: &str, dialect: SqlDialect) -> String {
 /// for both dialects; backslashes are additionally doubled on MySQL (where `\` is
 /// an escape character in string literals by default, unlike standard-conforming
 /// Postgres strings).
+///
+/// **Delegates to [`crate::export::sql_literal`]**, which wrote the same
+/// escaping independently — and which is the one that knows SQL Server's
+/// literal wants an `N` prefix.
 fn quote_value(v: &str, dialect: SqlDialect) -> String {
-    let escaped = match dialect {
-        SqlDialect::MySql => v.replace('\\', "\\\\").replace('\'', "''"),
-        SqlDialect::Postgres | SqlDialect::Sqlite => v.replace('\'', "''"),
-    };
-    format!("'{escaped}'")
+    crate::export::sql_literal(&crate::model::Value::Str(v.to_string()), dialect)
 }
 
 /// Does `name` have to be quoted to survive a round-trip through the server?
@@ -374,9 +388,15 @@ fn needs_quoting(name: &str, dialect: SqlDialect) -> bool {
                     .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
         }
         // SQLite: letters, digits, `_`, `$`; no leading digit — MySQL's rule, and
-        // case-preserving like it, so mixed case needs no quoting.
-        SqlDialect::Sqlite => {
-            !name.starts_with(|c: char| c.is_ascii_digit())
+        // case-preserving like it, so mixed case needs no quoting. SQL Server's
+        // regular identifier is the same shape (it also allows `@` and `#`,
+        // which begin variables and temporary tables, and are quoted here), and
+        // its names compare under the database's collation — case-insensitively
+        // by default. **Neither takes a leading `$`**, which is where the two
+        // part from MySQL: SQLite reads `$price` as a parameter and T-SQL as a
+        // `money` literal, `$`, aliased `price`.
+        SqlDialect::Sqlite | SqlDialect::MsSql => {
+            !name.starts_with(|c: char| c.is_ascii_digit() || c == '$')
                 && name
                     .chars()
                     .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$')
@@ -506,6 +526,18 @@ pub fn qualified_table_name(
             None => quote_if_needed(table, dialect),
         },
         SqlDialect::Sqlite => quote_if_needed(table, dialect),
+        // Always schema-qualified, `dbo` included: an unqualified name
+        // resolves through the *login's* default schema, which need not be
+        // `dbo`, so the bare form would read a different table for a
+        // different user.
+        SqlDialect::MsSql => match schema {
+            Some(s) => format!(
+                "{}.{}",
+                quote_if_needed(s, dialect),
+                quote_if_needed(table, dialect)
+            ),
+            None => quote_if_needed(table, dialect),
+        },
     }
 }
 
@@ -566,7 +598,7 @@ pub fn table_query(
             .join(", ");
         format!(" ORDER BY {cols}")
     };
-    format!("SELECT {projection} FROM {name}{order_by} LIMIT {limit}")
+    crate::sql::limited_select(dialect, &projection, &format!("{name}{order_by}"), limit)
 }
 
 #[cfg(test)]
@@ -578,8 +610,111 @@ mod tests {
         build_query(base, filter, &sort, d).unwrap()
     }
 
-    const EVERY_DIALECT: [SqlDialect; 3] =
-        [SqlDialect::MySql, SqlDialect::Postgres, SqlDialect::Sqlite];
+    const EVERY_DIALECT: [SqlDialect; 4] = SqlDialect::ALL;
+
+    // ── SQL Server ────────────────────────────────────────────────────────
+
+    /// T-SQL has no `LIMIT`: a browse page is `SELECT TOP (n)`. The table is
+    /// always schema-qualified, even in `dbo` — an unqualified name resolves
+    /// through the *login's* default schema, which need not be `dbo`.
+    #[test]
+    fn a_sql_server_browse_query_takes_the_top_rows_of_a_qualified_table() {
+        let ms = SqlDialect::MsSql;
+        let cols = ["id".to_string()];
+        assert_eq!(
+            table_query(
+                ms,
+                "app",
+                Some("dbo"),
+                "orders",
+                BrowseKey::Columns(&cols),
+                Order::Asc,
+                500
+            ),
+            "SELECT TOP (500) * FROM dbo.orders ORDER BY id ASC"
+        );
+        assert_eq!(
+            table_query(
+                ms,
+                "app",
+                Some("sales"),
+                "Order Lines",
+                BrowseKey::None,
+                Order::Asc,
+                10
+            ),
+            "SELECT TOP (10) * FROM sales.[Order Lines]"
+        );
+        // A reserved word is quoted; mixed case is not — T-SQL names compare
+        // under the database's collation, case-insensitively by default.
+        assert_eq!(
+            qualified_table_name(ms, "app", Some("dbo"), "User"),
+            "dbo.[User]"
+        );
+        assert_eq!(
+            qualified_table_name(ms, "app", Some("dbo"), "Orders"),
+            "dbo.Orders"
+        );
+        assert_eq!(qualified_table_name(ms, "app", None, "t"), "t");
+    }
+
+    /// **A `$` may follow a name's first character, not be it.** T-SQL reads a
+    /// leading `$` as a `money` literal — `$price` bare is `$` aliased `price`
+    /// — and SQLite as a parameter, so such a name is quoted on both. MySQL
+    /// takes it as an identifier.
+    #[test]
+    fn a_name_that_starts_with_a_dollar_is_quoted_where_that_is_not_a_name() {
+        assert_eq!(
+            qualified_table_name(SqlDialect::MsSql, "app", Some("dbo"), "$price"),
+            "dbo.[$price]"
+        );
+        assert_eq!(
+            qualified_table_name(SqlDialect::Sqlite, "main", None, "$price"),
+            "\"$price\""
+        );
+        assert_eq!(
+            qualified_table_name(SqlDialect::MsSql, "app", Some("dbo"), "a$b"),
+            "dbo.a$b"
+        );
+    }
+
+    /// **A sort column is quoted by `ident_sql`, not by `sqlparser`**, which
+    /// renders a bracketed name without doubling a `]` inside it. A column
+    /// called `x]; DROP TABLE t; --` would otherwise come back as SQL.
+    #[test]
+    fn a_sort_column_holding_a_bracket_cannot_end_its_name() {
+        let ms = SqlDialect::MsSql;
+        let out = build("SELECT * FROM t", "", &[("x]; DROP TABLE t; --", true)], ms).unwrap();
+        assert!(
+            out.ends_with("ORDER BY [x]]; DROP TABLE t; --] ASC"),
+            "{out}"
+        );
+        for d in EVERY_DIALECT {
+            let out = build("SELECT * FROM t", "", &[("a b", false)], d).unwrap();
+            assert!(
+                out.contains(&crate::export::ident_sql("a b", d)),
+                "{d:?}: {out}"
+            );
+        }
+    }
+
+    /// And a name the *user* wrote with a `]` in it cannot survive the same
+    /// round trip, so on SQL Server the statement is left as it is rather
+    /// than rewritten into a different one.
+    #[test]
+    fn a_sql_server_query_naming_a_bracket_is_not_rewritten() {
+        let ms = SqlDialect::MsSql;
+        assert_eq!(build("SELECT * FROM [a]]b]", "x = 1", &[], ms), None);
+        // `[a]]]` is the name `a]`: the escape is at the very end.
+        assert_eq!(build("SELECT * FROM [a]]]", "x = 1", &[], ms), None);
+        assert_eq!(
+            build_query("SELECT * FROM t", "[a]]b] = 1", &[], ms),
+            Err(FilterError::BadCondition(
+                "a name containing `]` cannot be filtered here".to_string()
+            ))
+        );
+        assert!(build("SELECT * FROM [t]", "x = 1", &[], ms).is_some());
+    }
 
     // ── rerun_statement: which SQL may be executed a second time ──────────
     //

@@ -1488,20 +1488,50 @@ pub fn is_sqlite(db_type: &str) -> bool {
     t.eq_ignore_ascii_case("sqlite") || t.eq_ignore_ascii_case("sqlite3")
 }
 
+/// What a **Read-only** connection does not guarantee on this engine, where
+/// that is worth a sentence under the switch — or `None` where the server
+/// itself refuses the writes.
+///
+/// SQL Server is the one engine with no read-only session to ask for, so a
+/// read there runs inside a transaction that is rolled back, behind the text
+/// gate (`db::mssql::fetch_query`). What a rollback cannot undo is what the
+/// sentence names, and a login that can only read is the one guard that has
+/// no such gap — so the form says so where the switch is.
+pub fn read_only_caveat(db_type: &str) -> Option<&'static str> {
+    is_mssql(db_type).then_some(
+        "SQL Server has no read-only session, so reads run in a transaction Schemaic rolls \
+         back. A procedure's effect outside the database survives that; for a guarantee, \
+         connect with a login that can only read.",
+    )
+}
+
+/// Is this saved `db_type` label Microsoft SQL Server?
+///
+/// **The one answer**, on the same terms as [`is_postgres`]. Whole labels
+/// only, never a substring: `MySQL` contains "SQL" too, and a label that meant
+/// SQL Server to the driver and MySQL to the form would send a TDS handshake to
+/// a MySQL port.
+pub fn is_mssql(db_type: &str) -> bool {
+    let t = db_type.trim();
+    t.eq_ignore_ascii_case("sql server")
+        || t.eq_ignore_ascii_case("sqlserver")
+        || t.eq_ignore_ascii_case("mssql")
+}
+
 /// Do two `db_type` labels name the **same engine**?
 ///
 /// One engine has more than one label — `MariaDB` and `MySQL` are the same
 /// engine, `pg` and `PostgreSQL` are, and an empty label predates the field —
 /// so a string comparison is not this question. Answered through
-/// [`is_postgres`]/[`is_sqlite`] rather than by a `match` of its own, so a
-/// fourth engine cannot sort onto whichever side it happens to fall.
+/// [`is_postgres`]/[`is_sqlite`]/[`is_mssql`] rather than by a `match` of its
+/// own, so a new engine cannot sort onto whichever side it happens to fall.
 ///
 /// The connection form's Type picker asks it to tell *its own* change apart from
 /// a connection being loaded into the form: on a pick the stored label still
 /// names the previous engine, on a load it already names the new one. Only the
 /// first should rewrite the label or offer the new engine's default port.
 pub fn same_engine(a: &str, b: &str) -> bool {
-    is_postgres(a) == is_postgres(b) && is_sqlite(a) == is_sqlite(b)
+    is_postgres(a) == is_postgres(b) && is_sqlite(a) == is_sqlite(b) && is_mssql(a) == is_mssql(b)
 }
 
 /// How to name a connection's engine on screen.
@@ -1516,6 +1546,9 @@ pub fn engine_label(db_type: &str) -> String {
     }
     if is_sqlite(db_type) {
         return "SQLite".to_string();
+    }
+    if is_mssql(db_type) {
+        return "SQL Server".to_string();
     }
     match db_type.trim() {
         "" => "MySQL".to_string(),
@@ -1614,7 +1647,13 @@ pub fn default_port(db_type: &str) -> u16 {
     if is_sqlite(db_type) {
         return 0;
     }
-    if is_postgres(db_type) { 5432 } else { 3306 }
+    if is_postgres(db_type) {
+        5432
+    } else if is_mssql(db_type) {
+        1433
+    } else {
+        3306
+    }
 }
 
 #[cfg(test)]
@@ -2696,6 +2735,44 @@ mod tests {
         }
     }
 
+    #[test]
+    fn sql_server_is_recognised_by_any_of_its_labels() {
+        for label in ["SQL Server", "sqlserver", "MSSQL", "  sql server  "] {
+            assert!(is_mssql(label), "{label}");
+            assert!(!is_postgres(label), "{label}");
+            assert!(!is_sqlite(label), "{label}");
+            assert!(is_networked(label), "{label}");
+            assert_eq!(engine_label(label), "SQL Server", "{label}");
+            assert_eq!(default_port(label), 1433, "{label}");
+        }
+    }
+
+    /// Only the engine with no read-only session needs the sentence.
+    #[test]
+    fn only_sql_server_qualifies_what_read_only_means() {
+        assert!(read_only_caveat("SQL Server").is_some_and(|s| s.contains("login")));
+        for label in ["MySQL", "MariaDB", "PostgreSQL", "SQLite", ""] {
+            assert_eq!(read_only_caveat(label), None, "{label}");
+        }
+    }
+
+    /// `MySQL` must not be read as SQL Server because both contain "SQL", and
+    /// the MySQL fallback must not swallow a SQL Server label.
+    #[test]
+    fn no_other_engine_is_sql_server() {
+        for label in [
+            "MySQL",
+            "MariaDB",
+            "",
+            "PostgreSQL",
+            "SQLite",
+            "sql",
+            "server",
+        ] {
+            assert!(!is_mssql(label), "{label}");
+        }
+    }
+
     /// The label predicates and the dialect must never disagree about an engine:
     /// `SqlDialect::from_db_type` used to re-spell the alias match in another
     /// module, so a label the connection list called Postgres could have parsed as
@@ -2713,12 +2790,16 @@ mod tests {
             "SQLite",
             "sqlite3",
             "  SQLITE ",
+            "SQL Server",
+            "mssql",
             "something else",
         ] {
             let by_predicate = if is_postgres(label) {
                 SqlDialect::Postgres
             } else if is_sqlite(label) {
                 SqlDialect::Sqlite
+            } else if is_mssql(label) {
+                SqlDialect::MsSql
             } else {
                 SqlDialect::MySql
             };
@@ -2822,7 +2903,14 @@ mod tests {
     /// refusing everything.
     #[test]
     fn a_networked_engine_still_reaches_its_server() {
-        for label in ["MySQL", "MariaDB", "PostgreSQL", "", "something else"] {
+        for label in [
+            "MySQL",
+            "MariaDB",
+            "PostgreSQL",
+            "SQL Server",
+            "",
+            "something else",
+        ] {
             assert!(is_networked(label), "{label}");
             let mut c = conn();
             c.db_type = label.to_string();
@@ -2847,6 +2935,7 @@ mod tests {
             ("postgres", "  POSTGRESQL "),
             ("SQLite", "sqlite3"),
             ("  sqlite ", "SQLite"),
+            ("SQL Server", "mssql"),
         ] {
             assert!(same_engine(a, b), "{a} vs {b}");
             assert!(same_engine(b, a), "{b} vs {a}");
@@ -2861,6 +2950,9 @@ mod tests {
             ("PostgreSQL", "sqlite3"),
             ("", "pg"),
             ("SQLite", ""),
+            ("MySQL", "SQL Server"),
+            ("", "mssql"),
+            ("PostgreSQL", "sqlserver"),
         ] {
             assert!(!same_engine(a, b), "{a} vs {b}");
             assert!(!same_engine(b, a), "{b} vs {a}");
@@ -2879,11 +2971,15 @@ mod tests {
             "pg",
             "SQLite",
             "sqlite3",
+            "SQL Server",
+            "mssql",
             "something else",
         ];
         for a in labels {
             for b in labels {
-                let by_predicate = is_postgres(a) == is_postgres(b) && is_sqlite(a) == is_sqlite(b);
+                let by_predicate = is_postgres(a) == is_postgres(b)
+                    && is_sqlite(a) == is_sqlite(b)
+                    && is_mssql(a) == is_mssql(b);
                 assert_eq!(same_engine(a, b), by_predicate, "{a} vs {b}");
             }
         }

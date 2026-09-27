@@ -86,11 +86,19 @@ impl SqlDialect {
         matches!(self, SqlDialect::MySql | SqlDialect::Sqlite)
     }
 
-    /// Are `[…]` identifiers accepted? SQLite only (taken for SQL-Server/Access
-    /// compatibility). There is **no escape inside one** — the span ends at the
-    /// first `]`, because SQLite defines no way to write one.
+    /// Are `[…]` identifiers accepted? SQL Server's own syntax, which SQLite
+    /// also takes for compatibility. Whether a `]` can be written inside one is
+    /// [`Self::bracket_doubles`].
     pub(crate) fn bracket_ident(self) -> bool {
-        matches!(self, SqlDialect::Sqlite)
+        matches!(self, SqlDialect::Sqlite | SqlDialect::MsSql)
+    }
+
+    /// Does `]]` stand for a `]` inside a `[…]` name? SQL Server only. SQLite
+    /// defines no escape, so there the span ends at the first `]`.
+    ///
+    /// `pub(crate)` for `filter`, which has to know when a name holds one.
+    pub(crate) fn bracket_doubles(self) -> bool {
+        matches!(self, SqlDialect::MsSql)
     }
 
     /// Does the server expand `/*! … */` (and MariaDB's `/*M! … */`) as **code**
@@ -109,17 +117,27 @@ impl SqlDialect {
         matches!(self, SqlDialect::Postgres)
     }
 
-    /// Do `/* … */` comments nest? PostgreSQL only, as the SQL standard has
-    /// it: `/* a /* b */ c */` is one comment there, and on MySQL and SQLite
-    /// the first `*/` ends it.
+    /// Do `/* … */` comments nest? PostgreSQL and SQL Server, as the SQL
+    /// standard has it: `/* a /* b */ c */` is one comment there, and on MySQL
+    /// and SQLite the first `*/` ends it.
     fn nested_block_comments(self) -> bool {
-        matches!(self, SqlDialect::Postgres)
+        matches!(self, SqlDialect::Postgres | SqlDialect::MsSql)
     }
 
     /// Does the client honour a `DELIMITER` directive? MySQL only — see
     /// [`delimiter_directive`] for why it exists there at all.
     fn delimiter_directive(self) -> bool {
         matches!(self, SqlDialect::MySql)
+    }
+
+    /// Does the client split a script into batches at `GO` lines, and does a
+    /// routine body run to the end of its batch? SQL Server only — see
+    /// [`go_directive`] and [`BodyScan`].
+    ///
+    /// `pub(crate)` for `ddl::join_scripts`, which writes a `GO` between the
+    /// objects of a script. (`sqlfmt` asks [`go_directive`] instead.)
+    pub(crate) fn batch_separator(self) -> bool {
+        matches!(self, SqlDialect::MsSql)
     }
 }
 
@@ -431,14 +449,36 @@ fn e_prefixed(b: &[u8], i: usize) -> bool {
     i >= 1 && matches!(b[i - 1], b'e' | b'E') && (i < 2 || !is_word_byte(b[i - 2]))
 }
 
-/// Scan a SQLite `[…]` bracketed identifier to just past its `]`. There is no
-/// escape inside one, so the span simply ends at the first `]`; unterminated →
-/// end of input, matching [`scan_quoted`]'s policy.
-fn scan_bracket(b: &[u8], i: usize) -> usize {
+/// Scan a `[…]` bracketed identifier to just past its `]`. On SQLite there is
+/// no escape inside one, so the span ends at the first `]`; on SQL Server `]]`
+/// is an escaped `]` ([`SqlDialect::bracket_doubles`]). Unterminated → end of
+/// input, matching [`scan_quoted`]'s policy.
+fn scan_bracket(b: &[u8], i: usize, dialect: SqlDialect) -> usize {
+    if dialect.bracket_doubles() {
+        return scan_quoted_until(b, i, b']');
+    }
     let n = b.len();
     let mut j = i + 1;
     while j < n {
         if b[j] == b']' {
+            return j + 1;
+        }
+        j += 1;
+    }
+    n
+}
+
+/// [`scan_quoted`] for a span whose closing byte differs from its opening one
+/// (`[` … `]`), with the doubled closer as its only escape.
+fn scan_quoted_until(b: &[u8], i: usize, close: u8) -> usize {
+    let n = b.len();
+    let mut j = i + 1;
+    while j < n {
+        if b[j] == close {
+            if j + 1 < n && b[j + 1] == close {
+                j += 2;
+                continue;
+            }
             return j + 1;
         }
         j += 1;
@@ -473,7 +513,7 @@ pub fn skip_noncode(b: &[u8], i: usize, dialect: SqlDialect) -> Option<usize> {
         }
         b'"' => Some(scan_quoted(b, i, b'"', !dialect.double_quote_is_ident())),
         b'`' if dialect.backtick_ident() => Some(scan_quoted(b, i, b'`', false)),
-        b'[' if dialect.bracket_ident() => Some(scan_bracket(b, i)),
+        b'[' if dialect.bracket_ident() => Some(scan_bracket(b, i, dialect)),
         b'$' if dialect.dollar_quoted() => scan_dollar(b, i),
         _ => None,
     }
@@ -776,12 +816,103 @@ fn delimiter_directive(sql: &str, i: usize, dialect: SqlDialect) -> Option<(usiz
     Some((end, token))
 }
 
-/// Is `sql[lo..hi]` a `DELIMITER` directive rather than a statement?
+/// Is `sql[lo..hi]` a client directive rather than a statement — MySQL's
+/// `DELIMITER`, or SQL Server's `GO` batch separator?
 ///
 /// Exposed so the callers that *execute* ranges can drop it: the server would
-/// answer a syntax error, since it is the client that owns the word.
+/// answer a syntax error, since it is the client that owns the word. One
+/// predicate for both, so no executing path can drop one and send the other.
 pub fn is_delimiter_directive(sql: &str, lo: usize, hi: usize, dialect: SqlDialect) -> bool {
     delimiter_directive(sql, lo, dialect).is_some_and(|(end, _)| end >= hi)
+        || go_directive(sql, lo, dialect).is_some_and(|end| end >= hi)
+}
+
+/// A `GO` batch separator starting at `i`: the offset just past its line.
+///
+/// **A client directive, not T-SQL** — `sqlcmd` and SSMS split a script into
+/// batches at it and never send it — and SQL Server's alone. It stands on a
+/// line of its own: `GO`, an optional repeat count, and an optional `--`
+/// comment. The count is accepted and **not** honoured; a batch runs once.
+///
+/// The caller answers "is `i` at the start of a line"; this answers whether
+/// the line is a directive.
+pub(crate) fn go_directive(sql: &str, i: usize, dialect: SqlDialect) -> Option<usize> {
+    if !dialect.batch_separator() {
+        return None;
+    }
+    let b = sql.as_bytes();
+    if !b.get(i..i + 2)?.eq_ignore_ascii_case(b"GO") {
+        return None;
+    }
+    let mut j = i + 2;
+    let blank = |c: u8| c == b' ' || c == b'\t' || c == b'\r';
+    while b.get(j).is_some_and(|&c| blank(c)) {
+        j += 1;
+    }
+    while b.get(j).is_some_and(u8::is_ascii_digit) {
+        j += 1;
+    }
+    while b.get(j).is_some_and(|&c| blank(c)) {
+        j += 1;
+    }
+    if b.get(j..j + 2) == Some(b"--") {
+        while b.get(j).is_some_and(|&c| c != b'\n') {
+            j += 1;
+        }
+    }
+    match b.get(j) {
+        None => Some(j),
+        Some(b'\n') => Some(j + 1),
+        Some(_) => None,
+    }
+}
+
+/// Is `i` the first non-blank byte of its line?
+pub(crate) fn at_line_start(b: &[u8], i: usize) -> bool {
+    b[..i]
+        .iter()
+        .rev()
+        .take_while(|&&c| c != b'\n')
+        .all(|&c| c == b' ' || c == b'\t')
+}
+
+/// Where a scan through a SQL Server segment stands with respect to a routine
+/// body.
+///
+/// `CREATE PROCEDURE`, `FUNCTION` and `TRIGGER` (and their `ALTER` and
+/// `CREATE OR ALTER` forms) take **the rest of the batch** as their body, `;`s
+/// and all, so only a `GO` line or the end of the input ends one. A view is a
+/// single `SELECT` and needs nothing here.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BodyScan {
+    /// At the start of a segment, still able to become a routine.
+    Start,
+    /// `CREATE`, `ALTER` or `CREATE OR ALTER` seen.
+    Create,
+    /// `CREATE OR` seen; `ALTER` must follow.
+    Or,
+    /// Inside a routine body, which runs to the batch's end.
+    In,
+    /// This segment is something else.
+    No,
+}
+
+impl BodyScan {
+    fn word(self, w: &str) -> BodyScan {
+        let is = |k: &str| w.eq_ignore_ascii_case(k);
+        match self {
+            BodyScan::Start if is("CREATE") || is("ALTER") => BodyScan::Create,
+            BodyScan::Create if is("OR") => BodyScan::Or,
+            BodyScan::Or if is("ALTER") => BodyScan::Create,
+            BodyScan::Create
+                if is("PROC") || is("PROCEDURE") || is("FUNCTION") || is("TRIGGER") =>
+            {
+                BodyScan::In
+            }
+            BodyScan::In => BodyScan::In,
+            _ => BodyScan::No,
+        }
+    }
 }
 
 /// Where a scan through a SQLite statement stands with respect to a
@@ -996,9 +1127,49 @@ fn scan_bounds(
     // silently alter what Run Everything sends to a server.
     let track_triggers = dialect == SqlDialect::Sqlite;
     let mut scan = TriggerScan::Start;
+    let track_bodies = dialect.batch_separator();
+    let mut body = BodyScan::Start;
     while i < n {
         if let Some(j) = skip_noncode(b, i, dialect) {
             i = j;
+            continue;
+        }
+        // SQL Server's `GO` line ends the statement before it — which need not
+        // have a `;` — and is a segment of its own that `is_runnable_segment`
+        // drops. Before the word walk below, which would step over it.
+        if track_bodies
+            && at_line_start(b, i)
+            && let Some(end) = go_directive(sql, i, dialect)
+        {
+            // A `GO` line with no newline behind it mid-script may be the
+            // front of a longer word (`GOTO`); wait for the rest.
+            if !at_eof && b.get(end - 1) != Some(&b'\n') {
+                break;
+            }
+            let line = b[..i]
+                .iter()
+                .rposition(|&c| c == b'\n')
+                .map_or(0, |k| k + 1);
+            if bounds.last().is_none_or(|last| last.at < line) {
+                bounds.push(Bound { at: line, strip: 0 });
+            }
+            bounds.push(Bound { at: end, strip: 0 });
+            if until.is_some_and(|u| end > u) {
+                break;
+            }
+            i = end;
+            seg = end;
+            body = BodyScan::Start;
+            continue;
+        }
+        if track_bodies && is_word_start(b[i]) {
+            let start = i;
+            let mut end = i + 1;
+            while end < n && is_word_byte(b[end]) {
+                end += 1;
+            }
+            body = body.word(&sql[start..end]);
+            i = end;
             continue;
         }
         // Only at the start of a segment — `SELECT delimiter FROM t` is data.
@@ -1038,7 +1209,7 @@ fn scan_bounds(
             continue;
         }
         if b[i..].starts_with(delim.as_slice()) {
-            if scan.inside_body() {
+            if scan.inside_body() || body == BodyScan::In {
                 i += delim.len();
                 continue;
             }
@@ -1060,6 +1231,7 @@ fn scan_bounds(
             }
             seg = i;
             scan = TriggerScan::Start;
+            body = BodyScan::Start;
             continue;
         }
         i += 1;
@@ -1326,8 +1498,15 @@ fn leading_keyword_span(sql: &str, dialect: SqlDialect) -> Option<(usize, usize)
 /// The identifier goes through [`skip_noncode`], so a backtick-quoted name is
 /// lifted out whole and unquoted (`` USE `my db` `` → `my db`), and a comment
 /// between the keyword and the name is skipped.
+///
+/// SQL Server has `USE` too, with the same effect on the statements after it
+/// in one batch.
 pub fn use_target(sql: &str, dialect: SqlDialect) -> Option<String> {
-    if dialect != SqlDialect::MySql || leading_keyword(sql, dialect)? != "USE" {
+    let has_use = match dialect {
+        SqlDialect::MySql | SqlDialect::MsSql => true,
+        SqlDialect::Postgres | SqlDialect::Sqlite => false,
+    };
+    if !has_use || leading_keyword(sql, dialect)? != "USE" {
         return None;
     }
     let b = sql.as_bytes();
@@ -1344,10 +1523,13 @@ pub fn use_target(sql: &str, dialect: SqlDialect) -> Option<String> {
             None => break,
         }
     }
-    let (name, mut i) = if i < n && b[i] == b'`' {
-        // `` `a``b` `` — a doubled backtick is one literal backtick.
-        let end = skip_noncode(b, i, dialect)?;
-        (sql[i + 1..end - 1].replace("``", "`"), end)
+    let (name, mut i) = if i < n && crate::intel::ident_quote(dialect, b[i]).is_some() {
+        // `` `a``b` `` and `[a]]b]` — a doubled closer is one literal one.
+        // `ident_at` knows each dialect's quoting; it answers the end too.
+        match ident_at(sql, i, dialect) {
+            (Some(name), end) => (name, end),
+            (None, _) => return None,
+        }
     } else if i < n && is_word_start(b[i]) {
         let s = i;
         let mut j = i + 1;
@@ -1457,7 +1639,17 @@ pub fn unsafe_reason(stmt: &str, dialect: SqlDialect) -> Option<String> {
 ///
 /// `pub(crate)` for the `.sql` panel, which counts these as destruction
 /// (`script::is_destructive`), apart from the every-row count.
+///
+/// Each T-SQL statement in `stmt` is judged, not its first alone — see
+/// [`tsql_statements`].
 pub(crate) fn drop_reason(stmt: &str, dialect: SqlDialect) -> Option<String> {
+    tsql_statements(stmt, dialect)
+        .into_iter()
+        .find_map(|s| one_drop_reason(s, dialect))
+}
+
+/// [`drop_reason`] for one statement.
+fn one_drop_reason(stmt: &str, dialect: SqlDialect) -> Option<String> {
     let stmt = analyzed_statement(stmt, dialect).unwrap_or(stmt);
     let words = leading_words(stmt, PARTITION_WORDS, dialect);
     let word = |i: usize| words.get(i).map(String::as_str);
@@ -1608,7 +1800,18 @@ fn matching_paren(b: &[u8], open: usize, dialect: SqlDialect) -> Option<usize> {
 /// Under an `EXPLAIN ANALYZE` (or MariaDB's `ANALYZE`) it judges the statement
 /// the prefix runs ([`analyzed_statement`]); and MySQL's `ALTER TABLE …
 /// TRUNCATE PARTITION ALL` is a `TRUNCATE` by another name.
+///
+/// **Each T-SQL statement in `stmt` is judged**, not its first alone: with no
+/// `;` between them, a bare `DELETE` on the line below a scoped one borrowed
+/// that one's `WHERE` — see [`tsql_statements`].
 pub fn every_row_reason(stmt: &str, dialect: SqlDialect) -> Option<String> {
+    tsql_statements(stmt, dialect)
+        .into_iter()
+        .find_map(|s| one_every_row_reason(s, dialect))
+}
+
+/// [`every_row_reason`] for one statement.
+fn one_every_row_reason(stmt: &str, dialect: SqlDialect) -> Option<String> {
     let stmt = analyzed_statement(stmt, dialect).unwrap_or(stmt);
     match leading_keyword(stmt, dialect)?.as_str() {
         "ALTER" => {
@@ -1739,9 +1942,16 @@ pub enum RunVerdict {
 /// So: server-level `CREATE`/`DROP`/`ALTER DATABASE` (and the other cluster-wide
 /// objects, which don't live in a database either) are allowed, as is anything
 /// that can't leave a persistent object behind. Everything else is refused.
+///
+/// **SQL Server asks too**, for the same reason: a connection naming no
+/// database is in the login's default one, `master` unless someone changed it.
+/// Its server-level objects are different ones — a `USER` lives in a database
+/// there, a `LOGIN` does not — so it has its own arm.
 pub fn needs_database(sql: &str, dialect: SqlDialect) -> bool {
-    if dialect != SqlDialect::Postgres {
-        return false;
+    match dialect {
+        SqlDialect::Postgres => {}
+        SqlDialect::MsSql => return mssql_needs_database(sql),
+        SqlDialect::MySql | SqlDialect::Sqlite => return false,
     }
     let Some(kw) = leading_keyword(sql, dialect) else {
         return false; // empty, or comments only — nothing will run
@@ -1789,6 +1999,207 @@ pub fn needs_database(sql: &str, dialect: SqlDialect) -> bool {
     true
 }
 
+/// [`needs_database`]'s SQL Server arm.
+///
+/// Reads, `USE` (which is how a batch picks its database), session or
+/// transaction control and flow control leave nothing behind, and neither do
+/// the statements about the server rather than a database in it — `KILL`,
+/// `BACKUP`, `RESTORE`, `DBCC`, `RECONFIGURE`, `SHUTDOWN`. The server-level
+/// objects are the ones that live in no database: databases, logins, server
+/// roles, endpoints, credentials, server audits and availability groups.
+/// `EXEC` needs one, since a procedure can create anything, and so does a
+/// `SELECT … INTO`, which creates the table it names.
+///
+/// **Every statement in the range is asked, in order** ([`tsql_statements`]):
+/// T-SQL needs no `;`, so `SET NOCOUNT ON` on the line above a `CREATE TABLE`
+/// is one range, and its head alone sent the table to `master`. A `USE`
+/// answers for everything after it.
+fn mssql_needs_database(sql: &str) -> bool {
+    let dialect = SqlDialect::MsSql;
+    for stmt in tsql_statements(sql, dialect) {
+        let Some(kw) = leading_keyword(stmt, dialect) else {
+            continue;
+        };
+        match kw.as_str() {
+            "USE" => return false,
+            // A read — unless it writes a table, or its common table
+            // expressions feed a statement that does.
+            "SELECT" | "WITH" => {
+                let words = word_tokens(stmt, dialect).0;
+                let writes = |k: usize| match words[k].as_str() {
+                    "INTO" | "INSERT" | "UPDATE" | "DELETE" => true,
+                    // `INNER MERGE JOIN` is a join hint.
+                    "MERGE" => words.get(k + 1).map(String::as_str) != Some("JOIN"),
+                    _ => false,
+                };
+                if (0..words.len()).any(writes) {
+                    return true;
+                }
+            }
+            "BEGIN" | "COMMIT" | "ROLLBACK" | "SAVE" | "SET" | "DECLARE" | "PRINT"
+            | "CHECKPOINT" | "WAITFOR" | "IF" | "WHILE" | "RETURN" | "THROW" | "RAISERROR"
+            | "KILL" | "BACKUP" | "RESTORE" | "DBCC" | "RECONFIGURE" | "SHUTDOWN" => {}
+            "CREATE" | "DROP" | "ALTER" => {
+                let rest = leading_keyword_end(stmt, dialect)
+                    .map(|e| &stmt[e..])
+                    .unwrap_or("");
+                let obj = leading_keyword(rest, dialect).unwrap_or_default();
+                if !matches!(
+                    obj.as_str(),
+                    "DATABASE" | "LOGIN" | "SERVER" | "ENDPOINT" | "CREDENTIAL" | "AVAILABILITY"
+                ) {
+                    return true;
+                }
+            }
+            _ => return true,
+        }
+    }
+    false
+}
+
+/// The statements one T-SQL range holds; any other dialect's range, whole.
+///
+/// **T-SQL needs no `;` between statements**, so a range that
+/// [`statement_ranges`] cut at `;` and `GO` can hold several — `SET NOCOUNT
+/// ON` and a `CREATE TABLE` on the next line, a scoped `DELETE` and a bare one
+/// — and a guard that reads a range's head judges its first statement alone.
+/// This cuts the range again before each top-level word that begins a
+/// statement.
+///
+/// **Not a parser**, and it does not have to be: it finds where the
+/// statements the guards ask about *begin*, and a cut it makes in the wrong
+/// place produces a fragment no guard answers for. It does not cut where
+/// the word belongs to the statement before it — a set operator's second
+/// `SELECT`, `MERGE`'s `THEN UPDATE`, a cursor's `FOR UPDATE`, a foreign key's
+/// `ON DELETE CASCADE` — nor after the head of a statement whose text runs on
+/// to the end: a procedure, function, trigger or view is one statement
+/// whatever it holds, and a `GRANT`'s privilege list is made of those words.
+/// A leading `WITH` keeps the statement its common table expressions feed.
+pub(crate) fn tsql_statements(stmt: &str, dialect: SqlDialect) -> Vec<&str> {
+    if !dialect.batch_separator() {
+        return vec![stmt];
+    }
+    // The top-level tokens, each a word (upper-cased, with where it starts)
+    // or `None` for anything else — punctuation, a literal, a quoted name, a
+    // variable, a whole parenthesised group.
+    let b = stmt.as_bytes();
+    let mut toks: Vec<Option<(usize, String)>> = Vec::new();
+    let mut depth = 0usize;
+    let mut i = 0;
+    while i < b.len() {
+        if let Some(j) = skip_noncode(b, i, dialect) {
+            if depth == 0 && skip_comment(b, i, dialect).is_none() {
+                toks.push(None);
+            }
+            i = j;
+            continue;
+        }
+        let c = b[i];
+        if is_word_start(c) {
+            let s = i;
+            while i < b.len() && is_word_byte(b[i]) {
+                i += 1;
+            }
+            // `@delete` is a variable, `#update` a temporary table and
+            // `x.select` a qualified name: none is the keyword it spells.
+            let named = s > 0 && matches!(b[s - 1], b'@' | b'#' | b'.');
+            if depth == 0 {
+                toks.push((!named).then(|| (s, stmt[s..i].to_ascii_uppercase())));
+            }
+            continue;
+        }
+        match c {
+            b'(' => {
+                if depth == 0 {
+                    toks.push(None);
+                }
+                depth += 1;
+            }
+            b')' => depth = depth.saturating_sub(1),
+            c if depth == 0 && !c.is_ascii_whitespace() => toks.push(None),
+            _ => {}
+        }
+        i += 1;
+    }
+    let word = |k: usize| {
+        toks.get(k)
+            .and_then(|t| t.as_ref())
+            .map(|(_, w)| w.as_str())
+    };
+    let module = |k: usize| {
+        matches!(
+            word(k),
+            Some("PROC" | "PROCEDURE" | "FUNCTION" | "TRIGGER" | "VIEW")
+        )
+    };
+    // Does the statement headed at `k` run to the end of the range?
+    let runs_to_end = |k: usize| match word(k) {
+        Some("CREATE") => {
+            module(k + 1)
+                || (word(k + 1) == Some("OR") && word(k + 2) == Some("ALTER") && module(k + 3))
+        }
+        Some("ALTER") => module(k + 1),
+        Some("GRANT" | "REVOKE" | "DENY") => true,
+        _ => false,
+    };
+    // `EXPLAIN` and `ANALYZE` are no T-SQL, and whole is how the guards'
+    // `analyzed_statement` reads the prefixes other engines give them.
+    let prefixed = matches!(word(0), Some("EXPLAIN" | "ANALYZE"));
+    let mut cuts = Vec::new();
+    let mut cte = word(0) == Some("WITH");
+    if !runs_to_end(0) && !prefixed {
+        for (k, tok) in toks.iter().enumerate().skip(1) {
+            let Some((at, w)) = tok else { continue };
+            let (prev, next) = (word(k - 1), word(k + 1));
+            let continues = match w.as_str() {
+                "SELECT" => matches!(
+                    prev,
+                    Some("UNION" | "ALL" | "EXCEPT" | "INTERSECT" | "FOR" | "AS")
+                ),
+                "UPDATE" | "DELETE" => {
+                    matches!(prev, Some("THEN" | "FOR"))
+                        || (prev == Some("ON")
+                            && matches!(next, Some("CASCADE" | "SET" | "NO" | "RESTRICT")))
+                }
+                "INSERT" => prev == Some("THEN"),
+                // `INNER MERGE JOIN` is a join hint, not a `MERGE`.
+                "MERGE" => next == Some("JOIN"),
+                // `DROP TABLE IF EXISTS t` is one statement.
+                "IF" => prev.is_some() && next == Some("EXISTS"),
+                // An `ALTER TABLE`'s partition clause.
+                "TRUNCATE" | "DROP" => next == Some("PARTITION"),
+                "CREATE" | "ALTER" | "DECLARE" | "WHILE" | "PRINT" | "EXEC" | "EXECUTE"
+                | "BEGIN" | "COMMIT" | "ROLLBACK" | "USE" | "RETURN" | "GRANT" | "REVOKE"
+                | "DENY" => false,
+                _ => continue,
+            };
+            if continues {
+                continue;
+            }
+            // The first statement after a leading `WITH` is the one it feeds.
+            if std::mem::take(&mut cte) {
+                continue;
+            }
+            cuts.push(*at);
+            if runs_to_end(k) {
+                break;
+            }
+        }
+    }
+    let mut out = Vec::with_capacity(cuts.len() + 1);
+    let mut from = 0;
+    for at in cuts {
+        out.push(stmt[from..at].trim());
+        from = at;
+    }
+    out.push(stmt[from..].trim());
+    out.retain(|s| !s.is_empty());
+    if out.is_empty() {
+        out.push(stmt);
+    }
+    out
+}
+
 /// How a statement failed for want of a database — see [`no_database_failure`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NoDatabaseFailure {
@@ -1834,6 +2245,13 @@ pub fn no_database_failure(message: &str, dialect: SqlDialect) -> Option<NoDatab
             && message.contains("\" does not exist"))
         .then_some(NoDatabaseFailure::RanElsewhere),
         SqlDialect::Sqlite => None,
+        // SQL Server never refuses either: an unscoped connection is in the
+        // login's default database, and the failure is error 208 there. The
+        // text is the server's, in English unless the login's language says
+        // otherwise, which only loses the hint.
+        SqlDialect::MsSql => message
+            .contains("Invalid object name '")
+            .then_some(NoDatabaseFailure::RanElsewhere),
     }
 }
 
@@ -2078,6 +2496,54 @@ fn deny_keywords_for(dialect: SqlDialect) -> &'static [&'static str] {
             "VACUUM",
             "REINDEX",
         ],
+        // T-SQL's own. Its statements need no `;` between them, so each of
+        // these may follow a `SELECT` as a second statement, and the scan over
+        // every word is what finds it there. `EXEC` is `EXECUTE`'s short form,
+        // and a procedure can do anything — `xp_cmdshell` included. `INTO` is
+        // `SELECT … INTO`, which creates a table. `BEGIN` opens a transaction
+        // or a Service Broker dialog. `OPENROWSET(BULK …)` reads a file on the
+        // server; `OPENQUERY`/`OPENDATASOURCE` send text to another server,
+        // which this gate cannot read. `WHILE` and `GOTO` are T-SQL's
+        // `BENCHMARK`: a loop writes nothing and runs until it is stopped. The
+        // table hints are named as locks by [`locking_clause`].
+        SqlDialect::MsSql => &[
+            "EXEC",
+            "DECLARE",
+            "WAITFOR",
+            "WHILE",
+            "GOTO",
+            "BACKUP",
+            "RESTORE",
+            "DBCC",
+            "BULK",
+            "OPENROWSET",
+            "OPENQUERY",
+            "OPENDATASOURCE",
+            "RECONFIGURE",
+            "DENY",
+            "REVERT",
+            "BEGIN",
+            "RECEIVE",
+            "CONVERSATION",
+            "INTO",
+            "THROW",
+            "RAISERROR",
+            "CHECKPOINT",
+            "SETUSER",
+            "UPDATETEXT",
+            "WRITETEXT",
+            "ENABLE",
+            "DISABLE",
+            "OPEN",
+            "CLOSE",
+            "UPDLOCK",
+            "XLOCK",
+            "TABLOCK",
+            "TABLOCKX",
+            "HOLDLOCK",
+            "SERIALIZABLE",
+            "REPEATABLEREAD",
+        ],
     }
 }
 
@@ -2098,11 +2564,57 @@ fn is_denied(word: &str, dialect: SqlDialect) -> bool {
 /// sleeps, advisory locks, replication slots, statistics resets, the functions
 /// that evaluate SQL text — failed open with every release and every extension,
 /// and could not speak about a function the database's own owner had written.
-fn read_function_allowlist(dialect: SqlDialect) -> Option<&'static [&'static str]> {
+///
+/// **SQL Server is the second such engine.** Its builtins are closed, but a
+/// user-defined function may call an extended stored procedure, and a CLR
+/// function may do whatever its assembly is permitted to — so a name the text
+/// gate cannot vouch for is refused there too.
+fn read_call_policy(dialect: SqlDialect) -> Option<CallPolicy> {
     match dialect {
-        SqlDialect::Postgres => Some(PG_READ_FUNCTIONS),
+        SqlDialect::Postgres => Some(CallPolicy {
+            functions: PG_READ_FUNCTIONS,
+            catalog_functions: PG_READ_FUNCTIONS,
+            catalog: "pg_catalog",
+            paren_keywords: PG_PAREN_KEYWORDS,
+            double_colon_is_cast: true,
+            quoted_names_a_builtin: true,
+        }),
+        SqlDialect::MsSql => Some(CallPolicy {
+            functions: MSSQL_READ_FUNCTIONS,
+            catalog_functions: MSSQL_SYS_READ_FUNCTIONS,
+            catalog: "sys",
+            paren_keywords: MSSQL_PAREN_KEYWORDS,
+            double_colon_is_cast: false,
+            quoted_names_a_builtin: false,
+        }),
         SqlDialect::MySql | SqlDialect::Sqlite => None,
     }
+}
+
+/// How [`unlisted_call`] reads one dialect's calls.
+struct CallPolicy {
+    /// The functions known only to read, lower-case, as an unqualified call
+    /// names them.
+    functions: &'static [&'static str],
+    /// The same, as a call qualified with [`Self::catalog`] names them. One
+    /// list on PostgreSQL, where `pg_catalog.lower` is `lower`. Two on SQL
+    /// Server, whose builtins take no schema and whose `sys` functions must
+    /// be named with one — so an owner's `dbo.fn_my_permissions` is not
+    /// vouched for by the system function it shares a name with.
+    catalog_functions: &'static [&'static str],
+    /// The one schema a qualified call may name and still be listed — the
+    /// system's own. Any other is whatever the owner defined under the name.
+    catalog: &'static str,
+    /// Words that cannot name a function, standing before a `(` that is the
+    /// grammar's rather than a call's.
+    paren_keywords: &'static [&'static str],
+    /// Is `::` a cast, so the name after it a type? PostgreSQL's reading. On
+    /// SQL Server `Type::Method(…)` calls a static method of a CLR type, which
+    /// is a call like any other.
+    double_colon_is_cast: bool,
+    /// Can a quoted name call a builtin? PostgreSQL resolves one against the
+    /// stored lower-case name; SQL Server resolves one as a user-defined object.
+    quoted_names_a_builtin: bool,
 }
 
 /// PostgreSQL builtins known to only read, lower-case as `pg_catalog` stores
@@ -2663,7 +3175,7 @@ const PG_READ_FUNCTIONS: &[&str] = &[
 /// a word that can also name one — the unreserved `EXPLAIN`, the
 /// `type_func_name` keywords `JOIN`, `ILIKE`, `SIMILAR`, `LEFT` — is not here:
 /// a builtin of that name belongs in [`PG_READ_FUNCTIONS`], and the rest are
-/// grammar only where [`pg_paren_is_grammar`] finds them in place, since an
+/// grammar only where [`paren_is_grammar`] finds them in place, since an
 /// owner's `join(1)` is a call like any other.
 /// `no_word_skipped_before_a_paren_names_an_unlisted_builtin` holds the builtin
 /// half of that line; the keyword categories are PostgreSQL's appendix C.
@@ -2707,6 +3219,335 @@ const PG_PAREN_KEYWORDS: &[&str] = &[
     "VARIADIC",
     "WHEN",
     "WHERE",
+];
+
+/// SQL Server builtins known to only read, lower-case, as an unqualified call
+/// names them.
+///
+/// **What earns a place** is the same test as [`PG_READ_FUNCTIONS`]: every
+/// form reads — no file, no wait, no session state beyond the statement, no
+/// sequence, no SQL text evaluated. So `OPENROWSET`, `OPENQUERY` and
+/// `OPENDATASOURCE` are absent (and deny-listed besides). `NEWID` makes a
+/// value and changes nothing, so it is here; `RAND` with a seed reseeds the
+/// connection's generator, and the connection ends with the query, so it is
+/// here too.
+///
+/// A few entries are grammar rather than functions — a type written with its
+/// length where `CONVERT` takes one (`nvarchar(20)`), and `FOR XML`/`FOR JSON`'s
+/// `PATH`, `RAW` and `ROOT` — and are here because they sit before a `(`
+/// exactly as a call does.
+///
+/// **Checked against SQL Server 2022 (16.0.4295).** It publishes no catalogue
+/// of its builtins, so each name was called with no arguments: a name that is
+/// not a builtin answers error 195 (*"is not a recognized built-in function
+/// name"*), and every entry here answered something else — an argument count,
+/// a missing `OVER`, the syntax a special form needs — except the three rowset
+/// functions (`OPENJSON`, `STRING_SPLIT`, `GENERATE_SERIES`), which were run
+/// in a `FROM`, and the grammar entries, which were run in place.
+const MSSQL_READ_FUNCTIONS: &[&str] = &[
+    // Aggregates.
+    "avg",
+    "checksum_agg",
+    "count",
+    "count_big",
+    "grouping",
+    "grouping_id",
+    "max",
+    "min",
+    "stdev",
+    "stdevp",
+    "string_agg",
+    "sum",
+    "var",
+    "varp",
+    "approx_count_distinct",
+    "approx_percentile_cont",
+    "approx_percentile_disc",
+    // Ranking and analytic.
+    "row_number",
+    "rank",
+    "dense_rank",
+    "ntile",
+    "cume_dist",
+    "percent_rank",
+    "first_value",
+    "last_value",
+    "lag",
+    "lead",
+    "percentile_cont",
+    "percentile_disc",
+    // Strings.
+    "ascii",
+    "char",
+    "charindex",
+    "concat",
+    "concat_ws",
+    "datalength",
+    "difference",
+    "format",
+    "left",
+    "len",
+    "lower",
+    "ltrim",
+    "nchar",
+    "patindex",
+    "quotename",
+    "replace",
+    "replicate",
+    "reverse",
+    "right",
+    "rtrim",
+    "soundex",
+    "space",
+    "str",
+    "string_escape",
+    "string_split",
+    "stuff",
+    "substring",
+    "translate",
+    "trim",
+    "unicode",
+    "upper",
+    // Mathematics.
+    "abs",
+    "acos",
+    "asin",
+    "atan",
+    "atn2",
+    "ceiling",
+    "cos",
+    "cot",
+    "degrees",
+    "exp",
+    "floor",
+    "greatest",
+    "least",
+    "log",
+    "log10",
+    "pi",
+    "power",
+    "radians",
+    "rand",
+    "round",
+    "sign",
+    "sin",
+    "sqrt",
+    "square",
+    "tan",
+    // Dates and times.
+    "dateadd",
+    "date_bucket",
+    "datediff",
+    "datediff_big",
+    "datefromparts",
+    "datename",
+    "datepart",
+    "datetrunc",
+    "datetime2fromparts",
+    "datetimefromparts",
+    "datetimeoffsetfromparts",
+    "day",
+    "eomonth",
+    "getdate",
+    "getutcdate",
+    "isdate",
+    "month",
+    "smalldatetimefromparts",
+    "switchoffset",
+    "sysdatetime",
+    "sysdatetimeoffset",
+    "sysutcdatetime",
+    "timefromparts",
+    "todatetimeoffset",
+    "year",
+    // Conversion and logic.
+    "cast",
+    "convert",
+    "parse",
+    "try_cast",
+    "try_convert",
+    "try_parse",
+    "choose",
+    "coalesce",
+    "iif",
+    "isnull",
+    "isnumeric",
+    "nullif",
+    // JSON. `JSON_MODIFY` returns a modified *copy* of its argument.
+    "isjson",
+    "json_array",
+    "json_modify",
+    "json_object",
+    "json_path_exists",
+    "json_query",
+    "json_value",
+    "openjson",
+    // Bits, hashing, compression and generated values.
+    "binary_checksum",
+    "bit_count",
+    "checksum",
+    "compress",
+    "decompress",
+    "get_bit",
+    "hashbytes",
+    "left_shift",
+    "newid",
+    "right_shift",
+    "set_bit",
+    // Full-text predicates and the rowsets beside them.
+    "contains",
+    "containstable",
+    "freetext",
+    "freetexttable",
+    // Rowset builders over their own arguments.
+    "generate_series",
+    // Metadata: names, ids and properties of the catalogue and the session.
+    "app_name",
+    "col_length",
+    "col_name",
+    "collationproperty",
+    "columnproperty",
+    "connectionproperty",
+    "databasepropertyex",
+    "db_id",
+    "db_name",
+    "file_id",
+    "file_idex",
+    "file_name",
+    "filegroup_id",
+    "filegroup_name",
+    "filegroupproperty",
+    "fileproperty",
+    "has_perms_by_name",
+    "host_id",
+    "host_name",
+    "ident_current",
+    "ident_incr",
+    "ident_seed",
+    "index_col",
+    "indexkey_property",
+    "indexproperty",
+    "is_member",
+    "is_rolemember",
+    "is_srvrolemember",
+    "object_definition",
+    "object_id",
+    "object_name",
+    "object_schema_name",
+    "objectproperty",
+    "objectpropertyex",
+    "original_db_name",
+    "parsename",
+    "schema_id",
+    "schema_name",
+    "scope_identity",
+    "serverproperty",
+    "session_context",
+    "sql_variant_property",
+    "stats_date",
+    "suser_id",
+    "suser_name",
+    "suser_sid",
+    "suser_sname",
+    "type_id",
+    "type_name",
+    "typeproperty",
+    "user_id",
+    "user_name",
+    "xact_state",
+    // Grammar: a type's length where `CONVERT` takes the type, and `FOR XML`/
+    // `FOR JSON` options.
+    "binary",
+    "datetime2",
+    "datetimeoffset",
+    "decimal",
+    "float",
+    "numeric",
+    "nvarchar",
+    "time",
+    "varbinary",
+    "varchar",
+    "path",
+    "raw",
+    "root",
+];
+
+/// [`MSSQL_READ_FUNCTIONS`], for the live tier's oracle in `schemaic-db`,
+/// which asks a real server whether every name is a builtin. Public rather
+/// than copied there, so the test reads the list the gate reads.
+pub fn mssql_read_functions_for_test() -> &'static [&'static str] {
+    MSSQL_READ_FUNCTIONS
+}
+
+/// [`MSSQL_SYS_READ_FUNCTIONS`], for the same oracle.
+pub fn mssql_sys_read_functions_for_test() -> &'static [&'static str] {
+    MSSQL_SYS_READ_FUNCTIONS
+}
+
+/// SQL Server's `sys` functions known to only read, as `sys.<name>(…)` calls
+/// them — and only so qualified: see [`CallPolicy::catalog_functions`]. The
+/// file readers (`fn_get_audit_file`, `fn_xe_file_target_read_file`,
+/// `fn_trace_gettable`) and the log reader (`fn_dblog`) are absent on purpose.
+const MSSQL_SYS_READ_FUNCTIONS: &[&str] = &[
+    "dm_db_index_physical_stats",
+    "dm_db_stats_properties",
+    "dm_exec_cursors",
+    "dm_exec_plan_attributes",
+    "dm_exec_query_plan",
+    "dm_exec_sql_text",
+    "dm_exec_text_query_plan",
+    "dm_sql_referenced_entities",
+    "dm_sql_referencing_entities",
+    "fn_builtin_permissions",
+    "fn_helpcollations",
+    "fn_listextendedproperty",
+    "fn_my_permissions",
+];
+
+/// Words T-SQL's grammar puts before a `(` that is not a call's — its reserved
+/// keywords, which can never name a function. `LEFT` and `RIGHT` are absent
+/// because they are also string functions (listed above); a `LEFT JOIN (` is
+/// found by [`paren_is_grammar`]'s `JOIN` rule instead.
+const MSSQL_PAREN_KEYWORDS: &[&str] = &[
+    "ALL",
+    "AND",
+    "ANY",
+    "APPLY",
+    "AS",
+    "BETWEEN",
+    "CASE",
+    "DISTINCT",
+    "ELSE",
+    "EXCEPT",
+    "EXISTS",
+    "FROM",
+    "HAVING",
+    "IN",
+    // The table hint `WITH (INDEX(ix))`.
+    "INDEX",
+    "INTERSECT",
+    "IS",
+    "JOIN",
+    "LIKE",
+    "NOT",
+    "ON",
+    "OPTION",
+    "OR",
+    "OVER",
+    "PIVOT",
+    "SELECT",
+    "SOME",
+    // `TABLESAMPLE (10 PERCENT)`, which takes no method name as PostgreSQL's
+    // does.
+    "TABLESAMPLE",
+    "THEN",
+    "TOP",
+    "UNION",
+    "UNPIVOT",
+    "VALUES",
+    "WHEN",
+    "WHERE",
+    "WITH",
 ];
 
 /// One code token of a statement, for [`unlisted_call`]: what the word scan
@@ -2858,7 +3699,11 @@ fn cte_column_list_names(t: &[CallTok]) -> Vec<usize> {
 /// keywords only where they stand — `BY` after `ORDER`, `EXPLAIN` at the head,
 /// `JOIN (` before a relation — so asking the word alone would have let a
 /// function of that name through everywhere else.
-fn pg_paren_is_grammar(t: &[CallTok], k: usize) -> bool {
+///
+/// SQL Server reads through the same positions with its own keyword list
+/// ([`CallPolicy::paren_keywords`]), and with `::` a method call rather than a
+/// cast. `GROUP` after `WITHIN` is an ordered aggregate's clause.
+fn paren_is_grammar(t: &[CallTok], k: usize, policy: &CallPolicy) -> bool {
     if t[k].is_word("OPERATOR") {
         return false;
     }
@@ -2871,7 +3716,9 @@ fn pg_paren_is_grammar(t: &[CallTok], k: usize) -> bool {
             prev,
             Some(CallTok::Punct(b')' | b']') | CallTok::Other | CallTok::Quoted(_))
         )
-        || (prev == Some(&CallTok::Punct(b':')) && prev2 == Some(&CallTok::Punct(b':')))
+        || (policy.double_colon_is_cast
+            && prev == Some(&CallTok::Punct(b':'))
+            && prev2 == Some(&CallTok::Punct(b':')))
     {
         return true;
     }
@@ -2879,9 +3726,10 @@ fn pg_paren_is_grammar(t: &[CallTok], k: usize) -> bool {
         return false;
     };
     let w = w.to_ascii_uppercase();
-    PG_PAREN_KEYWORDS.contains(&w.as_str())
+    policy.paren_keywords.contains(&w.as_str())
         || match w.as_str() {
             "BY" => after("ORDER") || after("GROUP") || after("PARTITION"),
+            "GROUP" => after("WITHIN"),
             "SETS" => after("GROUPING"),
             "VARYING" => after("CHARACTER") || after("CHAR") || after("BIT"),
             "FIRST" | "NEXT" => after("FETCH"),
@@ -2956,14 +3804,20 @@ fn opens_a_relation(t: &[CallTok], open: usize) -> bool {
 /// replaced. The parser is also not PostgreSQL's: a statement it rejects would
 /// be refused outright, and one it reads differently from the server is the
 /// disagreement every text gate here has been bypassed through.
-fn unlisted_call(sql: &str, dialect: SqlDialect, allowed: &[&str]) -> Option<String> {
+///
+/// **A quoted name is never a SQL Server builtin.** T-SQL resolves `[len](x)`
+/// as a user-defined object, not as `LEN`, so on that dialect a quoted call is
+/// refused whatever it spells; PostgreSQL resolves a quoted name against the
+/// stored lower-case `proname`, and compares it as written.
+fn unlisted_call(sql: &str, dialect: SqlDialect, policy: &CallPolicy) -> Option<String> {
     let t = call_tokens(sql, dialect);
     let ctes = cte_column_list_names(&t);
-    let listed = |tok: &CallTok| match tok {
+    let listed_in = |allowed: &[&str], tok: &CallTok| match tok {
         CallTok::Word(w) => allowed.contains(&w.to_ascii_lowercase().as_str()),
-        CallTok::Quoted(q) => allowed.contains(&q.as_str()),
+        CallTok::Quoted(q) => policy.quoted_names_a_builtin && allowed.contains(&q.as_str()),
         _ => false,
     };
+    let listed = |tok: &CallTok| listed_in(policy.functions, tok);
     let shown = |tok: &CallTok| match tok {
         CallTok::Word(w) => w.to_string(),
         CallTok::Quoted(q) => format!("\"{q}\""),
@@ -2986,17 +3840,21 @@ fn unlisted_call(sql: &str, dialect: SqlDialect, allowed: &[&str]) -> Option<Str
             continue;
         }
         if dotted && let Some(schema) = before_dot.filter(|q| q.is_name()) {
+            // A quoted schema keeps its case on PostgreSQL; on SQL Server the
+            // catalog's name is compared as the server's collation would,
+            // case-insensitively.
             let in_catalog = match schema {
-                CallTok::Word(w) => w.eq_ignore_ascii_case("pg_catalog"),
-                CallTok::Quoted(q) => q == "pg_catalog",
+                CallTok::Word(w) => w.eq_ignore_ascii_case(policy.catalog),
+                CallTok::Quoted(q) if policy.quoted_names_a_builtin => q == policy.catalog,
+                CallTok::Quoted(q) => q.eq_ignore_ascii_case(policy.catalog),
                 _ => false,
             };
-            if !in_catalog || !listed(&t[k]) {
+            if !in_catalog || !listed_in(policy.catalog_functions, &t[k]) {
                 return Some(format!("{}.{}", shown(schema), shown(&t[k])));
             }
             continue;
         }
-        if ctes.contains(&k) || (!dotted && pg_paren_is_grammar(&t, k)) || listed(&t[k]) {
+        if ctes.contains(&k) || (!dotted && paren_is_grammar(&t, k, policy)) || listed(&t[k]) {
             continue;
         }
         return Some(shown(&t[k]));
@@ -3131,6 +3989,8 @@ pub fn read_only_heads(dialect: SqlDialect) -> &'static [&'static str] {
         SqlDialect::MySql => &["SELECT", "SHOW", "DESCRIBE", "DESC", "EXPLAIN", "WITH"],
         SqlDialect::Postgres => &["SELECT", "SHOW", "EXPLAIN", "WITH"],
         SqlDialect::Sqlite => &["SELECT", "EXPLAIN", "WITH"],
+        // No `EXPLAIN`: a T-SQL plan is `SET SHOWPLAN_XML ON`, session state.
+        SqlDialect::MsSql => &["SELECT", "WITH"],
     }
 }
 
@@ -3192,10 +4052,16 @@ pub fn read_only_refusal(sql: &str, dialect: SqlDialect) -> Result<(), ReadRefus
             WRITE_KEYWORDS.contains(&words[k].as_str()),
         );
     }
+    if advances_a_sequence(&words) {
+        return refuse(
+            "`NEXT VALUE FOR` advances a sequence, which a read-only query does not".to_string(),
+            true,
+        );
+    }
     // After a write, so a deleting CTE is still named as the `DELETE`; before a
     // lock, whose "drop the clause" retry this would refuse again.
-    if let Some(allowed) = read_function_allowlist(dialect)
-        && let Some(name) = unlisted_call(sql, dialect, allowed)
+    if let Some(policy) = read_call_policy(dialect)
+        && let Some(name) = unlisted_call(sql, dialect, &policy)
     {
         return refuse(
             format!(
@@ -3256,8 +4122,32 @@ fn locking_clause(words: &[String], k: usize) -> Option<&'static str> {
         "LOCK" if (after(1), after(2), after(3)) == (Some("IN"), Some("SHARE"), Some("MODE")) => {
             Some("LOCK IN SHARE MODE")
         }
+        // SQL Server's table hints. Only ever deny-listed on that dialect, so
+        // on the others these words never reach here.
+        "UPDLOCK" => Some("UPDLOCK"),
+        "XLOCK" => Some("XLOCK"),
+        "TABLOCK" => Some("TABLOCK"),
+        "TABLOCKX" => Some("TABLOCKX"),
+        "HOLDLOCK" => Some("HOLDLOCK"),
+        "SERIALIZABLE" => Some("SERIALIZABLE"),
+        "REPEATABLEREAD" => Some("REPEATABLEREAD"),
         _ => None,
     }
+}
+
+/// Does the statement advance a sequence with `NEXT VALUE FOR` — SQL Server's
+/// spelling and MariaDB's, and the standard's — which no rollback undoes? A
+/// phrase rather than a denied word, because `value` and `next` are both
+/// ordinary column names.
+///
+/// **Every dialect**, because the question is the phrase's: MariaDB 10.3+
+/// takes it too, so `SELECT NEXT VALUE FOR s` passed the gate there as a read.
+/// On an engine without it the phrase is a syntax error, and refusing that is
+/// the safe direction.
+fn advances_a_sequence(words: &[String]) -> bool {
+    words
+        .windows(3)
+        .any(|w| w[0] == "NEXT" && w[1] == "VALUE" && w[2] == "FOR")
 }
 
 /// The `sql_mode` names under which a MySQL/MariaDB server reads a quote
@@ -3370,10 +4260,82 @@ pub fn contains_write(sql: &str, dialect: SqlDialect) -> bool {
                 if words.iter().any(|w| WRITE_KEYWORDS.contains(&w.as_str())) {
                     return true;
                 }
+                if words
+                    .iter()
+                    .any(|w| unterminated_write_words(dialect).contains(&w.as_str()))
+                    || advances_a_sequence(&words)
+                {
+                    return true;
+                }
             }
         }
     }
     false
+}
+
+/// The words that make a statement a write **anywhere** in it on an engine
+/// whose statements need no `;` between them — SQL Server's.
+///
+/// There, the text after a `SELECT` can be a second statement, so a head test
+/// cannot see it: `SELECT 1 COMMIT EXEC('DELETE FROM t')` read as one read,
+/// and on a read-only connection its `COMMIT` ended the rollback-only
+/// transaction the session is guarded by (`db::mssql::fetch_query`) and the
+/// procedure's writes stuck. So every word that begins a statement other than
+/// a read, or does something a rollback cannot undo, counts wherever it
+/// stands. Over-blocking a column of that name is the safe direction on a
+/// connection the user marked read-only.
+fn unterminated_write_words(dialect: SqlDialect) -> &'static [&'static str] {
+    if !dialect.batch_separator() {
+        return &[];
+    }
+    &[
+        "EXEC",
+        "EXECUTE",
+        "COMMIT",
+        "ROLLBACK",
+        "SAVE",
+        "BEGIN",
+        "SET",
+        "DECLARE",
+        "USE",
+        "DENY",
+        "BACKUP",
+        "RESTORE",
+        "DBCC",
+        "BULK",
+        "KILL",
+        "RECONFIGURE",
+        "SHUTDOWN",
+        "OPENROWSET",
+        "OPENQUERY",
+        "OPENDATASOURCE",
+        "INTO",
+        "UPDATETEXT",
+        "WRITETEXT",
+        "ENABLE",
+        "DISABLE",
+        "RECEIVE",
+        "CONVERSATION",
+        "CHECKPOINT",
+        "SETUSER",
+        "REVERT",
+    ]
+}
+
+/// `SELECT {projection} FROM {rest}` capped at `limit` rows, in `dialect` —
+/// **the** spelling of a generated row cap.
+///
+/// `rest` is everything after `FROM`: the table, and any `WHERE`/`ORDER BY`.
+/// Three engines write the cap as a trailing `LIMIT n`; T-SQL has no `LIMIT`
+/// and writes `TOP (n)` after `SELECT`. The generators each wrote the
+/// trailing form into a `format!`, which is a comparison no census finds.
+pub fn limited_select(dialect: SqlDialect, projection: &str, rest: &str, limit: usize) -> String {
+    match dialect {
+        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => {
+            format!("SELECT {projection} FROM {rest} LIMIT {limit}")
+        }
+        SqlDialect::MsSql => format!("SELECT TOP ({limit}) {projection} FROM {rest}"),
+    }
 }
 
 /// Does any statement here carry a **credential in its text** — the class the
@@ -3555,11 +4517,8 @@ mod tests {
     use super::*;
     use crate::intel::SqlDialect;
 
-    /// Every engine this build ships. A test whose expected answer does not
-    /// depend on the dialect should loop over this rather than pick one, so a
-    /// fourth engine is added to the suite by adding it here.
-    const EVERY_DIALECT: [SqlDialect; 3] =
-        [SqlDialect::MySql, SqlDialect::Postgres, SqlDialect::Sqlite];
+    /// Every engine this build ships — see [`SqlDialect::ALL`].
+    const EVERY_DIALECT: [SqlDialect; 4] = SqlDialect::ALL;
 
     /// **The test A2-L3-01 names, and it could not be compiled before.**
     ///
@@ -3971,13 +4930,155 @@ mod tests {
         assert_eq!(&sql[r[0].0..r[0].1], "SELECT * FROM [my; tbl];");
     }
 
-    /// Brackets are SQLite's alone: on the other engines `[` is ordinary code, so
-    /// the same text splits where its semicolons are.
+    /// Brackets are SQLite's and SQL Server's: on the other engines `[` is
+    /// ordinary code, so the same text splits where its semicolons are.
     #[test]
     fn brackets_are_not_identifiers_on_the_other_engines() {
         let sql = "SELECT * FROM [my; tbl]; SELECT 2;";
         assert_eq!(super::statement_ranges(sql, SqlDialect::MySql).len(), 3);
         assert_eq!(super::statement_ranges(sql, SqlDialect::Postgres).len(), 3);
+        assert_eq!(super::statement_ranges(sql, SqlDialect::MsSql).len(), 2);
+    }
+
+    /// **T-SQL escapes `]` inside a bracketed name by doubling it**, where
+    /// SQLite has no escape at all. Ending the span at the first `]` would read
+    /// `[a]]; DROP TABLE t; --]` as a name, then a real `DROP`, where SQL
+    /// Server sees one identifier — or, the other way round, hide a statement
+    /// the server runs.
+    #[test]
+    fn a_doubled_bracket_stays_inside_a_sql_server_name() {
+        let s = b"[a]]b] x";
+        assert_eq!(super::skip_noncode(s, 0, SqlDialect::MsSql), Some(6));
+        assert_eq!(super::skip_noncode(s, 0, SqlDialect::Sqlite), Some(3));
+        let sql = "SELECT [a]]; DROP TABLE t; --] FROM t; SELECT 2";
+        let r = super::statement_ranges(sql, SqlDialect::MsSql);
+        assert_eq!(r.len(), 2, "{r:?}");
+        assert_eq!(
+            super::ident_at("[a]]b]", 0, SqlDialect::MsSql).0.as_deref(),
+            Some("a]b")
+        );
+    }
+
+    /// **A read-only SQL Server connection cannot be written through a
+    /// statement that needs no `;`.** `contains_write` split at `;` and knew
+    /// neither `COMMIT` nor `EXEC`, so `SELECT 1 COMMIT EXEC('DELETE …')` was a
+    /// read: the `COMMIT` ended the guard's own transaction and the procedure's
+    /// writes stuck.
+    #[test]
+    fn a_sql_server_write_hidden_behind_a_read_is_still_a_write() {
+        let ms = SqlDialect::MsSql;
+        for sql in [
+            "SELECT 1 COMMIT EXEC('DELETE FROM t')",
+            "SELECT 1 EXEC sp_executesql N'DELETE FROM t'",
+            "SELECT 1 EXECUTE dbo.purge",
+            "SELECT 1 ROLLBACK",
+            "SELECT * INTO copy FROM t",
+            "SELECT NEXT VALUE FOR s",
+            "SELECT 1 DECLARE @x int SET @x = 1",
+            "SELECT 1 DBCC FREEPROCCACHE",
+            "SELECT * FROM OPENQUERY(srv, 'DELETE FROM t')",
+        ] {
+            assert!(super::contains_write(sql, ms), "{sql}");
+        }
+        // Reads stay reads.
+        for sql in [
+            "SELECT a FROM t WHERE a = N'EXEC'",
+            "SELECT TOP (5) [commit] FROM t",
+            "WITH c AS (SELECT 1 AS a) SELECT * FROM c",
+        ] {
+            assert!(!super::contains_write(sql, ms), "{sql}");
+        }
+    }
+
+    #[test]
+    fn a_row_cap_is_a_trailing_limit_except_on_sql_server() {
+        for d in [SqlDialect::MySql, SqlDialect::Postgres, SqlDialect::Sqlite] {
+            assert_eq!(
+                super::limited_select(d, "*", "t ORDER BY id", 5),
+                "SELECT * FROM t ORDER BY id LIMIT 5"
+            );
+        }
+        assert_eq!(
+            super::limited_select(SqlDialect::MsSql, "*", "t ORDER BY id", 5),
+            "SELECT TOP (5) * FROM t ORDER BY id"
+        );
+    }
+
+    /// **`GO` is the client's batch separator**, like MySQL's `DELIMITER`: SQL
+    /// Server has never heard of it, so it ends a statement and is not sent.
+    #[test]
+    fn a_go_line_ends_a_sql_server_batch_and_is_not_sent() {
+        let d = SqlDialect::MsSql;
+        let sql = "SELECT 1\nGO\nSELECT 2\ngo 3\nSELECT 3";
+        assert_eq!(
+            super::executable_statements(sql, d),
+            vec!["SELECT 1", "SELECT 2", "SELECT 3"]
+        );
+        assert_eq!(super::statement_ranges(sql, d).len(), 3);
+        // Only a line of its own: a column called `go`, and `GO` in a string or
+        // comment, are data.
+        let data = "SELECT go FROM t\nSELECT 'x\nGO\n' /*\nGO\n*/";
+        assert_eq!(super::executable_statements(data, d).len(), 1);
+        // A `GO` after a trailing comment on the line is still the separator.
+        assert_eq!(
+            super::executable_statements("SELECT 1\nGO -- next\nSELECT 2", d).len(),
+            2
+        );
+        // Not a directive on any other engine.
+        assert_eq!(
+            super::executable_statements(sql, SqlDialect::Postgres).len(),
+            1
+        );
+    }
+
+    /// **A routine body holds its own `;`s and runs to the end of the batch.**
+    /// `CREATE PROCEDURE … AS BEGIN …; …; END` cut at its semicolons is a
+    /// procedure that stops at its first statement and a stray `END`.
+    #[test]
+    fn a_sql_server_routine_body_is_not_cut_at_its_semicolons() {
+        let d = SqlDialect::MsSql;
+        let sql = "CREATE PROCEDURE p AS BEGIN SELECT 1; SELECT 2; END;\nGO\nSELECT 3; SELECT 4";
+        let stmts = super::executable_statements(sql, d);
+        assert_eq!(stmts.len(), 3, "{stmts:?}");
+        assert!(stmts[0].ends_with("END;"), "{}", stmts[0]);
+        for head in [
+            "CREATE OR ALTER PROCEDURE p AS SELECT 1; SELECT 2",
+            "ALTER PROC p AS SELECT 1; SELECT 2",
+            "CREATE FUNCTION f() RETURNS INT AS BEGIN DECLARE @x INT; RETURN 1; END",
+            "CREATE TRIGGER tr ON t AFTER INSERT AS SELECT 1; SELECT 2",
+        ] {
+            assert_eq!(super::executable_statements(head, d).len(), 1, "{head}");
+        }
+        // A view is one `SELECT`, and a table is not a body.
+        assert_eq!(
+            super::executable_statements("CREATE TABLE t (a INT); SELECT 1", d).len(),
+            2
+        );
+        // The chunked scanner agrees, cut anywhere.
+        for chunk in [1, 3, 7, 64] {
+            assert_eq!(chunked(sql, d, chunk).len(), 3, "chunk {chunk}");
+        }
+    }
+
+    /// SQL Server's lexical rules otherwise: standard `--` comments, no `#`
+    /// comment (`#t` is a temporary table), no backslash escape, `"…"` spans a
+    /// name, no backticks, no dollar quotes.
+    #[test]
+    fn sql_server_lexes_by_its_own_rules() {
+        let d = SqlDialect::MsSql;
+        assert_eq!(super::skip_noncode(b"--x\ny", 0, d), Some(3));
+        assert_eq!(super::skip_noncode(b"1--2", 1, d), Some(4));
+        assert_eq!(super::skip_noncode(b"#t", 0, d), None);
+        assert_eq!(super::skip_noncode(br"'C:\' x", 0, d), Some(5));
+        assert_eq!(super::skip_noncode(br#""a""b" x"#, 0, d), Some(6));
+        assert_eq!(super::skip_noncode(b"`a` x", 0, d), None);
+        assert_eq!(super::skip_noncode(b"$a$ x $a$", 0, d), None);
+        // `N'…'` is a word and a string, and the string is what is skipped.
+        assert_eq!(super::skip_noncode(b"N'a;b'", 1, d), Some(6));
+        assert_eq!(
+            super::statement_ranges("SELECT N'a;b'; SELECT 2", d).len(),
+            2
+        );
     }
 
     /// `$` is a parameter sigil in SQLite, not a dollar-quote: `$tag$` must stay
@@ -5096,6 +6197,13 @@ mod tests {
         assert!(super::contains_write(hidden, pg));
         // An unterminated nest runs to the end, as an unterminated comment does.
         assert_eq!(super::leading_keyword("/* /* */ DELETE FROM t", pg), None);
+        // SQL Server nests them too.
+        let ms = SqlDialect::MsSql;
+        assert_eq!(
+            super::leading_keyword(nested, ms).as_deref(),
+            Some("DELETE")
+        );
+        assert!(super::contains_write(hidden, ms));
         for d in [SqlDialect::MySql, SqlDialect::Sqlite] {
             assert_eq!(
                 super::leading_keyword(nested, d).as_deref(),
@@ -5876,6 +6984,172 @@ mod tests {
         assert!(gate("DESC t", SqlDialect::MySql).is_ok());
         assert!(gate("DESCRIBE t", SqlDialect::Postgres).is_err());
         assert!(gate("DESCRIBE t", SqlDialect::Sqlite).is_err());
+        // T-SQL has no `EXPLAIN`, `SHOW` or `DESCRIBE`: a plan is asked for
+        // with `SET SHOWPLAN_XML ON`, which is session state.
+        let ms = SqlDialect::MsSql;
+        assert!(gate("SELECT 1", ms).is_ok());
+        assert!(gate("WITH c AS (SELECT 1 AS a) SELECT * FROM c", ms).is_ok());
+        for other in ["EXPLAIN SELECT 1", "SHOW TABLES", "DESCRIBE t"] {
+            assert!(gate(other, ms).is_err(), "{other}");
+        }
+    }
+
+    /// **T-SQL needs no `;` between statements**, so the text after a read
+    /// can be a second statement that writes. The deny list reads every word,
+    /// not just the head, and that is what refuses it.
+    #[test]
+    fn a_sql_server_write_without_a_semicolon_is_still_refused() {
+        use super::read_only_reason as gate;
+        let ms = SqlDialect::MsSql;
+        for sql in [
+            "SELECT 1 DELETE FROM t",
+            "SELECT 1\nUPDATE t SET a = 1",
+            "SELECT 1 INSERT t VALUES (1)",
+            "SELECT 1 DROP TABLE t",
+            "SELECT 1 TRUNCATE TABLE t",
+            "SELECT 1 MERGE t USING s ON 1 = 1 WHEN MATCHED THEN DELETE;",
+        ] {
+            assert!(gate(sql, ms).is_err(), "{sql}");
+        }
+    }
+
+    /// The T-SQL statements and clauses that act with no `INSERT`/`UPDATE`/
+    /// `DELETE` in sight: a procedure call (which can do anything, including
+    /// through `xp_cmdshell`), a sleep, a backup, a server-side file read,
+    /// a table created by `SELECT … INTO`, a sequence advanced, a permission
+    /// denied, a Service Broker message consumed, a transaction opened.
+    #[test]
+    fn the_gate_refuses_sql_servers_own_side_effects() {
+        use super::read_only_reason as gate;
+        let ms = SqlDialect::MsSql;
+        for sql in [
+            "EXEC sp_who",
+            "SELECT 1 EXEC xp_cmdshell 'dir'",
+            "SELECT 1 EXECUTE ('DELETE FROM t')",
+            "SELECT 1 WAITFOR DELAY '00:00:10'",
+            "SELECT 1 BACKUP DATABASE d TO DISK = 'c:\\x.bak'",
+            "SELECT * FROM OPENROWSET(BULK 'C:\\secret.txt', SINGLE_CLOB) AS x",
+            "SELECT * FROM OPENQUERY(linked, 'DELETE FROM t')",
+            "SELECT * FROM OPENDATASOURCE('SQLNCLI', 'x').db.dbo.t",
+            "SELECT * INTO copy_of_t FROM t",
+            "SELECT * INTO #t FROM t",
+            "SELECT NEXT VALUE FOR dbo.seq",
+            "SELECT 1 DENY SELECT ON t TO u",
+            "SELECT 1 DBCC FREEPROCCACHE",
+            "SELECT 1 DECLARE @x INT",
+            "SELECT 1 BEGIN TRAN",
+            "SELECT 1 RECEIVE TOP (1) * FROM q",
+            "SELECT 1 RECONFIGURE",
+            "SELECT 1 CHECKPOINT",
+        ] {
+            assert!(gate(sql, ms).is_err(), "{sql}");
+        }
+    }
+
+    /// **`NEXT VALUE FOR` advances a sequence on MariaDB too**, which the gate
+    /// passed there as a read until SQL Server's arm asked the question.
+    #[test]
+    fn advancing_a_sequence_is_refused_on_every_engine() {
+        for d in EVERY_DIALECT {
+            assert!(
+                super::read_only_reason("SELECT NEXT VALUE FOR s", d).is_err(),
+                "{d:?}"
+            );
+            // A column called `next` or `value` is still a read.
+            assert!(
+                super::read_only_reason("SELECT next, value FROM t", d).is_ok(),
+                "{d:?}"
+            );
+        }
+    }
+
+    /// A table hint that takes an update or exclusive lock, or holds a shared
+    /// one to the end of the transaction, is refused and named as the lock.
+    #[test]
+    fn a_sql_server_locking_hint_is_named_as_a_lock() {
+        use super::read_only_reason as gate;
+        let ms = SqlDialect::MsSql;
+        for hint in ["UPDLOCK", "XLOCK", "TABLOCKX", "HOLDLOCK", "TABLOCK"] {
+            let sql = format!("SELECT * FROM t WITH ({hint})");
+            let err = gate(&sql, ms).expect_err(&sql);
+            assert!(err.contains("lock"), "{sql}: {err}");
+        }
+        // `NOLOCK` takes no lock at all, and `READPAST` skips locked rows.
+        assert!(gate("SELECT * FROM t WITH (NOLOCK)", ms).is_ok());
+        assert!(gate("SELECT * FROM t WITH (READPAST)", ms).is_ok());
+    }
+
+    /// **A function call is answered by an allowlist, as on PostgreSQL.** A
+    /// user-defined function can call an extended stored procedure, and a CLR
+    /// function can do anything its assembly can, so a name that is not a
+    /// known builtin is refused — qualified or not, except in `sys`.
+    #[test]
+    fn a_sql_server_call_must_be_a_known_read_only_builtin() {
+        use super::read_only_reason as gate;
+        let ms = SqlDialect::MsSql;
+        for ok in [
+            "SELECT COUNT(*), SUM(a), MAX(b) FROM t",
+            "SELECT LEN(name), UPPER(name), SUBSTRING(name, 1, 2) FROM t",
+            "SELECT CAST(a AS varchar(10)), CONVERT(nvarchar(20), b, 120) FROM t",
+            "SELECT TRY_CAST(a AS decimal(10, 2)) FROM t",
+            "SELECT GETDATE(), SYSDATETIME(), DATEADD(day, 1, d), DATEDIFF(day, a, b) FROM t",
+            "SELECT ISNULL(a, 0), COALESCE(a, b), IIF(a > 1, 'x', 'y'), NULLIF(a, 0) FROM t",
+            "SELECT ROW_NUMBER() OVER (PARTITION BY a ORDER BY b) FROM t",
+            "SELECT TOP (10) * FROM t WHERE a IN (1, 2) AND EXISTS (SELECT 1)",
+            "SELECT * FROM t ORDER BY a OFFSET 10 ROWS FETCH NEXT 5 ROWS ONLY",
+            "SELECT JSON_VALUE(doc, '$.a'), OBJECT_ID('dbo.t'), DB_NAME() FROM t",
+            "SELECT STRING_AGG(name, ',') WITHIN GROUP (ORDER BY name) FROM t",
+            "SELECT * FROM sys.dm_exec_sessions",
+            "SELECT * FROM sys.fn_helpcollations()",
+            "SELECT * FROM t FOR XML PATH('row'), ROOT('rows')",
+            "SELECT * FROM OPENJSON(@j) WITH (a int '$.a')",
+        ] {
+            assert!(gate(ok, ms).is_ok(), "{ok}: {:?}", gate(ok, ms));
+        }
+        for refused in [
+            "SELECT dbo.my_function(1)",
+            "SELECT * FROM dbo.tvf(1)",
+            "SELECT * FROM tvf(1)",
+            "SELECT [dbo].[f](1)",
+            "SELECT otherdb.dbo.f(1)",
+            "SELECT * FROM sys.fn_get_audit_file('c:\\x', DEFAULT, DEFAULT)",
+            "SELECT * FROM sys.fn_xe_file_target_read_file('c:\\x', NULL, NULL, NULL)",
+            "SELECT geography::Point(1, 2, 4326)",
+        ] {
+            assert!(gate(refused, ms).is_err(), "{refused}");
+        }
+    }
+
+    /// **A reserved word before a `(` is grammar, not a call** — T-SQL cannot
+    /// name a function `INDEX` or `TABLESAMPLE` — so a table hint and a sample
+    /// clause are reads like any other, rather than calls to unlisted
+    /// functions.
+    #[test]
+    fn a_sql_server_hint_or_sample_clause_is_not_a_call() {
+        use super::read_only_reason as gate;
+        let ms = SqlDialect::MsSql;
+        for ok in [
+            "SELECT * FROM t WITH (INDEX(ix_a))",
+            "SELECT * FROM t WITH (NOLOCK, INDEX(0))",
+            "SELECT * FROM t TABLESAMPLE (10 PERCENT)",
+        ] {
+            assert!(gate(ok, ms).is_ok(), "{ok}: {:?}", gate(ok, ms));
+        }
+    }
+
+    /// **A loop is T-SQL's `BENCHMARK`**: it writes nothing and runs until
+    /// someone stops it, which on the unattended paths is nobody.
+    #[test]
+    fn a_sql_server_loop_is_not_a_read() {
+        for sql in [
+            "SELECT 1 WHILE 1 = 1 PRINT 'x'",
+            "SELECT 1 again: PRINT 1 GOTO again",
+        ] {
+            assert!(
+                super::read_only_reason(sql, SqlDialect::MsSql).is_err(),
+                "{sql}"
+            );
+        }
     }
 
     // ── The gate's lexer half, per dialect ───────────────────────────────────
@@ -6442,6 +7716,147 @@ line */",
         }
     }
 
+    /// **SQL Server has PostgreSQL's hazard.** A connection that names no
+    /// database is in the login's default one — `master`, unless someone
+    /// changed it — so an unscoped `CREATE TABLE` builds a table there.
+    #[test]
+    fn a_sql_server_statement_that_would_land_in_master_needs_a_database() {
+        let ms = SqlDialect::MsSql;
+        for sql in [
+            "CREATE TABLE users (id int)",
+            "CREATE INDEX ix ON users (id)",
+            "CREATE SCHEMA sales",
+            "CREATE USER bob FOR LOGIN bob",
+            "INSERT INTO users VALUES (1)",
+            "UPDATE users SET id = 2",
+            "DELETE FROM users",
+            "TRUNCATE TABLE users",
+            "EXEC sp_rename 'a', 'b'",
+        ] {
+            assert!(needs_database(sql, ms), "{sql}");
+        }
+        for sql in [
+            "SELECT name FROM sys.databases",
+            "CREATE DATABASE app",
+            "DROP DATABASE app",
+            "ALTER DATABASE app SET RECOVERY SIMPLE",
+            "CREATE LOGIN bob WITH PASSWORD = 'x'",
+            "USE app",
+            "BEGIN TRAN",
+            "COMMIT",
+            "SET NOCOUNT ON",
+            "DECLARE @x INT",
+        ] {
+            assert!(!needs_database(sql, ms), "{sql}");
+        }
+    }
+
+    /// **T-SQL's `;` is optional, so a harmless head can front a statement
+    /// that is not.** `SET NOCOUNT ON` on the line above a `CREATE TABLE` is how
+    /// a great many scripts begin, and the range's head alone said the table
+    /// could go anywhere — into `master`, on an unscoped tab.
+    #[test]
+    fn a_sql_server_statement_behind_a_harmless_one_still_needs_a_database() {
+        let ms = SqlDialect::MsSql;
+        for sql in [
+            "SET NOCOUNT ON\nCREATE TABLE t (id int)",
+            "DECLARE @x int = 1\nINSERT INTO t VALUES (@x)",
+            "SELECT 1 CREATE TABLE t (id int)",
+            "BEGIN TRAN\nUPDATE t SET a = 1\nCOMMIT",
+            "SELECT * INTO copy_of_t FROM app.dbo.t",
+            "IF OBJECT_ID('t') IS NULL CREATE TABLE t (id int)",
+            "DROP TABLE IF EXISTS t",
+            "WITH c AS (SELECT 1 AS a) INSERT INTO t SELECT a FROM c",
+        ] {
+            assert!(needs_database(sql, ms), "{sql}");
+        }
+        for sql in [
+            // `USE` moves the rest of the batch to the database it names.
+            "USE app\nCREATE TABLE t (id int)",
+            // Server-level: nothing is left behind in the current database.
+            "KILL 55",
+            "BACKUP DATABASE app TO DISK = N'/var/opt/mssql/app.bak'",
+            "RESTORE DATABASE app FROM DISK = N'/var/opt/mssql/app.bak'",
+            "DBCC SQLPERF(LOGSPACE)",
+            "RECONFIGURE",
+            "SET NOCOUNT ON\nSELECT name FROM sys.databases",
+            "IF DB_ID('app') IS NULL CREATE DATABASE app",
+            "DROP DATABASE IF EXISTS app",
+            // A join hint, not a `MERGE`.
+            "SELECT * FROM sys.objects o INNER MERGE JOIN sys.columns c \
+             ON c.object_id = o.object_id",
+        ] {
+            assert!(!needs_database(sql, ms), "{sql}");
+        }
+    }
+
+    /// **The missing-`WHERE` net judges every T-SQL statement in a range**,
+    /// not the range's head: with no `;` between them, a bare `DELETE` on the
+    /// line below a scoped one borrowed the first one's `WHERE`, and ran with
+    /// no confirmation.
+    #[test]
+    fn every_sql_server_statement_in_a_range_is_judged_for_a_missing_where() {
+        let ms = SqlDialect::MsSql;
+        for sql in [
+            "DELETE FROM a WHERE id = 1\nDELETE FROM b",
+            "UPDATE t SET a = 1 WHERE id = 5\nUPDATE t SET b = 2",
+            "SET NOCOUNT ON\nDELETE FROM t",
+            "SET XACT_ABORT ON DELETE FROM t",
+            "UPDATE t SET a = 1 SELECT * FROM t WHERE id = 1",
+            "IF @x = 1 DELETE FROM t",
+            "BEGIN TRAN DELETE FROM t COMMIT",
+            "SELECT 1 TRUNCATE TABLE t",
+            "WITH c AS (SELECT a FROM t) SELECT * FROM c DELETE FROM u",
+            "SELECT 1 DROP TABLE t",
+        ] {
+            assert!(super::first_unsafe(sql, ms).is_some(), "{sql}");
+        }
+        // What is one statement is judged as one — or, as `INSERT INTO t
+        // SELECT`, cut only where neither piece is a statement a guard asks
+        // about.
+        for sql in [
+            "DELETE FROM t WHERE id IN (SELECT id FROM u)",
+            "UPDATE t SET a = CASE WHEN b = 1 THEN 2 END WHERE c = 3",
+            "MERGE t USING s ON t.id = s.id WHEN MATCHED THEN UPDATE SET a = s.a \
+             WHEN NOT MATCHED BY SOURCE THEN DELETE;",
+            "INSERT INTO t SELECT * FROM u",
+            "SELECT a FROM t UNION ALL SELECT a FROM u",
+            "DECLARE c CURSOR FOR SELECT a FROM t FOR UPDATE OF a",
+            "ALTER TABLE t ADD CONSTRAINT fk FOREIGN KEY (a) REFERENCES u (id) \
+             ON DELETE CASCADE ON UPDATE NO ACTION",
+            "CREATE PROCEDURE p AS DELETE FROM t",
+            "GRANT SELECT, UPDATE, DELETE ON t TO u",
+            "DECLARE @delete int SELECT @delete = 1",
+            "DELETE FROM t OUTPUT deleted.id WHERE id = 1",
+            "WITH c AS (SELECT TOP (10) * FROM t ORDER BY id) DELETE FROM c WHERE a = 1",
+        ] {
+            assert_eq!(super::first_unsafe(sql, ms), None, "{sql}");
+        }
+        // The other engines end a statement at `;` alone, as before.
+        assert_eq!(
+            super::first_unsafe(
+                "DELETE FROM a WHERE id = 1\nDELETE FROM b",
+                SqlDialect::MySql
+            ),
+            None
+        );
+    }
+
+    /// And the error it answers with, when it ran in `master` and the table
+    /// was not there, is error 208's.
+    #[test]
+    fn sql_server_says_invalid_object_name_when_it_ran_elsewhere() {
+        let ms = SqlDialect::MsSql;
+        assert_eq!(
+            no_database_failure("query failed: Invalid object name 'company'.", ms),
+            Some(NoDatabaseFailure::RanElsewhere)
+        );
+        assert_eq!(
+            no_database_failure("query failed: Invalid column name 'x'.", ms),
+            None
+        );
+    }
+
     /// MySQL's connection genuinely has no database, and the server says so
     /// (ERROR 1046). Answering first would only add a second voice.
     #[test]
@@ -6850,6 +8265,17 @@ line */",
     #[test]
     fn postgres_has_no_use_statement() {
         assert_eq!(use_target("USE sakila", SqlDialect::Postgres), None);
+    }
+
+    /// SQL Server's `USE` carries across a batch as MySQL's does, and its
+    /// quoted form is a bracket with the closer doubled.
+    #[test]
+    fn a_sql_server_use_switches_the_database_by_its_bracketed_name() {
+        let ms = SqlDialect::MsSql;
+        assert_eq!(use_target("USE app", ms).as_deref(), Some("app"));
+        assert_eq!(use_target("USE [my db];", ms).as_deref(), Some("my db"));
+        assert_eq!(use_target("USE [a]]b]", ms).as_deref(), Some("a]b"));
+        assert_eq!(use_target("USE app SELECT 1", ms), None);
     }
 
     // ── SQLite trigger bodies ────────────────────────────────────────────────

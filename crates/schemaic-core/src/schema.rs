@@ -721,7 +721,9 @@ pub(crate) enum DefaultGrammar {
 pub(crate) fn default_grammar(dialect: crate::intel::SqlDialect) -> DefaultGrammar {
     use crate::intel::SqlDialect;
     match dialect {
-        SqlDialect::Postgres => DefaultGrammar::AnyExpression,
+        // A T-SQL `DEFAULT` takes any constant expression — the server stores
+        // it parenthesised, `((0))` and `(getdate())`.
+        SqlDialect::Postgres | SqlDialect::MsSql => DefaultGrammar::AnyExpression,
         SqlDialect::MySql => DefaultGrammar::MysqlKeywords,
         SqlDialect::Sqlite => DefaultGrammar::LiteralsOnly,
     }
@@ -1957,6 +1959,31 @@ impl TriggerInfo {
             .collect()
     }
 
+    /// [`Self::create_sql`] for SQL Server: the trigger's stored statement.
+    ///
+    /// `db::mssql` reads the whole `CREATE TRIGGER` (`sys.sql_modules`) into
+    /// the body, for the reason `RoutineInfo::create_sql` hands a routine's
+    /// back: reassembling one from parts would be a second author of text the
+    /// server already has verbatim. Wrapped in the MySQL header this fell
+    /// through to, it came out as a trigger inside a trigger.
+    fn tsql_create_sql(&self) -> String {
+        let d = crate::intel::SqlDialect::MsSql;
+        match &self.action {
+            TriggerAction::Body(b) if !b.trim().is_empty() => crate::sql::terminated(b.trim(), d),
+            // `NULL` for one created `WITH ENCRYPTION`, which the server shows
+            // nobody. Comment-safed: the name is the server's.
+            TriggerAction::Body(_) => format!(
+                "-- The definition of trigger {} was not available (it may be encrypted, or \
+                 not visible to this login).",
+                crate::export::comment_text(&self.name)
+            ),
+            TriggerAction::Function { name, .. } => format!(
+                "-- Schemaic can't call the function {} from a SQL Server trigger.",
+                crate::export::comment_text(name)
+            ),
+        }
+    }
+
     /// The `CREATE TRIGGER` that recreates this trigger exactly — the **one**
     /// trigger emitter, shared by Copy DDL, the round-trip gate and the apply
     /// path, for the same reason [`crate::ddl::view_ddl`] is one.
@@ -1965,6 +1992,13 @@ impl TriggerInfo {
     /// too: `CREATE TRIGGER` always produces an enabled one, so a plan that
     /// stopped at the create would quietly switch it back on.
     pub fn create_sql(&self, dialect: crate::intel::SqlDialect) -> String {
+        // SQL Server's is the statement it stored, not one built here.
+        match dialect {
+            crate::intel::SqlDialect::MsSql => return self.tsql_create_sql(),
+            crate::intel::SqlDialect::MySql
+            | crate::intel::SqlDialect::Postgres
+            | crate::intel::SqlDialect::Sqlite => {}
+        }
         let pg = dialect == crate::intel::SqlDialect::Postgres;
         // SQLite's shape is neither of the other two: it has PostgreSQL's
         // `UPDATE OF` and `WHEN` but MySQL's inline body, so it is asked for by
@@ -2503,7 +2537,11 @@ impl RoutineInfo {
                 };
                 format!("{name}({args})")
             }
-            crate::intel::SqlDialect::MySql | crate::intel::SqlDialect::Sqlite => name,
+            // T-SQL has no overloading: a routine's name is unique in its
+            // schema, and `DROP PROCEDURE p(...)` does not parse.
+            crate::intel::SqlDialect::MySql
+            | crate::intel::SqlDialect::Sqlite
+            | crate::intel::SqlDialect::MsSql => name,
         }
     }
 
@@ -2525,7 +2563,9 @@ impl RoutineInfo {
                 };
                 format!("({args})")
             }
-            crate::intel::SqlDialect::MySql | crate::intel::SqlDialect::Sqlite => String::new(),
+            crate::intel::SqlDialect::MySql
+            | crate::intel::SqlDialect::Sqlite
+            | crate::intel::SqlDialect::MsSql => String::new(),
         }
     }
 
@@ -2547,6 +2587,12 @@ impl RoutineInfo {
             crate::intel::SqlDialect::MySql | crate::intel::SqlDialect::Sqlite => {
                 self.mysql_create_sql(dialect)
             }
+            // SQL Server keeps the routine's whole `CREATE` statement
+            // (`sys.sql_modules.definition`), and `mssql` reads it into
+            // `body`. Reassembling one from parts would be a second author of
+            // text the server already has verbatim. Not editable yet, so
+            // `replace` has nothing to change.
+            crate::intel::SqlDialect::MsSql => self.body.trim().to_string(),
         }
     }
 
@@ -3941,6 +3987,15 @@ impl TableInfo {
     /// re-creation would otherwise reset. This branch used to build its own
     /// statement and drop all of them.
     pub fn create_ddl(&self, dialect: crate::intel::SqlDialect) -> String {
+        // SQL Server's is a statement of its own shape — `IDENTITY`, named
+        // constraints, `AS (…) PERSISTED`, no `KEY` inline — so it has its own
+        // emitter rather than a branch per clause through the MySQL one.
+        match dialect {
+            crate::intel::SqlDialect::MsSql => return self.tsql_create_ddl(),
+            crate::intel::SqlDialect::MySql
+            | crate::intel::SqlDialect::Postgres
+            | crate::intel::SqlDialect::Sqlite => {}
+        }
         let pg = dialect == crate::intel::SqlDialect::Postgres;
         // Delegated, not inlined. This was a fifth copy of the identifier
         // quoter — byte-identical to `ddl_ident_in`, so it produced no wrong
@@ -4086,6 +4141,145 @@ impl TableInfo {
             }
             format!("CREATE TABLE {qname} (\n{}\n);", lines.join(",\n"))
         }
+    }
+
+    /// [`Self::create_ddl`] for SQL Server — what its own tools call *Script
+    /// table as CREATE*, from the model.
+    ///
+    /// A view is its stored `CREATE VIEW` verbatim (`sys.sql_modules`), which
+    /// `db::mssql` keeps in `create_sql`. A table is rebuilt: columns with
+    /// their types, `IDENTITY`, nullability, collation, default and computed
+    /// definitions; the primary key and every unique constraint under their
+    /// own names; checks; then each other index as a statement of its own,
+    /// since T-SQL declares none inline that the model can say.
+    ///
+    /// **What it does not restate is said in a comment**, as the view arms
+    /// do: an identity's seed and increment are not in the model, so they read
+    /// `(1,1)`; an index with included columns or of a kind the model has no
+    /// field for is named rather than rebuilt without them; foreign keys, as
+    /// on every engine here, are left to the script that orders them.
+    fn tsql_create_ddl(&self) -> String {
+        let d = crate::intel::SqlDialect::MsSql;
+        let q = |s: &str| ddl_ident_in(s, d);
+        let qname = match self.schema.as_deref() {
+            Some(s) => format!("{}.{}", q(s), q(&self.name)),
+            None => q(&self.name),
+        };
+        let cname = crate::export::comment_text(&qname);
+        if self.is_view {
+            return match self
+                .create_sql
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                Some(sql) => crate::sql::terminated(sql, d),
+                None => format!(
+                    "-- The definition of view {cname} was not available (it may be \
+                     encrypted, or not visible to this login)."
+                ),
+            };
+        }
+        let mut lines: Vec<String> = Vec::new();
+        let mut notes: Vec<String> = Vec::new();
+        for c in &self.columns {
+            let mut line = format!("  {} ", q(&c.name));
+            if let Some(expr) = c.generated.as_deref() {
+                line.push_str(&format!("AS ({expr})"));
+                if c.generated_stored {
+                    line.push_str(" PERSISTED");
+                }
+                lines.push(line);
+                continue;
+            }
+            line.push_str(&c.type_name);
+            if c.auto_increment {
+                line.push_str(" IDENTITY(1,1)");
+                notes.push(format!(
+                    "-- {}: the identity's seed and increment are not read, and are written (1,1).",
+                    crate::export::comment_text(&c.name)
+                ));
+            }
+            if let Some(col) = c.collation.as_deref().filter(|s| !s.is_empty()) {
+                line.push_str(&format!(" COLLATE {col}"));
+            }
+            line.push_str(if c.nullable { " NULL" } else { " NOT NULL" });
+            if let Some(def) = c.default.as_deref().filter(|s| !s.trim().is_empty()) {
+                line.push_str(&format!(" DEFAULT ({def})"));
+            }
+            lines.push(line);
+        }
+        let constraint = |ix: &IndexInfo| {
+            ix.constraint
+                .as_deref()
+                .map(|n| format!("CONSTRAINT {} ", q(n)))
+                .unwrap_or_default()
+        };
+        if let Some(pk) = self.indexes.iter().find(|ix| ix.is_primary()) {
+            lines.push(format!(
+                "  {}PRIMARY KEY ({})",
+                constraint(pk),
+                pk.key_sql(d)
+            ));
+        } else {
+            let pk: Vec<String> = self
+                .columns
+                .iter()
+                .filter(|c| c.primary_key)
+                .map(|c| q(&c.name))
+                .collect();
+            if !pk.is_empty() {
+                lines.push(format!("  PRIMARY KEY ({})", pk.join(", ")));
+            }
+        }
+        for ix in self
+            .indexes
+            .iter()
+            .filter(|ix| !ix.is_primary() && ix.unique && ix.constraint.is_some())
+        {
+            lines.push(format!("  {}UNIQUE ({})", constraint(ix), ix.key_sql(d)));
+        }
+        for ck in &self.check_constraints {
+            lines.push(format!(
+                "  CONSTRAINT {} CHECK ({})",
+                q(&ck.name),
+                ck.expression
+            ));
+        }
+        let mut out = String::new();
+        for n in &notes {
+            out.push_str(n);
+            out.push('\n');
+        }
+        out.push_str(&format!(
+            "CREATE TABLE {qname} (\n{}\n);",
+            lines.join(",\n")
+        ));
+        for ix in self
+            .indexes
+            .iter()
+            .filter(|ix| !ix.is_primary() && !(ix.unique && ix.constraint.is_some()))
+        {
+            if ix.lossy {
+                out.push_str(&format!(
+                    "\n-- Index {} has included columns, or is of a kind this script \
+                     cannot restate; it is left out.",
+                    crate::export::comment_text(&ix.name)
+                ));
+                continue;
+            }
+            let uniq = if ix.unique { "UNIQUE " } else { "" };
+            let filter = match &ix.predicate {
+                Some(p) => format!(" WHERE {p}"),
+                None => String::new(),
+            };
+            out.push_str(&format!(
+                "\nCREATE {uniq}INDEX {} ON {qname} ({}){filter};",
+                q(&ix.name),
+                ix.key_sql(d),
+            ));
+        }
+        out
     }
 
     /// Does any of this table's column names contain `needle_lower`
@@ -4841,14 +5035,17 @@ impl DbSchema {
         .flat_map(|k| self.objects_in(schema, k))
         .map(|o| o.create_sql(dialect))
         .collect();
-        types
-            .into_iter()
-            .chain(tables.into_iter().map(|t| t.create_ddl(dialect)))
-            .chain(views.into_iter().map(|t| t.create_ddl(dialect)))
-            .chain(seqs)
-            .chain(routines)
-            .collect::<Vec<_>>()
-            .join("\n\n")
+        // Through `join_scripts`, which puts each object in a batch of its own
+        // where the engine needs one to run the script at all.
+        crate::ddl::join_scripts(
+            types
+                .into_iter()
+                .chain(tables.into_iter().map(|t| t.create_ddl(dialect)))
+                .chain(views.into_iter().map(|t| t.create_ddl(dialect)))
+                .chain(seqs)
+                .chain(routines),
+            dialect,
+        )
     }
 
     /// A `CREATE` script for the **whole database** — the database node's
@@ -4873,14 +5070,15 @@ impl DbSchema {
         if namespaces.is_empty() {
             return self.create_ddl_script(None, dialect);
         }
-        namespaces
-            .iter()
-            .map(|ns| self.create_ddl_script(Some(ns), dialect))
-            // An empty namespace contributes nothing rather than a blank run:
-            // `join` over the parts that exist, not over every namespace.
-            .filter(|s| !s.is_empty())
-            .collect::<Vec<_>>()
-            .join("\n\n")
+        crate::ddl::join_scripts(
+            namespaces
+                .iter()
+                .map(|ns| self.create_ddl_script(Some(ns), dialect))
+                // An empty namespace contributes nothing rather than a blank
+                // run: join the parts that exist, not every namespace.
+                .filter(|s| !s.is_empty()),
+            dialect,
+        )
     }
 
     /// Every namespace present, in display order (`public` first, then
@@ -5271,6 +5469,36 @@ mod trigger_tests {
             },
             ..Default::default()
         }
+    }
+
+    /// **A SQL Server trigger is its stored statement.** `sys.sql_modules`
+    /// keeps the whole `CREATE TRIGGER` and `db::mssql` reads it into the body,
+    /// so wrapping it in MySQL's header wrote a trigger inside a trigger.
+    #[test]
+    fn a_sql_server_trigger_is_its_stored_statement() {
+        let t = TriggerInfo {
+            name: "tr".into(),
+            schema: Some("dbo".into()),
+            table: "t".into(),
+            timing: TriggerTiming::After,
+            events: vec![TriggerEvent::Insert],
+            action: TriggerAction::Body(
+                "CREATE TRIGGER dbo.tr ON dbo.t AFTER INSERT AS SET NOCOUNT ON".into(),
+            ),
+            ..Default::default()
+        };
+        assert_eq!(
+            t.create_sql(SqlDialect::MsSql),
+            "CREATE TRIGGER dbo.tr ON dbo.t AFTER INSERT AS SET NOCOUNT ON;"
+        );
+        // One created `WITH ENCRYPTION` has no text anybody can read, and the
+        // DDL says so rather than writing half a statement.
+        let hidden = TriggerInfo {
+            action: TriggerAction::Body(String::new()),
+            ..t
+        };
+        let sql = hidden.create_sql(SqlDialect::MsSql);
+        assert!(sql.starts_with("-- ") && !sql.contains("CREATE"), "{sql}");
     }
 
     #[test]
@@ -6984,6 +7212,157 @@ mod tests {
             // The empty needle is nobody's match, on either path.
             assert!(!object_name_matches(name, ""));
         }
+    }
+
+    /// SQL Server's table is written in its own shape — `IDENTITY`, named
+    /// constraints, a computed column's `AS (…) PERSISTED`, indexes as their
+    /// own statements — and says what it could not restate.
+    #[test]
+    fn create_ddl_sql_server_writes_t_sql() {
+        let mut id = col("id", "int", false, true);
+        id.auto_increment = true;
+        let mut bal = col("balance", "decimal(10,2)", false, false);
+        bal.default = Some("0".into());
+        let mut doubled = col("doubled", "decimal(12,2)", true, false);
+        doubled.generated = Some("[balance]*(2)".into());
+        doubled.generated_stored = true;
+        let mut pk = IndexInfo::plain("PRIMARY", vec!["id"], true);
+        pk.constraint = Some("pk_t".into());
+        let mut uq = IndexInfo::plain("uq_bal", vec!["balance"], true);
+        uq.constraint = Some("uq_bal".into());
+        let plain = IndexInfo::plain("ix_d", vec!["doubled"], false);
+        let mut covering = IndexInfo::plain("ix_cover", vec!["id"], false);
+        covering.lossy = true;
+        let t = TableInfo {
+            schema: Some("dbo".into()),
+            name: "t]x".into(),
+            columns: vec![id, bal, doubled],
+            indexes: vec![pk, uq, plain, covering],
+            check_constraints: vec![CheckInfo {
+                name: "ck_b".into(),
+                expression: "[balance]>=(0)".into(),
+                enforced: true,
+                validated: true,
+                inherited: false,
+                column_level: false,
+            }],
+            ..Default::default()
+        };
+        let ddl = t.create_ddl(crate::intel::SqlDialect::MsSql);
+        assert!(ddl.contains("CREATE TABLE [dbo].[t]]x] (\n"), "{ddl}");
+        assert!(ddl.contains("  [id] int IDENTITY(1,1) NOT NULL,"), "{ddl}");
+        assert!(
+            ddl.contains("  [balance] decimal(10,2) NOT NULL DEFAULT (0),"),
+            "{ddl}"
+        );
+        assert!(
+            ddl.contains("  [doubled] AS ([balance]*(2)) PERSISTED,"),
+            "{ddl}"
+        );
+        assert!(
+            ddl.contains("  CONSTRAINT [pk_t] PRIMARY KEY ([id]),"),
+            "{ddl}"
+        );
+        assert!(
+            ddl.contains("  CONSTRAINT [uq_bal] UNIQUE ([balance]),"),
+            "{ddl}"
+        );
+        assert!(
+            ddl.contains("  CONSTRAINT [ck_b] CHECK ([balance]>=(0))\n);"),
+            "{ddl}"
+        );
+        assert!(
+            ddl.contains("\nCREATE INDEX [ix_d] ON [dbo].[t]]x] ([doubled]);"),
+            "{ddl}"
+        );
+        assert!(
+            ddl.contains("-- Index ix_cover has included columns"),
+            "{ddl}"
+        );
+        assert!(!ddl.contains("CREATE INDEX [ix_cover]"), "{ddl}");
+        assert!(ddl.starts_with("-- id: the identity's seed"), "{ddl}");
+        assert!(
+            !ddl.contains("AUTO_INCREMENT") && !ddl.contains('`'),
+            "{ddl}"
+        );
+        // Every line that is not a comment is T-SQL the lexer ends where the
+        // server does: two statements after the table's.
+        assert_eq!(
+            crate::sql::statement_ranges(&ddl, crate::intel::SqlDialect::MsSql).len(),
+            2
+        );
+    }
+
+    /// A view is its stored statement, verbatim.
+    #[test]
+    fn create_ddl_sql_server_view_is_its_stored_statement() {
+        let v = TableInfo {
+            schema: Some("dbo".into()),
+            name: "v".into(),
+            is_view: true,
+            create_sql: Some("CREATE VIEW dbo.v AS SELECT 1 AS a".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            v.create_ddl(crate::intel::SqlDialect::MsSql),
+            "CREATE VIEW dbo.v AS SELECT 1 AS a;"
+        );
+    }
+
+    /// **A SQL Server script closes each object's batch with `GO`.** A view, a
+    /// procedure and a function must each begin a batch, and a procedure's
+    /// body runs to the end of its own: joined with blank lines alone, the
+    /// first procedure swallowed every statement after it, in this editor and
+    /// in SQL Server's own tools.
+    #[test]
+    fn a_sql_server_script_puts_each_object_in_a_batch_of_its_own() {
+        let ms = crate::intel::SqlDialect::MsSql;
+        let procedure = |name: &str| {
+            std::sync::Arc::new(RoutineInfo {
+                name: name.into(),
+                schema: Some("dbo".into()),
+                kind: RoutineKind::Procedure,
+                body: format!("CREATE PROCEDURE dbo.{name} AS BEGIN SELECT 1; SELECT 2; END"),
+                ..Default::default()
+            })
+        };
+        let schema = DbSchema {
+            tables: vec![
+                TableInfo {
+                    schema: Some("dbo".into()),
+                    name: "t".into(),
+                    columns: vec![col("id", "int", false, true)],
+                    ..Default::default()
+                },
+                TableInfo {
+                    schema: Some("dbo".into()),
+                    name: "v".into(),
+                    is_view: true,
+                    create_sql: Some("CREATE VIEW dbo.v AS SELECT 1 AS a".into()),
+                    ..Default::default()
+                },
+            ],
+            routines: vec![procedure("p1"), procedure("p2")],
+            ..Default::default()
+        };
+        let script = schema.create_ddl_script(Some("dbo"), ms);
+        let stmts = crate::sql::executable_statements(&script, ms);
+        assert!(
+            stmts.iter().any(|s| s.starts_with("CREATE VIEW")),
+            "{script}"
+        );
+        for p in ["p1", "p2"] {
+            let head = format!("CREATE PROCEDURE dbo.{p} ");
+            assert!(stmts.iter().any(|s| s.starts_with(&head)), "{script}");
+        }
+        // The database's script is the namespaces' in turn, batches intact —
+        // and a script that already ends its batch gets no second `GO`.
+        let all = schema.create_ddl_script_all(ms);
+        assert_eq!(all, script);
+        assert!(!script.contains("GO\nGO"), "{script}");
+        // No other engine has a batch separator to write.
+        let my = schema.create_ddl_script(Some("dbo"), crate::intel::SqlDialect::MySql);
+        assert!(!my.lines().any(|l| l == "GO"), "{my}");
     }
 
     #[test]

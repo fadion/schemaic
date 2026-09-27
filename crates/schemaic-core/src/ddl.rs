@@ -4867,6 +4867,13 @@ impl ChangeSet {
                     SqlDialect::Sqlite => {
                         debug_assert!(false, "SQLite has no statement that renames a view")
                     }
+                    // Unreachable too: no change reaches the emitter on SQL
+                    // Server (`supports_change`), and its rename is
+                    // `sp_rename`, which leaves the stored definition naming
+                    // the old view — the reason `supports_routine_rename` gives.
+                    SqlDialect::MsSql => {
+                        debug_assert!(false, "no SQL Server view change reaches the emitter")
+                    }
                 },
                 _ => {}
             }
@@ -4897,7 +4904,9 @@ impl ChangeSet {
                     ddl_ident_in(name, d),
                     self.qname()
                 ),
-                SqlDialect::MySql | SqlDialect::Sqlite => format!(
+                // T-SQL's DML trigger is a schema object too, dropped by its
+                // qualified name alone.
+                SqlDialect::MySql | SqlDialect::Sqlite | SqlDialect::MsSql => format!(
                     "DROP TRIGGER {};",
                     qualified(name, self.schema.as_deref(), d)
                 ),
@@ -6543,6 +6552,29 @@ pub fn common_types(dialect: SqlDialect) -> &'static [&'static str] {
             "json",
             "blob",
         ],
+        // `nvarchar` first among the strings: `varchar` holds only the
+        // database's code page. `datetime2` rather than the older `datetime`,
+        // whose fraction is rounded to 1/300 s.
+        SqlDialect::MsSql => &[
+            "int",
+            "bigint",
+            "smallint",
+            "tinyint",
+            "bit",
+            "decimal(10,2)",
+            "float",
+            "money",
+            "nvarchar(255)",
+            "nvarchar(max)",
+            "varchar(255)",
+            "nchar(1)",
+            "date",
+            "datetime2",
+            "datetimeoffset",
+            "time",
+            "uniqueidentifier",
+            "varbinary(max)",
+        ],
     }
 }
 
@@ -6657,6 +6689,11 @@ impl TypeAliasing {
             SqlDialect::Postgres => TypeAliasing::Postgres,
             SqlDialect::MySql => TypeAliasing::MySql,
             SqlDialect::Sqlite => TypeAliasing::Verbatim,
+            // T-SQL has aliases (`integer`, `dec`, `national character
+            // varying`), but its catalogue answers with the canonical name, and
+            // no draft is compared against one yet (`supports_change`), so
+            // nothing here has earned a table.
+            SqlDialect::MsSql => TypeAliasing::Verbatim,
         }
     }
 }
@@ -7271,6 +7308,36 @@ pub fn client_script(stmts: &[String], dialect: SqlDialect) -> String {
     out
 }
 
+/// Whole scripts — each object's `CREATE`, each namespace's script — joined
+/// into one, for a reader to copy and run.
+///
+/// **On SQL Server each part closes its batch with `GO`.** A view, procedure,
+/// function or trigger must begin a batch of its own, and a routine's body
+/// runs to the end of its batch: joined with blank lines alone, a script's
+/// first procedure swallowed every statement after it, in this editor and in
+/// SQL Server's own tools. A part that already ends in `GO` gets no second
+/// one. Every other engine ends a statement at its `;` and gets the blank
+/// lines alone.
+pub fn join_scripts(parts: impl IntoIterator<Item = String>, dialect: SqlDialect) -> String {
+    let parts = parts.into_iter();
+    if !dialect.batch_separator() {
+        return parts.collect::<Vec<_>>().join("\n\n");
+    }
+    parts
+        .filter(|p| !p.trim().is_empty())
+        .map(|p| {
+            let p = p.trim_end();
+            let last_line = p[p.rfind('\n').map_or(0, |k| k + 1)..].trim_start();
+            if sql::go_directive(last_line, 0, dialect).is_some() {
+                p.to_string()
+            } else {
+                format!("{p}\nGO")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
 /// One statement, ending in the `;` a client splits on. A no-op for the many
 /// that already carry theirs.
 fn terminated(stmt: &str) -> String {
@@ -7527,10 +7594,14 @@ pub fn supports_namespace_editing(dialect: SqlDialect) -> bool {
 /// what differs is whether a *field* of it means anything. The two callers are
 /// the editor's Owner row and the role fetch that fills its menu, and both need
 /// the answer before there is a change to ask about.
+///
+/// SQL Server's containers do have owners (`CREATE SCHEMA … AUTHORIZATION`,
+/// `ALTER AUTHORIZATION ON DATABASE::…`), and answers no here until its
+/// principals can be listed to fill the menu — see `users::supports_users`.
 pub fn supports_owners(dialect: SqlDialect) -> bool {
     match dialect {
         SqlDialect::Postgres => true,
-        SqlDialect::MySql | SqlDialect::Sqlite => false,
+        SqlDialect::MySql | SqlDialect::Sqlite | SqlDialect::MsSql => false,
     }
 }
 
@@ -7543,10 +7614,14 @@ pub fn supports_owners(dialect: SqlDialect) -> bool {
 /// see [`DatabaseDraft`]'s fields. SQLite has no `CREATE DATABASE` at all.
 ///
 /// An exhaustive `match`, for the reason [`supports_owners`] gives.
+///
+/// SQL Server takes a collation (`CREATE DATABASE … COLLATE`) and no
+/// character set — the collation implies the code page — so the pair of fields
+/// does not fit it.
 pub fn supports_database_charset(dialect: SqlDialect) -> bool {
     match dialect {
         SqlDialect::MySql => true,
-        SqlDialect::Postgres | SqlDialect::Sqlite => false,
+        SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::MsSql => false,
     }
 }
 
@@ -7557,8 +7632,16 @@ pub fn supports_database_charset(dialect: SqlDialect) -> bool {
 /// redefinition there is a `DROP` plus a `CREATE` — the same arm PostgreSQL
 /// already takes when a replace won't do, reached unconditionally instead of on
 /// a body test.
+///
+/// SQL Server has the statement under another spelling, `CREATE OR ALTER VIEW`,
+/// which the view emitter does not write — so it answers no until it does, and
+/// a redefinition there would take the `DROP` plus `CREATE` arm. View editing is
+/// not offered on it yet in any case ([`supports_view_editing`]).
 pub fn supports_or_replace_view(dialect: SqlDialect) -> bool {
-    !matches!(dialect, SqlDialect::Sqlite)
+    match dialect {
+        SqlDialect::MySql | SqlDialect::Postgres => true,
+        SqlDialect::Sqlite | SqlDialect::MsSql => false,
+    }
 }
 
 /// Does `dialect` publish a whole `CREATE INDEX` statement per index, so an
@@ -7578,7 +7661,9 @@ pub fn supports_or_replace_view(dialect: SqlDialect) -> bool {
 pub fn publishes_index_ddl(dialect: SqlDialect) -> bool {
     match dialect {
         SqlDialect::Postgres | SqlDialect::Sqlite => true,
-        SqlDialect::MySql => false,
+        // No per-index accessor either: SSMS scripts an index from
+        // `sys.indexes` and `sys.index_columns`, as the model does.
+        SqlDialect::MySql | SqlDialect::MsSql => false,
     }
 }
 
@@ -7603,7 +7688,8 @@ pub fn publishes_index_ddl(dialect: SqlDialect) -> bool {
 pub fn ref_schema_is_database(dialect: SqlDialect) -> bool {
     match dialect {
         SqlDialect::MySql => true,
-        SqlDialect::Postgres | SqlDialect::Sqlite => false,
+        // A real schema inside the database, as on PostgreSQL.
+        SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::MsSql => false,
     }
 }
 
@@ -7626,7 +7712,8 @@ pub fn ref_schema_is_database(dialect: SqlDialect) -> bool {
 pub fn view_definition_is_qualified(dialect: SqlDialect) -> bool {
     match dialect {
         SqlDialect::MySql => true,
-        SqlDialect::Postgres | SqlDialect::Sqlite => false,
+        // `sys.sql_modules.definition` is the statement as it was written.
+        SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::MsSql => false,
     }
 }
 
@@ -7769,7 +7856,8 @@ pub fn supports_trigger_editing(dialect: SqlDialect) -> bool {
 /// left open.
 pub fn trigger_names_are_schema_scoped(dialect: SqlDialect) -> bool {
     match dialect {
-        SqlDialect::MySql | SqlDialect::Sqlite => true,
+        // A T-SQL trigger is an object of its schema, in `sys.objects`.
+        SqlDialect::MySql | SqlDialect::Sqlite | SqlDialect::MsSql => true,
         SqlDialect::Postgres => false,
     }
 }
@@ -7840,10 +7928,13 @@ pub fn supports_event_editing(dialect: SqlDialect) -> bool {
 ///
 /// An exhaustive `match` rather than a `== Postgres`, so a fourth engine has to
 /// answer rather than inheriting whichever side it falls on.
+///
+/// SQL Server has `CREATE OR ALTER`, which the routine emitter does not write,
+/// so it answers no — see [`supports_or_replace_view`].
 pub fn supports_or_replace_routine(dialect: SqlDialect) -> bool {
     match dialect {
         SqlDialect::Postgres => true,
-        SqlDialect::MySql | SqlDialect::Sqlite => false,
+        SqlDialect::MySql | SqlDialect::Sqlite | SqlDialect::MsSql => false,
     }
 }
 
@@ -7854,10 +7945,15 @@ pub fn supports_or_replace_routine(dialect: SqlDialect) -> bool {
 /// the name, so a rename rides along with the re-create every edit already
 /// performs — which is why [`diff_routine`] treats a bare rename there as a
 /// redefinition, exactly as [`diff_view`] does on SQLite.
+///
+/// SQL Server's `sp_rename` renames the object and leaves the name inside its
+/// stored `CREATE` text unchanged, so the definition would then disagree with
+/// the object — which is why its own documentation says to drop and recreate
+/// instead.
 pub fn supports_routine_rename(dialect: SqlDialect) -> bool {
     match dialect {
         SqlDialect::Postgres => true,
-        SqlDialect::MySql | SqlDialect::Sqlite => false,
+        SqlDialect::MySql | SqlDialect::Sqlite | SqlDialect::MsSql => false,
     }
 }
 
@@ -7879,7 +7975,7 @@ pub fn supports_routine_rename(dialect: SqlDialect) -> bool {
 pub fn overloads_routines(dialect: SqlDialect) -> bool {
     match dialect {
         SqlDialect::Postgres => true,
-        SqlDialect::MySql | SqlDialect::Sqlite => false,
+        SqlDialect::MySql | SqlDialect::Sqlite | SqlDialect::MsSql => false,
     }
 }
 
@@ -7947,6 +8043,9 @@ pub fn default_new_column_type(dialect: SqlDialect) -> &'static str {
     match dialect {
         SqlDialect::MySql | SqlDialect::Sqlite => "varchar(255)",
         SqlDialect::Postgres => "text",
+        // `nvarchar`, not `varchar`: the latter holds only the database's code
+        // page, and anything outside it is stored as `?`.
+        SqlDialect::MsSql => "nvarchar(255)",
     }
 }
 
@@ -7968,7 +8067,8 @@ pub fn default_new_column_type(dialect: SqlDialect) -> &'static str {
 pub fn supports_column_reorder(dialect: SqlDialect) -> bool {
     match dialect {
         SqlDialect::MySql | SqlDialect::Sqlite => true,
-        SqlDialect::Postgres => false,
+        // No statement moves a column there either.
+        SqlDialect::Postgres | SqlDialect::MsSql => false,
     }
 }
 
@@ -7992,7 +8092,10 @@ pub fn supports_column_reorder(dialect: SqlDialect) -> bool {
 pub fn enforces_declared_byte_length(dialect: SqlDialect) -> bool {
     match dialect {
         SqlDialect::MySql => true,
-        SqlDialect::Postgres | SqlDialect::Sqlite => false,
+        // SQL Server enforces `varbinary(n)` too ("String or binary data would
+        // be truncated"), but [`crate::blob::column_byte_cap`] reads MySQL's
+        // type names, so it is not asked there until it reads SQL Server's.
+        SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::MsSql => false,
     }
 }
 
@@ -8015,7 +8118,8 @@ pub fn enforces_declared_byte_length(dialect: SqlDialect) -> bool {
 /// question has been answered for.
 pub fn schema_body_is_emittable(dialect: SqlDialect) -> bool {
     match dialect {
-        SqlDialect::Postgres | SqlDialect::Sqlite => true,
+        // SQL Server's `sys.sql_modules.definition` is the statement verbatim.
+        SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::MsSql => true,
         SqlDialect::MySql => false,
     }
 }
@@ -8041,7 +8145,10 @@ pub fn schema_body_is_emittable(dialect: SqlDialect) -> bool {
 /// report of a half-applied plan.
 pub fn ddl_rolls_back_as_a_whole(dialect: SqlDialect) -> bool {
     match dialect {
-        SqlDialect::Postgres | SqlDialect::Sqlite => true,
+        // T-SQL DDL is transactional. `mssql::run_ddl` is not written yet (it
+        // refuses, and `supports_change` keeps every plan from it); wrapping
+        // the plan in one transaction is what it is to do.
+        SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::MsSql => true,
         SqlDialect::MySql => false,
     }
 }
@@ -8063,7 +8170,9 @@ pub fn ddl_rolls_back_as_a_whole(dialect: SqlDialect) -> bool {
 pub fn supports_sequence_resync(dialect: SqlDialect) -> bool {
     match dialect {
         SqlDialect::Postgres => true,
-        SqlDialect::MySql | SqlDialect::Sqlite => false,
+        // An `IDENTITY` column moves its current value up to the largest one
+        // inserted explicitly, so it follows the data as MySQL's does.
+        SqlDialect::MySql | SqlDialect::Sqlite | SqlDialect::MsSql => false,
     }
 }
 
@@ -9231,6 +9340,21 @@ pub fn sqlite_rebuild_sql(current: &TableInfo, draft: &TableDraft) -> Vec<String
 /// absent, and the emitter honours it so a change that slipped through emits
 /// nothing rather than MySQL's spelling of it.
 pub fn supports_change(dialect: SqlDialect, change: &Change) -> bool {
+    // **SQL Server: no generated DDL yet, and that is unfinished work.** The
+    // emitters below write MySQL's, PostgreSQL's and SQLite's statements, and
+    // T-SQL differs from all three at nearly every change — `sp_rename` for a
+    // rename, a named `DEFAULT` constraint to drop before a column can change,
+    // `CREATE OR ALTER` for a redefinition, no `ALTER COLUMN … SET DEFAULT`.
+    // Answering no here, first, is what switches every editor off together:
+    // `supports_view_editing`, `supports_trigger_editing`,
+    // `supports_routine_editing` and `supports_table_design` all compute from
+    // this. The arms below answer for SQL Server only because they must
+    // compile; none of them is reached for it. A `match`, not an `==`, so the
+    // next engine has to say which side of this it is on.
+    match dialect {
+        SqlDialect::MsSql => return false,
+        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => {}
+    }
     // **The one family that is narrower than "everything but SQLite".** A
     // scheduled event is MySQL's; PostgreSQL has no `CREATE EVENT` and SQLite no
     // scheduler, so this is asked before the blanket answer below rather than
@@ -9242,7 +9366,7 @@ pub fn supports_change(dialect: SqlDialect, change: &Change) -> bool {
     ) {
         return match dialect {
             SqlDialect::MySql => true,
-            SqlDialect::Postgres | SqlDialect::Sqlite => false,
+            SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::MsSql => false,
         };
     }
     // **A namespace inside a database is PostgreSQL's alone.** MySQL spells
@@ -9258,7 +9382,7 @@ pub fn supports_change(dialect: SqlDialect, change: &Change) -> bool {
     ) {
         return match dialect {
             SqlDialect::Postgres => true,
-            SqlDialect::MySql | SqlDialect::Sqlite => false,
+            SqlDialect::MySql | SqlDialect::Sqlite | SqlDialect::MsSql => false,
         };
     }
     // **A materialized view is PostgreSQL's alone, and so is the statement that
@@ -9270,7 +9394,7 @@ pub fn supports_change(dialect: SqlDialect, change: &Change) -> bool {
     if matches!(change, Change::RefreshView { .. }) {
         return match dialect {
             SqlDialect::Postgres => true,
-            SqlDialect::MySql | SqlDialect::Sqlite => false,
+            SqlDialect::MySql | SqlDialect::Sqlite | SqlDialect::MsSql => false,
         };
     }
     // **An account is a server's, and SQLite has no server.** Asked through the
@@ -9330,7 +9454,7 @@ pub fn supports_change(dialect: SqlDialect, change: &Change) -> bool {
     if is_server_level(change) {
         return match dialect {
             SqlDialect::MySql | SqlDialect::Postgres => true,
-            SqlDialect::Sqlite => false,
+            SqlDialect::Sqlite | SqlDialect::MsSql => false,
         };
     }
     // **MySQL cannot move a generated column between `VIRTUAL` and `STORED`**,

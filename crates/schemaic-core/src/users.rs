@@ -41,8 +41,18 @@ use crate::text_ops::contains_ignore_ascii_case;
 ///
 /// So a SQLite connection is told that in a sentence, rather than shown an empty
 /// list that would read as "a server with no users".
+///
+/// **SQL Server answers no for now, and that one *is* unfinished work.** Its
+/// accounts are two catalogues — server logins (`sys.server_principals`) and
+/// the users mapped to them inside each database (`sys.database_principals`)
+/// — with permissions granted at the server, the database and the schema. The
+/// browser's one list of `(name, kind)` rows fits neither half, so it is not
+/// offered until it has a model of its own.
 pub fn supports_users(dialect: SqlDialect) -> bool {
-    !matches!(dialect, SqlDialect::Sqlite)
+    match dialect {
+        SqlDialect::MySql | SqlDialect::Postgres => true,
+        SqlDialect::Sqlite | SqlDialect::MsSql => false,
+    }
 }
 
 /// Can accounts be *created and dropped* from here, not just read?
@@ -1163,6 +1173,8 @@ impl GrantLevel {
                     format!("{}.*", crate::export::ident_pattern_sql(d, dialect))
                 }
                 SqlDialect::Postgres | SqlDialect::Sqlite => format!("DATABASE {}", q(d)),
+                // T-SQL names a securable by its class: `ON DATABASE::[d]`.
+                SqlDialect::MsSql => format!("DATABASE::{}", q(d)),
             },
             GrantLevel::Schema(s) => format!("SCHEMA {}", q(s)),
             GrantLevel::Table { qualifier, name } => match dialect {
@@ -1170,6 +1182,7 @@ impl GrantLevel {
                 SqlDialect::Postgres | SqlDialect::Sqlite => {
                     format!("TABLE {}.{}", q(qualifier), q(name))
                 }
+                SqlDialect::MsSql => format!("OBJECT::{}.{}", q(qualifier), q(name)),
             },
             GrantLevel::Sequence { qualifier, name } => {
                 format!("SEQUENCE {}.{}", q(qualifier), q(name))
@@ -1195,8 +1208,10 @@ pub fn levels_for(dialect: SqlDialect) -> &'static [GrantLevelKind] {
         ],
         // Unreachable through the UI — `supports_user_admin` is the gate — and an
         // empty list rather than a panic, so a caller that skipped the gate gets
-        // a picker with nothing in it instead of a crash.
-        SqlDialect::Sqlite => &[],
+        // a picker with nothing in it instead of a crash. SQL Server's levels
+        // (server, database, schema, object) wait on its account model; see
+        // `supports_users`.
+        SqlDialect::Sqlite | SqlDialect::MsSql => &[],
     }
 }
 
@@ -1633,6 +1648,9 @@ pub fn account_draft_sql(d: &AccountDraft, dialect: SqlDialect) -> Option<String
                     // password clause is a bare `PASSWORD`.
                     SqlDialect::Postgres | SqlDialect::Sqlite => "PASSWORD",
                     SqlDialect::MySql => "IDENTIFIED BY",
+                    // A contained database user; unreachable until SQL
+                    // Server's accounts are offered (`supports_users`).
+                    SqlDialect::MsSql => "WITH PASSWORD =",
                 },
                 password_literal(
                     &d.password,
@@ -1682,7 +1700,9 @@ pub struct PasswordReset {
 pub fn supports_password_verifier(dialect: SqlDialect) -> bool {
     match dialect {
         SqlDialect::Postgres => true,
-        SqlDialect::MySql | SqlDialect::Sqlite => false,
+        // SQL Server takes a hashed password only for a login
+        // (`WITH PASSWORD = 0x… HASHED`), in a format of its own.
+        SqlDialect::MySql | SqlDialect::Sqlite | SqlDialect::MsSql => false,
     }
 }
 
@@ -1876,6 +1896,7 @@ pub fn set_password_sql(r: &PasswordReset, dialect: SqlDialect) -> Option<String
     let (verb, clause) = match dialect {
         SqlDialect::MySql => ("ALTER USER", "IDENTIFIED BY"),
         SqlDialect::Postgres | SqlDialect::Sqlite => ("ALTER ROLE", "PASSWORD"),
+        SqlDialect::MsSql => ("ALTER LOGIN", "WITH PASSWORD ="),
     };
     Some(format!(
         "{verb} {who} {clause} {}",

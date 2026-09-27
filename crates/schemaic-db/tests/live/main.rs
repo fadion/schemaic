@@ -40,6 +40,7 @@ mod editable;
 mod endpoint;
 mod enforced;
 mod mariadb_catalog;
+mod mssql;
 mod namespaces;
 mod pg_catalog;
 mod routines;

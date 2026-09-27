@@ -83,6 +83,23 @@ pub fn tables_sql(dialect: SqlDialect, database: Option<&str>) -> Option<String>
             name = q("name"),
             ty = q("type"),
         ),
+        // Schemas inside a database, as on PostgreSQL, so `schema` comes
+        // first here too. Without a database the connection is in the
+        // login's default one — usually `master` — whose tables are not the
+        // connection's.
+        SqlDialect::MsSql => {
+            database?;
+            format!(
+                "SELECT s.name AS {schema}, o.name AS {name}, \
+                 CASE o.type WHEN 'U' THEN 'table' WHEN 'V' THEN 'view' END AS {ty} \
+                 FROM sys.objects o JOIN sys.schemas s ON s.schema_id = o.schema_id \
+                 WHERE o.type IN ('U', 'V') AND o.is_ms_shipped = 0 \
+                 ORDER BY 1, 2",
+                schema = q("schema"),
+                name = q("name"),
+                ty = q("type"),
+            )
+        }
     })
 }
 
@@ -166,6 +183,51 @@ pub fn describe_sql(dialect: SqlDialect, database: Option<&str>, table: &str) ->
              FROM pragma_table_xinfo({table}, 'main') WHERE hidden <> 1 ORDER BY cid",
             table = lit(table),
         ),
+        // `OBJECT_ID` reads the name as the server reads one — through the
+        // login's default schema when bare, `schema.table` when qualified —
+        // and the object has to be a table or a view, as `tables` lists. The
+        // type is spelled as it was declared, from `sys.types` and the
+        // column's sizes (`max_length` is in bytes, so an `n` type's length is
+        // half of it); `UNI` is a single-column unfiltered unique index, as on
+        // PostgreSQL.
+        SqlDialect::MsSql => {
+            database?;
+            format!(
+                "SELECT c.name AS {column}, \
+                 CASE WHEN t.name IN ('varchar', 'char', 'varbinary', 'binary') \
+                   THEN t.name + '(' + CASE WHEN c.max_length = -1 THEN 'max' \
+                     ELSE CAST(c.max_length AS varchar(10)) END + ')' \
+                 WHEN t.name IN ('nvarchar', 'nchar') \
+                   THEN t.name + '(' + CASE WHEN c.max_length = -1 THEN 'max' \
+                     ELSE CAST(c.max_length / 2 AS varchar(10)) END + ')' \
+                 WHEN t.name IN ('decimal', 'numeric') \
+                   THEN t.name + '(' + CAST(c.precision AS varchar(3)) + ',' \
+                     + CAST(c.scale AS varchar(3)) + ')' \
+                 WHEN t.name IN ('datetime2', 'datetimeoffset', 'time') \
+                   THEN t.name + '(' + CAST(c.scale AS varchar(3)) + ')' \
+                 ELSE t.name END AS {ty}, \
+                 CASE WHEN c.is_nullable = 1 THEN 'YES' ELSE 'NO' END AS {nullable}, \
+                 OBJECT_DEFINITION(c.default_object_id) AS {default}, \
+                 CASE WHEN EXISTS (SELECT 1 FROM sys.index_columns ic \
+                   JOIN sys.indexes i ON i.object_id = ic.object_id AND i.index_id = ic.index_id \
+                   WHERE i.is_primary_key = 1 AND ic.object_id = c.object_id \
+                   AND ic.column_id = c.column_id) THEN 'PRI' \
+                 WHEN EXISTS (SELECT 1 FROM sys.index_columns ic \
+                   JOIN sys.indexes i ON i.object_id = ic.object_id AND i.index_id = ic.index_id \
+                   WHERE i.is_unique = 1 AND i.has_filter = 0 AND ic.object_id = c.object_id \
+                   AND ic.column_id = c.column_id AND ic.is_included_column = 0 \
+                   AND (SELECT COUNT(*) FROM sys.index_columns k \
+                        WHERE k.object_id = i.object_id AND k.index_id = i.index_id \
+                        AND k.is_included_column = 0) = 1) THEN 'UNI' \
+                 ELSE '' END AS {key} \
+                 FROM sys.columns c \
+                 JOIN sys.types t ON t.user_type_id = c.user_type_id \
+                 JOIN sys.objects o ON o.object_id = c.object_id \
+                 WHERE c.object_id = OBJECT_ID({table}) AND o.type IN ('U', 'V') \
+                 ORDER BY c.column_id",
+                table = lit(table),
+            )
+        }
     })
 }
 
@@ -173,7 +235,7 @@ pub fn describe_sql(dialect: SqlDialect, database: Option<&str>, table: &str) ->
 mod tests {
     use super::*;
 
-    const ALL: [SqlDialect; 3] = [SqlDialect::MySql, SqlDialect::Postgres, SqlDialect::Sqlite];
+    const ALL: [SqlDialect; 4] = SqlDialect::ALL;
 
     /// **What these run is a read the gate lets through**, on every engine —
     /// the same gate a typed `query` meets, so a canned statement it refused
@@ -197,10 +259,10 @@ mod tests {
     /// SQLite file always is one.
     #[test]
     fn only_a_file_database_needs_no_database_named() {
-        assert!(tables_sql(SqlDialect::MySql, None).is_none());
-        assert!(tables_sql(SqlDialect::Postgres, None).is_none());
-        assert!(describe_sql(SqlDialect::MySql, None, "t").is_none());
-        assert!(describe_sql(SqlDialect::Postgres, None, "t").is_none());
+        for d in [SqlDialect::MySql, SqlDialect::Postgres, SqlDialect::MsSql] {
+            assert!(tables_sql(d, None).is_none(), "{d:?}");
+            assert!(describe_sql(d, None, "t").is_none(), "{d:?}");
+        }
         let sqlite = tables_sql(SqlDialect::Sqlite, None).unwrap();
         assert!(sqlite.contains("\"main\".sqlite_master"), "{sqlite}");
         let sqlite = describe_sql(SqlDialect::Sqlite, None, "t").unwrap();

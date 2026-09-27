@@ -64,16 +64,23 @@ enum DbKind {
     MySql,
     Postgres,
     Sqlite,
+    MsSql,
 }
 
 impl DbKind {
-    const ALL: [DbKind; 3] = [DbKind::MySql, DbKind::Postgres, DbKind::Sqlite];
+    const ALL: [DbKind; 4] = [
+        DbKind::MySql,
+        DbKind::Postgres,
+        DbKind::Sqlite,
+        DbKind::MsSql,
+    ];
 
     fn label(self) -> &'static str {
         match self {
             DbKind::MySql => "MySQL",
             DbKind::Postgres => "PostgreSQL",
             DbKind::Sqlite => "SQLite",
+            DbKind::MsSql => "SQL Server",
         }
     }
 
@@ -103,6 +110,8 @@ impl DbKind {
             DbKind::Postgres
         } else if schemaic_core::connection::is_sqlite(s) {
             DbKind::Sqlite
+        } else if schemaic_core::connection::is_mssql(s) {
+            DbKind::MsSql
         } else {
             DbKind::MySql
         }
@@ -1639,6 +1648,28 @@ fn conn_form(
             s.width_full()
                 .font_size(theme::font_hint())
                 .color(theme::text_muted())
+        }),
+    ))
+    .style(|s| s.flex_col().gap(theme::scaled(6.0)).width_full());
+
+    // Under the switch, and only where the engine cannot be asked to refuse
+    // writes itself — see `connection::read_only_caveat`.
+    let read_only_toggle = v_stack((
+        read_only_toggle,
+        label(move || {
+            schemaic_core::connection::read_only_caveat(&draft.db_type.get())
+                .unwrap_or_default()
+                .to_string()
+        })
+        .style(move |s| {
+            s.width_full()
+                .font_size(theme::font_hint())
+                .color(theme::text_muted())
+                .apply_if(
+                    schemaic_core::connection::read_only_caveat(&draft.db_type.get()).is_none()
+                        || !draft.read_only.get(),
+                    |s| s.hide(),
+                )
         }),
     ))
     .style(|s| s.flex_col().gap(theme::scaled(6.0)).width_full());

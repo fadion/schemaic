@@ -168,7 +168,8 @@ impl BoolWire {
     pub fn of(dialect: SqlDialect) -> BoolWire {
         match dialect {
             SqlDialect::Postgres => BoolWire::Letter,
-            SqlDialect::MySql | SqlDialect::Sqlite => BoolWire::OneZero,
+            // SQL Server's `bit` reads back as the integers.
+            SqlDialect::MySql | SqlDialect::Sqlite | SqlDialect::MsSql => BoolWire::OneZero,
         }
     }
 }
@@ -228,6 +229,11 @@ pub fn editor_for_type(declared: &str, dialect: SqlDialect) -> CellEditor {
     }
     match base.as_str() {
         "bool" | "boolean" => return CellEditor::Bool(BoolWire::of(dialect)),
+        "bit" if bit_is_boolean(dialect) => return CellEditor::Bool(BoolWire::of(dialect)),
+        // SQL Server's zoneless date-times — names no other engine has, so no
+        // dialect needs asking. `datetimeoffset` stays text until the picker
+        // writes the offset in the form the server reads back.
+        "datetime2" | "smalldatetime" => return CellEditor::DateTime(Zoned::Naive),
         "enum" if dialect == SqlDialect::MySql => {
             let members = value_list(type_args(t), dialect);
             if !members.is_empty() {
@@ -251,6 +257,18 @@ pub fn editor_for_type(declared: &str, dialect: SqlDialect) -> CellEditor {
         _ => {}
     }
     CellEditor::Text
+}
+
+/// Is a column declared `bit` a **boolean** on `dialect`?
+///
+/// SQL Server's is: `bit` is its boolean type, `1`/`0`/`NULL`. MySQL's `bit(n)`
+/// is an n-bit field and PostgreSQL's a bit string, so a toggle over one would
+/// write the wrong kind of value; SQLite has no such type of its own.
+fn bit_is_boolean(dialect: SqlDialect) -> bool {
+    match dialect {
+        SqlDialect::MsSql => true,
+        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => false,
+    }
 }
 
 /// The editor for a column, **with** the catalogue its type may point into.
@@ -651,7 +669,7 @@ mod tests {
     use crate::model::Value;
     use crate::schema::{DbSchema, EnumInfo};
 
-    use SqlDialect::{MySql, Postgres, Sqlite};
+    use SqlDialect::{MsSql, MySql, Postgres, Sqlite};
 
     fn members(e: &CellEditor) -> Vec<String> {
         match e {
@@ -727,6 +745,28 @@ mod tests {
     #[test]
     fn postgres_has_no_tinyint_boolean() {
         assert_eq!(editor_for_type("tinyint(1)", Postgres), CellEditor::Text);
+    }
+
+    /// SQL Server's boolean is `bit`, read back as `1`/`0`. MySQL's `bit` is a
+    /// bit-field and stays text there. Its dates are `date`, and `datetime`,
+    /// `datetime2` and `smalldatetime` without a zone; a `tinyint` is a byte.
+    #[test]
+    fn sql_server_types_get_their_editors() {
+        assert_eq!(
+            editor_for_type("bit", MsSql),
+            CellEditor::Bool(BoolWire::OneZero)
+        );
+        assert_eq!(editor_for_type("bit(1)", MySql), CellEditor::Text);
+        assert_eq!(editor_for_type("tinyint", MsSql), CellEditor::Text);
+        assert_eq!(editor_for_type("date", MsSql), CellEditor::Date);
+        for t in ["datetime", "datetime2(7)", "smalldatetime"] {
+            assert_eq!(
+                editor_for_type(t, MsSql),
+                CellEditor::DateTime(Zoned::Naive),
+                "{t}"
+            );
+        }
+        assert_eq!(BoolWire::of(MsSql).text(true), "1");
     }
 
     // ── ENUM / SET ──────────────────────────────────────────────────────────

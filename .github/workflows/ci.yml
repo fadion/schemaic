@@ -143,7 +143,7 @@ jobs:
   # legs stay pure and fast, and a server that failed to come up cannot mask a
   # compile break on a platform nobody develops on.
   live:
-    name: Live engines (MySQL + MariaDB + PostgreSQL)
+    name: Live engines (MySQL + MariaDB + PostgreSQL + SQL Server)
     runs-on: ubuntu-latest
     # **The one job here that talks to something that can stop answering.** Every
     # other job either compiles or does not; this one waits on three servers, a
@@ -188,6 +188,23 @@ jobs:
         options: >-
           --health-cmd="pg_isready -U schemaic"
           --health-interval=5s --health-timeout=5s --health-retries=20
+      # SQL Server's leg, `tests/live/mssql.rs` — outside the shared suite
+      # until the engine answers enough of it. Developer edition, which the
+      # EULA grants for testing. Its first start builds the system databases
+      # and takes the better part of half a minute, hence the longer interval;
+      # `sqlcmd` ships in the image, and `-C` trusts the certificate the server
+      # generates for itself.
+      mssql:
+        image: mcr.microsoft.com/mssql/server:2022-latest
+        env:
+          ACCEPT_EULA: "Y"
+          MSSQL_PID: Developer
+          MSSQL_SA_PASSWORD: Schemaic_2026
+        ports:
+          - 1433:1433
+        options: >-
+          --health-cmd="/opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P Schemaic_2026 -C -Q 'SELECT 1'"
+          --health-interval=10s --health-timeout=10s --health-retries=24
     steps:
       - uses: actions/checkout@v5
       # No GUI packages: this builds `schemaic-db` and `schemaic-core` only,
@@ -207,3 +224,5 @@ jobs:
           SCHEMAIC_IT_MYSQL_PASSWORD: schemaic
           SCHEMAIC_IT_PG_USER: schemaic
           SCHEMAIC_IT_PG_PASSWORD: schemaic
+          SCHEMAIC_IT_MSSQL_USER: sa
+          SCHEMAIC_IT_MSSQL_PASSWORD: Schemaic_2026

@@ -4170,17 +4170,20 @@ mod engine_comparison_gate {
         ),
         (
             "schemaic-core/ddl.rs",
-            24,
-            "Seven of the twenty-four *are* the capability definitions the rest \
-             of the app asks — `supports_or_replace_view`, \
-             `supports_view_rename`, `alter_column_disturbs_checks`, \
-             `requires_named_checks`, `requires_rowid_key`, \
-             `strict_type_allowed`, `supports_change` — and a `match` is how \
-             they answer. The other seventeen are DDL grammar inside the \
-             emitters (`create_view_sql`, `create_table_sql`, `client_script`'s \
-             `DELIMITER`, `is_begin_end_block`, `repoint_check_column`), where \
-             the three engines write genuinely different statements rather than \
-             one statement with a switch in it.",
+            23,
+            "Seven of the twenty-three are in the capability definitions the \
+             rest of the app asks — `supports_view_rename`, \
+             `alter_column_disturbs_checks`, `requires_named_checks`, \
+             `requires_rowid_key`, `strict_type_allowed`, and two in \
+             `supports_change` — and a comparison is how they answer. The other \
+             sixteen are DDL grammar inside the emitters and validators \
+             (`create_view_sql`, `create_table_sql`, `client_script`'s \
+             `DELIMITER`, `repoint_check_column`, the drafts' `validate`), \
+             where the engines write genuinely different statements rather \
+             than one statement with a switch in it. 24 → 23: \
+             `supports_change`'s SQL Server answer is an exhaustive `match`, \
+             not an `== MsSql` a fifth engine would fall past; \
+             `supports_or_replace_view` became one when SQL Server arrived.",
         ),
         (
             "schemaic-core/filter.rs",
@@ -4218,13 +4221,9 @@ mod engine_comparison_gate {
             "`supports_table_stats` — a capability definition, and one CLAUDE.md \
              names by hand.",
         ),
-        (
-            "schemaic-core/users.rs",
-            1,
-            "`supports_users` — a capability definition. `supports_user_admin` \
-             is what `ddl::supports_change` asks of it rather than comparing \
-             engines a second time.",
-        ),
+        // `schemaic-core/users.rs` left the census when `supports_users` became
+        // an exhaustive `match`: SQL Server has accounts it cannot list yet,
+        // and a `!matches!(… Sqlite)` sorted it onto "has them" in silence.
         // ── schemaic-ui / schemaic-app ──────────────────────────────────────
         (
             "lib.rs",
@@ -12443,9 +12442,8 @@ fn footer(ui: Ui) -> impl IntoView {
 
     // Does the active tab's engine have a manual-transaction mode at all?
     //
-    // SQLite doesn't yet — `schemaic_db::session::Session::open` refuses one,
-    // because a pinned `rusqlite::Connection` is blocking and `!Sync` and needs a
-    // thread of its own. The segment is hidden rather than left clickable: a
+    // Not SQLite's or SQL Server's yet — `schemaic_core::tx::supports_manual_mode`
+    // says why for each. The segment is hidden rather than left clickable: a
     // control that reports an error every time it is pressed is worse than one
     // that isn't there, and the cluster below it (the pill, Commit, Rollback)
     // only ever appears while a transaction is open, which can't happen here.
@@ -12456,7 +12454,11 @@ fn footer(ui: Ui) -> impl IntoView {
         conns_for_tx.with(|cs| {
             cs.iter()
                 .find(|c| c.id == cid)
-                .map(|c| !schemaic_core::connection::is_sqlite(&c.db_type))
+                .map(|c| {
+                    schemaic_core::tx::supports_manual_mode(
+                        schemaic_core::intel::SqlDialect::from_db_type(&c.db_type),
+                    )
+                })
                 // An unknown connection keeps the segment: hiding chrome on a
                 // lookup miss would be a worse guess than showing it.
                 .unwrap_or(true)

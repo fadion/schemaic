@@ -27,6 +27,22 @@ pub enum TxEngine {
     Postgres,
 }
 
+/// Does `dialect` have a **Manual** transaction mode here — a pinned
+/// connection that holds a transaction until the user ends it?
+///
+/// Not on SQLite, whose pinned connection would need a thread of its own (see
+/// `schemaic_db::Session::open`), and not yet on SQL Server, whose is simply not
+/// written. The footer asks this and hides the Auto/Manual segment where it is
+/// `false`: a control that reports an error every time it is pressed is worse
+/// than one that is not there. `Session::open` refusing both is the backstop.
+pub fn supports_manual_mode(dialect: crate::intel::SqlDialect) -> bool {
+    use crate::intel::SqlDialect;
+    match dialect {
+        SqlDialect::MySql | SqlDialect::Postgres => true,
+        SqlDialect::Sqlite | SqlDialect::MsSql => false,
+    }
+}
+
 /// A tab's commit mode. Session-only — a tab always starts in [`TxMode::Auto`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum TxMode {

@@ -11721,6 +11721,14 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                 // itself, which the config already names.
                 schemaic_db::Engine::Sqlite => sqlite_shell(&conn),
                 schemaic_db::Engine::MySql => mysql_shell(&conn, db.as_deref()),
+                // **Not launched yet.** `sqlcmd` takes the database after `-d`
+                // and its TLS as `-N`/`-C`, and neither has been through
+                // `core::launch` — how a server-supplied name after `-d` is
+                // parsed, and how a connection's mode maps to those two flags,
+                // is the validation every other client here got first.
+                schemaic_db::Engine::MsSql => {
+                    Err("Opening SQL Server's command-line client is not supported yet.")
+                }
             };
             // Badge the panel only for a session that really is a client. The
             // no-client arm spawns a message instead, which is nobody's engine.

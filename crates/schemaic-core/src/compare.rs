@@ -1512,6 +1512,21 @@ fn occupied_names(
         SqlDialect::Sqlite => {
             out.extend(t.indexes.iter().map(|ix| qualify(&ix.name)));
         }
+        // A T-SQL constraint is an object of its schema (`sys.objects`),
+        // whichever clause declared it — so a foreign key, a check (on its
+        // column or on the table), a primary key and a unique constraint each
+        // hold their name against every table there. An index that is no
+        // constraint is named per table.
+        SqlDialect::MsSql => {
+            out.extend(t.foreign_keys.iter().map(|fk| qualify(&fk.name)));
+            out.extend(t.check_constraints.iter().map(|c| qualify(&c.name)));
+            out.extend(
+                t.indexes
+                    .iter()
+                    .filter_map(|ix| ix.constraint.as_deref())
+                    .map(qualify),
+            );
+        }
     }
     out.remove(&String::new());
     out
@@ -1570,6 +1585,12 @@ impl NameClash {
                 "One statement will be refused, which rolls the whole migration back."
             }
             SqlDialect::Sqlite => "One statement will be refused.",
+            // T-SQL DDL is transactional too. `mssql::run_ddl` is not written
+            // yet — it refuses, and no plan reaches it (`ddl::supports_change`)
+            // — and this is the promise it is to keep: one transaction a plan.
+            SqlDialect::MsSql => {
+                "One statement will be refused, which rolls the whole migration back."
+            }
         };
         format!(
             "{} still holds {names}, which creating {} needs — {why}. {cost}",
@@ -2791,6 +2812,52 @@ mod tests {
         assert_eq!(
             names(SqlDialect::Sqlite, ServerFlavour::Unknown),
             vec!["ix_orders_customer"]
+        );
+    }
+
+    /// **Every T-SQL constraint is an object of its schema** (`sys.objects`),
+    /// whichever clause declared it: a primary key and a unique constraint as
+    /// much as a foreign key, and a check written on its column as much as one
+    /// on the table. An index that is no constraint is the table's own.
+    #[test]
+    fn a_sql_server_table_occupies_every_constraint_name_it_declares() {
+        use crate::schema::{CheckInfo, IndexInfo, ServerFlavour};
+        let index = |name: &str, constraint: Option<&str>| IndexInfo {
+            name: name.to_string(),
+            constraint: constraint.map(str::to_string),
+            ..Default::default()
+        };
+        let t = TableInfo {
+            schema: None,
+            indexes: vec![
+                index("PRIMARY", Some("pk_orders")),
+                index("uq_orders_no", Some("uq_orders_no")),
+                index("ix_orders_customer", None),
+            ],
+            check_constraints: vec![
+                CheckInfo {
+                    name: "ck_orders_total".to_string(),
+                    ..Default::default()
+                },
+                CheckInfo {
+                    name: "ck_orders_qty".to_string(),
+                    column_level: true,
+                    ..Default::default()
+                },
+            ],
+            ..child("orders", "fk_orders_customer", "customers")
+        };
+        assert_eq!(
+            occupied_names(&t, SqlDialect::MsSql, ServerFlavour::Unknown)
+                .into_iter()
+                .collect::<Vec<_>>(),
+            vec![
+                "ck_orders_qty",
+                "ck_orders_total",
+                "fk_orders_customer",
+                "pk_orders",
+                "uq_orders_no"
+            ]
         );
     }
 

@@ -6,7 +6,10 @@ read/write and edits **tables** (through the twelve-step rebuild), **views** and
 has no manual-transaction mode — see `db::session`'s `Session::open` for what that one is a
 statement about. All three engines now edit all three of those objects, and they get there
 differently, so ask the *narrow* capability (`ddl::supports_or_replace_view`,
-`ddl::supports_view_rename`) rather than the engine.
+`ddl::supports_view_rename`) rather than the engine. **Microsoft SQL Server is a fourth, and a
+preview rather than a peer**: it connects, reads, validates, introspects and runs scripts, and
+every editor, the grid's write-back, import, dump, the plan and Manual mode are switched off by
+capability — see `db::mssql`.
 
 This is the project's reference document: the crate/module map, the architecture invariants, the
 UI conventions, and the Floem hazards each subsystem is built on. `CLAUDE.md` at the repo root
@@ -348,9 +351,20 @@ existing prose was left alone.
     boundaries agree by construction.
     **The per-dialect rules are a capability table on `SqlDialect`**, one predicate per divergence
     (`dash_comment_needs_space`, `hash_line_comment`, `backslash_escapes`, `e_string_backslash`,
-    `double_quote_is_ident`, `backtick_ident`, `bracket_ident`, `dollar_quoted`,
-    `nested_block_comments`, `delimiter_directive`), and they are predicates because the question
-    stopped being binary. **`nested_block_comments` was a divergence the table did not have**:
+    `double_quote_is_ident`, `backtick_ident`, `bracket_ident`, `bracket_doubles`, `dollar_quoted`,
+    `nested_block_comments`, `delimiter_directive`, `batch_separator`), and they are predicates
+    because the question stopped being binary. SQL Server filled in the table as a fourth row:
+    `[…]` names (shared with SQLite, but only T-SQL writes a `]` inside one as `]]` —
+    `bracket_doubles`; SQLite's span ends at the first `]`, and ending T-SQL's there too would cut
+    `SELECT [a]]; DROP TABLE t; --] FROM t` into statements the server reads as one name —
+    `a_doubled_bracket_stays_inside_a_sql_server_name`), comments that nest (shared with
+    PostgreSQL), and `batch_separator`, which is two rules. A `GO` line — `go_directive`, alone on its
+    line with an optional count and `--` comment — ends a batch and is the client's, never sent, so
+    `is_delimiter_directive` answers for it beside MySQL's `DELIMITER` and one predicate lets every
+    executing path drop both; the count is accepted and **not** honoured, a batch runs once. And
+    `BodyScan`: a `CREATE`/`ALTER`/`CREATE OR ALTER` `PROC`/`FUNCTION`/`TRIGGER` takes the rest of
+    its batch as its body, `;`s and all, so only a `GO` or the end ends it — SQLite's `TriggerScan`
+    problem with a different terminator. **`nested_block_comments` was a divergence the table did not have**:
     PostgreSQL nests `/* … */` and `skip_comment` ended every comment at its first `*/`, so a head
     after a nested comment was read from inside it — `/* a /* b */ c */ DELETE FROM t` ran its
     every-row DELETE with no ask — and a quote in the comment's tail opened a "string" that hid a
@@ -404,7 +418,8 @@ existing prose was left alone.
     which `read_only_reason` both tests against and builds its rejection message from:
     `SELECT/SHOW/DESCRIBE/DESC/EXPLAIN/WITH` on MySQL, `SELECT/SHOW/EXPLAIN/WITH` on PostgreSQL
     (`SHOW search_path` is real SQL there, while `DESCRIBE` isn't — psql's `\d` is a client command
-    rather than a statement), `SELECT/EXPLAIN/WITH` on SQLite. One shared list was wrong in both
+    rather than a statement), `SELECT/EXPLAIN/WITH` on SQLite, and `SELECT/WITH` on SQL Server,
+    whose plan is `SET SHOWPLAN_XML ON` — session state, not a head. One shared list was wrong in both
     directions at once for a third engine: it waved `SHOW TABLES` through to SQLite, which has no
     such syntax, so the model got a raw parser error instead of being told the engine has no such
     thing, and a rejection named heads that connection couldn't use — which a model will keep
@@ -416,6 +431,17 @@ existing prose was left alone.
     `DENY_ANY_ENGINE` for every engine plus `deny_keywords_for`'s per-dialect half, since each
     engine's file, sleep and lock primitives share nothing but their effect — MySQL's and SQLite's,
     that is: PostgreSQL's are function calls, and are answered by an allowlist instead (below).
+    SQL Server has both halves. Its deny list is T-SQL's statements (`EXEC`, `DECLARE`, `WAITFOR`,
+    `BACKUP`, `DBCC`, `BEGIN`, `INTO` for `SELECT … INTO`, …) and its table hints (`UPDLOCK`,
+    `HOLDLOCK`, …), which `locking_clause` names as locks rather than as writes; T-SQL needs no `;`
+    between statements, so any of them may follow a `SELECT` as a second one, and only the scan over
+    every word finds it there. `OPENROWSET`/`OPENQUERY`/`OPENDATASOURCE` are on it because they read
+    a server file or send text to another server this gate cannot read. `WHILE` and `GOTO` are on it
+    as T-SQL's `BENCHMARK`: a loop writes nothing for the rolled-back session to undo, and runs until
+    it is stopped — on the unattended paths, by nobody (`a_sql_server_loop_is_not_a_read`).
+    **`NEXT VALUE FOR` is a phrase, asked on every dialect** (`advances_a_sequence`): `NEXT` and `VALUE` are ordinary column
+    names, so it cannot be a denied word, and no rollback returns a sequence — and MariaDB 10.3+
+    takes the phrase too, so `SELECT NEXT VALUE FOR s` had been passing there as a read.
     **The gate has two front ends now, so its wording names neither.** It was the AI's alone and its
     refusals said so; `schemaic query` runs the same function, and a person typing a `SLEEP()` at a
     prompt being told it *"is not permitted in an AI query"* is being answered about somebody else's
@@ -494,9 +520,25 @@ existing prose was left alone.
     sequence, large object, evaluated SQL text or write the session cannot see). A name not on it is
     refused, and that is every extension function and every function the owner defined *under a name
     of its own* — the gate cannot read a body, and a function's `STABLE` is its author's claim; an
-    owner's overload of a listed name is another matter (below). `read_function_allowlist` picks the list by an exhaustive match — `Some` for
-    PostgreSQL, `None` for MySQL and SQLite, whose builtin sets are small and closed and keep their
-    deny lists. The refusal's `writes` is `false`, since the fix is not `exec`
+    owner's overload of a listed name is another matter (below). `read_call_policy` picks the list by an exhaustive match — `Some` for
+    PostgreSQL and SQL Server, `None` for MySQL and SQLite, whose builtin sets are small and closed
+    and keep their deny lists. SQL Server's builtins are closed too, but a user-defined function may
+    call an extended stored procedure and a CLR one does whatever its assembly may, so a name the
+    gate cannot vouch for is refused there as well. What differs between the two is a `CallPolicy`
+    rather than a second scanner: the lists (`MSSQL_READ_FUNCTIONS` unqualified, and
+    `MSSQL_SYS_READ_FUNCTIONS` only under `sys.`, since T-SQL builtins take no schema and `sys`
+    functions need one — so an owner's `dbo.fn_my_permissions` is not vouched for by its namesake),
+    the catalogue schema, the paren keywords (`MSSQL_PAREN_KEYWORDS`, the reserved words T-SQL puts
+    before a `(` that is not a call's, which can never name a function — `INDEX` and `TABLESAMPLE`
+    among them, without which the table hint `WITH (INDEX(ix))` and a `TABLESAMPLE (10 PERCENT)`,
+    whose `(` follows the keyword rather than a method name as on PostgreSQL, were refused as calls
+    to unlisted functions; `a_sql_server_hint_or_sample_clause_is_not_a_call`), whether `::` is a
+    cast (on SQL Server
+    `Type::Method(…)` calls a CLR static method, so it is a call), and whether a quoted name can
+    reach a builtin (on SQL Server it resolves as a user object). SQL Server publishes no catalogue
+    of its builtins, so the list was checked on 2022 (16.0.4295) by calling each name: error 195 is
+    "not a built-in", and `mssql::every_allowlisted_function_is_a_builtin` in the live tier holds it
+    there. The refusal's `writes` is `false`, since the fix is not `exec`
     (`a_postgres_function_off_the_read_list_is_refused`). In `read_only_refusal` it comes **after**
     the denied words, so a deleting CTE is still named as its `DELETE`, and **before** the locks,
     whose "drop the clause" retry it would otherwise refuse a second time.
@@ -532,7 +574,9 @@ existing prose was left alone.
     `no_word_skipped_before_a_paren_names_an_unlisted_builtin` holds the builtin half of that line —
     it fails on a skipped word that is also a builtin off the list, and caught `like` and
     `overlaps`, which moved to the allowlist; the keyword categories are PostgreSQL's appendix C, and
-    no test holds that half. `pg_paren_is_grammar` adds the positional rules: any name after `AS`,
+    no test holds that half. `paren_is_grammar` adds the positional rules (renamed from
+    `pg_paren_is_grammar` when SQL Server began reading through them with its own
+    `MSSQL_PAREN_KEYWORDS`, and `::` there a method call rather than a cast): any name after `AS`,
     after `::` (a type's modifier), after `TABLESAMPLE`, or straight after a **value** — a `)`, a
     `]`, a literal or number, a quoted name. The grammar never juxtaposes a value and a call, so there
     it is an alias's column list (`(VALUES (1)) v(n)`, `FROM "t" x(a, b)`) or `OVER`/`FILTER` —
@@ -650,6 +694,44 @@ existing prose was left alone.
     plain `EXPLAIN` only plans and `ANALYZE TABLE t`/PostgreSQL's `ANALYZE t` gather statistics, so
     neither is asked; an option list's `ANALYZE false` still counts as analysing, over-asking being
     the safe direction (`an_analyzed_statement_is_judged_as_the_statement_it_runs`).
+    **On SQL Server both halves judge every statement in a range, not the range's head.** T-SQL
+    needs no `;` between statements, so one range `statement_ranges` cut at `;` and `GO` can hold
+    several, and every arm here reads a head: `DELETE FROM a WHERE id = 1\nDELETE FROM b` borrowed the
+    first statement's `WHERE`, and the second emptied `b` with no ask. `tsql_statements` cuts a SQL
+    Server range again before each top-level word that begins a statement, and `every_row_reason`
+    and `drop_reason` ask each piece — so `unsafe_reason`, `first_unsafe` and the `.sql` panel's
+    probes all do. It is **not a parser**, and does not have to be: it finds where the statements the
+    guards ask about *begin*, and a cut in the wrong place produces a fragment no guard answers for.
+    What it must not do is cut where the word continues the statement before it — a set operator's
+    second `SELECT`, `MERGE`'s `THEN UPDATE`/`DELETE`/`INSERT`, a cursor's `FOR UPDATE`, a foreign
+    key's `ON DELETE CASCADE`, `INNER MERGE JOIN`, `DROP … IF EXISTS`, an `ALTER TABLE`'s
+    `TRUNCATE`/`DROP PARTITION` — or anywhere after the head of a procedure, function, trigger or
+    view, which is one statement whatever it holds, or of a `GRANT`/`REVOKE`/`DENY`, whose privilege
+    list is made of those words. A leading `WITH` keeps the statement its CTEs feed, and text headed
+    `EXPLAIN`/`ANALYZE` — no T-SQL, but the prefixes `analyzed_statement` strips — stays whole. Every
+    other dialect gets its range back whole
+    (`every_sql_server_statement_in_a_range_is_judged_for_a_missing_where`, whose last assertion is
+    that MySQL still reads the first shape as one statement).
+    **`limited_select` is the one spelling of a generated row cap**, because T-SQL has no `LIMIT`
+    and writes `TOP (n)` after `SELECT`: the generators had each written a trailing `LIMIT` into a
+    `format!`, which is an engine assumption no census can find. `filter::table_query` and
+    `mssql::fetch_table` build through it. The rest of SQL Server's arms here are the ones
+    already written for the others: `use_target` reads T-SQL's `USE` (bracketed names included),
+    `needs_database` has an arm because a login lands in its default database, usually `master` —
+    everything but a read, `USE`, session and transaction control, flow control (`IF`, `WHILE`,
+    `RETURN`, `THROW`, `RAISERROR`), the statements about the server rather than a database in it
+    (`KILL`, `BACKUP`, `RESTORE`, `DBCC`, `RECONFIGURE`, `SHUTDOWN`) and the server-level objects
+    (databases, logins, endpoints, …) needs one: `EXEC`, since a procedure can create anything, and a
+    `SELECT … INTO` or a `WITH` whose CTEs feed an `INSERT`/`UPDATE`/`DELETE`/`MERGE`, which are no
+    reads. The flow-control and server-level heads had been hard-blocked with *No database
+    selected.* **`mssql_needs_database` asks every statement in the range, in order**, through
+    `tsql_statements` (above): `SET NOCOUNT ON` on the line above a `CREATE TABLE` is one range, and
+    its head alone sent the table to `master` on an unscoped tab. The statement an `IF` guards is
+    asked on its own, so `IF OBJECT_ID('t') IS NULL CREATE TABLE t` still needs one, and a `USE`
+    answers for everything after it
+    (`a_sql_server_statement_behind_a_harmless_one_still_needs_a_database`). And
+    `no_database_failure` matches error 208,
+    *Invalid object name*, as the hint that the statement ran somewhere other than meant.
   - `intel.rs` — the **SQL intelligence** layer (structure-aware, dialect-pluggable). Parses a
     *complete* statement with a real per-dialect AST (`sqlparser`; `SqlDialect` seam — MySQL,
     PostgreSQL and SQLite all wired) and answers what a token stream can't: `statement_scope`
@@ -812,7 +894,10 @@ existing prose was left alone.
     `pg_catalog` on a real server, which is what `pg_builtins.rs` below was *generated* from. **The
     `Option` outlives that**: all three engines answer `Some` today, and the `None` arm stays for the
     *fourth*, which has to land on it rather than inherit whichever list is nearest — the original
-    bug, one engine further on.
+    bug, one engine further on. **SQL Server is that fourth, and it landed on `None`**: no
+    completion builtins and no misspelled-function checker until a catalog can be checked against a
+    server as PostgreSQL's is. Its reserved words (`MSSQL_RESERVED`, the documented list) are there
+    — T-SQL has no fallback like SQLite's, so its alias set and identifier set are one list.
     **The checker's exemption set is the other half of "a name this engine really has", and an
     extension's functions fell straight through it.** `function_typo_checks` passes anything in the
     catalog's `known_idents` — databases, tables, columns, namespaces and the schema's stored
@@ -1397,10 +1482,26 @@ existing prose was left alone.
     would be a column of noise.
     Quoting here goes through the same rules as the rest of the app; don't add a fourth, and
     `needs_quoting` asks `intel::must_quote_ident` — the identifier question — never
-    `is_reserved_word`, which answers the alias one and on SQLite is a shorter list.
+    `is_reserved_word`, which answers the alias one and on SQLite is a shorter list. Its bare-name
+    shape is MySQL's on SQLite and SQL Server too, but for a leading `$`, which MySQL takes bare and
+    the other two do not: SQLite reads `$price` as a parameter and T-SQL as a `money` literal `$`
+    aliased `price`, so both quote it
+    (`a_name_that_starts_with_a_dollar_is_quoted_where_that_is_not_a_name`).
     The table name itself is **`qualified_table_name`**, which `table_query` and `skeleton.rs` both
     call: whether a dialect needs a qualifier at all is a capability answered once, or a generated
-    `UPDATE` and the browse `SELECT` above it end up spelling the same table two ways.
+    `UPDATE` and the browse `SELECT` above it end up spelling the same table two ways. On SQL
+    Server it always qualifies, because an unqualified name resolves through the *login's* default
+    schema, which need not be `dbo` — the bare form would read a different table for a different
+    user — and the cap is `TOP (n)`, through `sql::limited_select`.
+    **SQL Server's `]` is the one quote `sqlparser` will not escape**, and two rules follow from it.
+    The sort column goes into the AST **already quoted** by the one quoter and wrapped as an
+    unquoted `Ident`, which renders verbatim: `Ident::with_quote` took the quote character and
+    escaped it itself — correctly for `"` and `` ` ``, not at all for `[` — so a column called
+    `x]; DROP TABLE t; --` came back as SQL (`a_sort_column_holding_a_bracket_cannot_end_its_name`).
+    And a base query or filter that spells a doubled `]]` inside a name (`spells_a_doubled_bracket`)
+    is not rewritten at all — the base degrades to "not filterable", the filter is refused — since
+    the round trip returns `[a]]b]` as `[a]b]`, a different statement
+    (`a_sql_server_query_naming_a_bracket_is_not_rewritten`).
   - `skeleton.rs` — the `INSERT`/`UPDATE`/`DELETE` drafts behind a table's **Generate** menu, and
     they are drafts *for a person*, never statements for a server. Values are named placeholders
     (`:price`), which no engine accepts, so a skeleton run by reflex fails to parse instead of
@@ -4327,7 +4428,12 @@ existing prose was left alone.
     exists*). So that arm is `t.indexes` alone — it was firing on plans the server will not refuse,
     **and reordering them on that basis** — and the real clash is still caught, the index a unique or
     primary-key constraint creates being an `IndexInfo` already. SQLite keys index names to the
-    database and names no foreign key at all.
+    database and names no foreign key at all. **SQL Server holds every constraint name against its
+    whole schema**, since a T-SQL constraint is an object there (`sys.objects`) whichever clause
+    declared it: a foreign key, every check — a column-level one as much as a table's — and a
+    primary-key or unique constraint's name (`IndexInfo::constraint`); only an index that is no
+    constraint is the table's own (`a_sql_server_table_occupies_every_constraint_name_it_declares`).
+    That arm is read off the catalogue's scoping; no live measurement is recorded for it.
     `clashes_between` intersects each `OnlyLeft` table's set with each claiming table's, and the
     claim side is `OnlyRight` **or `Differing`**. The second half was missing under a rationale that
     does not cover it — *"a `Differing` table keeps its identity, so its constraint names are the
@@ -4956,8 +5062,10 @@ existing prose was left alone.
     engine produced it. `supports_users` is the capability (**false for SQLite, and that is a
     statement about SQLite rather than unfinished work**: it is a library linked into this process
     and its access control is the filesystem's — the database file's permissions, granted to an OS
-    user by the OS — so there is no account to browse and no statement that would create one), and
-    `supports_user_admin` is *computed* from it rather than spelling out a second `!= Sqlite`. A
+    user by the OS — so there is no account to browse and no statement that would create one; false
+    for SQL Server too, and *that* one is unfinished work — server logins and the users mapped to
+    them in each database are two catalogues, and the browser's one list of `(name, kind)` rows fits
+    neither half), and `supports_user_admin` is *computed* from it rather than spelling out a second `!= Sqlite`. A
     `Principal` is `name`/`host`/`kind`/`system`/`attributes`/`role_ambiguous`, and the `Option`
     on `host` is the one place the two engines disagree about what an account *is*: on MySQL/MariaDB
     it **is** the `(user, host)` pair, where `'app'@'%'` and `'app'@'localhost'` are two accounts
@@ -5580,7 +5688,10 @@ existing prose was left alone.
     transactions but because a pinned `rusqlite::Connection` is blocking and `!Sync`, needing a
     thread of its own and a channel, which is worth building deliberately rather than as a side
     effect of adding an engine. Running the tab's statements on fresh connections instead would
-    break the single promise the mode makes.
+    break the single promise the mode makes. **SQL Server has none yet either**, for the plainer
+    reason that its pinned session is not written; `supports_manual_mode` is the one answer for
+    both, an exhaustive `match` the footer asks (it asked `is_sqlite` before there was a second
+    engine without one), with `Session::open` refusing both as the backstop.
     `TxState::on_statement(engine, sql, outcome)` folds one statement into
     `Idle`/`Open{stmts}`/`Poisoned{stmts}`/`Lost`. It is a state machine rather than a bool because
     the engines diverge: PostgreSQL aborts the *whole* transaction on any error (`Poisoned` — only
@@ -6026,9 +6137,14 @@ existing prose was left alone.
     **both** platforms' separators since `connections.json` is portable and `std::path` on Linux
     returns a whole Windows path as its own file name, and `targets_same_server` counts the file,
     because pointing a connection at another `.db` reaches an entirely different set of tables and
-    is reached the same way a repointed host is. `is_sqlite`/`is_postgres` are the one answer to
-    which engine a label names — `schemaic_db::Engine::from_db_type`, the form's picker and
+    is reached the same way a repointed host is. `is_sqlite`/`is_postgres`/`is_mssql` are the one
+    answer to which engine a label names — `schemaic_db::Engine::from_db_type`, the form's picker and
     `SqlDialect::from_db_type` all delegate, the last of which used to re-spell the aliases itself.
+    `is_mssql` takes `SQL Server`/`sqlserver`/`mssql` as **whole labels only**, never a substring:
+    `MySQL` contains "SQL" too, and a label that meant SQL Server to the driver and MySQL to the form
+    would send a TDS handshake to a MySQL port. `read_only_caveat` is the sentence the form puts
+    under the Read-only switch on SQL Server alone, since that engine's read-only is a rollback
+    rather than a refusal (`db::mssql`).
     `same_engine` is that pair asked of *two* labels — `MariaDB` and `MySQL` name one engine, as do
     `pg` and `PostgreSQL`, and as do `MySQL` and the empty label that predates the field — so the
     question is not a string comparison. It is what the connection form's Type picker tells its own
@@ -6401,6 +6517,15 @@ existing prose was left alone.
     `create_ddl_script` already carries for foreign keys, and it is accepted for the same reason —
     the script goes to the clipboard and an editor tab, is read and edited before it is run, and
     `ddl_preview` is still the only thing that runs anything.
+    **Both join their parts through `ddl::join_scripts`, and so does the tree's folder script**
+    (`schema_tree`'s object-group menu). On SQL Server each part closes its batch with `GO` — one
+    that already ends in a `GO` gets no second, which is what a namespace's script is when the
+    database's joins it — because a view, procedure, function or trigger must begin a batch and a
+    routine's body runs to the end of its batch: joined with blank lines alone, a script's first
+    procedure swallowed every statement after it, in this editor and in SQL Server's own tools
+    (`a_sql_server_script_puts_each_object_in_a_batch_of_its_own`). Every other engine ends a
+    statement at its `;` and gets the blank lines it always had. It joins whole scripts rather than
+    emitted statements — a routine's part is already a `client_script` — so it is not a second one.
     **`TriggerInfo`/`TriggerAction`/`TriggerEvent`/`TriggerEnabled`/`TriggerSource`** are the
     trigger half, and carry three rules the
     same "restate everything or it silently resets" logic as `ViewOptions`.
@@ -6422,11 +6547,17 @@ existing prose was left alone.
     user's work but a few characters riding a `'it's'` that Apply would `DROP` the trigger to emit.
     `None` for `opened` means no record of what the row opened with, so nothing can be said and the
     row is left alone. The failure and the call site are under `ui/trigger_editor.rs`.
-    `TriggerInfo::create_sql` is the one trigger emitter and has **three** arms, not two: SQLite's
+    `TriggerInfo::create_sql` is the one trigger emitter and has **four** arms, not two: SQLite's
     shape is neither of the others' — PostgreSQL's `UPDATE OF` and `WHEN` with MySQL's inline
     body, no definer, no ordering clause, no session state and always `FOR EACH ROW` — so it is
     asked for by name rather than reached by falling off the end of a `!pg`. `update_columns` and
     `condition` are consequently **not** PostgreSQL-only fields: MySQL is the engine with neither.
+    **SQL Server's arm builds nothing** (`tsql_create_sql`): `sys.sql_modules.definition` is the
+    whole `CREATE TRIGGER`, `db::mssql` reads it into the body, and the arm hands it back, as
+    `RoutineInfo::create_sql` does a routine's. It used to fall through to MySQL's header and emit a
+    trigger inside a trigger, which Compare's DDL panes showed; a definition the server shows nobody
+    (`WITH ENCRYPTION`) comes back as a comment line saying so rather than half a statement
+    (`a_sql_server_trigger_is_its_stored_statement`).
     **`create_set_sql` is the whole-set form beside it, and the difference is `FOLLOWS`/`PRECEDES`.**
     That clause is a statement about the group as it stands when the statement runs, not a property
     of the trigger: both MySQL and MariaDB refuse one naming a trigger that is not there yet
@@ -7597,6 +7728,16 @@ existing prose was left alone.
     `lo :hi` — a spelling `params` *does* read as a placeholder, so Format Code created a query
     parameter by moving a space and held the run until it was bound. That rule has one definition
     now, `params::opens_placeholder`, and both callers ask it.
+    **A T-SQL `GO` line is a `Kind::Directive`, one verbatim token that owns its line.** It is the
+    client's batch separator, not SQL, and only on a line of its own; `tokenize` read it as an
+    ordinary word, so Format Code laid it out on the line before (`SELECT 1 GO`), where it separates
+    nothing, and the script lost its batches. `tokenize` asks the splitter's own definition —
+    `sql::go_directive` at `sql::at_line_start`, `pub(crate)` for this — and takes the line whole,
+    count and `--` comment included; `run` puts it at the margin on a line of its own and resets the
+    layout state as a `;` does, the next batch starting after a blank line. `go_directive` answers
+    `None` on every other dialect, so there `go` is still a word
+    (`a_sql_server_go_line_survives_formatting`, which asserts the formatted script splits into the
+    original's statements, each formatted).
   - `pairs.rs` — caret-driven, boundary-aware editor highlights + auto-close pairs (via
     `skip_noncode`): `auto_pair` (auto-close `()`/`''`/`""`/`` `` `` [MySQL] at code positions, wrap a
     selection, type-over a closer/quote already at the caret — respects string/comment regions and
@@ -8673,7 +8814,8 @@ existing prose was left alone.
     and `the_wider_scan_reaches_the_keyring_store` asserts this file is among what it reads —
     `ui/source_gate.rs` has the per-label floors.
 - `schemaic-db` — MySQL/MariaDB (`mysql_async`) in `mysql.rs`, PostgreSQL in `pg.rs`,
-  SQLite in `sqlite.rs`, SSH tunnels in `ssh.rs`, and
+  SQLite in `sqlite.rs`, SQL Server (`tiberius`, vendored) in `mssql.rs` — a preview, see its
+  entry — SSH tunnels in `ssh.rs`, and
   the pinned manual-transaction connection in `session.rs`.
   **Three engines and three modules — the move is finished.** For most of the crate's life MySQL
   had no module: its bodies were inline in `lib.rs`, so `pg.rs` and `sqlite.rs` were peers of each
@@ -8687,7 +8829,11 @@ existing prose was left alone.
   `ENGINE_ENTRY_POINTS` and so is outside the census below.) Both convention tests read
   three engines now, and the second is renamed for it:
   `every_engine_module_answers_the_whole_interface` and
-  `the_dispatcher_calls_every_engine_module_for_every_entry_point`.
+  `the_dispatcher_calls_every_engine_module_for_every_entry_point`. **`mssql.rs` is a fourth module
+  and answers every name**, the unwritten ones with a refusal: it is in the first test's list and
+  in `the_entry_point_list_is_what_the_dispatcher_actually_dispatches`'s intersection, whose
+  listed-⊆-called half is what holds its dispatch arms; the second test's own loop still names only
+  the first three.
   **Flipping them to three is what found the last three doors.** `commit_writes`, `refetch_rows`
   and `fetch_blob` existed in `mysql.rs` only as `write_on`, `refetch_on` and `blob_on` — the
   bodies `session.rs` calls directly — while the dispatcher's arm was still inline, so the interface
@@ -8821,9 +8967,10 @@ existing prose was left alone.
   resolves the transitive case a hand-written `pg_locks` join gets wrong. A row whose `pid` won't
   parse is **dropped**, never admitted under id `0`: a session `0` renders a full row with a live
   "Kill session" under it and can be pointed at by other rows' edges, which is the same reasoning
-  `parse_pid_array` already applies to the graph. **Both exclude the caller's own connection** —
-  every operation here opens a fresh one, so the poller would otherwise report itself running the
-  activity query at the top of every refresh. **Both also sort blocked-or-working sessions above
+  `parse_pid_array` already applies to the graph. **Both exclude the caller's own connection**, as
+  SQL Server's query does now (`@@SPID`, under `mssql.rs`) — every operation here opens a fresh
+  one, so the poller would otherwise report itself running the activity query at the top of every
+  refresh. **Both also sort blocked-or-working sessions above
   idle ones before the `LIMIT`**, and that is not cosmetic: `activity::rank` puts lock waits at the
   top of the panel, but a session that started waiting four seconds ago has the *smallest* age on
   the server, so ordering the fetch by age alone — which reads like "keep the interesting end" —
@@ -9423,7 +9570,17 @@ existing prose was left alone.
   it to sit inside. None of the three can be lifted by the statement it guards: PostgreSQL refuses
   `transaction_read_only` once a transaction has taken its snapshot, which a `SELECT` has; a MySQL
   transaction's access mode cannot change while it runs, so a stored function cannot undo it from
-  inside; and a `SELECT` cannot set a pragma. **What it refuses is a transactional write, and no
+  inside; and a `SELECT` cannot set a pragma. **SQL Server has no read-only session or transaction
+  to ask for**, so its arm is a different kind of thing — a rollback rather than a refusal: the
+  statement (or the whole batch) runs inside a `BEGIN TRANSACTION` and the connection is dropped
+  without a commit, which the server rolls back, and since its DDL is transactional a table a
+  `SELECT … INTO` made goes too. The write *happens* first, so it is briefly visible to a session
+  reading uncommitted data, and what a rollback cannot return — a procedure's effect outside the
+  database (`EXEC`, `xp_cmdshell`), a sequence `NEXT VALUE FOR` advanced, anything sent to another
+  server (`OPENQUERY`, `OPENROWSET`) — rests on the text gate, which refuses each by name
+  (`core::sql`). A login granted only `SELECT` is the one guard that sees everything, and
+  `connection::read_only_caveat` puts a sentence saying so under the connection form's Read-only
+  switch, on SQL Server alone. **What it refuses is a transactional write, and no
   more**: on PostgreSQL a function that never calls `PreventCommandIfReadOnly` — a replication slot
   dropped or created, `pg_stat_reset` — ran on this very session live on 16.15, so those are the
   text gate's to refuse (`core::sql`'s entry). **`Enforce::AsJudged` is the lexer the gate
@@ -9441,7 +9598,9 @@ existing prose was left alone.
   `ReadOnly` adds its `SET SESSION TRANSACTION READ ONLY`. PostgreSQL's `AsJudged` asks nothing,
   because the one setting that moves a quote there, `standard_conforming_strings`, is already pinned
   on the startup packet by `connect_probe` (above) — the same hazard, closed earlier — and SQLite's
-  asks nothing because it has no backslash escape to disagree about. **Failing to put the session in
+  asks nothing because it has no backslash escape to disagree about. SQL Server's asks nothing
+  either: the gate reads `"…"` as a name, and T-SQL under either `QUOTED_IDENTIFIER` setting ends
+  that span where the gate does. **Failing to put the session in
   the asked-for state fails the statement**: it never runs on a session that was only *meant* to be
   guarded. The editor asks for `ReadOnly` on a read-only connection and for nothing otherwise
   (`main.rs`'s `session_enforce`), so a writable connection's run is plain `fetch_query` as it always
@@ -10201,6 +10360,110 @@ existing prose was left alone.
   reason — a `Session` cannot exist without a live connection, and reading MySQL's forgiving model
   as PostgreSQL's poisoned one is the difference between "still committable" and "discard
   everything".
+  **`mssql.rs` is the fourth engine — SQL Server over TDS, through `tiberius` 0.13 — and a preview,
+  not parity.** What it does: connect (following **one** routing redirect, which is how Azure SQL's
+  gateway hands a client to the node that serves its database), `ping`, the database list,
+  `fetch_query` and `run_batch` (with `Enforce`, above), `prepare_check`, `fetch_table_list` and
+  `fetch_schema`, the monitor's `fetch_table`, `count_rows` (`COUNT_BIG`), table statistics from
+  `sys.dm_db_partition_stats`, Server Activity, and `run_script`. `explain`, `run_ddl`,
+  `run_server_ddl`, `commit_writes`, `refetch_rows`, `fetch_blob` and `import_rows` answer
+  `DbError::Refused("… is not available for SQL Server yet.")`, and so does `Session::open`, as it
+  does for SQLite. **The refusals are the backstop, not the gate**: the app is kept off them by
+  capabilities, each an exhaustive `match` with `MsSql` on `false`, asked at the UI site that
+  offers the thing — `edit::supports_grid_writes` inside `analyze_edit`, so no cell is
+  writable; `plan::supports_plan` for the editor's Plan entry; `import::supports_import` and
+  `dump::supports_dump` for the tree's *Import* and *Export ▸ SQL*; `tx::supports_manual_mode` for
+  the footer's Auto/Manual segment, which used to ask `is_sqlite`; `users::supports_users`, since
+  logins and the users mapped to them in each database are two catalogues the browser's one list
+  fits neither half of; and
+  `ddl::supports_change`, which answers `false` for SQL Server before anything else and so turns
+  every editor off at once, the four editor predicates computing from it. Its early answer is an
+  exhaustive `match` of its own ahead of the change arms; it was an `== SqlDialect::MsSql` guard,
+  the one exception to "exhaustive" here, and a `match` makes the next engine say which side of it
+  it is on. Unlike SQLite's gaps, all
+  of these are **unfinished work**, not statements about the engine. Server Activity is the one
+  split that *is* about the engine: `KILL` ends a session, but no T-SQL statement cancels another
+  session's request and leaves the session standing — a cancel is an attention sent by the owner's
+  own client — so `activity::supports_kill_kind` says no to *Cancel query* there and
+  `kill_session` refuses it rather than performing a `KILL` under a label that promises less.
+  The panel's row menu asks the same predicate (`activity_panel::row_menu`), so on SQL Server
+  the entry is absent rather than dimmed; the refusal is the backstop. The activity query drops its
+  own session (`session_id <> @@SPID`), as PostgreSQL's `pg_backend_pid()` and MySQL's
+  `CONNECTION_ID()` do — without it every refresh listed the poll as a running session with a
+  *Kill session* under it.
+  **Values arrive typed**, not as text — an `int` as an `i32`, a `decimal` as a scaled integer, a
+  `datetime2` as a day count and ticks — so `cell_value` renders each to the text SQL Server's own
+  tools print, and nothing in it is lossy: a `decimal` from its scaled integer, never through a
+  float; a `real` from its own shortest form rather than widened to `f64` first (which shows `0.1`
+  as `0.10000000149011612`); dates from their epochs' day counts; a `datetimeoffset` in the offset
+  it was stored with, which takes arithmetic because **the wire carries the instant in UTC** with
+  the offset beside it; a `uniqueidentifier` upper-case; bytes as `binary_display`, as on every
+  engine. `money` needed the driver patched (below) — upstream decoded it to an `f64`, which loses
+  cents past about 900 billion (2^53 at scale 4) and prints `12.5` for `12.5000` below it. The live tier's type matrix holds every arm to
+  the server (`every_type_renders_as_sql_server_prints_it`).
+  **Column provenance is not in TDS's metadata**, so each statement is first described by
+  `sys.dm_exec_describe_first_result_set` in browse mode, which compiles without running and names
+  each column's base table and column — PostgreSQL's `PREPARE`, here — at the cost of one more
+  round trip per statement. The description is of the batch's *first* result set, compiled a
+  moment before it ran, so `result_columns` uses it **only when it agrees with the wire** about how
+  many columns there are and what they are called: an `IF … SELECT … ELSE SELECT …` can describe
+  one shape and return another, and every cell would sit under another column's name and type.
+  (Nothing writes back through that provenance yet — `supports_grid_writes` is `false` — but it is
+  what the grid's editing will stand on.) A read reports **one result set**: a second is logged and
+  the read stops there. **`prepare_check` is the same DMF, and not `SET NOEXEC ON`**, which was the
+  first version: `NOEXEC` compiles without resolving names, so `SELECT * FROM nope` came back clean
+  on SQL Server 2022, and a missing table is the error validation exists to show. The describe
+  answers it as error 208 in a row; `describe_error` passes over its own 115xx answers (a temporary
+  table, dynamic SQL — "cannot say"), which are not faults in the statement.
+  **A cancel is TDS's attention, on the query's own connection** — `Client::cancel_query` aborts
+  the running batch and waits for the server's acknowledgement, bounded by `CANCEL_TIMEOUT` — so
+  there is no second connection and no transport to choose, which is why `pg_cancel_gate` skips
+  this file (below). **Every step of a read is raced against Stop, and every Stop sends the
+  attention** — `cancel_now`, which `fetch_schema` and `run_script` share. `run_statement` awaited
+  its describe alone, and the describe compiles the statement, which waits behind another session's
+  schema lock: Stop did nothing until the lock let go — 4.5 s on the live tier, measured before the
+  fix against the five-second lock `a_query_waiting_to_compile_stops_when_asked` takes, which now
+  holds the read under 3 s. `simple_query` does not return until the statement's first
+  result set — for an `UPDATE`, until it has finished — and a Stop there had been left to the
+  connection's close. `run_script` holds one connection for the file, as on every engine, over
+  statements the splitter has already cut at `GO` lines with each routine body kept whole
+  (`core::sql`'s `batch_separator`), which is what SQL Server's own tools send. A failed T-SQL
+  statement leaves its transaction usable, as MySQL's does, so `tx_engine_of` maps it to MySQL's
+  model — unless the session set `XACT_ABORT ON`, which is its own choice to make.
+  **`DATABASE_LISTING` asks `HAS_DBACCESS` inside a `CASE`, and only of a multi-user database.**
+  On one another session holds `SINGLE_USER`, that call took 2,174 ms against 150 ms (SQL Server
+  2022 CU27) — what an administrator's maintenance window would cost every tree refresh — and a
+  plain `AND user_access = 0` beside it does not stop it being evaluated, since T-SQL promises no
+  order for `AND`. `CASE` does. Such a database could not be opened by this login while it is held
+  anyway, so it is left out; the four system databases (ids 1–4) are too.
+  **`sys.objects.type` is `char(2)`**, so a procedure's `P` arrives padded as `P `, and until
+  `routine_shape` trimmed it every stored procedure was read as a function
+  (`a_routine_is_shaped_by_its_padded_object_type`).
+  **The driver is vendored and patched**, on the terms `vendor/floem/` is (*Floem 0.2 gotchas*):
+  `vendor/tiberius/` is the published 0.13.0 through `[patch.crates-io]`, each change marked
+  `schemaic patch (PATCHES.md)`, and `vendor/tiberius/PATCHES.md` is the record. Four patches:
+  **`ring` instead of `aws-lc-rs`**, because the workspace keeps one rustls provider and upstream's
+  default features bring a C/cmake/NASM build and a second provider rustls cannot choose between;
+  **`Config::rustls_client_config`**, so `db::tls`'s configuration is the one that handshakes
+  (`tls.rs`, below); **`QueryStream::rows_affected`**, since upstream skips every `DONE` token and
+  the affected count lives only there — and `forward_to_metadata` must collect them as well, since
+  `simple_query` calls it before handing the stream back, and for a statement with no result set
+  that is every token it produces; and **`money` as an exact `Numeric` at scale 4**. A re-vendor
+  re-applies the list; when it is empty the directory and the `[patch]` entry go.
+  The rest of the engine's surface is in `core`: `TableInfo::create_ddl` has a T-SQL arm
+  (`tsql_create_ddl` — `IDENTITY(1,1)` with a comment that the seed and increment are not read,
+  named primary-key and unique constraints, checks, `AS (…) PERSISTED`, other indexes as separate
+  statements and what it cannot restate named in a comment; a view is its stored definition), held
+  to the server by `a_tables_ddl_rebuilds_the_table_it_was_read_from`; a trigger's DDL is its stored
+  statement and a schema script closes each object's batch with `GO` (`TriggerInfo::create_sql`,
+  `ddl::join_scripts`, both under `schema.rs`);
+  `activity::from_mssql_rows`/`mssql_state` fold the session rows, drawing no blocking edge to a
+  negative id (not a session) or to the session's own — a parallel query's threads waiting on one
+  another are reported as the session blocking itself, which is no lock anyone else holds
+  (`a_sql_server_blocker_is_an_edge_only_when_it_is_a_session`); `snippet` has an `mssql` scope
+  with a five-snippet DMV pack (`every_builtin_snippet_runs`). In the app, the terminal's *open DB
+  client* answers "not supported yet": `sqlcmd` takes the database after `-d` and TLS as `-N`/`-C`, and
+  neither has been through `core::launch`.
   SSH tunnels return a `TunnelHandle` (drop → port freed) with
   keepalives + TOFU host-key verification (`ssh_known_hosts.json`). **`russh` stays on 0.62
   deliberately**: 0.63 changes `Handler::check_server_key` to take a `&PublicKeyOrCertificate`
@@ -10245,7 +10508,7 @@ existing prose was left alone.
   another candidate, because repeating a rejected certificate or a wrong password once per
   candidate is how a misconfigured certificate came to report "timed out" rather than naming
   itself.
-  **`tls.rs` translates a connection's TLS settings into the two networked drivers**, and only
+  **`tls.rs` translates a connection's TLS settings into the networked drivers**, and only
   translates: the decisions were already made by `core::connection::Tls::plan`, which collapses the
   five libpq `sslmode` levels into the four booleans a handshake is actually made of. The drivers
   spell those very differently — `mysql_async` takes two `danger_*` toggles on an `SslOpts`, while
@@ -10276,7 +10539,10 @@ existing prose was left alone.
   exactly the servers this setting exists for, with the failure discarded. That is a property of a
   **set of call sites**, not of the function — the function was right the whole time two of the ten
   sites bypassed it — so the gate is `session::pg_cancel_gate`, which scans the crate for a
-  `cancel_query` outside the module that defines the helper. **Its needle stops before the paren**,
+  `cancel_query` outside the module that defines the helper — and outside `mssql.rs`, which it skips
+  by name, because `tiberius::Client::cancel_query` shares only the name: it is a TDS attention on
+  the query's *own* connection, so there is no second connection and no transport to choose.
+  **Its needle stops before the paren**,
   because `tokio_postgres::CancelToken` has two of them: `cancel_query(tls)` and
   `cancel_query_raw(stream, tls)`, the second being what a cancel riding an already-open socket
   would reach for — so a needle ending in `(` sees the first and walks past the second, which
@@ -10353,7 +10619,26 @@ existing prose was left alone.
   itself a symptom. Separately, Windows populates its root program lazily, so a certificate every
   browser accepts can still fail `verify-ca` with `UnknownIssuer`, and one installed during a
   session needs a restart to be seen.
-  `import_rows` is the bulk-load path, and it has an arm for **all three** engines: `Engine::Postgres`
+  **SQL Server is the third driver, and it takes PostgreSQL's configuration rather than a third
+  spelling.** Upstream `tiberius` builds its rustls config from its own trust settings and offers no
+  way to supply one, so the vendored copy grows `Config::rustls_client_config` (`PATCHES.md`, patch
+  2) and `mssql_client_config` hands it the same `client_config` the verifying modes build for
+  PostgreSQL — so SQL Server's `verify-ca` is this module's, not the driver's. The TDS half
+  is `mssql_encryption`: `prefer` is `On`, `require` and both verifying modes are `Required`,
+  refusing a server that cannot — `pg_ssl_mode`'s line — and **`disable` is `Off`, not
+  `NotSupported`**, because TDS's `Off` still encrypts the *login* packet, the one carrying the
+  password, where `NotSupported` would send it as written; every Microsoft driver does the same
+  with `Encrypt=false` (`a_sql_server_connection_never_sends_its_password_in_the_clear`). **The
+  modes that trust no certificate do not even parse one**, and that is load-bearing: a SQL Server
+  with no certificate configured generates a self-signed one at start that rustls cannot read —
+  every handshake failed with `UnsupportedCertVersion`, `disable` included since the login is
+  encrypted regardless, measured on SQL Server 2022 CU27 in Docker. `NoVerification` still checks
+  the handshake signature against the certificate's key, which needs the parse, so those modes get
+  `AnyCertificate`, which skips it. That costs nothing an attacker could use: where no certificate
+  is trusted, an attacker presents their own and signs with it. The verifying modes keep the full
+  check and so need a real certificate, which the auto-generated one never is.
+  `import_rows` is the bulk-load path, and it has an arm for **all three** full engines (SQL
+  Server's refuses, and `import::supports_import` keeps the wizard off it): `Engine::Postgres`
   and `Engine::Sqlite` hand off to `pg::import_rows`/`sqlite::import_rows`, `Engine::MySql` falls
   through to the body here, and the shape is the same in each — one transaction of batched multi-row
   `INSERT`s pulled from a `RowSource` iterator, each batch required to affect exactly as many rows
@@ -10426,8 +10711,8 @@ existing prose was left alone.
   a capability instead of comparing a dialect. **MariaDB is a leg of its own**, not a MySQL
   stand-in: the divergences are in exactly what this crate reads, which is how a MySQL 8
   `CHECK_CLAUSE` escaping quirk once hid behind a MariaDB that returned runnable text.
-  **`pg_catalog.rs` and `mariadb_catalog.rs` are the two modules outside the macro, and the two that
-  name an engine.** `pg_catalog.rs` holds `core::pg_builtins::PG_FUNCTIONS` to what the server under
+  **`pg_catalog.rs` and `mariadb_catalog.rs` are two of the three modules outside the macro, and
+  of the three that name an engine** (`mssql.rs`, below, is the third). `pg_catalog.rs` holds `core::pg_builtins::PG_FUNCTIONS` to what the server under
   test reports — every name the server has is in the catalog, the overhang is exactly the 24
   grammar-only forms (`over_listing`), and those 24 are really in the catalog
   (`the_grammar_forms_are_in_the_catalog`, so the allowance cannot outlive what it was granted for).
@@ -10550,9 +10835,28 @@ existing prose was left alone.
   anywhere that composes the catalog with the checker that reads it: a name absent from `FUNCTIONS`
   is a *defect* only when it produces a warning under correct SQL, and adding an unrelated entry
   that brings a real builtin within edit distance fails here where no membership test can see it.
+  **`mssql.rs` is SQL Server's whole leg, and it is outside the macro for the opposite reason**:
+  not because its subject is a data file but because the shared suite writes rows back, applies
+  DDL and pins sessions, and SQL Server answers all three with a refusal until they are written.
+  So it tests what the engine does do, on its own terms — ping and the database list, every type
+  `cell_value` renders against the text SQL Server's tools print, `SELECT *` provenance, the
+  read-only rollback (`a_read_only_session_rolls_back_what_a_select_hides`: a `SELECT … INTO`
+  under `Enforce::ReadOnly` reports its two rows and leaves no table behind, and the same guard
+  over a batch leaves a `DELETE`'s rows in place), validation that names a missing table and runs
+  nothing, a script split at `GO`, introspection, a table's generated DDL rebuilding the table it
+  was read from (`a_tables_ddl_rebuilds_the_table_it_was_read_from`), a cancel (of a running
+  statement, and of one still compiling behind another session's lock), activity (the poll's own
+  session absent from it), and the
+  two catalogues only it has — `every_allowlisted_function_is_a_builtin` (the read gate's lists,
+  by error 195) and `every_builtin_snippet_runs`. It is not a `Target`, so `endpoint.rs` carries
+  `OUTSIDE_THE_SUITE` for it, `leg_enabled` to answer `SCHEMAIC_IT_ENGINES` for a leg with no
+  `Target`, and `note_leg_skipped` to say so when it is left out; its endpoint is
+  `SCHEMAIC_IT_MSSQL_HOST`/`_PORT`/`_USER`/`_PASSWORD` (defaults `127.0.0.1`/`1433`/`sa`/
+  `Schemaic_2026`, the local container's and CI's `mcr.microsoft.com/mssql/server:2022-latest`
+  service's). When enough of the suite answers, it joins the macro.
   **`endpoint.rs` is where a leg comes from**, and it is the whole environment contract: three
-  `SCHEMAIC_IT_<ENGINE>_HOST`/`_PORT`/`_USER`/`_PASSWORD` groups with localhost defaults, plus
-  `SCHEMAIC_IT_ENGINES` as the one way to run fewer than all three. An *unreachable* endpoint is a
+  `SCHEMAIC_IT_<ENGINE>_HOST`/`_PORT`/`_USER`/`_PASSWORD` groups with localhost defaults (four with
+  SQL Server's), plus `SCHEMAIC_IT_ENGINES` as the one way to run fewer than all of them. An *unreachable* endpoint is a
   hard failure rather than a skip — a tier that green-lights by not running is the failure mode
   this whole directory exists to avoid — so narrowing it costs a developer a deliberate sentence
   (`SCHEMAIC_IT_ENGINES=mariadb,pg`), and CI refuses that variable outright.
@@ -21247,8 +21551,8 @@ existing prose was left alone.
     next fix. The gate is
     `core::sql::read_only_reason` and is strictly stronger than the editor's `run_verdict`: an
     allowlist of read-only statement *heads* per dialect plus a deny-list of keywords anywhere —
-    and, on PostgreSQL, an allowlist of the functions a statement may call — with no confirm arm to
-    say yes to, which is the right shape when there is nobody at the keyboard.
+    and, on PostgreSQL and SQL Server, an allowlist of the functions a statement may call — with no
+    confirm arm to say yes to, which is the right shape when there is nobody at the keyboard.
     **It is not what makes the statement read-only**, and this entry used to say it was: a head is a
     spelling, and `SELECT setval(…)` or a `SELECT` of a function that deletes passed it and wrote —
     PostgreSQL's function allowlist refuses both there now, but not a `SELECT … INTO newtable`, a
@@ -22086,6 +22390,13 @@ Re-introducing the anti-patterns these guard against is a regression:
   `run_verdict` refuses a write by `contains_write`, a whitelist of heads, and `SELECT setval('s',
   1000)`, `SELECT lo_unlink(…)` and a `SELECT` of a function whose body deletes all open with one —
   the hole the headless gate had (below), still open on the editor after that one was closed.
+  **On SQL Server `contains_write` reads every word, not only a statement's head**
+  (`unterminated_write_words`): T-SQL needs no `;` between statements, and its backing session is
+  a transaction rolled back rather than a refusal, so `SELECT 1 COMMIT EXEC('DELETE FROM t')`
+  once read as one read whose `COMMIT` ended that transaction and whose procedure's writes stuck
+  (`a_sql_server_write_hidden_behind_a_read_is_still_a_write`). The missing-`WHERE` net had the
+  same blind spot on the same engine — a bare `DELETE` below a scoped one borrowed its `WHERE` —
+  and reads each statement of the range now (`sql::tsql_statements`, under `core::sql`).
   `main.rs`'s `session_enforce(connections, conn_id)` answers `Enforce::ReadOnly` for a read-only
   connection and `None` otherwise, an id no connection has counting as writable, as
   `read_only_of` answers it (`only_a_read_only_connection_asks_for_a_read_only_session`). Five
@@ -22189,7 +22500,7 @@ Re-introducing the anti-patterns these guard against is a regression:
   **The headless CLI is the fourth path, and it splits the question in two rather than adding a
   gate.** `schemaic query` runs `cli/query.rs`'s `read_only_query`, whose gate is
   `sql::read_only_reason` — an allowlist of read heads per dialect plus a keyword deny-list, and on
-  PostgreSQL an allowlist of functions, with **no `Confirm` arm to say yes to**, which is the right shape when there is nobody at the keyboard,
+  PostgreSQL and SQL Server an allowlist of functions, with **no `Confirm` arm to say yes to**, which is the right shape when there is nobody at the keyboard,
   and stronger than the verdict on the same axis `rerunnable_for_export` is. That function is the
   one headless read path: the MCP server's `run_query` calls it too, rather than the CLI writing a
   second copy of the gate beside the one `mcp.rs` already had. Both live in `schemaic-cli` now, and
@@ -22985,10 +23296,14 @@ Re-introducing the anti-patterns these guard against is a regression:
   Which gate to ask depends on the question: `supports_change` for a single change
   with no draft behind it, and for an editor the capability for *that object* —
   `supports_view_editing`, `supports_trigger_editing` or `supports_table_design`. All three answer
-  true for every engine today (SQLite reaches a table edit by rebuilding, `Change::RebuildTable`),
+  true for every full engine (SQLite reaches a table edit by rebuilding, `Change::RebuildTable`),
   and all three **derive** that from `supports_change` rather than returning a literal, which is the
   only form of "always true" that isn't a constant with a function's name on it: the answer changes
-  when the emitter's does, and a fourth engine gets whatever the change table says about it. A menu
+  when the emitter's does, and a fourth engine gets whatever the change table says about it. SQL
+  Server is that fourth, and the derivation is what switched it off: `supports_change` answers
+  `false` for it before any arm is consulted — no emitter writes T-SQL yet (`sp_rename`, a named
+  `DEFAULT` constraint to drop first, `CREATE OR ALTER`) — and every editor predicate, the
+  routine editor's included, follows with no edit of its own. A menu
   entry with **no** predicate is the same failure with nothing to grep for — the designer's three
   entries were exactly that until `supports_table_design` existed. **Keep asking them, and keep them
   apart**:
@@ -23374,7 +23689,12 @@ Re-introducing the anti-patterns these guard against is a regression:
   quoter (`schema::ddl_string`) and only PostgreSQL's host-less half reaches `export::ident_sql`.
   SQLite *reads* three quotings but **emits only `"x"`**: it is the one of the three with a defined
   escape, since a `]` cannot be written inside brackets at all. Its literals take Postgres' arm —
-  no backslash escape, so doubling one would corrupt the value.
+  no backslash escape, so doubling one would corrupt the value. **SQL Server is where brackets do
+  have an escape**, so it emits them: `ident_sql` writes `[name]` with a `]` doubled, and
+  `qualified_table` names `schema.table`, never the database, since a two-part name there is
+  schema-first. Its literals double only the quote and are **`N`-prefixed** — an unprefixed one is
+  `varchar`, converted to the database's code page on the way in, so `'Ωμέγα'` can arrive as
+  `'?????'` (`a_sql_server_string_literal_is_national_and_doubles_only_the_quote`).
   **The other half of a *conditional* quoter is which predicate the condition asks**, and that is
   the same bug by a second route: `ident_if_needed` and `filter::needs_quoting` ask
   `intel::must_quote_ident` (can this be a bare **identifier**), never `intel::is_reserved_word`
@@ -24186,6 +24506,8 @@ Re-introducing the anti-patterns these guard against is a regression:
   `[lints]` table appended to the vendored manifest allowing every rust and clippy lint, since Cargo
   caps a registry crate's warnings but not a path dependency's. The last is in the manifest rather
   than the source so that `src/` stays upstream's byte for byte, apart from what `PATCHES.md` lists.
+  **`vendor/tiberius/` (SQL Server's driver) is vendored on the same terms** and under the same
+  three measures, so `exclude = ["vendor"]` now covers two crates; its patches are under `db::mssql`.
 - **floem's file dialogs run on a thread with no runtime, so the `rfd` backend must need none.**
   `file_action::open_file`/`save_as` — every open and save dialog in the app — run
   `rfd::FileDialog` on a bare `std::thread::spawn`. floem's `rfd-tokio` feature puts rfd → `ashpd`

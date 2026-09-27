@@ -424,10 +424,11 @@ pub(crate) fn holds_bytes(rs: &ResultSet, ci: usize) -> bool {
 /// closure that reads its schema signals; tests supply a plain map. `schema` is
 /// the PostgreSQL namespace, `None` on MySQL.
 ///
-/// `dialect` is the tab's connection engine, and reaches only
-/// [`EditModel::byte_cap`]: a declared byte length is a promise on one engine
+/// `dialect` is the tab's connection engine. It reaches
+/// [`EditModel::byte_cap`] — a declared byte length is a promise on one engine
 /// and a note on another, so a type name cannot be read without knowing whose
-/// it is — see [`crate::blob::column_byte_cap`].
+/// it is, see [`crate::blob::column_byte_cap`] — and [`supports_grid_writes`],
+/// which leaves nothing writable on an engine with no write-back.
 pub fn analyze_edit(
     rs: &ResultSet,
     dialect: SqlDialect,
@@ -518,6 +519,14 @@ pub fn analyze_edit(
             }
         }
     }
+    // An engine whose write-back is not written yet gets a result with nothing
+    // writable in it — the same model a result with no key gets — rather than
+    // cells that stage edits a commit then refuses. The binary flags stay:
+    // they say what a cell holds, not whether it can be written.
+    if !supports_grid_writes(dialect) {
+        col_table.iter_mut().for_each(|t| *t = None);
+        tables.clear();
+    }
     EditModel {
         col_table,
         col_binary,
@@ -528,6 +537,19 @@ pub fn analyze_edit(
         // a key. `insert_target` needs the former, or a join whose second table
         // is keyless reads as a single-table result — see that method.
         origin_tables: groups.len(),
+    }
+}
+
+/// Can a result's rows be written back through the grid on `dialect`?
+///
+/// Every engine but SQL Server, whose `commit_writes` and `refetch_rows` are
+/// not written yet — that is unfinished work, not a fact about the engine,
+/// and [`analyze_edit`] answering from it is what keeps the grid from
+/// offering an edit the commit would refuse.
+pub fn supports_grid_writes(dialect: SqlDialect) -> bool {
+    match dialect {
+        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => true,
+        SqlDialect::MsSql => false,
     }
 }
 
@@ -2354,6 +2376,26 @@ mod tests {
                 .collect(),
             ..Default::default()
         }
+    }
+
+    /// **A keyed result is not editable on SQL Server yet** — the same result
+    /// that is editable on MySQL offers nothing, so no cell stages an edit the
+    /// commit would refuse. What a cell holds is still said.
+    #[test]
+    fn nothing_is_editable_where_the_engine_cannot_write_back() {
+        let r = rs(vec![
+            col("id", "INT", "t", true, false),
+            col("photo", "varbinary(max)", "t", false, true),
+        ]);
+        let schema = |_: &str, _: Option<&str>, t: &str| {
+            (t == "t").then(|| schema_with_pk("t", &["id"], &[("id", "int"), ("photo", "blob")]))
+        };
+        let my = super::analyze_edit(&r, SqlDialect::MySql, schema);
+        assert!(my.editable(0), "the control: MySQL writes it");
+        let ms = super::analyze_edit(&r, SqlDialect::MsSql, schema);
+        assert!(!ms.editable(0) && !ms.editable(1));
+        assert!(ms.binary(1), "a binary cell still says what it holds");
+        assert!(!supports_grid_writes(SqlDialect::MsSql));
     }
 
     /// **The one field the `dialect` parameter reaches, and nothing exercised

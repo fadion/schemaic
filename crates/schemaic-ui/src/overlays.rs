@@ -152,8 +152,15 @@ fn export_submenu(
     schema: Option<&str>,
     preselect: Option<&str>,
 ) -> MenuEntry {
+    // The one format that is a dump rather than rows written to files, and an
+    // engine without one does not offer it (`dump::supports_dump`).
+    let dialect = dump.edit_ctx().dialect;
     let children = schemaic_core::export::ExportFormat::ALL
         .iter()
+        .filter(|&&format| {
+            format != schemaic_core::export::ExportFormat::Sql
+                || schemaic_core::dump::supports_dump(dialect)
+        })
         .map(|&format| {
             // A `DumpCtx` per format rather than a whole `Ui` per format: four
             // `Copy` bundles and four `Rc`s against the root bundle's
@@ -331,8 +338,9 @@ pub(crate) fn object_entries(
     let edits_triggers = schemaic_core::ddl::supports_trigger_editing(dialect);
     ObjectEntries {
         // A view is not insertable, and owns no rows to delete. Neither is a
-        // sequence: its one row *is* the counter.
-        import: is_table,
+        // sequence: its one row *is* the counter. And an engine whose import
+        // is not written yet has no entry at all (`import::supports_import`).
+        import: is_table && schemaic_core::import::supports_import(dialect),
         // **Gated on the capability, like every sibling here.** It was the one
         // entry in this struct that wasn't, and Truncate is the entry that can
         // least afford it: on an engine with no arm for it, the menu offered a

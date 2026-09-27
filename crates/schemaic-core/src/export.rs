@@ -830,16 +830,17 @@ pub fn sql_literal(v: &Value, dialect: SqlDialect) -> String {
         Value::UInt(u) => u.to_string(),
         Value::Float(f) if !f.is_finite() => "NULL".to_string(),
         Value::Float(f) => f.to_string(),
-        Value::Str(s) => {
-            let escaped = match dialect {
-                SqlDialect::MySql => s.replace('\\', "\\\\").replace('\'', "''"),
-                // SQLite is standard-conforming like Postgres and has no
-                // backslash escape at all, so doubling one would corrupt the
-                // value exactly as it would there.
-                SqlDialect::Postgres | SqlDialect::Sqlite => s.replace('\'', "''"),
-            };
-            format!("'{escaped}'")
-        }
+        Value::Str(s) => match dialect {
+            SqlDialect::MySql => format!("'{}'", s.replace('\\', "\\\\").replace('\'', "''")),
+            // SQLite is standard-conforming like Postgres and has no
+            // backslash escape at all, so doubling one would corrupt the
+            // value exactly as it would there.
+            SqlDialect::Postgres | SqlDialect::Sqlite => format!("'{}'", s.replace('\'', "''")),
+            // No backslash escape either, and **`N`-prefixed**: an unprefixed
+            // literal is `varchar`, converted to the database's code page on
+            // the way in, so any character outside it arrives as `?`.
+            SqlDialect::MsSql => format!("N'{}'", s.replace('\'', "''")),
+        },
     }
 }
 
@@ -852,12 +853,17 @@ pub fn sql_literal(v: &Value, dialect: SqlDialect) -> String {
 /// three), but **emits only the standard form**: `"` is the one with a defined
 /// escape, since a `]` cannot be written inside brackets at all, so a name
 /// containing one would be unquotable in the form we chose to generate.
+///
+/// SQL Server gets `[name]`, with `]` doubled. It reads `"x"` too, but only
+/// while the session has `QUOTED_IDENTIFIER` on, and a session can turn it
+/// off; a bracket means a name whatever the session says.
 pub fn ident_sql(name: &str, dialect: SqlDialect) -> String {
     match dialect {
         SqlDialect::MySql => format!("`{}`", name.replace('`', "``")),
         SqlDialect::Postgres | SqlDialect::Sqlite => {
             format!("\"{}\"", name.replace('"', "\"\""))
         }
+        SqlDialect::MsSql => format!("[{}]", name.replace(']', "]]")),
     }
 }
 
@@ -914,7 +920,9 @@ pub const MYSQL_LITERAL_MODE_SQL: &str = "SET SESSION sql_mode = TRIM(BOTH ',' F
 pub fn literal_mode_sql(dialect: SqlDialect) -> Option<&'static str> {
     match dialect {
         SqlDialect::MySql => Some(MYSQL_LITERAL_MODE_SQL),
-        SqlDialect::Postgres | SqlDialect::Sqlite => None,
+        // SQL Server, like SQLite, has no backslash escape and no setting that
+        // would give it one.
+        SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::MsSql => None,
     }
 }
 
@@ -959,7 +967,8 @@ pub fn ident_pattern_sql(name: &str, dialect: SqlDialect) -> String {
                 .replace('%', "\\%");
             format!("`{}`", pattern.replace('`', "``"))
         }
-        SqlDialect::Postgres | SqlDialect::Sqlite => ident_sql(name, dialect),
+        // T-SQL's `GRANT … ON` names one securable exactly.
+        SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::MsSql => ident_sql(name, dialect),
     }
 }
 
@@ -2176,6 +2185,13 @@ pub fn qualified_table(
             None if database.is_empty() => q(table),
             None => format!("{}.{}", q(database), q(table)),
         },
+        // In one database, like PostgreSQL — but a two-part name is
+        // `schema.table` there, so the database is never the fallback: it
+        // would name a schema of that name.
+        SqlDialect::MsSql => match schema {
+            Some(ns) => format!("{}.{}", q(ns), q(table)),
+            None => q(table),
+        },
     }
 }
 
@@ -2864,7 +2880,7 @@ mod tests {
         )
     }
 
-    use crate::intel::SqlDialect::{MySql, Postgres, Sqlite};
+    use crate::intel::SqlDialect::{MsSql, MySql, Postgres, Sqlite};
 
     /// Rows with something for every renderer to trip over: a NULL, an embedded
     /// quote, a pipe and a newline (Markdown), an angle bracket (HTML), a
@@ -3583,6 +3599,57 @@ mod tests {
         );
     }
 
+    /// **A SQL Server string literal is written `N'…'`.** Unprefixed it is
+    /// `varchar`, converted to the database's code page on the way in, so
+    /// `'Ωμέγα'` can arrive as `'?????'`. No backslash escape, as on the
+    /// standard-conforming engines.
+    #[test]
+    fn a_sql_server_string_literal_is_national_and_doubles_only_the_quote() {
+        assert_eq!(
+            sql_literal(&Value::Str("Ωμέγα".to_string()), MsSql),
+            "N'Ωμέγα'"
+        );
+        assert_eq!(
+            sql_literal(&Value::Str("C:\\tmp".to_string()), MsSql),
+            "N'C:\\tmp'"
+        );
+        assert_eq!(
+            sql_literal(&Value::Str("x'; DROP TABLE t; --".to_string()), MsSql),
+            "N'x''; DROP TABLE t; --'"
+        );
+        assert_eq!(sql_literal(&Value::Int(-3), MsSql), "-3");
+        assert_eq!(literal_mode_sql(MsSql), None);
+    }
+
+    /// SQL Server's own quoting is `[…]`, with a `]` doubled inside it. `"…"`
+    /// would also work, but only while `QUOTED_IDENTIFIER` is on, and a session
+    /// can turn it off; brackets mean a name whatever the session says.
+    #[test]
+    fn a_sql_server_name_is_bracketed_with_the_closer_doubled() {
+        assert_eq!(ident_sql("plain", MsSql), "[plain]");
+        assert_eq!(ident_sql("a]b", MsSql), "[a]]b]");
+        assert_eq!(ident_sql("a[b\"c`d", MsSql), "[a[b\"c`d]");
+        assert_eq!(ident_pattern_sql("app_db", MsSql), "[app_db]");
+        // The lexer reads back exactly what the quoter wrote.
+        for name in ["plain", "a]b", "]]", "a b;c", "sélect"] {
+            let q = ident_sql(name, MsSql);
+            assert_eq!(
+                crate::sql::ident_at(&q, 0, MsSql).0.as_deref(),
+                Some(name),
+                "{q}"
+            );
+        }
+    }
+
+    /// A table is named `[schema].[table]`, as on PostgreSQL — the connection
+    /// is in one database — and bare with no schema. Qualifying with the
+    /// *database* in two parts would name a schema of that name.
+    #[test]
+    fn a_sql_server_table_is_qualified_by_its_schema_only() {
+        assert_eq!(qualified_table("app", Some("dbo"), "t", MsSql), "[dbo].[t]");
+        assert_eq!(qualified_table("app", None, "t", MsSql), "[t]");
+    }
+
     /// **`None` is a claim about the connection, not about the engine**, and
     /// this pins the claim rather than the value.
     ///
@@ -3644,36 +3711,26 @@ mod tests {
             "",
         ];
         for name in nasty {
-            for d in [MySql, Postgres, Sqlite] {
+            for d in crate::intel::SqlDialect::ALL {
                 assert_eq!(
                     crate::schema::ddl_ident_in(name, d),
                     ident_sql(name, d),
                     "ddl_ident_in({name:?}, {d:?})"
                 );
+                // `filter`'s is `ident_sql` itself now; assert the re-export
+                // really is the same function rather than a lookalike that
+                // could be swapped back to a local copy.
+                assert_eq!(
+                    crate::filter::quoted_ident_for_test(name, d),
+                    ident_sql(name, d)
+                );
             }
-            // `filter`'s is `ident_sql` itself now; assert the re-export really
-            // is the same function rather than a lookalike that could be swapped
-            // back to a local copy.
-            assert_eq!(
-                crate::filter::quoted_ident_for_test(name, MySql),
-                ident_sql(name, MySql)
-            );
         }
-        // **The fourth table, which this test's doc already claimed to
-        // cover.** `filter::quote_char` feeds `sqlparser`'s
-        // `Ident::with_quote`, which takes a `char` and so cannot be handed
-        // `ident_sql`'s output — it derives the character from it instead, and
-        // this is what says so. Its SQLite arm had no test anywhere.
-        for d in [MySql, Postgres, Sqlite] {
-            let q = crate::filter::order_by_quote_for_test(d);
-            assert_eq!(
-                ident_sql("", d),
-                format!("{q}{q}"),
-                "the ORDER BY quote disagrees with ident_sql on {d:?}"
-            );
-            // And it really is a quote, not a fallback.
-            assert!(q == '`' || q == '"', "{d:?} -> {q:?}");
-        }
+        // There was a fourth table, `filter::quote_char`, which handed
+        // `sqlparser`'s `Ident::with_quote` a quote *character*. It is gone:
+        // `sqlparser` does not double a `]` inside `[…]`, so the `ORDER BY`
+        // name now goes in already quoted by `ident_sql` —
+        // `a_sort_column_holding_a_bracket_cannot_end_its_name` holds that.
     }
 
     /// The pattern quoter is not a fifth identifier quoter: on a name holding

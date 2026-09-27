@@ -54,6 +54,7 @@ impl Scope {
             Scope::Dialect(SqlDialect::MySql) => "mysql".to_string(),
             Scope::Dialect(SqlDialect::Postgres) => "postgres".to_string(),
             Scope::Dialect(SqlDialect::Sqlite) => "sqlite".to_string(),
+            Scope::Dialect(SqlDialect::MsSql) => "mssql".to_string(),
             Scope::Conn(id) => format!("conn:{id}"),
             Scope::Unknown(s) => s.clone(),
         }
@@ -74,6 +75,7 @@ impl<'de> Deserialize<'de> for Scope {
             "mysql" => Scope::Dialect(SqlDialect::MySql),
             "postgres" => Scope::Dialect(SqlDialect::Postgres),
             "sqlite" => Scope::Dialect(SqlDialect::Sqlite),
+            "mssql" => Scope::Dialect(SqlDialect::MsSql),
             other => match other.strip_prefix("conn:").map(str::parse::<u64>) {
                 Some(Ok(id)) => Scope::Conn(id),
                 // Includes `conn:` followed by something that isn't a number —
@@ -383,6 +385,42 @@ pub fn builtins(dialect: SqlDialect) -> Vec<Snippet> {
                 "Indexes of a table",
                 "idx",
                 "SELECT il.name AS index_name,\n       il.\"unique\" AS is_unique,\n       group_concat(ii.name) AS columns_in_order\nFROM pragma_index_list(:table_name) il\nJOIN pragma_index_info(il.name) ii\nGROUP BY il.name, il.\"unique\"\nORDER BY il.name;",
+            ),
+        ],
+        // The dynamic management views need `VIEW SERVER STATE` (or, on
+        // Azure SQL Database, `VIEW DATABASE STATE`); without it they return
+        // only the caller's own session, which is a smaller answer rather
+        // than an error.
+        SqlDialect::MsSql => &[
+            (
+                301,
+                "Running queries",
+                "ps",
+                "SELECT r.session_id, s.login_name, s.host_name,\n       DB_NAME(r.database_id) AS database_name,\n       r.status, r.command, r.wait_type,\n       r.total_elapsed_time / 1000 AS seconds,\n       LEFT(t.text, 200) AS query\nFROM sys.dm_exec_requests r\nJOIN sys.dm_exec_sessions s ON s.session_id = r.session_id\nCROSS APPLY sys.dm_exec_sql_text(r.sql_handle) t\nWHERE r.session_id <> @@SPID\nORDER BY r.total_elapsed_time DESC;",
+            ),
+            (
+                302,
+                "Table sizes",
+                "sizes",
+                "SELECT s.name AS schema_name, t.name AS table_name,\n       SUM(CASE WHEN p.index_id IN (0, 1) THEN p.row_count ELSE 0 END) AS row_count,\n       CAST(SUM(p.reserved_page_count) * 8 / 1024.0 AS decimal(12, 1)) AS size_mb\nFROM sys.dm_db_partition_stats p\nJOIN sys.tables t ON t.object_id = p.object_id\nJOIN sys.schemas s ON s.schema_id = t.schema_id\nGROUP BY s.name, t.name\nORDER BY SUM(p.reserved_page_count) DESC;",
+            ),
+            (
+                303,
+                "Open transactions",
+                "trx",
+                "SELECT st.session_id, tr.transaction_id, tr.name,\n       tr.transaction_begin_time,\n       DATEDIFF(second, tr.transaction_begin_time, SYSDATETIME()) AS seconds_open\nFROM sys.dm_tran_active_transactions tr\nJOIN sys.dm_tran_session_transactions st ON st.transaction_id = tr.transaction_id\nORDER BY tr.transaction_begin_time;",
+            ),
+            (
+                304,
+                "Blocked sessions",
+                "blocked",
+                "SELECT r.session_id, r.blocking_session_id, r.wait_type,\n       r.wait_time / 1000 AS wait_seconds,\n       LEFT(t.text, 200) AS query\nFROM sys.dm_exec_requests r\nCROSS APPLY sys.dm_exec_sql_text(r.sql_handle) t\nWHERE r.blocking_session_id <> 0\nORDER BY r.wait_time DESC;",
+            ),
+            (
+                305,
+                "Unused indexes",
+                "unused",
+                "SELECT OBJECT_SCHEMA_NAME(i.object_id) AS schema_name,\n       OBJECT_NAME(i.object_id) AS table_name,\n       i.name AS index_name,\n       ISNULL(u.user_seeks + u.user_scans + u.user_lookups, 0) AS reads,\n       ISNULL(u.user_updates, 0) AS writes\nFROM sys.indexes i\nLEFT JOIN sys.dm_db_index_usage_stats u\n  ON u.object_id = i.object_id AND u.index_id = i.index_id AND u.database_id = DB_ID()\nWHERE OBJECTPROPERTY(i.object_id, 'IsUserTable') = 1\n  AND i.type_desc = 'NONCLUSTERED'\n  AND i.is_primary_key = 0 AND i.is_unique = 0\nORDER BY reads, writes DESC;",
             ),
         ],
     };
@@ -1131,7 +1169,7 @@ mod tests {
 
     // ── the built-in pack ───────────────────────────────────────────────────
 
-    const EVERY_DIALECT: [SqlDialect; 3] = [MY, PG, SqlDialect::Sqlite];
+    const EVERY_DIALECT: [SqlDialect; 4] = SqlDialect::ALL;
 
     /// Every shipped statement has to *parse* in the dialect it is shipped for.
     /// It cannot be run from here — there is no server in a unit test — so this

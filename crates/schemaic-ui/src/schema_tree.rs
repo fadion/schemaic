@@ -2333,12 +2333,12 @@ fn object_group_node(
                 label.to_lowercase()
             );
             // Every object in the folder, in the order the rows are in. Built on
-            // open, as the namespace and database scripts are.
-            let ddl = objects
-                .iter()
-                .map(|o| o.create_sql(dialect))
-                .collect::<Vec<_>>()
-                .join("\n\n");
+            // open, as the namespace and database scripts are — and joined as
+            // they are, so a folder of SQL Server procedures is one batch each.
+            let ddl = schemaic_core::ddl::join_scripts(
+                objects.iter().map(|o| o.create_sql(dialect)),
+                dialect,
+            );
             context_menu.set(Some(CtxMenu {
                 kind: CtxKind::ObjectGroup {
                     database: db.clone(),

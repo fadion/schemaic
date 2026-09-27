@@ -785,6 +785,18 @@ pub fn coerce(
     }
 }
 
+/// Can a file be imported into a table on `dialect`?
+///
+/// Not on SQL Server yet: its `import_rows` is not written, and the table
+/// menu's *Import* entry asks this so it is absent there rather than opening a
+/// wizard whose last step is a refusal.
+pub fn supports_import(dialect: SqlDialect) -> bool {
+    match dialect {
+        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => true,
+        SqlDialect::MsSql => false,
+    }
+}
+
 /// Does a boolean go into this engine as the **integer** `1`/`0` rather than the
 /// quoted literal `'true'`/`'false'`?
 ///

@@ -87,6 +87,17 @@ pub(crate) fn activity_panel(
                 .with(|cs| schemaic_core::connection::read_only_of(cs, id))
         })
     };
+    // The engine, for which kills the row menu offers at all — SQL Server has
+    // no *Cancel query* (`activity::supports_kill_kind`). A memo for the reason
+    // `read_only` is one.
+    let dialect = floem::reactive::create_memo(move |_| {
+        let id = conn.active_conn.get();
+        conn.connections.with(|cs| {
+            schemaic_core::connection::by_id(cs, id)
+                .map(|c| schemaic_core::intel::SqlDialect::from_db_type(&c.db_type))
+                .unwrap_or_default()
+        })
+    });
 
     // Panel-local search filter, debounced like the history panel's so a burst of
     // typing re-filters once. Local to this panel build.
@@ -211,6 +222,7 @@ pub(crate) fn activity_panel(
                         overlay,
                         menus,
                         read_only,
+                        dialect,
                     )
                 })
                 .collect::<Vec<_>>();
@@ -611,6 +623,7 @@ fn session_row(
     // The memo, for the reason `banner` takes it: this is built in a
     // `dyn_container` builder, and the menu it raises is built later still.
     read_only: floem::reactive::Memo<bool>,
+    dialect: floem::reactive::Memo<schemaic_core::intel::SqlDialect>,
 ) -> floem::AnyView {
     let color = state_color(s.state);
     // The identity group, then the age hard against the right edge.
@@ -755,6 +768,7 @@ fn session_row(
                     &menu_session,
                     kill.clone(),
                     read_only.get_untracked(),
+                    dialect.get_untracked(),
                 )));
         })
         .style(|s| {
@@ -784,19 +798,34 @@ fn session_row(
 /// own doc states the pairing: "The disabled button stays: it is what *says* the
 /// action is unavailable. This is what makes it so." The runtime refusal stays
 /// as the backstop.
-fn row_menu(s: &SessionInfo, kill: Rc<dyn Fn(i64, KillKind)>, read_only: bool) -> Vec<MenuEntry> {
+///
+/// **An engine with no statement for a kind of kill has no entry for it** —
+/// SQL Server's *Cancel query* (`activity::supports_kill_kind`). That is absent
+/// rather than dimmed: dimming says "not on this row", and on such an engine
+/// it is no row's.
+fn row_menu(
+    s: &SessionInfo,
+    kill: Rc<dyn Fn(i64, KillKind)>,
+    read_only: bool,
+    dialect: schemaic_core::intel::SqlDialect,
+) -> Vec<MenuEntry> {
     let id = s.id;
     let cancel = kill.clone();
-    let mut entries = vec![
-        MenuEntry::action(KillKind::Query.label(), move || {
-            (cancel)(id, KillKind::Query)
-        })
-        .disabled(read_only || !KillKind::Query.applies_to(s)),
+    let mut entries = Vec::new();
+    if activity::supports_kill_kind(dialect, KillKind::Query) {
+        entries.push(
+            MenuEntry::action(KillKind::Query.label(), move || {
+                (cancel)(id, KillKind::Query)
+            })
+            .disabled(read_only || !KillKind::Query.applies_to(s)),
+        );
+    }
+    entries.push(
         MenuEntry::action(KillKind::Session.label(), move || {
             (kill)(id, KillKind::Session)
         })
         .disabled(read_only),
-    ];
+    );
     if let Some(sql) = s.sql.clone() {
         entries.push(MenuEntry::Separator);
         entries.push(MenuEntry::action("Copy statement", move || {

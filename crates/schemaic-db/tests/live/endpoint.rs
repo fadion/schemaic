@@ -577,12 +577,27 @@ fn engines_var() -> Option<Vec<String>> {
         .collect();
     for n in &names {
         assert!(
-            ALL.iter().any(|t| t.name == n),
-            "SCHEMAIC_IT_ENGINES names {n:?}, which is not a leg — valid names are {}",
-            ALL.iter().map(|t| t.name).collect::<Vec<_>>().join(", ")
+            ALL.iter().any(|t| t.name == n) || OUTSIDE_THE_SUITE.contains(&n.as_str()),
+            "SCHEMAIC_IT_ENGINES names {n:?}, which is not a leg — valid names are {}, {}",
+            ALL.iter().map(|t| t.name).collect::<Vec<_>>().join(", "),
+            OUTSIDE_THE_SUITE.join(", ")
         );
     }
     Some(names)
+}
+
+/// Legs that are not a [`Target`], because the shared suite does not run on
+/// them — SQL Server's, which `crate::mssql` tests on its own terms until the
+/// engine answers enough of the suite to join it.
+pub const OUTSIDE_THE_SUITE: &[&str] = &["mssql"];
+
+/// Was the leg called `name` asked for? [`Target::enabled`] for a leg that has
+/// no [`Target`].
+pub fn leg_enabled(name: &str) -> bool {
+    match engines_var() {
+        None => true,
+        Some(list) => list.iter().any(|n| n == name),
+    }
 }
 
 /// **Every leg's declared case counts match its slices — and needs no server.**
@@ -678,23 +693,25 @@ fn every_leg_declares_the_number_of_cases_it_has() {
 /// spelling, because a `#[test]` cannot observe libtest's capture about its own
 /// run — the same argument the crate's source gates all make.
 pub fn note_skipped(target: &'static Target) {
+    note_leg_skipped(target.name);
+}
+
+/// [`note_skipped`] by the leg's name, for a leg that has no [`Target`] —
+/// [`OUTSIDE_THE_SUITE`]'s.
+pub fn note_leg_skipped(name: &'static str) {
     use std::io::Write as _;
     use std::sync::OnceLock;
     static SAID: OnceLock<std::sync::Mutex<std::collections::HashSet<&'static str>>> =
         OnceLock::new();
     let said = SAID.get_or_init(Default::default);
-    let first = said
-        .lock()
-        .map(|mut s| s.insert(target.name))
-        .unwrap_or(false);
+    let first = said.lock().map(|mut s| s.insert(name)).unwrap_or(false);
     if !first {
         return;
     }
     let mut err = std::io::stderr().lock();
     let _ = writeln!(
         err,
-        "live: {} is not in SCHEMAIC_IT_ENGINES — its tests asserted nothing",
-        target.name
+        "live: {name} is not in SCHEMAIC_IT_ENGINES — its tests asserted nothing"
     );
     let _ = err.flush();
 }

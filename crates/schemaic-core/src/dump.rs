@@ -283,6 +283,21 @@ pub fn cancel_note(name: &str, partial: bool) -> String {
     }
 }
 
+/// Can a database be dumped to a `.sql` file on `dialect`?
+///
+/// Not on SQL Server yet. Its tables' DDL is written (`TableInfo::create_ddl`)
+/// and its literals are, but a dump's `INSERT`s would name every identity
+/// column, and SQL Server refuses an explicit value there without `SET
+/// IDENTITY_INSERT … ON` around the table's rows, which this module does not
+/// write. The Export menu's *SQL* entry asks this; the per-table formats read
+/// rows and write files, and are offered.
+pub fn supports_dump(dialect: SqlDialect) -> bool {
+    match dialect {
+        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => true,
+        SqlDialect::MsSql => false,
+    }
+}
+
 /// The session switch that turns foreign-key enforcement off and back on, when
 /// the engine has one an ordinary user can throw.
 ///
@@ -297,7 +312,11 @@ pub fn fk_guard_sql(dialect: SqlDialect) -> Option<(&'static str, &'static str)>
     match dialect {
         SqlDialect::MySql => Some(("SET FOREIGN_KEY_CHECKS = 0;", "SET FOREIGN_KEY_CHECKS = 1;")),
         SqlDialect::Sqlite => Some(("PRAGMA foreign_keys = OFF;", "PRAGMA foreign_keys = ON;")),
-        SqlDialect::Postgres => None,
+        // SQL Server's switch is per table (`ALTER TABLE … NOCHECK CONSTRAINT
+        // ALL`), and turning it back on with `CHECK` leaves every key marked
+        // untrusted unless it is re-validated. Like PostgreSQL, the ordering
+        // and the closing constraints section are the answer.
+        SqlDialect::Postgres | SqlDialect::MsSql => None,
     }
 }
 
@@ -341,6 +360,8 @@ pub fn transaction_sql(dialect: SqlDialect) -> (&'static str, &'static str) {
     match dialect {
         SqlDialect::MySql => ("START TRANSACTION;", "COMMIT;"),
         SqlDialect::Postgres | SqlDialect::Sqlite => ("BEGIN;", "COMMIT;"),
+        // A bare `BEGIN` opens a block there, not a transaction.
+        SqlDialect::MsSql => ("BEGIN TRANSACTION;", "COMMIT TRANSACTION;"),
     }
 }
 
@@ -375,7 +396,8 @@ pub fn needs_fk_section(t: &TableInfo) -> bool {
 pub fn drop_cascade(dialect: SqlDialect) -> &'static str {
     match dialect {
         SqlDialect::Postgres => " CASCADE",
-        SqlDialect::MySql | SqlDialect::Sqlite => "",
+        // T-SQL's `DROP TABLE` has no `CASCADE`.
+        SqlDialect::MySql | SqlDialect::Sqlite | SqlDialect::MsSql => "",
     }
 }
 
@@ -412,6 +434,20 @@ pub fn create_container_sql(
             .map(|ns| format!("CREATE SCHEMA IF NOT EXISTS {};", ident_sql(ns, dialect)))
             .collect(),
         SqlDialect::Sqlite => Vec::new(),
+        // No `IF NOT EXISTS`, and `CREATE SCHEMA` must be alone in its batch,
+        // so it goes through `EXEC` behind a test. `dbo` is in every database.
+        SqlDialect::MsSql => namespaces
+            .iter()
+            .filter_map(|ns| ns.as_deref())
+            .filter(|ns| !ns.eq_ignore_ascii_case("dbo"))
+            .map(|ns| {
+                let lit =
+                    crate::export::sql_literal(&crate::model::Value::Str(ns.to_string()), dialect);
+                let stmt = format!("CREATE SCHEMA {}", ident_sql(ns, dialect));
+                let stmt_lit = crate::export::sql_literal(&crate::model::Value::Str(stmt), dialect);
+                format!("IF SCHEMA_ID({lit}) IS NULL EXEC({stmt_lit});")
+            })
+            .collect(),
     }
 }
 
@@ -432,7 +468,8 @@ pub fn create_container_sql(
 pub fn target_database_sql(dialect: SqlDialect, database: &str) -> Option<String> {
     match dialect {
         SqlDialect::MySql => Some(format!("USE {};", ident_sql(database, dialect))),
-        SqlDialect::Postgres | SqlDialect::Sqlite => None,
+        // SQL Server names the schema on both halves, as PostgreSQL does.
+        SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::MsSql => None,
     }
 }
 
@@ -1762,6 +1799,28 @@ mod tests {
     use crate::schema::{
         ColumnInfo, ForeignKeyInfo, TriggerAction, TriggerEvent, TriggerInfo, TriggerTiming,
     };
+
+    /// SQL Server has no `CREATE SCHEMA IF NOT EXISTS`, and a `CREATE SCHEMA`
+    /// must be alone in its batch, so the test-and-`EXEC` form is the one that
+    /// both restores onto a fresh database and replays onto the one it came
+    /// from. `dbo` exists everywhere and is not made.
+    #[test]
+    fn a_sql_server_schema_is_made_only_when_missing() {
+        let out = create_container_sql(
+            SqlDialect::MsSql,
+            "app",
+            &[Some("dbo".into()), Some("sa'les".into()), None],
+        );
+        assert_eq!(
+            out,
+            vec!["IF SCHEMA_ID(N'sa''les') IS NULL EXEC(N'CREATE SCHEMA [sa''les]');".to_string()]
+        );
+        assert_eq!(
+            transaction_sql(SqlDialect::MsSql),
+            ("BEGIN TRANSACTION;", "COMMIT TRANSACTION;")
+        );
+        assert_eq!(target_database_sql(SqlDialect::MsSql, "app"), None);
+    }
 
     fn table(name: &str) -> TableInfo {
         TableInfo {

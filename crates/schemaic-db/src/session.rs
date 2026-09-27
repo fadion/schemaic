@@ -244,6 +244,18 @@ impl Session {
                         .to_string(),
                 ));
             }
+            // **Not yet on SQL Server, and that one is unfinished work**: the
+            // pinned connection is a `tiberius::Client` behind this mutex like
+            // the other two, and it is simply not written. Refused for the same
+            // reason SQLite's is — a Manual tab that quietly auto-committed
+            // would break the one promise the mode makes.
+            Engine::MsSql => {
+                return Err(DbError::Refused(
+                    "SQL Server connections don't support manual transaction mode yet — \
+                     statements run and commit as they are sent"
+                        .to_string(),
+                ));
+            }
         };
         Ok(Arc::new(Session {
             db: db.clone(),
@@ -973,7 +985,10 @@ impl Session {
 pub fn tx_engine_of(engine: Engine) -> tx::TxEngine {
     match engine {
         Engine::Postgres => tx::TxEngine::Postgres,
-        Engine::MySql | Engine::Sqlite => tx::TxEngine::MySql,
+        // A failed T-SQL statement leaves its transaction open and usable, as
+        // MySQL's does — unless the session set `XACT_ABORT ON`, which is the
+        // session's own choice to make.
+        Engine::MySql | Engine::Sqlite | Engine::MsSql => tx::TxEngine::MySql,
     }
 }
 
@@ -1017,6 +1032,13 @@ mod pg_cancel_gate {
             // The definition itself, and the only place `NoTls` is a correct
             // answer — when the plan says the connection is plaintext.
             if name == "pg.rs" {
+                continue;
+            }
+            // **Not PostgreSQL's method.** `tiberius::Client::cancel_query` is
+            // a TDS attention written to the query's *own* connection — the
+            // socket, and so the TLS, it is already on — so there is no second
+            // connection and no transport to choose. It shares only the name.
+            if name == "mssql.rs" {
                 continue;
             }
             let src = std::fs::read_to_string(&path).expect("a source file");

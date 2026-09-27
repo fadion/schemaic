@@ -71,6 +71,7 @@
 //! that packet but keeps only the alias name + type, so it can't tell which real
 //! table/column a result cell came from.
 
+pub mod mssql;
 pub mod mysql;
 pub mod pg;
 pub mod session;
@@ -410,6 +411,8 @@ pub enum Engine {
     MySql,
     Postgres,
     Sqlite,
+    /// Microsoft SQL Server and Azure SQL, in [`mssql`].
+    MsSql,
 }
 
 impl Engine {
@@ -420,6 +423,7 @@ impl Engine {
             Engine::MySql => schemaic_core::intel::SqlDialect::MySql,
             Engine::Postgres => schemaic_core::intel::SqlDialect::Postgres,
             Engine::Sqlite => schemaic_core::intel::SqlDialect::Sqlite,
+            Engine::MsSql => schemaic_core::intel::SqlDialect::MsSql,
         }
     }
 
@@ -430,6 +434,7 @@ impl Engine {
             Engine::MySql => "mysql",
             Engine::Postgres => "postgres",
             Engine::Sqlite => "sqlite",
+            Engine::MsSql => "mssql",
         }
     }
 
@@ -460,6 +465,8 @@ impl Engine {
             Engine::Postgres
         } else if schemaic_core::connection::is_sqlite(db_type) {
             Engine::Sqlite
+        } else if schemaic_core::connection::is_mssql(db_type) {
+            Engine::MsSql
         } else {
             Engine::MySql
         }
@@ -643,7 +650,9 @@ impl Db {
     pub fn implied_database(&self) -> Option<&'static str> {
         match self.engine {
             Engine::Sqlite => Some(sqlite::MAIN),
-            Engine::MySql | Engine::Postgres => None,
+            // A SQL Server login lands in its default database, which is the
+            // server's to name — `DB_NAME()` — not ours to assume.
+            Engine::MySql | Engine::Postgres | Engine::MsSql => None,
         }
     }
 
@@ -1026,6 +1035,7 @@ impl Db {
             Engine::Postgres => pg::fetch_query(self, database, sql, dest, cancel, enforce).await?,
             Engine::Sqlite => sqlite::fetch_query(self, sql, dest, cancel, enforce).await?,
             Engine::MySql => mysql::fetch_query(self, database, sql, dest, cancel, enforce).await?,
+            Engine::MsSql => mssql::fetch_query(self, database, sql, dest, cancel, enforce).await?,
         };
         // A SQLite connection has exactly one database and the caller passes none,
         // so the label comes from the engine rather than from a scope nobody set.
@@ -1090,6 +1100,9 @@ impl Db {
                 }
                 Engine::MySql => {
                     mysql::fetch_table(self, database, schema, table, order_by, limit, cancel).await
+                }
+                Engine::MsSql => {
+                    mssql::fetch_table(self, database, schema, table, order_by, limit, cancel).await
                 }
             }
         };
@@ -1162,6 +1175,7 @@ impl Db {
                     .await;
             }
             Engine::MySql => mysql::explain(self, database, sql, analyze, read_only, cancel).await,
+            Engine::MsSql => mssql::explain(self, database, sql, analyze, read_only, cancel).await,
         }
     }
 
@@ -1193,7 +1207,8 @@ impl Db {
         // trigger carries its body, and SQLite's carries a statement list.
         match self.engine {
             Engine::Postgres => pg::trigger_functions(self, database).await,
-            Engine::MySql | Engine::Sqlite => Ok(Vec::new()),
+            // A T-SQL trigger carries its own body, as MySQL's does.
+            Engine::MySql | Engine::Sqlite | Engine::MsSql => Ok(Vec::new()),
         }
     }
 
@@ -1208,7 +1223,9 @@ impl Db {
     pub async fn roles(&self) -> Result<Vec<String>, DbError> {
         match self.engine {
             Engine::Postgres => pg::roles(self).await,
-            Engine::MySql | Engine::Sqlite => Ok(Vec::new()),
+            // SQL Server's owners wait on its principals — see
+            // `ddl::supports_owners`, which answers no for it.
+            Engine::MySql | Engine::Sqlite | Engine::MsSql => Ok(Vec::new()),
         }
     }
 
@@ -1344,6 +1361,7 @@ impl Db {
             Engine::Postgres => pg::prepare_check(self, database, sql).await,
             Engine::Sqlite => sqlite::prepare_check(self, stmt).await,
             Engine::MySql => mysql::prepare_check(self, database, stmt).await,
+            Engine::MsSql => mssql::prepare_check(self, database, stmt).await,
         }
     }
 }
@@ -1446,6 +1464,13 @@ impl Db {
                 )
                 .await;
             }
+            // `scope` goes across for the same reason: T-SQL has `USE` too.
+            Engine::MsSql => {
+                mssql::run_batch(
+                    self, database, stmts, row_cap, cancel, on_result, scope, enforce,
+                )
+                .await;
+            }
         }
     }
 }
@@ -1506,6 +1531,7 @@ impl Db {
             }
             // Bounded inside, like its two neighbours — see `mysql::ping`.
             Engine::MySql => mysql::ping(self, timeout).await,
+            Engine::MsSql => mssql::ping(self, timeout).await,
         }
     }
 
@@ -1526,6 +1552,7 @@ impl Db {
             Engine::Postgres => pg::fetch_databases(self).await,
             Engine::Sqlite => sqlite::fetch_databases(self).await,
             Engine::MySql => mysql::fetch_databases(self).await,
+            Engine::MsSql => mssql::fetch_databases(self).await,
         }
     }
 
@@ -1560,6 +1587,7 @@ impl Db {
             Engine::Postgres => pg::fetch_schema(self, database, cancel).await,
             Engine::Sqlite => sqlite::fetch_schema(self, cancel).await,
             Engine::MySql => mysql::fetch_schema(self, database, cancel).await,
+            Engine::MsSql => mssql::fetch_schema(self, database, cancel).await,
         }
     }
 
@@ -1581,6 +1609,7 @@ impl Db {
             // exists for is the *per-table* pragmas, so the list path skips those.
             Engine::Sqlite => sqlite::fetch_table_list(self).await,
             Engine::MySql => mysql::fetch_table_list(self, database).await,
+            Engine::MsSql => mssql::fetch_table_list(self, database).await,
         }
     }
 
@@ -1605,6 +1634,7 @@ impl Db {
             Engine::Postgres => pg::fetch_table_stats(self, database).await,
             Engine::Sqlite => Ok(SchemaStats::default()),
             Engine::MySql => mysql::fetch_table_stats(self, database).await,
+            Engine::MsSql => mssql::fetch_table_stats(self, database).await,
         }
     }
 
@@ -1632,6 +1662,7 @@ impl Db {
             Engine::Postgres => pg::count_rows(self, database, &sql, cancel).await,
             Engine::Sqlite => sqlite::count_rows(self, &sql, cancel).await,
             Engine::MySql => mysql::count_rows(self, database, &sql, cancel).await,
+            Engine::MsSql => mssql::count_rows(self, database, &sql, cancel).await,
         }
     }
 
@@ -1694,6 +1725,7 @@ impl Db {
             match self.engine {
                 Engine::Postgres => pg::fetch_sessions(self).await,
                 Engine::MySql => mysql::fetch_sessions(self).await,
+                Engine::MsSql => mssql::fetch_sessions(self).await,
                 // Unreachable — `supports_activity` above is the gate.
                 Engine::Sqlite => Err(DbError::Query(NO_SESSIONS_MSG.to_string())),
             }
@@ -1735,6 +1767,7 @@ impl Db {
             match self.engine {
                 Engine::Postgres => pg::kill_session(self, id, kind).await,
                 Engine::MySql => mysql::kill_session(self, id, kind).await,
+                Engine::MsSql => mssql::kill_session(self, id, kind).await,
                 // Unreachable — `supports_kill` above is the gate.
                 Engine::Sqlite => Err(DbError::Query(NO_SESSIONS_MSG.to_string())),
             }
@@ -1759,7 +1792,7 @@ impl Db {
             Engine::Postgres => pg::fetch_principals(self).await,
             Engine::MySql => mysql::fetch_principals(self).await,
             // Unreachable — `supports_users` above is the gate.
-            Engine::Sqlite => Err(DbError::Query(NO_USERS_MSG.to_string())),
+            Engine::Sqlite | Engine::MsSql => Err(DbError::Query(NO_USERS_MSG.to_string())),
         }
     }
 
@@ -1785,7 +1818,7 @@ impl Db {
             // parameter for.
             Engine::MySql => mysql::fetch_grants(self, principal).await,
             // Unreachable — `supports_users` above is the gate.
-            Engine::Sqlite => Err(DbError::Query(NO_USERS_MSG.to_string())),
+            Engine::Sqlite | Engine::MsSql => Err(DbError::Query(NO_USERS_MSG.to_string())),
         }
     }
 }
@@ -1795,7 +1828,10 @@ impl Db {
 /// it names the capability rather than the engine because that is what the
 /// caller asked. The browser checks `supports_users` itself and shows its own
 /// explanation; this is the backstop for a caller that didn't.
-const NO_USERS_MSG: &str = "this connection's engine has no user accounts";
+///
+/// Worded to be true of both engines it covers: SQLite has no accounts at
+/// all, and SQL Server's are not browsable here yet (`users::supports_users`).
+const NO_USERS_MSG: &str = "Schemaic cannot list this connection's user accounts";
 
 /// Why a connection has no Server Activity to report. One sentence, one place,
 /// so the two methods that raise it can't drift apart.
@@ -2099,6 +2135,8 @@ fn lock_wait_sql(engine: Engine) -> String {
         Engine::MySql => format!("SET SESSION lock_wait_timeout = {DDL_LOCK_WAIT_SECS}"),
         Engine::Postgres => format!("SET lock_timeout = '{DDL_LOCK_WAIT_SECS}s'"),
         Engine::Sqlite => String::new(),
+        // In milliseconds, and `-1` (the default) waits forever.
+        Engine::MsSql => format!("SET LOCK_TIMEOUT {}", DDL_LOCK_WAIT_SECS * 1000),
     }
 }
 
@@ -2168,6 +2206,9 @@ impl Db {
             // the reason is in `sqlite::run_ddl`, and it is not an optimisation.
             Engine::Sqlite => sqlite::run_ddl(self, stmts, cancel).await,
             Engine::MySql => mysql::run_ddl(self, database, stmts, cancel, fail).await,
+            // No plan reaches here from the app (`ddl::supports_change`); the
+            // arm is the backstop that says so.
+            Engine::MsSql => mssql::run_ddl(self, database, stmts, cancel).await,
         }
     }
 
@@ -2216,6 +2257,7 @@ impl Db {
                 ),
             )),
             Engine::MySql => mysql::run_server_ddl(self, stmts, cancel, fail).await,
+            Engine::MsSql => mssql::run_server_ddl(self, avoid, stmts, cancel).await,
         }
     }
 }
@@ -2276,6 +2318,7 @@ impl Db {
             Engine::Postgres => pg::run_script(self, database, rx, cancel).await,
             Engine::Sqlite => sqlite::run_script(self, rx, cancel).await,
             Engine::MySql => mysql::run_script(self, database, rx, cancel).await,
+            Engine::MsSql => mssql::run_script(self, database, rx, cancel).await,
         }
     }
 }
@@ -2315,6 +2358,7 @@ impl Db {
             Engine::Postgres => pg::commit_writes(self, write, cancel).await,
             Engine::Sqlite => sqlite::commit_writes(self, write, cancel).await,
             Engine::MySql => mysql::commit_writes(self, write, cancel).await,
+            Engine::MsSql => mssql::commit_writes(self, write, cancel).await,
         }
     }
 }
@@ -2341,6 +2385,7 @@ impl Db {
             Engine::Postgres => pg::refetch_rows(self, template, rows, cancel).await,
             Engine::Sqlite => sqlite::refetch_rows(self, template, rows, cancel).await,
             Engine::MySql => mysql::refetch_rows(self, template, rows, cancel).await,
+            Engine::MsSql => mssql::refetch_rows(self, template, rows, cancel).await,
         }
     }
 }
@@ -2384,6 +2429,7 @@ impl Db {
             Engine::Postgres => pg::fetch_blob(self, r, cancel).await,
             Engine::Sqlite => sqlite::fetch_blob(self, r, cancel).await,
             Engine::MySql => mysql::fetch_blob(self, r, cancel).await,
+            Engine::MsSql => mssql::fetch_blob(self, r, cancel).await,
         }
     }
 }
@@ -2447,6 +2493,7 @@ impl Db {
             Engine::Postgres => pg::import_rows(self, target, rows, cancel).await,
             Engine::Sqlite => sqlite::import_rows(self, target, rows, cancel).await,
             Engine::MySql => mysql::import_rows(self, target, rows, cancel).await,
+            Engine::MsSql => mssql::import_rows(self, target, rows, cancel).await,
         }
     }
 }
@@ -2702,10 +2749,15 @@ mod tests {
         // notices a module answering one name short could only ever check two
         // engines out of three, and the engine that ships most was the one it
         // could not check.
+        //
+        // Four now: SQL Server's module answers every name too, several of them
+        // with a refusal until they are written — which is the point of
+        // answering, since the alternative is a dispatch arm with nothing to call.
         for (name, src) in [
             ("mysql.rs", include_str!("mysql.rs")),
             ("pg.rs", include_str!("pg.rs")),
             ("sqlite.rs", include_str!("sqlite.rs")),
+            ("mssql.rs", include_str!("mssql.rs")),
         ] {
             for f in ENGINE_ENTRY_POINTS {
                 let sync = format!("\npub(crate) fn {f}(");
@@ -2801,7 +2853,7 @@ mod tests {
     fn the_dispatcher_calls_every_engine_module_for_every_entry_point() {
         let me = dispatcher_code();
         for f in ENGINE_ENTRY_POINTS {
-            for module in ["mysql", "pg", "sqlite"] {
+            for module in ["mysql", "pg", "sqlite", "mssql"] {
                 assert!(
                     me.contains(&format!("{module}::{f}(")),
                     "nothing in the dispatcher calls `{module}::{f}` — either the \
@@ -2858,6 +2910,9 @@ mod tests {
             .cloned()
             .collect::<HashSet<String>>()
             .intersection(&called("sqlite"))
+            .cloned()
+            .collect::<HashSet<String>>()
+            .intersection(&called("mssql"))
             .cloned()
             .collect();
         let listed: HashSet<String> = ENGINE_ENTRY_POINTS.iter().map(|s| s.to_string()).collect();

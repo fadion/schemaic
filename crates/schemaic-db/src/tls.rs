@@ -1,4 +1,10 @@
-//! Turning a [`TlsPlan`] into the two networked drivers' TLS configuration.
+//! Turning a [`TlsPlan`] into the networked drivers' TLS configuration.
+//!
+//! **Three drivers now.** SQL Server's (`tiberius`, vendored) takes a finished
+//! rustls `ClientConfig` from [`mssql_client_config`] — the same one
+//! [`client_config`] builds for PostgreSQL — and a TDS negotiation level from
+//! [`mssql_encryption`]. The paragraphs below were written for the first two
+//! and hold for all three.
 //!
 //! The plan is made once, in `schemaic_core::connection::Tls::plan` — five
 //! `sslmode` levels collapsed into the four decisions a handshake is actually
@@ -156,6 +162,112 @@ pub(crate) fn pg_ssl_mode(plan: Option<&TlsPlan>) -> PgSslMode {
 /// A rustls connector honouring this plan's verification decisions.
 pub(crate) fn pg_connector(plan: &TlsPlan) -> Result<MakeRustlsConnect, DbError> {
     Ok(MakeRustlsConnect::new(client_config(plan)?))
+}
+
+/// How tiberius should negotiate with SQL Server — the TDS half.
+///
+/// **There is no plaintext login in TDS worth offering.** With no plan
+/// (`disable`) the answer is `Off`, which still encrypts the *login* packet —
+/// the one carrying the password — and leaves the rest of the session in the
+/// clear; `NotSupported` would send the password as it is. That is what every
+/// Microsoft driver does with `Encrypt=false`, and like them nothing is
+/// verified for it, since a server with no certificate of its own makes a
+/// self-signed one for exactly this.
+///
+/// `prefer` is `On`: the whole session is encrypted when the server can, which
+/// every SQL Server can. `require` and the two verifying modes are `Required`,
+/// which refuses a server that cannot — the same line [`pg_ssl_mode`] draws.
+pub(crate) fn mssql_encryption(plan: Option<&TlsPlan>) -> tiberius::EncryptionLevel {
+    match plan {
+        None => tiberius::EncryptionLevel::Off,
+        Some(p) if p.fallback_to_plaintext => tiberius::EncryptionLevel::On,
+        Some(_) => tiberius::EncryptionLevel::Required,
+    }
+}
+
+/// The rustls configuration tiberius handshakes with — through the vendored
+/// driver's `Config::rustls_client_config` (see `vendor/tiberius/PATCHES.md`),
+/// so SQL Server's `verify-ca` is this module's `verify-ca`, not the driver's.
+///
+/// With no plan it is the login-only handshake [`mssql_encryption`] describes,
+/// which verifies nothing: the same configuration a `require` plan gets.
+///
+/// **Where nothing is verified, the certificate is not even read.** A SQL
+/// Server with no certificate configured generates a self-signed one at start,
+/// and rustls cannot parse it — measured on SQL Server 2022 CU27 in Docker,
+/// where every handshake failed with `UnsupportedCertVersion`, `disable`
+/// included, since TDS encrypts the login regardless. [`NoVerification`]
+/// still checks the handshake signature against the certificate's key, which
+/// needs the parse; [`AnyCertificate`] does not, for the modes that trust no
+/// certificate anyway — see its doc for why that costs nothing there. The
+/// verifying modes keep the full check, so they need a certificate a real
+/// verifier can read, which the auto-generated one never is.
+pub(crate) fn mssql_client_config(plan: Option<&TlsPlan>) -> Result<Arc<ClientConfig>, DbError> {
+    match plan {
+        Some(p) if !p.accept_invalid_certs => client_config(p).map(Arc::new),
+        _ => {
+            let provider = Arc::new(rustls::crypto::ring::default_provider());
+            let cfg = ClientConfig::builder_with_provider(provider.clone())
+                .with_safe_default_protocol_versions()
+                .map_err(|e| DbError::Connect(format!("TLS setup failed: {e}")))?
+                .dangerous()
+                .with_custom_certificate_verifier(Arc::new(AnyCertificate(provider)));
+            let cfg = match plan.and_then(|p| p.client_identity.as_ref()) {
+                None => cfg.with_no_client_auth(),
+                Some((cert, key)) => cfg
+                    .with_client_auth_cert(read_certs(cert)?, read_key(key)?)
+                    .map_err(|e| DbError::Connect(format!("client certificate rejected: {e}")))?,
+            };
+            Ok(Arc::new(cfg))
+        }
+    }
+}
+
+/// Accepts any certificate **and does not parse it** — SQL Server's
+/// `disable`, `prefer` and `require`, which trust no certificate at all.
+///
+/// The difference from [`NoVerification`] is the handshake signature, and it
+/// is no difference in what an attacker can do: a signature proves the peer
+/// holds the key of the certificate it presented, and where no certificate is
+/// trusted an attacker simply presents one of their own and signs with it.
+/// Checking it would only refuse the certificate SQL Server generates for
+/// itself, which is the one most servers present.
+#[derive(Debug)]
+struct AnyCertificate(Arc<rustls::crypto::CryptoProvider>);
+
+impl ServerCertVerifier for AnyCertificate {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: UnixTime,
+    ) -> Result<ServerCertVerified, rustls::Error> {
+        Ok(ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        Ok(HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        Ok(HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.0.signature_verification_algorithms.supported_schemes()
+    }
 }
 
 /// The rustls client configuration for a plan: which roots, which verifier, and
@@ -632,6 +744,37 @@ mod tests {
                 PgSslMode::Require,
                 "{m:?} must not be allowed to fall back"
             );
+        }
+    }
+
+    /// **SQL Server has no plaintext login.** `disable` still encrypts the
+    /// login packet, which carries the password — `Off` in TDS, and what every
+    /// Microsoft driver does with `Encrypt=false` — and verifies nothing there,
+    /// as they do not. `prefer` asks for the whole session; `require` upward
+    /// refuses a server that cannot give it.
+    #[test]
+    fn a_sql_server_connection_never_sends_its_password_in_the_clear() {
+        use tiberius::EncryptionLevel as E;
+        assert_eq!(mssql_encryption(None), E::Off);
+        assert_eq!(mssql_encryption(Some(&plan_for(SslMode::Prefer))), E::On);
+        for m in [SslMode::Require, SslMode::VerifyCa, SslMode::VerifyFull] {
+            assert_eq!(
+                mssql_encryption(Some(&plan_for(m))),
+                E::Required,
+                "{m:?} must not be allowed to fall back"
+            );
+        }
+        // And every one of them — the login-only case included — has a rustls
+        // configuration to hand the driver, built on the workspace's one
+        // provider rather than the driver's own.
+        assert!(mssql_client_config(None).is_ok());
+        for m in SslMode::ALL {
+            let plan = (Tls {
+                mode: m,
+                ..Tls::default()
+            })
+            .plan();
+            assert!(mssql_client_config(plan.as_ref()).is_ok(), "{m:?}");
         }
     }
 
