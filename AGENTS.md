@@ -2,17 +2,22 @@
 
 A native SQL editor (Rust + [Floem](https://github.com/lapce/floem) 0.2.0), MySQL/MariaDB-first,
 Zed-inspired, aiming to replace DataGrip. Workspace crates: `schemaic-core` (models + the pure,
-unit-tested SQL/edit/export/DDL logic), `schemaic-db` (MySQL/MariaDB + PostgreSQL + SQLite + SSH
-tunnels), `schemaic-conn` (saved connections hydrated from the OS keyring — the seam a non-GUI
+unit-tested SQL/edit/export/DDL logic), `schemaic-db` (MySQL/MariaDB + PostgreSQL + SQLite + SQL
+Server + SSH tunnels), `schemaic-conn` (saved connections hydrated from the OS keyring — the seam a non-GUI
 front end loads a connection through), `schemaic-cli` (the headless `schemaic query`/`exec` and their
 siblings, and the MCP server both `schemaic mcp` and the AI panel run; no Floem), `schemaic-ai`,
 `schemaic-term`, `schemaic-ui` (the Floem views), `schemaic-app` (signal wiring, the panel's
 `--mcp-serve` branch, the CLI's argv branch).
 
-**Three engines, and they are not equal.** MySQL/MariaDB and PostgreSQL are full; SQLite reads,
+**Four engines, and they are not equal.** MySQL/MariaDB and PostgreSQL are full; SQLite reads,
 writes, imports and edits **tables** (through the twelve-step rebuild — `ddl::sqlite_rebuild_sql`),
 **views** and **triggers**, but has **no manual-transaction mode** — a statement about SQLite
-rather than unfinished work (`db::session::Session::open` carries the reason). What differs between the
+rather than unfinished work (`db::session::Session::open` carries the reason). **SQL Server is a
+preview** (`db::mssql`, on a vendored `tiberius` — `vendor/tiberius/PATCHES.md`): it reads,
+introspects and runs scripts, and each thing it does not do yet is a capability answering no —
+`ddl::supports_change`, `edit::supports_grid_writes`, `tx::supports_manual_mode`,
+`plan::supports_plan`, `import::supports_import`, `dump::supports_dump`, `users::supports_users` —
+so it is absent from the UI rather than failing there; that one *is* unfinished work. What differs between the
 engines now lives in the *narrow* predicates that decide how an edit is performed rather than
 whether it is offered: `ddl::supports_or_replace_view`, `supports_view_rename`,
 `supports_column_reorder`, `supports_change`, `alter_column_disturbs_checks`,
@@ -71,13 +76,15 @@ substitute for the statement, and none of these is a style preference.
   *strictly stronger* than it. There are **three** such refusals now:
   `sql::rerunnable_for_export`, which has no `Confirm` arm; `sql::script_verdict`, which treats
   a whole `.sql` file as a write without reading it; and `sql::read_only_reason`, a per-dialect
-  allowlist of read-only statement *heads* plus a keyword deny-list — and, on PostgreSQL, an
-  allowlist of the functions a read may call — with no confirm arm at all,
+  allowlist of read-only statement *heads* plus a keyword deny-list — and, on PostgreSQL and
+  SQL Server, an allowlist of the functions a read may call — with no confirm arm at all,
   which is the gate for both paths that run SQL with nobody at the keyboard — the MCP server's
   `run_query` tool and `schemaic query`. **A head is a spelling, not a read**: `SELECT … INTO t`
   passes it and writes, so those paths also run on a session that refuses writes by their effect
   (`Db::fetch_query_enforced` with `Enforce::ReadOnly`), and the text gate stays in front for what
-  such a session still allows. **So does the editor on a read-only connection** — its run, Run All,
+  such a session still allows. SQL Server has no such session: there it is a transaction that is
+  always rolled back (`db::mssql::fetch_query`), so the gate also refuses by name what a rollback
+  cannot undo. **So does the editor on a read-only connection** — its run, Run All,
   a Manual tab's pinned `Session`, EXPLAIN ANALYZE and the *All rows* export all take their `Enforce` from
   the app's `session_enforce`, since `run_verdict` is a text gate too. Never a second, laxer gate. **The requests its guard mints are a
   separate list from the refusals**: `ScriptRequest::approved` for the file,

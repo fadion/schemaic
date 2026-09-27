@@ -1,8 +1,8 @@
 # Schemaic
 
-A fast, native SQL editor for MySQL, MariaDB, PostgreSQL, and SQLite — written in
-Rust, with an editable results grid, visual schema editing, and schema-aware
-intelligence, built to feel instant.
+A fast, native SQL editor for MySQL, MariaDB, PostgreSQL, and SQLite — with SQL
+Server in preview — written in Rust, with an editable results grid, visual schema
+editing, and schema-aware intelligence, built to feel instant.
 
 <p align="center">
   <img src="assets/screenshot.png" alt="Schemaic — SQL editor and results grid" width="820">
@@ -122,8 +122,13 @@ intelligence, built to feel instant.
   TLS from *prefer* through *verify-full* (client certificates included, verified
   against the OS trust store rather than a root set compiled in years ago), and
   SQLite by picking a file (no server, so no host, credentials or tunnel to fill
-  in). Per-connection colours, environment badges, and a read-only guard-rail on
-  all of them. Coming from another client, you can import the servers you already
+  in). **SQL Server and Azure SQL are in preview**: SQL Server logins, querying,
+  scripts with `GO`, browsing the schema, table DDL, exports, server activity and
+  the AI panel's read access work; editing rows, importing, query plans, manual
+  transactions and the schema editors are not offered there yet. Per-connection
+  colours, environment badges, and a read-only guard-rail on all of them — on SQL
+  Server, which has no read-only session, a read runs in a transaction that is
+  rolled back, and a login that can only read is the full guarantee. Coming from another client, you can import the servers you already
   have — a pasted URL or DSN, DBeaver, DataGrip, `~/.my.cnf`, `~/.pgpass`,
   `~/.pg_service.conf` — as a proposal you review row by row. Where a source keeps
   its passwords encrypted or in the OS credential store, you're told so rather
@@ -408,7 +413,7 @@ Requires a recent Rust toolchain (edition 2024). On any platform:
 cargo run -p schemaic-app
 ```
 
-No database client libraries to install for any of the three engines — SQLite is
+No database client libraries to install for any of the engines — SQLite is
 compiled in from source, so building needs a working C compiler (the MSVC tools on
 Windows, `build-essential` / `gcc` on Linux, the Xcode command line tools on
 macOS) alongside the GUI libraries below.
