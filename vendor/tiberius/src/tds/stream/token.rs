@@ -213,12 +213,15 @@ where
         }
     }
 
-    /// Drain the token stream after a client Attention signal has been sent,
-    /// discarding every remaining token of the cancelled request until the
-    /// acknowledging DONE token (with the `DONE_ATTN` status bit set) is
-    /// received, per MS-TDS section 2.2.1.6. Returns that DONE token so the
-    /// connection is left clean and ready for reuse.
-    pub(crate) async fn flush_done_attention(self) -> crate::Result<TokenDone> {
+    /// Drain one response message after a client Attention signal has been
+    /// sent, discarding every remaining token of the cancelled request, and
+    /// return the acknowledging DONE token (with the `DONE_ATTN` status bit
+    /// set) if this message carried it, per MS-TDS section 2.2.1.6.
+    ///
+    /// `Ok(None)` when the message ended without it: the server finishes its
+    /// reply to the aborted request and may send the acknowledgement as a
+    /// message of its own, so the caller reads on. schemaic patch (PATCHES.md)
+    pub(crate) async fn flush_done_attention(self) -> crate::Result<Option<TokenDone>> {
         let mut stream = self.try_unfold();
 
         loop {
@@ -228,14 +231,10 @@ where
                 | Some(ReceivedToken::DoneInProc(token))
                     if token.is_attention() =>
                 {
-                    return Ok(token);
+                    return Ok(Some(token));
                 }
                 Some(_) => (),
-                None => {
-                    return Err(crate::Error::Protocol(
-                        "Never got a DONE token acknowledging the Attention signal.".into(),
-                    ))
-                }
+                None => return Ok(None),
             }
         }
     }

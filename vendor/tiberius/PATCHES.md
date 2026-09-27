@@ -102,3 +102,24 @@ the value as text, and a wrong digit there is a wrong figure in a report.
 scaled integer. A `NULL` is `Numeric(None)`. `FromSql` for `f64` no longer
 reads a `money` column as a result; nothing here uses it. The module's own
 tests for the two decode arms still expect `F64` and are not built here.
+
+### 5. `cancel_query` reads past the aborted request's reply to the acknowledgement
+
+**Why.** After an Attention, SQL Server finishes its reply to the request it
+aborted — ending that message — and can send the acknowledging `DONE_ATTN` as a
+message of its own. Upstream stops at the first end-of-message and answers
+`Protocol("Never got a DONE token acknowledging the Attention signal.")`, so a
+Stop during an `UPDATE` held by a trigger reported the attention as failed and
+left the connection at an unknown point in the stream. Schemaic's grid commit
+only trusts a rollback sent after an *acknowledged* attention, so every such
+Stop was reported as a rollback that could not be confirmed.
+
+**What.**
+
+- `src/tds/stream/token.rs`, `flush_done_attention`: returns
+  `Result<Option<TokenDone>>` — `None` when the message ended without the
+  acknowledgement — instead of an error there.
+- `src/client/connection.rs`, `cancel_request`: loops over messages, clearing
+  `flushed` between them so the next one is read from the wire, until the
+  acknowledgement arrives. A server that never sends one leaves it waiting;
+  every caller in `schemaic_db::mssql` bounds it with `CANCEL_TIMEOUT`.

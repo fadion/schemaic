@@ -457,7 +457,17 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Connection<S> {
         self.flush_sink().await?;
         self.poisoned = false;
 
-        TokenStream::new(self).flush_done_attention().await
+        // The aborted request's reply ends with its own end-of-message, and the
+        // acknowledgement can follow as a message of its own — so a message that
+        // ends without it is read past, not reported as a protocol error. A
+        // server that never acknowledges leaves this waiting, which is why every
+        // caller bounds it with a timeout. schemaic patch (PATCHES.md)
+        loop {
+            if let Some(done) = TokenStream::new(self).flush_done_attention().await? {
+                return Ok(done);
+            }
+            self.flushed = false;
+        }
     }
 
     /// Cleans the packet stream from previous use. It is important to use the
