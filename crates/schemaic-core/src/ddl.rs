@@ -11097,6 +11097,23 @@ pub fn drop_object(
     object_set(name, schema, dialect, Change::DropObject { kind })
 }
 
+/// The `DROP` for whatever standalone object a schema-tree row holds — the
+/// route the row's **Drop** entry takes, and the set its gate asks about.
+///
+/// One function for both so the entry cannot be offered for one statement and
+/// then build another. **A routine is addressed by signature, not by name**:
+/// [`drop_object`] refuses one (and would emit a statement that is right until
+/// the first PostgreSQL overload), so the whole [`RoutineInfo`] goes to
+/// [`drop_routine`]. An **event** is refused by [`drop_object`] too, for its
+/// own reason ([`ObjectKind::uses_shared_changes`]), and goes to [`drop_event`].
+pub fn drop_item(item: &crate::schema::ObjectItem, dialect: SqlDialect) -> ChangeSet {
+    match (item.routine(), item.event()) {
+        (Some(r), _) => drop_routine(r, dialect),
+        (_, Some(e)) => drop_event(e, dialect),
+        _ => drop_object(item.kind(), item.name(), item.schema(), dialect),
+    }
+}
+
 /// A no-change set against a named object. See [`drop_object`] for why one is
 /// ever built.
 fn object_set_empty(name: &str, schema: Option<&str>, dialect: SqlDialect) -> ChangeSet {

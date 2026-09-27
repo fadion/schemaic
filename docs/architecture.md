@@ -4165,6 +4165,10 @@ existing prose was left alone.
     what the three shared-arm constructors ask. It returns an **empty** change set for one, so a
     preview says "no changes" rather than a bare-name statement that is right up until
     the first overload; `drop_routine` takes the whole `RoutineInfo` and is the route.
+    `drop_item` is that routing written once — a routine to `drop_routine`, an event to
+    `drop_event`, anything else to `drop_object` — and it was lifted out of the tree's menu handler
+    so the row's **Drop** entry could be gated on the same set it opens
+    (`overlays::object_drop_offered`) rather than on a second copy of the match.
     SQLite has no stored routines at all — a function there is registered by the host program,
     not stored in the database — so its arms are absent from `supports_change`,
     `supports_routine_editing` is false, and the tree grows no folder and the Create menu no entry.
@@ -10380,7 +10384,17 @@ existing prose was left alone.
   every editor off at once, the four editor predicates computing from it. Its early answer is an
   exhaustive `match` of its own ahead of the change arms; it was an `== SqlDialect::MsSql` guard,
   the one exception to "exhaustive" here, and a `match` makes the next engine say which side of it
-  it is on. Unlike SQLite's gaps, all
+  it is on. It turned off only what asked it, and three schema-tree entries asked nothing — the
+  table/view **Drop**, a standalone object's **Drop**, and **Create ▸ Table**, under a comment
+  saying every engine can create a table — so each opened a confirm and a DDL preview whose Apply
+  could only end in `run_ddl`'s refusal. Each now asks `supports_change` of the statement it would
+  really build and is absent here, as Truncate already was: `ObjectEntries::drop` asks it of
+  `overlays::object_drop_change`, the one `Change` the menu action also sends; an object row asks
+  `overlays::object_drop_offered`, over the set `ddl::drop_item` builds — the set the entry opens —
+  and wants it non-empty as well as expressible; and `create_children`'s Table entry asks it of
+  `Change::CreateTable`, so on SQL Server that list is empty and `create_submenu` leaves the Create
+  row out (`object_menu_tests::sql_server_offers_no_drop_or_any_other_schema_change`,
+  `create_menu_tests::sql_server_is_offered_nothing_to_create`). Unlike SQLite's gaps, all
   of these are **unfinished work**, not statements about the engine. Server Activity is the one
   split that *is* about the engine: `KILL` ends a session, but no T-SQL statement cancels another
   session's request and leaves the session standing — a cancel is an attention sent by the owner's

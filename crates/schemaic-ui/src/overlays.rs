@@ -287,7 +287,7 @@ fn create_submenu(
 /// still dims, because there the action is real and merely unavailable.
 ///
 /// Separate from the menu builder so the rule can be asserted at all — the
-/// builder needs a `Ui` — and because two of the five are **not uniform**
+/// builder needs a `Ui` — and because two of the six are **not uniform**
 /// (`triggers` and `refresh_view`), which is exactly the kind of thing a later
 /// edit flattens.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -309,6 +309,45 @@ pub(crate) struct ObjectEntries {
     /// invitation to wire the read entry to it, which would put a server write
     /// where the eye expects a reload.
     pub refresh_view: bool,
+    /// Whether **Drop** is offered — asked of the statement the entry would
+    /// really build ([`object_drop_change`]), so the gate and the action cannot
+    /// be about two different changes.
+    pub drop: bool,
+}
+
+/// The change a table-menu **Drop** makes of the object under the cursor.
+///
+/// **`DropTable` for a sequence, deliberately.** There is no
+/// `Change::DropSequence`, and MariaDB's own `DROP TABLE sq1` drops a sequence —
+/// measured on 10.11.14: the object is gone and the catalogue is empty
+/// afterwards. Spelled out per shape rather than left on a boolean, so a
+/// `DROP SEQUENCE` arm has a place to land.
+pub(crate) fn object_drop_change(
+    shape: schemaic_core::schema::TableShape,
+    materialized: bool,
+) -> schemaic_core::ddl::Change {
+    use schemaic_core::schema::TableShape;
+    match shape {
+        TableShape::View => schemaic_core::ddl::Change::DropView { materialized },
+        TableShape::Sequence | TableShape::Table => schemaic_core::ddl::Change::DropTable,
+    }
+}
+
+/// Whether a standalone object's row (a type, domain, sequence, routine or
+/// event) offers **Drop** at all — asked of the set [`schemaic_core::ddl::drop_item`]
+/// would build for it, which is the set the entry opens.
+pub(crate) fn object_drop_offered(
+    item: &schemaic_core::schema::ObjectItem,
+    dialect: schemaic_core::intel::SqlDialect,
+) -> bool {
+    // Non-empty as well as expressible: an empty set is a preview saying "no
+    // changes", an entry that can only ever lead nowhere.
+    let cs = schemaic_core::ddl::drop_item(item, dialect);
+    !cs.changes.is_empty()
+        && cs
+            .changes
+            .iter()
+            .all(|c| schemaic_core::ddl::supports_change(dialect, c))
 }
 
 /// See [`ObjectEntries`]. `materialized` is only meaningful on PostgreSQL, which
@@ -393,6 +432,14 @@ pub(crate) fn object_entries(
                     concurrently: false,
                 },
             ),
+        // **Gated like Truncate, and for Truncate's reason.** It was the last
+        // entry here that asked nothing, so on SQL Server — no emitter yet — it
+        // was a red enabled item that asked "This can't be undone" of a change
+        // that could only end in the runner's refusal.
+        drop: schemaic_core::ddl::supports_change(
+            dialect,
+            &object_drop_change(shape, materialized),
+        ),
     }
 }
 
@@ -537,14 +584,22 @@ pub(crate) fn create_children(
     read_only: bool,
 ) -> Vec<CreateEntry> {
     use schemaic_core::ddl::ObjectKind;
-    // Every engine can create a table. A view is a separate capability — see
+    // A table asks for the one statement a new table's designer emits — it was a
+    // literal "every engine can create a table" until SQL Server, which has no
+    // emitter yet. A view is a separate capability — see
     // `ddl::supports_view_editing` — and is absent rather than dimmed where the
     // emitter would write a statement the engine has no form of.
-    let mut out = vec![CreateEntry {
-        label: "Table",
-        kind: CreateKind::Table,
-        disabled: read_only,
-    }];
+    let mut out = Vec::new();
+    if schemaic_core::ddl::supports_change(
+        dialect,
+        &schemaic_core::ddl::Change::CreateTable(Box::default()),
+    ) {
+        out.push(CreateEntry {
+            label: "Table",
+            kind: CreateKind::Table,
+            disabled: read_only,
+        });
+    }
     if schemaic_core::ddl::supports_view_editing(dialect) {
         out.push(CreateEntry {
             label: "View",
@@ -1871,7 +1926,10 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                             .disabled(read_only || !editable),
                         );
                     }
-                    {
+                    if object_drop_offered(
+                        &item,
+                        crate::table_designer::edit_ctx(import_ui.conn).dialect,
+                    ) {
                         let ui = import_ui.clone();
                         let confirm = ui.overlay.confirm;
                         let (db, obj) = (database.clone(), item.clone());
@@ -1894,33 +1952,11 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                                             return;
                                         }
                                         let ctx = crate::table_designer::edit_ctx(ui.conn);
-                                        // **A routine is addressed by signature,
-                                        // not by name.** `drop_object` refuses one
-                                        // (and would emit a statement that is right
-                                        // until the first PostgreSQL overload); the
-                                        // whole `RoutineInfo` is already on the row,
-                                        // so `drop_routine` gets it without a second
-                                        // lookup that could disagree.
-                                        // …and an **event** is refused by
-                                        // `drop_object` too, for its own reason
-                                        // (`ObjectKind::uses_shared_changes`).
-                                        // The whole `EventInfo` is on the row,
-                                        // so `drop_event` gets it without a
-                                        // second lookup that could disagree.
-                                        let cs = match (obj.routine(), obj.event()) {
-                                            (Some(r), _) => {
-                                                schemaic_core::ddl::drop_routine(r, ctx.dialect)
-                                            }
-                                            (_, Some(e)) => {
-                                                schemaic_core::ddl::drop_event(e, ctx.dialect)
-                                            }
-                                            _ => schemaic_core::ddl::drop_object(
-                                                kind,
-                                                obj.name(),
-                                                obj.schema(),
-                                                ctx.dialect,
-                                            ),
-                                        };
+                                        // The routine, the event or the plain
+                                        // object — whichever the row holds, and
+                                        // the same set the gate above asked about
+                                        // (`ddl::drop_item`).
+                                        let cs = schemaic_core::ddl::drop_item(&obj, ctx.dialect);
                                         crate::ddl_preview::open_preview(
                                             ui.ddl,
                                             crate::ddl_preview::preview_of(
@@ -2614,7 +2650,7 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                                 .disabled(read_only),
                             );
                         }
-                        {
+                        if offers.drop {
                             let ui = import_ui.clone();
                             let confirm = ui.overlay.confirm;
                             let (db, ns, tbl) = (database.clone(), schema.clone(), table.clone());
@@ -2665,21 +2701,10 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                                                     // out per shape rather than
                                                     // left on the boolean, so a
                                                     // `DROP SEQUENCE` arm has a
-                                                    // place to land.
-                                                    {
-                                                        use schemaic_core::schema::TableShape;
-                                                        match shape {
-                                                            TableShape::View => {
-                                                                schemaic_core::ddl::Change::DropView {
-                                                                    materialized,
-                                                                }
-                                                            }
-                                                            TableShape::Sequence
-                                                            | TableShape::Table => {
-                                                                schemaic_core::ddl::Change::DropTable
-                                                            }
-                                                        }
-                                                    },
+                                                    // place to land — in
+                                                    // `object_drop_change`, which
+                                                    // the gate asks about too.
+                                                    object_drop_change(shape, materialized),
                                                 );
                                             }
                                         }),
@@ -6162,7 +6187,61 @@ mod object_menu_tests {
                 d == Postgres,
                 "{d:?} matview refresh"
             );
+
+            // Drop is offered for both shapes on every engine with an emitter.
+            assert!(t.drop && v.drop, "{d:?}: {t:?} {v:?}");
         }
+    }
+
+    /// **SQL Server is offered no schema change from this menu**, Drop included.
+    ///
+    /// Drop was the one entry here not gated on a capability, so on SQL Server —
+    /// where `ddl::supports_change` answers no to everything — it was a red
+    /// enabled item that asked "This can't be undone", opened a preview, and
+    /// could only ever end in `db::mssql::run_ddl`'s refusal.
+    #[test]
+    fn sql_server_offers_no_drop_or_any_other_schema_change() {
+        use schemaic_core::intel::SqlDialect::MsSql;
+        for shape in [Shape::Table, Shape::View] {
+            for materialized in [false, true] {
+                let e = object_entries(shape, MsSql, materialized);
+                assert!(
+                    !e.drop
+                        && !e.edit
+                        && !e.truncate
+                        && !e.triggers
+                        && !e.import
+                        && !e.refresh_view,
+                    "{shape:?} (materialized: {materialized}): {e:?}"
+                );
+            }
+        }
+        // The premise: a MariaDB sequence is still dropped, so the gate is about
+        // the engine's emitter and not about the shape.
+        assert!(object_entries(Shape::Sequence, MySql, false).drop);
+    }
+
+    /// **The standalone objects' Drop asks the same question.** A routine row on
+    /// SQL Server (whose routines the tree does list) offered Drop on the same
+    /// terms as a table did.
+    #[test]
+    fn a_standalone_objects_drop_is_offered_only_where_its_statement_emits() {
+        use schemaic_core::intel::SqlDialect::MsSql;
+        use schemaic_core::schema::{EnumInfo, ObjectItem, RoutineInfo};
+        let routine = ObjectItem::Routine(std::sync::Arc::new(RoutineInfo {
+            name: "f".into(),
+            ..Default::default()
+        }));
+        assert!(!super::object_drop_offered(&routine, MsSql));
+        for d in [MySql, Postgres] {
+            assert!(super::object_drop_offered(&routine, d), "{d:?}");
+        }
+        let ty = ObjectItem::Enum(EnumInfo {
+            name: "mood".into(),
+            ..Default::default()
+        });
+        assert!(super::object_drop_offered(&ty, Postgres));
+        assert!(!super::object_drop_offered(&ty, MsSql));
     }
 }
 
@@ -6207,6 +6286,14 @@ mod create_menu_tests {
     /// SQLite has no stored routines at all — not an unfinished emitter, an
     /// engine where a function is registered by the host program rather than
     /// stored in the database.
+    /// **SQL Server is offered nothing to create**, not even a table: every entry
+    /// opens an editor whose Apply ends at `db::mssql::run_ddl`'s refusal. With
+    /// no children the Create row itself is left out (`create_submenu`).
+    #[test]
+    fn sql_server_is_offered_nothing_to_create() {
+        assert_eq!(labels(SqlDialect::MsSql), Vec::<&str>::new());
+    }
+
     #[test]
     fn sqlite_is_offered_no_routines() {
         let labels = labels(SqlDialect::Sqlite);
