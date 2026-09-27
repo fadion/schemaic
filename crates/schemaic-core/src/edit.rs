@@ -130,6 +130,14 @@ impl EditModel {
         self.editable(ci) && !self.binary(ci)
     }
 
+    /// Can **any** column of the result be written? What the grid's row entry
+    /// is named for: the panel it opens is a viewer whose Edit button appears
+    /// only when something is writable, so on a result with nothing writable
+    /// (a keyless table, a join, an engine with no write-back) it is *View row*.
+    pub fn any_editable(&self) -> bool {
+        self.col_table.iter().any(Option::is_some)
+    }
+
     /// What the *open what I am on* gesture aims at for result column `ci` —
     /// Enter from the keyboard, a double-click from the pointer.
     ///
@@ -2396,6 +2404,32 @@ mod tests {
         assert!(!ms.editable(0) && !ms.editable(1));
         assert!(ms.binary(1), "a binary cell still says what it holds");
         assert!(!supports_grid_writes(SqlDialect::MsSql));
+    }
+
+    /// **The row entry's name follows the whole result.** On SQL Server the
+    /// grid's context menu said *Edit row* over a result it could not write,
+    /// and opened a viewer with no way to edit — so `any_editable` is what the
+    /// label asks, and it has to be false exactly where no column is writable.
+    #[test]
+    fn a_result_says_whether_anything_in_it_is_writable() {
+        let r = rs(vec![
+            col("id", "INT", "t", true, false),
+            col("name", "VARCHAR", "t", false, false),
+        ]);
+        let schema = |_: &str, _: Option<&str>, t: &str| {
+            (t == "t").then(|| schema_with_pk("t", &["id"], &[("id", "int"), ("name", "text")]))
+        };
+        assert!(super::analyze_edit(&r, SqlDialect::MySql, schema).any_editable());
+        assert!(!super::analyze_edit(&r, SqlDialect::MsSql, schema).any_editable());
+        // A keyless table on an engine that does write back: nothing either.
+        let keyless = rs(vec![
+            col("id", "INT", "t", false, false),
+            col("name", "VARCHAR", "t", false, false),
+        ]);
+        let no_schema = |_: &str, _: Option<&str>, _: &str| None;
+        assert!(!super::analyze_edit(&keyless, SqlDialect::MySql, no_schema).any_editable());
+        // And an empty model.
+        assert!(!EditModel::default().any_editable());
     }
 
     /// **The one field the `dialect` parameter reaches, and nothing exercised

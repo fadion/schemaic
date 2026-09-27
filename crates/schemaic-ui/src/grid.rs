@@ -7391,8 +7391,10 @@ fn edit_row_panel(gs: GridState, max_rows: RwSignal<usize>) -> impl IntoView {
             // rowid-keyed table, where the key itself is excluded from the write
             // model) showed the *Edit* button, staged the file, and then offered
             // no way to save it.
-            let any_editable = first_editable.is_some()
-                || (0..cols.len()).any(|ci| gs.edit_model.get_untracked().editable(ci));
+            // `EditModel::any_editable`, the question the menu's *Edit row* /
+            // *View row* label asks, so the label and the ✓ cannot disagree.
+            let any_editable =
+                first_editable.is_some() || gs.edit_model.get_untracked().any_editable();
             let mut rows: Vec<AnyView> = Vec::with_capacity(cols.len());
             for (ci, c) in cols.iter().enumerate() {
                 let type_name = rs
@@ -10856,8 +10858,17 @@ fn data_cell(
                     start_edit(gs, i, ci)
                 }));
             }
+            // Named for what the panel will let you do: it is a viewer whose Edit
+            // button appears only when something is writable, so over a result
+            // with nothing writable (SQL Server, a keyless table, a join) it said
+            // *Edit row* and opened a view.
             if pending.is_none() {
-                entries.push(MenuEntry::action("Edit row", move || {
+                let label = if model.any_editable() {
+                    "Edit row"
+                } else {
+                    "View row"
+                };
+                entries.push(MenuEntry::action(label, move || {
                     open_edit_row(gs, data_idx)
                 }));
             }

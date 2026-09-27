@@ -27275,12 +27275,20 @@ this bundle's.
   fires inside the grid; cell/header/gutter click handlers call `gs.dismiss` (closes both
   `ui.popup_menu` and `ui.context_menu`, guarded).
 - **Row view/edit panel** (`edit_row_panel`, replaced the old single-cell value viewer): the cell
-  `View` item opens an **integrated in-flow bottom strip** (not a popup — `border_top` + panel bg, like
+  menu's row entry — *Edit row*, or *View row* where `EditModel::any_editable()` says no column of
+  the result can be written — opens an **integrated in-flow bottom strip** (not a popup —
+  `border_top` + panel bg, like
   the old viewer; the grid above shrinks) rendering the row as a **structured, per-field editor**, one
   row per column, over `core::rowjson`. Header = `Row {gutter#} · {table}` + a Save (✓) icon (shown
   only when the result has ≥1 writable column, text **or** binary — `any_editable`, below;
   otherwise it's a read-only row viewer) then Close (✕);
-  a "Saving…" line shows while a save is in flight. Its **errors are not inline** — they go to
+  a "Saving…" line shows while a save is in flight. **The entry is named for which of the two it
+  will open.** It always read *Edit row*, so over a result with nothing writable — a SQL Server one
+  (no grid write-back yet, `edit::supports_grid_writes`), a keyless table, a join — the menu promised
+  an editor and opened a viewer. The action is the same either way; only the word follows the
+  result, and the ✓'s gate asks the same question column by column, so the label and the icon cannot
+  disagree (`a_result_says_whether_anything_in_it_is_writable`). The panel's **errors are not
+  inline** — they go to
   `commit_err`, the same bottom bar a grid commit failure uses, because an inline message rendered
   under the field it came from was, on a JSON column, nested several scrolls down, so a save that
   didn't happen looked like one that did nothing. The JSON tree's own parse errors go the same way,
