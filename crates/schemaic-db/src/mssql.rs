@@ -1132,6 +1132,64 @@ fn tsql_trigger_reading(
     }
 }
 
+/// What [`tsql_routine_reading`] fills in of a routine.
+struct TsqlRoutineReading {
+    arguments: String,
+    returns: String,
+    body: String,
+    tsql: schemaic_core::schema::TsqlRoutine,
+}
+
+/// A routine's stored text (`None` when the server shows none) read into its
+/// parameter list, return clause, body and SQL Server parts, through
+/// `ddl::tsql_routine_parts` — with the catalogue's `arguments` and `returns`
+/// (from `sys.parameters`) as the fallback for a routine that cannot be
+/// rebuilt, where they are only for display.
+///
+/// **The text's parameter list wins when it reads**, because it is the only
+/// place a T-SQL default lives: `sys.parameters.has_default_value` is 0 for
+/// `@a int = 5` (measured on SQL Server 2022), so the catalogue's list, fed
+/// back to `CREATE OR ALTER`, would silently drop every default.
+fn tsql_routine_reading(
+    definition: Option<&str>,
+    arguments: String,
+    returns: String,
+) -> TsqlRoutineReading {
+    use schemaic_core::schema::TsqlRoutine;
+    let Some(def) = definition else {
+        return TsqlRoutineReading {
+            arguments,
+            returns,
+            body: String::new(),
+            tsql: TsqlRoutine {
+                hidden: true,
+                ..TsqlRoutine::default()
+            },
+        };
+    };
+    match schemaic_core::ddl::tsql_routine_parts(def) {
+        Some(p) => TsqlRoutineReading {
+            arguments: p.arguments,
+            returns: p.returns,
+            body: p.body,
+            tsql: TsqlRoutine {
+                options: p.options,
+                for_replication: p.for_replication,
+                ..TsqlRoutine::default()
+            },
+        },
+        None => TsqlRoutineReading {
+            arguments,
+            returns,
+            body: def.to_string(),
+            tsql: TsqlRoutine {
+                verbatim: Some(def.to_string()),
+                ..TsqlRoutine::default()
+            },
+        },
+    }
+}
+
 /// Every procedure and function written in T-SQL: `(schema, name, type,
 /// definition, deterministic, description)`. CLR routines have no module
 /// text and are left out.
@@ -1730,18 +1788,23 @@ async fn collect_schema(client: &mut MsClient) -> Result<DbSchema, DbError> {
                 .remove(&(ns.clone(), name.clone()))
                 .unwrap_or_default();
             let (kind, returns) = routine_shape(&cell(&r, 2), returns);
+            // The parts of the stored text — see `tsql_routine_reading`.
+            let read = tsql_routine_reading(
+                r.get(3).and_then(|d| d.as_deref()),
+                args.join(", "),
+                returns,
+            );
             Arc::new(RoutineInfo {
                 name,
                 schema: Some(ns),
                 kind,
-                arguments: args.join(", "),
-                returns,
+                arguments: read.arguments,
+                returns: read.returns,
                 language: "SQL".to_string(),
-                // The whole stored `CREATE`, which is what
-                // `RoutineInfo::create_sql` hands back for SQL Server.
-                body: cell(&r, 3),
+                body: read.body,
                 deterministic: flag(&r, 4),
                 comment: r.get(5).cloned().flatten(),
+                tsql: read.tsql,
                 ..Default::default()
             })
         })
@@ -3404,6 +3467,36 @@ mod tests {
         let (action, tsql) = tsql_trigger_reading(None);
         assert!(tsql.hidden);
         assert_eq!(action, TriggerAction::Body(String::new()));
+    }
+
+    /// A stored routine reads into the parts its `CREATE` has — the
+    /// parameter list **with its defaults**, which the catalogue does not keep
+    /// — and one the parts cannot hold keeps the catalogue's list, the whole
+    /// text as `verbatim`; no text at all is `hidden`.
+    #[test]
+    fn a_stored_routine_reads_into_its_parts_or_is_kept_whole() {
+        use schemaic_core::schema::TsqlRoutineOption;
+        let r = tsql_routine_reading(
+            Some("create procedure dbo.p @a int = 5 with recompile as select @a"),
+            "@a int".into(),
+            String::new(),
+        );
+        assert_eq!(
+            (r.arguments.as_str(), r.body.as_str()),
+            ("@a int = 5", "select @a")
+        );
+        assert_eq!(r.tsql.options, [TsqlRoutineOption::Recompile]);
+        assert!(r.tsql.verbatim.is_none() && !r.tsql.hidden);
+        let odd = "CREATE PROCEDURE p;2 AS SELECT 1";
+        let r = tsql_routine_reading(Some(odd), "@a int".into(), String::new());
+        assert_eq!((r.arguments.as_str(), r.body.as_str()), ("@a int", odd));
+        assert_eq!(r.tsql.verbatim.as_deref(), Some(odd));
+        let r = tsql_routine_reading(None, "@x int".into(), "int".into());
+        assert!(r.tsql.hidden);
+        assert_eq!(
+            (r.arguments.as_str(), r.returns.as_str(), r.body.as_str()),
+            ("@x int", "int", "")
+        );
     }
 
     fn names(n: &[&str]) -> Vec<String> {

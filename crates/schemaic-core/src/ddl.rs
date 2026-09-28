@@ -1529,6 +1529,22 @@ impl RoutineDraft {
         if f.body.trim().is_empty() {
             out.push(format!("The {what} needs a body."));
         }
+        match dialect {
+            // T-SQL names every parameter with `@`; a bare name is the first
+            // syntax error the server would answer, after nothing else ran.
+            SqlDialect::MsSql => {
+                if tsql_parameters(&f.arguments)
+                    .iter()
+                    .any(|p| !p.starts_with('@'))
+                {
+                    out.push(
+                        "SQL Server names every parameter with @ — @sku varchar(20), @n int OUTPUT."
+                            .to_string(),
+                    );
+                }
+            }
+            SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => {}
+        }
         // Not a syntax error — it creates fine and then fails on every write.
         if f.is_trigger_function() && !f.arguments.trim().is_empty() {
             out.push(
@@ -4228,14 +4244,12 @@ impl ChangeSet {
                 Change::CreateTable(t) => out.extend(create_table_sql(t, d)),
                 Change::DropTable => out.push(format!("DROP TABLE {q};")),
                 Change::TruncateTable => out.push(format!("TRUNCATE TABLE {q};")),
-                Change::DropRoutine(f) => out.push(format!(
-                    "DROP {} {};",
-                    f.kind.sql_keyword(),
-                    f.signature_sql(d)
-                )),
                 _ => {}
             }
         }
+        // A routine's own changes — its drop among them — through the builder
+        // every engine shares; each `CREATE [OR ALTER]` its own statement.
+        out.extend(self.routine_statements());
         // A view's own changes, through the builder every engine shares; each
         // `CREATE VIEW` is its own statement, and so its own batch, as T-SQL
         // requires.
@@ -4427,6 +4441,7 @@ impl ChangeSet {
         let table = TsqlComment {
             schema,
             table: &self.table,
+            object_type: "TABLE",
             column: None,
         };
         for c in &admitted {
@@ -5456,6 +5471,7 @@ impl ChangeSet {
                 Change::CreateRoutine(draft) => {
                     let f = &draft.info;
                     out.extend(session_wrapped(None, f.create_sql(d, false), f, d));
+                    out.extend(routine_follow_ups(f, None, d));
                 }
                 Change::ReplaceRoutine {
                     draft,
@@ -5502,6 +5518,10 @@ impl ChangeSet {
                     // nothing — the `CREATE` runs under the same session either
                     // way — and removes two ways to lose the routine.
                     out.extend(session_wrapped(drop, f.create_sql(d, !*recreate), f, d));
+                    // A recreate's drop took whatever lived beside the routine;
+                    // an alter in place kept it, and only a change needs saying.
+                    let before = (!*recreate).then_some(&**server);
+                    out.extend(routine_follow_ups(f, before, d));
                 }
                 Change::RenameRoutine { from, to } => out.push(format!(
                     "ALTER {} {} RENAME TO {};",
@@ -6675,7 +6695,11 @@ fn tsql_drop_default(qtable: &str, column: &str) -> String {
 /// comment.
 struct TsqlComment<'a> {
     schema: &'a str,
+    /// The object's name — a table's, or a routine's.
     table: &'a str,
+    /// Its level-1 type: `TABLE` (a view is filed under it too), `PROCEDURE`
+    /// or `FUNCTION`.
+    object_type: &'a str,
     column: Option<&'a str>,
 }
 
@@ -6684,8 +6708,9 @@ impl TsqlComment<'_> {
     /// are string arguments, taken literally, so they are not bracketed.
     fn path(&self) -> String {
         let mut out = format!(
-            "@level0type = N'SCHEMA', @level0name = {}, @level1type = N'TABLE', @level1name = {}",
+            "@level0type = N'SCHEMA', @level0name = {}, @level1type = {}, @level1name = {}",
             tsql_n(self.schema),
+            tsql_n(self.object_type),
             tsql_n(self.table)
         );
         if let Some(c) = self.column {
@@ -6757,6 +6782,7 @@ pub(crate) fn tsql_add_comment(
     TsqlComment {
         schema,
         table,
+        object_type: "TABLE",
         column,
     }
     .add(text)
@@ -7028,6 +7054,7 @@ fn create_table_tsql_comments(d: &TableDraft, out: &mut Vec<String>) {
             .as_deref()
             .unwrap_or(crate::schema::MSSQL_DEFAULT_SCHEMA),
         table: &d.name,
+        object_type: "TABLE",
         column: None,
     };
     if let Some(c) = blank_as_none(d.comment.as_deref()) {
@@ -7687,6 +7714,40 @@ fn fks_equal(a: &ForeignKeyInfo, b: &ForeignKeyInfo) -> bool {
         // engines that cannot report them, so this costs nothing there.
         && a.match_type == b.match_type
         && a.deferrable == b.deferrable
+}
+
+/// What a routine's create or alter must be followed by, as statements of
+/// their own: on SQL Server its comment, the `MS_Description` extended
+/// property, which a `CREATE` has no clause for and a recreate's `DROP` takes
+/// with it. `before` is the server's copy when the routine was altered in
+/// place — then only a changed comment is written — and `None` when it was
+/// created, fresh or again, and any comment is. Set whether or not one is
+/// there (`TsqlComment::set`). Nothing on the other engines, whose comment is
+/// part of the `CREATE` (MySQL) or its own change (PostgreSQL).
+fn routine_follow_ups(f: &RoutineInfo, before: Option<&RoutineInfo>, d: SqlDialect) -> Vec<String> {
+    match d {
+        SqlDialect::MsSql => {
+            let comment = blank_as_none(f.comment.as_deref());
+            let changed = match before {
+                Some(server) => comment != blank_as_none(server.comment.as_deref()),
+                None => comment.is_some(),
+            };
+            if !changed {
+                return Vec::new();
+            }
+            let on = TsqlComment {
+                schema: f
+                    .schema
+                    .as_deref()
+                    .unwrap_or(crate::schema::MSSQL_DEFAULT_SCHEMA),
+                table: &f.name,
+                object_type: f.kind.sql_keyword(),
+                column: None,
+            };
+            vec![on.set(comment)]
+        }
+        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => Vec::new(),
+    }
 }
 
 /// The statements that create — or, with `or_alter`, alter in place — one
@@ -8779,7 +8840,7 @@ pub fn trigger_names_are_schema_scoped(dialect: SqlDialect) -> bool {
 
 /// Can `dialect` have its **stored routines** edited here?
 ///
-/// MySQL and PostgreSQL, not SQLite — which has no stored routines at all, so
+/// MySQL, PostgreSQL and SQL Server, not SQLite — which has no stored routines at all, so
 /// the answer there is not "unfinished work" but "there is nothing to edit".
 ///
 /// Computed from [`supports_change`] rather than stated, for the reason
@@ -8844,12 +8905,14 @@ pub fn supports_event_editing(dialect: SqlDialect) -> bool {
 /// An exhaustive `match` rather than a `== Postgres`, so a fourth engine has to
 /// answer rather than inheriting whichever side it falls on.
 ///
-/// SQL Server has `CREATE OR ALTER`, which the routine emitter does not write,
-/// so it answers no — see [`supports_or_replace_view`].
+/// SQL Server has `CREATE OR ALTER`, which keeps the routine's grants
+/// (measured: a `GRANT EXECUTE` survived one) — what it cannot do is change a
+/// routine's kind or a function's shape, which [`routine_signature_changed`]
+/// answers for it.
 pub fn supports_or_replace_routine(dialect: SqlDialect) -> bool {
     match dialect {
-        SqlDialect::Postgres => true,
-        SqlDialect::MySql | SqlDialect::Sqlite | SqlDialect::MsSql => false,
+        SqlDialect::Postgres | SqlDialect::MsSql => true,
+        SqlDialect::MySql | SqlDialect::Sqlite => false,
     }
 }
 
@@ -9252,6 +9315,9 @@ enum TsqlTok<'a> {
 struct TsqlCursor<'a> {
     s: &'a str,
     i: usize,
+    /// Where the token [`Self::next`] last returned starts — so a caller can
+    /// cut a span of the text verbatim between two tokens.
+    start: usize,
 }
 
 impl<'a> TsqlCursor<'a> {
@@ -9266,6 +9332,7 @@ impl<'a> TsqlCursor<'a> {
                 return None;
             }
             let at = self.i;
+            self.start = at;
             if let Some(j) = sql::skip_noncode(b, at, d) {
                 self.i = j.max(at + 1);
                 if matches!(b[at], b'-' | b'/') {
@@ -9343,6 +9410,7 @@ pub fn tsql_trigger_parts(definition: &str) -> Option<TsqlTriggerParts> {
     let mut c = TsqlCursor {
         s: definition,
         i: 0,
+        start: 0,
     };
     let mut out = TsqlTriggerParts::default();
     if !(c.keyword("CREATE") || c.keyword("ALTER")) {
@@ -9430,6 +9498,275 @@ pub fn tsql_trigger_parts(definition: &str) -> Option<TsqlTriggerParts> {
     }
     if !c.keyword("AS") {
         return None;
+    }
+    let body = definition[c.i..].trim();
+    if body.is_empty() {
+        return None;
+    }
+    out.body = body.to_string();
+    Some(out)
+}
+
+/// What [`tsql_routine_parts`] reads out of a stored T-SQL procedure or
+/// function.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TsqlRoutineParts {
+    pub kind: crate::schema::RoutineKind,
+    pub arguments: String,
+    pub returns: String,
+    pub options: Vec<crate::schema::TsqlRoutineOption>,
+    pub for_replication: bool,
+    pub body: String,
+}
+
+impl<'a> TsqlCursor<'a> {
+    /// Step to the matching `)` of the `(` just consumed, over nested ones;
+    /// `None` when the text ends first.
+    fn close_paren(&mut self) -> Option<()> {
+        let mut depth = 1usize;
+        while depth > 0 {
+            match self.next()? {
+                TsqlTok::Punct(b'(') => depth += 1,
+                TsqlTok::Punct(b')') => depth -= 1,
+                _ => {}
+            }
+        }
+        Some(())
+    }
+
+    /// The text from here up to — not including — the first token at paren
+    /// depth 0 that is one of the keywords `stops`, trimmed, with the cursor
+    /// left in front of that keyword. `None` when the text ends first.
+    fn span_until(&mut self, stops: &[&str]) -> Option<&'a str> {
+        let from = self.i;
+        loop {
+            let before = *self;
+            match self.next()? {
+                TsqlTok::Word(w) if stops.iter().any(|s| w.eq_ignore_ascii_case(s)) => {
+                    *self = before;
+                    return Some(self.s[from..before.i].trim());
+                }
+                TsqlTok::Punct(b'(') => self.close_paren()?,
+                _ => {}
+            }
+        }
+    }
+}
+
+/// A T-SQL parameter list cut at its top-level commas — not one inside a
+/// type's parentheses (`decimal(10, 2)`) or a string default (`N'x, y'`) —
+/// each part trimmed, empties dropped.
+fn tsql_parameters(list: &str) -> Vec<&str> {
+    let mut c = TsqlCursor {
+        s: list,
+        i: 0,
+        start: 0,
+    };
+    let mut out = Vec::new();
+    let mut from = 0usize;
+    loop {
+        match c.next() {
+            None => break,
+            Some(TsqlTok::Punct(b'(')) => {
+                if c.close_paren().is_none() {
+                    break;
+                }
+            }
+            Some(TsqlTok::Punct(b',')) => {
+                out.push(list[from..c.start].trim());
+                from = c.i;
+            }
+            Some(_) => {}
+        }
+    }
+    out.push(list[from..].trim());
+    out.retain(|p| !p.is_empty());
+    out
+}
+
+/// `inner` when `s` is exactly `( inner )` — one pair of parens around the
+/// whole of it — else `s`. Walked over the lexer, so a paren in a string
+/// default does not count.
+fn tsql_strip_outer_parens(s: &str) -> &str {
+    let mut c = TsqlCursor { s, i: 0, start: 0 };
+    if c.next() != Some(TsqlTok::Punct(b'(')) {
+        return s;
+    }
+    let open_end = c.i;
+    if c.close_paren().is_none() {
+        return s;
+    }
+    let close_at = c.start;
+    if c.next().is_some() {
+        return s;
+    }
+    s[open_end..close_at].trim()
+}
+
+/// A SQL Server procedure's or function's stored `CREATE`, read into the
+/// parts a `CREATE OR ALTER` must restate — or `None` when the parts cannot
+/// restate it.
+///
+/// **The same walk as [`tsql_trigger_parts`], for the same stated reason**:
+/// sqlparser's T-SQL routine grammar does not carry the `WITH` options, and a
+/// routine's body is exactly the text an AST would re-print rather than keep.
+/// The header is `CREATE [OR ALTER] {PROC | PROCEDURE} name [params] [WITH
+/// option, …] [FOR REPLICATION] AS body`, or `CREATE [OR ALTER] FUNCTION name
+/// (params) RETURNS {type | TABLE | @t TABLE (…)} [WITH option, …] [AS]
+/// body` — a function's `AS` is optional, so its body starts at `BEGIN` or
+/// `RETURN` where the keyword is left out.
+///
+/// **The parameter list is kept as text, defaults and all**: the catalogue
+/// does not keep a T-SQL default (`sys.parameters.has_default_value` is 0 for
+/// `@a int = 5`, measured on SQL Server 2022), so the stored text is the only
+/// place it lives, and the editor edits the list as the one string it is. A
+/// procedure's optional parentheses are taken off, and written back without.
+///
+/// `None` — shown, droppable, never rebuilt — for `WITH ENCRYPTION`, an
+/// option not modelled, a numbered procedure (`p;2`), a CLR routine's
+/// `EXTERNAL NAME`, and anything not in that shape.
+pub fn tsql_routine_parts(definition: &str) -> Option<TsqlRoutineParts> {
+    use crate::schema::{ExecuteAs, RoutineKind, TsqlRoutineOption};
+    let mut c = TsqlCursor {
+        s: definition,
+        i: 0,
+        start: 0,
+    };
+    let mut out = TsqlRoutineParts::default();
+    if !(c.keyword("CREATE") || c.keyword("ALTER")) {
+        return None;
+    }
+    if c.keyword("OR") && !c.keyword("ALTER") {
+        return None;
+    }
+    out.kind = if c.keyword("PROC") || c.keyword("PROCEDURE") {
+        RoutineKind::Procedure
+    } else if c.keyword("FUNCTION") {
+        RoutineKind::Function
+    } else {
+        return None;
+    };
+    c.object_name()?;
+    if c.peek() == Some(TsqlTok::Punct(b';')) {
+        return None; // a numbered procedure group
+    }
+    let function = out.kind == RoutineKind::Function;
+    if function {
+        if c.next()? != TsqlTok::Punct(b'(') {
+            return None;
+        }
+        let from = c.i;
+        c.close_paren()?;
+        out.arguments = definition[from..c.start].trim().to_string();
+        if !c.keyword("RETURNS") {
+            return None;
+        }
+        if c.peek() == Some(TsqlTok::Punct(b'@')) {
+            // `RETURNS @t TABLE (…)` — a multi-statement table function.
+            let from = c.i;
+            c.next();
+            if !matches!(c.next()?, TsqlTok::Word(_)) || !c.keyword("TABLE") {
+                return None;
+            }
+            if c.next()? != TsqlTok::Punct(b'(') {
+                return None;
+            }
+            c.close_paren()?;
+            out.returns = definition[from..c.i].trim().to_string();
+        } else {
+            out.returns = c
+                .span_until(&["WITH", "AS", "BEGIN", "RETURN"])?
+                .to_string();
+        }
+        if out.returns.is_empty() {
+            return None;
+        }
+    } else {
+        out.arguments = tsql_strip_outer_parens(c.span_until(&["WITH", "FOR", "AS"])?).to_string();
+    }
+    if c.keyword("WITH") {
+        loop {
+            let opt = match c.next()? {
+                TsqlTok::Word(w) if w.eq_ignore_ascii_case("RECOMPILE") && !function => {
+                    TsqlRoutineOption::Recompile
+                }
+                TsqlTok::Word(w) if w.eq_ignore_ascii_case("SCHEMABINDING") => {
+                    TsqlRoutineOption::SchemaBinding
+                }
+                TsqlTok::Word(w) if w.eq_ignore_ascii_case("NATIVE_COMPILATION") => {
+                    TsqlRoutineOption::NativeCompilation
+                }
+                TsqlTok::Word(w) if w.eq_ignore_ascii_case("RETURNS") && function => {
+                    if !(c.keyword("NULL")
+                        && c.keyword("ON")
+                        && c.keyword("NULL")
+                        && c.keyword("INPUT"))
+                    {
+                        return None;
+                    }
+                    TsqlRoutineOption::ReturnsNullOnNullInput
+                }
+                TsqlTok::Word(w) if w.eq_ignore_ascii_case("CALLED") && function => {
+                    if !(c.keyword("ON") && c.keyword("NULL") && c.keyword("INPUT")) {
+                        return None;
+                    }
+                    TsqlRoutineOption::CalledOnNullInput
+                }
+                TsqlTok::Word(w) if w.eq_ignore_ascii_case("INLINE") && function => {
+                    if c.next()? != TsqlTok::Punct(b'=') {
+                        return None;
+                    }
+                    if c.keyword("ON") {
+                        TsqlRoutineOption::Inline(true)
+                    } else if c.keyword("OFF") {
+                        TsqlRoutineOption::Inline(false)
+                    } else {
+                        return None;
+                    }
+                }
+                TsqlTok::Word(w)
+                    if w.eq_ignore_ascii_case("EXECUTE") || w.eq_ignore_ascii_case("EXEC") =>
+                {
+                    if !c.keyword("AS") {
+                        return None;
+                    }
+                    TsqlRoutineOption::ExecuteAs(match c.next()? {
+                        TsqlTok::Word(w) if w.eq_ignore_ascii_case("CALLER") => ExecuteAs::Caller,
+                        TsqlTok::Word(w) if w.eq_ignore_ascii_case("SELF") => ExecuteAs::SelfUser,
+                        TsqlTok::Word(w) if w.eq_ignore_ascii_case("OWNER") => ExecuteAs::Owner,
+                        TsqlTok::Quoted(q) if q.len() >= 2 && q.starts_with('\'') => {
+                            ExecuteAs::User(q[1..q.len() - 1].replace("''", "'"))
+                        }
+                        _ => return None,
+                    })
+                }
+                // `ENCRYPTION` among them, and anything newer.
+                _ => return None,
+            };
+            out.options.push(opt);
+            if c.peek() != Some(TsqlTok::Punct(b',')) {
+                break;
+            }
+            c.next();
+        }
+    }
+    if !function && c.keyword("FOR") {
+        if !c.keyword("REPLICATION") {
+            return None;
+        }
+        out.for_replication = true;
+    }
+    // A procedure's `AS` is required; a function may leave it out and start
+    // its body with `BEGIN` or `RETURN`.
+    if !c.keyword("AS") {
+        let starts_body = matches!(c.peek(), Some(TsqlTok::Word(w))
+            if w.eq_ignore_ascii_case("BEGIN") || w.eq_ignore_ascii_case("RETURN"));
+        if !(function && starts_body) {
+            return None;
+        }
+    }
+    if matches!(c.peek(), Some(TsqlTok::Word(w)) if w.eq_ignore_ascii_case("EXTERNAL")) {
+        return None; // a CLR routine: `AS EXTERNAL NAME assembly.class.method`
     }
     let body = definition[c.i..].trim();
     if body.is_empty() {
@@ -10981,13 +11318,15 @@ pub fn supports_change(dialect: SqlDialect, change: &Change) -> bool {
 /// is created and replaced (`CREATE OR ALTER VIEW`); its `RenameView` is never
 /// raised, a rename being a re-create. A trigger is created, altered in place
 /// (`CREATE OR ALTER TRIGGER`, [`supports_trigger_alter_in_place`]) and
-/// dropped. The routine editor needs a `Create` and a `Replace` besides its
-/// drop, so it stays off.
+/// dropped, and so is a routine (`CREATE OR ALTER PROCEDURE`/`FUNCTION`); a
+/// routine's `RenameRoutine` is never raised, a rename being a re-create.
 fn tsql_supports(change: &Change) -> bool {
     match change {
-        Change::CreateTrigger(_) | Change::ReplaceTrigger { .. } | Change::DropTrigger { .. } => {
-            true
-        }
+        Change::CreateTrigger(_)
+        | Change::ReplaceTrigger { .. }
+        | Change::DropTrigger { .. }
+        | Change::CreateRoutine(_)
+        | Change::ReplaceRoutine { .. } => true,
         Change::CreateTable(_)
         | Change::DropTable
         | Change::TruncateTable
@@ -12098,15 +12437,33 @@ pub fn routine_identity_args(arguments: &str, dialect: SqlDialect) -> String {
 /// types — and is refused (or creates a *second* overload) for anything that is.
 /// See [`routine_identity_args`] for why the declaration forms cannot be
 /// compared directly.
+///
+/// **SQL Server asks something else**: it does not overload, so a new
+/// parameter list or a scalar's new return type is the same routine, altered
+/// in place — and what `CREATE OR ALTER` refuses (Msg 2010, *"incompatible
+/// object type"*) is a change of **kind**, procedure to function, or of a
+/// function's **shape**: scalar, inline table-valued (`RETURNS TABLE`),
+/// multi-statement (`RETURNS @t TABLE (…)`), each its own object type.
 pub fn routine_signature_changed(
     current: &RoutineInfo,
     draft: &RoutineInfo,
     dialect: SqlDialect,
 ) -> bool {
-    routine_identity_args(&draft.arguments, dialect)
-        != routine_identity_args(&current.arguments, dialect)
-        || routine_identity_args(&draft.returns, dialect)
-            != routine_identity_args(&current.returns, dialect)
+    match dialect {
+        SqlDialect::MsSql => {
+            let shape = |f: &RoutineInfo| {
+                let r = f.returns.trim();
+                (f.kind, r.eq_ignore_ascii_case("TABLE"), r.starts_with('@'))
+            };
+            shape(current) != shape(draft)
+        }
+        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => {
+            routine_identity_args(&draft.arguments, dialect)
+                != routine_identity_args(&current.arguments, dialect)
+                || routine_identity_args(&draft.returns, dialect)
+                    != routine_identity_args(&current.returns, dialect)
+        }
+    }
 }
 
 /// Everything that has to happen to turn the routine `current` into `draft`.
@@ -12135,13 +12492,20 @@ pub fn diff_routine(current: &RoutineInfo, draft: &RoutineDraft, dialect: SqlDia
     // drop the old signature first — which is what `recreate` means, and what
     // earns `destructive()`'s "drops it first" sentence.
     let signature_changed = routine_signature_changed(current, &draft.info, dialect);
-    let recreate = !supports_or_replace_routine(dialect) || signature_changed;
+    let renamed = draft.info.name != current.name && !draft.info.name.trim().is_empty();
+    // **A rename the engine has no verb for is a recreate**, even where
+    // `CREATE OR ALTER` would otherwise alter in place: altering under the new
+    // name creates a second routine and leaves the first standing. MySQL
+    // recreates every edit anyway; SQL Server is the engine this line exists
+    // for.
+    let recreate = !supports_or_replace_routine(dialect)
+        || signature_changed
+        || (renamed && !supports_routine_rename(dialect));
     // A rename is its own statement only where the routine *survives* the
     // replace. Once the plan drops the old signature there is nothing left for
     // an `ALTER … RENAME` to address, so the recreate carries the new name
     // itself — which is the route MySQL always takes.
     let rename_alone = supports_routine_rename(dialect) && !recreate;
-    let renamed = draft.info.name != current.name && !draft.info.name.trim().is_empty();
     // Compare everything *except* the name when the rename is its own change;
     // where it isn't, the name is part of what the recreate carries.
     let mut same_name = draft.info.clone();
@@ -14205,6 +14569,12 @@ mod tests {
                 materialized: false,
             },
             Change::DropRoutine(Box::default()),
+            Change::CreateRoutine(Box::default()),
+            Change::ReplaceRoutine {
+                draft: Box::default(),
+                server: Box::default(),
+                recreate: false,
+            },
             Change::CreateView(Box::default()),
             Change::ReplaceView {
                 draft: Box::default(),
@@ -14313,7 +14683,6 @@ mod tests {
             Change::DropView { materialized: true },
             // Never raised — `diff_view` re-creates to rename.
             Change::RenameView { to: "w".into() },
-            Change::CreateRoutine(Box::default()),
             Change::DropDatabase { name: "d".into() },
         ];
         for c in &no {
@@ -14329,7 +14698,7 @@ mod tests {
         assert!(supports_table_design(MsSql));
         assert!(!supports_column_reorder(MsSql));
         assert!(supports_view_editing(MsSql));
-        assert!(!supports_routine_editing(MsSql));
+        assert!(supports_routine_editing(MsSql));
         assert!(supports_trigger_editing(MsSql));
     }
 
@@ -23648,6 +24017,371 @@ mod tsql_trigger_read_tests {
         ] {
             assert!(tsql_trigger_parts(sql).is_none(), "{sql}");
         }
+    }
+}
+
+#[cfg(test)]
+mod tsql_routine_read_tests {
+    use super::*;
+    use crate::schema::{ExecuteAs, RoutineKind, TsqlRoutineOption};
+
+    fn parts(sql: &str) -> TsqlRoutineParts {
+        tsql_routine_parts(sql).unwrap_or_else(|| panic!("should read: {sql}"))
+    }
+
+    /// A procedure as SQL Server stores it — as typed — split into its
+    /// parameter list **with its defaults**, which the catalogue does not keep
+    /// (`sys.parameters.has_default_value` is 0 for a T-SQL `= 5`), the
+    /// options an alter resets, and the body.
+    #[test]
+    fn a_stored_procedure_splits_into_its_parts() {
+        let p = parts(
+            "-- lead\ncreate procedure dbo.p @a int = 5, @b nvarchar(10) = N'with (as) for' \
+             OUTPUT WITH RECOMPILE, EXECUTE AS OWNER as select @a",
+        );
+        assert_eq!(p.kind, RoutineKind::Procedure);
+        assert_eq!(
+            p.arguments,
+            "@a int = 5, @b nvarchar(10) = N'with (as) for' OUTPUT"
+        );
+        assert_eq!(p.returns, "");
+        assert_eq!(
+            p.options,
+            [
+                TsqlRoutineOption::Recompile,
+                TsqlRoutineOption::ExecuteAs(ExecuteAs::Owner)
+            ]
+        );
+        assert!(!p.for_replication);
+        assert_eq!(p.body, "select @a");
+        // Parenthesised, stored from a `CREATE OR ALTER`, and FOR REPLICATION.
+        let p = parts("CREATE   PROC [dbo].[p2] ( @a int ) FOR REPLICATION AS SELECT 1");
+        assert_eq!((p.arguments.as_str(), p.for_replication), ("@a int", true));
+        assert_eq!(
+            parts("CREATE PROCEDURE p AS BEGIN SELECT 1 END").arguments,
+            ""
+        );
+    }
+
+    /// The three function shapes, each with the `AS` T-SQL lets a function
+    /// leave out: a scalar's `BEGIN … RETURN … END`, an inline table-valued
+    /// `RETURN (SELECT …)`, a multi-statement one's `RETURNS @t TABLE (…)`.
+    #[test]
+    fn each_function_shape_splits_into_its_parts() {
+        let p = parts(
+            "CREATE FUNCTION dbo.f (@x int = 1) RETURNS decimal(10, 2) WITH SCHEMABINDING BEGIN RETURN @x * 2 END",
+        );
+        assert_eq!(p.kind, RoutineKind::Function);
+        assert_eq!(
+            (p.arguments.as_str(), p.returns.as_str()),
+            ("@x int = 1", "decimal(10, 2)")
+        );
+        assert_eq!(p.options, [TsqlRoutineOption::SchemaBinding]);
+        assert_eq!(p.body, "BEGIN RETURN @x * 2 END");
+        let p = parts("CREATE FUNCTION dbo.itvf (@x int) RETURNS TABLE AS RETURN (SELECT @x AS v)");
+        assert_eq!(
+            (p.returns.as_str(), p.body.as_str()),
+            ("TABLE", "RETURN (SELECT @x AS v)")
+        );
+        let p = parts("CREATE FUNCTION dbo.itvf2 () RETURNS TABLE RETURN SELECT 1 AS v");
+        assert_eq!(
+            (p.arguments.as_str(), p.body.as_str()),
+            ("", "RETURN SELECT 1 AS v")
+        );
+        let p = parts(
+            "CREATE FUNCTION dbo.mtvf () RETURNS @r TABLE (v int, w nvarchar(5)) \
+             WITH EXECUTE AS CALLER, RETURNS NULL ON NULL INPUT, INLINE = OFF \
+             AS BEGIN INSERT @r VALUES (1, N'a'); RETURN END",
+        );
+        assert_eq!(p.returns, "@r TABLE (v int, w nvarchar(5))");
+        assert_eq!(
+            p.options,
+            [
+                TsqlRoutineOption::ExecuteAs(ExecuteAs::Caller),
+                TsqlRoutineOption::ReturnsNullOnNullInput,
+                TsqlRoutineOption::Inline(false)
+            ]
+        );
+        assert!(p.body.starts_with("BEGIN INSERT"), "{}", p.body);
+    }
+
+    fn routine(kind: RoutineKind, arguments: &str, returns: &str, body: &str) -> RoutineInfo {
+        RoutineInfo {
+            name: "r".into(),
+            schema: Some("dbo".into()),
+            kind,
+            arguments: arguments.into(),
+            returns: returns.into(),
+            language: "SQL".into(),
+            body: body.into(),
+            ..Default::default()
+        }
+    }
+
+    /// **A SQL Server routine is rebuilt from its parts**, `CREATE` or `CREATE
+    /// OR ALTER`, every option restated — and reads back as the same parts,
+    /// the round trip an edit rests on.
+    #[test]
+    fn a_sql_server_routine_is_written_from_its_parts() {
+        let mut p = routine(
+            RoutineKind::Procedure,
+            "@a int = 5, @b nvarchar(10) OUTPUT",
+            "",
+            "select @a",
+        );
+        p.tsql.options = vec![
+            TsqlRoutineOption::Recompile,
+            TsqlRoutineOption::ExecuteAs(ExecuteAs::Owner),
+        ];
+        assert_eq!(
+            p.create_sql(SqlDialect::MsSql, false),
+            "CREATE PROCEDURE [dbo].[r]\n    @a int = 5, @b nvarchar(10) OUTPUT\n\
+             WITH RECOMPILE, EXECUTE AS OWNER\nAS\nselect @a"
+        );
+        p.tsql.for_replication = true;
+        let sql = p.create_sql(SqlDialect::MsSql, true);
+        assert!(
+            sql.starts_with("CREATE OR ALTER PROCEDURE [dbo].[r]"),
+            "{sql}"
+        );
+        let back = parts(&sql);
+        assert_eq!(
+            (back.arguments.as_str(), back.options.clone()),
+            (p.arguments.as_str(), p.tsql.options.clone())
+        );
+        assert!(back.for_replication);
+        assert_eq!(back.body, "select @a");
+        let bare = routine(RoutineKind::Procedure, "", "", "SELECT 1");
+        assert_eq!(
+            bare.create_sql(SqlDialect::MsSql, false),
+            "CREATE PROCEDURE [dbo].[r]\nAS\nSELECT 1"
+        );
+
+        for (returns, body) in [
+            ("decimal(10, 2)", "BEGIN RETURN 1 END"),
+            ("TABLE", "RETURN (SELECT 1 AS v)"),
+            ("@t TABLE (v int)", "BEGIN INSERT @t VALUES (1); RETURN END"),
+        ] {
+            let mut f = routine(RoutineKind::Function, "@x int = 1", returns, body);
+            f.tsql.options = vec![TsqlRoutineOption::SchemaBinding];
+            let sql = f.create_sql(SqlDialect::MsSql, false);
+            assert!(
+                sql.starts_with("CREATE FUNCTION [dbo].[r] (@x int = 1)\nRETURNS "),
+                "{sql}"
+            );
+            let back = parts(&sql);
+            assert_eq!(
+                (
+                    back.arguments.as_str(),
+                    back.returns.as_str(),
+                    back.body.as_str()
+                ),
+                ("@x int = 1", returns, body),
+                "{sql}"
+            );
+            assert_eq!(back.options, [TsqlRoutineOption::SchemaBinding]);
+        }
+    }
+
+    /// One whose header could not be read is restated as stored; one whose
+    /// text is hidden says so. Neither is editable.
+    #[test]
+    fn a_sql_server_routine_the_parts_cannot_hold_is_restated_verbatim() {
+        let mut v = routine(RoutineKind::Procedure, "", "", "");
+        v.tsql.verbatim = Some("CREATE PROCEDURE r;2 AS SELECT 1".into());
+        assert_eq!(
+            v.create_sql(SqlDialect::MsSql, true),
+            "CREATE PROCEDURE r;2 AS SELECT 1"
+        );
+        assert!(!v.is_editable());
+        let mut h = routine(RoutineKind::Function, "", "int", "");
+        h.tsql.hidden = true;
+        let sql = h.create_sql(SqlDialect::MsSql, false);
+        assert!(sql.starts_with("-- ") && !sql.contains("CREATE"), "{sql}");
+        assert!(!h.is_editable());
+        assert!(routine(RoutineKind::Procedure, "", "", "SELECT 1").is_editable());
+    }
+
+    /// Refused, not dropped: `ENCRYPTION`, an unknown option, a numbered
+    /// procedure (`p;2`), a CLR routine's `EXTERNAL NAME`, and anything that
+    /// is not a routine's `CREATE`.
+    #[test]
+    fn a_routine_header_the_parts_cannot_restate_is_unreadable() {
+        for sql in [
+            "CREATE PROCEDURE p WITH ENCRYPTION AS SELECT 1",
+            "CREATE PROCEDURE p WITH SOMETHING_NEW AS SELECT 1",
+            "CREATE PROCEDURE p;2 AS SELECT 1",
+            "CREATE PROCEDURE p AS EXTERNAL NAME a.b.c",
+            "CREATE FUNCTION f () RETURNS int",
+            "CREATE FUNCTION f RETURNS int AS BEGIN RETURN 1 END",
+            "CREATE PROCEDURE p @a int",
+            "CREATE TRIGGER t ON u AFTER INSERT AS SELECT 1",
+            "",
+        ] {
+            assert!(tsql_routine_parts(sql).is_none(), "{sql}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod tsql_routine_plan_tests {
+    use super::*;
+    use crate::intel::SqlDialect::MsSql;
+    use crate::schema::RoutineKind;
+
+    fn proc_r() -> RoutineInfo {
+        RoutineInfo {
+            name: "r".into(),
+            schema: Some("dbo".into()),
+            kind: RoutineKind::Procedure,
+            arguments: "@a int = 5".into(),
+            language: "SQL".into(),
+            body: "SELECT @a".into(),
+            ..Default::default()
+        }
+    }
+
+    fn plan(cur: &RoutineInfo, edit: impl Fn(&mut RoutineInfo)) -> Vec<String> {
+        let mut d = RoutineDraft::from_info(cur);
+        edit(&mut d.info);
+        diff_routine(cur, &d, MsSql).emit()
+    }
+
+    #[test]
+    fn sql_server_offers_the_routine_editor() {
+        assert!(supports_routine_editing(MsSql));
+        assert!(supports_or_replace_routine(MsSql));
+        assert!(!supports_routine_rename(MsSql));
+        assert!(diff_routine(&proc_r(), &RoutineDraft::from_info(&proc_r()), MsSql).is_empty());
+    }
+
+    /// **An edit — body, parameters, options — is altered in place**, which
+    /// keeps the routine's grants (measured: a `GRANT EXECUTE` survived a
+    /// `CREATE OR ALTER`); T-SQL does not overload, so a new parameter list is
+    /// the same routine, not a second one.
+    #[test]
+    fn an_edited_sql_server_routine_is_altered_in_place() {
+        let sql = plan(&proc_r(), |f| {
+            f.arguments = "@a int = 6, @b int = 0".into();
+            f.body = "SELECT @a + @b".into();
+        });
+        assert_eq!(
+            sql,
+            ["CREATE OR ALTER PROCEDURE [dbo].[r]\n    @a int = 6, @b int = 0\nAS\nSELECT @a + @b"]
+        );
+    }
+
+    /// A rename is a drop and a create — `sp_rename` leaves the stored text
+    /// naming the old routine — and so is a change of kind or of a function's
+    /// shape, which `CREATE OR ALTER` refuses (Msg 2010, *"incompatible object
+    /// type"*, measured for a scalar to an inline table function and for a
+    /// procedure to a function). What the drop takes with it, the comment, is
+    /// set again after the create.
+    #[test]
+    fn a_renamed_or_reshaped_sql_server_routine_is_dropped_and_created() {
+        let mut cur = proc_r();
+        cur.comment = Some("it's the one".into());
+        let sql = plan(&cur, |f| f.name = "r2".into());
+        assert_eq!(sql[0], "DROP PROCEDURE IF EXISTS [dbo].[r];");
+        assert!(sql[1].starts_with("CREATE PROCEDURE [dbo].[r2]"), "{sql:?}");
+        assert!(
+            sql[2].contains("sp_addextendedproperty") && sql[2].contains("N'it''s the one'"),
+            "{sql:?}"
+        );
+        assert!(
+            sql[2].contains("N'PROCEDURE'") && sql[2].contains("N'r2'"),
+            "{sql:?}"
+        );
+        assert_eq!(sql.len(), 3);
+
+        let scalar = RoutineInfo {
+            kind: RoutineKind::Function,
+            arguments: "@x int".into(),
+            returns: "int".into(),
+            body: "BEGIN RETURN @x END".into(),
+            ..proc_r()
+        };
+        let sql = plan(&scalar, |f| {
+            f.returns = "TABLE".into();
+            f.body = "RETURN (SELECT @x AS v)".into();
+        });
+        assert_eq!(sql[0], "DROP FUNCTION IF EXISTS [dbo].[r];");
+        assert!(sql[1].starts_with("CREATE FUNCTION"), "{sql:?}");
+        // A scalar's new return type is still a scalar: altered in place.
+        let sql = plan(&scalar, |f| f.returns = "bigint".into());
+        assert!(sql[0].starts_with("CREATE OR ALTER FUNCTION"), "{sql:?}");
+        // Procedure to function, the other refusal.
+        let sql = plan(&proc_r(), |f| {
+            f.kind = RoutineKind::Function;
+            f.returns = "int".into();
+            f.body = "BEGIN RETURN 1 END".into();
+        });
+        assert_eq!(sql[0], "DROP PROCEDURE IF EXISTS [dbo].[r];");
+    }
+
+    /// A comment edited on its own is set in place, whether or not one is
+    /// there — the same lookup-as-it-runs `TsqlComment::set` makes for a table.
+    #[test]
+    fn a_sql_server_routines_comment_is_set_in_place() {
+        let sql = plan(&proc_r(), |f| f.comment = Some("new".into()));
+        assert!(sql[0].starts_with("CREATE OR ALTER PROCEDURE"), "{sql:?}");
+        assert!(
+            sql[1].starts_with("IF EXISTS") && sql[1].contains("N'new'"),
+            "{sql:?}"
+        );
+        let mut cur = proc_r();
+        cur.comment = Some("old".into());
+        let sql = plan(&cur, |f| f.comment = None);
+        assert!(sql[1].contains("sp_dropextendedproperty"), "{sql:?}");
+    }
+
+    /// A toggle adds an option once, at the end, and takes it out again — the
+    /// others keep their order, so switching one on and off is no change.
+    #[test]
+    fn a_routine_option_toggles_without_disturbing_the_rest() {
+        use crate::schema::{ExecuteAs, TsqlRoutine, TsqlRoutineOption as O};
+        let start = vec![O::ExecuteAs(ExecuteAs::Owner), O::SchemaBinding];
+        let mut t = TsqlRoutine {
+            options: start.clone(),
+            ..TsqlRoutine::default()
+        };
+        assert!(t.has_option(&O::SchemaBinding) && !t.has_option(&O::Recompile));
+        t.set_option(O::Recompile, true);
+        t.set_option(O::Recompile, true);
+        assert_eq!(
+            t.options,
+            [
+                O::ExecuteAs(ExecuteAs::Owner),
+                O::SchemaBinding,
+                O::Recompile
+            ]
+        );
+        t.set_option(O::Recompile, false);
+        assert_eq!(t.options, start);
+        t.set_option(O::SchemaBinding, false);
+        assert_eq!(t.options, [O::ExecuteAs(ExecuteAs::Owner)]);
+    }
+
+    /// New routines open on what T-SQL compiles, and the validator holds
+    /// T-SQL's own rule that a parameter is named with `@`.
+    #[test]
+    fn a_new_sql_server_routine_opens_valid() {
+        for kind in [RoutineKind::Procedure, RoutineKind::Function] {
+            let d = RoutineDraft::blank(kind, "r", Some("dbo".into()), MsSql);
+            assert!(
+                d.validate(MsSql).is_empty(),
+                "{kind:?}: {:?}",
+                d.validate(MsSql)
+            );
+            assert!(d.info.body.contains("BEGIN"), "{}", d.info.body);
+        }
+        let mut d = RoutineDraft::from_info(&proc_r());
+        d.info.arguments = "a int".into();
+        assert!(!d.validate(MsSql).is_empty());
+        d.info.arguments = "@a int, b int".into();
+        assert!(!d.validate(MsSql).is_empty());
+        d.info.arguments = "@a int, @b nvarchar(10) = N'x, y'".into();
+        assert!(d.validate(MsSql).is_empty(), "{:?}", d.validate(MsSql));
     }
 }
 

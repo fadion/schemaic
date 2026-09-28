@@ -8,10 +8,9 @@ statement about. All three engines now edit all three of those objects, and they
 differently, so ask the *narrow* capability (`ddl::supports_or_replace_view`,
 `ddl::supports_view_rename`) rather than the engine. **Microsoft SQL Server is a fourth, and a
 preview rather than a peer**: it connects, reads, validates, introspects, runs scripts, writes
-the grid's edits back, imports a file into a table, designs tables, edits views and triggers,
-drops a table, view or routine, holds a Manual tab's transaction, shows a query plan and dumps a
-database to a `.sql` file, and the routine editor is switched off by capability — see
-`db::mssql`.
+the grid's edits back, imports a file into a table, designs tables, edits views, triggers and
+stored routines, drops a table, view or routine, holds a Manual tab's transaction, shows a query
+plan and dumps a database to a `.sql` file — see `db::mssql`.
 
 This is the project's reference document: the crate/module map, the architecture invariants, the
 UI conventions, and the Floem hazards each subsystem is built on. `CLAUDE.md` at the repo root
@@ -4355,7 +4354,10 @@ existing prose was left alone.
     ordered *after* the redefinition — which has to address the signature the server still holds.
     MySQL has neither verb: every edit there is a `DROP … IF EXISTS` plus a `CREATE`, so a rename
     is folded into that recreate (the drop names the old routine, the create the new one) and a
-    bare rename reads as a redefinition, exactly as `diff_view` resolves one on SQLite. Which
+    bare rename reads as a redefinition, exactly as `diff_view` resolves one on SQLite. SQL Server
+    has the first verb and not the second, which is why a rename on an engine with no rename verb
+    now forces the recreate *even where the replace exists* — altering in place under the new name
+    creates a second routine and leaves the first standing (below, after the triggers). Which
     route a change took rides on `Change::ReplaceRoutine { recreate }` rather than being re-derived
     at emit time, so the preview's risk sentence and the SQL cannot disagree — and `recreate` is
     what earns the "a definition the server rejects leaves no procedure at all" warning, the same
@@ -4491,6 +4493,51 @@ existing prose was left alone.
     `TriggerInfo::is_editable` says no to, on the constraint trigger's terms: it may sit in the set
     while a neighbour is edited, and dropping it is fine
     (`an_unreadable_sql_server_trigger_can_be_dropped_but_not_changed`).
+    **SQL Server's routines came the triggers' way, reader first.** `tsql_routine_parts` reads a
+    stored procedure or function into `TsqlRoutineParts` — kind, parameter list, `RETURNS`, the
+    `WITH` options, a procedure's `FOR REPLICATION`, the body — by the same `TsqlCursor` walk and
+    under the same stated exception, since sqlparser's T-SQL routine grammar does not carry the
+    `WITH` options and a body is exactly the text an AST would re-print rather than keep. The
+    cursor now records each token's `start`, which the three helpers the routine header needed
+    stand on: `close_paren`, `span_until` (the text up to a keyword at depth 0) and
+    `tsql_strip_outer_parens`. The header is `CREATE [OR ALTER] {PROC | PROCEDURE} name [params]
+    [WITH …] [FOR REPLICATION] AS body` or `CREATE [OR ALTER] FUNCTION name (params) RETURNS
+    {type | TABLE | @t TABLE (…)} [WITH …] [AS] body` — **a function's `AS` is optional**, so its
+    body may start at `BEGIN` or `RETURN` instead. **The parameter list is kept as text, defaults
+    and all**, because the catalogue does not keep a T-SQL default:
+    `sys.parameters.has_default_value` is 0 for `@a int = 5` (measured on SQL Server 2022), so a
+    list rebuilt from `sys.parameters` and fed back to `CREATE OR ALTER` would silently drop every
+    default — the stored text is the only place one lives. A procedure's optional parentheses are
+    taken off and written back without. It answers `None` — listed, droppable, restated verbatim,
+    never rebuilt — for `WITH ENCRYPTION`, an option it does not model, a numbered procedure
+    (`p;2`), a CLR routine's `EXTERNAL NAME` and anything else outside that shape
+    (`a_routine_header_the_parts_cannot_restate_is_unreadable`), on the trigger walk's rule that a
+    word merely skipped is a word the rebuild drops (`a_stored_procedure_splits_into_its_parts`,
+    `each_function_shape_splits_into_its_parts`).
+    **`supports_or_replace_routine(MsSql)` is true**: `CREATE OR ALTER` keeps the routine's grants
+    (measured: a `GRANT EXECUTE` survived one), so an edit is altered in place. **What it refuses is
+    what `routine_signature_changed` asks there**, which is per-engine now: on SQL Server a change
+    of **kind** (procedure ↔ function) or of a function's **shape** — scalar, inline table-valued
+    (`RETURNS TABLE`), multi-statement (`RETURNS @t TABLE (…)`), each its own object type — which
+    `CREATE OR ALTER` answers with Msg 2010, *"incompatible object type"* (measured for a scalar
+    turned inline table-valued and for a procedure turned function). The parameter list is *not*
+    part of it, T-SQL having no overloading, so a new list or a scalar's new return type is the
+    same routine altered (`an_edited_sql_server_routine_is_altered_in_place`). A rename is a
+    recreate, `sp_rename` leaving the stored text naming the old routine — the call
+    `supports_view_rename` makes for a view — and it is the case the `diff_routine` rule above
+    exists for (`a_renamed_or_reshaped_sql_server_routine_is_dropped_and_created`).
+    **What a create loses is its comment**, the `MS_Description` property, which a `CREATE` has no
+    clause for and a recreate's `DROP` takes with it. `routine_follow_ups`, one exhaustive `match`,
+    sets it through `TsqlComment::set` after a create or a recreate when there is one, and after an
+    in-place alter only when it changed (`a_sql_server_routines_comment_is_set_in_place`);
+    `TsqlComment` gained `object_type` for it, the level-1 type being `PROCEDURE` or `FUNCTION`
+    rather than `TABLE`. `emit_mssql` now routes the shared `routine_statements`, whose drop arm
+    replaced the inline `DropRoutine` one it had, and `tsql_supports` admits `CreateRoutine` and
+    `ReplaceRoutine`, which is what switched `supports_routine_editing(MsSql)` on
+    (`sql_server_offers_the_routine_editor`). `RoutineDraft::validate` has a SQL Server arm — every
+    parameter named with `@`, the list cut at its top-level commas by `tsql_parameters` so neither
+    `decimal(10, 2)` nor a `N'x, y'` default splits one — and `RoutineDraft::blank` already opened
+    on T-SQL that compiles (`a_new_sql_server_routine_opens_valid`).
   - `compare.rs` — **two databases, object by object**, and a chosen subset of the differences as
     one migration. The pure half of schema compare (the UI half is `ui/compare_view.rs`): no DB, no
     view code, nothing here runs anything (98 unit tests).
@@ -6951,8 +6998,8 @@ existing prose was left alone.
     `condition` are consequently **not** PostgreSQL-only fields: MySQL is the engine with neither.
     **SQL Server's arm rebuilds the statement from its parts** (`tsql_create_sql`, which is
     `tsql_statement(false)`; the apply path asks `tsql_statement(true)` for the `CREATE OR ALTER`).
-    It used to replay `sys.sql_modules.definition` whole, as `RoutineInfo::create_sql` does a
-    routine's — and before that it fell through to MySQL's header and emitted a trigger inside a
+    It used to replay `sys.sql_modules.definition` whole, as `RoutineInfo::create_sql` did a
+    routine's until the routine editor came (below) — and before that it fell through to MySQL's header and emitted a trigger inside a
     trigger, which Compare's DDL panes showed. Replaying is right until something can be edited:
     then an edit to any part has to be the statement that runs, so the arm writes the header from
     `TriggerInfo::tsql` and appends the body after `AS` verbatim, and the result reads back through
@@ -7017,13 +7064,14 @@ existing prose was left alone.
     but a syntax error — while inventing a name would make a rebuild read as though it renamed
     something.
     **`RoutineInfo`/`RoutineKind`/`SqlDataAccess`/`Volatility`/`RoutineSource`** are the stored
-    functions and procedures, on both engines that have them, under the same rule again — a
+    functions and procedures, on the three engines that have them, under the same rule again — a
     redefinition replaces the whole routine, so anything the statement doesn't restate reverts.
     Which fields those are is per-engine: PostgreSQL's `volatility`, `strict`, `language`, the
     per-routine `SET` clauses (a `SECURITY DEFINER` function that loses its pinned `search_path`
     is a privilege-escalation hole) and `identity_arguments` (the parameter list in the form that
     *identifies* a routine, which is not the form a `CREATE` takes — see `ddl.rs`), MySQL's
-    `deterministic`, `data_access`, `definer` and `comment`. `security_definer` is the one field both engines have and **their defaults are
+    `deterministic`, `data_access`, `definer` and `comment`, SQL Server's `tsql` (below).
+    `security_definer` is the one field PostgreSQL and MySQL share and **their defaults are
     opposite** — PostgreSQL's is INVOKER, MySQL's is DEFINER — which is why the MySQL arm of
     `create_sql` states the clause in *both* directions instead of leaving the default unwritten
     as the PostgreSQL arm does, and why `RoutineDraft::blank` seeds it per-engine rather than
@@ -7040,6 +7088,28 @@ existing prose was left alone.
     `LANGUAGE c` and `LANGUAGE internal`, where `prosrc` is a link symbol and the recreate needs
     `AS 'obj_file', 'link_symbol'` — so those are listed and droppable but not editable, the call a
     materialized view gets.
+    **SQL Server's arm of `create_sql` rebuilds the routine from its parts** (`tsql_create_sql`,
+    `replace` being `CREATE OR ALTER`): `CREATE [OR ALTER] PROCEDURE name` with the parameter list
+    on the next line, or `FUNCTION name (params)` then `RETURNS …`; the `WITH` options; a
+    procedure's `FOR REPLICATION`; then `AS` and the body verbatim, unterminated as a trigger's is.
+    It returned the stored text whole until the editor came, which is right until an edit to a part
+    has to be the statement that runs — the trigger arm's reasoning above, and its trade: text
+    outside the body is the rebuilt spelling, not the stored one. The result reads back through
+    `ddl::tsql_routine_parts` as the same parts (`a_sql_server_routine_is_written_from_its_parts`).
+    **`RoutineInfo::tsql` (`TsqlRoutine`) is what the shared model lacked**, on the same "restate it
+    or it resets" rule: `options`, a `Vec<TsqlRoutineOption>` (`Recompile`, `SchemaBinding`,
+    `NativeCompilation`, `ReturnsNullOnNullInput`, `CalledOnNullInput`, `ExecuteAs`, and a scalar's
+    `Inline(bool)`, each with its `sql()`), because each is one a `CREATE OR ALTER` resets unless
+    restated — measured on SQL Server 2022, an alter without `WITH RECOMPILE, EXECUTE AS OWNER` left
+    neither; and `for_replication`. `options` is in the stored text's order, and **`set_option` is
+    the toggle that keeps it**: switching one on appends it once, switching it off removes it and
+    leaves the rest in place, so a toggle turned on and off again is no change to diff
+    (`a_routine_option_toggles_without_disturbing_the_rest`) — a toggle that re-sorted the list would
+    make a phantom change of every routine it touched. `verbatim` and `hidden` are the trigger's two
+    fallbacks: the stored text restated whole when the parts could not read its header, a comment
+    line saying so when the server shows no text (`WITH ENCRYPTION`, or no `VIEW DEFINITION`)
+    (`a_sql_server_routine_the_parts_cannot_hold_is_restated_verbatim`). `is_editable` is false for
+    both, beside `c` and `internal` — the same case: listed and droppable, nothing to edit.
     `RoutineSource` is the MySQL body + session state, fetched lazily, and exists
     for exactly the reason `TriggerSource` does — `information_schema.ROUTINE_DEFINITION` resolves
     the body's escapes, and every edit on that engine begins with a `DROP` that commits on its own,
@@ -10873,17 +10943,20 @@ existing prose was left alone.
   fits neither half of; and
   `ddl::supports_change`, whose SQL Server answer comes before anything else and is
   `tsql_supports`: a table's own changes, new or existing, the table, view and routine drops, a
-  view's `CreateView` and `ReplaceView`, and a trigger's create, replace and drop, and nothing
-  more. The four editor predicates compute
+  view's `CreateView` and `ReplaceView`, a trigger's create, replace and drop, and a routine's
+  `CreateRoutine` and `ReplaceRoutine`, and nothing more. The four editor predicates compute
   from it, so it decides which editors open: `supports_table_design` probes a column retype, which
   T-SQL's `ALTER COLUMN` writes, so the designer opens on an existing table — in place, as on MySQL
   and PostgreSQL, with no rebuild — and `supports_view_editing` probes the create and the replace,
   which `emit_mssql` writes through the shared `view_statements` (`CREATE OR ALTER VIEW`, under
   `ddl.rs`), so the view editor opens too; `supports_trigger_editing` probes all three trigger
   changes, which `emit_mssql` writes through the shared `trigger_statements` (`CREATE OR ALTER
-  TRIGGER` for a same-name edit, under `ddl.rs`), so the trigger editor opens as well; the routine
-  editor wants a `Create` and a `Replace` besides its drop and stays off
-  (`sql_server_admits_the_table_changes_it_can_write`, `sql_server_offers_the_trigger_editor`).
+  TRIGGER` for a same-name edit, under `ddl.rs`), so the trigger editor opens as well; and
+  `supports_routine_editing` probes a routine's create, replace and drop, which `emit_mssql` writes
+  through the shared `routine_statements` (`CREATE OR ALTER PROCEDURE`/`FUNCTION`, under `ddl.rs`),
+  so the routine editor opens last of the four
+  (`sql_server_admits_the_table_changes_it_can_write`, `sql_server_offers_the_trigger_editor`,
+  `sql_server_offers_the_routine_editor`).
   What `tsql_supports`
   refuses is under `run_ddl` (below). The three drops needed no emitter
   change — `DROP TABLE`/`DROP VIEW` over `export::ident_sql`'s brackets were T-SQL already, and
@@ -10908,10 +10981,12 @@ existing prose was left alone.
   is written; a view **Edit view** with its Drop, and
   the Create menu *View* after *Table*, now that it writes a view's create and replace; and both a
   table and a plain view **Triggers**, now that it writes `CREATE OR ALTER TRIGGER`, a view's
-  `INSTEAD OF` being how one is written to at all
+  `INSTEAD OF` being how one is written to at all; and the Create menu *Function* and *Procedure*,
+  now that it writes `CREATE OR ALTER PROCEDURE`/`FUNCTION` — the entries `create_children` gates
+  on `supports_routine_editing`, so nothing in the menu changed but the test's expected list
   (`object_menu_tests::sql_server_offers_its_table_changes_and_a_views_drop`,
   `a_standalone_objects_drop_is_offered_only_where_its_statement_emits`,
-  `create_menu_tests::sql_server_is_offered_a_table_and_a_view`). Unlike SQLite's gaps, all
+  `create_menu_tests::sql_server_is_offered_a_table_a_view_and_its_routines`). Unlike SQLite's gaps, all
   of these are **unfinished work**, not statements about the engine. `edit::supports_grid_writes`
   was one of them and is the first to have come back: asked inside `analyze_edit`, it kept every
   cell unwritable until the write-back below landed, and it answers `true` for all four engines now
@@ -11309,8 +11384,18 @@ existing prose was left alone.
   altered, never dropped — and renames the second, and it reads the rank restored, the trigger still
   disabled, the rename landed and the encrypted one untouched, the round-trip gate holding again.
   The renamed one fires, the disabled one stays silent until it is enabled and then fires its edited
-  body, and a new `INSTEAD OF` trigger on a view fires in place of the write to it. Still not done: the routine editor, and a control for a trigger's
+  body, and a new `INSTEAD OF` trigger on a view fires in place of the write to it. Still not done:
+  a control for a trigger's
   `EXECUTE AS` or its rank — both are read, kept and restated on apply, but the form offers neither.
+  `a_routine_is_altered_in_place_and_keeps_what_the_alter_resets` is the routine editor's leg: a
+  procedure with two defaulted parameters (one a string default holding a comma), `WITH RECOMPILE,
+  EXECUTE AS OWNER`, a grant and a comment, beside a scalar function written without `AS` and an
+  encrypted procedure. It reads the defaults and the options back, the encrypted one `hidden` and
+  not editable, and every routine diffing to nothing; then an edit of the body and a default —
+  asserted to carry no `DROP` — runs with the default kept and the grant, the options and the
+  comment still there. A rename lands and restates the comment; the scalar made table-valued is
+  recreated and returns its rows; and a procedure made from `RoutineDraft::blank` validates,
+  creates, runs and diffs to nothing.
   **A trigger is read from `TRIGGER_LISTING`, one row per event**, folded into one `TriggerInfo`
   each; the row carries `sys.trigger_events.is_first`/`is_last`, so the rank is per event, as
   `sp_settriggerorder` sets it. The events are sorted into `TriggerEvent`'s declaration order as
@@ -11319,6 +11404,14 @@ existing prose was left alone.
   gives the body after the header's `AS` and the options; a header it cannot read keeps the whole
   text as `verbatim` (and as the body, for whatever displays it); a NULL `definition` is `hidden`
   (`a_stored_trigger_reads_into_its_parts_or_is_kept_whole`).
+  **A routine's text goes through `tsql_routine_reading`**, pure, on the same terms: the parts
+  `tsql_routine_parts` reads give its parameter list, `RETURNS`, body and `TsqlRoutine`; a header
+  it cannot read is `verbatim`; a NULL `definition` is `hidden`. **The text's parameter list wins
+  whenever it reads**, over the one `PARAMETER_LISTING` builds from `sys.parameters`, because that
+  one has no defaults (`has_default_value` is 0 for `@a int = 5`, measured) and fed back to `CREATE
+  OR ALTER` it would drop every one; the catalogue's list and return type are kept only for a
+  routine that cannot be rebuilt, where they are for display
+  (`a_stored_routine_reads_into_its_parts_or_is_kept_whole`).
   **A view's header is read off its stored definition, in two halves by one walk.**
   `view_select_body` is the `SELECT` — everything after the first `AS` outside parentheses,
   strings, comments and quoted names, over `sql::skip_noncode` — and `view_header_options` is what
@@ -12469,8 +12562,12 @@ existing prose was left alone.
   `routines.rs`'s two `eprintln!`s were: four of six leg-tests reported green with nothing on
   screen, on every run including CI's, under a doc claiming the opposite. It is deliberately *not*
   deduped the way `note_skipped` is, that one being about a target and this one about a leg with a
-  different reason each time. Endpoints come from one environment variable per field (no URL to
-  parse, no password to encode), defaulting to this project's own test bed.
+  different reason each time. `endpoint::note_leg_no_op(name, reason)` is the same notice by the
+  leg's name, for a leg with no `Target` — `OUTSIDE_THE_SUITE`'s, as `note_leg_skipped` is
+  `note_skipped`'s — and `note_no_op` delegates to it. It exists because the gate caught one more:
+  `mssql.rs`'s AdventureWorksLT round trip returned through an `eprintln!` where the sample is not
+  installed, a green that asserted nothing, on the one leg the macro does not cover. Endpoints
+  come from one environment variable per field (no URL to parse, no password to encode), defaulting to this project's own test bed.
   **Nothing here touches a database it did not create.** `scratch.rs` generates every name with the
   `schemaic_it_` prefix, the process id and the leg, and both the create and the drop path assert
   the prefix — the drop guard runs during unwinding, where nothing else is checking anything, and
@@ -16842,7 +16939,7 @@ existing prose was left alone.
     propose `new_trigger_2` for no reason the user can see; empty too until the database's schema has
     loaded. Only `blank_trigger` reads it, and only to pick a name.
   - `routine_editor.rs` — the **stored routine** modal: one form for a function or a procedure,
-    over `core::ddl`'s `RoutineDraft`, on both engines that have them. Reached from the schema
+    over `core::ddl`'s `RoutineDraft`, on the three engines that have them. Reached from the schema
     tree's Functions/Procedures folders (row **Edit**, folder **Create**), from the database and
     namespace **Create** submenus, from Find-Anywhere, and from the trigger editor's
     **New function** / **Edit** buttons — which is the path it was born on and the reason
@@ -16869,6 +16966,16 @@ existing prose was left alone.
     apply, which is a rule the kind axis needs as much as the engine one. The Language dropdown
     carries the routine's own language alongside the two it proposes, for the same reason: a list
     that didn't would silently retype a `plpython3u` function the moment the control was touched.
+    **SQL Server's options are an arm of their own**, and that is the fix as much as the feature:
+    the section was an `if pg … else`, and the `else` would have offered a SQL Server routine
+    MySQL's determinism, data access and definer, none of which T-SQL has. It is a `match
+    target.dialect` now, and the SQL Server arm offers **Recompile** (procedures only — the walk
+    reads `RECOMPILE` on a procedure alone), **Schema binding** and **Comment** (the
+    `MS_Description` property). The two toggles write through `TsqlRoutine::set_option`, so the
+    options the form has no control for — `EXECUTE AS`, the null-input clauses, `INLINE` — keep
+    their place and are restated untouched, and a toggle flipped and flipped back is no change. The
+    Parameters and Returns placeholders are a `match` per engine too, SQL Server's naming the `@`
+    its parameters take and the `TABLE` a table function returns.
     **MySQL's body is fetched a
     second time and it is not an optimisation** (`Db::routine_source` via `RoutineSrcFn`, applied
     to *both* sides of the diff so a routine doesn't open already-changed, and guarded by
@@ -23835,10 +23942,13 @@ Re-introducing the anti-patterns these guard against is a regression:
   walk (`TsqlCursor`) over `skip_noncode` that reads a SQL Server trigger's stored header into the
   options a `CREATE OR ALTER` must restate. sqlparser 0.62's T-SQL `CREATE TRIGGER` knows neither
   the `WITH` options nor `NOT FOR REPLICATION` and parses the body as statements, so the AST answers
-  `None` for the very triggers the editor has to read — `core::ddl`'s entry has the rest. It is held
+  `None` for the very triggers the editor has to read — `core::ddl`'s entry has the rest. **Its
+  sibling `ddl::tsql_routine_parts` is the same exception, not a third**: the same cursor reading a
+  procedure's or function's header, for the same reason — the T-SQL routine grammar carries no
+  `WITH` options, and a body is text an AST would re-print rather than keep. Both are held
   to the grammar's header and nothing more, and anything outside that shape answers `None`, which
-  keeps the trigger listed and droppable but never rebuilt — so it may be widened only for a clause
-  the model then restates, since a word it merely skipped would be dropped by the rebuild.
+  keeps the object listed and droppable but never rebuilt — so either may be widened only for a
+  clause the model then restates, since a word it merely skipped would be dropped by the rebuild.
 - **One connection per operation — except a Manual-mode tab, and a running script.** Every `Db` method opens a fresh
   connection, runs, and disconnects; that statelessness is why a dropped connection is never a
   problem. The *first* exception is manual-transaction mode: a tab set to `TxMode::Manual` pins one
@@ -24294,14 +24404,15 @@ Re-introducing the anti-patterns these guard against is a regression:
   Server is that fourth, and the derivation is what switched its editors off and then turned them
   back on one at a time: `supports_change` answers for it before any arm is consulted
   (`tsql_supports`), admitting a table's own changes, the table, view and routine drops, a view's
-  create and replace and a trigger's create, replace and drop — no emitter writes T-SQL's `CREATE OR
-  ALTER` for a routine yet — and every editor predicate follows with no edit of its own. It held
+  create and replace, a trigger's create, replace and drop, and a routine's create and replace —
+  and every editor predicate follows with no edit of its own. It held
   when the first four came on (a new table and the three drops): no editor probes only them, so
   none opened. When `emit_mssql` learned `ALTER COLUMN`, the table designer opened on an existing
   table by that alone, while the other three stayed shut
   (`sql_server_admits_the_table_changes_it_can_write`); when it learned `CREATE OR ALTER VIEW`,
   the view editor opened the same way, and when it learned `CREATE OR ALTER TRIGGER` so did the
-  trigger editor (`sql_server_offers_the_trigger_editor`). A menu
+  trigger editor (`sql_server_offers_the_trigger_editor`), and with `CREATE OR ALTER
+  PROCEDURE`/`FUNCTION` the routine editor (`sql_server_offers_the_routine_editor`). A menu
   entry with **no** predicate is the same failure with nothing to grep for — the designer's three
   entries were exactly that until `supports_table_design` existed. **Keep asking them, and keep them
   apart**:

@@ -529,10 +529,10 @@ fn routine_form(ui: DdlUi, target: &RoutineTarget, ring: FocusRing) -> AnyView {
                 d,
                 draft.info.arguments.clone(),
                 FieldCfg {
-                    placeholder: if postgres {
-                        "a integer, b text DEFAULT ''"
-                    } else {
-                        "IN sku VARCHAR(20), OUT n INT"
+                    placeholder: match target.dialect {
+                        SqlDialect::Postgres => "a integer, b text DEFAULT ''",
+                        SqlDialect::MsSql => "@sku varchar(20), @n int = 0 OUTPUT",
+                        SqlDialect::MySql | SqlDialect::Sqlite => "IN sku VARCHAR(20), OUT n INT",
                     },
                     mono: true,
                     focus: Some((ring.clone(), TAB_ARGS)),
@@ -544,7 +544,7 @@ fn routine_form(ui: DdlUi, target: &RoutineTarget, ring: FocusRing) -> AnyView {
         )
     });
 
-    // A procedure has no return type on either engine, and stating one is a
+    // A procedure has no return type on any engine, and stating one is a
     // syntax error rather than a harmless extra.
     let returns = (is_function && !trigger_fn).then(|| {
         form_setting(
@@ -553,7 +553,13 @@ fn routine_form(ui: DdlUi, target: &RoutineTarget, ring: FocusRing) -> AnyView {
                 d,
                 draft.info.returns.clone(),
                 FieldCfg {
-                    placeholder: if postgres { "integer" } else { "INT" },
+                    // SQL Server's is also where a table function says so:
+                    // `TABLE`, or `@t TABLE (…)`.
+                    placeholder: match target.dialect {
+                        SqlDialect::Postgres => "integer",
+                        SqlDialect::MsSql => "int, or TABLE",
+                        SqlDialect::MySql | SqlDialect::Sqlite => "INT",
+                    },
                     mono: true,
                     focus: Some((ring.clone(), TAB_RETURNS)),
                     ..Default::default()
@@ -633,159 +639,211 @@ fn routine_form(ui: DdlUi, target: &RoutineTarget, ring: FocusRing) -> AnyView {
     // resets. On PostgreSQL the sharpest is the `SET search_path` pinned to a
     // SECURITY DEFINER function; on MySQL it is the definer itself.
     let mut options: Vec<AnyView> = Vec::new();
-    if postgres {
-        // **Volatility and strictness are function-only.** PostgreSQL's
-        // `CREATE PROCEDURE` grammar takes a strict subset of a function's
-        // attributes and answers anything else with
-        // `ERROR: invalid attribute in procedure definition`, so offering these
-        // two over a procedure is offering an edit that can only fail at Apply —
-        // the "hide what an engine can't express" call this form already makes
-        // per engine, made per *kind*.
-        if is_function {
+    // SQL Server's `WITH` options: the two a user reaches for, as toggles
+    // over `TsqlRoutine::set_option`, so the rest — `EXECUTE AS`, the
+    // null-input clauses, `INLINE` — keep their place and are restated
+    // untouched; and the comment, its `MS_Description` property. Its own arm
+    // rather than MySQL's `else`, whose characteristics T-SQL has none of.
+    match target.dialect {
+        SqlDialect::MsSql => {
+            use schemaic_core::schema::TsqlRoutineOption as O;
+            if !is_function {
+                options.push(bound_toggle(
+                    d,
+                    "Recompile",
+                    "WITH RECOMPILE — a fresh plan on every call, never a cached one.",
+                    draft.info.tsql.has_option(&O::Recompile),
+                    ring.clone(),
+                    TAB_OPT,
+                    |d, v| d.info.tsql.set_option(O::Recompile, v),
+                ));
+            }
+            options.push(bound_toggle(
+                d,
+                "Schema binding",
+                "WITH SCHEMABINDING — the tables and views it reads can't be changed out \
+             from under it.",
+                draft.info.tsql.has_option(&O::SchemaBinding),
+                ring.clone(),
+                TAB_OPT + 10,
+                |d, v| d.info.tsql.set_option(O::SchemaBinding, v),
+            ));
             options.push(
                 form_setting(
-                    "Volatility",
+                    "Comment",
+                    bound_field(
+                        d,
+                        draft.info.comment.clone().unwrap_or_default(),
+                        FieldCfg {
+                            placeholder: "what it does",
+                            focus: Some((ring.clone(), TAB_OPT + 40)),
+                            ..Default::default()
+                        },
+                        |d, v| {
+                            let v = v.trim();
+                            d.info.comment = (!v.is_empty()).then(|| v.to_string());
+                        },
+                    )
+                    .style(move |s| s.width(field_w() * 1.6)),
+                )
+                .into_any(),
+            );
+        }
+        SqlDialect::Postgres => {
+            // **Volatility and strictness are function-only.** PostgreSQL's
+            // `CREATE PROCEDURE` grammar takes a strict subset of a function's
+            // attributes and answers anything else with
+            // `ERROR: invalid attribute in procedure definition`, so offering these
+            // two over a procedure is offering an edit that can only fail at Apply —
+            // the "hide what an engine can't express" call this form already makes
+            // per engine, made per *kind*.
+            if is_function {
+                options.push(
+                    form_setting(
+                        "Volatility",
+                        bound_choice(
+                            d,
+                            draft.info.volatility,
+                            vec![
+                                ("VOLATILE".to_string(), Volatility::Volatile),
+                                ("STABLE".to_string(), Volatility::Stable),
+                                ("IMMUTABLE".to_string(), Volatility::Immutable),
+                            ],
+                            ring.clone(),
+                            TAB_OPT,
+                            |d, v| d.info.volatility = v,
+                        ),
+                    )
+                    .into_any(),
+                );
+                options.push(bound_toggle(
+                    d,
+                    "Strict",
+                    "RETURNS NULL ON NULL INPUT — the body doesn't run when an argument \
+                 is NULL.",
+                    draft.info.strict,
+                    ring.clone(),
+                    TAB_OPT + 10,
+                    |d, v| d.info.strict = v,
+                ));
+            }
+            options.push(bound_toggle(
+                d,
+                "Security definer",
+                "Runs with the owner's rights instead of the caller's. Pin a search_path \
+             below when you use this.",
+                draft.info.security_definer,
+                ring.clone(),
+                TAB_OPT + 20,
+                |d, v| d.info.security_definer = v,
+            ));
+            options.push(
+                form_setting(
+                    "Settings",
+                    value_rows(
+                        "search_path=public, pg_temp",
+                        "Add setting",
+                        true,
+                        ring.clone(),
+                        crate::widgets::VALUE_TAB,
+                        move || d.with(|s| s.info.settings.clone()),
+                        move |v| d.update(|s| s.info.settings = v),
+                    )
+                    .style(move |s| s.width(field_w() * 1.6)),
+                )
+                .into_any(),
+            );
+        }
+        SqlDialect::MySql | SqlDialect::Sqlite => {
+            options.push(bound_toggle(
+                d,
+                "Deterministic",
+                "Promises the same result for the same arguments. A server with binary \
+             logging refuses a non-deterministic routine unless it trusts creators.",
+                draft.info.deterministic,
+                ring.clone(),
+                TAB_OPT,
+                |d, v| d.info.deterministic = v,
+            ));
+            options.push(
+                form_setting(
+                    "Data access",
                     bound_choice(
                         d,
-                        draft.info.volatility,
+                        draft.info.data_access,
                         vec![
-                            ("VOLATILE".to_string(), Volatility::Volatile),
-                            ("STABLE".to_string(), Volatility::Stable),
-                            ("IMMUTABLE".to_string(), Volatility::Immutable),
+                            ("CONTAINS SQL".to_string(), SqlDataAccess::ContainsSql),
+                            ("NO SQL".to_string(), SqlDataAccess::NoSql),
+                            ("READS SQL DATA".to_string(), SqlDataAccess::ReadsSqlData),
+                            (
+                                "MODIFIES SQL DATA".to_string(),
+                                SqlDataAccess::ModifiesSqlData,
+                            ),
                         ],
                         ring.clone(),
-                        TAB_OPT,
-                        |d, v| d.info.volatility = v,
+                        TAB_OPT + 10,
+                        |d, v| d.info.data_access = v,
                     ),
                 )
                 .into_any(),
             );
             options.push(bound_toggle(
                 d,
-                "Strict",
-                "RETURNS NULL ON NULL INPUT — the body doesn't run when an argument \
-                 is NULL.",
-                draft.info.strict,
-                ring.clone(),
-                TAB_OPT + 10,
-                |d, v| d.info.strict = v,
-            ));
-        }
-        options.push(bound_toggle(
-            d,
-            "Security definer",
-            "Runs with the owner's rights instead of the caller's. Pin a search_path \
-             below when you use this.",
-            draft.info.security_definer,
-            ring.clone(),
-            TAB_OPT + 20,
-            |d, v| d.info.security_definer = v,
-        ));
-        options.push(
-            form_setting(
-                "Settings",
-                value_rows(
-                    "search_path=public, pg_temp",
-                    "Add setting",
-                    true,
-                    ring.clone(),
-                    crate::widgets::VALUE_TAB,
-                    move || d.with(|s| s.info.settings.clone()),
-                    move |v| d.update(|s| s.info.settings = v),
-                )
-                .style(move |s| s.width(field_w() * 1.6)),
-            )
-            .into_any(),
-        );
-    } else {
-        options.push(bound_toggle(
-            d,
-            "Deterministic",
-            "Promises the same result for the same arguments. A server with binary \
-             logging refuses a non-deterministic routine unless it trusts creators.",
-            draft.info.deterministic,
-            ring.clone(),
-            TAB_OPT,
-            |d, v| d.info.deterministic = v,
-        ));
-        options.push(
-            form_setting(
-                "Data access",
-                bound_choice(
-                    d,
-                    draft.info.data_access,
-                    vec![
-                        ("CONTAINS SQL".to_string(), SqlDataAccess::ContainsSql),
-                        ("NO SQL".to_string(), SqlDataAccess::NoSql),
-                        ("READS SQL DATA".to_string(), SqlDataAccess::ReadsSqlData),
-                        (
-                            "MODIFIES SQL DATA".to_string(),
-                            SqlDataAccess::ModifiesSqlData,
-                        ),
-                    ],
-                    ring.clone(),
-                    TAB_OPT + 10,
-                    |d, v| d.info.data_access = v,
-                ),
-            )
-            .into_any(),
-        );
-        options.push(bound_toggle(
-            d,
-            "Security definer",
-            "Runs with the definer's rights instead of the caller's. This is MySQL's \
+                "Security definer",
+                "Runs with the definer's rights instead of the caller's. This is MySQL's \
              default — turning it off is SQL SECURITY INVOKER.",
-            draft.info.security_definer,
-            ring.clone(),
-            TAB_OPT + 20,
-            |d, v| d.info.security_definer = v,
-        ));
-        // Carried rather than offered as a free choice would be honest either
-        // way, and a field is the honest one: a recreate that dropped the clause
-        // would hand the routine to whoever applied the edit, and a recreate
-        // that restates an account the applier may not impersonate is refused by
-        // the server with a message that says so.
-        options.push(
-            form_setting(
-                "Definer",
-                bound_field(
-                    d,
-                    draft.info.definer.clone().unwrap_or_default(),
-                    FieldCfg {
-                        placeholder: "root@localhost",
-                        mono: true,
-                        focus: Some((ring.clone(), TAB_OPT + 30)),
-                        ..Default::default()
-                    },
-                    |d, v| {
-                        let v = v.trim();
-                        d.info.definer = (!v.is_empty()).then(|| v.to_string());
-                    },
+                draft.info.security_definer,
+                ring.clone(),
+                TAB_OPT + 20,
+                |d, v| d.info.security_definer = v,
+            ));
+            // Carried rather than offered as a free choice would be honest either
+            // way, and a field is the honest one: a recreate that dropped the clause
+            // would hand the routine to whoever applied the edit, and a recreate
+            // that restates an account the applier may not impersonate is refused by
+            // the server with a message that says so.
+            options.push(
+                form_setting(
+                    "Definer",
+                    bound_field(
+                        d,
+                        draft.info.definer.clone().unwrap_or_default(),
+                        FieldCfg {
+                            placeholder: "root@localhost",
+                            mono: true,
+                            focus: Some((ring.clone(), TAB_OPT + 30)),
+                            ..Default::default()
+                        },
+                        |d, v| {
+                            let v = v.trim();
+                            d.info.definer = (!v.is_empty()).then(|| v.to_string());
+                        },
+                    )
+                    .style(move |s| s.width(field_w())),
                 )
-                .style(move |s| s.width(field_w())),
-            )
-            .into_any(),
-        );
-        options.push(
-            form_setting(
-                "Comment",
-                bound_field(
-                    d,
-                    draft.info.comment.clone().unwrap_or_default(),
-                    FieldCfg {
-                        placeholder: "what it does",
-                        focus: Some((ring.clone(), TAB_OPT + 40)),
-                        ..Default::default()
-                    },
-                    |d, v| {
-                        let v = v.trim();
-                        d.info.comment = (!v.is_empty()).then(|| v.to_string());
-                    },
+                .into_any(),
+            );
+            options.push(
+                form_setting(
+                    "Comment",
+                    bound_field(
+                        d,
+                        draft.info.comment.clone().unwrap_or_default(),
+                        FieldCfg {
+                            placeholder: "what it does",
+                            focus: Some((ring.clone(), TAB_OPT + 40)),
+                            ..Default::default()
+                        },
+                        |d, v| {
+                            let v = v.trim();
+                            d.info.comment = (!v.is_empty()).then(|| v.to_string());
+                        },
+                    )
+                    .style(move |s| s.width(field_w() * 1.6)),
                 )
-                .style(move |s| s.width(field_w() * 1.6)),
-            )
-            .into_any(),
-        );
+                .into_any(),
+            );
+        }
     }
 
     let mut rows: Vec<AnyView> = vec![

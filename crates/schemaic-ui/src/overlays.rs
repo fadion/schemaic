@@ -622,7 +622,7 @@ pub(crate) fn create_children(
             }),
         );
     }
-    // Stored routines, on the two engines that have them. A **capability**, not
+    // Stored routines, on the three engines that have them. A **capability**, not
     // an engine test — SQLite has no `CREATE PROCEDURE` and no catalogue of one,
     // so the entries are absent there rather than dimmed, which is the same call
     // the view entry above makes.
@@ -6295,12 +6295,16 @@ mod create_menu_tests {
         );
     }
 
-    /// **SQL Server is offered a table and a view** — the Creates whose
-    /// statements it emits. Its routines and containers wait on their own
-    /// `Create` arms, and are absent rather than dimmed.
+    /// **SQL Server is offered a table, a view, and its routines** — the
+    /// Creates whose statements it emits, the routines since `CREATE OR
+    /// ALTER PROCEDURE`/`FUNCTION` landed. Its containers wait on their own
+    /// `Create` arm, and are absent rather than dimmed.
     #[test]
-    fn sql_server_is_offered_a_table_and_a_view() {
-        assert_eq!(labels(SqlDialect::MsSql), vec!["Table", "View"]);
+    fn sql_server_is_offered_a_table_a_view_and_its_routines() {
+        assert_eq!(
+            labels(SqlDialect::MsSql),
+            vec!["Table", "View", "Function", "Procedure"]
+        );
     }
 
     /// SQLite has no stored routines at all — not an unfinished emitter, an

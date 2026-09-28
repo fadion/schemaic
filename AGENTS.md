@@ -15,9 +15,9 @@ writes, imports and edits **tables** (through the twelve-step rebuild — `ddl::
 rather than unfinished work (`db::session::Session::open` carries the reason). **SQL Server is a
 preview** (`db::mssql`, on a vendored `tiberius` — `vendor/tiberius/PATCHES.md`): it reads,
 introspects, runs scripts, writes grid edits back, imports files, designs tables, edits views, holds a Manual tab's
-transaction, shows query plans, dumps to `.sql`, opens `sqlcmd` and edits triggers, and each thing it
-does not do yet is a capability answering no — `ddl::supports_change` (for the routine
-editor, and the column changes T-SQL's `ALTER COLUMN` cannot make), `users::supports_users` —
+transaction, shows query plans, dumps to `.sql`, opens `sqlcmd` and edits triggers and routines, and each thing it
+does not do yet is a capability answering no — `ddl::supports_change` (for the column changes
+T-SQL's `ALTER COLUMN` cannot make), `users::supports_users` —
 so it is absent from the UI rather than failing there; that one *is* unfinished work. What differs between the
 engines now lives in the *narrow* predicates that decide how an edit is performed rather than
 whether it is offered: `ddl::supports_or_replace_view`, `supports_view_rename`,
@@ -105,8 +105,9 @@ substitute for the statement, and none of these is a style preference.
 - **Structure-aware SQL analysis goes through `core::intel`** (a real per-dialect AST), not a new
   hand-rolled scanner. The DB stays the semantic authority. Two stated exceptions: the read-only
   gate's PostgreSQL function scan, which has to fail closed where an AST visitor fails open; and
-  `ddl::tsql_trigger_parts`, a T-SQL trigger's header walked over `sql::skip_noncode`, because
-  sqlparser's T-SQL `CREATE TRIGGER` knows neither its `WITH` options nor `NOT FOR REPLICATION`.
+  `ddl::tsql_trigger_parts` and `tsql_routine_parts`, a T-SQL trigger's and routine's header
+  walked over `sql::skip_noncode`, because sqlparser's T-SQL grammar does not carry their `WITH`
+  options and would re-print the body an edit has to keep verbatim.
 - **One connection per operation** — every `Db` method connects, runs, disconnects. **Two**
   exceptions, both because their statements are not independent: a `TxMode::Manual` tab's pinned
   `Session`, and `Db::run_script`, which holds one connection for a whole `.sql` file (a dump's

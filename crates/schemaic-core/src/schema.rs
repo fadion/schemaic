@@ -2019,6 +2019,72 @@ impl ExecuteAs {
     }
 }
 
+/// One option in a SQL Server routine's `WITH` list — each one a
+/// `CREATE OR ALTER` resets unless it is restated (measured on SQL Server
+/// 2022: an alter without `WITH RECOMPILE, EXECUTE AS OWNER` left neither).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TsqlRoutineOption {
+    Recompile,
+    SchemaBinding,
+    NativeCompilation,
+    ReturnsNullOnNullInput,
+    CalledOnNullInput,
+    ExecuteAs(ExecuteAs),
+    /// A scalar function's `INLINE = ON | OFF`.
+    Inline(bool),
+}
+
+impl TsqlRoutineOption {
+    pub fn sql(&self) -> String {
+        match self {
+            TsqlRoutineOption::Recompile => "RECOMPILE".to_string(),
+            TsqlRoutineOption::SchemaBinding => "SCHEMABINDING".to_string(),
+            TsqlRoutineOption::NativeCompilation => "NATIVE_COMPILATION".to_string(),
+            TsqlRoutineOption::ReturnsNullOnNullInput => "RETURNS NULL ON NULL INPUT".to_string(),
+            TsqlRoutineOption::CalledOnNullInput => "CALLED ON NULL INPUT".to_string(),
+            TsqlRoutineOption::ExecuteAs(who) => format!("EXECUTE AS {}", who.sql()),
+            TsqlRoutineOption::Inline(on) => format!("INLINE = {}", if *on { "ON" } else { "OFF" }),
+        }
+    }
+}
+
+/// What a **SQL Server** routine carries beyond the shared model: its `WITH`
+/// options, a procedure's `FOR REPLICATION`, and the fallbacks for one that
+/// cannot be rebuilt. Read by `db::mssql` through
+/// [`crate::ddl::tsql_routine_parts`], restated by [`RoutineInfo::create_sql`].
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TsqlRoutine {
+    /// In the order the stored text had them.
+    pub options: Vec<TsqlRoutineOption>,
+    pub for_replication: bool,
+    /// **The stored statement, whole, when its header could not be read** —
+    /// shown, restated verbatim, droppable, never rebuilt (see
+    /// [`TsqlTrigger::verbatim`], the same call).
+    pub verbatim: Option<String>,
+    /// **The server shows no text for it** — `WITH ENCRYPTION`, or no
+    /// `VIEW DEFINITION`. Droppable, not editable.
+    pub hidden: bool,
+}
+
+impl TsqlRoutine {
+    pub fn has_option(&self, opt: &TsqlRoutineOption) -> bool {
+        self.options.contains(opt)
+    }
+
+    /// Switch `opt` on — once, after the others — or off, leaving the rest
+    /// in the order the stored text had them, so a toggle turned on and off
+    /// again is no change to diff.
+    pub fn set_option(&mut self, opt: TsqlRoutineOption, on: bool) {
+        if on {
+            if !self.has_option(&opt) {
+                self.options.push(opt);
+            }
+        } else {
+            self.options.retain(|o| *o != opt);
+        }
+    }
+}
+
 /// A SQL Server trigger's place among the triggers on one event —
 /// `sp_settriggerorder`'s `First` and `Last`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2805,6 +2871,9 @@ pub struct RoutineInfo {
     /// Not user-editable: it rides with the session state in
     /// [`RoutineSource::apply_session_to`], not with the body.
     pub aggregate: bool,
+    /// **SQL Server**: the `WITH` options and fallbacks — see
+    /// [`TsqlRoutine`]. Default everywhere else.
+    pub tsql: TsqlRoutine,
 }
 
 impl RoutineInfo {
@@ -2832,10 +2901,14 @@ impl RoutineInfo {
     /// column's sequence is: the tree row is context, and hiding it would be a
     /// worse lie than showing it with Edit greyed out.
     pub fn is_editable(&self) -> bool {
+        // A SQL Server routine with no text to rebuild from, or a header the
+        // parts could not hold (`TsqlRoutine`), is the same case as a C one:
+        // listed and droppable, nothing to edit.
         !matches!(
             self.language.trim().to_ascii_lowercase().as_str(),
             "c" | "internal"
-        )
+        ) && self.tsql.verbatim.is_none()
+            && !self.tsql.hidden
     }
 
     /// The routine's identity in SQL, as `DROP`/`ALTER`/`COMMENT ON` need it.
@@ -2915,13 +2988,57 @@ impl RoutineInfo {
             crate::intel::SqlDialect::MySql | crate::intel::SqlDialect::Sqlite => {
                 self.mysql_create_sql(dialect)
             }
-            // SQL Server keeps the routine's whole `CREATE` statement
-            // (`sys.sql_modules.definition`), and `mssql` reads it into
-            // `body`. Reassembling one from parts would be a second author of
-            // text the server already has verbatim. Not editable yet, so
-            // `replace` has nothing to change.
-            crate::intel::SqlDialect::MsSql => self.body.trim().to_string(),
+            // SQL Server's is rebuilt from the parts `mssql` read the stored
+            // text into; `replace` is `CREATE OR ALTER`.
+            crate::intel::SqlDialect::MsSql => self.tsql_create_sql(replace),
         }
+    }
+
+    /// [`Self::create_sql`] for SQL Server: `CREATE [OR ALTER] {PROCEDURE |
+    /// FUNCTION}`, **rebuilt from the parts** — the parameter list as the
+    /// verbatim text it is, a function's `RETURNS`, every `WITH` option a
+    /// `CREATE OR ALTER` would otherwise reset ([`TsqlRoutine`]), a
+    /// procedure's `FOR REPLICATION`, then the body after `AS`. The whole
+    /// reads back through [`crate::ddl::tsql_routine_parts`] as the same
+    /// parts. The body is verbatim and not terminated, as a trigger's is.
+    ///
+    /// The stored text is restated instead when its header could not be read
+    /// (`TsqlRoutine::verbatim`), and one the server shows nobody gets a
+    /// comment saying so.
+    fn tsql_create_sql(&self, or_alter: bool) -> String {
+        let d = crate::intel::SqlDialect::MsSql;
+        if let Some(v) = &self.tsql.verbatim {
+            return v.trim().to_string();
+        }
+        if self.tsql.hidden || self.body.trim().is_empty() {
+            return format!(
+                "-- The definition of {} {} was not available (it may be encrypted, or \
+                 not visible to this login).",
+                self.kind.label(),
+                crate::export::comment_text(&self.name)
+            );
+        }
+        let name = qualified_ident(&self.name, self.schema.as_deref(), d);
+        let head = format!(
+            "CREATE {}{} {name}",
+            if or_alter { "OR ALTER " } else { "" },
+            self.kind.sql_keyword()
+        );
+        let args = self.arguments.trim();
+        let mut out = match self.kind {
+            RoutineKind::Procedure if args.is_empty() => head,
+            RoutineKind::Procedure => format!("{head}\n    {args}"),
+            RoutineKind::Function => format!("{head} ({args})\nRETURNS {}", self.returns.trim()),
+        };
+        if !self.tsql.options.is_empty() {
+            let opts: Vec<String> = self.tsql.options.iter().map(|o| o.sql()).collect();
+            out.push_str(&format!("\nWITH {}", opts.join(", ")));
+        }
+        if self.tsql.for_replication && self.kind == RoutineKind::Procedure {
+            out.push_str("\nFOR REPLICATION");
+        }
+        out.push_str(&format!("\nAS\n{}", self.body.trim()));
+        out
     }
 
     /// What PostgreSQL assumes a function costs when the `CREATE` says nothing:
@@ -7852,7 +7969,7 @@ mod tests {
                 name: name.into(),
                 schema: Some("dbo".into()),
                 kind: RoutineKind::Procedure,
-                body: format!("CREATE PROCEDURE dbo.{name} AS BEGIN SELECT 1; SELECT 2; END"),
+                body: "BEGIN SELECT 1; SELECT 2; END".into(),
                 ..Default::default()
             })
         };
@@ -7882,7 +7999,7 @@ mod tests {
             "{script}"
         );
         for p in ["p1", "p2"] {
-            let head = format!("CREATE PROCEDURE dbo.{p} ");
+            let head = format!("CREATE PROCEDURE [dbo].[{p}]");
             assert!(stmts.iter().any(|s| s.starts_with(&head)), "{script}");
         }
         // The database's script is the namespaces' in turn, batches intact —

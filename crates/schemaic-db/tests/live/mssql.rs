@@ -1548,6 +1548,137 @@ async fn a_view_is_altered_in_place_and_renamed() {
     assert_eq!(s.scalar("SELECT b FROM dbo.w").await, "5");
 }
 
+/// **A routine is altered in place and keeps what the alter would reset**:
+/// its parameters' defaults (which live only in the text), its `WITH`
+/// options, its grant and its comment. A rename is a drop and a create that
+/// restates the comment; a scalar function turned table-valued, which `CREATE
+/// OR ALTER` refuses, is dropped and created; an encrypted routine is listed,
+/// hidden and not editable. Each read back diffs to nothing against its own
+/// draft.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_routine_is_altered_in_place_and_keeps_what_the_alter_resets() {
+    use schemaic_core::ddl::{RoutineDraft, diff_routine};
+    use schemaic_core::schema::{ExecuteAs, RoutineInfo, RoutineKind, TsqlRoutineOption};
+    if !enabled() {
+        return;
+    }
+    let s = Scratch::create("ddl_routine").await;
+    s.exec(
+        "create procedure dbo.p @a int = 5, @b nvarchar(10) = N'x, y' \
+         with recompile, execute as owner as select @a + len(@b)",
+    )
+    .await;
+    s.exec("GRANT EXECUTE ON dbo.p TO public").await;
+    s.exec(
+        "EXEC sp_addextendedproperty @name = N'MS_Description', @value = N'adds', \
+         @level0type = N'SCHEMA', @level0name = N'dbo', @level1type = N'PROCEDURE', @level1name = N'p'",
+    )
+    .await;
+    s.exec("CREATE FUNCTION dbo.f (@x int) RETURNS int BEGIN RETURN @x * 2 END")
+        .await;
+    s.exec("CREATE PROCEDURE dbo.hid WITH ENCRYPTION AS SELECT 1")
+        .await;
+
+    let read = |s: &Scratch| {
+        let db = s.db.clone();
+        let name = s.name.clone();
+        async move {
+            db.fetch_schema(&name, CancellationToken::new())
+                .await
+                .expect("the schema")
+                .routines
+        }
+    };
+    let find = |all: &[std::sync::Arc<RoutineInfo>], n: &str| {
+        all.iter()
+            .find(|r| r.name == n)
+            .unwrap_or_else(|| panic!("{n}"))
+            .as_ref()
+            .clone()
+    };
+    let apply = |stmts: Vec<String>| {
+        let db = s.db.clone();
+        let name = s.name.clone();
+        async move {
+            db.run_ddl(&name, &stmts, CancellationToken::new())
+                .await
+                .unwrap_or_else(|e| panic!("{e}\n{stmts:#?}"));
+        }
+    };
+
+    let all = read(&s).await;
+    let p = find(&all, "p");
+    assert_eq!(p.arguments, "@a int = 5, @b nvarchar(10) = N'x, y'");
+    assert_eq!(
+        p.tsql.options,
+        [
+            TsqlRoutineOption::Recompile,
+            TsqlRoutineOption::ExecuteAs(ExecuteAs::Owner)
+        ]
+    );
+    assert_eq!(p.comment.as_deref(), Some("adds"));
+    assert!(find(&all, "hid").tsql.hidden && !find(&all, "hid").is_editable());
+    for r in &all {
+        assert!(
+            diff_routine(r, &RoutineDraft::from_info(r), MS).is_empty(),
+            "the round-trip gate: {}",
+            r.name
+        );
+    }
+
+    // An edit in place: the body and a parameter.
+    let mut d = RoutineDraft::from_info(&p);
+    d.info.arguments = "@a int = 7, @b nvarchar(10) = N'x, y'".into();
+    d.info.body = "select @a * 10 + len(@b)".into();
+    let stmts = diff_routine(&p, &d, MS).emit();
+    assert!(!stmts.iter().any(|x| x.starts_with("DROP")), "{stmts:#?}");
+    apply(stmts).await;
+    assert_eq!(s.scalar("EXEC dbo.p").await, "74", "the default kept");
+    assert_eq!(
+        s.scalar(
+            "SELECT COUNT(*) FROM sys.database_permissions WHERE major_id = OBJECT_ID('dbo.p')"
+        )
+        .await,
+        "1",
+        "the grant kept"
+    );
+    let p2 = find(&read(&s).await, "p");
+    assert_eq!(p2.tsql.options, p.tsql.options, "the options restated");
+    assert_eq!(p2.comment.as_deref(), Some("adds"));
+
+    // A rename: dropped and created, the comment set again.
+    let mut d = RoutineDraft::from_info(&p2);
+    d.info.name = "q".into();
+    apply(diff_routine(&p2, &d, MS).emit()).await;
+    let all = read(&s).await;
+    assert!(!all.iter().any(|r| r.name == "p"));
+    assert_eq!(find(&all, "q").comment.as_deref(), Some("adds"));
+    assert_eq!(
+        s.scalar("EXEC dbo.q @a = 1").await,
+        "14",
+        "1 * 10 + len(N'x, y')"
+    );
+
+    // A scalar made table-valued, which only a drop and a create can do.
+    let f = find(&all, "f");
+    let mut d = RoutineDraft::from_info(&f);
+    d.info.returns = "TABLE".into();
+    d.info.body = "RETURN (SELECT @x * 3 AS v)".into();
+    apply(diff_routine(&f, &d, MS).emit()).await;
+    assert_eq!(s.scalar("SELECT v FROM dbo.f(2)").await, "6");
+
+    // A new one, from the editor's own starting point.
+    let mut d = RoutineDraft::blank(RoutineKind::Procedure, "fresh", Some("dbo".into()), MS);
+    assert!(d.validate(MS).is_empty());
+    d.info.arguments = "@n int".into();
+    d.info.body = "BEGIN SELECT @n + 1; END".into();
+    apply(schemaic_core::ddl::create_routine(&d, MS).emit()).await;
+    assert_eq!(s.scalar("EXEC dbo.fresh @n = 41").await, "42");
+    let all = read(&s).await;
+    let fresh = find(&all, "fresh");
+    assert!(diff_routine(&fresh, &RoutineDraft::from_info(&fresh), MS).is_empty());
+}
+
 /// **A trigger is altered in place and keeps what the alter would reset.**
 /// Its header options come back through the parts (`EXECUTE AS`, `NOT FOR
 /// REPLICATION`), a disabled trigger stays disabled, the `First` rank any
