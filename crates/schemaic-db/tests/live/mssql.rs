@@ -165,19 +165,9 @@ async fn a_ping_and_the_database_list_reach_the_server() {
         .await
         .expect("the server answers");
     let s = Scratch::create("dblist").await;
-    // **Retried, and the reason is a known product limit, not noise:** the
-    // listing's `HAS_DBACCESS` waits on a database another session is
-    // creating or dropping, and the rest of this leg is doing exactly that in
-    // parallel — measured up to 5.1 s against the 5 s bound. Parked in
-    // TODO.md; the retry goes when the listing stops waiting.
-    let mut listed = base_db().fetch_databases().await;
-    for _ in 0..3 {
-        if listed.is_ok() {
-            break;
-        }
-        listed = base_db().fetch_databases().await;
-    }
-    let names = listed.expect("a database list");
+    // Not retried: the rest of this leg creates and drops databases in
+    // parallel, which the listing reads past (`mssql::DATABASE_LISTING`).
+    let names = base_db().fetch_databases().await.expect("a database list");
     assert!(names.contains(&s.name), "{names:?}");
     for system in ["master", "tempdb", "model", "msdb"] {
         assert!(!names.iter().any(|n| n == system), "{system} is plumbing");

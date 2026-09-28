@@ -11115,6 +11115,26 @@ existing prose was left alone.
   plain `AND user_access = 0` beside it does not stop it being evaluated, since T-SQL promises no
   order for `AND`. `CASE` does. Such a database could not be opened by this login while it is held
   anyway, so it is left out; the four system databases (ids 1–4) are too.
+  **The listing can also wait on a database another session is creating or dropping**, and that is
+  why it reads `sys.databases WITH (READPAST)` and asks nothing per database of a login holding
+  `CONNECT ANY DATABASE` (`sysadmin` does). Its catalogue row is held under a lock that reading
+  `sys.databases` and `HAS_DBACCESS` both wait on — `LCK_M_S`, which `SET LOCK_TIMEOUT` does not
+  govern, `READ UNCOMMITTED` does not avoid, and every other source tried (`sys.sysdatabases`,
+  `sys.master_files`, `DB_NAME`) waits on the same way. Under six parallel create/drop loops (SQL
+  Server 2022 CU27) the plain listing took up to 5.1 s against its 5 s `PING_TIMEOUT`; the
+  `READPAST` scan took 0 ms, and with the short-circuit `sa`'s listing 0–4 ms. `READPAST` skips
+  only the rows under that lock — a database mid-create or mid-drop, which the next refresh shows.
+  **A plain login still asks `HAS_DBACCESS`, which still waits** (to 7.8 s measured), so
+  `listing_within` gives the access-checked query `ACCESS_CHECK_BUDGET`, three seconds, and on a
+  stall runs `DATABASE_LISTING_UNFILTERED` on a fresh connection in what is left of the five. The
+  cost is a list that may name a database this login cannot enter, which then says so when it is
+  expanded — the answer it had before the check existed. **Only a stall falls back**: an error from
+  the filtered query is returned as the answer, since a refused login would be refused again
+  (`the_fallback_is_bounded_and_an_error_is_not_retried`, beside
+  `a_stalled_access_check_falls_back_to_the_unfiltered_listing` on a paused clock;
+  `the_listings_read_past_a_database_mid_create` pins both queries' text). The live leg's
+  `a_ping_and_the_database_list_reach_the_server` used to retry the listing three times for exactly
+  this — the rest of the leg creates and drops databases in parallel — and no longer does.
   **`sys.objects.type` is `char(2)`**, so a procedure's `P` arrives padded as `P `, and until
   `routine_shape` trimmed it every stored procedure was read as a function
   (`a_routine_is_shaped_by_its_padded_object_type`).
